@@ -32,6 +32,9 @@ wheels/
 *~
 .DS_Store
 
+# Local tool settings
+.claude/
+
 # Environment
 .env
 .env.*
