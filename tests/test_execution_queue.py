@@ -6,6 +6,7 @@ from src.core.execution_queue import (
     OrbCandidate,
     OrbCandidateStatus,
     build_orb_candidate,
+    queue_key,
     select_best_orb_candidate,
 )
 
@@ -50,7 +51,30 @@ def test_one_symbol_creates_only_one_execution_queue_item():
     manager.upsert_item(symbol="aapl", name="Apple", candidates={"5m": _candidate("5m", 60)})
 
     assert len(manager.items) == 1
-    assert manager.items["AAPL"].name == "Apple"
+    assert manager.items[queue_key("AAPL", "SIM")].name == "Apple"
+
+
+def test_same_symbol_can_be_queued_independently_by_environment():
+    manager = ExecutionQueueManager()
+
+    sim_item = manager.upsert_item(
+        symbol="AAPL",
+        environment="SIM",
+        name="Apple SIM",
+        candidates={"1m": _candidate("1m", 50)},
+    )
+    prod_item = manager.upsert_item(
+        symbol="AAPL",
+        environment="PROD",
+        name="Apple PROD",
+        candidates={"5m": _candidate("5m", 60)},
+    )
+
+    assert len(manager.items) == 2
+    assert manager.items[queue_key("AAPL", "SIM")] is sim_item
+    assert manager.items[queue_key("AAPL", "PROD")] is prod_item
+    assert sim_item.name == "Apple SIM"
+    assert prod_item.name == "Apple PROD"
 
 
 def test_1m_candidate_becomes_available_first_and_is_selected():
@@ -209,7 +233,7 @@ def test_order_failure_unlocks_selected_candidate_for_retry():
 
     manager.mark_order_failed("AAPL")
 
-    item = manager.items["AAPL"]
+    item = manager.items[queue_key("AAPL", "SIM")]
     assert item.locked is False
     assert item.order_status == "REJECTED"
     assert item.selected_window == "1m"
@@ -223,8 +247,25 @@ def test_execution_queue_serializes_enum_values_round_trip():
 
     restored = ExecutionQueueManager.from_dict(manager.to_dict())
 
-    assert restored.items["AAPL"].status == ExecutionQueueStatus.ORDER_SUBMITTED
-    assert restored.items["AAPL"].selected_candidate.status == OrbCandidateStatus.EXECUTE_READY
+    assert restored.items[queue_key("AAPL", "SIM")].status == ExecutionQueueStatus.ORDER_SUBMITTED
+    assert restored.items[queue_key("AAPL", "SIM")].selected_candidate.status == OrbCandidateStatus.EXECUTE_READY
+    assert restored.items[queue_key("AAPL", "SIM")].environment == "SIM"
+
+
+def test_old_symbol_only_execution_queue_state_loads_as_sim_key():
+    manager = ExecutionQueueManager()
+    manager.upsert_item(symbol="AAPL", candidates={"1m": _candidate("1m", 50)})
+    old_item = manager.items[queue_key("AAPL", "SIM")].to_dict()
+    old_item.pop("environment")
+
+    restored = ExecutionQueueManager.from_dict({
+        "upgrade_margin": 5.0,
+        "items": {"AAPL": old_item},
+    })
+
+    assert list(restored.items) == [queue_key("AAPL", "SIM")]
+    assert restored.items[queue_key("AAPL", "SIM")].symbol == "AAPL"
+    assert restored.items[queue_key("AAPL", "SIM")].environment == "SIM"
 
 
 def test_duplicate_pending_or_submitted_orders_are_prevented():
@@ -245,6 +286,7 @@ def test_duplicate_pending_or_submitted_orders_are_prevented():
     )
 
     assert manager.has_pending_or_submitted_order("AAPL") is True
+    assert manager.has_pending_or_submitted_order("AAPL", environment="PROD") is False
     assert duplicate_candidate.status == OrbCandidateStatus.REJECTED
     assert "Duplicate" in duplicate_candidate.reason
 

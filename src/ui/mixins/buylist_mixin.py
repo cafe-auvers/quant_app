@@ -443,13 +443,7 @@ class BuylistMixin:
     def _execution_queue_status_for_buylist_item(self, item) -> Optional[str]:
         if item is None or not self._is_pre_entry_execution_queue_buylist_item(item):
             return None
-        symbol = str(getattr(item, "symbol", "") or "").upper()
-        if not symbol:
-            return None
-        manager = self.__dict__.get("execution_queue_manager")
-        if manager is None:
-            manager = self._ensure_execution_queue_manager()
-        queue_item = manager.items.get(symbol)
+        queue_item = self._execution_queue_item_for_buylist_item(item)
         if queue_item is None:
             return None
         return self._execution_queue_value(queue_item.status)
@@ -457,18 +451,32 @@ class BuylistMixin:
     def _queue_display_state_for_buylist_item(self, item):
         if item is None or not self._is_pre_entry_execution_queue_buylist_item(item):
             return None
-        symbol = str(getattr(item, "symbol", "") or "").upper()
-        if not symbol:
-            return None
-        manager = self.__dict__.get("execution_queue_manager")
-        if manager is None:
-            manager = self._ensure_execution_queue_manager()
-        queue_item = manager.items.get(symbol)
+        queue_item = self._execution_queue_item_for_buylist_item(item)
         if queue_item is None:
             return None
         from src.core.execution_queue import build_queue_display_state
 
         return build_queue_display_state(queue_item, item)
+
+    def _execution_queue_item_for_buylist_item(self, item):
+        if item is None:
+            return None
+        symbol = str(getattr(item, "symbol", "") or "").upper()
+        if not symbol:
+            return None
+        environment = str(getattr(item, "environment", "") or "SIM").upper()
+        manager = self.__dict__.get("execution_queue_manager")
+        if manager is None:
+            manager = self._ensure_execution_queue_manager()
+        get_item = getattr(manager, "get_item", None)
+        if callable(get_item):
+            return get_item(symbol, environment)
+        from src.core.execution_queue import queue_key
+
+        queue_item = manager.items.get(queue_key(symbol, environment))
+        if queue_item is None and environment == "SIM":
+            queue_item = manager.items.get(symbol)
+        return queue_item
 
     def _buylist_dashboard_status(self, item) -> str:
         queue_status = self._execution_queue_status_for_buylist_item(item)
@@ -717,8 +725,7 @@ class BuylistMixin:
     def _queue_item_for_buylist_item(self, item):
         if item is None:
             return None
-        manager = self._ensure_execution_queue_manager()
-        return manager.items.get(str(getattr(item, "symbol", "") or "").upper())
+        return self._execution_queue_item_for_buylist_item(item)
 
     def _format_execution_queue_order_review(self, env: str, item, queue_item) -> str:
         candidate = getattr(queue_item, "selected_candidate", None)
@@ -1320,7 +1327,7 @@ class BuylistMixin:
             manager = self.__dict__.get("execution_queue_manager")
             if manager is None:
                 manager = self._ensure_execution_queue_manager()
-            queue_item = manager.items.get(str(getattr(item, "symbol", "") or "").upper()) if manager is not None else None
+            queue_item = self._execution_queue_item_for_buylist_item(item) if manager is not None else None
             candidate = getattr(queue_item, "selected_candidate", None) if queue_item is not None else None
             queue_status = self._execution_queue_value(getattr(queue_item, "status", "")) if queue_item is not None else ""
             if candidate is not None and queue_status == "EXECUTE_READY":
@@ -1334,8 +1341,8 @@ class BuylistMixin:
             if manager is None and self._is_execution_queue_buylist_item(item):
                 manager = self._ensure_execution_queue_manager()
             if manager is not None:
-                manager.mark_order_failed(item.symbol, order_status="DUPLICATE")
-                queue_item = manager.items.get(item.symbol)
+                manager.mark_order_failed(item.symbol, order_status="DUPLICATE", environment=env)
+                queue_item = self._execution_queue_item_for_buylist_item(item)
                 if queue_item is not None:
                     item.monitoring_status = self._execution_queue_value(queue_item.status)
                     item.status = item.monitoring_status
@@ -1384,8 +1391,8 @@ class BuylistMixin:
             if manager is None and self._is_execution_queue_buylist_item(item):
                 manager = self._ensure_execution_queue_manager()
             if manager is not None:
-                manager.mark_order_failed(item.symbol, order_status="ERROR")
-                queue_item = manager.items.get(item.symbol)
+                manager.mark_order_failed(item.symbol, order_status="ERROR", environment=env)
+                queue_item = self._execution_queue_item_for_buylist_item(item)
                 if queue_item is not None:
                     item.monitoring_status = self._execution_queue_value(queue_item.status)
                     item.status = item.monitoring_status
@@ -1445,12 +1452,13 @@ class BuylistMixin:
         item._buy_order_pending = False
         self._record_broker_order(order)
         manager = self.__dict__.get("execution_queue_manager")
-        queue_item = manager.items.get(item.symbol) if manager is not None else None
+        queue_item = self._execution_queue_item_for_buylist_item(item) if manager is not None else None
+        env = self._buylist_order_environment(item)
 
         if order.status == OrderStatus.REJECTED:
             if manager is not None:
-                manager.mark_order_failed(item.symbol, order_status="REJECTED")
-                queue_item = manager.items.get(item.symbol)
+                manager.mark_order_failed(item.symbol, order_status="REJECTED", environment=env)
+                queue_item = self._execution_queue_item_for_buylist_item(item)
             queue_status = self._execution_queue_status_for_buylist_item(item)
             block_reason = ""
             if self._is_kis_sim_unsupported_order_error(order.error_message):
@@ -1475,12 +1483,12 @@ class BuylistMixin:
             )
             return
 
-        symbol_key = str(getattr(item, "symbol", "") or "").upper()
-        if manager is not None and symbol_key in manager.items:
+        if manager is not None and queue_item is not None:
             manager.mark_order_submitted(
                 item.symbol,
                 order_id=order.broker_order_id or order.client_order_id,
                 order_status=self._execution_queue_value(order.status).upper() or "SUBMITTED",
+                environment=env,
             )
             item.monitoring_status = self._execution_queue_status_for_buylist_item(item) or "ORDER_SUBMITTED"
         else:
@@ -1705,6 +1713,7 @@ class BuylistMixin:
                         order.symbol,
                         order_id=order.broker_order_id or order.client_order_id,
                         order_status=self._execution_queue_value(order.status).upper(),
+                        environment=str(getattr(item, "environment", "") or getattr(order, "environment", "") or "SIM").upper(),
                     )
                     queue_status = self._execution_queue_status_for_buylist_item(item)
                     if queue_status:
@@ -1780,8 +1789,12 @@ class BuylistMixin:
             if manager is None and self._is_execution_queue_buylist_item(item):
                 manager = self._ensure_execution_queue_manager()
             if manager is not None and str(side).lower() == "buy":
-                manager.mark_order_failed(symbol, order_status="ERROR")
-                queue_item = manager.items.get(str(symbol or "").upper())
+                manager.mark_order_failed(
+                    symbol,
+                    order_status="ERROR",
+                    environment=str(getattr(item, "environment", "") or "SIM").upper(),
+                )
+                queue_item = self._execution_queue_item_for_buylist_item(item)
                 if queue_item is not None:
                     item.monitoring_status = self._execution_queue_value(queue_item.status)
                     item.status = item.monitoring_status

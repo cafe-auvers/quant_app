@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 
 import src.ui.mixins.buylist_mixin as buylist_mixin_module
-from src.core.execution_queue import ExecutionQueueStatus, OrbCandidateStatus
+from src.core.execution_queue import ExecutionQueueStatus, OrbCandidateStatus, queue_key
 from src.core.watchlist import BuylistManager, Watchlist, WatchlistItem
 from src.ui.main_window import MainWindow
 
@@ -100,6 +100,9 @@ def _build_queue_window(monkeypatch, tmp_path):
     window.buylist_sim_positions_label = None
     window.buylist_sim_capital_label = None
     window.buylist_sim_pnl_label = None
+    window.buylist_prod_positions_label = None
+    window.buylist_prod_capital_label = None
+    window.buylist_prod_pnl_label = None
     return window
 
 
@@ -132,7 +135,7 @@ def test_intentional_selected_symbol_creates_one_buylist_queue_item(monkeypatch,
     assert item.entry_price == pytest.approx(100.1)
     assert item._planned_shares > 0
     assert item.shares_held == 0
-    assert window.execution_queue_manager.items["AAPL"].selected_window == "1m"
+    assert window.execution_queue_manager.items[queue_key("AAPL", "SIM")].selected_window == "1m"
     result = window._last_execution_queue_refresh_result
     assert result.refreshed == 1
     assert result.missing_symbols == []
@@ -170,7 +173,7 @@ def test_duplicate_pending_order_rejects_queue_candidates(monkeypatch, tmp_path)
         create_missing=True,
     )
 
-    queue_item = window.execution_queue_manager.items["AAPL"]
+    queue_item = window.execution_queue_manager.items[queue_key("AAPL", "SIM")]
     assert refreshed == 1
     assert queue_item.status == ExecutionQueueStatus.REJECTED
     assert queue_item.selected_candidate is None
@@ -208,7 +211,7 @@ def test_buy_dashboard_status_uses_execution_queue_status(monkeypatch, tmp_path)
     )
     item = window.buylist_manager.get("AAPL", "SIM")
     item.monitoring_status = "ACTIVE"
-    window.execution_queue_manager.items["AAPL"].status = ExecutionQueueStatus.ORDER_SUBMITTED
+    window.execution_queue_manager.items[queue_key("AAPL", "SIM")].status = ExecutionQueueStatus.ORDER_SUBMITTED
 
     assert MainWindow._buylist_dashboard_status(window, item) == "ORDER_SUBMITTED"
     assert "ORDER_SUBMITTED" in MainWindow._buylist_compute_alerts(window, item, 101.0, 0)
@@ -233,12 +236,50 @@ def test_buy_dashboard_queue_row_uses_execution_queue_candidate_values(monkeypat
 
     MainWindow._populate_buylist_env_table(window, "SIM")
 
-    candidate = window.execution_queue_manager.items["AAPL"].selected_candidate
+    candidate = window.execution_queue_manager.items[queue_key("AAPL", "SIM")].selected_candidate
     assert table.item(0, 4).text() == f"{candidate.entry_trigger:.2f}"
     assert table.item(0, 6).text() == f"{candidate.stop_loss:.2f}"
     assert table.item(0, 9).text() == str(candidate.shares)
     assert table.item(0, 10).text() == f"{candidate.capital_percent:.1f}%"
     assert "Qty 1" not in table.item(0, 12).text()
+
+
+def test_buy_dashboard_uses_environment_specific_queue_item(monkeypatch, tmp_path):
+    window = _build_queue_window(monkeypatch, tmp_path)
+    for env in ("SIM", "PROD"):
+        MainWindow.refresh_execution_queue(
+            window,
+            env,
+            show_log=False,
+            symbols=["AAPL"],
+            create_missing=True,
+        )
+
+    sim_queue = window.execution_queue_manager.get_item("AAPL", "SIM")
+    prod_queue = window.execution_queue_manager.get_item("AAPL", "PROD")
+    sim_queue.selected_candidate.entry_trigger = 111.11
+    sim_queue.selected_candidate.shares = 11
+    sim_queue.selected_candidate.capital_percent = 11.0
+    prod_queue.selected_candidate.entry_trigger = 222.22
+    prod_queue.selected_candidate.shares = 22
+    prod_queue.selected_candidate.capital_percent = 22.0
+
+    window.buylist_manager.get("AAPL", "SIM").entry_price = 1.0
+    window.buylist_manager.get("AAPL", "PROD").entry_price = 2.0
+    sim_table = FakeTable()
+    prod_table = FakeTable()
+    window.buylist_sim_table = sim_table
+    window.buylist_prod_table = prod_table
+
+    MainWindow._populate_buylist_env_table(window, "SIM")
+    MainWindow._populate_buylist_env_table(window, "PROD")
+
+    assert sim_table.item(0, 4).text() == "111.11"
+    assert sim_table.item(0, 9).text() == "11"
+    assert sim_table.item(0, 10).text() == "11.0%"
+    assert prod_table.item(0, 4).text() == "222.22"
+    assert prod_table.item(0, 9).text() == "22"
+    assert prod_table.item(0, 10).text() == "22.0%"
 
 
 def test_buy_dashboard_queue_row_falls_back_to_buylist_when_queue_missing(monkeypatch, tmp_path):
@@ -255,7 +296,7 @@ def test_buy_dashboard_queue_row_falls_back_to_buylist_when_queue_missing(monkey
     item.stop_loss = 11.11
     item.position_percent = 3.4
     item._planned_shares = 6
-    del window.execution_queue_manager.items["AAPL"]
+    del window.execution_queue_manager.items[queue_key("AAPL", "SIM")]
     table = FakeTable()
     window.buylist_sim_table = table
 
@@ -308,7 +349,7 @@ def test_queue_order_review_uses_selected_candidate_values(monkeypatch, tmp_path
     )
     item = window.buylist_manager.get("AAPL", "SIM")
     item.entry_price = 1.23
-    queue_item = window.execution_queue_manager.items["AAPL"]
+    queue_item = window.execution_queue_manager.items[queue_key("AAPL", "SIM")]
     queue_item.selected_candidate.entry_trigger = 123.45
     queue_item.selected_candidate.shares = 7
 

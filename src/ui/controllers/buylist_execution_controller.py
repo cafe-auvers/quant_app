@@ -86,7 +86,10 @@ class BuylistExecutionController(WindowController):
                 current_price = request.signal_price_for_symbol(symbol)
                 if current_price > 0:
                     request.set_latest_intraday_price(symbol, current_price)
-                duplicate_order = request.manager.has_pending_or_submitted_order(symbol) or request.has_duplicate_open_order(
+                duplicate_order = request.manager.has_pending_or_submitted_order(
+                    symbol,
+                    environment=request.env,
+                ) or request.has_duplicate_open_order(
                     request.env,
                     request.account_no,
                     symbol,
@@ -99,6 +102,7 @@ class BuylistExecutionController(WindowController):
                     current_price=current_price,
                     account_size=request.account_size,
                     risk_percent=request.risk_percent,
+                    environment=request.env,
                     adr_percent=request.adr_percent_for_symbol(symbol),
                     buffer_pct=request.buffer_pct,
                     duplicate_pending_order=duplicate_order,
@@ -271,7 +275,7 @@ class BuylistExecutionController(WindowController):
             return
 
         manager = self._ensure_execution_queue_manager()
-        manager.mark_order_submitted(item.symbol, order_status="PENDING")
+        manager.mark_order_submitted(item.symbol, order_status="PENDING", environment=env)
         queue_status = self._execution_queue_status_for_buylist_item(item) or "ORDER_PENDING"
         item.monitoring_status = queue_status
         item.status = queue_status

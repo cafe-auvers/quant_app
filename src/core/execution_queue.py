@@ -26,6 +26,18 @@ MIN_STOP_ADR = 15.0
 MAX_STOP_ADR = 66.0
 
 
+def queue_key(symbol: str, environment: str = "SIM") -> str:
+    return f"{str(environment or 'SIM').upper()}:{str(symbol or '').upper()}"
+
+
+def _split_queue_key(key: str) -> tuple[str, str]:
+    raw = str(key or "").upper()
+    if ":" in raw:
+        environment, symbol = raw.split(":", 1)
+        return environment or "SIM", symbol
+    return "SIM", raw
+
+
 class ExecutionQueueStatus(str, Enum):
     WATCHING = "WATCHING"
     ORB_FORMING = "ORB_FORMING"
@@ -120,6 +132,7 @@ class OrbCandidate:
 @dataclass
 class ExecutionQueueItem:
     symbol: str
+    environment: str = "SIM"
     name: str = ""
     breakout_price: Optional[float] = None
     current_price: Optional[float] = None
@@ -137,6 +150,7 @@ class ExecutionQueueItem:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "symbol": self.symbol,
+            "environment": self.environment,
             "name": self.name,
             "breakout_price": self.breakout_price,
             "current_price": self.current_price,
@@ -167,6 +181,7 @@ class ExecutionQueueItem:
             last_updated = datetime.now()
         return cls(
             symbol=str(data.get("symbol", "")).upper(),
+            environment=str(data.get("environment", "SIM") or "SIM").upper(),
             name=str(data.get("name", "")),
             breakout_price=_optional_float(data.get("breakout_price")),
             current_price=_optional_float(data.get("current_price")),
@@ -626,16 +641,32 @@ def resolve_queue_status(
 
 
 class ExecutionQueueManager:
-    """Stateful manager for one execution queue row per symbol."""
+    """Stateful manager for one execution queue row per environment and symbol."""
 
     def __init__(self, upgrade_margin: float = DEFAULT_UPGRADE_MARGIN) -> None:
         self.upgrade_margin = upgrade_margin
         self.items: Dict[str, ExecutionQueueItem] = {}
 
+    def get_item(
+        self,
+        symbol: str,
+        environment: str = "SIM",
+        *,
+        legacy_fallback: bool = True,
+    ) -> Optional[ExecutionQueueItem]:
+        key = queue_key(symbol, environment)
+        item = self.items.get(key)
+        if item is not None:
+            return item
+        if legacy_fallback and str(environment or "SIM").upper() == "SIM":
+            return self.items.get(str(symbol or "").upper())
+        return None
+
     def upsert_item(
         self,
         *,
         symbol: str,
+        environment: str = "SIM",
         name: str = "",
         breakout_price: Optional[float] = None,
         current_price: Optional[float] = None,
@@ -643,11 +674,21 @@ class ExecutionQueueManager:
         warnings: Optional[Iterable[str]] = None,
     ) -> ExecutionQueueItem:
         symbol_key = str(symbol or "").upper()
-        existing = self.items.get(symbol_key)
+        environment_key = str(environment or "SIM").upper()
+        item_key = queue_key(symbol_key, environment_key)
+        legacy_key = symbol_key
+        existing = self.items.get(item_key)
+        if existing is None and environment_key == "SIM" and legacy_key in self.items:
+            existing = self.items.pop(legacy_key)
+            existing.environment = "SIM"
+            existing.symbol = symbol_key
+            self.items[item_key] = existing
         if existing is None:
-            existing = ExecutionQueueItem(symbol=symbol_key, name=name)
-            self.items[symbol_key] = existing
+            existing = ExecutionQueueItem(symbol=symbol_key, environment=environment_key, name=name)
+            self.items[item_key] = existing
 
+        existing.symbol = symbol_key
+        existing.environment = environment_key
         existing.name = name or existing.name
         existing.breakout_price = breakout_price
         existing.current_price = current_price
@@ -684,6 +725,7 @@ class ExecutionQueueManager:
         current_price: Optional[float],
         account_size: float,
         risk_percent: float,
+        environment: str = "SIM",
         adr_percent: Optional[float] = None,
         buffer_pct: float = DEFAULT_ORB_BUFFER_PCT,
         duplicate_pending_order: bool = False,
@@ -709,14 +751,23 @@ class ExecutionQueueManager:
         }
         return self.upsert_item(
             symbol=symbol,
+            environment=environment,
             name=str(getattr(item, "name", "") or symbol),
             breakout_price=breakout_price,
             current_price=current_price,
             candidates=candidates,
         )
 
-    def mark_order_submitted(self, symbol: str, order_id: str = "", order_status: str = "SUBMITTED") -> None:
-        item = self.items[str(symbol or "").upper()]
+    def mark_order_submitted(
+        self,
+        symbol: str,
+        order_id: str = "",
+        order_status: str = "SUBMITTED",
+        environment: str = "SIM",
+    ) -> None:
+        item = self.get_item(symbol, environment)
+        if item is None:
+            raise KeyError(queue_key(symbol, environment))
         item.locked = True
         item.locked_reason = "Order submitted"
         item.order_status = order_status
@@ -724,8 +775,8 @@ class ExecutionQueueManager:
         item.status = resolve_queue_status(item.candidates, item.selected_candidate, locked=True, order_status=order_status)
         item.last_updated = datetime.now()
 
-    def mark_order_failed(self, symbol: str, order_status: str = "REJECTED") -> None:
-        item = self.items.get(str(symbol or "").upper())
+    def mark_order_failed(self, symbol: str, order_status: str = "REJECTED", environment: str = "SIM") -> None:
+        item = self.get_item(symbol, environment)
         if item is None:
             return
         item.locked = False
@@ -735,8 +786,14 @@ class ExecutionQueueManager:
         item.status = resolve_queue_status(item.candidates, item.selected_candidate)
         item.last_updated = datetime.now()
 
-    def mark_order_filled(self, symbol: str, order_id: str = "", order_status: str = "FILLED") -> None:
-        item = self.items.get(str(symbol or "").upper())
+    def mark_order_filled(
+        self,
+        symbol: str,
+        order_id: str = "",
+        order_status: str = "FILLED",
+        environment: str = "SIM",
+    ) -> None:
+        item = self.get_item(symbol, environment)
         if item is None:
             return
         item.locked = True
@@ -746,8 +803,8 @@ class ExecutionQueueManager:
         item.status = ExecutionQueueStatus.FILLED
         item.last_updated = datetime.now()
 
-    def has_pending_or_submitted_order(self, symbol: str) -> bool:
-        item = self.items.get(str(symbol or "").upper())
+    def has_pending_or_submitted_order(self, symbol: str, environment: str = "SIM") -> bool:
+        item = self.get_item(symbol, environment)
         if item is None:
             return False
         return item.status in {ExecutionQueueStatus.ORDER_PENDING, ExecutionQueueStatus.ORDER_SUBMITTED}
@@ -758,14 +815,25 @@ class ExecutionQueueManager:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "upgrade_margin": self.upgrade_margin,
-            "items": {symbol: item.to_dict() for symbol, item in self.items.items()},
+            "items": {
+                queue_key(item.symbol or _split_queue_key(key)[1], item.environment): item.to_dict()
+                for key, item in self.items.items()
+            },
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ExecutionQueueManager":
         manager = cls(upgrade_margin=float(data.get("upgrade_margin", DEFAULT_UPGRADE_MARGIN)))
-        manager.items = {
-            str(symbol).upper(): ExecutionQueueItem.from_dict(item_data)
-            for symbol, item_data in dict(data.get("items", {})).items()
-        }
+        for raw_key, item_data in dict(data.get("items", {})).items():
+            if not isinstance(item_data, dict):
+                continue
+            key_environment, key_symbol = _split_queue_key(str(raw_key))
+            item = ExecutionQueueItem.from_dict(item_data)
+            if not item.symbol:
+                item.symbol = key_symbol
+            if item_data.get("environment") is None:
+                item.environment = key_environment
+            item.symbol = str(item.symbol or "").upper()
+            item.environment = str(item.environment or "SIM").upper()
+            manager.items[queue_key(item.symbol, item.environment)] = item
         return manager

@@ -94,8 +94,9 @@ class AccountController(WindowController):
             item._buy_order_pending = False
             if self._is_execution_queue_buylist_item(item):
                 manager = self._ensure_execution_queue_manager()
-                if symbol in manager.items:
-                    manager.mark_order_filled(symbol, order_status="FILLED")
+                queue_item = manager.get_item(symbol, environment) if hasattr(manager, "get_item") else None
+                if queue_item is not None:
+                    manager.mark_order_filled(symbol, order_status="FILLED", environment=environment)
                     item.status = self._execution_queue_status_for_buylist_item(item) or item.status
             if item.monitoring_status in {"WATCHING", "ACTIVE", "BUY_SUBMITTED", "BUY_PARTIAL", "ERROR", "BOUGHT"}:
                 item.monitoring_status = "BOUGHT"

@@ -51,14 +51,18 @@ class FakeQueueManager:
         self.status = status
         self.pending = pending
         self.duplicate_pending_order = None
+        self.pending_environment = None
+        self.build_environment = None
         self.build_calls = 0
 
-    def has_pending_or_submitted_order(self, symbol):
+    def has_pending_or_submitted_order(self, symbol, environment="SIM"):
+        self.pending_environment = environment
         return self.pending
 
     def build_or_update_from_watchlist_item(self, item, intraday_by_window, **kwargs):
         self.build_calls += 1
         self.duplicate_pending_order = kwargs["duplicate_pending_order"]
+        self.build_environment = kwargs["environment"]
         return _queue_item(item.symbol, self.status)
 
 
@@ -164,6 +168,8 @@ def test_duplicate_pending_order_is_passed_to_queue_builder():
     assert result.refreshed == 1
     assert manager.build_calls == 1
     assert manager.duplicate_pending_order is True
+    assert manager.pending_environment == "SIM"
+    assert manager.build_environment == "SIM"
 
 
 def test_callback_failure_is_captured_and_refresh_continues():
@@ -250,30 +256,37 @@ def test_apply_queue_item_does_not_overwrite_bought_position_fields():
 
 def test_submit_selected_queue_order_uses_queue_candidate_not_buylist_mirrors(monkeypatch):
     item = _existing_buylist_item(
+        environment="PROD",
         monitoring_status="EXECUTE_READY",
         entry_price=1.23,
         stop_loss=0.45,
         breakout_method="execution_queue:1m",
     )
-    queue_item = _queue_item()
-    queue_item.selected_candidate.entry_trigger = 123.45
-    queue_item.selected_candidate.stop_loss = 120.0
-    queue_item.selected_candidate.shares = 7
+    sim_queue_item = _queue_item()
+    sim_queue_item.selected_candidate.entry_trigger = 12.34
+    sim_queue_item.selected_candidate.shares = 1
+    prod_queue_item = _queue_item()
+    prod_queue_item.selected_candidate.entry_trigger = 123.45
+    prod_queue_item.selected_candidate.stop_loss = 120.0
+    prod_queue_item.selected_candidate.shares = 7
     submissions = []
 
     class Manager:
         def __init__(self):
-            self.items = {"AAPL": queue_item}
+            self.items = {("SIM", "AAPL"): sim_queue_item, ("PROD", "AAPL"): prod_queue_item}
             self.mark_calls = []
 
-        def mark_order_submitted(self, symbol, order_id="", order_status="SUBMITTED"):
-            self.mark_calls.append((symbol, order_id, order_status))
-            self.items[symbol].status = "ORDER_PENDING"
+        def get_item(self, symbol, environment="SIM"):
+            return self.items.get((environment, symbol))
+
+        def mark_order_submitted(self, symbol, order_id="", order_status="SUBMITTED", environment="SIM"):
+            self.mark_calls.append((symbol, order_id, order_status, environment))
+            self.items[(environment, symbol)].status = "ORDER_PENDING"
 
     manager = Manager()
     window = SimpleNamespace(
         _buylist_selected_item=lambda env: item,
-        _queue_item_for_buylist_item=lambda selected: queue_item,
+        _queue_item_for_buylist_item=lambda selected: manager.get_item(selected.symbol, selected.environment),
         _buylist_auto_order_blocked=lambda selected: False,
         _first_account_no_for_environment=lambda env: "12345678",
         _has_duplicate_open_order=lambda *args: False,
@@ -291,9 +304,9 @@ def test_submit_selected_queue_order_uses_queue_candidate_not_buylist_mirrors(mo
         lambda *args, **kwargs: controller_module.QMessageBox.Yes,
     )
 
-    BuylistExecutionController(window).submit_selected_queue_order("SIM")
+    BuylistExecutionController(window).submit_selected_queue_order("PROD")
 
-    assert manager.mark_calls == [("AAPL", "", "PENDING")]
+    assert manager.mark_calls == [("AAPL", "", "PENDING", "PROD")]
     assert submissions == [(item, {"quantity": 7, "order_price": 123.45})]
     assert item.entry_price == 1.23
     assert item.stop_loss == 0.45
