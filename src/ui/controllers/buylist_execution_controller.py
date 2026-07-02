@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from PyQt5.QtWidgets import QMessageBox
 
@@ -9,149 +10,117 @@ from src.core.watchlist import BuylistItem
 from src.ui.controllers.base import WindowController
 
 
+@dataclass
+class ExecutionQueueRefreshRequest:
+    env: str
+    manager: Any
+    buylist_manager: Any
+    target_items: Sequence[Any]
+    missing_symbols: List[str] = field(default_factory=list)
+    requested_symbols: Optional[List[str]] = None
+    account_size: float = 100000.0
+    risk_percent: float = 0.01
+    buffer_pct: float = 0.001
+    account_no: str = ""
+    window_days: int = 7
+    latest_intraday_session: Callable[[Any], Any] = lambda frame: frame
+    load_intraday_interval: Callable[[str, str, int], Any] = lambda _symbol, _interval, _window_days: None
+    signal_price_for_symbol: Callable[[str], float] = lambda _symbol: 0.0
+    set_latest_intraday_price: Callable[[str, float], None] = lambda _symbol, _price: None
+    has_duplicate_open_order: Callable[[str, str, str, OrderSide, OrderIntent], bool] = lambda *_args: False
+    adr_percent_for_symbol: Callable[[str], Optional[float]] = lambda _symbol: None
+
+    @property
+    def scope(self) -> str:
+        return "queued" if self.requested_symbols is None else "selected"
+
+
+@dataclass
+class ExecutionQueueRefreshResult:
+    env: str
+    requested_symbols: Optional[List[str]] = None
+    missing_symbols: List[str] = field(default_factory=list)
+    status_counts: Dict[str, int] = field(default_factory=dict)
+    failures: List[str] = field(default_factory=list)
+    refreshed: int = 0
+    target_count: int = 0
+
+    @property
+    def scope(self) -> str:
+        return "queued" if self.requested_symbols is None else "selected"
+
+
 class BuylistExecutionController(WindowController):
     """Own execution-queue refresh and order submission workflows."""
 
-    def execution_queue_target_items(
-        self,
-        env: str,
-        symbols: Optional[List[str]] = None,
-        *,
-        create_missing: bool = False,
-    ) -> Tuple[List[Any], List[str]]:
-        watch_items = list(getattr(getattr(self, "watchlist", None), "items", []) or [])
-        watch_by_symbol = {
-            str(getattr(item, "symbol", "") or "").strip().upper(): item
-            for item in watch_items
-            if str(getattr(item, "symbol", "") or "").strip()
-        }
-        queued_symbols = [
-            str(getattr(item, "symbol", "") or "").strip().upper()
-            for item in list(getattr(getattr(self, "buylist_manager", None), "items", []) or [])
-            if str(getattr(item, "environment", "") or "").upper() == env
-            and self._is_execution_queue_buylist_item(item)
-        ]
+    @staticmethod
+    def _status_text(value: Any) -> str:
+        return str(getattr(value, "value", value) or "")
 
-        if symbols is None:
-            target_symbols = queued_symbols
-        else:
-            requested = []
-            for raw_symbol in symbols:
-                symbol = str(raw_symbol or "").strip().upper()
-                if symbol and symbol not in requested:
-                    requested.append(symbol)
-            target_symbols = requested if create_missing else [symbol for symbol in requested if symbol in queued_symbols]
-
-        targets: List[Any] = []
-        missing: List[str] = []
-        for symbol in target_symbols:
-            item = watch_by_symbol.get(symbol)
-            if item is None:
-                existing = self.buylist_manager.get(symbol, env) if hasattr(self, "buylist_manager") else None
-                if existing is not None and self._is_execution_queue_buylist_item(existing):
-                    item = existing
-            if item is None:
-                missing.append(symbol)
-                continue
-            targets.append(item)
-        return targets, missing
-
-    def refresh_execution_queue(
-        self,
-        env: Optional[str] = None,
-        show_log: bool = True,
-        symbols: Optional[List[str]] = None,
-        *,
-        create_missing: bool = False,
-    ) -> int:
+    def refresh_execution_queue(self, request: ExecutionQueueRefreshRequest) -> ExecutionQueueRefreshResult:
         """Refresh existing queue rows, or intentionally queue selected symbols."""
-        env = (env or (self.watchlist_env_combo.currentText() if hasattr(self, "watchlist_env_combo") else "SIM")).upper()
-        target_items, missing_symbols = self.execution_queue_target_items(
-            env,
-            symbols,
-            create_missing=create_missing,
+        result = ExecutionQueueRefreshResult(
+            env=request.env,
+            requested_symbols=request.requested_symbols,
+            missing_symbols=list(request.missing_symbols),
+            target_count=len(request.target_items),
         )
-        if not target_items:
-            if show_log:
-                if symbols is None:
-                    self.append_log(f"[Execution Queue/{env}] No queued buylist symbols to refresh.")
-                else:
-                    self.append_log(f"[Execution Queue/{env}] No selected watchlist symbols could be queued.")
-                if missing_symbols:
-                    self.append_log(f"[Execution Queue/{env}] Missing symbols: " + ", ".join(missing_symbols[:10]))
-            return 0
+        if not request.target_items:
+            return result
 
-        manager = self._ensure_execution_queue_manager()
-        account_size = self._get_account_balance_for_env(env) if hasattr(self, "_get_account_balance_for_env") else 100000.0
-        risk_percent = (
-            self._parse_float(self.risk_percent_input, 1.0) / 100.0
-            if hasattr(self, "risk_percent_input") else 0.01
-        )
-        if risk_percent <= 0:
-            risk_percent = 0.01
-        buffer_pct = self._watchlist_orb_buffer_pct() if hasattr(self, "_watchlist_orb_buffer_pct") else 0.001
-        account_no = self._first_account_no_for_environment(env) or ""
-
-        status_counts: Dict[str, int] = {}
-        failed: List[str] = []
-        refreshed = 0
-        for watch_item in target_items:
+        for watch_item in request.target_items:
             symbol = str(getattr(watch_item, "symbol", "") or "").strip().upper()
             if not symbol:
                 continue
             try:
-                one_minute = self._latest_intraday_session(
-                    self._load_cached_intraday_interval(symbol, "1m", window_days=7)
+                one_minute = request.latest_intraday_session(
+                    request.load_intraday_interval(symbol, "1m", request.window_days)
                 )
-                five_minute = self._latest_intraday_session(
-                    self._load_cached_intraday_interval(symbol, "5m", window_days=7)
+                five_minute = request.latest_intraday_session(
+                    request.load_intraday_interval(symbol, "5m", request.window_days)
                 )
-                current_price = self._watchlist_orb_signal_price(symbol) if hasattr(self, "_watchlist_orb_signal_price") else 0.0
+                current_price = request.signal_price_for_symbol(symbol)
                 if current_price > 0:
-                    self.latest_intraday_prices[symbol] = current_price
-                duplicate_order = manager.has_pending_or_submitted_order(symbol) or self._has_duplicate_open_order(
-                    env,
-                    account_no,
+                    request.set_latest_intraday_price(symbol, current_price)
+                duplicate_order = request.manager.has_pending_or_submitted_order(symbol) or request.has_duplicate_open_order(
+                    request.env,
+                    request.account_no,
                     symbol,
                     OrderSide.BUY,
                     OrderIntent.ENTRY,
                 )
-                queue_item = manager.build_or_update_from_watchlist_item(
+                queue_item = request.manager.build_or_update_from_watchlist_item(
                     watch_item,
                     {"1m": one_minute, "5m": five_minute, "30m": five_minute},
                     current_price=current_price,
-                    account_size=account_size,
-                    risk_percent=risk_percent,
-                    adr_percent=self._calculate_adr_percent_for_symbol(symbol),
-                    buffer_pct=buffer_pct,
+                    account_size=request.account_size,
+                    risk_percent=request.risk_percent,
+                    adr_percent=request.adr_percent_for_symbol(symbol),
+                    buffer_pct=request.buffer_pct,
                     duplicate_pending_order=duplicate_order,
                 )
-                self.apply_execution_queue_item_to_buylist(queue_item, watch_item, env, buffer_pct)
-                status_text = self._execution_queue_value(queue_item.status)
-                status_counts[status_text] = status_counts.get(status_text, 0) + 1
-                refreshed += 1
+                self.apply_execution_queue_item_to_buylist(
+                    queue_item,
+                    watch_item,
+                    request.env,
+                    request.buffer_pct,
+                    buylist_manager=request.buylist_manager,
+                )
+                status_text = self._status_text(queue_item.status)
+                result.status_counts[status_text] = result.status_counts.get(status_text, 0) + 1
+                result.refreshed += 1
             except Exception as exc:
-                failed.append(f"{symbol}: {exc}")
+                result.failures.append(f"{symbol}: {exc}")
+        return result
 
-        self.populate_buylist_dashboard()
-        if hasattr(self, "update_dashboard_summary"):
-            self.update_dashboard_summary()
-        self._save_buylist_state()
-        self._save_execution_queue_state()
-
-        if show_log:
-            counts_text = ", ".join(f"{key}={value}" for key, value in sorted(status_counts.items())) or "none"
-            scope = "queued" if symbols is None else "selected"
-            self.append_log(
-                f"[Execution Queue/{env}] Refreshed {refreshed} {scope} symbol(s): {counts_text}."
-            )
-            if missing_symbols:
-                self.append_log(f"[Execution Queue/{env}] Missing symbols: " + ", ".join(missing_symbols[:10]))
-            if failed:
-                self.append_log(f"[Execution Queue/{env}] Refresh failures: " + "; ".join(failed[:10]))
-        return refreshed
-
-    def apply_execution_queue_item_to_buylist(self, queue_item, watch_item, env: str, buffer_pct: float) -> None:
+    def apply_execution_queue_item_to_buylist(
+        self,
+        queue_item,
+        watch_item,
+        env: str,
+        buffer_pct: float,
+        buylist_manager: Optional[Any] = None,
+    ) -> None:
         symbol = str(queue_item.symbol or "").upper()
         if not symbol:
             return
@@ -160,12 +129,13 @@ class BuylistExecutionController(WindowController):
             "BOUGHT", "BUY_SUBMITTED", "BUY_PARTIAL", "SELL_SUBMITTED",
             "PARTIAL_EXIT_SUBMITTED", "SOLD",
         }
-        existing = self.buylist_manager.get(symbol, env)
+        manager = buylist_manager if buylist_manager is not None else self.buylist_manager
+        existing = manager.get(symbol, env)
         if existing is not None and str(getattr(existing, "monitoring_status", "")).upper() in protected_statuses:
             return
 
         candidate = queue_item.selected_candidate
-        status_text = self._execution_queue_value(queue_item.status)
+        status_text = self._status_text(queue_item.status)
         entry_trigger = float(getattr(candidate, "entry_trigger", 0.0) or 0.0) if candidate else 0.0
         orb_high = float(getattr(candidate, "orb_high", 0.0) or 0.0) if candidate else 0.0
         stop_loss = float(getattr(candidate, "stop_loss", 0.0) or 0.0) if candidate else float(getattr(watch_item, "stop_loss", 0.0) or 0.0)
@@ -227,7 +197,7 @@ class BuylistExecutionController(WindowController):
                 breakout_method=f"execution_queue:{selected_window}" if selected_window else "execution_queue",
                 buffer_pct=buffer_pct,
             )
-            self.buylist_manager.add(existing)
+            manager.add(existing)
         else:
             existing.name = str(getattr(watch_item, "name", "") or existing.name or symbol)
             existing.entry_price = entry_price
@@ -262,7 +232,7 @@ class BuylistExecutionController(WindowController):
             QMessageBox.warning(self.window, "No queue item", f"{item.symbol} is not in the execution queue. Click Refresh Queue first.")
             return
         candidate = getattr(queue_item, "selected_candidate", None)
-        status_text = self._execution_queue_value(getattr(queue_item, "status", ""))
+        status_text = self._status_text(getattr(queue_item, "status", ""))
         if candidate is None or status_text != "EXECUTE_READY":
             QMessageBox.warning(
                 self.window,

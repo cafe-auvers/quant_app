@@ -510,11 +510,136 @@ class BuylistMixin:
         *,
         create_missing: bool = False,
     ) -> Tuple[List[Any], List[str]]:
-        from src.ui.controllers.base import get_controller
-        from src.ui.controllers.buylist_execution_controller import BuylistExecutionController
+        watch_items = list(getattr(getattr(self, "watchlist", None), "items", []) or [])
+        watch_by_symbol = {
+            str(getattr(item, "symbol", "") or "").strip().upper(): item
+            for item in watch_items
+            if str(getattr(item, "symbol", "") or "").strip()
+        }
+        queued_symbols = [
+            str(getattr(item, "symbol", "") or "").strip().upper()
+            for item in list(getattr(getattr(self, "buylist_manager", None), "items", []) or [])
+            if str(getattr(item, "environment", "") or "").upper() == env
+            and self._is_execution_queue_buylist_item(item)
+        ]
 
-        controller = get_controller(self, "buylist_execution_controller", BuylistExecutionController)
-        return controller.execution_queue_target_items(env, symbols, create_missing=create_missing)
+        if symbols is None:
+            target_symbols = queued_symbols
+        else:
+            requested = []
+            for raw_symbol in symbols:
+                symbol = str(raw_symbol or "").strip().upper()
+                if symbol and symbol not in requested:
+                    requested.append(symbol)
+            target_symbols = requested if create_missing else [symbol for symbol in requested if symbol in queued_symbols]
+
+        targets: List[Any] = []
+        missing: List[str] = []
+        for symbol in target_symbols:
+            item = watch_by_symbol.get(symbol)
+            if item is None:
+                existing = self.buylist_manager.get(symbol, env) if hasattr(self, "buylist_manager") else None
+                if existing is not None and self._is_execution_queue_buylist_item(existing):
+                    item = existing
+            if item is None:
+                missing.append(symbol)
+                continue
+            targets.append(item)
+        return targets, missing
+
+    def _build_execution_queue_refresh_request(
+        self,
+        env: Optional[str] = None,
+        symbols: Optional[List[str]] = None,
+        *,
+        create_missing: bool = False,
+    ):
+        from src.ui.controllers.buylist_execution_controller import ExecutionQueueRefreshRequest
+
+        env = (env or (self.watchlist_env_combo.currentText() if hasattr(self, "watchlist_env_combo") else "SIM")).upper()
+        requested_symbols = None
+        if symbols is not None:
+            requested_symbols = []
+            for raw_symbol in symbols:
+                symbol = str(raw_symbol or "").strip().upper()
+                if symbol and symbol not in requested_symbols:
+                    requested_symbols.append(symbol)
+
+        target_items, missing_symbols = self._execution_queue_target_items(
+            env,
+            requested_symbols,
+            create_missing=create_missing,
+        )
+        manager = None
+        account_size = 100000.0
+        risk_percent = 0.01
+        buffer_pct = 0.001
+        account_no = ""
+        if target_items:
+            manager = self._ensure_execution_queue_manager()
+            account_size = self._get_account_balance_for_env(env) if hasattr(self, "_get_account_balance_for_env") else 100000.0
+            risk_percent = (
+                self._parse_float(self.risk_percent_input, 1.0) / 100.0
+                if hasattr(self, "risk_percent_input") else 0.01
+            )
+            if risk_percent <= 0:
+                risk_percent = 0.01
+            buffer_pct = self._watchlist_orb_buffer_pct() if hasattr(self, "_watchlist_orb_buffer_pct") else 0.001
+            account_no = self._first_account_no_for_environment(env) or ""
+
+        return ExecutionQueueRefreshRequest(
+            env=env,
+            manager=manager,
+            buylist_manager=self.buylist_manager,
+            target_items=target_items,
+            missing_symbols=missing_symbols,
+            requested_symbols=requested_symbols,
+            account_size=account_size,
+            risk_percent=risk_percent,
+            buffer_pct=buffer_pct,
+            account_no=account_no,
+            latest_intraday_session=self._latest_intraday_session,
+            load_intraday_interval=lambda symbol, interval, window_days: self._load_cached_intraday_interval(
+                symbol,
+                interval,
+                window_days=window_days,
+            ),
+            signal_price_for_symbol=(
+                self._watchlist_orb_signal_price if hasattr(self, "_watchlist_orb_signal_price") else lambda _symbol: 0.0
+            ),
+            set_latest_intraday_price=lambda symbol, price: self.latest_intraday_prices.__setitem__(symbol, price),
+            has_duplicate_open_order=self._has_duplicate_open_order,
+            adr_percent_for_symbol=self._calculate_adr_percent_for_symbol,
+        )
+
+    def _apply_execution_queue_refresh_result(self, result, show_log: bool = True) -> None:
+        if result.target_count > 0:
+            self.populate_buylist_dashboard()
+            if hasattr(self, "update_dashboard_summary"):
+                self.update_dashboard_summary()
+            self._save_buylist_state()
+            self._save_execution_queue_state()
+
+        if not show_log:
+            return
+
+        if result.target_count == 0:
+            if result.requested_symbols is None:
+                self.append_log(f"[Execution Queue/{result.env}] No queued buylist symbols to refresh.")
+            else:
+                self.append_log(f"[Execution Queue/{result.env}] No selected watchlist symbols could be queued.")
+            if result.missing_symbols:
+                self.append_log(f"[Execution Queue/{result.env}] Missing symbols: " + ", ".join(result.missing_symbols[:10]))
+            return
+
+        counts_text = ", ".join(f"{key}={value}" for key, value in sorted(result.status_counts.items())) or "none"
+        self.append_log(
+            f"[Execution Queue/{result.env}] Refreshed {result.refreshed} {result.scope} symbol(s): {counts_text}."
+        )
+        if result.missing_symbols:
+            self.append_log(f"[Execution Queue/{result.env}] Missing symbols: " + ", ".join(result.missing_symbols[:10]))
+        if result.failures:
+            self.append_log(f"[Execution Queue/{result.env}] Refresh failures: " + "; ".join(result.failures[:10]))
 
     def refresh_execution_queue(
         self,
@@ -529,12 +654,15 @@ class BuylistMixin:
         from src.ui.controllers.buylist_execution_controller import BuylistExecutionController
 
         controller = get_controller(self, "buylist_execution_controller", BuylistExecutionController)
-        return controller.refresh_execution_queue(
+        request = self._build_execution_queue_refresh_request(
             env,
-            show_log=show_log,
             symbols=symbols,
             create_missing=create_missing,
         )
+        result = controller.refresh_execution_queue(request)
+        self._last_execution_queue_refresh_result = result
+        self._apply_execution_queue_refresh_result(result, show_log=show_log)
+        return result.refreshed
 
     def _apply_execution_queue_item_to_buylist(self, queue_item, watch_item, env: str, buffer_pct: float) -> None:
         from src.ui.controllers.base import get_controller
