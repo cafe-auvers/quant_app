@@ -106,6 +106,7 @@ MARKET_DATA_READY_TIME_KST = dt.time(7, 0)
 LIVE_INTRADAY_REFRESH_INTERVAL_MS = 5 * 60 * 1000
 TRADINGVIEW_REFRESH_INTERVAL_SECONDS = 5 * 60
 KIS_DAILY_CHART_FAILURE_COOLDOWN_SECONDS = 30 * 60
+WORKER_SHUTDOWN_TIMEOUT_MS = 30_000
 US_MARKET_OPEN_TIME = dt.time(9, 30)
 US_MARKET_CLOSE_TIME = dt.time(16, 0)
 
@@ -723,6 +724,18 @@ class MainWindow(
         remaining = max(0.0, deadline - time.monotonic())
         return self._save_state_now(timeout=remaining, supersede_pending=True)
 
+    @staticmethod
+    def _stop_workers_for_shutdown(running_workers: List[QThread], timeout_ms: int = WORKER_SHUTDOWN_TIMEOUT_MS) -> bool:
+        deadline = time.monotonic() + max(0, timeout_ms) / 1000
+        for worker in running_workers:
+            worker.requestInterruption()
+        for worker in running_workers:
+            worker.quit()
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+            if not worker.wait(remaining_ms):
+                return False
+        return True
+
     def closeEvent(self, event) -> None:
         if self.live_data_timer is not None:
             self.live_data_timer.stop()
@@ -742,18 +755,14 @@ class MainWindow(
             ]
             if worker is not None and worker.isRunning()
         ]
-        for worker in running_workers:
-            worker.requestInterruption()
-        for worker in running_workers:
-            worker.quit()
-            if not worker.wait(30000):
-                QMessageBox.warning(
-                    self,
-                    "Background task running",
-                    "A background data fetch is still running. Wait for it to finish before closing.",
-                )
-                event.ignore()
-                return
+        if not self._stop_workers_for_shutdown(running_workers, timeout_ms=WORKER_SHUTDOWN_TIMEOUT_MS):
+            QMessageBox.warning(
+                self,
+                "Background task running",
+                "A background data fetch is still running. Wait for it to finish before closing.",
+            )
+            event.ignore()
+            return
         save_result = self._flush_state_saves_for_shutdown(timeout=5.0)
         if not save_result.success:
             message = save_result.error or "Unknown local state save error."

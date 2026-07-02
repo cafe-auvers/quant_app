@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 from src.services import app_state
 from src.services.app_state import SaveResult, StateSaveManager
+import src.ui.main_window as main_window_module
 from src.ui.main_window import MainWindow
 from src.utils.storage import load_json, save_json
 
@@ -172,3 +173,35 @@ def test_shutdown_flush_uses_bounded_wait_and_sync_save():
     assert window.state_save_manager.wait_timeout == 0.5
     assert 0 <= window.state_save_manager.save_timeout <= 0.5
     assert window.state_save_manager.supersede_pending is True
+
+
+def test_worker_shutdown_uses_one_total_timeout_budget(monkeypatch):
+    clock = {"now": 100.0}
+    monkeypatch.setattr(main_window_module.time, "monotonic", lambda: clock["now"])
+
+    class Worker:
+        def __init__(self, elapsed_seconds):
+            self.elapsed_seconds = elapsed_seconds
+            self.interrupted = False
+            self.quit_called = False
+            self.wait_calls = []
+
+        def requestInterruption(self):
+            self.interrupted = True
+
+        def quit(self):
+            self.quit_called = True
+
+        def wait(self, timeout_ms):
+            self.wait_calls.append(timeout_ms)
+            clock["now"] += self.elapsed_seconds
+            return True
+
+    workers = [Worker(0.6), Worker(0.0)]
+
+    assert MainWindow._stop_workers_for_shutdown(workers, timeout_ms=1000) is True
+
+    assert all(worker.interrupted for worker in workers)
+    assert all(worker.quit_called for worker in workers)
+    assert workers[0].wait_calls == [1000]
+    assert 0 <= workers[1].wait_calls[0] <= 400
