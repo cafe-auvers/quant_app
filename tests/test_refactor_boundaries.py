@@ -3,12 +3,24 @@ import json
 
 def test_refactored_ui_modules_importable():
     from src.ui.chart_bridge import ChartBridge
+    from src.ui.controllers import (
+        AccountController,
+        BuylistExecutionController,
+        ChartDataController,
+        ScannerController,
+        WatchlistController,
+    )
     from src.ui.filter_catalog import DEFAULT_SCANNER_SETUPS, DEFAULT_TAB_OPTIONS
     from src.ui.main_window import MainWindow, _extract_latest_opening_bar
     from src.ui.workers import RefreshWorker, ScannerWorker, WatchlistAiWorker
 
+    assert AccountController is not None
+    assert BuylistExecutionController is not None
     assert ChartBridge is not None
+    assert ChartDataController is not None
     assert MainWindow is not None
+    assert ScannerController is not None
+    assert WatchlistController is not None
     assert _extract_latest_opening_bar is not None
     assert RefreshWorker is not None
     assert ScannerWorker is not None

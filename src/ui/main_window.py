@@ -1,11 +1,6 @@
 """Main application window for the stock dashboard."""
 import datetime as dt
-import html
-import json
-import math
-from pathlib import Path
-from typing import Any, Dict, Optional, List, Tuple
-from urllib.parse import quote
+from typing import Optional, List, Tuple
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -15,76 +10,29 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QHBoxLayout,
     QTabWidget,
-    QDockWidget,
     QLabel,
-    QPushButton,
     QLineEdit,
-    QFormLayout,
-    QTableWidget,
-    QTableWidgetItem,
-    QListWidget,
-    QListWidgetItem,
-    QComboBox,
-    QCheckBox,
-    QSpinBox,
     QTextEdit,
     QProgressBar,
     QMessageBox,
-    QGroupBox,
-    QHeaderView,
-    QAbstractItemView,
     QSizePolicy,
-    QShortcut,
     QDialog,
-    QKeySequenceEdit,
-    QScrollArea,
-    QTextBrowser,
-    QSplitter,
-    QSlider,
-    QDialogButtonBox,
 )
-from PyQt5.QtCore import Qt, QThread, QTimer, QUrl
-from PyQt5.QtGui import QColor, QKeySequence
+from PyQt5.QtCore import Qt, QThread, QTimer
+from PyQt5.QtGui import QKeySequence
 try:
     from PyQt5.QtWebEngineWidgets import QWebEngineView
 except ImportError:
     QWebEngineView = None
-try:
-    from PyQt5.QtWebChannel import QWebChannel
-except ImportError:
-    QWebChannel = None
 
-from src.core.position_sizer import PositionSizer
-from src.core.order_state import BrokerOrder, OrderIntent, OrderSide, OrderStatus, OPEN_ORDER_STATUSES
-from src.core.orb import calculate_orb_range, evaluate_orb_entry_signal, resample_intraday_bars
-from src.core.scanner import StockScanner, ComparisonOperator, ScanRule
-from src.core.watchlist import Watchlist, TradePlanManager, TradePlan, BuylistManager, BuylistItem
-from src.core.trade_reviewer import TradeReviewer, TradeSetup
-from src.utils.data_loader import (
-    download_price_history,
-    get_default_universe,
-    _extract_symbol_history,
-)
-from src.utils.db_loader import (
-    init_mysql_engine,
-    load_symbol_history_from_db,
-    load_hourly_history_from_db,
-    get_latest_price_history_date,
-    get_latest_hourly_price_history_timestamp,
-    load_chart_indicators_from_db,
-    calculate_chart_indicators,
-    refresh_chart_indicators_for_symbol,
-    save_symbol_history_to_db,
-    delete_intraday_history_for_symbol,
-)
-from src.utils.storage import load_json, save_json
-from src.api.kis_account_snapshot_dual import (
-    KisEnvironment,
-    discover_account_profiles,
-    load_config,
-)
+from src.core.order_state import BrokerOrder, OrderIntent, OrderSide
+from src.core.scanner import StockScanner
+from src.core.watchlist import Watchlist, TradePlanManager, BuylistManager
+from src.core.trade_reviewer import TradeReviewer
+from src.utils.data_loader import get_default_universe
+from src.utils.db_loader import init_mysql_engine
+from src.utils.storage import load_json
 from src.services.app_state import (
-    SCANNER_SETUPS_FILE,
     SETTINGS_FILE,
     load_buylist_state,
     load_chart_drawings_state,
@@ -94,12 +42,14 @@ from src.services.app_state import (
     load_watchlist_state,
     save_app_state,
 )
-from src.services.intraday_data_service import (
-    format_intraday_source_label,
-    load_best_intraday_history,
+from src.ui.controllers import (
+    AccountController,
+    BuylistExecutionController,
+    ChartDataController,
+    ScannerController,
+    WatchlistController,
 )
-from src.ui.chart_bridge import ChartBridge
-from src.ui.dialogs import SettingsDialog, AddFilterDialog
+from src.ui.dialogs import SettingsDialog
 from src.ui.mixins.sidebar_mixin import SidebarMixin
 from src.ui.mixins.dashboard_mixin import DashboardMixin
 from src.ui.mixins.scanner_mixin import ScannerMixin
@@ -111,23 +61,8 @@ from src.ui.filter_catalog import (
     DEFAULT_SCANNER_SETUPS,
     DEFAULT_SETTINGS,
     DEFAULT_TAB_OPTIONS,
-    FILTER_CATALOG,
-    SCANNER_METRICS_LABELS,
 )
-from src.ui.workers import (
-    FxRateWorker,
-    HourlyRefreshWorker,
-    IntradayBulkFetchWorker,
-    IntradayFetchWorker,
-    KisAccountWorker,
-    KisOrderWorker,
-    KisStartupAccountsWorker,
-    OrderReconciliationWorker,
-    RefreshWorker,
-    ScannerWorker,
-    SingleStockAiWorker,
-    WatchlistAiWorker,
-)
+from src.ui.workers import WatchlistAiWorker
 from src.services.order_ledger import (
     append_order,
     find_open_orders,
@@ -138,10 +73,21 @@ from src.services.order_ledger import (
 )
 from src.utils.intraday_helpers import (
     extract_latest_opening_bar as _extract_latest_opening_bar,
-    intraday_cache_needs_backfill,
-    utcnow_naive as _utcnow_naive,
 )
 
+
+__all__ = [
+    "MainWindow",
+    "QTimer",
+    "WatchlistAiWorker",
+    "_extract_latest_opening_bar",
+    "append_order",
+    "find_open_orders",
+    "has_open_order",
+    "load_order_ledger",
+    "save_order_ledger",
+    "update_order",
+]
 
 
 
@@ -260,6 +206,7 @@ class MainWindow(
         self.kis_daily_chart_unavailable_until: Optional[dt.datetime] = None
         self.kis_daily_chart_unavailable_key: str = ""
         self.kis_daily_chart_last_error: str = ""
+        self._init_controllers()
 
         # Create central widget
         central_widget = QWidget()
@@ -295,6 +242,14 @@ class MainWindow(
         QTimer.singleShot(2500, lambda: self.refresh_usd_krw_rate(show_messages=False))
         QTimer.singleShot(4000, self.reconcile_open_orders)
         self._apply_shortcuts()
+
+    def _init_controllers(self) -> None:
+        """Initialize non-rendering workflow controllers."""
+        self.watchlist_controller = WatchlistController(self)
+        self.buylist_execution_controller = BuylistExecutionController(self)
+        self.scanner_controller = ScannerController(self)
+        self.chart_data_controller = ChartDataController(self)
+        self.account_controller = AccountController(self)
 
     def _apply_unresolved_order_startup_state(self) -> None:
         """Reflect durable unresolved broker orders in the UI after startup."""

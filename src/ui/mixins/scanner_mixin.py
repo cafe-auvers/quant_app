@@ -530,23 +530,19 @@ class ScannerMixin:
         self.scanner_worker.start()
     def run_all_scanners(self, checked: bool = False, show_warnings: bool = True) -> None:
         """Run all configured scanner setups against the MySQL cache."""
-        if not self._prepare_scanner_run(show_warnings=show_warnings):
-            return
+        from src.ui.controllers.base import get_controller
+        from src.ui.controllers.scanner_controller import ScannerController
 
-        self.running_scanner_setup_name = "__ALL__"
-        self.running_scanner_show_warnings = show_warnings
-        self.append_log(f"Starting database scanner run for {len(self.scanner_setups)} setups.")
-        self._start_scanner_worker()
+        controller = get_controller(self, "scanner_controller", ScannerController)
+        controller.run_all_scanners(checked=checked, show_warnings=show_warnings)
+
     def run_scanner(self, checked: bool = False, show_warnings: bool = True) -> None:
         """Start the selected database-backed scanner asynchronously."""
-        if not self._prepare_scanner_run(show_warnings=show_warnings):
-            return
+        from src.ui.controllers.base import get_controller
+        from src.ui.controllers.scanner_controller import ScannerController
 
-        setup_name = self.scanner_setup_combo.currentText() if hasattr(self, "scanner_setup_combo") else "current filters"
-        self.running_scanner_setup_name = setup_name
-        self.running_scanner_show_warnings = show_warnings
-        self.append_log(f"Starting database scanner run with setup: {setup_name}.")
-        self._start_scanner_worker()
+        controller = get_controller(self, "scanner_controller", ScannerController)
+        controller.run_scanner(checked=checked, show_warnings=show_warnings)
     def _scan_metrics_for_setup(self, setup_name: str, stock_metrics: list) -> List[dict]:
         """Apply a named scanner setup to raw stock metrics."""
         setup = self.scanner_setups.get(setup_name, self.get_current_scanner_setup_values())
