@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir \"C:\\\\Users\\\\tonyh\\\\Documents\\\\quant_app\")",
+      "Bash(grep -n \"ORB\\\\|orb\\\\|Cap:\\\\|cap_\\\\|capital\\\\|position_percent\\\\|shares.*@\\\\|trade_plan\\\\|43\\\\\\\\.3\\\\|43\\\\\\\\.32\" \"C:/Users/tonyh/Documents/quant_app/src/ui/main_window.py\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('src/ui/main_window.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('src/core/watchlist.py'\\).read\\(\\)\\); print\\('watchlist.py: Syntax OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('src/api/kis_order.py'\\).read\\(\\)\\); print\\('kis_order.py: Syntax OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('src/ui/main_window.py'\\).read\\(\\)\\); print\\('main_window.py: Syntax OK'\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(Get-Content \"C:\\\\Users\\\\tonyh\\\\.claude\\\\projects\\\\C--Users-tonyh-Documents-quant-app\\\\memory\\\\MEMORY.md\")",
+      "Bash(python *)",
+      "Bash(powershell -Command \"Get-ChildItem -Force | Select-Object Name, PSIsContainer | Format-Table -AutoSize\")",
+      "Bash(powershell -Command \"Get-ChildItem -Path src/core -Force -ErrorAction SilentlyContinue | Select-Object Name\")",
+      "Bash(powershell -Command \"Get-ChildItem -Path src/ui -Force -ErrorAction SilentlyContinue | Select-Object Name\")",
+      "Bash(powershell -Command \"Get-ChildItem -Path data -Force -ErrorAction SilentlyContinue | Select-Object Name\")",
+      "Bash(powershell -Command \"Get-ChildItem -Path scripts -Force -ErrorAction SilentlyContinue | Select-Object Name\")",
+      "Bash(powershell -Command \"Get-ChildItem -Recurse -Include *.json | Select-Object FullName\")",
+      "Bash(powershell -Command \"Get-ChildItem -Recurse -Include *chart*, *draw* | Select-Object FullName\")",
+      "Bash(powershell -Command \"Get-ChildItem -Path src/api | Select-Object Name\")",
+      "Bash(dir /s /b data\\\\*.json config\\\\*.py)",
+      "PowerShell(New-Item *)",
+      "PowerShell(python \"C:\\\\Users\\\\tonyh\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-tonyh-Documents-quant-app\\\\1048a900-8822-464d-82a2-6b2c4f5266f9\\\\scratchpad\\\\test_new_detector.py\" 2>&1)",
+      "PowerShell(python -X utf8 \"$env:TEMP\\\\broad_test2.py\" 2>&1)",
+      "PowerShell(python -X utf8 \"$env:TEMP\\\\final_reg.py\" 2>&1)",
+      "PowerShell(python \"C:\\\\Users\\\\tonyh\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-tonyh-Documents-quant-app\\\\8ad69197-47f2-4ca5-a5e6-7aa49e6832fb\\\\scratchpad\\\\fix_encoding.py\")"
+    ]
+  }
+}

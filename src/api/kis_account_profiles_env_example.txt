@@ -1,0 +1,57 @@
+# -----------------------------------------------------------------------------
+# KIS API profiles for kis_account_snapshot_dual.py
+# -----------------------------------------------------------------------------
+# Keep SIM and PROD credentials fully separated.
+# SIM = paper / virtual trading
+# PROD = actual live account
+# -----------------------------------------------------------------------------
+
+# =========================
+# SIM / PAPER TRADING
+# =========================
+KIS_SIM_APP_KEY=your_sim_app_key_here
+KIS_SIM_APP_SECRET=your_sim_app_secret_here
+KIS_SIM_ACCOUNT_NO=12345678-01
+KIS_SIM_BASE_URL=https://openapivts.koreainvestment.com:29443
+KIS_SIM_TOKEN_CACHE=.kis_token_cache_sim.json
+
+# Optional overseas settings for SIM
+KIS_SIM_OVERSEAS_EXCHANGES=NASD,NYSE,AMEX
+KIS_SIM_OVERSEAS_CURRENCY=USD
+KIS_SIM_OVERSEAS_BALANCE_TR_ID=VTTS3012R
+
+
+# =========================
+# PROD / LIVE TRADING
+# =========================
+KIS_PROD_APP_KEY=your_prod_app_key_here
+KIS_PROD_APP_SECRET=your_prod_app_secret_here
+KIS_PROD_ACCOUNT_NO=87654321-01
+KIS_PROD_BASE_URL=https://openapi.koreainvestment.com:9443
+KIS_PROD_TOKEN_CACHE=.kis_token_cache_prod.json
+
+# Optional overseas settings for PROD
+KIS_PROD_OVERSEAS_EXCHANGES=NASD,NYSE,AMEX
+KIS_PROD_OVERSEAS_CURRENCY=USD
+KIS_PROD_OVERSEAS_BALANCE_TR_ID=TTTS3012R
+
+
+# =========================
+# KIS INTRADAY / ORB DATA
+# =========================
+# Disabled by default. Enable only after endpoint, TR_ID, request params,
+# output field, and OHLCV field mappings are verified from official KIS
+# documentation or a successful manual API test.
+KIS_INTRADAY_ENABLED=false
+KIS_OVERSEAS_INTRADAY_ENDPOINT=
+KIS_OVERSEAS_INTRADAY_TR_ID=
+KIS_OVERSEAS_INTRADAY_TIME_FIELD=
+KIS_OVERSEAS_INTRADAY_OPEN_FIELD=
+KIS_OVERSEAS_INTRADAY_HIGH_FIELD=
+KIS_OVERSEAS_INTRADAY_LOW_FIELD=
+KIS_OVERSEAS_INTRADAY_CLOSE_FIELD=
+KIS_OVERSEAS_INTRADAY_VOLUME_FIELD=
+KIS_OVERSEAS_INTRADAY_OUTPUT_FIELD=output2
+
+# Optional JSON object. Values may use {symbol}, {exchange}, and {date}.
+KIS_OVERSEAS_INTRADAY_PARAMS_JSON=
