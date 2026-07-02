@@ -13,7 +13,7 @@ from src.ui.controllers.base import WindowController
 @dataclass
 class ExecutionQueueRefreshRequest:
     env: str
-    manager: Any
+    manager: Optional[Any]
     buylist_manager: Any
     target_items: Sequence[Any]
     missing_symbols: List[str] = field(default_factory=list)
@@ -66,6 +66,9 @@ class BuylistExecutionController(WindowController):
             target_count=len(request.target_items),
         )
         if not request.target_items:
+            return result
+        if request.manager is None:
+            result.failures.append("Execution queue manager is unavailable.")
             return result
 
         for watch_item in request.target_items:
