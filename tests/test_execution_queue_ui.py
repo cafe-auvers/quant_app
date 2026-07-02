@@ -29,6 +29,29 @@ def _line_edit(text: str):
     return SimpleNamespace(text=lambda: text)
 
 
+class FakeTable:
+    def __init__(self):
+        self.rows = []
+
+    def setRowCount(self, count):
+        self.rows = [{} for _ in range(count)]
+
+    def rowCount(self):
+        return len(self.rows)
+
+    def insertRow(self, row):
+        self.rows.insert(row, {})
+
+    def setItem(self, row, column, item):
+        self.rows[row][column] = item
+
+    def item(self, row, column):
+        return self.rows[row].get(column)
+
+    def columnCount(self):
+        return 13
+
+
 def _build_queue_window(monkeypatch, tmp_path):
     monkeypatch.setattr(
         buylist_mixin_module,
@@ -59,11 +82,13 @@ def _build_queue_window(monkeypatch, tmp_path):
     window.watchlist = watchlist
     window.buylist_manager = BuylistManager()
     window.latest_intraday_prices = {}
+    window.account_size_input = _line_edit("100000")
     window.risk_percent_input = _line_edit("0.50")
     window.append_log = lambda _message: None
     window.populate_buylist_dashboard = lambda: None
     window.update_dashboard_summary = lambda: None
     window._save_state = lambda: None
+    window._parse_float = lambda input_widget, default=0.0: float(input_widget.text() or default)
     window._get_account_balance_for_env = lambda _env: 100000.0
     window._first_account_no_for_environment = lambda _env: "12345678"
     window._has_duplicate_open_order = lambda *args, **kwargs: False
@@ -72,6 +97,9 @@ def _build_queue_window(monkeypatch, tmp_path):
     window._calculate_adr_percent_for_symbol = lambda _symbol: 5.0
     window._load_cached_intraday_interval = lambda *_args, **_kwargs: _intraday()
     window._latest_intraday_session = lambda frame: frame
+    window.buylist_sim_positions_label = None
+    window.buylist_sim_capital_label = None
+    window.buylist_sim_pnl_label = None
     return window
 
 
@@ -184,6 +212,111 @@ def test_buy_dashboard_status_uses_execution_queue_status(monkeypatch, tmp_path)
 
     assert MainWindow._buylist_dashboard_status(window, item) == "ORDER_SUBMITTED"
     assert "ORDER_SUBMITTED" in MainWindow._buylist_compute_alerts(window, item, 101.0, 0)
+
+
+def test_buy_dashboard_queue_row_uses_execution_queue_candidate_values(monkeypatch, tmp_path):
+    window = _build_queue_window(monkeypatch, tmp_path)
+    MainWindow.refresh_execution_queue(
+        window,
+        "SIM",
+        show_log=False,
+        symbols=["AAPL"],
+        create_missing=True,
+    )
+    item = window.buylist_manager.get("AAPL", "SIM")
+    item.entry_price = 1.23
+    item.stop_loss = 0.45
+    item.position_percent = 1.0
+    item._planned_shares = 1
+    table = FakeTable()
+    window.buylist_sim_table = table
+
+    MainWindow._populate_buylist_env_table(window, "SIM")
+
+    candidate = window.execution_queue_manager.items["AAPL"].selected_candidate
+    assert table.item(0, 4).text() == f"{candidate.entry_trigger:.2f}"
+    assert table.item(0, 6).text() == f"{candidate.stop_loss:.2f}"
+    assert table.item(0, 9).text() == str(candidate.shares)
+    assert table.item(0, 10).text() == f"{candidate.capital_percent:.1f}%"
+    assert "Qty 1" not in table.item(0, 12).text()
+
+
+def test_buy_dashboard_queue_row_falls_back_to_buylist_when_queue_missing(monkeypatch, tmp_path):
+    window = _build_queue_window(monkeypatch, tmp_path)
+    MainWindow.refresh_execution_queue(
+        window,
+        "SIM",
+        show_log=False,
+        symbols=["AAPL"],
+        create_missing=True,
+    )
+    item = window.buylist_manager.get("AAPL", "SIM")
+    item.entry_price = 12.34
+    item.stop_loss = 11.11
+    item.position_percent = 3.4
+    item._planned_shares = 6
+    del window.execution_queue_manager.items["AAPL"]
+    table = FakeTable()
+    window.buylist_sim_table = table
+
+    MainWindow._populate_buylist_env_table(window, "SIM")
+
+    assert table.item(0, 4).text() == "12.34"
+    assert table.item(0, 6).text() == "11.11"
+    assert table.item(0, 9).text() == "6"
+    assert table.item(0, 10).text() == "3.4%"
+
+
+def test_buy_dashboard_bought_row_uses_position_values_not_queue_projection(monkeypatch, tmp_path):
+    window = _build_queue_window(monkeypatch, tmp_path)
+    MainWindow.refresh_execution_queue(
+        window,
+        "SIM",
+        show_log=False,
+        symbols=["AAPL"],
+        create_missing=True,
+    )
+    item = window.buylist_manager.get("AAPL", "SIM")
+    item.monitoring_status = "BOUGHT"
+    item.status = "BOUGHT"
+    item.shares_held = 12
+    item.avg_cost = 100.0
+    item.position_percent = 33.3
+    item.entry_price = 1.23
+    item.stop_loss = 90.0
+    window.latest_intraday_prices = {"AAPL": 110.0}
+    table = FakeTable()
+    window.buylist_sim_table = table
+
+    MainWindow._populate_buylist_env_table(window, "SIM")
+
+    assert table.item(0, 2).text() == "BOUGHT"
+    assert table.item(0, 7).text() == "110.00"
+    assert table.item(0, 8).text() == "+10.0%"
+    assert table.item(0, 9).text() == "12"
+    assert table.item(0, 10).text() == "33.3%"
+
+
+def test_queue_order_review_uses_selected_candidate_values(monkeypatch, tmp_path):
+    window = _build_queue_window(monkeypatch, tmp_path)
+    MainWindow.refresh_execution_queue(
+        window,
+        "SIM",
+        show_log=False,
+        symbols=["AAPL"],
+        create_missing=True,
+    )
+    item = window.buylist_manager.get("AAPL", "SIM")
+    item.entry_price = 1.23
+    queue_item = window.execution_queue_manager.items["AAPL"]
+    queue_item.selected_candidate.entry_trigger = 123.45
+    queue_item.selected_candidate.shares = 7
+
+    review = MainWindow._format_execution_queue_order_review(window, "SIM", item, queue_item)
+
+    assert "Limit price: $123.45" in review
+    assert "Quantity: 7" in review
+    assert "Limit price: $1.23" not in review
 
 
 def test_legacy_orb_active_row_does_not_auto_buy(monkeypatch, tmp_path):

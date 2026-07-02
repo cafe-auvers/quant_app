@@ -261,10 +261,15 @@ class BuylistMixin:
         for item in items:
             row = table.rowCount()
             table.insertRow(row)
-            display_status = self._buylist_dashboard_status(item)
+            queue_display = self._queue_display_state_for_buylist_item(item)
+            display_status = queue_display.display_status if queue_display else self._buylist_dashboard_status(item)
             is_queue_item = self._is_execution_queue_buylist_item(item)
 
-            current_price = self.latest_intraday_prices.get(item.symbol, 0.0)
+            current_price = (
+                queue_display.current_price
+                if queue_display and queue_display.current_price > 0
+                else self.latest_intraday_prices.get(item.symbol, 0.0)
+            )
             pnl_pct = pnl_usd = 0.0
             if item.monitoring_status == "BOUGHT" and item.avg_cost > 0 and current_price > 0:
                 pnl_pct = (current_price - item.avg_cost) / item.avg_cost * 100.0
@@ -279,6 +284,8 @@ class BuylistMixin:
             # account_size_input can change (e.g. KIS balance load) and would give nonsense %.
             if item.monitoring_status == "BOUGHT" and item.shares_held > 0 and item.avg_cost > 0:
                 capital_pct = item.position_percent
+            elif queue_display:
+                capital_pct = queue_display.capital_percent
             else:
                 account_size = self._parse_float(self.account_size_input, 100000.0) if hasattr(self, "account_size_input") else 100000.0
                 capital_pct = (
@@ -286,31 +293,36 @@ class BuylistMixin:
                     if account_size > 0 and item.avg_cost > 0
                     else item.position_percent
                 )
-            alerts = self._buylist_compute_alerts(item, current_price, days_held)
+            alerts = self._buylist_compute_alerts(item, current_price, days_held, queue_display)
 
             def _cell(text: str) -> QTableWidgetItem:
                 c = QTableWidgetItem(str(text))
                 c.setTextAlignment(Qt.AlignCenter)
                 return c
 
-            # Compute entry_trigger for display (max of ORB high and buffered breakout level)
-            bp_val = getattr(item, "breakout_price", None) or 0.0
-            buf_val = getattr(item, "buffer_pct", 0.001)
+            entry_price = queue_display.entry_price if queue_display else item.entry_price
+            stop_loss = queue_display.stop_loss if queue_display else item.stop_loss
+            bp_val = (
+                queue_display.breakout_price
+                if queue_display and queue_display.breakout_price is not None
+                else getattr(item, "breakout_price", None)
+            ) or 0.0
             bp_display = f"{bp_val:.2f}" if bp_val > 0 else "—"
 
-            table.setItem(row, 0,  _cell(item.symbol))
-            table.setItem(row, 1,  _cell(item.name[:16] if item.name else ""))
+            table.setItem(row, 0,  _cell(queue_display.symbol if queue_display else item.symbol))
+            display_name = queue_display.name if queue_display else item.name
+            table.setItem(row, 1,  _cell(display_name[:16] if display_name else ""))
             table.setItem(row, 2,  _cell(display_status))
             monitor_on = item.monitoring_status in ("ACTIVE", "BOUGHT") and not (
                 is_queue_item and item.monitoring_status == "ACTIVE"
             )
             table.setItem(row, 3,  _cell("ON" if monitor_on else "OFF"))
-            table.setItem(row, 4,  _cell(f"{item.entry_price:.2f}"))   # ORB high (execution ref)
+            table.setItem(row, 4,  _cell(f"{entry_price:.2f}"))
             table.setItem(row, 5,  _cell(bp_display))                  # daily breakout level
-            table.setItem(row, 6,  _cell(f"{item.stop_loss:.2f}"))
+            table.setItem(row, 6,  _cell(f"{stop_loss:.2f}"))
             table.setItem(row, 7,  _cell(f"{current_price:.2f}" if current_price > 0 else "-"))
             table.setItem(row, 8,  _cell(f"{pnl_pct:+.1f}%" if item.monitoring_status == "BOUGHT" else "-"))
-            planned_shares = int(getattr(item, "_planned_shares", 0) or 0)
+            planned_shares = queue_display.planned_shares if queue_display else int(getattr(item, "_planned_shares", 0) or 0)
             display_shares = item.shares_held if item.monitoring_status == "BOUGHT" else planned_shares
             table.setItem(row, 9,  _cell(str(display_shares) if display_shares > 0 else "-"))
             table.setItem(row, 10, _cell(f"{capital_pct:.1f}%"))
@@ -356,9 +368,18 @@ class BuylistMixin:
             sign = "+" if total_pnl_usd >= 0 else ""
             pnl_lbl.setText(f"P&L: {sign}${total_pnl_usd:,.0f}")
             pnl_lbl.setStyleSheet(f"color: {'#4CAF50' if total_pnl_usd >= 0 else '#f44336'}; font-weight: bold;")
-    def _buylist_compute_alerts(self, item, current_price: float, days_held: int) -> str:
+    def _buylist_compute_alerts(self, item, current_price: float, days_held: int, queue_display=None) -> str:
         """Return a pipe-separated alert string for a buylist item."""
         alerts = []
+        if queue_display is not None:
+            if queue_display.display_status:
+                alerts.append(queue_display.display_status)
+            if queue_display.selected_window:
+                alerts.append(f"ORB {queue_display.selected_window}")
+            if queue_display.planned_shares > 0:
+                alerts.append(f"Qty {queue_display.planned_shares}")
+            return " | ".join(dict.fromkeys(alerts))
+
         queue_status = self._execution_queue_status_for_buylist_item(item)
         if queue_status:
             alerts.append(queue_status)
@@ -420,7 +441,7 @@ class BuylistMixin:
         return {status.value for status in ExecutionQueueStatus}
 
     def _execution_queue_status_for_buylist_item(self, item) -> Optional[str]:
-        if item is None or not self._is_execution_queue_buylist_item(item):
+        if item is None or not self._is_pre_entry_execution_queue_buylist_item(item):
             return None
         symbol = str(getattr(item, "symbol", "") or "").upper()
         if not symbol:
@@ -432,6 +453,22 @@ class BuylistMixin:
         if queue_item is None:
             return None
         return self._execution_queue_value(queue_item.status)
+
+    def _queue_display_state_for_buylist_item(self, item):
+        if item is None or not self._is_pre_entry_execution_queue_buylist_item(item):
+            return None
+        symbol = str(getattr(item, "symbol", "") or "").upper()
+        if not symbol:
+            return None
+        manager = self.__dict__.get("execution_queue_manager")
+        if manager is None:
+            manager = self._ensure_execution_queue_manager()
+        queue_item = manager.items.get(symbol)
+        if queue_item is None:
+            return None
+        from src.core.execution_queue import build_queue_display_state
+
+        return build_queue_display_state(queue_item, item)
 
     def _buylist_dashboard_status(self, item) -> str:
         queue_status = self._execution_queue_status_for_buylist_item(item)
@@ -502,6 +539,12 @@ class BuylistMixin:
         method = str(getattr(item, "breakout_method", "") or "")
         status = str(getattr(item, "monitoring_status", "") or "").upper()
         return method.startswith("execution_queue") or status in queue_statuses
+
+    @staticmethod
+    def _is_pre_entry_execution_queue_buylist_item(item) -> bool:
+        from src.core.execution_queue import is_pre_entry_execution_queue_item
+
+        return is_pre_entry_execution_queue_item(item)
 
     def _execution_queue_target_items(
         self,
@@ -1273,6 +1316,18 @@ class BuylistMixin:
         env = self._buylist_order_environment(item)
         account_no = self._first_account_no_for_environment(env) or ""
         intent = OrderIntent.ENTRY
+        if self._is_pre_entry_execution_queue_buylist_item(item):
+            manager = self.__dict__.get("execution_queue_manager")
+            if manager is None:
+                manager = self._ensure_execution_queue_manager()
+            queue_item = manager.items.get(str(getattr(item, "symbol", "") or "").upper()) if manager is not None else None
+            candidate = getattr(queue_item, "selected_candidate", None) if queue_item is not None else None
+            queue_status = self._execution_queue_value(getattr(queue_item, "status", "")) if queue_item is not None else ""
+            if candidate is not None and queue_status == "EXECUTE_READY":
+                if quantity is None:
+                    quantity = int(getattr(candidate, "shares", 0) or 0)
+                if order_price is None and limit_price is None:
+                    order_price = float(getattr(candidate, "entry_trigger", 0.0) or 0.0)
         if self._has_duplicate_open_order(env, account_no, item.symbol, OrderSide.BUY, intent):
             item._buy_order_pending = False
             manager = self.__dict__.get("execution_queue_manager")
@@ -1291,7 +1346,16 @@ class BuylistMixin:
             )
             return
 
-        order_price = self._buylist_order_price(item, order_price, limit_price)
+        explicit_price = None
+        for value in (order_price, limit_price):
+            try:
+                price = float(value or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if price > 0:
+                explicit_price = price
+                break
+        order_price = max(0.01, explicit_price) if explicit_price is not None else self._buylist_order_price(item)
         quantity = self._buylist_order_quantity(item, order_price, quantity)
         try:
             self.kis_order_worker = KisOrderWorker(

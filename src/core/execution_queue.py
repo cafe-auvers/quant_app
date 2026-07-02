@@ -39,6 +39,24 @@ class ExecutionQueueStatus(str, Enum):
     REJECTED = "REJECTED"
 
 
+PRE_ENTRY_EXECUTION_QUEUE_STATUS_VALUES = {
+    ExecutionQueueStatus.WATCHING.value,
+    ExecutionQueueStatus.ORB_FORMING.value,
+    ExecutionQueueStatus.WAITING_BREAKOUT.value,
+    ExecutionQueueStatus.ARMED.value,
+    ExecutionQueueStatus.EXECUTE_READY.value,
+    ExecutionQueueStatus.ORDER_PENDING.value,
+    ExecutionQueueStatus.ORDER_SUBMITTED.value,
+}
+
+NON_PRE_ENTRY_BUYLIST_STATUSES = {
+    "BOUGHT",
+    "SOLD",
+    "SELL_SUBMITTED",
+    "PARTIAL_EXIT_SUBMITTED",
+}
+
+
 class OrbCandidateStatus(str, Enum):
     NOT_AVAILABLE = "NOT_AVAILABLE"
     FORMING = "FORMING"
@@ -169,6 +187,23 @@ class ExecutionQueueItem:
         )
 
 
+@dataclass
+class QueueDisplayState:
+    symbol: str
+    name: str
+    display_status: str
+    entry_price: float = 0.0
+    breakout_price: Optional[float] = None
+    stop_loss: float = 0.0
+    current_price: float = 0.0
+    planned_shares: int = 0
+    capital_percent: float = 0.0
+    stop_adr: Optional[float] = None
+    selected_window: str = ""
+    warnings: List[str] = field(default_factory=list)
+    trade_plan: str = ""
+
+
 def _optional_float(value: Any) -> Optional[float]:
     if value in (None, ""):
         return None
@@ -176,6 +211,120 @@ def _optional_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _status_text(value: Any) -> str:
+    return str(getattr(value, "value", value) or "").split(".")[-1].upper()
+
+
+def is_pre_entry_execution_queue_item(item: Any) -> bool:
+    """Return True for buylist rows whose pre-entry state is queue-backed."""
+    if item is None:
+        return False
+
+    status = _status_text(
+        getattr(item, "monitoring_status", None)
+        or getattr(item, "status", "")
+    )
+    if status in NON_PRE_ENTRY_BUYLIST_STATUSES:
+        return False
+
+    method = str(getattr(item, "breakout_method", "") or "").lower()
+    if method.startswith("execution_queue"):
+        return True
+
+    return status in PRE_ENTRY_EXECUTION_QUEUE_STATUS_VALUES
+
+
+def build_queue_display_state(
+    queue_item: ExecutionQueueItem,
+    buylist_item: Optional[Any] = None,
+) -> QueueDisplayState:
+    """Project queue state into display-only values for pre-entry dashboard rows."""
+    candidate = getattr(queue_item, "selected_candidate", None)
+    if candidate is None:
+        selected_window = str(getattr(queue_item, "selected_window", "") or "")
+        if selected_window:
+            candidate = getattr(queue_item, "candidates", {}).get(selected_window)
+
+    symbol = str(getattr(queue_item, "symbol", "") or getattr(buylist_item, "symbol", "") or "").upper()
+    name = str(getattr(queue_item, "name", "") or getattr(buylist_item, "name", "") or symbol)
+    selected_window = str(
+        getattr(candidate, "window", "")
+        or getattr(queue_item, "selected_window", "")
+        or getattr(buylist_item, "_selected_orb_window", "")
+        or ""
+    )
+
+    entry_price = (
+        _optional_float(getattr(candidate, "entry_trigger", None))
+        or _optional_float(getattr(candidate, "orb_high", None))
+        or _optional_float(getattr(buylist_item, "entry_price", None))
+        or 0.0
+    )
+    breakout_price = (
+        _optional_float(getattr(candidate, "breakout_price", None))
+        or _optional_float(getattr(queue_item, "breakout_price", None))
+        or _optional_float(getattr(buylist_item, "breakout_price", None))
+    )
+    stop_loss = (
+        _optional_float(getattr(candidate, "stop_loss", None))
+        or _optional_float(getattr(buylist_item, "stop_loss", None))
+        or 0.0
+    )
+    current_price = (
+        _optional_float(getattr(queue_item, "current_price", None))
+        or _optional_float(getattr(candidate, "current_price", None))
+        or _optional_float(getattr(buylist_item, "current_price", None))
+        or 0.0
+    )
+    planned_shares = int(
+        getattr(candidate, "shares", None)
+        or getattr(buylist_item, "_planned_shares", 0)
+        or 0
+    )
+    capital_percent = (
+        _optional_float(getattr(candidate, "capital_percent", None))
+        or _optional_float(getattr(buylist_item, "position_percent", None))
+        or 0.0
+    )
+    stop_adr = (
+        _optional_float(getattr(candidate, "stop_adr", None))
+        or _optional_float(getattr(buylist_item, "stop_adr", None))
+    )
+
+    warnings: List[str] = list(getattr(queue_item, "warnings", []) or [])
+    if candidate is not None:
+        warnings.extend(list(getattr(candidate, "warnings", []) or []))
+        reason = str(getattr(candidate, "reason", "") or "")
+        if reason and not bool(getattr(candidate, "valid", False)):
+            warnings.append(reason)
+    elif getattr(queue_item, "candidates", None):
+        for window, cand in queue_item.candidates.items():
+            reason = str(getattr(cand, "reason", "") or "")
+            if reason:
+                warnings.append(f"{window}: {reason}")
+    warnings = list(dict.fromkeys(warnings))
+
+    trade_plan = str(getattr(buylist_item, "trade_plan", "") or "")
+    if selected_window and entry_price > 0 and planned_shares > 0:
+        trade_plan = f"ORB {selected_window}: buy {planned_shares} @ {entry_price:.2f}"
+
+    return QueueDisplayState(
+        symbol=symbol,
+        name=name,
+        display_status=_status_text(getattr(queue_item, "status", "")),
+        entry_price=entry_price,
+        breakout_price=breakout_price,
+        stop_loss=stop_loss,
+        current_price=current_price,
+        planned_shares=planned_shares,
+        capital_percent=capital_percent,
+        stop_adr=stop_adr,
+        selected_window=selected_window,
+        warnings=warnings,
+        trade_plan=trade_plan,
+    )
 
 
 def _candidate_unavailable(symbol: str, window: str, status: OrbCandidateStatus, reason: str) -> OrbCandidate:

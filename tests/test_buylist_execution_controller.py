@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import src.ui.controllers.buylist_execution_controller as controller_module
 from src.ui.controllers.buylist_execution_controller import (
     BuylistExecutionController,
     ExecutionQueueRefreshRequest,
@@ -70,6 +71,35 @@ class FakeBuylistManager:
 
     def add(self, item):
         self.items[(item.symbol, item.environment)] = item
+
+
+def _existing_buylist_item(**overrides):
+    data = {
+        "symbol": "AAPL",
+        "name": "Apple",
+        "entry_price": 1.23,
+        "stop_loss": 0.45,
+        "total_score": 1.0,
+        "status": "WATCHING",
+        "stop_adr": 2.0,
+        "position_percent": 3.0,
+        "ai_summary": "old",
+        "warnings": ["old warning"],
+        "notes": "old note",
+        "risk_percent": 4.0,
+        "trade_plan": "old plan",
+        "monitoring_status": "WATCHING",
+        "environment": "SIM",
+        "breakout_price": 99.0,
+        "breakout_method": "execution_queue:5m",
+        "buffer_pct": 0.002,
+        "shares_held": 0,
+        "avg_cost": 0.0,
+        "buy_date": None,
+        "sell_half_done": False,
+    }
+    data.update(overrides)
+    return SimpleNamespace(**data)
 
 
 def _request(**overrides):
@@ -155,3 +185,116 @@ def test_callback_failure_is_captured_and_refresh_continues():
         "AAPL: cache unavailable",
         "MSFT: cache unavailable",
     ]
+
+
+def test_apply_queue_item_preserves_existing_volatile_compatibility_mirrors():
+    controller = BuylistExecutionController(SimpleNamespace())
+    manager = FakeBuylistManager()
+    existing = _existing_buylist_item()
+    manager.items[(existing.symbol, existing.environment)] = existing
+
+    controller.apply_execution_queue_item_to_buylist(
+        _queue_item(),
+        _target(),
+        "SIM",
+        0.001,
+        buylist_manager=manager,
+    )
+
+    assert existing.entry_price == 1.23
+    assert existing.stop_loss == 0.45
+    assert existing.position_percent == 3.0
+    assert existing.stop_adr == 2.0
+    assert existing.risk_percent == 4.0
+    assert existing.trade_plan == "old plan"
+    assert existing.monitoring_status == "EXECUTE_READY"
+    assert existing.breakout_method == "execution_queue:1m"
+    assert existing._planned_shares == 10
+    assert existing._execution_entry_trigger == 100.1
+
+
+def test_apply_queue_item_does_not_overwrite_bought_position_fields():
+    controller = BuylistExecutionController(SimpleNamespace())
+    manager = FakeBuylistManager()
+    existing = _existing_buylist_item(
+        monitoring_status="BOUGHT",
+        status="BOUGHT",
+        entry_price=55.0,
+        stop_loss=50.0,
+        shares_held=8,
+        avg_cost=54.25,
+        buy_date="2026-07-01",
+        sell_half_done=True,
+        position_percent=12.5,
+    )
+    manager.items[(existing.symbol, existing.environment)] = existing
+
+    controller.apply_execution_queue_item_to_buylist(
+        _queue_item(),
+        _target(),
+        "SIM",
+        0.001,
+        buylist_manager=manager,
+    )
+
+    assert existing.monitoring_status == "BOUGHT"
+    assert existing.entry_price == 55.0
+    assert existing.stop_loss == 50.0
+    assert existing.shares_held == 8
+    assert existing.avg_cost == 54.25
+    assert existing.buy_date == "2026-07-01"
+    assert existing.sell_half_done is True
+    assert existing.position_percent == 12.5
+    assert not hasattr(existing, "_planned_shares")
+
+
+def test_submit_selected_queue_order_uses_queue_candidate_not_buylist_mirrors(monkeypatch):
+    item = _existing_buylist_item(
+        monitoring_status="EXECUTE_READY",
+        entry_price=1.23,
+        stop_loss=0.45,
+        breakout_method="execution_queue:1m",
+    )
+    queue_item = _queue_item()
+    queue_item.selected_candidate.entry_trigger = 123.45
+    queue_item.selected_candidate.stop_loss = 120.0
+    queue_item.selected_candidate.shares = 7
+    submissions = []
+
+    class Manager:
+        def __init__(self):
+            self.items = {"AAPL": queue_item}
+            self.mark_calls = []
+
+        def mark_order_submitted(self, symbol, order_id="", order_status="SUBMITTED"):
+            self.mark_calls.append((symbol, order_id, order_status))
+            self.items[symbol].status = "ORDER_PENDING"
+
+    manager = Manager()
+    window = SimpleNamespace(
+        _buylist_selected_item=lambda env: item,
+        _queue_item_for_buylist_item=lambda selected: queue_item,
+        _buylist_auto_order_blocked=lambda selected: False,
+        _first_account_no_for_environment=lambda env: "12345678",
+        _has_duplicate_open_order=lambda *args: False,
+        _format_execution_queue_order_review=lambda env, selected, queue: "review",
+        _ensure_execution_queue_manager=lambda: manager,
+        _execution_queue_status_for_buylist_item=lambda selected: "ORDER_PENDING",
+        _save_buylist_state=lambda: None,
+        _save_execution_queue_state=lambda: None,
+        populate_buylist_dashboard=lambda: None,
+        _submit_kis_buy_order=lambda selected, **kwargs: submissions.append((selected, kwargs)),
+    )
+    monkeypatch.setattr(
+        controller_module.QMessageBox,
+        "question",
+        lambda *args, **kwargs: controller_module.QMessageBox.Yes,
+    )
+
+    BuylistExecutionController(window).submit_selected_queue_order("SIM")
+
+    assert manager.mark_calls == [("AAPL", "", "PENDING")]
+    assert submissions == [(item, {"quantity": 7, "order_price": 123.45})]
+    assert item.entry_price == 1.23
+    assert item.stop_loss == 0.45
+    assert item.monitoring_status == "ORDER_PENDING"

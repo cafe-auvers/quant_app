@@ -790,6 +790,82 @@ def test_submit_kis_sell_order_uses_environment_and_live_price_without_current_p
     assert any("SELL submitted for AAPL" in message for message in logs)
 
 
+def test_submit_kis_buy_order_honors_explicit_order_price_over_live_price(monkeypatch):
+    logs = []
+    created_workers = []
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+    class FakeKisOrderWorker:
+        def __init__(
+            self,
+            environment,
+            symbol,
+            quantity,
+            price,
+            side,
+            exchange="NASD",
+            order_type="limit",
+            account_no=None,
+            intent=OrderIntent.UNKNOWN,
+            buylist_symbol_key="",
+        ):
+            self.environment = environment
+            self.symbol = symbol
+            self.quantity = quantity
+            self.price = price
+            self.side = side
+            self.account_no = account_no
+            self.intent = intent
+            self.buylist_symbol_key = buylist_symbol_key
+            self.finished_order = FakeSignal()
+            self.error_occurred = FakeSignal()
+            self.started = False
+            created_workers.append(self)
+
+        def start(self):
+            self.started = True
+
+    item = SimpleNamespace(
+        symbol="AAPL",
+        environment="SIM",
+        _buy_order_pending=True,
+        monitoring_status="ORDER_PENDING",
+        breakout_method="execution_queue:1m",
+        shares_held=0,
+        avg_cost=0.0,
+        stop_loss=90.0,
+        entry_price=1.23,
+        position_percent=50.0,
+    )
+    window = MainWindow.__new__(MainWindow)
+    window.latest_intraday_prices = {"AAPL": 999.0}
+    window.append_log = logs.append
+    window._first_account_no_for_environment = lambda environment: "12345678"
+    window._has_duplicate_open_order = lambda *args: False
+    window._ensure_execution_queue_manager = lambda: SimpleNamespace(items={})
+    window.buylist_manager = SimpleNamespace()
+    window.populate_buylist_dashboard = lambda: None
+
+    monkeypatch.setattr(buylist_mixin_module, "KisOrderWorker", FakeKisOrderWorker)
+
+    MainWindow._submit_kis_buy_order(window, item, quantity=7, order_price=123.45)
+
+    assert len(created_workers) == 1
+    worker = created_workers[0]
+    assert worker.price == 123.45
+    assert worker.quantity == 7
+    assert worker.side == "buy"
+    assert worker.intent == OrderIntent.ENTRY
+    assert worker.started is True
+    assert any("BUY submitted for AAPL: 7 shares @ limit $123.45" in message for message in logs)
+
+
 def test_apply_partial_sell_fill_is_idempotent(monkeypatch):
     save_calls = []
     item = SimpleNamespace(

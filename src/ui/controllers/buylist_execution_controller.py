@@ -6,6 +6,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 from PyQt5.QtWidgets import QMessageBox
 
 from src.core.order_state import OrderIntent, OrderSide
+from src.core.execution_queue import build_queue_display_state
 from src.core.watchlist import BuylistItem
 from src.ui.controllers.base import WindowController
 
@@ -137,49 +138,34 @@ class BuylistExecutionController(WindowController):
         if existing is not None and str(getattr(existing, "monitoring_status", "")).upper() in protected_statuses:
             return
 
-        candidate = queue_item.selected_candidate
         status_text = self._status_text(queue_item.status)
-        entry_trigger = float(getattr(candidate, "entry_trigger", 0.0) or 0.0) if candidate else 0.0
-        orb_high = float(getattr(candidate, "orb_high", 0.0) or 0.0) if candidate else 0.0
-        stop_loss = float(getattr(candidate, "stop_loss", 0.0) or 0.0) if candidate else float(getattr(watch_item, "stop_loss", 0.0) or 0.0)
-        planned_shares = int(getattr(candidate, "shares", 0) or 0) if candidate else 0
-        capital_percent = float(getattr(candidate, "capital_percent", 0.0) or 0.0) if candidate else 0.0
-        stop_adr = float(getattr(candidate, "stop_adr", 0.0) or 0.0) if candidate and getattr(candidate, "stop_adr", None) is not None else 0.0
+        candidate = queue_item.selected_candidate
+        display = build_queue_display_state(queue_item, existing or watch_item)
+        entry_price = display.entry_price
+        stop_loss = display.stop_loss
+        planned_shares = display.planned_shares
+        capital_percent = display.capital_percent
+        stop_adr = float(display.stop_adr or 0.0)
         risk_percent = float(getattr(candidate, "risk_percent", 0.0) or 0.0) * 100.0 if candidate else 0.0
-        selected_window = str(getattr(candidate, "window", "") or queue_item.selected_window or "")
-
-        warnings = list(getattr(queue_item, "warnings", []) or [])
-        if candidate:
-            warnings.extend(list(getattr(candidate, "warnings", []) or []))
-            if getattr(candidate, "reason", "") and not getattr(candidate, "valid", False):
-                warnings.append(str(candidate.reason))
-        elif queue_item.candidates:
-            for window, cand in queue_item.candidates.items():
-                reason = str(getattr(cand, "reason", "") or "")
-                if reason:
-                    warnings.append(f"{window}: {reason}")
-        warnings = list(dict.fromkeys(warnings))
-
-        entry_price = entry_trigger or orb_high or float(getattr(watch_item, "entry_price", 0.0) or 0.0)
+        selected_window = display.selected_window
+        warnings = display.warnings
+        score = float(getattr(candidate, "score", 0.0) or 0.0) if candidate else 0.0
         summary = (
             f"Execution queue {status_text}"
             + (f"; selected ORB {selected_window}" if selected_window else "")
-            + (f"; entry {entry_trigger:.2f}" if entry_trigger > 0 else "")
+            + (f"; entry {entry_price:.2f}" if entry_price > 0 else "")
         )
-        trade_plan = (
-            f"ORB {selected_window}: buy {planned_shares} @ {entry_trigger:.2f}"
-            if selected_window and entry_trigger > 0 and planned_shares > 0
-            else status_text
-        )
+        trade_plan = display.trade_plan or status_text
 
         if existing is None:
+            # Compatibility mirrors: queue state remains authoritative for display/order flow.
             existing = BuylistItem(
                 symbol=symbol,
                 name=str(getattr(watch_item, "name", "") or symbol),
                 entry_price=entry_price,
                 target_price=0.0,
                 stop_loss=stop_loss,
-                total_score=float(getattr(candidate, "score", 0.0) or 0.0) if candidate else 0.0,
+                total_score=score,
                 status=status_text,
                 technical_score=0.0,
                 setup_score=0.0,
@@ -203,27 +189,36 @@ class BuylistExecutionController(WindowController):
             manager.add(existing)
         else:
             existing.name = str(getattr(watch_item, "name", "") or existing.name or symbol)
-            existing.entry_price = entry_price
-            existing.stop_loss = stop_loss
-            existing.total_score = float(getattr(candidate, "score", 0.0) or 0.0) if candidate else 0.0
             existing.status = status_text
-            existing.stop_adr = stop_adr
-            existing.position_percent = capital_percent
             existing.ai_summary = summary
-            existing.warnings = warnings
             existing.notes = str(getattr(watch_item, "notes", "") or existing.notes or "")
-            existing.risk_percent = risk_percent
-            existing.trade_plan = trade_plan
             existing.monitoring_status = status_text
             existing.environment = env
             existing.breakout_price = getattr(watch_item, "breakout_price", None)
             existing.breakout_method = f"execution_queue:{selected_window}" if selected_window else "execution_queue"
             existing.buffer_pct = buffer_pct
+            # Preserve existing compatibility mirrors unless they are missing.
+            if float(getattr(existing, "entry_price", 0.0) or 0.0) <= 0:
+                existing.entry_price = entry_price
+            if float(getattr(existing, "stop_loss", 0.0) or 0.0) <= 0:
+                existing.stop_loss = stop_loss
+            if float(getattr(existing, "total_score", 0.0) or 0.0) <= 0:
+                existing.total_score = score
+            if float(getattr(existing, "stop_adr", 0.0) or 0.0) <= 0:
+                existing.stop_adr = stop_adr
+            if float(getattr(existing, "position_percent", 0.0) or 0.0) <= 0:
+                existing.position_percent = capital_percent
+            if float(getattr(existing, "risk_percent", 0.0) or 0.0) <= 0:
+                existing.risk_percent = risk_percent
+            if not str(getattr(existing, "trade_plan", "") or ""):
+                existing.trade_plan = trade_plan
+            if not list(getattr(existing, "warnings", []) or []):
+                existing.warnings = warnings
 
         existing._planned_shares = planned_shares
         existing._selected_orb_window = selected_window
         existing._execution_queue_symbol = symbol
-        existing._execution_entry_trigger = entry_trigger
+        existing._execution_entry_trigger = entry_price
 
     def submit_selected_queue_order(self, env: str) -> None:
         item = self._buylist_selected_item(env)
@@ -280,8 +275,6 @@ class BuylistExecutionController(WindowController):
         queue_status = self._execution_queue_status_for_buylist_item(item) or "ORDER_PENDING"
         item.monitoring_status = queue_status
         item.status = queue_status
-        item.entry_price = float(candidate.entry_trigger or 0.0)
-        item.stop_loss = float(candidate.stop_loss or 0.0)
         item._planned_shares = int(candidate.shares or 0)
         item._selected_orb_window = str(candidate.window or "")
         item._buy_order_pending = True
