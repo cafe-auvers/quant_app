@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 
 import src.ui.mixins.buylist_mixin as buylist_mixin_module
-from src.core.execution_queue import ExecutionQueueStatus
+from src.core.execution_queue import ExecutionQueueStatus, OrbCandidateStatus
 from src.core.watchlist import BuylistManager, Watchlist, WatchlistItem
 from src.ui.main_window import MainWindow
 
@@ -105,6 +105,67 @@ def test_intentional_selected_symbol_creates_one_buylist_queue_item(monkeypatch,
     assert item._planned_shares > 0
     assert item.shares_held == 0
     assert window.execution_queue_manager.items["AAPL"].selected_window == "1m"
+    result = window._last_execution_queue_refresh_result
+    assert result.refreshed == 1
+    assert result.missing_symbols == []
+    assert result.status_counts == {"EXECUTE_READY": 1}
+
+
+def test_missing_selected_symbol_is_returned_in_refresh_result(monkeypatch, tmp_path):
+    window = _build_queue_window(monkeypatch, tmp_path)
+
+    refreshed = MainWindow.refresh_execution_queue(
+        window,
+        "SIM",
+        show_log=False,
+        symbols=["ZZZ"],
+        create_missing=True,
+    )
+
+    result = window._last_execution_queue_refresh_result
+    assert refreshed == 0
+    assert result.refreshed == 0
+    assert result.target_count == 0
+    assert result.missing_symbols == ["ZZZ"]
+    assert result.status_counts == {}
+
+
+def test_duplicate_pending_order_rejects_queue_candidates(monkeypatch, tmp_path):
+    window = _build_queue_window(monkeypatch, tmp_path)
+    window._has_duplicate_open_order = lambda *args, **kwargs: True
+
+    refreshed = MainWindow.refresh_execution_queue(
+        window,
+        "SIM",
+        show_log=False,
+        symbols=["AAPL"],
+        create_missing=True,
+    )
+
+    queue_item = window.execution_queue_manager.items["AAPL"]
+    assert refreshed == 1
+    assert queue_item.status == ExecutionQueueStatus.REJECTED
+    assert queue_item.selected_candidate is None
+    assert queue_item.candidates
+    assert all(candidate.status == OrbCandidateStatus.REJECTED for candidate in queue_item.candidates.values())
+    assert all("Duplicate" in candidate.reason for candidate in queue_item.candidates.values())
+    assert window._last_execution_queue_refresh_result.status_counts == {"REJECTED": 1}
+
+
+def test_refresh_result_status_counts_are_correct(monkeypatch, tmp_path):
+    window = _build_queue_window(monkeypatch, tmp_path)
+
+    MainWindow.refresh_execution_queue(
+        window,
+        "SIM",
+        show_log=False,
+        symbols=["AAPL"],
+        create_missing=True,
+    )
+
+    result = window._last_execution_queue_refresh_result
+    assert result.scope == "selected"
+    assert result.status_counts == {"EXECUTE_READY": 1}
 
 
 def test_buy_dashboard_status_uses_execution_queue_status(monkeypatch, tmp_path):
