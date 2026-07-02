@@ -1,6 +1,8 @@
 """Main application window for the stock dashboard."""
 import datetime as dt
-from typing import Optional, List, Tuple
+import threading
+import time
+from typing import Any, Dict, Optional, List, Tuple
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -34,6 +36,8 @@ from src.utils.db_loader import init_mysql_engine
 from src.utils.storage import load_json
 from src.services.app_state import (
     SETTINGS_FILE,
+    SaveResult,
+    get_state_save_manager,
     load_buylist_state,
     load_chart_drawings_state,
     load_scanner_setups_state,
@@ -206,6 +210,7 @@ class MainWindow(
         self.kis_daily_chart_unavailable_until: Optional[dt.datetime] = None
         self.kis_daily_chart_unavailable_key: str = ""
         self.kis_daily_chart_last_error: str = ""
+        self.state_save_manager = get_state_save_manager()
         self._init_controllers()
 
         # Create central widget
@@ -576,28 +581,65 @@ class MainWindow(
         """Load persisted trade plan state."""
         return load_trade_plans_state()
 
-    def _save_state(self) -> None:
-        """Persist user-managed state."""
-        import threading
-
-        if not hasattr(self, "_save_lock"):
+    def _ensure_save_lock(self) -> threading.Lock:
+        if "_save_lock" not in self.__dict__:
             self._save_lock = threading.Lock()
+        return self._save_lock
 
-        watchlist_dict = self.watchlist.to_dict() if hasattr(self, "watchlist") else {"name": "Default", "items": []}
-        buylist_dict = self.buylist_manager.to_dict() if hasattr(self, "buylist_manager") else {"items": []}
-        trade_manager_dict = self.trade_manager.to_dict() if hasattr(self, "trade_manager") else {"plans": []}
-        scanner_setups_copy = list(self.scanner_setups) if hasattr(self, "scanner_setups") and isinstance(self.scanner_setups, list) else getattr(self, "scanner_setups", [])
-        chart_drawings_copy = dict(self.chart_drawings) if hasattr(self, "chart_drawings") and isinstance(self.chart_drawings, dict) else getattr(self, "chart_drawings", {})
-        tab_options_copy = dict(self.tab_options) if hasattr(self, "tab_options") and isinstance(self.tab_options, dict) else getattr(self, "tab_options", {})
+    def _state_save_manager(self):
+        manager = self.__dict__.get("state_save_manager")
+        if manager is None:
+            manager = get_state_save_manager()
+            self.state_save_manager = manager
+        return manager
 
-        save_app_state(
+    def _state_save_payload(self) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Any, Dict[str, Any], Dict[str, Any]]:
+        values = self.__dict__
+        watchlist = values.get("watchlist")
+        buylist_manager = values.get("buylist_manager")
+        trade_manager = values.get("trade_manager")
+        scanner_setups = values.get("scanner_setups", [])
+        chart_drawings = values.get("chart_drawings", {})
+        tab_options = values.get("tab_options", {})
+
+        watchlist_dict = watchlist.to_dict() if watchlist is not None else {"name": "Default", "items": []}
+        buylist_dict = buylist_manager.to_dict() if buylist_manager is not None else {"items": []}
+        trade_manager_dict = trade_manager.to_dict() if trade_manager is not None else {"plans": []}
+        scanner_setups_copy = list(scanner_setups) if isinstance(scanner_setups, list) else scanner_setups
+        chart_drawings_copy = dict(chart_drawings) if isinstance(chart_drawings, dict) else chart_drawings
+        tab_options_copy = dict(tab_options) if isinstance(tab_options, dict) else tab_options
+        return (
             watchlist_dict,
             buylist_dict,
             trade_manager_dict,
             scanner_setups_copy,
             chart_drawings_copy,
             tab_options_copy,
-            save_lock=self._save_lock,
+        )
+
+    def _save_state(self) -> None:
+        """Persist user-managed state."""
+        payload = self._state_save_payload()
+
+        save_app_state(
+            *payload,
+            save_lock=self._ensure_save_lock(),
+            append_log=getattr(self, "append_log", None),
+        )
+
+    def _save_state_now(
+        self,
+        *,
+        timeout: float | None = None,
+        supersede_pending: bool = False,
+    ) -> SaveResult:
+        """Synchronously persist user-managed state."""
+        return self._state_save_manager().save_now(
+            *self._state_save_payload(),
+            save_lock=self._ensure_save_lock(),
+            append_log=getattr(self, "append_log", None),
+            lock_timeout=timeout,
+            supersede_pending=supersede_pending,
         )
 
     def _load_chart_drawings(self) -> dict:
@@ -670,6 +712,17 @@ class MainWindow(
         """Load persisted scanner setups."""
         return self._normalize_scanner_setups(load_scanner_setups_state(DEFAULT_SCANNER_SETUPS))
 
+    def _flush_state_saves_for_shutdown(self, timeout: float = 5.0) -> SaveResult:
+        manager = self._state_save_manager()
+        deadline = time.monotonic() + timeout
+        pending_timeout = min(3.0, timeout)
+        pending_finished = manager.wait_for_pending_saves(timeout=pending_timeout)
+        if not pending_finished:
+            self.append_log("Timed out waiting for pending local state save before shutdown.")
+
+        remaining = max(0.0, deadline - time.monotonic())
+        return self._save_state_now(timeout=remaining, supersede_pending=True)
+
     def closeEvent(self, event) -> None:
         if self.live_data_timer is not None:
             self.live_data_timer.stop()
@@ -701,7 +754,15 @@ class MainWindow(
                 )
                 event.ignore()
                 return
-        self._save_state()
+        save_result = self._flush_state_saves_for_shutdown(timeout=5.0)
+        if not save_result.success:
+            message = save_result.error or "Unknown local state save error."
+            self.append_log(f"Final local state save failed during shutdown: {message}")
+            QMessageBox.warning(
+                self,
+                "Local Save Warning",
+                f"Final local state save failed:\n\n{message}",
+            )
         super().closeEvent(event)
 
     def _clear_worker_reference(self, attribute_name: str, worker: QThread) -> None:

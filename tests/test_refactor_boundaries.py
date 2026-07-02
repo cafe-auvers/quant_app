@@ -38,6 +38,7 @@ def test_app_state_save_preserves_json_shapes(tmp_path, monkeypatch):
     monkeypatch.setattr(app_state, "SCANNER_SETUPS_FILE", tmp_path / "scanner_setups.json")
     monkeypatch.setattr(app_state, "CHART_DRAWINGS_FILE", tmp_path / "chart_drawings.json")
     monkeypatch.setattr(app_state, "TAB_OPTIONS_FILE", tmp_path / "tab_options.json")
+    monkeypatch.setattr(app_state, "STATE_METADATA_FILE", tmp_path / "state_metadata.json")
 
     scanner_setups = {"Setup 1": {"rules": []}}
     chart_drawings = {"AAPL": []}
@@ -51,6 +52,7 @@ def test_app_state_save_preserves_json_shapes(tmp_path, monkeypatch):
         chart_drawings,
         tab_options,
     )
+    assert thread.daemon is False
     thread.join(timeout=2)
 
     assert json.loads((tmp_path / "watchlist.json").read_text()) == {"name": "Default", "items": []}
