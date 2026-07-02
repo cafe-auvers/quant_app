@@ -118,6 +118,78 @@ def is_closed_status(status: OrderStatus | str) -> bool:
 
 
 @dataclass
+class BrokerOrderStatusSnapshot:
+    environment: str
+    account_no: str
+    symbol: str
+    broker_order_id: str = ""
+    client_order_id: str = ""
+    side: OrderSide = OrderSide.BUY
+    status: OrderStatus = OrderStatus.UNKNOWN
+    quantity_requested: int = 0
+    filled_quantity: int = 0
+    remaining_quantity: int = 0
+    avg_fill_price: float = 0.0
+    limit_price: float = 0.0
+    raw_response: Dict[str, Any] = field(default_factory=dict)
+    checked_at: str = field(default_factory=utc_now_iso)
+
+    def __post_init__(self) -> None:
+        self.environment = str(self.environment or "").upper()
+        self.account_no = str(self.account_no or "")
+        self.symbol = str(self.symbol or "").upper()
+        self.broker_order_id = str(self.broker_order_id or "")
+        self.client_order_id = str(self.client_order_id or "")
+        self.side = _enum_value(self.side, OrderSide, OrderSide.BUY)
+        self.status = _enum_value(self.status, OrderStatus, OrderStatus.UNKNOWN)
+        self.quantity_requested = int(float(self.quantity_requested or 0))
+        self.filled_quantity = int(float(self.filled_quantity or 0))
+        self.remaining_quantity = int(float(self.remaining_quantity or 0))
+        self.avg_fill_price = float(self.avg_fill_price or 0.0)
+        self.limit_price = float(self.limit_price or 0.0)
+        if not isinstance(self.raw_response, dict):
+            self.raw_response = {"raw": self.raw_response}
+        self.checked_at = str(self.checked_at or utc_now_iso())
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "environment": self.environment,
+            "account_no": self.account_no,
+            "symbol": self.symbol,
+            "broker_order_id": self.broker_order_id,
+            "client_order_id": self.client_order_id,
+            "side": self.side.value,
+            "status": self.status.value,
+            "quantity_requested": self.quantity_requested,
+            "filled_quantity": self.filled_quantity,
+            "remaining_quantity": self.remaining_quantity,
+            "avg_fill_price": self.avg_fill_price,
+            "limit_price": self.limit_price,
+            "raw_response": self.raw_response,
+            "checked_at": self.checked_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "BrokerOrderStatusSnapshot":
+        return cls(
+            environment=str(data.get("environment", "")),
+            account_no=str(data.get("account_no", "")),
+            symbol=str(data.get("symbol", "")),
+            broker_order_id=str(data.get("broker_order_id", "")),
+            client_order_id=str(data.get("client_order_id", "")),
+            side=_enum_value(data.get("side"), OrderSide, OrderSide.BUY),
+            status=_enum_value(data.get("status"), OrderStatus, OrderStatus.UNKNOWN),
+            quantity_requested=int(float(data.get("quantity_requested", 0) or 0)),
+            filled_quantity=int(float(data.get("filled_quantity", 0) or 0)),
+            remaining_quantity=int(float(data.get("remaining_quantity", 0) or 0)),
+            avg_fill_price=float(data.get("avg_fill_price", 0.0) or 0.0),
+            limit_price=float(data.get("limit_price", 0.0) or 0.0),
+            raw_response=data.get("raw_response") if isinstance(data.get("raw_response"), dict) else {},
+            checked_at=str(data.get("checked_at") or utc_now_iso()),
+        )
+
+
+@dataclass
 class BrokerOrder:
     client_order_id: str
     environment: str

@@ -636,7 +636,7 @@ def resolve_queue_status(
             return ExecutionQueueStatus.FILLED
         if normalized_order_status in UNKNOWN_SUBMISSION_ORDER_STATUS_VALUES:
             return ExecutionQueueStatus.UNKNOWN_SUBMISSION_STATE
-        if normalized_order_status in {"SUBMITTED", "ACCEPTED", "WORKING", "ORDER_SUBMITTED"}:
+        if normalized_order_status in {"SUBMITTED", "ACCEPTED", "WORKING", "ORDER_SUBMITTED", "CANCEL_REQUESTED"}:
             return ExecutionQueueStatus.ORDER_SUBMITTED
         if normalized_order_status in {"PENDING", "SUBMITTING", "ORDER_PENDING"}:
             return ExecutionQueueStatus.ORDER_PENDING

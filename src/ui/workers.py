@@ -345,6 +345,63 @@ class OrderReconciliationWorker(QThread):
             self.error_occurred.emit(str(exc))
 
 
+class KisOrderQueryWorker(QThread):
+    finished_query = pyqtSignal(list)
+    error_occurred = pyqtSignal(str)
+
+    def __init__(
+        self,
+        environment: Optional[str] = None,
+        account_no: Optional[str] = None,
+        symbol: Optional[str] = None,
+        broker_order_id: Optional[str] = None,
+        client_order_id: Optional[str] = None,
+    ) -> None:
+        super().__init__()
+        self.environment = environment
+        self.account_no = account_no
+        self.symbol = symbol
+        self.broker_order_id = broker_order_id
+        self.client_order_id = client_order_id
+
+    def run(self) -> None:
+        try:
+            from src.services.order_reconciliation import query_and_reconcile_unresolved_orders
+
+            updated = query_and_reconcile_unresolved_orders(
+                environment=self.environment,
+                account_no=self.account_no,
+                symbol=self.symbol,
+            )
+            if self.client_order_id:
+                updated = [
+                    order for order in updated
+                    if order.client_order_id == self.client_order_id
+                    or (self.broker_order_id and order.broker_order_id == self.broker_order_id)
+                ]
+            self.finished_query.emit(updated)
+        except Exception as exc:
+            self.error_occurred.emit(str(exc))
+
+
+class KisOrderCancelWorker(QThread):
+    finished_cancel = pyqtSignal(object)
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, client_order_id: str) -> None:
+        super().__init__()
+        self.client_order_id = client_order_id
+
+    def run(self) -> None:
+        try:
+            from src.services.order_reconciliation import cancel_and_reconcile_order
+
+            order = cancel_and_reconcile_order(self.client_order_id)
+            self.finished_cancel.emit(order)
+        except Exception as exc:
+            self.error_occurred.emit(str(exc))
+
+
 class IntradayFetchWorker(QThread):
     finished_fetch = pyqtSignal(str, object, int, str)
     error_occurred = pyqtSignal(str, str)

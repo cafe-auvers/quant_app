@@ -61,7 +61,8 @@ from src.ui.filter_catalog import (
 )
 from src.ui.workers import (
     FxRateWorker, HourlyRefreshWorker, IntradayBulkFetchWorker, IntradayFetchWorker,
-    KisAccountWorker, KisOrderWorker, KisStartupAccountsWorker, OrderReconciliationWorker,
+    KisAccountWorker, KisOrderCancelWorker, KisOrderQueryWorker, KisOrderWorker,
+    KisStartupAccountsWorker, OrderReconciliationWorker,
     RefreshWorker, ScannerWorker, SingleStockAiWorker, WatchlistAiWorker,
 )
 from src.services.order_ledger import (
@@ -186,6 +187,10 @@ class BuylistMixin:
              lambda _=False, e=env: self._buylist_review_selected_queue_order(e)),
             (f"Submit {env}", 105, "background-color: #4CAF50; color: white;",
              lambda _=False, e=env: self._buylist_submit_selected_queue_order(e)),
+            ("Check Order Status", 145, None,
+             lambda _=False, e=env: self._buylist_check_order_status(e)),
+            ("Cancel Order", 110, "background-color: #b71c1c; color: white;",
+             lambda _=False, e=env: self._buylist_cancel_selected_order(e)),
             ("Deactivate",    90,  None,
              lambda _=False, e=env: self._buylist_deactivate_selected(e)),
             ("Breakeven",    100, "background-color: #2196F3; color: white;",
@@ -235,6 +240,8 @@ class BuylistMixin:
         self._buylist_sim_monitor_active = False
 
         self._buylist_order_workers: List[QThread] = []
+        self.broker_order_query_worker = None
+        self.broker_order_cancel_worker = None
 
         self.populate_buylist_dashboard()
 
@@ -789,6 +796,272 @@ class BuylistMixin:
     # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Buylist Dashboard — action button handlers
     # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    def _open_orders_for_buylist_item(self, item, env: str) -> List[BrokerOrder]:
+        if item is None:
+            return []
+        load_fn = _main_window_global("load_order_ledger", load_order_ledger)
+        find_fn = _main_window_global("find_open_orders", find_open_orders)
+        self.order_ledger = load_fn()
+        account_no = self._first_account_no_for_environment(env) or ""
+        matches = find_fn(
+            self.order_ledger,
+            environment=env,
+            account_no=account_no,
+            symbol=getattr(item, "symbol", ""),
+        )
+        if not matches and account_no:
+            matches = find_fn(
+                self.order_ledger,
+                environment=env,
+                symbol=getattr(item, "symbol", ""),
+            )
+        kis_order_id = str(getattr(item, "kis_order_id", "") or "")
+        if kis_order_id:
+            exact = [
+                order for order in matches
+                if order.broker_order_id == kis_order_id or order.client_order_id == kis_order_id
+            ]
+            if exact:
+                return exact
+        return matches
+
+    def _selected_open_broker_order(self, env: str) -> Tuple[Optional[Any], Optional[BrokerOrder]]:
+        item = self._buylist_selected_item(env)
+        if item is None:
+            return None, None
+        orders = self._open_orders_for_buylist_item(item, env)
+        return item, (orders[0] if orders else None)
+
+    def _apply_broker_order_status_updates_to_buylist(self, updated_orders: List[BrokerOrder]) -> None:
+        manager = self.__dict__.get("execution_queue_manager")
+        changed = False
+        queue_changed = False
+
+        for order in updated_orders:
+            if order.status in {OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED}:
+                continue
+            try:
+                item = self.buylist_manager.get(order.symbol, order.environment)
+            except TypeError:
+                item = self.buylist_manager.get(order.symbol)
+            if item is None:
+                continue
+
+            if manager is None and self._is_execution_queue_buylist_item(item):
+                manager = self._ensure_execution_queue_manager()
+
+            if order.side == OrderSide.BUY:
+                queue_item = self._execution_queue_item_for_buylist_item(item) if manager is not None else None
+                if manager is not None and queue_item is not None and self._is_execution_queue_buylist_item(item):
+                    if order.status == OrderStatus.UNKNOWN_SUBMISSION_STATE:
+                        manager.mark_order_submitted(
+                            order.symbol,
+                            order_id=order.broker_order_id or order.client_order_id,
+                            order_status=OrderStatus.UNKNOWN_SUBMISSION_STATE.value,
+                            environment=order.environment,
+                        )
+                    elif order.status in {OrderStatus.ACCEPTED, OrderStatus.WORKING, OrderStatus.CANCEL_REQUESTED}:
+                        manager.mark_order_submitted(
+                            order.symbol,
+                            order_id=order.broker_order_id or order.client_order_id,
+                            order_status=order.status.value,
+                            environment=order.environment,
+                        )
+                    elif order.status in {OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.EXPIRED}:
+                        manager.mark_order_failed(
+                            order.symbol,
+                            order_status=order.status.value,
+                            environment=order.environment,
+                        )
+                    queue_changed = True
+                    queue_status = self._execution_queue_status_for_buylist_item(item)
+                else:
+                    queue_status = None
+
+                if order.status == OrderStatus.UNKNOWN_SUBMISSION_STATE:
+                    new_status = OrderStatus.UNKNOWN_SUBMISSION_STATE.value
+                elif order.status in {OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.EXPIRED}:
+                    new_status = queue_status or "ACTIVE"
+                elif order.status == OrderStatus.CANCEL_REQUESTED:
+                    new_status = queue_status or "ORDER_SUBMITTED"
+                else:
+                    new_status = queue_status or "BUY_SUBMITTED"
+            else:
+                if order.status in {OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.EXPIRED}:
+                    new_status = "BOUGHT" if int(getattr(item, "shares_held", 0) or 0) > 0 else "WATCHING"
+                elif order.status == OrderStatus.CANCEL_REQUESTED:
+                    new_status = "SELL_SUBMITTED"
+                elif order.intent in {OrderIntent.PARTIAL_EXIT, OrderIntent.PARTIAL_TAKE_PROFIT}:
+                    new_status = "PARTIAL_EXIT_SUBMITTED"
+                else:
+                    new_status = "SELL_SUBMITTED"
+
+            if getattr(item, "monitoring_status", "") != new_status:
+                item.monitoring_status = new_status
+                item.status = new_status
+                changed = True
+            kis_order_id = order.broker_order_id or order.client_order_id
+            if kis_order_id and getattr(item, "kis_order_id", "") != kis_order_id:
+                item.kis_order_id = kis_order_id
+                changed = True
+
+        if queue_changed:
+            self._save_execution_queue_state()
+        if changed:
+            self._save_buylist_state()
+
+    def _on_broker_order_query_finished(self, updated_orders: List[BrokerOrder]) -> None:
+        load_fn = _main_window_global("load_order_ledger", load_order_ledger)
+        self.order_ledger = load_fn()
+        self.apply_confirmed_order_fills_to_buylist(updated_orders)
+        self._apply_broker_order_status_updates_to_buylist(updated_orders)
+        self.populate_buylist_dashboard()
+        if hasattr(self, "update_dashboard_summary"):
+            self.update_dashboard_summary()
+
+        if not updated_orders:
+            self.append_log("Broker order status check finished: no unresolved matching orders were updated.")
+            return
+        counts: Dict[str, int] = {}
+        unknown_manual = 0
+        for order in updated_orders:
+            status = order.status.value
+            counts[status] = counts.get(status, 0) + 1
+            raw_status = order.raw_status_response or {}
+            raw_response = raw_status.get("raw_response", {}) if isinstance(raw_status, dict) else {}
+            if order.status == OrderStatus.UNKNOWN_SUBMISSION_STATE or (
+                isinstance(raw_response, dict) and raw_response.get("not_found")
+            ):
+                unknown_manual += 1
+        summary = ", ".join(f"{key}={value}" for key, value in sorted(counts.items()))
+        self.append_log(f"Broker order status check updated {len(updated_orders)} order(s): {summary}.")
+        if unknown_manual:
+            self.append_log(
+                "Broker query did not find clear evidence for one or more unknown submissions; manual verification is still required."
+            )
+
+    def _buylist_check_order_status(self, env: str) -> None:
+        worker = self.__dict__.get("broker_order_query_worker")
+        if worker is not None and worker.isRunning():
+            self.append_log("Broker order status check is already running.")
+            return
+
+        item = self._buylist_selected_item(env)
+        account_no = self._first_account_no_for_environment(env) or ""
+        symbol = None
+        broker_order_id = None
+        client_order_id = None
+        if item is not None:
+            orders = self._open_orders_for_buylist_item(item, env)
+            if not orders:
+                QMessageBox.information(self, "No unresolved order", f"No unresolved local broker order exists for {item.symbol}.")
+                return
+            order = orders[0]
+            account_no = order.account_no or account_no
+            symbol = order.symbol
+            broker_order_id = order.broker_order_id
+            client_order_id = order.client_order_id
+
+        self.broker_order_query_worker = KisOrderQueryWorker(
+            environment=env,
+            account_no=account_no or None,
+            symbol=symbol,
+            broker_order_id=broker_order_id,
+            client_order_id=client_order_id,
+        )
+        self.broker_order_query_worker.finished_query.connect(self._on_broker_order_query_finished)
+        self.broker_order_query_worker.error_occurred.connect(
+            lambda message: self.append_log(f"Broker order status check failed: {message}")
+        )
+        self.broker_order_query_worker.finished.connect(
+            lambda: setattr(self, "broker_order_query_worker", None)
+        )
+        self.broker_order_query_worker.start()
+        scope = symbol or "all unresolved orders"
+        self.append_log(f"Checking broker order status for {env} {account_no or '<ledger accounts>'} {scope}.")
+
+    @staticmethod
+    def _cancel_allowed_for_order(order: BrokerOrder) -> bool:
+        return order.status in {
+            OrderStatus.SUBMITTING,
+            OrderStatus.ACCEPTED,
+            OrderStatus.WORKING,
+            OrderStatus.PARTIALLY_FILLED,
+        }
+
+    def _format_cancel_order_confirmation(self, order: BrokerOrder) -> str:
+        remaining = order.remaining_quantity or max(0, order.quantity_requested - order.filled_quantity)
+        return "\n".join([
+            f"Environment: {order.environment}",
+            f"Account: {order.account_no or '<unknown account>'}",
+            f"Symbol: {order.symbol}",
+            f"Broker order id: {order.broker_order_id}",
+            f"Side: {order.side.value}",
+            f"Quantity remaining: {remaining}",
+            "",
+            "This is a broker-side cancel request.",
+        ])
+
+    def _buylist_cancel_selected_order(self, env: str) -> None:
+        worker = self.__dict__.get("broker_order_cancel_worker")
+        if worker is not None and worker.isRunning():
+            self.append_log("Broker order cancel is already running.")
+            return
+
+        item, order = self._selected_open_broker_order(env)
+        if item is None:
+            QMessageBox.warning(self, "No selection", "Select a buylist row with an unresolved broker order first.")
+            return
+        if order is None:
+            QMessageBox.warning(self, "No open order", f"No unresolved local broker order exists for {item.symbol}.")
+            return
+        if not order.broker_order_id:
+            QMessageBox.warning(
+                self,
+                "Cancel blocked",
+                f"{order.symbol} cannot be cancelled from the app because the local order has no broker order id.",
+            )
+            return
+        if not self._cancel_allowed_for_order(order):
+            QMessageBox.warning(
+                self,
+                "Cancel blocked",
+                f"{order.symbol} order is {order.status.value}; cancel is allowed only for known open broker orders.",
+            )
+            return
+
+        reply = QMessageBox.question(
+            self,
+            f"Cancel {order.environment} Order",
+            self._format_cancel_order_confirmation(order) + "\n\nCancel this broker order?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self.broker_order_cancel_worker = KisOrderCancelWorker(order.client_order_id)
+        self.broker_order_cancel_worker.finished_cancel.connect(self._on_broker_order_cancel_finished)
+        self.broker_order_cancel_worker.error_occurred.connect(
+            lambda message: self.append_log(f"Broker order cancel failed: {message}")
+        )
+        self.broker_order_cancel_worker.finished.connect(
+            lambda: setattr(self, "broker_order_cancel_worker", None)
+        )
+        self.broker_order_cancel_worker.start()
+        self.append_log(f"Cancel requested at broker for {order.environment} {order.symbol} order {order.broker_order_id}.")
+
+    def _on_broker_order_cancel_finished(self, order: BrokerOrder) -> None:
+        load_fn = _main_window_global("load_order_ledger", load_order_ledger)
+        self.order_ledger = load_fn()
+        self._apply_broker_order_status_updates_to_buylist([order])
+        self.populate_buylist_dashboard()
+        if hasattr(self, "update_dashboard_summary"):
+            self.update_dashboard_summary()
+        self.append_log(
+            f"Broker cancel response for {order.symbol} {order.broker_order_id or order.client_order_id}: {order.status.value}."
+        )
+
     def _buylist_selected_item(self, env: str):
         """Return the BuylistItem for the selected row in the given env table, or None."""
         table_attr = f"buylist_{env.lower()}_table"
@@ -1824,7 +2097,6 @@ class BuylistMixin:
             self.order_ledger = load_fn()
     def request_cancel_order(self, client_order_id: str) -> bool:
         load_fn = _main_window_global("load_order_ledger", load_order_ledger)
-        update_fn = _main_window_global("update_order", update_order)
         self.order_ledger = load_fn()
         target = next((order for order in self.order_ledger if order.client_order_id == client_order_id), None)
         if target is None:
@@ -1833,13 +2105,20 @@ class BuylistMixin:
         if target.status not in OPEN_ORDER_STATUSES:
             self.append_log(f"Cancel request skipped: order {client_order_id} is already {target.status.value}")
             return False
-        target.status = OrderStatus.CANCEL_REQUESTED
-        target.touch()
-        update_fn(target)
+        if not target.broker_order_id:
+            self.append_log(f"Cancel request skipped: order {client_order_id} has no broker order id")
+            return False
+        try:
+            from src.services.order_reconciliation import cancel_and_reconcile_order
+
+            updated = cancel_and_reconcile_order(client_order_id)
+        except Exception as exc:
+            self.append_log(f"Cancel request failed for {target.symbol} order {client_order_id}: {exc}")
+            return False
         self.order_ledger = load_fn()
-        self.append_log(
-            f"Cancel requested for {target.symbol} {target.side.value} order {client_order_id}; direct KIS cancel endpoint is not implemented yet"
-        )
+        self._apply_broker_order_status_updates_to_buylist([updated])
+        self.populate_buylist_dashboard()
+        self.append_log(f"Cancel requested for {updated.symbol} {updated.side.value} order {client_order_id}: {updated.status.value}")
         return True
     def _on_order_error(self, symbol: str, side: str, error: str, item=None) -> None:
         side_text = str(side).lower()
