@@ -33,7 +33,7 @@ from src.core.position_sizer import PositionSizer
 from src.core.order_state import BrokerOrder, OrderIntent, OrderSide, OrderStatus, OPEN_ORDER_STATUSES
 from src.core.orb import calculate_orb_range, evaluate_orb_entry_signal, resample_intraday_bars
 from src.core.scanner import StockScanner, ComparisonOperator, ScanRule
-from src.core.watchlist import Watchlist, TradePlanManager, TradePlan, BuylistManager, BuylistItem
+from src.core.watchlist import Watchlist, TradePlanManager, TradePlan, BuylistManager
 from src.core.trade_reviewer import TradeReviewer, TradeSetup
 from src.utils.data_loader import download_price_history, get_default_universe, _extract_symbol_history
 from src.utils.db_loader import (
@@ -1102,82 +1102,7 @@ class WatchlistMixin:
                 f"'{symbol}' could not be added to the {env} execution queue. Check the log for details."
             )
         self.refresh_orb_trade_plan_table()
-        return
-            
-        if not hasattr(self, "watchlist_scores") or symbol not in self.watchlist_scores:
-            QMessageBox.warning(
-                self, 
-                "Not Scored", 
-                "This candidate has not been analyzed yet. Click 'Check with AI' to score the watchlist first."
-            )
-            return
-            
-        scores = self.watchlist_scores[symbol]
-        
-        total_score = scores.get("total_score", 0.0)
-        status = scores.get("status", "")
-        warnings_list = scores.get("warnings", [])
-        rr = scores.get("rr", 0.0)
-        stop_adr = scores.get("stop_adr", 999.0)
-        position_percent = scores.get("position_percent", 999.0)
-        
-        rejections = []
-        if warnings_list:
-            rejections.append(f"Has violations/warnings: {', '.join(warnings_list)}")
-        if stop_adr > 100.0:
-            rejections.append(f"Stop loss exceeds ADR 20-day (Stop/ADR is {stop_adr:.2f}%)")
-        if position_percent >= 30.0:
-            rejections.append(f"Position size {position_percent:.1f}% exceeds 30% of account")
 
-        if rejections:
-            msg = f"Candidate '{symbol}' has potential issues:\n\n" + "\n".join(f"- {r}" for r in rejections)
-            msg += "\n\nAdd to Buylist anyway?"
-            reply = QMessageBox.question(
-                self, "Add to Buylist?", msg,
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-            )
-            if reply != QMessageBox.Yes:
-                return
-            
-        env = self.watchlist_env_combo.currentText() if hasattr(self, "watchlist_env_combo") else "SIM"
-        buylist_item = BuylistItem(
-            symbol=symbol,
-            name=item.name,
-            entry_price=scores.get("entry_price", item.entry_price or 0.0),
-            target_price=0.0,
-            stop_loss=scores.get("stop_loss", item.stop_loss or 0.0),
-            total_score=total_score,
-            status=status,
-            technical_score=scores.get("technical_score", 0.0),
-            setup_score=scores.get("setup_score", 0.0),
-            risk_score=scores.get("risk_score", 0.0),
-            news_score=scores.get("news_score", 0.0),
-            timing_score=scores.get("timing_score", 0.0),
-            rr=rr,
-            stop_adr=stop_adr,
-            position_percent=position_percent,
-            ai_summary=scores.get("ai_summary", ""),
-            warnings=warnings_list,
-            notes=item.notes,
-            environment=env,
-            breakout_price=scores.get("breakout_price"),
-            confirmation_price=scores.get("confirmation_price"),
-            breakout_method="manual_trendline" if scores.get("breakout_price") else "",
-            buffer_pct=float(scores.get("buffer_pct", 0.001)),
-        )
-        self.buylist_manager.add(buylist_item)
-
-        self.populate_watchlist_table()
-        self.populate_buylist_dashboard()
-        self.update_dashboard_summary()
-        self._save_state()
-
-        QMessageBox.information(
-            self,
-            "Added to Buylist",
-            f"'{symbol}' added to Buylist ({env}) — visible in Buy Dashboard."
-        )
-        self.refresh_orb_trade_plan_table()
     def on_watchlist_selection_changed(self) -> None:
         """Called when the selected row in the watchlist changes (mouse click or keyboard arrows)."""
         selected_rows = self.watchlist_table.selectionModel().selectedRows()

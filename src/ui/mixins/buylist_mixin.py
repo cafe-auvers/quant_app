@@ -261,6 +261,8 @@ class BuylistMixin:
         for item in items:
             row = table.rowCount()
             table.insertRow(row)
+            display_status = self._buylist_dashboard_status(item)
+            is_queue_item = self._is_execution_queue_buylist_item(item)
 
             current_price = self.latest_intraday_prices.get(item.symbol, 0.0)
             pnl_pct = pnl_usd = 0.0
@@ -298,8 +300,11 @@ class BuylistMixin:
 
             table.setItem(row, 0,  _cell(item.symbol))
             table.setItem(row, 1,  _cell(item.name[:16] if item.name else ""))
-            table.setItem(row, 2,  _cell(item.monitoring_status))
-            table.setItem(row, 3,  _cell("ON" if item.monitoring_status in ("ACTIVE", "BOUGHT") else "OFF"))
+            table.setItem(row, 2,  _cell(display_status))
+            monitor_on = item.monitoring_status in ("ACTIVE", "BOUGHT") and not (
+                is_queue_item and item.monitoring_status == "ACTIVE"
+            )
+            table.setItem(row, 3,  _cell("ON" if monitor_on else "OFF"))
             table.setItem(row, 4,  _cell(f"{item.entry_price:.2f}"))   # ORB high (execution ref)
             table.setItem(row, 5,  _cell(bp_display))                  # daily breakout level
             table.setItem(row, 6,  _cell(f"{item.stop_loss:.2f}"))
@@ -324,7 +329,7 @@ class BuylistMixin:
             row_color = None
             if item.monitoring_status == "BOUGHT":
                 row_color = QColor("#2e7d32") if pnl_pct >= 0 else QColor("#c62828")  # medium green / red
-            elif item.monitoring_status == "ACTIVE":
+            elif item.monitoring_status == "ACTIVE" and not is_queue_item:
                 row_color = QColor("#1565c0")    # medium blue
             elif item.monitoring_status == "SOLD":
                 row_color = QColor("#546e7a")    # blue-grey
@@ -354,6 +359,10 @@ class BuylistMixin:
     def _buylist_compute_alerts(self, item, current_price: float, days_held: int) -> str:
         """Return a pipe-separated alert string for a buylist item."""
         alerts = []
+        queue_status = self._execution_queue_status_for_buylist_item(item)
+        if queue_status:
+            alerts.append(queue_status)
+
         if item.monitoring_status == "BOUGHT":
             if current_price > 0 and item.stop_loss > 0 and current_price <= item.stop_loss:
                 alerts.append("STOP HIT")
@@ -368,6 +377,9 @@ class BuylistMixin:
             if ema20 > 0 and current_price < ema20:
                 alerts.append("< 20 EMA")
         elif item.monitoring_status == "ACTIVE":
+            if self._is_orb_buylist_item(item):
+                alerts.append("QUEUE REQUIRED")
+                return " | ".join(dict.fromkeys(alerts))
             bought_count = sum(1 for it in self.buylist_manager.items
                                if it.monitoring_status == "BOUGHT" and it.environment == item.environment)
             if bought_count >= 5:
@@ -385,10 +397,7 @@ class BuylistMixin:
                 else:
                     alerts.append(f"below ORB ${item.entry_price:.2f}")
         else:
-            queue_statuses = {
-                "ORB_FORMING", "WAITING_BREAKOUT", "ARMED", "EXECUTE_READY",
-                "ORDER_PENDING", "ORDER_SUBMITTED", "FILLED", "EXPIRED", "REJECTED",
-            }
+            queue_statuses = self._execution_queue_status_values()
             status_text = str(getattr(item, "monitoring_status", "") or "").upper()
             if status_text in queue_statuses:
                 alerts.append(status_text)
@@ -398,11 +407,51 @@ class BuylistMixin:
             planned_shares = int(getattr(item, "_planned_shares", 0) or 0)
             if planned_shares > 0:
                 alerts.append(f"Qty {planned_shares}")
-        return " | ".join(alerts)
+        return " | ".join(dict.fromkeys(alerts))
 
     @staticmethod
     def _execution_queue_value(value) -> str:
         return str(getattr(value, "value", value) or "")
+
+    @staticmethod
+    def _execution_queue_status_values() -> set:
+        from src.core.execution_queue import ExecutionQueueStatus
+
+        return {status.value for status in ExecutionQueueStatus}
+
+    def _execution_queue_status_for_buylist_item(self, item) -> Optional[str]:
+        if item is None or not self._is_execution_queue_buylist_item(item):
+            return None
+        symbol = str(getattr(item, "symbol", "") or "").upper()
+        if not symbol:
+            return None
+        manager = self.__dict__.get("execution_queue_manager")
+        if manager is None:
+            manager = self._ensure_execution_queue_manager()
+        queue_item = manager.items.get(symbol)
+        if queue_item is None:
+            return None
+        return self._execution_queue_value(queue_item.status)
+
+    def _buylist_dashboard_status(self, item) -> str:
+        queue_status = self._execution_queue_status_for_buylist_item(item)
+        if queue_status:
+            return queue_status
+        return str(getattr(item, "monitoring_status", "") or "")
+
+    def _is_orb_buylist_item(self, item) -> bool:
+        if self._is_execution_queue_buylist_item(item):
+            return True
+        method = str(getattr(item, "breakout_method", "") or "").lower()
+        if "orb" in method:
+            return True
+        if str(getattr(item, "_selected_orb_window", "") or ""):
+            return True
+        try:
+            breakout_price = float(getattr(item, "breakout_price", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            breakout_price = 0.0
+        return breakout_price > 0
 
     def _ensure_execution_queue_manager(self):
         from src.core.execution_queue import ExecutionQueueManager
@@ -447,10 +496,9 @@ class BuylistMixin:
 
     @staticmethod
     def _is_execution_queue_buylist_item(item) -> bool:
-        queue_statuses = {
-            "ORB_FORMING", "WAITING_BREAKOUT", "ARMED", "EXECUTE_READY",
-            "ORDER_PENDING", "ORDER_SUBMITTED", "FILLED", "EXPIRED", "REJECTED",
-        }
+        from src.core.execution_queue import ExecutionQueueStatus
+
+        queue_statuses = {status.value for status in ExecutionQueueStatus}
         method = str(getattr(item, "breakout_method", "") or "")
         status = str(getattr(item, "monitoring_status", "") or "").upper()
         return method.startswith("execution_queue") or status in queue_statuses
@@ -796,8 +844,9 @@ class BuylistMixin:
 
         manager = self._ensure_execution_queue_manager()
         manager.mark_order_submitted(item.symbol, order_status="PENDING")
-        item.monitoring_status = "ORDER_PENDING"
-        item.status = "ORDER_PENDING"
+        queue_status = self._execution_queue_status_for_buylist_item(item) or "ORDER_PENDING"
+        item.monitoring_status = queue_status
+        item.status = queue_status
         item.entry_price = float(candidate.entry_trigger or 0.0)
         item.stop_loss = float(candidate.stop_loss or 0.0)
         item._planned_shares = int(candidate.shares or 0)
@@ -837,11 +886,11 @@ class BuylistMixin:
         if item.monitoring_status == "BOUGHT":
             QMessageBox.information(self, "Already bought", f"{item.symbol} is already in a BOUGHT position.")
             return
-        if str(getattr(item, "breakout_method", "")).startswith("execution_queue"):
+        if self._is_orb_buylist_item(item):
             QMessageBox.information(
                 self,
                 "Execution Queue",
-                f"{item.symbol} is managed by the execution queue. Use Review Order and Submit Buy.",
+                f"{item.symbol} is an ORB entry. Queue it from the Watchlist and use Review Order and Submit Buy.",
             )
             return
         bought_count = sum(1 for it in self.buylist_manager.items if it.monitoring_status == "BOUGHT" and it.environment == env)
@@ -857,6 +906,13 @@ class BuylistMixin:
         item = self._buylist_selected_item(env)
         if not item:
             QMessageBox.warning(self, "No selection", "Select a buylist row to deactivate.")
+            return
+        if item.monitoring_status != "BOUGHT" and self._is_execution_queue_buylist_item(item):
+            QMessageBox.information(
+                self,
+                "Execution Queue",
+                f"{item.symbol} is managed by the execution queue. Remove the row if it is no longer needed.",
+            )
             return
         if item.monitoring_status == "BOUGHT":
             reply = QMessageBox.question(
@@ -1062,6 +1118,15 @@ class BuylistMixin:
                 continue
 
             if item.monitoring_status == "ACTIVE":
+                if self._is_orb_buylist_item(item):
+                    if not getattr(item, "_orb_queue_required_notice_logged", False):
+                        item._orb_queue_required_notice_logged = True
+                        self.append_log(
+                            f"[Buylist/{env}] {item.symbol} is an ORB entry; skipping legacy ACTIVE auto-buy. "
+                            "Use the execution queue Review Order and Submit Buy flow."
+                        )
+                    continue
+
                 # Compute entry_trigger: max(ORB high, breakout_price * (1+buffer))
                 bp = getattr(item, "breakout_price", None) or 0.0
                 buf = getattr(item, "buffer_pct", 0.001)
@@ -1341,6 +1406,8 @@ class BuylistMixin:
         if self._has_duplicate_open_order(env, account_no, item.symbol, OrderSide.BUY, intent):
             item._buy_order_pending = False
             manager = self.__dict__.get("execution_queue_manager")
+            if manager is None and self._is_execution_queue_buylist_item(item):
+                manager = self._ensure_execution_queue_manager()
             if manager is not None:
                 manager.mark_order_failed(item.symbol, order_status="DUPLICATE")
                 queue_item = manager.items.get(item.symbol)
@@ -1380,6 +1447,8 @@ class BuylistMixin:
         except Exception as exc:
             item._buy_order_pending = False
             manager = self.__dict__.get("execution_queue_manager")
+            if manager is None and self._is_execution_queue_buylist_item(item):
+                manager = self._ensure_execution_queue_manager()
             if manager is not None:
                 manager.mark_order_failed(item.symbol, order_status="ERROR")
                 queue_item = manager.items.get(item.symbol)
@@ -1448,15 +1517,15 @@ class BuylistMixin:
             if manager is not None:
                 manager.mark_order_failed(item.symbol, order_status="REJECTED")
                 queue_item = manager.items.get(item.symbol)
+            queue_status = self._execution_queue_status_for_buylist_item(item)
             block_reason = ""
             if self._is_kis_sim_unsupported_order_error(order.error_message):
                 block_reason = "KIS SIM rejected overseas order routing for this account/API (90000000)."
                 self._set_buylist_auto_order_block(item, block_reason)
-                item.monitoring_status = self._execution_queue_value(queue_item.status) if queue_item is not None else "ACTIVE"
+                item.monitoring_status = queue_status or ("WATCHING" if self._is_orb_buylist_item(item) else "ACTIVE")
             else:
-                item.monitoring_status = self._execution_queue_value(queue_item.status) if queue_item is not None else "ERROR"
-            if queue_item is not None:
-                item.status = item.monitoring_status
+                item.monitoring_status = queue_status or "ERROR"
+            item.status = item.monitoring_status
             self._save_buylist_state()
             self.populate_buylist_dashboard()
             self.append_log(
@@ -1472,13 +1541,17 @@ class BuylistMixin:
             )
             return
 
-        if manager is not None:
+        symbol_key = str(getattr(item, "symbol", "") or "").upper()
+        if manager is not None and symbol_key in manager.items:
             manager.mark_order_submitted(
                 item.symbol,
                 order_id=order.broker_order_id or order.client_order_id,
                 order_status=self._execution_queue_value(order.status).upper() or "SUBMITTED",
             )
-        item.monitoring_status = "BUY_SUBMITTED"
+            item.monitoring_status = self._execution_queue_status_for_buylist_item(item) or "ORDER_SUBMITTED"
+        else:
+            item.monitoring_status = "BUY_SUBMITTED"
+        item.status = item.monitoring_status
         item.kis_order_id = order.broker_order_id or order.client_order_id
         self._clear_buylist_auto_order_block(item)
         self._save_buylist_state()
@@ -1710,6 +1783,11 @@ class BuylistMixin:
             if not getattr(item, "buy_date", None):
                 item.buy_date = dt.datetime.now()
             item._buy_order_pending = False
+            if self._is_execution_queue_buylist_item(item):
+                manager = self._ensure_execution_queue_manager()
+                if symbol in manager.items:
+                    manager.mark_order_filled(symbol, order_status="FILLED")
+                    item.status = self._execution_queue_status_for_buylist_item(item) or item.status
             if item.monitoring_status in {"WATCHING", "ACTIVE", "BUY_SUBMITTED", "BUY_PARTIAL", "ERROR", "BOUGHT"}:
                 item.monitoring_status = "BOUGHT"
 
@@ -1744,12 +1822,17 @@ class BuylistMixin:
 
             if order.side == OrderSide.BUY:
                 manager = self.__dict__.get("execution_queue_manager")
+                if manager is None and self._is_execution_queue_buylist_item(item):
+                    manager = self._ensure_execution_queue_manager()
                 if manager is not None:
                     manager.mark_order_filled(
                         order.symbol,
                         order_id=order.broker_order_id or order.client_order_id,
                         order_status=self._execution_queue_value(order.status).upper(),
                     )
+                    queue_status = self._execution_queue_status_for_buylist_item(item)
+                    if queue_status:
+                        item.status = queue_status
                 item.shares_held = filled_qty
                 if order.avg_fill_price:
                     item.avg_cost = float(order.avg_fill_price)
@@ -1818,6 +1901,8 @@ class BuylistMixin:
             item._buy_order_pending = False
             item._stop_order_pending = False
             manager = self.__dict__.get("execution_queue_manager")
+            if manager is None and self._is_execution_queue_buylist_item(item):
+                manager = self._ensure_execution_queue_manager()
             if manager is not None and str(side).lower() == "buy":
                 manager.mark_order_failed(symbol, order_status="ERROR")
                 queue_item = manager.items.get(str(symbol or "").upper())

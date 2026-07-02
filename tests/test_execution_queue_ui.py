@@ -4,6 +4,7 @@ import pandas as pd
 import pytest
 
 import src.ui.mixins.buylist_mixin as buylist_mixin_module
+from src.core.execution_queue import ExecutionQueueStatus
 from src.core.watchlist import BuylistManager, Watchlist, WatchlistItem
 from src.ui.main_window import MainWindow
 
@@ -104,3 +105,48 @@ def test_intentional_selected_symbol_creates_one_buylist_queue_item(monkeypatch,
     assert item._planned_shares > 0
     assert item.shares_held == 0
     assert window.execution_queue_manager.items["AAPL"].selected_window == "1m"
+
+
+def test_buy_dashboard_status_uses_execution_queue_status(monkeypatch, tmp_path):
+    window = _build_queue_window(monkeypatch, tmp_path)
+
+    MainWindow.refresh_execution_queue(
+        window,
+        "SIM",
+        show_log=False,
+        symbols=["AAPL"],
+        create_missing=True,
+    )
+    item = window.buylist_manager.get("AAPL", "SIM")
+    item.monitoring_status = "ACTIVE"
+    window.execution_queue_manager.items["AAPL"].status = ExecutionQueueStatus.ORDER_SUBMITTED
+
+    assert MainWindow._buylist_dashboard_status(window, item) == "ORDER_SUBMITTED"
+    assert "ORDER_SUBMITTED" in MainWindow._buylist_compute_alerts(window, item, 101.0, 0)
+
+
+def test_legacy_orb_active_row_does_not_auto_buy(monkeypatch, tmp_path):
+    window = _build_queue_window(monkeypatch, tmp_path)
+    logs = []
+    submissions = []
+    item = SimpleNamespace(
+        symbol="AAPL",
+        environment="SIM",
+        monitoring_status="ACTIVE",
+        breakout_method="manual_trendline",
+        breakout_price=100.0,
+        buffer_pct=0.001,
+        entry_price=100.1,
+        stop_loss=98.0,
+    )
+    window.buylist_manager = SimpleNamespace(items=[item])
+    window.latest_intraday_prices = {"AAPL": 101.0}
+    window.append_log = logs.append
+    window._buylist_refresh_item_data = lambda _item: None
+    window._populate_buylist_env_table = lambda _env: None
+    window._submit_kis_buy_order = lambda *_args, **_kwargs: submissions.append(True)
+
+    MainWindow._run_buylist_monitor_cycle(window, "SIM")
+
+    assert submissions == []
+    assert any("skipping legacy ACTIVE auto-buy" in message for message in logs)
