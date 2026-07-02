@@ -30,7 +30,7 @@ Prefer small helper functions over duplicating logic in UI handlers. Keep commen
 
 ## Testing Guidelines
 
-Tests use `pytest`. Add tests for changes in scanner rules, watchlist persistence, trade planning, database helpers, and pure UI formatting helpers. Name tests with `test_...` and place them under `tests/`.
+Tests use `pytest`. Add tests for changes in scanner rules, watchlist persistence, local JSON persistence/shutdown flushing, trade planning, database helpers, and pure UI formatting helpers. Name tests with `test_...` and place them under `tests/`.
 
 For database-related helpers, prefer isolated in-memory or temporary test fixtures when possible. Do not require a developer's local MySQL instance for normal unit tests.
 

@@ -117,7 +117,7 @@ Workers live in `src/ui/workers.py`.
 
 | Module | Responsibility |
 |---|---|
-| `src/services/app_state.py` | Threaded save helper for watchlist, buylist, trade plans, scanner setups, drawings, and tab options |
+| `src/services/app_state.py` | `StateSaveManager`, save-result tracking, metadata writes, and compatibility helpers for watchlist, buylist, trade plans, scanner setups, drawings, and tab options |
 | `src/services/intraday_provider.py` | Provider-neutral request/result contracts and OHLCV normalization/resampling helpers |
 | `src/services/intraday_data_service.py` | KIS-first intraday orchestration, yfinance fallback, and best-source cache loading |
 | `src/services/kis_intraday_provider.py` | KIS intraday provider wrapper using existing SIM/PROD account config |
@@ -144,7 +144,7 @@ The buylist is the local monitoring model. Broker orders are now tracked separat
 
 ## Data and Persistence
 
-Local JSON state is read/written through `src/utils/storage.py` and service helpers.
+Local JSON state is read/written through `src/utils/storage.py` and service helpers. Writes use a temp file followed by atomic replace. When an existing JSON file is overwritten, `save_json()` first keeps a rolling `.bak` copy; `load_json()` falls back to that backup if the main file is missing or malformed.
 
 | File | Purpose |
 |---|---|
@@ -155,10 +155,15 @@ Local JSON state is read/written through `src/utils/storage.py` and service help
 | `data/chart_drawings.json` | Saved chart line drawings; watchlist breakout prices are persisted in `data/watchlist.json` |
 | `data/tab_options.json` | Tab visibility settings |
 | `data/orders.json` | Local broker-order ledger, created when the first order is recorded |
+| `data/state_metadata.json` | Optional sidecar with last successful/failed app-state save time, last error, and files written |
 | `data/us_kis_tickers.csv` | Cached KIS-registered US stock universe used by scanner refreshes |
 | `data/sp500_tickers.csv` | Cached S&P 500 fallback universe |
 
 `data/settings.json` may be created when settings or shortcuts are saved.
+
+Critical local state files keep one rolling `.bak` backup beside the JSON file, including watchlist, buylist, trade plans, orders, and execution queue state. The app does not wrap existing JSON payloads in a schema envelope, so legacy loaders keep their current formats.
+
+`MainWindow.closeEvent()` requests interruption for active background workers, waits with one shared bounded shutdown budget, then attempts a final synchronous app-state save and waits briefly for pending background saves. Normal UI save calls still schedule background saves through `save_app_state()`, but those threads are tracked and non-daemon.
 
 ## Market Data Layer
 
@@ -351,7 +356,7 @@ python -m compileall main.py src tests -q
 pytest -q
 ```
 
-Coverage includes scanner rules, scoring, position sizing, ORB logic, watchlist and buylist persistence, MySQL helper behavior, KIS account config/profile parsing, selected `MainWindow` formatting/helpers, refactor boundaries, and KIS order lifecycle safety.
+Coverage includes scanner rules, scoring, position sizing, ORB logic, watchlist and buylist persistence, local JSON backup/recovery and shutdown flushing, MySQL helper behavior, KIS account config/profile parsing, selected `MainWindow` formatting/helpers, refactor boundaries, and KIS order lifecycle safety.
 Intraday provider coverage includes KIS disabled/configuration errors, yfinance fallback behavior, source-priority cache loading, ORB invariance across normalized provider data, 1m-to-5m resampling, and worker signal payload shape.
 
 ## Production Safety Notes
@@ -363,3 +368,4 @@ Intraday provider coverage includes KIS disabled/configuration errors, yfinance 
 - Do not treat KIS order acceptance as a fill. Confirm fills through verified order status endpoints or conservative account snapshot reconciliation.
 - MySQL is optional, but production workflows that depend on scanner/cache freshness should configure `MYSQL_*` and validate refresh jobs.
 - `data/` files are local state unless intentionally replaced with sanitized sample data.
+- Keep generated `.bak` files and `data/state_metadata.json` out of source control with the rest of local runtime state.

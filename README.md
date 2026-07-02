@@ -12,6 +12,7 @@ A desktop trading dashboard for US-market swing trading with scanner workflows, 
 - ORB planning where entry is valid only after price clears both ORB high and the buffered breakout price.
 - Buy dashboard monitoring with partial-exit and EMA-close exit workflow support.
 - Daily, hourly, TradingView, and intraday chart views with persisted drawings and breakout markers.
+- Shutdown-safe local JSON persistence with atomic writes, rolling `.bak` recovery, and save-status metadata.
 - Optional OpenAI-backed trade review with deterministic fallback analysis.
 
 ## Strategy Terminology
@@ -82,6 +83,7 @@ Only enable KIS intraday after the endpoint, TR ID, request parameters, output f
 - Smoke-test KIS order workflows in SIM before using PROD.
 - Treat successful KIS order submission as broker acceptance only.
 - Use `data/orders.json` as the durable local order ledger for idempotency and restart protection.
+- Keep local JSON `.bak` files and `data/state_metadata.json` with the rest of local runtime state.
 - Do not bypass reconciliation when updating buylist position state after order submission.
 
 ## Documentation
