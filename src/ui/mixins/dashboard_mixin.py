@@ -583,31 +583,11 @@ class DashboardMixin:
         self.apply_cached_trade_account_size()
         return True
     def refresh_trade_account_size(self) -> None:
-        profile = self.trade_kis_account_combo.currentData() if hasattr(self, "trade_kis_account_combo") else None
-        if not profile:
-            QMessageBox.warning(self, "No KIS account", "Select a configured KIS account first.")
-            return
-        if self.kis_startup_worker is not None and self.kis_startup_worker.isRunning():
-            QMessageBox.information(self, "KIS preload running", "Startup KIS account preload is still running.")
-            return
-        if self.kis_account_worker is not None and self.kis_account_worker.isRunning():
-            QMessageBox.information(self, "KIS refresh running", "A KIS refresh is already running.")
-            return
+        from src.ui.controllers.account_controller import AccountController
+        from src.ui.controllers.base import get_controller
 
-        environment = self.trade_kis_environment_combo.currentText()
-        self.append_log(f"Fetching {profile.get('label', environment)} account value...")
-        self.kis_account_worker = KisAccountWorker(
-            environment=environment,
-            include_domestic=True,
-            include_overseas=True,
-            account_no=profile.get("account_no"),
-        )
-        self.kis_account_worker.finished_snapshot.connect(self._on_trade_account_snapshot_finished)
-        self.kis_account_worker.error_occurred.connect(self._on_trade_account_snapshot_error)
-        self.kis_account_worker.finished.connect(
-            lambda worker=self.kis_account_worker: self._clear_worker_reference("kis_account_worker", worker)
-        )
-        self.kis_account_worker.start()
+        controller = get_controller(self, "account_controller", AccountController)
+        controller.refresh_trade_account_size()
     def _on_trade_account_snapshot_finished(self, snapshot: dict) -> None:
         profile = self.trade_kis_account_combo.currentData() if hasattr(self, "trade_kis_account_combo") else None
         environment = self.trade_kis_environment_combo.currentText() if hasattr(self, "trade_kis_environment_combo") else ""
