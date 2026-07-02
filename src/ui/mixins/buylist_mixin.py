@@ -46,6 +46,7 @@ from src.utils.db_loader import (
 )
 from src.utils.storage import load_json, save_json
 from src.api.kis_account_snapshot_dual import KisEnvironment, discover_account_profiles, load_config
+from src.api.kis_order import is_ambiguous_order_submission_error
 from src.services.app_state import (
     SCANNER_SETUPS_FILE, SETTINGS_FILE, load_buylist_state, load_chart_drawings_state,
     load_scanner_setups_state, load_tab_options_state, load_trade_plans_state,
@@ -374,6 +375,8 @@ class BuylistMixin:
         if queue_display is not None:
             if queue_display.display_status:
                 alerts.append(queue_display.display_status)
+                if queue_display.display_status == "UNKNOWN_SUBMISSION_STATE":
+                    alerts.append("UNKNOWN SUBMISSION - RECONCILE BEFORE RETRY")
             if queue_display.selected_window:
                 alerts.append(f"ORB {queue_display.selected_window}")
             if queue_display.planned_shares > 0:
@@ -383,6 +386,8 @@ class BuylistMixin:
         queue_status = self._execution_queue_status_for_buylist_item(item)
         if queue_status:
             alerts.append(queue_status)
+            if queue_status == "UNKNOWN_SUBMISSION_STATE":
+                alerts.append("UNKNOWN SUBMISSION - RECONCILE BEFORE RETRY")
 
         if item.monitoring_status == "BOUGHT":
             if current_price > 0 and item.stop_loss > 0 and current_price <= item.stop_loss:
@@ -1449,13 +1454,46 @@ class BuylistMixin:
         append_fn(order)
         self.order_ledger = load_fn()
     def _on_buy_order_accepted(self, item, order: BrokerOrder) -> None:
-        item._buy_order_pending = False
         self._record_broker_order(order)
         manager = self.__dict__.get("execution_queue_manager")
         queue_item = self._execution_queue_item_for_buylist_item(item) if manager is not None else None
         env = self._buylist_order_environment(item)
 
+        if order.status == OrderStatus.UNKNOWN_SUBMISSION_STATE:
+            item._buy_order_pending = True
+            order_id = order.broker_order_id or order.client_order_id
+            if manager is not None and queue_item is not None:
+                manager.mark_order_submitted(
+                    item.symbol,
+                    order_id=order_id,
+                    order_status=OrderStatus.UNKNOWN_SUBMISSION_STATE.value,
+                    environment=env,
+                )
+                item.monitoring_status = self._execution_queue_status_for_buylist_item(item) or OrderStatus.UNKNOWN_SUBMISSION_STATE.value
+            else:
+                item.monitoring_status = OrderStatus.UNKNOWN_SUBMISSION_STATE.value
+            item.status = item.monitoring_status
+            item.kis_order_id = order_id
+            self._save_buylist_state()
+            self._save_execution_queue_state()
+            self.populate_buylist_dashboard()
+            self.append_log(
+                f"WARNING: BUY submission result UNKNOWN for {item.symbol}: "
+                f"{order.error_message or 'no broker confirmation received'}. "
+                "Reconcile KIS account/orders before retry."
+            )
+            QMessageBox.warning(
+                self,
+                "KIS order submission unknown",
+                f"{item.symbol} buy order submission result is unknown.\n\n"
+                "Verify KIS account/order status before clearing this state or submitting again.",
+            )
+            timer = _main_window_global("QTimer", QTimer)
+            timer.singleShot(5000, self.reconcile_open_orders)
+            return
+
         if order.status == OrderStatus.REJECTED:
+            item._buy_order_pending = False
             if manager is not None:
                 manager.mark_order_failed(item.symbol, order_status="REJECTED", environment=env)
                 queue_item = self._execution_queue_item_for_buylist_item(item)
@@ -1483,6 +1521,7 @@ class BuylistMixin:
             )
             return
 
+        item._buy_order_pending = False
         if manager is not None and queue_item is not None:
             manager.mark_order_submitted(
                 item.symbol,
@@ -1506,6 +1545,28 @@ class BuylistMixin:
     def _on_sell_order_accepted(self, item, quantity: int, reason: str, order: BrokerOrder) -> None:
         item._stop_order_pending = False
         self._record_broker_order(order)
+
+        if order.status == OrderStatus.UNKNOWN_SUBMISSION_STATE:
+            item._stop_order_pending = True
+            item.monitoring_status = OrderStatus.UNKNOWN_SUBMISSION_STATE.value
+            item.status = item.monitoring_status
+            item.kis_order_id = order.broker_order_id or order.client_order_id
+            self._save_buylist_state()
+            self.populate_buylist_dashboard()
+            self.append_log(
+                f"WARNING: SELL submission result UNKNOWN for {item.symbol}: "
+                f"{order.error_message or 'no broker confirmation received'}. "
+                "Reconcile KIS account/orders before retry."
+            )
+            QMessageBox.warning(
+                self,
+                "KIS order submission unknown",
+                f"{item.symbol} sell order submission result is unknown.\n\n"
+                "Verify KIS account/order status before clearing this state or submitting again.",
+            )
+            timer = _main_window_global("QTimer", QTimer)
+            timer.singleShot(5000, self.reconcile_open_orders)
+            return
 
         if order.status == OrderStatus.REJECTED:
             try:
@@ -1781,26 +1842,50 @@ class BuylistMixin:
         )
         return True
     def _on_order_error(self, symbol: str, side: str, error: str, item=None) -> None:
-        # Clear pending flags so the next monitor cycle can retry
+        side_text = str(side).lower()
+        ambiguous = is_ambiguous_order_submission_error(error)
         if item is not None:
-            item._buy_order_pending = False
-            item._stop_order_pending = False
+            item._buy_order_pending = bool(ambiguous and side_text == "buy")
+            item._stop_order_pending = bool(ambiguous and side_text == "sell")
             manager = self.__dict__.get("execution_queue_manager")
             if manager is None and self._is_execution_queue_buylist_item(item):
                 manager = self._ensure_execution_queue_manager()
-            if manager is not None and str(side).lower() == "buy":
-                manager.mark_order_failed(
-                    symbol,
-                    order_status="ERROR",
-                    environment=str(getattr(item, "environment", "") or "SIM").upper(),
-                )
+            if manager is not None and side_text == "buy":
+                environment = str(getattr(item, "environment", "") or "SIM").upper()
+                if ambiguous:
+                    manager.mark_order_submitted(
+                        symbol,
+                        order_status=OrderStatus.UNKNOWN_SUBMISSION_STATE.value,
+                        environment=environment,
+                    )
+                else:
+                    manager.mark_order_failed(
+                        symbol,
+                        order_status="ERROR",
+                        environment=environment,
+                    )
                 queue_item = self._execution_queue_item_for_buylist_item(item)
                 if queue_item is not None:
                     item.monitoring_status = self._execution_queue_value(queue_item.status)
                     item.status = item.monitoring_status
                 self._save_execution_queue_state()
+            elif ambiguous:
+                item.monitoring_status = OrderStatus.UNKNOWN_SUBMISSION_STATE.value
+                item.status = item.monitoring_status
             self._save_buylist_state()
             self.populate_buylist_dashboard()
+        if ambiguous:
+            self.append_log(
+                f"WARNING: KIS {side.upper()} submission result UNKNOWN for {symbol}: {error}. "
+                "Reconcile KIS account/orders before retry."
+            )
+            QMessageBox.warning(
+                self,
+                f"Order Submission Unknown - {symbol}",
+                f"{side.upper()} order submission result is unknown.\n\n"
+                "Verify KIS account/order status before clearing this state or submitting again.",
+            )
+            return
         self.append_log(f"[Buylist] KIS {side.upper()} order FAILED for {symbol}: {error}")
         QMessageBox.warning(self, f"Order Failed — {symbol}", f"{side.upper()} order error:\n{error}")
     def _cleanup_order_worker(self, worker: QThread) -> None:

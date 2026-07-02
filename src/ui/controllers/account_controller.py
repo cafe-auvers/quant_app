@@ -98,7 +98,15 @@ class AccountController(WindowController):
                 if queue_item is not None:
                     manager.mark_order_filled(symbol, order_status="FILLED", environment=environment)
                     item.status = self._execution_queue_status_for_buylist_item(item) or item.status
-            if item.monitoring_status in {"WATCHING", "ACTIVE", "BUY_SUBMITTED", "BUY_PARTIAL", "ERROR", "BOUGHT"}:
+            if item.monitoring_status in {
+                "WATCHING",
+                "ACTIVE",
+                "BUY_SUBMITTED",
+                "BUY_PARTIAL",
+                "ERROR",
+                "UNKNOWN_SUBMISSION_STATE",
+                "BOUGHT",
+            }:
                 item.monitoring_status = "BOUGHT"
 
             if old_shares != item.shares_held or old_avg != item.avg_cost or old_status != item.monitoring_status:

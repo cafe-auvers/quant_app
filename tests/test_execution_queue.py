@@ -7,6 +7,7 @@ from src.core.execution_queue import (
     OrbCandidateStatus,
     build_orb_candidate,
     queue_key,
+    resolve_queue_status,
     select_best_orb_candidate,
 )
 
@@ -289,6 +290,38 @@ def test_duplicate_pending_or_submitted_orders_are_prevented():
     assert manager.has_pending_or_submitted_order("AAPL", environment="PROD") is False
     assert duplicate_candidate.status == OrbCandidateStatus.REJECTED
     assert "Duplicate" in duplicate_candidate.reason
+
+
+def test_unknown_submission_state_resolves_and_blocks_duplicate_only_in_environment():
+    manager = ExecutionQueueManager()
+    manager.upsert_item(symbol="AAPL", environment="SIM", candidates={"1m": _candidate("1m", 50)})
+    manager.upsert_item(symbol="AAPL", environment="PROD", candidates={"1m": _candidate("1m", 50)})
+
+    for order_status in ("UNKNOWN", "UNKNOWN_SUBMISSION_STATE", "AMBIGUOUS", "TIMEOUT", "NETWORK_ERROR"):
+        assert (
+            resolve_queue_status(
+                {"1m": _candidate("1m", 50)},
+                _candidate("1m", 50),
+                locked=True,
+                order_status=order_status,
+            )
+            == ExecutionQueueStatus.UNKNOWN_SUBMISSION_STATE
+        )
+
+    manager.mark_order_submitted(
+        "AAPL",
+        order_id="LOCAL-1",
+        order_status="UNKNOWN_SUBMISSION_STATE",
+        environment="SIM",
+    )
+
+    sim_item = manager.items[queue_key("AAPL", "SIM")]
+    prod_item = manager.items[queue_key("AAPL", "PROD")]
+    assert sim_item.status == ExecutionQueueStatus.UNKNOWN_SUBMISSION_STATE
+    assert sim_item.locked is True
+    assert manager.has_pending_or_submitted_order("AAPL", environment="SIM") is True
+    assert manager.has_pending_or_submitted_order("AAPL", environment="PROD") is False
+    assert prod_item.status == ExecutionQueueStatus.EXECUTE_READY
 
 
 def test_queue_status_rejected_when_all_candidates_fail_hard_validation():

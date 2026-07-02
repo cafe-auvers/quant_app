@@ -2,15 +2,81 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, Optional
+
+import requests
 
 from src.core.order_state import BrokerOrder, OrderIntent, OrderSide, OrderStatus
 
-from .kis_account_snapshot_dual import KisAccountClient, KisEnvironment, KisTokenError, load_config
+from .kis_account_snapshot_dual import (
+    KisAccountClient,
+    KisEnvironment,
+    KisInvalidAccountError,
+    KisTokenError,
+    load_config,
+)
 
 logger = logging.getLogger(__name__)
 
 OVERSEAS_ORDER_ENDPOINT = "/uapi/overseas-stock/v1/trading/order"
+AMBIGUOUS_ORDER_HTTP_STATUS_CODES = {502, 503, 504}
+
+_AMBIGUOUS_ORDER_ERROR_FRAGMENTS = (
+    "timeout",
+    "timed out",
+    "connection reset",
+    "connection aborted",
+    "connection refused",
+    "network unreachable",
+    "network error",
+    "temporary failure in name resolution",
+    "temporary dns",
+    "temporary network",
+    "name resolution",
+    "max retries exceeded",
+    "remote end closed connection",
+    "connection broken",
+    "non-json response",
+    "invalid response",
+    "invalid json",
+    "empty response",
+    "no response",
+    "bad gateway",
+    "service unavailable",
+    "gateway timeout",
+)
+
+_CLEAR_ORDER_ERROR_FRAGMENTS = (
+    "quantity must be positive",
+    "limit_price must be positive",
+    "price must be positive",
+    "no tr_id",
+    "invalid symbol",
+    "invalid quantity",
+    "invalid pdno",
+    "invalid_check_acno",
+    "insufficient",
+    "not enough",
+    "account",
+    "auth",
+    "unauthorized",
+    "forbidden",
+    "token",
+    "unsupported",
+    "does not provide this task",
+    "not provide this task",
+    "parameter",
+    "validation",
+    "rejected",
+    "reject",
+    "missing required environment variable",
+    "must look like",
+    "not configured",
+    "rate limit",
+    "duplicate",
+    "already exists",
+)
 
 _ORDER_TR_IDS: Dict[tuple, str] = {
     ("SIM",  "buy"):  "VTTT1002U",  # v1_해외주식-001 모의투자 매수
@@ -18,6 +84,60 @@ _ORDER_TR_IDS: Dict[tuple, str] = {
     ("PROD", "buy"):  "TTTT1002U",  # v1_해외주식-001 실전투자 매수
     ("PROD", "sell"): "TTTT1006U",  # v1_해외주식-001 실전투자 매도
 }
+
+
+def _flatten_error_message(value: Any) -> str:
+    parts = []
+    current = value
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        parts.append(f"{current.__class__.__name__}: {current}" if isinstance(current, BaseException) else str(current))
+        if not isinstance(current, BaseException):
+            break
+        current = current.__cause__ or current.__context__
+    return " | ".join(part for part in parts if part)
+
+
+def _http_status_from_error(value: Any, message: str) -> Optional[int]:
+    response = getattr(value, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code is not None:
+        try:
+            return int(status_code)
+        except (TypeError, ValueError):
+            pass
+
+    match = re.search(r"\bHTTP\s+(\d{3})\b", message, flags=re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def is_ambiguous_order_submission_error(exc_or_message: Any) -> bool:
+    """Return True when a submission failure may still have reached KIS."""
+    message = _flatten_error_message(exc_or_message)
+    lowered = message.lower()
+    status_code = _http_status_from_error(exc_or_message, message)
+
+    if status_code in AMBIGUOUS_ORDER_HTTP_STATUS_CODES or (status_code is not None and 500 <= status_code < 600):
+        return True
+    if status_code is not None and 400 <= status_code < 500:
+        return False
+
+    if isinstance(exc_or_message, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+        return True
+    if isinstance(exc_or_message, (ValueError, KisTokenError, KisInvalidAccountError)):
+        return False
+
+    if any(fragment in lowered for fragment in _AMBIGUOUS_ORDER_ERROR_FRAGMENTS):
+        return True
+    if "kis api error" in lowered or "rt_cd" in lowered:
+        return False
+    if any(fragment in lowered for fragment in _CLEAR_ORDER_ERROR_FRAGMENTS):
+        return False
+
+    return isinstance(exc_or_message, BaseException)
 
 
 def place_overseas_order(
@@ -184,7 +304,17 @@ def submit_overseas_order(
         order.touch()
         return order
     except Exception as exc:
-        order.status = OrderStatus.REJECTED
+        if is_ambiguous_order_submission_error(exc):
+            order.status = OrderStatus.UNKNOWN_SUBMISSION_STATE
+            logger.warning(
+                "KIS order submission result unknown for %s %s %s: %s",
+                environment,
+                side.upper(),
+                symbol,
+                exc,
+            )
+        else:
+            order.status = OrderStatus.REJECTED
         order.error_message = str(exc)
         order.touch()
         return order

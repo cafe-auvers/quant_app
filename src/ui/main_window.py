@@ -27,7 +27,7 @@ try:
 except ImportError:
     QWebEngineView = None
 
-from src.core.order_state import BrokerOrder, OrderIntent, OrderSide
+from src.core.order_state import BrokerOrder, OrderIntent, OrderSide, OrderStatus
 from src.core.scanner import StockScanner
 from src.core.watchlist import Watchlist, TradePlanManager, BuylistManager
 from src.core.trade_reviewer import TradeReviewer
@@ -277,7 +277,9 @@ class MainWindow(
             if item is None:
                 continue
 
-            if order.side == OrderSide.BUY:
+            if order.status == OrderStatus.UNKNOWN_SUBMISSION_STATE:
+                new_status = "UNKNOWN_SUBMISSION_STATE"
+            elif order.side == OrderSide.BUY:
                 new_status = "BUY_SUBMITTED"
             elif order.intent in {OrderIntent.PARTIAL_EXIT, OrderIntent.PARTIAL_TAKE_PROFIT}:
                 new_status = "PARTIAL_EXIT_SUBMITTED"

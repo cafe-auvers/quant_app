@@ -311,3 +311,31 @@ def test_submit_selected_queue_order_uses_queue_candidate_not_buylist_mirrors(mo
     assert item.entry_price == 1.23
     assert item.stop_loss == 0.45
     assert item.monitoring_status == "ORDER_PENDING"
+
+
+def test_submit_selected_queue_order_blocks_unknown_submission_state(monkeypatch):
+    item = _existing_buylist_item(
+        environment="SIM",
+        monitoring_status="UNKNOWN_SUBMISSION_STATE",
+        breakout_method="execution_queue:1m",
+    )
+    queue_item = _queue_item(status="UNKNOWN_SUBMISSION_STATE")
+    warnings = []
+    submissions = []
+    window = SimpleNamespace(
+        _buylist_selected_item=lambda env: item,
+        _queue_item_for_buylist_item=lambda selected: queue_item,
+        _submit_kis_buy_order=lambda selected, **kwargs: submissions.append((selected, kwargs)),
+    )
+    monkeypatch.setattr(
+        controller_module.QMessageBox,
+        "warning",
+        lambda parent, title, message: warnings.append((title, message)),
+    )
+
+    BuylistExecutionController(window).submit_selected_queue_order("SIM")
+
+    assert submissions == []
+    assert warnings
+    assert warnings[0][0] == "Submission state unknown"
+    assert "before clearing this state or submitting again" in warnings[0][1]

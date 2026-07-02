@@ -2,6 +2,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+import requests
 
 from src.api import kis_order
 from src.api.kis_account_snapshot_dual import KisAccountClient, KisEnvironment, KisTokenError
@@ -14,6 +15,7 @@ from src.core.order_state import (
 )
 from src.services.order_ledger import (
     append_order,
+    clear_unknown_submission_order,
     find_open_orders,
     has_open_order,
     has_open_order_for_buylist_item,
@@ -278,6 +280,103 @@ def test_same_symbol_account_with_closed_previous_order_does_not_block(monkeypat
     assert order.status != OrderStatus.FILLED
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        requests.exceptions.Timeout("read timed out"),
+        requests.exceptions.ConnectionError("connection reset by peer"),
+        RuntimeError("KIS HTTP error from /order: HTTP 502: {}"),
+        RuntimeError("KIS HTTP error from /order: HTTP 503: {}"),
+        RuntimeError("KIS HTTP error from /order: HTTP 504: {}"),
+        RuntimeError("KIS returned non-JSON response from /order. HTTP 200: <html></html>"),
+    ],
+)
+def test_order_submission_classifier_treats_network_and_gateway_errors_as_ambiguous(error):
+    assert kis_order.is_ambiguous_order_submission_error(error) is True
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ValueError("quantity must be positive, got 0"),
+        RuntimeError("KIS API error from /order: ABC invalid quantity. Raw={'rt_cd': '1'}"),
+        RuntimeError("KIS rejected account"),
+        RuntimeError("insufficient funds"),
+        RuntimeError("unsupported route/account"),
+    ],
+)
+def test_order_submission_classifier_treats_clear_rejections_as_not_ambiguous(error):
+    assert kis_order.is_ambiguous_order_submission_error(error) is False
+
+
+def test_unknown_submission_order_is_open_persistent_and_blocks_duplicate(monkeypatch, tmp_path):
+    path = tmp_path / "orders.json"
+    order = _order(status=OrderStatus.UNKNOWN_SUBMISSION_STATE)
+    order.error_message = "read timed out"
+    append_order(order, path=path)
+
+    loaded = load_order_ledger(path=path)
+    assert loaded[0].status == OrderStatus.UNKNOWN_SUBMISSION_STATE
+    assert find_open_orders(loaded, environment="SIM", account_no="12345678", symbol="AAPL")
+    assert has_open_order("SIM", "12345678", "AAPL", side=OrderSide.BUY, intent=OrderIntent.ENTRY, path=path)
+
+    monkeypatch.setattr(kis_order, "place_overseas_order", lambda **kwargs: pytest.fail("duplicate was not blocked"))
+    with pytest.raises(DuplicateOpenOrderError):
+        submit_guarded_overseas_order(
+            environment="SIM",
+            account_no="12345678",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            intent=OrderIntent.ENTRY,
+            quantity=1,
+            limit_price=100.0,
+            path=path,
+        )
+
+
+def test_clear_unknown_submission_order_requires_verification_and_unblocks(tmp_path):
+    path = tmp_path / "orders.json"
+    order = _order(status=OrderStatus.UNKNOWN_SUBMISSION_STATE)
+    append_order(order, path=path)
+
+    with pytest.raises(ValueError):
+        clear_unknown_submission_order(order.client_order_id, path=path)
+
+    cleared = clear_unknown_submission_order(order.client_order_id, verified=True, path=path)
+
+    assert cleared is not None
+    assert cleared.status == OrderStatus.EXPIRED
+    assert not has_open_order("SIM", "12345678", "AAPL", side=OrderSide.BUY, intent=OrderIntent.ENTRY, path=path)
+
+
+def test_submit_guarded_order_persists_unknown_state_on_ambiguous_error(monkeypatch, tmp_path):
+    path = tmp_path / "orders.json"
+
+    def fake_place_overseas_order(**kwargs):
+        raise requests.exceptions.Timeout("read timed out")
+
+    monkeypatch.setattr(kis_order, "place_overseas_order", fake_place_overseas_order)
+
+    order = submit_guarded_overseas_order(
+        environment="SIM",
+        account_no="12345678",
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        intent=OrderIntent.ENTRY,
+        quantity=3,
+        limit_price=191.23,
+        path=path,
+    )
+
+    loaded = load_orders(path=path)
+    assert order.status == OrderStatus.UNKNOWN_SUBMISSION_STATE
+    assert order.broker_order_id == ""
+    assert order.client_order_id
+    assert loaded[0].status == OrderStatus.UNKNOWN_SUBMISSION_STATE
+    assert loaded[0].client_order_id == order.client_order_id
+    assert "timed out" in loaded[0].error_message
+
+
 def test_kis_order_worker_import_still_works():
     from src.ui.workers import KisOrderWorker
 
@@ -448,6 +547,20 @@ def test_reconciliation_keeps_ambiguous_order_working_without_baseline():
     assert updated.filled_quantity == 0
 
 
+def test_reconciliation_keeps_unknown_submission_without_fill_evidence():
+    order = _order(side=OrderSide.BUY, quantity=10, status=OrderStatus.UNKNOWN_SUBMISSION_STATE)
+
+    [updated] = reconcile_orders_with_snapshot(
+        [order],
+        snapshot=_snapshot("AAPL", 0),
+        previous_snapshot=_snapshot("AAPL", 0),
+    )
+
+    assert updated.status == OrderStatus.UNKNOWN_SUBMISSION_STATE
+    assert updated.filled_quantity == 0
+    assert updated.remaining_quantity == 10
+
+
 def test_reconciliation_marks_partial_sell_from_holdings_delta():
     order = _order(
         side=OrderSide.SELL,
@@ -505,6 +618,115 @@ def test_buy_acceptance_does_not_mark_position_filled(monkeypatch):
     assert recorded == [order]
     assert save_calls == [True]
     assert any("waiting for fill confirmation" in message for message in logs)
+
+
+def test_ambiguous_buy_submission_keeps_queue_and_buylist_blocked(monkeypatch):
+    logs = []
+    recorded = []
+    save_calls = []
+    item = SimpleNamespace(
+        symbol="AAPL",
+        environment="SIM",
+        _buy_order_pending=True,
+        monitoring_status="ORDER_PENDING",
+        status="ORDER_PENDING",
+        breakout_method="execution_queue:1m",
+        shares_held=0,
+        avg_cost=0.0,
+        buy_date="",
+        position_percent=0.0,
+        kis_order_id="",
+    )
+
+    class Manager:
+        def __init__(self):
+            self.queue_item = SimpleNamespace(status="ORDER_PENDING")
+            self.mark_calls = []
+
+        def get_item(self, symbol, environment="SIM"):
+            assert symbol == "AAPL"
+            assert environment == "SIM"
+            return self.queue_item
+
+        def mark_order_submitted(self, symbol, order_id="", order_status="SUBMITTED", environment="SIM"):
+            self.mark_calls.append((symbol, order_id, order_status, environment))
+            self.queue_item.status = order_status
+
+    manager = Manager()
+    window = MainWindow.__new__(MainWindow)
+    window.order_ledger = []
+    window.buylist_manager = SimpleNamespace()
+    window.execution_queue_manager = manager
+    window._save_state = lambda: save_calls.append("state")
+    window._save_execution_queue_state = lambda: save_calls.append("queue")
+    window.populate_buylist_dashboard = lambda: None
+    window.append_log = logs.append
+    window.reconcile_open_orders = lambda: None
+
+    monkeypatch.setattr(main_window_module, "append_order", lambda order: recorded.append(order))
+    monkeypatch.setattr(main_window_module, "load_order_ledger", lambda: list(recorded))
+    monkeypatch.setattr(main_window_module.QTimer, "singleShot", lambda *_args: None)
+    monkeypatch.setattr(buylist_mixin_module.QMessageBox, "warning", lambda *args, **kwargs: None)
+
+    order = _order(side=OrderSide.BUY, quantity=5, status=OrderStatus.UNKNOWN_SUBMISSION_STATE)
+    order.error_message = "read timed out"
+
+    MainWindow._on_buy_order_accepted(window, item, order)
+
+    assert item.monitoring_status == "UNKNOWN_SUBMISSION_STATE"
+    assert item.status == "UNKNOWN_SUBMISSION_STATE"
+    assert item._buy_order_pending is True
+    assert item.kis_order_id == order.client_order_id
+    assert manager.mark_calls == [("AAPL", order.client_order_id, "UNKNOWN_SUBMISSION_STATE", "SIM")]
+    assert recorded == [order]
+    assert "UNKNOWN" in logs[-1]
+    assert "Reconcile KIS account/orders before retry" in logs[-1]
+    assert save_calls == ["state", "queue", "queue"]
+
+
+def test_ambiguous_buy_order_error_keeps_duplicate_protection_active(monkeypatch):
+    logs = []
+    save_calls = []
+    item = SimpleNamespace(
+        symbol="AAPL",
+        environment="SIM",
+        _buy_order_pending=True,
+        _stop_order_pending=False,
+        monitoring_status="ORDER_PENDING",
+        status="ORDER_PENDING",
+        breakout_method="execution_queue:1m",
+    )
+
+    class Manager:
+        def __init__(self):
+            self.queue_item = SimpleNamespace(status="ORDER_PENDING")
+            self.mark_calls = []
+
+        def get_item(self, symbol, environment="SIM"):
+            return self.queue_item
+
+        def mark_order_submitted(self, symbol, order_id="", order_status="SUBMITTED", environment="SIM"):
+            self.mark_calls.append((symbol, order_id, order_status, environment))
+            self.queue_item.status = order_status
+
+    manager = Manager()
+    window = MainWindow.__new__(MainWindow)
+    window.execution_queue_manager = manager
+    window._save_state = lambda: save_calls.append("state")
+    window._save_execution_queue_state = lambda: save_calls.append("queue")
+    window.populate_buylist_dashboard = lambda: None
+    window.append_log = logs.append
+
+    monkeypatch.setattr(buylist_mixin_module.QMessageBox, "warning", lambda *args, **kwargs: None)
+
+    MainWindow._on_order_error(window, "AAPL", "buy", "read timed out", item)
+
+    assert item.monitoring_status == "UNKNOWN_SUBMISSION_STATE"
+    assert item.status == "UNKNOWN_SUBMISSION_STATE"
+    assert item._buy_order_pending is True
+    assert manager.mark_calls == [("AAPL", "", "UNKNOWN_SUBMISSION_STATE", "SIM")]
+    assert any("submission result UNKNOWN" in message for message in logs)
+    assert save_calls == ["queue", "state", "queue"]
 
 
 def test_sell_acceptance_does_not_reduce_position_or_move_stop(monkeypatch):

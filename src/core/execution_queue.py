@@ -1,7 +1,7 @@
 """Dynamic ORB execution queue workflow.
 
 This module owns the strategy/workflow state for turning watchlist ORB plans
-into one execution queue item per symbol. UI layers should render these objects
+into one execution queue item per environment and symbol. UI layers should render these objects
 and call order services only after user review.
 """
 from __future__ import annotations
@@ -46,6 +46,7 @@ class ExecutionQueueStatus(str, Enum):
     EXECUTE_READY = "EXECUTE_READY"
     ORDER_PENDING = "ORDER_PENDING"
     ORDER_SUBMITTED = "ORDER_SUBMITTED"
+    UNKNOWN_SUBMISSION_STATE = "UNKNOWN_SUBMISSION_STATE"
     FILLED = "FILLED"
     EXPIRED = "EXPIRED"
     REJECTED = "REJECTED"
@@ -59,6 +60,15 @@ PRE_ENTRY_EXECUTION_QUEUE_STATUS_VALUES = {
     ExecutionQueueStatus.EXECUTE_READY.value,
     ExecutionQueueStatus.ORDER_PENDING.value,
     ExecutionQueueStatus.ORDER_SUBMITTED.value,
+    ExecutionQueueStatus.UNKNOWN_SUBMISSION_STATE.value,
+}
+
+UNKNOWN_SUBMISSION_ORDER_STATUS_VALUES = {
+    "UNKNOWN",
+    "UNKNOWN_SUBMISSION_STATE",
+    "AMBIGUOUS",
+    "TIMEOUT",
+    "NETWORK_ERROR",
 }
 
 NON_PRE_ENTRY_BUYLIST_STATUSES = {
@@ -319,6 +329,9 @@ def build_queue_display_state(
             reason = str(getattr(cand, "reason", "") or "")
             if reason:
                 warnings.append(f"{window}: {reason}")
+    display_status = _status_text(getattr(queue_item, "status", ""))
+    if display_status == ExecutionQueueStatus.UNKNOWN_SUBMISSION_STATE.value:
+        warnings.insert(0, "UNKNOWN SUBMISSION - RECONCILE BEFORE RETRY")
     warnings = list(dict.fromkeys(warnings))
 
     trade_plan = str(getattr(buylist_item, "trade_plan", "") or "")
@@ -328,7 +341,7 @@ def build_queue_display_state(
     return QueueDisplayState(
         symbol=symbol,
         name=name,
-        display_status=_status_text(getattr(queue_item, "status", "")),
+        display_status=display_status,
         entry_price=entry_price,
         breakout_price=breakout_price,
         stop_loss=stop_loss,
@@ -621,6 +634,8 @@ def resolve_queue_status(
     if locked:
         if normalized_order_status in {"FILLED", "PARTIALLY_FILLED"}:
             return ExecutionQueueStatus.FILLED
+        if normalized_order_status in UNKNOWN_SUBMISSION_ORDER_STATUS_VALUES:
+            return ExecutionQueueStatus.UNKNOWN_SUBMISSION_STATE
         if normalized_order_status in {"SUBMITTED", "ACCEPTED", "WORKING", "ORDER_SUBMITTED"}:
             return ExecutionQueueStatus.ORDER_SUBMITTED
         if normalized_order_status in {"PENDING", "SUBMITTING", "ORDER_PENDING"}:
@@ -807,7 +822,23 @@ class ExecutionQueueManager:
         item = self.get_item(symbol, environment)
         if item is None:
             return False
-        return item.status in {ExecutionQueueStatus.ORDER_PENDING, ExecutionQueueStatus.ORDER_SUBMITTED}
+        return item.status in {
+            ExecutionQueueStatus.ORDER_PENDING,
+            ExecutionQueueStatus.ORDER_SUBMITTED,
+            ExecutionQueueStatus.UNKNOWN_SUBMISSION_STATE,
+        }
+
+    def clear_unknown_submission_state(self, symbol: str, environment: str = "SIM") -> bool:
+        item = self.get_item(symbol, environment)
+        if item is None or item.status != ExecutionQueueStatus.UNKNOWN_SUBMISSION_STATE:
+            return False
+        item.locked = False
+        item.locked_reason = None
+        item.order_status = None
+        item.order_id = None
+        item.status = resolve_queue_status(item.candidates, item.selected_candidate)
+        item.last_updated = datetime.now()
+        return True
 
     def values(self) -> List[ExecutionQueueItem]:
         return list(self.items.values())

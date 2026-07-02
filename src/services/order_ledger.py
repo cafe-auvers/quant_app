@@ -98,6 +98,33 @@ def update_order(
     return updated
 
 
+def clear_unknown_submission_order(
+    client_order_id: str,
+    *,
+    verified: bool = False,
+    path: Path = ORDERS_FILE,
+) -> Optional[BrokerOrder]:
+    """Close an unknown submission only after external broker verification."""
+    if not verified:
+        raise ValueError("verified=True is required after manual KIS account/order verification")
+
+    orders = load_orders(path)
+    target: Optional[BrokerOrder] = None
+    for order in orders:
+        if order.client_order_id == str(client_order_id or ""):
+            target = order
+            break
+    if target is None or target.status != OrderStatus.UNKNOWN_SUBMISSION_STATE:
+        return None
+
+    target.status = OrderStatus.EXPIRED
+    note = "Manually cleared UNKNOWN_SUBMISSION_STATE after KIS verification."
+    target.error_message = f"{target.error_message}; {note}" if target.error_message else note
+    target.touch()
+    save_orders(orders, path)
+    return target
+
+
 def find_order(client_order_id: str, path: Path = ORDERS_FILE) -> Optional[BrokerOrder]:
     client_order_id = str(client_order_id or "")
     return next((order for order in load_orders(path) if order.client_order_id == client_order_id), None)

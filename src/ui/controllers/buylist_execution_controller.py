@@ -235,6 +235,14 @@ class BuylistExecutionController(WindowController):
             return
         candidate = getattr(queue_item, "selected_candidate", None)
         status_text = self._status_text(getattr(queue_item, "status", ""))
+        if status_text == "UNKNOWN_SUBMISSION_STATE":
+            QMessageBox.warning(
+                self.window,
+                "Submission state unknown",
+                f"{item.symbol} has an unknown broker submission result.\n\n"
+                "Reconcile KIS account/order status before clearing this state or submitting again.",
+            )
+            return
         if candidate is None or status_text != "EXECUTE_READY":
             QMessageBox.warning(
                 self.window,

@@ -217,6 +217,25 @@ def test_buy_dashboard_status_uses_execution_queue_status(monkeypatch, tmp_path)
     assert "ORDER_SUBMITTED" in MainWindow._buylist_compute_alerts(window, item, 101.0, 0)
 
 
+def test_buy_dashboard_alerts_unknown_submission_state(monkeypatch, tmp_path):
+    window = _build_queue_window(monkeypatch, tmp_path)
+
+    MainWindow.refresh_execution_queue(
+        window,
+        "SIM",
+        show_log=False,
+        symbols=["AAPL"],
+        create_missing=True,
+    )
+    item = window.buylist_manager.get("AAPL", "SIM")
+    window.execution_queue_manager.items[queue_key("AAPL", "SIM")].status = ExecutionQueueStatus.UNKNOWN_SUBMISSION_STATE
+
+    alerts = MainWindow._buylist_compute_alerts(window, item, 101.0, 0)
+
+    assert "UNKNOWN_SUBMISSION_STATE" in alerts
+    assert "UNKNOWN SUBMISSION - RECONCILE BEFORE RETRY" in alerts
+
+
 def test_buy_dashboard_queue_row_uses_execution_queue_candidate_values(monkeypatch, tmp_path):
     window = _build_queue_window(monkeypatch, tmp_path)
     MainWindow.refresh_execution_queue(

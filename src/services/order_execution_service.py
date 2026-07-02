@@ -1,12 +1,15 @@
 """Durable guarded order submission for KIS overseas orders."""
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from src.api import kis_order
 from src.core.order_state import BrokerOrder, OrderIntent, OrderSide, OrderStatus
 from src.services.order_ledger import ORDERS_FILE, append_order, has_open_order, upsert_order
+
+logger = logging.getLogger(__name__)
 
 
 class DuplicateOpenOrderError(RuntimeError):
@@ -137,7 +140,18 @@ def submit_guarded_overseas_order(
             order_type="limit",
         )
     except Exception as exc:
-        order.status = OrderStatus.REJECTED
+        if kis_order.is_ambiguous_order_submission_error(exc):
+            order.status = OrderStatus.UNKNOWN_SUBMISSION_STATE
+            logger.warning(
+                "KIS guarded order submission result unknown for %s %s %s account %s: %s",
+                environment,
+                side.value,
+                symbol,
+                account_no or "<unknown>",
+                exc,
+            )
+        else:
+            order.status = OrderStatus.REJECTED
         order.error_message = str(exc)
         order.touch()
         upsert_order(order, path=path)
