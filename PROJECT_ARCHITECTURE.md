@@ -16,6 +16,7 @@ main.py
   -> src.ui.main_window.MainWindow
       -> load local JSON state
       -> initialize optional MySQL engine
+      -> initialize UI workflow controllers
       -> build tabs, sidebar, status log, and menus
       -> preload KIS profiles and account data
       -> run scanner/watchlist/chart workers through QThread
@@ -30,7 +31,7 @@ Long-running work runs in `QThread` workers so the PyQt UI remains responsive.
 quant_app/
   main.py                         Application entry point
   src/
-    ui/                           PyQt windows, workers, chart bridge, UI constants
+    ui/                           PyQt windows, UI controllers, workers, chart bridge, UI constants
     core/                         Trading domain models and pure business logic
     services/                     App-state persistence and order lifecycle services
     utils/                        Storage, configuration, market-data, and MySQL helpers
@@ -47,6 +48,8 @@ Generated files such as `__pycache__/` and `.pytest_cache/` are not part of the 
 ## UI Layer
 
 `src/ui/main_window.py` owns the `MainWindow` shell: application state, startup ordering, tab registration, menus, status/progress helpers, persistence entry points, and shared parsing/formatting helpers. Domain-heavy UI behavior is split into plain Python mixins inherited by `MainWindow`; the mixins do not inherit Qt classes and do not import `MainWindow`.
+
+Workflow orchestration that can be tested outside the full PyQt window lives in `src/ui/controllers/`. Mixins keep widget construction, event parsing, table refreshes, logging, and state-save side effects close to the UI while delegating account, scanner, watchlist, chart-data, and buylist execution workflows to controllers.
 
 Current inheritance shape:
 
@@ -69,16 +72,29 @@ Supporting UI modules:
 |---|---|
 | `src/ui/main_window.py` | Main shell, startup ordering, local state loading/saving, tab registration, menus, status log, shared helpers |
 | `src/ui/dialogs.py` | Settings dialog and scanner filter dialog |
+| `src/ui/controllers/` | Workflow controllers for account sync, scanner runs, watchlist ORB refreshes, chart data loading, and buylist execution queue actions |
 | `src/ui/mixins/sidebar_mixin.py` | Left sidebar source switching, selected-symbol routing, and sidebar actions |
-| `src/ui/mixins/dashboard_mixin.py` | Dashboard tab, KIS account snapshots/profile selection, FX refresh, account-size application, summary widgets |
-| `src/ui/mixins/scanner_mixin.py` | Scanner tab, scanner setup/rule UI, scanner worker orchestration, scanner result actions |
-| `src/ui/mixins/watchlist_mixin.py` | Watchlist tab, breakout-price persistence, ORB planning UI, AI review, move-to-buylist flow |
-| `src/ui/mixins/buylist_mixin.py` | Buy dashboard, monitoring controls, order submission UI, order reconciliation callbacks |
+| `src/ui/mixins/dashboard_mixin.py` | Dashboard tab, KIS account snapshot UI, profile selection widgets, FX/account-size display, summary widgets |
+| `src/ui/mixins/scanner_mixin.py` | Scanner tab, scanner setup/rule UI, worker signal wiring, scanner result table actions |
+| `src/ui/mixins/watchlist_mixin.py` | Watchlist tab, breakout-price persistence, ORB planning UI, AI review UI, move-to-buylist flow |
+| `src/ui/mixins/buylist_mixin.py` | Buy dashboard widgets, monitoring controls, execution queue request parsing/result application, order submission UI, order reconciliation callbacks |
 | `src/ui/mixins/charts_render_mixin.py` | Chart HTML/SVG generation, TradingView symbol formatting, indicator panel rendering, chart data normalization helpers |
-| `src/ui/mixins/charts_controller_mixin.py` | Chart tabs, symbol controls, chart fetch/cache orchestration, drawing callbacks, chart bridge actions |
+| `src/ui/mixins/charts_controller_mixin.py` | Chart tabs, symbol controls, drawing callbacks, chart bridge actions, chart refresh UI |
 | `src/ui/workers.py` | `QThread` workers for refreshes, KIS snapshots, KIS order submission, order reconciliation, intraday fetches, scanner runs, and review jobs |
 | `src/ui/chart_bridge.py` | `QWebChannel` bridge used by chart JavaScript to persist drawings and breakout-price markers |
 | `src/ui/filter_catalog.py` | Default scanner setups, scanner metric labels, tab defaults, and settings defaults |
+
+### UI Workflow Controllers
+
+Controllers are ordinary Python objects that receive the `MainWindow` only as a dependency boundary. They keep workflow code out of tab rendering methods while preserving the existing UI side effects in the mixins.
+
+| Controller | Responsibility |
+|---|---|
+| `AccountController` | KIS account snapshot/profile sync, FX/account-size application, and account refresh commands |
+| `ScannerController` | Scanner setup persistence, scanner worker orchestration, and result action coordination |
+| `WatchlistController` | Watchlist ORB status refreshes and watchlist-to-buylist workflow helpers |
+| `ChartDataController` | Chart data loading and refresh coordination for daily, hourly, TradingView, and intraday views |
+| `BuylistExecutionController` | Execution queue refresh and guarded order-command coordination; `ExecutionQueueRefreshRequest` carries parsed UI inputs and callbacks, and `ExecutionQueueRefreshResult` returns missing symbols, failures, refreshed count, and status counts |
 
 Current tab construction in `_setup_tabs()`:
 
@@ -136,6 +152,7 @@ The service layer contains persistence and lifecycle logic that is not specific 
 | `src/core/watchlist.py` | `Watchlist`, `TradePlanManager`, `BuylistManager`, and persistence-ready dataclasses |
 | `src/core/position_sizer.py` | Fixed-risk and fixed-dollar position sizing calculations |
 | `src/core/orb.py` | Opening range breakout range calculation, signal evaluation, and intraday resampling |
+| `src/core/execution_queue.py` | Dynamic ORB execution queue strategy, queue item/candidate state, environment-symbol queue keys, duplicate-pending candidate rejection, and display-state helpers |
 | `src/core/trade_reviewer.py` | Rulebook-backed trade setup review model |
 | `src/core/scoring.py` | Deterministic scoring, optional OpenAI review, fallback analysis, and HTML rendering |
 | `src/core/order_state.py` | Broker order lifecycle enums and `BrokerOrder` persistence model |
@@ -150,6 +167,7 @@ Local JSON state is read/written through `src/utils/storage.py` and service help
 |---|---|
 | `data/watchlist.json` | User watchlist items |
 | `data/buylist.json` | Buy dashboard and monitoring items |
+| `data/execution_queue.json` | Dynamic ORB execution queue items, selected candidates, status, and warnings |
 | `data/trade_plans.json` | Saved trade plans |
 | `data/scanner_setups.json` | Named scanner rule presets |
 | `data/chart_drawings.json` | Saved chart line drawings; watchlist breakout prices are persisted in `data/watchlist.json` |
@@ -260,7 +278,8 @@ Only enable KIS intraday after the endpoint, TR ID, request params, output field
 KIS order handling is intentionally split into submission, local ledgering, and fill reconciliation.
 
 ```text
-Buy/Sell UI action
+Buy/Sell UI action or EXECUTE_READY execution queue submit action
+  -> BuylistExecutionController submit command validation
   -> KisOrderWorker
   -> submit_guarded_overseas_order()
   -> duplicate-open-order check in data/orders.json by environment, account, symbol, side, and intent
@@ -275,6 +294,7 @@ Buy/Sell UI action
 
 Important safety rules:
 
+- Execution queue submit actions are gated to `EXECUTE_READY` queue rows before KIS order submission starts.
 - A successful KIS API order response means broker acceptance only. It does not mean filled.
 - Buylist positions are not marked `BOUGHT`, `SOLD`, or partially exited from submission responses.
 - Open-order duplicate checks prevent repeated submission for the same environment, account, symbol, side, and intent.
@@ -318,8 +338,11 @@ Watchlist symbol
   -> deterministic score and optional AI review
   -> ORB range from 1m/5m/30m bars
   -> account/risk-aware position plan
-  -> optional buylist monitoring
-  -> optional guarded KIS order submission
+  -> BuylistMixin builds ExecutionQueueRefreshRequest for queued or selected symbols
+  -> BuylistExecutionController.refresh_execution_queue()
+  -> ExecutionQueueManager builds/updates queue items without changing core strategy rules
+  -> ExecutionQueueRefreshResult drives logs, table refreshes, and state saving
+  -> optional guarded KIS order submission from EXECUTE_READY queue rows
 ```
 
 Account value comes from the selected KIS profile when a snapshot is available. Otherwise the UI falls back to manual/default account-size values. USD/KRW conversion is tracked in the UI and refreshed separately.
@@ -356,7 +379,8 @@ python -m compileall main.py src tests -q
 pytest -q
 ```
 
-Coverage includes scanner rules, scoring, position sizing, ORB logic, watchlist and buylist persistence, local JSON backup/recovery and shutdown flushing, MySQL helper behavior, KIS account config/profile parsing, selected `MainWindow` formatting/helpers, refactor boundaries, and KIS order lifecycle safety.
+Coverage includes scanner rules, scoring, position sizing, ORB logic, execution queue strategy, watchlist and buylist persistence, local JSON backup/recovery and shutdown flushing, MySQL helper behavior, KIS account config/profile parsing, selected `MainWindow` formatting/helpers, refactor boundaries, buylist execution queue refresh request/result behavior, and KIS order lifecycle safety.
+Buylist execution controller coverage includes selected-symbol queueing, missing symbols, unavailable queue manager failures, duplicate pending/open-order propagation, callback failures, refreshed counts, and result status counts.
 Intraday provider coverage includes KIS disabled/configuration errors, yfinance fallback behavior, source-priority cache loading, ORB invariance across normalized provider data, 1m-to-5m resampling, and worker signal payload shape.
 
 ## Production Safety Notes

@@ -1,5 +1,7 @@
 # main_window.py Split Plan
 
+> Status: Completed and superseded by the live architecture map. The current codebase has the mixin split plus `src/ui/controllers/` for account, scanner, watchlist, buylist execution, and chart-data workflows. Use `PROJECT_ARCHITECTURE.md` as the canonical maintenance document.
+
 ## Current Assessment
 
 The original mixin plan is directionally valid as a low-risk first refactor: it keeps one `MainWindow` object, preserves existing `self.*` state, and avoids redesigning PyQt signal ownership while reducing file size.
@@ -463,14 +465,13 @@ Targeted manual checks by phase:
 
 | Phase | Target | Status |
 |---|---|---|
-| 0 | Baseline inventory and validation | TODO |
-| 1 | `src/ui/dialogs.py` | TODO |
-| 2 | `src/ui/mixins/sidebar_mixin.py` | TODO |
-| 3 | `src/ui/mixins/buylist_mixin.py` | TODO |
-| 4 | `src/ui/mixins/dashboard_mixin.py` | TODO |
-| 5 | `src/ui/mixins/scanner_mixin.py` | TODO |
-| 6 | `src/ui/mixins/watchlist_mixin.py` | TODO |
-| 7A | `src/ui/mixins/charts_render_mixin.py` | TODO |
-| 7B | `src/ui/mixins/charts_controller_mixin.py` | TODO |
-| 8 | optional shared/shell helper extraction | TODO |
-
+| 0 | Baseline inventory and validation | Completed |
+| 1 | `src/ui/dialogs.py` | Completed |
+| 2 | `src/ui/mixins/sidebar_mixin.py` | Completed |
+| 3 | `src/ui/mixins/buylist_mixin.py` | Completed |
+| 4 | `src/ui/mixins/dashboard_mixin.py` | Completed |
+| 5 | `src/ui/mixins/scanner_mixin.py` | Completed |
+| 6 | `src/ui/mixins/watchlist_mixin.py` | Completed |
+| 7A | `src/ui/mixins/charts_render_mixin.py` | Completed |
+| 7B | `src/ui/mixins/charts_controller_mixin.py` | Completed |
+| 8 | optional shared/shell helper extraction | Superseded by `src/ui/controllers/` and existing shared shell helpers |

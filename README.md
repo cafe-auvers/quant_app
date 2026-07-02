@@ -32,9 +32,10 @@ src/
   ui/
     main_window.py              MainWindow shell, state loading, menus, tabs, shared helpers
     dialogs.py                  Settings and scanner-filter dialogs
-    mixins/                     Domain UI methods inherited by MainWindow
+    controllers/                Testable workflow controllers for UI-owned workflows
+    mixins/                     Tab rendering, widget callbacks, and UI glue inherited by MainWindow
   api/                          KIS account, order, intraday, and daily-price adapters
-  core/                         Scanner, watchlist, ORB, scoring, sizing, order models
+  core/                         Scanner, watchlist, ORB, scoring, sizing, order and execution queue models
   services/                     App-state, intraday, order ledger, execution, reconciliation
   utils/                        Storage, config, Yahoo data loading, MySQL cache helpers
 config/                         Non-secret configuration templates
@@ -43,6 +44,8 @@ rulebooks/                      Markdown trading rules used by review workflows
 tests/                          Pytest regression suite
 md_archive/                     Historical implementation notes and completed plans
 ```
+
+UI mixins keep PyQt tab construction, widget callbacks, table refreshes, and log/state-save side effects close to the widgets. `src/ui/controllers/` owns workflows that are easier to unit test outside the full `MainWindow`, including KIS account sync, scanner orchestration, watchlist ORB refreshes, chart data loading, and buylist execution queue refresh/submission coordination.
 
 ## Setup
 
