@@ -929,14 +929,66 @@ class MainWindow(
         self.append_log(f"Refresh complete: {updated_count} symbols updated.")
         self.progress_label.setText("Refresh complete.")
 
+    @staticmethod
+    def _nyse_holidays(year: int) -> set:
+        """Return the set of NYSE observed holiday dates for the given year."""
+        def nearest_weekday(d: dt.date) -> dt.date:
+            if d.weekday() == 5:  # Saturday → Friday
+                return d - dt.timedelta(days=1)
+            if d.weekday() == 6:  # Sunday → Monday
+                return d + dt.timedelta(days=1)
+            return d
+
+        def easter(y: int) -> dt.date:
+            # Anonymous Gregorian algorithm
+            a = y % 19
+            b, c = divmod(y, 100)
+            d, e = divmod(b, 4)
+            f = (b + 8) // 25
+            g = (b - f + 1) // 3
+            h = (19 * a + b - d - g + 15) % 30
+            i, k = divmod(c, 4)
+            l = (32 + 2 * e + 2 * i - h - k) % 7
+            m = (a + 11 * h + 22 * l) // 451
+            month, day = divmod(114 + h + l - 7 * m, 31)
+            return dt.date(y, month, day + 1)
+
+        def nth_weekday(y: int, month: int, weekday: int, n: int) -> dt.date:
+            first = dt.date(y, month, 1)
+            delta = (weekday - first.weekday()) % 7
+            return first + dt.timedelta(days=delta + 7 * (n - 1))
+
+        def last_weekday(y: int, month: int, weekday: int) -> dt.date:
+            last = dt.date(y, month + 1, 1) - dt.timedelta(days=1)
+            delta = (last.weekday() - weekday) % 7
+            return last - dt.timedelta(days=delta)
+
+        holidays = {
+            nearest_weekday(dt.date(year, 1, 1)),    # New Year's Day
+            nth_weekday(year, 1, 0, 3),              # MLK Day (3rd Monday Jan)
+            nth_weekday(year, 2, 0, 3),              # Presidents' Day (3rd Monday Feb)
+            easter(year) - dt.timedelta(days=2),     # Good Friday
+            last_weekday(year, 5, 0),                # Memorial Day (last Monday May)
+            nearest_weekday(dt.date(year, 6, 19)),   # Juneteenth
+            nearest_weekday(dt.date(year, 7, 4)),    # Independence Day
+            nth_weekday(year, 9, 0, 1),              # Labor Day (1st Monday Sep)
+            nth_weekday(year, 11, 3, 4),             # Thanksgiving (4th Thursday Nov)
+            nearest_weekday(dt.date(year, 12, 25)),  # Christmas
+        }
+        # New Year's Day observed in the following year when Jan 1 is Saturday
+        if dt.date(year, 12, 31).weekday() == 6:  # Dec 31 is Sunday → Jan 1 next year is Monday
+            holidays.add(dt.date(year, 12, 31))
+        return holidays
+
     def update_market_countdown_status(self) -> None:
         """Update the market status countdown label (US Market hours)."""
         if not hasattr(self, "market_status_label"):
             return
-        
+
         now_ny = dt.datetime.now(US_MARKET_ZONE)
         weekday = now_ny.weekday()
-        
+        today = now_ny.date()
+
         dot = getattr(self, "market_status_dot", None)
 
         def _set_dot_open():
@@ -948,16 +1000,19 @@ class MainWindow(
                 dot.setStyleSheet("border-radius: 5px; background-color: #f23645;")
 
         if weekday >= 5:
-            # Weekend
             _set_dot_closed()
-            self.market_status_label.setText("<b>Market Status:</b> Closed (Weekend Off Day)")
+            self.market_status_label.setText("<b>Market Status:</b> Closed (Weekend)")
+            return
+
+        if today in self._nyse_holidays(today.year):
+            _set_dot_closed()
+            self.market_status_label.setText("<b>Market Status:</b> Closed (Holiday)")
             return
 
         market_open = now_ny.replace(hour=9, minute=30, second=0, microsecond=0)
         market_close = now_ny.replace(hour=16, minute=0, second=0, microsecond=0)
 
         if now_ny < market_open:
-            # Market day, before open
             _set_dot_closed()
             diff = market_open - now_ny
             seconds = int(diff.total_seconds())
@@ -967,7 +1022,6 @@ class MainWindow(
                 f"<b>Market Status:</b> Closed (Opens in {hours:02d}:{minutes:02d}:{seconds:02d})"
             )
         elif now_ny < market_close:
-            # Market is open
             _set_dot_open()
             diff = market_close - now_ny
             seconds = int(diff.total_seconds())
@@ -977,11 +1031,9 @@ class MainWindow(
                 f"<b>Market Status:</b> <font color='#009688'><b>OPEN</b></font> (Closes in {hours:02d}:{minutes:02d}:{seconds:02d})"
             )
         else:
-            # Market day, after close
             _set_dot_closed()
             if weekday == 4:
-                # Friday after close
-                self.market_status_label.setText("<b>Market Status:</b> Closed (Weekend Off Day)")
+                self.market_status_label.setText("<b>Market Status:</b> Closed (Weekend)")
             else:
                 self.market_status_label.setText("<b>Market Status:</b> Closed (After Hours)")
 
@@ -1022,7 +1074,7 @@ class MainWindow(
         if hasattr(self, 'intraday_erase_shortcut'):
             self.intraday_erase_shortcut.setKey(parse_key(shortcuts.get("erase_drawing", "E")))
         if hasattr(self, 'intraday_full_view_shortcut'):
-            self.intraday_full_view_shortcut.setKey(parse_key(shortcuts.get("full_view", "A")))
+            self.intraday_full_view_shortcut.setKey(parse_key(shortcuts.get("full_view", "F")))
 
         # 2. Charts tab shortcuts
         if hasattr(self, 'chart_target_shortcut'):
@@ -1040,7 +1092,7 @@ class MainWindow(
         if hasattr(self, 'chart_down_shortcut'):
             self.chart_down_shortcut.setKey(parse_key(shortcuts.get("next_symbol", "Down")))
         if hasattr(self, 'chart_full_view_shortcut'):
-            self.chart_full_view_shortcut.setKey(parse_key(shortcuts.get("full_view", "A")))
+            self.chart_full_view_shortcut.setKey(parse_key(shortcuts.get("full_view", "F")))
 
         # 3. TradingView widget shortcuts
         if hasattr(self, 'tradingview_draw_shortcut'):
@@ -1052,7 +1104,7 @@ class MainWindow(
         if hasattr(self, 'tradingview_down_shortcut'):
             self.tradingview_down_shortcut.setKey(parse_key(shortcuts.get("next_symbol", "Down")))
         if hasattr(self, 'tradingview_full_view_shortcut'):
-            self.tradingview_full_view_shortcut.setKey(parse_key(shortcuts.get("full_view", "A")))
+            self.tradingview_full_view_shortcut.setKey(parse_key(shortcuts.get("full_view", "F")))
         if hasattr(self, 'tradingview_watchlist_shortcut'):
             self.tradingview_watchlist_shortcut.setKey(parse_key(shortcuts.get("add_watchlist", "W")))
 
@@ -1060,7 +1112,7 @@ class MainWindow(
         t_key = shortcuts.get("set_target", "T")
         d_key = shortcuts.get("draw_line", "D")
         e_key = shortcuts.get("erase_drawing", "E")
-        a_key = shortcuts.get("full_view", "A")
+        f_key = shortcuts.get("full_view", "F")
         w_key = shortcuts.get("add_watchlist", "W")
 
         if hasattr(self, 'intraday_set_target_button'):
@@ -1070,7 +1122,12 @@ class MainWindow(
         if hasattr(self, 'intraday_erase_line_button'):
             self.intraday_erase_line_button.setText(f"Erase Drawing ({e_key})")
         if hasattr(self, 'intraday_full_view_button'):
-            self.intraday_full_view_button.setText(f"Full View ({a_key})")
+            self.intraday_full_view_button.setText(f"Full View ({f_key})")
+        if hasattr(self, 'intraday_queue_btn') and self.intraday_queue_btn.text().startswith("Queue"):
+            self.intraday_queue_btn.setText("Queue for Buy (Q)")
+        if hasattr(self, 'intraday_activate_btn'):
+            cur = self.intraday_activate_btn.text()
+            self.intraday_activate_btn.setText("Deactivate (A)" if cur.startswith("Deactivate") else "Activate (A)")
 
         if hasattr(self, 'chart_set_target_button'):
             self.chart_set_target_button.setText(f"Set Breakout Price ({t_key})")
@@ -1079,16 +1136,24 @@ class MainWindow(
         if hasattr(self, 'chart_erase_line_button'):
             self.chart_erase_line_button.setText(f"Erase Drawing ({e_key})")
         if hasattr(self, 'chart_full_view_button'):
-            self.chart_full_view_button.setText(f"Full View ({a_key})")
+            self.chart_full_view_button.setText(f"Full View ({f_key})")
 
         if hasattr(self, 'tradingview_set_target_button'):
             self.tradingview_set_target_button.setText(f"Set Breakout Price ({t_key})")
         if hasattr(self, 'tradingview_line_tool_button'):
             self.tradingview_line_tool_button.setText(f"Line Tool ({d_key})")
         if hasattr(self, 'tradingview_full_view_button'):
-            self.tradingview_full_view_button.setText(f"Full View ({a_key})")
+            self.tradingview_full_view_button.setText(f"Full View ({f_key})")
         if hasattr(self, 'tradingview_add_watchlist_button'):
-            self.tradingview_add_watchlist_button.setText(f"Add Watchlist ({w_key})")
+            cur_wl = self.tradingview_add_watchlist_button.text()
+            self.tradingview_add_watchlist_button.setText(
+                f"Remove from Watchlist ({w_key})" if cur_wl.startswith("Remove") else f"Add to Watchlist ({w_key})"
+            )
+        if hasattr(self, 'tradingview_queue_btn') and self.tradingview_queue_btn.text().startswith("Queue"):
+            self.tradingview_queue_btn.setText("Queue for Buy (Q)")
+        if hasattr(self, 'tradingview_activate_btn'):
+            cur = self.tradingview_activate_btn.text()
+            self.tradingview_activate_btn.setText("Deactivate (A)" if cur.startswith("Deactivate") else "Activate (A)")
 
     def show_about(self) -> None:
         QMessageBox.information(

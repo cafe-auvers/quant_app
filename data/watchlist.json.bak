@@ -598,6 +598,17 @@
       "notes": "",
       "added_date": "2026-07-03T16:07:32.270649",
       "ai_analysis": null
+    },
+    {
+      "symbol": "AIIO",
+      "name": "AIIO",
+      "entry_price": null,
+      "breakout_price": 4.27,
+      "target_price": null,
+      "stop_loss": null,
+      "notes": "",
+      "added_date": "2026-07-04T02:13:24.137041",
+      "ai_analysis": null
     }
   ]
 }

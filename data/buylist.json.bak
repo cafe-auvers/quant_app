@@ -127,7 +127,7 @@
       "timing_score": 0.0,
       "rr": 0.0,
       "stop_adr": 91.44202276560027,
-      "position_percent": 18.28419390581717,
+      "position_percent": 18.184636469999997,
       "ai_summary": "Execution queue ARMED; selected ORB 1m; entry 627.06",
       "warnings": [
         "1m: ORB window has not completed",
@@ -167,7 +167,7 @@
       "timing_score": 0.0,
       "rr": 0.0,
       "stop_adr": 53.46259968876604,
-      "position_percent": 16.370723137483598,
+      "position_percent": 15.924308399999997,
       "ai_summary": "Execution queue ARMED; selected ORB 30m; entry 663.51",
       "warnings": [
         "1m: ORB window has not completed",
@@ -207,7 +207,7 @@
       "timing_score": 0.0,
       "rr": 0.0,
       "stop_adr": 372.69769529887435,
-      "position_percent": 4.981054672692812,
+      "position_percent": 4.98309812,
       "ai_summary": "Execution queue REJECTED; selected ORB 1m; entry 54.16",
       "warnings": [
         "1m: ORB window has not completed",
@@ -247,7 +247,7 @@
       "timing_score": 0.0,
       "rr": 0.0,
       "stop_adr": 90.13956840458668,
-      "position_percent": 17.248942994605628,
+      "position_percent": 16.478962499999998,
       "ai_summary": "Execution queue ARMED; selected ORB 1m; entry 1098.60",
       "warnings": [
         "1m: ORB window has not completed",
@@ -287,7 +287,7 @@
       "timing_score": 0.0,
       "rr": 0.0,
       "stop_adr": 11.364686637229218,
-      "position_percent": 332.72186907712495,
+      "position_percent": 332.7244515,
       "ai_summary": "Execution queue REJECTED; selected ORB 1m; entry 47.74",
       "warnings": [
         "1m: ORB window has not completed",
@@ -327,7 +327,7 @@
       "timing_score": 0.0,
       "rr": 0.0,
       "stop_adr": 40.89910039439432,
-      "position_percent": 18.253479426245136,
+      "position_percent": 18.25,
       "ai_summary": "Execution queue ARMED; selected ORB 30m; entry 2.92",
       "warnings": [
         "1m: ORB window has not completed",
@@ -350,7 +350,47 @@
       "breakout_method": "execution_queue:30m",
       "buffer_pct": 0.001,
       "auto_order_block_reason": "",
-      "orb_monitor_enabled": false
+      "orb_monitor_enabled": true
+    },
+    {
+      "symbol": "AIIO",
+      "name": "AIIO",
+      "entry_price": 4.32,
+      "target_price": 0.0,
+      "stop_loss": 3.82,
+      "total_score": 0.0,
+      "status": "ARMED",
+      "technical_score": 0.0,
+      "setup_score": 0.0,
+      "risk_score": 0.0,
+      "news_score": 0.0,
+      "timing_score": 0.0,
+      "rr": 0.0,
+      "stop_adr": 68.25140311002907,
+      "position_percent": 17.28,
+      "ai_summary": "Execution queue ARMED; selected ORB 5m; entry 4.32",
+      "warnings": [
+        "1m: intraday data missing",
+        "5m: intraday data missing",
+        "30m: intraday data missing"
+      ],
+      "notes": "",
+      "added_date": "2026-07-04T02:13:30.113215",
+      "risk_percent": 2.0,
+      "trade_plan": "WATCHING",
+      "monitoring_status": "ARMED",
+      "shares_held": 0,
+      "avg_cost": 0.0,
+      "buy_date": null,
+      "sell_half_done": false,
+      "kis_order_id": "",
+      "environment": "SIM",
+      "breakout_price": 4.27,
+      "confirmation_price": null,
+      "breakout_method": "execution_queue:5m",
+      "buffer_pct": 0.001,
+      "auto_order_block_reason": "",
+      "orb_monitor_enabled": true
     }
   ]
 }

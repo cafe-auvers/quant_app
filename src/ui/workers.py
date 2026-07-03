@@ -443,7 +443,7 @@ class IntradayFetchWorker(QThread):
                             if oldest <= pd.Timestamp(since) + pd.Timedelta(hours=12):
                                 needs_backfill = False
                         if not needs_backfill:
-                            days_to_fetch = 1
+                            days_to_fetch = 2
                     except Exception:
                         pass  # keep self.window_days
 

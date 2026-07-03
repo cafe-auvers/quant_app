@@ -643,7 +643,16 @@ def save_intraday_history_to_db(
             }
             conn.execute(stmt.on_duplicate_key_update(**update_cols))
         else:
-            conn.execute(insert(intraday_history), records)
+            stmt = sqlite_insert(intraday_history).values(records)
+            update_cols = {
+                col.name: stmt.excluded[col.name]
+                for col in intraday_history.columns
+                if col.name not in ("symbol", "timestamp", "interval", "source")
+            }
+            conn.execute(stmt.on_conflict_do_update(
+                index_elements=["symbol", "timestamp", "interval", "source"],
+                set_=update_cols,
+            ))
     return True
 
 
@@ -1256,6 +1265,7 @@ def refresh_universe_history_to_db(
                 batch_sleep=0,
                 max_retries=0,
                 fallback_to_single=False,
+                chart_fallback=False,
             )
             available = _symbols_with_history(history, batch)
             missing = [symbol for symbol in batch if symbol not in available]
@@ -1433,6 +1443,7 @@ def refresh_universe_hourly_history_to_db(
                 batch_sleep=0,
                 max_retries=0,
                 fallback_to_single=False,
+                chart_fallback=False,
             )
             available = _symbols_with_history(history, batch)
             missing = [symbol for symbol in batch if symbol not in available]
@@ -1482,6 +1493,7 @@ def refresh_universe_hourly_history_to_db(
                     batch_sleep=0,
                     max_retries=0,
                     fallback_to_single=False,
+                    chart_fallback=False,
                 )
                 available = _symbols_with_history(history, batch)
                 missing = [symbol for symbol in batch if symbol not in available]

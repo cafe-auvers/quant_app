@@ -5,7 +5,7 @@ DEFAULT_SETTINGS = {
         "set_target": "T",
         "draw_line": "D",
         "erase_drawing": "E",
-        "full_view": "A",
+        "full_view": "F",
         "add_watchlist": "W",
         "prev_symbol": "Up",
         "next_symbol": "Down",

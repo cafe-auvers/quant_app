@@ -24,10 +24,12 @@ class ChartDataController(WindowController):
         window_days = max(1, min(7, int(window_days or 7)))
         if timeframe == "5M":
             cached = self._load_cached_intraday_5m(symbol, window_days=window_days)
+            if force_refresh:
+                self.start_intraday_fetch(symbol, window_days=window_days)
+            elif self._can_start_intraday_fetch(symbol, window_days):
+                self.start_intraday_fetch(symbol, window_days=window_days)
             if cached is not None and not cached.empty:
                 return cached
-            if self._can_start_intraday_fetch(symbol, window_days):
-                self.start_intraday_fetch(symbol, window_days=window_days)
             if use_live_fallback:
                 return download_price_history([symbol], period=f"{window_days}d", interval="5m", max_symbols=1)
             return pd.DataFrame()

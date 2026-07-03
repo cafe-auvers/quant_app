@@ -203,7 +203,7 @@ class ChartsControllerMixin:
         self.intraday_window_combo = QComboBox()
         self.intraday_window_combo.addItems(["1D", "3D", "5D", "7D"])
         self.intraday_window_combo.setCurrentText("7D")
-        refresh_button = QPushButton("Refresh Intraday Chart")
+        refresh_button = QPushButton("Refresh Intraday Chart (R)")
         refresh_button.clicked.connect(self.plot_intraday_watchlist_symbol)
 
         controls_layout.addWidget(QLabel("Watchlist symbol:"))
@@ -267,8 +267,8 @@ class ChartsControllerMixin:
         self.intraday_queue_btn = QPushButton("Queue for Buy (Q)")
         self.intraday_queue_btn.setMinimumWidth(150)
         self.intraday_queue_btn.clicked.connect(self._intraday_queue_toggle)
-        self.intraday_activate_btn = QPushButton("Activate")
-        self.intraday_activate_btn.setMinimumWidth(100)
+        self.intraday_activate_btn = QPushButton("Activate (A)")
+        self.intraday_activate_btn.setMinimumWidth(110)
         self.intraday_activate_btn.clicked.connect(self._intraday_activate_toggle)
 
         chart_area_layout.addWidget(self.intraday_chart_view, 1)
@@ -310,8 +310,20 @@ class ChartsControllerMixin:
         self.intraday_queue_shortcut = QShortcut(QKeySequence("Q"), self.intraday_charts_widget)
         self.intraday_queue_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.intraday_queue_shortcut.activated.connect(self._intraday_queue_toggle)
+        self.intraday_activate_shortcut = QShortcut(QKeySequence("A"), self.intraday_charts_widget)
+        self.intraday_activate_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self.intraday_activate_shortcut.activated.connect(self._intraday_activate_toggle)
+        self.intraday_refresh_shortcut = QShortcut(QKeySequence("R"), self.intraday_charts_widget)
+        self.intraday_refresh_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self.intraday_refresh_shortcut.activated.connect(self._intraday_force_refresh)
         self._update_intraday_queue_btn()
         self._update_intraday_activate_btn()
+    def _intraday_force_refresh(self) -> None:
+        symbol = self.intraday_symbol_combo.currentText().strip().upper() if hasattr(self, "intraday_symbol_combo") else ""
+        if symbol:
+            window_days = self._get_intraday_window_days()
+            self.start_intraday_fetch(symbol, window_days=window_days)
+        self.plot_intraday_watchlist_symbol(allow_fetch=False)
     def _intraday_queue_toggle(self) -> None:
         symbol = self.intraday_symbol_combo.currentText().strip().upper() if hasattr(self, "intraday_symbol_combo") else ""
         if not symbol:
@@ -478,7 +490,7 @@ class ChartsControllerMixin:
         previous_button.clicked.connect(lambda: self.step_tradingview_watchlist_symbol(-1))
         next_button = QPushButton("Next")
         next_button.clicked.connect(lambda: self.step_tradingview_watchlist_symbol(1))
-        refresh_button = QPushButton("Load Chart")
+        refresh_button = QPushButton("Load Chart (R)")
         refresh_button.clicked.connect(lambda: self.load_tradingview_chart(force=True, fetch_live=True))
 
         controls_layout.addWidget(QLabel("Symbol:"))
@@ -580,8 +592,8 @@ class ChartsControllerMixin:
         self.tradingview_queue_btn = QPushButton("Queue for Buy (Q)")
         self.tradingview_queue_btn.setMinimumWidth(150)
         self.tradingview_queue_btn.clicked.connect(self._tradingview_queue_toggle)
-        self.tradingview_activate_btn = QPushButton("Activate")
-        self.tradingview_activate_btn.setMinimumWidth(100)
+        self.tradingview_activate_btn = QPushButton("Activate (A)")
+        self.tradingview_activate_btn.setMinimumWidth(110)
         self.tradingview_activate_btn.clicked.connect(self._tradingview_activate_toggle)
         tools_layout.addWidget(self.tradingview_set_target_button)
         tools_layout.addWidget(self.tradingview_line_tool_button)
@@ -609,6 +621,9 @@ class ChartsControllerMixin:
         self.tradingview_queue_shortcut = QShortcut(QKeySequence("Q"), self.tradingview_widget)
         self.tradingview_queue_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.tradingview_queue_shortcut.activated.connect(self._tradingview_queue_toggle)
+        self.tradingview_activate_shortcut = QShortcut(QKeySequence("A"), self.tradingview_widget)
+        self.tradingview_activate_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self.tradingview_activate_shortcut.activated.connect(self._tradingview_activate_toggle)
         self.tradingview_up_shortcut = QShortcut(QKeySequence(Qt.Key_Up), self.tradingview_widget)
         self.tradingview_up_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.tradingview_up_shortcut.activated.connect(lambda: self.step_tradingview_watchlist_symbol(-1))
@@ -624,6 +639,9 @@ class ChartsControllerMixin:
         self.tradingview_load_shortcut = QShortcut(QKeySequence(Qt.Key_F4), self.tradingview_widget)
         self.tradingview_load_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.tradingview_load_shortcut.activated.connect(lambda: self.load_tradingview_chart(force=True, fetch_live=True))
+        self.tradingview_refresh_shortcut = QShortcut(QKeySequence("R"), self.tradingview_widget)
+        self.tradingview_refresh_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self.tradingview_refresh_shortcut.activated.connect(lambda: self.load_tradingview_chart(force=True, fetch_live=True))
         self._update_tradingview_queue_btn()
         self._update_tradingview_watchlist_btn()
         self._update_tradingview_activate_btn()
@@ -961,13 +979,13 @@ class ChartsControllerMixin:
         is_active = self._is_symbol_monitor_active(symbol, env)
         btn.setEnabled(in_queue)
         if is_active:
-            btn.setText("Deactivate")
+            btn.setText("Deactivate (A)")
             btn.setStyleSheet("background-color: #c0392b; color: white; font-weight: 600;")
         elif in_queue:
-            btn.setText("Activate")
+            btn.setText("Activate (A)")
             btn.setStyleSheet("background-color: #27ae60; color: white; font-weight: 600;")
         else:
-            btn.setText("Activate")
+            btn.setText("Activate (A)")
             btn.setStyleSheet("")
 
     def _update_tradingview_activate_btn(self, _text: str = "") -> None:
@@ -1397,10 +1415,12 @@ class ChartsControllerMixin:
         if not symbol:
             return
         if self.intraday_fetch_worker is not None and self.intraday_fetch_worker.isRunning():
+            self.append_log(f"Intraday fetch for {symbol} already running, skipping.")
             return
         engine = self.db_engine if self.db_enabled else None
         profile = self._selected_dashboard_kis_profile() or {}
         self.intraday_fetch_attempts[self._intraday_fetch_key(symbol, window_days)] = _utcnow_naive()
+        self.append_log(f"Starting intraday fetch for {symbol} ({window_days}d window)...")
         self.intraday_fetch_worker = IntradayFetchWorker(
             symbol,
             engine,
@@ -1423,7 +1443,13 @@ class ChartsControllerMixin:
     def _on_intraday_fetch_finished(self, symbol: str, fetched, window_days: int, source: str) -> None:
         source_text = "yfinance fallback" if source == "yfinance" else source
         self.latest_intraday_sources[(symbol.strip().upper(), "5m")] = source
-        self.append_log(f"Updated intraday cache for {symbol} from {source_text}.")
+        latest_ts = ""
+        try:
+            if hasattr(fetched, "index") and not fetched.empty:
+                latest_ts = f" | latest bar: {pd.Timestamp(fetched.index.max())}"
+        except Exception:
+            pass
+        self.append_log(f"Updated intraday cache for {symbol} from {source_text}.{latest_ts}")
         if hasattr(self, "live_data_source_label"):
             self.live_data_source_label.setText(format_intraday_source_label(source))
         if self.intraday_symbol_combo.currentText().strip().upper() == symbol:
@@ -1433,6 +1459,17 @@ class ChartsControllerMixin:
         if hasattr(self, "refresh_execution_queue"):
             env = self.watchlist_env_combo.currentText() if hasattr(self, "watchlist_env_combo") else "SIM"
             self.refresh_execution_queue(env, show_log=False)
+        if (
+            hasattr(self, "tradingview_timeframe_combo")
+            and hasattr(self, "tradingview_widget")
+            and hasattr(self, "tabs")
+            and self.tabs.currentWidget() is self.tradingview_widget
+        ):
+            timeframe = self.tradingview_timeframe_combo.currentText().strip().upper()
+            if timeframe in ("5M", "1H"):
+                active = self.tradingview_symbol_combo.currentText().strip().upper() if hasattr(self, "tradingview_symbol_combo") else ""
+                if active == symbol.strip().upper():
+                    self.load_tradingview_chart(force=True)
     def _on_intraday_fetch_error(self, symbol: str, message: str) -> None:
         self.append_log(f"Intraday fetch failed for {symbol}: {message}")
         if hasattr(self, "intraday_status_label"):
@@ -1520,6 +1557,14 @@ class ChartsControllerMixin:
             self.live_data_status_label.setText(status)
         if hasattr(self, "intraday_symbol_combo") and self.tabs.currentWidget() is self.intraday_charts_widget:
             self.plot_intraday_watchlist_symbol()
+        if (
+            hasattr(self, "tradingview_timeframe_combo")
+            and hasattr(self, "tradingview_widget")
+            and self.tabs.currentWidget() is self.tradingview_widget
+        ):
+            timeframe = self.tradingview_timeframe_combo.currentText().strip().upper()
+            if timeframe in ("5M", "1H"):
+                self.load_tradingview_chart(force=True)
     @staticmethod
     def _intraday_cache_needs_backfill(cached: pd.DataFrame, since: dt.datetime) -> bool:
         return intraday_cache_needs_backfill(cached, since)
