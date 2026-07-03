@@ -458,8 +458,10 @@ class IntradayFetchWorker(QThread):
             if self.engine is not None:
                 save_intraday_history_to_db(self.symbol, fetched, self.engine, interval="5m", source=result.source)
                 opening_result = fetch_intraday_with_fallback(self._request(IntradayInterval.ONE_MINUTE, 1))
+                seen_warnings = set(result.warnings)
                 for warning in opening_result.warnings:
-                    self.provider_warning.emit(self.symbol, warning)
+                    if warning not in seen_warnings:
+                        self.provider_warning.emit(self.symbol, warning)
                 if not opening_result.bars.empty:
                     save_intraday_history_to_db(
                         self.symbol,
@@ -541,8 +543,10 @@ class IntradayBulkFetchWorker(QThread):
                 if self.engine is not None:
                     save_intraday_history_to_db(symbol, fetched, self.engine, interval="5m", source=result.source)
                     opening_result = fetch_intraday_with_fallback(self._request(symbol, IntradayInterval.ONE_MINUTE, 1))
+                    seen_warnings = set(result.warnings)
                     for warning in opening_result.warnings:
-                        self.provider_warning.emit(symbol, warning)
+                        if warning not in seen_warnings:
+                            self.provider_warning.emit(symbol, warning)
                     if not opening_result.bars.empty:
                         save_intraday_history_to_db(
                             symbol,

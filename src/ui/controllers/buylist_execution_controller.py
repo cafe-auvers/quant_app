@@ -150,7 +150,7 @@ class BuylistExecutionController(WindowController):
         planned_shares = display.planned_shares
         capital_percent = display.capital_percent
         stop_adr = float(display.stop_adr or 0.0)
-        risk_percent = float(getattr(candidate, "risk_percent", 0.0) or 0.0) * 100.0 if candidate else 0.0
+        risk_percent = display.risk_percent
         selected_window = display.selected_window
         warnings = display.warnings
         score = float(getattr(candidate, "score", 0.0) or 0.0) if candidate else 0.0
@@ -210,10 +210,9 @@ class BuylistExecutionController(WindowController):
                 existing.total_score = score
             if float(getattr(existing, "stop_adr", 0.0) or 0.0) <= 0:
                 existing.stop_adr = stop_adr
-            if float(getattr(existing, "position_percent", 0.0) or 0.0) <= 0:
-                existing.position_percent = capital_percent
-            if float(getattr(existing, "risk_percent", 0.0) or 0.0) <= 0:
-                existing.risk_percent = risk_percent
+            # Always update sizing fields — auto-selected risk% changes each refresh
+            existing.position_percent = capital_percent
+            existing.risk_percent = risk_percent
             if not str(getattr(existing, "trade_plan", "") or ""):
                 existing.trade_plan = trade_plan
             if not list(getattr(existing, "warnings", []) or []):

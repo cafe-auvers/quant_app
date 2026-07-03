@@ -223,6 +223,7 @@ class QueueDisplayState:
     current_price: float = 0.0
     planned_shares: int = 0
     capital_percent: float = 0.0
+    risk_percent: float = 0.0
     stop_adr: Optional[float] = None
     selected_window: str = ""
     warnings: List[str] = field(default_factory=list)
@@ -271,6 +272,18 @@ def build_queue_display_state(
         selected_window = str(getattr(queue_item, "selected_window", "") or "")
         if selected_window:
             candidate = getattr(queue_item, "candidates", {}).get(selected_window)
+    if candidate is None:
+        _display_priority = {
+            OrbCandidateStatus.WAITING_BREAKOUT: 0,
+            OrbCandidateStatus.RISK_INVALID: 1,
+            OrbCandidateStatus.REJECTED: 2,
+        }
+        _displayable = [
+            c for c in getattr(queue_item, "candidates", {}).values()
+            if c.status in _display_priority
+        ]
+        if _displayable:
+            candidate = min(_displayable, key=lambda c: (_display_priority[c.status], -c.score))
 
     symbol = str(getattr(queue_item, "symbol", "") or getattr(buylist_item, "symbol", "") or "").upper()
     name = str(getattr(queue_item, "name", "") or getattr(buylist_item, "name", "") or symbol)
@@ -338,6 +351,8 @@ def build_queue_display_state(
     if selected_window and entry_price > 0 and planned_shares > 0:
         trade_plan = f"ORB {selected_window}: buy {planned_shares} @ {entry_price:.2f}"
 
+    risk_percent = float(getattr(candidate, "risk_percent", 0.0) or 0.0) * 100.0 if candidate else 0.0
+
     return QueueDisplayState(
         symbol=symbol,
         name=name,
@@ -348,6 +363,7 @@ def build_queue_display_state(
         current_price=current_price,
         planned_shares=planned_shares,
         capital_percent=capital_percent,
+        risk_percent=risk_percent,
         stop_adr=stop_adr,
         selected_window=selected_window,
         warnings=warnings,
@@ -423,8 +439,6 @@ def validate_position_values(sizing: Dict[str, Any], adr_percent: Optional[float
         warnings.append(f"Capital allocation ({capital_percent:.2f}%) exceeds {MAX_CAPITAL_PERCENT:.0f}%")
     if adr_percent is not None and adr_percent > 0 and stop_loss_percent >= adr_percent:
         warnings.append(f"Stop loss % ({stop_loss_percent:.2f}%) is wider than ADR ({adr_percent:.2f}%)")
-    if stop_adr is not None and (float(stop_adr) < MIN_STOP_ADR or float(stop_adr) > MAX_STOP_ADR):
-        warnings.append(f"Stop/ADR ({float(stop_adr):.0f}%) is outside {MIN_STOP_ADR:.0f}-{MAX_STOP_ADR:.0f}%")
     return warnings
 
 
@@ -486,21 +500,6 @@ def build_orb_candidate(
             reason=warnings[0],
         )
 
-    if breakout is None or breakout <= 0:
-        warnings.append("Manual breakout price is required")
-        return OrbCandidate(
-            symbol=symbol,
-            window=window,
-            orb_high=orb_high,
-            orb_low=orb_low,
-            breakout_price=breakout,
-            current_price=price,
-            stop_loss=candidate_stop,
-            status=OrbCandidateStatus.REJECTED,
-            valid=False,
-            warnings=warnings,
-            reason=warnings[0],
-        )
     if price is None or price <= 0:
         warnings.append("Current price is unavailable")
 
@@ -517,13 +516,37 @@ def build_orb_candidate(
     if candidate_stop <= 0 or candidate_stop >= entry_trigger:
         warnings.append("Stop loss must be below entry trigger")
 
-    sizing = calculate_position_values(
+    # Auto-select the best valid risk% (same cases as watchlist scoreboard),
+    # so execution queue sizing matches what the watchlist displays.
+    _risk_cases = sorted({0.0025, 0.005, 0.0075, 0.01, 0.0125, 0.015, 0.0175, 0.02, risk_percent})
+    _best_risk = risk_percent
+    _best_sizing: Optional[Dict[str, Any]] = None
+    _best_score = -1.0
+    if not warnings:
+        for _rc in _risk_cases:
+            _s = calculate_position_values(
+                account_size=account_size,
+                risk_percent=_rc,
+                entry_price=entry_trigger,
+                stop_price=candidate_stop,
+                adr_percent=adr_percent,
+            )
+            _cap = float(_s.get("capital_percent", 0.0))
+            if MIN_CAPITAL_PERCENT <= _cap < MAX_CAPITAL_PERCENT and int(_s.get("shares", 0)) >= 1:
+                _sc = score_orb_candidate(_s, _rc)
+                if _sc > _best_score:
+                    _best_score = _sc
+                    _best_sizing = _s
+                    _best_risk = _rc
+
+    sizing = _best_sizing if _best_sizing is not None else calculate_position_values(
         account_size=account_size,
         risk_percent=risk_percent,
         entry_price=entry_trigger,
         stop_price=candidate_stop,
         adr_percent=adr_percent,
     )
+    risk_percent = _best_risk
     warnings.extend(validate_position_values(sizing, adr_percent))
     score = score_orb_candidate(sizing, risk_percent)
 
@@ -646,7 +669,11 @@ def resolve_queue_status(
         return ExecutionQueueStatus.EXECUTE_READY
 
     statuses = {candidate.status for candidate in candidates.values()}
-    if any(status == OrbCandidateStatus.FORMING for status in statuses):
+    # Only block on ORB_FORMING when non-1m windows are still forming.
+    # The 1m window uses a single opening bar and can lag due to data staleness;
+    # if 5m/30m have already progressed, treat the 1m FORMING as stale data.
+    forming_windows = {w for w, c in candidates.items() if c.status == OrbCandidateStatus.FORMING}
+    if forming_windows and forming_windows != {"1m"}:
         return ExecutionQueueStatus.ORB_FORMING
     if any(status == OrbCandidateStatus.WAITING_BREAKOUT for status in statuses):
         return ExecutionQueueStatus.ARMED

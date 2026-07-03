@@ -42,9 +42,28 @@ KIS_PROD_OVERSEAS_BALANCE_TR_ID=TTTS3012R
 # Disabled by default. Enable only after endpoint, TR_ID, request params,
 # output field, and OHLCV field mappings are verified from official KIS
 # documentation or a successful manual API test.
+#
+# Standard KIS overseas 1-minute chart settings (HHDFS76950200):
+#   KIS_INTRADAY_ENABLED=true
+#   KIS_OVERSEAS_INTRADAY_ENDPOINT=/uapi/overseas-price/v1/quotations/inquire-time-itemchartprice
+#   KIS_OVERSEAS_INTRADAY_TR_ID=HHDFS76950200
+#   KIS_OVERSEAS_INTRADAY_DATE_FIELD=xymd
+#   KIS_OVERSEAS_INTRADAY_TIME_FIELD=xhms
+#   KIS_OVERSEAS_INTRADAY_OPEN_FIELD=open
+#   KIS_OVERSEAS_INTRADAY_HIGH_FIELD=high
+#   KIS_OVERSEAS_INTRADAY_LOW_FIELD=low
+#   KIS_OVERSEAS_INTRADAY_CLOSE_FIELD=clos
+#   KIS_OVERSEAS_INTRADAY_VOLUME_FIELD=tvol
+#   KIS_OVERSEAS_INTRADAY_OUTPUT_FIELD=output2
+#   KIS_OVERSEAS_INTRADAY_PARAMS_JSON={"AUTH":"","EXCD":"{exchange}","SYMB":"{symbol}","NMIN":"1","PINC":"1","NEXT":"","NREC":"120","FILL":"","KEYB":""}
+#
+# Note: KIS intraday uses NAS/NYS/AMS exchange codes (not NASD/NYSE/AMEX).
+# The app will try NAS, NYS, AMS in order for each symbol.
 KIS_INTRADAY_ENABLED=false
 KIS_OVERSEAS_INTRADAY_ENDPOINT=
 KIS_OVERSEAS_INTRADAY_TR_ID=
+# Optional: if the API returns date and time as separate fields, set the date field name here
+KIS_OVERSEAS_INTRADAY_DATE_FIELD=
 KIS_OVERSEAS_INTRADAY_TIME_FIELD=
 KIS_OVERSEAS_INTRADAY_OPEN_FIELD=
 KIS_OVERSEAS_INTRADAY_HIGH_FIELD=

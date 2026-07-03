@@ -252,6 +252,7 @@ class BuylistItem:
     breakout_method: str = ""                   # e.g. "manual_trendline", "manual_pivot_high"
     buffer_pct: float = 0.001                   # 0.1% buffer applied above breakout_price
     auto_order_block_reason: str = ""
+    orb_monitor_enabled: bool = False           # user explicitly activated monitoring for this queue item
 
     def to_dict(self) -> Dict:
         """Convert to dictionary for serialization."""
@@ -289,6 +290,7 @@ class BuylistItem:
             "breakout_method": self.breakout_method,
             "buffer_pct": self.buffer_pct,
             "auto_order_block_reason": self.auto_order_block_reason,
+            "orb_monitor_enabled": self.orb_monitor_enabled,
         }
 
     @classmethod
@@ -339,6 +341,7 @@ class BuylistItem:
             breakout_method=str(data.get("breakout_method", "")),
             buffer_pct=float(data.get("buffer_pct", 0.001)),
             auto_order_block_reason=str(data.get("auto_order_block_reason", "")),
+            orb_monitor_enabled=bool(data.get("orb_monitor_enabled", False)),
         )
 
 

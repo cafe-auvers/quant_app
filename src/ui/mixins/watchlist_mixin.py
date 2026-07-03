@@ -773,6 +773,8 @@ class WatchlistMixin:
         self.populate_chart_symbol_combo()
         self.populate_intraday_watchlist_symbols()
         self.populate_tradingview_watchlist_symbols()
+        if hasattr(self, "_update_tradingview_watchlist_btn"):
+            self._update_tradingview_watchlist_btn()
     def remove_selected_watchlist_item(self) -> None:
         selected = self.watchlist_table.currentRow()
         if selected < 0:
@@ -790,6 +792,10 @@ class WatchlistMixin:
                 del self.watchlist_scores[symbol]
             self.delete_intraday_cache_for_symbol(symbol)
             self.populate_watchlist_table()
+            # Restore cursor to same position (or last row if removed the last item)
+            new_count = self.watchlist_table.rowCount()
+            if new_count > 0:
+                self.watchlist_table.setCurrentCell(min(selected, new_count - 1), 0)
             self.update_dashboard_summary()
             self._save_state()
             self.append_log(f"Removed {symbol} from watchlist.")
@@ -1090,10 +1096,18 @@ class WatchlistMixin:
         self._save_state()
 
         if added:
+            # Auto-start the monitor so ARMED items are watched immediately.
+            active_attr = f"_buylist_{env.lower()}_monitor_active"
+            monitor_started = False
+            if hasattr(self, "_toggle_buylist_monitor") and not getattr(self, active_attr, False):
+                self._toggle_buylist_monitor(env)
+                monitor_started = True
+            monitor_note = "\n\nMonitor auto-started — will auto-buy when price hits the entry trigger." if monitor_started else \
+                           "\n\nMonitor is running — will auto-buy when price hits the entry trigger."
             QMessageBox.information(
                 self,
                 "Added to Execution Queue",
-                f"'{symbol}' added to the {env} Buy Dashboard execution queue."
+                f"'{symbol}' added to the {env} Buy Dashboard execution queue.{monitor_note}"
             )
         else:
             QMessageBox.warning(

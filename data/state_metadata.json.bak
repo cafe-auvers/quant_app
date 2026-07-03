@@ -1,0 +1,12 @@
+{
+  "last_successful_save_at": "2026-07-03T13:07:12.971881+00:00",
+  "last_error": "",
+  "files_written": [
+    "data\\watchlist.json",
+    "data\\buylist.json",
+    "data\\trade_plans.json",
+    "data\\scanner_setups.json",
+    "data\\chart_drawings.json",
+    "data\\tab_options.json"
+  ]
+}

@@ -32,6 +32,7 @@ KIS_INTRADAY_TR_ID_KEY = "KIS_OVERSEAS_INTRADAY_TR_ID"
 KIS_INTRADAY_OUTPUT_FIELD_KEY = "KIS_OVERSEAS_INTRADAY_OUTPUT_FIELD"
 KIS_INTRADAY_PARAMS_JSON_KEY = "KIS_OVERSEAS_INTRADAY_PARAMS_JSON"
 
+# Required OHLCV field mappings
 KIS_INTRADAY_FIELD_KEYS = {
     "time_field": "KIS_OVERSEAS_INTRADAY_TIME_FIELD",
     "open_field": "KIS_OVERSEAS_INTRADAY_OPEN_FIELD",
@@ -40,6 +41,9 @@ KIS_INTRADAY_FIELD_KEYS = {
     "close_field": "KIS_OVERSEAS_INTRADAY_CLOSE_FIELD",
     "volume_field": "KIS_OVERSEAS_INTRADAY_VOLUME_FIELD",
 }
+
+# Optional: separate date field (e.g. KIS returns xymd + xhms instead of a combined timestamp)
+KIS_INTRADAY_DATE_FIELD_KEY = "KIS_OVERSEAS_INTRADAY_DATE_FIELD"
 
 
 class KisIntradayError(RuntimeError):
@@ -101,6 +105,7 @@ class KisIntradayClient:
                     low_field=config["low_field"],
                     close_field=config["close_field"],
                     volume_field=config["volume_field"],
+                    date_field=config.get("date_field"),
                 )
                 if not result.bars.empty:
                     return result
@@ -143,13 +148,21 @@ def normalize_intraday_rows(
     low_field: str,
     close_field: str,
     volume_field: str,
+    date_field: Optional[str] = None,
 ) -> IntradayFetchResult:
     records = []
     for row in rows:
         if not isinstance(row, dict):
             continue
         try:
-            timestamp = pd.to_datetime(str(row[time_field]))
+            if date_field and date_field in row:
+                # KIS returns date and time as separate fields, e.g. xymd="20260703" xhms="093000"
+                timestamp = pd.to_datetime(
+                    str(row[date_field]) + str(row[time_field]),
+                    format="%Y%m%d%H%M%S",
+                )
+            else:
+                timestamp = pd.to_datetime(str(row[time_field]))
             records.append(
                 {
                     "timestamp": timestamp,
@@ -199,6 +212,10 @@ def _load_intraday_endpoint_config() -> Dict[str, str]:
         raise KisIntradayNotConfiguredError(
             "KIS intraday field mapping is incomplete. Missing: " + ", ".join(missing_fields)
         )
+    # Optional separate date field (e.g. KIS xymd alongside xhms)
+    date_field_value = os.environ.get(KIS_INTRADAY_DATE_FIELD_KEY, "").strip()
+    if date_field_value:
+        config["date_field"] = date_field_value
     return config
 
 

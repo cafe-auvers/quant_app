@@ -33,9 +33,10 @@ def fetch_kis_intraday(request: IntradayRequest) -> IntradayResult:
         client = KisAccountClient(config)
         client.authenticate()
         kis_client = KisIntradayClient(client)
+        # The rest of the app uses NASD/NYSE/AMEX codes; KIS uses NAS/NYS/AMS.
+        # Always try all standard US exchanges so a mismatched code doesn't silently fail.
         raw_result = kis_client.fetch_overseas_1m(
             request.symbol,
-            exchanges=(request.exchange,),
         )
     except (KisIntradayNotConfiguredError, KisIntradayError, Exception) as exc:
         raise KisIntradayProviderError(str(exc)) from exc

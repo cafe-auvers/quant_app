@@ -1,0 +1,11 @@
+{
+  "tabs": {
+    "dashboard": true,
+    "scanner": true,
+    "watchlist": true,
+    "charts": false,
+    "tradingview": true,
+    "intraday_charts": false,
+    "trade_plan": true
+  }
+}

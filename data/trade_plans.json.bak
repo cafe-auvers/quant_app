@@ -1,0 +1,16 @@
+{
+  "plans": [
+    {
+      "symbol": "MGM",
+      "entry_price": 46.65,
+      "stop_loss": 42.92,
+      "take_profit": 54.11,
+      "position_size": 268,
+      "reason": "Watching MGM (MGM) from scanner/watchlist.",
+      "entry_date": "2026-06-24T01:22:43.948658",
+      "status": "active",
+      "notes": "",
+      "risk_percent": 0.01
+    }
+  ]
+}

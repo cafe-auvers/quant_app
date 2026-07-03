@@ -262,8 +262,14 @@ class ChartsControllerMixin:
         self.intraday_erase_all_button = QPushButton("Erase All")
         self.intraday_erase_all_button.setObjectName("eraseAllButton")
         self.intraday_erase_all_button.clicked.connect(self.clear_current_chart_drawings)
-        self.intraday_full_view_button = QPushButton("Full View (A)")
+        self.intraday_full_view_button = QPushButton("Full View (F)")
         self.intraday_full_view_button.clicked.connect(self.reset_chart_full_view)
+        self.intraday_queue_btn = QPushButton("Queue for Buy (Q)")
+        self.intraday_queue_btn.setMinimumWidth(150)
+        self.intraday_queue_btn.clicked.connect(self._intraday_queue_toggle)
+        self.intraday_activate_btn = QPushButton("Activate")
+        self.intraday_activate_btn.setMinimumWidth(100)
+        self.intraday_activate_btn.clicked.connect(self._intraday_activate_toggle)
 
         chart_area_layout.addWidget(self.intraday_chart_view, 1)
         intraday_tools_layout = QHBoxLayout()
@@ -271,11 +277,18 @@ class ChartsControllerMixin:
         intraday_tools_layout.addWidget(self.intraday_draw_line_button)
         intraday_tools_layout.addWidget(self.intraday_erase_line_button)
         intraday_tools_layout.addWidget(self.intraday_erase_all_button)
+        intraday_tools_layout.addWidget(self.intraday_queue_btn)
+        intraday_tools_layout.addWidget(self.intraday_activate_btn)
         intraday_tools_layout.addWidget(self.intraday_full_view_button)
         intraday_tools_layout.addStretch(1)
         chart_area_layout.addLayout(intraday_tools_layout)
         layout.addLayout(chart_area_layout, 1)
         self.intraday_charts_widget.setLayout(layout)
+
+        # Update queue/activate buttons whenever symbol changes
+        self.intraday_symbol_combo.currentTextChanged.connect(self._update_intraday_queue_btn)
+        self.intraday_symbol_combo.currentTextChanged.connect(self._update_intraday_activate_btn)
+
         self.intraday_up_shortcut = QShortcut(QKeySequence(Qt.Key_Up), self.intraday_charts_widget)
         self.intraday_up_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.intraday_up_shortcut.activated.connect(lambda: self.step_intraday_watchlist_symbol(-1))
@@ -291,9 +304,26 @@ class ChartsControllerMixin:
         self.intraday_erase_shortcut = QShortcut(QKeySequence("E"), self.intraday_charts_widget)
         self.intraday_erase_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.intraday_erase_shortcut.activated.connect(self.enable_chart_erase_mode)
-        self.intraday_full_view_shortcut = QShortcut(QKeySequence("A"), self.intraday_charts_widget)
+        self.intraday_full_view_shortcut = QShortcut(QKeySequence("F"), self.intraday_charts_widget)
         self.intraday_full_view_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.intraday_full_view_shortcut.activated.connect(self.reset_chart_full_view)
+        self.intraday_queue_shortcut = QShortcut(QKeySequence("Q"), self.intraday_charts_widget)
+        self.intraday_queue_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self.intraday_queue_shortcut.activated.connect(self._intraday_queue_toggle)
+        self._update_intraday_queue_btn()
+        self._update_intraday_activate_btn()
+    def _intraday_queue_toggle(self) -> None:
+        symbol = self.intraday_symbol_combo.currentText().strip().upper() if hasattr(self, "intraday_symbol_combo") else ""
+        if not symbol:
+            return
+        self._chart_queue_toggle(symbol)
+        self._update_intraday_queue_btn()
+    def _update_intraday_queue_btn(self, _text: str = "") -> None:
+        btn = getattr(self, "intraday_queue_btn", None)
+        if btn is None:
+            return
+        symbol = self.intraday_symbol_combo.currentText().strip().upper() if hasattr(self, "intraday_symbol_combo") else ""
+        self._apply_chart_queue_btn_state(symbol, btn)
     def _build_charts_tab(self) -> None:
         """Build content for the charts tab."""
         layout = QVBoxLayout()
@@ -385,7 +415,7 @@ class ChartsControllerMixin:
         self.chart_erase_all_button = QPushButton("Erase All")
         self.chart_erase_all_button.setObjectName("eraseAllButton")
         self.chart_erase_all_button.clicked.connect(self.clear_current_chart_drawings)
-        self.chart_full_view_button = QPushButton("Full View (A)")
+        self.chart_full_view_button = QPushButton("Full View (F)")
         self.chart_full_view_button.clicked.connect(self.reset_chart_full_view)
 
         chart_views_layout = QHBoxLayout()
@@ -425,7 +455,7 @@ class ChartsControllerMixin:
         self.chart_down_shortcut = QShortcut(QKeySequence(Qt.Key_Down), self.charts_widget)
         self.chart_down_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.chart_down_shortcut.activated.connect(lambda: self.step_chart_symbol(1))
-        self.chart_full_view_shortcut = QShortcut(QKeySequence("A"), self.charts_widget)
+        self.chart_full_view_shortcut = QShortcut(QKeySequence("F"), self.charts_widget)
         self.chart_full_view_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.chart_full_view_shortcut.activated.connect(self.reset_chart_full_view)
         self.chart_load_shortcut = QShortcut(QKeySequence(Qt.Key_F4), self.charts_widget)
@@ -543,18 +573,31 @@ class ChartsControllerMixin:
         self.tradingview_clear_target_button = QPushButton("Clear Breakout")
         self.tradingview_clear_target_button.setObjectName("clearTargetButton")
         self.tradingview_clear_target_button.clicked.connect(self.clear_current_chart_target)
-        self.tradingview_full_view_button = QPushButton("Full View (A)")
+        self.tradingview_full_view_button = QPushButton("Full View (F)")
         self.tradingview_full_view_button.clicked.connect(self.reset_chart_full_view)
         self.tradingview_add_watchlist_button = QPushButton("Add to Watchlist (W)")
         self.tradingview_add_watchlist_button.clicked.connect(self.add_current_tradingview_symbol_to_watchlist)
+        self.tradingview_queue_btn = QPushButton("Queue for Buy (Q)")
+        self.tradingview_queue_btn.setMinimumWidth(150)
+        self.tradingview_queue_btn.clicked.connect(self._tradingview_queue_toggle)
+        self.tradingview_activate_btn = QPushButton("Activate")
+        self.tradingview_activate_btn.setMinimumWidth(100)
+        self.tradingview_activate_btn.clicked.connect(self._tradingview_activate_toggle)
         tools_layout.addWidget(self.tradingview_set_target_button)
         tools_layout.addWidget(self.tradingview_line_tool_button)
         tools_layout.addWidget(self.tradingview_clear_target_button)
         tools_layout.addWidget(self.tradingview_erase_all_button)
         tools_layout.addWidget(self.tradingview_add_watchlist_button)
+        tools_layout.addWidget(self.tradingview_queue_btn)
+        tools_layout.addWidget(self.tradingview_activate_btn)
         tools_layout.addWidget(self.tradingview_full_view_button)
         tools_layout.addStretch(1)
         layout.addLayout(tools_layout)
+
+        # Update queue/watchlist/activate buttons whenever symbol changes
+        self.tradingview_symbol_combo.currentTextChanged.connect(self._update_tradingview_queue_btn)
+        self.tradingview_symbol_combo.currentTextChanged.connect(self._update_tradingview_watchlist_btn)
+        self.tradingview_symbol_combo.currentTextChanged.connect(self._update_tradingview_activate_btn)
 
         self.tradingview_widget.setLayout(layout)
         self.tradingview_draw_shortcut = QShortcut(QKeySequence("D"), self.tradingview_widget)
@@ -563,13 +606,16 @@ class ChartsControllerMixin:
         self.tradingview_target_shortcut = QShortcut(QKeySequence("T"), self.tradingview_widget)
         self.tradingview_target_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.tradingview_target_shortcut.activated.connect(self.enable_chart_target_mode)
+        self.tradingview_queue_shortcut = QShortcut(QKeySequence("Q"), self.tradingview_widget)
+        self.tradingview_queue_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self.tradingview_queue_shortcut.activated.connect(self._tradingview_queue_toggle)
         self.tradingview_up_shortcut = QShortcut(QKeySequence(Qt.Key_Up), self.tradingview_widget)
         self.tradingview_up_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.tradingview_up_shortcut.activated.connect(lambda: self.step_tradingview_watchlist_symbol(-1))
         self.tradingview_down_shortcut = QShortcut(QKeySequence(Qt.Key_Down), self.tradingview_widget)
         self.tradingview_down_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.tradingview_down_shortcut.activated.connect(lambda: self.step_tradingview_watchlist_symbol(1))
-        self.tradingview_full_view_shortcut = QShortcut(QKeySequence("A"), self.tradingview_widget)
+        self.tradingview_full_view_shortcut = QShortcut(QKeySequence("F"), self.tradingview_widget)
         self.tradingview_full_view_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.tradingview_full_view_shortcut.activated.connect(self.reset_chart_full_view)
         self.tradingview_watchlist_shortcut = QShortcut(QKeySequence("W"), self.tradingview_widget)
@@ -578,6 +624,9 @@ class ChartsControllerMixin:
         self.tradingview_load_shortcut = QShortcut(QKeySequence(Qt.Key_F4), self.tradingview_widget)
         self.tradingview_load_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.tradingview_load_shortcut.activated.connect(lambda: self.load_tradingview_chart(force=True, fetch_live=True))
+        self._update_tradingview_queue_btn()
+        self._update_tradingview_watchlist_btn()
+        self._update_tradingview_activate_btn()
         self.load_tradingview_chart(show_empty_message=False)
     def _refresh_active_chart_for_symbol(self, symbol: str) -> None:
         """Force-refresh the current chart view if it matches symbol."""
@@ -764,22 +813,13 @@ class ChartsControllerMixin:
             QMessageBox.information(self, "No symbol", "Load a symbol before adding it to the watchlist.")
             return
         if self.watchlist.get(symbol) is not None:
-            sidebar_type = "watchlist"
-            sidebar_source_combo = self.__dict__.get("sidebar_source_combo")
-            if sidebar_source_combo is not None:
-                source = sidebar_source_combo.currentData() or {}
-                sidebar_type = source.get("type")
-            
-            if sidebar_type == "watchlist":
-                self.watchlist.remove(symbol)
-                self.populate_watchlist_table()
-                self.update_dashboard_summary()
-                self._save_state()
-                self.append_log(f"Removed {symbol} from watchlist from TradingView.")
-                return
-            else:
-                self.append_log(f"{symbol} is already in watchlist.")
-                return
+            self.watchlist.remove(symbol)
+            self.populate_watchlist_table()
+            self.update_dashboard_summary()
+            self._save_state()
+            self.append_log(f"Removed {symbol} from watchlist from TradingView.")
+            self._update_tradingview_watchlist_btn()
+            return
         name = symbol
         selected = self._get_sidebar_selected_data()
         if selected and str(selected.get("symbol", "")).strip().upper() == symbol:
@@ -790,7 +830,175 @@ class ChartsControllerMixin:
         self._save_state()
         self.prefetch_intraday_cache_for_symbol(symbol)
         self.append_log(f"Added/updated {symbol} in watchlist from TradingView.")
-    def load_tradingview_chart(self, show_empty_message: bool = True, force: bool = False, fetch_live: bool = False) -> None:
+        self._update_tradingview_watchlist_btn()
+    def _update_tradingview_watchlist_btn(self, _text: str = "") -> None:
+        btn = getattr(self, "tradingview_add_watchlist_button", None)
+        if btn is None:
+            return
+        symbol = self.tradingview_symbol_combo.currentText().strip().upper() if hasattr(self, "tradingview_symbol_combo") else ""
+        in_watchlist = symbol and getattr(self, "watchlist", None) is not None and self.watchlist.get(symbol) is not None
+        if in_watchlist:
+            btn.setText("Remove from Watchlist (W)")
+            btn.setStyleSheet("background-color: #c0392b; color: white; font-weight: 600;")
+        else:
+            btn.setText("Add to Watchlist (W)")
+            btn.setStyleSheet("background-color: #27ae60; color: white; font-weight: 600;")
+
+    def _tradingview_queue_toggle(self) -> None:
+        symbol = self.tradingview_symbol_combo.currentText().strip().upper() if hasattr(self, "tradingview_symbol_combo") else ""
+        if not symbol:
+            return
+        self._chart_queue_toggle(symbol)
+        self._update_tradingview_queue_btn()
+
+    def _update_tradingview_queue_btn(self, _text: str = "") -> None:
+        btn = getattr(self, "tradingview_queue_btn", None)
+        if btn is None:
+            return
+        symbol = self.tradingview_symbol_combo.currentText().strip().upper() if hasattr(self, "tradingview_symbol_combo") else ""
+        self._apply_chart_queue_btn_state(symbol, btn)
+
+    def _chart_queue_toggle(self, symbol: str) -> None:
+        if not symbol:
+            return
+        env = self.watchlist_env_combo.currentText() if hasattr(self, "watchlist_env_combo") else "SIM"
+        buylist_manager = getattr(self, "buylist_manager", None)
+        item = buylist_manager.get(symbol, env) if buylist_manager is not None else None
+        in_queue = item is not None and self._is_execution_queue_buylist_item(item)
+        if in_queue:
+            if item.monitoring_status in ("BOUGHT", "BUY_SUBMITTED", "BUY_PARTIAL"):
+                from PyQt5.QtWidgets import QMessageBox
+                QMessageBox.warning(self, "Active position", f"{symbol} has an active position and cannot be removed here.")
+                return
+            buylist_manager.remove(symbol, env)
+            self._save_state()
+            self.populate_buylist_dashboard()
+            self.append_log(f"[Chart] {symbol} removed from execution queue.")
+        else:
+            self.refresh_execution_queue(env, symbols=[symbol], create_missing=True)
+            self.populate_buylist_dashboard()
+            self.append_log(f"[Chart] {symbol} queued for buy.")
+
+    def _apply_chart_queue_btn_state(self, symbol: str, btn) -> None:
+        env = self.watchlist_env_combo.currentText() if hasattr(self, "watchlist_env_combo") else "SIM"
+        buylist_manager = getattr(self, "buylist_manager", None)
+        item = buylist_manager.get(symbol, env) if buylist_manager is not None else None
+        in_queue = item is not None and self._is_execution_queue_buylist_item(item)
+        if in_queue:
+            btn.setText("Remove from Queue")
+            btn.setStyleSheet("background-color: #c0392b; color: white; font-weight: 600;")
+        else:
+            btn.setText("Queue for Buy (Q)")
+            btn.setStyleSheet("background-color: #27ae60; color: white; font-weight: 600;")
+
+    def _is_symbol_monitor_active(self, symbol: str, env: str) -> bool:
+        buylist_manager = getattr(self, "buylist_manager", None)
+        if buylist_manager is None or not symbol:
+            return False
+        item = buylist_manager.get(symbol, env)
+        if item is None:
+            return False
+        if self._is_execution_queue_buylist_item(item):
+            return bool(getattr(item, "orb_monitor_enabled", False))
+        return str(getattr(item, "monitoring_status", "")).upper() in ("ACTIVE", "BOUGHT")
+
+    def _chart_activate_toggle(self, symbol: str) -> None:
+        if not symbol:
+            return
+        env = self.watchlist_env_combo.currentText() if hasattr(self, "watchlist_env_combo") else "SIM"
+        buylist_manager = getattr(self, "buylist_manager", None)
+        if buylist_manager is None:
+            return
+        item = buylist_manager.get(symbol, env)
+        if item is None:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.information(self, "Not in queue", f"{symbol} is not queued. Use 'Queue for Buy' first.")
+            return
+
+        is_active = self._is_symbol_monitor_active(symbol, env)
+        if is_active:
+            if self._is_execution_queue_buylist_item(item):
+                item.orb_monitor_enabled = False
+            elif str(getattr(item, "monitoring_status", "")).upper() not in ("BOUGHT",):
+                item.monitoring_status = "WATCHING"
+                self._clear_buylist_auto_order_block(item)
+            self._save_state()
+            self.populate_buylist_dashboard()
+            self.append_log(f"[Chart] {symbol} monitoring deactivated.")
+        else:
+            if str(getattr(item, "monitoring_status", "")).upper() == "BOUGHT":
+                from PyQt5.QtWidgets import QMessageBox
+                QMessageBox.information(self, "Already bought", f"{symbol} is already in a BOUGHT position.")
+                return
+            if self._is_execution_queue_buylist_item(item):
+                item.orb_monitor_enabled = True
+                active_attr = f"_buylist_{env.lower()}_monitor_active"
+                if not getattr(self, active_attr, False):
+                    self._toggle_buylist_monitor(env)
+            else:
+                bought_count = sum(
+                    1 for it in buylist_manager.items
+                    if str(getattr(it, "monitoring_status", "")).upper() == "BOUGHT" and it.environment == env
+                )
+                if bought_count >= 5:
+                    from PyQt5.QtWidgets import QMessageBox
+                    QMessageBox.warning(self, "Max positions", "Already holding 5 positions.")
+                    return
+                item.monitoring_status = "ACTIVE"
+                self._clear_buylist_auto_order_block(item)
+            self._save_state()
+            self.populate_buylist_dashboard()
+            self.append_log(f"[Chart] {symbol} monitoring activated.")
+            # Pre-load intraday data so the Intraday tab is ready
+            self._set_intraday_symbol(symbol)
+            self.prefetch_intraday_cache_for_symbol(symbol)
+
+    def _apply_chart_activate_btn_state(self, symbol: str, btn) -> None:
+        env = self.watchlist_env_combo.currentText() if hasattr(self, "watchlist_env_combo") else "SIM"
+        buylist_manager = getattr(self, "buylist_manager", None)
+        item = buylist_manager.get(symbol, env) if buylist_manager and symbol else None
+        in_queue = item is not None
+        is_active = self._is_symbol_monitor_active(symbol, env)
+        btn.setEnabled(in_queue)
+        if is_active:
+            btn.setText("Deactivate")
+            btn.setStyleSheet("background-color: #c0392b; color: white; font-weight: 600;")
+        elif in_queue:
+            btn.setText("Activate")
+            btn.setStyleSheet("background-color: #27ae60; color: white; font-weight: 600;")
+        else:
+            btn.setText("Activate")
+            btn.setStyleSheet("")
+
+    def _update_tradingview_activate_btn(self, _text: str = "") -> None:
+        btn = getattr(self, "tradingview_activate_btn", None)
+        if btn is None:
+            return
+        symbol = self.tradingview_symbol_combo.currentText().strip().upper() if hasattr(self, "tradingview_symbol_combo") else ""
+        self._apply_chart_activate_btn_state(symbol, btn)
+
+    def _tradingview_activate_toggle(self) -> None:
+        symbol = self.tradingview_symbol_combo.currentText().strip().upper() if hasattr(self, "tradingview_symbol_combo") else ""
+        if not symbol:
+            return
+        self._chart_activate_toggle(symbol)
+        self._update_tradingview_activate_btn()
+
+    def _update_intraday_activate_btn(self, _text: str = "") -> None:
+        btn = getattr(self, "intraday_activate_btn", None)
+        if btn is None:
+            return
+        symbol = self.intraday_symbol_combo.currentText().strip().upper() if hasattr(self, "intraday_symbol_combo") else ""
+        self._apply_chart_activate_btn_state(symbol, btn)
+
+    def _intraday_activate_toggle(self) -> None:
+        symbol = self.intraday_symbol_combo.currentText().strip().upper() if hasattr(self, "intraday_symbol_combo") else ""
+        if not symbol:
+            return
+        self._chart_activate_toggle(symbol)
+        self._update_intraday_activate_btn()
+
+    def load_tradingview_chart(self, show_empty_message: bool = True, force: bool = False, fetch_live: bool = False, skip_split_view: bool = False) -> None:
         if not hasattr(self, "tradingview_symbol_combo"):
             return
         symbol = self.tradingview_symbol_combo.currentText().strip().upper()
@@ -857,17 +1065,20 @@ class ChartsControllerMixin:
                 fetch_live=fetch_live,
                 view_key="left",
             )
-            split_status = self._render_tradingview_chart_view(
-                self.tradingview_split_chart_view,
-                symbol=symbol,
-                tradingview_symbol=tradingview_symbol,
-                timeframe="1H",
-                base_options=base_options,
-                now=now,
-                force=force,
-                fetch_live=fetch_live,
-                view_key="right",
-            )
+            if not skip_split_view:
+                split_status = self._render_tradingview_chart_view(
+                    self.tradingview_split_chart_view,
+                    symbol=symbol,
+                    tradingview_symbol=tradingview_symbol,
+                    timeframe="1H",
+                    base_options=base_options,
+                    now=now,
+                    force=force,
+                    fetch_live=fetch_live,
+                    view_key="right",
+                )
+            else:
+                split_status = "1H skipped (drawing sync)"
             self.current_tradingview_symbol = (
                 f"{tradingview_symbol}|split|volume={int(base_options['show_volume'])}|"
                 f"ema={int(base_options['show_ema'])}|rs={int(base_options.get('show_rs', True))}"
@@ -1231,6 +1442,7 @@ class ChartsControllerMixin:
         checked: bool = False,
         show_messages: bool = True,
         triggered_by_live: bool = False,
+        source: str = "",
     ) -> None:
         symbols = [item.symbol for item in self.watchlist.items]
         if not symbols:
@@ -1251,8 +1463,8 @@ class ChartsControllerMixin:
         if hasattr(self, "refresh_watchlist_orb_button"):
             self.refresh_watchlist_orb_button.setEnabled(False)
         self.refresh_intraday_button.setEnabled(False)
-        source = "live auto refresh" if triggered_by_live else "manual refresh"
-        self.append_log(f"Starting 5-minute intraday {source} for {len(symbols)} watchlist symbols.")
+        log_source = source or ("live auto refresh" if triggered_by_live else "manual refresh")
+        self.append_log(f"Starting 5-minute intraday {log_source} for {len(symbols)} watchlist symbols.")
         profile = self._selected_dashboard_kis_profile() or {}
         self.intraday_bulk_worker = IntradayBulkFetchWorker(
             symbols,
@@ -1299,6 +1511,8 @@ class ChartsControllerMixin:
         if hasattr(self, "refresh_execution_queue"):
             env = self.watchlist_env_combo.currentText() if hasattr(self, "watchlist_env_combo") else "SIM"
             self.refresh_execution_queue(env, show_log=False)
+            if hasattr(self, "_auto_submit_execute_ready_queue_items"):
+                self._auto_submit_execute_ready_queue_items(env)
         if hasattr(self, "live_data_checkbox") and self.live_data_checkbox.isChecked():
             status = f"Live data: updated {len(updated)}, failed {len(failed)}"
             if not self._is_us_regular_market_open():
@@ -1471,7 +1685,7 @@ class ChartsControllerMixin:
             return
         active_symbol = self._active_chart_symbol()
         if active_symbol and active_symbol == symbol.strip().upper():
-            self.load_tradingview_chart(force=True)
+            self.load_tradingview_chart(force=True, skip_split_view=True)
     def enable_tradingview_line_tool_mode(self) -> None:
         if not hasattr(self, "tabs") or self.tabs.currentWidget() is not self.tradingview_widget:
             return

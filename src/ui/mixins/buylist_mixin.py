@@ -153,11 +153,11 @@ class BuylistMixin:
 
         # â”€â”€ Table â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Columns: Symbol | Name | Status | Monitor | Entry(ORB) | Breakout | Stop |
-        #          Current | P&L% | Shares | Capital% | Days | Alerts
-        table = QTableWidget(0, 13)
+        #          Current | P&L% | Shares | Capital% | Risk% | Days | Alerts
+        table = QTableWidget(0, 14)
         table.setHorizontalHeaderLabels([
             "Symbol", "Name", "Status", "Monitor", "Entry", "Breakout", "Stop",
-            "Current", "P&L%", "Shares", "Capital%",
+            "Current", "P&L%", "Shares", "Capital%", "Risk%",
             "Days", "Alerts",
         ])
         table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
@@ -166,7 +166,7 @@ class BuylistMixin:
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         table.setAlternatingRowColors(True)
         table.verticalHeader().setVisible(False)
-        for col, width in enumerate([65, 120, 80, 62, 70, 72, 70, 70, 60, 55, 65, 48, 170]):
+        for col, width in enumerate([65, 120, 80, 62, 70, 72, 70, 70, 60, 55, 65, 52, 48, 170]):
             table.setColumnWidth(col, width)
         layout.addWidget(table, 1)
 
@@ -252,6 +252,14 @@ class BuylistMixin:
         """Refresh both PROD and SIM buylist tables."""
         for env in ("PROD", "SIM"):
             self._populate_buylist_env_table(env)
+        if hasattr(self, "_update_tradingview_queue_btn"):
+            self._update_tradingview_queue_btn()
+        if hasattr(self, "_update_intraday_queue_btn"):
+            self._update_intraday_queue_btn()
+        if hasattr(self, "_update_tradingview_activate_btn"):
+            self._update_tradingview_activate_btn()
+        if hasattr(self, "_update_intraday_activate_btn"):
+            self._update_intraday_activate_btn()
     def _populate_buylist_env_table(self, env: str) -> None:
         """Populate the table for one environment and update its summary bar."""
         table_attr = f"buylist_{env.lower()}_table"
@@ -265,6 +273,9 @@ class BuylistMixin:
         bought_count  = sum(1 for it in items if it.monitoring_status == "BOUGHT")
         total_capital = 0.0
         total_pnl_usd = 0.0
+
+        active_attr = f"_buylist_{env.lower()}_monitor_active"
+        monitor_running = getattr(self, active_attr, False)
 
         for item in items:
             row = table.rowCount()
@@ -321,9 +332,14 @@ class BuylistMixin:
             display_name = queue_display.name if queue_display else item.name
             table.setItem(row, 1,  _cell(display_name[:16] if display_name else ""))
             table.setItem(row, 2,  _cell(display_status))
-            monitor_on = item.monitoring_status in ("ACTIVE", "BOUGHT") and not (
-                is_queue_item and item.monitoring_status == "ACTIVE"
-            )
+            if is_queue_item:
+                monitor_on = (
+                    monitor_running
+                    and getattr(item, "orb_monitor_enabled", False)
+                    and item.monitoring_status in ("ARMED", "EXECUTE_READY")
+                )
+            else:
+                monitor_on = item.monitoring_status in ("ACTIVE", "BOUGHT")
             table.setItem(row, 3,  _cell("ON" if monitor_on else "OFF"))
             table.setItem(row, 4,  _cell(f"{entry_price:.2f}"))
             table.setItem(row, 5,  _cell(bp_display))                  # daily breakout level
@@ -334,7 +350,10 @@ class BuylistMixin:
             display_shares = item.shares_held if item.monitoring_status == "BOUGHT" else planned_shares
             table.setItem(row, 9,  _cell(str(display_shares) if display_shares > 0 else "-"))
             table.setItem(row, 10, _cell(f"{capital_pct:.1f}%"))
-            table.setItem(row, 11, _cell(str(days_held) if item.monitoring_status == "BOUGHT" else "-"))
+            risk_pct_val = queue_display.risk_percent if queue_display else item.risk_percent
+            risk_pct_display = f"{risk_pct_val:.2f}%" if risk_pct_val > 0 else "-"
+            table.setItem(row, 11, _cell(risk_pct_display))
+            table.setItem(row, 12, _cell(str(days_held) if item.monitoring_status == "BOUGHT" else "-"))
 
             alert_cell = _cell(alerts if alerts else "OK")
             if "STOP" in alerts:
@@ -343,7 +362,7 @@ class BuylistMixin:
             elif alerts and alerts != "OK":
                 alert_cell.setBackground(QColor("#fb8c00"))
                 alert_cell.setForeground(QColor("white"))
-            table.setItem(row, 12, alert_cell)
+            table.setItem(row, 13, alert_cell)
 
             # Row color by status
             row_color = None
@@ -740,9 +759,30 @@ class BuylistMixin:
         return self._execution_queue_item_for_buylist_item(item)
 
     def _format_execution_queue_order_review(self, env: str, item, queue_item) -> str:
+        from src.core.execution_queue import OrbCandidateStatus
+
         candidate = getattr(queue_item, "selected_candidate", None)
+        pending_trigger = False
+
         if candidate is None:
-            return f"{item.symbol} has no selected ORB candidate."
+            # ARMED: best candidate is WAITING_BREAKOUT — not yet EXECUTE_READY.
+            # Show it as a preview so the user can verify the planned order.
+            _priority = {
+                OrbCandidateStatus.WAITING_BREAKOUT: 0,
+                OrbCandidateStatus.RISK_INVALID: 1,
+                OrbCandidateStatus.REJECTED: 2,
+            }
+            all_candidates = list(getattr(queue_item, "candidates", {}).values())
+            displayable = [c for c in all_candidates if c.status in _priority]
+            if displayable:
+                candidate = min(displayable, key=lambda c: (_priority[c.status], -float(c.score or 0)))
+                pending_trigger = True
+
+        if candidate is None:
+            return (
+                f"{item.symbol} has no ORB candidate computed yet.\n\n"
+                "Click 'Refresh Queue' on the watchlist to recalculate."
+            )
 
         account_no = self._first_account_no_for_environment(env) or "<not selected>"
         entry_trigger = float(candidate.entry_trigger or 0.0)
@@ -752,21 +792,27 @@ class BuylistMixin:
         risk_amount = max(0.0, entry_trigger - stop_loss) * shares
         warnings = list(getattr(candidate, "warnings", []) or []) + list(getattr(queue_item, "warnings", []) or [])
         warning_text = "; ".join(dict.fromkeys(warnings)) if warnings else "None"
+        status_line = (
+            "Status: ARMED — waiting for price to cross entry trigger (auto-buy on next monitor cycle)"
+            if pending_trigger else
+            "Status: EXECUTE_READY — will auto-buy on next monitor cycle"
+        )
         return "\n".join([
+            status_line,
+            "",
             f"Environment: {env}",
             f"Account: {account_no}",
             f"Symbol: {item.symbol}",
             f"Selected ORB: {candidate.window}",
             "Side: BUY",
-            f"Limit price: {self._format_queue_price(entry_trigger)}",
+            f"Entry trigger: {self._format_queue_price(entry_trigger)}",
             f"Quantity: {shares}",
             f"Estimated amount: {self._format_queue_price(estimated_amount)}",
-            f"Breakout price: {self._format_queue_price(candidate.breakout_price)}",
-            f"Breakout trigger: {self._format_queue_price(candidate.breakout_trigger)}",
             f"ORB high: {self._format_queue_price(candidate.orb_high)}",
             f"ORB low: {self._format_queue_price(candidate.orb_low)}",
-            f"Entry trigger: {self._format_queue_price(candidate.entry_trigger)}",
-            f"Stop loss: {self._format_queue_price(candidate.stop_loss)}",
+            f"Breakout price: {self._format_queue_price(candidate.breakout_price)}",
+            f"Breakout trigger: {self._format_queue_price(candidate.breakout_trigger)}",
+            f"Stop loss: {self._format_queue_price(stop_loss)}",
             f"Risk amount: {self._format_queue_price(risk_amount)}",
             f"Capital allocation: {self._format_queue_percent(candidate.capital_percent)}",
             f"Stop/ADR: {self._format_queue_percent(candidate.stop_adr)}",
@@ -775,6 +821,8 @@ class BuylistMixin:
         ])
 
     def _buylist_review_selected_queue_order(self, env: str) -> None:
+        from src.core.execution_queue import OrbCandidateStatus, select_best_orb_candidate, SUPPORTED_ORB_WINDOWS
+
         item = self._buylist_selected_item(env)
         if not item:
             QMessageBox.warning(self, "No selection", "Select an execution queue row first.")
@@ -783,8 +831,189 @@ class BuylistMixin:
         if queue_item is None:
             QMessageBox.warning(self, "No queue item", f"{item.symbol} is not in the execution queue. Click Refresh Queue first.")
             return
-        review = self._format_execution_queue_order_review(env, item, queue_item)
-        QMessageBox.information(self, f"Review BUY Order - {item.symbol}", review)
+
+        candidates: dict = getattr(queue_item, "candidates", {}) or {}
+        if not any(c for c in candidates.values() if c.status not in (OrbCandidateStatus.NOT_AVAILABLE,)):
+            QMessageBox.warning(self, "No data", f"{item.symbol} has no ORB candidates yet. Click Refresh Queue first.")
+            return
+
+        # ── Dialog ────────────────────────────────────────────────────────────
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"ORB Plan — {item.symbol}  [{env}]")
+        dlg.setMinimumWidth(780)
+        dlg.setMinimumHeight(320)
+        dlg_layout = QVBoxLayout(dlg)
+        dlg_layout.setSpacing(8)
+
+        # Lock status banner
+        lock_lbl = QLabel()
+        lock_lbl.setStyleSheet("font-weight: bold; padding: 4px 8px; border-radius: 4px;")
+        dlg_layout.addWidget(lock_lbl)
+
+        # ── Candidate table ────────────────────────────────────────────────────
+        COLS = ["Window", "Status", "ORB High", "ORB Low", "Entry", "Stop", "Shares", "Capital%", "Risk%", "Score", "Stop/ADR", "Warnings"]
+        tbl = QTableWidget(0, len(COLS))
+        tbl.setHorizontalHeaderLabels(COLS)
+        tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        tbl.horizontalHeader().setStretchLastSection(True)
+        tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
+        tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        tbl.setAlternatingRowColors(True)
+        tbl.verticalHeader().setVisible(False)
+        for col, w in enumerate([52, 105, 72, 72, 72, 68, 58, 72, 60, 56, 70, 150]):
+            tbl.setColumnWidth(col, w)
+        dlg_layout.addWidget(tbl, 1)
+
+        _status_color = {
+            OrbCandidateStatus.EXECUTE_READY:    ("#1b5e20", "#a5d6a7"),
+            OrbCandidateStatus.WAITING_BREAKOUT: ("#0d47a1", "#90caf9"),
+            OrbCandidateStatus.RISK_INVALID:     ("#b71c1c", "#ef9a9a"),
+            OrbCandidateStatus.REJECTED:         ("#37474f", "#b0bec5"),
+            OrbCandidateStatus.FORMING:          ("#4a148c", "#ce93d8"),
+        }
+
+        def _fmt_p(v) -> str:
+            try:
+                return f"${float(v):.2f}" if v is not None else "—"
+            except (TypeError, ValueError):
+                return "—"
+
+        def _fmt_pct(v) -> str:
+            try:
+                return f"{float(v):.1f}%" if v is not None else "—"
+            except (TypeError, ValueError):
+                return "—"
+
+        def _populate_table():
+            tbl.setRowCount(0)
+            current_window = getattr(queue_item, "selected_window", None)
+            # If selected_window not set, derive from selected_candidate
+            if not current_window:
+                sc = getattr(queue_item, "selected_candidate", None)
+                if sc:
+                    current_window = getattr(sc, "window", None)
+            for window in SUPPORTED_ORB_WINDOWS:
+                cand = candidates.get(window)
+                if cand is None:
+                    continue
+                is_selected = (window == current_window)
+                row = tbl.rowCount()
+                tbl.insertRow(row)
+                status_str = cand.status.value if hasattr(cand.status, "value") else str(cand.status)
+                window_label = f"▶ {window}" if is_selected else window
+                vals = [
+                    window_label,
+                    status_str,
+                    _fmt_p(cand.orb_high),
+                    _fmt_p(cand.orb_low),
+                    _fmt_p(cand.entry_trigger),
+                    _fmt_p(cand.stop_loss),
+                    str(int(cand.shares or 0)) if cand.shares else "—",
+                    _fmt_pct(cand.capital_percent),
+                    _fmt_pct(float(cand.risk_percent or 0) * 100) if cand.risk_percent else "—",
+                    f"{float(cand.score or 0):.1f}",
+                    _fmt_pct(cand.stop_adr),
+                    "; ".join(cand.warnings) if cand.warnings else "OK",
+                ]
+                for col, val in enumerate(vals):
+                    cell = QTableWidgetItem(val)
+                    cell.setTextAlignment(Qt.AlignCenter)
+                    tbl.setItem(row, col, cell)
+
+                if is_selected:
+                    # Yellow highlight with bold black text — clearly selected
+                    from PyQt5.QtGui import QFont
+                    bold = QFont()
+                    bold.setBold(True)
+                    for col in range(len(COLS)):
+                        c = tbl.item(row, col)
+                        if c:
+                            c.setBackground(QColor("#fff176"))
+                            c.setForeground(QColor("#000000"))
+                            c.setFont(bold)
+                else:
+                    # Color by status
+                    fg, bg = _status_color.get(cand.status, ("#212121", "#f5f5f5"))
+                    for col in range(len(COLS)):
+                        c = tbl.item(row, col)
+                        if c:
+                            c.setBackground(QColor(bg))
+                            c.setForeground(QColor(fg))
+
+        def _update_lock_label():
+            if getattr(queue_item, "locked", False):
+                w = getattr(queue_item, "selected_window", "?")
+                lock_lbl.setText(f"🔒  LOCKED to {w} window — queue refresh will not change the selected plan")
+                lock_lbl.setStyleSheet("font-weight: bold; background-color: #e65100; color: white; padding: 4px 8px; border-radius: 4px;")
+            else:
+                lock_lbl.setText("⚡  AUTO — best-scoring valid plan selected each queue refresh")
+                lock_lbl.setStyleSheet("font-weight: bold; background-color: #1565c0; color: white; padding: 4px 8px; border-radius: 4px;")
+
+        _populate_table()
+        _update_lock_label()
+
+        # ── Buttons ────────────────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+
+        lock_btn = QPushButton("🔒  Lock Selected Window")
+        lock_btn.setMinimumWidth(170)
+        lock_btn.setStyleSheet("background-color: #e65100; color: white; font-weight: bold;")
+
+        unlock_btn = QPushButton("⚡  Unlock (Auto)")
+        unlock_btn.setMinimumWidth(130)
+        unlock_btn.setStyleSheet("background-color: #1565c0; color: white; font-weight: bold;")
+
+        close_btn = QPushButton("Close")
+        close_btn.setMinimumWidth(80)
+
+        btn_row.addWidget(lock_btn)
+        btn_row.addWidget(unlock_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(close_btn)
+        dlg_layout.addLayout(btn_row)
+
+        def _lock_selected():
+            sel = tbl.currentRow()
+            if sel < 0:
+                QMessageBox.warning(dlg, "No row selected", "Click a window row first, then lock.")
+                return
+            window_cell = tbl.item(sel, 0)
+            if window_cell is None:
+                return
+            chosen = window_cell.text().strip()
+            cand = candidates.get(chosen)
+            if cand is None:
+                return
+            queue_item.locked = True
+            queue_item.selected_window = chosen
+            queue_item.selected_candidate = cand
+            self._save_execution_queue_state()
+            self.populate_buylist_dashboard()
+            _populate_table()
+            _update_lock_label()
+
+        def _unlock():
+            manager = self.__dict__.get("execution_queue_manager")
+            upgrade_margin = getattr(manager, "upgrade_margin", 5.0) if manager else 5.0
+            queue_item.locked = False
+            best = select_best_orb_candidate(
+                candidates,
+                getattr(queue_item, "selected_window", None),
+                False,
+                upgrade_margin=upgrade_margin,
+            )
+            queue_item.selected_candidate = best
+            queue_item.selected_window = best.window if best else None
+            self._save_execution_queue_state()
+            self.populate_buylist_dashboard()
+            _populate_table()
+            _update_lock_label()
+
+        lock_btn.clicked.connect(_lock_selected)
+        unlock_btn.clicked.connect(_unlock)
+        close_btn.clicked.connect(dlg.accept)
+
+        dlg.exec_()
 
     def _buylist_submit_selected_queue_order(self, env: str) -> None:
         from src.ui.controllers.base import get_controller
@@ -1084,12 +1313,30 @@ class BuylistMixin:
         if item.monitoring_status == "BOUGHT":
             QMessageBox.information(self, "Already bought", f"{item.symbol} is already in a BOUGHT position.")
             return
-        if self._is_orb_buylist_item(item):
-            QMessageBox.information(
-                self,
-                "Execution Queue",
-                f"{item.symbol} is an ORB entry. Queue it from the Watchlist and use Review Order and Submit Buy.",
-            )
+        if self._is_execution_queue_buylist_item(item):
+            item.orb_monitor_enabled = True
+            self._save_state()
+            active_attr = f"_buylist_{env.lower()}_monitor_active"
+            was_running = getattr(self, active_attr, False)
+            if not was_running:
+                self._toggle_buylist_monitor(env)
+            self.populate_buylist_dashboard()
+            status = str(getattr(item, "monitoring_status", "") or "")
+            started_note = "Monitor started." if not was_running else "Monitor already running."
+            if status == "EXECUTE_READY":
+                msg = (
+                    f"{item.symbol} activated — EXECUTE_READY.\n\n"
+                    f"{started_note} Will auto-submit the BUY on the next 60-second cycle.\n\n"
+                    "Use 'Submit Buy' to submit immediately."
+                )
+            else:
+                msg = (
+                    f"{item.symbol} activated (status: {status}).\n\n"
+                    f"{started_note} Checking every 60 seconds — will auto-submit the BUY "
+                    "when price crosses the ORB entry trigger.\n\n"
+                    "Use 'Review Order' to see the planned entry/stop/shares."
+                )
+            QMessageBox.information(self, "Activated", msg)
             return
         bought_count = sum(1 for it in self.buylist_manager.items if it.monitoring_status == "BOUGHT" and it.environment == env)
         if bought_count >= 5:
@@ -1106,10 +1353,15 @@ class BuylistMixin:
             QMessageBox.warning(self, "No selection", "Select a buylist row to deactivate.")
             return
         if item.monitoring_status != "BOUGHT" and self._is_execution_queue_buylist_item(item):
+            item.orb_monitor_enabled = False
+            self._save_state()
+            self.populate_buylist_dashboard()
+            self.append_log(f"[Buylist/{env}] {item.symbol} deactivated — monitor will no longer auto-buy this item.")
             QMessageBox.information(
                 self,
-                "Execution Queue",
-                f"{item.symbol} is managed by the execution queue. Remove the row if it is no longer needed.",
+                "Deactivated",
+                f"{item.symbol} monitoring disabled. Monitor column will show OFF.\n\n"
+                "Click Activate again to re-enable auto-buy for this item.",
             )
             return
         if item.monitoring_status == "BOUGHT":
@@ -1296,6 +1548,65 @@ class BuylistMixin:
                 btn.setText("Stop Monitor")
             self.append_log(f"[Buylist/{env}] Monitor started — checking every 60 seconds.")
             self._run_buylist_monitor_cycle(env)  # run immediately
+    def _auto_submit_execute_ready_queue_items(self, env: str) -> None:
+        """Auto-submit EXECUTE_READY execution-queue items when the monitor is active for env."""
+        active_attr = f"_buylist_{env.lower()}_monitor_active"
+        if not getattr(self, active_attr, False):
+            return
+        if not hasattr(self, "buylist_manager"):
+            return
+        items = [it for it in self.buylist_manager.items if it.environment == env]
+        for it in items:
+            if it.monitoring_status != "EXECUTE_READY":
+                continue
+            if not self._is_pre_entry_execution_queue_buylist_item(it):
+                continue
+            if not getattr(it, "orb_monitor_enabled", False):
+                continue
+            if getattr(it, "_buy_order_pending", False):
+                continue
+            auto_order_blocked = self._buylist_auto_order_blocked(it)
+            if auto_order_blocked:
+                if not getattr(it, "_auto_order_block_notice_logged", False):
+                    it._auto_order_block_notice_logged = True
+                    self.append_log(
+                        f"[Buylist/{env}] {it.symbol} EXECUTE_READY but auto order is blocked: "
+                        f"{getattr(it, 'auto_order_block_reason', '')}"
+                    )
+                continue
+            queue_item = self._queue_item_for_buylist_item(it)
+            candidate = getattr(queue_item, "selected_candidate", None) if queue_item is not None else None
+            if candidate is None:
+                self.append_log(
+                    f"[Buylist/{env}] {it.symbol} EXECUTE_READY but no selected candidate — skipping auto-buy."
+                )
+                continue
+            entry_trigger = float(getattr(candidate, "entry_trigger", 0.0) or 0.0)
+            shares = int(getattr(candidate, "shares", 0) or 0)
+            if shares < 1 or entry_trigger <= 0:
+                self.append_log(
+                    f"[Buylist/{env}] {it.symbol} EXECUTE_READY but invalid order "
+                    f"(shares={shares}, trigger={entry_trigger:.2f}) — skipping auto-buy."
+                )
+                continue
+            current_price = self.latest_intraday_prices.get(it.symbol, 0.0)
+            mgr = self._ensure_execution_queue_manager()
+            if mgr is not None:
+                mgr.mark_order_submitted(it.symbol, order_status="PENDING", environment=env)
+            queue_status = self._execution_queue_status_for_buylist_item(it) or "ORDER_PENDING"
+            it.monitoring_status = queue_status
+            it.status = queue_status
+            it._planned_shares = shares
+            it._selected_orb_window = str(getattr(candidate, "window", "") or "")
+            it._buy_order_pending = True
+            self._save_buylist_state()
+            self._save_execution_queue_state()
+            self.append_log(
+                f"[Buylist/{env}] {it.symbol} EXECUTE_READY — auto-submitting BUY "
+                f"{shares} shares @ ${entry_trigger:.2f} (current ${current_price:.2f})"
+            )
+            self._submit_kis_buy_order(it, quantity=shares, order_price=entry_trigger)
+
     def _run_buylist_monitor_cycle(self, env: str) -> None:
         """Check ACTIVE/BOUGHT items for one environment and fire orders as needed."""
         if not hasattr(self, "buylist_manager"):
@@ -1304,10 +1615,33 @@ class BuylistMixin:
         items = [it for it in self.buylist_manager.items if it.environment == env]
         self._restore_monitorable_buylist_error_positions(items, env)
         active_items = [it for it in items if it.monitoring_status in ("ACTIVE", "BOUGHT")]
-        if not active_items:
+
+        # Execution queue items whose trigger hasn't fired yet
+        _skip_statuses = {
+            "BOUGHT", "BUY_SUBMITTED", "BUY_PARTIAL",
+            "SELL_SUBMITTED", "PARTIAL_EXIT_SUBMITTED", "SOLD",
+            "ORDER_SUBMITTED", "ORDER_PENDING",
+        }
+        queue_watching_items = [
+            it for it in items
+            if self._is_pre_entry_execution_queue_buylist_item(it)
+            and it.monitoring_status not in _skip_statuses
+            and not getattr(it, "_buy_order_pending", False)
+            and getattr(it, "orb_monitor_enabled", False)
+        ]
+
+        if not active_items and not queue_watching_items:
             return
 
         bought_count = sum(1 for it in items if it.monitoring_status == "BOUGHT")
+
+        # Trigger an async KIS-first intraday refresh for execution-queue items.
+        # When the worker finishes, _on_intraday_bulk_finished calls refresh_execution_queue
+        # and then _auto_submit_execute_ready_queue_items, which fires any EXECUTE_READY orders.
+        if queue_watching_items and hasattr(self, "refresh_watchlist_intraday_cache"):
+            worker = getattr(self, "intraday_bulk_worker", None)
+            if worker is None or not worker.isRunning():
+                self.refresh_watchlist_intraday_cache(show_messages=False, triggered_by_live=True, source="buylist monitor")
 
         for item in active_items:
             self._buylist_refresh_item_data(item)

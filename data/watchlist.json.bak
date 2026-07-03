@@ -1,0 +1,603 @@
+{
+  "name": "Default",
+  "created_date": "2026-06-24T00:37:07.734843",
+  "items": [
+    {
+      "symbol": "SNDK",
+      "name": "SNDK",
+      "entry_price": null,
+      "breakout_price": 1978.56,
+      "target_price": 1978.56,
+      "stop_loss": null,
+      "notes": "",
+      "added_date": "2026-06-24T16:26:51.779657",
+      "ai_analysis": {
+        "summary": "Decision: BUYLIST_READY (BUY_READY)\nAction: ADD_TO_BUYLIST\nEntry: Breakout above recent consolidation level near $2021.50.\nSummary: [API Error 429] Clean consolidation setup above key EMAs.",
+        "catalyst": "- Micron + One Explosive AI Memory Stock to Buy Before H2 2026",
+        "news_score": 80.0,
+        "status": "BUY_READY",
+        "total_score": 70,
+        "full_json": {
+          "symbol": "SNDK",
+          "as_of_date": "2026-06-29",
+          "decision": "BUYLIST_READY",
+          "setup_type": "BREAKOUT",
+          "total_score": 70,
+          "score_breakdown": {
+            "technical_setup_quality": 20,
+            "relative_strength_momentum": 15,
+            "volume_liquidity_execution": 12,
+            "catalyst_fundamental_support": 12,
+            "risk_reward_stop_quality": 12
+          },
+          "confidence": 0.85,
+          "summary": "[API Error 429] Clean consolidation setup above key EMAs.",
+          "technical_assessment": {
+            "trend_status": "UPTREND",
+            "relative_strength_status": "STRONG",
+            "volume_status": "NORMAL",
+            "setup_structure": "TIGHT",
+            "entry_trigger_status": "CONFIRMED",
+            "extension_risk": "LOW"
+          },
+          "risk_assessment": {
+            "entry_price": 2021.5,
+            "stop_loss": 1925.08,
+            "take_profit": 2214.34,
+            "risk_reward_ratio": 2.0,
+            "stop_distance_pct": 0.0,
+            "adr_20_pct": 8.106617616558427,
+            "position_size_pct": 16.2,
+            "account_risk_pct": 0.77,
+            "risk_valid": true,
+            "risk_comments": "Risk profile acceptable."
+          },
+          "catalyst_assessment": {
+            "has_verified_catalyst": true,
+            "catalyst_strength": "MODERATE",
+            "catalyst_summary": "Micron + One Explosive AI Memory Stock to Buy Before H2 2026",
+            "source_quality": "SECONDARY"
+          },
+          "hard_disqualifiers": [],
+          "soft_warnings": [],
+          "missing_data": [],
+          "recommended_action": {
+            "action": "ADD_TO_BUYLIST",
+            "entry_condition": "Breakout above recent consolidation level near $2021.50.",
+            "stop_condition": "Close below $1925.08.",
+            "target_logic": "2R default target.",
+            "next_check": "Next daily close."
+          },
+          "ai_notes_for_user": [
+            "Generated via rulebook-based fallback scoring model.",
+            "Please verify trend intensity and volume breakout metrics on daily chart."
+          ]
+        }
+      }
+    },
+    {
+      "symbol": "DELL",
+      "name": "DELL",
+      "entry_price": null,
+      "breakout_price": 417.29,
+      "target_price": 417.29,
+      "stop_loss": null,
+      "notes": "",
+      "added_date": "2026-06-24T16:37:10.014086",
+      "ai_analysis": {
+        "summary": "Decision: BUYLIST_READY (BUY_READY)\nAction: ADD_TO_BUYLIST\nEntry: Breakout above recent consolidation level near $435.00.\nSummary: [API Error 429] Clean consolidation setup above key EMAs.",
+        "catalyst": "- Will Dell\u2019s Expanded AI Infrastructure Ecosystem Shift Dell Technologies' (DELL) Investment Narrative?",
+        "news_score": 80.0,
+        "status": "BUY_READY",
+        "total_score": 70,
+        "full_json": {
+          "symbol": "DELL",
+          "as_of_date": "2026-06-29",
+          "decision": "BUYLIST_READY",
+          "setup_type": "BREAKOUT",
+          "total_score": 70,
+          "score_breakdown": {
+            "technical_setup_quality": 20,
+            "relative_strength_momentum": 15,
+            "volume_liquidity_execution": 12,
+            "catalyst_fundamental_support": 12,
+            "risk_reward_stop_quality": 12
+          },
+          "confidence": 0.85,
+          "summary": "[API Error 429] Clean consolidation setup above key EMAs.",
+          "technical_assessment": {
+            "trend_status": "UPTREND",
+            "relative_strength_status": "STRONG",
+            "volume_status": "NORMAL",
+            "setup_structure": "TIGHT",
+            "entry_trigger_status": "CONFIRMED",
+            "extension_risk": "LOW"
+          },
+          "risk_assessment": {
+            "entry_price": 435.0,
+            "stop_loss": 418.34,
+            "take_profit": 468.32000000000005,
+            "risk_reward_ratio": 2.0,
+            "stop_distance_pct": 0.0,
+            "adr_20_pct": 7.283159960197774,
+            "position_size_pct": 20.0,
+            "account_risk_pct": 0.77,
+            "risk_valid": true,
+            "risk_comments": "Risk profile acceptable."
+          },
+          "catalyst_assessment": {
+            "has_verified_catalyst": true,
+            "catalyst_strength": "MODERATE",
+            "catalyst_summary": "Will Dell\u2019s Expanded AI Infrastructure Ecosystem Shift Dell Technologies' (DELL) Investment Narrative?",
+            "source_quality": "SECONDARY"
+          },
+          "hard_disqualifiers": [],
+          "soft_warnings": [],
+          "missing_data": [],
+          "recommended_action": {
+            "action": "ADD_TO_BUYLIST",
+            "entry_condition": "Breakout above recent consolidation level near $435.00.",
+            "stop_condition": "Close below $418.34.",
+            "target_logic": "2R default target.",
+            "next_check": "Next daily close."
+          },
+          "ai_notes_for_user": [
+            "Generated via rulebook-based fallback scoring model.",
+            "Please verify trend intensity and volume breakout metrics on daily chart."
+          ]
+        }
+      }
+    },
+    {
+      "symbol": "MRVL",
+      "name": "MRVL",
+      "entry_price": null,
+      "breakout_price": 278.61,
+      "target_price": 278.61,
+      "stop_loss": null,
+      "notes": "",
+      "added_date": "2026-06-24T19:56:45.583218",
+      "ai_analysis": {
+        "summary": "Decision: BUYLIST_READY (BUY_READY)\nAction: ADD_TO_BUYLIST\nEntry: Breakout above recent consolidation level near $281.54.\nSummary: [API Error 429] Clean consolidation setup above key EMAs.",
+        "catalyst": "- Why Marvell Technology (MRVL) Shares Are Trading Lower Today",
+        "news_score": 80.0,
+        "status": "BUY_READY",
+        "total_score": 70,
+        "full_json": {
+          "symbol": "MRVL",
+          "as_of_date": "2026-06-29",
+          "decision": "BUYLIST_READY",
+          "setup_type": "BREAKOUT",
+          "total_score": 70,
+          "score_breakdown": {
+            "technical_setup_quality": 20,
+            "relative_strength_momentum": 15,
+            "volume_liquidity_execution": 12,
+            "catalyst_fundamental_support": 12,
+            "risk_reward_stop_quality": 12
+          },
+          "confidence": 0.85,
+          "summary": "[API Error 429] Clean consolidation setup above key EMAs.",
+          "technical_assessment": {
+            "trend_status": "UPTREND",
+            "relative_strength_status": "STRONG",
+            "volume_status": "NORMAL",
+            "setup_structure": "TIGHT",
+            "entry_trigger_status": "CONFIRMED",
+            "extension_risk": "LOW"
+          },
+          "risk_assessment": {
+            "entry_price": 281.535,
+            "stop_loss": 268.4,
+            "take_profit": 307.8050000000001,
+            "risk_reward_ratio": 2.0,
+            "stop_distance_pct": 0.0,
+            "adr_20_pct": 9.937003283461928,
+            "position_size_pct": 16.3,
+            "account_risk_pct": 0.76,
+            "risk_valid": true,
+            "risk_comments": "Risk profile acceptable."
+          },
+          "catalyst_assessment": {
+            "has_verified_catalyst": true,
+            "catalyst_strength": "MODERATE",
+            "catalyst_summary": "Why Marvell Technology (MRVL) Shares Are Trading Lower Today",
+            "source_quality": "SECONDARY"
+          },
+          "hard_disqualifiers": [],
+          "soft_warnings": [],
+          "missing_data": [],
+          "recommended_action": {
+            "action": "ADD_TO_BUYLIST",
+            "entry_condition": "Breakout above recent consolidation level near $281.54.",
+            "stop_condition": "Close below $268.40.",
+            "target_logic": "2R default target.",
+            "next_check": "Next daily close."
+          },
+          "ai_notes_for_user": [
+            "Generated via rulebook-based fallback scoring model.",
+            "Please verify trend intensity and volume breakout metrics on daily chart."
+          ]
+        }
+      }
+    },
+    {
+      "symbol": "WDC",
+      "name": "WDC",
+      "entry_price": null,
+      "breakout_price": 626.43,
+      "target_price": 626.43,
+      "stop_loss": null,
+      "notes": "",
+      "added_date": "2026-06-26T07:18:39.700757",
+      "ai_analysis": {
+        "summary": "Decision: BUYLIST_READY (BUY_READY)\nAction: ADD_TO_BUYLIST\nEntry: Breakout above recent consolidation level near $710.00.\nSummary: [API Error 429] Clean consolidation setup above key EMAs.",
+        "catalyst": "- Western Digital (WDC) Stock Rallies As Micron\u2019s $100 Billion AI Deals Lift Storage Demand",
+        "news_score": 80.0,
+        "status": "BUY_READY",
+        "total_score": 70,
+        "full_json": {
+          "symbol": "WDC",
+          "as_of_date": "2026-06-29",
+          "decision": "BUYLIST_READY",
+          "setup_type": "BREAKOUT",
+          "total_score": 70,
+          "score_breakdown": {
+            "technical_setup_quality": 20,
+            "relative_strength_momentum": 15,
+            "volume_liquidity_execution": 12,
+            "catalyst_fundamental_support": 12,
+            "risk_reward_stop_quality": 12
+          },
+          "confidence": 0.85,
+          "summary": "[API Error 429] Clean consolidation setup above key EMAs.",
+          "technical_assessment": {
+            "trend_status": "UPTREND",
+            "relative_strength_status": "STRONG",
+            "volume_status": "NORMAL",
+            "setup_structure": "TIGHT",
+            "entry_trigger_status": "CONFIRMED",
+            "extension_risk": "LOW"
+          },
+          "risk_assessment": {
+            "entry_price": 710.0,
+            "stop_loss": 695.42,
+            "take_profit": 739.1600000000001,
+            "risk_reward_ratio": 2.0,
+            "stop_distance_pct": 0.0,
+            "adr_20_pct": 7.279785480598518,
+            "position_size_pct": 12.8,
+            "account_risk_pct": 0.26,
+            "risk_valid": true,
+            "risk_comments": "Risk profile acceptable."
+          },
+          "catalyst_assessment": {
+            "has_verified_catalyst": true,
+            "catalyst_strength": "MODERATE",
+            "catalyst_summary": "Western Digital (WDC) Stock Rallies As Micron\u2019s $100 Billion AI Deals Lift Storage Demand",
+            "source_quality": "SECONDARY"
+          },
+          "hard_disqualifiers": [],
+          "soft_warnings": [],
+          "missing_data": [],
+          "recommended_action": {
+            "action": "ADD_TO_BUYLIST",
+            "entry_condition": "Breakout above recent consolidation level near $710.00.",
+            "stop_condition": "Close below $695.42.",
+            "target_logic": "2R default target.",
+            "next_check": "Next daily close."
+          },
+          "ai_notes_for_user": [
+            "Generated via rulebook-based fallback scoring model.",
+            "Please verify trend intensity and volume breakout metrics on daily chart."
+          ]
+        }
+      }
+    },
+    {
+      "symbol": "AMAT",
+      "name": "AMAT",
+      "entry_price": null,
+      "breakout_price": 662.85,
+      "target_price": 662.85,
+      "stop_loss": null,
+      "notes": "",
+      "added_date": "2026-06-26T07:18:58.429579",
+      "ai_analysis": {
+        "summary": "Decision: BUYLIST_READY (BUY_READY)\nAction: ADD_TO_BUYLIST\nEntry: Breakout above recent consolidation level near $638.64.\nSummary: [API Error 429] Clean consolidation setup above key EMAs.",
+        "catalyst": "- This Analyst Sees 20% Upside For AMAT Stock \u2013 Says High Expectations Around Applied Materials\u2019 Businesses Create Short-Term Risk",
+        "news_score": 80.0,
+        "status": "BUY_READY",
+        "total_score": 70,
+        "full_json": {
+          "symbol": "AMAT",
+          "as_of_date": "2026-06-29",
+          "decision": "BUYLIST_READY",
+          "setup_type": "BREAKOUT",
+          "total_score": 70,
+          "score_breakdown": {
+            "technical_setup_quality": 20,
+            "relative_strength_momentum": 15,
+            "volume_liquidity_execution": 12,
+            "catalyst_fundamental_support": 12,
+            "risk_reward_stop_quality": 12
+          },
+          "confidence": 0.85,
+          "summary": "[API Error 429] Clean consolidation setup above key EMAs.",
+          "technical_assessment": {
+            "trend_status": "UPTREND",
+            "relative_strength_status": "STRONG",
+            "volume_status": "NORMAL",
+            "setup_structure": "TIGHT",
+            "entry_trigger_status": "CONFIRMED",
+            "extension_risk": "LOW"
+          },
+          "risk_assessment": {
+            "entry_price": 638.636,
+            "stop_loss": 626.53,
+            "take_profit": 662.848,
+            "risk_reward_ratio": 2.0,
+            "stop_distance_pct": 0.0,
+            "adr_20_pct": 5.800554836589489,
+            "position_size_pct": 13.4,
+            "account_risk_pct": 0.25,
+            "risk_valid": true,
+            "risk_comments": "Risk profile acceptable."
+          },
+          "catalyst_assessment": {
+            "has_verified_catalyst": true,
+            "catalyst_strength": "MODERATE",
+            "catalyst_summary": "This Analyst Sees 20% Upside For AMAT Stock \u2013 Says High Expectations Around Applied Materials\u2019 Businesses Create Short-Term Risk",
+            "source_quality": "SECONDARY"
+          },
+          "hard_disqualifiers": [],
+          "soft_warnings": [],
+          "missing_data": [],
+          "recommended_action": {
+            "action": "ADD_TO_BUYLIST",
+            "entry_condition": "Breakout above recent consolidation level near $638.64.",
+            "stop_condition": "Close below $626.53.",
+            "target_logic": "2R default target.",
+            "next_check": "Next daily close."
+          },
+          "ai_notes_for_user": [
+            "Generated via rulebook-based fallback scoring model.",
+            "Please verify trend intensity and volume breakout metrics on daily chart."
+          ]
+        }
+      }
+    },
+    {
+      "symbol": "HPE",
+      "name": "HPE",
+      "entry_price": null,
+      "breakout_price": 54.11,
+      "target_price": 54.11,
+      "stop_loss": null,
+      "notes": "",
+      "added_date": "2026-06-26T09:40:48.059569",
+      "ai_analysis": {
+        "summary": "Decision: BUYLIST_READY (BUY_READY)\nAction: ADD_TO_BUYLIST\nEntry: Breakout above recent consolidation level near $48.16.\nSummary: [API Error 429] Clean consolidation setup above key EMAs.",
+        "catalyst": "- HPE Stock On Track To Hit Fresh Record High After Unveiling New Server Featuring Nvidia Chips \u2013 \u2018Agentic AI Has Arrived, And It Needs A New CPU\u2019",
+        "news_score": 80.0,
+        "status": "BUY_READY",
+        "total_score": 70,
+        "full_json": {
+          "symbol": "HPE",
+          "as_of_date": "2026-06-29",
+          "decision": "BUYLIST_READY",
+          "setup_type": "BREAKOUT",
+          "total_score": 70,
+          "score_breakdown": {
+            "technical_setup_quality": 20,
+            "relative_strength_momentum": 15,
+            "volume_liquidity_execution": 12,
+            "catalyst_fundamental_support": 12,
+            "risk_reward_stop_quality": 12
+          },
+          "confidence": 0.85,
+          "summary": "[API Error 429] Clean consolidation setup above key EMAs.",
+          "technical_assessment": {
+            "trend_status": "UPTREND",
+            "relative_strength_status": "STRONG",
+            "volume_status": "NORMAL",
+            "setup_structure": "TIGHT",
+            "entry_trigger_status": "CONFIRMED",
+            "extension_risk": "LOW"
+          },
+          "risk_assessment": {
+            "entry_price": 48.16,
+            "stop_loss": 46.22,
+            "take_profit": 52.03999999999999,
+            "risk_reward_ratio": 2.0,
+            "stop_distance_pct": 0.0,
+            "adr_20_pct": 6.8677323770610075,
+            "position_size_pct": 18.6,
+            "account_risk_pct": 0.75,
+            "risk_valid": true,
+            "risk_comments": "Risk profile acceptable."
+          },
+          "catalyst_assessment": {
+            "has_verified_catalyst": true,
+            "catalyst_strength": "MODERATE",
+            "catalyst_summary": "HPE Stock On Track To Hit Fresh Record High After Unveiling New Server Featuring Nvidia Chips \u2013 \u2018Agentic AI Has Arrived, And It Needs A New CPU\u2019",
+            "source_quality": "SECONDARY"
+          },
+          "hard_disqualifiers": [],
+          "soft_warnings": [],
+          "missing_data": [],
+          "recommended_action": {
+            "action": "ADD_TO_BUYLIST",
+            "entry_condition": "Breakout above recent consolidation level near $48.16.",
+            "stop_condition": "Close below $46.22.",
+            "target_logic": "2R default target.",
+            "next_check": "Next daily close."
+          },
+          "ai_notes_for_user": [
+            "Generated via rulebook-based fallback scoring model.",
+            "Please verify trend intensity and volume breakout metrics on daily chart."
+          ]
+        }
+      }
+    },
+    {
+      "symbol": "MU",
+      "name": "MU",
+      "entry_price": null,
+      "breakout_price": 1097.5,
+      "target_price": 1097.5,
+      "stop_loss": null,
+      "notes": "",
+      "added_date": "2026-06-26T10:01:42.951327",
+      "ai_analysis": {
+        "summary": "Decision: BUYLIST_READY (BUY_READY)\nAction: ADD_TO_BUYLIST\nEntry: Breakout above recent consolidation level near $1253.00.\nSummary: [API Error 429] Clean consolidation setup above key EMAs.",
+        "catalyst": "- Micron\u2019s stock is still dirt cheap. Some analysts say that\u2019s about to change.",
+        "news_score": 80.0,
+        "status": "BUY_READY",
+        "total_score": 70,
+        "full_json": {
+          "symbol": "MU",
+          "as_of_date": "2026-06-29",
+          "decision": "BUYLIST_READY",
+          "setup_type": "BREAKOUT",
+          "total_score": 70,
+          "score_breakdown": {
+            "technical_setup_quality": 20,
+            "relative_strength_momentum": 15,
+            "volume_liquidity_execution": 12,
+            "catalyst_fundamental_support": 12,
+            "risk_reward_stop_quality": 12
+          },
+          "confidence": 0.85,
+          "summary": "[API Error 429] Clean consolidation setup above key EMAs.",
+          "technical_assessment": {
+            "trend_status": "UPTREND",
+            "relative_strength_status": "STRONG",
+            "volume_status": "NORMAL",
+            "setup_structure": "TIGHT",
+            "entry_trigger_status": "CONFIRMED",
+            "extension_risk": "LOW"
+          },
+          "risk_assessment": {
+            "entry_price": 1253.0,
+            "stop_loss": 1220.25,
+            "take_profit": 1318.5,
+            "risk_reward_ratio": 2.0,
+            "stop_distance_pct": 0.0,
+            "adr_20_pct": 7.123079062607814,
+            "position_size_pct": 20.0,
+            "account_risk_pct": 0.52,
+            "risk_valid": true,
+            "risk_comments": "Risk profile acceptable."
+          },
+          "catalyst_assessment": {
+            "has_verified_catalyst": true,
+            "catalyst_strength": "MODERATE",
+            "catalyst_summary": "Micron\u2019s stock is still dirt cheap. Some analysts say that\u2019s about to change.",
+            "source_quality": "SECONDARY"
+          },
+          "hard_disqualifiers": [],
+          "soft_warnings": [],
+          "missing_data": [],
+          "recommended_action": {
+            "action": "ADD_TO_BUYLIST",
+            "entry_condition": "Breakout above recent consolidation level near $1253.00.",
+            "stop_condition": "Close below $1220.25.",
+            "target_logic": "2R default target.",
+            "next_check": "Next daily close."
+          },
+          "ai_notes_for_user": [
+            "Generated via rulebook-based fallback scoring model.",
+            "Please verify trend intensity and volume breakout metrics on daily chart."
+          ]
+        }
+      }
+    },
+    {
+      "symbol": "MGM",
+      "name": "MGM",
+      "entry_price": null,
+      "breakout_price": 47.62,
+      "target_price": 47.62,
+      "stop_loss": null,
+      "notes": "",
+      "added_date": "2026-06-28T06:57:38.628235",
+      "ai_analysis": {
+        "summary": "Decision: REJECT (REJECTED)\nAction: KEEP_ON_WATCHLIST\nEntry: Breakout above recent consolidation level near $46.65.\nSummary: [API Error 429] Setup is too extended or stop is too wide (Stop loss % (8.00%) is wider than ADR 20-day (2.98%)).",
+        "catalyst": "- SG Americas Securities LLC Sells 465,522 Shares of MGM Resorts International $MGM",
+        "news_score": 50.0,
+        "status": "REJECTED",
+        "total_score": 70,
+        "full_json": {
+          "symbol": "MGM",
+          "as_of_date": "2026-06-29",
+          "decision": "REJECT",
+          "setup_type": "INVALID",
+          "total_score": 70,
+          "score_breakdown": {
+            "technical_setup_quality": 10,
+            "relative_strength_momentum": 8,
+            "volume_liquidity_execution": 5,
+            "catalyst_fundamental_support": 12,
+            "risk_reward_stop_quality": 5
+          },
+          "confidence": 0.5,
+          "summary": "[API Error 429] Setup is too extended or stop is too wide (Stop loss % (8.00%) is wider than ADR 20-day (2.98%)).",
+          "technical_assessment": {
+            "trend_status": "UPTREND",
+            "relative_strength_status": "STRONG",
+            "volume_status": "NORMAL",
+            "setup_structure": "CONSOLIDATION",
+            "entry_trigger_status": "WAITING",
+            "extension_risk": "HIGH"
+          },
+          "risk_assessment": {
+            "entry_price": 46.65,
+            "stop_loss": 42.92,
+            "take_profit": 54.11,
+            "risk_reward_ratio": 2.0,
+            "stop_distance_pct": 0.0,
+            "adr_20_pct": 2.9835249738467313,
+            "position_size_pct": 12.5,
+            "account_risk_pct": 1.0,
+            "risk_valid": false,
+            "risk_comments": "Stop loss % (8.00%) is wider than ADR 20-day (2.98%)"
+          },
+          "catalyst_assessment": {
+            "has_verified_catalyst": true,
+            "catalyst_strength": "MODERATE",
+            "catalyst_summary": "SG Americas Securities LLC Sells 465,522 Shares of MGM Resorts International $MGM",
+            "source_quality": "SECONDARY"
+          },
+          "hard_disqualifiers": [
+            "Stop loss % (8.00%) is wider than ADR 20-day (2.98%)"
+          ],
+          "soft_warnings": [],
+          "missing_data": [],
+          "recommended_action": {
+            "action": "KEEP_ON_WATCHLIST",
+            "entry_condition": "Breakout above recent consolidation level near $46.65.",
+            "stop_condition": "Close below $42.92.",
+            "target_logic": "2R default target.",
+            "next_check": "Next daily close."
+          },
+          "ai_notes_for_user": [
+            "Generated via rulebook-based fallback scoring model.",
+            "Please verify trend intensity and volume breakout metrics on daily chart."
+          ]
+        }
+      }
+    },
+    {
+      "symbol": "EHGO",
+      "name": "EHGO",
+      "entry_price": null,
+      "breakout_price": null,
+      "target_price": null,
+      "stop_loss": null,
+      "notes": "",
+      "added_date": "2026-07-03T16:07:32.270649",
+      "ai_analysis": null
+    }
+  ]
+}

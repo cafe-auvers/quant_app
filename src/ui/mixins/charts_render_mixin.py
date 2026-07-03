@@ -310,12 +310,12 @@ class ChartsRenderMixin:
             "set_target": "T",
             "draw_line": "D",
             "erase_drawing": "E",
-            "full_view": "A"
+            "full_view": "F"
         })
         target_cond_js = ChartsRenderMixin._get_js_key_condition(shortcuts.get("set_target", "T"))
         draw_cond_js = ChartsRenderMixin._get_js_key_condition(shortcuts.get("draw_line", "D"))
         erase_cond_js = ChartsRenderMixin._get_js_key_condition(shortcuts.get("erase_drawing", "E"))
-        full_view_cond_js = ChartsRenderMixin._get_js_key_condition(shortcuts.get("full_view", "A"))
+        full_view_cond_js = ChartsRenderMixin._get_js_key_condition(shortcuts.get("full_view", "F"))
 
         chart_history = ChartsRenderMixin._normalize_chart_history(history, symbol, max_rows=260)
         if chart_history.empty:
@@ -514,7 +514,7 @@ class ChartsRenderMixin:
         rs_sma_points_json = json.dumps(rs_sma_points)
         rs_markers_json = json.dumps(rs_markers)
         ti65_background_json = json.dumps(ti65_background)
-        show_rs_panel = bool(options.get("show_rs", True))
+        show_rs_panel = bool(options.get("show_rs", True)) and bool(rs_points)
         price_panel_height = "70%" if show_rs_panel else "100%"
         rs_panel_display = "block" if show_rs_panel else "none"
         rs_panel_height = "30%" if show_rs_panel else "0"
@@ -664,7 +664,11 @@ class ChartsRenderMixin:
                     rightPriceScale: {{ borderColor: '#374151' }},
                     localization: {{
                         timeFormatter: (time) => {{
-                            if (typeof time !== 'number') return String(time);
+                            if (typeof time === 'string') return time;
+                            if (typeof time !== 'number') {{
+                                const y = time.year || '', mo = String(time.month || '').padStart(2,'0'), d = String(time.day || '').padStart(2,'0');
+                                return `${{y}}-${{mo}}-${{d}}`;
+                            }}
                             const d = new Date((time + 32400) * 1000);
                             const yyyy = d.getUTCFullYear(), mm = String(d.getUTCMonth()+1).padStart(2,'0'), dd = String(d.getUTCDate()).padStart(2,'0');
                             const h = String(d.getUTCHours()).padStart(2,'0'), m = String(d.getUTCMinutes()).padStart(2,'0');
@@ -679,13 +683,23 @@ class ChartsRenderMixin:
                         rightOffset: 40,
                         rightBarStaysOnScroll: false,
                         tickMarkFormatter: (time, tickMarkType) => {{
-                            if (typeof time !== 'number') return time.year + '-' + String(time.month).padStart(2,'0') + '-' + String(time.day).padStart(2,'0');
-                            const d = new Date((time + 32400) * 1000);
                             const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-                            if (tickMarkType === 0) return String(d.getUTCFullYear());
-                            if (tickMarkType === 1) return months[d.getUTCMonth()];
-                            if (tickMarkType === 2) return String(d.getUTCDate());
-                            return String(d.getUTCHours()).padStart(2,'0') + ':' + String(d.getUTCMinutes()).padStart(2,'0');
+                            if (typeof time === 'number') {{
+                                const d = new Date((time + 32400) * 1000);
+                                if (tickMarkType === 0) return String(d.getUTCFullYear());
+                                if (tickMarkType === 1) return months[d.getUTCMonth()];
+                                if (tickMarkType === 2) return String(d.getUTCDate());
+                                return String(d.getUTCHours()).padStart(2,'0') + ':' + String(d.getUTCMinutes()).padStart(2,'0');
+                            }}
+                            let y, mo, dy;
+                            if (typeof time === 'string') {{
+                                const p = time.split('-'); y = p[0]; mo = parseInt(p[1]); dy = parseInt(p[2]);
+                            }} else {{
+                                y = time.year; mo = time.month; dy = time.day;
+                            }}
+                            if (tickMarkType === 0) return String(y);
+                            if (tickMarkType === 1) return months[(mo || 1) - 1] || String(mo);
+                            return String(mo).padStart(2,'0') + '-' + String(dy).padStart(2,'0');
                         }}
                     }},
                     crosshair: {{ mode: LightweightCharts.CrosshairMode.Normal }}
@@ -774,7 +788,11 @@ class ChartsRenderMixin:
                         rightPriceScale: {{ borderColor: '#374151' }},
                         localization: {{
                             timeFormatter: (time) => {{
-                                if (typeof time !== 'number') return String(time);
+                                if (typeof time === 'string') return time;
+                                if (typeof time !== 'number') {{
+                                    const y = time.year || '', mo = String(time.month || '').padStart(2,'0'), d = String(time.day || '').padStart(2,'0');
+                                    return `${{y}}-${{mo}}-${{d}}`;
+                                }}
                                 const d = new Date((time + 32400) * 1000);
                                 const yyyy = d.getUTCFullYear(), mm = String(d.getUTCMonth()+1).padStart(2,'0'), dd = String(d.getUTCDate()).padStart(2,'0');
                                 const h = String(d.getUTCHours()).padStart(2,'0'), m = String(d.getUTCMinutes()).padStart(2,'0');
@@ -789,13 +807,23 @@ class ChartsRenderMixin:
                             rightOffset: 40,
                             rightBarStaysOnScroll: false,
                             tickMarkFormatter: (time, tickMarkType) => {{
-                                if (typeof time !== 'number') return time.year + '-' + String(time.month).padStart(2,'0') + '-' + String(time.day).padStart(2,'0');
-                                const d = new Date((time + 32400) * 1000);
                                 const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-                                if (tickMarkType === 0) return String(d.getUTCFullYear());
-                                if (tickMarkType === 1) return months[d.getUTCMonth()];
-                                if (tickMarkType === 2) return String(d.getUTCDate());
-                                return String(d.getUTCHours()).padStart(2,'0') + ':' + String(d.getUTCMinutes()).padStart(2,'0');
+                                if (typeof time === 'number') {{
+                                    const d = new Date((time + 32400) * 1000);
+                                    if (tickMarkType === 0) return String(d.getUTCFullYear());
+                                    if (tickMarkType === 1) return months[d.getUTCMonth()];
+                                    if (tickMarkType === 2) return String(d.getUTCDate());
+                                    return String(d.getUTCHours()).padStart(2,'0') + ':' + String(d.getUTCMinutes()).padStart(2,'0');
+                                }}
+                                let y, mo, dy;
+                                if (typeof time === 'string') {{
+                                    const p = time.split('-'); y = p[0]; mo = parseInt(p[1]); dy = parseInt(p[2]);
+                                }} else {{
+                                    y = time.year; mo = time.month; dy = time.day;
+                                }}
+                                if (tickMarkType === 0) return String(y);
+                                if (tickMarkType === 1) return months[(mo || 1) - 1] || String(mo);
+                                return String(mo).padStart(2,'0') + '-' + String(dy).padStart(2,'0');
                             }}
                         }},
                         crosshair: {{ mode: LightweightCharts.CrosshairMode.Normal }}
@@ -1312,7 +1340,7 @@ class ChartsRenderMixin:
             "set_target": "T",
             "draw_line": "D",
             "erase_drawing": "E",
-            "full_view": "A",
+            "full_view": "F",
             "prev_symbol": "Up",
             "next_symbol": "Down",
             "pan_left": "Left",
@@ -1321,7 +1349,7 @@ class ChartsRenderMixin:
         target_cond_js = ChartsRenderMixin._get_js_key_condition(shortcuts.get("set_target", "T"))
         draw_cond_js = ChartsRenderMixin._get_js_key_condition(shortcuts.get("draw_line", "D"))
         erase_cond_js = ChartsRenderMixin._get_js_key_condition(shortcuts.get("erase_drawing", "E"))
-        full_view_cond_js = ChartsRenderMixin._get_js_key_condition(shortcuts.get("full_view", "A"))
+        full_view_cond_js = ChartsRenderMixin._get_js_key_condition(shortcuts.get("full_view", "F"))
         prev_symbol_cond_js = ChartsRenderMixin._get_js_key_condition(shortcuts.get("prev_symbol", "Up"))
         next_symbol_cond_js = ChartsRenderMixin._get_js_key_condition(shortcuts.get("next_symbol", "Down"))
         pan_left_cond_js = ChartsRenderMixin._get_js_key_condition(shortcuts.get("pan_left", "Left"))

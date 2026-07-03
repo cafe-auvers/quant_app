@@ -31,6 +31,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from src.utils.config import get_mysql_config
 from src.utils.data_loader import download_price_history, _extract_symbol_history, compute_stock_metrics
 
+_ensured_engines: set = set()
 
 def _utcnow_naive() -> dt.datetime:
     """Return a naive UTC timestamp for existing DB columns and comparisons."""
@@ -95,10 +96,13 @@ def _get_price_history_table(metadata: MetaData) -> Table:
 
 
 def _ensure_price_history_table(engine: Engine) -> Table:
+    engine_key = id(engine)
     metadata = MetaData()
     price_history = _get_price_history_table(metadata)
-    metadata.create_all(engine)
-    _ensure_price_history_interval_column(engine)
+    if engine_key not in _ensured_engines:
+        metadata.create_all(engine)
+        _ensure_price_history_interval_column(engine)
+        _ensured_engines.add(engine_key)
     return price_history
 
 

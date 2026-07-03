@@ -922,7 +922,7 @@ class ScannerMixin:
             row = self.scanner_table.rowCount()
             self.scanner_table.insertRow(row)
             self.scanner_table.setItem(row, 0, QTableWidgetItem(stock["symbol"]))
-            self.scanner_table.setItem(row, 1, QTableWidgetItem(stock["name"]))
+            self.scanner_table.setItem(row, 1, QTableWidgetItem(stock.get("name", stock["symbol"])))
             self.scanner_table.setItem(row, 2, QTableWidgetItem(f"{stock['price']:.2f}"))
             self.scanner_table.setItem(row, 3, QTableWidgetItem(str(stock["volume"])))
             self.scanner_table.setItem(row, 4, QTableWidgetItem(f"{stock['dollar_volume']:.0f}"))

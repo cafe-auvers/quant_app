@@ -174,6 +174,7 @@ class SidebarMixin:
             return
 
         current_symbol = self._get_sidebar_selected_symbol()
+        current_row = self.sidebar_stock_list.currentRow()
         self.sidebar_stock_list.clear()
         source = self.sidebar_source_combo.currentData() or {}
 
@@ -235,7 +236,9 @@ class SidebarMixin:
                     self.sidebar_stock_list.setCurrentRow(row)
                     break
         if self.sidebar_stock_list.currentRow() < 0 and self.sidebar_stock_list.count() > 0:
-            self.sidebar_stock_list.setCurrentRow(0)
+            # Symbol no longer in list (e.g. removed) — stay at same position rather than jumping to top
+            restore = min(current_row, self.sidebar_stock_list.count() - 1) if current_row >= 0 else 0
+            self.sidebar_stock_list.setCurrentRow(restore)
         self.on_sidebar_selection_changed()
     def _get_sidebar_selected_data(self) -> Optional[dict]:
         if not hasattr(self, "sidebar_stock_list"):

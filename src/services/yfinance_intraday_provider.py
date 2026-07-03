@@ -14,7 +14,6 @@ from src.services.intraday_provider import (
     normalize_ohlcv_frame,
 )
 from src.utils.data_loader import _extract_symbol_history, download_price_history
-from src.utils.intraday_helpers import extract_latest_opening_bar
 
 
 def fetch_yfinance_intraday(request: IntradayRequest) -> IntradayResult:
@@ -59,6 +58,12 @@ def _download_5m_with_retries(symbol: str, days: int, attempts: int = 3) -> pd.D
 def _download_opening_1m_bar(symbol: str) -> pd.DataFrame:
     try:
         history = download_price_history([symbol], period="1d", interval="1m", max_symbols=1)
-        return extract_latest_opening_bar(history, symbol)
+        bars = _extract_symbol_history(history, symbol)
+        if bars is None or bars.empty:
+            return pd.DataFrame()
+        bars = bars.sort_index()
+        session_dates = pd.to_datetime(bars.index).date
+        latest_date = session_dates[-1]
+        return bars[session_dates == latest_date]
     except Exception:
         return pd.DataFrame()
