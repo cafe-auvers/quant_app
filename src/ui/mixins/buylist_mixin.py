@@ -387,8 +387,8 @@ class BuylistMixin:
         cap_lbl = getattr(self, f"buylist_{env.lower()}_capital_label", None)
         pnl_lbl = getattr(self, f"buylist_{env.lower()}_pnl_label", None)
         if pos_lbl:
-            pos_lbl.setText(f"Positions: {bought_count} / 5")
-            pos_lbl.setStyleSheet(f"font-weight: bold; color: {'#f44336' if bought_count >= 5 else '#4CAF50'};")
+            pos_lbl.setText(f"Positions: {bought_count} / 30")
+            pos_lbl.setStyleSheet(f"font-weight: bold; color: {'#f44336' if bought_count >= 30 else '#4CAF50'};")
         if cap_lbl:
             cap_lbl.setText(f"Capital: {total_capital:.1f}%")
         if pnl_lbl:
@@ -434,7 +434,7 @@ class BuylistMixin:
                 return " | ".join(dict.fromkeys(alerts))
             bought_count = sum(1 for it in self.buylist_manager.items
                                if it.monitoring_status == "BOUGHT" and it.environment == item.environment)
-            if bought_count >= 5:
+            if bought_count >= 30:
                 alerts.append("MAX POSITIONS")
             # Show where price stands relative to ORB high and daily breakout trigger
             bp = getattr(item, "breakout_price", None) or 0.0
@@ -1339,8 +1339,8 @@ class BuylistMixin:
             QMessageBox.information(self, "Activated", msg)
             return
         bought_count = sum(1 for it in self.buylist_manager.items if it.monitoring_status == "BOUGHT" and it.environment == env)
-        if bought_count >= 5:
-            QMessageBox.warning(self, "Max positions", "Already holding 5 positions. Sell one before activating another.")
+        if bought_count >= 30:
+            QMessageBox.warning(self, "Max positions", "Already holding 30 positions. Sell one before activating another.")
             return
         item.monitoring_status = "ACTIVE"
         self._clear_buylist_auto_order_block(item)
@@ -1678,7 +1678,7 @@ class BuylistMixin:
                         f"setup stale, skipping auto-buy."
                     )
                 elif (
-                    bought_count < 5
+                    bought_count < 30
                     and current_price >= entry_trigger
                     and not auto_order_blocked
                     and not getattr(item, "_buy_order_pending", False)

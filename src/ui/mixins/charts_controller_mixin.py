@@ -958,9 +958,9 @@ class ChartsControllerMixin:
                     1 for it in buylist_manager.items
                     if str(getattr(it, "monitoring_status", "")).upper() == "BOUGHT" and it.environment == env
                 )
-                if bought_count >= 5:
+                if bought_count >= 30:
                     from PyQt5.QtWidgets import QMessageBox
-                    QMessageBox.warning(self, "Max positions", "Already holding 5 positions.")
+                    QMessageBox.warning(self, "Max positions", "Already holding 30 positions.")
                     return
                 item.monitoring_status = "ACTIVE"
                 self._clear_buylist_auto_order_block(item)
