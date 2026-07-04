@@ -167,16 +167,6 @@ class ScannerMixin:
         self.scanner_metrics_details.setHtml("<i>Select a symbol to view detailed computed metrics.</i>")
         form_layout.addRow("Metrics Details", self.scanner_metrics_details)
 
-        self.scanner_preview_label = QLabel("Preview chart")
-        form_layout.addRow(self.scanner_preview_label)
-        if QWebEngineView is not None:
-            self.scanner_preview_chart = QWebEngineView()
-        else:
-            self.scanner_preview_chart = QTextEdit()
-            self.scanner_preview_chart.setReadOnly(True)
-        self.scanner_preview_chart.setMinimumHeight(260)
-        self.scanner_preview_chart.setMaximumHeight(320)
-        form_layout.addRow(self.scanner_preview_chart)
  
         form_group.setLayout(form_layout)
         layout.addWidget(form_group, 1)
@@ -955,37 +945,9 @@ class ScannerMixin:
         self.selected_scan_symbol = symbol_item.text()
         self.scanner_selection_label.setText(f"Selected symbol: {self.selected_scan_symbol}")
         self._set_chart_symbol(self.selected_scan_symbol)
-        self.update_scanner_preview_chart(self.selected_scan_symbol)
         self.update_scanner_metrics_details(self.selected_scan_symbol)
     def update_scanner_preview_chart(self, symbol: str) -> None:
-        """Render a compact chart preview for the selected scanner symbol."""
-        symbol = symbol.strip().upper()
-        if not symbol:
-            return
-
-        if not self.db_enabled or self.db_engine is None:
-            self._set_html_or_text(
-                self.scanner_preview_chart,
-                self._generate_message_html("Database unavailable", "Configure MySQL to show scanner previews."),
-                "Database unavailable. Configure MySQL to show scanner previews.",
-            )
-            return
-
-        history = load_symbol_history_from_db(symbol, self.db_engine)
-        chart_history = self._normalize_chart_history(history, symbol)
-        if chart_history.empty:
-            self._set_html_or_text(
-                self.scanner_preview_chart,
-                self._generate_message_html(symbol, "No cached history found. Run Update 1D Data first."),
-                f"{symbol}: no cached history found. Run Update 1D Data first.",
-            )
-            return
-
-        self._set_html_or_text(
-            self.scanner_preview_chart,
-            self._generate_local_chart_html(symbol, chart_history, compact=True),
-            f"{symbol} preview loaded. Latest close: {float(chart_history['Close'].iloc[-1]):.2f}",
-        )
+        pass
     def _get_scanner_stock(self, symbol: str) -> Optional[dict]:
         return next((item for item in self.scanner_results if item["symbol"] == symbol), None)
     def load_scanner_item_to_trade_plan(self, row: int, column: int) -> None:

@@ -19,7 +19,7 @@
           "current_price": 1745.0,
           "stop_loss": 1995.0,
           "shares": 3,
-          "capital_percent": 13.776334388962782,
+          "capital_percent": 13.775898770422318,
           "stop_loss_percent": 2.5688611056846997,
           "stop_adr": 28.51079340120018,
           "risk_percent": 0.0025,
@@ -40,7 +40,7 @@
           "current_price": 1745.0,
           "stop_loss": 1991.57,
           "shares": 4,
-          "capital_percent": 18.372034139868322,
+          "capital_percent": 18.371453201683213,
           "stop_loss_percent": 2.755371093750003,
           "stop_adr": 30.580795444215603,
           "risk_percent": 0.005,
@@ -61,7 +61,7 @@
           "current_price": 1745.0,
           "stop_loss": 1976.0,
           "shares": 3,
-          "capital_percent": 13.809570905802731,
+          "capital_percent": 13.809134236297435,
           "stop_loss_percent": 3.729038167343875,
           "stop_adr": 41.38714877930062,
           "risk_percent": 0.005,
@@ -99,7 +99,7 @@
       "locked_reason": null,
       "order_status": null,
       "order_id": null,
-      "last_updated": "2026-07-04T03:54:47.450167",
+      "last_updated": "2026-07-04T04:24:28.568538",
       "warnings": []
     },
     "SIM:DELL": {
@@ -664,7 +664,7 @@
           "current_price": 539.0,
           "stop_loss": 583.913,
           "shares": 13,
-          "capital_percent": 18.281729469554605,
+          "capital_percent": 18.281151386874274,
           "stop_loss_percent": 6.880310596607687,
           "stop_adr": 86.59695403374718,
           "risk_percent": 0.0125,
@@ -685,7 +685,7 @@
           "current_price": 539.0,
           "stop_loss": 583.0,
           "shares": 13,
-          "capital_percent": 18.281729469554605,
+          "capital_percent": 18.281151386874274,
           "stop_loss_percent": 7.025911527611618,
           "stop_adr": 88.42951623459243,
           "risk_percent": 0.0125,
@@ -706,7 +706,7 @@
           "current_price": 539.0,
           "stop_loss": 583.0,
           "shares": 13,
-          "capital_percent": 18.281729469554605,
+          "capital_percent": 18.281151386874274,
           "stop_loss_percent": 7.025911527611618,
           "stop_adr": 88.42951623459243,
           "risk_percent": 0.0125,
@@ -724,7 +724,7 @@
       "locked_reason": null,
       "order_status": null,
       "order_id": null,
-      "last_updated": "2026-07-04T03:54:47.523417",
+      "last_updated": "2026-07-04T04:24:28.894749",
       "warnings": []
     },
     "SIM:AMAT": {
@@ -745,7 +745,7 @@
           "current_price": 603.04,
           "stop_loss": 648.444,
           "shares": 15,
-          "capital_percent": 22.32070446614013,
+          "capital_percent": 22.319998667890236,
           "stop_loss_percent": 2.271071313841171,
           "stop_adr": 33.93112620595626,
           "risk_percent": 0.005,
@@ -766,7 +766,7 @@
           "current_price": 603.04,
           "stop_loss": 641.06,
           "shares": 10,
-          "capital_percent": 14.88046964409342,
+          "capital_percent": 14.879999111926823,
           "stop_loss_percent": 3.3839359704940177,
           "stop_adr": 50.55797138025832,
           "risk_percent": 0.005,
@@ -787,7 +787,7 @@
           "current_price": 603.04,
           "stop_loss": 632.13,
           "shares": 11,
-          "capital_percent": 16.368516608502762,
+          "capital_percent": 16.367999023119506,
           "stop_loss_percent": 4.729802896809002,
           "stop_adr": 70.66600596943982,
           "risk_percent": 0.0075,
@@ -805,7 +805,7 @@
       "locked_reason": null,
       "order_status": null,
       "order_id": null,
-      "last_updated": "2026-07-04T03:54:47.593177",
+      "last_updated": "2026-07-04T04:24:29.183993",
       "warnings": []
     },
     "SIM:HPE": {
@@ -826,7 +826,7 @@
           "current_price": 41.23,
           "stop_loss": 43.18,
           "shares": 41,
-          "capital_percent": 4.980383300915394,
+          "capital_percent": 4.98022581727401,
           "stop_loss_percent": 20.27931410670275,
           "stop_adr": 368.27493279010366,
           "risk_percent": 0.01,
@@ -850,7 +850,7 @@
           "current_price": 41.23,
           "stop_loss": 43.18,
           "shares": 41,
-          "capital_percent": 4.980383300915394,
+          "capital_percent": 4.98022581727401,
           "stop_loss_percent": 20.27931410670275,
           "stop_adr": 368.27493279010366,
           "risk_percent": 0.01,
@@ -874,7 +874,7 @@
           "current_price": 41.23,
           "stop_loss": 43.18,
           "shares": 41,
-          "capital_percent": 4.980383300915394,
+          "capital_percent": 4.98022581727401,
           "stop_loss_percent": 20.27931410670275,
           "stop_adr": 368.27493279010366,
           "risk_percent": 0.01,
@@ -895,7 +895,7 @@
       "locked_reason": null,
       "order_status": null,
       "order_id": null,
-      "last_updated": "2026-07-04T03:54:47.665345",
+      "last_updated": "2026-07-04T04:24:29.516072",
       "warnings": []
     },
     "SIM:MU": {
@@ -916,7 +916,7 @@
           "current_price": 975.56,
           "stop_loss": 1027.18,
           "shares": 7,
-          "capital_percent": 17.246618094704335,
+          "capital_percent": 17.246072743060694,
           "stop_loss_percent": 6.500788505344296,
           "stop_adr": 87.06929560107646,
           "risk_percent": 0.01,
@@ -937,7 +937,7 @@
           "current_price": 975.56,
           "stop_loss": 1026.99,
           "shares": 7,
-          "capital_percent": 17.246618094704335,
+          "capital_percent": 17.246072743060694,
           "stop_loss_percent": 6.518083283459125,
           "stop_adr": 87.30093583161113,
           "risk_percent": 0.01,
@@ -958,7 +958,7 @@
           "current_price": 975.56,
           "stop_loss": 1026.99,
           "shares": 7,
-          "capital_percent": 17.246618094704335,
+          "capital_percent": 17.246072743060694,
           "stop_loss_percent": 6.518083283459125,
           "stop_adr": 87.30093583161113,
           "risk_percent": 0.01,
@@ -976,7 +976,7 @@
       "locked_reason": null,
       "order_status": null,
       "order_id": null,
-      "last_updated": "2026-07-04T03:54:47.734293",
+      "last_updated": "2026-07-04T04:24:29.802464",
       "warnings": []
     },
     "SIM:MGM": {
@@ -997,7 +997,7 @@
           "current_price": 47.1,
           "stop_loss": 47.6,
           "shares": 3108,
-          "capital_percent": 332.7840965285332,
+          "capital_percent": 332.77357363337643,
           "stop_loss_percent": 0.30056447474524484,
           "stop_adr": 11.316035744522845,
           "risk_percent": 0.01,
@@ -1005,9 +1005,9 @@
           "status": "RISK_INVALID",
           "valid": false,
           "warnings": [
-            "Capital allocation (332.78%) exceeds 30%"
+            "Capital allocation (332.77%) exceeds 30%"
           ],
-          "reason": "Capital allocation (332.78%) exceeds 30%"
+          "reason": "Capital allocation (332.77%) exceeds 30%"
         },
         "5m": {
           "symbol": "MGM",
@@ -1020,7 +1020,7 @@
           "current_price": 47.1,
           "stop_loss": 47.6,
           "shares": 2347,
-          "capital_percent": 251.546002636046,
+          "capital_percent": 251.53804855338265,
           "stop_loss_percent": 0.39757271395689,
           "stop_adr": 14.968326000590663,
           "risk_percent": 0.01,
@@ -1028,9 +1028,9 @@
           "status": "RISK_INVALID",
           "valid": false,
           "warnings": [
-            "Capital allocation (251.55%) exceeds 30%"
+            "Capital allocation (251.54%) exceeds 30%"
           ],
-          "reason": "Capital allocation (251.55%) exceeds 30%"
+          "reason": "Capital allocation (251.54%) exceeds 30%"
         },
         "30m": {
           "symbol": "MGM",
@@ -1043,7 +1043,7 @@
           "current_price": 47.1,
           "stop_loss": 47.6,
           "shares": 1652,
-          "capital_percent": 177.35391126747072,
+          "capital_percent": 177.34830319715314,
           "stop_loss_percent": 0.5640275746814206,
           "stop_adr": 21.235231480371286,
           "risk_percent": 0.01,
@@ -1063,7 +1063,7 @@
       "locked_reason": null,
       "order_status": null,
       "order_id": null,
-      "last_updated": "2026-07-04T03:54:47.813955",
+      "last_updated": "2026-07-04T04:24:30.108763",
       "warnings": []
     },
     "SIM:PANW": {
@@ -1185,7 +1185,7 @@
           "current_price": 2.79,
           "stop_loss": 2.76,
           "shares": 3279,
-          "capital_percent": 20.796398076587966,
+          "capital_percent": 20.795740478106303,
           "stop_loss_percent": 2.4045261669024067,
           "stop_adr": 17.796070468892513,
           "risk_percent": 0.005,
@@ -1206,7 +1206,7 @@
           "current_price": 2.79,
           "stop_loss": 2.76,
           "shares": 2478,
-          "capital_percent": 15.838478601805672,
+          "capital_percent": 15.837977776641523,
           "stop_loss_percent": 3.157894736842116,
           "stop_adr": 23.371805241189545,
           "risk_percent": 0.005,
@@ -1227,7 +1227,7 @@
           "current_price": 2.79,
           "stop_loss": 2.76,
           "shares": 2787,
-          "capital_percent": 18.251019129835694,
+          "capital_percent": 18.250442018240484,
           "stop_loss_percent": 5.479452054794526,
           "stop_adr": 40.55381731347947,
           "risk_percent": 0.01,
@@ -1245,7 +1245,7 @@
       "locked_reason": null,
       "order_status": null,
       "order_id": null,
-      "last_updated": "2026-07-04T03:54:47.869059",
+      "last_updated": "2026-07-04T04:24:30.346330",
       "warnings": []
     },
     "SIM:AIIO": {
@@ -1266,7 +1266,7 @@
           "current_price": 4.17,
           "stop_loss": 4.04,
           "shares": 1593,
-          "capital_percent": 15.433585163864775,
+          "capital_percent": 15.433097141749935,
           "stop_loss_percent": 6.481481481481486,
           "stop_adr": 38.22078574161628,
           "risk_percent": 0.01,
@@ -1287,7 +1287,7 @@
           "current_price": 4.17,
           "stop_loss": 3.82,
           "shares": 1784,
-          "capital_percent": 17.284065243147996,
+          "capital_percent": 17.283518707396038,
           "stop_loss_percent": 11.574074074074083,
           "stop_adr": 68.25140311002907,
           "risk_percent": 0.02,
@@ -1308,7 +1308,7 @@
           "current_price": 4.17,
           "stop_loss": 3.82,
           "shares": 1784,
-          "capital_percent": 17.284065243147996,
+          "capital_percent": 17.283518707396038,
           "stop_loss_percent": 11.574074074074083,
           "stop_adr": 68.25140311002907,
           "risk_percent": 0.02,
@@ -1326,7 +1326,7 @@
       "locked_reason": null,
       "order_status": null,
       "order_id": null,
-      "last_updated": "2026-07-04T03:54:47.936358",
+      "last_updated": "2026-07-04T04:24:30.621148",
       "warnings": []
     }
   }

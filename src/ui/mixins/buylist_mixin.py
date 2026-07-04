@@ -296,8 +296,19 @@ class BuylistMixin:
 
             days_held = 0
             if item.buy_date:
-                from datetime import datetime as _dt
-                days_held = (_dt.now() - item.buy_date).days
+                buy_date = item.buy_date.date() if hasattr(item.buy_date, "date") else item.buy_date
+                today = dt.date.today()
+                if hasattr(self, "_nyse_holidays"):
+                    holidays: set = set()
+                    for y in range(buy_date.year, today.year + 1):
+                        holidays |= self._nyse_holidays(y)
+                    d = buy_date
+                    while d < today:
+                        if d.weekday() < 5 and d not in holidays:
+                            days_held += 1
+                        d += dt.timedelta(days=1)
+                else:
+                    days_held = (today - buy_date).days
 
             # For BOUGHT positions use the frozen position_percent snapshotted at fill time —
             # account_size_input can change (e.g. KIS balance load) and would give nonsense %.
