@@ -21,117 +21,12 @@ from src.utils.data_loader import download_price_history, _extract_symbol_histor
 from src.utils.db_loader import (
     load_symbol_history_from_db,
     prune_intraday_history,
-    refresh_chart_indicators_to_db,
-    refresh_universe_history_to_db,
-    refresh_universe_hourly_history_to_db,
     save_intraday_history_to_db,
 )
 from src.utils.intraday_helpers import (
     intraday_cache_needs_backfill,
     utcnow_naive as _utcnow_naive,
 )
-
-
-REFERENCE_SYMBOL = "SPY"
-
-
-class RefreshWorker(QThread):
-    log_message = pyqtSignal(str)
-    progress_changed = pyqtSignal(int, int, int, str)
-    daily_data_finished = pyqtSignal(list)
-    finished_refresh = pyqtSignal(list)
-    error_occurred = pyqtSignal(str)
-
-    def __init__(self, tickers, engine, period="3mo", interval="1d", hourly_period="730d", refresh_hourly=False):
-        super().__init__()
-        self.tickers = tickers
-        self.engine = engine
-        self.period = period
-        self.interval = interval
-        self.hourly_period = hourly_period
-        self.refresh_hourly = refresh_hourly
-        self.daily_update_complete = False
-
-    def run(self) -> None:
-        try:
-            daily_updated = refresh_universe_history_to_db(
-                self.tickers,
-                engine=self.engine,
-                period=self.period,
-                interval=self.interval,
-                progress_callback=self._progress_callback,
-                log_callback=self._log_callback,
-            )
-            self.daily_update_complete = True
-            self.daily_data_finished.emit(daily_updated)
-            self._log_callback("1D data update complete. Calculating chart indicators and scanner metrics...")
-            indicator_updated = refresh_chart_indicators_to_db(
-                self.tickers,
-                engine=self.engine,
-                reference_symbol=REFERENCE_SYMBOL,
-                log_callback=self._log_callback,
-            )
-            self._log_callback(f"Calculated chart indicators for {len(indicator_updated)} symbols.")
-            
-            from src.utils.db_loader import refresh_scanner_metrics_to_db
-            refresh_scanner_metrics_to_db(self.tickers, self.engine, log_callback=self._log_callback)
-
-            hourly_updated = []
-            if self.refresh_hourly:
-                self._log_callback("Starting 1-hour price history refresh...")
-                hourly_updated = refresh_universe_hourly_history_to_db(
-                    self.tickers,
-                    engine=self.engine,
-                    full_period=self.hourly_period,
-                    progress_callback=self._progress_callback,
-                    log_callback=self._log_callback,
-                )
-                self._log_callback(f"Saved 1-hour price history for {len(hourly_updated)} symbols.")
-            else:
-                self._log_callback("Skipped broad 1-hour refresh. Use the 1H refresh or intraday tools for prioritized symbols.")
-            self.finished_refresh.emit(sorted(set(daily_updated) | set(hourly_updated)))
-        except Exception as exc:
-            self.error_occurred.emit(str(exc))
-
-    def _log_callback(self, message: str) -> None:
-        self.log_message.emit(message)
-
-    def _progress_callback(self, symbol: str, index: int, total: int, percent: int, eta: str) -> None:
-        self.progress_changed.emit(percent, index, total, eta)
-
-
-class HourlyRefreshWorker(QThread):
-    log_message = pyqtSignal(str)
-    progress_changed = pyqtSignal(int, int, int, str)
-    finished_refresh = pyqtSignal(list)
-    error_occurred = pyqtSignal(str)
-
-    def __init__(self, tickers, engine, full_period="730d", backfill=False):
-        super().__init__()
-        self.tickers = tickers
-        self.engine = engine
-        self.full_period = full_period
-        self.backfill = backfill
-
-    def run(self) -> None:
-        try:
-            updated = refresh_universe_hourly_history_to_db(
-                self.tickers,
-                engine=self.engine,
-                full_period=self.full_period,
-                backfill=self.backfill,
-                progress_callback=self._progress_callback,
-                log_callback=self._log_callback,
-            )
-            self.finished_refresh.emit(updated)
-        except Exception as exc:
-            self.error_occurred.emit(str(exc))
-
-    def _log_callback(self, message: str) -> None:
-        self.log_message.emit(message)
-
-    def _progress_callback(self, symbol: str, index: int, total: int, percent: int, eta: str) -> None:
-        self.progress_changed.emit(percent, index, total, eta)
 
 
 class KisAccountWorker(QThread):

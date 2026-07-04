@@ -60,10 +60,10 @@ from src.ui.filter_catalog import (
     FILTER_CATALOG, SCANNER_METRICS_LABELS,
 )
 from src.ui.workers import (
-    FxRateWorker, HourlyRefreshWorker, IntradayBulkFetchWorker, IntradayFetchWorker,
+    FxRateWorker, IntradayBulkFetchWorker, IntradayFetchWorker,
     KisAccountWorker, KisOrderCancelWorker, KisOrderQueryWorker, KisOrderWorker,
     KisStartupAccountsWorker, OrderReconciliationWorker,
-    RefreshWorker, ScannerWorker, SingleStockAiWorker, WatchlistAiWorker,
+    ScannerWorker, SingleStockAiWorker, WatchlistAiWorker,
 )
 from src.services.order_ledger import (
     append_order, find_open_orders, has_open_order, load_order_ledger,
@@ -169,6 +169,7 @@ class BuylistMixin:
         for col, width in enumerate([65, 120, 80, 62, 70, 72, 70, 70, 60, 55, 65, 52, 48, 170]):
             table.setColumnWidth(col, width)
         layout.addWidget(table, 1)
+        table.cellDoubleClicked.connect(self._buylist_show_tradingview_chart)
 
         if is_prod:
             self.buylist_prod_table = table
@@ -216,6 +217,22 @@ class BuylistMixin:
 
         panel.setLayout(layout)
         return panel
+
+    def _buylist_show_tradingview_chart(self, row: int, column: int) -> None:
+        """Buy Dashboard double-click: jump to the TradingView tab for the selected symbol."""
+        table = self.sender()
+        symbol_item = table.item(row, 0) if table is not None else None
+        if symbol_item is None:
+            return
+        symbol = symbol_item.text().strip().upper()
+        if not symbol:
+            return
+        self._set_chart_symbol(symbol)
+        if hasattr(self, "tradingview_symbol_combo"):
+            self._set_tradingview_symbol(symbol)
+        self.tabs.setCurrentWidget(self.tradingview_widget)
+        self.load_tradingview_chart(force=True)
+
     def _build_buylist_tab(self) -> None:
         """Build the Buylist Dashboard tab — PROD and SIM panels each with their own monitor."""
         layout = QVBoxLayout()

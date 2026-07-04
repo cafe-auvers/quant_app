@@ -53,6 +53,8 @@ config/kis_config.py
 # Data
 data/*.csv
 data/*.json
+data/*.lock
+data/refresh_status_*.json.bak
 data/cache/
 
 # Logs

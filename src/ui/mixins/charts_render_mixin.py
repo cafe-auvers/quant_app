@@ -58,9 +58,9 @@ from src.ui.filter_catalog import (
     FILTER_CATALOG, SCANNER_METRICS_LABELS,
 )
 from src.ui.workers import (
-    FxRateWorker, HourlyRefreshWorker, IntradayBulkFetchWorker, IntradayFetchWorker,
+    FxRateWorker, IntradayBulkFetchWorker, IntradayFetchWorker,
     KisAccountWorker, KisOrderWorker, KisStartupAccountsWorker, OrderReconciliationWorker,
-    RefreshWorker, ScannerWorker, SingleStockAiWorker, WatchlistAiWorker,
+    ScannerWorker, SingleStockAiWorker, WatchlistAiWorker,
 )
 from src.services.order_ledger import (
     append_order, find_open_orders, has_open_order, load_order_ledger,

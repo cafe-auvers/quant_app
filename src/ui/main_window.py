@@ -34,6 +34,7 @@ from src.core.trade_reviewer import TradeReviewer
 from src.utils.data_loader import get_default_universe
 from src.utils.db_loader import init_mysql_engine
 from src.utils.storage import load_json
+from src.services.historical_refresh_control import MODE_1D, MODE_1H, reconcile_stale_status
 from src.services.app_state import (
     SETTINGS_FILE,
     SaveResult,
@@ -194,8 +195,8 @@ class MainWindow(
         self.running_scanner_setup_name: Optional[str] = None
         self.running_scanner_show_warnings = True
         self.scanner_worker = None
-        self.refresh_worker = None
-        self.hourly_refresh_worker = None
+        self._refresh_last_finished_at: Dict[str, Optional[str]] = {}
+        self._refresh_last_log_count: Dict[str, int] = {}
         self.kis_account_worker = None
         self.kis_startup_worker = None
         self.order_reconciliation_worker = None
@@ -239,6 +240,16 @@ class MainWindow(
         # Create menu bar
         self._create_menu_bar()
         self._setup_live_data_timer()
+
+        # Recover historical.py refresh state (e.g. main.py was restarted mid-refresh)
+        # before the window is shown, then keep polling it live for the rest of the session.
+        for _mode in (MODE_1D, MODE_1H):
+            reconcile_stale_status(_mode)
+        self._refresh_poll_timer = QTimer(self)
+        self._refresh_poll_timer.setInterval(2000)
+        self._refresh_poll_timer.timeout.connect(self._poll_refresh_status)
+        self._refresh_poll_timer.start()
+        self._poll_refresh_status()
 
         # Run initial scans
         self.run_all_scanners(show_warnings=False)
@@ -743,13 +754,13 @@ class MainWindow(
             self.live_data_timer.stop()
         if hasattr(self, "market_status_timer") and self.market_status_timer is not None:
             self.market_status_timer.stop()
+        if hasattr(self, "_refresh_poll_timer") and self._refresh_poll_timer is not None:
+            self._refresh_poll_timer.stop()
         running_workers = [
             worker for worker in [
                 self.scanner_worker,
                 self.intraday_fetch_worker,
                 self.intraday_bulk_worker,
-                self.refresh_worker,
-                self.hourly_refresh_worker,
                 self.kis_account_worker,
                 self.kis_startup_worker,
                 self.order_reconciliation_worker,

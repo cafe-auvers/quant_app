@@ -127,7 +127,7 @@
       "timing_score": 0.0,
       "rr": 0.0,
       "stop_adr": 91.44202276560027,
-      "position_percent": 18.281151386874274,
+      "position_percent": 18.184636469999997,
       "ai_summary": "Execution queue ARMED; selected ORB 1m; entry 627.06",
       "warnings": [
         "1m: ORB window has not completed",
@@ -167,7 +167,7 @@
       "timing_score": 0.0,
       "rr": 0.0,
       "stop_adr": 53.46259968876604,
-      "position_percent": 16.367999023119506,
+      "position_percent": 15.924308399999997,
       "ai_summary": "Execution queue ARMED; selected ORB 30m; entry 663.51",
       "warnings": [
         "1m: ORB window has not completed",
@@ -207,7 +207,7 @@
       "timing_score": 0.0,
       "rr": 0.0,
       "stop_adr": 372.69769529887435,
-      "position_percent": 4.98022581727401,
+      "position_percent": 4.98309812,
       "ai_summary": "Execution queue REJECTED; selected ORB 1m; entry 54.16",
       "warnings": [
         "1m: ORB window has not completed",
@@ -247,7 +247,7 @@
       "timing_score": 0.0,
       "rr": 0.0,
       "stop_adr": 90.13956840458668,
-      "position_percent": 17.246072743060694,
+      "position_percent": 16.478962499999998,
       "ai_summary": "Execution queue ARMED; selected ORB 1m; entry 1098.60",
       "warnings": [
         "1m: ORB window has not completed",
@@ -287,7 +287,7 @@
       "timing_score": 0.0,
       "rr": 0.0,
       "stop_adr": 11.364686637229218,
-      "position_percent": 332.77357363337643,
+      "position_percent": 332.7244515,
       "ai_summary": "Execution queue REJECTED; selected ORB 1m; entry 47.74",
       "warnings": [
         "1m: ORB window has not completed",
@@ -327,7 +327,7 @@
       "timing_score": 0.0,
       "rr": 0.0,
       "stop_adr": 40.89910039439432,
-      "position_percent": 18.250442018240484,
+      "position_percent": 18.25,
       "ai_summary": "Execution queue ARMED; selected ORB 30m; entry 2.92",
       "warnings": [
         "1m: ORB window has not completed",
@@ -367,7 +367,7 @@
       "timing_score": 0.0,
       "rr": 0.0,
       "stop_adr": 68.25140311002907,
-      "position_percent": 17.283518707396038,
+      "position_percent": 17.28,
       "ai_summary": "Execution queue ARMED; selected ORB 5m; entry 4.32",
       "warnings": [
         "1m: intraday data missing",

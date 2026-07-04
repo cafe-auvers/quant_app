@@ -38,12 +38,16 @@ from src.core.trade_reviewer import TradeReviewer, TradeSetup
 from src.utils.data_loader import download_price_history, get_default_universe, _extract_symbol_history
 from src.utils.db_loader import (
     init_mysql_engine, load_symbol_history_from_db, load_hourly_history_from_db,
-    get_latest_price_history_date, get_latest_hourly_price_history_timestamp,
+    get_latest_price_history_date,
     load_chart_indicators_from_db, calculate_chart_indicators,
     refresh_chart_indicators_for_symbol, save_symbol_history_to_db,
     delete_intraday_history_for_symbol,
 )
 from src.utils.storage import load_json, save_json
+from src.services.historical_refresh_control import (
+    MODE_1D, MODE_1H, is_refresh_running, launch_refresh, read_status,
+    reconcile_stale_status, terminate_refresh,
+)
 from src.api.kis_account_snapshot_dual import KisEnvironment, discover_account_profiles, load_config
 from src.services.app_state import (
     SCANNER_SETUPS_FILE, SETTINGS_FILE, load_buylist_state, load_chart_drawings_state,
@@ -58,9 +62,9 @@ from src.ui.filter_catalog import (
     FILTER_CATALOG, SCANNER_METRICS_LABELS,
 )
 from src.ui.workers import (
-    FxRateWorker, HourlyRefreshWorker, IntradayBulkFetchWorker, IntradayFetchWorker,
+    FxRateWorker, IntradayBulkFetchWorker, IntradayFetchWorker,
     KisAccountWorker, KisOrderWorker, KisStartupAccountsWorker, OrderReconciliationWorker,
-    RefreshWorker, ScannerWorker, SingleStockAiWorker, WatchlistAiWorker,
+    ScannerWorker, SingleStockAiWorker, WatchlistAiWorker,
 )
 from src.services.order_ledger import (
     append_order, find_open_orders, has_open_order, load_order_ledger,
@@ -766,27 +770,8 @@ class ScannerMixin:
         self.progress_label.setText("Scanner failed.")
         self.running_scanner_setup_name = None
         self.running_scanner_show_warnings = True
-    def _is_refresh_worker_running(self) -> bool:
-        return self.refresh_worker is not None and self.refresh_worker.isRunning()
-    def _is_hourly_refresh_worker_running(self) -> bool:
-        return getattr(self, "hourly_refresh_worker", None) is not None and self.hourly_refresh_worker.isRunning()
-    def _is_daily_update_complete(self) -> bool:
-        return bool(getattr(self.refresh_worker, "daily_update_complete", False))
-    def _sync_refresh_button_states(self) -> None:
-        daily_running = self._is_refresh_worker_running()
-        hourly_running = self._is_hourly_refresh_worker_running()
-        if hasattr(self, "refresh_db_button"):
-            self.refresh_db_button.setEnabled(not daily_running and not hourly_running)
-        if hasattr(self, "refresh_hourly_button"):
-            self.refresh_hourly_button.setEnabled(not hourly_running and (not daily_running or self._is_daily_update_complete()))
-    def _on_refresh_worker_finished(self, worker) -> None:
-        self._clear_worker_reference("refresh_worker", worker)
-        self._sync_refresh_button_states()
-    def _on_hourly_refresh_worker_finished(self, worker) -> None:
-        self._clear_worker_reference("hourly_refresh_worker", worker)
-        self._sync_refresh_button_states()
     def refresh_data_to_db(self) -> None:
-        """Refresh KIS-registered US universe history from yfinance into MySQL cache."""
+        """Launch (or terminate) the standalone 1D historical.py refresh process."""
         if not self.db_enabled:
             QMessageBox.warning(
                 self,
@@ -795,55 +780,23 @@ class ScannerMixin:
             )
             return
 
-        if self.refresh_worker is not None and self.refresh_worker.isRunning():
-            QMessageBox.information(
-                self,
-                "Refresh in progress",
-                "A MySQL refresh is already running. Please wait for it to finish."
-            )
+        running, _ = is_refresh_running(MODE_1D)
+        if running:
+            self._confirm_and_terminate_refresh(MODE_1D, "1D Data")
             return
 
-        self.universe_tickers = get_default_universe(max_symbols=self.universe_limit, refresh=True)
-        self.append_log(
-            f"Loaded {len(self.universe_tickers)} KIS-registered US symbols. "
-            "Starting 1D data update for MySQL cache, indicators, and scanner metrics..."
-        )
+        self.append_log("Launching 1D data refresh as a background process (historical.py)...")
         self.progress_bar.setValue(0)
-        self.progress_label.setText("Starting refresh...")
-        self._sync_refresh_button_states()
+        self.progress_label.setText("Starting 1D refresh...")
+        try:
+            launch_refresh(MODE_1D, universe_limit=self.universe_limit)
+        except Exception as exc:
+            QMessageBox.warning(self, "Launch failed", f"Could not start historical.py: {exc}")
+            return
+        self._poll_refresh_status()
 
-        refresh_tickers = list(dict.fromkeys([REFERENCE_SYMBOL, *self.universe_tickers]))
-        self.refresh_worker = RefreshWorker(
-            refresh_tickers,
-            engine=self.db_engine,
-            period="1y",
-            interval="1d",
-        )
-        self.refresh_worker.log_message.connect(self.append_log)
-        self.refresh_worker.progress_changed.connect(self.update_progress)
-        self.refresh_worker.daily_data_finished.connect(self._on_daily_data_update_finished)
-        self.refresh_worker.finished_refresh.connect(self._on_refresh_finished)
-        self.refresh_worker.error_occurred.connect(self._on_refresh_error)
-        self.refresh_worker.finished.connect(
-            lambda worker=self.refresh_worker: self._on_refresh_worker_finished(worker)
-        )
-        self.refresh_worker.start()
-        self._sync_refresh_button_states()
-    def _on_daily_data_update_finished(self, updated) -> None:
-        if hasattr(self, "refresh_hourly_button"):
-            self.refresh_hourly_button.setEnabled(not self._is_hourly_refresh_worker_running())
-        self.progress_label.setText("1D update complete. Calculating indicators and scanner metrics...")
-        self.append_log(f"1D data update complete. Updated {len(updated)} symbols.")
-    def _on_refresh_finished(self, updated):
-        self.show_refresh_complete(len(updated))
-        self.update_dashboard_summary(force=True)
-        self._sync_refresh_button_states()
-    def _on_refresh_error(self, error_message: str) -> None:
-        self.show_refresh_error(error_message)
-        QMessageBox.warning(self, "Refresh failed", error_message)
-        self._sync_refresh_button_states()
     def refresh_hourly_data_to_db(self) -> None:
-        """Refresh only the historical 1-hour chart cache for KIS-registered US symbols."""
+        """Launch (or terminate) the standalone 1H historical.py refresh process."""
         if not self.db_enabled:
             QMessageBox.warning(
                 self,
@@ -852,59 +805,103 @@ class ScannerMixin:
             )
             return
 
-        if self.refresh_worker is not None and self.refresh_worker.isRunning() and not self._is_daily_update_complete():
-            QMessageBox.information(
-                self,
-                "Refresh in progress",
-                "A 1D data update is still running. Please wait for the 1D download phase to finish."
-            )
-            return
-        if getattr(self, "hourly_refresh_worker", None) is not None and self.hourly_refresh_worker.isRunning():
-            QMessageBox.information(
-                self,
-                "1H refresh in progress",
-                "A 1-hour data refresh is already running. Please wait for it to finish."
-            )
+        running, _ = is_refresh_running(MODE_1H)
+        if running:
+            self._confirm_and_terminate_refresh(MODE_1H, "1H Data")
             return
 
-        self.universe_tickers = get_default_universe(max_symbols=self.universe_limit, refresh=True)
-        refresh_tickers = list(dict.fromkeys([REFERENCE_SYMBOL, *self.universe_tickers]))
-        latest_hourly = get_latest_hourly_price_history_timestamp(self.db_engine)
-        latest_text = pd.Timestamp(latest_hourly).strftime("%Y-%m-%d %H:%M UTC") if latest_hourly else "none"
-        self.append_log(
-            f"Loaded {len(self.universe_tickers)} KIS-registered US symbols. "
-            f"Starting 1H data refresh. Latest cached 1H timestamp: {latest_text}."
-        )
+        self.append_log("Launching 1H data refresh as a background process (historical.py)...")
         self.progress_bar.setValue(0)
         self.progress_label.setText("Starting 1H refresh...")
+        try:
+            launch_refresh(MODE_1H, universe_limit=self.universe_limit)
+        except Exception as exc:
+            QMessageBox.warning(self, "Launch failed", f"Could not start historical.py: {exc}")
+            return
+        self._poll_refresh_status()
 
-        self.hourly_refresh_worker = HourlyRefreshWorker(
-            refresh_tickers,
-            engine=self.db_engine,
-            full_period="730d",
+    def _confirm_and_terminate_refresh(self, mode: str, label: str) -> None:
+        reply = QMessageBox.question(
+            self,
+            f"Terminate {label} refresh?",
+            f"A {label} refresh is currently running. Are you sure you want to terminate it?\n\n"
+            "Data already saved to MySQL for symbols processed so far will NOT be lost. "
+            "The next refresh will resume from where this one left off.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
         )
-        self.hourly_refresh_worker.log_message.connect(self.append_log)
-        self.hourly_refresh_worker.progress_changed.connect(self.update_progress)
-        self.hourly_refresh_worker.finished_refresh.connect(self._on_hourly_refresh_finished)
-        self.hourly_refresh_worker.error_occurred.connect(self._on_hourly_refresh_error)
-        self.hourly_refresh_worker.finished.connect(
-            lambda worker=self.hourly_refresh_worker: self._on_hourly_refresh_worker_finished(worker)
-        )
-        self.hourly_refresh_worker.start()
-        self._sync_refresh_button_states()
-    def _on_hourly_refresh_finished(self, updated) -> None:
-        latest_hourly = get_latest_hourly_price_history_timestamp(self.db_engine)
-        latest_text = pd.Timestamp(latest_hourly).strftime("%Y-%m-%d %H:%M UTC") if latest_hourly else "none"
-        self.append_log(f"1H data refresh complete. Updated {len(updated)} symbols. Latest 1H timestamp: {latest_text}.")
-        self.progress_label.setText("1H refresh complete.")
-        self.progress_bar.setValue(100)
-        self.update_dashboard_summary(force=True)
-        self._sync_refresh_button_states()
-    def _on_hourly_refresh_error(self, error_message: str) -> None:
-        self.progress_label.setText("1H refresh failed.")
-        self.append_log(f"1H data refresh failed: {error_message}")
-        QMessageBox.warning(self, "1H refresh failed", error_message)
-        self._sync_refresh_button_states()
+        if reply != QMessageBox.Yes:
+            return
+        if terminate_refresh(mode):
+            self.append_log(f"Termination requested for {label} refresh.")
+        else:
+            self.append_log(f"{label} refresh was not running (already finished).")
+        self._poll_refresh_status()
+
+    def _poll_refresh_status(self) -> None:
+        """Polled by main_window's refresh-status QTimer to reflect historical.py progress."""
+        for mode, button, label_prefix in (
+            (MODE_1D, getattr(self, "refresh_db_button", None), "Update 1D Data"),
+            (MODE_1H, getattr(self, "refresh_hourly_button", None), "Update 1H Data"),
+        ):
+            if button is None:
+                continue
+            running, status = is_refresh_running(mode)
+            if not running and status.get("status") == "running":
+                reconcile_stale_status(mode)
+                status = read_status(mode)
+            self._apply_refresh_status_to_ui(mode, button, label_prefix, running, status)
+
+    def _apply_refresh_status_to_ui(self, mode: str, button, label_prefix: str, running: bool, status: dict) -> None:
+        self._append_new_status_log_lines(mode, status.get("recent_log") or [])
+        if running:
+            progress = status.get("progress") or {}
+            percent = progress.get("percent", 0)
+            eta = progress.get("eta_text", "?")
+            phase = status.get("phase", "")
+            action_label = label_prefix.split(" ", 1)[1] if " " in label_prefix else label_prefix
+            button.setText(f"Terminate {action_label} ({percent}%, ETA {eta})")
+            button.setEnabled(True)
+            self.progress_bar.setValue(percent)
+            self.progress_label.setText(f"{label_prefix}: {phase} - {percent}% (ETA {eta})")
+            return
+
+        button.setText(label_prefix)
+        button.setEnabled(True)
+        if status.get("status") in ("completed", "error", "terminated") and self._is_new_terminal_refresh_event(mode, status):
+            self._handle_refresh_terminal_status(mode, status)
+
+    def _is_new_terminal_refresh_event(self, mode: str, status: dict) -> bool:
+        finished_at = status.get("finished_at")
+        if not finished_at:
+            return False
+        if self._refresh_last_finished_at.get(mode) == finished_at:
+            return False
+        self._refresh_last_finished_at[mode] = finished_at
+        return True
+
+    def _append_new_status_log_lines(self, mode: str, recent_log: list) -> None:
+        seen = self._refresh_last_log_count.get(mode, 0)
+        if seen > len(recent_log):
+            seen = 0  # a new run started and the recent_log buffer reset
+        for line in recent_log[seen:]:
+            self.append_log(line)
+        self._refresh_last_log_count[mode] = len(recent_log)
+
+    def _handle_refresh_terminal_status(self, mode: str, status: dict) -> None:
+        result = status.get("result") or {}
+        outcome = status.get("status")
+        if outcome == "completed":
+            self.show_refresh_complete(result.get("updated_count", 0))
+            self.update_dashboard_summary(force=True)
+        elif outcome == "error":
+            message = result.get("error_message") or "Unknown error"
+            self.show_refresh_error(message)
+            QMessageBox.warning(self, "Refresh failed", message)
+        elif outcome == "terminated":
+            self.append_log(f"{mode.upper()} refresh was terminated by user request.")
+            self.progress_label.setText(f"{mode.upper()} refresh terminated.")
+            self.update_dashboard_summary(force=True)
     def populate_scanner_table(self) -> None:
         """Populate the scanner table with the latest scan results."""
         self.scanner_table.setRowCount(0)
