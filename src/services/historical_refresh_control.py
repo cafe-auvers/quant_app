@@ -40,9 +40,10 @@ REQUIRED_PHASES: Dict[str, Tuple[str, ...]] = {
     MODE_1H: ("hourly_history",),
 }
 
-# How long a "starting" record may sit without the child having flipped it to
-# "running" before we stop trusting it (covers a child that crashed before
-# writing anything further, without waiting forever).
+# Retained for diagnostics/logging only. "starting" liveness is now decided
+# solely by whether the PID is alive (see is_refresh_running()) — a live
+# child that is merely slow to flip its own status to "running" must not be
+# treated as inactive just because this much time has passed.
 STARTING_STATUS_MAX_AGE_SECONDS = 30.0
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -71,19 +72,6 @@ def log_path(mode: str) -> Path:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _seconds_since(iso_value: Optional[str]) -> float:
-    """Seconds elapsed since an ISO timestamp; treats missing/unparseable as infinitely old."""
-    if not iso_value:
-        return float("inf")
-    try:
-        then = datetime.fromisoformat(iso_value)
-    except ValueError:
-        return float("inf")
-    if then.tzinfo is None:
-        then = then.replace(tzinfo=timezone.utc)
-    return (datetime.now(timezone.utc) - then).total_seconds()
 
 
 def is_derived_data_complete(mode: str, completed_phases: Optional[List[str]]) -> bool:
@@ -181,19 +169,16 @@ def is_refresh_running(mode: str) -> Tuple[bool, Dict[str, Any]]:
     """Returns (running, status_dict).
 
     'running' requires status=='running' and a live PID. 'starting' counts as
-    running only while its PID is alive and the record isn't stale (guards
-    against a child that died before ever writing 'running').
+    running for as long as its PID is alive — the parent process is alive and
+    working, it just hasn't (yet) overwritten its own transient 'starting'
+    record with 'running'. Only a dead PID makes a 'starting' record inactive.
     """
     status = read_status(mode)
     state = status.get("status")
     if state == "running":
         return is_process_alive(status.get("pid")), status
     if state == "starting":
-        if not is_process_alive(status.get("pid")):
-            return False, status
-        if _seconds_since(status.get("updated_at")) > STARTING_STATUS_MAX_AGE_SECONDS:
-            return False, status
-        return True, status
+        return is_process_alive(status.get("pid")), status
     return False, status
 
 
@@ -231,6 +216,13 @@ def launch_refresh(
     previous run_id is no longer the freshest thing on disk by the time the
     caller's next status poll runs. historical.py overwrites this same
     run_id's record to 'running' shortly after it starts.
+
+    The child can start and write its own status (running/completed/error/
+    terminated) before this function gets to write 'starting' -- Popen()
+    returning control to the parent is not synchronized with the child's own
+    execution. So the current status is re-read right before writing, and if
+    the child has already recorded a status for this same run_id, that record
+    is left untouched rather than being clobbered with a stale 'starting'.
     """
     reconcile_stale_status(mode)
     running, _ = is_refresh_running(mode)
@@ -261,6 +253,14 @@ def launch_refresh(
             stdout=log_fh,
             stderr=subprocess.STDOUT,
         )
+
+    current = read_status(mode)
+    if current.get("run_id") == run_id and current.get("status") in (
+        "running", "completed", "error", "terminated",
+    ):
+        # The child already recorded its own status for this run_id -- do not
+        # clobber a real (and possibly already-terminal) status with 'starting'.
+        return LaunchResult(process=process, run_id=run_id)
 
     now = _now_iso()
     starting_status = _default_status(mode)

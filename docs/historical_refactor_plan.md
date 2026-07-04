@@ -233,15 +233,27 @@ edges before treating this as production-safe. All of the following live in
   `completed`/`error` status is left untouched rather than being relabeled
   `terminated`.
 - **Status is now `run_id`-aware with an explicit `starting` state.**
-  `launch_refresh()` writes a `status="starting"` record (with the real PID
-  and a fresh `run_id`) immediately after `Popen()` returns, before the
-  function returns to its caller. This means a stale terminal status from a
-  previous run_id is never the freshest thing on disk by the time the UI's
-  next poll runs. `historical.py` overwrites the same run_id's record to
-  `"running"` shortly after. `is_refresh_running()` treats `"starting"` as
-  active only while its PID is alive and the record isn't older than
-  `STARTING_STATUS_MAX_AGE_SECONDS` (30s), guarding against a child that
-  crashed before ever writing `"running"`.
+  `"starting"` is a *parent*-written, transient state: `launch_refresh()`
+  writes it (with the real PID and a fresh `run_id`) immediately after
+  `Popen()` returns, before the function returns to its caller. This means a
+  stale terminal status from a previous run_id is never the freshest thing on
+  disk by the time the UI's next poll runs. `historical.py` overwrites the
+  same run_id's record to `"running"` shortly after.
+
+  `Popen()` returning control to the parent is not synchronized with the
+  child's own execution — a fast-starting (or fast-failing) child can write
+  its own `running`/`completed`/`error`/`terminated` status *before* the
+  parent gets around to writing `"starting"`. To avoid clobbering that real
+  status, `launch_refresh()` re-reads the status file right before writing and
+  skips the `"starting"` write entirely if a status for the same `run_id`
+  already exists (see the "race hardening" note below).
+
+  A live PID in `"starting"` is always considered active — `is_refresh_running()`
+  no longer ages `"starting"` out after a fixed window, since a child that is
+  alive but merely slow to flip its own status to `"running"` is not
+  meaningfully different from one already reporting `"running"`.
+  `reconcile_stale_status()` only converts `"starting"` (or `"running"`) to
+  `"error"` when the PID is confirmed dead.
 - **The UI no longer replays stale terminal events.** `scanner_mixin.py`
   tracks `_refresh_active_run_id` (the run_id it's currently watching per
   mode) and `_refresh_last_finished_at` (the last `finished_at` already
@@ -278,3 +290,20 @@ edges before treating this as production-safe. All of the following live in
   behavior (with `subprocess.run`/`Popen`/`is_process_alive` monkeypatched —
   no real process spawned, no MySQL/yfinance touched) and the UI's terminal-
   event de-duplication logic in isolation.
+
+### Follow-up: parent/child status-write race
+
+`launch_refresh()` writing `"starting"` after `Popen()` returns is not
+synchronized with the child actually running — a fast-starting or
+fast-failing `historical.py` could write its own real status for the same
+`run_id` *before* the parent got to write `"starting"`, and the parent would
+then clobber that real status (potentially a terminal `completed`/`error`)
+with a stale `"starting"`. Fixed by re-reading the status right before that
+write and skipping it entirely if a same-`run_id` status already exists in
+`{"running", "completed", "error", "terminated"}`. Combined with dropping the
+`STARTING_STATUS_MAX_AGE_SECONDS` liveness gate (a live PID in `"starting"` is
+now always active, never aged out), `"starting"` is purely a best-effort
+optimistic UI hint — the source of truth is always whatever the child last
+wrote, and PID liveness. See `tests/test_historical_refresh_control.py` for
+the regression tests (`test_launch_refresh_does_not_overwrite_child_*`,
+`test_starting_with_live_pid_is_running_regardless_of_age`).

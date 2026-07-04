@@ -7,6 +7,7 @@ throughout, and all status/lock/log paths are redirected into a tmp_path.
 from __future__ import annotations
 
 import subprocess
+import uuid
 
 import pytest
 
@@ -193,6 +194,103 @@ def test_launch_refresh_rejects_duplicate_when_already_running(monkeypatch):
 
     with pytest.raises(RuntimeError):
         hrc.launch_refresh(hrc.MODE_1D, universe_limit=5)
+
+
+class _FakeUUID:
+    def __init__(self, hex_value: str):
+        self.hex = hex_value
+
+
+def test_launch_refresh_does_not_overwrite_child_running_status(monkeypatch):
+    """Regression: historical.py can write 'running' before Popen() returns to the parent."""
+    monkeypatch.setattr(uuid, "uuid4", lambda: _FakeUUID("run123"))
+    monkeypatch.setattr(hrc, "is_process_alive", lambda pid: False)
+
+    def racing_popen(cmd, **kwargs):
+        # Simulate the child starting extremely fast and already recording its
+        # own real status for this run_id before Popen() returns control here.
+        _write_status(hrc.MODE_1D, status="running", pid=555555, run_id="run123")
+        return _FakePopen(cmd, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", racing_popen)
+
+    result = hrc.launch_refresh(hrc.MODE_1D, universe_limit=5)
+
+    assert result.run_id == "run123"
+    status = hrc.read_status(hrc.MODE_1D)
+    assert status["status"] == "running"
+    assert status["pid"] == 555555
+
+
+def test_launch_refresh_does_not_overwrite_child_error_status(monkeypatch):
+    """Regression: a child that fails almost instantly must not be masked by 'starting'."""
+    monkeypatch.setattr(uuid, "uuid4", lambda: _FakeUUID("run456"))
+    monkeypatch.setattr(hrc, "is_process_alive", lambda pid: False)
+
+    def racing_popen(cmd, **kwargs):
+        _write_status(
+            hrc.MODE_1D,
+            status="error",
+            pid=555555,
+            run_id="run456",
+            finished_at="2026-01-01T00:00:00+00:00",
+            result={"updated_count": 0, "error_message": "boom"},
+        )
+        return _FakePopen(cmd, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", racing_popen)
+
+    result = hrc.launch_refresh(hrc.MODE_1D, universe_limit=5)
+
+    assert result.run_id == "run456"
+    status = hrc.read_status(hrc.MODE_1D)
+    assert status["status"] == "error"
+    assert status["result"]["error_message"] == "boom"
+
+
+def test_launch_refresh_writes_starting_when_child_has_not_reported_yet(monkeypatch):
+    """No same-run_id status exists yet -- ordinary launch behavior is unchanged."""
+    monkeypatch.setattr(uuid, "uuid4", lambda: _FakeUUID("run789"))
+    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kwargs: _FakePopen(cmd, **kwargs))
+    monkeypatch.setattr(hrc, "is_process_alive", lambda pid: False)
+
+    result = hrc.launch_refresh(hrc.MODE_1D, universe_limit=5)
+
+    assert result.run_id == "run789"
+    status = hrc.read_status(hrc.MODE_1D)
+    assert status["status"] == "starting"
+    assert status["run_id"] == "run789"
+
+
+# --- "starting" liveness: PID alive always wins over age --------------------
+
+def test_starting_with_live_pid_is_running_regardless_of_age(monkeypatch):
+    old_timestamp = "2020-01-01T00:00:00+00:00"
+    _write_status(
+        hrc.MODE_1D,
+        status="starting",
+        pid=123,
+        run_id="r1",
+        started_at=old_timestamp,
+        updated_at=old_timestamp,
+    )
+    monkeypatch.setattr(hrc, "is_process_alive", lambda pid: True)
+
+    running, status = hrc.is_refresh_running(hrc.MODE_1D)
+    assert running is True
+
+    hrc.reconcile_stale_status(hrc.MODE_1D)
+    status_after = hrc.read_status(hrc.MODE_1D)
+    assert status_after["status"] == "starting"
+
+
+def test_starting_with_dead_pid_is_not_running(monkeypatch):
+    _write_status(hrc.MODE_1D, status="starting", pid=999999, run_id="r1")
+    monkeypatch.setattr(hrc, "is_process_alive", lambda pid: False)
+
+    running, _ = hrc.is_refresh_running(hrc.MODE_1D)
+
+    assert running is False
 
 
 # --- is_process_alive / tasklist CSV parsing --------------------------------
