@@ -53,9 +53,15 @@ config/kis_config.py
 # Data
 data/*.csv
 data/*.json
+data/*.json.bak
 data/*.lock
-data/refresh_status_*.json.bak
 data/cache/
+
+# Historical refresh process runtime state (historical.py / historical_refresh_control.py)
+data/refresh_status_*.json
+data/refresh_status_*.json.bak
+data/refresh_lock_*.lock
+data/logs/
 
 # Logs
 *.log

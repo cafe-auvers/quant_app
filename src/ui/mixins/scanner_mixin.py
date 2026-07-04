@@ -789,10 +789,11 @@ class ScannerMixin:
         self.progress_bar.setValue(0)
         self.progress_label.setText("Starting 1D refresh...")
         try:
-            launch_refresh(MODE_1D, universe_limit=self.universe_limit)
+            result = launch_refresh(MODE_1D, universe_limit=self.universe_limit)
         except Exception as exc:
             QMessageBox.warning(self, "Launch failed", f"Could not start historical.py: {exc}")
             return
+        self._refresh_active_run_id[MODE_1D] = result.run_id
         self._poll_refresh_status()
 
     def refresh_hourly_data_to_db(self) -> None:
@@ -814,10 +815,11 @@ class ScannerMixin:
         self.progress_bar.setValue(0)
         self.progress_label.setText("Starting 1H refresh...")
         try:
-            launch_refresh(MODE_1H, universe_limit=self.universe_limit)
+            result = launch_refresh(MODE_1H, universe_limit=self.universe_limit)
         except Exception as exc:
             QMessageBox.warning(self, "Launch failed", f"Could not start historical.py: {exc}")
             return
+        self._refresh_active_run_id[MODE_1H] = result.run_id
         self._poll_refresh_status()
 
     def _confirm_and_terminate_refresh(self, mode: str, label: str) -> None:
@@ -832,10 +834,18 @@ class ScannerMixin:
         )
         if reply != QMessageBox.Yes:
             return
-        if terminate_refresh(mode):
-            self.append_log(f"Termination requested for {label} refresh.")
+        terminated = terminate_refresh(mode)
+        if terminated:
+            self.append_log(f"Termination requested for {label} refresh. Process confirmed stopped.")
         else:
-            self.append_log(f"{label} refresh was not running (already finished).")
+            status = read_status(mode)
+            if status.get("status") == "running":
+                self.append_log(
+                    f"Termination requested for {label} refresh, but the process is still running. "
+                    "Try again if needed."
+                )
+            else:
+                self.append_log(f"{label} refresh was not running (already finished).")
         self._poll_refresh_status()
 
     def _poll_refresh_status(self) -> None:
@@ -847,9 +857,14 @@ class ScannerMixin:
             if button is None:
                 continue
             running, status = is_refresh_running(mode)
-            if not running and status.get("status") == "running":
+            if not running and status.get("status") in ("running", "starting"):
                 reconcile_stale_status(mode)
                 status = read_status(mode)
+            if status.get("status") in ("starting", "running"):
+                # Adopt whatever run is actually active as "the" run we're tracking,
+                # regardless of whether this session's button click started it (e.g.
+                # after reopening main.py mid-refresh) — see _is_new_terminal_refresh_event.
+                self._refresh_active_run_id[mode] = status.get("run_id")
             self._apply_refresh_status_to_ui(mode, button, label_prefix, running, status)
 
     def _apply_refresh_status_to_ui(self, mode: str, button, label_prefix: str, running: bool, status: dict) -> None:
@@ -857,8 +872,9 @@ class ScannerMixin:
         if running:
             progress = status.get("progress") or {}
             percent = progress.get("percent", 0)
-            eta = progress.get("eta_text", "?")
-            phase = status.get("phase", "")
+            is_starting = status.get("status") == "starting"
+            eta = progress.get("eta_text") or ("starting..." if is_starting else "?")
+            phase = status.get("phase") or ("starting" if is_starting else "")
             action_label = label_prefix.split(" ", 1)[1] if " " in label_prefix else label_prefix
             button.setText(f"Terminate {action_label} ({percent}%, ETA {eta})")
             button.setEnabled(True)
@@ -868,12 +884,21 @@ class ScannerMixin:
 
         button.setText(label_prefix)
         button.setEnabled(True)
-        if status.get("status") in ("completed", "error", "terminated") and self._is_new_terminal_refresh_event(mode, status):
-            self._handle_refresh_terminal_status(mode, status)
+        if status.get("status") in ("completed", "error", "terminated"):
+            # Always safe to show passively (no dialog, no repeated side effects) so a
+            # reopened main.py reflects the last known outcome without re-triggering it.
+            self.progress_label.setText(self._refresh_terminal_summary_text(mode, status))
+            if self._is_new_terminal_refresh_event(mode, status):
+                self._handle_refresh_terminal_status(mode, status)
 
     def _is_new_terminal_refresh_event(self, mode: str, status: dict) -> bool:
         finished_at = status.get("finished_at")
         if not finished_at:
+            return False
+        active_run_id = self._refresh_active_run_id.get(mode)
+        if active_run_id is not None and status.get("run_id") != active_run_id:
+            # A different (older or unrelated) run's terminal event -- the run this
+            # session is actually tracking hasn't reached a terminal state yet.
             return False
         if self._refresh_last_finished_at.get(mode) == finished_at:
             return False
@@ -891,17 +916,49 @@ class ScannerMixin:
     def _handle_refresh_terminal_status(self, mode: str, status: dict) -> None:
         result = status.get("result") or {}
         outcome = status.get("status")
+        derived_note = self._refresh_derived_data_note(mode, status)
         if outcome == "completed":
             self.show_refresh_complete(result.get("updated_count", 0))
             self.update_dashboard_summary(force=True)
         elif outcome == "error":
             message = result.get("error_message") or "Unknown error"
             self.show_refresh_error(message)
+            if derived_note:
+                self.append_log(derived_note)
             QMessageBox.warning(self, "Refresh failed", message)
+            self.update_dashboard_summary(force=True)
         elif outcome == "terminated":
             self.append_log(f"{mode.upper()} refresh was terminated by user request.")
+            if derived_note:
+                self.append_log(derived_note)
             self.progress_label.setText(f"{mode.upper()} refresh terminated.")
             self.update_dashboard_summary(force=True)
+
+    def _refresh_derived_data_note(self, mode: str, status: dict) -> str:
+        """Explain when 1D price data was saved but indicators/scanner metrics didn't finish."""
+        if mode != MODE_1D:
+            return ""
+        completed_phases = status.get("completed_phases") or []
+        if status.get("derived_data_complete") or "daily_history" not in completed_phases:
+            return ""
+        return (
+            "Price data was saved, but chart indicators/scanner metrics did not finish. "
+            "Run the 1D refresh again to bring derived data back in sync."
+        )
+
+    def _refresh_terminal_summary_text(self, mode: str, status: dict) -> str:
+        """Short, always-safe-to-show summary of the last known outcome (no dialogs/side effects)."""
+        outcome = status.get("status")
+        result = status.get("result") or {}
+        label = mode.upper()
+        note = " Derived data may be stale." if self._refresh_derived_data_note(mode, status) else ""
+        if outcome == "completed":
+            return f"{label} refresh: completed ({result.get('updated_count', 0)} updated)."
+        if outcome == "error":
+            return f"{label} refresh: error - {result.get('error_message') or 'unknown error'}.{note}"
+        if outcome == "terminated":
+            return f"{label} refresh: terminated.{note}"
+        return f"{label} refresh: {outcome}."
     def populate_scanner_table(self) -> None:
         """Populate the scanner table with the latest scan results."""
         self.scanner_table.setRowCount(0)

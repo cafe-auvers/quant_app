@@ -34,7 +34,9 @@ from src.core.trade_reviewer import TradeReviewer
 from src.utils.data_loader import get_default_universe
 from src.utils.db_loader import init_mysql_engine
 from src.utils.storage import load_json
-from src.services.historical_refresh_control import MODE_1D, MODE_1H, reconcile_stale_status
+from src.services.historical_refresh_control import (
+    MODE_1D, MODE_1H, read_status, reconcile_stale_status,
+)
 from src.services.app_state import (
     SETTINGS_FILE,
     SaveResult,
@@ -197,6 +199,7 @@ class MainWindow(
         self.scanner_worker = None
         self._refresh_last_finished_at: Dict[str, Optional[str]] = {}
         self._refresh_last_log_count: Dict[str, int] = {}
+        self._refresh_active_run_id: Dict[str, Optional[str]] = {}
         self.kis_account_worker = None
         self.kis_startup_worker = None
         self.order_reconciliation_worker = None
@@ -243,8 +246,13 @@ class MainWindow(
 
         # Recover historical.py refresh state (e.g. main.py was restarted mid-refresh)
         # before the window is shown, then keep polling it live for the rest of the session.
+        # Seed the "already seen" terminal-event marker from whatever's on disk so a
+        # completed/error/terminated status from a *previous* session doesn't pop a
+        # dialog every time the app opens -- only genuinely new events do that.
         for _mode in (MODE_1D, MODE_1H):
             reconcile_stale_status(_mode)
+            _existing_status = read_status(_mode)
+            self._refresh_last_finished_at[_mode] = _existing_status.get("finished_at")
         self._refresh_poll_timer = QTimer(self)
         self._refresh_poll_timer.setInterval(2000)
         self._refresh_poll_timer.timeout.connect(self._poll_refresh_status)

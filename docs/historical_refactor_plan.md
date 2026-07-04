@@ -215,3 +215,66 @@ Drop `RefreshWorker` from the import and the `assert RefreshWorker is not None` 
    completion without interfering with each other's status files or DB writes.
 6. Run `pytest tests/test_refactor_boundaries.py` after removing `RefreshWorker` to
    confirm the updated assertion passes.
+
+## Safety hardening (follow-up review)
+
+A follow-up review of the initial implementation tightened several correctness
+edges before treating this as production-safe. All of the following live in
+`src/services/historical_refresh_control.py` unless noted:
+
+- **`terminate_refresh()` no longer assumes success.** It calls `taskkill`,
+  waits up to `wait_seconds`, then re-checks `is_process_alive(pid)`. It only
+  writes `status="terminated"` when the PID is confirmed dead *and* that death
+  can be attributed to this request. If the process is still alive, the status
+  is kept/restored to `"running"` with `result.error_message = "Termination
+  requested but process is still running."` and the function returns `False`.
+  If the child happened to finish or error on its own in the same window (a
+  race between our kill and its natural completion), its authentic
+  `completed`/`error` status is left untouched rather than being relabeled
+  `terminated`.
+- **Status is now `run_id`-aware with an explicit `starting` state.**
+  `launch_refresh()` writes a `status="starting"` record (with the real PID
+  and a fresh `run_id`) immediately after `Popen()` returns, before the
+  function returns to its caller. This means a stale terminal status from a
+  previous run_id is never the freshest thing on disk by the time the UI's
+  next poll runs. `historical.py` overwrites the same run_id's record to
+  `"running"` shortly after. `is_refresh_running()` treats `"starting"` as
+  active only while its PID is alive and the record isn't older than
+  `STARTING_STATUS_MAX_AGE_SECONDS` (30s), guarding against a child that
+  crashed before ever writing `"running"`.
+- **The UI no longer replays stale terminal events.** `scanner_mixin.py`
+  tracks `_refresh_active_run_id` (the run_id it's currently watching per
+  mode) and `_refresh_last_finished_at` (the last `finished_at` already
+  handled per mode). `_is_new_terminal_refresh_event()` only fires the
+  completion/error dialog and `update_dashboard_summary()` when the event's
+  `run_id` matches the currently-tracked run and its `finished_at` hasn't been
+  seen before. At startup, `main_window.py` seeds `_refresh_last_finished_at`
+  from whatever's already on disk (after reconciling any stale
+  running/starting record) so a completed/error/terminated status left over
+  from a previous session is shown passively in the progress label but does
+  not pop a dialog every time the app opens.
+- **Interrupted 1D refreshes clearly flag stale derived data.** The status
+  schema (bumped to `schema_version: 2`) adds `completed_phases` (a list built
+  up as `daily_history` → `chart_indicators` → `scanner_metrics` each finish)
+  and `derived_data_complete` (true only once all phases required for that
+  mode are done — for 1H, just `hourly_history`). If a 1D refresh is
+  terminated or errors after `daily_history` but before the derived phases
+  finish, the UI appends a note: *"Price data was saved, but chart
+  indicators/scanner metrics did not finish. Run the 1D refresh again to bring
+  derived data back in sync."* `status="completed"` still only means all
+  required phases finished.
+- **`is_process_alive()` parses `tasklist` output properly** via `csv.reader`
+  instead of substring matching, comparing the PID column as an integer. This
+  fixes a false-positive class of bug where PID `123` would match within a
+  PID field like `1234`, and cleanly returns `False` for the no-match
+  (`"INFO: No tasks..."`) and malformed-output cases.
+- **Runtime state is no longer committed.** `data/refresh_status_*.json`,
+  `data/refresh_status_*.json.bak`, `data/refresh_lock_*.lock`, and
+  `data/logs/` are gitignored. The pre-existing `data/*.json.bak` backup files
+  (written automatically by `src/utils/storage.py:save_json`) are untracked
+  from git entirely, since they are runtime-generated, not source data.
+- **Tests**: `tests/test_historical_refresh_control.py` covers
+  `read_status`/`reconcile_stale_status`/`terminate_refresh`/`launch_refresh`
+  behavior (with `subprocess.run`/`Popen`/`is_process_alive` monkeypatched —
+  no real process spawned, no MySQL/yfinance touched) and the UI's terminal-
+  event de-duplication logic in isolation.

@@ -27,7 +27,9 @@ REPO_ROOT = Path(__file__).resolve().parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.services.historical_refresh_control import MODE_1D, MODE_1H, lock_path, status_path
+from src.services.historical_refresh_control import (
+    MODE_1D, MODE_1H, is_derived_data_complete, lock_path, status_path,
+)
 from src.utils.data_loader import get_default_universe
 from src.utils.db_loader import (
     init_mysql_engine,
@@ -59,6 +61,7 @@ class RunState:
         self.phase = "starting"
         self.progress: Dict[str, object] = {}
         self.recent_log: Deque[str] = collections.deque(maxlen=RECENT_LOG_LIMIT)
+        self.completed_phases: List[str] = []
         self.updated_count = 0
         self._last_write = 0.0
 
@@ -67,6 +70,12 @@ class RunState:
 
     def set_phase(self, phase: str) -> None:
         self.phase = phase
+        self._write(force=True)
+
+    def complete_phase(self, phase: str) -> None:
+        """Record a phase as durably finished (its own work is already committed to MySQL)."""
+        if phase not in self.completed_phases:
+            self.completed_phases.append(phase)
         self._write(force=True)
 
     def update_progress(self, symbol: str, processed: int, total: int, percent: int, eta_text: str) -> None:
@@ -99,7 +108,7 @@ class RunState:
     def _to_dict(self, status: str, error_message: Optional[str] = None) -> dict:
         now = _now_iso()
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "mode": self.mode,
             "status": status,
             "run_id": self.run_id,
@@ -111,6 +120,8 @@ class RunState:
             "phase": self.phase,
             "progress": self.progress,
             "recent_log": list(self.recent_log),
+            "completed_phases": list(self.completed_phases),
+            "derived_data_complete": is_derived_data_complete(self.mode, self.completed_phases),
             "result": {"updated_count": self.updated_count, "error_message": error_message},
         }
 
@@ -171,14 +182,17 @@ def run_1d(engine, tickers: List[str], state: RunState) -> None:
         log_callback=state.log,
     )
     state.updated_count = len(updated)
+    state.complete_phase("daily_history")
 
     state.set_phase("chart_indicators")
     refresh_chart_indicators_to_db(
         tickers, engine, reference_symbol=REFERENCE_SYMBOL, log_callback=state.log,
     )
+    state.complete_phase("chart_indicators")
 
     state.set_phase("scanner_metrics")
     refresh_scanner_metrics_to_db(tickers, engine, log_callback=state.log)
+    state.complete_phase("scanner_metrics")
 
 
 def run_1h(engine, tickers: List[str], backfill: bool, state: RunState) -> None:
@@ -192,6 +206,7 @@ def run_1h(engine, tickers: List[str], backfill: bool, state: RunState) -> None:
         log_callback=state.log,
     )
     state.updated_count = len(updated)
+    state.complete_phase("hourly_history")
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -225,6 +240,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         state.finish("completed")
         return 0
     except Exception as exc:
+        if mode == MODE_1D and "daily_history" in state.completed_phases and not is_derived_data_complete(mode, state.completed_phases):
+            state.log(
+                "Price history was saved, but chart indicators/scanner metrics did not finish — "
+                "run the 1D refresh again to bring derived data back in sync."
+            )
         state.log(f"{mode} refresh failed: {exc}")
         state.finish("error", error_message=str(exc))
         return 1

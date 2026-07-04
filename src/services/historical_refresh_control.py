@@ -6,16 +6,25 @@ effect on an in-flight refresh. This module is the only place that knows how
 to talk to that subprocess: it owns the status-file schema, PID liveness
 checks, and launch/terminate mechanics, so the UI mixins only ever call these
 functions and never touch subprocess/taskkill/status-file details directly.
+
+Status file lifecycle: idle -> starting -> running -> completed | error | terminated.
+"starting" is written by launch_refresh() itself (with the real PID) the
+moment Popen() returns, so a stale terminal status from a previous run_id is
+never the freshest thing on disk once a new launch has happened. historical.py
+overwrites the same run_id's record to "running" shortly after.
 """
 from __future__ import annotations
 
+import csv
+import io
 import subprocess
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.utils.storage import load_json, save_json
 
@@ -23,10 +32,29 @@ MODE_1D = "1d"
 MODE_1H = "1h"
 REFRESH_MODES = (MODE_1D, MODE_1H)
 
+# Phases each mode must complete before its derived data (indicators/scanner
+# metrics for 1D; the hourly bars themselves for 1H) is considered consistent
+# with the freshly-saved price history.
+REQUIRED_PHASES: Dict[str, Tuple[str, ...]] = {
+    MODE_1D: ("daily_history", "chart_indicators", "scanner_metrics"),
+    MODE_1H: ("hourly_history",),
+}
+
+# How long a "starting" record may sit without the child having flipped it to
+# "running" before we stop trusting it (covers a child that crashed before
+# writing anything further, without waiting forever).
+STARTING_STATUS_MAX_AGE_SECONDS = 30.0
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HISTORICAL_SCRIPT_PATH = REPO_ROOT / "historical.py"
 DATA_DIR = REPO_ROOT / "data"
 LOG_DIR = DATA_DIR / "logs"
+
+
+@dataclass
+class LaunchResult:
+    process: subprocess.Popen
+    run_id: str
 
 
 def status_path(mode: str) -> Path:
@@ -45,9 +73,27 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _seconds_since(iso_value: Optional[str]) -> float:
+    """Seconds elapsed since an ISO timestamp; treats missing/unparseable as infinitely old."""
+    if not iso_value:
+        return float("inf")
+    try:
+        then = datetime.fromisoformat(iso_value)
+    except ValueError:
+        return float("inf")
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - then).total_seconds()
+
+
+def is_derived_data_complete(mode: str, completed_phases: Optional[List[str]]) -> bool:
+    required = set(REQUIRED_PHASES.get(mode, ()))
+    return required.issubset(set(completed_phases or []))
+
+
 def _default_status(mode: str) -> Dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "mode": mode,
         "status": "idle",
         "run_id": None,
@@ -55,9 +101,12 @@ def _default_status(mode: str) -> Dict[str, Any]:
         "started_at": None,
         "updated_at": None,
         "finished_at": None,
+        "backfill": False,
         "phase": "",
         "progress": {},
         "recent_log": [],
+        "completed_phases": [],
+        "derived_data_complete": False,
         "result": {},
     }
 
@@ -65,6 +114,34 @@ def _default_status(mode: str) -> Dict[str, Any]:
 def read_status(mode: str) -> Dict[str, Any]:
     """Tolerant status read; an absent/corrupt file reads back as idle."""
     return load_json(status_path(mode), _default_status(mode))
+
+
+# --- Windows process liveness -----------------------------------------------
+# Isolated here so the rest of the module stays OS-agnostic in intent, even
+# though this app currently only targets Windows.
+
+def _parse_tasklist_csv(output: str, pid: int) -> bool:
+    """Parse `tasklist /FO CSV /NH` output for an exact PID column match.
+
+    Guards against substring false positives (e.g. PID 123 matching within
+    "1234") by parsing the PID as its own CSV field and comparing as an int,
+    and against malformed/no-match output (tasklist prints a plain
+    "INFO: No tasks..." line, which is not valid CSV).
+    """
+    output = output.strip()
+    if not output or output.startswith("INFO:"):
+        return False
+    try:
+        rows = list(csv.reader(io.StringIO(output)))
+    except csv.Error:
+        return False
+    for row in rows:
+        if len(row) < 2:
+            continue
+        pid_field = row[1].strip()
+        if pid_field.isdigit() and int(pid_field) == pid:
+            return True
+    return False
 
 
 def is_process_alive(pid: Optional[int]) -> bool:
@@ -80,24 +157,53 @@ def is_process_alive(pid: Optional[int]) -> bool:
         )
     except (OSError, subprocess.SubprocessError):
         return False
-    output = result.stdout.strip()
-    return bool(output) and str(pid) in output and "No tasks" not in output
+    if result.returncode != 0:
+        return False
+    return _parse_tasklist_csv(result.stdout, pid)
 
+
+def _taskkill(pid: int) -> None:
+    """Best-effort forced kill. Never raises — actual success is verified by the caller via is_process_alive."""
+    try:
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+# --- Status queries ----------------------------------------------------------
 
 def is_refresh_running(mode: str) -> Tuple[bool, Dict[str, Any]]:
-    """Returns (running, status_dict). running requires status=='running' AND a live PID."""
+    """Returns (running, status_dict).
+
+    'running' requires status=='running' and a live PID. 'starting' counts as
+    running only while its PID is alive and the record isn't stale (guards
+    against a child that died before ever writing 'running').
+    """
     status = read_status(mode)
-    if status.get("status") != "running":
-        return False, status
-    if not is_process_alive(status.get("pid")):
-        return False, status
-    return True, status
+    state = status.get("status")
+    if state == "running":
+        return is_process_alive(status.get("pid")), status
+    if state == "starting":
+        if not is_process_alive(status.get("pid")):
+            return False, status
+        if _seconds_since(status.get("updated_at")) > STARTING_STATUS_MAX_AGE_SECONDS:
+            return False, status
+        return True, status
+    return False, status
 
 
 def reconcile_stale_status(mode: str) -> None:
-    """Self-heal a 'running' status whose PID is actually dead (crash / manual kill)."""
+    """Self-heal a 'running'/'starting' status whose process is actually dead or stuck."""
     status = read_status(mode)
-    if status.get("status") != "running" or is_process_alive(status.get("pid")):
+    if status.get("status") not in ("running", "starting"):
+        return
+    running, _ = is_refresh_running(mode)
+    if running:
         return
     now = _now_iso()
     status["status"] = "error"
@@ -111,16 +217,20 @@ def reconcile_stale_status(mode: str) -> None:
     save_json(status_path(mode), status)
 
 
+# --- Launch / terminate --------------------------------------------------
+
 def launch_refresh(
     mode: str,
     backfill: bool = False,
     universe_limit: Optional[int] = None,
-) -> subprocess.Popen:
+) -> LaunchResult:
     """Launch historical.py as a detached subprocess for the given mode.
 
-    Does not pre-write the status file — historical.py writes status='running'
-    itself moments after starting, avoiding a race where main.py would read a
-    'running' record for a PID that doesn't exist yet.
+    Writes a 'starting' status (with the real PID and a fresh run_id)
+    immediately after Popen() returns, so any stale terminal status left by a
+    previous run_id is no longer the freshest thing on disk by the time the
+    caller's next status poll runs. historical.py overwrites this same
+    run_id's record to 'running' shortly after it starts.
     """
     reconcile_stale_status(mode)
     running, _ = is_refresh_running(mode)
@@ -151,11 +261,32 @@ def launch_refresh(
             stdout=log_fh,
             stderr=subprocess.STDOUT,
         )
-    return process
+
+    now = _now_iso()
+    starting_status = _default_status(mode)
+    starting_status.update({
+        "status": "starting",
+        "run_id": run_id,
+        "pid": process.pid,
+        "started_at": now,
+        "updated_at": now,
+        "backfill": backfill,
+    })
+    save_json(status_path(mode), starting_status)
+
+    return LaunchResult(process=process, run_id=run_id)
 
 
 def terminate_refresh(mode: str, wait_seconds: float = 3.0) -> bool:
-    """Force-terminate the running refresh for a mode. Returns False if nothing was running.
+    """Force-terminate the running refresh for a mode.
+
+    Returns True only when the PID is confirmed dead *and* that death can be
+    attributed to this termination request. Returns False if nothing was
+    running, if the process is still alive after waiting (status is kept as
+    'running' with an explanatory result.error_message in that case), or if
+    the child turned out to have already written its own completed/error
+    status before the kill could take effect (that authentic status is left
+    untouched rather than being relabeled 'terminated').
 
     Force-kill is safe here because durability comes from per-batch DB upserts
     (see docs/historical_refactor_plan.md), not from a graceful in-process
@@ -166,26 +297,37 @@ def terminate_refresh(mode: str, wait_seconds: float = 3.0) -> bool:
         return False
 
     pid = status["pid"]
-    try:
-        subprocess.run(
-            ["taskkill", "/PID", str(pid), "/T", "/F"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError):
-        pass
+    run_id = status.get("run_id")
+    _taskkill(pid)
 
     deadline = time.monotonic() + wait_seconds
     while time.monotonic() < deadline and is_process_alive(pid):
         time.sleep(0.25)
 
     now = _now_iso()
-    status["status"] = "terminated"
-    status["updated_at"] = now
-    status["finished_at"] = now
-    result = status.get("result") or {}
-    result["error_message"] = None
-    status["result"] = result
-    save_json(status_path(mode), status)
-    return True
+    current = read_status(mode)
+
+    if is_process_alive(pid):
+        result = current.get("result") or {}
+        result["error_message"] = "Termination requested but process is still running."
+        current["status"] = "running"
+        current["result"] = result
+        current["updated_at"] = now
+        save_json(status_path(mode), current)
+        return False
+
+    if current.get("run_id") == run_id and current.get("status") not in ("completed", "error", "terminated"):
+        # Died without writing its own terminal status -- our kill caused this.
+        current["status"] = "terminated"
+        current["updated_at"] = now
+        current["finished_at"] = now
+        result = current.get("result") or {}
+        result["error_message"] = None
+        current["result"] = result
+        save_json(status_path(mode), current)
+        return True
+
+    # Either the child already wrote its own completed/error status before
+    # dying, or a newer run has since taken over this mode's status file --
+    # in both cases it would be inaccurate to relabel it "terminated".
+    return False
