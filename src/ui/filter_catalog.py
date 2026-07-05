@@ -11,7 +11,8 @@ DEFAULT_SETTINGS = {
         "next_symbol": "Down",
         "pan_left": "Left",
         "pan_right": "Right"
-    }
+    },
+    "chart_pan_step_bars": 1
 }
 
 DEFAULT_SCANNER_SETUPS = {

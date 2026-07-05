@@ -23,7 +23,11 @@
       "PowerShell(python \"C:\\\\Users\\\\tonyh\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-tonyh-Documents-quant-app\\\\1048a900-8822-464d-82a2-6b2c4f5266f9\\\\scratchpad\\\\test_new_detector.py\" 2>&1)",
       "PowerShell(python -X utf8 \"$env:TEMP\\\\broad_test2.py\" 2>&1)",
       "PowerShell(python -X utf8 \"$env:TEMP\\\\final_reg.py\" 2>&1)",
-      "PowerShell(python \"C:\\\\Users\\\\tonyh\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-tonyh-Documents-quant-app\\\\8ad69197-47f2-4ca5-a5e6-7aa49e6832fb\\\\scratchpad\\\\fix_encoding.py\")"
+      "PowerShell(python \"C:\\\\Users\\\\tonyh\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-tonyh-Documents-quant-app\\\\8ad69197-47f2-4ca5-a5e6-7aa49e6832fb\\\\scratchpad\\\\fix_encoding.py\")",
+      "Bash(python -m py_compile src/ui/mixins/charts_controller_mixin.py src/ui/mixins/charts_render_mixin.py)",
+      "Bash(python -m py_compile src/ui/mixins/charts_controller_mixin.py src/ui/mixins/charts_render_mixin.py src/ui/dialogs.py src/ui/filter_catalog.py)",
+      "Bash(python -m py_compile src/ui/main_window.py)",
+      "Bash(python -m py_compile src/ui/mixins/charts_controller_mixin.py)"
     ]
   }
 }

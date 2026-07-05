@@ -240,13 +240,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         state.finish("completed")
         return 0
     except Exception as exc:
-        if mode == MODE_1D and "daily_history" in state.completed_phases and not is_derived_data_complete(mode, state.completed_phases):
-            state.log(
-                "Price history was saved, but chart indicators/scanner metrics did not finish — "
-                "run the 1D refresh again to bring derived data back in sync."
-            )
-        state.log(f"{mode} refresh failed: {exc}")
-        state.finish("error", error_message=str(exc))
+        # Best-effort status/log writes: a transient file lock (antivirus,
+        # OneDrive sync, etc.) while recording the failure must not itself
+        # crash the process, or the run leaves no terminal status behind and
+        # looks like an unclean kill instead of a reported error.
+        try:
+            if mode == MODE_1D and "daily_history" in state.completed_phases and not is_derived_data_complete(mode, state.completed_phases):
+                state.log(
+                    "Price history was saved, but chart indicators/scanner metrics did not finish — "
+                    "run the 1D refresh again to bring derived data back in sync."
+                )
+            state.log(f"{mode} refresh failed: {exc}")
+        except Exception:
+            print(f"{mode} refresh failed: {exc}", file=sys.stderr, flush=True)
+
+        try:
+            state.finish("error", error_message=str(exc))
+        except Exception as finish_exc:
+            print(f"Failed to write terminal error status: {finish_exc}", file=sys.stderr, flush=True)
         return 1
     finally:
         lock.release()

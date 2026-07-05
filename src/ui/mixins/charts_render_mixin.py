@@ -310,12 +310,20 @@ class ChartsRenderMixin:
             "set_target": "T",
             "draw_line": "D",
             "erase_drawing": "E",
-            "full_view": "F"
+            "full_view": "F",
+            "pan_left": "Left",
+            "pan_right": "Right"
         })
         target_cond_js = ChartsRenderMixin._get_js_key_condition(shortcuts.get("set_target", "T"))
         draw_cond_js = ChartsRenderMixin._get_js_key_condition(shortcuts.get("draw_line", "D"))
         erase_cond_js = ChartsRenderMixin._get_js_key_condition(shortcuts.get("erase_drawing", "E"))
         full_view_cond_js = ChartsRenderMixin._get_js_key_condition(shortcuts.get("full_view", "F"))
+        pan_left_cond_js = ChartsRenderMixin._get_js_key_condition(shortcuts.get("pan_left", "Left"))
+        pan_right_cond_js = ChartsRenderMixin._get_js_key_condition(shortcuts.get("pan_right", "Right"))
+        try:
+            pan_step_bars = max(1, int(settings.get("chart_pan_step_bars", 1)))
+        except (TypeError, ValueError):
+            pan_step_bars = 1
 
         chart_history = ChartsRenderMixin._normalize_chart_history(history, symbol, max_rows=260)
         if chart_history.empty:
@@ -1146,6 +1154,14 @@ class ChartsRenderMixin:
                     if (rsChart) rsChart.timeScale().setVisibleLogicalRange(range);
                     renderDrawings();
                 }};
+                window.panView = function(deltaBars) {{
+                    const current = chart.timeScale().getVisibleLogicalRange();
+                    if (!current) return;
+                    const range = {{ from: current.from + deltaBars, to: current.to + deltaBars }};
+                    chart.timeScale().setVisibleLogicalRange(range);
+                    if (rsChart) rsChart.timeScale().setVisibleLogicalRange(range);
+                    renderDrawings();
+                }};
 
                 document.addEventListener('keydown', (event) => {{
                     if ({target_cond_js}) {{
@@ -1166,6 +1182,16 @@ class ChartsRenderMixin:
                     if ({full_view_cond_js}) {{
                         event.preventDefault();
                         window.resetFullView();
+                        return;
+                    }}
+                    if ({pan_left_cond_js}) {{
+                        event.preventDefault();
+                        window.panView(-{pan_step_bars});
+                        return;
+                    }}
+                    if ({pan_right_cond_js}) {{
+                        event.preventDefault();
+                        window.panView({pan_step_bars});
                         return;
                     }}
                     if (event.key === 'Escape') {{
@@ -1354,6 +1380,10 @@ class ChartsRenderMixin:
         next_symbol_cond_js = ChartsRenderMixin._get_js_key_condition(shortcuts.get("next_symbol", "Down"))
         pan_left_cond_js = ChartsRenderMixin._get_js_key_condition(shortcuts.get("pan_left", "Left"))
         pan_right_cond_js = ChartsRenderMixin._get_js_key_condition(shortcuts.get("pan_right", "Right"))
+        try:
+            pan_step_bars = max(1, int(settings.get("chart_pan_step_bars", 1)))
+        except (TypeError, ValueError):
+            pan_step_bars = 1
         chart_history = ChartsRenderMixin._normalize_chart_history(
             history,
             symbol,
@@ -1945,12 +1975,12 @@ class ChartsRenderMixin:
                 document.addEventListener("keydown", (event) => {{
                     if ({pan_left_cond_js}) {{
                         event.preventDefault();
-                        updateChartWindow(visibleState.end - 5, visibleState.visibleBars);
+                        updateChartWindow(visibleState.end - {pan_step_bars}, visibleState.visibleBars);
                         return;
                     }}
                     if ({pan_right_cond_js}) {{
                         event.preventDefault();
-                        updateChartWindow(visibleState.end + 5, visibleState.visibleBars);
+                        updateChartWindow(visibleState.end + {pan_step_bars}, visibleState.visibleBars);
                         return;
                     }}
                     if ({prev_symbol_cond_js}) {{

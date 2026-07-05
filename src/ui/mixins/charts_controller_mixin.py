@@ -457,10 +457,10 @@ class ChartsControllerMixin:
         self.chart_erase_shortcut.activated.connect(self.enable_chart_erase_mode)
         self.chart_left_shortcut = QShortcut(QKeySequence(Qt.Key_Left), self.charts_widget)
         self.chart_left_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
-        self.chart_left_shortcut.activated.connect(lambda: self.pan_chart_window(-5))
+        self.chart_left_shortcut.activated.connect(lambda: self.pan_chart_window(-self._chart_pan_step_bars()))
         self.chart_right_shortcut = QShortcut(QKeySequence(Qt.Key_Right), self.charts_widget)
         self.chart_right_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
-        self.chart_right_shortcut.activated.connect(lambda: self.pan_chart_window(5))
+        self.chart_right_shortcut.activated.connect(lambda: self.pan_chart_window(self._chart_pan_step_bars()))
         self.chart_up_shortcut = QShortcut(QKeySequence(Qt.Key_Up), self.charts_widget)
         self.chart_up_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.chart_up_shortcut.activated.connect(lambda: self.step_chart_symbol(-1))
@@ -630,6 +630,12 @@ class ChartsControllerMixin:
         self.tradingview_down_shortcut = QShortcut(QKeySequence(Qt.Key_Down), self.tradingview_widget)
         self.tradingview_down_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.tradingview_down_shortcut.activated.connect(lambda: self.step_tradingview_watchlist_symbol(1))
+        self.tradingview_left_shortcut = QShortcut(QKeySequence(Qt.Key_Left), self.tradingview_widget)
+        self.tradingview_left_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self.tradingview_left_shortcut.activated.connect(lambda: self.pan_tradingview_chart_view(-self._chart_pan_step_bars()))
+        self.tradingview_right_shortcut = QShortcut(QKeySequence(Qt.Key_Right), self.tradingview_widget)
+        self.tradingview_right_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self.tradingview_right_shortcut.activated.connect(lambda: self.pan_tradingview_chart_view(self._chart_pan_step_bars()))
         self.tradingview_full_view_shortcut = QShortcut(QKeySequence("F"), self.tradingview_widget)
         self.tradingview_full_view_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.tradingview_full_view_shortcut.activated.connect(self.reset_chart_full_view)
@@ -893,6 +899,14 @@ class ChartsControllerMixin:
             self.populate_buylist_dashboard()
             self.append_log(f"[Chart] {symbol} removed from execution queue.")
         else:
+            watch_item = self.watchlist.get(symbol) if hasattr(self, "watchlist") else None
+            if watch_item is None or not watch_item.breakout_price:
+                QMessageBox.information(
+                    self,
+                    "Breakout price required",
+                    f"Set a breakout price for {symbol} before queuing it for buy.",
+                )
+                return
             self.refresh_execution_queue(env, symbols=[symbol], create_missing=True)
             self.populate_buylist_dashboard()
             self.append_log(f"[Chart] {symbol} queued for buy.")
@@ -1804,6 +1818,20 @@ class ChartsControllerMixin:
             self.append_log("Erase mode enabled. Click a drawing line to remove it.")
         else:
             self.append_log("Erase mode requires PyQtWebEngine chart view.")
+    def _chart_pan_step_bars(self) -> int:
+        settings = self.__dict__.get("settings") or {}
+        try:
+            step = int(settings.get("chart_pan_step_bars", 1)) if isinstance(settings, dict) else 1
+        except (TypeError, ValueError):
+            step = 1
+        return max(1, step)
+    def pan_tradingview_chart_view(self, delta_bars: int) -> None:
+        for view in self._active_chart_command_views():
+            if QWebEngineView is not None and isinstance(view, QWebEngineView):
+                view.page().runJavaScript(
+                    f"window.panView && window.panView({int(delta_bars)});",
+                    lambda result: None,
+                )
     def set_chart_target_price(self, symbol: str, breakout_price: float) -> None:
         symbol = symbol.strip().upper()
         if not symbol or breakout_price <= 0:
@@ -1827,6 +1855,22 @@ class ChartsControllerMixin:
         item = self.watchlist.get(symbol)
         if item is None or item.breakout_price is None:
             return
+
+        env = self.watchlist_env_combo.currentText() if hasattr(self, "watchlist_env_combo") else "SIM"
+        buylist_manager = getattr(self, "buylist_manager", None)
+        buylist_item = buylist_manager.get(symbol, env) if buylist_manager is not None else None
+        if buylist_item is not None and self._is_execution_queue_buylist_item(buylist_item):
+            if buylist_item.monitoring_status in ("BOUGHT", "BUY_SUBMITTED", "BUY_PARTIAL"):
+                QMessageBox.warning(
+                    self,
+                    "Active position",
+                    f"{symbol} has an active position and cannot be dequeued here. Breakout price was not cleared.",
+                )
+                return
+            buylist_manager.remove(symbol, env)
+            self.populate_buylist_dashboard()
+            self.append_log(f"[Chart] {symbol} removed from execution queue (breakout price cleared).")
+
         item.breakout_price = None
         self.populate_watchlist_table()
         self.update_dashboard_summary()

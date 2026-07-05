@@ -3,7 +3,7 @@ from __future__ import annotations
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGroupBox, QFormLayout, QPushButton,
     QLineEdit, QKeySequenceEdit, QMessageBox, QLabel, QTreeWidget,
-    QTreeWidgetItem, QAbstractItemView, QHeaderView,
+    QTreeWidgetItem, QAbstractItemView, QHeaderView, QSpinBox,
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor, QKeySequence
@@ -58,7 +58,17 @@ class SettingsDialog(QDialog):
             
         form_group.setLayout(form_layout)
         layout.addWidget(form_group)
-        
+
+        chart_group = QGroupBox("Chart Navigation")
+        chart_form_layout = QFormLayout()
+        self.pan_step_spin = QSpinBox()
+        self.pan_step_spin.setMinimum(1)
+        self.pan_step_spin.setMaximum(50)
+        self.pan_step_spin.setValue(int(self.settings.get("chart_pan_step_bars", DEFAULT_SETTINGS.get("chart_pan_step_bars", 1))))
+        chart_form_layout.addRow("Pan Step (bars per keypress)", self.pan_step_spin)
+        chart_group.setLayout(chart_form_layout)
+        layout.addWidget(chart_group)
+
         btn_layout = QHBoxLayout()
         reset_btn = QPushButton("Reset to Defaults")
         reset_btn.setObjectName("resetDefaultsButton")
@@ -83,6 +93,7 @@ class SettingsDialog(QDialog):
         for key, val in DEFAULT_SETTINGS["shortcuts"].items():
             if key in self.shortcut_edits:
                 self.shortcut_edits[key].setKeySequence(QKeySequence(val))
+        self.pan_step_spin.setValue(int(DEFAULT_SETTINGS.get("chart_pan_step_bars", 1)))
 
     def save_settings(self):
         new_shortcuts = {}
@@ -103,7 +114,9 @@ class SettingsDialog(QDialog):
             return
 
         self.settings["shortcuts"] = new_shortcuts
+        self.settings["chart_pan_step_bars"] = self.pan_step_spin.value()
         save_json(SETTINGS_FILE, self.settings)
+        self.accept()
 
 
 class AddFilterDialog(QDialog):

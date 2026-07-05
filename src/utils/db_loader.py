@@ -1265,7 +1265,7 @@ def refresh_universe_history_to_db(
                 batch_sleep=0,
                 max_retries=0,
                 fallback_to_single=False,
-                chart_fallback=False,
+                chart_fallback=True,
             )
             available = _symbols_with_history(history, batch)
             missing = [symbol for symbol in batch if symbol not in available]
@@ -1443,7 +1443,7 @@ def refresh_universe_hourly_history_to_db(
                 batch_sleep=0,
                 max_retries=0,
                 fallback_to_single=False,
-                chart_fallback=False,
+                chart_fallback=True,
             )
             available = _symbols_with_history(history, batch)
             missing = [symbol for symbol in batch if symbol not in available]
@@ -1493,7 +1493,7 @@ def refresh_universe_hourly_history_to_db(
                     batch_sleep=0,
                     max_retries=0,
                     fallback_to_single=False,
-                    chart_fallback=False,
+                    chart_fallback=True,
                 )
                 available = _symbols_with_history(history, batch)
                 missing = [symbol for symbol in batch if symbol not in available]

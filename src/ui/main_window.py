@@ -1122,6 +1122,10 @@ class MainWindow(
             self.tradingview_up_shortcut.setKey(parse_key(shortcuts.get("prev_symbol", "Up")))
         if hasattr(self, 'tradingview_down_shortcut'):
             self.tradingview_down_shortcut.setKey(parse_key(shortcuts.get("next_symbol", "Down")))
+        if hasattr(self, 'tradingview_left_shortcut'):
+            self.tradingview_left_shortcut.setKey(parse_key(shortcuts.get("pan_left", "Left")))
+        if hasattr(self, 'tradingview_right_shortcut'):
+            self.tradingview_right_shortcut.setKey(parse_key(shortcuts.get("pan_right", "Right")))
         if hasattr(self, 'tradingview_full_view_shortcut'):
             self.tradingview_full_view_shortcut.setKey(parse_key(shortcuts.get("full_view", "F")))
         if hasattr(self, 'tradingview_watchlist_shortcut'):
