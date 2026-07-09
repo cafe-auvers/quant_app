@@ -2191,6 +2191,7 @@ class BuylistMixin:
 
             elif item.monitoring_status == "BOUGHT":
                 auto_order_blocked = self._buylist_auto_order_blocked(item)
+                exit_order_pending = getattr(item, "_exit_order_pending", False)
                 if (
                     item.stop_loss > 0
                     and current_price <= item.stop_loss
@@ -2208,6 +2209,7 @@ class BuylistMixin:
                         reason="stop-loss",
                         order_price=self._stop_loss_sell_limit_price(current_price),
                     )
+                    continue
                 elif (
                     item.stop_loss > 0
                     and current_price <= item.stop_loss
@@ -2218,6 +2220,57 @@ class BuylistMixin:
                     self.append_log(
                         f"[Buylist/{env}] STOP still hit for {item.symbol}, but auto KIS order is blocked: "
                         f"{getattr(item, 'auto_order_block_reason', '')}"
+                    )
+                    continue
+
+                if auto_order_blocked or exit_order_pending:
+                    continue
+
+                try:
+                    shares_held = int(getattr(item, "shares_held", 0) or 0)
+                except (TypeError, ValueError):
+                    shares_held = 0
+                days_held = self._buylist_days_held(item)
+                avg_cost = float(getattr(item, "avg_cost", 0.0) or 0.0)
+                if (
+                    shares_held > 0
+                    and 3 <= days_held <= 5
+                    and not getattr(item, "sell_half_done", False)
+                    and avg_cost > 0
+                    and current_price > avg_cost
+                ):
+                    quantity = self._partial_exit_quantity(shares_held)
+                    if quantity > 0:
+                        item._exit_order_pending = True
+                        self.append_log(
+                            f"[Buylist/{env}] {item.symbol} day-rule partial exit: "
+                            f"{days_held} days held and current ${current_price:.2f} "
+                            f"> avg cost ${avg_cost:.2f}. Selling {quantity}/{shares_held} shares."
+                        )
+                        self._submit_kis_sell_order(
+                            item,
+                            quantity,
+                            reason="partial sell day rule",
+                            order_price=current_price,
+                        )
+                        continue
+
+                momentum_signal = self._momentum_exit_signal(item, current_price)
+                if (
+                    shares_held > 0
+                    and getattr(item, "sell_half_done", False)
+                    and momentum_signal
+                ):
+                    item._exit_order_pending = True
+                    self.append_log(
+                        f"[Buylist/{env}] {item.symbol} momentum exit: current ${current_price:.2f} "
+                        f"below {momentum_signal}. Selling remaining {shares_held} shares."
+                    )
+                    self._submit_kis_sell_order(
+                        item,
+                        shares_held,
+                        reason=f"momentum exit below {momentum_signal}",
+                        order_price=current_price,
                     )
 
         self._populate_buylist_env_table(env)
@@ -2257,12 +2310,60 @@ class BuylistMixin:
         item.auto_order_block_reason = str(reason or "").strip()
         item._buy_order_pending = False
         item._stop_order_pending = False
+        item._exit_order_pending = False
         item._auto_order_block_notice_logged = False
 
     def _clear_buylist_auto_order_block(self, item) -> None:
         if hasattr(item, "auto_order_block_reason"):
             item.auto_order_block_reason = ""
         item._auto_order_block_notice_logged = False
+
+    def _buylist_days_held(self, item) -> int:
+        buy_date = getattr(item, "buy_date", None)
+        if not buy_date:
+            return 0
+        buy_day = buy_date.date() if hasattr(buy_date, "date") else buy_date
+        today = dt.date.today()
+        if buy_day >= today:
+            return 0
+        if hasattr(self, "_nyse_holidays"):
+            holidays: set = set()
+            for year in range(buy_day.year, today.year + 1):
+                holidays |= self._nyse_holidays(year)
+            days = 0
+            cursor = buy_day
+            while cursor < today:
+                if cursor.weekday() < 5 and cursor not in holidays:
+                    days += 1
+                cursor += dt.timedelta(days=1)
+            return days
+        return (today - buy_day).days
+
+    @staticmethod
+    def _partial_exit_quantity(shares_held: int) -> int:
+        try:
+            shares = int(shares_held or 0)
+        except (TypeError, ValueError):
+            shares = 0
+        if shares <= 0:
+            return 0
+        return max(1, shares // 3)
+
+    @staticmethod
+    def _momentum_exit_signal(item, current_price: float) -> str:
+        try:
+            price = float(current_price or 0.0)
+        except (TypeError, ValueError):
+            price = 0.0
+        if price <= 0:
+            return ""
+        ema10 = float(getattr(item, "_ema10", 0.0) or 0.0)
+        ema20 = float(getattr(item, "_ema20", 0.0) or 0.0)
+        if ema10 > 0 and price < ema10:
+            return "10 EMA"
+        if ema20 > 0 and price < ema20:
+            return "20 EMA"
+        return ""
     def _buylist_refresh_item_data(self, item) -> None:
         """Fetch latest 30d daily closes and compute 10/20 EMA for a buylist item.
 
@@ -2349,6 +2450,8 @@ class BuylistMixin:
             return OrderIntent.STOP_LOSS
         if "partial" in reason_text or "half" in reason_text:
             return OrderIntent.PARTIAL_EXIT
+        if "momentum" in reason_text or "ema" in reason_text:
+            return OrderIntent.MOMENTUM_EXIT
         if "manual" in reason_text or "all" in reason_text or "exit" in reason_text:
             return OrderIntent.MANUAL_EXIT
         return OrderIntent.UNKNOWN
@@ -2500,6 +2603,7 @@ class BuylistMixin:
         intent = self._sell_intent_for_reason(reason)
         if self._has_duplicate_open_order(env, account_no, item.symbol, OrderSide.SELL, intent):
             item._stop_order_pending = False
+            item._exit_order_pending = False
             self.append_log(
                 f"Open SELL {intent.value} order already exists for {item.symbol} in {env} account {account_no}. "
                 "Reconcile or cancel it before submitting another order."
@@ -2539,6 +2643,7 @@ class BuylistMixin:
             )
         except Exception as exc:
             item._stop_order_pending = False
+            item._exit_order_pending = False
             item.monitoring_status = "ERROR"
             self._save_buylist_state()
             self.populate_buylist_dashboard()
@@ -2639,6 +2744,7 @@ class BuylistMixin:
         timer.singleShot(5000, self.reconcile_open_orders)
     def _on_sell_order_accepted(self, item, quantity: int, reason: str, order: BrokerOrder) -> None:
         item._stop_order_pending = False
+        item._exit_order_pending = False
         self._record_broker_order(order)
 
         if order.status == OrderStatus.UNKNOWN_SUBMISSION_STATE:
@@ -2948,6 +3054,7 @@ class BuylistMixin:
         if item is not None:
             item._buy_order_pending = bool(ambiguous and side_text == "buy")
             item._stop_order_pending = bool(ambiguous and side_text == "sell")
+            item._exit_order_pending = bool(ambiguous and side_text == "sell")
             manager = self.__dict__.get("execution_queue_manager")
             if manager is None and self._is_execution_queue_buylist_item(item):
                 manager = self._ensure_execution_queue_manager()

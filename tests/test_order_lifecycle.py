@@ -922,6 +922,102 @@ def test_monitor_submits_stop_loss_with_aggressive_limit():
     assert submitted[0][1]["order_price"] == pytest.approx(48.51)
 
 
+def test_monitor_auto_submits_one_third_partial_after_day_rule_when_trade_worked():
+    submitted = []
+    item = SimpleNamespace(
+        symbol="AAPL",
+        environment="SIM",
+        monitoring_status="BOUGHT",
+        shares_held=9,
+        avg_cost=100.0,
+        stop_loss=90.0,
+        sell_half_done=False,
+        entry_price=100.0,
+        auto_order_block_reason="",
+        buy_date=None,
+    )
+    window = MainWindow.__new__(MainWindow)
+    window.buylist_manager = SimpleNamespace(items=[item])
+    window.latest_intraday_prices = {"AAPL": 110.0}
+    window._buylist_refresh_item_data = lambda _item: None
+    window._buylist_days_held = lambda _item: 3
+    window._populate_buylist_env_table = lambda _env: None
+    window._submit_kis_sell_order = lambda *args, **kwargs: submitted.append((args, kwargs))
+    window.append_log = lambda _message: None
+
+    MainWindow._run_buylist_monitor_cycle(window, "SIM")
+
+    assert len(submitted) == 1
+    assert submitted[0][0] == (item, 3)
+    assert submitted[0][1]["reason"] == "partial sell day rule"
+    assert submitted[0][1]["order_price"] == pytest.approx(110.0)
+    assert item._exit_order_pending is True
+
+
+def test_monitor_does_not_partial_exit_day_rule_when_trade_has_not_worked():
+    submitted = []
+    item = SimpleNamespace(
+        symbol="AAPL",
+        environment="SIM",
+        monitoring_status="BOUGHT",
+        shares_held=9,
+        avg_cost=100.0,
+        stop_loss=90.0,
+        sell_half_done=False,
+        entry_price=100.0,
+        auto_order_block_reason="",
+        buy_date=None,
+    )
+    window = MainWindow.__new__(MainWindow)
+    window.buylist_manager = SimpleNamespace(items=[item])
+    window.latest_intraday_prices = {"AAPL": 99.0}
+    window._buylist_refresh_item_data = lambda _item: None
+    window._buylist_days_held = lambda _item: 3
+    window._populate_buylist_env_table = lambda _env: None
+    window._submit_kis_sell_order = lambda *args, **kwargs: submitted.append((args, kwargs))
+    window.append_log = lambda _message: None
+
+    MainWindow._run_buylist_monitor_cycle(window, "SIM")
+
+    assert submitted == []
+    assert not getattr(item, "_exit_order_pending", False)
+
+
+def test_monitor_auto_submits_momentum_exit_after_partial_when_below_ema():
+    submitted = []
+    item = SimpleNamespace(
+        symbol="AAPL",
+        environment="SIM",
+        monitoring_status="BOUGHT",
+        shares_held=6,
+        avg_cost=100.0,
+        stop_loss=90.0,
+        sell_half_done=True,
+        entry_price=100.0,
+        auto_order_block_reason="",
+        buy_date=None,
+        _ema10=100.0,
+        _ema20=95.0,
+    )
+    window = MainWindow.__new__(MainWindow)
+    window.buylist_manager = SimpleNamespace(items=[item])
+    window.latest_intraday_prices = {"AAPL": 94.0}
+    window._buylist_refresh_item_data = lambda _item: None
+    window._buylist_days_held = lambda _item: 8
+    window._populate_buylist_env_table = lambda _env: None
+    window._submit_kis_sell_order = lambda *args, **kwargs: submitted.append((args, kwargs))
+    window.append_log = lambda _message: None
+
+    MainWindow._run_buylist_monitor_cycle(window, "SIM")
+
+    assert len(submitted) == 1
+    assert submitted[0][0] == (item, 6)
+    assert submitted[0][1]["reason"] == "momentum exit below 10 EMA"
+    assert submitted[0][1]["order_price"] == pytest.approx(94.0)
+    assert item._exit_order_pending is True
+    assert MainWindow._sell_intent_for_reason("momentum exit below 10 EMA") == OrderIntent.MOMENTUM_EXIT
+
+
 def test_stop_loss_sell_reprice_starts_cancel_when_price_moves_lower(monkeypatch):
     started = []
 
