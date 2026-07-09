@@ -1008,6 +1008,15 @@ class MainWindow(
         weekday = now_ny.weekday()
         today = now_ny.date()
 
+        is_holiday = today in self._nyse_holidays(today.year)
+        market_open = now_ny.replace(hour=9, minute=30, second=0, microsecond=0)
+        market_close = now_ny.replace(hour=16, minute=0, second=0, microsecond=0)
+        is_open = weekday < 5 and not is_holiday and market_open <= now_ny < market_close
+        was_open = getattr(self, "_market_was_open", None)
+        if was_open and not is_open and hasattr(self, "_deactivate_pre_entry_orb_monitoring"):
+            self._deactivate_pre_entry_orb_monitoring()
+        self._market_was_open = is_open
+
         dot = getattr(self, "market_status_dot", None)
 
         def _set_dot_open():
@@ -1023,13 +1032,10 @@ class MainWindow(
             self.market_status_label.setText("<b>Market Status:</b> Closed (Weekend)")
             return
 
-        if today in self._nyse_holidays(today.year):
+        if is_holiday:
             _set_dot_closed()
             self.market_status_label.setText("<b>Market Status:</b> Closed (Holiday)")
             return
-
-        market_open = now_ny.replace(hour=9, minute=30, second=0, microsecond=0)
-        market_close = now_ny.replace(hour=16, minute=0, second=0, microsecond=0)
 
         if now_ny < market_open:
             _set_dot_closed()

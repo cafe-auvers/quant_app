@@ -1635,6 +1635,77 @@ class BuylistMixin:
             )
             self._submit_kis_buy_order(it, quantity=shares, order_price=entry_trigger)
 
+    def _deactivate_pre_entry_orb_monitoring(self) -> None:
+        """Reset all pre-entry ORB/queue monitoring to WATCHING at market close.
+
+        BOUGHT positions (and any order mid-flight) are left untouched — they still need
+        stop-loss monitoring next session. Today's ORB ranges (1m/5m/30m) are meaningless
+        tomorrow since a new session opens a new range, so pre-entry items are fully reset
+        rather than just paused, avoiding a stale window/candidate carried into the open.
+        """
+        if not hasattr(self, "buylist_manager"):
+            return
+
+        from src.core.execution_queue import ExecutionQueueStatus
+
+        manager = self.__dict__.get("execution_queue_manager")
+        pre_entry_watching = {
+            ExecutionQueueStatus.ORB_FORMING.value,
+            ExecutionQueueStatus.WAITING_BREAKOUT.value,
+            ExecutionQueueStatus.ARMED.value,
+            ExecutionQueueStatus.EXECUTE_READY.value,
+        }
+        reset_symbols: List[Tuple[str, str]] = []
+
+        for item in self.buylist_manager.items:
+            status = str(getattr(item, "monitoring_status", "") or "").upper()
+            is_queue = self._is_execution_queue_buylist_item(item)
+
+            if is_queue:
+                if status not in pre_entry_watching:
+                    continue
+            elif status != "ACTIVE":
+                continue
+
+            symbol = str(getattr(item, "symbol", "") or "").upper()
+            environment = str(getattr(item, "environment", "") or "SIM").upper()
+
+            if is_queue:
+                item.orb_monitor_enabled = False
+                item._buy_order_pending = False
+                item._selected_orb_window = ""
+                item._planned_shares = 0
+                item._auto_order_block_notice_logged = False
+                item._orb_queue_required_notice_logged = False
+                self._clear_buylist_auto_order_block(item)
+
+                queue_item = manager.get_item(symbol, environment) if manager is not None else None
+                if queue_item is not None:
+                    queue_item.locked = False
+                    queue_item.locked_reason = None
+                    queue_item.candidates = {}
+                    queue_item.selected_window = None
+                    queue_item.selected_candidate = None
+                    queue_item.order_status = None
+                    queue_item.order_id = None
+                    queue_item.warnings = []
+                    queue_item.status = ExecutionQueueStatus.WATCHING
+
+            item.monitoring_status = "WATCHING"
+            item.status = "WATCHING"
+            reset_symbols.append((symbol, environment))
+
+        if not reset_symbols:
+            return
+
+        self._save_buylist_state()
+        if manager is not None:
+            self._save_execution_queue_state()
+        if hasattr(self, "populate_buylist_dashboard"):
+            self.populate_buylist_dashboard()
+        symbols_text = ", ".join(f"{sym}/{env}" for sym, env in reset_symbols)
+        self.append_log(f"[Buylist] Market closed — deactivated pre-entry ORB monitoring for: {symbols_text}")
+
     def _run_buylist_monitor_cycle(self, env: str) -> None:
         """Check ACTIVE/BOUGHT items for one environment and fire orders as needed."""
         if not hasattr(self, "buylist_manager"):
