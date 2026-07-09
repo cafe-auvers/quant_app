@@ -47,7 +47,7 @@ class OrbEntrySignal:
     orb_low: float
     breakout_price: Optional[float]
     breakout_trigger: float           # breakout_price * (1 + buffer_pct)
-    entry_trigger: float              # max(orb_high, breakout_trigger)
+    entry_trigger: float              # ORB high; valid only after it clears breakout_trigger
     current_price: float
     signal: str                       # see evaluate_orb_entry_signal for values
     allow_entry: bool
@@ -75,18 +75,23 @@ def evaluate_orb_entry_signal(
     """
     bp = breakout_price if (breakout_price is not None and breakout_price > 0) else 0.0
     breakout_trigger = bp * (1 + buffer_pct) if bp > 0 else 0.0
-    entry_trigger = max(orb_high, breakout_trigger) if breakout_trigger > 0 else orb_high
+    entry_trigger = orb_high
 
-    if current_price > entry_trigger:
+    if bp <= 0:
+        signal = "missing_breakout_price"
+        allow_entry = False
+        allow_full_size = False
+        size_mult = 0.0
+    elif orb_high <= breakout_trigger:
+        signal = "orb_high_below_breakout_trigger"
+        allow_entry = False
+        allow_full_size = False
+        size_mult = 0.0
+    elif current_price > entry_trigger:
         signal = "confirmed_orb_breakout"
         allow_entry = True
         allow_full_size = True
         size_mult = 1.0
-    elif bp > 0 and current_price > orb_high and current_price <= breakout_trigger:
-        signal = "orb_only_inside_base"
-        allow_entry = False
-        allow_full_size = False
-        size_mult = 0.0
     elif (
         allow_probe and bp > 0
         and current_price > breakout_trigger

@@ -19,7 +19,7 @@ from src.core.position_sizer import PositionSizer
 
 SUPPORTED_ORB_WINDOWS = ("1m", "5m", "30m")
 DEFAULT_ORB_BUFFER_PCT = 0.001
-DEFAULT_UPGRADE_MARGIN = 5.0
+DEFAULT_UPGRADE_MARGIN = 0.0
 MIN_CAPITAL_PERCENT = 10.0
 MAX_CAPITAL_PERCENT = 30.0
 MIN_STOP_ADR = 15.0
@@ -152,6 +152,7 @@ class ExecutionQueueItem:
     status: ExecutionQueueStatus = ExecutionQueueStatus.WATCHING
     locked: bool = False
     locked_reason: Optional[str] = None
+    manual_window_lock: bool = False
     order_status: Optional[str] = None
     order_id: Optional[str] = None
     last_updated: datetime = field(default_factory=datetime.now)
@@ -170,6 +171,7 @@ class ExecutionQueueItem:
             "status": self.status.value,
             "locked": self.locked,
             "locked_reason": self.locked_reason,
+            "manual_window_lock": self.manual_window_lock,
             "order_status": self.order_status,
             "order_id": self.order_id,
             "last_updated": self.last_updated.isoformat(),
@@ -205,6 +207,7 @@ class ExecutionQueueItem:
             ),
             locked=bool(data.get("locked", False)),
             locked_reason=data.get("locked_reason"),
+            manual_window_lock=bool(data.get("manual_window_lock", False)),
             order_status=data.get("order_status"),
             order_id=data.get("order_id"),
             last_updated=last_updated,
@@ -439,6 +442,12 @@ def validate_position_values(sizing: Dict[str, Any], adr_percent: Optional[float
         warnings.append(f"Capital allocation ({capital_percent:.2f}%) exceeds {MAX_CAPITAL_PERCENT:.0f}%")
     if adr_percent is not None and adr_percent > 0 and stop_loss_percent >= adr_percent:
         warnings.append(f"Stop loss % ({stop_loss_percent:.2f}%) is wider than ADR ({adr_percent:.2f}%)")
+    if stop_adr is not None:
+        stop_adr_value = float(stop_adr)
+        if stop_adr_value < MIN_STOP_ADR:
+            warnings.append(f"Stop/ADR ({stop_adr_value:.2f}%) is below {MIN_STOP_ADR:.0f}%")
+        elif stop_adr_value > MAX_STOP_ADR:
+            warnings.append(f"Stop/ADR ({stop_adr_value:.2f}%) exceeds {MAX_STOP_ADR:.0f}%")
     return warnings
 
 
@@ -484,6 +493,24 @@ def build_orb_candidate(
     candidate_stop = _optional_float(stop_loss) or orb_low
     warnings: List[str] = []
 
+    if breakout is None or breakout <= 0:
+        warnings.append("Manual breakout price is required")
+        return OrbCandidate(
+            symbol=symbol,
+            window=window,
+            orb_high=orb_high,
+            orb_low=orb_low,
+            breakout_price=breakout,
+            breakout_trigger=None,
+            entry_trigger=orb_high,
+            current_price=price,
+            stop_loss=candidate_stop,
+            status=OrbCandidateStatus.REJECTED,
+            valid=False,
+            warnings=warnings,
+            reason=warnings[0],
+        )
+
     if duplicate_pending_order:
         warnings.append("Duplicate pending/submitted order exists for symbol")
         return OrbCandidate(
@@ -512,6 +539,27 @@ def build_orb_candidate(
     )
     breakout_trigger = float(entry_signal.breakout_trigger)
     entry_trigger = float(entry_signal.entry_trigger)
+
+    if entry_signal.signal == "orb_high_below_breakout_trigger":
+        reason = (
+            f"ORB high {orb_high:.2f} has not cleared breakout trigger "
+            f"{breakout_trigger:.2f}"
+        )
+        return OrbCandidate(
+            symbol=symbol,
+            window=window,
+            orb_high=orb_high,
+            orb_low=orb_low,
+            breakout_price=breakout,
+            breakout_trigger=breakout_trigger,
+            entry_trigger=entry_trigger,
+            current_price=price,
+            stop_loss=candidate_stop,
+            status=OrbCandidateStatus.REJECTED,
+            valid=False,
+            warnings=[reason],
+            reason=reason,
+        )
 
     if candidate_stop <= 0 or candidate_stop >= entry_trigger:
         warnings.append("Stop loss must be below entry trigger")
@@ -641,7 +689,11 @@ def select_best_orb_candidate(
     if current_candidate is None or not current_candidate.valid:
         return best_candidate
 
-    if best_candidate.window != current_candidate.window and best_candidate.score >= current_candidate.score + upgrade_margin:
+    if (
+        best_candidate.window != current_candidate.window
+        and best_candidate.score > current_candidate.score
+        and best_candidate.score >= current_candidate.score + max(0.0, float(upgrade_margin or 0.0))
+    ):
         return best_candidate
     return current_candidate
 
@@ -739,7 +791,10 @@ class ExecutionQueueManager:
         existing.warnings = list(warnings or [])
         existing.last_updated = datetime.now()
 
-        if existing.locked and existing.selected_candidate is not None:
+        if existing.manual_window_lock and existing.selected_window:
+            selected = existing.candidates.get(existing.selected_window) or existing.selected_candidate
+            existing.selected_candidate = selected
+        elif existing.locked and existing.selected_candidate is not None:
             selected = existing.selected_candidate
         else:
             selected = select_best_orb_candidate(

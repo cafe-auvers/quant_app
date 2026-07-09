@@ -9,7 +9,7 @@ from src.core.watchlist import BuylistManager, Watchlist, WatchlistItem
 from src.ui.main_window import MainWindow
 
 
-def _intraday(minutes=31, high=100.0, low=98.0, close=101.0):
+def _intraday(minutes=31, high=101.0, low=99.0, close=102.0):
     index = pd.date_range("2026-07-01 09:30", periods=minutes, freq="min")
     rows = []
     for i, _ts in enumerate(index):
@@ -132,7 +132,7 @@ def test_intentional_selected_symbol_creates_one_buylist_queue_item(monkeypatch,
     assert item is not None
     assert item.monitoring_status == "EXECUTE_READY"
     assert item.breakout_method == "execution_queue:1m"
-    assert item.entry_price == pytest.approx(100.1)
+    assert item.entry_price == pytest.approx(101.01)
     assert item._planned_shares > 0
     assert item.shares_held == 0
     assert window.execution_queue_manager.items[queue_key("AAPL", "SIM")].selected_window == "1m"

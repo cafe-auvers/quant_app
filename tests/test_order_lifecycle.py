@@ -893,6 +893,163 @@ def test_monitor_skips_blocked_stop_loss_auto_order():
     assert len([message for message in logs if "auto KIS order is blocked" in message]) == 1
 
 
+def test_monitor_submits_stop_loss_with_aggressive_limit():
+    submitted = []
+    item = SimpleNamespace(
+        symbol="AAPL",
+        environment="SIM",
+        monitoring_status="BOUGHT",
+        shares_held=10,
+        avg_cost=100.0,
+        stop_loss=50.0,
+        sell_half_done=False,
+        entry_price=100.0,
+        auto_order_block_reason="",
+    )
+    window = MainWindow.__new__(MainWindow)
+    window.buylist_manager = SimpleNamespace(items=[item])
+    window.latest_intraday_prices = {"AAPL": 49.0}
+    window._buylist_refresh_item_data = lambda _item: None
+    window._populate_buylist_env_table = lambda _env: None
+    window._submit_kis_sell_order = lambda *args, **kwargs: submitted.append((args, kwargs))
+    window.append_log = lambda _message: None
+
+    MainWindow._run_buylist_monitor_cycle(window, "SIM")
+
+    assert len(submitted) == 1
+    assert submitted[0][0] == (item, 10)
+    assert submitted[0][1]["reason"] == "stop-loss"
+    assert submitted[0][1]["order_price"] == pytest.approx(48.51)
+
+
+def test_stop_loss_sell_reprice_starts_cancel_when_price_moves_lower(monkeypatch):
+    started = []
+
+    class FakeSignal:
+        def connect(self, callback):
+            self.callback = callback
+
+    class FakeCancelWorker:
+        def __init__(self, client_order_id):
+            self.client_order_id = client_order_id
+            self.finished_cancel = FakeSignal()
+            self.error_occurred = FakeSignal()
+            self.finished = FakeSignal()
+
+        def isRunning(self):
+            return False
+
+        def start(self):
+            started.append(self.client_order_id)
+
+    item = SimpleNamespace(
+        symbol="AAPL",
+        environment="SIM",
+        monitoring_status="SELL_SUBMITTED",
+        shares_held=10,
+        stop_loss=50.0,
+        auto_order_block_reason="",
+    )
+    order = _order(side=OrderSide.SELL, intent=OrderIntent.STOP_LOSS, status=OrderStatus.ACCEPTED)
+    order.broker_order_id = "KIS-STOP"
+    order.limit_price = 49.0
+    window = MainWindow.__new__(MainWindow)
+    window.broker_order_cancel_worker = None
+    window._open_broker_orders_for_buylist_item = lambda *args, **kwargs: [order]
+    window.append_log = lambda _message: None
+
+    monkeypatch.setattr(buylist_mixin_module, "KisOrderCancelWorker", FakeCancelWorker)
+
+    MainWindow._maybe_reprice_stop_loss_sell(window, item, "SIM", 45.0)
+
+    assert item._stop_reprice_pending is True
+    assert started == [order.client_order_id]
+
+
+def test_better_ready_orb_candidate_requires_higher_score_and_respects_manual_lock():
+    current = SimpleNamespace(window="1m", score=50.0, valid=True, status="EXECUTE_READY")
+    better = SimpleNamespace(window="5m", score=51.0, valid=True, status="EXECUTE_READY")
+    queue_item = SimpleNamespace(
+        manual_window_lock=False,
+        selected_candidate=current,
+        selected_window="1m",
+        candidates={"1m": current, "5m": better},
+    )
+
+    assert MainWindow._better_ready_orb_candidate(queue_item) is better
+
+    better.score = 50.0
+    assert MainWindow._better_ready_orb_candidate(queue_item) is None
+
+    better.score = 51.0
+    queue_item.manual_window_lock = True
+    assert MainWindow._better_ready_orb_candidate(queue_item) is None
+
+
+def test_market_close_requests_cancel_for_unfilled_entry_buy_before_reset():
+    cancel_calls = []
+    open_orders = []
+    item = SimpleNamespace(
+        symbol="AAPL",
+        environment="SIM",
+        monitoring_status="ORDER_SUBMITTED",
+        status="ORDER_SUBMITTED",
+        breakout_method="execution_queue:1m",
+        orb_monitor_enabled=True,
+        _buy_order_pending=True,
+        _selected_orb_window="1m",
+        _planned_shares=10,
+        _auto_order_block_notice_logged=True,
+        _orb_queue_required_notice_logged=True,
+    )
+    queue_item = SimpleNamespace(
+        locked=True,
+        locked_reason="Order submitted",
+        manual_window_lock=False,
+        candidates={"1m": object()},
+        selected_window="1m",
+        selected_candidate=object(),
+        order_status="ACCEPTED",
+        order_id="KIS-BUY",
+        warnings=["old"],
+        status="ORDER_SUBMITTED",
+    )
+    order = _order(side=OrderSide.BUY, intent=OrderIntent.ENTRY, status=OrderStatus.ACCEPTED)
+    order.broker_order_id = "KIS-BUY"
+    open_orders.append(order)
+
+    class Manager:
+        def get_item(self, symbol, environment):
+            assert (symbol, environment) == ("AAPL", "SIM")
+            return queue_item
+
+    def request_cancel(client_order_id):
+        cancel_calls.append(client_order_id)
+        open_orders.clear()
+        item.monitoring_status = "EXECUTE_READY"
+        return True
+
+    window = MainWindow.__new__(MainWindow)
+    window.buylist_manager = SimpleNamespace(items=[item])
+    window.execution_queue_manager = Manager()
+    window._open_broker_orders_for_buylist_item = lambda *args, **kwargs: list(open_orders)
+    window.request_cancel_order = request_cancel
+    window._clear_buylist_auto_order_block = lambda selected: None
+    window._save_buylist_state = lambda: None
+    window._save_execution_queue_state = lambda: None
+    window.populate_buylist_dashboard = lambda: None
+    window.append_log = lambda _message: None
+
+    MainWindow._deactivate_pre_entry_orb_monitoring(window)
+
+    assert cancel_calls == [order.client_order_id]
+    assert item.monitoring_status == "WATCHING"
+    assert item._buy_order_pending is False
+    assert queue_item.status.value == "WATCHING"
+    assert queue_item.candidates == {}
+    assert queue_item.selected_window is None
+
+
 def test_monitor_restores_error_position_with_shares_to_bought():
     logs = []
     save_calls = []

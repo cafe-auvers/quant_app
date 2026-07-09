@@ -790,11 +790,11 @@ class WatchlistAiWorker(QThread):
                     breakout_price = float(getattr(item, "breakout_price", 0.0) or 0.0)
                     buffer_pct = 0.001
                     breakout_trigger = breakout_price * (1 + buffer_pct) if breakout_price > 0 else 0.0
-                    entry_price = max(orb_high, breakout_trigger) if breakout_trigger > 0 else orb_high
+                    entry_price = orb_high
                     stop_loss = float(orb_range.low)
                     
                     sizing = self._calculate_position_values(self.account_size, r_case, entry_price, stop_loss, adr_percent)
-                    valid = self._is_plan_valid(sizing, adr_percent)
+                    valid = breakout_price > 0 and orb_high > breakout_trigger and self._is_plan_valid(sizing, adr_percent)
                     score = self._score_recommendation(sizing, r_case)
                     
                     all_candidates.append({

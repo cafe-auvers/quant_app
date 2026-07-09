@@ -179,9 +179,9 @@ def test_current_price_below_entry_trigger_is_armed_not_execute_ready():
     waiting = build_orb_candidate(
         symbol="AAPL",
         window="1m",
-        intraday=_intraday(minutes=3, high=100.0, low=98.0),
+        intraday=_intraday(minutes=3, high=101.0, low=99.0),
         breakout_price=100.0,
-        current_price=99.5,
+        current_price=100.5,
         account_size=100000.0,
         risk_percent=0.005,
         adr_percent=5.0,
@@ -196,9 +196,9 @@ def test_current_price_above_entry_trigger_with_valid_risk_is_execute_ready():
     candidate = build_orb_candidate(
         symbol="AAPL",
         window="1m",
-        intraday=_intraday(minutes=3, high=100.0, low=98.0),
+        intraday=_intraday(minutes=3, high=101.0, low=99.0),
         breakout_price=100.0,
-        current_price=101.0,
+        current_price=102.0,
         account_size=100000.0,
         risk_percent=0.005,
         adr_percent=5.0,
@@ -207,6 +207,23 @@ def test_current_price_above_entry_trigger_with_valid_risk_is_execute_ready():
     assert candidate.status == OrbCandidateStatus.EXECUTE_READY
     assert candidate.valid is True
     assert candidate.shares >= 1
+
+
+def test_orb_high_must_clear_buffered_breakout_trigger():
+    candidate = build_orb_candidate(
+        symbol="AAPL",
+        window="1m",
+        intraday=_intraday(minutes=3, high=100.0, low=98.0),
+        breakout_price=100.0,
+        current_price=102.0,
+        account_size=100000.0,
+        risk_percent=0.005,
+        adr_percent=5.0,
+    )
+
+    assert candidate.status == OrbCandidateStatus.REJECTED
+    assert candidate.valid is False
+    assert "has not cleared breakout trigger" in candidate.reason
 
 
 def test_after_order_submission_selected_window_is_locked():
@@ -359,9 +376,9 @@ def test_stop_adr_validation_follows_existing_thresholds():
     too_tight = build_orb_candidate(
         symbol="AAPL",
         window="1m",
-        intraday=_intraday(minutes=3, high=100.0, low=99.9),
+        intraday=_intraday(minutes=3, high=101.0, low=100.9),
         breakout_price=100.0,
-        current_price=101.0,
+        current_price=102.0,
         account_size=100000.0,
         risk_percent=0.0001,
         adr_percent=5.0,
@@ -369,9 +386,9 @@ def test_stop_adr_validation_follows_existing_thresholds():
     valid = build_orb_candidate(
         symbol="AAPL",
         window="1m",
-        intraday=_intraday(minutes=3, high=100.0, low=98.0),
+        intraday=_intraday(minutes=3, high=101.0, low=99.0),
         breakout_price=100.0,
-        current_price=101.0,
+        current_price=102.0,
         account_size=100000.0,
         risk_percent=0.005,
         adr_percent=5.0,
@@ -379,9 +396,9 @@ def test_stop_adr_validation_follows_existing_thresholds():
     too_wide = build_orb_candidate(
         symbol="AAPL",
         window="1m",
-        intraday=_intraday(minutes=3, high=100.0, low=90.0),
+        intraday=_intraday(minutes=3, high=101.0, low=90.0),
         breakout_price=100.0,
-        current_price=101.0,
+        current_price=102.0,
         account_size=100000.0,
         risk_percent=0.005,
         adr_percent=5.0,
@@ -392,13 +409,13 @@ def test_stop_adr_validation_follows_existing_thresholds():
     assert too_wide.status == OrbCandidateStatus.RISK_INVALID
 
 
-def test_capital_allocation_validation_follows_existing_thresholds():
+def test_capital_allocation_auto_selects_valid_supported_risk_case():
     too_low = build_orb_candidate(
         symbol="AAPL",
         window="1m",
-        intraday=_intraday(minutes=3, high=100.0, low=98.0),
+        intraday=_intraday(minutes=3, high=101.0, low=99.0),
         breakout_price=100.0,
-        current_price=101.0,
+        current_price=102.0,
         account_size=100000.0,
         risk_percent=0.001,
         adr_percent=5.0,
@@ -406,9 +423,9 @@ def test_capital_allocation_validation_follows_existing_thresholds():
     valid = build_orb_candidate(
         symbol="AAPL",
         window="1m",
-        intraday=_intraday(minutes=3, high=100.0, low=98.0),
+        intraday=_intraday(minutes=3, high=101.0, low=99.0),
         breakout_price=100.0,
-        current_price=101.0,
+        current_price=102.0,
         account_size=100000.0,
         risk_percent=0.005,
         adr_percent=5.0,
@@ -416,14 +433,17 @@ def test_capital_allocation_validation_follows_existing_thresholds():
     too_high = build_orb_candidate(
         symbol="AAPL",
         window="1m",
-        intraday=_intraday(minutes=3, high=100.0, low=98.0),
+        intraday=_intraday(minutes=3, high=101.0, low=99.0),
         breakout_price=100.0,
-        current_price=101.0,
+        current_price=102.0,
         account_size=100000.0,
         risk_percent=0.01,
         adr_percent=5.0,
     )
 
-    assert too_low.status == OrbCandidateStatus.RISK_INVALID
+    assert too_low.status == OrbCandidateStatus.EXECUTE_READY
     assert valid.status == OrbCandidateStatus.EXECUTE_READY
-    assert too_high.status == OrbCandidateStatus.RISK_INVALID
+    assert too_high.status == OrbCandidateStatus.EXECUTE_READY
+    assert 0.0025 <= too_low.risk_percent <= 0.02
+    assert 0.0025 <= valid.risk_percent <= 0.02
+    assert 0.0025 <= too_high.risk_percent <= 0.02

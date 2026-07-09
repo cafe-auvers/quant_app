@@ -836,12 +836,19 @@ class ChartsControllerMixin:
         if not symbol:
             QMessageBox.information(self, "No symbol", "Load a symbol before adding it to the watchlist.")
             return
-        if self.watchlist.get(symbol) is not None:
+        existing = self.watchlist.get(symbol)
+        source_combo = self.__dict__.get("sidebar_source_combo")
+        source = source_combo.currentData() if source_combo is not None else {"type": "watchlist"}
+        source_type = source.get("type") if isinstance(source, dict) else ""
+        if existing is not None and source_type == "watchlist":
             self.watchlist.remove(symbol)
             self.populate_watchlist_table()
             self.update_dashboard_summary()
             self._save_state()
             self.append_log(f"Removed {symbol} from watchlist from TradingView.")
+            self._update_tradingview_watchlist_btn()
+            return
+        if existing is not None:
             self._update_tradingview_watchlist_btn()
             return
         name = symbol
@@ -856,11 +863,13 @@ class ChartsControllerMixin:
         self.append_log(f"Added/updated {symbol} in watchlist from TradingView.")
         self._update_tradingview_watchlist_btn()
     def _update_tradingview_watchlist_btn(self, _text: str = "") -> None:
-        btn = getattr(self, "tradingview_add_watchlist_button", None)
+        btn = self.__dict__.get("tradingview_add_watchlist_button")
         if btn is None:
             return
-        symbol = self.tradingview_symbol_combo.currentText().strip().upper() if hasattr(self, "tradingview_symbol_combo") else ""
-        in_watchlist = symbol and getattr(self, "watchlist", None) is not None and self.watchlist.get(symbol) is not None
+        combo = self.__dict__.get("tradingview_symbol_combo")
+        symbol = combo.currentText().strip().upper() if combo is not None else ""
+        watchlist = self.__dict__.get("watchlist")
+        in_watchlist = symbol and watchlist is not None and watchlist.get(symbol) is not None
         if in_watchlist:
             btn.setText("Remove from Watchlist (W)")
             btn.setStyleSheet("background-color: #c0392b; color: white; font-weight: 600;")
@@ -1562,6 +1571,8 @@ class ChartsControllerMixin:
         if hasattr(self, "refresh_execution_queue"):
             env = self.watchlist_env_combo.currentText() if hasattr(self, "watchlist_env_combo") else "SIM"
             self.refresh_execution_queue(env, show_log=False)
+            if hasattr(self, "_auto_replace_working_entry_queue_items"):
+                self._auto_replace_working_entry_queue_items(env)
             if hasattr(self, "_auto_submit_execute_ready_queue_items"):
                 self._auto_submit_execute_ready_queue_items(env)
         if hasattr(self, "live_data_checkbox") and self.live_data_checkbox.isChecked():

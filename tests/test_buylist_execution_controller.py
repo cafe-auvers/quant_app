@@ -159,7 +159,7 @@ def test_successful_fake_queue_refresh_increments_refreshed_and_status_counts():
     assert result.failures == []
 
 
-def test_duplicate_pending_order_is_passed_to_queue_builder():
+def test_queue_pending_order_still_refreshes_candidates_for_replacement():
     controller = BuylistExecutionController(SimpleNamespace())
     manager = FakeQueueManager(pending=True)
 
@@ -167,9 +167,22 @@ def test_duplicate_pending_order_is_passed_to_queue_builder():
 
     assert result.refreshed == 1
     assert manager.build_calls == 1
-    assert manager.duplicate_pending_order is True
+    assert manager.duplicate_pending_order is False
     assert manager.pending_environment == "SIM"
     assert manager.build_environment == "SIM"
+
+
+def test_external_duplicate_broker_order_is_passed_to_queue_builder():
+    controller = BuylistExecutionController(SimpleNamespace())
+    manager = FakeQueueManager(pending=False)
+
+    result = controller.refresh_execution_queue(
+        _request(manager=manager, has_duplicate_open_order=lambda *args: True)
+    )
+
+    assert result.refreshed == 1
+    assert manager.build_calls == 1
+    assert manager.duplicate_pending_order is True
 
 
 def test_callback_failure_is_captured_and_refresh_continues():
@@ -209,9 +222,9 @@ def test_apply_queue_item_preserves_existing_volatile_compatibility_mirrors():
 
     assert existing.entry_price == 1.23
     assert existing.stop_loss == 0.45
-    assert existing.position_percent == 3.0
+    assert existing.position_percent == 10.0
     assert existing.stop_adr == 2.0
-    assert existing.risk_percent == 4.0
+    assert existing.risk_percent == 1.0
     assert existing.trade_plan == "old plan"
     assert existing.monitoring_status == "EXECUTE_READY"
     assert existing.breakout_method == "execution_queue:1m"

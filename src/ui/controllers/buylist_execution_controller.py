@@ -58,6 +58,15 @@ class BuylistExecutionController(WindowController):
     def _status_text(value: Any) -> str:
         return str(getattr(value, "value", value) or "")
 
+    @staticmethod
+    def _latest_close(frame: Any) -> float:
+        try:
+            if frame is None or frame.empty or "Close" not in frame.columns:
+                return 0.0
+            return float(frame.sort_index()["Close"].iloc[-1])
+        except Exception:
+            return 0.0
+
     def refresh_execution_queue(self, request: ExecutionQueueRefreshRequest) -> ExecutionQueueRefreshResult:
         """Refresh existing queue rows, or intentionally queue selected symbols."""
         result = ExecutionQueueRefreshResult(
@@ -83,19 +92,25 @@ class BuylistExecutionController(WindowController):
                 five_minute = request.latest_intraday_session(
                     request.load_intraday_interval(symbol, "5m", request.window_days)
                 )
-                current_price = request.signal_price_for_symbol(symbol)
+                current_price = (
+                    self._latest_close(one_minute)
+                    or self._latest_close(five_minute)
+                    or request.signal_price_for_symbol(symbol)
+                )
                 if current_price > 0:
                     request.set_latest_intraday_price(symbol, current_price)
-                duplicate_order = request.manager.has_pending_or_submitted_order(
+                queue_has_working_order = request.manager.has_pending_or_submitted_order(
                     symbol,
                     environment=request.env,
-                ) or request.has_duplicate_open_order(
+                )
+                broker_has_open_order = request.has_duplicate_open_order(
                     request.env,
                     request.account_no,
                     symbol,
                     OrderSide.BUY,
                     OrderIntent.ENTRY,
                 )
+                duplicate_order = bool(broker_has_open_order and not queue_has_working_order)
                 queue_item = request.manager.build_or_update_from_watchlist_item(
                     watch_item,
                     {"1m": one_minute, "5m": five_minute, "30m": five_minute},

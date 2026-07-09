@@ -1510,8 +1510,8 @@ class WatchlistMixin:
 
                 orb_high = float(orb_range.high)
                 stop_price = float(orb_range.low)
-                entry_trigger = max(orb_high, breakout_trigger) if breakout_trigger > 0 else orb_high
-                signal_price = current_live_price if current_live_price > 0 else entry_trigger
+                entry_trigger = orb_high
+                signal_price = current_live_price if current_live_price > 0 else 0.0
                 entry_signal = evaluate_orb_entry_signal(
                     orb_high=orb_high,
                     orb_low=stop_price,
@@ -1527,13 +1527,16 @@ class WatchlistMixin:
                     stop_price=stop_price,
                     adr_percent=adr_percent,
                 )
-                plan_valid = self._orb_position_plan_is_valid(sizing, adr_percent)
-                if not self._orb_position_plan_is_valid(sizing, adr_percent):
+                breakout_plan_valid = breakout_price > 0 and orb_high > breakout_trigger
+                plan_valid = breakout_plan_valid and self._orb_position_plan_is_valid(sizing, adr_percent)
+                if breakout_price <= 0:
+                    status_reason = "no_breakout"
+                elif orb_high <= breakout_trigger:
+                    status_reason = "below_breakout"
+                elif not self._orb_position_plan_is_valid(sizing, adr_percent):
                     status_reason = "invalid_sizing"
                 elif entry_signal.signal == "confirmed_orb_breakout":
                     status_reason = "confirmed"
-                elif entry_signal.signal == "orb_only_inside_base":
-                    status_reason = "below_breakout"
                 else:
                     status_reason = "price_not_ready"
 
@@ -1733,13 +1736,12 @@ class WatchlistMixin:
                     continue
                 orb_high = float(orb_range.high)
                 stop_price = float(orb_range.low)
-                # entry_trigger = max(ORB high, breakout_price * (1+buffer)); falls back to orb_high if no breakout set
-                entry_trigger = max(orb_high, breakout_trigger) if breakout_trigger > 0 else orb_high
+                entry_trigger = orb_high
 
                 # Evaluate the combined entry signal using the actual current live price.
                 # This shows the REAL zone the stock is in right now, not a hypothetical.
                 from src.core.orb import evaluate_orb_entry_signal
-                signal_price = current_live_price if current_live_price > 0 else entry_trigger
+                signal_price = current_live_price if current_live_price > 0 else 0.0
                 entry_signal = evaluate_orb_entry_signal(
                     orb_high=orb_high,
                     orb_low=stop_price,
@@ -1755,13 +1757,16 @@ class WatchlistMixin:
                     stop_price=stop_price,
                     adr_percent=adr_percent,
                 )
-                column_valid = self._orb_position_plan_is_valid(sizing, adr_percent)
-                if not self._orb_position_plan_is_valid(sizing, adr_percent):
+                breakout_plan_valid = breakout_price > 0 and orb_high > breakout_trigger
+                column_valid = breakout_plan_valid and self._orb_position_plan_is_valid(sizing, adr_percent)
+                if breakout_price <= 0:
+                    status_reason = "no_breakout"
+                elif orb_high <= breakout_trigger:
+                    status_reason = "below_breakout"
+                elif not self._orb_position_plan_is_valid(sizing, adr_percent):
                     status_reason = "invalid_sizing"
                 elif entry_signal.signal == "confirmed_orb_breakout":
                     status_reason = "confirmed"
-                elif entry_signal.signal == "orb_only_inside_base":
-                    status_reason = "below_breakout"
                 else:
                     status_reason = "price_not_ready"
                 recommendation_score = self._score_orb_position_recommendation(sizing, risk_percent)
@@ -1769,6 +1774,8 @@ class WatchlistMixin:
                 # Human-readable signal label + machine key for aggregate status
                 signal_key = entry_signal.signal
                 signal_display = {
+                    "missing_breakout_price": "Missing breakout",
+                    "orb_high_below_breakout_trigger": "ORB below breakout",
                     "confirmed_orb_breakout": "✓ Confirmed",
                     "orb_only_inside_base": "⚠ ORB only / below BKT",
                     "structural_breakout_not_fully_confirmed": "◑ Partial (probe)",

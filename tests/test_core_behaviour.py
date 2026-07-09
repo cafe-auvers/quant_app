@@ -310,10 +310,10 @@ def test_orb_best_recommendation_prefers_higher_score_then_lower_risk():
 def test_orb_entry_signal_confirmed_when_price_above_entry_trigger():
     """Price clears both ORB high and buffered breakout price -> confirmed breakout."""
     result = evaluate_orb_entry_signal(
-        orb_high=100.0,
+        orb_high=103.0,
         orb_low=95.0,
         breakout_price=102.0,
-        current_price=103.0,   # above max(100, 102*1.001=102.102)
+        current_price=104.0,
         buffer_pct=0.001,
     )
 
@@ -323,20 +323,20 @@ def test_orb_entry_signal_confirmed_when_price_above_entry_trigger():
     assert result.allow_full_size is True
     assert result.suggested_size_multiplier == 1.0
     assert round(result.breakout_trigger, 4) == round(102.0 * 1.001, 4)
-    assert result.entry_trigger == max(100.0, 102.0 * 1.001)
+    assert result.entry_trigger == 103.0
 
 
-def test_orb_entry_signal_orb_only_inside_base_when_above_orb_below_breakout():
-    """Price is above ORB high but below the buffered breakout -> no entry allowed."""
+def test_orb_entry_signal_rejects_orb_high_below_breakout_trigger():
+    """A completed ORB below the buffered breakout is not tradable."""
     result = evaluate_orb_entry_signal(
         orb_high=100.0,
         orb_low=95.0,
         breakout_price=105.0,
-        current_price=101.0,   # above orb_high=100 but below breakout_trigger=105.105
+        current_price=106.0,
         buffer_pct=0.001,
     )
 
-    assert result.signal == "orb_only_inside_base"
+    assert result.signal == "orb_high_below_breakout_trigger"
     assert result.allow_entry is False
     assert result.allow_full_size is False
     assert result.suggested_size_multiplier == 0.0
@@ -386,8 +386,8 @@ def test_orb_entry_signal_no_entry_when_price_below_orb_high():
     assert result.allow_full_size is False
 
 
-def test_orb_entry_signal_no_breakout_price_falls_back_to_orb_only():
-    """When breakout_price is None, entry_trigger equals orb_high and confirmed when price exceeds it."""
+def test_orb_entry_signal_no_breakout_price_blocks_entry():
+    """ORB entries require a daily structural breakout price."""
     result = evaluate_orb_entry_signal(
         orb_high=100.0,
         orb_low=95.0,
@@ -397,18 +397,13 @@ def test_orb_entry_signal_no_breakout_price_falls_back_to_orb_only():
     )
 
     assert result.breakout_trigger == 0.0
-    assert result.entry_trigger == 100.0    # falls back to orb_high
-    assert result.signal == "confirmed_orb_breakout"
-    assert result.allow_entry is True
+    assert result.entry_trigger == 100.0
+    assert result.signal == "missing_breakout_price"
+    assert result.allow_entry is False
 
 
-def test_orb_entry_signal_entry_trigger_is_breakout_when_orb_high_is_lower():
-    """When orb_high < breakout_price the entry trigger is the buffered breakout level.
-
-    This is the key validity rule: if the ORB candle high is below the daily structural
-    level, entering on the ORB high alone would be before the daily breakout is confirmed.
-    The entry_trigger correctly becomes the breakout level (not the ORB high).
-    """
+def test_orb_entry_signal_entry_trigger_stays_orb_high_when_orb_high_is_lower():
+    """ORB high below the buffered breakout invalidates that ORB window."""
     result = evaluate_orb_entry_signal(
         orb_high=98.0,
         orb_low=94.0,
@@ -417,14 +412,13 @@ def test_orb_entry_signal_entry_trigger_is_breakout_when_orb_high_is_lower():
         buffer_pct=0.001,
     )
 
-    expected_trigger = 105.0 * 1.001
-    assert round(result.entry_trigger, 6) == round(expected_trigger, 6)
-    assert result.entry_trigger > result.orb_high  # ORB high is NOT the binding level
-    assert result.signal == "no_entry"              # price hasn't cleared anything yet
+    assert result.entry_trigger == 98.0
+    assert result.signal == "orb_high_below_breakout_trigger"
+    assert result.allow_entry is False
 
 
 def test_orb_entry_signal_buffer_applied_correctly():
-    """Verify buffer_pct is applied to breakout_price before the max comparison."""
+    """Verify buffer_pct is applied before deciding whether the ORB is tradable."""
     result = evaluate_orb_entry_signal(
         orb_high=100.0,
         orb_low=95.0,
@@ -433,10 +427,9 @@ def test_orb_entry_signal_buffer_applied_correctly():
         buffer_pct=0.001,      # breakout_trigger = 100.1
     )
 
-    # 100.05 > orb_high (100) but <= breakout_trigger (100.1) -> orb_only_inside_base
     assert result.breakout_trigger == 100.1
-    assert result.entry_trigger == 100.1
-    assert result.signal == "orb_only_inside_base"
+    assert result.entry_trigger == 100.0
+    assert result.signal == "orb_high_below_breakout_trigger"
 
 
 def test_orb_plan_records_sort_best_recommendation_first():
@@ -2110,7 +2103,7 @@ def test_orb_range_and_signal_use_opening_window():
     )
 
     orb_range = calculate_orb_range("AAPL", intraday, "5m")
-    signal = evaluate_orb_signal("AAPL", intraday, "5m", target_price=17.0)
+    signal = evaluate_orb_signal("AAPL", intraday, "5m", target_price=14.0)
 
     assert orb_range is not None
     assert orb_range.high == 15

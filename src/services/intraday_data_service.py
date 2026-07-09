@@ -37,6 +37,7 @@ def fetch_intraday_with_fallback(request: IntradayRequest) -> IntradayResult:
                 warning="KIS intraday failed/unavailable and fallback is disabled.",
             )
     else:
+        warnings.append("KIS intraday disabled/unconfigured.")
         if not request.allow_fallback:
             return empty_intraday_result(
                 request,
