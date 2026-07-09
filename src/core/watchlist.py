@@ -253,6 +253,11 @@ class BuylistItem:
     buffer_pct: float = 0.001                   # 0.1% buffer applied above breakout_price
     auto_order_block_reason: str = ""
     orb_monitor_enabled: bool = False           # user explicitly activated monitoring for this queue item
+    partial_exit_review_alert: bool = False
+    partial_exit_review_reason: str = ""
+    ema_trailing_stop_alert: bool = False
+    ema_trailing_stop_reason: str = ""
+    suggested_action: str = ""
 
     def to_dict(self) -> Dict:
         """Convert to dictionary for serialization."""
@@ -291,6 +296,11 @@ class BuylistItem:
             "buffer_pct": self.buffer_pct,
             "auto_order_block_reason": self.auto_order_block_reason,
             "orb_monitor_enabled": self.orb_monitor_enabled,
+            "partial_exit_review_alert": self.partial_exit_review_alert,
+            "partial_exit_review_reason": self.partial_exit_review_reason,
+            "ema_trailing_stop_alert": self.ema_trailing_stop_alert,
+            "ema_trailing_stop_reason": self.ema_trailing_stop_reason,
+            "suggested_action": self.suggested_action,
         }
 
     @classmethod
@@ -342,6 +352,11 @@ class BuylistItem:
             buffer_pct=float(data.get("buffer_pct", 0.001)),
             auto_order_block_reason=str(data.get("auto_order_block_reason", "")),
             orb_monitor_enabled=bool(data.get("orb_monitor_enabled", False)),
+            partial_exit_review_alert=bool(data.get("partial_exit_review_alert", False)),
+            partial_exit_review_reason=str(data.get("partial_exit_review_reason", "")),
+            ema_trailing_stop_alert=bool(data.get("ema_trailing_stop_alert", False)),
+            ema_trailing_stop_reason=str(data.get("ema_trailing_stop_reason", "")),
+            suggested_action=str(data.get("suggested_action", "")),
         )
 
 

@@ -1,4 +1,5 @@
 import json
+import datetime as dt
 from types import SimpleNamespace
 
 import pytest
@@ -922,8 +923,9 @@ def test_monitor_submits_stop_loss_with_aggressive_limit():
     assert submitted[0][1]["order_price"] == pytest.approx(48.51)
 
 
-def test_monitor_auto_submits_one_third_partial_after_day_rule_when_trade_worked():
+def test_monitor_creates_partial_exit_review_alert_without_auto_sell():
     submitted = []
+    logs = []
     item = SimpleNamespace(
         symbol="AAPL",
         environment="SIM",
@@ -943,18 +945,22 @@ def test_monitor_auto_submits_one_third_partial_after_day_rule_when_trade_worked
     window._buylist_days_held = lambda _item: 3
     window._populate_buylist_env_table = lambda _env: None
     window._submit_kis_sell_order = lambda *args, **kwargs: submitted.append((args, kwargs))
-    window.append_log = lambda _message: None
+    window._save_state = lambda: None
+    window.append_log = logs.append
 
     MainWindow._run_buylist_monitor_cycle(window, "SIM")
 
-    assert len(submitted) == 1
-    assert submitted[0][0] == (item, 3)
-    assert submitted[0][1]["reason"] == "partial sell day rule"
-    assert submitted[0][1]["order_price"] == pytest.approx(110.0)
-    assert item._exit_order_pending is True
+    assert submitted == []
+    assert item.shares_held == 9
+    assert item.sell_half_done is False
+    assert getattr(item, "partial_exit_review_alert") is True
+    assert "3-5 trading day partial-exit review window" in item.partial_exit_review_reason
+    assert item.suggested_action == "Review manually; no automatic sell submitted."
+    assert not getattr(item, "_exit_order_pending", False)
+    assert any("no automatic sell submitted" in message for message in logs)
 
 
-def test_monitor_does_not_partial_exit_day_rule_when_trade_has_not_worked():
+def test_monitor_partial_exit_review_alert_does_not_depend_on_intraday_gain():
     submitted = []
     item = SimpleNamespace(
         symbol="AAPL",
@@ -975,16 +981,21 @@ def test_monitor_does_not_partial_exit_day_rule_when_trade_has_not_worked():
     window._buylist_days_held = lambda _item: 3
     window._populate_buylist_env_table = lambda _env: None
     window._submit_kis_sell_order = lambda *args, **kwargs: submitted.append((args, kwargs))
+    window._save_state = lambda: None
     window.append_log = lambda _message: None
 
     MainWindow._run_buylist_monitor_cycle(window, "SIM")
 
     assert submitted == []
+    assert getattr(item, "partial_exit_review_alert") is True
+    assert item.shares_held == 9
+    assert item.sell_half_done is False
     assert not getattr(item, "_exit_order_pending", False)
 
 
-def test_monitor_auto_submits_momentum_exit_after_partial_when_below_ema():
+def test_monitor_creates_ema10_exit_alert_without_auto_sell():
     submitted = []
+    logs = []
     item = SimpleNamespace(
         symbol="AAPL",
         environment="SIM",
@@ -998,24 +1009,102 @@ def test_monitor_auto_submits_momentum_exit_after_partial_when_below_ema():
         buy_date=None,
         _ema10=100.0,
         _ema20=95.0,
+        _latest_daily_close=94.0,
     )
     window = MainWindow.__new__(MainWindow)
     window.buylist_manager = SimpleNamespace(items=[item])
-    window.latest_intraday_prices = {"AAPL": 94.0}
+    window.latest_intraday_prices = {"AAPL": 110.0}
     window._buylist_refresh_item_data = lambda _item: None
     window._buylist_days_held = lambda _item: 8
     window._populate_buylist_env_table = lambda _env: None
     window._submit_kis_sell_order = lambda *args, **kwargs: submitted.append((args, kwargs))
+    window._save_state = lambda: None
+    window.append_log = logs.append
+
+    MainWindow._run_buylist_monitor_cycle(window, "SIM")
+
+    assert submitted == []
+    assert item.monitoring_status == "BOUGHT"
+    assert item.shares_held == 6
+    assert getattr(item, "ema_trailing_stop_alert") is True
+    assert "Close below 10 EMA" in item.ema_trailing_stop_reason
+    assert item.suggested_action == "Review manually; no automatic sell submitted."
+    assert not getattr(item, "_exit_order_pending", False)
+    assert any("Close below 10 EMA" in message for message in logs)
+    assert MainWindow._sell_intent_for_reason("momentum exit below 10 EMA") == OrderIntent.MOMENTUM_EXIT
+
+
+def test_monitor_creates_ema20_exit_alert_without_auto_sell():
+    submitted = []
+    item = SimpleNamespace(
+        symbol="AAPL",
+        environment="SIM",
+        monitoring_status="BOUGHT",
+        shares_held=6,
+        avg_cost=100.0,
+        stop_loss=90.0,
+        sell_half_done=True,
+        entry_price=100.0,
+        auto_order_block_reason="",
+        buy_date=None,
+        _ema10=95.0,
+        _ema20=100.0,
+        _latest_daily_close=97.0,
+    )
+    window = MainWindow.__new__(MainWindow)
+    window.buylist_manager = SimpleNamespace(items=[item])
+    window.latest_intraday_prices = {"AAPL": 110.0}
+    window._buylist_refresh_item_data = lambda _item: None
+    window._buylist_days_held = lambda _item: 8
+    window._populate_buylist_env_table = lambda _env: None
+    window._submit_kis_sell_order = lambda *args, **kwargs: submitted.append((args, kwargs))
+    window._save_state = lambda: None
     window.append_log = lambda _message: None
 
     MainWindow._run_buylist_monitor_cycle(window, "SIM")
 
-    assert len(submitted) == 1
-    assert submitted[0][0] == (item, 6)
-    assert submitted[0][1]["reason"] == "momentum exit below 10 EMA"
-    assert submitted[0][1]["order_price"] == pytest.approx(94.0)
-    assert item._exit_order_pending is True
-    assert MainWindow._sell_intent_for_reason("momentum exit below 10 EMA") == OrderIntent.MOMENTUM_EXIT
+    assert submitted == []
+    assert item.monitoring_status == "BOUGHT"
+    assert item.shares_held == 6
+    assert getattr(item, "ema_trailing_stop_alert") is True
+    assert "Close below 20 EMA" in item.ema_trailing_stop_reason
+    assert not getattr(item, "_exit_order_pending", False)
+
+
+def test_buylist_days_held_uses_us_market_session_date_for_kst_naive_timestamp():
+    item = SimpleNamespace(
+        buy_date=dt.datetime(2026, 7, 9, 22, 45),
+    )
+    window = MainWindow.__new__(MainWindow)
+    window._us_market_session_date = lambda: dt.date(2026, 7, 9)
+
+    assert MainWindow._buylist_days_held(window, item) == 0
+
+    window._us_market_session_date = lambda: dt.date(2026, 7, 10)
+
+    assert MainWindow._buylist_days_held(window, item) == 1
+
+
+def test_buylist_days_held_converts_after_midnight_kst_to_previous_us_session():
+    item = SimpleNamespace(
+        buy_date=dt.datetime(2026, 7, 10, 4, 0),
+    )
+    window = MainWindow.__new__(MainWindow)
+    window._us_market_session_date = lambda: dt.date(2026, 7, 10)
+
+    assert MainWindow._buylist_days_held(window, item) == 1
+
+
+def test_completed_daily_close_rows_excludes_current_session_before_close():
+    rows = [
+        (dt.date(2026, 7, 8), 100.0),
+        (dt.date(2026, 7, 9), 102.0),
+    ]
+    before_close = dt.datetime(2026, 7, 9, 15, 59, tzinfo=buylist_mixin_module.US_MARKET_ZONE)
+    after_close = dt.datetime(2026, 7, 9, 16, 1, tzinfo=buylist_mixin_module.US_MARKET_ZONE)
+
+    assert MainWindow._completed_daily_close_rows(rows, before_close) == [(dt.date(2026, 7, 8), 100.0)]
+    assert MainWindow._completed_daily_close_rows(rows, after_close) == rows
 
 
 def test_stop_loss_sell_reprice_starts_cancel_when_price_moves_lower(monkeypatch):
@@ -1186,6 +1275,267 @@ def test_buylist_order_price_uses_intraday_cache_without_current_price():
     assert MainWindow._buylist_order_price(window, item) == 90.0
 
 
+def test_buylist_sell_half_selected_submits_manual_partial_with_allowed_range(monkeypatch):
+    submitted = []
+    created_spins = []
+
+    class FakeSignal:
+        def connect(self, _callback):
+            pass
+
+    class FakeDialog:
+        Accepted = 1
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def setWindowTitle(self, _title):
+            pass
+
+        def setLayout(self, _layout):
+            pass
+
+        def accept(self):
+            pass
+
+        def reject(self):
+            pass
+
+        def exec_(self):
+            return self.Accepted
+
+    class FakeLayout:
+        def addWidget(self, _widget):
+            pass
+
+    class FakeLabel:
+        def __init__(self, _text=""):
+            self.text = _text
+
+        def setWordWrap(self, _enabled):
+            pass
+
+        def setText(self, text):
+            self.text = text
+
+    class FakeSlider:
+        def __init__(self, *_args, **_kwargs):
+            self.valueChanged = FakeSignal()
+
+        def setMinimum(self, value):
+            self.minimum = value
+
+        def setMaximum(self, value):
+            self.maximum = value
+
+        def setValue(self, value):
+            self.value = value
+
+        def setEnabled(self, enabled):
+            self.enabled = enabled
+
+    class FakeSpin:
+        def __init__(self, *_args, **_kwargs):
+            self.valueChanged = FakeSignal()
+            created_spins.append(self)
+
+        def setMinimum(self, value):
+            self.minimum = value
+
+        def setMaximum(self, value):
+            self.maximum = value
+
+        def setValue(self, value):
+            self._value = value
+
+        def value(self):
+            return self._value
+
+    class FakeButtonBox:
+        Ok = 1
+        Cancel = 2
+
+        def __init__(self, *_args, **_kwargs):
+            self.accepted = FakeSignal()
+            self.rejected = FakeSignal()
+
+    item = SimpleNamespace(
+        symbol="AAPL",
+        monitoring_status="BOUGHT",
+        shares_held=10,
+    )
+    window = MainWindow.__new__(MainWindow)
+    window._buylist_selected_item = lambda _env: item
+    window._warn_if_open_sell_order = lambda _item, _env: False
+    window._submit_kis_sell_order = lambda it, qty, reason: submitted.append((it, qty, reason))
+
+    monkeypatch.setattr(buylist_mixin_module, "QDialog", FakeDialog)
+    monkeypatch.setattr(buylist_mixin_module, "QVBoxLayout", FakeLayout)
+    monkeypatch.setattr(buylist_mixin_module, "QLabel", FakeLabel)
+    monkeypatch.setattr(buylist_mixin_module, "QSlider", FakeSlider)
+    monkeypatch.setattr(buylist_mixin_module, "QSpinBox", FakeSpin)
+    monkeypatch.setattr(buylist_mixin_module, "QDialogButtonBox", FakeButtonBox)
+
+    MainWindow._buylist_sell_half_selected(window, "SIM")
+
+    assert len(created_spins) == 1
+    assert created_spins[0].minimum == 3
+    assert created_spins[0].maximum == 5
+    assert submitted == [(item, 3, "partial sell")]
+    assert MainWindow._sell_intent_for_reason("partial sell") == OrderIntent.PARTIAL_EXIT
+
+
+def test_buylist_sell_half_selected_requires_bought_position(monkeypatch):
+    warnings = []
+    submitted = []
+    item = SimpleNamespace(
+        symbol="AAPL",
+        monitoring_status="WATCHING",
+        shares_held=0,
+    )
+    window = MainWindow.__new__(MainWindow)
+    window._buylist_selected_item = lambda _env: item
+    window._warn_if_open_sell_order = lambda _item, _env: pytest.fail("duplicate check should not run")
+    window._submit_kis_sell_order = lambda *args, **kwargs: submitted.append((args, kwargs))
+
+    monkeypatch.setattr(buylist_mixin_module.QMessageBox, "warning", lambda *args, **kwargs: warnings.append(args))
+
+    MainWindow._buylist_sell_half_selected(window, "SIM")
+
+    assert submitted == []
+    assert warnings
+
+
+def test_buylist_move_to_breakeven_requires_bought_position(monkeypatch):
+    warnings = []
+    item = SimpleNamespace(
+        symbol="AAPL",
+        monitoring_status="WATCHING",
+        shares_held=0,
+        avg_cost=100.0,
+        entry_price=95.0,
+        stop_loss=90.0,
+    )
+    window = MainWindow.__new__(MainWindow)
+    window._buylist_selected_item = lambda _env: item
+
+    monkeypatch.setattr(buylist_mixin_module.QMessageBox, "warning", lambda *args, **kwargs: warnings.append(args))
+
+    MainWindow._buylist_move_to_breakeven_selected(window, "SIM")
+
+    assert item.stop_loss == 90.0
+    assert warnings
+
+
+def test_buylist_move_to_breakeven_uses_avg_cost_and_never_lowers_stop(monkeypatch):
+    questions = []
+    infos = []
+    saves = []
+    item = SimpleNamespace(
+        symbol="AAPL",
+        monitoring_status="BOUGHT",
+        shares_held=10,
+        avg_cost=100.0,
+        entry_price=95.0,
+        stop_loss=90.0,
+    )
+    window = MainWindow.__new__(MainWindow)
+    window._buylist_selected_item = lambda _env: item
+    window._save_state = lambda: saves.append(True)
+    window.populate_buylist_dashboard = lambda: None
+    window.append_log = lambda _message: None
+
+    monkeypatch.setattr(
+        buylist_mixin_module.QMessageBox,
+        "question",
+        lambda *args, **kwargs: questions.append(args) or buylist_mixin_module.QMessageBox.Yes,
+    )
+    monkeypatch.setattr(buylist_mixin_module.QMessageBox, "information", lambda *args, **kwargs: infos.append(args))
+
+    MainWindow._buylist_move_to_breakeven_selected(window, "SIM")
+
+    assert item.stop_loss == 100.0
+    assert saves == [True]
+    assert questions
+
+    MainWindow._buylist_move_to_breakeven_selected(window, "SIM")
+
+    assert item.stop_loss == 100.0
+    assert infos
+
+
+def test_buylist_move_to_breakeven_falls_back_to_entry_price(monkeypatch):
+    item = SimpleNamespace(
+        symbol="AAPL",
+        monitoring_status="BOUGHT",
+        shares_held=10,
+        avg_cost=0.0,
+        entry_price=95.0,
+        stop_loss=90.0,
+    )
+    window = MainWindow.__new__(MainWindow)
+    window._buylist_selected_item = lambda _env: item
+    window._save_state = lambda: None
+    window.populate_buylist_dashboard = lambda: None
+    window.append_log = lambda _message: None
+
+    monkeypatch.setattr(
+        buylist_mixin_module.QMessageBox,
+        "question",
+        lambda *args, **kwargs: buylist_mixin_module.QMessageBox.Yes,
+    )
+
+    MainWindow._buylist_move_to_breakeven_selected(window, "SIM")
+
+    assert item.stop_loss == 95.0
+
+
+def test_buylist_sell_all_selected_confirms_limit_order_and_submits_full_quantity(monkeypatch):
+    questions = []
+    submitted = []
+    item = SimpleNamespace(
+        symbol="AAPL",
+        monitoring_status="BOUGHT",
+        shares_held=7,
+    )
+    window = MainWindow.__new__(MainWindow)
+    window._buylist_selected_item = lambda _env: item
+    window._warn_if_open_sell_order = lambda _item, _env: False
+    window._submit_kis_sell_order = lambda it, qty, reason: submitted.append((it, qty, reason))
+
+    monkeypatch.setattr(
+        buylist_mixin_module.QMessageBox,
+        "question",
+        lambda *args, **kwargs: questions.append(args) or buylist_mixin_module.QMessageBox.Yes,
+    )
+
+    MainWindow._buylist_sell_all_selected(window, "SIM")
+
+    assert submitted == [(item, 7, "manual sell all")]
+    assert "limit sell order" in questions[0][2]
+
+
+def test_buylist_sell_all_selected_blocks_when_open_sell_exists(monkeypatch):
+    questions = []
+    submitted = []
+    item = SimpleNamespace(
+        symbol="AAPL",
+        monitoring_status="BOUGHT",
+        shares_held=7,
+    )
+    window = MainWindow.__new__(MainWindow)
+    window._buylist_selected_item = lambda _env: item
+    window._warn_if_open_sell_order = lambda _item, _env: True
+    window._submit_kis_sell_order = lambda *args, **kwargs: submitted.append((args, kwargs))
+
+    monkeypatch.setattr(buylist_mixin_module.QMessageBox, "question", lambda *args, **kwargs: questions.append(args))
+
+    MainWindow._buylist_sell_all_selected(window, "SIM")
+
+    assert submitted == []
+    assert questions == []
+
+
 def test_submit_kis_sell_order_uses_environment_and_live_price_without_current_price(monkeypatch):
     logs = []
     created_workers = []
@@ -1244,6 +1594,7 @@ def test_submit_kis_sell_order_uses_environment_and_live_price_without_current_p
     window.append_log = logs.append
     window._first_account_no_for_environment = lambda environment: "12345678"
     window._has_duplicate_open_order = lambda *args: False
+    window._has_open_sell_order = lambda *args: False
     window.buylist_manager = SimpleNamespace()
     window.populate_buylist_dashboard = lambda: None
 
@@ -1263,6 +1614,41 @@ def test_submit_kis_sell_order_uses_environment_and_live_price_without_current_p
     assert worker.buylist_symbol_key == "SIM:AAPL"
     assert worker.started is True
     assert any("SELL submitted for AAPL" in message for message in logs)
+
+
+def test_submit_kis_sell_order_blocks_any_existing_open_sell(monkeypatch):
+    logs = []
+    created_workers = []
+
+    class FakeKisOrderWorker:
+        def __init__(self, *args, **kwargs):
+            created_workers.append((args, kwargs))
+
+    item = SimpleNamespace(
+        symbol="AAPL",
+        environment="SIM",
+        _stop_order_pending=True,
+        _exit_order_pending=True,
+        monitoring_status="BOUGHT",
+        shares_held=10,
+        avg_cost=100.0,
+        stop_loss=90.0,
+        entry_price=95.0,
+    )
+    window = MainWindow.__new__(MainWindow)
+    window.latest_intraday_prices = {"AAPL": 88.5}
+    window.append_log = logs.append
+    window._first_account_no_for_environment = lambda environment: "12345678"
+    window._has_open_sell_order = lambda environment, account_no, symbol: True
+
+    monkeypatch.setattr(buylist_mixin_module, "KisOrderWorker", FakeKisOrderWorker)
+
+    MainWindow._submit_kis_sell_order(window, item, 10, "manual sell all")
+
+    assert created_workers == []
+    assert item._stop_order_pending is False
+    assert item._exit_order_pending is False
+    assert any("Open SELL order already exists" in message for message in logs)
 
 
 def test_submit_kis_buy_order_honors_explicit_order_price_over_live_price(monkeypatch):

@@ -313,21 +313,7 @@ class BuylistMixin:
                 pnl_pct = (current_price - item.avg_cost) / item.avg_cost * 100.0
                 pnl_usd = (current_price - item.avg_cost) * item.shares_held
 
-            days_held = 0
-            if item.buy_date:
-                buy_date = item.buy_date.date() if hasattr(item.buy_date, "date") else item.buy_date
-                today = dt.date.today()
-                if hasattr(self, "_nyse_holidays"):
-                    holidays: set = set()
-                    for y in range(buy_date.year, today.year + 1):
-                        holidays |= self._nyse_holidays(y)
-                    d = buy_date
-                    while d < today:
-                        if d.weekday() < 5 and d not in holidays:
-                            days_held += 1
-                        d += dt.timedelta(days=1)
-                else:
-                    days_held = (today - buy_date).days
+            days_held = self._buylist_days_held(item) if item.buy_date else 0
 
             # For BOUGHT positions use the frozen position_percent snapshotted at fill time —
             # account_size_input can change (e.g. KIS balance load) and would give nonsense %.
@@ -451,13 +437,11 @@ class BuylistMixin:
             if getattr(item, "auto_order_block_reason", ""):
                 alerts.append("KIS ORDER BLOCKED")
             if 3 <= days_held <= 5 and not item.sell_half_done:
-                alerts.append("SELL 1/3—1/2 (day rule)")
-            ema10 = getattr(item, "_ema10", 0.0)
-            ema20 = getattr(item, "_ema20", 0.0)
-            if ema10 > 0 and current_price < ema10:
-                alerts.append("< 10 EMA")
-            if ema20 > 0 and current_price < ema20:
-                alerts.append("< 20 EMA")
+                alerts.append("PARTIAL EXIT REVIEW")
+            if getattr(item, "partial_exit_review_alert", False):
+                alerts.append(str(getattr(item, "partial_exit_review_reason", "") or "Manual partial-exit review"))
+            if getattr(item, "ema_trailing_stop_alert", False):
+                alerts.append(str(getattr(item, "ema_trailing_stop_reason", "") or "EMA trailing-stop review"))
         elif item.monitoring_status == "ACTIVE":
             if self._is_orb_buylist_item(item):
                 alerts.append("QUEUE REQUIRED")
@@ -1763,6 +1747,8 @@ class BuylistMixin:
         if item.monitoring_status != "BOUGHT" or item.shares_held <= 0:
             QMessageBox.warning(self, "No position", f"{item.symbol} has no open position.")
             return
+        if self._warn_if_open_sell_order(item, env):
+            return
         qty_third = max(1, item.shares_held // 3)
         qty_half = max(1, item.shares_held // 2)
 
@@ -1817,9 +1803,12 @@ class BuylistMixin:
         if item.monitoring_status != "BOUGHT" or item.shares_held <= 0:
             QMessageBox.warning(self, "No position", f"{item.symbol} has no open position.")
             return
+        if self._warn_if_open_sell_order(item, env):
+            return
         reply = QMessageBox.question(
             self, "Confirm Sell All",
-            f"Sell all {item.shares_held} shares of {item.symbol}?\nThis will submit a market order.",
+            f"Sell all {item.shares_held} shares of {item.symbol}?\n"
+            "This will submit a limit sell order using current/live fallback price.",
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply == QMessageBox.Yes:
@@ -1845,6 +1834,9 @@ class BuylistMixin:
         item = self._buylist_selected_item(env)
         if not item:
             QMessageBox.warning(self, "No selection", "Select a buylist row first.")
+            return
+        if item.monitoring_status != "BOUGHT" or item.shares_held <= 0:
+            QMessageBox.warning(self, "No position", f"{item.symbol} has no open bought position.")
             return
         breakeven = item.avg_cost if item.avg_cost > 0 else item.entry_price
         if breakeven <= 0:
@@ -2226,53 +2218,10 @@ class BuylistMixin:
                 if auto_order_blocked or exit_order_pending:
                     continue
 
-                try:
-                    shares_held = int(getattr(item, "shares_held", 0) or 0)
-                except (TypeError, ValueError):
-                    shares_held = 0
                 days_held = self._buylist_days_held(item)
-                avg_cost = float(getattr(item, "avg_cost", 0.0) or 0.0)
-                if (
-                    shares_held > 0
-                    and 3 <= days_held <= 5
-                    and not getattr(item, "sell_half_done", False)
-                    and avg_cost > 0
-                    and current_price > avg_cost
-                ):
-                    quantity = self._partial_exit_quantity(shares_held)
-                    if quantity > 0:
-                        item._exit_order_pending = True
-                        self.append_log(
-                            f"[Buylist/{env}] {item.symbol} day-rule partial exit: "
-                            f"{days_held} days held and current ${current_price:.2f} "
-                            f"> avg cost ${avg_cost:.2f}. Selling {quantity}/{shares_held} shares."
-                        )
-                        self._submit_kis_sell_order(
-                            item,
-                            quantity,
-                            reason="partial sell day rule",
-                            order_price=current_price,
-                        )
-                        continue
-
-                momentum_signal = self._momentum_exit_signal(item, current_price)
-                if (
-                    shares_held > 0
-                    and getattr(item, "sell_half_done", False)
-                    and momentum_signal
-                ):
-                    item._exit_order_pending = True
-                    self.append_log(
-                        f"[Buylist/{env}] {item.symbol} momentum exit: current ${current_price:.2f} "
-                        f"below {momentum_signal}. Selling remaining {shares_held} shares."
-                    )
-                    self._submit_kis_sell_order(
-                        item,
-                        shares_held,
-                        reason=f"momentum exit below {momentum_signal}",
-                        order_price=current_price,
-                    )
-
+                alert_changed = self._update_manual_exit_alerts(item, env, days_held)
+                if alert_changed:
+                    self._save_buylist_state()
         self._populate_buylist_env_table(env)
 
     def _restore_monitorable_buylist_error_positions(self, items, env: str) -> None:
@@ -2318,26 +2267,110 @@ class BuylistMixin:
             item.auto_order_block_reason = ""
         item._auto_order_block_notice_logged = False
 
+    @staticmethod
+    def _set_attr_if_changed(item, attr: str, value) -> bool:
+        if getattr(item, attr, None) == value:
+            return False
+        setattr(item, attr, value)
+        return True
+
+    def _update_manual_exit_alerts(self, item, env: str, days_held: int) -> bool:
+        changed = False
+        suggested_action = "Review manually; no automatic sell submitted."
+
+        try:
+            shares_held = int(getattr(item, "shares_held", 0) or 0)
+        except (TypeError, ValueError):
+            shares_held = 0
+
+        partial_reason = ""
+        if shares_held > 0 and 3 <= days_held <= 5 and not getattr(item, "sell_half_done", False):
+            partial_reason = "Position is within 3-5 trading day partial-exit review window."
+
+        changed |= self._set_attr_if_changed(item, "partial_exit_review_alert", bool(partial_reason))
+        changed |= self._set_attr_if_changed(item, "partial_exit_review_reason", partial_reason)
+
+        ema_reason = ""
+        if shares_held > 0 and getattr(item, "sell_half_done", False):
+            momentum_signal = self._momentum_exit_signal(item)
+            if momentum_signal:
+                ema_reason = f"Close below {momentum_signal} - review manual exit next market open."
+
+        changed |= self._set_attr_if_changed(item, "ema_trailing_stop_alert", bool(ema_reason))
+        changed |= self._set_attr_if_changed(item, "ema_trailing_stop_reason", ema_reason)
+
+        if partial_reason or ema_reason:
+            changed |= self._set_attr_if_changed(item, "suggested_action", suggested_action)
+        elif str(getattr(item, "suggested_action", "") or "") == suggested_action:
+            changed |= self._set_attr_if_changed(item, "suggested_action", "")
+
+        partial_notice_key = "_partial_exit_review_notice_reason"
+        if partial_reason and getattr(item, partial_notice_key, "") != partial_reason:
+            setattr(item, partial_notice_key, partial_reason)
+            self.append_log(f"[Buylist/{env}] {item.symbol}: {partial_reason} {suggested_action}")
+        elif not partial_reason and getattr(item, partial_notice_key, ""):
+            setattr(item, partial_notice_key, "")
+
+        ema_notice_key = "_ema_trailing_stop_notice_reason"
+        if ema_reason and getattr(item, ema_notice_key, "") != ema_reason:
+            setattr(item, ema_notice_key, ema_reason)
+            self.append_log(f"[Buylist/{env}] {item.symbol}: {ema_reason} {suggested_action}")
+        elif not ema_reason and getattr(item, ema_notice_key, ""):
+            setattr(item, ema_notice_key, "")
+
+        return changed
+
     def _buylist_days_held(self, item) -> int:
         buy_date = getattr(item, "buy_date", None)
         if not buy_date:
             return 0
-        buy_day = buy_date.date() if hasattr(buy_date, "date") else buy_date
-        today = dt.date.today()
-        if buy_day >= today:
+        buy_day = self._buylist_market_session_date_from_value(buy_date)
+        session_today = self._us_market_session_date()
+        if buy_day is None or buy_day >= session_today:
             return 0
         if hasattr(self, "_nyse_holidays"):
             holidays: set = set()
-            for year in range(buy_day.year, today.year + 1):
+            for year in range(buy_day.year, session_today.year + 1):
                 holidays |= self._nyse_holidays(year)
             days = 0
             cursor = buy_day
-            while cursor < today:
+            while cursor < session_today:
                 if cursor.weekday() < 5 and cursor not in holidays:
                     days += 1
                 cursor += dt.timedelta(days=1)
             return days
-        return (today - buy_day).days
+        return (session_today - buy_day).days
+
+    @staticmethod
+    def _us_market_session_date(now: Optional[dt.datetime] = None) -> dt.date:
+        market_now = now or dt.datetime.now(US_MARKET_ZONE)
+        if isinstance(market_now, dt.datetime) and market_now.tzinfo is None:
+            market_now = market_now.replace(tzinfo=KST_ZONE).astimezone(US_MARKET_ZONE)
+        elif isinstance(market_now, dt.datetime):
+            market_now = market_now.astimezone(US_MARKET_ZONE)
+        return market_now.date()
+
+    @staticmethod
+    def _buylist_market_session_date_from_value(value) -> Optional[dt.date]:
+        if isinstance(value, dt.datetime):
+            timestamp = value
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=KST_ZONE)
+            return timestamp.astimezone(US_MARKET_ZONE).date()
+        if isinstance(value, dt.date):
+            return value
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                return BuylistMixin._buylist_market_session_date_from_value(dt.datetime.fromisoformat(text))
+            except ValueError:
+                try:
+                    return dt.date.fromisoformat(text)
+                except ValueError:
+                    return None
+        return None
 
     @staticmethod
     def _partial_exit_quantity(shares_held: int) -> int:
@@ -2350,9 +2383,9 @@ class BuylistMixin:
         return max(1, shares // 3)
 
     @staticmethod
-    def _momentum_exit_signal(item, current_price: float) -> str:
+    def _momentum_exit_signal(item) -> str:
         try:
-            price = float(current_price or 0.0)
+            price = float(getattr(item, "_latest_daily_close", 0.0) or 0.0)
         except (TypeError, ValueError):
             price = 0.0
         if price <= 0:
@@ -2364,6 +2397,40 @@ class BuylistMixin:
         if ema20 > 0 and price < ema20:
             return "20 EMA"
         return ""
+
+    @staticmethod
+    def _completed_daily_close_rows(
+        daily_rows,
+        now: Optional[dt.datetime] = None,
+    ) -> List[Tuple[dt.date, float]]:
+        rows: List[Tuple[dt.date, float]] = []
+        for session_date, close in list(daily_rows or []):
+            if isinstance(session_date, dt.datetime):
+                session_date = session_date.astimezone(US_MARKET_ZONE).date()
+            if not isinstance(session_date, dt.date):
+                continue
+            try:
+                close_value = float(close)
+            except (TypeError, ValueError):
+                continue
+            rows.append((session_date, close_value))
+        if not rows:
+            return []
+
+        market_now = now or dt.datetime.now(US_MARKET_ZONE)
+        if market_now.tzinfo is None:
+            market_now = market_now.replace(tzinfo=KST_ZONE).astimezone(US_MARKET_ZONE)
+        else:
+            market_now = market_now.astimezone(US_MARKET_ZONE)
+
+        session_today = market_now.date()
+        today_is_complete = market_now.time() >= US_MARKET_CLOSE_TIME
+        completed = [
+            row for row in rows
+            if row[0] < session_today or (row[0] == session_today and today_is_complete)
+        ]
+        return completed or rows
+
     def _buylist_refresh_item_data(self, item) -> None:
         """Fetch latest 30d daily closes and compute 10/20 EMA for a buylist item.
 
@@ -2375,6 +2442,7 @@ class BuylistMixin:
 
         symbol = item.symbol
         closes = None
+        daily_rows = None
 
         # Primary: direct Yahoo Finance v8 chart API (browser UA bypasses Yahoo's bot block)
         try:
@@ -2392,8 +2460,16 @@ class BuylistMixin:
             r = session.get(url, params={"interval": "1d", "range": "30d", "events": "div,splits"}, timeout=15)
             r.raise_for_status()
             payload = r.json()
-            raw_closes = payload["chart"]["result"][0]["indicators"]["quote"][0]["close"]
-            closes = [float(c) for c in raw_closes if c is not None]
+            result = payload["chart"]["result"][0]
+            raw_closes = result["indicators"]["quote"][0]["close"]
+            timestamps = result.get("timestamp", []) or []
+            daily_rows = []
+            for ts_value, close_value in zip(timestamps, raw_closes):
+                if close_value is None:
+                    continue
+                session_date = dt.datetime.fromtimestamp(float(ts_value), dt.timezone.utc).astimezone(US_MARKET_ZONE).date()
+                daily_rows.append((session_date, float(close_value)))
+            closes = [close for _session_date, close in daily_rows] if daily_rows else [float(c) for c in raw_closes if c is not None]
         except Exception as exc:
             self.append_log(f"[Buylist] Direct fetch failed for {symbol}: {exc} — trying yfinance fallback.")
 
@@ -2405,7 +2481,22 @@ class BuylistMixin:
                 sys.stderr = io.StringIO()
                 hist = yf.Ticker(symbol).history(period="30d", interval="1d")
                 if not hist.empty:
-                    closes = hist["Close"].dropna().tolist()
+                    daily_rows = []
+                    for index_value, close_value in hist["Close"].dropna().items():
+                        if hasattr(index_value, "to_pydatetime"):
+                            timestamp = index_value.to_pydatetime()
+                        else:
+                            timestamp = index_value
+                        if isinstance(timestamp, dt.datetime):
+                            if timestamp.tzinfo is None:
+                                timestamp = timestamp.replace(tzinfo=US_MARKET_ZONE)
+                            session_date = timestamp.astimezone(US_MARKET_ZONE).date()
+                        elif isinstance(timestamp, dt.date):
+                            session_date = timestamp
+                        else:
+                            continue
+                        daily_rows.append((session_date, float(close_value)))
+                    closes = [close for _session_date, close in daily_rows]
             except Exception:
                 pass
             finally:
@@ -2415,7 +2506,18 @@ class BuylistMixin:
             self.append_log(f"[Buylist] No price data for {symbol} — skipping this cycle.")
             return
 
-        self.latest_intraday_prices[symbol] = closes[-1]
+        completed_rows = self._completed_daily_close_rows(daily_rows)
+        if completed_rows:
+            closes = [close for _session_date, close in completed_rows]
+
+        latest_close = closes[-1]
+        try:
+            existing_live_price = float(self.latest_intraday_prices.get(symbol, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            existing_live_price = 0.0
+        if existing_live_price <= 0:
+            self.latest_intraday_prices[symbol] = latest_close
+        item._latest_daily_close = latest_close
         item._ema10 = self._compute_ema(closes, 10)
         item._ema20 = self._compute_ema(closes, 20)
     @staticmethod
@@ -2473,6 +2575,30 @@ class BuylistMixin:
             side=side,
             intent=intent,
         )
+
+    def _has_open_sell_order(self, environment: str, account_no: str, symbol: str) -> bool:
+        load_fn = _main_window_global("load_order_ledger", load_order_ledger)
+        has_open_fn = _main_window_global("has_open_order", has_open_order)
+        self.order_ledger = load_fn()
+        return has_open_fn(
+            environment=environment,
+            account_no=account_no or "",
+            symbol=symbol,
+            side=OrderSide.SELL,
+        )
+
+    def _warn_if_open_sell_order(self, item, env: str) -> bool:
+        account_no = self._first_account_no_for_environment(env) or ""
+        if not self._has_open_sell_order(env, account_no, item.symbol):
+            return False
+        QMessageBox.warning(
+            self,
+            "Open sell order",
+            f"An open SELL order already exists for {item.symbol}. "
+            "Reconcile or cancel it before submitting another sell order.",
+        )
+        return True
+
     def _save_buylist_state(self) -> None:
         save_state = getattr(self, "_save_state", None)
         if callable(save_state):
@@ -2601,11 +2727,11 @@ class BuylistMixin:
         env = self._buylist_order_environment(item)
         account_no = self._first_account_no_for_environment(env) or ""
         intent = self._sell_intent_for_reason(reason)
-        if self._has_duplicate_open_order(env, account_no, item.symbol, OrderSide.SELL, intent):
+        if self._has_open_sell_order(env, account_no, item.symbol):
             item._stop_order_pending = False
             item._exit_order_pending = False
             self.append_log(
-                f"Open SELL {intent.value} order already exists for {item.symbol} in {env} account {account_no}. "
+                f"Open SELL order already exists for {item.symbol} in {env} account {account_no}. "
                 "Reconcile or cancel it before submitting another order."
             )
             return
@@ -2984,7 +3110,7 @@ class BuylistMixin:
                 if order.avg_fill_price:
                     item.avg_cost = float(order.avg_fill_price)
                 if not getattr(item, "buy_date", None):
-                    item.buy_date = dt.datetime.now()
+                    item.buy_date = dt.datetime.now(US_MARKET_ZONE)
                 item.kis_order_id = order.broker_order_id or order.client_order_id
                 item.monitoring_status = "BOUGHT" if order.status == OrderStatus.FILLED else "BUY_PARTIAL"
                 if item.avg_cost and item.shares_held:

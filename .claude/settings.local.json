@@ -28,7 +28,9 @@
       "Bash(python -m py_compile src/ui/mixins/charts_controller_mixin.py src/ui/mixins/charts_render_mixin.py src/ui/dialogs.py src/ui/filter_catalog.py)",
       "Bash(python -m py_compile src/ui/main_window.py)",
       "Bash(python -m py_compile src/ui/mixins/charts_controller_mixin.py)",
-      "Bash(python -m py_compile src/ui/main_window.py src/ui/mixins/buylist_mixin.py)"
+      "Bash(python -m py_compile src/ui/main_window.py src/ui/mixins/buylist_mixin.py)",
+      "Bash(wc -l \"c:\\\\Users\\\\tonyh\\\\Downloads\\\\replan_dashboard_queue_v24_fc_grouping.py\")",
+      "Read(//c/Users/tonyh/Downloads/**)"
     ]
   }
 }

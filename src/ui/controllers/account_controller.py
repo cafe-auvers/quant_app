@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import datetime as dt
 from typing import Any, Dict, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 from PyQt5.QtWidgets import QMessageBox
 
 from src.ui.controllers.base import WindowController
 from src.ui.workers import KisAccountWorker
+
+US_MARKET_ZONE = ZoneInfo("America/New_York")
 
 
 class AccountController(WindowController):
@@ -90,7 +93,7 @@ class AccountController(WindowController):
             if average_price > 0:
                 item.avg_cost = float(average_price)
             if not getattr(item, "buy_date", None):
-                item.buy_date = dt.datetime.now()
+                item.buy_date = dt.datetime.now(US_MARKET_ZONE)
             item._buy_order_pending = False
             if self._is_execution_queue_buylist_item(item):
                 manager = self._ensure_execution_queue_manager()
