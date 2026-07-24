@@ -637,9 +637,7 @@ class ScannerMixin:
             allow_fallback=True,
         )
         self.intraday_bulk_worker.progress.connect(self._on_intraday_bulk_progress)
-        self.intraday_bulk_worker.provider_warning.connect(
-            lambda symbol, warning: self.append_log(f"Intraday provider warning for {symbol}: {warning}")
-        )
+        self.intraday_bulk_worker.provider_warning.connect(self._log_intraday_provider_warning)
         self.intraday_bulk_worker.finished_bulk.connect(self._on_intraday_bulk_finished)
         self.intraday_bulk_worker.finished.connect(
             lambda worker=self.intraday_bulk_worker: self._clear_worker_reference("intraday_bulk_worker", worker)

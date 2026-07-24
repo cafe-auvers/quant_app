@@ -209,6 +209,7 @@ class MainWindow(
         self.usd_krw_rate_source = ""
         self.intraday_fetch_worker = None
         self.intraday_bulk_worker = None
+        self._intraday_provider_warning_log_keys: set[str] = set()
         self.live_data_timer = None
         self.current_tradingview_symbol = ""
         self.tradingview_refresh_timestamps: dict[str, dt.datetime] = {}
@@ -931,6 +932,20 @@ class MainWindow(
         timestamp = pd.Timestamp.now().strftime("%H:%M:%S")
         self.log_output.append(f"[{timestamp}] {message}")
         self.log_output.verticalScrollBar().setValue(self.log_output.verticalScrollBar().maximum())
+
+    def _log_intraday_provider_warning(self, symbol: str, warning: str) -> None:
+        warning_text = str(warning or "").strip()
+        if not warning_text:
+            return
+        if warning_text == "KIS intraday disabled/unconfigured.":
+            emitted_keys = getattr(self, "_intraday_provider_warning_log_keys", set())
+            if warning_text in emitted_keys:
+                return
+            emitted_keys.add(warning_text)
+            self._intraday_provider_warning_log_keys = emitted_keys
+            self.append_log("Intraday provider notice: KIS intraday disabled/unconfigured; using yfinance fallback.")
+            return
+        self.append_log(f"Intraday provider warning for {symbol}: {warning_text}")
 
     def update_progress(self, percent: int, current: int, total: int, eta: str) -> None:
         self.progress_bar.setValue(percent)

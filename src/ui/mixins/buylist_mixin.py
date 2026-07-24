@@ -349,10 +349,11 @@ class BuylistMixin:
             table.setItem(row, 1,  _cell(display_name[:16] if display_name else ""))
             table.setItem(row, 2,  _cell(display_status))
             if is_queue_item:
+                status_text = str(getattr(item, "monitoring_status", "") or "").upper()
                 monitor_on = (
                     monitor_running
                     and getattr(item, "orb_monitor_enabled", False)
-                    and item.monitoring_status in ("ARMED", "EXECUTE_READY")
+                    and status_text in {"WATCHING", "ORB_FORMING", "WAITING_BREAKOUT", "ARMED", "EXECUTE_READY"}
                 )
             else:
                 monitor_on = item.monitoring_status in ("ACTIVE", "BOUGHT")
@@ -1691,8 +1692,11 @@ class BuylistMixin:
         item.monitoring_status = "ACTIVE"
         self._clear_buylist_auto_order_block(item)
         self._save_state()
+        monitor_started = self._ensure_buylist_monitor_running(env)
         self.populate_buylist_dashboard()
         self.append_log(f"[Buylist/{env}] {item.symbol} set to ACTIVE — monitoring for entry at ${item.entry_price:.2f}.")
+        if monitor_started:
+            self.append_log(f"[Buylist/{env}] Monitor auto-started for active entry monitoring.")
     def _buylist_deactivate_selected(self, env: str) -> None:
         item = self._buylist_selected_item(env)
         if not item:
@@ -1902,6 +1906,16 @@ class BuylistMixin:
                 btn.setText("Stop Monitor")
             self.append_log(f"[Buylist/{env}] Monitor started — checking every 60 seconds.")
             self._run_buylist_monitor_cycle(env)  # run immediately
+    def _ensure_buylist_monitor_running(self, env: str) -> bool:
+        """Start one environment's buylist monitor if it is currently off."""
+        active_attr = f"_buylist_{env.lower()}_monitor_active"
+        if getattr(self, active_attr, False):
+            return False
+        if not hasattr(self, "_toggle_buylist_monitor"):
+            return False
+        self._toggle_buylist_monitor(env)
+        return bool(getattr(self, active_attr, False))
+
     def _auto_submit_execute_ready_queue_items(self, env: str) -> None:
         """Auto-submit EXECUTE_READY execution-queue items when the monitor is active for env."""
         active_attr = f"_buylist_{env.lower()}_monitor_active"

@@ -263,6 +263,27 @@ def test_buy_dashboard_queue_row_uses_execution_queue_candidate_values(monkeypat
     assert "Qty 1" not in table.item(0, 12).text()
 
 
+def test_buy_dashboard_queue_monitor_column_shows_active_watching_item(monkeypatch, tmp_path):
+    window = _build_queue_window(monkeypatch, tmp_path)
+    MainWindow.refresh_execution_queue(
+        window,
+        "SIM",
+        show_log=False,
+        symbols=["AAPL"],
+        create_missing=True,
+    )
+    item = window.buylist_manager.get("AAPL", "SIM")
+    item.monitoring_status = "WATCHING"
+    item.orb_monitor_enabled = True
+    window._buylist_sim_monitor_active = True
+    table = FakeTable()
+    window.buylist_sim_table = table
+
+    MainWindow._populate_buylist_env_table(window, "SIM")
+
+    assert table.item(0, 3).text() == "ON"
+
+
 def test_buy_dashboard_uses_environment_specific_queue_item(monkeypatch, tmp_path):
     window = _build_queue_window(monkeypatch, tmp_path)
     for env in ("SIM", "PROD"):

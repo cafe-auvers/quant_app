@@ -37,6 +37,7 @@ def fetch_kis_intraday(request: IntradayRequest) -> IntradayResult:
         # Always try all standard US exchanges so a mismatched code doesn't silently fail.
         raw_result = kis_client.fetch_overseas_1m(
             request.symbol,
+            window_days=request.window_days,
         )
     except (KisIntradayNotConfiguredError, KisIntradayError, Exception) as exc:
         raise KisIntradayProviderError(str(exc)) from exc

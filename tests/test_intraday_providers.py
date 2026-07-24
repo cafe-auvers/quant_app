@@ -19,6 +19,7 @@ from src.services.kis_intraday_provider import KisIntradayProviderError, fetch_k
 import src.services.kis_intraday_provider as kis_provider
 from src.services.yfinance_intraday_provider import fetch_yfinance_intraday
 import src.services.yfinance_intraday_provider as yfinance_provider
+from src.ui.main_window import MainWindow
 from src.ui.workers import IntradayFetchWorker
 from src.utils.db_loader import save_intraday_history_to_db
 
@@ -73,6 +74,51 @@ def test_kis_provider_raises_clear_error_when_not_configured(monkeypatch):
         fetch_kis_intraday(request)
 
 
+def test_kis_client_paginates_intraday_rows(monkeypatch):
+    monkeypatch.setenv("KIS_INTRADAY_ENABLED", "true")
+    monkeypatch.setenv("KIS_OVERSEAS_INTRADAY_ENDPOINT", "/mock")
+    monkeypatch.setenv("KIS_OVERSEAS_INTRADAY_TR_ID", "MOCKTR")
+    monkeypatch.setenv("KIS_OVERSEAS_INTRADAY_DATE_FIELD", "xymd")
+    monkeypatch.setenv("KIS_OVERSEAS_INTRADAY_TIME_FIELD", "xhms")
+    monkeypatch.setenv("KIS_OVERSEAS_INTRADAY_OPEN_FIELD", "open")
+    monkeypatch.setenv("KIS_OVERSEAS_INTRADAY_HIGH_FIELD", "high")
+    monkeypatch.setenv("KIS_OVERSEAS_INTRADAY_LOW_FIELD", "low")
+    monkeypatch.setenv("KIS_OVERSEAS_INTRADAY_CLOSE_FIELD", "last")
+    monkeypatch.setenv("KIS_OVERSEAS_INTRADAY_VOLUME_FIELD", "evol")
+    monkeypatch.setenv("KIS_OVERSEAS_INTRADAY_OUTPUT_FIELD", "output2")
+    monkeypatch.setenv(
+        "KIS_OVERSEAS_INTRADAY_PARAMS_JSON",
+        '{"AUTH":"","EXCD":"{exchange}","SYMB":"{symbol}","NEXT":"","KEYB":""}',
+    )
+    monkeypatch.setenv("KIS_OVERSEAS_INTRADAY_MAX_PAGES", "2")
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        def _get(self, endpoint, tr_id, params):
+            self.calls.append(dict(params))
+            if params.get("KEYB"):
+                rows = [
+                    {"xymd": "20260710", "xhms": "100000", "open": "11", "high": "12", "low": "10", "last": "11.5", "evol": "200"},
+                    {"xymd": "20260709", "xhms": "155900", "open": "9", "high": "10", "low": "8", "last": "9.5", "evol": "300"},
+                ]
+            else:
+                rows = [
+                    {"xymd": "20260710", "xhms": "100100", "open": "12", "high": "13", "low": "11", "last": "12.5", "evol": "100"},
+                    {"xymd": "20260710", "xhms": "100000", "open": "11", "high": "12", "low": "10", "last": "11.5", "evol": "200"},
+                ]
+            return {"rt_cd": "0", "output1": {"next": "1"}, "output2": rows}
+
+    fake = FakeClient()
+    result = KisIntradayClient(fake).fetch_overseas_1m("AAPL", exchanges=("NAS",), window_days=2)
+
+    assert len(fake.calls) == 2
+    assert fake.calls[1]["NEXT"] == "1"
+    assert fake.calls[1]["KEYB"] == "20260710100000"
+    assert list(result.bars["Close"]) == [9.5, 11.5, 12.5]
+
+
 def test_yfinance_provider_can_be_mocked(monkeypatch):
     bars = _bars(freq="5min")
     monkeypatch.setattr(yfinance_provider, "_download_5m_with_retries", lambda symbol, days: pd.DataFrame())
@@ -97,6 +143,25 @@ def test_fallback_service_uses_yfinance_when_kis_disabled(monkeypatch):
 
     assert result.source == "yfinance"
     assert "KIS intraday disabled/unconfigured." in result.warnings
+
+
+def test_disabled_kis_intraday_warning_is_logged_once():
+    logs = []
+
+    class Window:
+        def append_log(self, message):
+            logs.append(message)
+
+    window = Window()
+
+    MainWindow._log_intraday_provider_warning(window, "CLPT", "KIS intraday disabled/unconfigured.")
+    MainWindow._log_intraday_provider_warning(window, "SI", "KIS intraday disabled/unconfigured.")
+    MainWindow._log_intraday_provider_warning(window, "SI", "No 5m yfinance intraday rows returned for SI.")
+
+    assert logs == [
+        "Intraday provider notice: KIS intraday disabled/unconfigured; using yfinance fallback.",
+        "Intraday provider warning for SI: No 5m yfinance intraday rows returned for SI.",
+    ]
 
 
 def test_fallback_service_uses_yfinance_after_kis_failure(monkeypatch):

@@ -7,11 +7,11 @@ KIS field names.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 import json
 import logging
 import os
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import pandas as pd
 
@@ -31,6 +31,8 @@ KIS_INTRADAY_ENDPOINT_KEY = "KIS_OVERSEAS_INTRADAY_ENDPOINT"
 KIS_INTRADAY_TR_ID_KEY = "KIS_OVERSEAS_INTRADAY_TR_ID"
 KIS_INTRADAY_OUTPUT_FIELD_KEY = "KIS_OVERSEAS_INTRADAY_OUTPUT_FIELD"
 KIS_INTRADAY_PARAMS_JSON_KEY = "KIS_OVERSEAS_INTRADAY_PARAMS_JSON"
+KIS_INTRADAY_MAX_PAGES_KEY = "KIS_OVERSEAS_INTRADAY_MAX_PAGES"
+DEFAULT_KIS_INTRADAY_MAX_PAGES = 50
 
 # Required OHLCV field mappings
 KIS_INTRADAY_FIELD_KEYS = {
@@ -77,6 +79,7 @@ class KisIntradayClient:
         symbol: str,
         trading_date: Optional[date] = None,
         exchanges: Iterable[str] = DEFAULT_US_EXCHANGES,
+        window_days: int = 1,
     ) -> IntradayFetchResult:
         if not is_kis_intraday_enabled():
             raise KisIntradayNotConfiguredError(
@@ -91,10 +94,14 @@ class KisIntradayClient:
         last_error: Optional[Exception] = None
         for exchange in exchanges:
             exchange_code = str(exchange or "").strip().upper()
-            params = _configured_params(symbol=symbol, exchange=exchange_code, trading_date=trading_date)
             try:
-                data = self._get(config["endpoint"], tr_id=config["tr_id"], params=params)
-                rows = _rows_from_output(data, config["output_field"])
+                rows = self._fetch_paginated_rows(
+                    config=config,
+                    symbol=symbol,
+                    exchange=exchange_code,
+                    trading_date=trading_date,
+                    window_days=window_days,
+                )
                 result = normalize_intraday_rows(
                     symbol=symbol,
                     exchange=exchange_code,
@@ -108,6 +115,7 @@ class KisIntradayClient:
                     date_field=config.get("date_field"),
                 )
                 if not result.bars.empty:
+                    result = _filter_result_window(result, window_days)
                     return result
                 last_error = KisIntradayError(
                     f"KIS intraday returned no normalized rows for {symbol} on {exchange_code}."
@@ -124,6 +132,45 @@ class KisIntradayClient:
                 )
 
         raise KisIntradayError(f"KIS intraday fetch failed for {symbol}: {last_error}")
+
+    def _fetch_paginated_rows(
+        self,
+        config: Dict[str, str],
+        symbol: str,
+        exchange: str,
+        trading_date: Optional[date],
+        window_days: int,
+    ) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        page_key = ""
+        seen_page_keys = set()
+        cutoff_date: Optional[date] = None
+        max_pages = _max_intraday_pages(window_days)
+
+        for _page in range(max_pages):
+            params = _configured_params(symbol=symbol, exchange=exchange, trading_date=trading_date)
+            if page_key:
+                params["NEXT"] = "1"
+                params["KEYB"] = page_key
+            data = self._get(config["endpoint"], tr_id=config["tr_id"], params=params)
+            page_rows = list(_rows_from_output(data, config["output_field"]))
+            if not page_rows:
+                break
+
+            rows.extend(page_rows)
+            newest = _newest_row_timestamp(page_rows, config["time_field"], config.get("date_field"))
+            oldest = _oldest_row_timestamp(page_rows, config["time_field"], config.get("date_field"))
+            if cutoff_date is None and newest is not None:
+                cutoff_date = newest.date() - timedelta(days=max(0, int(window_days or 1) - 1))
+            next_key = _pagination_key_from_row(page_rows[-1], config["time_field"], config.get("date_field"))
+            if not next_key or next_key in seen_page_keys:
+                break
+            seen_page_keys.add(next_key)
+            page_key = next_key
+            if cutoff_date is not None and oldest is not None and oldest.date() < cutoff_date:
+                break
+
+        return rows
 
     def _get(self, endpoint: str, tr_id: str, params: Dict[str, str]) -> Dict[str, Any]:
         if hasattr(self.client, "_get"):
@@ -190,6 +237,78 @@ def normalize_intraday_rows(
         bars=bars,
         source="kis",
     )
+
+
+def _filter_result_window(result: IntradayFetchResult, window_days: int) -> IntradayFetchResult:
+    if result.bars.empty:
+        return result
+    window_days = max(1, int(window_days or 1))
+    latest = pd.Timestamp(result.bars.index.max())
+    cutoff_date = latest.date() - timedelta(days=window_days - 1)
+    filtered = result.bars[result.bars.index.date >= cutoff_date]
+    return IntradayFetchResult(
+        symbol=result.symbol,
+        exchange=result.exchange,
+        bars=filtered,
+        source=result.source,
+    )
+
+
+def _max_intraday_pages(window_days: int) -> int:
+    raw = os.environ.get(KIS_INTRADAY_MAX_PAGES_KEY, "").strip()
+    if raw:
+        try:
+            return max(1, min(DEFAULT_KIS_INTRADAY_MAX_PAGES, int(raw)))
+        except ValueError:
+            logger.warning("%s is not an integer; using default page limit.", KIS_INTRADAY_MAX_PAGES_KEY)
+    return max(1, min(DEFAULT_KIS_INTRADAY_MAX_PAGES, int(window_days or 1) * 6))
+
+
+def _row_timestamp(row: Dict[str, Any], time_field: str, date_field: Optional[str]) -> Optional[pd.Timestamp]:
+    if not isinstance(row, dict):
+        return None
+    try:
+        if date_field and row.get(date_field):
+            return pd.to_datetime(
+                str(row[date_field]) + str(row[time_field]),
+                format="%Y%m%d%H%M%S",
+            )
+        return pd.to_datetime(str(row[time_field]))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _newest_row_timestamp(
+    rows: Iterable[Dict[str, Any]],
+    time_field: str,
+    date_field: Optional[str],
+) -> Optional[pd.Timestamp]:
+    timestamps = [
+        timestamp
+        for timestamp in (_row_timestamp(row, time_field, date_field) for row in rows)
+        if timestamp is not None
+    ]
+    return max(timestamps) if timestamps else None
+
+
+def _oldest_row_timestamp(
+    rows: Iterable[Dict[str, Any]],
+    time_field: str,
+    date_field: Optional[str],
+) -> Optional[pd.Timestamp]:
+    timestamps = [
+        timestamp
+        for timestamp in (_row_timestamp(row, time_field, date_field) for row in rows)
+        if timestamp is not None
+    ]
+    return min(timestamps) if timestamps else None
+
+
+def _pagination_key_from_row(row: Dict[str, Any], time_field: str, date_field: Optional[str]) -> str:
+    timestamp = _row_timestamp(row, time_field, date_field)
+    if timestamp is None:
+        return ""
+    return pd.Timestamp(timestamp).strftime("%Y%m%d%H%M%S")
 
 
 def _load_intraday_endpoint_config() -> Dict[str, str]:

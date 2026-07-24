@@ -1721,6 +1721,59 @@ def test_tradingview_add_current_symbol_does_not_remove_when_sidebar_not_watchli
     assert window.watchlist.get("MSFT") is not None
 
 
+def test_tradingview_activate_starts_buy_dashboard_monitor():
+    class Combo:
+        def __init__(self, text):
+            self.text = text
+
+        def currentText(self):
+            return self.text
+
+    class Item:
+        symbol = "AAPL"
+        environment = "SIM"
+        monitoring_status = "WATCHING"
+        status = "WATCHING"
+        breakout_method = ""
+
+    class Manager:
+        def __init__(self, item):
+            self.items = [item]
+
+        def get(self, symbol, environment=None):
+            if symbol == "AAPL" and environment == "SIM":
+                return self.items[0]
+            return None
+
+    item = Item()
+    window = MainWindow.__new__(MainWindow)
+    window.tradingview_symbol_combo = Combo("AAPL")
+    window.watchlist_env_combo = Combo("SIM")
+    window.buylist_manager = Manager(item)
+    window._buylist_sim_monitor_active = False
+    window._clear_buylist_auto_order_block = lambda _item: None
+    window._save_state = lambda: None
+    window.populate_buylist_dashboard = lambda: None
+    window.append_log = lambda _message: None
+    window._set_intraday_symbol = lambda _symbol: None
+    window.prefetch_intraday_cache_for_symbol = lambda _symbol: None
+    window._update_tradingview_activate_btn = lambda: None
+    toggled = []
+
+    def toggle_monitor(env):
+        toggled.append(env)
+        window._buylist_sim_monitor_active = True
+
+    window._toggle_buylist_monitor = toggle_monitor
+
+    window._tradingview_activate_toggle()
+
+    assert item.monitoring_status == "WATCHING"
+    assert item.orb_monitor_enabled is True
+    assert window._buylist_sim_monitor_active is True
+    assert toggled == ["SIM"]
+
+
 def test_chart_html_includes_bounded_pan_zoom_state():
     history = pd.DataFrame(
         {

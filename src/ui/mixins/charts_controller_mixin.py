@@ -943,7 +943,7 @@ class ChartsControllerMixin:
             return bool(getattr(item, "orb_monitor_enabled", False))
         return str(getattr(item, "monitoring_status", "")).upper() in ("ACTIVE", "BOUGHT")
 
-    def _chart_activate_toggle(self, symbol: str) -> None:
+    def _chart_activate_toggle(self, symbol: str, start_monitor: bool = False) -> None:
         if not symbol:
             return
         env = self.watchlist_env_combo.currentText() if hasattr(self, "watchlist_env_combo") else "SIM"
@@ -973,9 +973,7 @@ class ChartsControllerMixin:
                 return
             if self._is_execution_queue_buylist_item(item):
                 item.orb_monitor_enabled = True
-                active_attr = f"_buylist_{env.lower()}_monitor_active"
-                if not getattr(self, active_attr, False):
-                    self._toggle_buylist_monitor(env)
+                self._ensure_buylist_monitor_running(env)
             else:
                 bought_count = sum(
                     1 for it in buylist_manager.items
@@ -987,6 +985,8 @@ class ChartsControllerMixin:
                     return
                 item.monitoring_status = "ACTIVE"
                 self._clear_buylist_auto_order_block(item)
+                if start_monitor:
+                    self._ensure_buylist_monitor_running(env)
             self._save_state()
             self.populate_buylist_dashboard()
             self.append_log(f"[Chart] {symbol} monitoring activated.")
@@ -1022,7 +1022,7 @@ class ChartsControllerMixin:
         symbol = self.tradingview_symbol_combo.currentText().strip().upper() if hasattr(self, "tradingview_symbol_combo") else ""
         if not symbol:
             return
-        self._chart_activate_toggle(symbol)
+        self._chart_activate_toggle(symbol, start_monitor=True)
         self._update_tradingview_activate_btn()
 
     def _update_intraday_activate_btn(self, _text: str = "") -> None:
@@ -1455,9 +1455,7 @@ class ChartsControllerMixin:
             allow_fallback=True,
         )
         self.intraday_fetch_worker.finished_fetch.connect(self._on_intraday_fetch_finished)
-        self.intraday_fetch_worker.provider_warning.connect(
-            lambda symbol, warning: self.append_log(f"Intraday provider warning for {symbol}: {warning}")
-        )
+        self.intraday_fetch_worker.provider_warning.connect(self._log_intraday_provider_warning)
         self.intraday_fetch_worker.error_occurred.connect(self._on_intraday_fetch_error)
         self.intraday_fetch_worker.finished.connect(
             lambda worker=self.intraday_fetch_worker: self._clear_worker_reference("intraday_fetch_worker", worker)
@@ -1536,9 +1534,7 @@ class ChartsControllerMixin:
             allow_fallback=True,
         )
         self.intraday_bulk_worker.progress.connect(self._on_intraday_bulk_progress)
-        self.intraday_bulk_worker.provider_warning.connect(
-            lambda symbol, warning: self.append_log(f"Intraday provider warning for {symbol}: {warning}")
-        )
+        self.intraday_bulk_worker.provider_warning.connect(self._log_intraday_provider_warning)
         self.intraday_bulk_worker.finished_bulk.connect(self._on_intraday_bulk_finished)
         self.intraday_bulk_worker.finished.connect(
             lambda worker=self.intraday_bulk_worker: self._clear_worker_reference("intraday_bulk_worker", worker)
