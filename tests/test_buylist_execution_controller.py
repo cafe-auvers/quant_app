@@ -55,7 +55,7 @@ class FakeQueueManager:
         self.build_environment = None
         self.build_calls = 0
 
-    def has_pending_or_submitted_order(self, symbol, environment="SIM"):
+    def has_pending_or_submitted_order(self, symbol, environment="PROD"):
         self.pending_environment = environment
         return self.pending
 
@@ -93,7 +93,7 @@ def _existing_buylist_item(**overrides):
         "risk_percent": 4.0,
         "trade_plan": "old plan",
         "monitoring_status": "WATCHING",
-        "environment": "SIM",
+        "environment": "PROD",
         "breakout_price": 99.0,
         "breakout_method": "execution_queue:5m",
         "buffer_pct": 0.002,
@@ -108,7 +108,7 @@ def _existing_buylist_item(**overrides):
 
 def _request(**overrides):
     data = {
-        "env": "SIM",
+        "env": "PROD",
         "manager": FakeQueueManager(),
         "buylist_manager": FakeBuylistManager(),
         "target_items": [_target()],
@@ -132,7 +132,12 @@ def _request(**overrides):
 def test_empty_target_items_returns_zero_and_preserves_missing_symbols():
     controller = BuylistExecutionController(SimpleNamespace())
     result = controller.refresh_execution_queue(
-        _request(target_items=[], manager=None, missing_symbols=["ZZZ"], requested_symbols=["ZZZ"])
+        _request(
+            target_items=[],
+            manager=None,
+            missing_symbols=["ZZZ"],
+            requested_symbols=["ZZZ"],
+        )
     )
 
     assert result.refreshed == 0
@@ -168,8 +173,8 @@ def test_queue_pending_order_still_refreshes_candidates_for_replacement():
     assert result.refreshed == 1
     assert manager.build_calls == 1
     assert manager.duplicate_pending_order is False
-    assert manager.pending_environment == "SIM"
-    assert manager.build_environment == "SIM"
+    assert manager.pending_environment == "PROD"
+    assert manager.build_environment == "PROD"
 
 
 def test_external_duplicate_broker_order_is_passed_to_queue_builder():
@@ -215,7 +220,7 @@ def test_apply_queue_item_preserves_existing_volatile_compatibility_mirrors():
     controller.apply_execution_queue_item_to_buylist(
         _queue_item(),
         _target(),
-        "SIM",
+        "PROD",
         0.001,
         buylist_manager=manager,
     )
@@ -251,7 +256,7 @@ def test_apply_queue_item_does_not_overwrite_bought_position_fields():
     controller.apply_execution_queue_item_to_buylist(
         _queue_item(),
         _target(),
-        "SIM",
+        "PROD",
         0.001,
         buylist_manager=manager,
     )
@@ -267,7 +272,9 @@ def test_apply_queue_item_does_not_overwrite_bought_position_fields():
     assert not hasattr(existing, "_planned_shares")
 
 
-def test_submit_selected_queue_order_uses_queue_candidate_not_buylist_mirrors(monkeypatch):
+def test_submit_selected_queue_order_uses_queue_candidate_not_buylist_mirrors(
+    monkeypatch,
+):
     item = _existing_buylist_item(
         environment="PROD",
         monitoring_status="EXECUTE_READY",
@@ -275,9 +282,6 @@ def test_submit_selected_queue_order_uses_queue_candidate_not_buylist_mirrors(mo
         stop_loss=0.45,
         breakout_method="execution_queue:1m",
     )
-    sim_queue_item = _queue_item()
-    sim_queue_item.selected_candidate.entry_trigger = 12.34
-    sim_queue_item.selected_candidate.shares = 1
     prod_queue_item = _queue_item()
     prod_queue_item.selected_candidate.entry_trigger = 123.45
     prod_queue_item.selected_candidate.stop_loss = 120.0
@@ -286,20 +290,24 @@ def test_submit_selected_queue_order_uses_queue_candidate_not_buylist_mirrors(mo
 
     class Manager:
         def __init__(self):
-            self.items = {("SIM", "AAPL"): sim_queue_item, ("PROD", "AAPL"): prod_queue_item}
+            self.items = {("PROD", "AAPL"): prod_queue_item}
             self.mark_calls = []
 
-        def get_item(self, symbol, environment="SIM"):
+        def get_item(self, symbol, environment="PROD"):
             return self.items.get((environment, symbol))
 
-        def mark_order_submitted(self, symbol, order_id="", order_status="SUBMITTED", environment="SIM"):
+        def mark_order_submitted(
+            self, symbol, order_id="", order_status="SUBMITTED", environment="PROD"
+        ):
             self.mark_calls.append((symbol, order_id, order_status, environment))
             self.items[(environment, symbol)].status = "ORDER_PENDING"
 
     manager = Manager()
     window = SimpleNamespace(
         _buylist_selected_item=lambda env: item,
-        _queue_item_for_buylist_item=lambda selected: manager.get_item(selected.symbol, selected.environment),
+        _queue_item_for_buylist_item=lambda selected: manager.get_item(
+            selected.symbol, selected.environment
+        ),
         _buylist_auto_order_blocked=lambda selected: False,
         _first_account_no_for_environment=lambda env: "12345678",
         _has_duplicate_open_order=lambda *args: False,
@@ -309,7 +317,9 @@ def test_submit_selected_queue_order_uses_queue_candidate_not_buylist_mirrors(mo
         _save_buylist_state=lambda: None,
         _save_execution_queue_state=lambda: None,
         populate_buylist_dashboard=lambda: None,
-        _submit_kis_buy_order=lambda selected, **kwargs: submissions.append((selected, kwargs)),
+        _submit_kis_buy_order=lambda selected, **kwargs: submissions.append(
+            (selected, kwargs)
+        ),
     )
     monkeypatch.setattr(
         controller_module.QMessageBox,
@@ -328,7 +338,7 @@ def test_submit_selected_queue_order_uses_queue_candidate_not_buylist_mirrors(mo
 
 def test_submit_selected_queue_order_blocks_unknown_submission_state(monkeypatch):
     item = _existing_buylist_item(
-        environment="SIM",
+        environment="PROD",
         monitoring_status="UNKNOWN_SUBMISSION_STATE",
         breakout_method="execution_queue:1m",
     )
@@ -338,7 +348,9 @@ def test_submit_selected_queue_order_blocks_unknown_submission_state(monkeypatch
     window = SimpleNamespace(
         _buylist_selected_item=lambda env: item,
         _queue_item_for_buylist_item=lambda selected: queue_item,
-        _submit_kis_buy_order=lambda selected, **kwargs: submissions.append((selected, kwargs)),
+        _submit_kis_buy_order=lambda selected, **kwargs: submissions.append(
+            (selected, kwargs)
+        ),
     )
     monkeypatch.setattr(
         controller_module.QMessageBox,
@@ -346,7 +358,7 @@ def test_submit_selected_queue_order_blocks_unknown_submission_state(monkeypatch
         lambda parent, title, message: warnings.append((title, message)),
     )
 
-    BuylistExecutionController(window).submit_selected_queue_order("SIM")
+    BuylistExecutionController(window).submit_selected_queue_order("PROD")
 
     assert submissions == []
     assert warnings

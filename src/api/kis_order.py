@@ -1,4 +1,5 @@
 """KIS overseas equity order placement."""
+
 from __future__ import annotations
 
 import logging
@@ -12,7 +13,13 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from src.core.order_state import BrokerOrder, BrokerOrderStatusSnapshot, OrderIntent, OrderSide, OrderStatus
+from src.core.order_state import (
+    BrokerOrder,
+    BrokerOrderStatusSnapshot,
+    OrderIntent,
+    OrderSide,
+    OrderStatus,
+)
 
 from .kis_account_snapshot_dual import (
     KisAccountClient,
@@ -87,27 +94,19 @@ _CLEAR_ORDER_ERROR_FRAGMENTS = (
 )
 
 _ORDER_TR_IDS: Dict[tuple, str] = {
-    ("SIM",  "buy"):  "VTTT1002U",  # v1_해외주식-001 모의투자 매수
-    ("SIM",  "sell"): "VTTT1001U",  # v1_해외주식-001 모의투자 미국 매도
-    ("PROD", "buy"):  "TTTT1002U",  # v1_해외주식-001 실전투자 매수
+    ("PROD", "buy"): "TTTT1002U",  # v1_해외주식-001 실전투자 매수
     ("PROD", "sell"): "TTTT1006U",  # v1_해외주식-001 실전투자 매도
 }
 
 _ORDER_INQUIRY_TR_IDS: Dict[str, str] = {
-    "SIM": "VTTS3035R",   # v1_overseas-stock-007 paper: order/fill history
     "PROD": "TTTS3035R",  # v1_overseas-stock-007 live: order/fill history
 }
 
 _OPEN_ORDER_INQUIRY_TR_IDS: Dict[str, str] = {
-    # Official KIS examples document TTTS3018R for this endpoint and include
-    # env_dv without a separate paper TR_ID. Keep this visible and overrideable
-    # if KIS publishes an account-specific SIM TR_ID.
-    "SIM": "TTTS3018R",
     "PROD": "TTTS3018R",
 }
 
 _ORDER_CANCEL_TR_IDS: Dict[str, str] = {
-    "SIM": "VTTT1004U",   # v1_overseas-stock-003 paper: revise/cancel
     "PROD": "TTTT1004U",  # v1_overseas-stock-003 live: revise/cancel
 }
 
@@ -118,7 +117,11 @@ def _flatten_error_message(value: Any) -> str:
     seen = set()
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        parts.append(f"{current.__class__.__name__}: {current}" if isinstance(current, BaseException) else str(current))
+        parts.append(
+            f"{current.__class__.__name__}: {current}"
+            if isinstance(current, BaseException)
+            else str(current)
+        )
         if not isinstance(current, BaseException):
             break
         current = current.__cause__ or current.__context__
@@ -146,12 +149,17 @@ def is_ambiguous_order_submission_error(exc_or_message: Any) -> bool:
     lowered = message.lower()
     status_code = _http_status_from_error(exc_or_message, message)
 
-    if status_code in AMBIGUOUS_ORDER_HTTP_STATUS_CODES or (status_code is not None and 500 <= status_code < 600):
+    if status_code in AMBIGUOUS_ORDER_HTTP_STATUS_CODES or (
+        status_code is not None and 500 <= status_code < 600
+    ):
         return True
     if status_code is not None and 400 <= status_code < 500:
         return False
 
-    if isinstance(exc_or_message, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+    if isinstance(
+        exc_or_message,
+        (requests.exceptions.Timeout, requests.exceptions.ConnectionError),
+    ):
         return True
     if isinstance(exc_or_message, (ValueError, KisTokenError, KisInvalidAccountError)):
         return False
@@ -175,7 +183,9 @@ def _order_tr_id(mapping: Dict[str, str], environment: str, suffix: str) -> str:
     override = os.getenv(f"KIS_{env_key}_OVERSEAS_{suffix}_TR_ID", "").strip()
     tr_id = override or mapping.get(env_key, "")
     if not tr_id:
-        raise ValueError(f"No KIS TR_ID configured for environment={environment!r} operation={suffix!r}")
+        raise ValueError(
+            f"No KIS TR_ID configured for environment={environment!r} operation={suffix!r}"
+        )
     return tr_id
 
 
@@ -242,7 +252,9 @@ def _side_query_code(side: str) -> str:
     return "00"
 
 
-def _default_order_dates(start_date: Optional[str], end_date: Optional[str]) -> tuple[str, str]:
+def _default_order_dates(
+    start_date: Optional[str], end_date: Optional[str]
+) -> tuple[str, str]:
     today = datetime.now(timezone.utc).date()
     start = start_date or (today - timedelta(days=14)).strftime("%Y%m%d")
     end = end_date or today.strftime("%Y%m%d")
@@ -250,13 +262,23 @@ def _default_order_dates(start_date: Optional[str], end_date: Optional[str]) -> 
 
 
 def _broker_order_id_from_row(row: Dict[str, Any]) -> str:
-    return str(_row_value(row, "odno", "ODNO", "order_no", "ord_no", "KIS_ORDER_NO") or "")
+    return str(
+        _row_value(row, "odno", "ODNO", "order_no", "ord_no", "KIS_ORDER_NO") or ""
+    )
 
 
-def _status_from_order_row(row: Dict[str, Any], *, source: str = "query") -> OrderStatus:
-    requested = _to_int(_row_value(row, "ft_ord_qty", "ORD_QTY", "ord_qty", "qty", "quantity"))
-    filled = _to_int(_row_value(row, "ft_ccld_qty", "CCLD_QTY", "filled_quantity", "filled_qty"))
-    remaining = _to_int(_row_value(row, "nccs_qty", "NCCS_QTY", "remaining_quantity", "remaining_qty"))
+def _status_from_order_row(
+    row: Dict[str, Any], *, source: str = "query"
+) -> OrderStatus:
+    requested = _to_int(
+        _row_value(row, "ft_ord_qty", "ORD_QTY", "ord_qty", "qty", "quantity")
+    )
+    filled = _to_int(
+        _row_value(row, "ft_ccld_qty", "CCLD_QTY", "filled_quantity", "filled_qty")
+    )
+    remaining = _to_int(
+        _row_value(row, "nccs_qty", "NCCS_QTY", "remaining_quantity", "remaining_qty")
+    )
     status_text = " ".join(
         str(_row_value(row, key) or "")
         for key in (
@@ -274,11 +296,16 @@ def _status_from_order_row(row: Dict[str, Any], *, source: str = "query") -> Ord
         )
     ).upper()
 
-    if any(token in status_text for token in ("REJECT", "REJECTED", "RJECT", "RJCT", "거부", "거절")):
+    if any(
+        token in status_text
+        for token in ("REJECT", "REJECTED", "RJECT", "RJCT", "거부", "거절")
+    ):
         return OrderStatus.REJECTED
     if any(token in status_text for token in ("EXPIRE", "EXPIRED", "만료")):
         return OrderStatus.EXPIRED
-    if any(token in status_text for token in ("CANCELLED", "CANCELED", "CANCEL", "취소")):
+    if any(
+        token in status_text for token in ("CANCELLED", "CANCELED", "CANCEL", "취소")
+    ):
         return OrderStatus.CANCELLED
 
     if source == "cancel_response":
@@ -295,7 +322,11 @@ def _status_from_order_row(row: Dict[str, Any], *, source: str = "query") -> Ord
     if any(token in status_text for token in ("ACCEPT", "RECEIVED", "접수", "처리")):
         return OrderStatus.ACCEPTED
     if any(token in status_text for token in ("FILLED", "체결", "완료")):
-        return OrderStatus.FILLED if requested <= 0 or filled >= requested else OrderStatus.PARTIALLY_FILLED
+        return (
+            OrderStatus.FILLED
+            if requested <= 0 or filled >= requested
+            else OrderStatus.PARTIALLY_FILLED
+        )
     return OrderStatus.UNKNOWN
 
 
@@ -309,15 +340,23 @@ def parse_broker_order_status_snapshot(
 ) -> BrokerOrderStatusSnapshot:
     """Normalize one KIS overseas order row into the app's broker snapshot model."""
     broker_order_id = _broker_order_id_from_row(row)
-    requested = _to_int(_row_value(row, "ft_ord_qty", "ORD_QTY", "ord_qty", "qty", "quantity"))
-    filled = _to_int(_row_value(row, "ft_ccld_qty", "CCLD_QTY", "filled_quantity", "filled_qty"))
-    remaining = _to_int(_row_value(row, "nccs_qty", "NCCS_QTY", "remaining_quantity", "remaining_qty"))
+    requested = _to_int(
+        _row_value(row, "ft_ord_qty", "ORD_QTY", "ord_qty", "qty", "quantity")
+    )
+    filled = _to_int(
+        _row_value(row, "ft_ccld_qty", "CCLD_QTY", "filled_quantity", "filled_qty")
+    )
+    remaining = _to_int(
+        _row_value(row, "nccs_qty", "NCCS_QTY", "remaining_quantity", "remaining_qty")
+    )
     if requested <= 0 and filled + remaining > 0:
         requested = filled + remaining
     if remaining <= 0 and requested > 0 and filled > 0:
         remaining = max(0, requested - filled)
     symbol = str(_row_value(row, "pdno", "PDNO", "symbol", "ovrs_pdno") or "").upper()
-    side = _normalize_side(_row_value(row, "sll_buy_dvsn_cd", "sll_buy_dvsn_cd_name", "side"))
+    side = _normalize_side(
+        _row_value(row, "sll_buy_dvsn_cd", "sll_buy_dvsn_cd_name", "side")
+    )
     status = _status_from_order_row(row, source=source)
 
     return BrokerOrderStatusSnapshot(
@@ -331,8 +370,12 @@ def parse_broker_order_status_snapshot(
         quantity_requested=requested,
         filled_quantity=filled,
         remaining_quantity=remaining,
-        avg_fill_price=_to_float(_row_value(row, "ft_ccld_unpr3", "avg_fill_price", "avg_price")),
-        limit_price=_to_float(_row_value(row, "ft_ord_unpr3", "OVRS_ORD_UNPR", "limit_price", "ord_unpr")),
+        avg_fill_price=_to_float(
+            _row_value(row, "ft_ccld_unpr3", "avg_fill_price", "avg_price")
+        ),
+        limit_price=_to_float(
+            _row_value(row, "ft_ord_unpr3", "OVRS_ORD_UNPR", "limit_price", "ord_unpr")
+        ),
         raw_response=dict(row),
     )
 
@@ -400,7 +443,9 @@ def _query_pages(
         pages.append(data)
         next_fk200 = str(data.get("ctx_area_fk200") or data.get("CTX_AREA_FK200") or "")
         next_nk200 = str(data.get("ctx_area_nk200") or data.get("CTX_AREA_NK200") or "")
-        header_tr_cont = str(headers.get("tr_cont") or headers.get("tr-cont") or "").strip()
+        header_tr_cont = str(
+            headers.get("tr_cont") or headers.get("tr-cont") or ""
+        ).strip()
         if header_tr_cont not in {"F", "M"} or (not next_fk200 and not next_nk200):
             break
         fk200, nk200 = next_fk200, next_nk200
@@ -459,7 +504,9 @@ def query_overseas_order(
             params=open_params,
         )
     except Exception as exc:
-        logger.warning("KIS open-order query failed for %s %s: %s", env_key, account_no, exc)
+        logger.warning(
+            "KIS open-order query failed for %s %s: %s", env_key, account_no, exc
+        )
 
     for page in all_pages["open"]:
         for row in _output_rows(page):
@@ -470,18 +517,20 @@ def query_overseas_order(
                 client_order_id=client_order_id,
                 source="open_orders",
             )
-            if _matches_order_filter(snapshot, symbol=symbol, broker_order_id=broker_order_id, side=side):
+            if _matches_order_filter(
+                snapshot, symbol=symbol, broker_order_id=broker_order_id, side=side
+            ):
                 snapshots.append(snapshot)
 
     history_params = {
         "CANO": config.cano,
         "ACNT_PRDT_CD": config.account_product_code,
-        "PDNO": "" if env_key == "SIM" else (symbol or "%"),
+        "PDNO": symbol or "%",
         "ORD_STRT_DT": start,
         "ORD_END_DT": end,
-        "SLL_BUY_DVSN": "00" if env_key == "SIM" else side_code,
+        "SLL_BUY_DVSN": side_code,
         "CCLD_NCCS_DVSN": "00",
-        "OVRS_EXCG_CD": "" if env_key == "SIM" else (exchange or "NASD"),
+        "OVRS_EXCG_CD": exchange or "NASD",
         "SORT_SQN": "DS",
         "ORD_DT": "",
         "ORD_GNO_BRNO": "",
@@ -505,7 +554,9 @@ def query_overseas_order(
                 client_order_id=client_order_id,
                 source="history",
             )
-            if _matches_order_filter(snapshot, symbol=symbol, broker_order_id=broker_order_id, side=side):
+            if _matches_order_filter(
+                snapshot, symbol=symbol, broker_order_id=broker_order_id, side=side
+            ):
                 snapshots.append(snapshot)
 
     by_key: Dict[tuple, BrokerOrderStatusSnapshot] = {}
@@ -559,7 +610,9 @@ def cancel_overseas_order(
     if not str(broker_order_id or "").strip():
         raise ValueError("broker_order_id is required for KIS overseas cancel")
     if quantity is None or int(quantity or 0) <= 0:
-        raise ValueError("quantity is required for KIS overseas cancel because order-rvsecncl requires ORD_QTY")
+        raise ValueError(
+            "quantity is required for KIS overseas cancel because order-rvsecncl requires ORD_QTY"
+        )
 
     env_key = _env_key(environment)
     env = KisEnvironment(env_key)
@@ -594,7 +647,10 @@ def cancel_overseas_order(
     try:
         result = _post_cancel()
     except KisTokenError:
-        logger.info("KIS cancel token expired for %s; refreshing token and retrying once.", env_key)
+        logger.info(
+            "KIS cancel token expired for %s; refreshing token and retrying once.",
+            env_key,
+        )
         client.authenticate(force_refresh=True)
         result = _post_cancel()
 
@@ -632,7 +688,7 @@ def place_overseas_order(
     """Place an overseas equity buy or sell order via KIS API.
 
     Args:
-        environment: "SIM" or "PROD"
+        environment: must be "PROD"
         symbol: Ticker symbol, e.g. "NVDA"
         quantity: Number of shares
         price: Limit price (ignored for market orders)
@@ -685,10 +741,17 @@ def place_overseas_order(
 
     logger.info(
         "KIS %s order: %s %s x%d @ %s on %s (tr_id=%s)",
-        environment, side.upper(), symbol, quantity, ovrs_ord_unpr, exchange, tr_id,
+        environment,
+        side.upper(),
+        symbol,
+        quantity,
+        ovrs_ord_unpr,
+        exchange,
+        tr_id,
     )
 
     url = f"{config.base_url}{OVERSEAS_ORDER_ENDPOINT}"
+
     def _post_order() -> Dict[str, Any]:
         response = client.session.post(
             url,
@@ -701,7 +764,10 @@ def place_overseas_order(
     try:
         result = _post_order()
     except KisTokenError:
-        logger.info("KIS order token expired for %s; refreshing token and retrying once.", environment)
+        logger.info(
+            "KIS order token expired for %s; refreshing token and retrying once.",
+            environment,
+        )
         client.authenticate(force_refresh=True)
         result = _post_order()
 

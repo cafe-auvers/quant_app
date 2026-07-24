@@ -1,4 +1,5 @@
 import pandas as pd
+import pytest
 
 from src.core.execution_queue import (
     ExecutionQueueManager,
@@ -49,33 +50,25 @@ def test_one_symbol_creates_only_one_execution_queue_item():
     manager = ExecutionQueueManager()
 
     manager.upsert_item(symbol="AAPL", candidates={"1m": _candidate("1m", 50)})
-    manager.upsert_item(symbol="aapl", name="Apple", candidates={"5m": _candidate("5m", 60)})
+    manager.upsert_item(
+        symbol="aapl", name="Apple", candidates={"5m": _candidate("5m", 60)}
+    )
 
     assert len(manager.items) == 1
-    assert manager.items[queue_key("AAPL", "SIM")].name == "Apple"
+    assert manager.items[queue_key("AAPL", "PROD")].name == "Apple"
 
 
-def test_same_symbol_can_be_queued_independently_by_environment():
+def test_non_production_environment_is_rejected():
     manager = ExecutionQueueManager()
 
-    sim_item = manager.upsert_item(
-        symbol="AAPL",
-        environment="SIM",
-        name="Apple SIM",
-        candidates={"1m": _candidate("1m", 50)},
-    )
-    prod_item = manager.upsert_item(
-        symbol="AAPL",
-        environment="PROD",
-        name="Apple PROD",
-        candidates={"5m": _candidate("5m", 60)},
-    )
-
-    assert len(manager.items) == 2
-    assert manager.items[queue_key("AAPL", "SIM")] is sim_item
-    assert manager.items[queue_key("AAPL", "PROD")] is prod_item
-    assert sim_item.name == "Apple SIM"
-    assert prod_item.name == "Apple PROD"
+    with pytest.raises(ValueError, match="PROD"):
+        manager.upsert_item(
+            symbol="AAPL",
+            environment="SIM",
+            candidates={"1m": _candidate("1m", 50)},
+        )
+    with pytest.raises(ValueError, match="PROD"):
+        queue_key("AAPL", "SIM")
 
 
 def test_1m_candidate_becomes_available_first_and_is_selected():
@@ -147,7 +140,9 @@ def test_30m_candidate_replaces_5m_only_when_valid_and_sufficiently_better():
 def test_invalid_candidates_are_ignored_by_selection():
     selected = select_best_orb_candidate(
         {
-            "1m": _candidate("1m", 90, valid=False, status=OrbCandidateStatus.RISK_INVALID),
+            "1m": _candidate(
+                "1m", 90, valid=False, status=OrbCandidateStatus.RISK_INVALID
+            ),
             "5m": _candidate("5m", 50, valid=True),
         },
         current_selected_window=None,
@@ -251,7 +246,7 @@ def test_order_failure_unlocks_selected_candidate_for_retry():
 
     manager.mark_order_failed("AAPL")
 
-    item = manager.items[queue_key("AAPL", "SIM")]
+    item = manager.items[queue_key("AAPL", "PROD")]
     assert item.locked is False
     assert item.order_status == "REJECTED"
     assert item.selected_window == "1m"
@@ -265,25 +260,46 @@ def test_execution_queue_serializes_enum_values_round_trip():
 
     restored = ExecutionQueueManager.from_dict(manager.to_dict())
 
-    assert restored.items[queue_key("AAPL", "SIM")].status == ExecutionQueueStatus.ORDER_SUBMITTED
-    assert restored.items[queue_key("AAPL", "SIM")].selected_candidate.status == OrbCandidateStatus.EXECUTE_READY
-    assert restored.items[queue_key("AAPL", "SIM")].environment == "SIM"
+    assert (
+        restored.items[queue_key("AAPL", "PROD")].status
+        == ExecutionQueueStatus.ORDER_SUBMITTED
+    )
+    assert (
+        restored.items[queue_key("AAPL", "PROD")].selected_candidate.status
+        == OrbCandidateStatus.EXECUTE_READY
+    )
+    assert restored.items[queue_key("AAPL", "PROD")].environment == "PROD"
 
 
-def test_old_symbol_only_execution_queue_state_loads_as_sim_key():
+def test_legacy_symbol_only_execution_queue_state_is_ignored():
     manager = ExecutionQueueManager()
     manager.upsert_item(symbol="AAPL", candidates={"1m": _candidate("1m", 50)})
-    old_item = manager.items[queue_key("AAPL", "SIM")].to_dict()
+    old_item = manager.items[queue_key("AAPL", "PROD")].to_dict()
     old_item.pop("environment")
 
-    restored = ExecutionQueueManager.from_dict({
-        "upgrade_margin": 5.0,
-        "items": {"AAPL": old_item},
-    })
+    restored = ExecutionQueueManager.from_dict(
+        {
+            "upgrade_margin": 5.0,
+            "items": {"AAPL": old_item},
+        }
+    )
 
-    assert list(restored.items) == [queue_key("AAPL", "SIM")]
-    assert restored.items[queue_key("AAPL", "SIM")].symbol == "AAPL"
-    assert restored.items[queue_key("AAPL", "SIM")].environment == "SIM"
+    assert restored.items == {}
+
+
+def test_legacy_sim_execution_queue_state_is_ignored():
+    restored = ExecutionQueueManager.from_dict(
+        {
+            "items": {
+                "SIM:AAPL": {
+                    "symbol": "AAPL",
+                    "environment": "SIM",
+                },
+            },
+        }
+    )
+
+    assert restored.items == {}
 
 
 def test_duplicate_pending_or_submitted_orders_are_prevented():
@@ -304,17 +320,24 @@ def test_duplicate_pending_or_submitted_orders_are_prevented():
     )
 
     assert manager.has_pending_or_submitted_order("AAPL") is True
-    assert manager.has_pending_or_submitted_order("AAPL", environment="PROD") is False
+    assert manager.has_pending_or_submitted_order("AAPL", environment="PROD") is True
     assert duplicate_candidate.status == OrbCandidateStatus.REJECTED
     assert "Duplicate" in duplicate_candidate.reason
 
 
-def test_unknown_submission_state_resolves_and_blocks_duplicate_only_in_environment():
+def test_unknown_submission_state_resolves_and_blocks_duplicate():
     manager = ExecutionQueueManager()
-    manager.upsert_item(symbol="AAPL", environment="SIM", candidates={"1m": _candidate("1m", 50)})
-    manager.upsert_item(symbol="AAPL", environment="PROD", candidates={"1m": _candidate("1m", 50)})
+    manager.upsert_item(
+        symbol="AAPL", environment="PROD", candidates={"1m": _candidate("1m", 50)}
+    )
 
-    for order_status in ("UNKNOWN", "UNKNOWN_SUBMISSION_STATE", "AMBIGUOUS", "TIMEOUT", "NETWORK_ERROR"):
+    for order_status in (
+        "UNKNOWN",
+        "UNKNOWN_SUBMISSION_STATE",
+        "AMBIGUOUS",
+        "TIMEOUT",
+        "NETWORK_ERROR",
+    ):
         assert (
             resolve_queue_status(
                 {"1m": _candidate("1m", 50)},
@@ -329,16 +352,13 @@ def test_unknown_submission_state_resolves_and_blocks_duplicate_only_in_environm
         "AAPL",
         order_id="LOCAL-1",
         order_status="UNKNOWN_SUBMISSION_STATE",
-        environment="SIM",
+        environment="PROD",
     )
 
-    sim_item = manager.items[queue_key("AAPL", "SIM")]
     prod_item = manager.items[queue_key("AAPL", "PROD")]
-    assert sim_item.status == ExecutionQueueStatus.UNKNOWN_SUBMISSION_STATE
-    assert sim_item.locked is True
-    assert manager.has_pending_or_submitted_order("AAPL", environment="SIM") is True
-    assert manager.has_pending_or_submitted_order("AAPL", environment="PROD") is False
-    assert prod_item.status == ExecutionQueueStatus.EXECUTE_READY
+    assert prod_item.status == ExecutionQueueStatus.UNKNOWN_SUBMISSION_STATE
+    assert prod_item.locked is True
+    assert manager.has_pending_or_submitted_order("AAPL", environment="PROD") is True
 
 
 def test_queue_status_rejected_when_all_candidates_fail_hard_validation():
@@ -347,7 +367,9 @@ def test_queue_status_rejected_when_all_candidates_fail_hard_validation():
         symbol="AAPL",
         candidates={
             "1m": _candidate("1m", 0, valid=False, status=OrbCandidateStatus.REJECTED),
-            "5m": _candidate("5m", 0, valid=False, status=OrbCandidateStatus.RISK_INVALID),
+            "5m": _candidate(
+                "5m", 0, valid=False, status=OrbCandidateStatus.RISK_INVALID
+            ),
         },
     )
 

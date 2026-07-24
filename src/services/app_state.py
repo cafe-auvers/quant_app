@@ -23,6 +23,10 @@ CHART_DRAWINGS_FILE = Path("data/chart_drawings.json")
 TAB_OPTIONS_FILE = Path("data/tab_options.json")
 SETTINGS_FILE = Path("data/settings.json")
 STATE_METADATA_FILE = Path("data/state_metadata.json")
+LEGACY_NON_PRODUCTION_BUYLIST_FILE = Path("data/legacy_non_prod_buylist.json")
+LEGACY_NON_PRODUCTION_EXECUTION_QUEUE_FILE = Path(
+    "data/legacy_non_prod_execution_queue.json"
+)
 
 
 @dataclass
@@ -329,8 +333,63 @@ def load_watchlist_state() -> Watchlist:
     return Watchlist.from_dict(load_json(WATCHLIST_FILE, {"name": "Default", "items": []}))
 
 
+def archive_non_production_buylist_state(
+    data: Dict[str, Any],
+    *,
+    archive_path: Path | None = None,
+) -> int:
+    """Preserve non-production buylist rows before the live-only loader filters them."""
+    items = data.get("items", []) if isinstance(data, dict) else []
+    archived_items = [
+        item
+        for item in items
+        if isinstance(item, dict)
+        and str(item.get("environment") or "").strip().upper() != "PROD"
+    ]
+    if not archived_items:
+        return 0
+    save_json(
+        archive_path or LEGACY_NON_PRODUCTION_BUYLIST_FILE,
+        {"items": archived_items},
+    )
+    return len(archived_items)
+
+
+def archive_non_production_execution_queue_state(
+    data: Dict[str, Any],
+    *,
+    archive_path: Path | None = None,
+) -> int:
+    """Preserve non-production queue rows before the live-only loader filters them."""
+    items = data.get("items", {}) if isinstance(data, dict) else {}
+    if not isinstance(items, dict):
+        return 0
+
+    archived_items = {}
+    for raw_key, item in items.items():
+        if not isinstance(item, dict):
+            continue
+        key_environment = str(raw_key).split(":", 1)[0].strip().upper()
+        environment = str(item.get("environment") or key_environment).strip().upper()
+        if environment != "PROD":
+            archived_items[str(raw_key)] = item
+
+    if not archived_items:
+        return 0
+    save_json(
+        archive_path or LEGACY_NON_PRODUCTION_EXECUTION_QUEUE_FILE,
+        {
+            "upgrade_margin": data.get("upgrade_margin"),
+            "items": archived_items,
+        },
+    )
+    return len(archived_items)
+
+
 def load_buylist_state() -> BuylistManager:
-    return BuylistManager.from_dict(load_json(BUYLIST_FILE, {"items": []}))
+    data = load_json(BUYLIST_FILE, {"items": []})
+    archive_non_production_buylist_state(data)
+    return BuylistManager.from_dict(data)
 
 
 def load_trade_plans_state() -> TradePlanManager:

@@ -119,7 +119,7 @@ Workers live in `src/ui/workers.py`.
 | `RefreshWorker` | Refresh daily price history and indicators into MySQL |
 | `HourlyRefreshWorker` | Refresh hourly price history into MySQL |
 | `KisAccountWorker` | Fetch one KIS account snapshot |
-| `KisStartupAccountsWorker` | Preload configured KIS SIM/PROD account profiles |
+| `KisStartupAccountsWorker` | Preload configured KIS production account profiles |
 | `FxRateWorker` | Resolve USD/KRW from KIS snapshot data or fallback sources |
 | `KisOrderWorker` | Submit KIS overseas orders and emit broker acceptance/rejection state |
 | `OrderReconciliationWorker` | Fetch account snapshots and reconcile open broker orders against holdings deltas |
@@ -136,7 +136,7 @@ Workers live in `src/ui/workers.py`.
 | `src/services/app_state.py` | `StateSaveManager`, save-result tracking, metadata writes, and compatibility helpers for watchlist, buylist, trade plans, scanner setups, drawings, and tab options |
 | `src/services/intraday_provider.py` | Provider-neutral request/result contracts and OHLCV normalization/resampling helpers |
 | `src/services/intraday_data_service.py` | KIS-first intraday orchestration, yfinance fallback, and best-source cache loading |
-| `src/services/kis_intraday_provider.py` | KIS intraday provider wrapper using existing SIM/PROD account config |
+| `src/services/kis_intraday_provider.py` | KIS intraday provider wrapper using production account config |
 | `src/services/yfinance_intraday_provider.py` | yfinance intraday fallback provider preserving existing retry behavior |
 | `src/services/order_ledger.py` | Persistent local order ledger stored at `data/orders.json` |
 | `src/services/order_execution_service.py` | Guarded KIS order submission with durable idempotency before and after API calls |
@@ -168,6 +168,8 @@ Local JSON state is read/written through `src/utils/storage.py` and service help
 | `data/watchlist.json` | User watchlist items |
 | `data/buylist.json` | Buy dashboard and monitoring items |
 | `data/execution_queue.json` | Dynamic ORB execution queue items, selected candidates, status, and warnings |
+| `data/legacy_non_prod_buylist.json` | One-time archive of non-production buylist rows removed from actionable state |
+| `data/legacy_non_prod_execution_queue.json` | One-time archive of non-production execution queue rows removed from actionable state |
 | `data/trade_plans.json` | Saved trade plans |
 | `data/scanner_setups.json` | Named scanner rule presets |
 | `data/chart_drawings.json` | Saved chart line drawings; watchlist breakout prices are persisted in `data/watchlist.json` |
@@ -180,6 +182,8 @@ Local JSON state is read/written through `src/utils/storage.py` and service help
 `data/settings.json` may be created when settings or shortcuts are saved.
 
 Critical local state files keep one rolling `.bak` backup beside the JSON file, including watchlist, buylist, trade plans, orders, and execution queue state. The app does not wrap existing JSON payloads in a schema envelope, so legacy loaders keep their current formats.
+
+The production-only migration archives legacy non-production buylist and execution queue rows before filtering them. Archived rows are never relabeled as `PROD` and cannot submit live orders. Historical non-production broker orders remain in `data/orders.json` for audit history but are excluded from startup reconciliation.
 
 `MainWindow.closeEvent()` requests interruption for active background workers, waits with one shared bounded shutdown budget, then attempts a final synchronous app-state save and waits briefly for pending background saves. Normal UI save calls still schedule background saves through `save_app_state()`, but those threads are tracked and non-daemon.
 
@@ -230,7 +234,7 @@ The ORB engine in `src/core/orb.py` remains source-agnostic. It consumes normali
 
 | Module | Purpose |
 |---|---|
-| `src/api/kis_account_snapshot_dual.py` | SIM/PROD config, token handling, domestic/overseas snapshots, account profile discovery |
+| `src/api/kis_account_snapshot_dual.py` | PROD config, token handling, domestic/overseas snapshots, account profile discovery |
 | `src/api/kis_fetch_all_daily.py` | KIS daily price fetches and domestic master parsing |
 | `src/api/kis_intraday.py` | Configuration-gated KIS intraday adapter and raw-row normalization |
 | `src/api/kis_order.py` | Overseas order submission wrapper that returns broker acceptance/rejection state |
@@ -240,9 +244,6 @@ The ORB engine in `src/core/orb.py` remains source-agnostic. It consumes normali
 KIS credentials are loaded from `.env`, for example:
 
 ```text
-KIS_SIM_APP_KEY
-KIS_SIM_APP_SECRET
-KIS_SIM_ACCOUNT_NO
 KIS_PROD_APP_KEY
 KIS_PROD_APP_SECRET
 KIS_PROD_ACCOUNT_NO
@@ -299,7 +300,7 @@ Important safety rules:
 - Buylist positions are not marked `BOUGHT`, `SOLD`, or partially exited from submission responses.
 - Open-order duplicate checks prevent repeated submission for the same environment, account, symbol, side, and intent.
 - Startup loads unresolved orders from `data/orders.json`, marks matching buylist rows as submitted/pending, and blocks duplicate execution after restart.
-- SIM and PROD are isolated by `environment`, and multiple accounts are isolated by `account_no`.
+- Only `PROD` records are actionable; legacy non-production records are ignored rather than migrated into live state. Multiple accounts remain isolated by `account_no`.
 - Account snapshot deltas are used as fill evidence. Ambiguous cases remain `WORKING` rather than being treated as filled.
 - Partial fills are idempotent through `BrokerOrder.applied_filled_quantity`, so repeated reconciliation cannot double-apply the same fill.
 - Cancel requests can be represented locally as `CANCEL_REQUESTED`; direct KIS cancel/status endpoint wrappers intentionally raise until the exact endpoints/TR IDs are verified.
@@ -365,7 +366,7 @@ Runtime configuration is environment-driven:
 | Key family | Used by | Purpose |
 |---|---|---|
 | `MYSQL_*` | `src/utils/config.py`, `src/utils/db_loader.py` | Optional MySQL cache connection |
-| `KIS_SIM_*`, `KIS_PROD_*` | KIS account/order modules | KIS account snapshots and order workflows |
+| `KIS_PROD_*` | KIS account/order modules | KIS production account snapshots and order workflows |
 | `OPENAI_API_KEY` | `src/core/scoring.py` | Optional AI review |
 
 The `.env` file is local-only and ignored by git. `config/template_config.py` remains a non-secret example configuration file.
@@ -386,7 +387,7 @@ Intraday provider coverage includes KIS disabled/configuration errors, yfinance 
 ## Production Safety Notes
 
 - Keep secrets out of source. `.env` and `.kis_token_cache*.json` are local runtime files.
-- KIS PROD order paths require valid credentials and should be smoke-tested in SIM before real trading.
+- KIS PROD order paths require valid credentials. Keep monitoring off until account snapshots, order review, and reconciliation have been verified.
 - KIS intraday remains configuration-gated. Do not enable it until endpoint/TR ID/request params/raw field mappings are verified.
 - yfinance fallback remains available for intraday/ORB workflows when KIS intraday is disabled or unavailable.
 - Do not treat KIS order acceptance as a fill. Confirm fills through verified order status endpoints or conservative account snapshot reconciliation.

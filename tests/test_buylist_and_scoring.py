@@ -34,7 +34,7 @@ def test_buylist_item_serialization():
     assert serialized["notes"] == "High conviction trade."
     assert serialized["auto_order_block_reason"] == ""
 
-    serialized["auto_order_block_reason"] = "KIS SIM rejected overseas order routing."
+    serialized["auto_order_block_reason"] = "Manual review required before retry."
     
     deserialized = BuylistItem.from_dict(serialized)
     assert deserialized.symbol == "AAPL"
@@ -44,7 +44,34 @@ def test_buylist_item_serialization():
     assert deserialized.rr == 3.0
     assert deserialized.stop_adr == 0.5
     assert deserialized.breakout_price == 180.0
-    assert deserialized.auto_order_block_reason == "KIS SIM rejected overseas order routing."
+    assert deserialized.auto_order_block_reason == "Manual review required before retry."
+
+
+def test_legacy_sim_buylist_state_is_ignored():
+    serialized = BuylistItem(
+        symbol="AAPL",
+        name="Apple Inc.",
+        entry_price=150.0,
+        target_price=180.0,
+        stop_loss=140.0,
+        total_score=88.5,
+        status="BUY_READY",
+        technical_score=90.0,
+        setup_score=85.0,
+        risk_score=90.0,
+        news_score=80.0,
+        timing_score=95.0,
+        rr=3.0,
+        stop_adr=0.5,
+        position_percent=17.5,
+        ai_summary="Strong breakout setup.",
+        warnings=[],
+    ).to_dict()
+    serialized["environment"] = "SIM"
+
+    restored = BuylistManager.from_dict({"items": [serialized]})
+
+    assert restored.items == []
 
 
 def test_buylist_manager():
@@ -350,7 +377,7 @@ def test_watchlist_worker_df_emission():
          assert "HUM" in df["symbol"].values
 
 
-def test_environment_combos_synchronization():
+def test_environment_combos_are_production_only():
     from PyQt5.QtWidgets import QComboBox
     from src.ui.main_window import MainWindow
     
@@ -359,58 +386,12 @@ def test_environment_combos_synchronization():
     app = QApplication.instance() or QApplication([])
     
     window = MainWindow.__new__(MainWindow)
-    
-    # Block signals during creation so we start clean
     window.watchlist_env_combo = QComboBox()
-    window.watchlist_env_combo.blockSignals(True)
-    window.watchlist_env_combo.addItems(["SIM", "PROD"])
-    window.watchlist_env_combo.blockSignals(False)
-    
+    window.watchlist_env_combo.addItem("PROD")
     window.trade_kis_environment_combo = QComboBox()
-    window.trade_kis_environment_combo.blockSignals(True)
-    window.trade_kis_environment_combo.addItems(["SIM", "PROD"])
-    window.trade_kis_environment_combo.blockSignals(False)
-    
-    # Mock calls
-    populate_called = []
-    apply_called = []
-    calc_called = []
-    review_called = []
-    
-    window.populate_trade_account_combo = lambda: populate_called.append(True)
-    window.apply_cached_trade_account_size = lambda: apply_called.append(True)
-    window.calculate_position_size = lambda show_warnings=False: calc_called.append(True)
-    window.run_watchlist_ai_review = lambda: review_called.append(True)
-    
-    # Connect signals (same as in _setup_tabs, wrapped in lambdas due to uninitialized mock QObject)
-    window.watchlist_env_combo.currentIndexChanged.connect(lambda idx: window.on_watchlist_env_changed(idx))
-    window.watchlist_env_combo.currentIndexChanged.connect(lambda: window.run_watchlist_ai_review())
-    window.trade_kis_environment_combo.currentTextChanged.connect(lambda env: window.on_trade_kis_environment_changed(env))
+    window.trade_kis_environment_combo.addItem("PROD")
 
-    
-    # Verify initial state: both are index 0 ("SIM")
-    assert window.watchlist_env_combo.currentText() == "SIM"
-    assert window.trade_kis_environment_combo.currentText() == "SIM"
-    
-    # 1. Test changing watchlist_env_combo -> "PROD" (index 1)
-    # This should sync trade_kis_environment_combo and run AI review.
-    window.watchlist_env_combo.setCurrentIndex(1)
-    
+    assert window.watchlist_env_combo.count() == 1
+    assert window.watchlist_env_combo.currentText() == "PROD"
+    assert window.trade_kis_environment_combo.count() == 1
     assert window.trade_kis_environment_combo.currentText() == "PROD"
-    assert len(populate_called) == 1
-    assert len(apply_called) == 1
-    assert len(calc_called) == 1
-    assert len(review_called) == 1
-    
-    # Reset call counts
-    populate_called.clear()
-    apply_called.clear()
-    calc_called.clear()
-    review_called.clear()
-    
-    # 2. Test changing trade_kis_environment_combo -> "SIM" (index 0)
-    # This should sync watchlist_env_combo and run AI review.
-    window.trade_kis_environment_combo.setCurrentIndex(0)
-    
-    assert window.watchlist_env_combo.currentText() == "SIM"
-    assert len(review_called) == 1

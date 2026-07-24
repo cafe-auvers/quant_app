@@ -12,15 +12,42 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QDockWidget, QLabel,
-    QPushButton, QLineEdit, QFormLayout, QTableWidget, QTableWidgetItem,
-    QListWidget, QListWidgetItem, QComboBox, QCheckBox, QSpinBox, QTextEdit,
-    QProgressBar, QMessageBox, QGroupBox, QHeaderView, QAbstractItemView,
-    QSizePolicy, QShortcut, QDialog, QKeySequenceEdit, QScrollArea,
-    QTextBrowser, QSplitter, QSlider, QDialogButtonBox, QMenu
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QTabWidget,
+    QDockWidget,
+    QLabel,
+    QPushButton,
+    QLineEdit,
+    QFormLayout,
+    QTableWidget,
+    QTableWidgetItem,
+    QListWidget,
+    QListWidgetItem,
+    QComboBox,
+    QCheckBox,
+    QSpinBox,
+    QTextEdit,
+    QProgressBar,
+    QMessageBox,
+    QGroupBox,
+    QHeaderView,
+    QAbstractItemView,
+    QSizePolicy,
+    QShortcut,
+    QDialog,
+    QKeySequenceEdit,
+    QScrollArea,
+    QTextBrowser,
+    QSplitter,
+    QSlider,
+    QDialogButtonBox,
+    QMenu,
 )
 from PyQt5.QtCore import Qt, QThread, QTimer, QUrl
 from PyQt5.QtGui import QColor, QKeySequence
+
 try:
     from PyQt5.QtWebEngineWidgets import QWebEngineView
 except ImportError:
@@ -31,43 +58,100 @@ except ImportError:
     QWebChannel = None
 
 from src.core.position_sizer import PositionSizer
-from src.core.order_state import BrokerOrder, OrderIntent, OrderSide, OrderStatus, OPEN_ORDER_STATUSES
-from src.core.orb import calculate_orb_range, evaluate_orb_entry_signal, resample_intraday_bars
+from src.core.order_state import (
+    BrokerOrder,
+    OrderIntent,
+    OrderSide,
+    OrderStatus,
+    OPEN_ORDER_STATUSES,
+)
+from src.core.orb import (
+    calculate_orb_range,
+    evaluate_orb_entry_signal,
+    resample_intraday_bars,
+)
 from src.core.scanner import StockScanner, ComparisonOperator, ScanRule
-from src.core.watchlist import Watchlist, TradePlanManager, TradePlan, BuylistManager, BuylistItem
+from src.core.watchlist import (
+    Watchlist,
+    TradePlanManager,
+    TradePlan,
+    BuylistManager,
+    BuylistItem,
+)
 from src.core.trade_reviewer import TradeReviewer, TradeSetup
-from src.utils.data_loader import download_price_history, get_default_universe, _extract_symbol_history
+from src.utils.data_loader import (
+    download_price_history,
+    get_default_universe,
+    _extract_symbol_history,
+)
 from src.utils.db_loader import (
-    init_mysql_engine, load_symbol_history_from_db, load_hourly_history_from_db,
-    get_latest_price_history_date, get_latest_hourly_price_history_timestamp,
-    load_chart_indicators_from_db, calculate_chart_indicators,
-    refresh_chart_indicators_for_symbol, save_symbol_history_to_db,
+    init_mysql_engine,
+    load_symbol_history_from_db,
+    load_hourly_history_from_db,
+    get_latest_price_history_date,
+    get_latest_hourly_price_history_timestamp,
+    load_chart_indicators_from_db,
+    calculate_chart_indicators,
+    refresh_chart_indicators_for_symbol,
+    save_symbol_history_to_db,
     delete_intraday_history_for_symbol,
 )
 from src.utils.storage import load_json, save_json
-from src.api.kis_account_snapshot_dual import KisEnvironment, discover_account_profiles, load_config
-from src.api.kis_order import format_overseas_order_price, is_ambiguous_order_submission_error
-from src.services.app_state import (
-    SCANNER_SETUPS_FILE, SETTINGS_FILE, load_buylist_state, load_chart_drawings_state,
-    load_scanner_setups_state, load_tab_options_state, load_trade_plans_state,
-    load_watchlist_state, save_app_state,
+from src.api.kis_account_snapshot_dual import (
+    KisEnvironment,
+    discover_account_profiles,
+    load_config,
 )
-from src.services.intraday_data_service import format_intraday_source_label, load_best_intraday_history
+from src.api.kis_order import (
+    format_overseas_order_price,
+    is_ambiguous_order_submission_error,
+)
+from src.services.app_state import (
+    SCANNER_SETUPS_FILE,
+    SETTINGS_FILE,
+    archive_non_production_execution_queue_state,
+    load_buylist_state,
+    load_chart_drawings_state,
+    load_scanner_setups_state,
+    load_tab_options_state,
+    load_trade_plans_state,
+    load_watchlist_state,
+    save_app_state,
+)
+from src.services.intraday_data_service import (
+    format_intraday_source_label,
+    load_best_intraday_history,
+)
 from src.ui.chart_bridge import ChartBridge
 from src.ui.dialogs import SettingsDialog, AddFilterDialog
 from src.ui.filter_catalog import (
-    DEFAULT_SCANNER_SETUPS, DEFAULT_SETTINGS, DEFAULT_TAB_OPTIONS,
-    FILTER_CATALOG, SCANNER_METRICS_LABELS,
+    DEFAULT_SCANNER_SETUPS,
+    DEFAULT_SETTINGS,
+    DEFAULT_TAB_OPTIONS,
+    FILTER_CATALOG,
+    SCANNER_METRICS_LABELS,
 )
 from src.ui.workers import (
-    FxRateWorker, IntradayBulkFetchWorker, IntradayFetchWorker,
-    KisAccountWorker, KisOrderCancelWorker, KisOrderQueryWorker, KisOrderWorker,
-    KisStartupAccountsWorker, OrderReconciliationWorker,
-    ScannerWorker, SingleStockAiWorker, WatchlistAiWorker,
+    FxRateWorker,
+    IntradayBulkFetchWorker,
+    IntradayFetchWorker,
+    KisAccountWorker,
+    KisOrderCancelWorker,
+    KisOrderQueryWorker,
+    KisOrderWorker,
+    KisStartupAccountsWorker,
+    OrderReconciliationWorker,
+    ScannerWorker,
+    SingleStockAiWorker,
+    WatchlistAiWorker,
 )
 from src.services.order_ledger import (
-    append_order, find_open_orders, has_open_order, load_order_ledger,
-    save_order_ledger, update_order,
+    append_order,
+    find_open_orders,
+    has_open_order,
+    load_order_ledger,
+    save_order_ledger,
+    update_order,
 )
 from src.utils.intraday_helpers import (
     extract_latest_opening_bar as _extract_latest_opening_bar,
@@ -96,13 +180,13 @@ def _main_window_global(name: str, fallback):
     return getattr(module, name, fallback) if module is not None else fallback
 
 
-
 class BuylistMixin:
     def _build_buylist_env_panel(self, env: str) -> QWidget:
-        """Build one environment panel (PROD or SIM) for the Buy Dashboard."""
-        is_prod = env == "PROD"
-        accent = "#b71c1c" if is_prod else "#0d47a1"
-        label_text = "PROD  —  Live Trading" if is_prod else "SIM  —  Paper Trading"
+        """Build the production environment panel for the Buy Dashboard."""
+        if env != "PROD":
+            raise ValueError("Buy Dashboard supports the PROD environment only")
+        accent = "#b71c1c"
+        label_text = "PROD  —  Live Trading"
 
         panel = QWidget()
         layout = QVBoxLayout()
@@ -123,9 +207,9 @@ class BuylistMixin:
 
         positions_lbl = QLabel("Positions: 0 / 5")
         positions_lbl.setStyleSheet("font-weight: bold; color: #4CAF50;")
-        capital_lbl   = QLabel("Capital: 0.0%")
-        pnl_lbl       = QLabel("P&L: —")
-        monitor_lbl   = QLabel("Monitor: OFF")
+        capital_lbl = QLabel("Capital: 0.0%")
+        pnl_lbl = QLabel("P&L: —")
+        monitor_lbl = QLabel("Monitor: OFF")
         monitor_lbl.setStyleSheet("color: #888;")
 
         header_layout.addWidget(positions_lbl)
@@ -139,75 +223,130 @@ class BuylistMixin:
         monitor_btn = QPushButton("Start Monitor")
         monitor_btn.setObjectName(f"buylistMonitorToggle_{env}")
         monitor_btn.setFixedWidth(120)
-        monitor_btn.clicked.connect(lambda _=False, e=env: self._toggle_buylist_monitor(e))
+        monitor_btn.clicked.connect(
+            lambda _=False, e=env: self._toggle_buylist_monitor(e)
+        )
         header_layout.addWidget(monitor_btn)
         layout.addLayout(header_layout)
 
-        # Store per-env summary label references
-        if is_prod:
-            self.buylist_prod_positions_label = positions_lbl
-            self.buylist_prod_capital_label   = capital_lbl
-            self.buylist_prod_pnl_label        = pnl_lbl
-            self.buylist_prod_monitor_status_label = monitor_lbl
-        else:
-            self.buylist_sim_positions_label = positions_lbl
-            self.buylist_sim_capital_label   = capital_lbl
-            self.buylist_sim_pnl_label        = pnl_lbl
-            self.buylist_sim_monitor_status_label = monitor_lbl
+        self.buylist_prod_positions_label = positions_lbl
+        self.buylist_prod_capital_label = capital_lbl
+        self.buylist_prod_pnl_label = pnl_lbl
+        self.buylist_prod_monitor_status_label = monitor_lbl
 
         # â”€â”€ Table â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Columns: Symbol | Name | Status | Monitor | Entry(ORB) | Breakout | Stop |
         #          Current | P&L% | Shares | Capital% | Risk% | Days | Alerts
         table = QTableWidget(0, 14)
-        table.setHorizontalHeaderLabels([
-            "Symbol", "Name", "Status", "Monitor", "Entry", "Breakout", "Stop",
-            "Current", "P&L%", "Shares", "Capital%", "Risk%",
-            "Days", "Alerts",
-        ])
+        table.setHorizontalHeaderLabels(
+            [
+                "Symbol",
+                "Name",
+                "Status",
+                "Monitor",
+                "Entry",
+                "Breakout",
+                "Stop",
+                "Current",
+                "P&L%",
+                "Shares",
+                "Capital%",
+                "Risk%",
+                "Days",
+                "Alerts",
+            ]
+        )
         table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         table.horizontalHeader().setStretchLastSection(True)
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         table.setAlternatingRowColors(True)
         table.verticalHeader().setVisible(False)
-        for col, width in enumerate([65, 120, 80, 62, 70, 72, 70, 70, 60, 55, 65, 52, 48, 170]):
+        for col, width in enumerate(
+            [65, 120, 80, 62, 70, 72, 70, 70, 60, 55, 65, 52, 48, 170]
+        ):
             table.setColumnWidth(col, width)
         layout.addWidget(table, 1)
         table.cellDoubleClicked.connect(self._buylist_show_tradingview_chart)
 
-        if is_prod:
-            self.buylist_prod_table = table
-        else:
-            self.buylist_sim_table = table
+        self.buylist_prod_table = table
 
         # ——— Action buttons ——————————————————————————————————————
         btn_layout = QHBoxLayout()
         # min_width keeps multi-word labels from breaking across lines
         btns = [
-            ("Activate",      80,  None,
-             lambda _=False, e=env: self._buylist_activate_selected(e)),
-            ("Refresh Queue", 110, None,
-             lambda _=False, e=env: self.refresh_execution_queue(e)),
-            ("Review Order", 105, None,
-             lambda _=False, e=env: self._buylist_review_selected_queue_order(e)),
-            (f"Submit {env}", 105, "background-color: #4CAF50; color: white;",
-             lambda _=False, e=env: self._buylist_submit_selected_queue_order(e)),
-            ("Check Order Status", 145, None,
-             lambda _=False, e=env: self._buylist_check_order_status(e)),
-            ("Cancel Order", 110, "background-color: #b71c1c; color: white;",
-             lambda _=False, e=env: self._buylist_cancel_selected_order(e)),
-            ("Deactivate",    90,  None,
-             lambda _=False, e=env: self._buylist_deactivate_selected(e)),
-            ("Breakeven",    100, "background-color: #2196F3; color: white;",
-             lambda _=False, e=env: self._buylist_move_to_breakeven_selected(e)),
-            ("Sell 1/3–1/2", 110, "background-color: #FF9800; color: white;",
-             lambda _=False, e=env: self._buylist_sell_half_selected(e)),
-            ("Sell All",      80,  "background-color: #f44336; color: white;",
-             lambda _=False, e=env: self._buylist_sell_all_selected(e)),
-            ("Remove",        75,  None,
-             lambda _=False, e=env: self._buylist_remove_selected(e)),
-            ("Refresh",       75,  None,
-             lambda _=False, e=env: self.populate_buylist_dashboard()),
+            (
+                "Activate",
+                80,
+                None,
+                lambda _=False, e=env: self._buylist_activate_selected(e),
+            ),
+            (
+                "Refresh Queue",
+                110,
+                None,
+                lambda _=False, e=env: self.refresh_execution_queue(e),
+            ),
+            (
+                "Review Order",
+                105,
+                None,
+                lambda _=False, e=env: self._buylist_review_selected_queue_order(e),
+            ),
+            (
+                f"Submit {env}",
+                105,
+                "background-color: #4CAF50; color: white;",
+                lambda _=False, e=env: self._buylist_submit_selected_queue_order(e),
+            ),
+            (
+                "Check Order Status",
+                145,
+                None,
+                lambda _=False, e=env: self._buylist_check_order_status(e),
+            ),
+            (
+                "Cancel Order",
+                110,
+                "background-color: #b71c1c; color: white;",
+                lambda _=False, e=env: self._buylist_cancel_selected_order(e),
+            ),
+            (
+                "Deactivate",
+                90,
+                None,
+                lambda _=False, e=env: self._buylist_deactivate_selected(e),
+            ),
+            (
+                "Breakeven",
+                100,
+                "background-color: #2196F3; color: white;",
+                lambda _=False, e=env: self._buylist_move_to_breakeven_selected(e),
+            ),
+            (
+                "Sell 1/3–1/2",
+                110,
+                "background-color: #FF9800; color: white;",
+                lambda _=False, e=env: self._buylist_sell_half_selected(e),
+            ),
+            (
+                "Sell All",
+                80,
+                "background-color: #f44336; color: white;",
+                lambda _=False, e=env: self._buylist_sell_all_selected(e),
+            ),
+            (
+                "Remove",
+                75,
+                None,
+                lambda _=False, e=env: self._buylist_remove_selected(e),
+            ),
+            (
+                "Refresh",
+                75,
+                None,
+                lambda _=False, e=env: self.populate_buylist_dashboard(),
+            ),
         ]
         for label, min_w, style, slot in btns:
             btn = QPushButton(label)
@@ -238,27 +377,23 @@ class BuylistMixin:
         self.load_tradingview_chart(force=True)
 
     def _build_buylist_tab(self) -> None:
-        """Build the Buylist Dashboard tab — PROD and SIM panels each with their own monitor."""
+        """Build the production Buylist Dashboard tab."""
         layout = QVBoxLayout()
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(4)
 
         splitter = QSplitter(Qt.Vertical)
         splitter.addWidget(self._build_buylist_env_panel("PROD"))
-        splitter.addWidget(self._build_buylist_env_panel("SIM"))
-        splitter.setSizes([1, 1])
         layout.addWidget(splitter, 1)
 
         self.buylist_widget.setLayout(layout)
 
-        # Two independent monitor timers — neither auto-starts
+        # The live monitor never auto-starts.
         self.buylist_prod_monitor_timer = QTimer()
-        self.buylist_prod_monitor_timer.timeout.connect(lambda: self._run_buylist_monitor_cycle("PROD"))
+        self.buylist_prod_monitor_timer.timeout.connect(
+            lambda: self._run_buylist_monitor_cycle("PROD")
+        )
         self._buylist_prod_monitor_active = False
-
-        self.buylist_sim_monitor_timer = QTimer()
-        self.buylist_sim_monitor_timer.timeout.connect(lambda: self._run_buylist_monitor_cycle("SIM"))
-        self._buylist_sim_monitor_active = False
 
         self._buylist_order_workers: List[QThread] = []
         self.broker_order_query_worker = None
@@ -270,9 +405,8 @@ class BuylistMixin:
     # Buylist Dashboard — populate & refresh
     # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     def populate_buylist_dashboard(self) -> None:
-        """Refresh both PROD and SIM buylist tables."""
-        for env in ("PROD", "SIM"):
-            self._populate_buylist_env_table(env)
+        """Refresh the production buylist table."""
+        self._populate_buylist_env_table("PROD")
         if hasattr(self, "_update_tradingview_queue_btn"):
             self._update_tradingview_queue_btn()
         if hasattr(self, "_update_intraday_queue_btn"):
@@ -281,6 +415,7 @@ class BuylistMixin:
             self._update_tradingview_activate_btn()
         if hasattr(self, "_update_intraday_activate_btn"):
             self._update_intraday_activate_btn()
+
     def _populate_buylist_env_table(self, env: str) -> None:
         """Populate the table for one environment and update its summary bar."""
         table_attr = f"buylist_{env.lower()}_table"
@@ -291,7 +426,7 @@ class BuylistMixin:
         items = [it for it in self.buylist_manager.items if it.environment == env]
         table.setRowCount(0)
 
-        bought_count  = sum(1 for it in items if it.monitoring_status == "BOUGHT")
+        bought_count = sum(1 for it in items if it.monitoring_status == "BOUGHT")
         total_capital = 0.0
         total_pnl_usd = 0.0
 
@@ -302,7 +437,11 @@ class BuylistMixin:
             row = table.rowCount()
             table.insertRow(row)
             queue_display = self._queue_display_state_for_buylist_item(item)
-            display_status = queue_display.display_status if queue_display else self._buylist_dashboard_status(item)
+            display_status = (
+                queue_display.display_status
+                if queue_display
+                else self._buylist_dashboard_status(item)
+            )
             is_queue_item = self._is_execution_queue_buylist_item(item)
 
             current_price = (
@@ -311,7 +450,11 @@ class BuylistMixin:
                 else self.latest_intraday_prices.get(item.symbol, 0.0)
             )
             pnl_pct = pnl_usd = 0.0
-            if item.monitoring_status == "BOUGHT" and item.avg_cost > 0 and current_price > 0:
+            if (
+                item.monitoring_status == "BOUGHT"
+                and item.avg_cost > 0
+                and current_price > 0
+            ):
                 pnl_pct = (current_price - item.avg_cost) / item.avg_cost * 100.0
                 pnl_usd = (current_price - item.avg_cost) * item.shares_held
 
@@ -319,25 +462,37 @@ class BuylistMixin:
 
             # For BOUGHT positions use the frozen position_percent snapshotted at fill time —
             # account_size_input can change (e.g. KIS balance load) and would give nonsense %.
-            if item.monitoring_status == "BOUGHT" and item.shares_held > 0 and item.avg_cost > 0:
+            if (
+                item.monitoring_status == "BOUGHT"
+                and item.shares_held > 0
+                and item.avg_cost > 0
+            ):
                 capital_pct = item.position_percent
             elif queue_display:
                 capital_pct = queue_display.capital_percent
             else:
-                account_size = self._parse_float(self.account_size_input, 100000.0) if hasattr(self, "account_size_input") else 100000.0
+                account_size = (
+                    self._parse_float(self.account_size_input, 100000.0)
+                    if hasattr(self, "account_size_input")
+                    else 100000.0
+                )
                 capital_pct = (
                     item.shares_held * item.avg_cost / account_size * 100.0
                     if account_size > 0 and item.avg_cost > 0
                     else item.position_percent
                 )
-            alerts = self._buylist_compute_alerts(item, current_price, days_held, queue_display)
+            alerts = self._buylist_compute_alerts(
+                item, current_price, days_held, queue_display
+            )
 
             def _cell(text: str) -> QTableWidgetItem:
                 c = QTableWidgetItem(str(text))
                 c.setTextAlignment(Qt.AlignCenter)
                 return c
 
-            entry_price = queue_display.entry_price if queue_display else item.entry_price
+            entry_price = (
+                queue_display.entry_price if queue_display else item.entry_price
+            )
             stop_loss = queue_display.stop_loss if queue_display else item.stop_loss
             bp_val = (
                 queue_display.breakout_price
@@ -346,33 +501,66 @@ class BuylistMixin:
             ) or 0.0
             bp_display = f"{bp_val:.2f}" if bp_val > 0 else "—"
 
-            table.setItem(row, 0,  _cell(queue_display.symbol if queue_display else item.symbol))
+            table.setItem(
+                row, 0, _cell(queue_display.symbol if queue_display else item.symbol)
+            )
             display_name = queue_display.name if queue_display else item.name
-            table.setItem(row, 1,  _cell(display_name[:16] if display_name else ""))
-            table.setItem(row, 2,  _cell(display_status))
+            table.setItem(row, 1, _cell(display_name[:16] if display_name else ""))
+            table.setItem(row, 2, _cell(display_status))
             if is_queue_item:
                 status_text = str(getattr(item, "monitoring_status", "") or "").upper()
                 monitor_on = (
                     monitor_running
                     and getattr(item, "orb_monitor_enabled", False)
-                    and status_text in {"WATCHING", "ORB_FORMING", "WAITING_BREAKOUT", "ARMED", "EXECUTE_READY"}
+                    and status_text
+                    in {
+                        "WATCHING",
+                        "ORB_FORMING",
+                        "WAITING_BREAKOUT",
+                        "ARMED",
+                        "EXECUTE_READY",
+                    }
                 )
             else:
                 monitor_on = item.monitoring_status in ("ACTIVE", "BOUGHT")
-            table.setItem(row, 3,  _cell("ON" if monitor_on else "OFF"))
-            table.setItem(row, 4,  _cell(f"{entry_price:.2f}"))
-            table.setItem(row, 5,  _cell(bp_display))                  # daily breakout level
-            table.setItem(row, 6,  _cell(f"{stop_loss:.2f}"))
-            table.setItem(row, 7,  _cell(f"{current_price:.2f}" if current_price > 0 else "-"))
-            table.setItem(row, 8,  _cell(f"{pnl_pct:+.1f}%" if item.monitoring_status == "BOUGHT" else "-"))
-            planned_shares = queue_display.planned_shares if queue_display else int(getattr(item, "_planned_shares", 0) or 0)
-            display_shares = item.shares_held if item.monitoring_status == "BOUGHT" else planned_shares
-            table.setItem(row, 9,  _cell(str(display_shares) if display_shares > 0 else "-"))
+            table.setItem(row, 3, _cell("ON" if monitor_on else "OFF"))
+            table.setItem(row, 4, _cell(f"{entry_price:.2f}"))
+            table.setItem(row, 5, _cell(bp_display))  # daily breakout level
+            table.setItem(row, 6, _cell(f"{stop_loss:.2f}"))
+            table.setItem(
+                row, 7, _cell(f"{current_price:.2f}" if current_price > 0 else "-")
+            )
+            table.setItem(
+                row,
+                8,
+                _cell(
+                    f"{pnl_pct:+.1f}%" if item.monitoring_status == "BOUGHT" else "-"
+                ),
+            )
+            planned_shares = (
+                queue_display.planned_shares
+                if queue_display
+                else int(getattr(item, "_planned_shares", 0) or 0)
+            )
+            display_shares = (
+                item.shares_held
+                if item.monitoring_status == "BOUGHT"
+                else planned_shares
+            )
+            table.setItem(
+                row, 9, _cell(str(display_shares) if display_shares > 0 else "-")
+            )
             table.setItem(row, 10, _cell(f"{capital_pct:.1f}%"))
-            risk_pct_val = queue_display.risk_percent if queue_display else item.risk_percent
+            risk_pct_val = (
+                queue_display.risk_percent if queue_display else item.risk_percent
+            )
             risk_pct_display = f"{risk_pct_val:.2f}%" if risk_pct_val > 0 else "-"
             table.setItem(row, 11, _cell(risk_pct_display))
-            table.setItem(row, 12, _cell(str(days_held) if item.monitoring_status == "BOUGHT" else "-"))
+            table.setItem(
+                row,
+                12,
+                _cell(str(days_held) if item.monitoring_status == "BOUGHT" else "-"),
+            )
 
             alert_cell = _cell(alerts if alerts else "OK")
             if "STOP" in alerts:
@@ -386,11 +574,13 @@ class BuylistMixin:
             # Row color by status
             row_color = None
             if item.monitoring_status == "BOUGHT":
-                row_color = QColor("#2e7d32") if pnl_pct >= 0 else QColor("#c62828")  # medium green / red
+                row_color = (
+                    QColor("#2e7d32") if pnl_pct >= 0 else QColor("#c62828")
+                )  # medium green / red
             elif item.monitoring_status == "ACTIVE" and not is_queue_item:
-                row_color = QColor("#1565c0")    # medium blue
+                row_color = QColor("#1565c0")  # medium blue
             elif item.monitoring_status == "SOLD":
-                row_color = QColor("#546e7a")    # blue-grey
+                row_color = QColor("#546e7a")  # blue-grey
             if row_color:
                 for col in range(table.columnCount()):
                     cell = table.item(row, col)
@@ -407,14 +597,21 @@ class BuylistMixin:
         pnl_lbl = getattr(self, f"buylist_{env.lower()}_pnl_label", None)
         if pos_lbl:
             pos_lbl.setText(f"Positions: {bought_count} / 30")
-            pos_lbl.setStyleSheet(f"font-weight: bold; color: {'#f44336' if bought_count >= 30 else '#4CAF50'};")
+            pos_lbl.setStyleSheet(
+                f"font-weight: bold; color: {'#f44336' if bought_count >= 30 else '#4CAF50'};"
+            )
         if cap_lbl:
             cap_lbl.setText(f"Capital: {total_capital:.1f}%")
         if pnl_lbl:
             sign = "+" if total_pnl_usd >= 0 else ""
             pnl_lbl.setText(f"P&L: {sign}${total_pnl_usd:,.0f}")
-            pnl_lbl.setStyleSheet(f"color: {'#4CAF50' if total_pnl_usd >= 0 else '#f44336'}; font-weight: bold;")
-    def _buylist_compute_alerts(self, item, current_price: float, days_held: int, queue_display=None) -> str:
+            pnl_lbl.setStyleSheet(
+                f"color: {'#4CAF50' if total_pnl_usd >= 0 else '#f44336'}; font-weight: bold;"
+            )
+
+    def _buylist_compute_alerts(
+        self, item, current_price: float, days_held: int, queue_display=None
+    ) -> str:
         """Return a pipe-separated alert string for a buylist item."""
         alerts = []
         if queue_display is not None:
@@ -435,22 +632,40 @@ class BuylistMixin:
                 alerts.append("UNKNOWN SUBMISSION - RECONCILE BEFORE RETRY")
 
         if item.monitoring_status == "BOUGHT":
-            if current_price > 0 and item.stop_loss > 0 and current_price <= item.stop_loss:
+            if (
+                current_price > 0
+                and item.stop_loss > 0
+                and current_price <= item.stop_loss
+            ):
                 alerts.append("STOP HIT")
             if getattr(item, "auto_order_block_reason", ""):
                 alerts.append("KIS ORDER BLOCKED")
             if 3 <= days_held <= 5 and not item.sell_half_done:
                 alerts.append("PARTIAL EXIT REVIEW")
             if getattr(item, "partial_exit_review_alert", False):
-                alerts.append(str(getattr(item, "partial_exit_review_reason", "") or "Manual partial-exit review"))
+                alerts.append(
+                    str(
+                        getattr(item, "partial_exit_review_reason", "")
+                        or "Manual partial-exit review"
+                    )
+                )
             if getattr(item, "ema_trailing_stop_alert", False):
-                alerts.append(str(getattr(item, "ema_trailing_stop_reason", "") or "EMA trailing-stop review"))
+                alerts.append(
+                    str(
+                        getattr(item, "ema_trailing_stop_reason", "")
+                        or "EMA trailing-stop review"
+                    )
+                )
         elif item.monitoring_status == "ACTIVE":
             if self._is_orb_buylist_item(item):
                 alerts.append("QUEUE REQUIRED")
                 return " | ".join(dict.fromkeys(alerts))
-            bought_count = sum(1 for it in self.buylist_manager.items
-                               if it.monitoring_status == "BOUGHT" and it.environment == item.environment)
+            bought_count = sum(
+                1
+                for it in self.buylist_manager.items
+                if it.monitoring_status == "BOUGHT"
+                and it.environment == item.environment
+            )
             if bought_count >= 30:
                 alerts.append("MAX POSITIONS")
             # Show where price stands relative to ORB high and daily breakout trigger
@@ -512,7 +727,7 @@ class BuylistMixin:
         symbol = str(getattr(item, "symbol", "") or "").upper()
         if not symbol:
             return None
-        environment = str(getattr(item, "environment", "") or "SIM").upper()
+        environment = str(getattr(item, "environment", "") or "PROD").upper()
         manager = self.__dict__.get("execution_queue_manager")
         if manager is None:
             manager = self._ensure_execution_queue_manager()
@@ -521,10 +736,7 @@ class BuylistMixin:
             return get_item(symbol, environment)
         from src.core.execution_queue import queue_key
 
-        queue_item = manager.items.get(queue_key(symbol, environment))
-        if queue_item is None and environment == "SIM":
-            queue_item = manager.items.get(symbol)
-        return queue_item
+        return manager.items.get(queue_key(symbol, environment))
 
     def _buylist_dashboard_status(self, item) -> str:
         queue_status = self._execution_queue_status_for_buylist_item(item)
@@ -554,10 +766,17 @@ class BuylistMixin:
             return manager
 
         data = load_json(EXECUTION_QUEUE_FILE, {})
+        archive_non_production_execution_queue_state(data)
         try:
-            manager = ExecutionQueueManager.from_dict(data) if data else ExecutionQueueManager()
+            manager = (
+                ExecutionQueueManager.from_dict(data)
+                if data
+                else ExecutionQueueManager()
+            )
         except Exception as exc:
-            self.append_log(f"Execution queue state could not be loaded; starting fresh: {exc}")
+            self.append_log(
+                f"Execution queue state could not be loaded; starting fresh: {exc}"
+            )
             manager = ExecutionQueueManager()
         manager.upgrade_margin = 0.0
         self.execution_queue_manager = manager
@@ -618,7 +837,9 @@ class BuylistMixin:
         }
         queued_symbols = [
             str(getattr(item, "symbol", "") or "").strip().upper()
-            for item in list(getattr(getattr(self, "buylist_manager", None), "items", []) or [])
+            for item in list(
+                getattr(getattr(self, "buylist_manager", None), "items", []) or []
+            )
             if str(getattr(item, "environment", "") or "").upper() == env
             and self._is_execution_queue_buylist_item(item)
         ]
@@ -631,15 +852,25 @@ class BuylistMixin:
                 symbol = str(raw_symbol or "").strip().upper()
                 if symbol and symbol not in requested:
                     requested.append(symbol)
-            target_symbols = requested if create_missing else [symbol for symbol in requested if symbol in queued_symbols]
+            target_symbols = (
+                requested
+                if create_missing
+                else [symbol for symbol in requested if symbol in queued_symbols]
+            )
 
         targets: List[Any] = []
         missing: List[str] = []
         for symbol in target_symbols:
             item = watch_by_symbol.get(symbol)
             if item is None:
-                existing = self.buylist_manager.get(symbol, env) if hasattr(self, "buylist_manager") else None
-                if existing is not None and self._is_execution_queue_buylist_item(existing):
+                existing = (
+                    self.buylist_manager.get(symbol, env)
+                    if hasattr(self, "buylist_manager")
+                    else None
+                )
+                if existing is not None and self._is_execution_queue_buylist_item(
+                    existing
+                ):
                     item = existing
             if item is None:
                 missing.append(symbol)
@@ -654,9 +885,18 @@ class BuylistMixin:
         *,
         create_missing: bool = False,
     ):
-        from src.ui.controllers.buylist_execution_controller import ExecutionQueueRefreshRequest
+        from src.ui.controllers.buylist_execution_controller import (
+            ExecutionQueueRefreshRequest,
+        )
 
-        env = (env or (self.watchlist_env_combo.currentText() if hasattr(self, "watchlist_env_combo") else "SIM")).upper()
+        env = (
+            env
+            or (
+                self.watchlist_env_combo.currentText()
+                if hasattr(self, "watchlist_env_combo")
+                else "PROD"
+            )
+        ).upper()
         requested_symbols = None
         if symbols is not None:
             requested_symbols = []
@@ -677,14 +917,23 @@ class BuylistMixin:
         account_no = ""
         if target_items:
             manager = self._ensure_execution_queue_manager()
-            account_size = self._get_account_balance_for_env(env) if hasattr(self, "_get_account_balance_for_env") else 100000.0
+            account_size = (
+                self._get_account_balance_for_env(env)
+                if hasattr(self, "_get_account_balance_for_env")
+                else 100000.0
+            )
             risk_percent = (
                 self._parse_float(self.risk_percent_input, 1.0) / 100.0
-                if hasattr(self, "risk_percent_input") else 0.01
+                if hasattr(self, "risk_percent_input")
+                else 0.01
             )
             if risk_percent <= 0:
                 risk_percent = 0.01
-            buffer_pct = self._watchlist_orb_buffer_pct() if hasattr(self, "_watchlist_orb_buffer_pct") else 0.001
+            buffer_pct = (
+                self._watchlist_orb_buffer_pct()
+                if hasattr(self, "_watchlist_orb_buffer_pct")
+                else 0.001
+            )
             account_no = self._first_account_no_for_environment(env) or ""
 
         return ExecutionQueueRefreshRequest(
@@ -705,14 +954,20 @@ class BuylistMixin:
                 window_days=window_days,
             ),
             signal_price_for_symbol=(
-                self._watchlist_orb_signal_price if hasattr(self, "_watchlist_orb_signal_price") else lambda _symbol: 0.0
+                self._watchlist_orb_signal_price
+                if hasattr(self, "_watchlist_orb_signal_price")
+                else lambda _symbol: 0.0
             ),
-            set_latest_intraday_price=lambda symbol, price: self.latest_intraday_prices.__setitem__(symbol, price),
+            set_latest_intraday_price=lambda symbol, price: self.latest_intraday_prices.__setitem__(
+                symbol, price
+            ),
             has_duplicate_open_order=self._has_duplicate_open_order,
             adr_percent_for_symbol=self._calculate_adr_percent_for_symbol,
         )
 
-    def _apply_execution_queue_refresh_result(self, result, show_log: bool = True) -> None:
+    def _apply_execution_queue_refresh_result(
+        self, result, show_log: bool = True
+    ) -> None:
         if result.target_count > 0:
             self.populate_buylist_dashboard()
             if hasattr(self, "update_dashboard_summary"):
@@ -725,21 +980,39 @@ class BuylistMixin:
 
         if result.target_count == 0:
             if result.requested_symbols is None:
-                self.append_log(f"[Execution Queue/{result.env}] No queued buylist symbols to refresh.")
+                self.append_log(
+                    f"[Execution Queue/{result.env}] No queued buylist symbols to refresh."
+                )
             else:
-                self.append_log(f"[Execution Queue/{result.env}] No selected watchlist symbols could be queued.")
+                self.append_log(
+                    f"[Execution Queue/{result.env}] No selected watchlist symbols could be queued."
+                )
             if result.missing_symbols:
-                self.append_log(f"[Execution Queue/{result.env}] Missing symbols: " + ", ".join(result.missing_symbols[:10]))
+                self.append_log(
+                    f"[Execution Queue/{result.env}] Missing symbols: "
+                    + ", ".join(result.missing_symbols[:10])
+                )
             return
 
-        counts_text = ", ".join(f"{key}={value}" for key, value in sorted(result.status_counts.items())) or "none"
+        counts_text = (
+            ", ".join(
+                f"{key}={value}" for key, value in sorted(result.status_counts.items())
+            )
+            or "none"
+        )
         self.append_log(
             f"[Execution Queue/{result.env}] Refreshed {result.refreshed} {result.scope} symbol(s): {counts_text}."
         )
         if result.missing_symbols:
-            self.append_log(f"[Execution Queue/{result.env}] Missing symbols: " + ", ".join(result.missing_symbols[:10]))
+            self.append_log(
+                f"[Execution Queue/{result.env}] Missing symbols: "
+                + ", ".join(result.missing_symbols[:10])
+            )
         if result.failures:
-            self.append_log(f"[Execution Queue/{result.env}] Refresh failures: " + "; ".join(result.failures[:10]))
+            self.append_log(
+                f"[Execution Queue/{result.env}] Refresh failures: "
+                + "; ".join(result.failures[:10])
+            )
 
     def refresh_execution_queue(
         self,
@@ -751,9 +1024,13 @@ class BuylistMixin:
     ) -> int:
         """Refresh existing queue rows, or intentionally queue selected symbols."""
         from src.ui.controllers.base import get_controller
-        from src.ui.controllers.buylist_execution_controller import BuylistExecutionController
+        from src.ui.controllers.buylist_execution_controller import (
+            BuylistExecutionController,
+        )
 
-        controller = get_controller(self, "buylist_execution_controller", BuylistExecutionController)
+        controller = get_controller(
+            self, "buylist_execution_controller", BuylistExecutionController
+        )
         request = self._build_execution_queue_refresh_request(
             env,
             symbols=symbols,
@@ -764,12 +1041,20 @@ class BuylistMixin:
         self._apply_execution_queue_refresh_result(result, show_log=show_log)
         return result.refreshed
 
-    def _apply_execution_queue_item_to_buylist(self, queue_item, watch_item, env: str, buffer_pct: float) -> None:
+    def _apply_execution_queue_item_to_buylist(
+        self, queue_item, watch_item, env: str, buffer_pct: float
+    ) -> None:
         from src.ui.controllers.base import get_controller
-        from src.ui.controllers.buylist_execution_controller import BuylistExecutionController
+        from src.ui.controllers.buylist_execution_controller import (
+            BuylistExecutionController,
+        )
 
-        controller = get_controller(self, "buylist_execution_controller", BuylistExecutionController)
-        controller.apply_execution_queue_item_to_buylist(queue_item, watch_item, env, buffer_pct)
+        controller = get_controller(
+            self, "buylist_execution_controller", BuylistExecutionController
+        )
+        controller.apply_execution_queue_item_to_buylist(
+            queue_item, watch_item, env, buffer_pct
+        )
 
     def _queue_item_for_buylist_item(self, item):
         if item is None:
@@ -793,7 +1078,10 @@ class BuylistMixin:
             all_candidates = list(getattr(queue_item, "candidates", {}).values())
             displayable = [c for c in all_candidates if c.status in _priority]
             if displayable:
-                candidate = min(displayable, key=lambda c: (_priority[c.status], -float(c.score or 0)))
+                candidate = min(
+                    displayable,
+                    key=lambda c: (_priority[c.status], -float(c.score or 0)),
+                )
                 pending_trigger = True
 
         if candidate is None:
@@ -808,51 +1096,73 @@ class BuylistMixin:
         stop_loss = float(candidate.stop_loss or 0.0)
         estimated_amount = entry_trigger * shares
         risk_amount = max(0.0, entry_trigger - stop_loss) * shares
-        warnings = list(getattr(candidate, "warnings", []) or []) + list(getattr(queue_item, "warnings", []) or [])
+        warnings = list(getattr(candidate, "warnings", []) or []) + list(
+            getattr(queue_item, "warnings", []) or []
+        )
         warning_text = "; ".join(dict.fromkeys(warnings)) if warnings else "None"
         status_line = (
             "Status: ARMED — waiting for price to cross entry trigger (auto-buy on next monitor cycle)"
-            if pending_trigger else
-            "Status: EXECUTE_READY — will auto-buy on next monitor cycle"
+            if pending_trigger
+            else "Status: EXECUTE_READY — will auto-buy on next monitor cycle"
         )
-        return "\n".join([
-            status_line,
-            "",
-            f"Environment: {env}",
-            f"Account: {account_no}",
-            f"Symbol: {item.symbol}",
-            f"Selected ORB: {candidate.window}",
-            "Side: BUY",
-            f"Limit price: {self._format_queue_price(entry_trigger)}",
-            f"Quantity: {shares}",
-            f"Estimated amount: {self._format_queue_price(estimated_amount)}",
-            f"ORB high: {self._format_queue_price(candidate.orb_high)}",
-            f"ORB low: {self._format_queue_price(candidate.orb_low)}",
-            f"Breakout price: {self._format_queue_price(candidate.breakout_price)}",
-            f"Breakout trigger: {self._format_queue_price(candidate.breakout_trigger)}",
-            f"Stop loss: {self._format_queue_price(stop_loss)}",
-            f"Risk amount: {self._format_queue_price(risk_amount)}",
-            f"Capital allocation: {self._format_queue_percent(candidate.capital_percent)}",
-            f"Stop/ADR: {self._format_queue_percent(candidate.stop_adr)}",
-            f"Score: {float(candidate.score or 0.0):.1f}",
-            f"Warnings: {warning_text}",
-        ])
+        return "\n".join(
+            [
+                status_line,
+                "",
+                f"Environment: {env}",
+                f"Account: {account_no}",
+                f"Symbol: {item.symbol}",
+                f"Selected ORB: {candidate.window}",
+                "Side: BUY",
+                f"Limit price: {self._format_queue_price(entry_trigger)}",
+                f"Quantity: {shares}",
+                f"Estimated amount: {self._format_queue_price(estimated_amount)}",
+                f"ORB high: {self._format_queue_price(candidate.orb_high)}",
+                f"ORB low: {self._format_queue_price(candidate.orb_low)}",
+                f"Breakout price: {self._format_queue_price(candidate.breakout_price)}",
+                f"Breakout trigger: {self._format_queue_price(candidate.breakout_trigger)}",
+                f"Stop loss: {self._format_queue_price(stop_loss)}",
+                f"Risk amount: {self._format_queue_price(risk_amount)}",
+                f"Capital allocation: {self._format_queue_percent(candidate.capital_percent)}",
+                f"Stop/ADR: {self._format_queue_percent(candidate.stop_adr)}",
+                f"Score: {float(candidate.score or 0.0):.1f}",
+                f"Warnings: {warning_text}",
+            ]
+        )
 
     def _buylist_review_selected_queue_order(self, env: str) -> None:
-        from src.core.execution_queue import OrbCandidateStatus, select_best_orb_candidate, SUPPORTED_ORB_WINDOWS
+        from src.core.execution_queue import (
+            OrbCandidateStatus,
+            select_best_orb_candidate,
+            SUPPORTED_ORB_WINDOWS,
+        )
 
         item = self._buylist_selected_item(env)
         if not item:
-            QMessageBox.warning(self, "No selection", "Select an execution queue row first.")
+            QMessageBox.warning(
+                self, "No selection", "Select an execution queue row first."
+            )
             return
         queue_item = self._queue_item_for_buylist_item(item)
         if queue_item is None:
-            QMessageBox.warning(self, "No queue item", f"{item.symbol} is not in the execution queue. Click Refresh Queue first.")
+            QMessageBox.warning(
+                self,
+                "No queue item",
+                f"{item.symbol} is not in the execution queue. Click Refresh Queue first.",
+            )
             return
 
         candidates: dict = getattr(queue_item, "candidates", {}) or {}
-        if not any(c for c in candidates.values() if c.status not in (OrbCandidateStatus.NOT_AVAILABLE,)):
-            QMessageBox.warning(self, "No data", f"{item.symbol} has no ORB candidates yet. Click Refresh Queue first.")
+        if not any(
+            c
+            for c in candidates.values()
+            if c.status not in (OrbCandidateStatus.NOT_AVAILABLE,)
+        ):
+            QMessageBox.warning(
+                self,
+                "No data",
+                f"{item.symbol} has no ORB candidates yet. Click Refresh Queue first.",
+            )
             return
 
         # ── Dialog ────────────────────────────────────────────────────────────
@@ -865,11 +1175,26 @@ class BuylistMixin:
 
         # Lock status banner
         lock_lbl = QLabel()
-        lock_lbl.setStyleSheet("font-weight: bold; padding: 4px 8px; border-radius: 4px;")
+        lock_lbl.setStyleSheet(
+            "font-weight: bold; padding: 4px 8px; border-radius: 4px;"
+        )
         dlg_layout.addWidget(lock_lbl)
 
         # ── Candidate table ────────────────────────────────────────────────────
-        COLS = ["Window", "Status", "ORB High", "ORB Low", "Entry", "Stop", "Shares", "Capital%", "Risk%", "Score", "Stop/ADR", "Warnings"]
+        COLS = [
+            "Window",
+            "Status",
+            "ORB High",
+            "ORB Low",
+            "Entry",
+            "Stop",
+            "Shares",
+            "Capital%",
+            "Risk%",
+            "Score",
+            "Stop/ADR",
+            "Warnings",
+        ]
         tbl = QTableWidget(0, len(COLS))
         tbl.setHorizontalHeaderLabels(COLS)
         tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
@@ -883,11 +1208,11 @@ class BuylistMixin:
         dlg_layout.addWidget(tbl, 1)
 
         _status_color = {
-            OrbCandidateStatus.EXECUTE_READY:    ("#1b5e20", "#a5d6a7"),
+            OrbCandidateStatus.EXECUTE_READY: ("#1b5e20", "#a5d6a7"),
             OrbCandidateStatus.WAITING_BREAKOUT: ("#0d47a1", "#90caf9"),
-            OrbCandidateStatus.RISK_INVALID:     ("#b71c1c", "#ef9a9a"),
-            OrbCandidateStatus.REJECTED:         ("#37474f", "#b0bec5"),
-            OrbCandidateStatus.FORMING:          ("#4a148c", "#ce93d8"),
+            OrbCandidateStatus.RISK_INVALID: ("#b71c1c", "#ef9a9a"),
+            OrbCandidateStatus.REJECTED: ("#37474f", "#b0bec5"),
+            OrbCandidateStatus.FORMING: ("#4a148c", "#ce93d8"),
         }
 
         def _fmt_p(v) -> str:
@@ -914,10 +1239,14 @@ class BuylistMixin:
                 cand = candidates.get(window)
                 if cand is None:
                     continue
-                is_selected = (window == current_window)
+                is_selected = window == current_window
                 row = tbl.rowCount()
                 tbl.insertRow(row)
-                status_str = cand.status.value if hasattr(cand.status, "value") else str(cand.status)
+                status_str = (
+                    cand.status.value
+                    if hasattr(cand.status, "value")
+                    else str(cand.status)
+                )
                 window_label = f"▶ {window}" if is_selected else window
                 vals = [
                     window_label,
@@ -928,7 +1257,11 @@ class BuylistMixin:
                     _fmt_p(cand.stop_loss),
                     str(int(cand.shares or 0)) if cand.shares else "—",
                     _fmt_pct(cand.capital_percent),
-                    _fmt_pct(float(cand.risk_percent or 0) * 100) if cand.risk_percent else "—",
+                    (
+                        _fmt_pct(float(cand.risk_percent or 0) * 100)
+                        if cand.risk_percent
+                        else "—"
+                    ),
                     f"{float(cand.score or 0):.1f}",
                     _fmt_pct(cand.stop_adr),
                     "; ".join(cand.warnings) if cand.warnings else "OK",
@@ -941,6 +1274,7 @@ class BuylistMixin:
                 if is_selected:
                     # Yellow highlight with bold black text — clearly selected
                     from PyQt5.QtGui import QFont
+
                     bold = QFont()
                     bold.setBold(True)
                     for col in range(len(COLS)):
@@ -961,24 +1295,44 @@ class BuylistMixin:
         def _update_lock_label():
             if getattr(queue_item, "manual_window_lock", False):
                 w = getattr(queue_item, "selected_window", "?")
-                lock_lbl.setText(f"Manual lock: {w} window. Queue refresh will not change the selected plan.")
-                lock_lbl.setStyleSheet("font-weight: bold; background-color: #e65100; color: white; padding: 4px 8px; border-radius: 4px;")
+                lock_lbl.setText(
+                    f"Manual lock: {w} window. Queue refresh will not change the selected plan."
+                )
+                lock_lbl.setStyleSheet(
+                    "font-weight: bold; background-color: #e65100; color: white; padding: 4px 8px; border-radius: 4px;"
+                )
                 return
             if getattr(queue_item, "locked", False):
                 w = getattr(queue_item, "selected_window", "?")
-                lock_lbl.setText(f"Order lock: {w} window. Auto replacement is allowed only for a higher ORB score.")
-                lock_lbl.setStyleSheet("font-weight: bold; background-color: #6d4c41; color: white; padding: 4px 8px; border-radius: 4px;")
+                lock_lbl.setText(
+                    f"Order lock: {w} window. Auto replacement is allowed only for a higher ORB score."
+                )
+                lock_lbl.setStyleSheet(
+                    "font-weight: bold; background-color: #6d4c41; color: white; padding: 4px 8px; border-radius: 4px;"
+                )
                 return
-            lock_lbl.setText("Auto: best-scoring valid plan selected each queue refresh.")
-            lock_lbl.setStyleSheet("font-weight: bold; background-color: #1565c0; color: white; padding: 4px 8px; border-radius: 4px;")
+            lock_lbl.setText(
+                "Auto: best-scoring valid plan selected each queue refresh."
+            )
+            lock_lbl.setStyleSheet(
+                "font-weight: bold; background-color: #1565c0; color: white; padding: 4px 8px; border-radius: 4px;"
+            )
             return
             if getattr(queue_item, "locked", False):
                 w = getattr(queue_item, "selected_window", "?")
-                lock_lbl.setText(f"🔒  LOCKED to {w} window — queue refresh will not change the selected plan")
-                lock_lbl.setStyleSheet("font-weight: bold; background-color: #e65100; color: white; padding: 4px 8px; border-radius: 4px;")
+                lock_lbl.setText(
+                    f"🔒  LOCKED to {w} window — queue refresh will not change the selected plan"
+                )
+                lock_lbl.setStyleSheet(
+                    "font-weight: bold; background-color: #e65100; color: white; padding: 4px 8px; border-radius: 4px;"
+                )
             else:
-                lock_lbl.setText("⚡  AUTO — best-scoring valid plan selected each queue refresh")
-                lock_lbl.setStyleSheet("font-weight: bold; background-color: #1565c0; color: white; padding: 4px 8px; border-radius: 4px;")
+                lock_lbl.setText(
+                    "⚡  AUTO — best-scoring valid plan selected each queue refresh"
+                )
+                lock_lbl.setStyleSheet(
+                    "font-weight: bold; background-color: #1565c0; color: white; padding: 4px 8px; border-radius: 4px;"
+                )
 
         _populate_table()
         _update_lock_label()
@@ -988,11 +1342,15 @@ class BuylistMixin:
 
         lock_btn = QPushButton("🔒  Lock Selected Window")
         lock_btn.setMinimumWidth(170)
-        lock_btn.setStyleSheet("background-color: #e65100; color: white; font-weight: bold;")
+        lock_btn.setStyleSheet(
+            "background-color: #e65100; color: white; font-weight: bold;"
+        )
 
         unlock_btn = QPushButton("⚡  Unlock (Auto)")
         unlock_btn.setMinimumWidth(130)
-        unlock_btn.setStyleSheet("background-color: #1565c0; color: white; font-weight: bold;")
+        unlock_btn.setStyleSheet(
+            "background-color: #1565c0; color: white; font-weight: bold;"
+        )
 
         close_btn = QPushButton("Close")
         close_btn.setMinimumWidth(80)
@@ -1006,13 +1364,22 @@ class BuylistMixin:
         def _lock_selected():
             sel = tbl.currentRow()
             if sel < 0:
-                QMessageBox.warning(dlg, "No row selected", "Click a window row first, then lock.")
+                QMessageBox.warning(
+                    dlg, "No row selected", "Click a window row first, then lock."
+                )
                 return
             window_cell = tbl.item(sel, 0)
             if window_cell is None:
                 return
             raw_chosen = window_cell.text().strip()
-            chosen = next((window for window in SUPPORTED_ORB_WINDOWS if window in raw_chosen.split()), raw_chosen)
+            chosen = next(
+                (
+                    window
+                    for window in SUPPORTED_ORB_WINDOWS
+                    if window in raw_chosen.split()
+                ),
+                raw_chosen,
+            )
             cand = candidates.get(chosen)
             if cand is None:
                 return
@@ -1053,9 +1420,13 @@ class BuylistMixin:
 
     def _buylist_submit_selected_queue_order(self, env: str) -> None:
         from src.ui.controllers.base import get_controller
-        from src.ui.controllers.buylist_execution_controller import BuylistExecutionController
+        from src.ui.controllers.buylist_execution_controller import (
+            BuylistExecutionController,
+        )
 
-        controller = get_controller(self, "buylist_execution_controller", BuylistExecutionController)
+        controller = get_controller(
+            self, "buylist_execution_controller", BuylistExecutionController
+        )
         controller.submit_selected_queue_order(env)
 
     # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -1083,8 +1454,10 @@ class BuylistMixin:
         kis_order_id = str(getattr(item, "kis_order_id", "") or "")
         if kis_order_id:
             exact = [
-                order for order in matches
-                if order.broker_order_id == kis_order_id or order.client_order_id == kis_order_id
+                order
+                for order in matches
+                if order.broker_order_id == kis_order_id
+                or order.client_order_id == kis_order_id
             ]
             if exact:
                 return exact
@@ -1137,14 +1510,18 @@ class BuylistMixin:
         except (TypeError, ValueError):
             return 0
 
-    def _selected_open_broker_order(self, env: str) -> Tuple[Optional[Any], Optional[BrokerOrder]]:
+    def _selected_open_broker_order(
+        self, env: str
+    ) -> Tuple[Optional[Any], Optional[BrokerOrder]]:
         item = self._buylist_selected_item(env)
         if item is None:
             return None, None
         orders = self._open_orders_for_buylist_item(item, env)
         return item, (orders[0] if orders else None)
 
-    def _apply_broker_order_status_updates_to_buylist(self, updated_orders: List[BrokerOrder]) -> None:
+    def _apply_broker_order_status_updates_to_buylist(
+        self, updated_orders: List[BrokerOrder]
+    ) -> None:
         manager = self.__dict__.get("execution_queue_manager")
         changed = False
         queue_changed = False
@@ -1163,8 +1540,16 @@ class BuylistMixin:
                 manager = self._ensure_execution_queue_manager()
 
             if order.side == OrderSide.BUY:
-                queue_item = self._execution_queue_item_for_buylist_item(item) if manager is not None else None
-                if manager is not None and queue_item is not None and self._is_execution_queue_buylist_item(item):
+                queue_item = (
+                    self._execution_queue_item_for_buylist_item(item)
+                    if manager is not None
+                    else None
+                )
+                if (
+                    manager is not None
+                    and queue_item is not None
+                    and self._is_execution_queue_buylist_item(item)
+                ):
                     if order.status == OrderStatus.UNKNOWN_SUBMISSION_STATE:
                         manager.mark_order_submitted(
                             order.symbol,
@@ -1172,14 +1557,22 @@ class BuylistMixin:
                             order_status=OrderStatus.UNKNOWN_SUBMISSION_STATE.value,
                             environment=order.environment,
                         )
-                    elif order.status in {OrderStatus.ACCEPTED, OrderStatus.WORKING, OrderStatus.CANCEL_REQUESTED}:
+                    elif order.status in {
+                        OrderStatus.ACCEPTED,
+                        OrderStatus.WORKING,
+                        OrderStatus.CANCEL_REQUESTED,
+                    }:
                         manager.mark_order_submitted(
                             order.symbol,
                             order_id=order.broker_order_id or order.client_order_id,
                             order_status=order.status.value,
                             environment=order.environment,
                         )
-                    elif order.status in {OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.EXPIRED}:
+                    elif order.status in {
+                        OrderStatus.CANCELLED,
+                        OrderStatus.REJECTED,
+                        OrderStatus.EXPIRED,
+                    }:
                         manager.mark_order_failed(
                             order.symbol,
                             order_status=order.status.value,
@@ -1192,18 +1585,33 @@ class BuylistMixin:
 
                 if order.status == OrderStatus.UNKNOWN_SUBMISSION_STATE:
                     new_status = OrderStatus.UNKNOWN_SUBMISSION_STATE.value
-                elif order.status in {OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.EXPIRED}:
+                elif order.status in {
+                    OrderStatus.CANCELLED,
+                    OrderStatus.REJECTED,
+                    OrderStatus.EXPIRED,
+                }:
                     new_status = queue_status or "ACTIVE"
                 elif order.status == OrderStatus.CANCEL_REQUESTED:
                     new_status = queue_status or "ORDER_SUBMITTED"
                 else:
                     new_status = queue_status or "BUY_SUBMITTED"
             else:
-                if order.status in {OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.EXPIRED}:
-                    new_status = "BOUGHT" if int(getattr(item, "shares_held", 0) or 0) > 0 else "WATCHING"
+                if order.status in {
+                    OrderStatus.CANCELLED,
+                    OrderStatus.REJECTED,
+                    OrderStatus.EXPIRED,
+                }:
+                    new_status = (
+                        "BOUGHT"
+                        if int(getattr(item, "shares_held", 0) or 0) > 0
+                        else "WATCHING"
+                    )
                 elif order.status == OrderStatus.CANCEL_REQUESTED:
                     new_status = "SELL_SUBMITTED"
-                elif order.intent in {OrderIntent.PARTIAL_EXIT, OrderIntent.PARTIAL_TAKE_PROFIT}:
+                elif order.intent in {
+                    OrderIntent.PARTIAL_EXIT,
+                    OrderIntent.PARTIAL_TAKE_PROFIT,
+                }:
                     new_status = "PARTIAL_EXIT_SUBMITTED"
                 else:
                     new_status = "SELL_SUBMITTED"
@@ -1222,7 +1630,9 @@ class BuylistMixin:
         if changed:
             self._save_buylist_state()
 
-    def _on_broker_order_query_finished(self, updated_orders: List[BrokerOrder]) -> None:
+    def _on_broker_order_query_finished(
+        self, updated_orders: List[BrokerOrder]
+    ) -> None:
         load_fn = _main_window_global("load_order_ledger", load_order_ledger)
         self.order_ledger = load_fn()
         self.apply_confirmed_order_fills_to_buylist(updated_orders)
@@ -1232,7 +1642,9 @@ class BuylistMixin:
             self.update_dashboard_summary()
 
         if not updated_orders:
-            self.append_log("Broker order status check finished: no unresolved matching orders were updated.")
+            self.append_log(
+                "Broker order status check finished: no unresolved matching orders were updated."
+            )
             return
         counts: Dict[str, int] = {}
         unknown_manual = 0
@@ -1240,13 +1652,19 @@ class BuylistMixin:
             status = order.status.value
             counts[status] = counts.get(status, 0) + 1
             raw_status = order.raw_status_response or {}
-            raw_response = raw_status.get("raw_response", {}) if isinstance(raw_status, dict) else {}
+            raw_response = (
+                raw_status.get("raw_response", {})
+                if isinstance(raw_status, dict)
+                else {}
+            )
             if order.status == OrderStatus.UNKNOWN_SUBMISSION_STATE or (
                 isinstance(raw_response, dict) and raw_response.get("not_found")
             ):
                 unknown_manual += 1
         summary = ", ".join(f"{key}={value}" for key, value in sorted(counts.items()))
-        self.append_log(f"Broker order status check updated {len(updated_orders)} order(s): {summary}.")
+        self.append_log(
+            f"Broker order status check updated {len(updated_orders)} order(s): {summary}."
+        )
         if unknown_manual:
             self.append_log(
                 "Broker query did not find clear evidence for one or more unknown submissions; manual verification is still required."
@@ -1266,7 +1684,11 @@ class BuylistMixin:
         if item is not None:
             orders = self._open_orders_for_buylist_item(item, env)
             if not orders:
-                QMessageBox.information(self, "No unresolved order", f"No unresolved local broker order exists for {item.symbol}.")
+                QMessageBox.information(
+                    self,
+                    "No unresolved order",
+                    f"No unresolved local broker order exists for {item.symbol}.",
+                )
                 return
             order = orders[0]
             account_no = order.account_no or account_no
@@ -1281,16 +1703,22 @@ class BuylistMixin:
             broker_order_id=broker_order_id,
             client_order_id=client_order_id,
         )
-        self.broker_order_query_worker.finished_query.connect(self._on_broker_order_query_finished)
+        self.broker_order_query_worker.finished_query.connect(
+            self._on_broker_order_query_finished
+        )
         self.broker_order_query_worker.error_occurred.connect(
-            lambda message: self.append_log(f"Broker order status check failed: {message}")
+            lambda message: self.append_log(
+                f"Broker order status check failed: {message}"
+            )
         )
         self.broker_order_query_worker.finished.connect(
             lambda: setattr(self, "broker_order_query_worker", None)
         )
         self.broker_order_query_worker.start()
         scope = symbol or "all unresolved orders"
-        self.append_log(f"Checking broker order status for {env} {account_no or '<ledger accounts>'} {scope}.")
+        self.append_log(
+            f"Checking broker order status for {env} {account_no or '<ledger accounts>'} {scope}."
+        )
 
     @staticmethod
     def _cancel_allowed_for_order(order: BrokerOrder) -> bool:
@@ -1302,17 +1730,21 @@ class BuylistMixin:
         }
 
     def _format_cancel_order_confirmation(self, order: BrokerOrder) -> str:
-        remaining = order.remaining_quantity or max(0, order.quantity_requested - order.filled_quantity)
-        return "\n".join([
-            f"Environment: {order.environment}",
-            f"Account: {order.account_no or '<unknown account>'}",
-            f"Symbol: {order.symbol}",
-            f"Broker order id: {order.broker_order_id}",
-            f"Side: {order.side.value}",
-            f"Quantity remaining: {remaining}",
-            "",
-            "This is a broker-side cancel request.",
-        ])
+        remaining = order.remaining_quantity or max(
+            0, order.quantity_requested - order.filled_quantity
+        )
+        return "\n".join(
+            [
+                f"Environment: {order.environment}",
+                f"Account: {order.account_no or '<unknown account>'}",
+                f"Symbol: {order.symbol}",
+                f"Broker order id: {order.broker_order_id}",
+                f"Side: {order.side.value}",
+                f"Quantity remaining: {remaining}",
+                "",
+                "This is a broker-side cancel request.",
+            ]
+        )
 
     def _buylist_cancel_selected_order(self, env: str) -> None:
         worker = self.__dict__.get("broker_order_cancel_worker")
@@ -1322,10 +1754,18 @@ class BuylistMixin:
 
         item, order = self._selected_open_broker_order(env)
         if item is None:
-            QMessageBox.warning(self, "No selection", "Select a buylist row with an unresolved broker order first.")
+            QMessageBox.warning(
+                self,
+                "No selection",
+                "Select a buylist row with an unresolved broker order first.",
+            )
             return
         if order is None:
-            QMessageBox.warning(self, "No open order", f"No unresolved local broker order exists for {item.symbol}.")
+            QMessageBox.warning(
+                self,
+                "No open order",
+                f"No unresolved local broker order exists for {item.symbol}.",
+            )
             return
         if not order.broker_order_id:
             QMessageBox.warning(
@@ -1345,7 +1785,8 @@ class BuylistMixin:
         reply = QMessageBox.question(
             self,
             f"Cancel {order.environment} Order",
-            self._format_cancel_order_confirmation(order) + "\n\nCancel this broker order?",
+            self._format_cancel_order_confirmation(order)
+            + "\n\nCancel this broker order?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -1353,7 +1794,9 @@ class BuylistMixin:
             return
 
         self.broker_order_cancel_worker = KisOrderCancelWorker(order.client_order_id)
-        self.broker_order_cancel_worker.finished_cancel.connect(self._on_broker_order_cancel_finished)
+        self.broker_order_cancel_worker.finished_cancel.connect(
+            self._on_broker_order_cancel_finished
+        )
         self.broker_order_cancel_worker.error_occurred.connect(
             lambda message: self.append_log(f"Broker order cancel failed: {message}")
         )
@@ -1361,7 +1804,9 @@ class BuylistMixin:
             lambda: setattr(self, "broker_order_cancel_worker", None)
         )
         self.broker_order_cancel_worker.start()
-        self.append_log(f"Cancel requested at broker for {order.environment} {order.symbol} order {order.broker_order_id}.")
+        self.append_log(
+            f"Cancel requested at broker for {order.environment} {order.symbol} order {order.broker_order_id}."
+        )
 
     def _on_broker_order_cancel_finished(self, order: BrokerOrder) -> None:
         load_fn = _main_window_global("load_order_ledger", load_order_ledger)
@@ -1379,7 +1824,11 @@ class BuylistMixin:
         if queue_item is None or getattr(queue_item, "manual_window_lock", False):
             return None
         current = getattr(queue_item, "selected_candidate", None)
-        current_window = str(getattr(current, "window", "") or getattr(queue_item, "selected_window", "") or "")
+        current_window = str(
+            getattr(current, "window", "")
+            or getattr(queue_item, "selected_window", "")
+            or ""
+        )
         try:
             current_score = float(getattr(current, "score", 0.0) or 0.0)
         except (TypeError, ValueError):
@@ -1388,13 +1837,23 @@ class BuylistMixin:
         if not candidates:
             return None
         ready = [
-            candidate for candidate in candidates
+            candidate
+            for candidate in candidates
             if bool(getattr(candidate, "valid", False))
-            and str(getattr(getattr(candidate, "status", ""), "value", getattr(candidate, "status", ""))).upper() == "EXECUTE_READY"
+            and str(
+                getattr(
+                    getattr(candidate, "status", ""),
+                    "value",
+                    getattr(candidate, "status", ""),
+                )
+            ).upper()
+            == "EXECUTE_READY"
         ]
         if not ready:
             return None
-        best = max(ready, key=lambda candidate: float(getattr(candidate, "score", 0.0) or 0.0))
+        best = max(
+            ready, key=lambda candidate: float(getattr(candidate, "score", 0.0) or 0.0)
+        )
         if str(getattr(best, "window", "") or "") == current_window:
             return None
         try:
@@ -1418,7 +1877,10 @@ class BuylistMixin:
             return
 
         for item in [it for it in self.buylist_manager.items if it.environment == env]:
-            if str(getattr(item, "monitoring_status", "") or "").upper() not in {"ORDER_PENDING", "ORDER_SUBMITTED"}:
+            if str(getattr(item, "monitoring_status", "") or "").upper() not in {
+                "ORDER_PENDING",
+                "ORDER_SUBMITTED",
+            }:
                 continue
             if getattr(item, "_buy_replace_pending", False):
                 continue
@@ -1434,7 +1896,8 @@ class BuylistMixin:
             )
             order = next(
                 (
-                    candidate_order for candidate_order in orders
+                    candidate_order
+                    for candidate_order in orders
                     if self._cancel_allowed_for_order(candidate_order)
                     and self._order_filled_quantity(candidate_order) == 0
                     and candidate_order.broker_order_id
@@ -1445,12 +1908,18 @@ class BuylistMixin:
                 continue
 
             item._buy_replace_pending = True
-            self.broker_order_cancel_worker = KisOrderCancelWorker(order.client_order_id)
+            self.broker_order_cancel_worker = KisOrderCancelWorker(
+                order.client_order_id
+            )
             self.broker_order_cancel_worker.finished_cancel.connect(
-                lambda updated, it=item, repl=replacement: self._on_entry_replacement_cancel_finished(it, repl, updated)
+                lambda updated, it=item, repl=replacement: self._on_entry_replacement_cancel_finished(
+                    it, repl, updated
+                )
             )
             self.broker_order_cancel_worker.error_occurred.connect(
-                lambda message, it=item: self._on_entry_replacement_cancel_error(it, message)
+                lambda message, it=item: self._on_entry_replacement_cancel_error(
+                    it, message
+                )
             )
             self.broker_order_cancel_worker.finished.connect(
                 lambda: setattr(self, "broker_order_cancel_worker", None)
@@ -1465,15 +1934,25 @@ class BuylistMixin:
 
     def _on_entry_replacement_cancel_error(self, item, message: str) -> None:
         item._buy_replace_pending = False
-        self.append_log(f"[Buylist/{getattr(item, 'environment', 'SIM')}] Buy replacement cancel failed for {item.symbol}: {message}")
+        self.append_log(
+            f"[Buylist/{getattr(item, 'environment', 'PROD')}] Buy replacement cancel failed for {item.symbol}: {message}"
+        )
 
-    def _on_entry_replacement_cancel_finished(self, item, replacement, order: BrokerOrder) -> None:
+    def _on_entry_replacement_cancel_finished(
+        self, item, replacement, order: BrokerOrder
+    ) -> None:
         item._buy_replace_pending = False
-        self.order_ledger = _main_window_global("load_order_ledger", load_order_ledger)()
+        self.order_ledger = _main_window_global(
+            "load_order_ledger", load_order_ledger
+        )()
         self.apply_confirmed_order_fills_to_buylist([order])
         self._apply_broker_order_status_updates_to_buylist([order])
 
-        if order.status not in {OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.EXPIRED}:
+        if order.status not in {
+            OrderStatus.CANCELLED,
+            OrderStatus.REJECTED,
+            OrderStatus.EXPIRED,
+        }:
             self.populate_buylist_dashboard()
             self.append_log(
                 f"[Buylist/{order.environment}] Replacement for {order.symbol} is waiting; "
@@ -1491,8 +1970,12 @@ class BuylistMixin:
         queue_item.locked_reason = None
         queue_item.order_status = None
         queue_item.order_id = None
-        manager.mark_order_submitted(item.symbol, order_status="PENDING", environment=order.environment)
-        item.monitoring_status = self._execution_queue_status_for_buylist_item(item) or "ORDER_PENDING"
+        manager.mark_order_submitted(
+            item.symbol, order_status="PENDING", environment=order.environment
+        )
+        item.monitoring_status = (
+            self._execution_queue_status_for_buylist_item(item) or "ORDER_PENDING"
+        )
         item.status = item.monitoring_status
         item._planned_shares = int(getattr(replacement, "shares", 0) or 0)
         item._selected_orb_window = str(getattr(replacement, "window", "") or "")
@@ -1521,7 +2004,9 @@ class BuylistMixin:
         discounted = price * (1.0 - STOP_LOSS_SELL_LIMIT_DISCOUNT_PCT)
         return max(0.0001, float(format_overseas_order_price(discounted)))
 
-    def _maybe_reprice_stop_loss_sell(self, item, env: str, current_price: float) -> None:
+    def _maybe_reprice_stop_loss_sell(
+        self, item, env: str, current_price: float
+    ) -> None:
         if getattr(item, "_stop_reprice_pending", False):
             return
         if self._buylist_auto_order_blocked(item):
@@ -1545,7 +2030,8 @@ class BuylistMixin:
         )
         order = next(
             (
-                candidate_order for candidate_order in orders
+                candidate_order
+                for candidate_order in orders
                 if self._cancel_allowed_for_order(candidate_order)
                 and candidate_order.broker_order_id
             ),
@@ -1559,13 +2045,17 @@ class BuylistMixin:
             old_limit = float(order.limit_price or 0.0)
         except (TypeError, ValueError):
             old_limit = 0.0
-        if old_limit > 0 and new_limit >= old_limit * (1.0 - STOP_LOSS_REPRICE_MIN_DROP_PCT):
+        if old_limit > 0 and new_limit >= old_limit * (
+            1.0 - STOP_LOSS_REPRICE_MIN_DROP_PCT
+        ):
             return
 
         item._stop_reprice_pending = True
         self.broker_order_cancel_worker = KisOrderCancelWorker(order.client_order_id)
         self.broker_order_cancel_worker.finished_cancel.connect(
-            lambda updated, it=item, px=new_limit: self._on_stop_reprice_cancel_finished(it, px, updated)
+            lambda updated, it=item, px=new_limit: self._on_stop_reprice_cancel_finished(
+                it, px, updated
+            )
         )
         self.broker_order_cancel_worker.error_occurred.connect(
             lambda message, it=item: self._on_stop_reprice_cancel_error(it, message)
@@ -1581,15 +2071,25 @@ class BuylistMixin:
 
     def _on_stop_reprice_cancel_error(self, item, message: str) -> None:
         item._stop_reprice_pending = False
-        self.append_log(f"[Buylist/{getattr(item, 'environment', 'SIM')}] Stop-loss reprice cancel failed for {item.symbol}: {message}")
+        self.append_log(
+            f"[Buylist/{getattr(item, 'environment', 'PROD')}] Stop-loss reprice cancel failed for {item.symbol}: {message}"
+        )
 
-    def _on_stop_reprice_cancel_finished(self, item, new_limit: float, order: BrokerOrder) -> None:
+    def _on_stop_reprice_cancel_finished(
+        self, item, new_limit: float, order: BrokerOrder
+    ) -> None:
         item._stop_reprice_pending = False
-        self.order_ledger = _main_window_global("load_order_ledger", load_order_ledger)()
+        self.order_ledger = _main_window_global(
+            "load_order_ledger", load_order_ledger
+        )()
         self.apply_confirmed_order_fills_to_buylist([order])
         self._apply_broker_order_status_updates_to_buylist([order])
 
-        if order.status not in {OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.EXPIRED}:
+        if order.status not in {
+            OrderStatus.CANCELLED,
+            OrderStatus.REJECTED,
+            OrderStatus.EXPIRED,
+        }:
             self.populate_buylist_dashboard()
             self.append_log(
                 f"[Buylist/{order.environment}] Stop-loss reprice for {order.symbol} is waiting; "
@@ -1613,7 +2113,9 @@ class BuylistMixin:
             f"[Buylist/{order.environment}] Resubmitting stop-loss SELL for {item.symbol}: "
             f"{quantity} shares @ aggressive limit ${new_limit:.2f}."
         )
-        self._submit_kis_sell_order(item, quantity, reason="stop-loss reprice", order_price=new_limit)
+        self._submit_kis_sell_order(
+            item, quantity, reason="stop-loss reprice", order_price=new_limit
+        )
 
     def _request_eod_entry_buy_cancellation(self, item, env: str) -> bool:
         orders = self._open_broker_orders_for_buylist_item(
@@ -1654,14 +2156,21 @@ class BuylistMixin:
         if not sym_cell:
             return None
         return self.buylist_manager.get(sym_cell.text().strip().upper(), env)
+
     def _buylist_activate_selected(self, env: str) -> None:
         """Activate the selected buylist item for entry monitoring."""
         item = self._buylist_selected_item(env)
         if not item:
-            QMessageBox.warning(self, "No selection", "Select a buylist row to activate.")
+            QMessageBox.warning(
+                self, "No selection", "Select a buylist row to activate."
+            )
             return
         if item.monitoring_status == "BOUGHT":
-            QMessageBox.information(self, "Already bought", f"{item.symbol} is already in a BOUGHT position.")
+            QMessageBox.information(
+                self,
+                "Already bought",
+                f"{item.symbol} is already in a BOUGHT position.",
+            )
             return
         if self._is_execution_queue_buylist_item(item):
             item.orb_monitor_enabled = True
@@ -1672,7 +2181,9 @@ class BuylistMixin:
                 self._toggle_buylist_monitor(env)
             self.populate_buylist_dashboard()
             status = str(getattr(item, "monitoring_status", "") or "")
-            started_note = "Monitor started." if not was_running else "Monitor already running."
+            started_note = (
+                "Monitor started." if not was_running else "Monitor already running."
+            )
             if status == "EXECUTE_READY":
                 msg = (
                     f"{item.symbol} activated — EXECUTE_READY.\n\n"
@@ -1688,28 +2199,48 @@ class BuylistMixin:
                 )
             QMessageBox.information(self, "Activated", msg)
             return
-        bought_count = sum(1 for it in self.buylist_manager.items if it.monitoring_status == "BOUGHT" and it.environment == env)
+        bought_count = sum(
+            1
+            for it in self.buylist_manager.items
+            if it.monitoring_status == "BOUGHT" and it.environment == env
+        )
         if bought_count >= 30:
-            QMessageBox.warning(self, "Max positions", "Already holding 30 positions. Sell one before activating another.")
+            QMessageBox.warning(
+                self,
+                "Max positions",
+                "Already holding 30 positions. Sell one before activating another.",
+            )
             return
         item.monitoring_status = "ACTIVE"
         self._clear_buylist_auto_order_block(item)
         self._save_state()
         monitor_started = self._ensure_buylist_monitor_running(env)
         self.populate_buylist_dashboard()
-        self.append_log(f"[Buylist/{env}] {item.symbol} set to ACTIVE — monitoring for entry at ${item.entry_price:.2f}.")
+        self.append_log(
+            f"[Buylist/{env}] {item.symbol} set to ACTIVE — monitoring for entry at ${item.entry_price:.2f}."
+        )
         if monitor_started:
-            self.append_log(f"[Buylist/{env}] Monitor auto-started for active entry monitoring.")
+            self.append_log(
+                f"[Buylist/{env}] Monitor auto-started for active entry monitoring."
+            )
+
     def _buylist_deactivate_selected(self, env: str) -> None:
         item = self._buylist_selected_item(env)
         if not item:
-            QMessageBox.warning(self, "No selection", "Select a buylist row to deactivate.")
+            QMessageBox.warning(
+                self, "No selection", "Select a buylist row to deactivate."
+            )
             return
-        if item.monitoring_status != "BOUGHT" and self._is_execution_queue_buylist_item(item):
+        if (
+            item.monitoring_status != "BOUGHT"
+            and self._is_execution_queue_buylist_item(item)
+        ):
             item.orb_monitor_enabled = False
             self._save_state()
             self.populate_buylist_dashboard()
-            self.append_log(f"[Buylist/{env}] {item.symbol} deactivated — monitor will no longer auto-buy this item.")
+            self.append_log(
+                f"[Buylist/{env}] {item.symbol} deactivated — monitor will no longer auto-buy this item."
+            )
             QMessageBox.information(
                 self,
                 "Deactivated",
@@ -1723,7 +2254,7 @@ class BuylistMixin:
                 "Reset position?",
                 f"{item.symbol} is BOUGHT ({item.shares_held} shares @ ${item.avg_cost:.2f}).\n\n"
                 f"Reset to WATCHING — no sell order is placed.\n"
-                f"Only use this to discard incorrect SIM entries.",
+                "Only use this to discard an incorrect local position entry.",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
@@ -1739,20 +2270,25 @@ class BuylistMixin:
             self._clear_buylist_auto_order_block(item)
             self._save_state()
             self.populate_buylist_dashboard()
-            self.append_log(f"[Buylist/{env}] {item.symbol} position reset to WATCHING (no KIS order placed).")
+            self.append_log(
+                f"[Buylist/{env}] {item.symbol} position reset to WATCHING (no KIS order placed)."
+            )
             return
         item.monitoring_status = "WATCHING"
         self._clear_buylist_auto_order_block(item)
         self._save_state()
         self.populate_buylist_dashboard()
         self.append_log(f"[Buylist/{env}] {item.symbol} deactivated.")
+
     def _buylist_sell_half_selected(self, env: str) -> None:
         item = self._buylist_selected_item(env)
         if not item:
             QMessageBox.warning(self, "No selection", "Select a buylist row to sell.")
             return
         if item.monitoring_status != "BOUGHT" or item.shares_held <= 0:
-            QMessageBox.warning(self, "No position", f"{item.symbol} has no open position.")
+            QMessageBox.warning(
+                self, "No position", f"{item.symbol} has no open position."
+            )
             return
         if self._warn_if_open_sell_order(item, env):
             return
@@ -1802,24 +2338,31 @@ class BuylistMixin:
         dialog.setLayout(layout)
         if dialog.exec_() == QDialog.Accepted:
             self._submit_kis_sell_order(item, spin.value(), reason="partial sell")
+
     def _buylist_sell_all_selected(self, env: str) -> None:
         item = self._buylist_selected_item(env)
         if not item:
             QMessageBox.warning(self, "No selection", "Select a buylist row to sell.")
             return
         if item.monitoring_status != "BOUGHT" or item.shares_held <= 0:
-            QMessageBox.warning(self, "No position", f"{item.symbol} has no open position.")
+            QMessageBox.warning(
+                self, "No position", f"{item.symbol} has no open position."
+            )
             return
         if self._warn_if_open_sell_order(item, env):
             return
         reply = QMessageBox.question(
-            self, "Confirm Sell All",
+            self,
+            "Confirm Sell All",
             f"Sell all {item.shares_held} shares of {item.symbol}?\n"
             "This will submit a limit sell order using current/live fallback price.",
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply == QMessageBox.Yes:
-            self._submit_kis_sell_order(item, item.shares_held, reason="manual sell all")
+            self._submit_kis_sell_order(
+                item, item.shares_held, reason="manual sell all"
+            )
+
     def _buylist_remove_selected(self, env: str) -> None:
         item = self._buylist_selected_item(env)
         if not item:
@@ -1827,7 +2370,8 @@ class BuylistMixin:
             return
         if item.monitoring_status in ("ACTIVE", "BOUGHT"):
             reply = QMessageBox.question(
-                self, "Confirm Remove",
+                self,
+                "Confirm Remove",
                 f"{item.symbol} is currently {item.monitoring_status}. Remove anyway?",
                 QMessageBox.Yes | QMessageBox.No,
             )
@@ -1837,26 +2381,33 @@ class BuylistMixin:
         self._save_state()
         self.populate_buylist_dashboard()
         self.append_log(f"[Buylist/{env}] {item.symbol} removed from buylist.")
+
     def _buylist_move_to_breakeven_selected(self, env: str) -> None:
         item = self._buylist_selected_item(env)
         if not item:
             QMessageBox.warning(self, "No selection", "Select a buylist row first.")
             return
         if item.monitoring_status != "BOUGHT" or item.shares_held <= 0:
-            QMessageBox.warning(self, "No position", f"{item.symbol} has no open bought position.")
+            QMessageBox.warning(
+                self, "No position", f"{item.symbol} has no open bought position."
+            )
             return
         breakeven = item.avg_cost if item.avg_cost > 0 else item.entry_price
         if breakeven <= 0:
-            QMessageBox.warning(self, "No price", f"No avg cost or entry price set for {item.symbol}.")
+            QMessageBox.warning(
+                self, "No price", f"No avg cost or entry price set for {item.symbol}."
+            )
             return
         if item.stop_loss >= breakeven:
             QMessageBox.information(
-                self, "Already at Breakeven",
-                f"{item.symbol} stop (${item.stop_loss:.2f}) is already at or above breakeven (${breakeven:.2f})."
+                self,
+                "Already at Breakeven",
+                f"{item.symbol} stop (${item.stop_loss:.2f}) is already at or above breakeven (${breakeven:.2f}).",
             )
             return
         reply = QMessageBox.question(
-            self, "Move Stop to Breakeven",
+            self,
+            "Move Stop to Breakeven",
             f"Move {item.symbol} stop loss from ${item.stop_loss:.2f} to breakeven ${breakeven:.2f}?",
             QMessageBox.Yes | QMessageBox.No,
         )
@@ -1871,16 +2422,15 @@ class BuylistMixin:
             f"${breakeven:.2f} (was ${old_stop:.2f})."
         )
 
-
     # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Buylist Dashboard — monitor timer
     # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     def _toggle_buylist_monitor(self, env: str) -> None:
-        """Toggle the monitor timer for one environment (PROD or SIM)."""
+        """Toggle the production monitor timer."""
         active_attr = f"_buylist_{env.lower()}_monitor_active"
-        timer_attr  = f"buylist_{env.lower()}_monitor_timer"
-        lbl_attr    = f"buylist_{env.lower()}_monitor_status_label"
-        btn_name    = f"buylistMonitorToggle_{env}"
+        timer_attr = f"buylist_{env.lower()}_monitor_timer"
+        lbl_attr = f"buylist_{env.lower()}_monitor_status_label"
+        btn_name = f"buylistMonitorToggle_{env}"
 
         if not hasattr(self, timer_attr):
             return
@@ -1907,8 +2457,11 @@ class BuylistMixin:
                 lbl.setStyleSheet("color: #4CAF50; font-weight: bold;")
             if btn:
                 btn.setText("Stop Monitor")
-            self.append_log(f"[Buylist/{env}] Monitor started — checking every 60 seconds.")
+            self.append_log(
+                f"[Buylist/{env}] Monitor started — checking every 60 seconds."
+            )
             self._run_buylist_monitor_cycle(env)  # run immediately
+
     def _ensure_buylist_monitor_running(self, env: str) -> bool:
         """Start one environment's buylist monitor if it is currently off."""
         active_attr = f"_buylist_{env.lower()}_monitor_active"
@@ -1946,7 +2499,11 @@ class BuylistMixin:
                     )
                 continue
             queue_item = self._queue_item_for_buylist_item(it)
-            candidate = getattr(queue_item, "selected_candidate", None) if queue_item is not None else None
+            candidate = (
+                getattr(queue_item, "selected_candidate", None)
+                if queue_item is not None
+                else None
+            )
             if candidate is None:
                 self.append_log(
                     f"[Buylist/{env}] {it.symbol} EXECUTE_READY but no selected candidate — skipping auto-buy."
@@ -1963,8 +2520,12 @@ class BuylistMixin:
             current_price = self.latest_intraday_prices.get(it.symbol, 0.0)
             mgr = self._ensure_execution_queue_manager()
             if mgr is not None:
-                mgr.mark_order_submitted(it.symbol, order_status="PENDING", environment=env)
-            queue_status = self._execution_queue_status_for_buylist_item(it) or "ORDER_PENDING"
+                mgr.mark_order_submitted(
+                    it.symbol, order_status="PENDING", environment=env
+                )
+            queue_status = (
+                self._execution_queue_status_for_buylist_item(it) or "ORDER_PENDING"
+            )
             it.monitoring_status = queue_status
             it.status = queue_status
             it._planned_shares = shares
@@ -2013,7 +2574,9 @@ class BuylistMixin:
             if is_queue:
                 if status in submitted_entry_statuses:
                     symbol = str(getattr(item, "symbol", "") or "").upper()
-                    environment = str(getattr(item, "environment", "") or "SIM").upper()
+                    environment = str(
+                        getattr(item, "environment", "") or "PROD"
+                    ).upper()
                     if status == ExecutionQueueStatus.UNKNOWN_SUBMISSION_STATE.value:
                         self.append_log(
                             f"[Buylist/{environment}] Market close: {symbol} has UNKNOWN_SUBMISSION_STATE; "
@@ -2031,13 +2594,17 @@ class BuylistMixin:
                         cancel_pending_symbols.append((symbol, environment))
                         continue
                     status = str(getattr(item, "monitoring_status", "") or "").upper()
-                if status not in pre_entry_watching and status not in {"ACTIVE", ExecutionQueueStatus.REJECTED.value, ExecutionQueueStatus.EXPIRED.value}:
+                if status not in pre_entry_watching and status not in {
+                    "ACTIVE",
+                    ExecutionQueueStatus.REJECTED.value,
+                    ExecutionQueueStatus.EXPIRED.value,
+                }:
                     continue
             elif status != "ACTIVE":
                 continue
 
             symbol = str(getattr(item, "symbol", "") or "").upper()
-            environment = str(getattr(item, "environment", "") or "SIM").upper()
+            environment = str(getattr(item, "environment", "") or "PROD").upper()
 
             if is_queue:
                 item.orb_monitor_enabled = False
@@ -2048,7 +2615,11 @@ class BuylistMixin:
                 item._orb_queue_required_notice_logged = False
                 self._clear_buylist_auto_order_block(item)
 
-                queue_item = manager.get_item(symbol, environment) if manager is not None else None
+                queue_item = (
+                    manager.get_item(symbol, environment)
+                    if manager is not None
+                    else None
+                )
                 if queue_item is not None:
                     queue_item.locked = False
                     queue_item.locked_reason = None
@@ -2066,8 +2637,12 @@ class BuylistMixin:
             reset_symbols.append((symbol, environment))
 
         if cancel_pending_symbols:
-            symbols_text = ", ".join(f"{sym}/{env}" for sym, env in cancel_pending_symbols)
-            self.append_log(f"[Buylist] Market close: entry BUY cancellation/reconciliation still pending for: {symbols_text}")
+            symbols_text = ", ".join(
+                f"{sym}/{env}" for sym, env in cancel_pending_symbols
+            )
+            self.append_log(
+                f"[Buylist] Market close: entry BUY cancellation/reconciliation still pending for: {symbols_text}"
+            )
 
         if not reset_symbols:
             return
@@ -2078,7 +2653,9 @@ class BuylistMixin:
         if hasattr(self, "populate_buylist_dashboard"):
             self.populate_buylist_dashboard()
         symbols_text = ", ".join(f"{sym}/{env}" for sym, env in reset_symbols)
-        self.append_log(f"[Buylist] Market closed — deactivated pre-entry ORB monitoring for: {symbols_text}")
+        self.append_log(
+            f"[Buylist] Market closed — deactivated pre-entry ORB monitoring for: {symbols_text}"
+        )
 
     def _run_buylist_monitor_cycle(self, env: str) -> None:
         """Check ACTIVE/BOUGHT items for one environment and fire orders as needed."""
@@ -2087,20 +2664,30 @@ class BuylistMixin:
 
         items = [it for it in self.buylist_manager.items if it.environment == env]
         self._restore_monitorable_buylist_error_positions(items, env)
-        active_items = [it for it in items if it.monitoring_status in ("ACTIVE", "BOUGHT")]
+        active_items = [
+            it for it in items if it.monitoring_status in ("ACTIVE", "BOUGHT")
+        ]
         stop_reprice_items = [
-            it for it in items
-            if str(getattr(it, "monitoring_status", "") or "").upper() == "SELL_SUBMITTED"
+            it
+            for it in items
+            if str(getattr(it, "monitoring_status", "") or "").upper()
+            == "SELL_SUBMITTED"
         ]
 
         # Execution queue items whose trigger hasn't fired yet
         _skip_statuses = {
-            "BOUGHT", "BUY_SUBMITTED", "BUY_PARTIAL",
-            "SELL_SUBMITTED", "PARTIAL_EXIT_SUBMITTED", "SOLD",
-            "ORDER_SUBMITTED", "ORDER_PENDING",
+            "BOUGHT",
+            "BUY_SUBMITTED",
+            "BUY_PARTIAL",
+            "SELL_SUBMITTED",
+            "PARTIAL_EXIT_SUBMITTED",
+            "SOLD",
+            "ORDER_SUBMITTED",
+            "ORDER_PENDING",
         }
         queue_watching_items = [
-            it for it in items
+            it
+            for it in items
             if self._is_pre_entry_execution_queue_buylist_item(it)
             and it.monitoring_status not in _skip_statuses
             and not getattr(it, "_buy_order_pending", False)
@@ -2118,7 +2705,11 @@ class BuylistMixin:
         if queue_watching_items and hasattr(self, "refresh_watchlist_intraday_cache"):
             worker = getattr(self, "intraday_bulk_worker", None)
             if worker is None or not worker.isRunning():
-                self.refresh_watchlist_intraday_cache(show_messages=False, triggered_by_live=True, source="buylist monitor")
+                self.refresh_watchlist_intraday_cache(
+                    show_messages=False,
+                    triggered_by_live=True,
+                    source="buylist monitor",
+                )
 
         for item in stop_reprice_items:
             self._buylist_refresh_item_data(item)
@@ -2146,7 +2737,11 @@ class BuylistMixin:
                 bp = getattr(item, "breakout_price", None) or 0.0
                 buf = getattr(item, "buffer_pct", 0.001)
                 breakout_trigger = bp * (1 + buf) if bp > 0 else 0.0
-                entry_trigger = max(item.entry_price, breakout_trigger) if breakout_trigger > 0 else item.entry_price
+                entry_trigger = (
+                    max(item.entry_price, breakout_trigger)
+                    if breakout_trigger > 0
+                    else item.entry_price
+                )
                 auto_order_blocked = self._buylist_auto_order_blocked(item)
 
                 # Chase guard: if price has already run â‰¥2% above the trigger the setup is
@@ -2192,7 +2787,11 @@ class BuylistMixin:
                         f"[Buylist/{env}] Trigger met for {item.symbol}, but auto KIS order is blocked: "
                         f"{getattr(item, 'auto_order_block_reason', '')}"
                     )
-                elif bp > 0 and current_price > item.entry_price and current_price < breakout_trigger:
+                elif (
+                    bp > 0
+                    and current_price > item.entry_price
+                    and current_price < breakout_trigger
+                ):
                     self.append_log(
                         f"[Buylist/{env}] {item.symbol} above ORB ${item.entry_price:.2f} "
                         f"but below breakout trigger ${breakout_trigger:.2f} (${current_price:.2f}) — waiting."
@@ -2265,10 +2864,6 @@ class BuylistMixin:
             self._save_buylist_state()
 
     @staticmethod
-    def _is_kis_sim_unsupported_order_error(error_message: str) -> bool:
-        return "90000000" in str(error_message or "")
-
-    @staticmethod
     def _buylist_auto_order_blocked(item) -> bool:
         return bool(str(getattr(item, "auto_order_block_reason", "") or "").strip())
 
@@ -2301,11 +2896,21 @@ class BuylistMixin:
             shares_held = 0
 
         partial_reason = ""
-        if shares_held > 0 and 3 <= days_held <= 5 and not getattr(item, "sell_half_done", False):
-            partial_reason = "Position is within 3-5 trading day partial-exit review window."
+        if (
+            shares_held > 0
+            and 3 <= days_held <= 5
+            and not getattr(item, "sell_half_done", False)
+        ):
+            partial_reason = (
+                "Position is within 3-5 trading day partial-exit review window."
+            )
 
-        changed |= self._set_attr_if_changed(item, "partial_exit_review_alert", bool(partial_reason))
-        changed |= self._set_attr_if_changed(item, "partial_exit_review_reason", partial_reason)
+        changed |= self._set_attr_if_changed(
+            item, "partial_exit_review_alert", bool(partial_reason)
+        )
+        changed |= self._set_attr_if_changed(
+            item, "partial_exit_review_reason", partial_reason
+        )
 
         ema_reason = ""
         if shares_held > 0 and getattr(item, "sell_half_done", False):
@@ -2313,25 +2918,35 @@ class BuylistMixin:
             if momentum_signal:
                 ema_reason = f"Close below {momentum_signal} - review manual exit next market open."
 
-        changed |= self._set_attr_if_changed(item, "ema_trailing_stop_alert", bool(ema_reason))
-        changed |= self._set_attr_if_changed(item, "ema_trailing_stop_reason", ema_reason)
+        changed |= self._set_attr_if_changed(
+            item, "ema_trailing_stop_alert", bool(ema_reason)
+        )
+        changed |= self._set_attr_if_changed(
+            item, "ema_trailing_stop_reason", ema_reason
+        )
 
         if partial_reason or ema_reason:
-            changed |= self._set_attr_if_changed(item, "suggested_action", suggested_action)
+            changed |= self._set_attr_if_changed(
+                item, "suggested_action", suggested_action
+            )
         elif str(getattr(item, "suggested_action", "") or "") == suggested_action:
             changed |= self._set_attr_if_changed(item, "suggested_action", "")
 
         partial_notice_key = "_partial_exit_review_notice_reason"
         if partial_reason and getattr(item, partial_notice_key, "") != partial_reason:
             setattr(item, partial_notice_key, partial_reason)
-            self.append_log(f"[Buylist/{env}] {item.symbol}: {partial_reason} {suggested_action}")
+            self.append_log(
+                f"[Buylist/{env}] {item.symbol}: {partial_reason} {suggested_action}"
+            )
         elif not partial_reason and getattr(item, partial_notice_key, ""):
             setattr(item, partial_notice_key, "")
 
         ema_notice_key = "_ema_trailing_stop_notice_reason"
         if ema_reason and getattr(item, ema_notice_key, "") != ema_reason:
             setattr(item, ema_notice_key, ema_reason)
-            self.append_log(f"[Buylist/{env}] {item.symbol}: {ema_reason} {suggested_action}")
+            self.append_log(
+                f"[Buylist/{env}] {item.symbol}: {ema_reason} {suggested_action}"
+            )
         elif not ema_reason and getattr(item, ema_notice_key, ""):
             setattr(item, ema_notice_key, "")
 
@@ -2381,7 +2996,9 @@ class BuylistMixin:
             if not text:
                 return None
             try:
-                return BuylistMixin._buylist_market_session_date_from_value(dt.datetime.fromisoformat(text))
+                return BuylistMixin._buylist_market_session_date_from_value(
+                    dt.datetime.fromisoformat(text)
+                )
             except ValueError:
                 try:
                     return dt.date.fromisoformat(text)
@@ -2443,7 +3060,8 @@ class BuylistMixin:
         session_today = market_now.date()
         today_is_complete = market_now.time() >= US_MARKET_CLOSE_TIME
         completed = [
-            row for row in rows
+            row
+            for row in rows
             if row[0] < session_today or (row[0] == session_today and today_is_complete)
         ]
         return completed or rows
@@ -2474,7 +3092,11 @@ class BuylistMixin:
                 self._yf_session = session
 
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-            r = session.get(url, params={"interval": "1d", "range": "30d", "events": "div,splits"}, timeout=15)
+            r = session.get(
+                url,
+                params={"interval": "1d", "range": "30d", "events": "div,splits"},
+                timeout=15,
+            )
             r.raise_for_status()
             payload = r.json()
             result = payload["chart"]["result"][0]
@@ -2484,15 +3106,26 @@ class BuylistMixin:
             for ts_value, close_value in zip(timestamps, raw_closes):
                 if close_value is None:
                     continue
-                session_date = dt.datetime.fromtimestamp(float(ts_value), dt.timezone.utc).astimezone(US_MARKET_ZONE).date()
+                session_date = (
+                    dt.datetime.fromtimestamp(float(ts_value), dt.timezone.utc)
+                    .astimezone(US_MARKET_ZONE)
+                    .date()
+                )
                 daily_rows.append((session_date, float(close_value)))
-            closes = [close for _session_date, close in daily_rows] if daily_rows else [float(c) for c in raw_closes if c is not None]
+            closes = (
+                [close for _session_date, close in daily_rows]
+                if daily_rows
+                else [float(c) for c in raw_closes if c is not None]
+            )
         except Exception as exc:
-            self.append_log(f"[Buylist] Direct fetch failed for {symbol}: {exc} — trying yfinance fallback.")
+            self.append_log(
+                f"[Buylist] Direct fetch failed for {symbol}: {exc} — trying yfinance fallback."
+            )
 
         # Fallback: yfinance Ticker.history() with stderr suppressed
         if not closes:
             import io, sys, yfinance as yf
+
             _stderr = sys.stderr
             try:
                 sys.stderr = io.StringIO()
@@ -2520,7 +3153,9 @@ class BuylistMixin:
                 sys.stderr = _stderr
 
         if not closes:
-            self.append_log(f"[Buylist] No price data for {symbol} — skipping this cycle.")
+            self.append_log(
+                f"[Buylist] No price data for {symbol} — skipping this cycle."
+            )
             return
 
         completed_rows = self._completed_daily_close_rows(daily_rows)
@@ -2529,7 +3164,9 @@ class BuylistMixin:
 
         latest_close = closes[-1]
         try:
-            existing_live_price = float(self.latest_intraday_prices.get(symbol, 0.0) or 0.0)
+            existing_live_price = float(
+                self.latest_intraday_prices.get(symbol, 0.0) or 0.0
+            )
         except (TypeError, ValueError):
             existing_live_price = 0.0
         if existing_live_price <= 0:
@@ -2537,6 +3174,7 @@ class BuylistMixin:
         item._latest_daily_close = latest_close
         item._ema10 = self._compute_ema(closes, 10)
         item._ema20 = self._compute_ema(closes, 20)
+
     @staticmethod
     def _compute_ema(prices: list, period: int) -> float:
         """Compute exponential moving average."""
@@ -2555,13 +3193,18 @@ class BuylistMixin:
         try:
             from src.api.kis_account_snapshot_dual import discover_account_profiles
 
-            profiles = [p for p in discover_account_profiles() if p.get("environment") == environment]
+            profiles = [
+                p
+                for p in discover_account_profiles()
+                if p.get("environment") == environment
+            ]
             if not profiles:
                 return None
             return profiles[0].get("account_no") or None
         except Exception as exc:
             self.append_log(f"KIS account discovery failed for {environment}: {exc}")
             return None
+
     @staticmethod
     def _sell_intent_for_reason(reason: str) -> OrderIntent:
         reason_text = (reason or "").lower()
@@ -2574,6 +3217,7 @@ class BuylistMixin:
         if "manual" in reason_text or "all" in reason_text or "exit" in reason_text:
             return OrderIntent.MANUAL_EXIT
         return OrderIntent.UNKNOWN
+
     def _has_duplicate_open_order(
         self,
         environment: str,
@@ -2593,7 +3237,9 @@ class BuylistMixin:
             intent=intent,
         )
 
-    def _has_open_sell_order(self, environment: str, account_no: str, symbol: str) -> bool:
+    def _has_open_sell_order(
+        self, environment: str, account_no: str, symbol: str
+    ) -> bool:
         load_fn = _main_window_global("load_order_ledger", load_order_ledger)
         has_open_fn = _main_window_global("has_open_order", has_open_order)
         self.order_ledger = load_fn()
@@ -2627,11 +3273,20 @@ class BuylistMixin:
         if callable(manager_save):
             manager_save()
         self._save_execution_queue_state()
+
     def _buylist_order_price(self, item, *fallbacks) -> float:
         live_price = getattr(item, "current_price", None)
         if not live_price:
-            live_price = getattr(self, "latest_intraday_prices", {}).get(getattr(item, "symbol", ""), 0.0)
-        for value in (live_price, *fallbacks, getattr(item, "stop_loss", 0.0), getattr(item, "avg_cost", 0.0), getattr(item, "entry_price", 0.0)):
+            live_price = getattr(self, "latest_intraday_prices", {}).get(
+                getattr(item, "symbol", ""), 0.0
+            )
+        for value in (
+            live_price,
+            *fallbacks,
+            getattr(item, "stop_loss", 0.0),
+            getattr(item, "avg_cost", 0.0),
+            getattr(item, "entry_price", 0.0),
+        ):
             try:
                 price = float(value or 0.0)
             except (TypeError, ValueError):
@@ -2639,10 +3294,18 @@ class BuylistMixin:
             if price > 0:
                 return max(0.01, price)
         return 0.01
+
     @staticmethod
     def _buylist_order_environment(item) -> str:
-        return str(getattr(item, "environment", None) or getattr(item, "market", None) or "REAL").upper()
-    def _buylist_order_quantity(self, item, order_price: float, quantity: Optional[int] = None) -> int:
+        return str(
+            getattr(item, "environment", None)
+            or getattr(item, "market", None)
+            or "REAL"
+        ).upper()
+
+    def _buylist_order_quantity(
+        self, item, order_price: float, quantity: Optional[int] = None
+    ) -> int:
         try:
             qty = int(quantity or 0)
         except (TypeError, ValueError):
@@ -2650,12 +3313,23 @@ class BuylistMixin:
         if qty > 0:
             return qty
 
-        account_size = self._get_account_balance_for_env(self._buylist_order_environment(item)) if hasattr(self, "_get_account_balance_for_env") else 0.0
+        account_size = (
+            self._get_account_balance_for_env(self._buylist_order_environment(item))
+            if hasattr(self, "_get_account_balance_for_env")
+            else 0.0
+        )
         position_percent = float(getattr(item, "position_percent", 0.0) or 0.0)
         if account_size > 0 and position_percent > 0 and order_price > 0:
             return max(1, int((account_size * position_percent / 100.0) // order_price))
         return max(1, int(getattr(item, "shares_held", 0) or 1))
-    def _submit_kis_buy_order(self, item, quantity: Optional[int] = None, limit_price: Optional[float] = None, order_price: Optional[float] = None) -> None:
+
+    def _submit_kis_buy_order(
+        self,
+        item,
+        quantity: Optional[int] = None,
+        limit_price: Optional[float] = None,
+        order_price: Optional[float] = None,
+    ) -> None:
         """Submit a KIS buy order without treating broker acceptance as a fill."""
         env = self._buylist_order_environment(item)
         account_no = self._first_account_no_for_environment(env) or ""
@@ -2664,24 +3338,42 @@ class BuylistMixin:
             manager = self.__dict__.get("execution_queue_manager")
             if manager is None:
                 manager = self._ensure_execution_queue_manager()
-            queue_item = self._execution_queue_item_for_buylist_item(item) if manager is not None else None
-            candidate = getattr(queue_item, "selected_candidate", None) if queue_item is not None else None
-            queue_status = self._execution_queue_value(getattr(queue_item, "status", "")) if queue_item is not None else ""
+            queue_item = (
+                self._execution_queue_item_for_buylist_item(item)
+                if manager is not None
+                else None
+            )
+            candidate = (
+                getattr(queue_item, "selected_candidate", None)
+                if queue_item is not None
+                else None
+            )
+            queue_status = (
+                self._execution_queue_value(getattr(queue_item, "status", ""))
+                if queue_item is not None
+                else ""
+            )
             if candidate is not None and queue_status == "EXECUTE_READY":
                 if quantity is None:
                     quantity = int(getattr(candidate, "shares", 0) or 0)
                 if order_price is None and limit_price is None:
                     order_price = float(getattr(candidate, "entry_trigger", 0.0) or 0.0)
-        if self._has_duplicate_open_order(env, account_no, item.symbol, OrderSide.BUY, intent):
+        if self._has_duplicate_open_order(
+            env, account_no, item.symbol, OrderSide.BUY, intent
+        ):
             item._buy_order_pending = False
             manager = self.__dict__.get("execution_queue_manager")
             if manager is None and self._is_execution_queue_buylist_item(item):
                 manager = self._ensure_execution_queue_manager()
             if manager is not None:
-                manager.mark_order_failed(item.symbol, order_status="DUPLICATE", environment=env)
+                manager.mark_order_failed(
+                    item.symbol, order_status="DUPLICATE", environment=env
+                )
                 queue_item = self._execution_queue_item_for_buylist_item(item)
                 if queue_item is not None:
-                    item.monitoring_status = self._execution_queue_value(queue_item.status)
+                    item.monitoring_status = self._execution_queue_value(
+                        queue_item.status
+                    )
                     item.status = item.monitoring_status
                 self._save_execution_queue_state()
             self.append_log(
@@ -2699,7 +3391,11 @@ class BuylistMixin:
             if price > 0:
                 explicit_price = price
                 break
-        order_price = max(0.01, explicit_price) if explicit_price is not None else self._buylist_order_price(item)
+        order_price = (
+            max(0.01, explicit_price)
+            if explicit_price is not None
+            else self._buylist_order_price(item)
+        )
         quantity = self._buylist_order_quantity(item, order_price, quantity)
         try:
             self.kis_order_worker = KisOrderWorker(
@@ -2728,10 +3424,14 @@ class BuylistMixin:
             if manager is None and self._is_execution_queue_buylist_item(item):
                 manager = self._ensure_execution_queue_manager()
             if manager is not None:
-                manager.mark_order_failed(item.symbol, order_status="ERROR", environment=env)
+                manager.mark_order_failed(
+                    item.symbol, order_status="ERROR", environment=env
+                )
                 queue_item = self._execution_queue_item_for_buylist_item(item)
                 if queue_item is not None:
-                    item.monitoring_status = self._execution_queue_value(queue_item.status)
+                    item.monitoring_status = self._execution_queue_value(
+                        queue_item.status
+                    )
                     item.status = item.monitoring_status
                 self._save_execution_queue_state()
             if manager is None:
@@ -2739,7 +3439,15 @@ class BuylistMixin:
             self._save_buylist_state()
             self.populate_buylist_dashboard()
             QMessageBox.warning(self, "KIS order failed", str(exc))
-    def _submit_kis_sell_order(self, item, quantity: int, reason: str, order_price: Optional[float] = None, limit_price: Optional[float] = None) -> None:
+
+    def _submit_kis_sell_order(
+        self,
+        item,
+        quantity: int,
+        reason: str,
+        order_price: Optional[float] = None,
+        limit_price: Optional[float] = None,
+    ) -> None:
         """Submit a KIS sell order without reducing local position until fill confirmation."""
         env = self._buylist_order_environment(item)
         account_no = self._first_account_no_for_environment(env) or ""
@@ -2762,7 +3470,11 @@ class BuylistMixin:
             if price > 0:
                 explicit_price = price
                 break
-        order_price = max(0.01, explicit_price) if explicit_price is not None else self._buylist_order_price(item)
+        order_price = (
+            max(0.01, explicit_price)
+            if explicit_price is not None
+            else self._buylist_order_price(item)
+        )
         try:
             self.kis_order_worker = KisOrderWorker(
                 env,
@@ -2775,10 +3487,14 @@ class BuylistMixin:
                 buylist_symbol_key=f"{env}:{item.symbol}",
             )
             self.kis_order_worker.finished_order.connect(
-                lambda order, it=item, rsn=reason: self._on_sell_order_accepted(it, quantity, rsn, order)
+                lambda order, it=item, rsn=reason: self._on_sell_order_accepted(
+                    it, quantity, rsn, order
+                )
             )
             self.kis_order_worker.error_occurred.connect(
-                lambda error, it=item: self._on_order_error(it.symbol, "sell", error, it)
+                lambda error, it=item: self._on_order_error(
+                    it.symbol, "sell", error, it
+                )
             )
             self.kis_order_worker.start()
             self.append_log(
@@ -2791,15 +3507,21 @@ class BuylistMixin:
             self._save_buylist_state()
             self.populate_buylist_dashboard()
             QMessageBox.warning(self, "KIS order failed", str(exc))
+
     def _record_broker_order(self, order: BrokerOrder) -> None:
         append_fn = _main_window_global("append_order", append_order)
         load_fn = _main_window_global("load_order_ledger", load_order_ledger)
         append_fn(order)
         self.order_ledger = load_fn()
+
     def _on_buy_order_accepted(self, item, order: BrokerOrder) -> None:
         self._record_broker_order(order)
         manager = self.__dict__.get("execution_queue_manager")
-        queue_item = self._execution_queue_item_for_buylist_item(item) if manager is not None else None
+        queue_item = (
+            self._execution_queue_item_for_buylist_item(item)
+            if manager is not None
+            else None
+        )
         env = self._buylist_order_environment(item)
 
         if order.status == OrderStatus.UNKNOWN_SUBMISSION_STATE:
@@ -2812,7 +3534,10 @@ class BuylistMixin:
                     order_status=OrderStatus.UNKNOWN_SUBMISSION_STATE.value,
                     environment=env,
                 )
-                item.monitoring_status = self._execution_queue_status_for_buylist_item(item) or OrderStatus.UNKNOWN_SUBMISSION_STATE.value
+                item.monitoring_status = (
+                    self._execution_queue_status_for_buylist_item(item)
+                    or OrderStatus.UNKNOWN_SUBMISSION_STATE.value
+                )
             else:
                 item.monitoring_status = OrderStatus.UNKNOWN_SUBMISSION_STATE.value
             item.status = item.monitoring_status
@@ -2838,16 +3563,12 @@ class BuylistMixin:
         if order.status == OrderStatus.REJECTED:
             item._buy_order_pending = False
             if manager is not None:
-                manager.mark_order_failed(item.symbol, order_status="REJECTED", environment=env)
+                manager.mark_order_failed(
+                    item.symbol, order_status="REJECTED", environment=env
+                )
                 queue_item = self._execution_queue_item_for_buylist_item(item)
             queue_status = self._execution_queue_status_for_buylist_item(item)
-            block_reason = ""
-            if self._is_kis_sim_unsupported_order_error(order.error_message):
-                block_reason = "KIS SIM rejected overseas order routing for this account/API (90000000)."
-                self._set_buylist_auto_order_block(item, block_reason)
-                item.monitoring_status = queue_status or ("WATCHING" if self._is_orb_buylist_item(item) else "ACTIVE")
-            else:
-                item.monitoring_status = queue_status or "ERROR"
+            item.monitoring_status = queue_status or "ERROR"
             item.status = item.monitoring_status
             self._save_buylist_state()
             self.populate_buylist_dashboard()
@@ -2855,8 +3576,6 @@ class BuylistMixin:
                 f"BUY rejected for {item.symbol}: {order.error_message or 'broker rejected order'} "
                 f"(status restored to {item.monitoring_status})"
             )
-            if block_reason:
-                self.append_log(f"[Buylist/{item.environment}] Auto KIS order retries blocked for {item.symbol}: {block_reason}")
             QMessageBox.warning(
                 self,
                 "KIS order rejected",
@@ -2869,10 +3588,13 @@ class BuylistMixin:
             manager.mark_order_submitted(
                 item.symbol,
                 order_id=order.broker_order_id or order.client_order_id,
-                order_status=self._execution_queue_value(order.status).upper() or "SUBMITTED",
+                order_status=self._execution_queue_value(order.status).upper()
+                or "SUBMITTED",
                 environment=env,
             )
-            item.monitoring_status = self._execution_queue_status_for_buylist_item(item) or "ORDER_SUBMITTED"
+            item.monitoring_status = (
+                self._execution_queue_status_for_buylist_item(item) or "ORDER_SUBMITTED"
+            )
         else:
             item.monitoring_status = "BUY_SUBMITTED"
         item.status = item.monitoring_status
@@ -2885,7 +3607,10 @@ class BuylistMixin:
         )
         timer = _main_window_global("QTimer", QTimer)
         timer.singleShot(5000, self.reconcile_open_orders)
-    def _on_sell_order_accepted(self, item, quantity: int, reason: str, order: BrokerOrder) -> None:
+
+    def _on_sell_order_accepted(
+        self, item, quantity: int, reason: str, order: BrokerOrder
+    ) -> None:
         item._stop_order_pending = False
         item._exit_order_pending = False
         self._record_broker_order(order)
@@ -2917,10 +3642,6 @@ class BuylistMixin:
                 shares_held = int(getattr(item, "shares_held", 0) or 0)
             except (TypeError, ValueError):
                 shares_held = 0
-            block_reason = ""
-            if self._is_kis_sim_unsupported_order_error(order.error_message):
-                block_reason = "KIS SIM rejected overseas order routing for this account/API (90000000)."
-                self._set_buylist_auto_order_block(item, block_reason)
             item.monitoring_status = "BOUGHT" if shares_held > 0 else "WATCHING"
             self._save_buylist_state()
             self.populate_buylist_dashboard()
@@ -2928,8 +3649,6 @@ class BuylistMixin:
                 f"SELL rejected for {item.symbol}: {order.error_message or 'broker rejected order'} "
                 f"(status restored to {item.monitoring_status})"
             )
-            if block_reason:
-                self.append_log(f"[Buylist/{item.environment}] Auto KIS order retries blocked for {item.symbol}: {block_reason}")
             QMessageBox.warning(
                 self,
                 "KIS order rejected",
@@ -2950,7 +3669,10 @@ class BuylistMixin:
         )
         timer = _main_window_global("QTimer", QTimer)
         timer.singleShot(5000, self.reconcile_open_orders)
-    def _on_buy_order_filled(self, item, quantity: int, order_price: float, result: dict) -> None:
+
+    def _on_buy_order_filled(
+        self, item, quantity: int, order_price: float, result: dict
+    ) -> None:
         """Backward-compatible slot: broker acceptance is no longer treated as filled."""
         env = self._buylist_order_environment(item)
         account_no = self._first_account_no_for_environment(env) or ""
@@ -2970,7 +3692,10 @@ class BuylistMixin:
         if isinstance(output, dict):
             order.broker_order_id = str(output.get("ODNO") or output.get("odno") or "")
         self._on_buy_order_accepted(item, order)
-    def _on_sell_order_filled(self, item, quantity: int, reason: str, result: dict) -> None:
+
+    def _on_sell_order_filled(
+        self, item, quantity: int, reason: str, result: dict
+    ) -> None:
         """Backward-compatible slot: broker acceptance is no longer treated as filled."""
         env = self._buylist_order_environment(item)
         account_no = self._first_account_no_for_environment(env) or ""
@@ -2991,14 +3716,20 @@ class BuylistMixin:
         if isinstance(output, dict):
             order.broker_order_id = str(output.get("ODNO") or output.get("odno") or "")
         self._on_sell_order_accepted(item, quantity, reason, order)
+
     def reconcile_open_orders(self) -> None:
-        if self.order_reconciliation_worker and self.order_reconciliation_worker.isRunning():
+        if (
+            self.order_reconciliation_worker
+            and self.order_reconciliation_worker.isRunning()
+        ):
             return
 
         load_fn = _main_window_global("load_order_ledger", load_order_ledger)
         find_fn = _main_window_global("find_open_orders", find_open_orders)
         self.order_ledger = load_fn()
-        open_orders = find_fn(self.order_ledger)
+        open_orders = [
+            order for order in find_fn(self.order_ledger) if order.environment == "PROD"
+        ]
         if not open_orders:
             self._pending_reconciliation_groups = []
             return
@@ -3019,7 +3750,9 @@ class BuylistMixin:
         else:
             return
 
-        previous_snapshot = self.kis_account_snapshots.get((environment, account_no), {})
+        previous_snapshot = self.kis_account_snapshots.get(
+            (environment, account_no), {}
+        )
         self.order_reconciliation_worker = OrderReconciliationWorker(
             environment,
             account_no,
@@ -3027,7 +3760,9 @@ class BuylistMixin:
             previous_snapshot=previous_snapshot,
         )
         self.order_reconciliation_worker.finished_reconciliation.connect(
-            lambda orders, snapshot, env=environment, acct=account_no: self._on_order_reconciliation_finished(env, acct, orders, snapshot)
+            lambda orders, snapshot, env=environment, acct=account_no: self._on_order_reconciliation_finished(
+                env, acct, orders, snapshot
+            )
         )
         self.order_reconciliation_worker.error_occurred.connect(
             lambda message: self.append_log(f"Order reconciliation failed: {message}")
@@ -3039,6 +3774,7 @@ class BuylistMixin:
         self.append_log(
             f"Reconciling {len(grouped[(environment, account_no)])} open broker order(s) for {environment} {account_no or '<unknown account>'}"
         )
+
     def _on_order_reconciliation_finished(
         self,
         environment: str,
@@ -3056,28 +3792,41 @@ class BuylistMixin:
         save_fn(list(by_id.values()))
         self.order_ledger = load_fn()
         self.apply_confirmed_order_fills_to_buylist(updated_orders)
-        self.sync_buylist_positions_from_kis_snapshots({(environment, account_no): snapshot})
+        self.sync_buylist_positions_from_kis_snapshots(
+            {(environment, account_no): snapshot}
+        )
 
         if self._pending_reconciliation_groups:
             timer = _main_window_global("QTimer", QTimer)
             timer.singleShot(1000, self.reconcile_open_orders)
+
     @staticmethod
     def _buylist_to_float(value: Any) -> float:
         try:
             return float(value or 0.0)
         except (TypeError, ValueError):
             return 0.0
+
     @classmethod
-    def _buylist_snapshot_holdings(cls, snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _buylist_snapshot_holdings(
+        cls, snapshot: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
         holdings: List[Dict[str, Any]] = []
         if not isinstance(snapshot, dict):
             return holdings
         for section_name in ("domestic", "overseas"):
             section = snapshot.get(section_name)
             if isinstance(section, dict):
-                holdings.extend(item for item in section.get("holdings", []) if isinstance(item, dict))
+                holdings.extend(
+                    item
+                    for item in section.get("holdings", [])
+                    if isinstance(item, dict)
+                )
         return holdings
-    def sync_buylist_positions_from_kis_snapshots(self, snapshots: Optional[Dict[Any, dict]] = None) -> int:
+
+    def sync_buylist_positions_from_kis_snapshots(
+        self, snapshots: Optional[Dict[Any, dict]] = None
+    ) -> int:
         """Sync held buylist positions to real KIS account holdings when snapshots are available."""
         from src.ui.controllers.account_controller import AccountController
         from src.ui.controllers.base import get_controller
@@ -3085,13 +3834,18 @@ class BuylistMixin:
         controller = get_controller(self, "account_controller", AccountController)
         return controller.sync_positions_from_kis(snapshots)
 
-    def sync_positions_from_kis(self, snapshots: Optional[Dict[Any, dict]] = None) -> int:
+    def sync_positions_from_kis(
+        self, snapshots: Optional[Dict[Any, dict]] = None
+    ) -> int:
         from src.ui.controllers.account_controller import AccountController
         from src.ui.controllers.base import get_controller
 
         controller = get_controller(self, "account_controller", AccountController)
         return controller.sync_positions_from_kis(snapshots)
-    def apply_confirmed_order_fills_to_buylist(self, updated_orders: List[BrokerOrder]) -> None:
+
+    def apply_confirmed_order_fills_to_buylist(
+        self, updated_orders: List[BrokerOrder]
+    ) -> None:
         changed = False
         for order in updated_orders:
             if order.status not in {OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED}:
@@ -3118,7 +3872,11 @@ class BuylistMixin:
                         order.symbol,
                         order_id=order.broker_order_id or order.client_order_id,
                         order_status=self._execution_queue_value(order.status).upper(),
-                        environment=str(getattr(item, "environment", "") or getattr(order, "environment", "") or "SIM").upper(),
+                        environment=str(
+                            getattr(item, "environment", "")
+                            or getattr(order, "environment", "")
+                            or "PROD"
+                        ).upper(),
                     )
                     queue_status = self._execution_queue_status_for_buylist_item(item)
                     if queue_status:
@@ -3129,7 +3887,9 @@ class BuylistMixin:
                 if not getattr(item, "buy_date", None):
                     item.buy_date = dt.datetime.now(US_MARKET_ZONE)
                 item.kis_order_id = order.broker_order_id or order.client_order_id
-                item.monitoring_status = "BOUGHT" if order.status == OrderStatus.FILLED else "BUY_PARTIAL"
+                item.monitoring_status = (
+                    "BOUGHT" if order.status == OrderStatus.FILLED else "BUY_PARTIAL"
+                )
                 if item.avg_cost and item.shares_held:
                     item.position_percent = 100.0
                 self.append_log(
@@ -3145,10 +3905,15 @@ class BuylistMixin:
             remaining_shares = max(0, previous_shares - newly_filled_qty)
             item.shares_held = remaining_shares
             item.kis_order_id = order.broker_order_id or order.client_order_id
-            if order.intent in {OrderIntent.PARTIAL_EXIT, OrderIntent.PARTIAL_TAKE_PROFIT}:
+            if order.intent in {
+                OrderIntent.PARTIAL_EXIT,
+                OrderIntent.PARTIAL_TAKE_PROFIT,
+            }:
                 item.sell_half_done = True
                 if getattr(item, "avg_cost", 0):
-                    item.stop_loss = max(float(item.stop_loss or 0), float(item.avg_cost))
+                    item.stop_loss = max(
+                        float(item.stop_loss or 0), float(item.avg_cost)
+                    )
             if remaining_shares <= 0 and order.status == OrderStatus.FILLED:
                 item.monitoring_status = "SOLD"
             else:
@@ -3166,31 +3931,50 @@ class BuylistMixin:
             self.populate_buylist_dashboard()
             load_fn = _main_window_global("load_order_ledger", load_order_ledger)
             self.order_ledger = load_fn()
+
     def request_cancel_order(self, client_order_id: str) -> bool:
         load_fn = _main_window_global("load_order_ledger", load_order_ledger)
         self.order_ledger = load_fn()
-        target = next((order for order in self.order_ledger if order.client_order_id == client_order_id), None)
+        target = next(
+            (
+                order
+                for order in self.order_ledger
+                if order.client_order_id == client_order_id
+            ),
+            None,
+        )
         if target is None:
-            self.append_log(f"Cancel request skipped: order {client_order_id} not found")
+            self.append_log(
+                f"Cancel request skipped: order {client_order_id} not found"
+            )
             return False
         if target.status not in OPEN_ORDER_STATUSES:
-            self.append_log(f"Cancel request skipped: order {client_order_id} is already {target.status.value}")
+            self.append_log(
+                f"Cancel request skipped: order {client_order_id} is already {target.status.value}"
+            )
             return False
         if not target.broker_order_id:
-            self.append_log(f"Cancel request skipped: order {client_order_id} has no broker order id")
+            self.append_log(
+                f"Cancel request skipped: order {client_order_id} has no broker order id"
+            )
             return False
         try:
             from src.services.order_reconciliation import cancel_and_reconcile_order
 
             updated = cancel_and_reconcile_order(client_order_id)
         except Exception as exc:
-            self.append_log(f"Cancel request failed for {target.symbol} order {client_order_id}: {exc}")
+            self.append_log(
+                f"Cancel request failed for {target.symbol} order {client_order_id}: {exc}"
+            )
             return False
         self.order_ledger = load_fn()
         self._apply_broker_order_status_updates_to_buylist([updated])
         self.populate_buylist_dashboard()
-        self.append_log(f"Cancel requested for {updated.symbol} {updated.side.value} order {client_order_id}: {updated.status.value}")
+        self.append_log(
+            f"Cancel requested for {updated.symbol} {updated.side.value} order {client_order_id}: {updated.status.value}"
+        )
         return True
+
     def _on_order_error(self, symbol: str, side: str, error: str, item=None) -> None:
         side_text = str(side).lower()
         ambiguous = is_ambiguous_order_submission_error(error)
@@ -3202,7 +3986,7 @@ class BuylistMixin:
             if manager is None and self._is_execution_queue_buylist_item(item):
                 manager = self._ensure_execution_queue_manager()
             if manager is not None and side_text == "buy":
-                environment = str(getattr(item, "environment", "") or "SIM").upper()
+                environment = str(getattr(item, "environment", "") or "PROD").upper()
                 if ambiguous:
                     manager.mark_order_submitted(
                         symbol,
@@ -3217,7 +4001,9 @@ class BuylistMixin:
                     )
                 queue_item = self._execution_queue_item_for_buylist_item(item)
                 if queue_item is not None:
-                    item.monitoring_status = self._execution_queue_value(queue_item.status)
+                    item.monitoring_status = self._execution_queue_value(
+                        queue_item.status
+                    )
                     item.status = item.monitoring_status
                 self._save_execution_queue_state()
             elif ambiguous:
@@ -3237,8 +4023,13 @@ class BuylistMixin:
                 "Verify KIS account/order status before clearing this state or submitting again.",
             )
             return
-        self.append_log(f"[Buylist] KIS {side.upper()} order FAILED for {symbol}: {error}")
-        QMessageBox.warning(self, f"Order Failed — {symbol}", f"{side.upper()} order error:\n{error}")
+        self.append_log(
+            f"[Buylist] KIS {side.upper()} order FAILED for {symbol}: {error}"
+        )
+        QMessageBox.warning(
+            self, f"Order Failed — {symbol}", f"{side.upper()} order error:\n{error}"
+        )
+
     def _cleanup_order_worker(self, worker: QThread) -> None:
         if worker in self._buylist_order_workers:
             self._buylist_order_workers.remove(worker)

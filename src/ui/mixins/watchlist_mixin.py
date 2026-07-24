@@ -11,15 +11,42 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QDockWidget, QLabel,
-    QPushButton, QLineEdit, QFormLayout, QTableWidget, QTableWidgetItem,
-    QListWidget, QListWidgetItem, QComboBox, QCheckBox, QSpinBox, QTextEdit,
-    QProgressBar, QMessageBox, QGroupBox, QHeaderView, QAbstractItemView,
-    QSizePolicy, QShortcut, QDialog, QKeySequenceEdit, QScrollArea,
-    QTextBrowser, QSplitter, QSlider, QDialogButtonBox, QMenu
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QTabWidget,
+    QDockWidget,
+    QLabel,
+    QPushButton,
+    QLineEdit,
+    QFormLayout,
+    QTableWidget,
+    QTableWidgetItem,
+    QListWidget,
+    QListWidgetItem,
+    QComboBox,
+    QCheckBox,
+    QSpinBox,
+    QTextEdit,
+    QProgressBar,
+    QMessageBox,
+    QGroupBox,
+    QHeaderView,
+    QAbstractItemView,
+    QSizePolicy,
+    QShortcut,
+    QDialog,
+    QKeySequenceEdit,
+    QScrollArea,
+    QTextBrowser,
+    QSplitter,
+    QSlider,
+    QDialogButtonBox,
+    QMenu,
 )
 from PyQt5.QtCore import Qt, QThread, QTimer, QUrl
 from PyQt5.QtGui import QColor, QKeySequence
+
 try:
     from PyQt5.QtWebEngineWidgets import QWebEngineView
 except ImportError:
@@ -30,41 +57,87 @@ except ImportError:
     QWebChannel = None
 
 from src.core.position_sizer import PositionSizer
-from src.core.order_state import BrokerOrder, OrderIntent, OrderSide, OrderStatus, OPEN_ORDER_STATUSES
-from src.core.orb import calculate_orb_range, evaluate_orb_entry_signal, resample_intraday_bars
+from src.core.order_state import (
+    BrokerOrder,
+    OrderIntent,
+    OrderSide,
+    OrderStatus,
+    OPEN_ORDER_STATUSES,
+)
+from src.core.orb import (
+    calculate_orb_range,
+    evaluate_orb_entry_signal,
+    resample_intraday_bars,
+)
 from src.core.scanner import StockScanner, ComparisonOperator, ScanRule
 from src.core.watchlist import Watchlist, TradePlanManager, TradePlan, BuylistManager
 from src.core.trade_reviewer import TradeReviewer, TradeSetup
-from src.utils.data_loader import download_price_history, get_default_universe, _extract_symbol_history
+from src.utils.data_loader import (
+    download_price_history,
+    get_default_universe,
+    _extract_symbol_history,
+)
 from src.utils.db_loader import (
-    init_mysql_engine, load_symbol_history_from_db, load_hourly_history_from_db,
-    get_latest_price_history_date, get_latest_hourly_price_history_timestamp,
-    load_chart_indicators_from_db, calculate_chart_indicators,
-    refresh_chart_indicators_for_symbol, save_symbol_history_to_db,
+    init_mysql_engine,
+    load_symbol_history_from_db,
+    load_hourly_history_from_db,
+    get_latest_price_history_date,
+    get_latest_hourly_price_history_timestamp,
+    load_chart_indicators_from_db,
+    calculate_chart_indicators,
+    refresh_chart_indicators_for_symbol,
+    save_symbol_history_to_db,
     delete_intraday_history_for_symbol,
 )
 from src.utils.storage import load_json, save_json
-from src.api.kis_account_snapshot_dual import KisEnvironment, discover_account_profiles, load_config
-from src.services.app_state import (
-    SCANNER_SETUPS_FILE, SETTINGS_FILE, load_buylist_state, load_chart_drawings_state,
-    load_scanner_setups_state, load_tab_options_state, load_trade_plans_state,
-    load_watchlist_state, save_app_state,
+from src.api.kis_account_snapshot_dual import (
+    KisEnvironment,
+    discover_account_profiles,
+    load_config,
 )
-from src.services.intraday_data_service import format_intraday_source_label, load_best_intraday_history
+from src.services.app_state import (
+    SCANNER_SETUPS_FILE,
+    SETTINGS_FILE,
+    load_buylist_state,
+    load_chart_drawings_state,
+    load_scanner_setups_state,
+    load_tab_options_state,
+    load_trade_plans_state,
+    load_watchlist_state,
+    save_app_state,
+)
+from src.services.intraday_data_service import (
+    format_intraday_source_label,
+    load_best_intraday_history,
+)
 from src.ui.chart_bridge import ChartBridge
 from src.ui.dialogs import SettingsDialog, AddFilterDialog
 from src.ui.filter_catalog import (
-    DEFAULT_SCANNER_SETUPS, DEFAULT_SETTINGS, DEFAULT_TAB_OPTIONS,
-    FILTER_CATALOG, SCANNER_METRICS_LABELS,
+    DEFAULT_SCANNER_SETUPS,
+    DEFAULT_SETTINGS,
+    DEFAULT_TAB_OPTIONS,
+    FILTER_CATALOG,
+    SCANNER_METRICS_LABELS,
 )
 from src.ui.workers import (
-    FxRateWorker, IntradayBulkFetchWorker, IntradayFetchWorker,
-    KisAccountWorker, KisOrderWorker, KisStartupAccountsWorker, OrderReconciliationWorker,
-    ScannerWorker, SingleStockAiWorker, WatchlistAiWorker,
+    FxRateWorker,
+    IntradayBulkFetchWorker,
+    IntradayFetchWorker,
+    KisAccountWorker,
+    KisOrderWorker,
+    KisStartupAccountsWorker,
+    OrderReconciliationWorker,
+    ScannerWorker,
+    SingleStockAiWorker,
+    WatchlistAiWorker,
 )
 from src.services.order_ledger import (
-    append_order, find_open_orders, has_open_order, load_order_ledger,
-    save_order_ledger, update_order,
+    append_order,
+    find_open_orders,
+    has_open_order,
+    load_order_ledger,
+    save_order_ledger,
+    update_order,
 )
 from src.utils.intraday_helpers import (
     extract_latest_opening_bar as _extract_latest_opening_bar,
@@ -83,34 +156,35 @@ US_MARKET_OPEN_TIME = dt.time(9, 30)
 US_MARKET_CLOSE_TIME = dt.time(16, 0)
 
 
-
 class WatchlistMixin:
     def _build_watchlist_tab(self) -> None:
         """Build content for the watchlist tab."""
         tab_layout = QVBoxLayout()
         tab_layout.setContentsMargins(0, 0, 0, 0)
-        
+
         # Top-level splitter: Left side is controls and table; Right side is full-height AI analysis sidebar
         self.watchlist_splitter = QSplitter(Qt.Horizontal)
-        
+
         # Left Panel (Controls + Table)
         left_panel = QWidget()
         left_layout = QVBoxLayout()
         left_layout.setContentsMargins(10, 10, 10, 10)
-        
+
         # Environment + Account Settings (migrated from Trade Plan tab)
         env_layout = QHBoxLayout()
-        env_layout.addWidget(QLabel("Env:"))
+        env_layout.addWidget(QLabel("Trading: PROD — Live"))
         self.watchlist_env_combo = QComboBox()
-        self.watchlist_env_combo.addItems(["SIM", "PROD"])
-        env_layout.addWidget(self.watchlist_env_combo)
+        self.watchlist_env_combo.addItem("PROD")
+        self.watchlist_env_combo.setVisible(False)
         # trade_kis_environment_combo is the same widget — no separate combo needed
         self.trade_kis_environment_combo = self.watchlist_env_combo
         env_layout.addSpacing(12)
         env_layout.addWidget(QLabel("KIS Account:"))
         self.trade_kis_account_combo = QComboBox()
         self.trade_kis_account_combo.setMinimumWidth(140)
-        self.trade_kis_account_combo.currentIndexChanged.connect(self.apply_cached_trade_account_size)
+        self.trade_kis_account_combo.currentIndexChanged.connect(
+            self.apply_cached_trade_account_size
+        )
         env_layout.addWidget(self.trade_kis_account_combo)
         kis_balance_btn = QPushButton("Use KIS Balance")
         kis_balance_btn.clicked.connect(self.refresh_trade_account_size)
@@ -135,7 +209,9 @@ class WatchlistMixin:
         self.usd_krw_rate_input.setMaximumWidth(75)
         sizing_layout.addWidget(self.usd_krw_rate_input)
         self.usd_krw_rate_refresh_button = QPushButton("Refresh FX")
-        self.usd_krw_rate_refresh_button.clicked.connect(lambda: self.refresh_usd_krw_rate(show_messages=True))
+        self.usd_krw_rate_refresh_button.clicked.connect(
+            lambda: self.refresh_usd_krw_rate(show_messages=True)
+        )
         sizing_layout.addWidget(self.usd_krw_rate_refresh_button)
         self.usd_krw_rate_status_label = QLabel("USD/KRW not refreshed")
         self.usd_krw_rate_status_label.setMinimumWidth(190)
@@ -144,13 +220,19 @@ class WatchlistMixin:
         left_layout.addLayout(sizing_layout, 0)
 
         self.account_size_input.textChanged.connect(self.on_account_size_text_changed)
-        self.account_size_input.textChanged.connect(self.recalculate_watchlist_scoreboard_sizes)
-        self.risk_percent_input.textChanged.connect(self.recalculate_watchlist_scoreboard_sizes)
-        self.usd_krw_rate_input.textChanged.connect(self.apply_cached_trade_account_size)
+        self.account_size_input.textChanged.connect(
+            self.recalculate_watchlist_scoreboard_sizes
+        )
+        self.risk_percent_input.textChanged.connect(
+            self.recalculate_watchlist_scoreboard_sizes
+        )
+        self.usd_krw_rate_input.textChanged.connect(
+            self.apply_cached_trade_account_size
+        )
         # NOTE: initial population of trade_kis_account_combo happens in _setup_tabs via an
         # explicit populate_trade_account_combo() call after the signal wiring. Do NOT add a
         # duplicate currentTextChanged connection here.
-        
+
         # Hidden inputs kept for compatibility with add_manual_watchlist_item callers
         self.watchlist_symbol_input = QLineEdit()
         self.watchlist_symbol_input.setVisible(False)
@@ -161,16 +243,33 @@ class WatchlistMixin:
 
         # Watchlist Table
         self.watchlist_table = QTableWidget(0, 14)
-        self.watchlist_table.setHorizontalHeaderLabels([
-            "Symbol", "Name", "Price", "Score", "Status",
-            "Stop/ADR", "Risk %", "Capital %", "Trade Plan",
-            "Env", "Entry Price", "Breakout Price", "Stop Loss", "Notes"
-        ])
+        self.watchlist_table.setHorizontalHeaderLabels(
+            [
+                "Symbol",
+                "Name",
+                "Price",
+                "Score",
+                "Status",
+                "Stop/ADR",
+                "Risk %",
+                "Capital %",
+                "Trade Plan",
+                "Env",
+                "Entry Price",
+                "Breakout Price",
+                "Stop Loss",
+                "Notes",
+            ]
+        )
         header = self.watchlist_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Interactive)
         self.watchlist_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.watchlist_table.cellDoubleClicked.connect(self.load_watchlist_item_to_trade_plan)
-        self.watchlist_table.itemSelectionChanged.connect(self.on_watchlist_selection_changed)
+        self.watchlist_table.cellDoubleClicked.connect(
+            self.load_watchlist_item_to_trade_plan
+        )
+        self.watchlist_table.itemSelectionChanged.connect(
+            self.on_watchlist_selection_changed
+        )
 
         # ORB Position Plan panel — identical calculation to the Trade Plan tab
         orb_group = QGroupBox("ORB Position Plan")
@@ -178,13 +277,19 @@ class WatchlistMixin:
         orb_group_layout.setContentsMargins(5, 5, 5, 5)
 
         orb_header_layout = QHBoxLayout()
-        self.watchlist_orb_symbol_label = QLabel("Select a watchlist symbol to view its ORB plan")
-        self.watchlist_orb_symbol_label.setStyleSheet("font-weight: bold; color: #aaaaaa;")
+        self.watchlist_orb_symbol_label = QLabel(
+            "Select a watchlist symbol to view its ORB plan"
+        )
+        self.watchlist_orb_symbol_label.setStyleSheet(
+            "font-weight: bold; color: #aaaaaa;"
+        )
         orb_header_layout.addWidget(self.watchlist_orb_symbol_label)
         orb_header_layout.addStretch()
         self.watchlist_orb_valid_only_checkbox = QCheckBox("Valid plans only")
         self.watchlist_orb_valid_only_checkbox.setChecked(True)
-        self.watchlist_orb_valid_only_checkbox.stateChanged.connect(self._on_watchlist_orb_filter_changed)
+        self.watchlist_orb_valid_only_checkbox.stateChanged.connect(
+            self._on_watchlist_orb_filter_changed
+        )
         orb_header_layout.addWidget(self.watchlist_orb_valid_only_checkbox)
         orb_group_layout.addLayout(orb_header_layout)
 
@@ -192,22 +297,32 @@ class WatchlistMixin:
         orb_breakout_layout = QHBoxLayout()
         orb_breakout_layout.addWidget(QLabel("Daily Breakout $:"))
         self.watchlist_breakout_price_input = QLineEdit()
-        self.watchlist_breakout_price_input.setPlaceholderText("e.g. 123.45 — leave blank for ORB-only")
+        self.watchlist_breakout_price_input.setPlaceholderText(
+            "e.g. 123.45 — leave blank for ORB-only"
+        )
         self.watchlist_breakout_price_input.setMaximumWidth(185)
-        self.watchlist_breakout_price_input.textChanged.connect(self._on_watchlist_orb_filter_changed)
+        self.watchlist_breakout_price_input.textChanged.connect(
+            self._on_watchlist_orb_filter_changed
+        )
         orb_breakout_layout.addWidget(self.watchlist_breakout_price_input)
         orb_breakout_layout.addSpacing(12)
         orb_breakout_layout.addWidget(QLabel("Buffer %:"))
         self.watchlist_buffer_pct_input = QLineEdit("0.10")
         self.watchlist_buffer_pct_input.setMaximumWidth(50)
-        self.watchlist_buffer_pct_input.setToolTip("Small buffer above breakout_price to avoid false touches (default 0.10%)")
-        self.watchlist_buffer_pct_input.textChanged.connect(self._on_watchlist_orb_filter_changed)
+        self.watchlist_buffer_pct_input.setToolTip(
+            "Small buffer above breakout_price to avoid false touches (default 0.10%)"
+        )
+        self.watchlist_buffer_pct_input.textChanged.connect(
+            self._on_watchlist_orb_filter_changed
+        )
         orb_breakout_layout.addWidget(self.watchlist_buffer_pct_input)
         orb_breakout_layout.addStretch()
         orb_group_layout.addLayout(orb_breakout_layout)
 
         self.watchlist_orb_table = QTableWidget(0, 10)
-        self.watchlist_orb_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.watchlist_orb_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.Stretch
+        )
         self.watchlist_orb_table.setSelectionBehavior(QAbstractItemView.SelectItems)
         self.watchlist_orb_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         orb_group_layout.addWidget(self.watchlist_orb_table)
@@ -236,44 +351,55 @@ class WatchlistMixin:
 
         self.refresh_watchlist_orb_button = QPushButton("Refresh ORB Status")
         self.refresh_watchlist_orb_button.setObjectName("refreshWatchlistOrbButton")
-        self.refresh_watchlist_orb_button.setToolTip("Refresh intraday data and evaluate ORB entry status for every watchlist symbol")
-        self.refresh_watchlist_orb_button.clicked.connect(self.refresh_watchlist_orb_statuses_with_data)
+        self.refresh_watchlist_orb_button.setToolTip(
+            "Refresh intraday data and evaluate ORB entry status for every watchlist symbol"
+        )
+        self.refresh_watchlist_orb_button.clicked.connect(
+            self.refresh_watchlist_orb_statuses_with_data
+        )
         button_layout.addWidget(self.refresh_watchlist_orb_button)
 
         self.move_buylist_button = QPushButton("Move Selected to Queue")
         self.move_buylist_button.setObjectName("moveBuylistButton")
         self.move_buylist_button.clicked.connect(self.move_selected_to_buylist)
         self.move_buylist_button.setShortcut("B")
-        self.move_buylist_button.setToolTip("Move selected Watchlist symbol to the Buy Dashboard execution queue (shortcut: B)")
+        self.move_buylist_button.setToolTip(
+            "Move selected Watchlist symbol to the Buy Dashboard execution queue (shortcut: B)"
+        )
         button_layout.addWidget(self.move_buylist_button)
 
         snapshot_button = QPushButton("Save Data Snapshot")
         snapshot_button.setObjectName("saveSnapshotButton")
-        snapshot_button.setToolTip("Save a JSON snapshot of the watchlist table and ORB plan for debugging")
+        snapshot_button.setToolTip(
+            "Save a JSON snapshot of the watchlist table and ORB plan for debugging"
+        )
         snapshot_button.clicked.connect(self.save_watchlist_snapshot)
         button_layout.addWidget(snapshot_button)
 
         left_layout.addLayout(button_layout, 0)
         left_panel.setLayout(left_layout)
-        
+
         # Add Left Panel to Splitter
         self.watchlist_splitter.addWidget(left_panel)
-        
+
         # AI sidebar widget
         self.ai_sidebar = QWidget()
         self.ai_sidebar.setVisible(False)
         ai_sidebar_layout = QVBoxLayout()
         ai_sidebar_layout.setContentsMargins(10, 10, 10, 10)
-        
+
         sidebar_header = QHBoxLayout()
         sidebar_title = QLabel("AI Quant Analysis")
-        sidebar_title.setStyleSheet("font-size: 15px; font-weight: bold; color: #ffffff;")
+        sidebar_title.setStyleSheet(
+            "font-size: 15px; font-weight: bold; color: #ffffff;"
+        )
         sidebar_header.addWidget(sidebar_title)
         sidebar_header.addStretch()
-        
+
         close_sidebar_btn = QPushButton("X")
         close_sidebar_btn.setFixedSize(22, 22)
-        close_sidebar_btn.setStyleSheet("""
+        close_sidebar_btn.setStyleSheet(
+            """
             QPushButton {
                 background-color: #333333;
                 color: #ffffff;
@@ -284,30 +410,34 @@ class WatchlistMixin:
             QPushButton:hover {
                 background-color: #555555;
             }
-        """)
+        """
+        )
         close_sidebar_btn.clicked.connect(lambda: self.ai_sidebar.setVisible(False))
         sidebar_header.addWidget(close_sidebar_btn)
         ai_sidebar_layout.addLayout(sidebar_header)
-        
+
         self.ai_report_view = QTextBrowser()
         self.ai_report_view.setOpenExternalLinks(True)
-        self.ai_report_view.setStyleSheet("""
+        self.ai_report_view.setStyleSheet(
+            """
             QTextBrowser {
                 background-color: #1e1e1e;
                 color: #dcdcdc;
                 border: 1px solid #333333;
                 padding: 5px;
             }
-        """)
+        """
+        )
         ai_sidebar_layout.addWidget(self.ai_report_view)
         self.ai_sidebar.setLayout(ai_sidebar_layout)
-        
+
         self.watchlist_splitter.addWidget(self.ai_sidebar)
         self.watchlist_splitter.setSizes([850, 350])
-        
+
         tab_layout.addWidget(self.watchlist_splitter)
         self.watchlist_widget.setLayout(tab_layout)
         self.populate_watchlist_table()
+
     def _get_account_balance_for_env(self, env: str) -> float:
         """Get the active account balance for the given environment.
 
@@ -331,16 +461,21 @@ class WatchlistMixin:
 
         # 2. Try the KIS snapshot for the *selected* profile (not first-match iteration),
         #    mirroring apply_cached_trade_account_size exactly.
-        if hasattr(self, "trade_kis_account_combo") and hasattr(self, "kis_account_snapshots"):
+        if hasattr(self, "trade_kis_account_combo") and hasattr(
+            self, "kis_account_snapshots"
+        ):
             profile = self.trade_kis_account_combo.currentData()
             if profile:
-                snapshot = self.kis_account_snapshots.get((env, profile.get("account_no", "")))
+                snapshot = self.kis_account_snapshots.get(
+                    (env, profile.get("account_no", ""))
+                )
                 if snapshot:
                     account_value_krw = self._extract_kis_account_value_krw(snapshot)
                     if account_value_krw and account_value_krw > 0:
                         usd_krw_rate = (
                             self._parse_float(self.usd_krw_rate_input, 1388.89)
-                            if hasattr(self, "usd_krw_rate_input") else 1388.89
+                            if hasattr(self, "usd_krw_rate_input")
+                            else 1388.89
                         )
                         if usd_krw_rate <= 0:
                             usd_krw_rate = 1388.89
@@ -354,6 +489,7 @@ class WatchlistMixin:
 
         # 4. Hard defaults
         return 10000.0 if env == "PROD" else 100000.0
+
     def _calculate_item_scores(self, item) -> dict:
         """Calculate live trade plan and deterministic scores for a watchlist item.
 
@@ -370,17 +506,29 @@ class WatchlistMixin:
         from src.core.orb import calculate_orb_range
 
         symbol = item.symbol.upper().strip()
-        env = self.watchlist_env_combo.currentText() if hasattr(self, "watchlist_env_combo") else "SIM"
+        env = (
+            self.watchlist_env_combo.currentText()
+            if hasattr(self, "watchlist_env_combo")
+            else "PROD"
+        )
         # Read account_size_input directly — same source as refresh_orb_trade_plan_table —
         # to guarantee the watchlist "Trade Plan" column uses the exact same account balance.
-        account_size = self._parse_float(self.account_size_input, 0.0) if hasattr(self, "account_size_input") else 0.0
+        account_size = (
+            self._parse_float(self.account_size_input, 0.0)
+            if hasattr(self, "account_size_input")
+            else 0.0
+        )
         if account_size <= 0:
             account_size = self._get_account_balance_for_env(env)
 
         # Load daily price history (local cache first, then live fallback)
-        history = self._load_chart_history_for_timeframe(symbol, timeframe="1D", use_live_fallback=False)
+        history = self._load_chart_history_for_timeframe(
+            symbol, timeframe="1D", use_live_fallback=False
+        )
         if history.empty:
-            history = self._load_chart_history_for_timeframe(symbol, timeframe="1D", use_live_fallback=True)
+            history = self._load_chart_history_for_timeframe(
+                symbol, timeframe="1D", use_live_fallback=True
+            )
 
         if history.empty:
             return {
@@ -392,7 +540,7 @@ class WatchlistMixin:
                 "risk_percent": 0.01,
                 "position_percent": 0.0,
                 "trade_plan": "No history data",
-                "env": env
+                "env": env,
             }
 
         latest_bar = history.iloc[-1]
@@ -400,11 +548,13 @@ class WatchlistMixin:
 
         # ADR — identical to _calculate_adr_percent_for_symbol
         prev_close = history["Close"].astype(float).shift(1)
-        adr_raw = ((history["High"].astype(float) - history["Low"].astype(float)) / prev_close).replace(
-            [float("inf"), float("-inf")], pd.NA
-        )
+        adr_raw = (
+            (history["High"].astype(float) - history["Low"].astype(float)) / prev_close
+        ).replace([float("inf"), float("-inf")], pd.NA)
         adr_value = adr_raw.rolling(20, min_periods=5).mean().iloc[-1]
-        adr_percent: Optional[float] = float(adr_value * 100.0) if not pd.isna(adr_value) else None
+        adr_percent: Optional[float] = (
+            float(adr_value * 100.0) if not pd.isna(adr_value) else None
+        )
 
         # â”€â”€ Determine entry / stop / target â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -416,7 +566,12 @@ class WatchlistMixin:
         buffer_pct: float = 0.001
         case_type: str = "DAILY"
 
-        if item.entry_price and item.entry_price > 0 and item.stop_loss and item.stop_loss > 0:
+        if (
+            item.entry_price
+            and item.entry_price > 0
+            and item.stop_loss
+            and item.stop_loss > 0
+        ):
             entry_price = item.entry_price
             stop_loss = item.stop_loss
             case_type = "MANUAL"
@@ -425,6 +580,7 @@ class WatchlistMixin:
             # best valid plan — identical logic to refresh_watchlist_orb_panel so the
             # watchlist table always shows the same numbers as the ORB panel below it.
             import datetime as dt
+
             since_dt = _utcnow_naive() - dt.timedelta(days=7)
             five_minute = pd.DataFrame()
             one_minute = pd.DataFrame()
@@ -455,11 +611,18 @@ class WatchlistMixin:
             # Pre-read risk % so the window search and the downstream loop share the same cases
             selected_risk = (
                 self._parse_float(self.risk_percent_input, 1.0) / 100.0
-                if hasattr(self, "risk_percent_input") else 0.01
+                if hasattr(self, "risk_percent_input")
+                else 0.01
             )
             risk_cases_orb = self._orb_risk_cases(selected_risk)
-            buffer_pct = self._watchlist_orb_buffer_pct() if hasattr(self, "watchlist_buffer_pct_input") else 0.001
-            breakout_trigger = breakout_price * (1 + buffer_pct) if breakout_price > 0 else 0.0
+            buffer_pct = (
+                self._watchlist_orb_buffer_pct()
+                if hasattr(self, "watchlist_buffer_pct_input")
+                else 0.001
+            )
+            breakout_trigger = (
+                breakout_price * (1 + buffer_pct) if breakout_price > 0 else 0.0
+            )
 
             _orb_best_entry: Optional[float] = None
             _orb_best_stop: Optional[float] = None
@@ -467,14 +630,22 @@ class WatchlistMixin:
             _orb_best_sizing: Optional[dict] = None
             _orb_best_score: float = -2.0
 
-            for w_name, w_df in [("1m", one_min_sess), ("5m", five_min_sess), ("30m", five_min_sess)]:
+            for w_name, w_df in [
+                ("1m", one_min_sess),
+                ("5m", five_min_sess),
+                ("30m", five_min_sess),
+            ]:
                 if w_df.empty:
                     continue
                 orb_range = calculate_orb_range(symbol, w_df, w_name)
                 if not orb_range:
                     continue
                 orb_high = float(orb_range.high)
-                w_entry = max(orb_high, breakout_trigger) if breakout_trigger > 0 else orb_high
+                w_entry = (
+                    max(orb_high, breakout_trigger)
+                    if breakout_trigger > 0
+                    else orb_high
+                )
                 w_stop = float(orb_range.low)
                 for rc in risk_cases_orb:
                     s = self._calculate_orb_position_values(
@@ -502,7 +673,11 @@ class WatchlistMixin:
                     orb_range = calculate_orb_range(symbol, w_df, w_name)
                     if orb_range:
                         orb_high = float(orb_range.high)
-                        _orb_best_entry = max(orb_high, breakout_trigger) if breakout_trigger > 0 else orb_high
+                        _orb_best_entry = (
+                            max(orb_high, breakout_trigger)
+                            if breakout_trigger > 0
+                            else orb_high
+                        )
                         _orb_best_stop = float(orb_range.low)
                         break
 
@@ -517,7 +692,8 @@ class WatchlistMixin:
         if "selected_risk" not in dir():
             selected_risk = (
                 self._parse_float(self.risk_percent_input, 1.0) / 100.0
-                if hasattr(self, "risk_percent_input") else 0.01
+                if hasattr(self, "risk_percent_input")
+                else 0.01
             )
 
         # Seed best_sizing from the cross-window search when available
@@ -585,8 +761,12 @@ class WatchlistMixin:
         # very high-priced stocks, floating-point rounding).  Ensure warnings are
         # always consistent with the values actually displayed in the table.
         plan_warnings = scores.setdefault("warnings", [])
-        if cap_pct_val >= 30.0 and not any("Capital allocation" in w for w in plan_warnings):
-            plan_warnings.append(f"Capital allocation ({cap_pct_val:.2f}%) exceeds hard limit of 30%")
+        if cap_pct_val >= 30.0 and not any(
+            "Capital allocation" in w for w in plan_warnings
+        ):
+            plan_warnings.append(
+                f"Capital allocation ({cap_pct_val:.2f}%) exceeds hard limit of 30%"
+            )
         if shares_val < 1 and not any("0 shares" in w for w in plan_warnings):
             plan_warnings.append("Position size calculation resulted in 0 shares")
 
@@ -602,7 +782,10 @@ class WatchlistMixin:
             except (TypeError, ValueError):
                 cached_stop = 0.0
             # Clear if the stop moved by more than 2% of entry (i.e. the plan changed materially)
-            if cached_stop > 0 and abs(cached_stop - stop_loss) / max(entry_price, 0.01) > 0.02:
+            if (
+                cached_stop > 0
+                and abs(cached_stop - stop_loss) / max(entry_price, 0.01) > 0.02
+            ):
                 item.ai_analysis = None
 
         # Status
@@ -616,40 +799,56 @@ class WatchlistMixin:
         if not hasattr(self, "watchlist_scores"):
             self.watchlist_scores = {}
         previous_scores = self.watchlist_scores.get(symbol, {})
-        self.watchlist_scores[symbol] = self._merge_watchlist_score_cache(previous_scores, {
-            "price": price,
-            "entry_price": entry_price,
-            "stop_loss": stop_loss,
-            "take_profit": 0.0,
-            "breakout_price": breakout_price if breakout_price > 0 else None,
-            "buffer_pct": buffer_pct,
-            "total_score": scores.get("total_score", 0.0),
-            "status": scores.get("status", "WATCHING"),
-            "rr": scores.get("rr", 0.0),
-            "stop_adr": sizing["sl_adr"],
-            "risk_percent": risk_pct,
-            "position_percent": cap_pct_val,
-            "trade_plan": desc,
-            "env": env,
-        })
+        self.watchlist_scores[symbol] = self._merge_watchlist_score_cache(
+            previous_scores,
+            {
+                "price": price,
+                "entry_price": entry_price,
+                "stop_loss": stop_loss,
+                "take_profit": 0.0,
+                "breakout_price": breakout_price if breakout_price > 0 else None,
+                "buffer_pct": buffer_pct,
+                "total_score": scores.get("total_score", 0.0),
+                "status": scores.get("status", "WATCHING"),
+                "rr": scores.get("rr", 0.0),
+                "stop_adr": sizing["sl_adr"],
+                "risk_percent": risk_pct,
+                "position_percent": cap_pct_val,
+                "trade_plan": desc,
+                "env": env,
+            },
+        )
 
         return scores
+
     @staticmethod
-    def _merge_watchlist_score_cache(previous_scores: dict, current_scores: dict) -> dict:
+    def _merge_watchlist_score_cache(
+        previous_scores: dict, current_scores: dict
+    ) -> dict:
         return {
             **previous_scores,
             **current_scores,
         }
+
     @staticmethod
     def _watchlist_display_status(status: str, orb_status: Optional[str]) -> str:
         """Return the status that should be shown in the watchlist table."""
-        if orb_status in {"NO_INTRADAY", "NO_VALID_ORB", "BELOW_BREAKOUT", "WAITING_ENTRY", "NO_ENTRY"}:
+        if orb_status in {
+            "NO_INTRADAY",
+            "NO_VALID_ORB",
+            "BELOW_BREAKOUT",
+            "WAITING_ENTRY",
+            "NO_ENTRY",
+        }:
             return orb_status
         if orb_status == "BUY_READY":
             return "BUY_READY"
         return status
+
     @staticmethod
-    def _watchlist_status_row_color(status: str, orb_status: Optional[str]) -> Optional[QColor]:
+    def _watchlist_status_row_color(
+        status: str, orb_status: Optional[str]
+    ) -> Optional[QColor]:
         """Return the row color for the effective watchlist status."""
         if orb_status in {"NO_INTRADAY", "NO_VALID_ORB"}:
             return QColor(108, 117, 125)
@@ -660,15 +859,16 @@ class WatchlistMixin:
         if status == "REJECTED":
             return QColor(192, 57, 43)
         return None
+
     def populate_watchlist_table(self) -> None:
         """Populate the watchlist scoreboard table."""
         self.watchlist_table.setRowCount(0)
-        
+
         for item in self.watchlist.items:
             symbol = item.symbol.strip().upper()
             row = self.watchlist_table.rowCount()
             self.watchlist_table.insertRow(row)
-            
+
             # Calculate live deterministic plan and scores directly!
             try:
                 scores = self._calculate_item_scores(item)
@@ -682,14 +882,18 @@ class WatchlistMixin:
                     "risk_percent": 0.01,
                     "position_percent": 0.0,
                     "trade_plan": f"Error: {str(e)}",
-                    "env": "SIM"
+                    "env": "PROD",
                 }
-            
+
             # Extract scores from cached AI analysis (score_breakdown) if available
             ai_data = getattr(item, "ai_analysis", None)
             if ai_data and isinstance(ai_data, dict) and "full_json" in ai_data:
-                total_score = ai_data["full_json"].get("total_score", scores.get("total_score", 0.0))
-                status = ai_data["full_json"].get("decision", scores.get("status", "WATCHING"))
+                total_score = ai_data["full_json"].get(
+                    "total_score", scores.get("total_score", 0.0)
+                )
+                status = ai_data["full_json"].get(
+                    "decision", scores.get("status", "WATCHING")
+                )
             else:
                 total_score = scores.get("total_score", 0.0)
                 status = scores.get("status", "WATCHING")
@@ -701,36 +905,60 @@ class WatchlistMixin:
                 status = "WATCHING"
             elif status == "REJECT":
                 status = "REJECTED"
-                
+
             def qitem(val):
                 return QTableWidgetItem(str(val) if val is not None else "")
-                
+
             self.watchlist_table.setItem(row, 0, qitem(item.symbol))
             self.watchlist_table.setItem(row, 1, qitem(item.name))
-            
+
             price_val = scores.get("price")
             price_str = f"{price_val:.2f}" if price_val and price_val > 0 else ""
             self.watchlist_table.setItem(row, 2, qitem(price_str))
-            
+
             self.watchlist_table.setItem(row, 3, qitem(total_score))
             self.watchlist_table.setItem(row, 4, qitem(status))
-            
-            self.watchlist_table.setItem(row, 5, qitem(f"{scores.get('stop_adr', 0.0):.1f}" if isinstance(scores.get('stop_adr'), (int, float)) else ""))
-            
+
+            self.watchlist_table.setItem(
+                row,
+                5,
+                qitem(
+                    f"{scores.get('stop_adr', 0.0):.1f}"
+                    if isinstance(scores.get("stop_adr"), (int, float))
+                    else ""
+                ),
+            )
+
             risk_pct_val = scores.get("risk_percent", "")
-            risk_pct_str = f"{risk_pct_val*100:.2f}%" if isinstance(risk_pct_val, (int, float)) and risk_pct_val < 1.0 else (f"{risk_pct_val:.2f}%" if isinstance(risk_pct_val, (int, float)) else "")
+            risk_pct_str = (
+                f"{risk_pct_val*100:.2f}%"
+                if isinstance(risk_pct_val, (int, float)) and risk_pct_val < 1.0
+                else (
+                    f"{risk_pct_val:.2f}%"
+                    if isinstance(risk_pct_val, (int, float))
+                    else ""
+                )
+            )
             self.watchlist_table.setItem(row, 6, qitem(risk_pct_str))
-            
+
             cap_pct_val = scores.get("position_percent", "")
-            cap_pct_str = f"{cap_pct_val:.2f}%" if isinstance(cap_pct_val, (int, float)) else ""
+            cap_pct_str = (
+                f"{cap_pct_val:.2f}%" if isinstance(cap_pct_val, (int, float)) else ""
+            )
             self.watchlist_table.setItem(row, 7, qitem(cap_pct_str))
-            
+
             self.watchlist_table.setItem(row, 8, qitem(scores.get("trade_plan", "")))
             self.watchlist_table.setItem(row, 9, qitem(scores.get("env", "")))
-            
-            self.watchlist_table.setItem(row, 10, qitem(self._format_optional_price(item.entry_price)))
-            self.watchlist_table.setItem(row, 11, qitem(self._format_optional_price(item.breakout_price)))
-            self.watchlist_table.setItem(row, 12, qitem(self._format_optional_price(item.stop_loss)))
+
+            self.watchlist_table.setItem(
+                row, 10, qitem(self._format_optional_price(item.entry_price))
+            )
+            self.watchlist_table.setItem(
+                row, 11, qitem(self._format_optional_price(item.breakout_price))
+            )
+            self.watchlist_table.setItem(
+                row, 12, qitem(self._format_optional_price(item.stop_loss))
+            )
             self.watchlist_table.setItem(row, 13, qitem(item.notes))
 
             # â”€â”€ ORB status takes precedence over scoring status â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -738,9 +966,12 @@ class WatchlistMixin:
             # BUY_READY â†’ a confirmed_orb_breakout signal is present
             orb_status = (
                 self.watchlist_scores.get(symbol, {}).get("orb_status")
-                if hasattr(self, "watchlist_scores") else None
+                if hasattr(self, "watchlist_scores")
+                else None
             )
-            if orb_status is None and getattr(self, "_force_watchlist_orb_status_eval", False):
+            if orb_status is None and getattr(
+                self, "_force_watchlist_orb_status_eval", False
+            ):
                 records = self._calculate_watchlist_orb_records_for_symbol(symbol)
                 orb_status = self._derive_watchlist_orb_status(records)
                 self.watchlist_scores.setdefault(symbol, {})["orb_status"] = orb_status
@@ -760,10 +991,9 @@ class WatchlistMixin:
                         cell.setBackground(row_color)
                         cell.setForeground(QColor(255, 255, 255))
 
-
         self.watchlist_table.resizeColumnsToContents()
-        self.watchlist_table.setColumnWidth(8, 250)   # Trade Plan
-        self.watchlist_table.setColumnWidth(9, 100)   # Env
+        self.watchlist_table.setColumnWidth(8, 250)  # Trade Plan
+        self.watchlist_table.setColumnWidth(9, 100)  # Env
         self.watchlist_table.setColumnWidth(13, 200)  # Notes
 
         if hasattr(self, "sidebar_source_combo"):
@@ -775,10 +1005,13 @@ class WatchlistMixin:
         self.populate_tradingview_watchlist_symbols()
         if hasattr(self, "_update_tradingview_watchlist_btn"):
             self._update_tradingview_watchlist_btn()
+
     def remove_selected_watchlist_item(self) -> None:
         selected = self.watchlist_table.currentRow()
         if selected < 0:
-            QMessageBox.warning(self, "No selection", "Please select a watchlist row to remove.")
+            QMessageBox.warning(
+                self, "No selection", "Please select a watchlist row to remove."
+            )
             return
 
         symbol_item = self.watchlist_table.item(selected, 0)
@@ -799,6 +1032,7 @@ class WatchlistMixin:
             self.update_dashboard_summary()
             self._save_state()
             self.append_log(f"Removed {symbol} from watchlist.")
+
     def load_watchlist_item_to_trade_plan(self, row: int, column: int) -> None:
         """Double-click handler: select symbol and refresh the ORB panel below.
 
@@ -813,10 +1047,15 @@ class WatchlistMixin:
         # Populate breakout price field from this symbol's breakout_price
         self._load_breakout_price_for_symbol(symbol)
         self.refresh_watchlist_orb_panel(symbol)
+
     def on_trade_kis_environment_changed(self, env: str) -> None:
         watchlist_combo = self.__dict__.get("watchlist_env_combo")
         trade_combo = self.__dict__.get("trade_kis_environment_combo")
-        if watchlist_combo is not None and watchlist_combo is not trade_combo and watchlist_combo.currentText() != env:
+        if (
+            watchlist_combo is not None
+            and watchlist_combo is not trade_combo
+            and watchlist_combo.currentText() != env
+        ):
             target_index = watchlist_combo.findText(env)
             if target_index >= 0:
                 watchlist_combo.setCurrentIndex(target_index)
@@ -828,12 +1067,17 @@ class WatchlistMixin:
         self.calculate_position_size(show_warnings=False)
         if hasattr(self, "run_watchlist_ai_review"):
             self.run_watchlist_ai_review()
+
     def on_watchlist_env_changed(self, index: int) -> None:
         """Repopulate account combo when the environment changes (balance reload is chained inside)."""
         watchlist_combo = self.__dict__.get("watchlist_env_combo")
         trade_combo = self.__dict__.get("trade_kis_environment_combo")
         env = watchlist_combo.currentText() if watchlist_combo is not None else ""
-        if trade_combo is not None and trade_combo is not watchlist_combo and trade_combo.currentText() != env:
+        if (
+            trade_combo is not None
+            and trade_combo is not watchlist_combo
+            and trade_combo.currentText() != env
+        ):
             old_block = trade_combo.blockSignals(True)
             target_index = trade_combo.findText(env)
             if target_index >= 0:
@@ -844,13 +1088,18 @@ class WatchlistMixin:
         if not populated:
             self.apply_cached_trade_account_size()
         self.calculate_position_size(show_warnings=False)
+
     def recalculate_watchlist_scoreboard_sizes(self) -> None:
         """Recalculate all watchlist scoreboard data when account size or risk % changes."""
         if not hasattr(self, "watchlist_table"):
             return
         self.populate_watchlist_table()
         # Also refresh the ORB panel for whichever symbol is currently selected
-        selected = self.watchlist_table.selectionModel().selectedRows() if self.watchlist_table.selectionModel() else []
+        selected = (
+            self.watchlist_table.selectionModel().selectedRows()
+            if self.watchlist_table.selectionModel()
+            else []
+        )
         if selected:
             sym_item = self.watchlist_table.item(selected[0].row(), 0)
             if sym_item:
@@ -867,17 +1116,45 @@ class WatchlistMixin:
         out_path = Path(f"data/watchlist_snapshot_{timestamp}.json")
 
         # â”€â”€ 1. Environment / account inputs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        env = self.watchlist_env_combo.currentText() if hasattr(self, "watchlist_env_combo") else "?"
-        trade_env = self.trade_kis_environment_combo.currentText() if hasattr(self, "trade_kis_environment_combo") else "?"
-        account_raw = self.account_size_input.text() if hasattr(self, "account_size_input") else ""
-        account_parsed = self._parse_float(self.account_size_input, 0.0) if hasattr(self, "account_size_input") else 0.0
-        risk_raw = self.risk_percent_input.text() if hasattr(self, "risk_percent_input") else ""
-        risk_parsed = self._parse_float(self.risk_percent_input, 0.0) / 100.0 if hasattr(self, "risk_percent_input") else 0.0
+        env = (
+            self.watchlist_env_combo.currentText()
+            if hasattr(self, "watchlist_env_combo")
+            else "?"
+        )
+        trade_env = (
+            self.trade_kis_environment_combo.currentText()
+            if hasattr(self, "trade_kis_environment_combo")
+            else "?"
+        )
+        account_raw = (
+            self.account_size_input.text()
+            if hasattr(self, "account_size_input")
+            else ""
+        )
+        account_parsed = (
+            self._parse_float(self.account_size_input, 0.0)
+            if hasattr(self, "account_size_input")
+            else 0.0
+        )
+        risk_raw = (
+            self.risk_percent_input.text()
+            if hasattr(self, "risk_percent_input")
+            else ""
+        )
+        risk_parsed = (
+            self._parse_float(self.risk_percent_input, 0.0) / 100.0
+            if hasattr(self, "risk_percent_input")
+            else 0.0
+        )
         balance_from_env_fn = self._get_account_balance_for_env(env)
 
         # â”€â”€ 2. Selected symbol â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         selected_symbol = ""
-        selected_rows = self.watchlist_table.selectionModel().selectedRows() if self.watchlist_table.selectionModel() else []
+        selected_rows = (
+            self.watchlist_table.selectionModel().selectedRows()
+            if self.watchlist_table.selectionModel()
+            else []
+        )
         if selected_rows:
             sym_item = self.watchlist_table.item(selected_rows[0].row(), 0)
             if sym_item:
@@ -885,8 +1162,11 @@ class WatchlistMixin:
 
         # â”€â”€ 3. Dump watchlist table â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         wl_headers = [
-            self.watchlist_table.horizontalHeaderItem(c).text()
-            if self.watchlist_table.horizontalHeaderItem(c) else f"col{c}"
+            (
+                self.watchlist_table.horizontalHeaderItem(c).text()
+                if self.watchlist_table.horizontalHeaderItem(c)
+                else f"col{c}"
+            )
             for c in range(self.watchlist_table.columnCount())
         ]
         wl_rows = []
@@ -911,7 +1191,11 @@ class WatchlistMixin:
                     for hr in range(2):  # first 2 rows are Risk% and Window
                         hi = t.item(hr, c)
                         col_label_items.append(hi.text() if hi else "")
-                    col_key = f"{col_label_items[0]}_{col_label_items[1]}" if any(col_label_items) else f"col{c}"
+                    col_key = (
+                        f"{col_label_items[0]}_{col_label_items[1]}"
+                        if any(col_label_items)
+                        else f"col{c}"
+                    )
                     cell = t.item(r, c)
                     row_data[col_key] = cell.text() if cell else ""
                 orb_rows_dump.append(row_data)
@@ -934,14 +1218,22 @@ class WatchlistMixin:
                 if item:
                     scores = self._calculate_item_scores(item)
                     # _calculate_item_scores puts entry/stop/shares in watchlist_scores cache
-                    wl_cache = getattr(self, "watchlist_scores", {}).get(selected_symbol, {})
+                    wl_cache = getattr(self, "watchlist_scores", {}).get(
+                        selected_symbol, {}
+                    )
                     diagnostic["_calculate_item_scores"] = {
                         "account_size_used": round(account_parsed, 4),
                         "entry_price": round(wl_cache.get("entry_price", 0.0), 4),
                         "stop_loss": round(wl_cache.get("stop_loss", 0.0), 4),
-                        "position_percent": round(scores.get("position_percent", 0.0), 4),
+                        "position_percent": round(
+                            scores.get("position_percent", 0.0), 4
+                        ),
                         "risk_percent_used": round(scores.get("risk_percent", 0.0), 6),
-                        "stop_adr": round(scores.get("stop_adr", 0.0), 4) if scores.get("stop_adr") is not None else None,
+                        "stop_adr": (
+                            round(scores.get("stop_adr", 0.0), 4)
+                            if scores.get("stop_adr") is not None
+                            else None
+                        ),
                         "trade_plan_string": scores.get("trade_plan", ""),
                         "rr": round(scores.get("rr", 0.0), 4),
                         "total_score": round(scores.get("total_score", 0.0), 2),
@@ -954,8 +1246,12 @@ class WatchlistMixin:
             # Direct ORB panel calculation for the same symbol
             try:
                 adr_pct = self._calculate_adr_percent_for_symbol(selected_symbol)
-                five_min = self._latest_intraday_session(self._load_cached_intraday_interval(selected_symbol, "5m", 7))
-                one_min = self._latest_intraday_session(self._load_cached_intraday_interval(selected_symbol, "1m", 7))
+                five_min = self._latest_intraday_session(
+                    self._load_cached_intraday_interval(selected_symbol, "5m", 7)
+                )
+                one_min = self._latest_intraday_session(
+                    self._load_cached_intraday_interval(selected_symbol, "1m", 7)
+                )
                 orb_diag: dict = {
                     "account_size_used": round(account_parsed, 4),
                     "adr_percent": round(adr_pct, 4) if adr_pct is not None else None,
@@ -982,9 +1278,17 @@ class WatchlistMixin:
                                 "shares": int(sizing["shares"]),
                                 "investment": round(sizing["investment"], 2),
                                 "capital_percent": round(sizing["capital_percent"], 4),
-                                "stop_loss_percent": round(sizing["stop_loss_percent"], 4),
-                                "sl_adr": round(sizing["sl_adr"], 4) if sizing["sl_adr"] is not None else None,
-                                "valid": self._orb_position_plan_is_valid(sizing, adr_pct),
+                                "stop_loss_percent": round(
+                                    sizing["stop_loss_percent"], 4
+                                ),
+                                "sl_adr": (
+                                    round(sizing["sl_adr"], 4)
+                                    if sizing["sl_adr"] is not None
+                                    else None
+                                ),
+                                "valid": self._orb_position_plan_is_valid(
+                                    sizing, adr_pct
+                                ),
                             }
                         else:
                             orb_diag[f"orb_{w_name}"] = "no_orb_range"
@@ -1023,21 +1327,39 @@ class WatchlistMixin:
                 f"  selected symbol    = {selected_symbol or '(none)'}",
             )
         except Exception as exc:
-            QMessageBox.warning(self, "Snapshot Failed", f"Could not save snapshot:\n{exc}")
+            QMessageBox.warning(
+                self, "Snapshot Failed", f"Could not save snapshot:\n{exc}"
+            )
+
     def run_watchlist_ai_review(self) -> None:
         """Start the background thread to analyze and score all watchlist symbols."""
         if not self.watchlist.items:
-            QMessageBox.information(self, "Empty Watchlist", "Watchlist is empty. Add symbols to watch first.")
+            QMessageBox.information(
+                self,
+                "Empty Watchlist",
+                "Watchlist is empty. Add symbols to watch first.",
+            )
             return
 
         self.analyze_stock_ai_button.setEnabled(False)
         self.analyze_stock_ai_button.setText("Analyzing...")
 
-        env = self.watchlist_env_combo.currentText() if hasattr(self, "watchlist_env_combo") else "SIM"
+        env = (
+            self.watchlist_env_combo.currentText()
+            if hasattr(self, "watchlist_env_combo")
+            else "PROD"
+        )
         account_size = self._get_account_balance_for_env(env)
         risk_percent = self._parse_float(self.risk_percent_input, 1.0) / 100.0
 
-        active_plans = {plan.symbol.upper(): plan for plan in self.trade_manager.get_active_plans()} if hasattr(self, "trade_manager") else {}
+        active_plans = (
+            {
+                plan.symbol.upper(): plan
+                for plan in self.trade_manager.get_active_plans()
+            }
+            if hasattr(self, "trade_manager")
+            else {}
+        )
         self.watchlist_worker = WatchlistAiWorker(
             watchlist_items=self.watchlist.items,
             db_engine=self.db_engine,
@@ -1046,14 +1368,22 @@ class WatchlistMixin:
             active_plans=active_plans,
             env=env,
         )
-        self.watchlist_worker.progress_update.connect(lambda msg: self.progress_label.setText(msg))
+        self.watchlist_worker.progress_update.connect(
+            lambda msg: self.progress_label.setText(msg)
+        )
         self.watchlist_worker.log_message.connect(self.append_log)
-        self.watchlist_worker.finished_analysis.connect(self.on_watchlist_ai_review_finished)
-        self.watchlist_worker.finished_analysis_df.connect(self.on_watchlist_df_finished)
+        self.watchlist_worker.finished_analysis.connect(
+            self.on_watchlist_ai_review_finished
+        )
+        self.watchlist_worker.finished_analysis_df.connect(
+            self.on_watchlist_df_finished
+        )
         self.watchlist_worker.start()
+
     def on_watchlist_df_finished(self, df: pd.DataFrame) -> None:
         """Called when watchlist worker thread finishes with DataFrame."""
         self.watchlist_df = df
+
     def on_watchlist_ai_review_finished(self, results: dict) -> None:
         """Called when watchlist worker thread finishes."""
         self.watchlist_scores = results
@@ -1065,26 +1395,37 @@ class WatchlistMixin:
         self._save_state()
         if hasattr(self, "refresh_execution_queue"):
             self.refresh_execution_queue(
-                self.watchlist_env_combo.currentText() if hasattr(self, "watchlist_env_combo") else "SIM",
+                (
+                    self.watchlist_env_combo.currentText()
+                    if hasattr(self, "watchlist_env_combo")
+                    else "PROD"
+                ),
                 show_log=False,
             )
+
     def move_selected_to_buylist(self) -> None:
         """Move only the selected watchlist symbol into the execution queue."""
         selected = self.watchlist_table.currentRow()
         if selected < 0:
-            QMessageBox.warning(self, "No selection", "Please select a watchlist candidate row first.")
+            QMessageBox.warning(
+                self, "No selection", "Please select a watchlist candidate row first."
+            )
             return
 
         symbol_item = self.watchlist_table.item(selected, 0)
         if symbol_item is None:
             return
-            
+
         symbol = symbol_item.text().strip().upper()
         item = self.watchlist.get(symbol)
         if item is None:
             return
 
-        env = self.watchlist_env_combo.currentText() if hasattr(self, "watchlist_env_combo") else "SIM"
+        env = (
+            self.watchlist_env_combo.currentText()
+            if hasattr(self, "watchlist_env_combo")
+            else "PROD"
+        )
         added = self.refresh_execution_queue(
             env,
             symbols=[symbol],
@@ -1099,21 +1440,26 @@ class WatchlistMixin:
             # Auto-start the monitor so ARMED items are watched immediately.
             active_attr = f"_buylist_{env.lower()}_monitor_active"
             monitor_started = False
-            if hasattr(self, "_toggle_buylist_monitor") and not getattr(self, active_attr, False):
+            if hasattr(self, "_toggle_buylist_monitor") and not getattr(
+                self, active_attr, False
+            ):
                 self._toggle_buylist_monitor(env)
                 monitor_started = True
-            monitor_note = "\n\nMonitor auto-started — will auto-buy when price hits the entry trigger." if monitor_started else \
-                           "\n\nMonitor is running — will auto-buy when price hits the entry trigger."
+            monitor_note = (
+                "\n\nMonitor auto-started — will auto-buy when price hits the entry trigger."
+                if monitor_started
+                else "\n\nMonitor is running — will auto-buy when price hits the entry trigger."
+            )
             QMessageBox.information(
                 self,
                 "Added to Execution Queue",
-                f"'{symbol}' added to the {env} Buy Dashboard execution queue.{monitor_note}"
+                f"'{symbol}' added to the {env} Buy Dashboard execution queue.{monitor_note}",
             )
         else:
             QMessageBox.warning(
                 self,
                 "Queue not updated",
-                f"'{symbol}' could not be added to the {env} execution queue. Check the log for details."
+                f"'{symbol}' could not be added to the {env} execution queue. Check the log for details.",
             )
         self.refresh_orb_trade_plan_table()
 
@@ -1140,6 +1486,7 @@ class WatchlistMixin:
         cached = getattr(item, "ai_analysis", None)
         if cached and isinstance(cached, dict) and cached.get("full_json"):
             from src.core.scoring import render_quant_analysis_html
+
             html = render_quant_analysis_html(cached["full_json"])
             self.ai_sidebar.setVisible(True)
             self.ai_report_view.setHtml(html)
@@ -1150,17 +1497,25 @@ class WatchlistMixin:
                 f"<p>No AI analysis cached for today.</p>"
                 f"<p>Click <b>Analyze with AI</b> to run the quantitative assessment for all watchlist symbols.</p>"
             )
-    def _load_cached_intraday_interval(self, symbol: str, interval: str, window_days: int = 7) -> pd.DataFrame:
+
+    def _load_cached_intraday_interval(
+        self, symbol: str, interval: str, window_days: int = 7
+    ) -> pd.DataFrame:
         symbol = symbol.strip().upper()
         if not symbol or not self.db_enabled or self.db_engine is None:
             return pd.DataFrame()
-        since = _utcnow_naive() - dt.timedelta(days=max(1, min(7, int(window_days or 7))))
+        since = _utcnow_naive() - dt.timedelta(
+            days=max(1, min(7, int(window_days or 7)))
+        )
         try:
-            bars, source = load_best_intraday_history(symbol, self.db_engine, interval=interval, since=since)
+            bars, source = load_best_intraday_history(
+                symbol, self.db_engine, interval=interval, since=since
+            )
             self.latest_intraday_sources[(symbol, interval)] = source
             return bars
         except Exception:
             return pd.DataFrame()
+
     @staticmethod
     def _latest_intraday_session(intraday: pd.DataFrame) -> pd.DataFrame:
         if intraday.empty:
@@ -1169,6 +1524,7 @@ class WatchlistMixin:
         session_dates = pd.to_datetime(bars.index).date
         latest_date = session_dates[-1]
         return bars[session_dates == latest_date]
+
     def _calculate_adr_percent_for_symbol(self, symbol: str) -> Optional[float]:
         if not symbol or not self.db_enabled or self.db_engine is None:
             return None
@@ -1176,7 +1532,9 @@ class WatchlistMixin:
         if history.empty or len(history) < 2:
             return None
         prev_close = history["Close"].astype(float).shift(1)
-        adr = ((history["High"].astype(float) - history["Low"].astype(float)) / prev_close).replace(
+        adr = (
+            (history["High"].astype(float) - history["Low"].astype(float)) / prev_close
+        ).replace(
             [float("inf"), float("-inf")],
             pd.NA,
         )
@@ -1184,6 +1542,7 @@ class WatchlistMixin:
         if pd.isna(value):
             return None
         return float(value * 100.0)
+
     def _get_trade_plan_target_price(self, symbol: str) -> Optional[float]:
         item = self.watchlist.get(symbol)
         if item is None or item.breakout_price is None:
@@ -1192,25 +1551,33 @@ class WatchlistMixin:
             return float(item.breakout_price)
         except (TypeError, ValueError):
             return None
+
     def _format_optional_price(self, value: Optional[float]) -> str:
         return "" if value is None else f"{float(value):.2f}"
+
     @staticmethod
     def _orb_risk_cases(selected_risk_percent: float) -> List[float]:
         cases = [0.0025, 0.005, 0.0075, 0.01, 0.0125, 0.015, 0.0175, 0.02]
-        if selected_risk_percent > 0 and all(abs(selected_risk_percent - case) > 0.00001 for case in cases):
+        if selected_risk_percent > 0 and all(
+            abs(selected_risk_percent - case) > 0.00001 for case in cases
+        ):
             cases.append(selected_risk_percent)
         return sorted(cases)
+
     @staticmethod
     def _orb_position_plan_headers(risk_cases: List[float]) -> List[str]:
         headers = ["Metric"]
         for risk_percent in risk_cases:
             risk_label = f"{risk_percent * 100:.2f}%"
-            headers.extend([
-                f"{risk_label} 1m",
-                f"{risk_label} 5m",
-                f"{risk_label} 30m",
-            ])
+            headers.extend(
+                [
+                    f"{risk_label} 1m",
+                    f"{risk_label} 5m",
+                    f"{risk_label} 30m",
+                ]
+            )
         return headers
+
     @staticmethod
     def _orb_position_plan_is_valid(sizing: dict, adr_percent: Optional[float]) -> bool:
         if sizing.get("shares", 0.0) < 1.0:
@@ -1219,12 +1586,17 @@ class WatchlistMixin:
         if capital_percent < 10.0 or capital_percent >= 30.0:
             return False
         stop_loss_percent = sizing.get("stop_loss_percent", 0.0)
-        if adr_percent is not None and adr_percent > 0 and stop_loss_percent >= adr_percent:
+        if (
+            adr_percent is not None
+            and adr_percent > 0
+            and stop_loss_percent >= adr_percent
+        ):
             return False
         sl_adr = sizing.get("sl_adr")
         if sl_adr is not None and (sl_adr < 15.0 or sl_adr > 66.0):
             return False
         return True
+
     @staticmethod
     def _score_orb_position_recommendation(sizing: dict, risk_percent: float) -> float:
         sl_adr = sizing.get("sl_adr")
@@ -1234,7 +1606,10 @@ class WatchlistMixin:
         sl_adr_score = max(0.0, 100.0 - abs(float(sl_adr) - 65.0) * 3.0)
         capital_score = max(0.0, 100.0 - abs(float(capital_percent) - 17.5) * 4.0)
         risk_score = max(0.0, 100.0 - float(risk_percent) * 100.0 * 25.0)
-        return round((sl_adr_score * 0.45) + (capital_score * 0.40) + (risk_score * 0.15), 1)
+        return round(
+            (sl_adr_score * 0.45) + (capital_score * 0.40) + (risk_score * 0.15), 1
+        )
+
     @staticmethod
     def _format_orb_recommendation(score: float, valid: bool) -> str:
         if not valid:
@@ -1244,6 +1619,7 @@ class WatchlistMixin:
         if score >= 70:
             return f"Good {score:.0f}"
         return f"OK {score:.0f}"
+
     @staticmethod
     def _sort_orb_plan_records(records: List[dict]) -> List[dict]:
         return sorted(
@@ -1255,6 +1631,7 @@ class WatchlistMixin:
             ),
             reverse=True,
         )
+
     @staticmethod
     def _calculate_orb_position_values(
         account_size: float,
@@ -1263,14 +1640,30 @@ class WatchlistMixin:
         stop_price: float,
         adr_percent: Optional[float] = None,
     ) -> dict:
-        total_risk = account_size * risk_percent if account_size > 0 and risk_percent > 0 else 0.0
+        total_risk = (
+            account_size * risk_percent
+            if account_size > 0 and risk_percent > 0
+            else 0.0
+        )
         risk_per_share = max(0.0, entry_price - stop_price)
-        raw_shares = total_risk / risk_per_share if total_risk > 0 and risk_per_share > 0 else 0.0
+        raw_shares = (
+            total_risk / risk_per_share
+            if total_risk > 0 and risk_per_share > 0
+            else 0.0
+        )
         shares = float(math.ceil(raw_shares)) if raw_shares > 0 else 0.0
         investment = shares * entry_price
-        capital_percent = (investment / account_size * 100.0) if account_size > 0 else 0.0
-        stop_loss_percent = (risk_per_share / entry_price * 100.0) if entry_price > 0 else 0.0
-        sl_adr = (stop_loss_percent / adr_percent * 100.0) if adr_percent and adr_percent > 0 else None
+        capital_percent = (
+            (investment / account_size * 100.0) if account_size > 0 else 0.0
+        )
+        stop_loss_percent = (
+            (risk_per_share / entry_price * 100.0) if entry_price > 0 else 0.0
+        )
+        sl_adr = (
+            (stop_loss_percent / adr_percent * 100.0)
+            if adr_percent and adr_percent > 0
+            else None
+        )
         return {
             "total_risk": total_risk,
             "risk_per_share": risk_per_share,
@@ -1280,21 +1673,32 @@ class WatchlistMixin:
             "stop_loss_percent": stop_loss_percent,
             "sl_adr": sl_adr,
         }
+
     def _apply_orb_trade_plan_selection(self, column: int, checked: bool) -> None:
         pass
-    def _apply_orb_trade_plan_column(self, column: int, update_checkbox_state: bool = False) -> None:
+
+    def _apply_orb_trade_plan_column(
+        self, column: int, update_checkbox_state: bool = False
+    ) -> None:
         pass
+
     def _auto_select_best_orb_plan(self) -> None:
         pass
+
     def refresh_orb_trade_plan_table(self) -> None:
         """Redirect to the watchlist ORB panel (Trade Plan tab removed)."""
         if not hasattr(self, "watchlist_table"):
             return
-        selected = self.watchlist_table.selectionModel().selectedRows() if self.watchlist_table.selectionModel() else []
+        selected = (
+            self.watchlist_table.selectionModel().selectedRows()
+            if self.watchlist_table.selectionModel()
+            else []
+        )
         if selected:
             sym_item = self.watchlist_table.item(selected[0].row(), 0)
             if sym_item:
                 self.refresh_watchlist_orb_panel(sym_item.text().strip().upper())
+
     def _load_breakout_price_for_symbol(self, symbol: str) -> None:
         """Populate the Daily Breakout $ field from watchlist.breakout_price for a symbol.
 
@@ -1307,9 +1711,12 @@ class WatchlistMixin:
         tp = item.breakout_price if item is not None else None
         old_block = self.watchlist_breakout_price_input.blockSignals(True)
         try:
-            self.watchlist_breakout_price_input.setText(f"{tp:.2f}" if tp and tp > 0 else "")
+            self.watchlist_breakout_price_input.setText(
+                f"{tp:.2f}" if tp and tp > 0 else ""
+            )
         finally:
             self.watchlist_breakout_price_input.blockSignals(old_block)
+
     def _on_watchlist_orb_filter_changed(self) -> None:
         """Re-render the ORB panel; save breakout price edits back to watchlist.breakout_price."""
         if not hasattr(self, "watchlist_orb_symbol_label"):
@@ -1319,7 +1726,9 @@ class WatchlistMixin:
             return
         symbol = text.upper()
         # Persist any manual edit of the Daily Breakout $ back to watchlist.breakout_price
-        if hasattr(self, "watchlist_breakout_price_input") and hasattr(self, "watchlist"):
+        if hasattr(self, "watchlist_breakout_price_input") and hasattr(
+            self, "watchlist"
+        ):
             try:
                 bp_text = self.watchlist_breakout_price_input.text().strip()
                 new_tp = float(bp_text) if bp_text else None
@@ -1330,6 +1739,7 @@ class WatchlistMixin:
             except ValueError:
                 pass
         self.refresh_watchlist_orb_panel(symbol)
+
     def _on_watchlist_orb_plan_selected(self, column: int, checked: bool) -> None:
         """Apply the chosen ORB plan column to the corresponding watchlist table row."""
         if getattr(self, "_updating_watchlist_orb_selection", False):
@@ -1390,30 +1800,35 @@ class WatchlistMixin:
                 else:
                     item.setText(text)
 
-            _set(5, f"{sl_adr:.0f}" if sl_adr is not None else "")       # Stop/ADR
-            _set(6, f"{risk_pct * 100:.2f}%")                            # Risk %
-            _set(7, f"{cap_pct:.2f}%")                                    # Capital %
-            _set(8, desc)                                                 # Trade Plan
-            _set(10, f"{entry_trigger:.2f}" if entry_trigger else "")    # Entry Price (= trigger)
-            _set(11, f"{bp:.2f}" if bp else "")                          # Breakout Price
-            _set(12, f"{stop_price:.2f}" if stop_price else "")          # Stop Loss
+            _set(5, f"{sl_adr:.0f}" if sl_adr is not None else "")  # Stop/ADR
+            _set(6, f"{risk_pct * 100:.2f}%")  # Risk %
+            _set(7, f"{cap_pct:.2f}%")  # Capital %
+            _set(8, desc)  # Trade Plan
+            _set(
+                10, f"{entry_trigger:.2f}" if entry_trigger else ""
+            )  # Entry Price (= trigger)
+            _set(11, f"{bp:.2f}" if bp else "")  # Breakout Price
+            _set(12, f"{stop_price:.2f}" if stop_price else "")  # Stop Loss
 
             # Keep watchlist_scores cache consistent
             if hasattr(self, "watchlist_scores") and symbol in self.watchlist_scores:
-                self.watchlist_scores[symbol].update({
-                    "entry_price": entry_trigger,
-                    "orb_high": orb_high,
-                    "breakout_price": bp,
-                    "target_price": 0.0,
-                    "buffer_pct": buffer_pct,
-                    "stop_loss": stop_price,
-                    "risk_percent": risk_pct,
-                    "position_percent": cap_pct,
-                    "stop_adr": sl_adr,
-                    "trade_plan": desc,
-                })
+                self.watchlist_scores[symbol].update(
+                    {
+                        "entry_price": entry_trigger,
+                        "orb_high": orb_high,
+                        "breakout_price": bp,
+                        "target_price": 0.0,
+                        "buffer_pct": buffer_pct,
+                        "stop_loss": stop_price,
+                        "risk_percent": risk_pct,
+                        "position_percent": cap_pct,
+                        "stop_adr": sl_adr,
+                        "trade_plan": desc,
+                    }
+                )
         finally:
             self._updating_watchlist_orb_selection = False
+
     def refresh_watchlist_orb_statuses_with_data(self) -> None:
         """Refresh intraday data, then evaluate ORB entry status for all watchlist rows."""
         from src.ui.controllers.base import get_controller
@@ -1429,8 +1844,11 @@ class WatchlistMixin:
 
         controller = get_controller(self, "watchlist_controller", WatchlistController)
         controller.refresh_all_orb_statuses()
+
     def _apply_cached_orb_statuses_to_watchlist_table(self) -> None:
-        if not hasattr(self, "watchlist_table") or not hasattr(self, "watchlist_scores"):
+        if not hasattr(self, "watchlist_table") or not hasattr(
+            self, "watchlist_scores"
+        ):
             return
 
         for row in range(self.watchlist_table.rowCount()):
@@ -1441,7 +1859,9 @@ class WatchlistMixin:
 
             symbol = symbol_item.text().strip().upper()
             orb_status = self.watchlist_scores.get(symbol, {}).get("orb_status")
-            display_status = self._watchlist_display_status(status_item.text().strip(), orb_status)
+            display_status = self._watchlist_display_status(
+                status_item.text().strip(), orb_status
+            )
             status_item.setText(display_status)
 
             row_color = self._watchlist_status_row_color(display_status, orb_status)
@@ -1453,31 +1873,51 @@ class WatchlistMixin:
                 if cell:
                     cell.setBackground(row_color)
                     cell.setForeground(QColor(255, 255, 255))
+
     def _refresh_selected_watchlist_orb_panel(self) -> None:
         if not hasattr(self, "watchlist_table"):
             return
-        selected = self.watchlist_table.selectionModel().selectedRows() if self.watchlist_table.selectionModel() else []
+        selected = (
+            self.watchlist_table.selectionModel().selectedRows()
+            if self.watchlist_table.selectionModel()
+            else []
+        )
         if not selected:
             return
         sym_item = self.watchlist_table.item(selected[0].row(), 0)
         if sym_item:
             self.refresh_watchlist_orb_panel(sym_item.text().strip().upper())
+
     def _calculate_watchlist_orb_records_for_symbol(self, symbol: str) -> list:
         symbol = (symbol or "").strip().upper()
         if not symbol:
             return []
 
-        account_size = self._parse_float(self.account_size_input, 0.0) if hasattr(self, "account_size_input") else 0.0
-        selected_risk_percent = self._parse_float(self.risk_percent_input, 0.0) / 100.0 if hasattr(self, "risk_percent_input") else 0.01
+        account_size = (
+            self._parse_float(self.account_size_input, 0.0)
+            if hasattr(self, "account_size_input")
+            else 0.0
+        )
+        selected_risk_percent = (
+            self._parse_float(self.risk_percent_input, 0.0) / 100.0
+            if hasattr(self, "risk_percent_input")
+            else 0.01
+        )
         risk_cases = self._orb_risk_cases(selected_risk_percent)
         adr_percent = self._calculate_adr_percent_for_symbol(symbol)
         breakout_price = self._watchlist_breakout_price_for_symbol(symbol)
         buffer_pct = self._watchlist_orb_buffer_pct()
-        breakout_trigger = breakout_price * (1 + buffer_pct) if breakout_price > 0 else 0.0
+        breakout_trigger = (
+            breakout_price * (1 + buffer_pct) if breakout_price > 0 else 0.0
+        )
         current_live_price = self._watchlist_orb_signal_price(symbol)
 
-        five_minute = self._latest_intraday_session(self._load_cached_intraday_interval(symbol, "5m", window_days=7))
-        one_minute = self._latest_intraday_session(self._load_cached_intraday_interval(symbol, "1m", window_days=7))
+        five_minute = self._latest_intraday_session(
+            self._load_cached_intraday_interval(symbol, "5m", window_days=7)
+        )
+        one_minute = self._latest_intraday_session(
+            self._load_cached_intraday_interval(symbol, "1m", window_days=7)
+        )
         orb_windows = [
             ("1m", one_minute),
             ("5m", five_minute),
@@ -1488,24 +1928,28 @@ class WatchlistMixin:
         for risk_percent in risk_cases:
             for window, history in orb_windows:
                 if history.empty:
-                    records.append({
-                        "risk_percent": risk_percent,
-                        "window": window,
-                        "valid": False,
-                        "sizing": {},
-                        "status_reason": "no_intraday",
-                    })
+                    records.append(
+                        {
+                            "risk_percent": risk_percent,
+                            "window": window,
+                            "valid": False,
+                            "sizing": {},
+                            "status_reason": "no_intraday",
+                        }
+                    )
                     continue
 
                 orb_range = calculate_orb_range(symbol, history, window)
                 if orb_range is None:
-                    records.append({
-                        "risk_percent": risk_percent,
-                        "window": window,
-                        "valid": False,
-                        "sizing": {},
-                        "status_reason": "no_orb",
-                    })
+                    records.append(
+                        {
+                            "risk_percent": risk_percent,
+                            "window": window,
+                            "valid": False,
+                            "sizing": {},
+                            "status_reason": "no_orb",
+                        }
+                    )
                     continue
 
                 orb_high = float(orb_range.high)
@@ -1528,7 +1972,9 @@ class WatchlistMixin:
                     adr_percent=adr_percent,
                 )
                 breakout_plan_valid = breakout_price > 0 and orb_high > breakout_trigger
-                plan_valid = breakout_plan_valid and self._orb_position_plan_is_valid(sizing, adr_percent)
+                plan_valid = breakout_plan_valid and self._orb_position_plan_is_valid(
+                    sizing, adr_percent
+                )
                 if breakout_price <= 0:
                     status_reason = "no_breakout"
                 elif orb_high <= breakout_trigger:
@@ -1540,21 +1986,29 @@ class WatchlistMixin:
                 else:
                     status_reason = "price_not_ready"
 
-                records.append({
-                    "risk_percent": risk_percent,
-                    "window": window,
-                    "valid": plan_valid,
-                    "sizing": sizing,
-                    "entry_signal_key": entry_signal.signal,
-                    "status_reason": status_reason,
-                })
+                records.append(
+                    {
+                        "risk_percent": risk_percent,
+                        "window": window,
+                        "valid": plan_valid,
+                        "sizing": sizing,
+                        "entry_signal_key": entry_signal.signal,
+                        "status_reason": status_reason,
+                    }
+                )
         return records
+
     def _watchlist_breakout_price_for_symbol(self, symbol: str) -> float:
         item = self.watchlist.get(symbol) if hasattr(self, "watchlist") else None
         try:
-            return float(item.breakout_price) if item is not None and item.breakout_price else 0.0
+            return (
+                float(item.breakout_price)
+                if item is not None and item.breakout_price
+                else 0.0
+            )
         except (TypeError, ValueError):
             return 0.0
+
     def _watchlist_orb_buffer_pct(self) -> float:
         if not hasattr(self, "watchlist_buffer_pct_input"):
             return 0.001
@@ -1563,19 +2017,27 @@ class WatchlistMixin:
             return float(text) / 100.0 if text else 0.001
         except ValueError:
             return 0.001
+
     def _watchlist_orb_signal_price(self, symbol: str) -> float:
-        current_live_price = getattr(self, "latest_intraday_prices", {}).get(symbol, 0.0)
+        current_live_price = getattr(self, "latest_intraday_prices", {}).get(
+            symbol, 0.0
+        )
         if current_live_price > 0:
             return current_live_price
         try:
             daily_history = self._load_chart_history_for_timeframe(
                 symbol, "1D", use_live_fallback=False, window_days=10
             )
-            if daily_history is not None and not daily_history.empty and "Close" in daily_history.columns:
+            if (
+                daily_history is not None
+                and not daily_history.empty
+                and "Close" in daily_history.columns
+            ):
                 return float(daily_history["Close"].iloc[-1])
         except Exception:
             pass
         return 0.0
+
     @staticmethod
     def _derive_watchlist_orb_status(records: list) -> str:
         if not records:
@@ -1585,10 +2047,7 @@ class WatchlistMixin:
         if reasons and all(reason == "no_intraday" for reason in reasons):
             return "NO_INTRADAY"
 
-        valid_records = [
-            r for r in records
-            if r.get("valid") and r.get("sizing")
-        ]
+        valid_records = [r for r in records if r.get("valid") and r.get("sizing")]
         if not valid_records:
             if any(reason == "below_breakout" for reason in reasons):
                 return "BELOW_BREAKOUT"
@@ -1602,6 +2061,7 @@ class WatchlistMixin:
         if all(s == "no_entry" for s in signals):
             return "WAITING_ENTRY"
         return "WATCHING"
+
     def refresh_watchlist_orb_panel(self, symbol: str = "") -> None:
         """Populate the ORB position plan below the watchlist table for the given symbol.
 
@@ -1617,7 +2077,9 @@ class WatchlistMixin:
                 symbol if symbol else "Select a watchlist symbol to view its ORB plan"
             )
             self.watchlist_orb_symbol_label.setStyleSheet(
-                "font-weight: bold; color: #ffffff;" if symbol else "font-weight: bold; color: #aaaaaa;"
+                "font-weight: bold; color: #ffffff;"
+                if symbol
+                else "font-weight: bold; color: #aaaaaa;"
             )
 
         # Always reload the Daily Breakout $ field from this symbol's watchlist breakout_price.
@@ -1676,29 +2138,49 @@ class WatchlistMixin:
                 buffer_pct = float(buf_text) / 100.0 if buf_text else 0.001
             except ValueError:
                 buffer_pct = 0.001
-        breakout_trigger = breakout_price * (1 + buffer_pct) if breakout_price > 0 else 0.0
+        breakout_trigger = (
+            breakout_price * (1 + buffer_pct) if breakout_price > 0 else 0.0
+        )
 
         # Use account_size_input directly — same as refresh_orb_trade_plan_table
-        account_size = self._parse_float(self.account_size_input, 0.0) if hasattr(self, "account_size_input") else 0.0
-        selected_risk_percent = self._parse_float(self.risk_percent_input, 0.0) / 100.0 if hasattr(self, "risk_percent_input") else 0.01
+        account_size = (
+            self._parse_float(self.account_size_input, 0.0)
+            if hasattr(self, "account_size_input")
+            else 0.0
+        )
+        selected_risk_percent = (
+            self._parse_float(self.risk_percent_input, 0.0) / 100.0
+            if hasattr(self, "risk_percent_input")
+            else 0.01
+        )
         risk_cases = self._orb_risk_cases(selected_risk_percent)
         adr_percent = self._calculate_adr_percent_for_symbol(symbol)
 
         # Resolve the actual current price for entry signal evaluation.
         # Priority: live intraday price â†’ last close from daily history.
-        current_live_price = getattr(self, "latest_intraday_prices", {}).get(symbol, 0.0)
+        current_live_price = getattr(self, "latest_intraday_prices", {}).get(
+            symbol, 0.0
+        )
         if current_live_price <= 0:
             try:
                 _daily_hist = self._load_chart_history_for_timeframe(
                     symbol, "1D", use_live_fallback=False, window_days=10
                 )
-                if _daily_hist is not None and not _daily_hist.empty and "Close" in _daily_hist.columns:
+                if (
+                    _daily_hist is not None
+                    and not _daily_hist.empty
+                    and "Close" in _daily_hist.columns
+                ):
                     current_live_price = float(_daily_hist["Close"].iloc[-1])
             except Exception:
                 pass
 
-        five_minute = self._latest_intraday_session(self._load_cached_intraday_interval(symbol, "5m", window_days=7))
-        one_minute = self._latest_intraday_session(self._load_cached_intraday_interval(symbol, "1m", window_days=7))
+        five_minute = self._latest_intraday_session(
+            self._load_cached_intraday_interval(symbol, "5m", window_days=7)
+        )
+        one_minute = self._latest_intraday_session(
+            self._load_cached_intraday_interval(symbol, "1m", window_days=7)
+        )
         if five_minute.empty and self._can_start_intraday_fetch(symbol, 7):
             self.start_intraday_fetch(symbol, window_days=7)
 
@@ -1712,27 +2194,31 @@ class WatchlistMixin:
         for risk_percent in risk_cases:
             for window, history in orb_windows:
                 if history.empty:
-                    records.append({
-                        "risk_percent": risk_percent,
-                        "window": window,
-                        "valid": False,
-                        "recommendation_score": -1.0,
-                        "values": ["No cache"] + [""] * (len(metric_labels) - 1),
-                        "sizing": {},
-                        "status_reason": "no_intraday",
-                    })
+                    records.append(
+                        {
+                            "risk_percent": risk_percent,
+                            "window": window,
+                            "valid": False,
+                            "recommendation_score": -1.0,
+                            "values": ["No cache"] + [""] * (len(metric_labels) - 1),
+                            "sizing": {},
+                            "status_reason": "no_intraday",
+                        }
+                    )
                     continue
                 orb_range = calculate_orb_range(symbol, history, window)
                 if orb_range is None:
-                    records.append({
-                        "risk_percent": risk_percent,
-                        "window": window,
-                        "valid": False,
-                        "recommendation_score": -1.0,
-                        "values": ["No ORB"] + [""] * (len(metric_labels) - 1),
-                        "sizing": {},
-                        "status_reason": "no_orb",
-                    })
+                    records.append(
+                        {
+                            "risk_percent": risk_percent,
+                            "window": window,
+                            "valid": False,
+                            "recommendation_score": -1.0,
+                            "values": ["No ORB"] + [""] * (len(metric_labels) - 1),
+                            "sizing": {},
+                            "status_reason": "no_orb",
+                        }
+                    )
                     continue
                 orb_high = float(orb_range.high)
                 stop_price = float(orb_range.low)
@@ -1741,6 +2227,7 @@ class WatchlistMixin:
                 # Evaluate the combined entry signal using the actual current live price.
                 # This shows the REAL zone the stock is in right now, not a hypothetical.
                 from src.core.orb import evaluate_orb_entry_signal
+
                 signal_price = current_live_price if current_live_price > 0 else 0.0
                 entry_signal = evaluate_orb_entry_signal(
                     orb_high=orb_high,
@@ -1758,7 +2245,9 @@ class WatchlistMixin:
                     adr_percent=adr_percent,
                 )
                 breakout_plan_valid = breakout_price > 0 and orb_high > breakout_trigger
-                column_valid = breakout_plan_valid and self._orb_position_plan_is_valid(sizing, adr_percent)
+                column_valid = breakout_plan_valid and self._orb_position_plan_is_valid(
+                    sizing, adr_percent
+                )
                 if breakout_price <= 0:
                     status_reason = "no_breakout"
                 elif orb_high <= breakout_trigger:
@@ -1769,7 +2258,9 @@ class WatchlistMixin:
                     status_reason = "confirmed"
                 else:
                     status_reason = "price_not_ready"
-                recommendation_score = self._score_orb_position_recommendation(sizing, risk_percent)
+                recommendation_score = self._score_orb_position_recommendation(
+                    sizing, risk_percent
+                )
 
                 # Human-readable signal label + machine key for aggregate status
                 signal_key = entry_signal.signal
@@ -1784,34 +2275,42 @@ class WatchlistMixin:
                 if False:
                     signal_display = "✗ ORB < Breakout (invalid)"
 
-                records.append({
-                    "window": window,
-                    "risk_percent": risk_percent,
-                    "orb_high": orb_high,
-                    "entry_price": orb_high,
-                    "entry_trigger": entry_trigger,
-                    "stop_price": stop_price,
-                    "valid": column_valid,
-                    "entry_signal_key": signal_key,
-                    "status_reason": status_reason,
-                    "recommendation_score": recommendation_score,
-                    "sizing": sizing,
-                    "values": [
-                        self._format_orb_recommendation(recommendation_score, column_valid),
-                        signal_display,
-                        f"{orb_high:.2f}",
-                        f"{breakout_price:.2f}" if breakout_price > 0 else "—",
-                        f"{entry_trigger:.2f}",
-                        f"{stop_price:.2f}",
-                        f"{sizing['risk_per_share']:.2f}",
-                        f"{sizing['shares']:.0f}",
-                        f"${sizing['investment']:.2f}",
-                        f"{sizing['capital_percent']:.1f}%",
-                        "" if adr_percent is None else f"{adr_percent:.2f}%",
-                        f"{sizing['stop_loss_percent']:.2f}%",
-                        "" if sizing["sl_adr"] is None else f"{sizing['sl_adr']:.0f}%",
-                    ],
-                })
+                records.append(
+                    {
+                        "window": window,
+                        "risk_percent": risk_percent,
+                        "orb_high": orb_high,
+                        "entry_price": orb_high,
+                        "entry_trigger": entry_trigger,
+                        "stop_price": stop_price,
+                        "valid": column_valid,
+                        "entry_signal_key": signal_key,
+                        "status_reason": status_reason,
+                        "recommendation_score": recommendation_score,
+                        "sizing": sizing,
+                        "values": [
+                            self._format_orb_recommendation(
+                                recommendation_score, column_valid
+                            ),
+                            signal_display,
+                            f"{orb_high:.2f}",
+                            f"{breakout_price:.2f}" if breakout_price > 0 else "—",
+                            f"{entry_trigger:.2f}",
+                            f"{stop_price:.2f}",
+                            f"{sizing['risk_per_share']:.2f}",
+                            f"{sizing['shares']:.0f}",
+                            f"${sizing['investment']:.2f}",
+                            f"{sizing['capital_percent']:.1f}%",
+                            "" if adr_percent is None else f"{adr_percent:.2f}%",
+                            f"{sizing['stop_loss_percent']:.2f}%",
+                            (
+                                ""
+                                if sizing["sl_adr"] is None
+                                else f"{sizing['sl_adr']:.0f}%"
+                            ),
+                        ],
+                    }
+                )
 
         records = self._sort_orb_plan_records(records)
         table.setColumnCount(1 + len(records))
@@ -1844,7 +2343,9 @@ class WatchlistMixin:
             cb_layout.addWidget(cb)
             table.setCellWidget(0, col, cb_wrapper)
 
-            table.setItem(1, col, QTableWidgetItem(f"{record['risk_percent'] * 100:.2f}%"))
+            table.setItem(
+                1, col, QTableWidgetItem(f"{record['risk_percent'] * 100:.2f}%")
+            )
             table.setItem(2, col, QTableWidgetItem(record["window"]))
 
             sizing = record.get("sizing", {})
@@ -1852,14 +2353,32 @@ class WatchlistMixin:
                 cell = QTableWidgetItem(value)
                 metric_name = metric_labels[row]
                 if (
-                    (metric_name == "Capital %" and sizing and (sizing.get("capital_percent", 0) < 10.0 or sizing.get("capital_percent", 0) >= 30.0))
-                    or (metric_name == "Stop Loss %" and sizing and adr_percent is not None and adr_percent > 0 and sizing.get("stop_loss_percent", 0) >= adr_percent)
-                    or (metric_name == "SL / ADR" and sizing and sizing.get("sl_adr") is not None and (sizing["sl_adr"] < 15.0 or sizing["sl_adr"] > 66.0))
+                    (
+                        metric_name == "Capital %"
+                        and sizing
+                        and (
+                            sizing.get("capital_percent", 0) < 10.0
+                            or sizing.get("capital_percent", 0) >= 30.0
+                        )
+                    )
+                    or (
+                        metric_name == "Stop Loss %"
+                        and sizing
+                        and adr_percent is not None
+                        and adr_percent > 0
+                        and sizing.get("stop_loss_percent", 0) >= adr_percent
+                    )
+                    or (
+                        metric_name == "SL / ADR"
+                        and sizing
+                        and sizing.get("sl_adr") is not None
+                        and (sizing["sl_adr"] < 15.0 or sizing["sl_adr"] > 66.0)
+                    )
                 ):
-                    cell.setBackground(QColor(210, 70, 60))   # coral red — readable
+                    cell.setBackground(QColor(210, 70, 60))  # coral red — readable
                     cell.setForeground(QColor(255, 255, 255))
                 elif is_valid:
-                    cell.setBackground(QColor(39, 174, 96))   # emerald green — readable
+                    cell.setBackground(QColor(39, 174, 96))  # emerald green — readable
                     cell.setForeground(QColor(255, 255, 255))
                 table.setItem(row + header_rows, col, cell)
 
@@ -1870,7 +2389,9 @@ class WatchlistMixin:
                 "risk_percent": record["risk_percent"],
                 "orb_high": record.get("orb_high", record.get("entry_price", 0.0)),
                 "entry_price": record.get("orb_high", record.get("entry_price", 0.0)),
-                "entry_trigger": record.get("entry_trigger", record.get("entry_price", 0.0)),
+                "entry_trigger": record.get(
+                    "entry_trigger", record.get("entry_price", 0.0)
+                ),
                 "breakout_price": breakout_price if breakout_price > 0 else None,
                 "buffer_pct": buffer_pct,
                 "stop_price": record.get("stop_price", 0.0),
@@ -1884,8 +2405,10 @@ class WatchlistMixin:
         # Base the status on VALID records only (invalid columns can't be entered).
         # If there are no valid plans at all, that itself means NO_ENTRY.
         valid_records = [
-            r for r in records
-            if r.get("valid") and r.get("sizing")  # must be valid AND have real sizing data
+            r
+            for r in records
+            if r.get("valid")
+            and r.get("sizing")  # must be valid AND have real sizing data
         ]
         if valid_records:
             signals = [r.get("entry_signal_key", "no_entry") for r in valid_records]
@@ -1910,13 +2433,16 @@ class WatchlistMixin:
         # Only repopulate the table when the status actually changes to avoid flicker
         if prev_status != orb_status:
             self.populate_watchlist_table()
+
     def add_manual_watchlist_item(self) -> None:
         """Add or update a watchlist item from manual inputs."""
         symbol = self.watchlist_symbol_input.text().strip().upper()
         name = self.watchlist_name_input.text().strip() or symbol
 
         if not symbol:
-            QMessageBox.warning(self, "Invalid input", "Enter a symbol before adding to the watchlist.")
+            QMessageBox.warning(
+                self, "Invalid input", "Enter a symbol before adding to the watchlist."
+            )
             return
 
         self.watchlist.add(symbol=symbol, name=name)
@@ -1927,6 +2453,7 @@ class WatchlistMixin:
         self.watchlist_symbol_input.clear()
         self.watchlist_name_input.clear()
         self.append_log(f"Added/updated {symbol} in watchlist.")
+
     def _seed_trade_plan_fields(
         self,
         symbol: str,
@@ -1951,9 +2478,12 @@ class WatchlistMixin:
             if overwrite or not self.stop_loss_input.text().strip():
                 self.stop_loss_input.setText(f"{price * 0.92:.2f}")
         if name and (overwrite or not self.reason_input.toPlainText().strip()):
-            self.reason_input.setPlainText(f"Watching {symbol} ({name}) from scanner/watchlist.")
+            self.reason_input.setPlainText(
+                f"Watching {symbol} ({name}) from scanner/watchlist."
+            )
         self.update_trade_plan_feedback()
         self.refresh_orb_trade_plan_table()
+
     def update_trade_prices_from_latest(self, symbol: str, latest_price: float) -> None:
         """Update active trade-plan prices from a refreshed market price."""
         symbol = symbol.strip().upper()
@@ -1974,21 +2504,29 @@ class WatchlistMixin:
         self.entry_price_input.blockSignals(old_entry_block)
         self.stop_loss_input.blockSignals(old_stop_block)
         self.update_trade_plan_feedback()
-    def calculate_position_size(self, show_warnings: bool = True, update_output: bool = True) -> bool:
+
+    def calculate_position_size(
+        self, show_warnings: bool = True, update_output: bool = True
+    ) -> bool:
         """Calculate shares from account risk, entry, and stop."""
         return False
+
     def review_trade(self, show_warnings: bool = True) -> bool:
         """Review a planned trade using basic rule validation."""
         return False
+
     def update_trade_plan_feedback(self) -> None:
         """Automatically update position size and trade review as fields change."""
         pass
+
     def save_trade_plan(self) -> None:
         """Save the current trade plan."""
         pass
+
     def populate_trade_plan_table(self) -> None:
         """Populate the trade plan table with active plans."""
         pass
+
     def load_saved_trade_plan(self, row: int, column: int) -> None:
         """Load a saved trade plan back into the form."""
         pass

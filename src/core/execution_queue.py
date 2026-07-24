@@ -4,6 +4,7 @@ This module owns the strategy/workflow state for turning watchlist ORB plans
 into one execution queue item per environment and symbol. UI layers should render these objects
 and call order services only after user review.
 """
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
@@ -24,18 +25,26 @@ MIN_CAPITAL_PERCENT = 10.0
 MAX_CAPITAL_PERCENT = 30.0
 MIN_STOP_ADR = 15.0
 MAX_STOP_ADR = 66.0
+PRODUCTION_ENVIRONMENT = "PROD"
 
 
-def queue_key(symbol: str, environment: str = "SIM") -> str:
-    return f"{str(environment or 'SIM').upper()}:{str(symbol or '').upper()}"
+def _require_production_environment(environment: str = PRODUCTION_ENVIRONMENT) -> str:
+    environment_key = str(environment or PRODUCTION_ENVIRONMENT).strip().upper()
+    if environment_key != PRODUCTION_ENVIRONMENT:
+        raise ValueError("Execution queue supports the PROD environment only")
+    return environment_key
+
+
+def queue_key(symbol: str, environment: str = PRODUCTION_ENVIRONMENT) -> str:
+    return f"{_require_production_environment(environment)}:{str(symbol or '').upper()}"
 
 
 def _split_queue_key(key: str) -> tuple[str, str]:
     raw = str(key or "").upper()
     if ":" in raw:
         environment, symbol = raw.split(":", 1)
-        return environment or "SIM", symbol
-    return "SIM", raw
+        return environment, symbol
+    return "", raw
 
 
 class ExecutionQueueStatus(str, Enum):
@@ -142,7 +151,7 @@ class OrbCandidate:
 @dataclass
 class ExecutionQueueItem:
     symbol: str
-    environment: str = "SIM"
+    environment: str = PRODUCTION_ENVIRONMENT
     name: str = ""
     breakout_price: Optional[float] = None
     current_price: Optional[float] = None
@@ -158,6 +167,9 @@ class ExecutionQueueItem:
     last_updated: datetime = field(default_factory=datetime.now)
     warnings: List[str] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        self.environment = _require_production_environment(self.environment)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "symbol": self.symbol,
@@ -165,9 +177,13 @@ class ExecutionQueueItem:
             "name": self.name,
             "breakout_price": self.breakout_price,
             "current_price": self.current_price,
-            "candidates": {key: candidate.to_dict() for key, candidate in self.candidates.items()},
+            "candidates": {
+                key: candidate.to_dict() for key, candidate in self.candidates.items()
+            },
             "selected_window": self.selected_window,
-            "selected_candidate": self.selected_candidate.to_dict() if self.selected_candidate else None,
+            "selected_candidate": (
+                self.selected_candidate.to_dict() if self.selected_candidate else None
+            ),
             "status": self.status.value,
             "locked": self.locked,
             "locked_reason": self.locked_reason,
@@ -185,15 +201,23 @@ class ExecutionQueueItem:
             for key, value in dict(data.get("candidates", {})).items()
         }
         selected_raw = data.get("selected_candidate")
-        selected = OrbCandidate.from_dict(selected_raw) if isinstance(selected_raw, dict) else None
+        selected = (
+            OrbCandidate.from_dict(selected_raw)
+            if isinstance(selected_raw, dict)
+            else None
+        )
         last_updated_raw = data.get("last_updated")
         try:
-            last_updated = datetime.fromisoformat(last_updated_raw) if last_updated_raw else datetime.now()
+            last_updated = (
+                datetime.fromisoformat(last_updated_raw)
+                if last_updated_raw
+                else datetime.now()
+            )
         except ValueError:
             last_updated = datetime.now()
         return cls(
             symbol=str(data.get("symbol", "")).upper(),
-            environment=str(data.get("environment", "SIM") or "SIM").upper(),
+            environment=str(data.get("environment") or PRODUCTION_ENVIRONMENT).upper(),
             name=str(data.get("name", "")),
             breakout_price=_optional_float(data.get("breakout_price")),
             current_price=_optional_float(data.get("current_price")),
@@ -252,8 +276,7 @@ def is_pre_entry_execution_queue_item(item: Any) -> bool:
         return False
 
     status = _status_text(
-        getattr(item, "monitoring_status", None)
-        or getattr(item, "status", "")
+        getattr(item, "monitoring_status", None) or getattr(item, "status", "")
     )
     if status in NON_PRE_ENTRY_BUYLIST_STATUSES:
         return False
@@ -282,14 +305,21 @@ def build_queue_display_state(
             OrbCandidateStatus.REJECTED: 2,
         }
         _displayable = [
-            c for c in getattr(queue_item, "candidates", {}).values()
+            c
+            for c in getattr(queue_item, "candidates", {}).values()
             if c.status in _display_priority
         ]
         if _displayable:
-            candidate = min(_displayable, key=lambda c: (_display_priority[c.status], -c.score))
+            candidate = min(
+                _displayable, key=lambda c: (_display_priority[c.status], -c.score)
+            )
 
-    symbol = str(getattr(queue_item, "symbol", "") or getattr(buylist_item, "symbol", "") or "").upper()
-    name = str(getattr(queue_item, "name", "") or getattr(buylist_item, "name", "") or symbol)
+    symbol = str(
+        getattr(queue_item, "symbol", "") or getattr(buylist_item, "symbol", "") or ""
+    ).upper()
+    name = str(
+        getattr(queue_item, "name", "") or getattr(buylist_item, "name", "") or symbol
+    )
     selected_window = str(
         getattr(candidate, "window", "")
         or getattr(queue_item, "selected_window", "")
@@ -329,9 +359,8 @@ def build_queue_display_state(
         or _optional_float(getattr(buylist_item, "position_percent", None))
         or 0.0
     )
-    stop_adr = (
-        _optional_float(getattr(candidate, "stop_adr", None))
-        or _optional_float(getattr(buylist_item, "stop_adr", None))
+    stop_adr = _optional_float(getattr(candidate, "stop_adr", None)) or _optional_float(
+        getattr(buylist_item, "stop_adr", None)
     )
 
     warnings: List[str] = list(getattr(queue_item, "warnings", []) or [])
@@ -354,7 +383,11 @@ def build_queue_display_state(
     if selected_window and entry_price > 0 and planned_shares > 0:
         trade_plan = f"ORB {selected_window}: buy {planned_shares} @ {entry_price:.2f}"
 
-    risk_percent = float(getattr(candidate, "risk_percent", 0.0) or 0.0) * 100.0 if candidate else 0.0
+    risk_percent = (
+        float(getattr(candidate, "risk_percent", 0.0) or 0.0) * 100.0
+        if candidate
+        else 0.0
+    )
 
     return QueueDisplayState(
         symbol=symbol,
@@ -374,7 +407,9 @@ def build_queue_display_state(
     )
 
 
-def _candidate_unavailable(symbol: str, window: str, status: OrbCandidateStatus, reason: str) -> OrbCandidate:
+def _candidate_unavailable(
+    symbol: str, window: str, status: OrbCandidateStatus, reason: str
+) -> OrbCandidate:
     return OrbCandidate(
         symbol=symbol.upper(),
         window=window,
@@ -414,9 +449,15 @@ def calculate_position_values(
         }
 
     sizer = PositionSizer(account_size=account_size, max_risk_per_trade=risk_percent)
-    sizing = sizer.size_risk_based(entry_price=entry_price, stop_loss_price=stop_price, risk_percent=risk_percent)
+    sizing = sizer.size_risk_based(
+        entry_price=entry_price, stop_loss_price=stop_price, risk_percent=risk_percent
+    )
     stop_loss_percent = risk_per_share / entry_price * 100.0
-    sl_adr = stop_loss_percent / adr_percent * 100.0 if adr_percent and adr_percent > 0 else None
+    sl_adr = (
+        stop_loss_percent / adr_percent * 100.0
+        if adr_percent and adr_percent > 0
+        else None
+    )
     return {
         "shares": int(sizing.shares),
         "investment": float(sizing.dollar_amount),
@@ -427,7 +468,9 @@ def calculate_position_values(
     }
 
 
-def validate_position_values(sizing: Dict[str, Any], adr_percent: Optional[float]) -> List[str]:
+def validate_position_values(
+    sizing: Dict[str, Any], adr_percent: Optional[float]
+) -> List[str]:
     warnings: List[str] = []
     shares = int(sizing.get("shares", 0) or 0)
     capital_percent = float(sizing.get("capital_percent", 0.0) or 0.0)
@@ -437,17 +480,27 @@ def validate_position_values(sizing: Dict[str, Any], adr_percent: Optional[float
     if shares < 1:
         warnings.append("Position size calculation resulted in 0 shares")
     if capital_percent < MIN_CAPITAL_PERCENT:
-        warnings.append(f"Capital allocation ({capital_percent:.2f}%) is below {MIN_CAPITAL_PERCENT:.0f}%")
+        warnings.append(
+            f"Capital allocation ({capital_percent:.2f}%) is below {MIN_CAPITAL_PERCENT:.0f}%"
+        )
     if capital_percent >= MAX_CAPITAL_PERCENT:
-        warnings.append(f"Capital allocation ({capital_percent:.2f}%) exceeds {MAX_CAPITAL_PERCENT:.0f}%")
+        warnings.append(
+            f"Capital allocation ({capital_percent:.2f}%) exceeds {MAX_CAPITAL_PERCENT:.0f}%"
+        )
     if adr_percent is not None and adr_percent > 0 and stop_loss_percent >= adr_percent:
-        warnings.append(f"Stop loss % ({stop_loss_percent:.2f}%) is wider than ADR ({adr_percent:.2f}%)")
+        warnings.append(
+            f"Stop loss % ({stop_loss_percent:.2f}%) is wider than ADR ({adr_percent:.2f}%)"
+        )
     if stop_adr is not None:
         stop_adr_value = float(stop_adr)
         if stop_adr_value < MIN_STOP_ADR:
-            warnings.append(f"Stop/ADR ({stop_adr_value:.2f}%) is below {MIN_STOP_ADR:.0f}%")
+            warnings.append(
+                f"Stop/ADR ({stop_adr_value:.2f}%) is below {MIN_STOP_ADR:.0f}%"
+            )
         elif stop_adr_value > MAX_STOP_ADR:
-            warnings.append(f"Stop/ADR ({stop_adr_value:.2f}%) exceeds {MAX_STOP_ADR:.0f}%")
+            warnings.append(
+                f"Stop/ADR ({stop_adr_value:.2f}%) exceeds {MAX_STOP_ADR:.0f}%"
+            )
     return warnings
 
 
@@ -459,7 +512,9 @@ def score_orb_candidate(sizing: Dict[str, Any], risk_percent: float) -> float:
     stop_adr_score = max(0.0, 100.0 - abs(float(stop_adr) - 65.0) * 3.0)
     capital_score = max(0.0, 100.0 - abs(capital_percent - 17.5) * 4.0)
     risk_score = max(0.0, 100.0 - float(risk_percent) * 100.0 * 25.0)
-    return round((stop_adr_score * 0.45) + (capital_score * 0.40) + (risk_score * 0.15), 1)
+    return round(
+        (stop_adr_score * 0.45) + (capital_score * 0.40) + (risk_score * 0.15), 1
+    )
 
 
 def build_orb_candidate(
@@ -478,13 +533,22 @@ def build_orb_candidate(
 ) -> OrbCandidate:
     symbol = str(symbol or "").upper()
     if window not in SUPPORTED_ORB_WINDOWS:
-        return _candidate_unavailable(symbol, window, OrbCandidateStatus.NOT_AVAILABLE, f"unsupported ORB window {window}")
+        return _candidate_unavailable(
+            symbol,
+            window,
+            OrbCandidateStatus.NOT_AVAILABLE,
+            f"unsupported ORB window {window}",
+        )
     if intraday is None or intraday.empty:
-        return _candidate_unavailable(symbol, window, OrbCandidateStatus.NOT_AVAILABLE, "intraday data missing")
+        return _candidate_unavailable(
+            symbol, window, OrbCandidateStatus.NOT_AVAILABLE, "intraday data missing"
+        )
 
     orb_range = calculate_orb_range(symbol, intraday, window)
     if orb_range is None:
-        return _candidate_unavailable(symbol, window, OrbCandidateStatus.FORMING, "ORB window has not completed")
+        return _candidate_unavailable(
+            symbol, window, OrbCandidateStatus.FORMING, "ORB window has not completed"
+        )
 
     orb_high = float(orb_range.high)
     orb_low = float(orb_range.low)
@@ -566,7 +630,9 @@ def build_orb_candidate(
 
     # Auto-select the best valid risk% (same cases as watchlist scoreboard),
     # so execution queue sizing matches what the watchlist displays.
-    _risk_cases = sorted({0.0025, 0.005, 0.0075, 0.01, 0.0125, 0.015, 0.0175, 0.02, risk_percent})
+    _risk_cases = sorted(
+        {0.0025, 0.005, 0.0075, 0.01, 0.0125, 0.015, 0.0175, 0.02, risk_percent}
+    )
     _best_risk = risk_percent
     _best_sizing: Optional[Dict[str, Any]] = None
     _best_score = -1.0
@@ -580,19 +646,26 @@ def build_orb_candidate(
                 adr_percent=adr_percent,
             )
             _cap = float(_s.get("capital_percent", 0.0))
-            if MIN_CAPITAL_PERCENT <= _cap < MAX_CAPITAL_PERCENT and int(_s.get("shares", 0)) >= 1:
+            if (
+                MIN_CAPITAL_PERCENT <= _cap < MAX_CAPITAL_PERCENT
+                and int(_s.get("shares", 0)) >= 1
+            ):
                 _sc = score_orb_candidate(_s, _rc)
                 if _sc > _best_score:
                     _best_score = _sc
                     _best_sizing = _s
                     _best_risk = _rc
 
-    sizing = _best_sizing if _best_sizing is not None else calculate_position_values(
-        account_size=account_size,
-        risk_percent=risk_percent,
-        entry_price=entry_trigger,
-        stop_price=candidate_stop,
-        adr_percent=adr_percent,
+    sizing = (
+        _best_sizing
+        if _best_sizing is not None
+        else calculate_position_values(
+            account_size=account_size,
+            risk_percent=risk_percent,
+            entry_price=entry_trigger,
+            stop_price=candidate_stop,
+            adr_percent=adr_percent,
+        )
     )
     risk_percent = _best_risk
     warnings.extend(validate_position_values(sizing, adr_percent))
@@ -675,9 +748,15 @@ def select_best_orb_candidate(
     upgrade_margin: float = DEFAULT_UPGRADE_MARGIN,
 ) -> Optional[OrbCandidate]:
     if locked:
-        return candidates.get(current_selected_window or "") if current_selected_window else None
+        return (
+            candidates.get(current_selected_window or "")
+            if current_selected_window
+            else None
+        )
 
-    valid_candidates = [candidate for candidate in candidates.values() if candidate.valid]
+    valid_candidates = [
+        candidate for candidate in candidates.values() if candidate.valid
+    ]
     if not valid_candidates:
         return None
 
@@ -692,7 +771,8 @@ def select_best_orb_candidate(
     if (
         best_candidate.window != current_candidate.window
         and best_candidate.score > current_candidate.score
-        and best_candidate.score >= current_candidate.score + max(0.0, float(upgrade_margin or 0.0))
+        and best_candidate.score
+        >= current_candidate.score + max(0.0, float(upgrade_margin or 0.0))
     ):
         return best_candidate
     return current_candidate
@@ -711,7 +791,13 @@ def resolve_queue_status(
             return ExecutionQueueStatus.FILLED
         if normalized_order_status in UNKNOWN_SUBMISSION_ORDER_STATUS_VALUES:
             return ExecutionQueueStatus.UNKNOWN_SUBMISSION_STATE
-        if normalized_order_status in {"SUBMITTED", "ACCEPTED", "WORKING", "ORDER_SUBMITTED", "CANCEL_REQUESTED"}:
+        if normalized_order_status in {
+            "SUBMITTED",
+            "ACCEPTED",
+            "WORKING",
+            "ORDER_SUBMITTED",
+            "CANCEL_REQUESTED",
+        }:
             return ExecutionQueueStatus.ORDER_SUBMITTED
         if normalized_order_status in {"PENDING", "SUBMITTING", "ORDER_PENDING"}:
             return ExecutionQueueStatus.ORDER_PENDING
@@ -724,12 +810,17 @@ def resolve_queue_status(
     # Only block on ORB_FORMING when non-1m windows are still forming.
     # The 1m window uses a single opening bar and can lag due to data staleness;
     # if 5m/30m have already progressed, treat the 1m FORMING as stale data.
-    forming_windows = {w for w, c in candidates.items() if c.status == OrbCandidateStatus.FORMING}
+    forming_windows = {
+        w for w, c in candidates.items() if c.status == OrbCandidateStatus.FORMING
+    }
     if forming_windows and forming_windows != {"1m"}:
         return ExecutionQueueStatus.ORB_FORMING
     if any(status == OrbCandidateStatus.WAITING_BREAKOUT for status in statuses):
         return ExecutionQueueStatus.ARMED
-    if statuses and all(status in {OrbCandidateStatus.REJECTED, OrbCandidateStatus.RISK_INVALID} for status in statuses):
+    if statuses and all(
+        status in {OrbCandidateStatus.REJECTED, OrbCandidateStatus.RISK_INVALID}
+        for status in statuses
+    ):
         return ExecutionQueueStatus.REJECTED
     return ExecutionQueueStatus.WATCHING
 
@@ -744,23 +835,18 @@ class ExecutionQueueManager:
     def get_item(
         self,
         symbol: str,
-        environment: str = "SIM",
+        environment: str = PRODUCTION_ENVIRONMENT,
         *,
         legacy_fallback: bool = True,
     ) -> Optional[ExecutionQueueItem]:
         key = queue_key(symbol, environment)
-        item = self.items.get(key)
-        if item is not None:
-            return item
-        if legacy_fallback and str(environment or "SIM").upper() == "SIM":
-            return self.items.get(str(symbol or "").upper())
-        return None
+        return self.items.get(key)
 
     def upsert_item(
         self,
         *,
         symbol: str,
-        environment: str = "SIM",
+        environment: str = PRODUCTION_ENVIRONMENT,
         name: str = "",
         breakout_price: Optional[float] = None,
         current_price: Optional[float] = None,
@@ -768,17 +854,13 @@ class ExecutionQueueManager:
         warnings: Optional[Iterable[str]] = None,
     ) -> ExecutionQueueItem:
         symbol_key = str(symbol or "").upper()
-        environment_key = str(environment or "SIM").upper()
+        environment_key = _require_production_environment(environment)
         item_key = queue_key(symbol_key, environment_key)
-        legacy_key = symbol_key
         existing = self.items.get(item_key)
-        if existing is None and environment_key == "SIM" and legacy_key in self.items:
-            existing = self.items.pop(legacy_key)
-            existing.environment = "SIM"
-            existing.symbol = symbol_key
-            self.items[item_key] = existing
         if existing is None:
-            existing = ExecutionQueueItem(symbol=symbol_key, environment=environment_key, name=name)
+            existing = ExecutionQueueItem(
+                symbol=symbol_key, environment=environment_key, name=name
+            )
             self.items[item_key] = existing
 
         existing.symbol = symbol_key
@@ -787,12 +869,19 @@ class ExecutionQueueManager:
         existing.breakout_price = breakout_price
         existing.current_price = current_price
         if candidates is not None:
-            existing.candidates = {key: value for key, value in candidates.items() if key in SUPPORTED_ORB_WINDOWS}
+            existing.candidates = {
+                key: value
+                for key, value in candidates.items()
+                if key in SUPPORTED_ORB_WINDOWS
+            }
         existing.warnings = list(warnings or [])
         existing.last_updated = datetime.now()
 
         if existing.manual_window_lock and existing.selected_window:
-            selected = existing.candidates.get(existing.selected_window) or existing.selected_candidate
+            selected = (
+                existing.candidates.get(existing.selected_window)
+                or existing.selected_candidate
+            )
             existing.selected_candidate = selected
         elif existing.locked and existing.selected_candidate is not None:
             selected = existing.selected_candidate
@@ -804,7 +893,9 @@ class ExecutionQueueManager:
                 upgrade_margin=self.upgrade_margin,
             )
             existing.selected_candidate = selected
-            existing.selected_window = selected.window if selected else existing.selected_window
+            existing.selected_window = (
+                selected.window if selected else existing.selected_window
+            )
 
         existing.status = resolve_queue_status(
             existing.candidates,
@@ -822,7 +913,7 @@ class ExecutionQueueManager:
         current_price: Optional[float],
         account_size: float,
         risk_percent: float,
-        environment: str = "SIM",
+        environment: str = PRODUCTION_ENVIRONMENT,
         adr_percent: Optional[float] = None,
         buffer_pct: float = DEFAULT_ORB_BUFFER_PCT,
         duplicate_pending_order: bool = False,
@@ -860,7 +951,7 @@ class ExecutionQueueManager:
         symbol: str,
         order_id: str = "",
         order_status: str = "SUBMITTED",
-        environment: str = "SIM",
+        environment: str = PRODUCTION_ENVIRONMENT,
     ) -> None:
         item = self.get_item(symbol, environment)
         if item is None:
@@ -869,10 +960,20 @@ class ExecutionQueueManager:
         item.locked_reason = "Order submitted"
         item.order_status = order_status
         item.order_id = order_id or item.order_id
-        item.status = resolve_queue_status(item.candidates, item.selected_candidate, locked=True, order_status=order_status)
+        item.status = resolve_queue_status(
+            item.candidates,
+            item.selected_candidate,
+            locked=True,
+            order_status=order_status,
+        )
         item.last_updated = datetime.now()
 
-    def mark_order_failed(self, symbol: str, order_status: str = "REJECTED", environment: str = "SIM") -> None:
+    def mark_order_failed(
+        self,
+        symbol: str,
+        order_status: str = "REJECTED",
+        environment: str = PRODUCTION_ENVIRONMENT,
+    ) -> None:
         item = self.get_item(symbol, environment)
         if item is None:
             return
@@ -888,7 +989,7 @@ class ExecutionQueueManager:
         symbol: str,
         order_id: str = "",
         order_status: str = "FILLED",
-        environment: str = "SIM",
+        environment: str = PRODUCTION_ENVIRONMENT,
     ) -> None:
         item = self.get_item(symbol, environment)
         if item is None:
@@ -900,7 +1001,11 @@ class ExecutionQueueManager:
         item.status = ExecutionQueueStatus.FILLED
         item.last_updated = datetime.now()
 
-    def has_pending_or_submitted_order(self, symbol: str, environment: str = "SIM") -> bool:
+    def has_pending_or_submitted_order(
+        self,
+        symbol: str,
+        environment: str = PRODUCTION_ENVIRONMENT,
+    ) -> bool:
         item = self.get_item(symbol, environment)
         if item is None:
             return False
@@ -910,7 +1015,11 @@ class ExecutionQueueManager:
             ExecutionQueueStatus.UNKNOWN_SUBMISSION_STATE,
         }
 
-    def clear_unknown_submission_state(self, symbol: str, environment: str = "SIM") -> bool:
+    def clear_unknown_submission_state(
+        self,
+        symbol: str,
+        environment: str = PRODUCTION_ENVIRONMENT,
+    ) -> bool:
         item = self.get_item(symbol, environment)
         if item is None or item.status != ExecutionQueueStatus.UNKNOWN_SUBMISSION_STATE:
             return False
@@ -929,24 +1038,37 @@ class ExecutionQueueManager:
         return {
             "upgrade_margin": self.upgrade_margin,
             "items": {
-                queue_key(item.symbol or _split_queue_key(key)[1], item.environment): item.to_dict()
+                queue_key(
+                    item.symbol or _split_queue_key(key)[1], item.environment
+                ): item.to_dict()
                 for key, item in self.items.items()
             },
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ExecutionQueueManager":
-        manager = cls(upgrade_margin=float(data.get("upgrade_margin", DEFAULT_UPGRADE_MARGIN)))
+        manager = cls(
+            upgrade_margin=float(data.get("upgrade_margin", DEFAULT_UPGRADE_MARGIN))
+        )
         for raw_key, item_data in dict(data.get("items", {})).items():
             if not isinstance(item_data, dict):
                 continue
             key_environment, key_symbol = _split_queue_key(str(raw_key))
-            item = ExecutionQueueItem.from_dict(item_data)
+            item_environment = (
+                str(item_data.get("environment") or key_environment).strip().upper()
+            )
+            if (
+                key_environment != PRODUCTION_ENVIRONMENT
+                or item_environment != PRODUCTION_ENVIRONMENT
+            ):
+                continue
+            try:
+                item = ExecutionQueueItem.from_dict(item_data)
+            except ValueError:
+                continue
             if not item.symbol:
                 item.symbol = key_symbol
-            if item_data.get("environment") is None:
-                item.environment = key_environment
             item.symbol = str(item.symbol or "").upper()
-            item.environment = str(item.environment or "SIM").upper()
+            item.environment = PRODUCTION_ENVIRONMENT
             manager.items[queue_key(item.symbol, item.environment)] = item
         return manager

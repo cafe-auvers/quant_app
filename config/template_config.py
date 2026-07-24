@@ -9,7 +9,6 @@ KIS_API = {
     "app_key": "YOUR_APP_KEY_HERE",
     "app_secret": "YOUR_APP_SECRET_HERE",
     "account_no": "YOUR_ACCOUNT_NO_HERE",
-    "virtual": True,  # True for virtual/paper trading
 }
 
 # Portfolio Configuration

@@ -4,7 +4,7 @@ A desktop trading dashboard for US-market swing trading with scanner workflows, 
 
 ## Current Capabilities
 
-- KIS SIM/PROD account snapshots with account profile selection.
+- KIS production account snapshots with account selection.
 - Guarded KIS overseas order submission with a durable local order ledger.
 - Conservative fill reconciliation from account snapshots; broker acceptance is not treated as a fill.
 - Rule-based scanner presets backed by a KIS-registered US universe, Yahoo/KIS data paths, and MySQL caches.
@@ -67,9 +67,6 @@ MYSQL_USER=root
 MYSQL_PASSWORD=your_password_here
 MYSQL_DB=quant_app
 
-KIS_SIM_APP_KEY=your_sim_key
-KIS_SIM_APP_SECRET=your_sim_secret
-KIS_SIM_ACCOUNT_NO=12345678-01
 KIS_PROD_APP_KEY=your_prod_key
 KIS_PROD_APP_SECRET=your_prod_secret
 KIS_PROD_ACCOUNT_NO=87654321-01
@@ -83,9 +80,10 @@ Only enable KIS intraday after the endpoint, TR ID, request parameters, output f
 ## Production Safety
 
 - Keep `.env`, token caches, and local account state out of source control.
-- Smoke-test KIS order workflows in SIM before using PROD.
+- Keep the live monitor off until the production account snapshot, order review, and reconciliation paths are verified.
 - Treat successful KIS order submission as broker acceptance only.
 - Use `data/orders.json` as the durable local order ledger for idempotency and restart protection.
+- Keep `data/legacy_non_prod_*.json`; these files preserve filtered paper-trading state without making it actionable.
 - Keep local JSON `.bak` files and `data/state_metadata.json` with the rest of local runtime state.
 - Do not bypass reconciliation when updating buylist position state after order submission.
 

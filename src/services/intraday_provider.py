@@ -1,4 +1,5 @@
 """Shared intraday provider contracts and OHLCV helpers."""
+
 from __future__ import annotations
 
 import datetime as dt
@@ -28,7 +29,7 @@ class IntradayRequest:
     symbol: str
     interval: IntradayInterval | str
     window_days: int = 7
-    environment: str = "SIM"
+    environment: str = "PROD"
     account_no: str = ""
     exchange: str = "NASD"
     allow_fallback: bool = True
@@ -36,10 +37,16 @@ class IntradayRequest:
     def __post_init__(self) -> None:
         object.__setattr__(self, "symbol", str(self.symbol or "").strip().upper())
         object.__setattr__(self, "interval", _interval_value(self.interval))
-        object.__setattr__(self, "window_days", max(1, min(7, int(self.window_days or 7))))
-        object.__setattr__(self, "environment", str(self.environment or "SIM").strip().upper())
+        object.__setattr__(
+            self, "window_days", max(1, min(7, int(self.window_days or 7)))
+        )
+        object.__setattr__(
+            self, "environment", str(self.environment or "PROD").strip().upper()
+        )
         object.__setattr__(self, "account_no", str(self.account_no or "").strip())
-        object.__setattr__(self, "exchange", str(self.exchange or "NASD").strip().upper())
+        object.__setattr__(
+            self, "exchange", str(self.exchange or "NASD").strip().upper()
+        )
 
 
 @dataclass
@@ -49,7 +56,9 @@ class IntradayResult:
     source: IntradayProviderName | str
     bars: pd.DataFrame
     exchange: str = "NASD"
-    as_of: dt.datetime = field(default_factory=lambda: dt.datetime.now(dt.timezone.utc).replace(tzinfo=None))
+    as_of: dt.datetime = field(
+        default_factory=lambda: dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+    )
     warnings: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -58,7 +67,9 @@ class IntradayResult:
         self.source = _provider_value(self.source)
         self.exchange = str(self.exchange or "").strip().upper()
         self.bars = normalize_ohlcv_frame(self.bars)
-        self.warnings = [str(warning) for warning in (self.warnings or []) if str(warning).strip()]
+        self.warnings = [
+            str(warning) for warning in (self.warnings or []) if str(warning).strip()
+        ]
 
 
 class IntradayProviderError(RuntimeError):
@@ -93,11 +104,19 @@ def normalize_ohlcv_frame(frame: pd.DataFrame | None) -> pd.DataFrame:
         "close": "Close",
         "volume": "Volume",
     }
-    normalized = normalized.rename(columns={key: value for key, value in rename_map.items() if key in normalized.columns})
+    normalized = normalized.rename(
+        columns={
+            key: value for key, value in rename_map.items() if key in normalized.columns
+        }
+    )
     for column in OHLCV_COLUMNS:
         if column not in normalized.columns:
             normalized[column] = 0.0
-    normalized = normalized[OHLCV_COLUMNS].apply(pd.to_numeric, errors="coerce").dropna(how="any")
+    normalized = (
+        normalized[OHLCV_COLUMNS]
+        .apply(pd.to_numeric, errors="coerce")
+        .dropna(how="any")
+    )
     if normalized.empty:
         return pd.DataFrame(columns=OHLCV_COLUMNS)
     normalized.index = pd.to_datetime(normalized.index)
@@ -105,7 +124,9 @@ def normalize_ohlcv_frame(frame: pd.DataFrame | None) -> pd.DataFrame:
     return normalized
 
 
-def resample_ohlcv_bars(frame: pd.DataFrame, interval: IntradayInterval | str) -> pd.DataFrame:
+def resample_ohlcv_bars(
+    frame: pd.DataFrame, interval: IntradayInterval | str
+) -> pd.DataFrame:
     normalized = normalize_ohlcv_frame(frame)
     if normalized.empty:
         return normalized

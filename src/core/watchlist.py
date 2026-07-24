@@ -1,4 +1,5 @@
 """Trading rules and watchlist management."""
+
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional
 from datetime import datetime
@@ -7,20 +8,24 @@ from datetime import datetime
 @dataclass
 class WatchlistItem:
     """A stock in a watchlist."""
+
     symbol: str
     name: str
     entry_price: Optional[float] = None
-    target_price: Optional[float] = None  # Deprecated; migrated to breakout_price on load.
+    target_price: Optional[float] = (
+        None  # Deprecated; migrated to breakout_price on load.
+    )
     breakout_price: Optional[float] = None
     stop_loss: Optional[float] = None
     notes: str = ""
     added_date: datetime = field(default_factory=datetime.now)
     ai_analysis: Optional[Dict] = None
-    
+
 
 @dataclass
 class TradePlan:
     """A trade plan with setup details."""
+
     symbol: str
     entry_price: float
     stop_loss: float
@@ -31,22 +36,22 @@ class TradePlan:
     status: str = "active"  # active, filled, closed, cancelled
     notes: str = ""
     risk_percent: float = 0.01
-    
+
 
 class Watchlist:
     """Watchlist manager."""
-    
+
     def __init__(self, name: str = "Default"):
         """
         Initialize a watchlist.
-        
+
         Args:
             name: Watchlist name
         """
         self.name = name
         self.items: List[WatchlistItem] = []
         self.created_date = datetime.now()
-    
+
     def add(self, symbol: str, name: str, entry_price=...) -> WatchlistItem:
         """Add or update a stock in the watchlist."""
         symbol = symbol.strip().upper()
@@ -57,23 +62,27 @@ class Watchlist:
                 existing.entry_price = entry_price
             return existing
 
-        item = WatchlistItem(symbol=symbol, name=name, entry_price=None if entry_price is ... else entry_price)
+        item = WatchlistItem(
+            symbol=symbol,
+            name=name,
+            entry_price=None if entry_price is ... else entry_price,
+        )
         self.items.append(item)
         return item
-    
+
     def remove(self, symbol: str) -> bool:
         """Remove a stock from watchlist. Returns True if found."""
         original_len = len(self.items)
         self.items = [item for item in self.items if item.symbol != symbol]
         return len(self.items) < original_len
-    
+
     def get(self, symbol: str) -> Optional[WatchlistItem]:
         """Get a watchlist item by symbol."""
         for item in self.items:
             if item.symbol == symbol:
                 return item
         return None
-    
+
     def to_dict(self) -> Dict:
         """Convert to dictionary for serialization."""
         return {
@@ -92,7 +101,7 @@ class Watchlist:
                     "ai_analysis": item.ai_analysis,
                 }
                 for item in self.items
-            ]
+            ],
         }
 
     @classmethod
@@ -117,7 +126,9 @@ class Watchlist:
         for raw_item in data.get("items", []):
             added_date = raw_item.get("added_date")
             try:
-                parsed_added_date = datetime.fromisoformat(added_date) if added_date else datetime.now()
+                parsed_added_date = (
+                    datetime.fromisoformat(added_date) if added_date else datetime.now()
+                )
             except ValueError:
                 parsed_added_date = datetime.now()
 
@@ -126,17 +137,19 @@ class Watchlist:
             if migrated_breakout_price is None and legacy_target_price is not None:
                 migrated_breakout_price = legacy_target_price
 
-            watchlist.items.append(WatchlistItem(
-                symbol=str(raw_item.get("symbol", "")).upper(),
-                name=raw_item.get("name", ""),
-                entry_price=optional_float(raw_item.get("entry_price")),
-                stop_loss=optional_float(raw_item.get("stop_loss")),
-                target_price=legacy_target_price,
-                breakout_price=migrated_breakout_price,
-                notes=raw_item.get("notes", ""),
-                added_date=parsed_added_date,
-                ai_analysis=raw_item.get("ai_analysis"),
-            ))
+            watchlist.items.append(
+                WatchlistItem(
+                    symbol=str(raw_item.get("symbol", "")).upper(),
+                    name=raw_item.get("name", ""),
+                    entry_price=optional_float(raw_item.get("entry_price")),
+                    stop_loss=optional_float(raw_item.get("stop_loss")),
+                    target_price=legacy_target_price,
+                    breakout_price=migrated_breakout_price,
+                    notes=raw_item.get("notes", ""),
+                    added_date=parsed_added_date,
+                    ai_analysis=raw_item.get("ai_analysis"),
+                )
+            )
 
         watchlist.items = [item for item in watchlist.items if item.symbol]
         return watchlist
@@ -144,19 +157,19 @@ class Watchlist:
 
 class TradePlanManager:
     """Trade plan manager."""
-    
+
     def __init__(self):
         """Initialize trade plan manager."""
         self.plans: List[TradePlan] = []
-    
+
     def add_plan(self, plan: TradePlan) -> None:
         """Add a new trade plan."""
         self.plans.append(plan)
-    
+
     def get_active_plans(self) -> List[TradePlan]:
         """Get all active trade plans."""
         return [plan for plan in self.plans if plan.status == "active"]
-    
+
     def update_plan_status(self, symbol: str, status: str) -> bool:
         """Update the status of a trade plan. Returns True if found."""
         for plan in self.plans:
@@ -164,7 +177,7 @@ class TradePlanManager:
                 plan.status = status
                 return True
         return False
-    
+
     def to_dict(self) -> Dict:
         """Convert to dictionary for serialization."""
         return {
@@ -192,23 +205,27 @@ class TradePlanManager:
         for raw_plan in data.get("plans", []):
             entry_date = raw_plan.get("entry_date")
             try:
-                parsed_entry_date = datetime.fromisoformat(entry_date) if entry_date else datetime.now()
+                parsed_entry_date = (
+                    datetime.fromisoformat(entry_date) if entry_date else datetime.now()
+                )
             except ValueError:
                 parsed_entry_date = datetime.now()
 
             try:
-                manager.plans.append(TradePlan(
-                    symbol=str(raw_plan.get("symbol", "")).upper(),
-                    entry_price=float(raw_plan.get("entry_price", 0.0)),
-                    stop_loss=float(raw_plan.get("stop_loss", 0.0)),
-                    take_profit=float(raw_plan.get("take_profit", 0.0)),
-                    position_size=int(raw_plan.get("position_size", 0)),
-                    reason=raw_plan.get("reason", ""),
-                    entry_date=parsed_entry_date,
-                    status=raw_plan.get("status", "active"),
-                    notes=raw_plan.get("notes", ""),
-                    risk_percent=float(raw_plan.get("risk_percent", 0.01)),
-                ))
+                manager.plans.append(
+                    TradePlan(
+                        symbol=str(raw_plan.get("symbol", "")).upper(),
+                        entry_price=float(raw_plan.get("entry_price", 0.0)),
+                        stop_loss=float(raw_plan.get("stop_loss", 0.0)),
+                        take_profit=float(raw_plan.get("take_profit", 0.0)),
+                        position_size=int(raw_plan.get("position_size", 0)),
+                        reason=raw_plan.get("reason", ""),
+                        entry_date=parsed_entry_date,
+                        status=raw_plan.get("status", "active"),
+                        notes=raw_plan.get("notes", ""),
+                        risk_percent=float(raw_plan.get("risk_percent", 0.01)),
+                    )
+                )
             except (TypeError, ValueError):
                 continue
 
@@ -219,6 +236,7 @@ class TradePlanManager:
 @dataclass
 class BuylistItem:
     """A stock in the buylist."""
+
     symbol: str
     name: str
     entry_price: float
@@ -240,24 +258,35 @@ class BuylistItem:
     added_date: datetime = field(default_factory=datetime.now)
     risk_percent: float = 1.0
     trade_plan: str = ""
-    monitoring_status: str = "WATCHING"   # WATCHING / ACTIVE / BOUGHT / SOLD
+    monitoring_status: str = "WATCHING"  # WATCHING / ACTIVE / BOUGHT / SOLD
     shares_held: int = 0
     avg_cost: float = 0.0
     buy_date: Optional[datetime] = None
     sell_half_done: bool = False
     kis_order_id: str = ""
-    environment: str = "SIM"
-    breakout_price: Optional[float] = None      # daily chart structural breakout level (user-entered)
-    confirmation_price: Optional[float] = None  # optional full-confirmation level above breakout
-    breakout_method: str = ""                   # e.g. "manual_trendline", "manual_pivot_high"
-    buffer_pct: float = 0.001                   # 0.1% buffer applied above breakout_price
+    environment: str = "PROD"
+    breakout_price: Optional[float] = (
+        None  # daily chart structural breakout level (user-entered)
+    )
+    confirmation_price: Optional[float] = (
+        None  # optional full-confirmation level above breakout
+    )
+    breakout_method: str = ""  # e.g. "manual_trendline", "manual_pivot_high"
+    buffer_pct: float = 0.001  # 0.1% buffer applied above breakout_price
     auto_order_block_reason: str = ""
-    orb_monitor_enabled: bool = False           # user explicitly activated monitoring for this queue item
+    orb_monitor_enabled: bool = (
+        False  # user explicitly activated monitoring for this queue item
+    )
     partial_exit_review_alert: bool = False
     partial_exit_review_reason: str = ""
     ema_trailing_stop_alert: bool = False
     ema_trailing_stop_reason: str = ""
     suggested_action: str = ""
+
+    def __post_init__(self) -> None:
+        self.environment = str(self.environment or "PROD").strip().upper()
+        if self.environment != "PROD":
+            raise ValueError("Buylist items must use the PROD environment")
 
     def to_dict(self) -> Dict:
         """Convert to dictionary for serialization."""
@@ -306,9 +335,16 @@ class BuylistItem:
     @classmethod
     def from_dict(cls, data: Dict) -> "BuylistItem":
         """Create a BuylistItem from serialized data."""
+        environment = str(data.get("environment") or "").strip().upper()
+        if environment != "PROD":
+            raise ValueError("Ignoring non-PROD legacy buylist item")
         added_date_str = data.get("added_date")
         try:
-            added_date = datetime.fromisoformat(added_date_str) if added_date_str else datetime.now()
+            added_date = (
+                datetime.fromisoformat(added_date_str)
+                if added_date_str
+                else datetime.now()
+            )
         except ValueError:
             added_date = datetime.now()
         legacy_target_price = float(data.get("target_price", 0.0))
@@ -339,20 +375,30 @@ class BuylistItem:
             added_date=added_date,
             risk_percent=float(data.get("risk_percent", 1.0)),
             trade_plan=str(data.get("trade_plan", "")),
-            environment=str(data.get("environment", "SIM")),
+            environment=environment,
             monitoring_status=str(data.get("monitoring_status", "WATCHING")),
             shares_held=int(data.get("shares_held", 0)),
             avg_cost=float(data.get("avg_cost", 0.0)),
-            buy_date=datetime.fromisoformat(data["buy_date"]) if data.get("buy_date") else None,
+            buy_date=(
+                datetime.fromisoformat(data["buy_date"])
+                if data.get("buy_date")
+                else None
+            ),
             sell_half_done=bool(data.get("sell_half_done", False)),
             kis_order_id=str(data.get("kis_order_id", "")),
             breakout_price=breakout_price,
-            confirmation_price=float(data["confirmation_price"]) if data.get("confirmation_price") is not None else None,
+            confirmation_price=(
+                float(data["confirmation_price"])
+                if data.get("confirmation_price") is not None
+                else None
+            ),
             breakout_method=str(data.get("breakout_method", "")),
             buffer_pct=float(data.get("buffer_pct", 0.001)),
             auto_order_block_reason=str(data.get("auto_order_block_reason", "")),
             orb_monitor_enabled=bool(data.get("orb_monitor_enabled", False)),
-            partial_exit_review_alert=bool(data.get("partial_exit_review_alert", False)),
+            partial_exit_review_alert=bool(
+                data.get("partial_exit_review_alert", False)
+            ),
             partial_exit_review_reason=str(data.get("partial_exit_review_reason", "")),
             ema_trailing_stop_alert=bool(data.get("ema_trailing_stop_alert", False)),
             ema_trailing_stop_reason=str(data.get("ema_trailing_stop_reason", "")),
@@ -362,13 +408,15 @@ class BuylistItem:
 
 class BuylistManager:
     """Buylist manager."""
+
     def __init__(self):
         self.items: List[BuylistItem] = []
 
     def add(self, item: BuylistItem) -> None:
         """Add or update an item in the buylist (keyed by symbol + environment)."""
         self.items = [
-            it for it in self.items
+            it
+            for it in self.items
             if not (it.symbol == item.symbol and it.environment == item.environment)
         ]
         self.items.append(item)
@@ -378,13 +426,18 @@ class BuylistManager:
         symbol = symbol.strip().upper()
         original_len = len(self.items)
         if environment:
-            self.items = [it for it in self.items
-                          if not (it.symbol == symbol and it.environment == environment)]
+            self.items = [
+                it
+                for it in self.items
+                if not (it.symbol == symbol and it.environment == environment)
+            ]
         else:
             self.items = [it for it in self.items if it.symbol != symbol]
         return len(self.items) < original_len
 
-    def get(self, symbol: str, environment: Optional[str] = None) -> Optional["BuylistItem"]:
+    def get(
+        self, symbol: str, environment: Optional[str] = None
+    ) -> Optional["BuylistItem"]:
         """Get a buylist item by symbol (and optionally environment)."""
         symbol = symbol.strip().upper()
         for item in self.items:
@@ -395,9 +448,7 @@ class BuylistManager:
 
     def to_dict(self) -> Dict:
         """Convert to dictionary for serialization."""
-        return {
-            "items": [item.to_dict() for item in self.items]
-        }
+        return {"items": [item.to_dict() for item in self.items]}
 
     @classmethod
     def from_dict(cls, data: Dict) -> "BuylistManager":

@@ -19,6 +19,10 @@ def _patch_app_state_paths(monkeypatch, tmp_path):
         "CHART_DRAWINGS_FILE": tmp_path / "chart_drawings.json",
         "TAB_OPTIONS_FILE": tmp_path / "tab_options.json",
         "STATE_METADATA_FILE": tmp_path / "state_metadata.json",
+        "LEGACY_NON_PRODUCTION_BUYLIST_FILE": tmp_path
+        / "legacy_non_prod_buylist.json",
+        "LEGACY_NON_PRODUCTION_EXECUTION_QUEUE_FILE": tmp_path
+        / "legacy_non_prod_execution_queue.json",
     }
     for name, path in paths.items():
         monkeypatch.setattr(app_state, name, path)
@@ -56,6 +60,44 @@ def test_load_json_falls_back_to_backup_when_main_is_malformed(tmp_path):
     )
 
     assert load_json(path, {"items": []}) == {"items": [{"symbol": "AAPL"}]}
+
+
+def test_load_buylist_state_archives_non_production_rows_before_filtering(
+    tmp_path, monkeypatch
+):
+    paths = _patch_app_state_paths(monkeypatch, tmp_path)
+    save_json(
+        paths["BUYLIST_FILE"],
+        {"items": [{"symbol": "AAPL", "environment": "SIM"}]},
+    )
+
+    manager = app_state.load_buylist_state()
+
+    assert manager.items == []
+    assert load_json(paths["LEGACY_NON_PRODUCTION_BUYLIST_FILE"], {}) == {
+        "items": [{"symbol": "AAPL", "environment": "SIM"}]
+    }
+
+
+def test_execution_queue_archive_keeps_only_non_production_rows(tmp_path):
+    archive_path = tmp_path / "legacy_non_prod_execution_queue.json"
+    data = {
+        "upgrade_margin": 5.0,
+        "items": {
+            "SIM:AAPL": {"symbol": "AAPL", "environment": "SIM"},
+            "PROD:MSFT": {"symbol": "MSFT", "environment": "PROD"},
+        },
+    }
+
+    archived_count = app_state.archive_non_production_execution_queue_state(
+        data,
+        archive_path=archive_path,
+    )
+
+    assert archived_count == 1
+    archived = load_json(archive_path, {})
+    assert list(archived["items"]) == ["SIM:AAPL"]
+    assert archived["items"]["SIM:AAPL"]["environment"] == "SIM"
 
 
 def test_state_save_manager_save_now_writes_all_expected_files(tmp_path, monkeypatch):

@@ -523,7 +523,7 @@ def test_place_overseas_order_refreshes_expired_token_once(monkeypatch):
     monkeypatch.setattr(kis_order, "KisAccountClient", lambda _config: fake_client)
 
     result = kis_order.place_overseas_order(
-        environment=KisEnvironment.SIM.value,
+        environment=KisEnvironment.PROD.value,
         account_no="12345678-01",
         symbol="AAPL",
         quantity=3,
@@ -536,7 +536,7 @@ def test_place_overseas_order_refreshes_expired_token_once(monkeypatch):
     assert len(posts) == 2
     assert posts[0]["headers"]["authorization"] == "Bearer cached-token"
     assert posts[1]["headers"]["authorization"] == "Bearer fresh-token"
-    assert posts[0]["headers"]["tr_id"] == "VTTT1001U"
+    assert posts[0]["headers"]["tr_id"] == "TTTT1006U"
 
 
 @pytest.mark.parametrize(
@@ -572,7 +572,7 @@ def test_place_overseas_order_rejects_invalid_order_contract_before_auth(
 
     with pytest.raises(ValueError, match=error):
         kis_order.place_overseas_order(
-            environment=KisEnvironment.SIM.value,
+            environment=KisEnvironment.PROD.value,
             account_no="12345678-01",
             symbol="AAPL",
             quantity=1,
@@ -922,12 +922,12 @@ def test_sell_rejection_keeps_held_position_as_bought(monkeypatch):
     assert any("status restored to BOUGHT" in message for message in logs)
 
 
-def test_kis_sim_unsupported_sell_rejection_blocks_auto_retry(monkeypatch):
+def test_production_sell_rejection_does_not_create_sim_retry_block(monkeypatch):
     logs = []
     save_calls = []
     item = SimpleNamespace(
         symbol="AAPL",
-        environment="SIM",
+        environment="PROD",
         _stop_order_pending=True,
         monitoring_status="BOUGHT",
         shares_held=10,
@@ -955,18 +955,16 @@ def test_kis_sim_unsupported_sell_rejection_blocks_auto_retry(monkeypatch):
         intent=OrderIntent.STOP_LOSS,
         status=OrderStatus.REJECTED,
     )
-    order.error_message = (
-        "KIS API error from /uapi/overseas-stock/v1/trading/order: "
-        "90000000 mock investment does not provide this task"
-    )
+    order.environment = "PROD"
+    order.error_message = "broker rejected order"
 
     MainWindow._on_sell_order_accepted(window, item, 10, "stop-loss", order)
 
     assert item.monitoring_status == "BOUGHT"
     assert item._stop_order_pending is False
-    assert "90000000" in item.auto_order_block_reason
+    assert item.auto_order_block_reason == ""
     assert save_calls == [True]
-    assert any("Auto KIS order retries blocked for AAPL" in message for message in logs)
+    assert not any("Auto KIS order retries blocked" in message for message in logs)
 
 
 def test_monitor_skips_blocked_stop_loss_auto_order():
@@ -974,14 +972,14 @@ def test_monitor_skips_blocked_stop_loss_auto_order():
     submitted = []
     item = SimpleNamespace(
         symbol="AAPL",
-        environment="SIM",
+        environment="PROD",
         monitoring_status="BOUGHT",
         shares_held=10,
         avg_cost=100.0,
         stop_loss=95.0,
         sell_half_done=False,
         entry_price=100.0,
-        auto_order_block_reason="KIS SIM rejected overseas order routing for this account/API (90000000).",
+        auto_order_block_reason="Manual review required before retry.",
     )
     window = MainWindow.__new__(MainWindow)
     window.buylist_manager = SimpleNamespace(items=[item])
@@ -991,8 +989,8 @@ def test_monitor_skips_blocked_stop_loss_auto_order():
     window._submit_kis_sell_order = lambda *args, **kwargs: submitted.append(args)
     window.append_log = logs.append
 
-    MainWindow._run_buylist_monitor_cycle(window, "SIM")
-    MainWindow._run_buylist_monitor_cycle(window, "SIM")
+    MainWindow._run_buylist_monitor_cycle(window, "PROD")
+    MainWindow._run_buylist_monitor_cycle(window, "PROD")
 
     assert submitted == []
     assert item.monitoring_status == "BOUGHT"
@@ -1803,7 +1801,7 @@ def test_submit_kis_buy_order_honors_explicit_order_price_over_live_price(monkey
 
     item = SimpleNamespace(
         symbol="AAPL",
-        environment="SIM",
+        environment="PROD",
         _buy_order_pending=True,
         monitoring_status="ORDER_PENDING",
         breakout_method="execution_queue:1m",
@@ -1889,7 +1887,7 @@ def test_buylist_position_sync_uses_total_kis_holding_quantity():
     populate_calls = []
     item = SimpleNamespace(
         symbol="MRVL",
-        environment="SIM",
+        environment="PROD",
         monitoring_status="BOUGHT",
         shares_held=23,
         avg_cost=270.0,
@@ -1905,7 +1903,7 @@ def test_buylist_position_sync_uses_total_kis_holding_quantity():
 
     changed = MainWindow.sync_buylist_positions_from_kis_snapshots(
         window,
-        {("SIM", "50194787-01"): snapshot},
+        {("PROD", "50194787-01"): snapshot},
     )
 
     assert changed == 1
@@ -1950,7 +1948,7 @@ def test_startup_unresolved_order_state_uses_app_state_save():
     populate_calls = []
     item = SimpleNamespace(
         symbol="AAPL",
-        environment="SIM",
+        environment="PROD",
         monitoring_status="BOUGHT",
         kis_order_id="",
     )
@@ -1958,7 +1956,7 @@ def test_startup_unresolved_order_state_uses_app_state_save():
     class Manager:
         def get(self, symbol, environment=None):
             assert symbol == "AAPL"
-            assert environment == "SIM"
+            assert environment == "PROD"
             return item
 
     order = _order(
@@ -1967,6 +1965,7 @@ def test_startup_unresolved_order_state_uses_app_state_save():
         intent=OrderIntent.STOP_LOSS,
         status=OrderStatus.ACCEPTED,
     )
+    order.environment = "PROD"
     order.broker_order_id = "KIS-STOP"
 
     window = MainWindow.__new__(MainWindow)

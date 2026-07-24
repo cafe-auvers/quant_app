@@ -142,7 +142,7 @@ def test_query_overseas_order_returns_unknown_not_found_without_credentials(monk
     monkeypatch.setattr(kis_order, "KisAccountClient", FakeClient)
 
     [snapshot] = kis_order.query_overseas_order(
-        environment="SIM",
+        environment="PROD",
         account_no="12345678-01",
         symbol="AAPL",
         broker_order_id="KIS-404",
@@ -259,7 +259,7 @@ def test_check_order_status_unknown_not_found_keeps_manual_verification_message(
     logs = []
     item = SimpleNamespace(
         symbol="AAPL",
-        environment="SIM",
+        environment="PROD",
         monitoring_status="UNKNOWN_SUBMISSION_STATE",
         status="UNKNOWN_SUBMISSION_STATE",
         kis_order_id="",
@@ -270,7 +270,11 @@ def test_check_order_status_unknown_not_found_keeps_manual_verification_message(
         def get(self, symbol, environment=None):
             return item
 
-    order = _order(status=OrderStatus.UNKNOWN_SUBMISSION_STATE, broker_order_id="")
+    order = _order(
+        environment="PROD",
+        status=OrderStatus.UNKNOWN_SUBMISSION_STATE,
+        broker_order_id="",
+    )
     order.raw_status_response = {"raw_response": {"not_found": True}}
     window = MainWindow.__new__(MainWindow)
     window.buylist_manager = Manager()

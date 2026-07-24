@@ -1,4 +1,5 @@
 """Main application window for the stock dashboard."""
+
 import datetime as dt
 import threading
 import time
@@ -22,6 +23,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QThread, QTimer
 from PyQt5.QtGui import QKeySequence
+
 try:
     from PyQt5.QtWebEngineWidgets import QWebEngineView
 except ImportError:
@@ -35,7 +37,10 @@ from src.utils.data_loader import get_default_universe
 from src.utils.db_loader import init_mysql_engine
 from src.utils.storage import load_json
 from src.services.historical_refresh_control import (
-    MODE_1D, MODE_1H, read_status, reconcile_stale_status,
+    MODE_1D,
+    MODE_1H,
+    read_status,
+    reconcile_stale_status,
 )
 from src.services.app_state import (
     SETTINGS_FILE,
@@ -97,11 +102,6 @@ __all__ = [
 ]
 
 
-
-
-
-
-
 REFERENCE_SYMBOL = "SPY"
 KST_ZONE = ZoneInfo("Asia/Seoul")
 US_MARKET_ZONE = ZoneInfo("America/New_York")
@@ -112,32 +112,6 @@ KIS_DAILY_CHART_FAILURE_COOLDOWN_SECONDS = 30 * 60
 WORKER_SHUTDOWN_TIMEOUT_MS = 30_000
 US_MARKET_OPEN_TIME = dt.time(9, 30)
 US_MARKET_CLOSE_TIME = dt.time(16, 0)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 class MainWindow(
@@ -279,7 +253,11 @@ class MainWindow(
 
     def _apply_unresolved_order_startup_state(self) -> None:
         """Reflect durable unresolved broker orders in the UI after startup."""
-        open_orders = find_open_orders(self.order_ledger)
+        open_orders = [
+            order
+            for order in find_open_orders(self.order_ledger)
+            if order.environment == "PROD"
+        ]
         if not open_orders:
             return
 
@@ -301,7 +279,10 @@ class MainWindow(
                 new_status = "UNKNOWN_SUBMISSION_STATE"
             elif order.side == OrderSide.BUY:
                 new_status = "BUY_SUBMITTED"
-            elif order.intent in {OrderIntent.PARTIAL_EXIT, OrderIntent.PARTIAL_TAKE_PROFIT}:
+            elif order.intent in {
+                OrderIntent.PARTIAL_EXIT,
+                OrderIntent.PARTIAL_TAKE_PROFIT,
+            }:
                 new_status = "PARTIAL_EXIT_SUBMITTED"
             else:
                 new_status = "SELL_SUBMITTED"
@@ -616,7 +597,16 @@ class MainWindow(
             self.state_save_manager = manager
         return manager
 
-    def _state_save_payload(self) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Any, Dict[str, Any], Dict[str, Any]]:
+    def _state_save_payload(
+        self,
+    ) -> tuple[
+        Dict[str, Any],
+        Dict[str, Any],
+        Dict[str, Any],
+        Any,
+        Dict[str, Any],
+        Dict[str, Any],
+    ]:
         values = self.__dict__
         watchlist = values.get("watchlist")
         buylist_manager = values.get("buylist_manager")
@@ -625,12 +615,26 @@ class MainWindow(
         chart_drawings = values.get("chart_drawings", {})
         tab_options = values.get("tab_options", {})
 
-        watchlist_dict = watchlist.to_dict() if watchlist is not None else {"name": "Default", "items": []}
-        buylist_dict = buylist_manager.to_dict() if buylist_manager is not None else {"items": []}
-        trade_manager_dict = trade_manager.to_dict() if trade_manager is not None else {"plans": []}
-        scanner_setups_copy = list(scanner_setups) if isinstance(scanner_setups, list) else scanner_setups
-        chart_drawings_copy = dict(chart_drawings) if isinstance(chart_drawings, dict) else chart_drawings
-        tab_options_copy = dict(tab_options) if isinstance(tab_options, dict) else tab_options
+        watchlist_dict = (
+            watchlist.to_dict()
+            if watchlist is not None
+            else {"name": "Default", "items": []}
+        )
+        buylist_dict = (
+            buylist_manager.to_dict() if buylist_manager is not None else {"items": []}
+        )
+        trade_manager_dict = (
+            trade_manager.to_dict() if trade_manager is not None else {"plans": []}
+        )
+        scanner_setups_copy = (
+            list(scanner_setups) if isinstance(scanner_setups, list) else scanner_setups
+        )
+        chart_drawings_copy = (
+            dict(chart_drawings) if isinstance(chart_drawings, dict) else chart_drawings
+        )
+        tab_options_copy = (
+            dict(tab_options) if isinstance(tab_options, dict) else tab_options
+        )
         return (
             watchlist_dict,
             buylist_dict,
@@ -698,29 +702,55 @@ class MainWindow(
                     continue
                 setup_data = {
                     "min_volume": float(values.get("min_volume", 40000.0)),
-                    "min_dollar_volume": float(values.get("min_dollar_volume", 35000.0)),
+                    "min_dollar_volume": float(
+                        values.get("min_dollar_volume", 35000.0)
+                    ),
                     "min_adr": float(values.get("min_adr", 2.4)),
                     "min_growth_rank": float(values.get("min_growth_rank", 97.04)),
-                    "min_trend_intensity": float(values.get("min_trend_intensity", 90.0)),
+                    "min_trend_intensity": float(
+                        values.get("min_trend_intensity", 90.0)
+                    ),
                 }
 
                 if "rules" in values and isinstance(values["rules"], list):
                     normalized_rules = []
                     for r in values["rules"]:
                         if isinstance(r, dict) and "attribute" in r:
-                            normalized_rules.append({
-                                "attribute": str(r.get("attribute")),
-                                "operator": str(r.get("operator", ">=")),
-                                "threshold": r.get("threshold", "")
-                            })
+                            normalized_rules.append(
+                                {
+                                    "attribute": str(r.get("attribute")),
+                                    "operator": str(r.get("operator", ">=")),
+                                    "threshold": r.get("threshold", ""),
+                                }
+                            )
                     setup_data["rules"] = normalized_rules
                 else:
                     setup_data["rules"] = [
-                        {"attribute": "volume", "operator": ">=", "threshold": setup_data["min_volume"]},
-                        {"attribute": "dollar_volume", "operator": ">=", "threshold": setup_data["min_dollar_volume"]},
-                        {"attribute": "adr_20", "operator": ">=", "threshold": setup_data["min_adr"]},
-                        {"attribute": "growth_rank_1m", "operator": ">=", "threshold": setup_data["min_growth_rank"]},
-                        {"attribute": "trend_intensity", "operator": ">=", "threshold": setup_data["min_trend_intensity"]},
+                        {
+                            "attribute": "volume",
+                            "operator": ">=",
+                            "threshold": setup_data["min_volume"],
+                        },
+                        {
+                            "attribute": "dollar_volume",
+                            "operator": ">=",
+                            "threshold": setup_data["min_dollar_volume"],
+                        },
+                        {
+                            "attribute": "adr_20",
+                            "operator": ">=",
+                            "threshold": setup_data["min_adr"],
+                        },
+                        {
+                            "attribute": "growth_rank_1m",
+                            "operator": ">=",
+                            "threshold": setup_data["min_growth_rank"],
+                        },
+                        {
+                            "attribute": "trend_intensity",
+                            "operator": ">=",
+                            "threshold": setup_data["min_trend_intensity"],
+                        },
                     ]
 
                 setups[setup_name] = setup_data
@@ -728,12 +758,16 @@ class MainWindow(
                 continue
 
         if not setups:
-            setups = {name: values.copy() for name, values in DEFAULT_SCANNER_SETUPS.items()}
+            setups = {
+                name: values.copy() for name, values in DEFAULT_SCANNER_SETUPS.items()
+            }
         return setups
 
     def _load_scanner_setups(self) -> dict:
         """Load persisted scanner setups."""
-        return self._normalize_scanner_setups(load_scanner_setups_state(DEFAULT_SCANNER_SETUPS))
+        return self._normalize_scanner_setups(
+            load_scanner_setups_state(DEFAULT_SCANNER_SETUPS)
+        )
 
     def _flush_state_saves_for_shutdown(self, timeout: float = 5.0) -> SaveResult:
         manager = self._state_save_manager()
@@ -741,13 +775,17 @@ class MainWindow(
         pending_timeout = min(3.0, timeout)
         pending_finished = manager.wait_for_pending_saves(timeout=pending_timeout)
         if not pending_finished:
-            self.append_log("Timed out waiting for pending local state save before shutdown.")
+            self.append_log(
+                "Timed out waiting for pending local state save before shutdown."
+            )
 
         remaining = max(0.0, deadline - time.monotonic())
         return self._save_state_now(timeout=remaining, supersede_pending=True)
 
     @staticmethod
-    def _stop_workers_for_shutdown(running_workers: List[QThread], timeout_ms: int = WORKER_SHUTDOWN_TIMEOUT_MS) -> bool:
+    def _stop_workers_for_shutdown(
+        running_workers: List[QThread], timeout_ms: int = WORKER_SHUTDOWN_TIMEOUT_MS
+    ) -> bool:
         deadline = time.monotonic() + max(0, timeout_ms) / 1000
         for worker in running_workers:
             worker.requestInterruption()
@@ -761,12 +799,19 @@ class MainWindow(
     def closeEvent(self, event) -> None:
         if self.live_data_timer is not None:
             self.live_data_timer.stop()
-        if hasattr(self, "market_status_timer") and self.market_status_timer is not None:
+        if (
+            hasattr(self, "market_status_timer")
+            and self.market_status_timer is not None
+        ):
             self.market_status_timer.stop()
-        if hasattr(self, "_refresh_poll_timer") and self._refresh_poll_timer is not None:
+        if (
+            hasattr(self, "_refresh_poll_timer")
+            and self._refresh_poll_timer is not None
+        ):
             self._refresh_poll_timer.stop()
         running_workers = [
-            worker for worker in [
+            worker
+            for worker in [
                 self.scanner_worker,
                 self.intraday_fetch_worker,
                 self.intraday_bulk_worker,
@@ -777,7 +822,9 @@ class MainWindow(
             ]
             if worker is not None and worker.isRunning()
         ]
-        if not self._stop_workers_for_shutdown(running_workers, timeout_ms=WORKER_SHUTDOWN_TIMEOUT_MS):
+        if not self._stop_workers_for_shutdown(
+            running_workers, timeout_ms=WORKER_SHUTDOWN_TIMEOUT_MS
+        ):
             QMessageBox.warning(
                 self,
                 "Background task running",
@@ -823,16 +870,24 @@ class MainWindow(
         self._build_charts_tab()
 
         self.tradingview_widget = QWidget()
-        self._add_configured_tab("tradingview", self.tradingview_widget, "TradingView Chart")
+        self._add_configured_tab(
+            "tradingview", self.tradingview_widget, "TradingView Chart"
+        )
         self._build_tradingview_tab()
 
         self.intraday_charts_widget = QWidget()
-        self._add_configured_tab("intraday_charts", self.intraday_charts_widget, "Intraday Charts")
+        self._add_configured_tab(
+            "intraday_charts", self.intraday_charts_widget, "Intraday Charts"
+        )
         self._build_intraday_charts_tab()
 
         # Wire env combo â†’ watchlist refresh (Trade Plan tab removed)
-        self.watchlist_env_combo.currentIndexChanged.connect(self.on_watchlist_env_changed)
-        self.watchlist_env_combo.currentIndexChanged.connect(self.populate_watchlist_table)
+        self.watchlist_env_combo.currentIndexChanged.connect(
+            self.on_watchlist_env_changed
+        )
+        self.watchlist_env_combo.currentIndexChanged.connect(
+            self.populate_watchlist_table
+        )
         # currentIndexChanged was emitted during addItems before the signal was connected,
         # so populate_trade_account_combo was never called. Trigger it once explicitly now.
         self.populate_trade_account_combo()
@@ -870,20 +925,24 @@ class MainWindow(
         corner_layout = QHBoxLayout()
         corner_layout.setContentsMargins(0, 0, 10, 0)
         corner_layout.setSpacing(6)
-        
+
         # Indicator circle (colored dot)
         self.market_status_dot = QLabel()
         self.market_status_dot.setFixedSize(10, 10)
-        self.market_status_dot.setStyleSheet("border-radius: 5px; background-color: #f23645;")  # Default red
-        
+        self.market_status_dot.setStyleSheet(
+            "border-radius: 5px; background-color: #f23645;"
+        )  # Default red
+
         # Text label
         self.market_status_label = QLabel("US Market: Calculating...")
-        self.market_status_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #131722;")
-        
+        self.market_status_label.setStyleSheet(
+            "font-size: 14px; font-weight: bold; color: #131722;"
+        )
+
         corner_layout.addWidget(self.market_status_dot)
         corner_layout.addWidget(self.market_status_label)
         self.market_status_widget.setLayout(corner_layout)
-        
+
         menubar.setCornerWidget(self.market_status_widget, Qt.TopRightCorner)
 
         # Set up a 1-second timer to update the countdown
@@ -931,7 +990,9 @@ class MainWindow(
             return
         timestamp = pd.Timestamp.now().strftime("%H:%M:%S")
         self.log_output.append(f"[{timestamp}] {message}")
-        self.log_output.verticalScrollBar().setValue(self.log_output.verticalScrollBar().maximum())
+        self.log_output.verticalScrollBar().setValue(
+            self.log_output.verticalScrollBar().maximum()
+        )
 
     def _log_intraday_provider_warning(self, symbol: str, warning: str) -> None:
         warning_text = str(warning or "").strip()
@@ -943,13 +1004,17 @@ class MainWindow(
                 return
             emitted_keys.add(warning_text)
             self._intraday_provider_warning_log_keys = emitted_keys
-            self.append_log("Intraday provider notice: KIS intraday disabled/unconfigured; using yfinance fallback.")
+            self.append_log(
+                "Intraday provider notice: KIS intraday disabled/unconfigured; using yfinance fallback."
+            )
             return
         self.append_log(f"Intraday provider warning for {symbol}: {warning_text}")
 
     def update_progress(self, percent: int, current: int, total: int, eta: str) -> None:
         self.progress_bar.setValue(percent)
-        self.progress_label.setText(f"Fetching {current}/{total} ({percent}%) - ETA {eta}")
+        self.progress_label.setText(
+            f"Fetching {current}/{total} ({percent}%) - ETA {eta}"
+        )
 
     def show_ready(self) -> None:
         self.progress_bar.setValue(0)
@@ -966,6 +1031,7 @@ class MainWindow(
     @staticmethod
     def _nyse_holidays(year: int) -> set:
         """Return the set of NYSE observed holiday dates for the given year."""
+
         def nearest_weekday(d: dt.date) -> dt.date:
             if d.weekday() == 5:  # Saturday → Friday
                 return d - dt.timedelta(days=1)
@@ -998,19 +1064,21 @@ class MainWindow(
             return last - dt.timedelta(days=delta)
 
         holidays = {
-            nearest_weekday(dt.date(year, 1, 1)),    # New Year's Day
-            nth_weekday(year, 1, 0, 3),              # MLK Day (3rd Monday Jan)
-            nth_weekday(year, 2, 0, 3),              # Presidents' Day (3rd Monday Feb)
-            easter(year) - dt.timedelta(days=2),     # Good Friday
-            last_weekday(year, 5, 0),                # Memorial Day (last Monday May)
-            nearest_weekday(dt.date(year, 6, 19)),   # Juneteenth
-            nearest_weekday(dt.date(year, 7, 4)),    # Independence Day
-            nth_weekday(year, 9, 0, 1),              # Labor Day (1st Monday Sep)
-            nth_weekday(year, 11, 3, 4),             # Thanksgiving (4th Thursday Nov)
+            nearest_weekday(dt.date(year, 1, 1)),  # New Year's Day
+            nth_weekday(year, 1, 0, 3),  # MLK Day (3rd Monday Jan)
+            nth_weekday(year, 2, 0, 3),  # Presidents' Day (3rd Monday Feb)
+            easter(year) - dt.timedelta(days=2),  # Good Friday
+            last_weekday(year, 5, 0),  # Memorial Day (last Monday May)
+            nearest_weekday(dt.date(year, 6, 19)),  # Juneteenth
+            nearest_weekday(dt.date(year, 7, 4)),  # Independence Day
+            nth_weekday(year, 9, 0, 1),  # Labor Day (1st Monday Sep)
+            nth_weekday(year, 11, 3, 4),  # Thanksgiving (4th Thursday Nov)
             nearest_weekday(dt.date(year, 12, 25)),  # Christmas
         }
         # New Year's Day observed in the following year when Jan 1 is Saturday
-        if dt.date(year, 12, 31).weekday() == 6:  # Dec 31 is Sunday → Jan 1 next year is Monday
+        if (
+            dt.date(year, 12, 31).weekday() == 6
+        ):  # Dec 31 is Sunday → Jan 1 next year is Monday
             holidays.add(dt.date(year, 12, 31))
         return holidays
 
@@ -1026,9 +1094,15 @@ class MainWindow(
         is_holiday = today in self._nyse_holidays(today.year)
         market_open = now_ny.replace(hour=9, minute=30, second=0, microsecond=0)
         market_close = now_ny.replace(hour=16, minute=0, second=0, microsecond=0)
-        is_open = weekday < 5 and not is_holiday and market_open <= now_ny < market_close
+        is_open = (
+            weekday < 5 and not is_holiday and market_open <= now_ny < market_close
+        )
         was_open = getattr(self, "_market_was_open", None)
-        if was_open and not is_open and hasattr(self, "_deactivate_pre_entry_orb_monitoring"):
+        if (
+            was_open
+            and not is_open
+            and hasattr(self, "_deactivate_pre_entry_orb_monitoring")
+        ):
             self._deactivate_pre_entry_orb_monitoring()
         self._market_was_open = is_open
 
@@ -1073,9 +1147,13 @@ class MainWindow(
         else:
             _set_dot_closed()
             if weekday == 4:
-                self.market_status_label.setText("<b>Market Status:</b> Closed (Weekend)")
+                self.market_status_label.setText(
+                    "<b>Market Status:</b> Closed (Weekend)"
+                )
             else:
-                self.market_status_label.setText("<b>Market Status:</b> Closed (After Hours)")
+                self.market_status_label.setText(
+                    "<b>Market Status:</b> Closed (After Hours)"
+                )
 
     def show_settings_placeholder(self) -> None:
         QMessageBox.information(self, "Settings", "Settings are not implemented yet.")
@@ -1090,7 +1168,7 @@ class MainWindow(
     def _apply_shortcuts(self) -> None:
         """Apply configured keyboard shortcuts from settings."""
         shortcuts = self.settings.get("shortcuts", {})
-        
+
         def parse_key(key_str: str):
             if key_str == "Up":
                 return QKeySequence(Qt.Key_Up)
@@ -1103,54 +1181,94 @@ class MainWindow(
             return QKeySequence(key_str)
 
         # 1. Intraday charts shortcuts
-        if hasattr(self, 'intraday_up_shortcut'):
-            self.intraday_up_shortcut.setKey(parse_key(shortcuts.get("prev_symbol", "Up")))
-        if hasattr(self, 'intraday_down_shortcut'):
-            self.intraday_down_shortcut.setKey(parse_key(shortcuts.get("next_symbol", "Down")))
-        if hasattr(self, 'intraday_target_shortcut'):
-            self.intraday_target_shortcut.setKey(parse_key(shortcuts.get("set_target", "T")))
-        if hasattr(self, 'intraday_draw_shortcut'):
-            self.intraday_draw_shortcut.setKey(parse_key(shortcuts.get("draw_line", "D")))
-        if hasattr(self, 'intraday_erase_shortcut'):
-            self.intraday_erase_shortcut.setKey(parse_key(shortcuts.get("erase_drawing", "E")))
-        if hasattr(self, 'intraday_full_view_shortcut'):
-            self.intraday_full_view_shortcut.setKey(parse_key(shortcuts.get("full_view", "F")))
+        if hasattr(self, "intraday_up_shortcut"):
+            self.intraday_up_shortcut.setKey(
+                parse_key(shortcuts.get("prev_symbol", "Up"))
+            )
+        if hasattr(self, "intraday_down_shortcut"):
+            self.intraday_down_shortcut.setKey(
+                parse_key(shortcuts.get("next_symbol", "Down"))
+            )
+        if hasattr(self, "intraday_target_shortcut"):
+            self.intraday_target_shortcut.setKey(
+                parse_key(shortcuts.get("set_target", "T"))
+            )
+        if hasattr(self, "intraday_draw_shortcut"):
+            self.intraday_draw_shortcut.setKey(
+                parse_key(shortcuts.get("draw_line", "D"))
+            )
+        if hasattr(self, "intraday_erase_shortcut"):
+            self.intraday_erase_shortcut.setKey(
+                parse_key(shortcuts.get("erase_drawing", "E"))
+            )
+        if hasattr(self, "intraday_full_view_shortcut"):
+            self.intraday_full_view_shortcut.setKey(
+                parse_key(shortcuts.get("full_view", "F"))
+            )
 
         # 2. Charts tab shortcuts
-        if hasattr(self, 'chart_target_shortcut'):
-            self.chart_target_shortcut.setKey(parse_key(shortcuts.get("set_target", "T")))
-        if hasattr(self, 'chart_draw_shortcut'):
+        if hasattr(self, "chart_target_shortcut"):
+            self.chart_target_shortcut.setKey(
+                parse_key(shortcuts.get("set_target", "T"))
+            )
+        if hasattr(self, "chart_draw_shortcut"):
             self.chart_draw_shortcut.setKey(parse_key(shortcuts.get("draw_line", "D")))
-        if hasattr(self, 'chart_erase_shortcut'):
-            self.chart_erase_shortcut.setKey(parse_key(shortcuts.get("erase_drawing", "E")))
-        if hasattr(self, 'chart_left_shortcut'):
-            self.chart_left_shortcut.setKey(parse_key(shortcuts.get("pan_left", "Left")))
-        if hasattr(self, 'chart_right_shortcut'):
-            self.chart_right_shortcut.setKey(parse_key(shortcuts.get("pan_right", "Right")))
-        if hasattr(self, 'chart_up_shortcut'):
+        if hasattr(self, "chart_erase_shortcut"):
+            self.chart_erase_shortcut.setKey(
+                parse_key(shortcuts.get("erase_drawing", "E"))
+            )
+        if hasattr(self, "chart_left_shortcut"):
+            self.chart_left_shortcut.setKey(
+                parse_key(shortcuts.get("pan_left", "Left"))
+            )
+        if hasattr(self, "chart_right_shortcut"):
+            self.chart_right_shortcut.setKey(
+                parse_key(shortcuts.get("pan_right", "Right"))
+            )
+        if hasattr(self, "chart_up_shortcut"):
             self.chart_up_shortcut.setKey(parse_key(shortcuts.get("prev_symbol", "Up")))
-        if hasattr(self, 'chart_down_shortcut'):
-            self.chart_down_shortcut.setKey(parse_key(shortcuts.get("next_symbol", "Down")))
-        if hasattr(self, 'chart_full_view_shortcut'):
-            self.chart_full_view_shortcut.setKey(parse_key(shortcuts.get("full_view", "F")))
+        if hasattr(self, "chart_down_shortcut"):
+            self.chart_down_shortcut.setKey(
+                parse_key(shortcuts.get("next_symbol", "Down"))
+            )
+        if hasattr(self, "chart_full_view_shortcut"):
+            self.chart_full_view_shortcut.setKey(
+                parse_key(shortcuts.get("full_view", "F"))
+            )
 
         # 3. TradingView widget shortcuts
-        if hasattr(self, 'tradingview_draw_shortcut'):
-            self.tradingview_draw_shortcut.setKey(parse_key(shortcuts.get("draw_line", "D")))
-        if hasattr(self, 'tradingview_target_shortcut'):
-            self.tradingview_target_shortcut.setKey(parse_key(shortcuts.get("set_target", "T")))
-        if hasattr(self, 'tradingview_up_shortcut'):
-            self.tradingview_up_shortcut.setKey(parse_key(shortcuts.get("prev_symbol", "Up")))
-        if hasattr(self, 'tradingview_down_shortcut'):
-            self.tradingview_down_shortcut.setKey(parse_key(shortcuts.get("next_symbol", "Down")))
-        if hasattr(self, 'tradingview_left_shortcut'):
-            self.tradingview_left_shortcut.setKey(parse_key(shortcuts.get("pan_left", "Left")))
-        if hasattr(self, 'tradingview_right_shortcut'):
-            self.tradingview_right_shortcut.setKey(parse_key(shortcuts.get("pan_right", "Right")))
-        if hasattr(self, 'tradingview_full_view_shortcut'):
-            self.tradingview_full_view_shortcut.setKey(parse_key(shortcuts.get("full_view", "F")))
-        if hasattr(self, 'tradingview_watchlist_shortcut'):
-            self.tradingview_watchlist_shortcut.setKey(parse_key(shortcuts.get("add_watchlist", "W")))
+        if hasattr(self, "tradingview_draw_shortcut"):
+            self.tradingview_draw_shortcut.setKey(
+                parse_key(shortcuts.get("draw_line", "D"))
+            )
+        if hasattr(self, "tradingview_target_shortcut"):
+            self.tradingview_target_shortcut.setKey(
+                parse_key(shortcuts.get("set_target", "T"))
+            )
+        if hasattr(self, "tradingview_up_shortcut"):
+            self.tradingview_up_shortcut.setKey(
+                parse_key(shortcuts.get("prev_symbol", "Up"))
+            )
+        if hasattr(self, "tradingview_down_shortcut"):
+            self.tradingview_down_shortcut.setKey(
+                parse_key(shortcuts.get("next_symbol", "Down"))
+            )
+        if hasattr(self, "tradingview_left_shortcut"):
+            self.tradingview_left_shortcut.setKey(
+                parse_key(shortcuts.get("pan_left", "Left"))
+            )
+        if hasattr(self, "tradingview_right_shortcut"):
+            self.tradingview_right_shortcut.setKey(
+                parse_key(shortcuts.get("pan_right", "Right"))
+            )
+        if hasattr(self, "tradingview_full_view_shortcut"):
+            self.tradingview_full_view_shortcut.setKey(
+                parse_key(shortcuts.get("full_view", "F"))
+            )
+        if hasattr(self, "tradingview_watchlist_shortcut"):
+            self.tradingview_watchlist_shortcut.setKey(
+                parse_key(shortcuts.get("add_watchlist", "W"))
+            )
 
         # 4. Update Button Labels
         t_key = shortcuts.get("set_target", "T")
@@ -1159,45 +1277,55 @@ class MainWindow(
         f_key = shortcuts.get("full_view", "F")
         w_key = shortcuts.get("add_watchlist", "W")
 
-        if hasattr(self, 'intraday_set_target_button'):
+        if hasattr(self, "intraday_set_target_button"):
             self.intraday_set_target_button.setText(f"Set Breakout Price ({t_key})")
-        if hasattr(self, 'intraday_draw_line_button'):
+        if hasattr(self, "intraday_draw_line_button"):
             self.intraday_draw_line_button.setText(f"Draw Line ({d_key})")
-        if hasattr(self, 'intraday_erase_line_button'):
+        if hasattr(self, "intraday_erase_line_button"):
             self.intraday_erase_line_button.setText(f"Erase Drawing ({e_key})")
-        if hasattr(self, 'intraday_full_view_button'):
+        if hasattr(self, "intraday_full_view_button"):
             self.intraday_full_view_button.setText(f"Full View ({f_key})")
-        if hasattr(self, 'intraday_queue_btn') and self.intraday_queue_btn.text().startswith("Queue"):
+        if hasattr(
+            self, "intraday_queue_btn"
+        ) and self.intraday_queue_btn.text().startswith("Queue"):
             self.intraday_queue_btn.setText("Queue for Buy (Q)")
-        if hasattr(self, 'intraday_activate_btn'):
+        if hasattr(self, "intraday_activate_btn"):
             cur = self.intraday_activate_btn.text()
-            self.intraday_activate_btn.setText("Deactivate (A)" if cur.startswith("Deactivate") else "Activate (A)")
+            self.intraday_activate_btn.setText(
+                "Deactivate (A)" if cur.startswith("Deactivate") else "Activate (A)"
+            )
 
-        if hasattr(self, 'chart_set_target_button'):
+        if hasattr(self, "chart_set_target_button"):
             self.chart_set_target_button.setText(f"Set Breakout Price ({t_key})")
-        if hasattr(self, 'chart_draw_line_button'):
+        if hasattr(self, "chart_draw_line_button"):
             self.chart_draw_line_button.setText(f"Draw Line ({d_key})")
-        if hasattr(self, 'chart_erase_line_button'):
+        if hasattr(self, "chart_erase_line_button"):
             self.chart_erase_line_button.setText(f"Erase Drawing ({e_key})")
-        if hasattr(self, 'chart_full_view_button'):
+        if hasattr(self, "chart_full_view_button"):
             self.chart_full_view_button.setText(f"Full View ({f_key})")
 
-        if hasattr(self, 'tradingview_set_target_button'):
+        if hasattr(self, "tradingview_set_target_button"):
             self.tradingview_set_target_button.setText(f"Set Breakout Price ({t_key})")
-        if hasattr(self, 'tradingview_line_tool_button'):
+        if hasattr(self, "tradingview_line_tool_button"):
             self.tradingview_line_tool_button.setText(f"Line Tool ({d_key})")
-        if hasattr(self, 'tradingview_full_view_button'):
+        if hasattr(self, "tradingview_full_view_button"):
             self.tradingview_full_view_button.setText(f"Full View ({f_key})")
-        if hasattr(self, 'tradingview_add_watchlist_button'):
+        if hasattr(self, "tradingview_add_watchlist_button"):
             cur_wl = self.tradingview_add_watchlist_button.text()
             self.tradingview_add_watchlist_button.setText(
-                f"Remove from Watchlist ({w_key})" if cur_wl.startswith("Remove") else f"Add to Watchlist ({w_key})"
+                f"Remove from Watchlist ({w_key})"
+                if cur_wl.startswith("Remove")
+                else f"Add to Watchlist ({w_key})"
             )
-        if hasattr(self, 'tradingview_queue_btn') and self.tradingview_queue_btn.text().startswith("Queue"):
+        if hasattr(
+            self, "tradingview_queue_btn"
+        ) and self.tradingview_queue_btn.text().startswith("Queue"):
             self.tradingview_queue_btn.setText("Queue for Buy (Q)")
-        if hasattr(self, 'tradingview_activate_btn'):
+        if hasattr(self, "tradingview_activate_btn"):
             cur = self.tradingview_activate_btn.text()
-            self.tradingview_activate_btn.setText("Deactivate (A)" if cur.startswith("Deactivate") else "Activate (A)")
+            self.tradingview_activate_btn.setText(
+                "Deactivate (A)" if cur.startswith("Deactivate") else "Activate (A)"
+            )
 
     def show_about(self) -> None:
         QMessageBox.information(
@@ -1210,7 +1338,11 @@ class MainWindow(
         """Persist watchlist and trade plans on demand."""
         self._save_state()
         self.append_log("Saved local watchlist, trade plans, and scanner setups.")
-        QMessageBox.information(self, "Saved", "Local watchlist, trade plans, and scanner setups have been saved.")
+        QMessageBox.information(
+            self,
+            "Saved",
+            "Local watchlist, trade plans, and scanner setups have been saved.",
+        )
 
     def _parse_float(self, value: QLineEdit, default: float) -> float:
         try:
@@ -1231,4 +1363,3 @@ class MainWindow(
             widget.setHtml(html_content)
         else:
             widget.setPlainText(text_content)
-

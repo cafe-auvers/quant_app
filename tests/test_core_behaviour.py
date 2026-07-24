@@ -1731,7 +1731,7 @@ def test_tradingview_activate_starts_buy_dashboard_monitor():
 
     class Item:
         symbol = "AAPL"
-        environment = "SIM"
+        environment = "PROD"
         monitoring_status = "WATCHING"
         status = "WATCHING"
         breakout_method = ""
@@ -1741,16 +1741,16 @@ def test_tradingview_activate_starts_buy_dashboard_monitor():
             self.items = [item]
 
         def get(self, symbol, environment=None):
-            if symbol == "AAPL" and environment == "SIM":
+            if symbol == "AAPL" and environment == "PROD":
                 return self.items[0]
             return None
 
     item = Item()
     window = MainWindow.__new__(MainWindow)
     window.tradingview_symbol_combo = Combo("AAPL")
-    window.watchlist_env_combo = Combo("SIM")
+    window.watchlist_env_combo = Combo("PROD")
     window.buylist_manager = Manager(item)
-    window._buylist_sim_monitor_active = False
+    window._buylist_prod_monitor_active = False
     window._clear_buylist_auto_order_block = lambda _item: None
     window._save_state = lambda: None
     window.populate_buylist_dashboard = lambda: None
@@ -1762,7 +1762,7 @@ def test_tradingview_activate_starts_buy_dashboard_monitor():
 
     def toggle_monitor(env):
         toggled.append(env)
-        window._buylist_sim_monitor_active = True
+        window._buylist_prod_monitor_active = True
 
     window._toggle_buylist_monitor = toggle_monitor
 
@@ -1770,8 +1770,8 @@ def test_tradingview_activate_starts_buy_dashboard_monitor():
 
     assert item.monitoring_status == "WATCHING"
     assert item.orb_monitor_enabled is True
-    assert window._buylist_sim_monitor_active is True
-    assert toggled == ["SIM"]
+    assert window._buylist_prod_monitor_active is True
+    assert toggled == ["PROD"]
 
 
 def test_chart_html_includes_bounded_pan_zoom_state():
@@ -1981,6 +1981,7 @@ def test_kis_account_profile_discovery_reads_multiple_configured_accounts(monkey
     monkeypatch.setenv("KIS_PROD_ACCOUNT_NO", "12345678-01")
     monkeypatch.setenv("KIS_PROD_ACCOUNTS", "87654321-01, bad-value, 1234567801")
     monkeypatch.setenv("KIS_PROD_ACCOUNT_NO_2", "11112222-03")
+    monkeypatch.setenv("KIS_SIM_ACCOUNT_NO", "99998888-01")
 
     profiles = kis_snapshot.discover_account_profiles()
     prod_profiles = [profile for profile in profiles if profile["environment"] == "PROD"]
@@ -1991,12 +1992,14 @@ def test_kis_account_profile_discovery_reads_multiple_configured_accounts(monkey
         "11112222-03",
     ]
     assert prod_profiles[0]["label"] == "PROD 12******-01"
+    assert all(profile["environment"] == "PROD" for profile in profiles)
+    assert list(KisEnvironment) == [KisEnvironment.PROD]
 
 
 def test_kis_snapshot_helpers_format_summary_and_holdings():
     snapshot = {
         "fetched_at": "2026-06-24T00:00:00+00:00",
-        "environment": "SIM",
+        "environment": "PROD",
         "account": "12******-01",
         "domestic": {
             "summary": {
@@ -2014,7 +2017,7 @@ def test_kis_snapshot_helpers_format_summary_and_holdings():
     summary = MainWindow._format_kis_snapshot_summary(snapshot)
     holdings = MainWindow._flatten_kis_holdings(snapshot)
 
-    assert "Profile: SIM" in summary
+    assert "Profile: PROD" in summary
     assert "cash 1,000,000 KRW" in summary
     assert "Overseas: 1 holdings loaded." in summary
     assert [item["symbol"] for item in holdings] == ["005930", "AAPL"]
