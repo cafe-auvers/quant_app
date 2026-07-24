@@ -46,7 +46,7 @@ from src.utils.db_loader import (
 )
 from src.utils.storage import load_json, save_json
 from src.api.kis_account_snapshot_dual import KisEnvironment, discover_account_profiles, load_config
-from src.api.kis_order import is_ambiguous_order_submission_error
+from src.api.kis_order import format_overseas_order_price, is_ambiguous_order_submission_error
 from src.services.app_state import (
     SCANNER_SETUPS_FILE, SETTINGS_FILE, load_buylist_state, load_chart_drawings_state,
     load_scanner_setups_state, load_tab_options_state, load_trade_plans_state,
@@ -82,7 +82,9 @@ MARKET_DATA_READY_TIME_KST = dt.time(7, 0)
 LIVE_INTRADAY_REFRESH_INTERVAL_MS = 5 * 60 * 1000
 TRADINGVIEW_REFRESH_INTERVAL_SECONDS = 5 * 60
 KIS_DAILY_CHART_FAILURE_COOLDOWN_SECONDS = 30 * 60
-STOP_LOSS_SELL_LIMIT_DISCOUNT_PCT = 0.01
+# Start no more than 0.5% below the observed trigger price. If it does not fill
+# and the market continues lower, the existing cancel/reprice path follows it.
+STOP_LOSS_SELL_LIMIT_DISCOUNT_PCT = 0.005
 STOP_LOSS_REPRICE_MIN_DROP_PCT = 0.002
 US_MARKET_OPEN_TIME = dt.time(9, 30)
 US_MARKET_CLOSE_TIME = dt.time(16, 0)
@@ -1516,7 +1518,8 @@ class BuylistMixin:
             price = 0.0
         if price <= 0:
             return 0.01
-        return max(0.01, round(price * (1.0 - STOP_LOSS_SELL_LIMIT_DISCOUNT_PCT), 2))
+        discounted = price * (1.0 - STOP_LOSS_SELL_LIMIT_DISCOUNT_PCT)
+        return max(0.0001, float(format_overseas_order_price(discounted)))
 
     def _maybe_reprice_stop_loss_sell(self, item, env: str, current_price: float) -> None:
         if getattr(item, "_stop_reprice_pending", False):

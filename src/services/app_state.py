@@ -113,12 +113,6 @@ class StateSaveManager:
                 self._generation += 1
 
         started_at = datetime.now(timezone.utc)
-        with self._status_lock:
-            self.last_save_status = "running"
-            self.last_save_error = ""
-            self.last_save_started_at = started_at
-            self.last_save_finished_at = None
-
         lock = save_lock or self._save_lock
         acquired = self._acquire_lock(lock, lock_timeout)
         if not acquired:
@@ -141,6 +135,12 @@ class StateSaveManager:
                     finished_at=datetime.now(timezone.utc),
                     error="Skipped superseded app-state save.",
                 )
+
+            with self._status_lock:
+                self.last_save_status = "running"
+                self.last_save_error = ""
+                self.last_save_started_at = started_at
+                self.last_save_finished_at = None
 
             files_written: list[str] = []
             try:

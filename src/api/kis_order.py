@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -86,7 +88,7 @@ _CLEAR_ORDER_ERROR_FRAGMENTS = (
 
 _ORDER_TR_IDS: Dict[tuple, str] = {
     ("SIM",  "buy"):  "VTTT1002U",  # v1_해외주식-001 모의투자 매수
-    ("SIM",  "sell"): "VTTT1006U",  # v1_해외주식-001 모의투자 매도
+    ("SIM",  "sell"): "VTTT1001U",  # v1_해외주식-001 모의투자 미국 매도
     ("PROD", "buy"):  "TTTT1002U",  # v1_해외주식-001 실전투자 매수
     ("PROD", "sell"): "TTTT1006U",  # v1_해외주식-001 실전투자 매도
 }
@@ -212,6 +214,16 @@ def _to_float(value: Any) -> float:
         return float(str(value or "0").replace(",", "").strip() or 0.0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def format_overseas_order_price(price: float) -> str:
+    """Format a U.S. limit without losing sub-dollar tick precision."""
+    if not math.isfinite(price) or price <= 0:
+        raise ValueError(f"price must be a positive finite number, got {price}")
+    value = Decimal(str(price))
+    tick = Decimal("0.0001") if value < Decimal("1") else Decimal("0.01")
+    quantized = value.quantize(tick, rounding=ROUND_DOWN)
+    return f"{quantized:.4f}" if tick == Decimal("0.0001") else f"{quantized:.2f}"
 
 
 def _normalize_side(value: Any) -> OrderSide:
@@ -636,6 +648,12 @@ def place_overseas_order(
     """
     if quantity <= 0:
         raise ValueError(f"quantity must be positive, got {quantity}")
+    if not str(symbol or "").strip():
+        raise ValueError("symbol is required")
+    if not math.isfinite(price) or price <= 0:
+        raise ValueError(f"price must be a positive finite number, got {price}")
+    if str(order_type or "").strip().lower() != "limit":
+        raise ValueError("KIS overseas U.S. orders support limit orders only")
 
     tr_id = _ORDER_TR_IDS.get((environment.upper(), side.lower()))
     if not tr_id:
@@ -649,7 +667,7 @@ def place_overseas_order(
     # KIS overseas (US) orders only support limit (ORD_DVSN=00).
     # "market" is not accepted — callers must pass an aggressive limit price instead.
     ord_dvsn = "00"
-    ovrs_ord_unpr = f"{price:.2f}"
+    ovrs_ord_unpr = format_overseas_order_price(price)
 
     body: Dict[str, str] = {
         "CANO": config.cano,

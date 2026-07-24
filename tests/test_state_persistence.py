@@ -129,6 +129,21 @@ def test_wait_for_pending_saves_waits_for_scheduled_save_completion(tmp_path, mo
     assert load_json(paths["WATCHLIST_FILE"], {})["items"][0]["symbol"] == "AAPL"
 
 
+def test_superseded_scheduled_save_does_not_leave_status_running(tmp_path, monkeypatch):
+    _patch_app_state_paths(monkeypatch, tmp_path)
+    manager = StateSaveManager()
+
+    with manager._pending_lock:
+        manager._generation = 2
+
+    result = manager.save_now(*_sample_payload(), _scheduled_generation=1)
+
+    assert result.success is True
+    assert result.error == "Skipped superseded app-state save."
+    assert manager.last_save_status == "idle"
+    assert manager.last_result is None
+
+
 def test_shutdown_flush_uses_bounded_wait_and_sync_save():
     class Obj:
         def __init__(self, data):

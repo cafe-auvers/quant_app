@@ -12,6 +12,7 @@ from src.core.order_state import (
 )
 from src.services.order_ledger import append_order, load_orders
 from src.services.order_reconciliation import (
+    _select_snapshot_for_order,
     cancel_and_reconcile_order,
     query_and_reconcile_unresolved_orders,
     reconcile_order_with_broker_snapshot,
@@ -43,6 +44,21 @@ def _order(
     )
     order.broker_order_id = broker_order_id
     return order
+
+
+def test_reconciliation_does_not_fall_back_when_known_broker_id_is_missing():
+    order = _order(broker_order_id="KIS-EXPECTED")
+    other = BrokerOrderStatusSnapshot(
+        environment="SIM",
+        account_no="12345678-01",
+        symbol="AAPL",
+        broker_order_id="KIS-OTHER",
+        side=OrderSide.BUY,
+        status=OrderStatus.FILLED,
+        filled_quantity=10,
+    )
+
+    assert _select_snapshot_for_order(order, [other]) is None
 
 
 def _snapshot(

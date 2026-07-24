@@ -201,6 +201,7 @@ def _select_snapshot_for_order(
         matches = [snapshot for snapshot in snapshots if snapshot.broker_order_id == order.broker_order_id]
         if matches:
             return max(matches, key=lambda snapshot: priority.get(snapshot.status, 0))
+        return None
     matches = [snapshot for snapshot in snapshots if snapshot.symbol == order.symbol and snapshot.side == order.side]
     if matches:
         return max(matches, key=lambda snapshot: priority.get(snapshot.status, 0))

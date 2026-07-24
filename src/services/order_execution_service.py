@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional
 
 from src.api import kis_order
 from src.core.order_state import BrokerOrder, OrderIntent, OrderSide, OrderStatus
-from src.services.order_ledger import ORDERS_FILE, append_order, has_open_order, upsert_order
+from src.services.order_ledger import ORDERS_FILE, reserve_order_if_no_matching_open, upsert_order
 
 logger = logging.getLogger(__name__)
 
@@ -22,28 +22,6 @@ class DuplicateOpenOrderError(RuntimeError):
             f"{order.symbol} in {order.environment} account {order.account_no}. "
             "Reconcile or cancel it before submitting another order."
         )
-
-
-def _find_matching_open_order(
-    *,
-    environment: str,
-    account_no: str,
-    symbol: str,
-    side: OrderSide,
-    intent: OrderIntent,
-    path: Path,
-) -> Optional[BrokerOrder]:
-    from src.services.order_ledger import find_open_orders
-
-    matches = find_open_orders(
-        environment=environment,
-        account_no=account_no,
-        symbol=symbol,
-        side=side,
-        intent=intent,
-        path=path,
-    )
-    return matches[0] if matches else None
 
 
 def _extract_broker_order_id(response: Dict[str, Any]) -> Optional[str]:
@@ -98,18 +76,6 @@ def submit_guarded_overseas_order(
     side = side if isinstance(side, OrderSide) else OrderSide(str(side).upper())
     intent = intent if isinstance(intent, OrderIntent) else OrderIntent(str(intent).upper())
 
-    if not allow_duplicate:
-        match = _find_matching_open_order(
-            environment=environment,
-            account_no=account_no,
-            symbol=symbol,
-            side=side,
-            intent=intent,
-            path=path,
-        )
-        if match is not None:
-            raise DuplicateOpenOrderError(match)
-
     order = BrokerOrder.create(
         environment=environment,
         account_no=account_no,
@@ -122,9 +88,18 @@ def submit_guarded_overseas_order(
         status=OrderStatus.CREATED,
         buylist_symbol_key=f"{environment}:{account_no}:{symbol}",
     )
-    append_order(order, path=path)
+    match = reserve_order_if_no_matching_open(
+        order,
+        allow_duplicate=allow_duplicate,
+        path=path,
+    )
+    if match is not None:
+        raise DuplicateOpenOrderError(match)
 
-    order.status = OrderStatus.SUBMITTING
+    # Once we are about to issue the non-idempotent broker request, a process
+    # crash or lost response must be treated as potentially submitted.  This
+    # blocks a retry until reconciliation checks the broker.
+    order.status = OrderStatus.UNKNOWN_SUBMISSION_STATE
     order.touch()
     upsert_order(order, path=path)
 

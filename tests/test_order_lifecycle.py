@@ -1,12 +1,18 @@
 import json
 import datetime as dt
+import threading
 from types import SimpleNamespace
 
 import pytest
 import requests
 
 from src.api import kis_order
-from src.api.kis_account_snapshot_dual import KisAccountClient, KisEnvironment, KisTokenError
+from src.api.kis_account_snapshot_dual import (
+    KisAccountClient,
+    KisEnvironment,
+    KisRateLimitError,
+    KisTokenError,
+)
 from src.core.order_state import (
     BrokerOrder,
     OrderIntent,
@@ -181,18 +187,18 @@ def test_has_open_order_respects_open_closed_account_and_environment(tmp_path):
 def test_submit_guarded_order_persists_created_before_api_and_accepted_after(monkeypatch, tmp_path):
     path = tmp_path / "orders.json"
     captured_statuses = []
-    real_append = order_execution_service.append_order
+    real_reserve = order_execution_service.reserve_order_if_no_matching_open
 
-    def capture_append(order, path=path):
+    def capture_reserve(order, *, allow_duplicate=False, path=path):
         captured_statuses.append(order.status)
-        return real_append(order, path=path)
+        return real_reserve(order, allow_duplicate=allow_duplicate, path=path)
 
     def fake_place_overseas_order(**kwargs):
         persisted = load_orders(path=path)
-        assert persisted[0].status == OrderStatus.SUBMITTING
+        assert persisted[0].status == OrderStatus.UNKNOWN_SUBMISSION_STATE
         return {"rt_cd": "0", "output": {"ODNO": "KIS-123"}}
 
-    monkeypatch.setattr(order_execution_service, "append_order", capture_append)
+    monkeypatch.setattr(order_execution_service, "reserve_order_if_no_matching_open", capture_reserve)
     monkeypatch.setattr(kis_order, "place_overseas_order", fake_place_overseas_order)
 
     order = submit_guarded_overseas_order(
@@ -279,6 +285,48 @@ def test_same_symbol_account_with_closed_previous_order_does_not_block(monkeypat
 
     assert order.status == OrderStatus.ACCEPTED
     assert order.status != OrderStatus.FILLED
+
+
+def test_concurrent_guarded_submissions_reserve_only_one_order(monkeypatch, tmp_path):
+    path = tmp_path / "orders.json"
+    start = threading.Barrier(2)
+    submitted = []
+    results = []
+
+    def fake_place_overseas_order(**kwargs):
+        submitted.append(kwargs)
+        return {"rt_cd": "0", "output": {"ODNO": "KIS-ONE"}}
+
+    monkeypatch.setattr(kis_order, "place_overseas_order", fake_place_overseas_order)
+
+    def submit():
+        start.wait()
+        try:
+            results.append(
+                submit_guarded_overseas_order(
+                    environment="PROD",
+                    account_no="12345678-01",
+                    symbol="AAPL",
+                    side=OrderSide.BUY,
+                    intent=OrderIntent.ENTRY,
+                    quantity=1,
+                    limit_price=100.0,
+                    path=path,
+                )
+            )
+        except DuplicateOpenOrderError as exc:
+            results.append(exc)
+
+    threads = [threading.Thread(target=submit), threading.Thread(target=submit)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(submitted) == 1
+    assert len(load_orders(path)) == 1
+    assert sum(isinstance(result, DuplicateOpenOrderError) for result in results) == 1
 
 
 @pytest.mark.parametrize(
@@ -398,6 +446,19 @@ def test_kis_parse_response_treats_http_token_error_as_token_error():
         KisAccountClient._parse_response(response, endpoint="/order")
 
 
+def test_kis_parse_response_classifies_token_issuance_throttle():
+    response = _FakeKisResponse(
+        403,
+        {
+            "error_code": "EGW00133",
+            "error_description": "access-token issuance is limited to once per minute",
+        },
+    )
+
+    with pytest.raises(KisRateLimitError, match="EGW00133"):
+        KisAccountClient._parse_response(response, endpoint="/oauth2/tokenP", check_rt_cd=False)
+
+
 def test_place_overseas_order_refreshes_expired_token_once(monkeypatch):
     auth_calls = []
     posts = []
@@ -475,6 +536,50 @@ def test_place_overseas_order_refreshes_expired_token_once(monkeypatch):
     assert len(posts) == 2
     assert posts[0]["headers"]["authorization"] == "Bearer cached-token"
     assert posts[1]["headers"]["authorization"] == "Bearer fresh-token"
+    assert posts[0]["headers"]["tr_id"] == "VTTT1001U"
+
+
+@pytest.mark.parametrize(
+    ("price", "expected"),
+    [
+        (191.239, "191.23"),
+        (0.897688, "0.8976"),
+        (0.9, "0.9000"),
+    ],
+)
+def test_overseas_order_price_preserves_valid_tick_precision(price, expected):
+    assert kis_order.format_overseas_order_price(price) == expected
+
+
+@pytest.mark.parametrize(
+    ("price", "order_type", "error"),
+    [
+        (float("nan"), "limit", "positive finite"),
+        (191.23, "market", "limit orders only"),
+    ],
+)
+def test_place_overseas_order_rejects_invalid_order_contract_before_auth(
+    monkeypatch,
+    price,
+    order_type,
+    error,
+):
+    monkeypatch.setattr(
+        kis_order,
+        "load_config",
+        lambda *args, **kwargs: pytest.fail("invalid order reached KIS authentication"),
+    )
+
+    with pytest.raises(ValueError, match=error):
+        kis_order.place_overseas_order(
+            environment=KisEnvironment.SIM.value,
+            account_no="12345678-01",
+            symbol="AAPL",
+            quantity=1,
+            price=price,
+            side="sell",
+            order_type=order_type,
+        )
 
 
 def test_submit_overseas_order_records_acceptance_not_fill(monkeypatch):
@@ -920,7 +1025,11 @@ def test_monitor_submits_stop_loss_with_aggressive_limit():
     assert len(submitted) == 1
     assert submitted[0][0] == (item, 10)
     assert submitted[0][1]["reason"] == "stop-loss"
-    assert submitted[0][1]["order_price"] == pytest.approx(48.51)
+    assert submitted[0][1]["order_price"] == pytest.approx(48.75)
+
+
+def test_stop_loss_limit_preserves_sub_dollar_precision():
+    assert MainWindow._stop_loss_sell_limit_price(0.8799) == pytest.approx(0.8755)
 
 
 def test_monitor_creates_partial_exit_review_alert_without_auto_sell():

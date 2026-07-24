@@ -92,7 +92,11 @@ OVERSEAS_BALANCE_TR_ID = {
 
 DEFAULT_OVERSEAS_EXCHANGES = ("NASD", "NYSE", "AMEX")
 DEFAULT_TIMEOUT = 15
-RATE_LIMIT_MSG_CD = "EGW00201"
+RATE_LIMIT_MSG_CODES = {
+    "EGW00133",  # access-token issuance is limited to once per minute
+    "EGW00201",  # API transaction rate limit
+    "EGW00215",  # API transaction rate limit variant
+}
 MAX_RATE_LIMIT_RETRIES = 3
 RATE_LIMIT_BACKOFF_SECONDS = (1.0, 2.0, 4.0)
 
@@ -457,9 +461,9 @@ class KisAccountClient:
                 f"HTTP {response.status_code}: {response.text[:300]}"
             ) from exc
 
-        msg_cd = str(data.get("msg_cd", ""))
-        msg1 = str(data.get("msg1", ""))
-        if msg_cd in (RATE_LIMIT_MSG_CD, "EGW00215"):
+        msg_cd = str(data.get("msg_cd") or data.get("error_code") or "")
+        msg1 = str(data.get("msg1") or data.get("error_description") or "")
+        if msg_cd in RATE_LIMIT_MSG_CODES:
             raise KisRateLimitError(f"KIS rate limit exceeded ({msg_cd}): {msg1}")
         if "token" in msg1.lower():
             raise KisTokenError(f"KIS token rejected by {endpoint}: {msg_cd} {msg1}. Raw={data}")

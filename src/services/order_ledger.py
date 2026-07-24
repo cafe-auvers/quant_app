@@ -1,14 +1,54 @@
 """Persistent local order ledger for submitted broker orders."""
 from __future__ import annotations
 
+import os
+import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable, List, Optional
+from typing import Any, Iterable, Iterator, List, Optional
 
 from src.core.order_state import BrokerOrder, OrderIntent, OrderSide, OrderStatus, is_open_status
 from src.utils.storage import load_json, save_json
 
 
 ORDERS_FILE = Path("data/orders.json")
+_LOCK_TIMEOUT_SECONDS = 5.0
+_STALE_LOCK_SECONDS = 30.0
+
+
+@contextmanager
+def _exclusive_ledger_lock(path: Path) -> Iterator[None]:
+    """Serialize short ledger transactions across threads and processes."""
+    lock_path = Path(path).with_suffix(Path(path).suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+    descriptor: Optional[int] = None
+    while descriptor is None:
+        try:
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(descriptor, f"{os.getpid()} {time.time()}".encode("ascii"))
+        except FileExistsError:
+            try:
+                stale = time.time() - lock_path.stat().st_mtime > _STALE_LOCK_SECONDS
+            except OSError:
+                stale = False
+            if stale:
+                try:
+                    lock_path.unlink()
+                except OSError:
+                    pass
+                continue
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Timed out waiting for order-ledger lock: {lock_path}")
+            time.sleep(0.05)
+    try:
+        yield
+    finally:
+        os.close(descriptor)
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
 
 
 def load_orders(path: Path = ORDERS_FILE) -> List[BrokerOrder]:
@@ -49,6 +89,32 @@ def append_order(order: BrokerOrder, path: Path = ORDERS_FILE) -> BrokerOrder:
     orders.append(order)
     save_orders(orders, path)
     return order
+
+
+def reserve_order_if_no_matching_open(
+    order: BrokerOrder,
+    *,
+    allow_duplicate: bool = False,
+    path: Path = ORDERS_FILE,
+) -> Optional[BrokerOrder]:
+    """Atomically check for a matching open order and reserve a new intent."""
+    with _exclusive_ledger_lock(path):
+        orders = load_orders(path)
+        if not allow_duplicate:
+            for existing in orders:
+                if (
+                    is_open_status(existing.status)
+                    and existing.environment == order.environment
+                    and str(existing.account_no or "") == str(order.account_no or "")
+                    and existing.symbol == order.symbol
+                    and existing.side == order.side
+                    and existing.intent == order.intent
+                ):
+                    return existing
+        if not any(existing.client_order_id == order.client_order_id for existing in orders):
+            orders.append(order)
+            save_orders(orders, path)
+        return None
 
 
 def upsert_order(order: BrokerOrder, path: Path = ORDERS_FILE) -> BrokerOrder:
