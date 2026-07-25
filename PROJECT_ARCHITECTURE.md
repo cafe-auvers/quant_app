@@ -237,7 +237,7 @@ The ORB engine in `src/core/orb.py` remains source-agnostic. It consumes normali
 | `src/api/kis_account_snapshot_dual.py` | PROD config, token handling, domestic/overseas snapshots, account profile discovery |
 | `src/api/kis_fetch_all_daily.py` | KIS daily price fetches and domestic master parsing |
 | `src/api/kis_intraday.py` | Configuration-gated KIS intraday adapter and raw-row normalization |
-| `src/api/kis_order.py` | Overseas order submission wrapper that returns broker acceptance/rejection state |
+| `src/api/kis_order.py` | Overseas regular-order and broker-held reservation submission/query/cancel wrappers |
 | `src/api/kis_order_status.py` | Explicit placeholders for direct order status/cancel endpoints until verified TR IDs are implemented |
 | `src/api/kis_config.py` | Compatibility loader for legacy PROD env variable access |
 
@@ -296,6 +296,10 @@ Buy/Sell UI action or EXECUTE_READY execution queue submit action
 Important safety rules:
 
 - Execution queue submit actions are gated to `EXECUTE_READY` queue rows before KIS order submission starts.
+- Manual PROD partial/full exits outside the U.S. regular session use KIS's
+  reserved U.S. sell endpoint with market-on-open execution. The selected
+  quantity and `RESERVED_MOO` policy are persisted before the broker call, so
+  accepted reservations survive desktop-app shutdown.
 - A successful KIS API order response means broker acceptance only. It does not mean filled.
 - Buylist positions are not marked `BOUGHT`, `SOLD`, or partially exited from submission responses.
 - Open-order duplicate checks prevent repeated submission for the same environment, account, symbol, side, and intent.

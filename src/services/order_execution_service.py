@@ -6,7 +6,14 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from src.api import kis_order
-from src.core.order_state import BrokerOrder, OrderIntent, OrderSide, OrderStatus
+from src.core.order_state import (
+    REGULAR_LIMIT_EXECUTION,
+    RESERVED_MOO_EXECUTION,
+    BrokerOrder,
+    OrderIntent,
+    OrderSide,
+    OrderStatus,
+)
 from src.services.order_ledger import ORDERS_FILE, reserve_order_if_no_matching_open, upsert_order
 
 logger = logging.getLogger(__name__)
@@ -25,7 +32,14 @@ class DuplicateOpenOrderError(RuntimeError):
 
 
 def _extract_broker_order_id(response: Dict[str, Any]) -> Optional[str]:
-    candidates = ("ODNO", "odno", "order_no", "ORD_NO")
+    candidates = (
+        "OVRS_RSVN_ODNO",
+        "ovrs_rsvn_odno",
+        "ODNO",
+        "odno",
+        "order_no",
+        "ORD_NO",
+    )
 
     def walk(value: Any) -> Optional[str]:
         if isinstance(value, dict):
@@ -56,6 +70,7 @@ def submit_guarded_overseas_order(
     quantity: int,
     limit_price: float,
     exchange: str = "NASD",
+    execution_policy: str = REGULAR_LIMIT_EXECUTION,
     allow_duplicate: bool = False,
     path: Path = ORDERS_FILE,
 ) -> BrokerOrder:
@@ -67,14 +82,26 @@ def submit_guarded_overseas_order(
     """
     if quantity <= 0:
         raise ValueError(f"quantity must be positive, got {quantity}")
-    if limit_price <= 0:
-        raise ValueError(f"limit_price must be positive, got {limit_price}")
 
     environment = str(environment or "").upper()
     account_no = str(account_no or "")
     symbol = str(symbol or "").upper()
     side = side if isinstance(side, OrderSide) else OrderSide(str(side).upper())
     intent = intent if isinstance(intent, OrderIntent) else OrderIntent(str(intent).upper())
+    execution_policy = str(
+        execution_policy or REGULAR_LIMIT_EXECUTION
+    ).strip().upper()
+    if execution_policy not in {
+        REGULAR_LIMIT_EXECUTION,
+        RESERVED_MOO_EXECUTION,
+    }:
+        raise ValueError(f"Unsupported execution_policy={execution_policy!r}")
+    if execution_policy == RESERVED_MOO_EXECUTION:
+        if environment != "PROD" or side != OrderSide.SELL:
+            raise ValueError("Reserved MOO execution requires a PROD sell order")
+        limit_price = 0.0
+    elif limit_price <= 0:
+        raise ValueError(f"limit_price must be positive, got {limit_price}")
 
     order = BrokerOrder.create(
         environment=environment,
@@ -86,6 +113,7 @@ def submit_guarded_overseas_order(
         limit_price=limit_price,
         exchange=exchange,
         status=OrderStatus.CREATED,
+        execution_policy=execution_policy,
         buylist_symbol_key=f"{environment}:{account_no}:{symbol}",
     )
     match = reserve_order_if_no_matching_open(
@@ -104,16 +132,25 @@ def submit_guarded_overseas_order(
     upsert_order(order, path=path)
 
     try:
-        response = kis_order.place_overseas_order(
-            environment=environment,
-            account_no=account_no,
-            symbol=symbol,
-            quantity=quantity,
-            price=limit_price,
-            side=side.value.lower(),
-            exchange=exchange,
-            order_type="limit",
-        )
+        if execution_policy == RESERVED_MOO_EXECUTION:
+            response = kis_order.place_overseas_reserved_market_on_open_sell(
+                environment=environment,
+                account_no=account_no,
+                symbol=symbol,
+                quantity=quantity,
+                exchange=exchange,
+            )
+        else:
+            response = kis_order.place_overseas_order(
+                environment=environment,
+                account_no=account_no,
+                symbol=symbol,
+                quantity=quantity,
+                price=limit_price,
+                side=side.value.lower(),
+                exchange=exchange,
+                order_type="limit",
+            )
     except Exception as exc:
         if kis_order.is_ambiguous_order_submission_error(exc):
             order.status = OrderStatus.UNKNOWN_SUBMISSION_STATE

@@ -82,6 +82,10 @@ Only enable KIS intraday after the endpoint, TR ID, request parameters, output f
 - Keep `.env`, token caches, and local account state out of source control.
 - Keep the live monitor off until the production account snapshot, order review, and reconciliation paths are verified.
 - Treat successful KIS order submission as broker acceptance only.
+- Manual PROD partial/full sells placed outside the U.S. regular session use a
+  broker-held KIS market-on-open reservation. This prioritizes exit execution
+  over price protection and still depends on KIS accepting and forwarding the
+  reservation.
 - Use `data/orders.json` as the durable local order ledger for idempotency and restart protection.
 - Keep `data/legacy_non_prod_*.json`; these files preserve filtered paper-trading state without making it actionable.
 - Keep local JSON `.bak` files and `data/state_metadata.json` with the rest of local runtime state.

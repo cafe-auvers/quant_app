@@ -12,7 +12,13 @@ import pandas as pd
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from src.api.kis_account_snapshot_dual import fetch_account_snapshot
-from src.core.order_state import BrokerOrder, OrderIntent, OrderSide
+from src.core.order_state import (
+    REGULAR_LIMIT_EXECUTION,
+    RESERVED_MOO_EXECUTION,
+    BrokerOrder,
+    OrderIntent,
+    OrderSide,
+)
 from src.core.orb import calculate_orb_range
 from src.core.scoring import calculate_deterministic_scores, run_ai_review
 from src.services.intraday_data_service import (
@@ -54,6 +60,27 @@ class KisAccountWorker(QThread):
 
     def run(self) -> None:
         try:
+            orders_to_reconcile = self.open_orders
+            if any(
+                order.execution_policy == RESERVED_MOO_EXECUTION
+                for order in self.open_orders
+            ):
+                from src.services.order_reconciliation import (
+                    query_and_reconcile_unresolved_orders,
+                )
+
+                direct_updates = query_and_reconcile_unresolved_orders(
+                    environment=self.environment,
+                    account_no=self.account_no,
+                    execution_policy=RESERVED_MOO_EXECUTION,
+                )
+                direct_by_id = {
+                    order.client_order_id: order for order in direct_updates
+                }
+                orders_to_reconcile = [
+                    direct_by_id.get(order.client_order_id, order)
+                    for order in self.open_orders
+                ]
             snapshot = fetch_account_snapshot(
                 self.environment,
                 include_domestic=self.include_domestic,
@@ -187,6 +214,7 @@ class KisOrderWorker(QThread):
         account_no: Optional[str] = None,
         intent: OrderIntent | str = OrderIntent.UNKNOWN,
         buylist_symbol_key: str = "",
+        execution_policy: str = REGULAR_LIMIT_EXECUTION,
     ) -> None:
         super().__init__()
         self.environment = environment
@@ -199,6 +227,7 @@ class KisOrderWorker(QThread):
         self.account_no = account_no
         self.intent = intent
         self.buylist_symbol_key = buylist_symbol_key
+        self.execution_policy = execution_policy
 
     def run(self) -> None:
         try:
@@ -219,6 +248,7 @@ class KisOrderWorker(QThread):
                 quantity=self.quantity,
                 limit_price=self.price,
                 exchange=self.exchange,
+                execution_policy=self.execution_policy,
             )
             self.finished_order.emit(order)
         except Exception as exc:
@@ -251,7 +281,7 @@ class OrderReconciliationWorker(QThread):
                 account_no=self.account_no,
             )
             updated_orders = reconcile_orders_with_snapshot(
-                self.open_orders,
+                orders_to_reconcile,
                 snapshot,
                 previous_snapshot=self.previous_snapshot,
             )

@@ -37,6 +37,10 @@ class OrderStatus(str, Enum):
     UNKNOWN = "UNKNOWN"
 
 
+REGULAR_LIMIT_EXECUTION = "REGULAR_LIMIT"
+RESERVED_MOO_EXECUTION = "RESERVED_MOO"
+
+
 OPEN_ORDER_STATUSES = {
     OrderStatus.CREATED,
     OrderStatus.SUBMITTING,
@@ -201,6 +205,7 @@ class BrokerOrder:
     limit_price: float
     exchange: str
     status: OrderStatus
+    execution_policy: str = REGULAR_LIMIT_EXECUTION
     broker_order_id: str = ""
     submitted_at: str = field(default_factory=utc_now_iso)
     updated_at: str = field(default_factory=utc_now_iso)
@@ -221,6 +226,9 @@ class BrokerOrder:
         self.side = _enum_value(self.side, OrderSide, OrderSide.BUY)
         self.intent = _enum_value(self.intent, OrderIntent, OrderIntent.UNKNOWN)
         self.status = _enum_value(self.status, OrderStatus, OrderStatus.UNKNOWN)
+        self.execution_policy = (
+            str(self.execution_policy or REGULAR_LIMIT_EXECUTION).strip().upper()
+        )
         self.quantity_requested = int(self.quantity_requested or 0)
         self.limit_price = float(self.limit_price or 0.0)
         self.exchange = str(self.exchange or "").upper()
@@ -247,6 +255,7 @@ class BrokerOrder:
         limit_price: float,
         exchange: str = "NASD",
         status: OrderStatus | str = OrderStatus.CREATED,
+        execution_policy: str = REGULAR_LIMIT_EXECUTION,
         buylist_symbol_key: str = "",
     ) -> "BrokerOrder":
         return cls(
@@ -266,6 +275,7 @@ class BrokerOrder:
             limit_price=limit_price,
             exchange=exchange,
             status=_enum_value(status, OrderStatus, OrderStatus.CREATED),
+            execution_policy=execution_policy,
             remaining_quantity=int(quantity_requested or 0),
             buylist_key=buylist_symbol_key or f"{str(environment or '').upper()}:{account_no or ''}:{str(symbol).upper()}",
             buylist_symbol_key=buylist_symbol_key or f"{str(environment or '').upper()}:{account_no or ''}:{str(symbol).upper()}",
@@ -293,6 +303,7 @@ class BrokerOrder:
             "limit_price": self.limit_price,
             "exchange": self.exchange,
             "status": self.status.value,
+            "execution_policy": self.execution_policy,
             "broker_order_id": self.broker_order_id,
             "submitted_at": self.submitted_at,
             "updated_at": self.updated_at,
@@ -320,6 +331,9 @@ class BrokerOrder:
             limit_price=float(data.get("limit_price", 0.0) or 0.0),
             exchange=str(data.get("exchange", "")),
             status=_enum_value(data.get("status"), OrderStatus, OrderStatus.UNKNOWN),
+            execution_policy=str(
+                data.get("execution_policy") or REGULAR_LIMIT_EXECUTION
+            ),
             broker_order_id=str(data.get("broker_order_id", "")),
             submitted_at=str(data.get("submitted_at") or utc_now_iso()),
             updated_at=str(data.get("updated_at") or utc_now_iso()),

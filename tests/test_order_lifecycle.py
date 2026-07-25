@@ -14,6 +14,8 @@ from src.api.kis_account_snapshot_dual import (
     KisTokenError,
 )
 from src.core.order_state import (
+    REGULAR_LIMIT_EXECUTION,
+    RESERVED_MOO_EXECUTION,
     BrokerOrder,
     OrderIntent,
     OrderSide,
@@ -539,6 +541,140 @@ def test_place_overseas_order_refreshes_expired_token_once(monkeypatch):
     assert posts[0]["headers"]["tr_id"] == "TTTT1006U"
 
 
+def test_reserved_moo_sell_uses_kis_broker_reservation_contract(monkeypatch):
+    posts = []
+
+    class FakeSession:
+        def post(self, url, headers, json, timeout):
+            posts.append(
+                {
+                    "url": url,
+                    "headers": headers,
+                    "json": json,
+                    "timeout": timeout,
+                }
+            )
+            return _FakeKisResponse(
+                200,
+                {
+                    "rt_cd": "0",
+                    "output": {"OVRS_RSVN_ODNO": "RSV-123"},
+                },
+            )
+
+    class FakeClient:
+        def __init__(self):
+            self.session = FakeSession()
+
+        def authenticate(self, force_refresh=False):
+            return "token"
+
+        def _headers(self, tr_id, tr_cont=""):
+            return {"tr_id": tr_id}
+
+        def _parse_response(self, response, endpoint, check_rt_cd=True):
+            return response.json()
+
+    fake_config = SimpleNamespace(
+        base_url="https://kis.example",
+        cano="12345678",
+        account_product_code="01",
+    )
+    monkeypatch.setattr(kis_order, "load_config", lambda *args, **kwargs: fake_config)
+    monkeypatch.setattr(kis_order, "KisAccountClient", lambda _config: FakeClient())
+
+    result = kis_order.place_overseas_reserved_market_on_open_sell(
+        environment="PROD",
+        account_no="12345678-01",
+        symbol="AAPL",
+        quantity=4,
+        exchange="NASD",
+    )
+
+    assert result["output"]["OVRS_RSVN_ODNO"] == "RSV-123"
+    assert len(posts) == 1
+    assert posts[0]["url"].endswith("/uapi/overseas-stock/v1/trading/order-resv")
+    assert posts[0]["headers"]["tr_id"] == "TTTT3016U"
+    assert posts[0]["json"] == {
+        "CANO": "12345678",
+        "ACNT_PRDT_CD": "01",
+        "PDNO": "AAPL",
+        "OVRS_EXCG_CD": "NASD",
+        "FT_ORD_QTY": "4",
+        "FT_ORD_UNPR3": "0",
+        "ORD_SVR_DVSN_CD": "0",
+        "ORD_DVSN": "31",
+    }
+
+
+def test_guarded_reserved_moo_sell_is_durable_and_does_not_call_regular_order(
+    monkeypatch, tmp_path
+):
+    path = tmp_path / "orders.json"
+    submitted = []
+    monkeypatch.setattr(
+        kis_order,
+        "place_overseas_order",
+        lambda **kwargs: pytest.fail("reserved sell used the regular order endpoint"),
+    )
+    monkeypatch.setattr(
+        kis_order,
+        "place_overseas_reserved_market_on_open_sell",
+        lambda **kwargs: submitted.append(kwargs)
+        or {"rt_cd": "0", "output": {"OVRS_RSVN_ODNO": "RSV-123"}},
+    )
+
+    order = submit_guarded_overseas_order(
+        environment="PROD",
+        account_no="12345678-01",
+        symbol="AAPL",
+        side=OrderSide.SELL,
+        intent=OrderIntent.PARTIAL_EXIT,
+        quantity=4,
+        limit_price=191.23,
+        execution_policy=RESERVED_MOO_EXECUTION,
+        path=path,
+    )
+
+    assert order.status == OrderStatus.ACCEPTED
+    assert order.execution_policy == RESERVED_MOO_EXECUTION
+    assert order.limit_price == 0.0
+    assert order.broker_order_id == "RSV-123"
+    assert submitted[0]["quantity"] == 4
+    [persisted] = load_orders(path=path)
+    assert persisted.execution_policy == RESERVED_MOO_EXECUTION
+    assert persisted.status == OrderStatus.ACCEPTED
+
+
+def test_manual_prod_sell_uses_reserved_moo_before_open_and_limit_during_session():
+    window = MainWindow.__new__(MainWindow)
+    before_open_kst = dt.datetime(
+        2026, 7, 27, 17, 0, tzinfo=buylist_mixin_module.KST_ZONE
+    )
+    during_session_kst = dt.datetime(
+        2026, 7, 27, 23, 0, tzinfo=buylist_mixin_module.KST_ZONE
+    )
+
+    assert (
+        MainWindow._manual_sell_execution_policy(
+            window, "PROD", before_open_kst
+        )
+        == RESERVED_MOO_EXECUTION
+    )
+    assert (
+        MainWindow._manual_sell_execution_policy(
+            window, "PROD", during_session_kst
+        )
+        == REGULAR_LIMIT_EXECUTION
+    )
+    assert (
+        MainWindow._manual_sell_execution_policy(
+            window, "SIM", before_open_kst
+        )
+        == REGULAR_LIMIT_EXECUTION
+    )
+
+
 @pytest.mark.parametrize(
     ("price", "expected"),
     [
@@ -877,6 +1013,52 @@ def test_sell_acceptance_does_not_reduce_position_or_move_stop(monkeypatch):
     assert item.sell_half_done is False
     assert item.kis_order_id == "KIS-2"
     assert save_calls == [True]
+
+
+def test_reserved_partial_sell_acceptance_shows_reserved_until_fill(monkeypatch):
+    logs = []
+    item = SimpleNamespace(
+        symbol="AAPL",
+        environment="PROD",
+        _stop_order_pending=False,
+        _exit_order_pending=False,
+        monitoring_status="BOUGHT",
+        shares_held=10,
+        avg_cost=100.0,
+        stop_loss=90.0,
+        sell_half_done=False,
+        kis_order_id="",
+    )
+    window = MainWindow.__new__(MainWindow)
+    window.order_ledger = []
+    window._save_state = lambda: None
+    window.populate_buylist_dashboard = lambda: None
+    window.append_log = logs.append
+    window._clear_buylist_auto_order_block = lambda _item: None
+    monkeypatch.setattr(main_window_module, "append_order", lambda _order: None)
+    monkeypatch.setattr(main_window_module, "load_order_ledger", lambda: [])
+    monkeypatch.setattr(main_window_module.QTimer, "singleShot", lambda *_args: None)
+
+    order = BrokerOrder.create(
+        environment="PROD",
+        account_no="12345678-01",
+        symbol="AAPL",
+        side=OrderSide.SELL,
+        intent=OrderIntent.PARTIAL_EXIT,
+        quantity_requested=4,
+        limit_price=0.0,
+        status=OrderStatus.ACCEPTED,
+        execution_policy=RESERVED_MOO_EXECUTION,
+    )
+    order.broker_order_id = "RSV-1"
+
+    MainWindow._on_sell_order_accepted(window, item, 4, "partial sell", order)
+
+    assert item.monitoring_status == "PARTIAL_EXIT_RESERVED"
+    assert item.shares_held == 10
+    assert item.sell_half_done is False
+    assert item.kis_order_id == "RSV-1"
+    assert any("next U.S. regular open" in message for message in logs)
 
 
 def test_sell_rejection_keeps_held_position_as_bought(monkeypatch):
@@ -1721,6 +1903,61 @@ def test_submit_kis_sell_order_uses_environment_and_live_price_without_current_p
     assert worker.buylist_symbol_key == "SIM:AAPL"
     assert worker.started is True
     assert any("SELL submitted for AAPL" in message for message in logs)
+
+
+def test_submit_manual_prod_sell_before_open_passes_selected_quantity_to_reserved_moo(
+    monkeypatch,
+):
+    created_workers = []
+    logs = []
+
+    class FakeSignal:
+        def connect(self, _callback):
+            pass
+
+    class FakeKisOrderWorker:
+        def __init__(self, environment, symbol, quantity, price, side, **kwargs):
+            self.environment = environment
+            self.symbol = symbol
+            self.quantity = quantity
+            self.price = price
+            self.side = side
+            self.execution_policy = kwargs.get("execution_policy")
+            self.finished_order = FakeSignal()
+            self.error_occurred = FakeSignal()
+            self.started = False
+            created_workers.append(self)
+
+        def start(self):
+            self.started = True
+
+    item = SimpleNamespace(
+        symbol="AAPL",
+        environment="PROD",
+        monitoring_status="BOUGHT",
+        shares_held=10,
+        avg_cost=100.0,
+        stop_loss=90.0,
+        entry_price=95.0,
+    )
+    window = MainWindow.__new__(MainWindow)
+    window.append_log = logs.append
+    window._first_account_no_for_environment = lambda _environment: "12345678-01"
+    window._has_open_sell_order = lambda *args: False
+    window._manual_sell_execution_policy = lambda _env: RESERVED_MOO_EXECUTION
+
+    monkeypatch.setattr(buylist_mixin_module, "KisOrderWorker", FakeKisOrderWorker)
+
+    MainWindow._submit_kis_sell_order(window, item, 4, "partial sell")
+
+    [worker] = created_workers
+    assert worker.environment == "PROD"
+    assert worker.quantity == 4
+    assert worker.price == 0.0
+    assert worker.side == "sell"
+    assert worker.execution_policy == RESERVED_MOO_EXECUTION
+    assert worker.started is True
+    assert any("market-on-open" in message for message in logs)
 
 
 def test_submit_kis_sell_order_blocks_any_existing_open_sell(monkeypatch):

@@ -4,6 +4,7 @@ import pytest
 
 from src.api import kis_order
 from src.core.order_state import (
+    RESERVED_MOO_EXECUTION,
     BrokerOrder,
     BrokerOrderStatusSnapshot,
     OrderIntent,
@@ -154,6 +155,52 @@ def test_query_overseas_order_returns_unknown_not_found_without_credentials(monk
     assert snapshot.broker_order_id == "KIS-404"
 
 
+def test_kis_reserved_order_query_parses_broker_reservation_fill(monkeypatch):
+    class FakeClient:
+        def __init__(self, config):
+            self.config = config
+
+        def authenticate(self, force_refresh=False):
+            return "token"
+
+        def _get_with_headers(self, endpoint, tr_id, params, tr_cont=""):
+            assert endpoint.endswith("/order-resv-list")
+            assert tr_id == "TTTT3039R"
+            return {
+                "rt_cd": "0",
+                "output": [
+                    {
+                        "pdno": "AAPL",
+                        "ovrs_rsvn_odno": "RSV-1",
+                        "sll_buy_dvsn_cd": "01",
+                        "ft_ord_qty": "4",
+                        "ft_ccld_qty": "4",
+                    }
+                ],
+            }, {}
+
+    fake_config = SimpleNamespace(
+        cano="12345678",
+        account_product_code="01",
+        base_url="https://kis.example",
+    )
+    monkeypatch.setattr(kis_order, "load_config", lambda *args, **kwargs: fake_config)
+    monkeypatch.setattr(kis_order, "KisAccountClient", FakeClient)
+
+    [snapshot] = kis_order.query_overseas_reserved_order(
+        environment="PROD",
+        account_no="12345678-01",
+        symbol="AAPL",
+        broker_order_id="RSV-1",
+        side="SELL",
+    )
+
+    assert snapshot.status == OrderStatus.FILLED
+    assert snapshot.side == OrderSide.SELL
+    assert snapshot.filled_quantity == 4
+    assert snapshot.broker_order_id == "RSV-1"
+
+
 def test_reconcile_unknown_submission_keeps_unknown_on_unknown_snapshot():
     order = _order(status=OrderStatus.UNKNOWN_SUBMISSION_STATE, broker_order_id="")
     snapshot = _snapshot(OrderStatus.UNKNOWN, broker_order_id="", remaining=0)
@@ -229,6 +276,52 @@ def test_reconcile_service_prefers_terminal_snapshot_over_open_row(monkeypatch, 
     assert load_orders(path)[0].status == OrderStatus.FILLED
 
 
+def test_reconcile_service_routes_reserved_moo_to_reservation_query(
+    monkeypatch, tmp_path
+):
+    path = tmp_path / "orders.json"
+    order = _order(
+        environment="PROD",
+        side=OrderSide.SELL,
+        broker_order_id="RSV-1",
+        quantity=4,
+    )
+    order.intent = OrderIntent.PARTIAL_EXIT
+    order.execution_policy = RESERVED_MOO_EXECUTION
+    append_order(order, path=path)
+    monkeypatch.setattr(
+        kis_order,
+        "query_overseas_order",
+        lambda **kwargs: pytest.fail("reserved order used regular order query"),
+    )
+    monkeypatch.setattr(
+        kis_order,
+        "query_overseas_reserved_order",
+        lambda **kwargs: [
+            BrokerOrderStatusSnapshot(
+                environment="PROD",
+                account_no=kwargs["account_no"],
+                symbol=kwargs["symbol"],
+                broker_order_id=kwargs["broker_order_id"],
+                side=OrderSide.SELL,
+                status=OrderStatus.FILLED,
+                quantity_requested=4,
+                filled_quantity=4,
+            )
+        ],
+    )
+
+    [updated] = query_and_reconcile_unresolved_orders(
+        environment="PROD",
+        account_no="12345678-01",
+        execution_policy=RESERVED_MOO_EXECUTION,
+        path=path,
+    )
+
+    assert updated.status == OrderStatus.FILLED
+    assert updated.filled_quantity == 4
+
+
 def test_cancel_and_reconcile_requires_broker_id_and_updates_order(monkeypatch, tmp_path):
     path = tmp_path / "orders.json"
     blocked = _order(broker_order_id="")
@@ -253,6 +346,45 @@ def test_cancel_and_reconcile_requires_broker_id_and_updates_order(monkeypatch, 
 
     assert updated.status == OrderStatus.CANCEL_REQUESTED
     assert load_orders(path)[1].status == OrderStatus.CANCEL_REQUESTED
+
+
+def test_cancel_and_reconcile_routes_reserved_moo_to_reservation_cancel(
+    monkeypatch, tmp_path
+):
+    path = tmp_path / "orders.json"
+    order = _order(
+        environment="PROD",
+        side=OrderSide.SELL,
+        broker_order_id="RSV-1",
+        quantity=4,
+    )
+    order.execution_policy = RESERVED_MOO_EXECUTION
+    order.submitted_at = "2026-07-27T08:00:00+00:00"
+    append_order(order, path=path)
+    captured = []
+    monkeypatch.setattr(
+        kis_order,
+        "cancel_overseas_order",
+        lambda **kwargs: pytest.fail("reserved order used regular cancel"),
+    )
+    monkeypatch.setattr(
+        kis_order,
+        "cancel_overseas_reserved_order",
+        lambda **kwargs: captured.append(kwargs)
+        or BrokerOrderStatusSnapshot(
+            environment="PROD",
+            account_no=kwargs["account_no"],
+            symbol="",
+            broker_order_id=kwargs["broker_order_id"],
+            side=OrderSide.SELL,
+            status=OrderStatus.CANCELLED,
+        ),
+    )
+
+    updated = cancel_and_reconcile_order(order.client_order_id, path=path)
+
+    assert updated.status == OrderStatus.CANCELLED
+    assert captured[0]["reservation_date"] == "20260727"
 
 
 def test_check_order_status_unknown_not_found_keeps_manual_verification_message():
@@ -349,3 +481,46 @@ def test_cancel_order_ui_confirms_and_starts_worker(monkeypatch):
 
     assert questions
     assert started == [order.client_order_id]
+
+
+def test_reserved_cancel_confirmation_identifies_market_on_open_reservation():
+    order = _order(
+        environment="PROD",
+        side=OrderSide.SELL,
+        broker_order_id="RSV-1",
+    )
+    order.execution_policy = RESERVED_MOO_EXECUTION
+    window = MainWindow.__new__(MainWindow)
+
+    message = MainWindow._format_cancel_order_confirmation(window, order)
+
+    assert "market-on-open reservation" in message
+    assert "final only after KIS confirms" in message
+
+
+def test_cancel_error_warns_order_is_still_active_and_checks_status(monkeypatch):
+    logs = []
+    warnings = []
+    checked = []
+    window = MainWindow.__new__(MainWindow)
+    window.append_log = logs.append
+    window._buylist_check_order_status = lambda env: checked.append(env)
+    monkeypatch.setattr(
+        buylist_mixin_module.QMessageBox,
+        "warning",
+        lambda _parent, title, message: warnings.append((title, message)),
+    )
+    monkeypatch.setattr(
+        buylist_mixin_module.QTimer,
+        "singleShot",
+        lambda _delay, callback: callback(),
+    )
+
+    MainWindow._on_broker_order_cancel_error(
+        window, "PROD", "reservation already forwarded"
+    )
+
+    assert checked == ["PROD"]
+    assert warnings[0][0] == "Cancellation not confirmed"
+    assert "still active" in warnings[0][1]
+    assert any("cancel failed" in message for message in logs)

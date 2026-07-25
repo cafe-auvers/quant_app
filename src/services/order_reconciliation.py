@@ -4,8 +4,10 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 from src.core.order_state import (
+    RESERVED_MOO_EXECUTION,
     BrokerOrder,
     BrokerOrderStatusSnapshot,
     OPEN_ORDER_STATUSES,
@@ -213,6 +215,7 @@ def query_and_reconcile_unresolved_orders(
     environment: Optional[str] = None,
     account_no: Optional[str] = None,
     symbol: Optional[str] = None,
+    execution_policy: Optional[str] = None,
     path: Path = ORDERS_FILE,
 ) -> List[BrokerOrder]:
     """Query KIS for unresolved local orders and persist broker-backed updates."""
@@ -221,6 +224,7 @@ def query_and_reconcile_unresolved_orders(
     environment_key = str(environment or "").upper()
     account_key = str(account_no or "")
     symbol_key = str(symbol or "").upper()
+    execution_policy_key = str(execution_policy or "").upper()
     orders = load_orders(path)
     updated_orders: List[BrokerOrder] = []
 
@@ -233,10 +237,17 @@ def query_and_reconcile_unresolved_orders(
             continue
         if symbol_key and order.symbol != symbol_key:
             continue
+        if execution_policy_key and order.execution_policy != execution_policy_key:
+            continue
 
         start, end = _date_window_for_order(order)
         try:
-            snapshots = kis_order.query_overseas_order(
+            query_fn = (
+                kis_order.query_overseas_reserved_order
+                if order.execution_policy == RESERVED_MOO_EXECUTION
+                else kis_order.query_overseas_order
+            )
+            snapshots = query_fn(
                 environment=order.environment,
                 account_no=order.account_no,
                 symbol=order.symbol,
@@ -287,15 +298,37 @@ def cancel_and_reconcile_order(
     quantity = target.remaining_quantity or max(0, target.quantity_requested - target.filled_quantity)
     if quantity <= 0:
         quantity = target.quantity_requested
-    snapshot = kis_order.cancel_overseas_order(
-        environment=target.environment,
-        account_no=target.account_no,
-        symbol=target.symbol,
-        broker_order_id=target.broker_order_id,
-        quantity=quantity,
-        side=target.side.value,
-        exchange=target.exchange or "NASD",
-    )
+    if target.execution_policy == RESERVED_MOO_EXECUTION:
+        try:
+            submitted = datetime.fromisoformat(
+                str(target.submitted_at).replace("Z", "+00:00")
+            )
+            if submitted.tzinfo is None:
+                submitted = submitted.replace(tzinfo=timezone.utc)
+            reservation_date = submitted.astimezone(
+                ZoneInfo("Asia/Seoul")
+            ).strftime("%Y%m%d")
+        except (TypeError, ValueError):
+            reservation_date = datetime.now(ZoneInfo("Asia/Seoul")).strftime(
+                "%Y%m%d"
+            )
+        snapshot = kis_order.cancel_overseas_reserved_order(
+            environment=target.environment,
+            account_no=target.account_no,
+            broker_order_id=target.broker_order_id,
+            reservation_date=reservation_date,
+        )
+        snapshot.symbol = target.symbol
+    else:
+        snapshot = kis_order.cancel_overseas_order(
+            environment=target.environment,
+            account_no=target.account_no,
+            symbol=target.symbol,
+            broker_order_id=target.broker_order_id,
+            quantity=quantity,
+            side=target.side.value,
+            exchange=target.exchange or "NASD",
+        )
     reconcile_order_with_broker_snapshot(target, snapshot)
     save_orders(orders, path)
     return target

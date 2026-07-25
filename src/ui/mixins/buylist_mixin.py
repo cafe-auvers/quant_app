@@ -59,6 +59,8 @@ except ImportError:
 
 from src.core.position_sizer import PositionSizer
 from src.core.order_state import (
+    REGULAR_LIMIT_EXECUTION,
+    RESERVED_MOO_EXECUTION,
     BrokerOrder,
     OrderIntent,
     OrderSide,
@@ -1608,6 +1610,21 @@ class BuylistMixin:
                     )
                 elif order.status == OrderStatus.CANCEL_REQUESTED:
                     new_status = "SELL_SUBMITTED"
+                elif (
+                    getattr(order, "execution_policy", REGULAR_LIMIT_EXECUTION)
+                    == RESERVED_MOO_EXECUTION
+                    and order.intent
+                    in {
+                        OrderIntent.PARTIAL_EXIT,
+                        OrderIntent.PARTIAL_TAKE_PROFIT,
+                    }
+                ):
+                    new_status = "PARTIAL_EXIT_RESERVED"
+                elif (
+                    getattr(order, "execution_policy", REGULAR_LIMIT_EXECUTION)
+                    == RESERVED_MOO_EXECUTION
+                ):
+                    new_status = "SELL_RESERVED"
                 elif order.intent in {
                     OrderIntent.PARTIAL_EXIT,
                     OrderIntent.PARTIAL_TAKE_PROFIT,
@@ -1733,18 +1750,26 @@ class BuylistMixin:
         remaining = order.remaining_quantity or max(
             0, order.quantity_requested - order.filled_quantity
         )
-        return "\n".join(
-            [
-                f"Environment: {order.environment}",
-                f"Account: {order.account_no or '<unknown account>'}",
-                f"Symbol: {order.symbol}",
-                f"Broker order id: {order.broker_order_id}",
-                f"Side: {order.side.value}",
-                f"Quantity remaining: {remaining}",
-                "",
-                "This is a broker-side cancel request.",
-            ]
-        )
+        lines = [
+            f"Environment: {order.environment}",
+            f"Account: {order.account_no or '<unknown account>'}",
+            f"Symbol: {order.symbol}",
+            f"Broker order id: {order.broker_order_id}",
+            f"Side: {order.side.value}",
+            f"Quantity remaining: {remaining}",
+        ]
+        if order.execution_policy == RESERVED_MOO_EXECUTION:
+            lines.extend(
+                [
+                    "Type: KIS market-on-open reservation",
+                    "",
+                    "Cancel before KIS forwards the reservation at the U.S. open.",
+                    "Cancellation is final only after KIS confirms it.",
+                ]
+            )
+        else:
+            lines.extend(["", "This is a broker-side cancel request."])
+        return "\n".join(lines)
 
     def _buylist_cancel_selected_order(self, env: str) -> None:
         worker = self.__dict__.get("broker_order_cancel_worker")
@@ -1798,7 +1823,7 @@ class BuylistMixin:
             self._on_broker_order_cancel_finished
         )
         self.broker_order_cancel_worker.error_occurred.connect(
-            lambda message: self.append_log(f"Broker order cancel failed: {message}")
+            lambda message, e=env: self._on_broker_order_cancel_error(e, message)
         )
         self.broker_order_cancel_worker.finished.connect(
             lambda: setattr(self, "broker_order_cancel_worker", None)
@@ -1817,6 +1842,31 @@ class BuylistMixin:
             self.update_dashboard_summary()
         self.append_log(
             f"Broker cancel response for {order.symbol} {order.broker_order_id or order.client_order_id}: {order.status.value}."
+        )
+        if (
+            order.execution_policy == RESERVED_MOO_EXECUTION
+            and order.status == OrderStatus.CANCELLED
+        ):
+            QMessageBox.information(
+                self,
+                "Reservation cancelled",
+                f"KIS confirmed cancellation of the market-on-open reservation for "
+                f"{order.symbol}. No sell will be released from this reservation.",
+            )
+
+    def _on_broker_order_cancel_error(self, env: str, message: str) -> None:
+        self.append_log(f"Broker order cancel failed: {message}")
+        QMessageBox.warning(
+            self,
+            "Cancellation not confirmed",
+            "KIS did not confirm the cancellation.\n\n"
+            "Treat the order as still active until its broker status is checked. "
+            f"Details: {message}",
+        )
+        timer = _main_window_global("QTimer", QTimer)
+        timer.singleShot(
+            1000,
+            lambda e=env: self._buylist_check_order_status(e),
         )
 
     @staticmethod
@@ -2301,7 +2351,9 @@ class BuylistMixin:
 
         info_label = QLabel(
             f"Sell partial position in {item.symbol}  ({item.shares_held} shares held).\n"
-            f"Choose any amount between 1/3 ({qty_third} shares) and 1/2 ({qty_half} shares):"
+            f"Choose any amount between 1/3 ({qty_third} shares) and 1/2 ({qty_half} shares):\n\n"
+            "Before the U.S. regular session, PROD uses a broker-held "
+            "market-on-open reservation. It prioritizes selling over price protection."
         )
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
@@ -2351,11 +2403,18 @@ class BuylistMixin:
             return
         if self._warn_if_open_sell_order(item, env):
             return
+        execution_policy = self._manual_sell_execution_policy(env)
+        order_description = (
+            "This will create a KIS market-on-open reservation. The broker will "
+            "release it at the next regular open; there is no limit-price protection."
+            if execution_policy == RESERVED_MOO_EXECUTION
+            else "This will submit a limit sell order using current/live fallback price."
+        )
         reply = QMessageBox.question(
             self,
             "Confirm Sell All",
             f"Sell all {item.shares_held} shares of {item.symbol}?\n"
-            "This will submit a limit sell order using current/live fallback price.",
+            f"{order_description}",
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply == QMessageBox.Yes:
@@ -2681,6 +2740,8 @@ class BuylistMixin:
             "BUY_PARTIAL",
             "SELL_SUBMITTED",
             "PARTIAL_EXIT_SUBMITTED",
+            "SELL_RESERVED",
+            "PARTIAL_EXIT_RESERVED",
             "SOLD",
             "ORDER_SUBMITTED",
             "ORDER_PENDING",
@@ -3323,6 +3384,33 @@ class BuylistMixin:
             return max(1, int((account_size * position_percent / 100.0) // order_price))
         return max(1, int(getattr(item, "shares_held", 0) or 1))
 
+    @staticmethod
+    def _us_regular_market_is_open(
+        now: Optional[dt.datetime] = None,
+    ) -> bool:
+        market_now = now or dt.datetime.now(US_MARKET_ZONE)
+        if market_now.tzinfo is None:
+            market_now = market_now.replace(tzinfo=KST_ZONE).astimezone(
+                US_MARKET_ZONE
+            )
+        else:
+            market_now = market_now.astimezone(US_MARKET_ZONE)
+        return (
+            market_now.weekday() < 5
+            and US_MARKET_OPEN_TIME <= market_now.time() < US_MARKET_CLOSE_TIME
+        )
+
+    def _manual_sell_execution_policy(
+        self,
+        env: str,
+        now: Optional[dt.datetime] = None,
+    ) -> str:
+        if str(env or "").upper() == "PROD" and not self._us_regular_market_is_open(
+            now
+        ):
+            return RESERVED_MOO_EXECUTION
+        return REGULAR_LIMIT_EXECUTION
+
     def _submit_kis_buy_order(
         self,
         item,
@@ -3452,6 +3540,16 @@ class BuylistMixin:
         env = self._buylist_order_environment(item)
         account_no = self._first_account_no_for_environment(env) or ""
         intent = self._sell_intent_for_reason(reason)
+        manual_exit = intent in {
+            OrderIntent.PARTIAL_EXIT,
+            OrderIntent.PARTIAL_TAKE_PROFIT,
+            OrderIntent.MANUAL_EXIT,
+        }
+        execution_policy = (
+            self._manual_sell_execution_policy(env)
+            if manual_exit
+            else REGULAR_LIMIT_EXECUTION
+        )
         if self._has_open_sell_order(env, account_no, item.symbol):
             item._stop_order_pending = False
             item._exit_order_pending = False
@@ -3470,21 +3568,29 @@ class BuylistMixin:
             if price > 0:
                 explicit_price = price
                 break
-        order_price = (
-            max(0.01, explicit_price)
-            if explicit_price is not None
-            else self._buylist_order_price(item)
-        )
+        if execution_policy == RESERVED_MOO_EXECUTION:
+            order_price = 0.0
+        else:
+            order_price = (
+                max(0.01, explicit_price)
+                if explicit_price is not None
+                else self._buylist_order_price(item)
+            )
         try:
+            worker_kwargs = {
+                "account_no": account_no,
+                "intent": intent,
+                "buylist_symbol_key": f"{env}:{item.symbol}",
+            }
+            if execution_policy == RESERVED_MOO_EXECUTION:
+                worker_kwargs["execution_policy"] = execution_policy
             self.kis_order_worker = KisOrderWorker(
                 env,
                 item.symbol,
                 quantity,
                 order_price,
                 "sell",
-                account_no=account_no,
-                intent=intent,
-                buylist_symbol_key=f"{env}:{item.symbol}",
+                **worker_kwargs,
             )
             self.kis_order_worker.finished_order.connect(
                 lambda order, it=item, rsn=reason: self._on_sell_order_accepted(
@@ -3497,9 +3603,16 @@ class BuylistMixin:
                 )
             )
             self.kis_order_worker.start()
-            self.append_log(
-                f"SELL submitted for {item.symbol}: {quantity} shares @ limit ${order_price:.2f} ({reason})"
-            )
+            if execution_policy == RESERVED_MOO_EXECUTION:
+                self.append_log(
+                    f"SELL reservation submitted for {item.symbol}: {quantity} shares "
+                    f"@ market-on-open ({reason})"
+                )
+            else:
+                self.append_log(
+                    f"SELL submitted for {item.symbol}: {quantity} shares @ limit "
+                    f"${order_price:.2f} ({reason})"
+                )
         except Exception as exc:
             item._stop_order_pending = False
             item._exit_order_pending = False
@@ -3656,17 +3769,35 @@ class BuylistMixin:
             )
             return
 
+        is_reserved_moo = (
+            getattr(order, "execution_policy", REGULAR_LIMIT_EXECUTION)
+            == RESERVED_MOO_EXECUTION
+        )
         if order.intent in {OrderIntent.PARTIAL_EXIT, OrderIntent.PARTIAL_TAKE_PROFIT}:
-            item.monitoring_status = "PARTIAL_EXIT_SUBMITTED"
+            item.monitoring_status = (
+                "PARTIAL_EXIT_RESERVED"
+                if is_reserved_moo
+                else "PARTIAL_EXIT_SUBMITTED"
+            )
         else:
-            item.monitoring_status = "SELL_SUBMITTED"
+            item.monitoring_status = (
+                "SELL_RESERVED" if is_reserved_moo else "SELL_SUBMITTED"
+            )
         item.kis_order_id = order.broker_order_id or order.client_order_id
         self._clear_buylist_auto_order_block(item)
         self._save_buylist_state()
         self.populate_buylist_dashboard()
-        self.append_log(
-            f"SELL order accepted by broker for {item.symbol}: {quantity} shares ({reason}); waiting for fill confirmation"
-        )
+        if is_reserved_moo:
+            self.append_log(
+                f"KIS accepted the market-on-open SELL reservation for {item.symbol}: "
+                f"{quantity} shares ({reason}); the broker will release it at the "
+                "next U.S. regular open"
+            )
+        else:
+            self.append_log(
+                f"SELL order accepted by broker for {item.symbol}: {quantity} shares "
+                f"({reason}); waiting for fill confirmation"
+            )
         timer = _main_window_global("QTimer", QTimer)
         timer.singleShot(5000, self.reconcile_open_orders)
 

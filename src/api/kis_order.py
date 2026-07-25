@@ -32,6 +32,13 @@ from .kis_account_snapshot_dual import (
 logger = logging.getLogger(__name__)
 
 OVERSEAS_ORDER_ENDPOINT = "/uapi/overseas-stock/v1/trading/order"
+OVERSEAS_RESERVED_ORDER_ENDPOINT = "/uapi/overseas-stock/v1/trading/order-resv"
+OVERSEAS_RESERVED_ORDER_CANCEL_ENDPOINT = (
+    "/uapi/overseas-stock/v1/trading/order-resv-ccnl"
+)
+OVERSEAS_RESERVED_ORDER_INQUIRY_ENDPOINT = (
+    "/uapi/overseas-stock/v1/trading/order-resv-list"
+)
 OVERSEAS_ORDER_INQUIRY_ENDPOINT = "/uapi/overseas-stock/v1/trading/inquire-ccnl"
 OVERSEAS_OPEN_ORDER_INQUIRY_ENDPOINT = "/uapi/overseas-stock/v1/trading/inquire-nccs"
 OVERSEAS_ORDER_CANCEL_ENDPOINT = "/uapi/overseas-stock/v1/trading/order-rvsecncl"
@@ -96,6 +103,18 @@ _CLEAR_ORDER_ERROR_FRAGMENTS = (
 _ORDER_TR_IDS: Dict[tuple, str] = {
     ("PROD", "buy"): "TTTT1002U",  # v1_해외주식-001 실전투자 매수
     ("PROD", "sell"): "TTTT1006U",  # v1_해외주식-001 실전투자 매도
+}
+
+_RESERVED_MOO_SELL_TR_IDS: Dict[str, str] = {
+    "PROD": "TTTT3016U",
+}
+
+_RESERVED_ORDER_CANCEL_TR_IDS: Dict[str, str] = {
+    "PROD": "TTTT3017U",
+}
+
+_RESERVED_ORDER_INQUIRY_TR_IDS: Dict[str, str] = {
+    "PROD": "TTTT3039R",
 }
 
 _ORDER_INQUIRY_TR_IDS: Dict[str, str] = {
@@ -263,7 +282,17 @@ def _default_order_dates(
 
 def _broker_order_id_from_row(row: Dict[str, Any]) -> str:
     return str(
-        _row_value(row, "odno", "ODNO", "order_no", "ord_no", "KIS_ORDER_NO") or ""
+        _row_value(
+            row,
+            "ovrs_rsvn_odno",
+            "OVRS_RSVN_ODNO",
+            "odno",
+            "ODNO",
+            "order_no",
+            "ord_no",
+            "KIS_ORDER_NO",
+        )
+        or ""
     )
 
 
@@ -292,10 +321,18 @@ def _status_from_order_row(
             "status",
             "ord_stat",
             "ord_stat_name",
+            "ovrs_rsvn_ord_stat_cd",
+            "ovrs_rsvn_ord_stat_cd_name",
+            "cncl_yn",
+            "nprc_rson_text",
             "msg1",
         )
     ).upper()
 
+    if str(_row_value(row, "cncl_yn") or "").strip().upper() == "Y":
+        return OrderStatus.CANCELLED
+    if str(_row_value(row, "nprc_rson_text") or "").strip():
+        return OrderStatus.REJECTED
     if any(
         token in status_text
         for token in ("REJECT", "REJECTED", "RJECT", "RJCT", "거부", "거절")
@@ -319,6 +356,10 @@ def _status_from_order_row(
         return OrderStatus.WORKING
     if source == "open_orders":
         return OrderStatus.WORKING
+    if source == "reservation":
+        if _row_value(row, "ord_fwdg_tmd", "odno", "ODNO"):
+            return OrderStatus.WORKING
+        return OrderStatus.ACCEPTED
     if any(token in status_text for token in ("ACCEPT", "RECEIVED", "접수", "처리")):
         return OrderStatus.ACCEPTED
     if any(token in status_text for token in ("FILLED", "체결", "완료")):
@@ -596,6 +637,92 @@ def query_overseas_order(
     ]
 
 
+def query_overseas_reserved_order(
+    *,
+    environment: str,
+    account_no: str,
+    symbol: str = "",
+    broker_order_id: str = "",
+    client_order_id: str = "",
+    side: str = "SELL",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    exchange: str = "NASD",
+) -> List[BrokerOrderStatusSnapshot]:
+    """Query KIS's broker-side overseas reservation ledger."""
+    env_key = _env_key(environment)
+    tr_id = _order_tr_id(
+        _RESERVED_ORDER_INQUIRY_TR_IDS, env_key, "RESERVATION_INQUIRY"
+    )
+    env = KisEnvironment(env_key)
+    config = load_config(env, account_no_override=account_no)
+    client = KisAccountClient(config)
+    client.authenticate()
+
+    symbol = str(symbol or "").strip().upper()
+    broker_order_id = str(broker_order_id or "").strip()
+    exchange = str(exchange or "NASD").strip().upper()
+    start, end = _default_order_dates(start_date, end_date)
+    params = {
+        "CANO": config.cano,
+        "ACNT_PRDT_CD": config.account_product_code,
+        "INQR_STRT_DT": start,
+        "INQR_END_DT": end,
+        "INQR_DVSN_CD": "00",
+        "OVRS_EXCG_CD": exchange,
+        "PRDT_TYPE_CD": "",
+        "CTX_AREA_FK200": "",
+        "CTX_AREA_NK200": "",
+    }
+    pages = _query_pages(
+        client,
+        endpoint=OVERSEAS_RESERVED_ORDER_INQUIRY_ENDPOINT,
+        tr_id=tr_id,
+        params=params,
+    )
+    snapshots: List[BrokerOrderStatusSnapshot] = []
+    for page in pages:
+        for row in _output_rows(page):
+            snapshot = parse_broker_order_status_snapshot(
+                row,
+                environment=env_key,
+                account_no=account_no,
+                client_order_id=client_order_id,
+                source="reservation",
+            )
+            if _matches_order_filter(
+                snapshot,
+                symbol=symbol,
+                broker_order_id=broker_order_id,
+                side=side,
+            ):
+                snapshots.append(snapshot)
+
+    if snapshots:
+        return snapshots
+    return [
+        _unknown_snapshot(
+            environment=env_key,
+            account_no=account_no,
+            symbol=symbol,
+            broker_order_id=broker_order_id,
+            client_order_id=client_order_id,
+            side=side,
+            raw_response={
+                "not_found": True,
+                "reservation_query": {
+                    "symbol": symbol,
+                    "broker_order_id": broker_order_id,
+                    "start_date": start,
+                    "end_date": end,
+                    "exchange": exchange,
+                },
+                "raw_pages": pages,
+            },
+        )
+    ]
+
+
 def cancel_overseas_order(
     *,
     environment: str,
@@ -773,6 +900,138 @@ def place_overseas_order(
 
     logger.info("KIS order result: %s", result)
     return result
+
+
+def place_overseas_reserved_market_on_open_sell(
+    *,
+    environment: str,
+    symbol: str,
+    quantity: int,
+    exchange: str = "NASD",
+    account_no: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Reserve a live U.S. market-on-open sell through KIS.
+
+    KIS documents ORD_DVSN=31 as MOO for live U.S. sells. The reservation
+    endpoint is broker-hosted, so an accepted reservation does not depend on
+    this desktop process remaining open.
+    """
+    if quantity <= 0:
+        raise ValueError(f"quantity must be positive, got {quantity}")
+    if not str(symbol or "").strip():
+        raise ValueError("symbol is required")
+
+    env_key = _env_key(environment)
+    tr_id = _RESERVED_MOO_SELL_TR_IDS.get(env_key)
+    if not tr_id:
+        raise ValueError(
+            "Reserved U.S. market-on-open sells are supported for PROD only"
+        )
+
+    env = KisEnvironment(env_key)
+    config = load_config(env, account_no_override=account_no)
+    client = KisAccountClient(config)
+    client.authenticate()
+
+    body: Dict[str, str] = {
+        "CANO": config.cano,
+        "ACNT_PRDT_CD": config.account_product_code,
+        "PDNO": str(symbol).strip().upper(),
+        "OVRS_EXCG_CD": str(exchange or "NASD").strip().upper(),
+        "FT_ORD_QTY": str(int(quantity)),
+        "FT_ORD_UNPR3": "0",
+        "ORD_SVR_DVSN_CD": "0",
+        "ORD_DVSN": "31",
+    }
+    url = f"{config.base_url}{OVERSEAS_RESERVED_ORDER_ENDPOINT}"
+
+    def _post_reserved_order() -> Dict[str, Any]:
+        response = client.session.post(
+            url,
+            headers=client._headers(tr_id=tr_id),
+            json=body,
+            timeout=15,
+        )
+        return client._parse_response(
+            response, endpoint=OVERSEAS_RESERVED_ORDER_ENDPOINT
+        )
+
+    try:
+        result = _post_reserved_order()
+    except KisTokenError:
+        logger.info(
+            "KIS reserved-order token expired for %s; refreshing token and retrying once.",
+            env_key,
+        )
+        client.authenticate(force_refresh=True)
+        result = _post_reserved_order()
+
+    logger.info(
+        "KIS reserved MOO SELL result for %s x%d: %s",
+        str(symbol).strip().upper(),
+        int(quantity),
+        result,
+    )
+    return result
+
+
+def cancel_overseas_reserved_order(
+    *,
+    environment: str,
+    account_no: str,
+    broker_order_id: str,
+    reservation_date: str,
+) -> BrokerOrderStatusSnapshot:
+    """Cancel one broker-held KIS overseas reservation."""
+    if not str(broker_order_id or "").strip():
+        raise ValueError("broker_order_id is required for KIS reservation cancel")
+    reservation_date = str(reservation_date or "").replace("-", "").strip()
+    if len(reservation_date) != 8 or not reservation_date.isdigit():
+        raise ValueError("reservation_date must be YYYYMMDD")
+
+    env_key = _env_key(environment)
+    tr_id = _RESERVED_ORDER_CANCEL_TR_IDS.get(env_key)
+    if not tr_id:
+        raise ValueError("KIS reservation cancel is supported for PROD only")
+
+    env = KisEnvironment(env_key)
+    config = load_config(env, account_no_override=account_no)
+    client = KisAccountClient(config)
+    client.authenticate()
+    body = {
+        "CANO": config.cano,
+        "ACNT_PRDT_CD": config.account_product_code,
+        "RSVN_ORD_RCIT_DT": reservation_date,
+        "OVRS_RSVN_ODNO": str(broker_order_id).strip(),
+    }
+    url = f"{config.base_url}{OVERSEAS_RESERVED_ORDER_CANCEL_ENDPOINT}"
+
+    def _post_cancel() -> Dict[str, Any]:
+        response = client.session.post(
+            url,
+            headers=client._headers(tr_id=tr_id),
+            json=body,
+            timeout=15,
+        )
+        return client._parse_response(
+            response, endpoint=OVERSEAS_RESERVED_ORDER_CANCEL_ENDPOINT
+        )
+
+    try:
+        result = _post_cancel()
+    except KisTokenError:
+        client.authenticate(force_refresh=True)
+        result = _post_cancel()
+
+    return BrokerOrderStatusSnapshot(
+        environment=env_key,
+        account_no=account_no,
+        symbol="",
+        broker_order_id=str(broker_order_id).strip(),
+        side=OrderSide.SELL,
+        status=OrderStatus.CANCELLED,
+        raw_response=result,
+    )
 
 
 def _find_broker_order_id(result: Dict[str, Any]) -> str:

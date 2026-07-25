@@ -150,7 +150,8 @@ class BuylistExecutionController(WindowController):
 
         protected_statuses = {
             "BOUGHT", "BUY_SUBMITTED", "BUY_PARTIAL", "SELL_SUBMITTED",
-            "PARTIAL_EXIT_SUBMITTED", "SOLD",
+            "PARTIAL_EXIT_SUBMITTED", "PARTIAL_EXIT_RESERVED", "SELL_RESERVED",
+            "SOLD",
         }
         manager = buylist_manager if buylist_manager is not None else self.buylist_manager
         existing = manager.get(symbol, env)
