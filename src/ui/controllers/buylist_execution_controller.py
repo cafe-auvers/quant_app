@@ -163,7 +163,6 @@ class BuylistExecutionController(WindowController):
         display = build_queue_display_state(queue_item, existing or watch_item)
         entry_price = display.entry_price
         stop_loss = display.stop_loss
-        planned_shares = display.planned_shares
         capital_percent = display.capital_percent
         stop_adr = float(display.stop_adr or 0.0)
         risk_percent = display.risk_percent
@@ -234,11 +233,6 @@ class BuylistExecutionController(WindowController):
             if not list(getattr(existing, "warnings", []) or []):
                 existing.warnings = warnings
 
-        existing._planned_shares = planned_shares
-        existing._selected_orb_window = selected_window
-        existing._execution_queue_symbol = symbol
-        existing._execution_entry_trigger = entry_price
-
     def submit_selected_queue_order(self, env: str) -> None:
         item = self._buylist_selected_item(env)
         if not item:
@@ -302,8 +296,6 @@ class BuylistExecutionController(WindowController):
         queue_status = self._execution_queue_status_for_buylist_item(item) or "ORDER_PENDING"
         item.monitoring_status = queue_status
         item.status = queue_status
-        item._planned_shares = int(candidate.shares or 0)
-        item._selected_orb_window = str(candidate.window or "")
         item._buy_order_pending = True
         self._save_buylist_state()
         self._save_execution_queue_state()

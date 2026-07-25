@@ -86,6 +86,7 @@ from src.utils.data_loader import (
     get_default_universe,
     _extract_symbol_history,
 )
+from src.utils.config import DATA_DIR
 from src.utils.db_loader import (
     init_mysql_engine,
     load_symbol_history_from_db,
@@ -118,6 +119,7 @@ from src.services.app_state import (
     load_tab_options_state,
     load_trade_plans_state,
     load_watchlist_state,
+    quarantine_rejected_records,
     save_app_state,
 )
 from src.services.intraday_data_service import (
@@ -152,6 +154,7 @@ from src.services.order_ledger import (
     find_open_orders,
     has_open_order,
     load_order_ledger,
+    merge_orders,
     save_order_ledger,
     update_order,
 )
@@ -174,7 +177,7 @@ STOP_LOSS_SELL_LIMIT_DISCOUNT_PCT = 0.005
 STOP_LOSS_REPRICE_MIN_DROP_PCT = 0.002
 US_MARKET_OPEN_TIME = dt.time(9, 30)
 US_MARKET_CLOSE_TIME = dt.time(16, 0)
-EXECUTION_QUEUE_FILE = Path("data/execution_queue.json")
+EXECUTION_QUEUE_FILE = DATA_DIR / "execution_queue.json"
 
 
 def _main_window_global(name: str, fallback):
@@ -542,7 +545,7 @@ class BuylistMixin:
             planned_shares = (
                 queue_display.planned_shares
                 if queue_display
-                else int(getattr(item, "_planned_shares", 0) or 0)
+                else 0
             )
             display_shares = (
                 item.shares_held
@@ -687,12 +690,6 @@ class BuylistMixin:
             status_text = str(getattr(item, "monitoring_status", "") or "").upper()
             if status_text in queue_statuses:
                 alerts.append(status_text)
-            selected_window = getattr(item, "_selected_orb_window", "")
-            if selected_window:
-                alerts.append(f"ORB {selected_window}")
-            planned_shares = int(getattr(item, "_planned_shares", 0) or 0)
-            if planned_shares > 0:
-                alerts.append(f"Qty {planned_shares}")
         return " | ".join(dict.fromkeys(alerts))
 
     @staticmethod
@@ -752,8 +749,6 @@ class BuylistMixin:
         method = str(getattr(item, "breakout_method", "") or "").lower()
         if "orb" in method:
             return True
-        if str(getattr(item, "_selected_orb_window", "") or ""):
-            return True
         try:
             breakout_price = float(getattr(item, "breakout_price", 0.0) or 0.0)
         except (TypeError, ValueError):
@@ -769,9 +764,26 @@ class BuylistMixin:
 
         data = load_json(EXECUTION_QUEUE_FILE, {})
         archive_non_production_execution_queue_state(data)
+        rejected_records = []
+
+        def collect_rejected(index, raw_record, error):
+            rejected_records.append(
+                {
+                    "index": index,
+                    "identity": (
+                        str(raw_record.get("key") or index)
+                        if isinstance(raw_record, dict)
+                        else str(index)
+                    ),
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                    "record": raw_record,
+                }
+            )
+
         try:
             manager = (
-                ExecutionQueueManager.from_dict(data)
+                ExecutionQueueManager.from_dict(data, on_rejected=collect_rejected)
                 if data
                 else ExecutionQueueManager()
             )
@@ -780,6 +792,7 @@ class BuylistMixin:
                 f"Execution queue state could not be loaded; starting fresh: {exc}"
             )
             manager = ExecutionQueueManager()
+        quarantine_rejected_records(EXECUTION_QUEUE_FILE, rejected_records)
         manager.upgrade_margin = 0.0
         self.execution_queue_manager = manager
         return manager
@@ -2027,19 +2040,18 @@ class BuylistMixin:
             self._execution_queue_status_for_buylist_item(item) or "ORDER_PENDING"
         )
         item.status = item.monitoring_status
-        item._planned_shares = int(getattr(replacement, "shares", 0) or 0)
-        item._selected_orb_window = str(getattr(replacement, "window", "") or "")
+        replacement_shares = int(getattr(replacement, "shares", 0) or 0)
         item._buy_order_pending = True
         self._save_buylist_state()
         self._save_execution_queue_state()
         self.populate_buylist_dashboard()
         self.append_log(
             f"[Buylist/{order.environment}] Replacing BUY for {item.symbol} with {replacement.window} "
-            f"ORB: {item._planned_shares} shares @ ${float(getattr(replacement, 'entry_trigger', 0.0) or 0.0):.2f}."
+            f"ORB: {replacement_shares} shares @ ${float(getattr(replacement, 'entry_trigger', 0.0) or 0.0):.2f}."
         )
         self._submit_kis_buy_order(
             item,
-            quantity=item._planned_shares,
+            quantity=replacement_shares,
             order_price=float(getattr(replacement, "entry_trigger", 0.0) or 0.0),
         )
 
@@ -2587,8 +2599,6 @@ class BuylistMixin:
             )
             it.monitoring_status = queue_status
             it.status = queue_status
-            it._planned_shares = shares
-            it._selected_orb_window = str(getattr(candidate, "window", "") or "")
             it._buy_order_pending = True
             self._save_buylist_state()
             self._save_execution_queue_state()
@@ -2668,8 +2678,6 @@ class BuylistMixin:
             if is_queue:
                 item.orb_monitor_enabled = False
                 item._buy_order_pending = False
-                item._selected_orb_window = ""
-                item._planned_shares = 0
                 item._auto_order_block_notice_logged = False
                 item._orb_queue_required_notice_logged = False
                 self._clear_buylist_auto_order_block(item)
@@ -3915,12 +3923,8 @@ class BuylistMixin:
     ) -> None:
         self.kis_account_snapshots[(environment, account_no)] = snapshot or {}
         load_fn = _main_window_global("load_order_ledger", load_order_ledger)
-        save_fn = _main_window_global("save_order_ledger", save_order_ledger)
-        latest_orders = load_fn()
-        by_id = {order.client_order_id: order for order in latest_orders}
-        for order in updated_orders:
-            by_id[order.client_order_id] = order
-        save_fn(list(by_id.values()))
+        merge_fn = _main_window_global("merge_orders", merge_orders)
+        merge_fn(updated_orders)
         self.order_ledger = load_fn()
         self.apply_confirmed_order_fills_to_buylist(updated_orders)
         self.sync_buylist_positions_from_kis_snapshots(

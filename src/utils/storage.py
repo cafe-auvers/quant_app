@@ -1,15 +1,19 @@
 """Local JSON persistence helpers."""
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import shutil
 import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict
 
+from src.utils.config import DATA_DIR
 
-DATA_DIR = Path("data")
+logger = logging.getLogger(__name__)
+
 
 # Windows occasionally holds a transient read/write lock on a file that's just
 # been closed (antivirus scan, OneDrive sync, search indexer), which makes
@@ -24,6 +28,7 @@ def load_json(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
     """Load JSON data, falling back to a rolling backup when needed."""
     path = Path(path)
     candidates = [path, path.with_suffix(path.suffix + ".bak")]
+    failures: list[str] = []
 
     for candidate in candidates:
         if not candidate.exists():
@@ -31,11 +36,23 @@ def load_json(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
         try:
             with candidate.open("r", encoding="utf-8") as file:
                 data = json.load(file)
-        except (OSError, json.JSONDecodeError):
+            if not isinstance(data, dict):
+                raise ValueError("top-level JSON value is not an object")
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            failures.append(f"{candidate.name}: {exc}")
+            _preserve_corrupt_json(candidate)
+            logger.warning("Ignoring unreadable JSON state %s: %s", candidate, exc)
             continue
-        if isinstance(data, dict):
-            return data
+        if candidate != path:
+            logger.warning("Recovered JSON state %s from backup %s", path, candidate)
+        return data
 
+    if failures:
+        logger.error(
+            "No readable JSON state remained for %s; using defaults. %s",
+            path,
+            "; ".join(failures),
+        )
     return default
 
 
@@ -80,3 +97,14 @@ def _retry_on_transient_oserror(action) -> None:
             if attempt == _REPLACE_RETRY_ATTEMPTS:
                 raise
             time.sleep(_REPLACE_RETRY_DELAY_SECONDS * attempt)
+
+
+def _preserve_corrupt_json(path: Path) -> None:
+    """Keep a content-addressed copy before a later save can replace bad state."""
+    try:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+        quarantine_path = path.with_name(f"{path.name}.corrupt-{digest}")
+        if not quarantine_path.exists():
+            shutil.copy2(path, quarantine_path)
+    except OSError as exc:
+        logger.warning("Could not preserve corrupt JSON state %s: %s", path, exc)

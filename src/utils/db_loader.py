@@ -1,5 +1,6 @@
 import os
 import datetime as dt
+import re
 import time
 import random
 from typing import Callable, Dict, List, Optional, Tuple
@@ -32,6 +33,21 @@ from src.utils.config import get_mysql_config
 from src.utils.data_loader import download_price_history, _extract_symbol_history, compute_stock_metrics
 
 _ensured_engines: set = set()
+_MYSQL_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
+
+
+def validate_mysql_identifier(value: str, *, label: str = "database name") -> str:
+    """Accept a deliberately narrow set of safe MySQL identifier characters."""
+    identifier = str(value or "").strip()
+    if (
+        not identifier
+        or len(identifier) > 64
+        or _MYSQL_IDENTIFIER_PATTERN.fullmatch(identifier) is None
+    ):
+        raise ValueError(
+            f"Invalid {label} {value!r}; use 1-64 ASCII letters, digits, or underscores"
+        )
+    return identifier
 
 def _utcnow_naive() -> dt.datetime:
     """Return a naive UTC timestamp for existing DB columns and comparisons."""
@@ -42,6 +58,7 @@ def get_mysql_connection_url(db_name: Optional[str] = None) -> URL:
     config = get_mysql_config()
     if db_name is None:
         db_name = config["database"]
+    db_name = validate_mysql_identifier(db_name)
 
     host = config["host"]
     port = int(config["port"])
@@ -59,7 +76,10 @@ def get_mysql_connection_url(db_name: Optional[str] = None) -> URL:
     )
 
 
-def init_mysql_engine(db_name: str = "quant_app") -> Optional[Engine]:
+def init_mysql_engine(db_name: Optional[str] = None) -> Optional[Engine]:
+    if db_name is None:
+        db_name = get_mysql_config()["database"]
+    db_name = validate_mysql_identifier(db_name)
     try:
         base_url = get_mysql_connection_url(db_name="mysql")
         base_engine = create_engine(base_url, future=True)

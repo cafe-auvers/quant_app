@@ -527,6 +527,7 @@ def test_storage_handles_missing_and_malformed_json(tmp_path: Path):
 
     path.write_text("{bad json", encoding="utf-8")
     assert load_json(path, {"fallback": True}) == {"fallback": True}
+    assert len(list(tmp_path.glob("data.json.corrupt-*"))) == 1
 
 
 def test_tab_options_normalization_defaults_legacy_chart_tabs_hidden():

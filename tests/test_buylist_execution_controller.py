@@ -211,7 +211,7 @@ def test_callback_failure_is_captured_and_refresh_continues():
     ]
 
 
-def test_apply_queue_item_preserves_existing_volatile_compatibility_mirrors():
+def test_apply_queue_item_does_not_create_volatile_compatibility_mirrors():
     controller = BuylistExecutionController(SimpleNamespace())
     manager = FakeBuylistManager()
     existing = _existing_buylist_item()
@@ -233,8 +233,9 @@ def test_apply_queue_item_preserves_existing_volatile_compatibility_mirrors():
     assert existing.trade_plan == "old plan"
     assert existing.monitoring_status == "EXECUTE_READY"
     assert existing.breakout_method == "execution_queue:1m"
-    assert existing._planned_shares == 10
-    assert existing._execution_entry_trigger == 100.1
+    assert not hasattr(existing, "_planned_shares")
+    assert not hasattr(existing, "_selected_orb_window")
+    assert not hasattr(existing, "_execution_entry_trigger")
 
 
 def test_apply_queue_item_does_not_overwrite_bought_position_fields():

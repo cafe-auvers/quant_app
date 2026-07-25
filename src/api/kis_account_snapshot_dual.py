@@ -53,6 +53,14 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import requests
 
 try:
+    from src.utils.config import DEFAULT_KIS_TOKEN_CACHE, ENV_FILE, resolve_repo_path
+except ModuleNotFoundError:  # Keep direct script execution usable.
+    repository_root = Path(__file__).resolve().parents[2]
+    if str(repository_root) not in sys.path:
+        sys.path.insert(0, str(repository_root))
+    from src.utils.config import DEFAULT_KIS_TOKEN_CACHE, ENV_FILE, resolve_repo_path
+
+try:
     from dotenv import load_dotenv
 except ImportError:  # python-dotenv is in requirements.txt, but keep script usable.
     load_dotenv = None
@@ -136,7 +144,7 @@ class KisEnvironment(str, Enum):
 
     @property
     def default_token_cache(self) -> Path:
-        return Path(".kis_token_cache_prod.json")
+        return DEFAULT_KIS_TOKEN_CACHE
 
     @property
     def domestic_balance_tr_id(self) -> str:
@@ -658,7 +666,7 @@ def load_config(
 ) -> KisConfig:
     """Build KisConfig from profile-specific environment variables."""
     if load_dotenv is not None:
-        load_dotenv()
+        load_dotenv(dotenv_path=ENV_FILE)
 
     prefix = f"KIS_{environment.value}"
     legacy_prod = load_legacy_prod_config() if environment.is_prod else {}
@@ -681,7 +689,7 @@ def load_config(
     token_cache_path = (
         None
         if token_cache_raw.lower() in {"", "none", "false", "0"}
-        else Path(token_cache_raw)
+        else resolve_repo_path(token_cache_raw)
     )
 
     overseas_exchanges_raw = os.getenv(

@@ -1,8 +1,53 @@
 """Trading rules and watchlist management."""
 
+import logging
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional
-from datetime import datetime
+from typing import Any, Callable, List, Dict, Optional
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+logger = logging.getLogger(__name__)
+RejectedRecordHandler = Optional[Callable[[int, Any, Exception], None]]
+US_MARKET_ZONE = ZoneInfo("America/New_York")
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_timestamp(
+    value: Any,
+    *,
+    default_timezone=timezone.utc,
+    normalize_timezone=timezone.utc,
+) -> datetime:
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=default_timezone)
+    return parsed.astimezone(normalize_timezone)
+
+
+def _report_rejected_record(
+    collection: str,
+    index: int,
+    raw_record: Any,
+    error: Exception,
+    handler: RejectedRecordHandler,
+) -> None:
+    identity = (
+        raw_record.get("symbol")
+        if isinstance(raw_record, dict)
+        else f"index {index}"
+    )
+    logger.warning(
+        "Rejected %s record %r at index %d: %s",
+        collection,
+        identity,
+        index,
+        error,
+    )
+    if handler is not None:
+        handler(index, raw_record, error)
 
 
 @dataclass
@@ -18,8 +63,11 @@ class WatchlistItem:
     breakout_price: Optional[float] = None
     stop_loss: Optional[float] = None
     notes: str = ""
-    added_date: datetime = field(default_factory=datetime.now)
+    added_date: datetime = field(default_factory=_utc_now)
     ai_analysis: Optional[Dict] = None
+
+    def __post_init__(self) -> None:
+        self.added_date = _parse_timestamp(self.added_date)
 
 
 @dataclass
@@ -32,10 +80,13 @@ class TradePlan:
     take_profit: float
     position_size: int
     reason: str
-    entry_date: datetime = field(default_factory=datetime.now)
+    entry_date: datetime = field(default_factory=_utc_now)
     status: str = "active"  # active, filled, closed, cancelled
     notes: str = ""
     risk_percent: float = 0.01
+
+    def __post_init__(self) -> None:
+        self.entry_date = _parse_timestamp(self.entry_date)
 
 
 class Watchlist:
@@ -50,7 +101,7 @@ class Watchlist:
         """
         self.name = name
         self.items: List[WatchlistItem] = []
-        self.created_date = datetime.now()
+        self.created_date = _utc_now()
 
     def add(self, symbol: str, name: str, entry_price=...) -> WatchlistItem:
         """Add or update a stock in the watchlist."""
@@ -105,13 +156,18 @@ class Watchlist:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict) -> "Watchlist":
+    def from_dict(
+        cls,
+        data: Dict,
+        *,
+        on_rejected: RejectedRecordHandler = None,
+    ) -> "Watchlist":
         """Create a watchlist from serialized data."""
         watchlist = cls(name=data.get("name", "Default"))
         created_date = data.get("created_date")
         if created_date:
             try:
-                watchlist.created_date = datetime.fromisoformat(created_date)
+                watchlist.created_date = _parse_timestamp(created_date)
             except ValueError:
                 pass
 
@@ -123,35 +179,46 @@ class Watchlist:
             except (TypeError, ValueError):
                 return None
 
-        for raw_item in data.get("items", []):
-            added_date = raw_item.get("added_date")
+        for index, raw_item in enumerate(data.get("items", [])):
             try:
-                parsed_added_date = (
-                    datetime.fromisoformat(added_date) if added_date else datetime.now()
+                if not isinstance(raw_item, dict):
+                    raise TypeError("record is not an object")
+                added_date = raw_item.get("added_date")
+                try:
+                    parsed_added_date = (
+                        _parse_timestamp(added_date)
+                        if added_date
+                        else _utc_now()
+                    )
+                except ValueError:
+                    parsed_added_date = _utc_now()
+
+                migrated_breakout_price = optional_float(raw_item.get("breakout_price"))
+                legacy_target_price = optional_float(raw_item.get("target_price"))
+                if migrated_breakout_price is None and legacy_target_price is not None:
+                    migrated_breakout_price = legacy_target_price
+
+                symbol = str(raw_item.get("symbol", "")).upper()
+                if not symbol:
+                    raise ValueError("symbol is required")
+                watchlist.items.append(
+                    WatchlistItem(
+                        symbol=symbol,
+                        name=raw_item.get("name", ""),
+                        entry_price=optional_float(raw_item.get("entry_price")),
+                        stop_loss=optional_float(raw_item.get("stop_loss")),
+                        target_price=legacy_target_price,
+                        breakout_price=migrated_breakout_price,
+                        notes=raw_item.get("notes", ""),
+                        added_date=parsed_added_date,
+                        ai_analysis=raw_item.get("ai_analysis"),
+                    )
                 )
-            except ValueError:
-                parsed_added_date = datetime.now()
-
-            migrated_breakout_price = optional_float(raw_item.get("breakout_price"))
-            legacy_target_price = optional_float(raw_item.get("target_price"))
-            if migrated_breakout_price is None and legacy_target_price is not None:
-                migrated_breakout_price = legacy_target_price
-
-            watchlist.items.append(
-                WatchlistItem(
-                    symbol=str(raw_item.get("symbol", "")).upper(),
-                    name=raw_item.get("name", ""),
-                    entry_price=optional_float(raw_item.get("entry_price")),
-                    stop_loss=optional_float(raw_item.get("stop_loss")),
-                    target_price=legacy_target_price,
-                    breakout_price=migrated_breakout_price,
-                    notes=raw_item.get("notes", ""),
-                    added_date=parsed_added_date,
-                    ai_analysis=raw_item.get("ai_analysis"),
+            except Exception as exc:
+                _report_rejected_record(
+                    "watchlist", index, raw_item, exc, on_rejected
                 )
-            )
-
-        watchlist.items = [item for item in watchlist.items if item.symbol]
+                continue
         return watchlist
 
 
@@ -199,22 +266,33 @@ class TradePlanManager:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict) -> "TradePlanManager":
+    def from_dict(
+        cls,
+        data: Dict,
+        *,
+        on_rejected: RejectedRecordHandler = None,
+    ) -> "TradePlanManager":
         """Create a trade plan manager from serialized data."""
         manager = cls()
-        for raw_plan in data.get("plans", []):
-            entry_date = raw_plan.get("entry_date")
+        for index, raw_plan in enumerate(data.get("plans", [])):
             try:
-                parsed_entry_date = (
-                    datetime.fromisoformat(entry_date) if entry_date else datetime.now()
-                )
-            except ValueError:
-                parsed_entry_date = datetime.now()
-
-            try:
+                if not isinstance(raw_plan, dict):
+                    raise TypeError("record is not an object")
+                entry_date = raw_plan.get("entry_date")
+                try:
+                    parsed_entry_date = (
+                        _parse_timestamp(entry_date)
+                        if entry_date
+                        else _utc_now()
+                    )
+                except ValueError:
+                    parsed_entry_date = _utc_now()
+                symbol = str(raw_plan.get("symbol", "")).upper()
+                if not symbol:
+                    raise ValueError("symbol is required")
                 manager.plans.append(
                     TradePlan(
-                        symbol=str(raw_plan.get("symbol", "")).upper(),
+                        symbol=symbol,
                         entry_price=float(raw_plan.get("entry_price", 0.0)),
                         stop_loss=float(raw_plan.get("stop_loss", 0.0)),
                         take_profit=float(raw_plan.get("take_profit", 0.0)),
@@ -226,10 +304,12 @@ class TradePlanManager:
                         risk_percent=float(raw_plan.get("risk_percent", 0.01)),
                     )
                 )
-            except (TypeError, ValueError):
+            except Exception as exc:
+                _report_rejected_record(
+                    "trade plan", index, raw_plan, exc, on_rejected
+                )
                 continue
 
-        manager.plans = [plan for plan in manager.plans if plan.symbol]
         return manager
 
 
@@ -255,7 +335,7 @@ class BuylistItem:
     ai_summary: str
     warnings: List[str]
     notes: str = ""
-    added_date: datetime = field(default_factory=datetime.now)
+    added_date: datetime = field(default_factory=_utc_now)
     risk_percent: float = 1.0
     trade_plan: str = ""
     monitoring_status: str = "WATCHING"  # WATCHING / ACTIVE / BOUGHT / SOLD
@@ -287,6 +367,13 @@ class BuylistItem:
         self.environment = str(self.environment or "PROD").strip().upper()
         if self.environment != "PROD":
             raise ValueError("Buylist items must use the PROD environment")
+        self.added_date = _parse_timestamp(self.added_date)
+        if self.buy_date is not None:
+            self.buy_date = _parse_timestamp(
+                self.buy_date,
+                default_timezone=US_MARKET_ZONE,
+                normalize_timezone=US_MARKET_ZONE,
+            )
 
     def to_dict(self) -> Dict:
         """Convert to dictionary for serialization."""
@@ -341,12 +428,12 @@ class BuylistItem:
         added_date_str = data.get("added_date")
         try:
             added_date = (
-                datetime.fromisoformat(added_date_str)
+                _parse_timestamp(added_date_str)
                 if added_date_str
-                else datetime.now()
+                else _utc_now()
             )
         except ValueError:
-            added_date = datetime.now()
+            added_date = _utc_now()
         legacy_target_price = float(data.get("target_price", 0.0))
         breakout_price = (
             float(data["breakout_price"])
@@ -380,7 +467,11 @@ class BuylistItem:
             shares_held=int(data.get("shares_held", 0)),
             avg_cost=float(data.get("avg_cost", 0.0)),
             buy_date=(
-                datetime.fromisoformat(data["buy_date"])
+                _parse_timestamp(
+                    data["buy_date"],
+                    default_timezone=US_MARKET_ZONE,
+                    normalize_timezone=US_MARKET_ZONE,
+                )
                 if data.get("buy_date")
                 else None
             ),
@@ -451,12 +542,25 @@ class BuylistManager:
         return {"items": [item.to_dict() for item in self.items]}
 
     @classmethod
-    def from_dict(cls, data: Dict) -> "BuylistManager":
+    def from_dict(
+        cls,
+        data: Dict,
+        *,
+        on_rejected: RejectedRecordHandler = None,
+    ) -> "BuylistManager":
         """Create a BuylistManager from serialized data."""
         manager = cls()
-        for item_data in data.get("items", []):
+        for index, item_data in enumerate(data.get("items", [])):
+            if (
+                isinstance(item_data, dict)
+                and str(item_data.get("environment") or "").strip().upper() != "PROD"
+            ):
+                continue
             try:
                 manager.items.append(BuylistItem.from_dict(item_data))
-            except Exception:
+            except Exception as exc:
+                _report_rejected_record(
+                    "buylist", index, item_data, exc, on_rejected
+                )
                 continue
         return manager

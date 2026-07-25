@@ -10,23 +10,78 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from src.core.watchlist import BuylistManager, TradePlanManager, Watchlist
+from src.utils.config import DATA_DIR
 from src.utils.storage import load_json, save_json
 
 
 logger = logging.getLogger(__name__)
 
-WATCHLIST_FILE = Path("data/watchlist.json")
-BUYLIST_FILE = Path("data/buylist.json")
-TRADE_PLANS_FILE = Path("data/trade_plans.json")
-SCANNER_SETUPS_FILE = Path("data/scanner_setups.json")
-CHART_DRAWINGS_FILE = Path("data/chart_drawings.json")
-TAB_OPTIONS_FILE = Path("data/tab_options.json")
-SETTINGS_FILE = Path("data/settings.json")
-STATE_METADATA_FILE = Path("data/state_metadata.json")
-LEGACY_NON_PRODUCTION_BUYLIST_FILE = Path("data/legacy_non_prod_buylist.json")
-LEGACY_NON_PRODUCTION_EXECUTION_QUEUE_FILE = Path(
-    "data/legacy_non_prod_execution_queue.json"
+WATCHLIST_FILE = DATA_DIR / "watchlist.json"
+BUYLIST_FILE = DATA_DIR / "buylist.json"
+TRADE_PLANS_FILE = DATA_DIR / "trade_plans.json"
+SCANNER_SETUPS_FILE = DATA_DIR / "scanner_setups.json"
+CHART_DRAWINGS_FILE = DATA_DIR / "chart_drawings.json"
+TAB_OPTIONS_FILE = DATA_DIR / "tab_options.json"
+SETTINGS_FILE = DATA_DIR / "settings.json"
+STATE_METADATA_FILE = DATA_DIR / "state_metadata.json"
+LEGACY_NON_PRODUCTION_BUYLIST_FILE = DATA_DIR / "legacy_non_prod_buylist.json"
+LEGACY_NON_PRODUCTION_EXECUTION_QUEUE_FILE = (
+    DATA_DIR / "legacy_non_prod_execution_queue.json"
 )
+
+
+def _rejection_collector() -> tuple[
+    list[dict[str, Any]], Callable[[int, Any, Exception], None]
+]:
+    records: list[dict[str, Any]] = []
+
+    def collect(index: int, raw_record: Any, error: Exception) -> None:
+        records.append(
+            {
+                "index": index,
+                "identity": (
+                    str(raw_record.get("symbol") or raw_record.get("key") or index)
+                    if isinstance(raw_record, dict)
+                    else str(index)
+                ),
+                "error_type": type(error).__name__,
+                "error": str(error),
+                "record": raw_record,
+            }
+        )
+
+    return records, collect
+
+
+def quarantine_rejected_records(source: Path, records: list[dict[str, Any]]) -> Path | None:
+    """Preserve rejected JSON records outside the normal save payload."""
+    if not records:
+        return None
+    source = Path(source)
+    quarantine_path = source.parent / "rejected" / f"{source.stem}.rejected.json"
+    try:
+        save_json(
+            quarantine_path,
+            {
+                "source": str(source),
+                "quarantined_at": datetime.now(timezone.utc).isoformat(),
+                "records": records,
+            },
+        )
+    except Exception:
+        logger.exception(
+            "Could not quarantine %d rejected state record(s) from %s",
+            len(records),
+            source,
+        )
+        return None
+    logger.error(
+        "Quarantined %d rejected state record(s) from %s to %s",
+        len(records),
+        source,
+        quarantine_path,
+    )
+    return quarantine_path
 
 
 @dataclass
@@ -330,7 +385,13 @@ def get_state_save_manager() -> StateSaveManager:
 
 
 def load_watchlist_state() -> Watchlist:
-    return Watchlist.from_dict(load_json(WATCHLIST_FILE, {"name": "Default", "items": []}))
+    records, collect = _rejection_collector()
+    watchlist = Watchlist.from_dict(
+        load_json(WATCHLIST_FILE, {"name": "Default", "items": []}),
+        on_rejected=collect,
+    )
+    quarantine_rejected_records(WATCHLIST_FILE, records)
+    return watchlist
 
 
 def archive_non_production_buylist_state(
@@ -389,11 +450,20 @@ def archive_non_production_execution_queue_state(
 def load_buylist_state() -> BuylistManager:
     data = load_json(BUYLIST_FILE, {"items": []})
     archive_non_production_buylist_state(data)
-    return BuylistManager.from_dict(data)
+    records, collect = _rejection_collector()
+    manager = BuylistManager.from_dict(data, on_rejected=collect)
+    quarantine_rejected_records(BUYLIST_FILE, records)
+    return manager
 
 
 def load_trade_plans_state() -> TradePlanManager:
-    return TradePlanManager.from_dict(load_json(TRADE_PLANS_FILE, {"plans": []}))
+    records, collect = _rejection_collector()
+    manager = TradePlanManager.from_dict(
+        load_json(TRADE_PLANS_FILE, {"plans": []}),
+        on_rejected=collect,
+    )
+    quarantine_rejected_records(TRADE_PLANS_FILE, records)
+    return manager
 
 
 def load_scanner_setups_state(defaults: Dict[str, Any]) -> Dict[str, Any]:
@@ -410,13 +480,32 @@ def load_chart_drawings_state() -> Dict[str, Any]:
         return {}
 
     normalized = {}
-    for symbol, drawings in data.items():
+    rejected: list[dict[str, Any]] = []
+    for symbol_index, (symbol, drawings) in enumerate(data.items()):
         symbol_key = str(symbol).strip().upper()
         if not symbol_key or not isinstance(drawings, list):
+            rejected.append(
+                {
+                    "index": symbol_index,
+                    "identity": symbol_key or str(symbol_index),
+                    "error_type": "ValueError",
+                    "error": "symbol is empty or drawings is not a list",
+                    "record": {"symbol": symbol, "drawings": drawings},
+                }
+            )
             continue
         clean_drawings = []
         for index, drawing in enumerate(drawings):
             if not isinstance(drawing, dict) or drawing.get("type") != "line":
+                rejected.append(
+                    {
+                        "index": index,
+                        "identity": f"{symbol_key}:{index}",
+                        "error_type": "ValueError",
+                        "error": "drawing is not a supported line object",
+                        "record": drawing,
+                    }
+                )
                 continue
             try:
                 clean_drawings.append({
@@ -427,10 +516,20 @@ def load_chart_drawings_state() -> Dict[str, Any]:
                     "end_date": str(drawing["end_date"]),
                     "end_price": float(drawing["end_price"]),
                 })
-            except (KeyError, TypeError, ValueError):
+            except (KeyError, TypeError, ValueError) as exc:
+                rejected.append(
+                    {
+                        "index": index,
+                        "identity": f"{symbol_key}:{index}",
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                        "record": drawing,
+                    }
+                )
                 continue
         if clean_drawings:
             normalized[symbol_key] = clean_drawings
+    quarantine_rejected_records(CHART_DRAWINGS_FILE, rejected)
     return normalized
 
 

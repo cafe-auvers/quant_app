@@ -23,6 +23,7 @@ from src.core.order_state import (
     generate_client_order_id,
 )
 from src.services.order_ledger import (
+    OrderLedgerCorruptionError,
     append_order,
     clear_unknown_submission_order,
     find_open_orders,
@@ -157,14 +158,85 @@ def test_generate_client_order_id_contains_idempotency_parts():
     assert "ENTRY" in client_order_id
 
 
-def test_load_orders_missing_and_malformed_are_safe(tmp_path):
+def test_load_orders_missing_is_empty_but_malformed_fails_closed(tmp_path):
     path = tmp_path / "orders.json"
 
     assert load_orders(path=path) == []
 
     path.write_text("{bad json", encoding="utf-8")
 
-    assert load_orders(path=path) == []
+    with pytest.raises(OrderLedgerCorruptionError, match="submission is blocked"):
+        load_orders(path=path)
+
+
+def test_load_orders_recovers_from_valid_backup(tmp_path):
+    path = tmp_path / "orders.json"
+    order = _order()
+    path.write_text("{bad json", encoding="utf-8")
+    path.with_suffix(".json.bak").write_text(
+        json.dumps({"orders": [order.to_dict()]}),
+        encoding="utf-8",
+    )
+
+    assert load_orders(path=path)[0].client_order_id == order.client_order_id
+
+
+def test_mutation_after_backup_recovery_preserves_good_backup(tmp_path):
+    path = tmp_path / "orders.json"
+    recovered = _order()
+    new_order = _order(side=OrderSide.SELL, intent=OrderIntent.PARTIAL_EXIT)
+    new_order.client_order_id = f"{new_order.client_order_id}-new"
+    path.write_text("{bad json", encoding="utf-8")
+    backup_path = path.with_suffix(".json.bak")
+    backup_path.write_text(
+        json.dumps({"orders": [recovered.to_dict()]}),
+        encoding="utf-8",
+    )
+
+    append_order(new_order, path=path)
+
+    assert {order.client_order_id for order in load_orders(path)} == {
+        recovered.client_order_id,
+        new_order.client_order_id,
+    }
+    backup_payload = json.loads(backup_path.read_text(encoding="utf-8"))
+    assert backup_payload == {"orders": [recovered.to_dict()]}
+    assert len(list(tmp_path.glob("orders.json.corrupt-*"))) == 1
+
+
+def test_load_orders_rejects_one_malformed_record_instead_of_skipping_it(tmp_path):
+    path = tmp_path / "orders.json"
+    path.write_text(
+        json.dumps({"orders": [_order().to_dict(), {"symbol": "MSFT"}]}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OrderLedgerCorruptionError, match="invalid record"):
+        load_orders(path=path)
+
+
+def test_guarded_submission_does_not_call_broker_with_corrupt_ledger(
+    monkeypatch, tmp_path
+):
+    path = tmp_path / "orders.json"
+    path.write_text("{bad json", encoding="utf-8")
+    monkeypatch.setattr(
+        kis_order,
+        "place_overseas_order",
+        lambda **kwargs: pytest.fail("broker must not be called"),
+    )
+
+    with pytest.raises(OrderLedgerCorruptionError):
+        submit_guarded_overseas_order(
+            environment="PROD",
+            account_no="12345678-01",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            intent=OrderIntent.ENTRY,
+            quantity=1,
+            limit_price=100.0,
+            path=path,
+        )
 
 
 def test_has_open_order_respects_open_closed_account_and_environment(tmp_path):
@@ -329,6 +401,33 @@ def test_concurrent_guarded_submissions_reserve_only_one_order(monkeypatch, tmp_
     assert len(submitted) == 1
     assert len(load_orders(path)) == 1
     assert sum(isinstance(result, DuplicateOpenOrderError) for result in results) == 1
+
+
+def test_concurrent_independent_ledger_appends_preserve_both_orders(tmp_path):
+    path = tmp_path / "orders.json"
+    start = threading.Barrier(2)
+    first = _order()
+    second = _order(side=OrderSide.SELL, intent=OrderIntent.PARTIAL_EXIT)
+    second.client_order_id = f"{second.client_order_id}-second"
+
+    def append_after_barrier(order):
+        start.wait()
+        append_order(order, path=path)
+
+    threads = [
+        threading.Thread(target=append_after_barrier, args=(first,)),
+        threading.Thread(target=append_after_barrier, args=(second,)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert {order.client_order_id for order in load_orders(path)} == {
+        first.client_order_id,
+        second.client_order_id,
+    }
 
 
 @pytest.mark.parametrize(
@@ -1471,8 +1570,6 @@ def test_market_close_requests_cancel_for_unfilled_entry_buy_before_reset():
         breakout_method="execution_queue:1m",
         orb_monitor_enabled=True,
         _buy_order_pending=True,
-        _selected_orb_window="1m",
-        _planned_shares=10,
         _auto_order_block_notice_logged=True,
         _orb_queue_required_notice_logged=True,
     )

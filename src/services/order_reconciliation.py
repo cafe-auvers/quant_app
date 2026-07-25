@@ -15,7 +15,7 @@ from src.core.order_state import (
     OrderStatus,
     is_open_status,
 )
-from src.services.order_ledger import ORDERS_FILE, load_orders, save_orders
+from src.services.order_ledger import ORDERS_FILE, load_orders, mutate_order
 
 
 def _to_float(value: Any) -> float:
@@ -261,14 +261,28 @@ def query_and_reconcile_unresolved_orders(
             snapshot = _select_snapshot_for_order(order, snapshots)
             if snapshot is None:
                 continue
-            reconcile_order_with_broker_snapshot(order, snapshot)
-            updated_orders.append(order)
-            save_orders(orders, path)
+            updated = mutate_order(
+                order.client_order_id,
+                lambda current, value=snapshot: reconcile_order_with_broker_snapshot(
+                    current, value
+                ),
+                path=path,
+            )
+            if updated is not None:
+                updated_orders.append(updated)
         except Exception as exc:
             note = f"Broker order query failed: {exc}"
-            order.error_message = f"{order.error_message}; {note}" if order.error_message else note
-            order.touch()
-            save_orders(orders, path)
+
+            def record_query_failure(current: BrokerOrder) -> BrokerOrder:
+                current.error_message = (
+                    f"{current.error_message}; {note}"
+                    if current.error_message
+                    else note
+                )
+                current.touch()
+                return current
+
+            mutate_order(order.client_order_id, record_query_failure, path=path)
             continue
 
     return updated_orders
@@ -329,6 +343,11 @@ def cancel_and_reconcile_order(
             side=target.side.value,
             exchange=target.exchange or "NASD",
         )
-    reconcile_order_with_broker_snapshot(target, snapshot)
-    save_orders(orders, path)
-    return target
+    updated = mutate_order(
+        target.client_order_id,
+        lambda current: reconcile_order_with_broker_snapshot(current, snapshot),
+        path=path,
+    )
+    if updated is None:
+        raise ValueError(f"Order {client_order_id} was not found after cancellation")
+    return updated

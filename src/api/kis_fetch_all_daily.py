@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import re
+import sys
 import time
 import zipfile
 from datetime import date, timedelta
@@ -13,6 +14,14 @@ import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+try:
+    from src.utils.config import DATA_DIR
+except ModuleNotFoundError:  # Keep direct script execution usable.
+    repository_root = Path(__file__).resolve().parents[2]
+    if str(repository_root) not in sys.path:
+        sys.path.insert(0, str(repository_root))
+    from src.utils.config import DATA_DIR
 
 try:
     from src.api.kis_config import KIS_BASE_URL, KIS_APP_KEY, KIS_APP_SECRET
@@ -35,10 +44,6 @@ MASTER_FILE_URLS = {
 }
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
 logger = logging.getLogger(__name__)
 
 
@@ -360,7 +365,7 @@ def fetch_one_symbol_daily_bar(
     return None
 
 
-def load_watchlist_symbols(path: Path = Path("data/watchlist.json")) -> List[str]:
+def load_watchlist_symbols(path: Path = DATA_DIR / "watchlist.json") -> List[str]:
     data = json.loads(path.read_text(encoding="utf-8"))
     items = data.get("items", [])
     if not isinstance(items, list):
@@ -474,6 +479,9 @@ def run_watchlist_overseas_fetch(target_yyyymmdd: str, output_path: Optional[str
 
 
 def main() -> None:
+    from src.utils.logging_config import configure_logging
+
+    configure_logging()
     args = parse_args()
     if args.watchlist_overseas:
         target_yyyymmdd = args.date or date.today().strftime("%Y%m%d")

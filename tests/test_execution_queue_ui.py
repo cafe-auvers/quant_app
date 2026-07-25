@@ -136,7 +136,7 @@ def test_intentional_selected_symbol_creates_one_buylist_queue_item(
     assert item.monitoring_status == "EXECUTE_READY"
     assert item.breakout_method == "execution_queue:1m"
     assert item.entry_price == pytest.approx(101.01)
-    assert item._planned_shares > 0
+    assert not hasattr(item, "_planned_shares")
     assert item.shares_held == 0
     assert (
         window.execution_queue_manager.items[queue_key("AAPL", "PROD")].selected_window
@@ -268,7 +268,6 @@ def test_buy_dashboard_queue_row_uses_execution_queue_candidate_values(
     item.entry_price = 1.23
     item.stop_loss = 0.45
     item.position_percent = 1.0
-    item._planned_shares = 1
     table = FakeTable()
     window.buylist_prod_table = table
 
@@ -348,7 +347,6 @@ def test_buy_dashboard_queue_row_falls_back_to_buylist_when_queue_missing(
     item.entry_price = 12.34
     item.stop_loss = 11.11
     item.position_percent = 3.4
-    item._planned_shares = 6
     del window.execution_queue_manager.items[queue_key("AAPL", "PROD")]
     table = FakeTable()
     window.buylist_prod_table = table
@@ -357,7 +355,7 @@ def test_buy_dashboard_queue_row_falls_back_to_buylist_when_queue_missing(
 
     assert table.item(0, 4).text() == "12.34"
     assert table.item(0, 6).text() == "11.11"
-    assert table.item(0, 9).text() == "6"
+    assert table.item(0, 9).text() == "-"
     assert table.item(0, 10).text() == "3.4%"
 
 

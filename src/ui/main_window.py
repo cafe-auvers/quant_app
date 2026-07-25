@@ -34,6 +34,7 @@ from src.core.scanner import StockScanner
 from src.core.watchlist import Watchlist, TradePlanManager, BuylistManager
 from src.core.trade_reviewer import TradeReviewer
 from src.utils.data_loader import get_default_universe
+from src.utils.config import RULEBOOK_DIR
 from src.utils.db_loader import init_mysql_engine
 from src.utils.storage import load_json
 from src.services.historical_refresh_control import (
@@ -80,6 +81,7 @@ from src.services.order_ledger import (
     find_open_orders,
     has_open_order,
     load_order_ledger,
+    merge_orders,
     save_order_ledger,
     update_order,
 )
@@ -97,6 +99,7 @@ __all__ = [
     "find_open_orders",
     "has_open_order",
     "load_order_ledger",
+    "merge_orders",
     "save_order_ledger",
     "update_order",
 ]
@@ -151,7 +154,7 @@ class MainWindow(
             for k, v in DEFAULT_SETTINGS["shortcuts"].items():
                 if k not in self.settings["shortcuts"]:
                     self.settings["shortcuts"][k] = v
-        self.reviewer = TradeReviewer(rulebook_dir="rulebooks")
+        self.reviewer = TradeReviewer(rulebook_dir=RULEBOOK_DIR)
         self.db_engine = init_mysql_engine()
         self.db_enabled = self.db_engine is not None
         self.kis_account_snapshots: dict[tuple[str, str], dict] = {}

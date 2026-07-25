@@ -1,8 +1,27 @@
 import pytest
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone
 from src.core.watchlist import BuylistItem, BuylistManager, TradePlan, TradePlanManager, Watchlist
 from src.core.scoring import calculate_deterministic_scores, run_ai_review
+
+
+def test_persisted_watchlist_timestamps_are_timezone_aware():
+    watchlist = Watchlist.from_dict(
+        {
+            "name": "Default",
+            "created_date": "2026-07-01T09:00:00",
+            "items": [
+                {
+                    "symbol": "AAPL",
+                    "name": "Apple",
+                    "added_date": "2026-07-01T09:30:00",
+                }
+            ],
+        }
+    )
+
+    assert watchlist.created_date.tzinfo == timezone.utc
+    assert watchlist.items[0].added_date.tzinfo == timezone.utc
 
 
 def test_buylist_item_serialization():

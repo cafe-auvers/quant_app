@@ -305,7 +305,7 @@ class ChartsRenderMixin:
     ) -> str:
         """Generate a stable TradingView Lightweight Charts page from local OHLCV data."""
         options = options or {}
-        settings = load_json(Path("data/settings.json"), {})
+        settings = load_json(SETTINGS_FILE, {})
         shortcuts = settings.get("shortcuts", {
             "set_target": "T",
             "draw_line": "D",
@@ -1361,7 +1361,7 @@ class ChartsRenderMixin:
     ) -> str:
         """Generate a local SVG chart from OHLCV data."""
         options = ChartsRenderMixin._normalize_chart_options(options)
-        settings = load_json(Path("data/settings.json"), {})
+        settings = load_json(SETTINGS_FILE, {})
         shortcuts = settings.get("shortcuts", {
             "set_target": "T",
             "draw_line": "D",

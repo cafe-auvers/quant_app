@@ -5,6 +5,8 @@ import sys
 from PyQt5.QtCore import qInstallMessageHandler
 from PyQt5.QtWidgets import QApplication
 
+from src.utils.logging_config import configure_logging
+
 
 def _qt_message_handler(mode, context, message):
     """Suppress one known Qt MIME warning while preserving other Qt output."""
@@ -18,6 +20,7 @@ def _qt_message_handler(mode, context, message):
 
 def main():
     """Initialize and run the application."""
+    configure_logging()
     qInstallMessageHandler(_qt_message_handler)
     from src.ui.main_window import MainWindow
 

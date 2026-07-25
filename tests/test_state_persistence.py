@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 from src.services import app_state
 from src.services.app_state import SaveResult, StateSaveManager
+from src.core.watchlist import BuylistItem
 import src.ui.main_window as main_window_module
 from src.ui.main_window import MainWindow
 from src.utils.storage import load_json, save_json
@@ -60,6 +61,42 @@ def test_load_json_falls_back_to_backup_when_main_is_malformed(tmp_path):
     )
 
     assert load_json(path, {"items": []}) == {"items": [{"symbol": "AAPL"}]}
+    assert len(list(tmp_path.glob("watchlist.json.corrupt-*"))) == 1
+
+
+def test_load_buylist_state_quarantines_rejected_rows(tmp_path, monkeypatch):
+    paths = _patch_app_state_paths(monkeypatch, tmp_path)
+    valid = BuylistItem(
+        symbol="AAPL",
+        name="Apple",
+        entry_price=100.0,
+        target_price=0.0,
+        stop_loss=95.0,
+        total_score=80.0,
+        status="WATCHING",
+        technical_score=80.0,
+        setup_score=80.0,
+        risk_score=80.0,
+        news_score=80.0,
+        timing_score=80.0,
+        rr=0.0,
+        stop_adr=20.0,
+        position_percent=10.0,
+        ai_summary="",
+        warnings=[],
+    ).to_dict()
+    invalid = dict(valid)
+    invalid["symbol"] = "BROKEN"
+    invalid["entry_price"] = "not-a-number"
+    save_json(paths["BUYLIST_FILE"], {"items": [valid, invalid]})
+
+    manager = app_state.load_buylist_state()
+
+    assert [item.symbol for item in manager.items] == ["AAPL"]
+    quarantine_path = tmp_path / "rejected" / "buylist.rejected.json"
+    quarantined = load_json(quarantine_path, {})
+    assert quarantined["records"][0]["identity"] == "BROKEN"
+    assert quarantined["records"][0]["record"]["entry_price"] == "not-a-number"
 
 
 def test_load_buylist_state_archives_non_production_rows_before_filtering(

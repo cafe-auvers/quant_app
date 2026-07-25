@@ -77,6 +77,7 @@ from src.utils.data_loader import (
     get_default_universe,
     _extract_symbol_history,
 )
+from src.utils.config import DATA_DIR
 from src.utils.db_loader import (
     init_mysql_engine,
     load_symbol_history_from_db,
@@ -1113,7 +1114,7 @@ class WatchlistMixin:
         import datetime as dt
 
         timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = Path(f"data/watchlist_snapshot_{timestamp}.json")
+        out_path = DATA_DIR / f"watchlist_snapshot_{timestamp}.json"
 
         # â”€â”€ 1. Environment / account inputs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         env = (

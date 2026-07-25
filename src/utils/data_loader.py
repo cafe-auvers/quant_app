@@ -15,8 +15,11 @@ import pandas as pd
 import requests
 import yfinance as yf
 
-DEFAULT_UNIVERSE_CACHE = Path("data/us_kis_tickers.csv")
-SP500_UNIVERSE_CACHE = Path("data/sp500_tickers.csv")
+from src.utils.config import DATA_DIR
+
+
+DEFAULT_UNIVERSE_CACHE = DATA_DIR / "us_kis_tickers.csv"
+SP500_UNIVERSE_CACHE = DATA_DIR / "sp500_tickers.csv"
 WIKI_SP500_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 DEFAULT_UNIVERSE = [
     "AAPL",

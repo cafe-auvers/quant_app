@@ -6,6 +6,15 @@ from typing import Dict, Optional
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 ENV_FILE = ROOT_DIR / ".env"
+DATA_DIR = ROOT_DIR / "data"
+RULEBOOK_DIR = ROOT_DIR / "rulebooks"
+DEFAULT_KIS_TOKEN_CACHE = ROOT_DIR / ".kis_token_cache_prod.json"
+
+
+def resolve_repo_path(path: str | Path) -> Path:
+    """Resolve application-owned relative paths against the repository root."""
+    candidate = Path(path).expanduser()
+    return candidate if candidate.is_absolute() else ROOT_DIR / candidate
 
 
 def load_env_file() -> Dict[str, str]:

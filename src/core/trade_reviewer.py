@@ -3,6 +3,8 @@ from typing import Dict, List, Optional
 from pathlib import Path
 from dataclasses import dataclass
 
+from src.utils.config import RULEBOOK_DIR
+
 
 @dataclass
 class TradeSetup:
@@ -30,7 +32,7 @@ class TradeReview:
 class TradeReviewer:
     """AI-powered trade setup reviewer."""
     
-    def __init__(self, rulebook_dir: str = "rulebooks/"):
+    def __init__(self, rulebook_dir: str | Path = RULEBOOK_DIR):
         """
         Initialize the trade reviewer.
         

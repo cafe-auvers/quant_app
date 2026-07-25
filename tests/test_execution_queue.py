@@ -271,6 +271,40 @@ def test_execution_queue_serializes_enum_values_round_trip():
     assert restored.items[queue_key("AAPL", "PROD")].environment == "PROD"
 
 
+def test_execution_queue_legacy_naive_timestamp_is_normalized_to_utc():
+    manager = ExecutionQueueManager.from_dict(
+        {
+            "items": {
+                "PROD:AAPL": {
+                    "symbol": "AAPL",
+                    "environment": "PROD",
+                    "last_updated": "2026-07-01T09:30:00",
+                }
+            }
+        }
+    )
+
+    assert manager.get_item("AAPL", "PROD").last_updated.utcoffset().total_seconds() == 0
+
+
+def test_execution_queue_invalid_container_is_reported_without_partial_load():
+    rejected = []
+
+    manager = ExecutionQueueManager.from_dict(
+        {"upgrade_margin": "invalid", "items": ["not", "a", "mapping"]},
+        on_rejected=lambda index, record, error: rejected.append(
+            (index, record, error)
+        ),
+    )
+
+    assert manager.items == {}
+    assert manager.upgrade_margin == 0.0
+    assert [record["field"] for _, record, _ in rejected] == [
+        "upgrade_margin",
+        "items",
+    ]
+
+
 def test_legacy_symbol_only_execution_queue_state_is_ignored():
     manager = ExecutionQueueManager()
     manager.upsert_item(symbol="AAPL", candidates={"1m": _candidate("1m", 50)})

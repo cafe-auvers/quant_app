@@ -7,16 +7,29 @@ and call order services only after user review.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import pandas as pd
 
 from src.core.orb import calculate_orb_range, evaluate_orb_entry_signal
 from src.core.position_sizer import PositionSizer
 
+logger = logging.getLogger(__name__)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_utc_timestamp(value: Any) -> datetime:
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 SUPPORTED_ORB_WINDOWS = ("1m", "5m", "30m")
 DEFAULT_ORB_BUFFER_PCT = 0.001
@@ -164,11 +177,12 @@ class ExecutionQueueItem:
     manual_window_lock: bool = False
     order_status: Optional[str] = None
     order_id: Optional[str] = None
-    last_updated: datetime = field(default_factory=datetime.now)
+    last_updated: datetime = field(default_factory=_utc_now)
     warnings: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.environment = _require_production_environment(self.environment)
+        self.last_updated = _parse_utc_timestamp(self.last_updated)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -209,12 +223,12 @@ class ExecutionQueueItem:
         last_updated_raw = data.get("last_updated")
         try:
             last_updated = (
-                datetime.fromisoformat(last_updated_raw)
+                _parse_utc_timestamp(last_updated_raw)
                 if last_updated_raw
-                else datetime.now()
+                else _utc_now()
             )
         except ValueError:
-            last_updated = datetime.now()
+            last_updated = _utc_now()
         return cls(
             symbol=str(data.get("symbol", "")).upper(),
             environment=str(data.get("environment") or PRODUCTION_ENVIRONMENT).upper(),
@@ -323,7 +337,6 @@ def build_queue_display_state(
     selected_window = str(
         getattr(candidate, "window", "")
         or getattr(queue_item, "selected_window", "")
-        or getattr(buylist_item, "_selected_orb_window", "")
         or ""
     )
 
@@ -349,11 +362,7 @@ def build_queue_display_state(
         or _optional_float(getattr(buylist_item, "current_price", None))
         or 0.0
     )
-    planned_shares = int(
-        getattr(candidate, "shares", None)
-        or getattr(buylist_item, "_planned_shares", 0)
-        or 0
-    )
+    planned_shares = int(getattr(candidate, "shares", None) or 0)
     capital_percent = (
         _optional_float(getattr(candidate, "capital_percent", None))
         or _optional_float(getattr(buylist_item, "position_percent", None))
@@ -875,7 +884,7 @@ class ExecutionQueueManager:
                 if key in SUPPORTED_ORB_WINDOWS
             }
         existing.warnings = list(warnings or [])
-        existing.last_updated = datetime.now()
+        existing.last_updated = _utc_now()
 
         if existing.manual_window_lock and existing.selected_window:
             selected = (
@@ -966,7 +975,7 @@ class ExecutionQueueManager:
             locked=True,
             order_status=order_status,
         )
-        item.last_updated = datetime.now()
+        item.last_updated = _utc_now()
 
     def mark_order_failed(
         self,
@@ -982,7 +991,7 @@ class ExecutionQueueManager:
         item.order_status = order_status
         item.order_id = None
         item.status = resolve_queue_status(item.candidates, item.selected_candidate)
-        item.last_updated = datetime.now()
+        item.last_updated = _utc_now()
 
     def mark_order_filled(
         self,
@@ -999,7 +1008,7 @@ class ExecutionQueueManager:
         item.order_status = order_status
         item.order_id = order_id or item.order_id
         item.status = ExecutionQueueStatus.FILLED
-        item.last_updated = datetime.now()
+        item.last_updated = _utc_now()
 
     def has_pending_or_submitted_order(
         self,
@@ -1028,7 +1037,7 @@ class ExecutionQueueManager:
         item.order_status = None
         item.order_id = None
         item.status = resolve_queue_status(item.candidates, item.selected_candidate)
-        item.last_updated = datetime.now()
+        item.last_updated = _utc_now()
         return True
 
     def values(self) -> List[ExecutionQueueItem]:
@@ -1046,12 +1055,41 @@ class ExecutionQueueManager:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "ExecutionQueueManager":
-        manager = cls(
-            upgrade_margin=float(data.get("upgrade_margin", DEFAULT_UPGRADE_MARGIN))
-        )
-        for raw_key, item_data in dict(data.get("items", {})).items():
+    def from_dict(
+        cls,
+        data: Dict[str, Any],
+        *,
+        on_rejected: Optional[Callable[[int, Any, Exception], None]] = None,
+    ) -> "ExecutionQueueManager":
+        try:
+            upgrade_margin = float(
+                data.get("upgrade_margin", DEFAULT_UPGRADE_MARGIN)
+            )
+        except (TypeError, ValueError) as exc:
+            logger.warning("Rejected execution queue upgrade margin: %s", exc)
+            if on_rejected is not None:
+                on_rejected(
+                    0,
+                    {"field": "upgrade_margin", "value": data.get("upgrade_margin")},
+                    exc,
+                )
+            upgrade_margin = DEFAULT_UPGRADE_MARGIN
+        manager = cls(upgrade_margin=upgrade_margin)
+        raw_items = data.get("items", {})
+        if not isinstance(raw_items, dict):
+            error = TypeError("items must be an object keyed by environment and symbol")
+            logger.warning("Rejected execution queue items container: %s", error)
+            if on_rejected is not None:
+                on_rejected(0, {"field": "items", "value": raw_items}, error)
+            return manager
+        for index, (raw_key, item_data) in enumerate(
+            raw_items.items()
+        ):
             if not isinstance(item_data, dict):
+                error = TypeError("record is not an object")
+                logger.warning("Rejected execution queue record %r: %s", raw_key, error)
+                if on_rejected is not None:
+                    on_rejected(index, {"key": raw_key, "value": item_data}, error)
                 continue
             key_environment, key_symbol = _split_queue_key(str(raw_key))
             item_environment = (
@@ -1064,7 +1102,10 @@ class ExecutionQueueManager:
                 continue
             try:
                 item = ExecutionQueueItem.from_dict(item_data)
-            except ValueError:
+            except Exception as exc:
+                logger.warning("Rejected execution queue record %r: %s", raw_key, exc)
+                if on_rejected is not None:
+                    on_rejected(index, {"key": raw_key, "value": item_data}, exc)
                 continue
             if not item.symbol:
                 item.symbol = key_symbol

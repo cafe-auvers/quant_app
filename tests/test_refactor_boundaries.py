@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 
 def test_refactored_ui_modules_importable():
@@ -26,6 +27,59 @@ def test_refactored_ui_modules_importable():
     assert WatchlistAiWorker is not None
     assert set(DEFAULT_SCANNER_SETUPS) == {"Setup 1", "Setup 2"}
     assert DEFAULT_TAB_OPTIONS["tradingview"] is True
+
+
+def test_account_and_order_reconciliation_workers_keep_separate_state(
+    monkeypatch,
+):
+    import src.ui.order_workers as order_workers
+    import src.ui.workers as workers
+
+    monkeypatch.setattr(
+        workers,
+        "fetch_account_snapshot",
+        lambda *args, **kwargs: {"kind": "account"},
+    )
+    account_results = []
+    account_errors = []
+    account_worker = workers.KisAccountWorker("PROD", True, True)
+    account_worker.finished_snapshot.connect(account_results.append)
+    account_worker.error_occurred.connect(account_errors.append)
+    account_worker.run()
+
+    open_order = SimpleNamespace(
+        client_order_id="client-1",
+        execution_policy="REGULAR_LIMIT",
+    )
+    monkeypatch.setattr(
+        order_workers,
+        "fetch_account_snapshot",
+        lambda *args, **kwargs: {"kind": "reconciliation"},
+    )
+    monkeypatch.setattr(
+        order_workers,
+        "reconcile_orders_with_snapshot",
+        lambda orders, snapshot, previous_snapshot=None: list(orders),
+    )
+    reconciliation_results = []
+    reconciliation_errors = []
+    reconciliation_worker = order_workers.OrderReconciliationWorker(
+        "PROD",
+        "12345678-01",
+        [open_order],
+    )
+    reconciliation_worker.finished_reconciliation.connect(
+        lambda orders, snapshot: reconciliation_results.append((orders, snapshot))
+    )
+    reconciliation_worker.error_occurred.connect(reconciliation_errors.append)
+    reconciliation_worker.run()
+
+    assert account_results == [{"kind": "account"}]
+    assert account_errors == []
+    assert reconciliation_results == [
+        ([open_order], {"kind": "reconciliation"})
+    ]
+    assert reconciliation_errors == []
 
 
 def test_app_state_save_preserves_json_shapes(tmp_path, monkeypatch):
