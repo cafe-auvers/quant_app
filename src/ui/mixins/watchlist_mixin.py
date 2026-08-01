@@ -45,7 +45,7 @@ from PyQt5.QtWidgets import (
     QMenu,
 )
 from PyQt5.QtCore import Qt, QThread, QTimer, QUrl
-from PyQt5.QtGui import QColor, QKeySequence
+from PyQt5.QtGui import QColor, QDoubleValidator, QKeySequence
 
 try:
     from PyQt5.QtWebEngineWidgets import QWebEngineView
@@ -196,11 +196,19 @@ class WatchlistMixin:
         sizing_layout = QHBoxLayout()
         sizing_layout.addWidget(QLabel("Account USD:"))
         self.account_size_input = QLineEdit("100000")
+        account_size_validator = QDoubleValidator(
+            0.0, 1_000_000_000_000.0, 2, self.account_size_input
+        )
+        account_size_validator.setNotation(QDoubleValidator.StandardNotation)
+        self.account_size_input.setValidator(account_size_validator)
         self.account_size_input.setMaximumWidth(90)
         sizing_layout.addWidget(self.account_size_input)
         sizing_layout.addSpacing(10)
         sizing_layout.addWidget(QLabel("Risk %:"))
         self.risk_percent_input = QLineEdit("1")
+        risk_validator = QDoubleValidator(0.0, 100.0, 4, self.risk_percent_input)
+        risk_validator.setNotation(QDoubleValidator.StandardNotation)
+        self.risk_percent_input.setValidator(risk_validator)
         self.risk_percent_input.setMaximumWidth(45)
         sizing_layout.addWidget(self.risk_percent_input)
         sizing_layout.addSpacing(10)
@@ -298,6 +306,11 @@ class WatchlistMixin:
         orb_breakout_layout = QHBoxLayout()
         orb_breakout_layout.addWidget(QLabel("Daily Breakout $:"))
         self.watchlist_breakout_price_input = QLineEdit()
+        breakout_validator = QDoubleValidator(
+            0.0, 1_000_000_000.0, 6, self.watchlist_breakout_price_input
+        )
+        breakout_validator.setNotation(QDoubleValidator.StandardNotation)
+        self.watchlist_breakout_price_input.setValidator(breakout_validator)
         self.watchlist_breakout_price_input.setPlaceholderText(
             "e.g. 123.45 — leave blank for ORB-only"
         )
@@ -309,6 +322,11 @@ class WatchlistMixin:
         orb_breakout_layout.addSpacing(12)
         orb_breakout_layout.addWidget(QLabel("Buffer %:"))
         self.watchlist_buffer_pct_input = QLineEdit("0.10")
+        buffer_validator = QDoubleValidator(
+            0.0, 100.0, 4, self.watchlist_buffer_pct_input
+        )
+        buffer_validator.setNotation(QDoubleValidator.StandardNotation)
+        self.watchlist_buffer_pct_input.setValidator(buffer_validator)
         self.watchlist_buffer_pct_input.setMaximumWidth(50)
         self.watchlist_buffer_pct_input.setToolTip(
             "Small buffer above breakout_price to avoid false touches (default 0.10%)"
@@ -563,7 +581,9 @@ class WatchlistMixin:
 
         entry_price: float = price
         stop_loss: float = price * (1.0 - (0.75 * (adr_percent or 2.5) / 100.0))
-        breakout_price: float = float(getattr(item, "breakout_price", 0.0) or 0.0)
+        breakout_price: float = self._positive_finite_number(
+            getattr(item, "breakout_price", None), default=0.0
+        )
         buffer_pct: float = 0.001
         case_type: str = "DAILY"
 
@@ -1342,6 +1362,15 @@ class WatchlistMixin:
             )
             return
 
+        existing_worker = self.__dict__.get("watchlist_worker")
+        if existing_worker is not None and existing_worker.isRunning():
+            QMessageBox.information(
+                self,
+                "Analysis running",
+                "Watchlist AI analysis is already running. Wait for it to finish before starting another review.",
+            )
+            return
+
         self.analyze_stock_ai_button.setEnabled(False)
         self.analyze_stock_ai_button.setText("Analyzing...")
 
@@ -1378,6 +1407,11 @@ class WatchlistMixin:
         )
         self.watchlist_worker.finished_analysis_df.connect(
             self.on_watchlist_df_finished
+        )
+        self.watchlist_worker.finished.connect(
+            lambda worker=self.watchlist_worker: self._clear_worker_reference(
+                "watchlist_worker", worker
+            )
         )
         self.watchlist_worker.start()
 
@@ -1548,10 +1582,8 @@ class WatchlistMixin:
         item = self.watchlist.get(symbol)
         if item is None or item.breakout_price is None:
             return None
-        try:
-            return float(item.breakout_price)
-        except (TypeError, ValueError):
-            return None
+        price = self._positive_finite_number(item.breakout_price, default=0.0)
+        return price or None
 
     def _format_optional_price(self, value: Optional[float]) -> str:
         return "" if value is None else f"{float(value):.2f}"
@@ -1726,19 +1758,22 @@ class WatchlistMixin:
         if not text or text == "Select a watchlist symbol to view its ORB plan":
             return
         symbol = text.upper()
-        # Persist any manual edit of the Daily Breakout $ back to watchlist.breakout_price
+        # Persist only a positive, finite manual breakout level.  Invalid UI
+        # text is treated as an unset level instead of leaking nan/inf into an
+        # execution plan.
         if hasattr(self, "watchlist_breakout_price_input") and hasattr(
             self, "watchlist"
         ):
-            try:
-                bp_text = self.watchlist_breakout_price_input.text().strip()
-                new_tp = float(bp_text) if bp_text else None
-                item = self.watchlist.get(symbol)
-                if item is not None and item.breakout_price != new_tp:
-                    item.breakout_price = new_tp
-                    self._save_state()
-            except ValueError:
-                pass
+            bp_text = self.watchlist_breakout_price_input.text().strip()
+            new_tp = (
+                self._positive_finite_number(bp_text, default=0.0)
+                if bp_text
+                else None
+            )
+            item = self.watchlist.get(symbol)
+            if item is not None and item.breakout_price != new_tp:
+                item.breakout_price = new_tp
+                self._save_state()
         self.refresh_watchlist_orb_panel(symbol)
 
     def _on_watchlist_orb_plan_selected(self, column: int, checked: bool) -> None:
@@ -1762,17 +1797,51 @@ class WatchlistMixin:
                         cb.setChecked(False)
 
             plan = getattr(self, "watchlist_orb_column_data", {}).get(column)
-            if not plan:
+            if not plan or not plan.get("valid"):
+                QMessageBox.warning(
+                    self,
+                    "Invalid ORB plan",
+                    "Only a plan that passes the position and risk checks can be selected.",
+                )
                 return
 
             symbol = plan["symbol"]
             sizing = plan["sizing"]
-            risk_pct = plan["risk_percent"]
-            orb_high = float(plan.get("orb_high") or plan.get("entry_price") or 0.0)
-            entry_trigger = float(plan.get("entry_trigger") or orb_high)
-            stop_price = float(plan.get("stop_price") or 0.0)
-            bp = plan.get("breakout_price")
-            buffer_pct = plan.get("buffer_pct", 0.001)
+            try:
+                risk_pct = float(plan["risk_percent"])
+                orb_high = float(
+                    plan.get("orb_high") or plan.get("entry_price") or 0.0
+                )
+                entry_trigger = float(plan.get("entry_trigger") or orb_high)
+                stop_price = float(plan.get("stop_price") or 0.0)
+                raw_breakout = plan.get("breakout_price")
+                bp = float(raw_breakout) if raw_breakout is not None else None
+                buffer_pct = float(plan.get("buffer_pct", 0.001))
+            except (TypeError, ValueError):
+                QMessageBox.warning(
+                    self,
+                    "Invalid ORB plan",
+                    "The selected plan contains an invalid price or risk value.",
+                )
+                return
+            if (
+                not all(
+                    math.isfinite(value)
+                    for value in (risk_pct, orb_high, entry_trigger, stop_price, buffer_pct)
+                )
+                or (bp is not None and not math.isfinite(bp))
+                or risk_pct <= 0
+                or entry_trigger <= 0
+                or stop_price <= 0
+                or stop_price >= entry_trigger
+                or buffer_pct < 0
+            ):
+                QMessageBox.warning(
+                    self,
+                    "Invalid ORB plan",
+                    "The selected plan must have finite positive prices and a stop below entry.",
+                )
+                return
             shares_val = int(sizing.get("shares", 0))
             cap_pct = sizing.get("capital_percent", 0.0)
             sl_adr = sizing.get("sl_adr")
@@ -1811,6 +1880,26 @@ class WatchlistMixin:
             _set(11, f"{bp:.2f}" if bp else "")  # Breakout Price
             _set(12, f"{stop_price:.2f}" if stop_price else "")  # Stop Loss
 
+            watch_item = self.watchlist.get(symbol)
+            if watch_item is None:
+                return
+            watch_item.entry_price = entry_trigger
+            watch_item.stop_loss = stop_price
+            if bp is not None and bp > 0:
+                watch_item.breakout_price = bp
+            watch_item.selected_orb_plan = {
+                "window": str(plan.get("window", "")),
+                "risk_percent": risk_pct,
+                "entry_trigger": entry_trigger,
+                "stop_price": stop_price,
+                "breakout_price": bp,
+                "buffer_pct": buffer_pct,
+                "shares": shares_val,
+                "capital_percent": float(cap_pct or 0.0),
+                "stop_adr": float(sl_adr) if sl_adr is not None else None,
+                "selected_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            }
+
             # Keep watchlist_scores cache consistent
             if hasattr(self, "watchlist_scores") and symbol in self.watchlist_scores:
                 self.watchlist_scores[symbol].update(
@@ -1826,6 +1915,24 @@ class WatchlistMixin:
                         "stop_adr": sl_adr,
                         "trade_plan": desc,
                     }
+                )
+            self._save_state()
+
+            # If the symbol is already queued, immediately recompute its
+            # candidate with this saved window/risk/buffer.  Unqueued symbols
+            # remain unqueued until the user explicitly moves them to the queue.
+            manager = self.__dict__.get("execution_queue_manager")
+            env = (
+                self.watchlist_env_combo.currentText()
+                if hasattr(self, "watchlist_env_combo")
+                else "PROD"
+            )
+            if manager is not None and manager.get_item(symbol, env) is not None:
+                self.refresh_execution_queue(
+                    env,
+                    show_log=False,
+                    symbols=[symbol],
+                    create_missing=False,
                 )
         finally:
             self._updating_watchlist_orb_selection = False
@@ -2001,27 +2108,33 @@ class WatchlistMixin:
 
     def _watchlist_breakout_price_for_symbol(self, symbol: str) -> float:
         item = self.watchlist.get(symbol) if hasattr(self, "watchlist") else None
+        return self._positive_finite_number(
+            getattr(item, "breakout_price", None), default=0.0
+        )
+
+    @staticmethod
+    def _positive_finite_number(value: Any, default: float = 0.0) -> float:
         try:
-            return (
-                float(item.breakout_price)
-                if item is not None and item.breakout_price
-                else 0.0
-            )
-        except (TypeError, ValueError):
-            return 0.0
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return default
+        return number if math.isfinite(number) and number > 0 else default
 
     def _watchlist_orb_buffer_pct(self) -> float:
         if not hasattr(self, "watchlist_buffer_pct_input"):
             return 0.001
         try:
             text = self.watchlist_buffer_pct_input.text().strip()
-            return float(text) / 100.0 if text else 0.001
-        except ValueError:
+            raw_percent = float(text) if text else 0.10
+        except (TypeError, ValueError, OverflowError):
             return 0.001
+        if not math.isfinite(raw_percent) or raw_percent < 0 or raw_percent > 100:
+            return 0.001
+        return raw_percent / 100.0
 
     def _watchlist_orb_signal_price(self, symbol: str) -> float:
-        current_live_price = getattr(self, "latest_intraday_prices", {}).get(
-            symbol, 0.0
+        current_live_price = self._positive_finite_number(
+            getattr(self, "latest_intraday_prices", {}).get(symbol, 0.0), default=0.0
         )
         if current_live_price > 0:
             return current_live_price
@@ -2034,7 +2147,9 @@ class WatchlistMixin:
                 and not daily_history.empty
                 and "Close" in daily_history.columns
             ):
-                return float(daily_history["Close"].iloc[-1])
+                return self._positive_finite_number(
+                    daily_history["Close"].iloc[-1], default=0.0
+                )
         except Exception:
             pass
         return 0.0
@@ -2127,18 +2242,10 @@ class WatchlistMixin:
         # Read manually entered daily breakout price and buffer from UI inputs
         breakout_price = 0.0
         if hasattr(self, "watchlist_breakout_price_input"):
-            try:
-                bp_text = self.watchlist_breakout_price_input.text().strip()
-                breakout_price = float(bp_text) if bp_text else 0.0
-            except ValueError:
-                breakout_price = 0.0
-        buffer_pct = 0.001
-        if hasattr(self, "watchlist_buffer_pct_input"):
-            try:
-                buf_text = self.watchlist_buffer_pct_input.text().strip()
-                buffer_pct = float(buf_text) / 100.0 if buf_text else 0.001
-            except ValueError:
-                buffer_pct = 0.001
+            breakout_price = self._positive_finite_number(
+                self.watchlist_breakout_price_input.text().strip(), default=0.0
+            )
+        buffer_pct = self._watchlist_orb_buffer_pct()
         breakout_trigger = (
             breakout_price * (1 + buffer_pct) if breakout_price > 0 else 0.0
         )
@@ -2324,6 +2431,21 @@ class WatchlistMixin:
             hasattr(self, "watchlist_orb_valid_only_checkbox")
             and self.watchlist_orb_valid_only_checkbox.isChecked()
         )
+        saved_plan = getattr(self.watchlist.get(symbol), "selected_orb_plan", None)
+        saved_window = (
+            str(saved_plan.get("window", "") or "")
+            if isinstance(saved_plan, dict)
+            else ""
+        )
+        try:
+            saved_risk_percent = (
+                float(saved_plan.get("risk_percent"))
+                if isinstance(saved_plan, dict)
+                and saved_plan.get("risk_percent") is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            saved_risk_percent = None
         for col, record in enumerate(records, start=1):
             is_valid = record.get("valid", False)
             if is_valid:
@@ -2333,7 +2455,21 @@ class WatchlistMixin:
 
             # Row 0: centred checkbox
             cb = QCheckBox()
-            cb.setToolTip("Apply this plan to the watchlist row")
+            if not is_valid:
+                cb.setEnabled(False)
+                cb.setToolTip("This plan does not meet the position and risk checks")
+            else:
+                cb.setToolTip("Apply and save this plan for the execution queue")
+            if (
+                is_valid
+                and record.get("window") == saved_window
+                and saved_risk_percent is not None
+                and abs(float(record.get("risk_percent", 0.0)) - saved_risk_percent)
+                < 0.000001
+            ):
+                # Set before wiring the signal so rebuilding the panel does not
+                # overwrite the saved choice or trigger a redundant refresh.
+                cb.setChecked(True)
             cb.toggled.connect(
                 lambda checked, c=col: self._on_watchlist_orb_plan_selected(c, checked)
             )
@@ -2510,24 +2646,394 @@ class WatchlistMixin:
         self, show_warnings: bool = True, update_output: bool = True
     ) -> bool:
         """Calculate shares from account risk, entry, and stop."""
-        return False
+        inputs = self._trade_plan_inputs()
+        account_size = self._trade_plan_number(inputs["account_size"])
+        entry_price = self._trade_plan_number(inputs["entry_price"])
+        stop_loss = self._trade_plan_number(inputs["stop_loss"])
+        risk_percent = self._trade_plan_number(inputs["risk_percent"])
+
+        problem = ""
+        if account_size is None or account_size <= 0:
+            problem = "Enter a finite account size greater than zero."
+        elif entry_price is None or entry_price <= 0:
+            problem = "Enter a finite entry price greater than zero."
+        elif stop_loss is None or stop_loss <= 0:
+            problem = "Enter a finite stop loss greater than zero."
+        elif stop_loss >= entry_price:
+            problem = "For a long trade, the stop loss must be below the entry price."
+        elif risk_percent is None or not 0 < risk_percent <= 100:
+            problem = "Risk must be greater than 0% and no more than 100%."
+
+        if problem:
+            self._set_trade_plan_position_size(0)
+            if update_output:
+                self._set_trade_plan_feedback_text(problem)
+            if show_warnings:
+                QMessageBox.warning(self, "Invalid trade plan", problem)
+            return False
+
+        risk_fraction = risk_percent / 100.0
+        sizing = PositionSizer(
+            account_size=account_size,
+            max_risk_per_trade=risk_fraction,
+        ).size_risk_based(entry_price, stop_loss, risk_fraction)
+        if sizing.shares <= 0:
+            problem = "The position size could not be calculated safely."
+            self._set_trade_plan_position_size(0)
+            if update_output:
+                self._set_trade_plan_feedback_text(problem)
+            if show_warnings:
+                QMessageBox.warning(self, "Invalid trade plan", problem)
+            return False
+
+        self._set_trade_plan_position_size(sizing.shares)
+        if update_output:
+            self._set_trade_plan_feedback_text(
+                "Position size: "
+                f"{sizing.shares:,} shares | "
+                f"${sizing.dollar_amount:,.2f} position | "
+                f"${sizing.risk_amount:,.2f} risk"
+            )
+        return True
 
     def review_trade(self, show_warnings: bool = True) -> bool:
         """Review a planned trade using basic rule validation."""
-        return False
+        if not self.calculate_position_size(
+            show_warnings=show_warnings, update_output=False
+        ):
+            return False
+
+        inputs = self._trade_plan_inputs()
+        account_size = self._trade_plan_number(inputs["account_size"])
+        entry_price = self._trade_plan_number(inputs["entry_price"])
+        stop_loss = self._trade_plan_number(inputs["stop_loss"])
+        risk_percent = self._trade_plan_number(inputs["risk_percent"])
+        position_size = self._trade_plan_integer(inputs["position_size"])
+        # The fixed take-profit field is optional because the strategy uses a
+        # rule-based EMA exit.  Retain a supplied guide price for persistence.
+        take_profit = self._trade_plan_number(inputs["take_profit"], blank=0.0)
+        symbol = self._trade_plan_text(inputs["symbol"]).upper()
+        reason_widget = inputs["reason"]
+        reason = (
+            reason_widget.toPlainText().strip()
+            if reason_widget is not None and hasattr(reason_widget, "toPlainText")
+            else ""
+        )
+
+        if (
+            not symbol
+            or account_size is None
+            or entry_price is None
+            or entry_price <= 0
+            or stop_loss is None
+            or stop_loss <= 0
+            or stop_loss >= entry_price
+            or risk_percent is None
+            or not 0 < risk_percent <= 100
+            or position_size <= 0
+            or take_profit is None
+            or take_profit < 0
+        ):
+            # This should only be reachable when a field changed while sizing
+            # was being recalculated; keep the form fail-closed in that case.
+            problem = "Complete the trade-plan fields with finite values before review."
+            self._set_trade_plan_feedback_text(problem)
+            if show_warnings:
+                QMessageBox.warning(self, "Invalid trade plan", problem)
+            return False
+
+        risk_fraction = risk_percent / 100.0
+        sizing = PositionSizer(
+            account_size=account_size,
+            max_risk_per_trade=risk_fraction,
+        ).size_risk_based(entry_price, stop_loss, risk_fraction)
+        reviewer = self.__dict__.get("reviewer") or TradeReviewer()
+        review = reviewer.review_trade(
+            TradeSetup(
+                symbol=symbol,
+                entry_price=entry_price,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                size_shares=position_size,
+                risk_amount=sizing.risk_amount,
+                reasoning=reason,
+            )
+        )
+
+        feedback = f"{'Approved' if review.approved else 'Not approved'} ({review.confidence:.0%}): {review.summary}"
+        if review.violations:
+            feedback += "\nViolations: " + "; ".join(review.violations)
+        if review.recommendations:
+            feedback += "\nRecommendations: " + "; ".join(review.recommendations)
+        self._set_trade_plan_feedback_text(feedback)
+
+        if show_warnings and not review.approved:
+            QMessageBox.warning(self, "Trade plan needs changes", feedback)
+        return review.approved
 
     def update_trade_plan_feedback(self) -> None:
         """Automatically update position size and trade review as fields change."""
-        pass
+        if self.__dict__.get("_updating_trade_plan_feedback"):
+            return
+        self.__dict__["_updating_trade_plan_feedback"] = True
+        try:
+            self._show_trade_plan_actions()
+            if self.calculate_position_size(show_warnings=False, update_output=False):
+                self.review_trade(show_warnings=False)
+            else:
+                self._set_trade_plan_feedback_text(
+                    "Enter a valid account size, entry, stop, and risk to review the plan."
+                )
+        finally:
+            self.__dict__["_updating_trade_plan_feedback"] = False
 
     def save_trade_plan(self) -> None:
         """Save the current trade plan."""
-        pass
+        if not self.calculate_position_size(show_warnings=True, update_output=False):
+            return
+        if not self.review_trade(show_warnings=True):
+            return
+
+        inputs = self._trade_plan_inputs()
+        symbol = self._trade_plan_text(inputs["symbol"]).upper()
+        account_size = self._trade_plan_number(inputs["account_size"])
+        entry_price = self._trade_plan_number(inputs["entry_price"])
+        stop_loss = self._trade_plan_number(inputs["stop_loss"])
+        take_profit = self._trade_plan_number(inputs["take_profit"], blank=0.0)
+        risk_percent = self._trade_plan_number(inputs["risk_percent"])
+        position_size = self._trade_plan_integer(inputs["position_size"])
+        reason_widget = inputs["reason"]
+        reason = (
+            reason_widget.toPlainText().strip()
+            if reason_widget is not None and hasattr(reason_widget, "toPlainText")
+            else ""
+        )
+        if (
+            not symbol
+            or account_size is None
+            or account_size <= 0
+            or entry_price is None
+            or entry_price <= 0
+            or stop_loss is None
+            or stop_loss <= 0
+            or stop_loss >= entry_price
+            or take_profit is None
+            or take_profit < 0
+            or risk_percent is None
+            or not 0 < risk_percent <= 100
+            or position_size <= 0
+        ):
+            # Keep this guard even though the preceding review normally catches
+            # invalid values, so persistence cannot be reached with a partial form.
+            QMessageBox.warning(
+                self,
+                "Invalid trade plan",
+                "Enter a symbol and complete all required finite trade-plan values.",
+            )
+            return
+
+        symbol_widget = inputs["symbol"]
+        if symbol_widget is not None and hasattr(symbol_widget, "setText"):
+            symbol_widget.setText(symbol)
+
+        manager = self.__dict__.get("trade_manager")
+        if manager is None:
+            manager = TradePlanManager()
+            self.trade_manager = manager
+
+        active_plan = next(
+            (
+                plan
+                for plan in manager.get_active_plans()
+                if plan.symbol.strip().upper() == symbol
+            ),
+            None,
+        )
+        if active_plan is None:
+            manager.add_plan(
+                TradePlan(
+                    symbol=symbol,
+                    entry_price=entry_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    position_size=position_size,
+                    reason=reason,
+                    risk_percent=risk_percent / 100.0,
+                )
+            )
+        else:
+            active_plan.entry_price = entry_price
+            active_plan.stop_loss = stop_loss
+            active_plan.take_profit = take_profit
+            active_plan.position_size = position_size
+            active_plan.reason = reason
+            active_plan.risk_percent = risk_percent / 100.0
+
+        self._save_state()
+        self.populate_trade_plan_table()
+        self._set_trade_plan_feedback_text(f"Saved active trade plan for {symbol}.")
 
     def populate_trade_plan_table(self) -> None:
         """Populate the trade plan table with active plans."""
-        pass
+        table = self.__dict__.get("trade_plan_table")
+        if table is None:
+            return
+
+        manager = self.__dict__.get("trade_manager")
+        plans = manager.get_active_plans() if manager is not None else []
+        table.setRowCount(len(plans))
+        for row, plan in enumerate(plans):
+            symbol_item = QTableWidgetItem(plan.symbol)
+            symbol_item.setData(Qt.UserRole, plan.symbol)
+            table.setItem(row, 0, symbol_item)
+            table.setItem(row, 1, QTableWidgetItem(f"{plan.entry_price:.2f}"))
+            table.setItem(row, 2, QTableWidgetItem(f"{plan.stop_loss:.2f}"))
+            exit_model = "Rule-based EMA exit"
+            if plan.take_profit > 0:
+                exit_model += f" (guide ${plan.take_profit:.2f})"
+            table.setItem(row, 3, QTableWidgetItem(exit_model))
+            table.setItem(row, 4, QTableWidgetItem(plan.status.title()))
+
+        self._attach_trade_plan_table_if_needed(table)
+        table.setVisible(True)
+        self._show_trade_plan_actions()
 
     def load_saved_trade_plan(self, row: int, column: int) -> None:
         """Load a saved trade plan back into the form."""
-        pass
+        table = self.__dict__.get("trade_plan_table")
+        manager = self.__dict__.get("trade_manager")
+        if table is None or manager is None or row < 0 or row >= table.rowCount():
+            return
+
+        symbol_item = table.item(row, 0)
+        if symbol_item is None:
+            return
+        symbol = str(symbol_item.data(Qt.UserRole) or symbol_item.text()).strip().upper()
+        plan = next(
+            (
+                candidate
+                for candidate in manager.get_active_plans()
+                if candidate.symbol.strip().upper() == symbol
+            ),
+            None,
+        )
+        if plan is None:
+            return
+
+        inputs = self._trade_plan_inputs()
+        values = {
+            "symbol": plan.symbol,
+            "entry_price": f"{plan.entry_price:.2f}",
+            "stop_loss": f"{plan.stop_loss:.2f}",
+            "take_profit": f"{plan.take_profit:.2f}" if plan.take_profit > 0 else "",
+            "position_size": str(plan.position_size),
+            "risk_percent": f"{getattr(plan, 'risk_percent', 0.01) * 100:g}",
+        }
+        previous_signal_states = []
+        try:
+            for name, value in values.items():
+                widget = inputs[name]
+                if widget is None or not hasattr(widget, "setText"):
+                    continue
+                previous_signal_states.append((widget, widget.blockSignals(True)))
+                widget.setText(value)
+            reason_widget = inputs["reason"]
+            if reason_widget is not None and hasattr(reason_widget, "setPlainText"):
+                previous_signal_states.append(
+                    (reason_widget, reason_widget.blockSignals(True))
+                )
+                reason_widget.setPlainText(plan.reason)
+        finally:
+            for widget, previous_state in previous_signal_states:
+                widget.blockSignals(previous_state)
+
+        if self.__dict__.get("chart_symbol_input") is not None:
+            self._set_chart_symbol(plan.symbol)
+        self.update_trade_plan_feedback()
+
+    def _trade_plan_inputs(self) -> Dict[str, Any]:
+        """Return form widgets without assuming the mixin owns the window."""
+        values = self.__dict__
+        return {
+            "symbol": values.get("symbol_input"),
+            "entry_price": values.get("entry_price_input"),
+            "stop_loss": values.get("stop_loss_input"),
+            "take_profit": values.get("take_profit_input"),
+            "position_size": values.get("position_size_input"),
+            "account_size": values.get("account_size_input"),
+            "risk_percent": values.get("risk_percent_input"),
+            "reason": values.get("reason_input"),
+        }
+
+    @staticmethod
+    def _trade_plan_text(widget: Any) -> str:
+        if widget is None or not hasattr(widget, "text"):
+            return ""
+        return str(widget.text()).strip()
+
+    @classmethod
+    def _trade_plan_number(
+        cls, widget: Any, blank: Optional[float] = None
+    ) -> Optional[float]:
+        text = cls._trade_plan_text(widget).replace(",", "").replace("%", "")
+        if not text:
+            return blank
+        try:
+            value = float(text)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return value if math.isfinite(value) else None
+
+    @classmethod
+    def _trade_plan_integer(cls, widget: Any) -> int:
+        value = cls._trade_plan_number(widget)
+        if value is None or value <= 0 or not value.is_integer():
+            return 0
+        return int(value)
+
+    def _set_trade_plan_position_size(self, shares: int) -> None:
+        widget = self._trade_plan_inputs()["position_size"]
+        if widget is None or not hasattr(widget, "setText"):
+            return
+        previous_state = widget.blockSignals(True)
+        try:
+            widget.setText(str(max(0, int(shares))))
+        finally:
+            widget.blockSignals(previous_state)
+
+    def _set_trade_plan_feedback_text(self, text: str) -> None:
+        output = self.__dict__.get("trade_review_output")
+        if output is not None and hasattr(output, "setText"):
+            output.setText(text)
+
+    def _show_trade_plan_actions(self) -> None:
+        widget = self.__dict__.get("trade_plan_widget")
+        if widget is None or not hasattr(widget, "findChild"):
+            return
+        save_button = widget.findChild(QPushButton, "savePlanButton")
+        if save_button is not None:
+            save_button.setVisible(True)
+
+    def _attach_trade_plan_table_if_needed(self, table: QTableWidget) -> None:
+        """Attach the saved-plan table that older layouts created but omitted."""
+        if table.parent() is not None:
+            return
+        trade_plan_widget = self.__dict__.get("trade_plan_widget")
+        if trade_plan_widget is None or not hasattr(trade_plan_widget, "layout"):
+            return
+        outer_layout = trade_plan_widget.layout()
+        orb_table = self.__dict__.get("orb_trade_plan_table")
+        if outer_layout is None or orb_table is None:
+            return
+
+        for index in range(outer_layout.count()):
+            right_layout = outer_layout.itemAt(index).layout()
+            if right_layout is None or right_layout.indexOf(orb_table) < 0:
+                continue
+            label = self.__dict__.get("trade_plan_table_label")
+            if label is None:
+                label = QLabel("Saved Trade Plans")
+                self.trade_plan_table_label = label
+                right_layout.addWidget(label)
+            right_layout.addWidget(table, 1)
+            return

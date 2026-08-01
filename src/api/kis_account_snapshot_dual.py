@@ -43,12 +43,14 @@ import platform
 import stat
 import subprocess
 import sys
+import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import requests
 
@@ -91,6 +93,8 @@ RATE_LIMIT_MSG_CODES = {
 }
 MAX_RATE_LIMIT_RETRIES = 3
 RATE_LIMIT_BACKOFF_SECONDS = (1.0, 2.0, 4.0)
+TOKEN_CACHE_LOCK_TIMEOUT_SECONDS = 90.0
+TOKEN_CACHE_STALE_LOCK_SECONDS = 180.0
 
 
 def _restrict_file_to_current_user(path: Path) -> None:
@@ -127,6 +131,86 @@ def _restrict_file_to_current_user(path: Path) -> None:
             path.chmod(stat.S_IRUSR | stat.S_IWUSR)
     except Exception:
         pass
+
+
+@contextmanager
+def _exclusive_token_cache_lock(path: Path) -> Iterator[None]:
+    """Serialize token-cache refreshes across workers and app processes.
+
+    KIS limits token issuance.  Without a cross-process lock two dashboard
+    workers can both miss the cache, request a new token, and immediately
+    trip that limit.  The lock is short-lived and stale-lock tolerant so a
+    crash cannot permanently prevent a later login.
+    """
+    token_path = Path(path)
+    lock_path = token_path.with_suffix(token_path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + TOKEN_CACHE_LOCK_TIMEOUT_SECONDS
+    descriptor: Optional[int] = None
+
+    while descriptor is None:
+        try:
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(descriptor, f"{os.getpid()} {time.time()}".encode("ascii"))
+            except Exception:
+                os.close(descriptor)
+                descriptor = None
+                try:
+                    lock_path.unlink()
+                except OSError:
+                    pass
+                raise
+        except FileExistsError:
+            try:
+                stale = time.time() - lock_path.stat().st_mtime > TOKEN_CACHE_STALE_LOCK_SECONDS
+            except OSError:
+                stale = False
+            if stale:
+                try:
+                    lock_path.unlink()
+                except OSError:
+                    pass
+                continue
+            if time.monotonic() >= deadline:
+                raise KisApiError("Timed out waiting for the KIS token-cache lock.")
+            time.sleep(0.05)
+
+    try:
+        yield
+    finally:
+        os.close(descriptor)
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
+
+
+def _atomic_write_token_cache(path: Path, payload: Dict[str, Any]) -> None:
+    """Write a token cache atomically without exposing a partial JSON file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        os.close(descriptor)
+        # mkstemp is owner-only on POSIX.  Explicitly apply the platform
+        # restriction before storing the secret on Windows as well.
+        _restrict_file_to_current_user(temporary_path)
+        with temporary_path.open("w", encoding="utf-8") as file:
+            json.dump(payload, file, indent=2)
+            file.write("\n")
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary_path, path)
+        _restrict_file_to_current_user(path)
+    except Exception:
+        try:
+            temporary_path.unlink()
+        except OSError:
+            pass
+        raise
 
 
 class KisEnvironment(str, Enum):
@@ -218,6 +302,34 @@ class KisAccountClient:
                 self.access_token = cached_token
                 return cached_token
 
+        path = self.config.token_cache_path
+        if path is None:
+            return self._request_new_access_token()
+
+        # Remember the stale token before taking the process-wide lock.  If a
+        # different worker refreshes it while we wait, its new cache value is
+        # safe to use even for a forced refresh and avoids a duplicate token
+        # issuance request.
+        # A forced refresh applies to this client's known token.  A fresh
+        # client has no token to invalidate, so it may safely reuse one that a
+        # concurrent worker writes while it is waiting for the process lock.
+        # This prevents a burst of fresh workers from issuing duplicate tokens.
+        stale_token = self.access_token if force_refresh else None
+        with _exclusive_token_cache_lock(path):
+            cached_token = self._load_cached_token()
+            if cached_token and (
+                not force_refresh
+                or stale_token is None
+                or cached_token != stale_token
+            ):
+                self.access_token = cached_token
+                return cached_token
+
+            return self._request_new_access_token(cache_lock_held=True)
+
+    def _request_new_access_token(self, cache_lock_held: bool = False) -> str:
+        """Request a token from KIS and persist it when caching is enabled."""
+
         url = f"{self.config.base_url}{TOKEN_ENDPOINT}"
         payload = {
             "grant_type": "client_credentials",
@@ -246,7 +358,10 @@ class KisAccountClient:
             expires_in = 60 * 60 * 23
 
         self.access_token = str(token)
-        self._save_cached_token(token=str(token), expires_in=expires_in)
+        if cache_lock_held:
+            self._save_cached_token_unlocked(token=str(token), expires_in=expires_in)
+        else:
+            self._save_cached_token(token=str(token), expires_in=expires_in)
         return str(token)
 
     def get_domestic_balance(self) -> Dict[str, Any]:
@@ -545,6 +660,14 @@ class KisAccountClient:
         path = self.config.token_cache_path
         if path is None:
             return
+        with _exclusive_token_cache_lock(path):
+            self._save_cached_token_unlocked(token=token, expires_in=expires_in)
+
+    def _save_cached_token_unlocked(self, token: str, expires_in: int) -> None:
+        """Persist a token while the caller owns the cache lock."""
+        path = self.config.token_cache_path
+        if path is None:
+            return
         payload = {
             "environment": self.config.environment.value,
             "app_key": self.config.app_key,
@@ -554,9 +677,7 @@ class KisAccountClient:
             "saved_at": datetime.now(timezone.utc).isoformat(),
         }
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            _restrict_file_to_current_user(path)
+            _atomic_write_token_cache(path, payload)
         except OSError:
             return
 

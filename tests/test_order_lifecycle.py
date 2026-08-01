@@ -2168,6 +2168,63 @@ def test_submit_kis_buy_order_honors_explicit_order_price_over_live_price(monkey
     assert any("BUY submitted for AAPL: 7 shares @ limit $123.45" in message for message in logs)
 
 
+def test_submit_kis_buy_order_uses_the_account_selected_in_the_ui(monkeypatch):
+    created_workers = []
+
+    class FakeSignal:
+        def connect(self, _callback):
+            pass
+
+    class FakeKisOrderWorker:
+        def __init__(self, environment, symbol, quantity, price, side, **kwargs):
+            self.environment = environment
+            self.symbol = symbol
+            self.quantity = quantity
+            self.price = price
+            self.side = side
+            self.account_no = kwargs.get("account_no")
+            self.finished_order = FakeSignal()
+            self.error_occurred = FakeSignal()
+            created_workers.append(self)
+
+        def start(self):
+            pass
+
+    class Combo:
+        def currentData(self):
+            return {
+                "environment": "PROD",
+                "account_no": "22222222-01",
+                "label": "PROD 22******-01",
+            }
+
+    item = SimpleNamespace(
+        symbol="AAPL",
+        environment="PROD",
+        kis_account_no="",
+        _buy_order_pending=True,
+        monitoring_status="WATCHING",
+        breakout_method="",
+        shares_held=0,
+        avg_cost=0.0,
+        stop_loss=90.0,
+        entry_price=100.0,
+        position_percent=10.0,
+    )
+    window = MainWindow.__new__(MainWindow)
+    window.trade_kis_account_combo = Combo()
+    window.latest_intraday_prices = {"AAPL": 101.0}
+    window.append_log = lambda _message: None
+    window._has_duplicate_open_order = lambda *args: False
+
+    monkeypatch.setattr(buylist_mixin_module, "KisOrderWorker", FakeKisOrderWorker)
+
+    MainWindow._submit_kis_buy_order(window, item, quantity=3, order_price=101.0)
+
+    assert len(created_workers) == 1
+    assert created_workers[0].account_no == "22222222-01"
+
+
 def test_apply_partial_sell_fill_is_idempotent(monkeypatch):
     save_calls = []
     item = SimpleNamespace(
@@ -2249,6 +2306,84 @@ def test_buylist_position_sync_uses_total_kis_holding_quantity():
     assert save_calls == [True]
     assert populate_calls == [True]
     assert any("shares 23 -> 41" in message for message in logs)
+
+
+def test_buylist_position_sync_uses_item_account_not_largest_same_symbol_holding():
+    item = SimpleNamespace(
+        symbol="MRVL",
+        environment="PROD",
+        kis_account_no="22222222-01",
+        monitoring_status="BOUGHT",
+        shares_held=0,
+        avg_cost=0.0,
+        buy_date=None,
+        _buy_order_pending=True,
+    )
+    window = MainWindow.__new__(MainWindow)
+    window.buylist_manager = SimpleNamespace(items=[item])
+    window.order_ledger = []
+    window.append_log = lambda _message: None
+    window._save_state = lambda: None
+    window.populate_buylist_dashboard = lambda: None
+
+    changed = MainWindow.sync_buylist_positions_from_kis_snapshots(
+        window,
+        {
+            ("PROD", "11111111-01"): _snapshot("MRVL", 100, 111.0),
+            ("PROD", "22222222-01"): _snapshot("MRVL", 7, 222.0),
+        },
+    )
+
+    assert changed == 1
+    assert item.shares_held == 7
+    assert item.avg_cost == 222.0
+    assert item.kis_account_no == "22222222-01"
+
+
+def test_cancelled_order_with_confirmed_partial_fill_updates_buylist(monkeypatch):
+    save_calls = []
+    item = SimpleNamespace(
+        symbol="AAPL",
+        environment="SIM",
+        kis_account_no="",
+        shares_held=10,
+        avg_cost=100.0,
+        stop_loss=90.0,
+        sell_half_done=False,
+        monitoring_status="SELL_SUBMITTED",
+        kis_order_id="",
+    )
+
+    class Manager:
+        def get(self, symbol, environment=None):
+            assert (symbol, environment) == ("AAPL", "SIM")
+            return item
+
+    order = _order(
+        side=OrderSide.SELL,
+        quantity=10,
+        intent=OrderIntent.PARTIAL_EXIT,
+        status=OrderStatus.CANCELLED,
+    )
+    order.filled_quantity = 4
+    order.remaining_quantity = 6
+
+    window = MainWindow.__new__(MainWindow)
+    window.buylist_manager = Manager()
+    window._save_state = lambda: save_calls.append(True)
+    window.populate_buylist_dashboard = lambda: None
+    window.append_log = lambda _message: None
+
+    monkeypatch.setattr(main_window_module, "update_order", lambda value: value)
+    monkeypatch.setattr(main_window_module, "load_order_ledger", lambda: [])
+
+    MainWindow.apply_confirmed_order_fills_to_buylist(window, [order])
+
+    assert item.shares_held == 6
+    assert item.sell_half_done is True
+    assert item.kis_account_no == "12345678"
+    assert order.applied_filled_quantity == 4
+    assert save_calls == [True]
 
 
 def test_buylist_position_sync_leaves_queued_item_without_holding_unchanged():

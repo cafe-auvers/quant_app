@@ -52,8 +52,10 @@ def test_buylist_item_serialization():
     assert serialized["status"] == "BUY_READY"
     assert serialized["notes"] == "High conviction trade."
     assert serialized["auto_order_block_reason"] == ""
+    assert serialized["kis_account_no"] == ""
 
     serialized["auto_order_block_reason"] = "Manual review required before retry."
+    serialized["kis_account_no"] = "12345678-01"
     
     deserialized = BuylistItem.from_dict(serialized)
     assert deserialized.symbol == "AAPL"
@@ -64,6 +66,7 @@ def test_buylist_item_serialization():
     assert deserialized.stop_adr == 0.5
     assert deserialized.breakout_price == 180.0
     assert deserialized.auto_order_block_reason == "Manual review required before retry."
+    assert deserialized.kis_account_no == "12345678-01"
 
 
 def test_legacy_sim_buylist_state_is_ignored():

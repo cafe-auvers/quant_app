@@ -36,6 +36,12 @@ FID_ORG_ADJ_PRC = "1"
 OVERSEAS_DAILY_PRICE_ENDPOINT = "/uapi/overseas-price/v1/quotations/dailyprice"
 OVERSEAS_DAILY_PRICE_TR_ID = "HHDFS76240000"
 DEFAULT_US_EXCHANGES = ("NAS", "NYS", "AMS")
+DOMESTIC_DAILY_COLUMNS = (
+    "symbol", "name", "market", "date", "open", "high", "low", "close", "volume",
+)
+OVERSEAS_DAILY_COLUMNS = (
+    "symbol", "market", "date", "open", "high", "low", "close", "volume",
+)
 
 MASTER_FILE_URLS = {
     "KOSPI": "https://new.real.download.dws.co.kr/common/master/kospi_code.mst.zip",
@@ -366,7 +372,12 @@ def fetch_one_symbol_daily_bar(
 
 
 def load_watchlist_symbols(path: Path = DATA_DIR / "watchlist.json") -> List[str]:
-    data = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, dict):
+        return []
     items = data.get("items", [])
     if not isinstance(items, list):
         return []
@@ -467,7 +478,7 @@ def run_watchlist_overseas_fetch(target_yyyymmdd: str, output_path: Optional[str
     symbols = load_watchlist_symbols()
     logger.info("Fetching overseas daily OHLCV for %s watchlist symbols on %s", len(symbols), target_yyyymmdd)
     records = fetch_watchlist_overseas_daily_bars(symbols=symbols, target_yyyymmdd=target_yyyymmdd)
-    result_df = pd.DataFrame(records)
+    result_df = pd.DataFrame(records, columns=OVERSEAS_DAILY_COLUMNS)
     if not result_df.empty:
         result_df = result_df.sort_values(["market", "symbol"]).reset_index(drop=True)
 
@@ -524,8 +535,12 @@ def main() -> None:
         except Exception as exc:
             logger.warning("Failed symbol=%s | error=%s", row.symbol, exc)
 
-    result_df = pd.DataFrame(records)
-    result_df = result_df.sort_values(["market", "symbol"]).reset_index(drop=True)
+    # Supplying the schema keeps an empty/holiday run usable: pandas otherwise
+    # creates no columns and ``sort_values`` raises KeyError before the CSV can
+    # be written.
+    result_df = pd.DataFrame(records, columns=DOMESTIC_DAILY_COLUMNS)
+    if not result_df.empty:
+        result_df = result_df.sort_values(["market", "symbol"]).reset_index(drop=True)
 
     output_path = f"kis_daily_all_{target_yyyymmdd}.csv"
     result_df.to_csv(output_path, index=False, encoding="utf-8-sig")

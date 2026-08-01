@@ -45,7 +45,7 @@ from PyQt5.QtWidgets import (
     QMenu,
 )
 from PyQt5.QtCore import Qt, QThread, QTimer, QUrl
-from PyQt5.QtGui import QColor, QKeySequence
+from PyQt5.QtGui import QColor, QDoubleValidator, QIntValidator, QKeySequence
 
 try:
     from PyQt5.QtWebEngineWidgets import QWebEngineView
@@ -181,6 +181,26 @@ class ChartsControllerMixin:
         self.usd_krw_rate_input = QLineEdit("1388.89")
         self.usd_krw_rate_input.setReadOnly(True)
         self.risk_percent_input = QLineEdit("1")
+        for input_widget in (
+            self.entry_price_input,
+            self.stop_loss_input,
+            self.take_profit_input,
+        ):
+            price_validator = QDoubleValidator(
+                0.0, 1_000_000_000.0, 6, input_widget
+            )
+            price_validator.setNotation(QDoubleValidator.StandardNotation)
+            input_widget.setValidator(price_validator)
+        position_size_validator = QIntValidator(0, 2_000_000_000, form_group)
+        self.position_size_input.setValidator(position_size_validator)
+        account_size_validator = QDoubleValidator(
+            0.0, 1_000_000_000_000.0, 2, self.account_size_input
+        )
+        account_size_validator.setNotation(QDoubleValidator.StandardNotation)
+        self.account_size_input.setValidator(account_size_validator)
+        risk_validator = QDoubleValidator(0.0, 100.0, 4, self.risk_percent_input)
+        risk_validator.setNotation(QDoubleValidator.StandardNotation)
+        self.risk_percent_input.setValidator(risk_validator)
         self.reason_input = QTextEdit()
         self.trade_kis_environment_combo = QComboBox()
         self.trade_kis_environment_combo.addItem(KisEnvironment.PROD.value)
@@ -1199,22 +1219,12 @@ class ChartsControllerMixin:
             )
             return
         existing = self.watchlist.get(symbol)
-        source_combo = self.__dict__.get("sidebar_source_combo")
-        source = (
-            source_combo.currentData()
-            if source_combo is not None
-            else {"type": "watchlist"}
-        )
-        source_type = source.get("type") if isinstance(source, dict) else ""
-        if existing is not None and source_type == "watchlist":
+        if existing is not None:
             self.watchlist.remove(symbol)
             self.populate_watchlist_table()
             self.update_dashboard_summary()
             self._save_state()
             self.append_log(f"Removed {symbol} from watchlist from TradingView.")
-            self._update_tradingview_watchlist_btn()
-            return
-        if existing is not None:
             self._update_tradingview_watchlist_btn()
             return
         name = symbol
@@ -1822,6 +1832,19 @@ class ChartsControllerMixin:
             self.intraday_status_label.setText("Add symbols to the watchlist first.")
             return
 
+        if not self.db_enabled or self.db_engine is None:
+            message = (
+                "Intraday charts and ORB monitoring require the MySQL cache. "
+                "Configure MySQL, then refresh intraday data."
+            )
+            self._set_html_or_text(
+                self.intraday_chart_view,
+                self._generate_message_html("Intraday cache unavailable", message),
+                message,
+            )
+            self.intraday_status_label.setText(message)
+            return
+
         interval = self.intraday_interval_combo.currentText()
         window_days = self._get_intraday_window_days()
         symbol_history, cache_source = self._load_cached_intraday_5m_with_source(
@@ -1971,17 +1994,23 @@ class ChartsControllerMixin:
                 return pd.DataFrame(), "none"
         return pd.DataFrame(), "none"
 
-    def start_intraday_fetch(self, symbol: str, window_days: int = 7) -> None:
+    def start_intraday_fetch(self, symbol: str, window_days: int = 7) -> bool:
         symbol = symbol.strip().upper()
         if not symbol:
-            return
+            return False
+        if not self.db_enabled or self.db_engine is None:
+            if hasattr(self, "intraday_status_label"):
+                self.intraday_status_label.setText(
+                    "Intraday cache requires MySQL; no background fetch was started."
+                )
+            return False
         if (
             self.intraday_fetch_worker is not None
             and self.intraday_fetch_worker.isRunning()
         ):
             self.append_log(f"Intraday fetch for {symbol} already running, skipping.")
-            return
-        engine = self.db_engine if self.db_enabled else None
+            return False
+        engine = self.db_engine
         profile = self._selected_dashboard_kis_profile() or {}
         self.intraday_fetch_attempts[self._intraday_fetch_key(symbol, window_days)] = (
             _utcnow_naive()
@@ -2012,6 +2041,7 @@ class ChartsControllerMixin:
             )
         )
         self.intraday_fetch_worker.start()
+        return True
 
     def _on_intraday_fetch_finished(
         self, symbol: str, fetched, window_days: int, source: str
@@ -2082,6 +2112,20 @@ class ChartsControllerMixin:
             if triggered_by_live and hasattr(self, "live_data_status_label"):
                 self.live_data_status_label.setText("Live data: no watchlist symbols")
             return
+        if not self.db_enabled or self.db_engine is None:
+            message = (
+                "Intraday watchlist refresh requires the MySQL cache; no data was fetched."
+            )
+            if not triggered_by_live or not getattr(
+                self, "_intraday_cache_unavailable_notice_logged", False
+            ):
+                self.append_log(message)
+                self._intraday_cache_unavailable_notice_logged = True
+            if show_messages:
+                QMessageBox.warning(self, "Intraday cache unavailable", message)
+            if triggered_by_live and hasattr(self, "live_data_status_label"):
+                self.live_data_status_label.setText("Live data: MySQL cache unavailable")
+            return
         if (
             self.intraday_bulk_worker is not None
             and self.intraday_bulk_worker.isRunning()
@@ -2098,7 +2142,7 @@ class ChartsControllerMixin:
                 )
             return
 
-        engine = self.db_engine if self.db_enabled else None
+        engine = self.db_engine
         self.intraday_bulk_purpose = "watchlist"
         if hasattr(self, "refresh_watchlist_orb_button"):
             self.refresh_watchlist_orb_button.setEnabled(False)
@@ -2201,8 +2245,8 @@ class ChartsControllerMixin:
         if not symbol:
             return
         try:
-            self.start_intraday_fetch(symbol, window_days=7)
-            self.append_log(f"Queued 7-day intraday cache refresh for {symbol}.")
+            if self.start_intraday_fetch(symbol, window_days=7):
+                self.append_log(f"Queued 7-day intraday cache refresh for {symbol}.")
         except Exception as exc:
             self.append_log(f"Intraday prefetch failed for {symbol}: {exc}")
 

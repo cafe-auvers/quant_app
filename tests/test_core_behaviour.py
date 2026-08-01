@@ -1698,7 +1698,7 @@ def test_tradingview_add_current_symbol_toggles_existing_watchlist_item():
     assert window.watchlist.get("MSFT") is None
 
 
-def test_tradingview_add_current_symbol_does_not_remove_when_sidebar_not_watchlist():
+def test_tradingview_add_current_symbol_removes_regardless_of_sidebar_source():
     class Combo:
         def currentText(self):
             return "MSFT"
@@ -1719,7 +1719,7 @@ def test_tradingview_add_current_symbol_does_not_remove_when_sidebar_not_watchli
 
     window.add_current_tradingview_symbol_to_watchlist()
 
-    assert window.watchlist.get("MSFT") is not None
+    assert window.watchlist.get("MSFT") is None
 
 
 def test_tradingview_activate_starts_buy_dashboard_monitor():

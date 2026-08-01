@@ -1,6 +1,7 @@
 """Main application window for the stock dashboard."""
 
 import datetime as dt
+import math
 import threading
 import time
 from typing import Any, Dict, Optional, List, Tuple
@@ -21,7 +22,7 @@ from PyQt5.QtWidgets import (
     QSizePolicy,
     QDialog,
 )
-from PyQt5.QtCore import Qt, QThread, QTimer
+from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QKeySequence
 
 try:
@@ -33,7 +34,6 @@ from src.core.order_state import BrokerOrder, OrderIntent, OrderSide, OrderStatu
 from src.core.scanner import StockScanner
 from src.core.watchlist import Watchlist, TradePlanManager, BuylistManager
 from src.core.trade_reviewer import TradeReviewer
-from src.utils.data_loader import get_default_universe
 from src.utils.config import RULEBOOK_DIR
 from src.utils.db_loader import init_mysql_engine
 from src.utils.storage import load_json
@@ -117,6 +117,22 @@ US_MARKET_OPEN_TIME = dt.time(9, 30)
 US_MARKET_CLOSE_TIME = dt.time(16, 0)
 
 
+class DatabaseInitWorker(QThread):
+    """Open the optional MySQL cache without delaying the first UI frame."""
+
+    initialized = pyqtSignal(object, str)
+
+    def run(self) -> None:
+        try:
+            engine = init_mysql_engine()
+            self.initialized.emit(engine, "")
+        except Exception as exc:
+            # init_mysql_engine normally returns None on optional-db failures,
+            # but the UI must also remain usable if an unexpected driver error
+            # escapes it.
+            self.initialized.emit(None, str(exc))
+
+
 class MainWindow(
     SidebarMixin,
     DashboardMixin,
@@ -137,7 +153,9 @@ class MainWindow(
         self.setGeometry(100, 100, 1600, 900)
 
         self.universe_limit = None
-        self.universe_tickers = get_default_universe(max_symbols=self.universe_limit)
+        # The full universe can trigger cache/network work on a cold start.
+        # ScannerWorker loads it off the GUI thread when it is first needed.
+        self.universe_tickers: List[str] = []
         self.scanner = StockScanner()
         self.watchlist = self._load_watchlist()
         self.buylist_manager = self._load_buylist()
@@ -155,8 +173,13 @@ class MainWindow(
                 if k not in self.settings["shortcuts"]:
                     self.settings["shortcuts"][k] = v
         self.reviewer = TradeReviewer(rulebook_dir=RULEBOOK_DIR)
-        self.db_engine = init_mysql_engine()
-        self.db_enabled = self.db_engine is not None
+        # MySQL is optional, and establishing a connection must never block the
+        # desktop window from appearing.  A short-lived worker finishes setup
+        # after the event loop begins.
+        self.db_engine = None
+        self.db_enabled = False
+        self.db_initializing = True
+        self.database_init_worker = None
         self.kis_account_snapshots: dict[tuple[str, str], dict] = {}
         self.latest_intraday_prices: dict[str, float] = {}
         self.latest_intraday_sources: dict[tuple[str, str], str] = {}
@@ -174,6 +197,9 @@ class MainWindow(
         self.running_scanner_setup_name: Optional[str] = None
         self.running_scanner_show_warnings = True
         self.scanner_worker = None
+        self.watchlist_worker = None
+        self.single_ai_worker = None
+        self.kis_order_worker = None
         self._refresh_last_finished_at: Dict[str, Optional[str]] = {}
         self._refresh_last_log_count: Dict[str, int] = {}
         self._refresh_active_run_id: Dict[str, Optional[str]] = {}
@@ -237,10 +263,9 @@ class MainWindow(
         self._refresh_poll_timer.start()
         self._poll_refresh_status()
 
-        # Run initial scans
-        self.run_all_scanners(show_warnings=False)
         self.update_dashboard_summary()
         self.on_tab_changed()
+        QTimer.singleShot(0, self._start_optional_database_initialization)
         QTimer.singleShot(1500, self.preload_kis_accounts_on_startup)
         QTimer.singleShot(2500, lambda: self.refresh_usd_krw_rate(show_messages=False))
         QTimer.singleShot(4000, self.reconcile_open_orders)
@@ -253,6 +278,35 @@ class MainWindow(
         self.scanner_controller = ScannerController(self)
         self.chart_data_controller = ChartDataController(self)
         self.account_controller = AccountController(self)
+
+    def _start_optional_database_initialization(self) -> None:
+        """Begin optional database setup after widgets have been rendered."""
+        if self.database_init_worker is not None and self.database_init_worker.isRunning():
+            return
+        worker = DatabaseInitWorker()
+        self.database_init_worker = worker
+        worker.initialized.connect(self._on_optional_database_initialized)
+        worker.finished.connect(
+            lambda finished_worker=worker: self._clear_worker_reference(
+                "database_init_worker", finished_worker
+            )
+        )
+        worker.start()
+
+    def _on_optional_database_initialized(self, engine, error: str = "") -> None:
+        self.db_engine = engine
+        self.db_enabled = engine is not None
+        self.db_initializing = False
+        if self.db_enabled:
+            self.append_log("MySQL cache connected; starting initial scanner refresh.")
+            self.run_all_scanners(show_warnings=False)
+        elif error:
+            self.append_log(f"MySQL cache unavailable: {error}")
+        else:
+            self.append_log(
+                "MySQL cache is unavailable; scanner and cached intraday features remain disabled."
+            )
+        self.update_dashboard_summary()
 
     def _apply_unresolved_order_startup_state(self) -> None:
         """Reflect durable unresolved broker orders in the UI after startup."""
@@ -812,19 +866,31 @@ class MainWindow(
             and self._refresh_poll_timer is not None
         ):
             self._refresh_poll_timer.stop()
-        running_workers = [
-            worker
-            for worker in [
-                self.scanner_worker,
-                self.intraday_fetch_worker,
-                self.intraday_bulk_worker,
-                self.kis_account_worker,
-                self.kis_startup_worker,
-                self.order_reconciliation_worker,
-                self.fx_rate_worker,
-            ]
-            if worker is not None and worker.isRunning()
+        candidate_workers = [
+            getattr(self, "database_init_worker", None),
+            self.scanner_worker,
+            self.watchlist_worker,
+            self.single_ai_worker,
+            self.kis_order_worker,
+            self.intraday_fetch_worker,
+            self.intraday_bulk_worker,
+            self.kis_account_worker,
+            self.kis_startup_worker,
+            self.order_reconciliation_worker,
+            self.fx_rate_worker,
+            getattr(self, "broker_order_query_worker", None),
+            getattr(self, "broker_order_cancel_worker", None),
+            *getattr(self, "_buylist_order_workers", []),
+            *getattr(self, "_buylist_aux_workers", []),
         ]
+        seen_workers: set[int] = set()
+        running_workers = []
+        for worker in candidate_workers:
+            if worker is None or id(worker) in seen_workers:
+                continue
+            seen_workers.add(id(worker))
+            if worker.isRunning():
+                running_workers.append(worker)
         if not self._stop_workers_for_shutdown(
             running_workers, timeout_ms=WORKER_SHUTDOWN_TIMEOUT_MS
         ):
@@ -1350,9 +1416,12 @@ class MainWindow(
     def _parse_float(self, value: QLineEdit, default: float) -> float:
         try:
             text = value.text().strip().replace("%", "")
-            return float(text)
-        except ValueError:
+            number = float(text)
+        except (TypeError, ValueError, OverflowError):
             return default
+        if not math.isfinite(number) or number < 0:
+            return default
+        return number
 
     def _parse_int(self, value: QLineEdit, default: int) -> int:
         try:

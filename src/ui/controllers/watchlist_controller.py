@@ -15,6 +15,18 @@ class WatchlistController(WindowController):
             QMessageBox.information(self.window, "No watchlist", "Add symbols to the watchlist first.")
             return
 
+        if not getattr(self.window, "db_enabled", False) or getattr(
+            self.window, "db_engine", None
+        ) is None:
+            message = (
+                "ORB status refresh requires the MySQL intraday cache. "
+                "Configure MySQL, then refresh intraday data."
+            )
+            self.append_log(message)
+            QMessageBox.warning(self.window, "Intraday cache unavailable", message)
+            self.refresh_all_orb_statuses()
+            return
+
         self._refresh_orb_after_intraday_bulk = True
         worker = getattr(self, "intraday_bulk_worker", None)
         if worker is not None and worker.isRunning():

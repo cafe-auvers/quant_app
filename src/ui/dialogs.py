@@ -103,13 +103,13 @@ class SettingsDialog(QDialog):
             
         from collections import Counter
         seq_counts = Counter(v for v in new_shortcuts.values() if v)
-        conflicts = [seq for seq, count in seq_counts.items() if count > 2]
+        conflicts = [seq for seq, count in seq_counts.items() if count > 1]
         if conflicts:
             QMessageBox.warning(
                 self,
                 "Shortcut Conflict",
                 f"The key sequence '{conflicts[0]}' is assigned to {seq_counts[conflicts[0]]} functions.\n"
-                "A single key combination cannot be assigned to more than 2 functions at the same time."
+                "Assign each key combination to only one function."
             )
             return
 

@@ -5,6 +5,7 @@ import datetime as dt
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Optional
+from uuid import uuid4
 
 
 class OrderSide(str, Enum):
@@ -77,7 +78,12 @@ def generate_client_order_id(
     intent: OrderIntent | str,
     timestamp: Optional[dt.datetime] = None,
 ) -> str:
-    """Generate a readable, unique local idempotency key for an order intent."""
+    """Generate a readable, unique local idempotency key for an order intent.
+
+    Windows clock resolution can yield the same microsecond timestamp for a
+    burst of orders.  Include an independent nonce so two locally reserved
+    orders never overwrite each other in the durable ledger.
+    """
     ts = timestamp or dt.datetime.now(dt.timezone.utc)
     if ts.tzinfo is not None:
         ts = ts.astimezone(dt.timezone.utc).replace(tzinfo=None)
@@ -90,6 +96,7 @@ def generate_client_order_id(
         side_value,
         intent_value,
         ts.strftime("%Y%m%dT%H%M%S%f"),
+        uuid4().hex[:16].upper(),
     ])
 
 

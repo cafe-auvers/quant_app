@@ -44,6 +44,26 @@ DEFAULT_UNIVERSE = [
     "NFLX",
 ]
 
+# ``yfinance.download(..., group_by="ticker")`` is deliberately exposed to
+# the rest of the application as a symbol-first MultiIndex frame.  Keeping
+# this contract stable matters because a batch can contain one or many
+# symbols, and yfinance changes its single-symbol column shape between
+# releases.  Use ``download_single_symbol_history`` when a flat OHLCV frame is
+# required instead of indexing a batch response directly.
+OHLCV_COLUMNS = ("Open", "High", "Low", "Close", "Adj Close", "Volume")
+REQUIRED_OHLCV_COLUMNS = ("Open", "High", "Low", "Close", "Volume")
+
+
+def normalize_yahoo_symbol(symbol: str) -> str:
+    """Return the Yahoo/yfinance spelling for an exchange-listed symbol.
+
+    KIS and the S&P 500 source use both ``BRK/B`` and ``BRK.B`` style class
+    share notation, while Yahoo expects ``BRK-B``.  Normalising at every
+    loader boundary prevents those otherwise valid stocks from silently being
+    omitted from scans or retried forever.
+    """
+    return str(symbol or "").strip().upper().replace("/", "-").replace(".", "-")
+
 
 def _limit_symbols(symbols: List[str], max_symbols: Optional[int]) -> List[str]:
     if max_symbols is None or int(max_symbols) <= 0:
@@ -61,7 +81,11 @@ def _read_symbol_cache(path: Path) -> List[str]:
 
     for column in ("Symbol", "YahooSymbol", "symbol", "ticker"):
         if column in df.columns:
-            symbols = [str(symbol).strip().upper() for symbol in df[column].tolist() if str(symbol).strip()]
+            symbols = [
+                normalize_yahoo_symbol(symbol)
+                for symbol in df[column].tolist()
+                if str(symbol).strip()
+            ]
             return list(dict.fromkeys(symbols))
     return []
 
@@ -90,7 +114,11 @@ def _read_kis_symbol_cache(path: Path) -> List[str]:
 
     for column in ("Symbol", "YahooSymbol", "symbol", "ticker"):
         if column in df.columns:
-            symbols = [str(symbol).strip().upper() for symbol in df[column].tolist() if str(symbol).strip()]
+            symbols = [
+                normalize_yahoo_symbol(symbol)
+                for symbol in df[column].tolist()
+                if str(symbol).strip()
+            ]
             return list(dict.fromkeys(symbols))
     return []
 
@@ -115,7 +143,12 @@ def get_sp500_tickers(max_symbols: Optional[int] = 200) -> List[str]:
         tables = pd.read_html(StringIO(response.text))
         for table in tables:
             if "Symbol" in table.columns:
-                symbols = table["Symbol"].astype(str).tolist()
+                symbols = [
+                    normalize_yahoo_symbol(symbol)
+                    for symbol in table["Symbol"].astype(str).tolist()
+                    if str(symbol).strip()
+                ]
+                symbols = list(dict.fromkeys(symbols))
                 SP500_UNIVERSE_CACHE.parent.mkdir(parents=True, exist_ok=True)
                 pd.DataFrame({"Symbol": symbols}).to_csv(SP500_UNIVERSE_CACHE, index=False)
                 return _limit_symbols(symbols, max_symbols)
@@ -136,7 +169,11 @@ def get_us_kis_tickers(max_symbols: Optional[int] = None, refresh: bool = False)
         from overseas_stock_code import load_us_kis_stock_universe
 
         universe = load_us_kis_stock_universe(cache_path=DEFAULT_UNIVERSE_CACHE, refresh=refresh)
-        symbols = [str(symbol).strip().upper() for symbol in universe.get("Symbol", []) if str(symbol).strip()]
+        symbols = [
+            normalize_yahoo_symbol(symbol)
+            for symbol in universe.get("Symbol", [])
+            if str(symbol).strip()
+        ]
         symbols = list(dict.fromkeys(symbols))
         if symbols:
             return _limit_symbols(symbols, max_symbols)
@@ -184,8 +221,33 @@ def _parse_chart_history_response(response: requests.Response) -> pd.DataFrame:
         "Close": quote.get("close", []),
         "Volume": quote.get("volume", []),
     }
-    df = pd.DataFrame(data, index=pd.to_datetime(timestamp, unit="s", utc=True))
+    full_index = pd.to_datetime(timestamp, unit="s", utc=True)
+    df = pd.DataFrame(data, index=full_index)
     df = df.dropna(subset=["Close", "High", "Low", "Volume"])
+
+    # The primary yfinance path uses ``auto_adjust=True``.  Yahoo's chart API
+    # returns raw OHLC values plus a separate adjusted close, so returning the
+    # raw values here would make a fallback disagree with the cached/batch
+    # path around splits and dividends.  Apply the adjusted-close ratio to
+    # OHLC (the same convention yfinance uses) while keeping volume raw.
+    adjusted_rows = result.get("indicators", {}).get("adjclose", [])
+    adjusted_close = (
+        adjusted_rows[0].get("adjclose", [])
+        if adjusted_rows and isinstance(adjusted_rows[0], dict)
+        else []
+    )
+    if len(adjusted_close) == len(timestamp):
+        adjusted = pd.to_numeric(pd.Series(adjusted_close, index=full_index), errors="coerce")
+        adjusted = adjusted.reindex(df.index)
+        raw_close = pd.to_numeric(df["Close"], errors="coerce")
+        adjustment = (adjusted / raw_close).replace([np.inf, -np.inf], np.nan)
+        # A missing/zero raw close cannot yield a meaningful ratio.  Leave
+        # that row untouched instead of dropping otherwise valid intraday
+        # bars solely because Yahoo omitted an adjusted-close value.
+        adjustment = adjustment.where(adjustment.notna() & (adjustment > 0), 1.0)
+        for column in ("Open", "High", "Low", "Close"):
+            df[column] = pd.to_numeric(df[column], errors="coerce") * adjustment
+        df["Adj Close"] = adjusted.where(adjusted.notna(), df["Close"])
 
     meta = result.get("meta", {})
     tz = meta.get("exchangeTimezoneName")
@@ -291,7 +353,11 @@ def _default_yfinance_chunk_size(interval: str) -> int:
 
 
 def _clean_download_tickers(tickers: List[str], max_symbols: Optional[int]) -> List[str]:
-    cleaned = [ticker.strip().upper() for ticker in tickers if ticker and ticker.strip()]
+    cleaned = []
+    for ticker in tickers:
+        normalized = normalize_yahoo_symbol(ticker)
+        if normalized and normalized != "NAN":
+            cleaned.append(normalized)
     cleaned = list(dict.fromkeys(cleaned))
     return _limit_symbols(cleaned, max_symbols)
 
@@ -325,11 +391,128 @@ def _download_yfinance_batch(
 
 
 def _normalize_batch_download_columns(history: pd.DataFrame, symbols: List[str]) -> pd.DataFrame:
-    if history.empty or isinstance(history.columns, pd.MultiIndex) or len(symbols) != 1:
+    """Coerce yfinance output to the symbol-first batch data contract.
+
+    yfinance can return either ``(symbol, field)`` or ``(field, symbol)``
+    MultiIndex columns depending on version and the number of tickers.  A
+    caller should never need to know which variant it received.
+    """
+    if history.empty:
         return history
+
+    normalized_symbols = [normalize_yahoo_symbol(symbol) for symbol in symbols]
     normalized = history.copy()
-    normalized.columns = pd.MultiIndex.from_product([[symbols[0]], normalized.columns])
+    if not isinstance(normalized.columns, pd.MultiIndex):
+        if len(normalized_symbols) != 1:
+            return normalized
+        normalized.columns = pd.MultiIndex.from_product(
+            [[normalized_symbols[0]], normalized.columns]
+        )
+        return normalized
+
+    symbol_level = _find_symbol_column_level(normalized.columns, normalized_symbols)
+    if symbol_level is None:
+        # A single ticker can still arrive in an unusual one-level MultiIndex
+        # shape.  Its provenance is unambiguous, so attach the requested
+        # symbol rather than leaking a field-first frame to consumers.
+        if len(normalized_symbols) != 1:
+            return normalized
+        flattened = _coalesce_ohlcv_columns(normalized)
+        if flattened.empty:
+            return normalized
+        flattened.columns = pd.MultiIndex.from_product(
+            [[normalized_symbols[0]], flattened.columns]
+        )
+        return flattened
+
+    if symbol_level != 0:
+        order = [symbol_level] + [
+            level for level in range(normalized.columns.nlevels) if level != symbol_level
+        ]
+        normalized.columns = normalized.columns.reorder_levels(order)
+
+    # Normalise class-share spellings in the outer symbol level without
+    # changing field labels or any remaining levels.
+    normalized.columns = pd.MultiIndex.from_tuples(
+        [
+            (normalize_yahoo_symbol(column[0]), *column[1:])
+            for column in normalized.columns.to_list()
+        ],
+        names=normalized.columns.names,
+    )
     return normalized
+
+
+def _find_symbol_column_level(
+    columns: pd.MultiIndex,
+    symbols: List[str],
+) -> Optional[int]:
+    expected = {normalize_yahoo_symbol(symbol) for symbol in symbols}
+    if not expected:
+        return None
+    for level in range(columns.nlevels):
+        values = {
+            normalize_yahoo_symbol(value)
+            for value in columns.get_level_values(level)
+        }
+        if values.intersection(expected):
+            return level
+    return None
+
+
+def _canonical_ohlcv_column(value: object) -> Optional[str]:
+    normalized = " ".join(str("" if value is None else value).strip().replace("_", " ").split()).casefold()
+    aliases = {
+        "open": "Open",
+        "high": "High",
+        "low": "Low",
+        "close": "Close",
+        "adj close": "Adj Close",
+        "adjusted close": "Adj Close",
+        "volume": "Volume",
+    }
+    return aliases.get(normalized)
+
+
+def _coalesce_ohlcv_columns(history: pd.DataFrame) -> pd.DataFrame:
+    """Flatten field columns and pick the first non-null value per row.
+
+    A partially failed yfinance batch can include all-null columns for a
+    symbol; a later chart/single-symbol fallback then adds the same field
+    labels.  Coalescing prevents duplicate ``Close`` columns from reaching
+    scanners and makes the fallback data usable.
+    """
+    if history.empty:
+        return pd.DataFrame(index=history.index)
+
+    if isinstance(history.columns, pd.MultiIndex):
+        field_level = None
+        for level in range(history.columns.nlevels):
+            if any(
+                _canonical_ohlcv_column(value) is not None
+                for value in history.columns.get_level_values(level)
+            ):
+                field_level = level
+                break
+        if field_level is None:
+            return pd.DataFrame(index=history.index)
+        labels = [
+            _canonical_ohlcv_column(column[field_level])
+            for column in history.columns.to_list()
+        ]
+    else:
+        labels = [_canonical_ohlcv_column(column) for column in history.columns]
+
+    result = pd.DataFrame(index=history.index)
+    for field in OHLCV_COLUMNS:
+        positions = [index for index, label in enumerate(labels) if label == field]
+        if not positions:
+            continue
+        candidates = history.iloc[:, positions]
+        # ``bfill`` preserves the earliest source when both paths supplied a
+        # value and fills an all-null batch column from a later fallback.
+        result[field] = candidates.bfill(axis=1).iloc[:, 0]
+    return result
 
 
 def _symbols_with_downloaded_history(history: pd.DataFrame, symbols: List[str]) -> List[str]:
@@ -382,8 +565,7 @@ def _download_chart_fallback_batch(
                 continue
             if symbol_history.empty:
                 continue
-            if not isinstance(symbol_history.columns, pd.MultiIndex):
-                symbol_history.columns = pd.MultiIndex.from_product([[symbol], symbol_history.columns])
+            symbol_history = _normalize_batch_download_columns(symbol_history, [symbol])
             frames.append(symbol_history)
 
     if not frames:
@@ -482,37 +664,97 @@ def download_price_history(
                 )
                 if symbol_history.empty:
                     continue
-                if not isinstance(symbol_history.columns, pd.MultiIndex):
-                    symbol_history.columns = pd.MultiIndex.from_product([[symbol], symbol_history.columns])
-                frames.append(symbol_history)
+                frames.append(_normalize_batch_download_columns(symbol_history, [symbol]))
             except Exception:
                 continue
 
     if not frames:
         return pd.DataFrame()
 
-    return pd.concat(frames, axis=1)
+    return _combine_download_frames(frames, universe)
 
 
 def _extract_symbol_history(history: pd.DataFrame, symbol: str) -> Optional[pd.DataFrame]:
+    """Extract one flat, de-duplicated OHLCV frame from a batch response."""
     if history.empty:
         return None
 
+    normalized_symbol = normalize_yahoo_symbol(symbol)
     if isinstance(history.columns, pd.MultiIndex):
-        if symbol in history.columns.levels[0]:
-            symbol_df = history[symbol].copy()
-        else:
+        symbol_level = _find_symbol_column_level(history.columns, [normalized_symbol])
+        if symbol_level is None:
             return None
+        matching_symbols = list(
+            dict.fromkeys(
+                value
+                for value in history.columns.get_level_values(symbol_level)
+                if normalize_yahoo_symbol(value) == normalized_symbol
+            )
+        )
+        if not matching_symbols:
+            return None
+        pieces = [
+            history.xs(value, axis=1, level=symbol_level, drop_level=True)
+            for value in matching_symbols
+        ]
+        symbol_df = pd.concat(pieces, axis=1) if len(pieces) > 1 else pieces[0]
     else:
         symbol_df = history.copy()
 
     if symbol_df.empty:
         return None
 
-    if "Close" not in symbol_df.columns or "High" not in symbol_df.columns or "Low" not in symbol_df.columns:
+    symbol_df = _coalesce_ohlcv_columns(symbol_df)
+    if symbol_df.empty or any(column not in symbol_df.columns for column in REQUIRED_OHLCV_COLUMNS):
         return None
 
-    return symbol_df.dropna(subset=["Close", "High", "Low", "Volume"])
+    symbol_df = symbol_df.dropna(subset=list(REQUIRED_OHLCV_COLUMNS))
+    return symbol_df if not symbol_df.empty else None
+
+
+def _combine_download_frames(frames: List[pd.DataFrame], symbols: List[str]) -> pd.DataFrame:
+    """Combine batch/retry/fallback frames without duplicated symbol fields."""
+    if not frames:
+        return pd.DataFrame()
+
+    combined = pd.concat(frames, axis=1)
+    normalized_frames: List[pd.DataFrame] = []
+    for symbol in dict.fromkeys(normalize_yahoo_symbol(item) for item in symbols):
+        symbol_history = _extract_symbol_history(combined, symbol)
+        if symbol_history is None or symbol_history.empty:
+            continue
+        symbol_history = symbol_history.copy()
+        symbol_history.columns = pd.MultiIndex.from_product([[symbol], symbol_history.columns])
+        normalized_frames.append(symbol_history)
+    return pd.concat(normalized_frames, axis=1) if normalized_frames else pd.DataFrame()
+
+
+def download_single_symbol_history(
+    symbol: str,
+    period: str = "3mo",
+    interval: str = "1d",
+    **kwargs,
+) -> pd.DataFrame:
+    """Download one symbol and return a flat OHLCV dataframe.
+
+    ``download_price_history`` intentionally remains a batch API and always
+    returns symbol-first MultiIndex columns.  This helper is the safe API for
+    analysis code that needs to access ``history[\"Close\"]`` directly.
+    """
+    normalized_symbol = normalize_yahoo_symbol(symbol)
+    # The helper always has exactly one input symbol; ignore an accidental
+    # batch-only limit from a migrated caller instead of passing max_symbols
+    # twice to the underlying function.
+    kwargs.pop("max_symbols", None)
+    history = download_price_history(
+        [normalized_symbol],
+        period=period,
+        interval=interval,
+        max_symbols=1,
+        **kwargs,
+    )
+    extracted = _extract_symbol_history(history, normalized_symbol)
+    return extracted if extracted is not None else pd.DataFrame()
 
 
 def compute_stock_metrics(
@@ -634,10 +876,15 @@ def compute_stock_metrics(
     rs_above_sma_50 = False
     rs_slope_20d = 0.0
 
-    # Handle automatic extraction of SPY history from multi-symbol history if not explicitly provided
+    # Handle automatic extraction of SPY history from any supported batch
+    # shape.  This also covers field-first MultiIndex data supplied by older
+    # yfinance versions or tests.
     if spy_history is None and isinstance(history, pd.DataFrame):
-        if isinstance(history.columns, pd.MultiIndex) and "SPY" in history.columns.levels[0]:
-            spy_history = history["SPY"].copy()
+        spy_history = _extract_symbol_history(history, "SPY")
+    elif spy_history is not None:
+        extracted_spy = _extract_symbol_history(spy_history, "SPY")
+        if extracted_spy is not None:
+            spy_history = extracted_spy
 
     if spy_history is not None and not spy_history.empty:
         stock_df = symbol_history.copy()
@@ -745,17 +992,16 @@ def get_universe_stock_metrics(
     max_symbols: int = 200,
 ) -> List[Dict]:
     """Download universe price history and return computed stock metrics."""
-    download_tickers = list(dict.fromkeys(["SPY", *tickers]))
+    universe = _clean_download_tickers(tickers, max_symbols)
+    download_tickers = list(dict.fromkeys(["SPY", *universe]))
     history = download_price_history(download_tickers, period=period, interval=interval, max_symbols=max_symbols + 1)
     if history.empty:
         return []
 
-    spy_history = None
-    if isinstance(history.columns, pd.MultiIndex) and "SPY" in history.columns.levels[0]:
-        spy_history = history["SPY"].copy()
+    spy_history = _extract_symbol_history(history, "SPY")
 
     metrics = []
-    for symbol in tickers[:max_symbols]:
+    for symbol in universe:
         result = compute_stock_metrics(symbol, history, spy_history=spy_history)
         if result is not None:
             metrics.append(result)

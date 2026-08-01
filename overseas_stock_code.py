@@ -131,7 +131,11 @@ def load_overseas_master(
 
 
 def to_yfinance_symbol(kis_symbol: str) -> str:
-    """Convert KIS US symbols such as BRK/B to the Yahoo Finance form BRK-B."""
+    """Convert KIS/S&P class-share symbols to the Yahoo Finance form.
+
+    KIS commonly emits ``BRK/B`` while S&P cache files can contain ``BRK.B``;
+    Yahoo uses ``BRK-B`` for both spellings.
+    """
     return str(kis_symbol or "").strip().upper().replace("/", "-").replace(".", "-")
 
 

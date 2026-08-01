@@ -1,6 +1,7 @@
 """Trading rules and watchlist management."""
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Dict, Optional
 from datetime import datetime, timezone
@@ -65,9 +66,62 @@ class WatchlistItem:
     notes: str = ""
     added_date: datetime = field(default_factory=_utc_now)
     ai_analysis: Optional[Dict] = None
+    # The plan explicitly selected in the Watchlist ORB panel.  The execution
+    # queue uses this to retain the user's chosen ORB window/risk/buffer rather
+    # than silently replacing it with a newly auto-ranked candidate.
+    selected_orb_plan: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         self.added_date = _parse_timestamp(self.added_date)
+        self.selected_orb_plan = _normalize_selected_orb_plan(
+            self.selected_orb_plan
+        )
+
+
+def _normalize_selected_orb_plan(value: Any) -> Optional[Dict[str, Any]]:
+    """Keep persisted ORB selections small, JSON-safe, and finite.
+
+    Watchlist state is user-editable local JSON, so an invalid optional plan
+    should be ignored without rejecting an otherwise valid watchlist item.
+    """
+    if not isinstance(value, dict):
+        return None
+
+    window = value.get("window")
+    if not isinstance(window, str) or not window.strip():
+        return None
+
+    normalized: Dict[str, Any] = {"window": window.strip()}
+    string_keys = {"selected_at"}
+    float_keys = {
+        "risk_percent",
+        "entry_trigger",
+        "stop_price",
+        "breakout_price",
+        "buffer_pct",
+        "capital_percent",
+        "stop_adr",
+    }
+    for key in string_keys:
+        raw = value.get(key)
+        if isinstance(raw, str) and raw.strip():
+            normalized[key] = raw.strip()
+    for key in float_keys:
+        raw = value.get(key)
+        try:
+            number = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            normalized[key] = number
+    if value.get("shares") is not None:
+        try:
+            shares = int(value.get("shares"))
+        except (TypeError, ValueError):
+            shares = -1
+        if shares >= 0:
+            normalized["shares"] = shares
+    return normalized
 
 
 @dataclass
@@ -123,12 +177,18 @@ class Watchlist:
 
     def remove(self, symbol: str) -> bool:
         """Remove a stock from watchlist. Returns True if found."""
+        symbol = str(symbol or "").strip().upper()
+        if not symbol:
+            return False
         original_len = len(self.items)
         self.items = [item for item in self.items if item.symbol != symbol]
         return len(self.items) < original_len
 
     def get(self, symbol: str) -> Optional[WatchlistItem]:
         """Get a watchlist item by symbol."""
+        symbol = str(symbol or "").strip().upper()
+        if not symbol:
+            return None
         for item in self.items:
             if item.symbol == symbol:
                 return item
@@ -150,6 +210,7 @@ class Watchlist:
                     "notes": item.notes,
                     "added_date": item.added_date.isoformat(),
                     "ai_analysis": item.ai_analysis,
+                    "selected_orb_plan": item.selected_orb_plan,
                 }
                 for item in self.items
             ],
@@ -212,6 +273,9 @@ class Watchlist:
                         notes=raw_item.get("notes", ""),
                         added_date=parsed_added_date,
                         ai_analysis=raw_item.get("ai_analysis"),
+                        selected_orb_plan=_normalize_selected_orb_plan(
+                            raw_item.get("selected_orb_plan")
+                        ),
                     )
                 )
             except Exception as exc:
@@ -344,6 +408,10 @@ class BuylistItem:
     buy_date: Optional[datetime] = None
     sell_half_done: bool = False
     kis_order_id: str = ""
+    # KIS account that owns this buylist position.  This must travel with the
+    # saved item so holdings from another configured account cannot be applied
+    # to the same symbol after an account switch or restart.
+    kis_account_no: str = ""
     environment: str = "PROD"
     breakout_price: Optional[float] = (
         None  # daily chart structural breakout level (user-entered)
@@ -367,6 +435,7 @@ class BuylistItem:
         self.environment = str(self.environment or "PROD").strip().upper()
         if self.environment != "PROD":
             raise ValueError("Buylist items must use the PROD environment")
+        self.kis_account_no = str(self.kis_account_no or "").strip()
         self.added_date = _parse_timestamp(self.added_date)
         if self.buy_date is not None:
             self.buy_date = _parse_timestamp(
@@ -405,6 +474,7 @@ class BuylistItem:
             "buy_date": self.buy_date.isoformat() if self.buy_date else None,
             "sell_half_done": self.sell_half_done,
             "kis_order_id": self.kis_order_id,
+            "kis_account_no": self.kis_account_no,
             "environment": self.environment,
             "breakout_price": self.breakout_price,
             "confirmation_price": self.confirmation_price,
@@ -477,6 +547,7 @@ class BuylistItem:
             ),
             sell_half_done=bool(data.get("sell_half_done", False)),
             kis_order_id=str(data.get("kis_order_id", "")),
+            kis_account_no=str(data.get("kis_account_no", "")),
             breakout_price=breakout_price,
             confirmation_price=(
                 float(data["confirmation_price"])

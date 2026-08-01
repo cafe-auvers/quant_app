@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from PyQt5.QtWidgets import QMessageBox
@@ -169,6 +170,20 @@ class BuylistExecutionController(WindowController):
         selected_window = display.selected_window
         warnings = display.warnings
         score = float(getattr(candidate, "score", 0.0) or 0.0) if candidate else 0.0
+        effective_buffer_pct = buffer_pct
+        saved_plan = getattr(watch_item, "selected_orb_plan", None)
+        if (
+            candidate is not None
+            and isinstance(saved_plan, dict)
+            and str(saved_plan.get("window", "") or "")
+            == str(getattr(candidate, "window", "") or "")
+        ):
+            try:
+                saved_buffer = float(saved_plan.get("buffer_pct"))
+            except (TypeError, ValueError):
+                saved_buffer = None
+            if saved_buffer is not None and math.isfinite(saved_buffer) and saved_buffer >= 0:
+                effective_buffer_pct = saved_buffer
         summary = (
             f"Execution queue {status_text}"
             + (f"; selected ORB {selected_window}" if selected_window else "")
@@ -203,7 +218,7 @@ class BuylistExecutionController(WindowController):
                 environment=env,
                 breakout_price=getattr(watch_item, "breakout_price", None),
                 breakout_method=f"execution_queue:{selected_window}" if selected_window else "execution_queue",
-                buffer_pct=buffer_pct,
+                buffer_pct=effective_buffer_pct,
             )
             manager.add(existing)
         else:
@@ -215,22 +230,25 @@ class BuylistExecutionController(WindowController):
             existing.environment = env
             existing.breakout_price = getattr(watch_item, "breakout_price", None)
             existing.breakout_method = f"execution_queue:{selected_window}" if selected_window else "execution_queue"
-            existing.buffer_pct = buffer_pct
-            # Preserve existing compatibility mirrors unless they are missing.
-            if float(getattr(existing, "entry_price", 0.0) or 0.0) <= 0:
+            existing.buffer_pct = effective_buffer_pct
+            # A durable Watchlist plan is an explicit user choice, so refresh
+            # its compatibility mirrors.  Legacy auto-selected queue rows keep
+            # their existing values unless missing.
+            use_selected_plan = bool(getattr(queue_item, "manual_window_lock", False))
+            if use_selected_plan or float(getattr(existing, "entry_price", 0.0) or 0.0) <= 0:
                 existing.entry_price = entry_price
-            if float(getattr(existing, "stop_loss", 0.0) or 0.0) <= 0:
+            if use_selected_plan or float(getattr(existing, "stop_loss", 0.0) or 0.0) <= 0:
                 existing.stop_loss = stop_loss
-            if float(getattr(existing, "total_score", 0.0) or 0.0) <= 0:
+            if use_selected_plan or float(getattr(existing, "total_score", 0.0) or 0.0) <= 0:
                 existing.total_score = score
-            if float(getattr(existing, "stop_adr", 0.0) or 0.0) <= 0:
+            if use_selected_plan or float(getattr(existing, "stop_adr", 0.0) or 0.0) <= 0:
                 existing.stop_adr = stop_adr
             # Always update sizing fields — auto-selected risk% changes each refresh
             existing.position_percent = capital_percent
             existing.risk_percent = risk_percent
-            if not str(getattr(existing, "trade_plan", "") or ""):
+            if use_selected_plan or not str(getattr(existing, "trade_plan", "") or ""):
                 existing.trade_plan = trade_plan
-            if not list(getattr(existing, "warnings", []) or []):
+            if use_selected_plan or not list(getattr(existing, "warnings", []) or []):
                 existing.warnings = warnings
 
     def submit_selected_queue_order(self, env: str) -> None:
@@ -259,7 +277,19 @@ class BuylistExecutionController(WindowController):
                 f"{item.symbol} is {status_text or 'not ready'}; submit is allowed only when status is EXECUTE_READY.",
             )
             return
-        if int(candidate.shares or 0) < 1 or float(candidate.entry_trigger or 0.0) <= 0:
+        try:
+            shares_value = float(candidate.shares)
+            entry_trigger = float(candidate.entry_trigger)
+        except (TypeError, ValueError, OverflowError):
+            shares_value = 0.0
+            entry_trigger = 0.0
+        if (
+            not math.isfinite(shares_value)
+            or not shares_value.is_integer()
+            or shares_value < 1
+            or not math.isfinite(entry_trigger)
+            or entry_trigger <= 0
+        ):
             QMessageBox.warning(self.window, "Invalid order", f"{item.symbol} has invalid quantity or entry trigger.")
             return
         if self._buylist_auto_order_blocked(item):
@@ -271,7 +301,39 @@ class BuylistExecutionController(WindowController):
             )
             return
 
-        account_no = self._first_account_no_for_environment(env) or ""
+        window_values = getattr(self.window, "__dict__", {})
+        selected_account_fn = window_values.get("_selected_order_account_for_item")
+        if selected_account_fn is None:
+            selected_account_fn = getattr(
+                type(self.window), "_selected_order_account_for_item", None
+            )
+        account_no = (
+            (
+                selected_account_fn(item, env)
+                if "_selected_order_account_for_item" in window_values
+                else selected_account_fn(self.window, item, env)
+            )
+            if callable(selected_account_fn)
+            else self._first_account_no_for_environment(env)
+        )
+        if not account_no:
+            warn_account_fn = window_values.get("_warn_order_account_unavailable")
+            if warn_account_fn is None:
+                warn_account_fn = getattr(
+                    type(self.window), "_warn_order_account_unavailable", None
+                )
+            if callable(warn_account_fn):
+                if "_warn_order_account_unavailable" in window_values:
+                    warn_account_fn(item, env)
+                else:
+                    warn_account_fn(self.window, item, env)
+            else:
+                QMessageBox.warning(
+                    self.window,
+                    "KIS account required",
+                    "Select a configured KIS account before submitting an order.",
+                )
+            return
         if self._has_duplicate_open_order(env, account_no, item.symbol, OrderSide.BUY, OrderIntent.ENTRY):
             QMessageBox.warning(self.window, "Duplicate order", f"An open BUY ENTRY order already exists for {item.symbol}.")
             return
@@ -302,6 +364,6 @@ class BuylistExecutionController(WindowController):
         self.populate_buylist_dashboard()
         self._submit_kis_buy_order(
             item,
-            quantity=int(candidate.shares or 0),
-            order_price=float(candidate.entry_trigger or 0.0),
+            quantity=int(shares_value),
+            order_price=entry_trigger,
         )

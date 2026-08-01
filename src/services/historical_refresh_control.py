@@ -17,14 +17,16 @@ from __future__ import annotations
 
 import csv
 import io
+import os
 import subprocess
 import sys
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from src.utils.storage import load_json, save_json
 
@@ -45,6 +47,8 @@ REQUIRED_PHASES: Dict[str, Tuple[str, ...]] = {
 # child that is merely slow to flip its own status to "running" must not be
 # treated as inactive just because this much time has passed.
 STARTING_STATUS_MAX_AGE_SECONDS = 30.0
+LAUNCH_LOCK_TIMEOUT_SECONDS = 5.0
+STALE_LAUNCH_LOCK_SECONDS = 30.0
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HISTORICAL_SCRIPT_PATH = REPO_ROOT / "historical.py"
@@ -66,12 +70,68 @@ def lock_path(mode: str) -> Path:
     return DATA_DIR / f"refresh_lock_{mode}.lock"
 
 
+def launch_lock_path(mode: str) -> Path:
+    """Path for the short parent-side launch transaction lock.
+
+    This is intentionally separate from ``lock_path``.  historical.py holds
+    the latter for the lifetime of a refresh, while this one only serializes
+    the parent process' check -> Popen -> status-write transaction.
+    """
+    return DATA_DIR / f"refresh_launch_{mode}.lock"
+
+
 def log_path(mode: str) -> Path:
     return LOG_DIR / f"historical_{mode}.log"
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+@contextmanager
+def _exclusive_launch_lock(mode: str) -> Iterator[None]:
+    """Serialize launch attempts across UI threads and application processes."""
+    path = launch_lock_path(mode)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + LAUNCH_LOCK_TIMEOUT_SECONDS
+    descriptor: Optional[int] = None
+
+    while descriptor is None:
+        try:
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(descriptor, f"{os.getpid()} {time.time()}".encode("ascii"))
+            except Exception:
+                os.close(descriptor)
+                descriptor = None
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+                raise
+        except FileExistsError:
+            try:
+                stale = time.time() - path.stat().st_mtime > STALE_LAUNCH_LOCK_SECONDS
+            except OSError:
+                stale = False
+            if stale:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+                continue
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"Timed out waiting to launch {mode} refresh.")
+            time.sleep(0.05)
+
+    try:
+        yield
+    finally:
+        os.close(descriptor)
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 def is_derived_data_complete(mode: str, completed_phases: Optional[List[str]]) -> bool:
@@ -224,57 +284,82 @@ def launch_refresh(
     the child has already recorded a status for this same run_id, that record
     is left untouched rather than being clobbered with a stale 'starting'.
     """
-    reconcile_stale_status(mode)
-    running, _ = is_refresh_running(mode)
-    if running:
-        raise RuntimeError(f"A {mode} refresh is already running.")
+    # This narrow lock closes the gap where two UI actions/processes can both
+    # observe an idle status and each spawn a child before historical.py gets
+    # a chance to take its lifetime mode lock.
+    with _exclusive_launch_lock(mode):
+        reconcile_stale_status(mode)
+        running, _ = is_refresh_running(mode)
+        if running:
+            raise RuntimeError(f"A {mode} refresh is already running.")
 
-    run_id = uuid.uuid4().hex
-    cmd = [sys.executable, str(HISTORICAL_SCRIPT_PATH), "--mode", mode, "--run-id", run_id]
-    if backfill:
-        cmd.append("--backfill")
-    if universe_limit:
-        cmd.extend(["--universe-limit", str(universe_limit)])
+        run_id = uuid.uuid4().hex
+        cmd = [sys.executable, str(HISTORICAL_SCRIPT_PATH), "--mode", mode, "--run-id", run_id]
+        if backfill:
+            cmd.append("--backfill")
+        if universe_limit:
+            cmd.extend(["--universe-limit", str(universe_limit)])
 
-    log_file = log_path(mode)
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-    creationflags = (
-        subprocess.CREATE_NEW_PROCESS_GROUP
-        | subprocess.DETACHED_PROCESS
-        | subprocess.CREATE_NO_WINDOW
-    )
-    with log_file.open("w", encoding="utf-8") as log_fh:
-        process = subprocess.Popen(
-            cmd,
-            cwd=str(REPO_ROOT),
-            creationflags=creationflags,
-            close_fds=True,
-            stdin=subprocess.DEVNULL,
-            stdout=log_fh,
-            stderr=subprocess.STDOUT,
+        # Publish ownership before spawning.  If Popen itself fails, turn this
+        # record into a terminal error below; otherwise a second launcher can
+        # never mistake the mode for idle while the first launch is in flight.
+        now = _now_iso()
+        starting_status = _default_status(mode)
+        starting_status.update({
+            "status": "starting",
+            "run_id": run_id,
+            "pid": None,
+            "started_at": now,
+            "updated_at": now,
+            "backfill": backfill,
+        })
+        save_json(status_path(mode), starting_status)
+
+        log_file = log_path(mode)
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        creationflags = (
+            subprocess.CREATE_NEW_PROCESS_GROUP
+            | subprocess.DETACHED_PROCESS
+            | subprocess.CREATE_NO_WINDOW
         )
+        try:
+            with log_file.open("w", encoding="utf-8") as log_fh:
+                process = subprocess.Popen(
+                    cmd,
+                    cwd=str(REPO_ROOT),
+                    creationflags=creationflags,
+                    close_fds=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_fh,
+                    stderr=subprocess.STDOUT,
+                )
+        except Exception as exc:
+            current = read_status(mode)
+            if current.get("run_id") == run_id and current.get("status") == "starting":
+                current["status"] = "error"
+                current["updated_at"] = _now_iso()
+                current["finished_at"] = current["updated_at"]
+                current["result"] = {"error_message": f"Could not launch refresh: {exc}"}
+                save_json(status_path(mode), current)
+            raise
 
-    current = read_status(mode)
-    if current.get("run_id") == run_id and current.get("status") in (
-        "running", "completed", "error", "terminated",
-    ):
-        # The child already recorded its own status for this run_id -- do not
-        # clobber a real (and possibly already-terminal) status with 'starting'.
+        current = read_status(mode)
+        if current.get("run_id") == run_id and current.get("status") in (
+            "running", "completed", "error", "terminated",
+        ):
+            # The child already recorded its own status for this run_id -- do
+            # not clobber a real (and possibly already-terminal) state.
+            return LaunchResult(process=process, run_id=run_id)
+
+        if current.get("run_id") == run_id and current.get("status") == "starting":
+            # The child has not reported yet.  Fill in the PID so
+            # is_refresh_running can correctly treat this transient status as
+            # active as soon as the launch lock is released.
+            current["pid"] = process.pid
+            current["updated_at"] = _now_iso()
+            save_json(status_path(mode), current)
+
         return LaunchResult(process=process, run_id=run_id)
-
-    now = _now_iso()
-    starting_status = _default_status(mode)
-    starting_status.update({
-        "status": "starting",
-        "run_id": run_id,
-        "pid": process.pid,
-        "started_at": now,
-        "updated_at": now,
-        "backfill": backfill,
-    })
-    save_json(status_path(mode), starting_status)
-
-    return LaunchResult(process=process, run_id=run_id)
 
 
 def terminate_refresh(mode: str, wait_seconds: float = 3.0) -> bool:

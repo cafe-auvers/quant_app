@@ -82,6 +82,55 @@ def test_account_and_order_reconciliation_workers_keep_separate_state(
     assert reconciliation_errors == []
 
 
+def test_scanner_worker_loads_cold_universe_off_the_calling_ui_path(monkeypatch):
+    import src.ui.workers as workers
+    import src.utils.data_loader as data_loader
+    import src.utils.db_loader as db_loader
+
+    monkeypatch.setattr(
+        data_loader, "get_default_universe", lambda max_symbols=None: ["AAPL", "MSFT"]
+    )
+    monkeypatch.setattr(
+        db_loader,
+        "get_universe_stock_metrics_from_db",
+        lambda tickers, engine: [{"symbol": ticker} for ticker in tickers],
+    )
+    loaded_universes = []
+    results = []
+    errors = []
+    worker = workers.ScannerWorker(
+        tickers=None,
+        engine=object(),
+        min_volume=0,
+        min_dollar_volume=0,
+        min_adr=0,
+        min_growth_rank=0,
+        min_trend_intensity=0,
+    )
+    worker.universe_loaded.connect(loaded_universes.append)
+    worker.finished_scan.connect(lambda metrics, _unused: results.append(metrics))
+    worker.error_occurred.connect(errors.append)
+
+    worker.run()
+
+    assert loaded_universes == [["AAPL", "MSFT"]]
+    assert results == [[{"symbol": "AAPL"}, {"symbol": "MSFT"}]]
+    assert errors == []
+
+
+def test_database_init_worker_never_raises_connection_errors_into_the_ui(monkeypatch):
+    import src.ui.main_window as main_window
+
+    monkeypatch.setattr(main_window, "init_mysql_engine", lambda: (_ for _ in ()).throw(RuntimeError("offline")))
+    results = []
+    worker = main_window.DatabaseInitWorker()
+    worker.initialized.connect(lambda engine, error: results.append((engine, error)))
+
+    worker.run()
+
+    assert results == [(None, "offline")]
+
+
 def test_app_state_save_preserves_json_shapes(tmp_path, monkeypatch):
     import src.services.app_state as app_state
 

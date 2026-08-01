@@ -561,16 +561,23 @@ class DashboardMixin:
         self.kis_account_status_label.setText(
             f"Fetching {profile.get('label', environment)} account snapshot..."
         )
+        requested_profile = dict(profile)
         self.kis_account_worker = KisAccountWorker(
             environment=environment,
             include_domestic=include_domestic,
             include_overseas=include_overseas,
-            account_no=profile.get("account_no"),
+            account_no=requested_profile.get("account_no"),
         )
         self.kis_account_worker.finished_snapshot.connect(
-            self._on_kis_snapshot_finished
+            lambda snapshot, requested=requested_profile: self._on_kis_snapshot_finished(
+                snapshot, requested
+            )
         )
-        self.kis_account_worker.error_occurred.connect(self._on_kis_snapshot_error)
+        self.kis_account_worker.error_occurred.connect(
+            lambda error, requested=requested_profile: self._on_kis_snapshot_error(
+                error, requested
+            )
+        )
         self.kis_account_worker.finished.connect(
             lambda worker=self.kis_account_worker: self._clear_worker_reference(
                 "kis_account_worker", worker
@@ -578,37 +585,71 @@ class DashboardMixin:
         )
         self.kis_account_worker.start()
 
-    def _on_kis_snapshot_finished(self, snapshot: dict) -> None:
+    def _on_kis_snapshot_finished(
+        self, snapshot: dict, requested_profile: Optional[dict] = None
+    ) -> None:
         self._schedule_kis_refresh_button_enable()
-        profile = self._selected_dashboard_kis_profile()
+        # The combo can change while the worker is in flight.  Store and sync
+        # under the profile that made the request, not the current selection.
+        profile = requested_profile or self._selected_dashboard_kis_profile()
         if profile:
+            environment = str(profile.get("environment") or "").upper()
+            account_no = str(profile.get("account_no") or "")
             self.kis_account_snapshots[
-                (profile["environment"], profile["account_no"])
+                (environment, account_no)
             ] = snapshot
             self.sync_buylist_positions_from_kis_snapshots(
-                {(profile["environment"], profile["account_no"]): snapshot}
+                {(environment, account_no): snapshot}
             )
-        self.kis_account_status_label.setText("KIS account snapshot loaded.")
-        fx = (
-            self._parse_float(self.usd_krw_rate_input, 0.0)
-            if hasattr(self, "usd_krw_rate_input")
-            else 0.0
+        current_profile_fn = getattr(self, "_selected_dashboard_kis_profile", None)
+        current_profile = current_profile_fn() if callable(current_profile_fn) else None
+        current_key = (
+            (
+                str(current_profile.get("environment") or "").upper(),
+                str(current_profile.get("account_no") or ""),
+            )
+            if isinstance(current_profile, dict)
+            else None
         )
-        self.kis_account_summary_label.setText(
-            self._format_kis_snapshot_summary(snapshot, fx_rate=fx)
+        requested_key = (
+            (environment, account_no) if profile else None
         )
-        self.populate_kis_holdings_table(self._flatten_kis_holdings(snapshot))
-        self.apply_cached_trade_account_size()
-        self.append_log("Loaded KIS account snapshot.")
+        if requested_key is not None and current_key not in {None, requested_key}:
+            label = str(profile.get("label") or account_no)
+            self.kis_account_status_label.setText(
+                f"KIS snapshot loaded for {label}; current selection was not changed."
+            )
+            self.append_log(f"Loaded KIS account snapshot for {label}.")
+        else:
+            self.kis_account_status_label.setText("KIS account snapshot loaded.")
+            fx = (
+                self._parse_float(self.usd_krw_rate_input, 0.0)
+                if hasattr(self, "usd_krw_rate_input")
+                else 0.0
+            )
+            self.kis_account_summary_label.setText(
+                self._format_kis_snapshot_summary(snapshot, fx_rate=fx)
+            )
+            self.populate_kis_holdings_table(self._flatten_kis_holdings(snapshot))
+            self.apply_cached_trade_account_size()
+            self.append_log("Loaded KIS account snapshot.")
         self.reconcile_open_orders()
 
-    def _on_kis_snapshot_error(self, error_message: str) -> None:
+    def _on_kis_snapshot_error(
+        self, error_message: str, requested_profile: Optional[dict] = None
+    ) -> None:
         self._schedule_kis_refresh_button_enable()
         friendly_message = self._format_kis_error_message(error_message)
-        self.kis_account_status_label.setText(
-            f"KIS account snapshot failed: {friendly_message}"
+        profile_label = (
+            str(requested_profile.get("label") or "")
+            if isinstance(requested_profile, dict)
+            else ""
         )
-        self.append_log(f"KIS account snapshot failed: {friendly_message}")
+        context = f" for {profile_label}" if profile_label else ""
+        self.kis_account_status_label.setText(
+            f"KIS account snapshot failed{context}: {friendly_message}"
+        )
+        self.append_log(f"KIS account snapshot failed{context}: {friendly_message}")
 
     def _schedule_kis_refresh_button_enable(self) -> None:
         if not hasattr(self, "kis_refresh_button"):
@@ -802,17 +843,24 @@ class DashboardMixin:
         controller = get_controller(self, "account_controller", AccountController)
         controller.refresh_trade_account_size()
 
-    def _on_trade_account_snapshot_finished(self, snapshot: dict) -> None:
-        profile = (
+    def _on_trade_account_snapshot_finished(
+        self, snapshot: dict, requested_profile: Optional[dict] = None
+    ) -> None:
+        # Use the request's profile.  A user can change the sizing account
+        # before the background request returns.
+        profile = requested_profile or (
             self.trade_kis_account_combo.currentData()
             if hasattr(self, "trade_kis_account_combo")
             else None
         )
-        environment = (
-            self.trade_kis_environment_combo.currentText()
-            if hasattr(self, "trade_kis_environment_combo")
-            else ""
-        )
+        environment = str(
+            (profile or {}).get("environment")
+            or (
+                self.trade_kis_environment_combo.currentText()
+                if hasattr(self, "trade_kis_environment_combo")
+                else ""
+            )
+        ).upper()
         if profile:
             self.kis_account_snapshots[(environment, profile.get("account_no", ""))] = (
                 snapshot
@@ -821,12 +869,21 @@ class DashboardMixin:
                 {(environment, profile.get("account_no", "")): snapshot}
             )
         self.refresh_usd_krw_rate(show_messages=False)
-        self.append_log("Loaded KIS account value for trade sizing.")
+        label = str(profile.get("label") or environment) if profile else environment
+        self.append_log(f"Loaded KIS account value for {label} trade sizing.")
         self.reconcile_open_orders()
 
-    def _on_trade_account_snapshot_error(self, error_message: str) -> None:
+    def _on_trade_account_snapshot_error(
+        self, error_message: str, requested_profile: Optional[dict] = None
+    ) -> None:
         friendly_message = self._format_kis_error_message(error_message)
-        self.append_log(f"KIS account value failed: {friendly_message}")
+        profile_label = (
+            str(requested_profile.get("label") or "")
+            if isinstance(requested_profile, dict)
+            else ""
+        )
+        context = f" for {profile_label}" if profile_label else ""
+        self.append_log(f"KIS account value failed{context}: {friendly_message}")
 
     def refresh_usd_krw_rate(self, show_messages: bool = True) -> None:
         if self.fx_rate_worker is not None and self.fx_rate_worker.isRunning():
@@ -1181,6 +1238,14 @@ class DashboardMixin:
 
     def run_single_stock_ai_analysis(self) -> None:
         """Run the new detailed single stock AI quantitative analysis."""
+        existing_worker = self.__dict__.get("single_ai_worker")
+        if existing_worker is not None and existing_worker.isRunning():
+            QMessageBox.information(
+                self,
+                "Analysis running",
+                "A single-stock AI analysis is already running. Wait for it to finish before starting another one.",
+            )
+            return
         selected_rows = self.watchlist_table.selectionModel().selectedRows()
         if not selected_rows:
             QMessageBox.information(
@@ -1209,6 +1274,11 @@ class DashboardMixin:
         )
         self.single_ai_worker.finished_analysis.connect(
             self.on_single_stock_ai_finished
+        )
+        self.single_ai_worker.finished.connect(
+            lambda worker=self.single_ai_worker: self._clear_worker_reference(
+                "single_ai_worker", worker
+            )
         )
         self.single_ai_worker.start()
 

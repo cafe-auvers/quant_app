@@ -148,6 +148,121 @@ def test_intentional_selected_symbol_creates_one_buylist_queue_item(
     assert result.status_counts == {"EXECUTE_READY": 1}
 
 
+def test_saved_watchlist_orb_plan_is_reapplied_to_execution_queue(
+    monkeypatch, tmp_path
+):
+    window = _build_queue_window(monkeypatch, tmp_path)
+    watch_item = window.watchlist.get("AAPL")
+    watch_item.entry_price = 101.01
+    watch_item.stop_loss = 98.0
+    watch_item.selected_orb_plan = {
+        "window": "5m",
+        "risk_percent": 0.005,
+        "entry_trigger": 101.01,
+        "stop_price": 98.0,
+        "breakout_price": 100.0,
+        "buffer_pct": 0.002,
+        "shares": 166,
+    }
+
+    MainWindow.refresh_execution_queue(
+        window,
+        "PROD",
+        show_log=False,
+        symbols=["AAPL"],
+        create_missing=True,
+    )
+
+    queue_item = window.execution_queue_manager.get_item("AAPL", "PROD")
+    candidate = queue_item.selected_candidate
+    buylist_item = window.buylist_manager.get("AAPL", "PROD")
+    assert queue_item.manual_window_lock is True
+    assert queue_item.selected_window == "5m"
+    assert candidate is queue_item.candidates["5m"]
+    assert candidate.risk_percent == pytest.approx(0.005)
+    assert candidate.breakout_trigger == pytest.approx(100.2)
+    assert buylist_item.buffer_pct == pytest.approx(0.002)
+
+
+def test_unlock_auto_clears_durable_watchlist_orb_selection(
+    monkeypatch, tmp_path
+):
+    window = _build_queue_window(monkeypatch, tmp_path)
+    save_calls = []
+    window._save_state = lambda: save_calls.append(True)
+    watch_item = window.watchlist.get("AAPL")
+    watch_item.entry_price = 101.01
+    watch_item.stop_loss = 98.0
+    watch_item.selected_orb_plan = {
+        "window": "5m",
+        "risk_percent": 0.005,
+        "entry_trigger": 101.01,
+        "stop_price": 98.0,
+        "breakout_price": 100.0,
+        "buffer_pct": 0.002,
+    }
+
+    MainWindow.refresh_execution_queue(
+        window,
+        "PROD",
+        show_log=False,
+        symbols=["AAPL"],
+        create_missing=True,
+    )
+    queue_item = window.execution_queue_manager.get_item("AAPL", "PROD")
+    assert queue_item.manual_window_lock is True
+    saves_before_unlock = len(save_calls)
+
+    MainWindow._unlock_execution_queue_item_for_auto(window, queue_item)
+
+    assert watch_item.selected_orb_plan is None
+    assert len(save_calls) == saves_before_unlock + 1
+    assert queue_item.manual_window_lock is False
+    assert queue_item.locked is False
+
+    MainWindow.refresh_execution_queue(window, "PROD", show_log=False)
+
+    assert queue_item.manual_window_lock is False
+    assert queue_item.locked is False
+
+
+def test_watchlist_selected_orb_plan_round_trips_without_nonfinite_values():
+    watchlist = Watchlist()
+    watchlist.items.append(
+        WatchlistItem(
+            symbol="AAPL",
+            name="Apple",
+            selected_orb_plan={
+                "window": "5m",
+                "risk_percent": 0.005,
+                "entry_trigger": float("nan"),
+                "stop_price": 98.0,
+                "buffer_pct": 0.001,
+                "shares": 50,
+            },
+        )
+    )
+
+    restored = Watchlist.from_dict(watchlist.to_dict())
+
+    assert restored.get("AAPL").selected_orb_plan == {
+        "window": "5m",
+        "risk_percent": 0.005,
+        "stop_price": 98.0,
+        "buffer_pct": 0.001,
+        "shares": 50,
+    }
+
+
+def test_watchlist_lookup_and_remove_normalize_user_symbol_casing():
+    watchlist = Watchlist()
+    watchlist.add("aapl", "Apple")
+
+    assert watchlist.get(" Aapl ").symbol == "AAPL"
+    assert watchlist.remove("aApL") is True
+    assert watchlist.items == []
+
+
 def test_missing_selected_symbol_is_returned_in_refresh_result(monkeypatch, tmp_path):
     window = _build_queue_window(monkeypatch, tmp_path)
 

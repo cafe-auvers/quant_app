@@ -8,6 +8,7 @@ and call order services only after user review.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -280,6 +281,36 @@ def _optional_float(value: Any) -> Optional[float]:
         return None
 
 
+def _saved_orb_selection(item: Any) -> tuple[Optional[str], Optional[float], Optional[float]]:
+    """Return the durable Watchlist ORB choice, when it is safe to apply.
+
+    A watchlist plan is a user decision, not merely a display preference.  Its
+    selected window and risk/buffer inputs must therefore survive a queue
+    refresh instead of being replaced by the current auto-ranked candidate.
+    """
+    raw_plan = getattr(item, "selected_orb_plan", None)
+    if not isinstance(raw_plan, dict):
+        return None, None, None
+
+    window = str(raw_plan.get("window", "") or "").strip()
+    if window not in SUPPORTED_ORB_WINDOWS:
+        return None, None, None
+
+    def _finite_number(key: str, *, positive: bool = False) -> Optional[float]:
+        try:
+            value = float(raw_plan.get(key))
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value) or (positive and value <= 0):
+            return None
+        return value
+
+    buffer_pct = _finite_number("buffer_pct")
+    if buffer_pct is not None and buffer_pct < 0:
+        buffer_pct = None
+    return window, _finite_number("risk_percent", positive=True), buffer_pct
+
+
 def _status_text(value: Any) -> str:
     return str(getattr(value, "value", value) or "").split(".")[-1].upper()
 
@@ -539,6 +570,7 @@ def build_orb_candidate(
     stop_loss: Optional[float] = None,
     buffer_pct: float = DEFAULT_ORB_BUFFER_PCT,
     duplicate_pending_order: bool = False,
+    lock_risk_percent: bool = False,
 ) -> OrbCandidate:
     symbol = str(symbol or "").upper()
     if window not in SUPPORTED_ORB_WINDOWS:
@@ -639,8 +671,22 @@ def build_orb_candidate(
 
     # Auto-select the best valid risk% (same cases as watchlist scoreboard),
     # so execution queue sizing matches what the watchlist displays.
-    _risk_cases = sorted(
-        {0.0025, 0.005, 0.0075, 0.01, 0.0125, 0.015, 0.0175, 0.02, risk_percent}
+    _risk_cases = (
+        [risk_percent]
+        if lock_risk_percent
+        else sorted(
+            {
+                0.0025,
+                0.005,
+                0.0075,
+                0.01,
+                0.0125,
+                0.015,
+                0.0175,
+                0.02,
+                risk_percent,
+            }
+        )
     )
     _best_risk = risk_percent
     _best_sizing: Optional[Dict[str, Any]] = None
@@ -930,23 +976,37 @@ class ExecutionQueueManager:
         symbol = str(getattr(item, "symbol", "")).upper()
         breakout_price = _optional_float(getattr(item, "breakout_price", None))
         stop_loss = _optional_float(getattr(item, "stop_loss", None))
-        candidates = {
-            window: build_orb_candidate(
+        selected_window, selected_risk_percent, selected_buffer_pct = (
+            _saved_orb_selection(item)
+        )
+        candidates = {}
+        for window in SUPPORTED_ORB_WINDOWS:
+            use_saved_selection = window == selected_window
+            candidates[window] = build_orb_candidate(
                 symbol=symbol,
                 window=window,
                 intraday=intraday_by_window.get(window, pd.DataFrame()),
                 breakout_price=breakout_price,
                 current_price=current_price,
                 account_size=account_size,
-                risk_percent=risk_percent,
+                risk_percent=(
+                    selected_risk_percent
+                    if use_saved_selection and selected_risk_percent is not None
+                    else risk_percent
+                ),
                 adr_percent=adr_percent,
                 stop_loss=stop_loss,
-                buffer_pct=buffer_pct,
+                buffer_pct=(
+                    selected_buffer_pct
+                    if use_saved_selection and selected_buffer_pct is not None
+                    else buffer_pct
+                ),
                 duplicate_pending_order=duplicate_pending_order,
+                lock_risk_percent=(
+                    use_saved_selection and selected_risk_percent is not None
+                ),
             )
-            for window in SUPPORTED_ORB_WINDOWS
-        }
-        return self.upsert_item(
+        queue_item = self.upsert_item(
             symbol=symbol,
             environment=environment,
             name=str(getattr(item, "name", "") or symbol),
@@ -954,6 +1014,22 @@ class ExecutionQueueManager:
             current_price=current_price,
             candidates=candidates,
         )
+        if selected_window:
+            selected_candidate = queue_item.candidates.get(selected_window)
+            if selected_candidate is not None:
+                queue_item.locked = True
+                queue_item.manual_window_lock = True
+                if not queue_item.order_status:
+                    queue_item.locked_reason = "Watchlist ORB plan selection"
+                queue_item.selected_window = selected_window
+                queue_item.selected_candidate = selected_candidate
+                queue_item.status = resolve_queue_status(
+                    queue_item.candidates,
+                    selected_candidate,
+                    locked=True,
+                    order_status=queue_item.order_status,
+                )
+        return queue_item
 
     def mark_order_submitted(
         self,

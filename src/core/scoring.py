@@ -11,6 +11,52 @@ from src.utils.config import get_env_value
 from src.core.position_sizer import PositionSizer
 
 
+def _finite_float(value: Any) -> Optional[float]:
+    """Return a finite float, or ``None`` when input cannot be used safely."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _rejected_scores(
+    warnings: List[str],
+    *,
+    price: float = 0.0,
+    entry_price: float = 0.0,
+    stop_loss: float = 0.0,
+    breakout_price: Optional[float] = None,
+    adr_percent: float = 0.0,
+    volume: float = 0.0,
+) -> Dict[str, Any]:
+    """Build a complete, non-actionable score payload for invalid inputs."""
+    return {
+        "price": price,
+        "technical_score": 0.0,
+        "setup_score": 0.0,
+        "risk_score": 0.0,
+        "timing_score": 0.0,
+        "rr": 0.0,
+        "stop_adr": 0.0,
+        "stop_loss_percent": 0.0,
+        "position_percent": 0.0,
+        "shares": 0,
+        "warnings": list(warnings),
+        "status": "REJECTED",
+        "entry_price": entry_price,
+        "stop_loss": stop_loss,
+        "target_price": 0.0,
+        "breakout_price": breakout_price,
+        "adr_percent": adr_percent,
+        "volume": volume,
+        "above_20_ema": False,
+        "above_50_ema": False,
+        "risk_percent": 0.0,
+        "trade_plan": "No shares (invalid risk inputs)",
+    }
+
+
 def calculate_deterministic_scores(
     symbol: str,
     history: pd.DataFrame,
@@ -25,66 +71,189 @@ def calculate_deterministic_scores(
     Calculate deterministic technical, setup, risk, and timing scores,
     and identify any hard reject reasons.
     """
-    symbol = symbol.strip().upper()
-    
+    symbol = str(symbol or "").strip().upper()
+
     # 1. Fallback / Default prices
-    if history.empty:
-        return {
-            "price": entry_price or 0.0,
-            "technical_score": 0.0,
-            "setup_score": 0.0,
-            "risk_score": 0.0,
-            "timing_score": 0.0,
-            "rr": 0.0,
-            "stop_adr": 0.0,
-            "position_percent": 0.0,
-            "shares": 0,
-            "warnings": ["No price history available"],
-            "status": "REJECTED",
-        }
-        
-    latest_bar = history.iloc[-1]
-    price = float(latest_bar["Close"])
-    volume = float(latest_bar["Volume"])
+    if not isinstance(history, pd.DataFrame) or history.empty:
+        return _rejected_scores(
+            ["No price history available"],
+            entry_price=_finite_float(entry_price) or 0.0,
+            stop_loss=_finite_float(stop_loss) or 0.0,
+            breakout_price=_finite_float(breakout_price),
+        )
+    required_columns = {"Close", "High", "Low", "Volume"}
+    missing_columns = sorted(required_columns.difference(history.columns))
+    if missing_columns:
+        return _rejected_scores(
+            [f"Price history is missing required columns: {', '.join(missing_columns)}"],
+            entry_price=_finite_float(entry_price) or 0.0,
+            stop_loss=_finite_float(stop_loss) or 0.0,
+            breakout_price=_finite_float(breakout_price),
+        )
+
+    try:
+        latest_bar = history.iloc[-1]
+        price = _finite_float(latest_bar["Close"])
+        volume = _finite_float(latest_bar["Volume"])
+    except (KeyError, TypeError, ValueError):
+        return _rejected_scores(["Latest price history row is invalid"])
+    if price is None or price <= 0 or volume is None or volume < 0:
+        return _rejected_scores(
+            ["Latest price or volume is invalid"],
+            entry_price=_finite_float(entry_price) or 0.0,
+            stop_loss=_finite_float(stop_loss) or 0.0,
+            breakout_price=_finite_float(breakout_price),
+        )
     dollar_volume = price * volume
-    
-    if entry_price is None or entry_price <= 0:
+    if not math.isfinite(dollar_volume):
+        return _rejected_scores(
+            ["Latest dollar volume is invalid"],
+            price=price,
+            entry_price=_finite_float(entry_price) or 0.0,
+            stop_loss=_finite_float(stop_loss) or 0.0,
+            breakout_price=_finite_float(breakout_price),
+            volume=volume,
+        )
+
+    if entry_price is None:
         entry_price = price
+    else:
+        entry_price = _finite_float(entry_price)
+    if entry_price is None or entry_price <= 0:
+        return _rejected_scores(
+            ["Entry price must be a finite positive value"],
+            price=price,
+            stop_loss=_finite_float(stop_loss) or 0.0,
+            breakout_price=_finite_float(breakout_price),
+            volume=volume,
+        )
         
-    # Calculate ADR (20-day Average Daily Range %)
-    prev_close = history["Close"].astype(float).shift(1)
-    high_low_ratio = (history["High"].astype(float) - history["Low"].astype(float)) / prev_close
+    # Calculate ADR (20-day Average Daily Range %).
+    try:
+        close_series = pd.to_numeric(history["Close"], errors="coerce").astype(float)
+        high_series = pd.to_numeric(history["High"], errors="coerce").astype(float)
+        low_series = pd.to_numeric(history["Low"], errors="coerce").astype(float)
+    except (TypeError, ValueError):
+        return _rejected_scores(
+            ["Price history contains unsupported numeric data"],
+            price=price,
+            entry_price=entry_price,
+            stop_loss=_finite_float(stop_loss) or 0.0,
+            breakout_price=_finite_float(breakout_price),
+            volume=volume,
+        )
+    if (
+        _finite_float(high_series.iloc[-1]) is None
+        or _finite_float(low_series.iloc[-1]) is None
+    ):
+        return _rejected_scores(
+            ["Latest high or low price is invalid"],
+            price=price,
+            entry_price=entry_price,
+            stop_loss=_finite_float(stop_loss) or 0.0,
+            breakout_price=_finite_float(breakout_price),
+            volume=volume,
+        )
+    prev_close = close_series.shift(1).replace(0.0, pd.NA)
+    high_low_ratio = (high_series - low_series) / prev_close
+    high_low_ratio = high_low_ratio.replace([float("inf"), float("-inf")], pd.NA)
     adr_percent_series = high_low_ratio.rolling(20, min_periods=5).mean() * 100.0
-    adr_percent = float(adr_percent_series.iloc[-1]) if not pd.isna(adr_percent_series.iloc[-1]) else 2.5
-    
-    # Default Stop Loss (if not provided, default to entry - 0.75 * ADR_percent as price)
-    if stop_loss is None or stop_loss <= 0:
+    adr_value = _finite_float(adr_percent_series.iloc[-1])
+    adr_percent = adr_value if adr_value is not None and adr_value > 0 else 2.5
+
+    # ``None`` requests the strategy default.  Any explicitly supplied invalid
+    # stop must fail closed instead of becoming a tradable default stop.
+    if stop_loss is None:
         stop_loss = entry_price * (1.0 - (0.75 * adr_percent / 100.0))
-        
+    else:
+        stop_loss = _finite_float(stop_loss)
+    if stop_loss is None or stop_loss <= 0 or stop_loss >= entry_price:
+        return _rejected_scores(
+            ["Stop loss must be a finite positive value below entry price"],
+            price=price,
+            entry_price=entry_price,
+            stop_loss=stop_loss or 0.0,
+            breakout_price=_finite_float(breakout_price),
+            adr_percent=adr_percent,
+            volume=volume,
+        )
+
+    normalized_account_size = _finite_float(account_size)
+    if normalized_account_size is None or normalized_account_size <= 0:
+        return _rejected_scores(
+            ["Account size must be a finite positive value"],
+            price=price,
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            breakout_price=_finite_float(breakout_price),
+            adr_percent=adr_percent,
+            volume=volume,
+        )
+    normalized_risk_percent = _finite_float(risk_percent)
+    if (
+        normalized_risk_percent is None
+        or normalized_risk_percent <= 0
+        or normalized_risk_percent > 1.0
+    ):
+        return _rejected_scores(
+            ["Risk percent must be a finite value greater than 0 and at most 100%"],
+            price=price,
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            breakout_price=_finite_float(breakout_price),
+            adr_percent=adr_percent,
+            volume=volume,
+        )
+
+    normalized_breakout_price = _finite_float(breakout_price)
+    if normalized_breakout_price is None or normalized_breakout_price <= 0:
+        legacy_target_price = _finite_float(target_price)
+        normalized_breakout_price = (
+            legacy_target_price
+            if legacy_target_price is not None and legacy_target_price > 0
+            else None
+        )
+
     risk_per_share = entry_price - stop_loss
-    if (breakout_price is None or breakout_price <= 0) and target_price and target_price > 0:
-        breakout_price = target_price
-        
-    # Recalculate risk per share and stop/ADR fit. Profit exits are rule-based,
-    # not fixed target or R/R based.
-    risk_per_share = max(0.001, entry_price - stop_loss)
     rr = 0.0
     stop_loss_percent = (risk_per_share / entry_price) * 100.0
     stop_adr = stop_loss_percent / adr_percent if adr_percent > 0 else 0.0
     
     # Moving Averages
-    close_series = history["Close"].astype(float)
-    ema_20 = close_series.ewm(span=20, adjust=False).mean().iloc[-1]
-    ema_50 = close_series.ewm(span=50, adjust=False).mean().iloc[-1]
+    ema_20 = _finite_float(close_series.ewm(span=20, adjust=False).mean().iloc[-1])
+    ema_50 = _finite_float(close_series.ewm(span=50, adjust=False).mean().iloc[-1])
+    if ema_20 is None or ema_50 is None:
+        return _rejected_scores(
+            ["Price history cannot produce valid moving averages"],
+            price=price,
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            breakout_price=normalized_breakout_price,
+            adr_percent=adr_percent,
+            volume=volume,
+        )
     
     # Trend Intensity (7 SMA / 65 SMA)
     sma_7 = close_series.rolling(7, min_periods=1).mean()
     sma_65 = close_series.rolling(65, min_periods=1).mean()
-    ti65 = float(sma_7.iloc[-1] / sma_65.iloc[-1]) if sma_65.iloc[-1] > 0 else 1.0
+    ti65 = (
+        _finite_float(sma_7.iloc[-1] / sma_65.iloc[-1])
+        if sma_65.iloc[-1] > 0
+        else 1.0
+    )
+    if ti65 is None:
+        ti65 = 1.0
     
     # Position Sizing
-    sizer = PositionSizer(account_size=account_size, max_risk_per_trade=risk_percent)
-    sizing = sizer.size_risk_based(entry_price=entry_price, stop_loss_price=stop_loss, risk_percent=risk_percent)
+    sizer = PositionSizer(
+        account_size=normalized_account_size,
+        max_risk_per_trade=normalized_risk_percent,
+    )
+    sizing = sizer.size_risk_based(
+        entry_price=entry_price,
+        stop_loss_price=stop_loss,
+        risk_percent=normalized_risk_percent,
+    )
     shares = sizing.shares
     capital_percent = sizing.percent_of_account * 100.0
     
@@ -175,18 +344,23 @@ def calculate_deterministic_scores(
         "timing_score": round(timing_score, 1),
         "rr": round(rr, 2),
         "stop_adr": round(stop_adr, 2),
+        "stop_loss_percent": round(stop_loss_percent, 2),
         "position_percent": round(capital_percent, 1),
         "shares": shares,
         "warnings": warnings,
+        "status": "REJECTED" if warnings else "BUY_READY",
         "entry_price": entry_price,
         "stop_loss": stop_loss,
         "target_price": 0.0,
-        "breakout_price": breakout_price,
+        "breakout_price": normalized_breakout_price,
         "adr_percent": adr_percent,
         "volume": volume,
         "above_20_ema": bool(price > ema_20),
         "above_50_ema": bool(price > ema_50),
-        "risk_percent": round((shares * risk_per_share / account_size) * 100.0, 2) if account_size > 0 else 0.0,
+        "risk_percent": round(
+            (shares * risk_per_share / normalized_account_size) * 100.0,
+            2,
+        ) if shares > 0 else 0.0,
         "trade_plan": f"Buy {shares:,.0f} shares @ ${entry_price:.2f}" if shares > 0 else "No shares (0 size)",
     }
 

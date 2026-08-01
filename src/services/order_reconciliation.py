@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import math
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -20,9 +21,10 @@ from src.services.order_ledger import ORDERS_FILE, load_orders, mutate_order
 
 def _to_float(value: Any) -> float:
     try:
-        return float(value or 0.0)
-    except (TypeError, ValueError):
+        number = float(value or 0.0)
+    except (TypeError, ValueError, OverflowError):
         return 0.0
+    return number if math.isfinite(number) else 0.0
 
 
 def _holding_for_symbol(snapshot: Optional[Dict[str, Any]], symbol: str) -> Tuple[float, float, Optional[Dict[str, Any]]]:
@@ -52,20 +54,89 @@ def _holding_for_symbol(snapshot: Optional[Dict[str, Any]], symbol: str) -> Tupl
     )
 
 
-def _mark_fill(order: BrokerOrder, filled_quantity: int, avg_fill_price: float, snapshot: Dict[str, Any]) -> None:
-    filled_quantity = max(0, min(int(filled_quantity), int(order.quantity_requested)))
+def _requested_quantity(order: BrokerOrder) -> int:
+    return max(0, int(_to_float(order.quantity_requested)))
+
+
+def _known_filled_quantity(order: BrokerOrder) -> int:
+    return max(0, min(int(_to_float(order.filled_quantity)), _requested_quantity(order)))
+
+
+def _mark_fill(
+    order: BrokerOrder,
+    filled_quantity: int,
+    avg_fill_price: float,
+    snapshot: Dict[str, Any],
+) -> None:
+    """Persist a cumulative fill without ever reducing known broker evidence."""
+    requested = _requested_quantity(order)
+    proposed = max(0, min(int(filled_quantity or 0), requested))
+    filled_quantity = max(_known_filled_quantity(order), proposed)
     order.filled_quantity = filled_quantity
-    order.remaining_quantity = max(0, int(order.quantity_requested) - filled_quantity)
+    order.remaining_quantity = max(0, requested - filled_quantity)
     if avg_fill_price > 0:
         order.avg_fill_price = avg_fill_price
     order.raw_status_response = snapshot
-    if filled_quantity >= order.quantity_requested:
+    if requested > 0 and filled_quantity >= requested:
         order.status = OrderStatus.FILLED
     elif filled_quantity > 0:
         order.status = OrderStatus.PARTIALLY_FILLED
     elif order.status in {OrderStatus.ACCEPTED, OrderStatus.SUBMITTING, OrderStatus.CREATED, OrderStatus.UNKNOWN}:
         order.status = OrderStatus.WORKING
     order.touch()
+
+
+def _mark_working_if_unfilled(order: BrokerOrder, snapshot: Dict[str, Any]) -> None:
+    """Record fresh holdings evidence without weakening a partial/unknown state."""
+    if order.status in {
+        OrderStatus.ACCEPTED,
+        OrderStatus.SUBMITTING,
+        OrderStatus.CREATED,
+        OrderStatus.UNKNOWN,
+    }:
+        order.status = OrderStatus.WORKING
+    order.raw_status_response = snapshot
+    order.touch()
+
+
+def _order_sort_key(order: BrokerOrder) -> str:
+    """Allocate ambiguous holdings deltas in FIFO order.
+
+    Python's stable sort preserves ledger/input order for orders sharing the
+    same legacy second-resolution submission timestamp.
+    """
+    return str(order.submitted_at or "")
+
+
+def _apply_broker_fill_progress(
+    order: BrokerOrder,
+    snapshot: BrokerOrderStatusSnapshot,
+    *,
+    terminal: bool = False,
+    assume_full_when_missing: bool = False,
+) -> int:
+    """Merge direct broker fill evidence without erasing a known partial fill."""
+    requested = _requested_quantity(order)
+    known_filled = _known_filled_quantity(order)
+    reported_filled = max(0, min(int(snapshot.filled_quantity or 0), requested))
+    if assume_full_when_missing and reported_filled <= 0:
+        reported_filled = requested
+    filled = max(known_filled, reported_filled)
+    order.filled_quantity = filled
+
+    reported_remaining = max(0, int(snapshot.remaining_quantity or 0))
+    if terminal:
+        # For a partial terminal order, retain the cancelled/unfilled remainder
+        # for auditability; a zero-fill cancellation has no remaining live qty.
+        order.remaining_quantity = max(0, requested - filled) if filled > 0 else 0
+    elif reported_remaining <= 0:
+        order.remaining_quantity = max(0, requested - filled)
+    else:
+        order.remaining_quantity = min(max(0, requested - filled), reported_remaining)
+    avg_fill_price = _to_float(snapshot.avg_fill_price)
+    if avg_fill_price > 0:
+        order.avg_fill_price = avg_fill_price
+    return filled
 
 
 def reconcile_orders_with_snapshot(
@@ -79,37 +150,71 @@ def reconcile_orders_with_snapshot(
     evidence is insufficient, the order remains working/unknown instead of being
     marked filled.
     """
-    reconciled: List[BrokerOrder] = []
-    for order in orders:
+    reconciled = list(orders)
+    open_by_symbol_and_side: Dict[tuple[str, OrderSide], List[BrokerOrder]] = {}
+    for order in reconciled:
         if order.status not in OPEN_ORDER_STATUSES:
-            reconciled.append(order)
+            continue
+        open_by_symbol_and_side.setdefault((order.symbol, order.side), []).append(order)
+
+    for (symbol, side), grouped_orders in open_by_symbol_and_side.items():
+        grouped_orders = sorted(grouped_orders, key=_order_sort_key)
+        current_qty, current_avg, _ = _holding_for_symbol(snapshot, symbol)
+
+        if previous_snapshot is None:
+            # With no baseline, holdings alone cannot distinguish this order
+            # from a pre-existing/manual position.  Preserve an already known
+            # partial fill, but do not manufacture a new fill.  The sole
+            # historical exception is a single known partial sell whose entire
+            # position has disappeared.
+            if (
+                side == OrderSide.SELL
+                and len(grouped_orders) == 1
+                and current_qty <= 0
+                and _known_filled_quantity(grouped_orders[0]) > 0
+            ):
+                _mark_fill(
+                    grouped_orders[0],
+                    _requested_quantity(grouped_orders[0]),
+                    current_avg,
+                    snapshot,
+                )
+                continue
+            for order in grouped_orders:
+                if _known_filled_quantity(order) > 0:
+                    _mark_fill(order, _known_filled_quantity(order), current_avg, snapshot)
+                else:
+                    _mark_working_if_unfilled(order, snapshot)
             continue
 
-        current_qty, current_avg, _ = _holding_for_symbol(snapshot, order.symbol)
-        previous_qty, _, _ = _holding_for_symbol(previous_snapshot, order.symbol)
-        confirmed_fill = 0
-
-        if previous_snapshot is not None:
-            if order.side == OrderSide.BUY:
-                confirmed_fill = max(0, int(round(current_qty - previous_qty)))
-            elif order.side == OrderSide.SELL:
-                confirmed_fill = max(0, int(round(previous_qty - current_qty)))
+        previous_qty, _, _ = _holding_for_symbol(previous_snapshot, symbol)
+        if side == OrderSide.BUY:
+            confirmed_delta = max(0, int(round(current_qty - previous_qty)))
         else:
-            # Conservative no-baseline inference. A full exit is clear when the
-            # position disappeared; otherwise keep the order working.
-            if order.side == OrderSide.SELL and current_qty <= 0 and order.filled_quantity > 0:
-                confirmed_fill = order.quantity_requested
-            elif order.filled_quantity > 0:
-                confirmed_fill = order.filled_quantity
+            confirmed_delta = max(0, int(round(previous_qty - current_qty)))
 
-        if confirmed_fill > 0:
-            _mark_fill(order, confirmed_fill, current_avg, snapshot)
-        elif order.status in {OrderStatus.ACCEPTED, OrderStatus.SUBMITTING, OrderStatus.CREATED, OrderStatus.UNKNOWN}:
-            order.status = OrderStatus.WORKING
-            order.raw_status_response = snapshot
-            order.touch()
+        # A holdings delta is aggregate evidence, not evidence that every open
+        # order for the same symbol filled.  Allocate it once across the FIFO
+        # open orders so the total locally confirmed quantity never exceeds the
+        # broker-observed position change.
+        unallocated_delta = confirmed_delta
+        for order in grouped_orders:
+            known_filled = _known_filled_quantity(order)
+            available_quantity = max(0, _requested_quantity(order) - known_filled)
+            allocated_quantity = min(available_quantity, unallocated_delta)
+            if allocated_quantity > 0:
+                _mark_fill(
+                    order,
+                    known_filled + allocated_quantity,
+                    current_avg,
+                    snapshot,
+                )
+                unallocated_delta -= allocated_quantity
+            elif known_filled > 0:
+                _mark_fill(order, known_filled, current_avg, snapshot)
+            else:
+                _mark_working_if_unfilled(order, snapshot)
 
-        reconciled.append(order)
     return reconciled
 
 
@@ -126,38 +231,48 @@ def reconcile_order_with_broker_snapshot(
         order.raw_status_response = snapshot.to_dict()
 
     if snapshot.status == OrderStatus.FILLED:
-        order.status = OrderStatus.FILLED
-        filled = snapshot.filled_quantity or order.quantity_requested
-        order.filled_quantity = max(0, int(filled))
-        order.remaining_quantity = 0
-        if snapshot.avg_fill_price > 0:
-            order.avg_fill_price = snapshot.avg_fill_price
+        filled = _apply_broker_fill_progress(
+            order,
+            snapshot,
+            terminal=True,
+            assume_full_when_missing=True,
+        )
+        # A malformed broker row that claims FILLED but reports a lower
+        # quantity must not invent the missing shares locally.
+        order.status = (
+            OrderStatus.FILLED
+            if filled >= _requested_quantity(order)
+            else OrderStatus.PARTIALLY_FILLED
+        )
     elif snapshot.status == OrderStatus.PARTIALLY_FILLED:
-        order.status = OrderStatus.PARTIALLY_FILLED
-        order.filled_quantity = max(0, int(snapshot.filled_quantity or order.filled_quantity))
-        if snapshot.remaining_quantity > 0:
-            order.remaining_quantity = int(snapshot.remaining_quantity)
-        else:
-            order.remaining_quantity = max(0, order.quantity_requested - order.filled_quantity)
-        if snapshot.avg_fill_price > 0:
-            order.avg_fill_price = snapshot.avg_fill_price
+        _apply_broker_fill_progress(order, snapshot)
+        order.status = (
+            OrderStatus.PARTIALLY_FILLED
+            if order.filled_quantity > 0
+            else OrderStatus.WORKING
+        )
     elif snapshot.status in {OrderStatus.WORKING, OrderStatus.ACCEPTED}:
-        order.status = snapshot.status
-        if snapshot.filled_quantity > 0:
-            order.filled_quantity = int(snapshot.filled_quantity)
-        if snapshot.remaining_quantity > 0:
-            order.remaining_quantity = int(snapshot.remaining_quantity)
+        _apply_broker_fill_progress(order, snapshot)
+        # A broad working response can omit fills.  Retain the stronger local
+        # evidence rather than downgrading a known partial order to WORKING.
+        order.status = (
+            OrderStatus.PARTIALLY_FILLED
+            if order.filled_quantity > 0
+            else snapshot.status
+        )
+    elif snapshot.status == OrderStatus.CANCEL_REQUESTED:
+        _apply_broker_fill_progress(order, snapshot)
+        order.status = OrderStatus.CANCEL_REQUESTED
     elif snapshot.status in {
-        OrderStatus.CANCEL_REQUESTED,
         OrderStatus.CANCELLED,
         OrderStatus.REJECTED,
         OrderStatus.EXPIRED,
     }:
+        # A terminal cancellation/rejection can still contain confirmed shares.
+        # Keep both the terminal state and the partial fill so downstream
+        # position application can safely apply the executed quantity once.
+        _apply_broker_fill_progress(order, snapshot, terminal=True)
         order.status = snapshot.status
-        if snapshot.filled_quantity > 0:
-            order.filled_quantity = int(snapshot.filled_quantity)
-        if snapshot.status in {OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.EXPIRED}:
-            order.remaining_quantity = max(0, int(snapshot.remaining_quantity or 0))
     elif snapshot.status == OrderStatus.UNKNOWN:
         if order.status != OrderStatus.UNKNOWN_SUBMISSION_STATE:
             order.status = order.status

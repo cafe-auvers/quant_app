@@ -46,10 +46,17 @@ def get_env_value(key: str, default: Optional[str] = None) -> Optional[str]:
 
 
 def get_mysql_config() -> Dict[str, str]:
+    """Return explicitly configured MySQL settings.
+
+    MySQL is optional for this desktop application.  Do not silently attempt
+    to log in as a local ``root`` user when no settings were supplied: that
+    both delays startup and assumes privileges a normal application account
+    should not need.
+    """
     return {
-        "host": get_env_value("MYSQL_HOST", "127.0.0.1") or "127.0.0.1",
+        "host": get_env_value("MYSQL_HOST", "") or "",
         "port": get_env_value("MYSQL_PORT", "3306") or "3306",
-        "user": get_env_value("MYSQL_USER", "root") or "root",
+        "user": get_env_value("MYSQL_USER", "") or "",
         "password": get_env_value("MYSQL_PASSWORD", "") or "",
         "database": get_env_value("MYSQL_DB", "quant_app") or "quant_app",
     }

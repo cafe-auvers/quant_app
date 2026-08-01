@@ -401,6 +401,8 @@ class BuylistMixin:
         self._buylist_prod_monitor_active = False
 
         self._buylist_order_workers: List[QThread] = []
+        self._buylist_aux_workers: List[QThread] = []
+        self.kis_order_worker = None
         self.broker_order_query_worker = None
         self.broker_order_cancel_worker = None
 
@@ -674,17 +676,29 @@ class BuylistMixin:
             if bought_count >= 30:
                 alerts.append("MAX POSITIONS")
             # Show where price stands relative to ORB high and daily breakout trigger
-            bp = getattr(item, "breakout_price", None) or 0.0
+            try:
+                bp = float(getattr(item, "breakout_price", None) or 0.0)
+                entry_price = float(getattr(item, "entry_price", None) or 0.0)
+                buf = float(getattr(item, "buffer_pct", 0.001) or 0.0)
+            except (TypeError, ValueError):
+                bp = entry_price = 0.0
+                buf = 0.0
+            if not math.isfinite(bp) or bp < 0:
+                bp = 0.0
+            if not math.isfinite(entry_price) or entry_price <= 0:
+                alerts.append("INVALID ENTRY - REVIEW PLAN")
+                return " | ".join(dict.fromkeys(alerts))
+            if not math.isfinite(buf) or buf < 0:
+                buf = 0.0
             if bp > 0 and current_price > 0:
-                buf = getattr(item, "buffer_pct", 0.001)
                 breakout_trigger = bp * (1 + buf)
-                entry_trigger = max(item.entry_price, breakout_trigger)
+                entry_trigger = max(entry_price, breakout_trigger)
                 if current_price >= entry_trigger:
                     alerts.append(f"TRIGGER MET ${entry_trigger:.2f}")
-                elif current_price > item.entry_price:
+                elif current_price > entry_price:
                     alerts.append(f"ORB OK / below BKT ${breakout_trigger:.2f}")
                 else:
-                    alerts.append(f"below ORB ${item.entry_price:.2f}")
+                    alerts.append(f"below ORB ${entry_price:.2f}")
         else:
             queue_statuses = self._execution_queue_status_values()
             status_text = str(getattr(item, "monitoring_status", "") or "").upper()
@@ -1076,6 +1090,48 @@ class BuylistMixin:
             return None
         return self._execution_queue_item_for_buylist_item(item)
 
+    def _clear_persisted_watchlist_orb_selection(self, symbol: str) -> bool:
+        """Return a watchlist symbol to automatic ORB-window selection.
+
+        A checked plan in the Watchlist ORB panel is deliberately durable and
+        re-locks its queue row on refresh. The Buylist dialog's ``Unlock
+        (Auto)`` action must clear that source of truth as well as the queue
+        row, otherwise its apparent unlock lasts only until the next refresh.
+        """
+        watchlist = self.__dict__.get("watchlist")
+        getter = getattr(watchlist, "get", None)
+        if not callable(getter):
+            return False
+        watch_item = getter(symbol)
+        if watch_item is None or not getattr(watch_item, "selected_orb_plan", None):
+            return False
+        watch_item.selected_orb_plan = None
+        self._save_state()
+        self.append_log(
+            f"Cleared saved Watchlist ORB selection for {str(symbol).strip().upper()}; auto selection is enabled."
+        )
+        return True
+
+    def _unlock_execution_queue_item_for_auto(self, queue_item) -> None:
+        """Clear both in-memory and durable manual ORB selection state."""
+        from src.core.execution_queue import select_best_orb_candidate
+
+        manager = self.__dict__.get("execution_queue_manager")
+        upgrade_margin = getattr(manager, "upgrade_margin", 0.0) if manager else 0.0
+        self._clear_persisted_watchlist_orb_selection(queue_item.symbol)
+        queue_item.locked = False
+        queue_item.manual_window_lock = False
+        queue_item.locked_reason = None
+        best = select_best_orb_candidate(
+            getattr(queue_item, "candidates", {}) or {},
+            getattr(queue_item, "selected_window", None),
+            False,
+            upgrade_margin=upgrade_margin,
+        )
+        queue_item.selected_candidate = best
+        queue_item.selected_window = best.window if best else None
+        self._save_execution_queue_state()
+
     def _format_execution_queue_order_review(self, env: str, item, queue_item) -> str:
         from src.core.execution_queue import OrbCandidateStatus
 
@@ -1409,20 +1465,7 @@ class BuylistMixin:
             _update_lock_label()
 
         def _unlock():
-            manager = self.__dict__.get("execution_queue_manager")
-            upgrade_margin = getattr(manager, "upgrade_margin", 0.0) if manager else 0.0
-            queue_item.locked = False
-            queue_item.manual_window_lock = False
-            queue_item.locked_reason = None
-            best = select_best_orb_candidate(
-                candidates,
-                getattr(queue_item, "selected_window", None),
-                False,
-                upgrade_margin=upgrade_margin,
-            )
-            queue_item.selected_candidate = best
-            queue_item.selected_window = best.window if best else None
-            self._save_execution_queue_state()
+            self._unlock_execution_queue_item_for_auto(queue_item)
             self.populate_buylist_dashboard()
             _populate_table()
             _update_lock_label()
@@ -1453,19 +1496,15 @@ class BuylistMixin:
         load_fn = _main_window_global("load_order_ledger", load_order_ledger)
         find_fn = _main_window_global("find_open_orders", find_open_orders)
         self.order_ledger = load_fn()
-        account_no = self._first_account_no_for_environment(env) or ""
+        account_no = self._order_lookup_account_no_for_item(item, env)
+        if not account_no:
+            return []
         matches = find_fn(
             self.order_ledger,
             environment=env,
             account_no=account_no,
             symbol=getattr(item, "symbol", ""),
         )
-        if not matches and account_no:
-            matches = find_fn(
-                self.order_ledger,
-                environment=env,
-                symbol=getattr(item, "symbol", ""),
-            )
         kis_order_id = str(getattr(item, "kis_order_id", "") or "")
         if kis_order_id:
             exact = [
@@ -1491,7 +1530,9 @@ class BuylistMixin:
         load_fn = _main_window_global("load_order_ledger", load_order_ledger)
         find_fn = _main_window_global("find_open_orders", find_open_orders)
         self.order_ledger = load_fn()
-        account_no = self._first_account_no_for_environment(env) or ""
+        account_no = self._order_lookup_account_no_for_item(item, env)
+        if not account_no:
+            return []
         symbol = getattr(item, "symbol", "")
         matches = find_fn(
             self.order_ledger,
@@ -1501,14 +1542,6 @@ class BuylistMixin:
             side=side,
             intent=intent,
         )
-        if not matches and account_no:
-            matches = find_fn(
-                self.order_ledger,
-                environment=env,
-                symbol=symbol,
-                side=side,
-                intent=intent,
-            )
         return matches
 
     @staticmethod
@@ -1707,7 +1740,20 @@ class BuylistMixin:
             return
 
         item = self._buylist_selected_item(env)
+        if item is not None and not self._selected_order_account_for_item(item, env):
+            self._warn_order_account_unavailable(item, env)
+            return
         account_no = self._first_account_no_for_environment(env) or ""
+        if not account_no:
+            self.append_log(
+                f"Broker order status check blocked for {env}: no KIS account is selected."
+            )
+            QMessageBox.warning(
+                self,
+                "KIS account required",
+                "Select a configured KIS account before checking broker order status.",
+            )
+            return
         symbol = None
         broker_order_id = None
         client_order_id = None
@@ -1741,8 +1787,8 @@ class BuylistMixin:
                 f"Broker order status check failed: {message}"
             )
         )
-        self.broker_order_query_worker.finished.connect(
-            lambda: setattr(self, "broker_order_query_worker", None)
+        self._track_buylist_aux_worker(
+            self.broker_order_query_worker, "broker_order_query_worker"
         )
         self.broker_order_query_worker.start()
         scope = symbol or "all unresolved orders"
@@ -1819,6 +1865,16 @@ class BuylistMixin:
                 f"{order.symbol} order is {order.status.value}; cancel is allowed only for known open broker orders.",
             )
             return
+        # Simulated orders do not require a configured KIS account.  For a
+        # real broker order, validate ownership only after basic local order
+        # checks so the user receives the most actionable error (for example,
+        # a missing broker id) and no account lookup masks it.
+        if (
+            str(getattr(order, "environment", env) or env).strip().upper() == "PROD"
+            and not self._selected_order_account_for_item(item, env)
+        ):
+            self._warn_order_account_unavailable(item, env)
+            return
 
         reply = QMessageBox.question(
             self,
@@ -1838,8 +1894,8 @@ class BuylistMixin:
         self.broker_order_cancel_worker.error_occurred.connect(
             lambda message, e=env: self._on_broker_order_cancel_error(e, message)
         )
-        self.broker_order_cancel_worker.finished.connect(
-            lambda: setattr(self, "broker_order_cancel_worker", None)
+        self._track_buylist_aux_worker(
+            self.broker_order_cancel_worker, "broker_order_cancel_worker"
         )
         self.broker_order_cancel_worker.start()
         self.append_log(
@@ -1849,6 +1905,7 @@ class BuylistMixin:
     def _on_broker_order_cancel_finished(self, order: BrokerOrder) -> None:
         load_fn = _main_window_global("load_order_ledger", load_order_ledger)
         self.order_ledger = load_fn()
+        self.apply_confirmed_order_fills_to_buylist([order])
         self._apply_broker_order_status_updates_to_buylist([order])
         self.populate_buylist_dashboard()
         if hasattr(self, "update_dashboard_summary"):
@@ -1984,8 +2041,8 @@ class BuylistMixin:
                     it, message
                 )
             )
-            self.broker_order_cancel_worker.finished.connect(
-                lambda: setattr(self, "broker_order_cancel_worker", None)
+            self._track_buylist_aux_worker(
+                self.broker_order_cancel_worker, "broker_order_cancel_worker"
             )
             self.broker_order_cancel_worker.start()
             self.append_log(
@@ -2122,8 +2179,8 @@ class BuylistMixin:
         self.broker_order_cancel_worker.error_occurred.connect(
             lambda message, it=item: self._on_stop_reprice_cancel_error(it, message)
         )
-        self.broker_order_cancel_worker.finished.connect(
-            lambda: setattr(self, "broker_order_cancel_worker", None)
+        self._track_buylist_aux_worker(
+            self.broker_order_cancel_worker, "broker_order_cancel_worker"
         )
         self.broker_order_cancel_worker.start()
         self.append_log(
@@ -2788,8 +2845,11 @@ class BuylistMixin:
 
         for item in active_items:
             self._buylist_refresh_item_data(item)
-            current_price = self.latest_intraday_prices.get(item.symbol, 0.0)
-            if current_price <= 0:
+            try:
+                current_price = float(self.latest_intraday_prices.get(item.symbol, 0.0))
+            except (TypeError, ValueError):
+                current_price = 0.0
+            if not math.isfinite(current_price) or current_price <= 0:
                 continue
 
             if item.monitoring_status == "ACTIVE":
@@ -2803,13 +2863,29 @@ class BuylistMixin:
                     continue
 
                 # Compute entry_trigger: max(ORB high, breakout_price * (1+buffer))
-                bp = getattr(item, "breakout_price", None) or 0.0
-                buf = getattr(item, "buffer_pct", 0.001)
+                try:
+                    bp = float(getattr(item, "breakout_price", None) or 0.0)
+                    buf = float(getattr(item, "buffer_pct", 0.001) or 0.0)
+                    item_entry_price = float(getattr(item, "entry_price", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    bp = buf = item_entry_price = 0.0
+                if not math.isfinite(bp) or bp < 0:
+                    bp = 0.0
+                if not math.isfinite(buf) or buf < 0:
+                    buf = 0.0
+                if not math.isfinite(item_entry_price) or item_entry_price <= 0:
+                    if not getattr(item, "_invalid_entry_notice_logged", False):
+                        item._invalid_entry_notice_logged = True
+                        self.append_log(
+                            f"[Buylist/{env}] {item.symbol} has an invalid entry trigger; "
+                            "monitoring will not submit an order until the plan is corrected."
+                        )
+                    continue
                 breakout_trigger = bp * (1 + buf) if bp > 0 else 0.0
                 entry_trigger = (
-                    max(item.entry_price, breakout_trigger)
+                    max(item_entry_price, breakout_trigger)
                     if breakout_trigger > 0
-                    else item.entry_price
+                    else item_entry_price
                 )
                 auto_order_blocked = self._buylist_auto_order_blocked(item)
 
@@ -3258,7 +3334,37 @@ class BuylistMixin:
     # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Buylist Dashboard — KIS order submission
     # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    def _selected_trade_account_no_for_environment(
+        self, environment: str
+    ) -> Optional[str]:
+        """Return the explicitly selected trade account for an environment."""
+        combo = self.__dict__.get("trade_kis_account_combo")
+        if combo is None:
+            return None
+        try:
+            profile = combo.currentData()
+        except RuntimeError:
+            return None
+        if not isinstance(profile, dict):
+            return None
+        selected_environment = str(
+            profile.get("environment") or environment or ""
+        ).strip().upper()
+        if selected_environment != str(environment or "").strip().upper():
+            return None
+        account_no = str(profile.get("account_no") or "").strip()
+        return account_no or None
+
     def _first_account_no_for_environment(self, environment: str) -> Optional[str]:
+        """Resolve an account, preferring the account actively selected by the user.
+
+        The legacy discovery fallback is retained only for non-UI callers.  When
+        the trade account combo exists, a missing/mismatched selection must not
+        silently route an order to the first configured account.
+        """
+        combo = self.__dict__.get("trade_kis_account_combo")
+        if combo is not None:
+            return self._selected_trade_account_no_for_environment(environment)
         try:
             from src.api.kis_account_snapshot_dual import discover_account_profiles
 
@@ -3273,6 +3379,46 @@ class BuylistMixin:
         except Exception as exc:
             self.append_log(f"KIS account discovery failed for {environment}: {exc}")
             return None
+
+    def _selected_order_account_for_item(self, item, environment: str) -> Optional[str]:
+        """Fail closed when a position belongs to another KIS account."""
+        account_no = self._first_account_no_for_environment(environment)
+        if not account_no:
+            return None
+        assigned_account = str(getattr(item, "kis_account_no", "") or "").strip()
+        if assigned_account and assigned_account != account_no:
+            return None
+        return account_no
+
+    def _order_lookup_account_no_for_item(self, item, environment: str) -> str:
+        """Use a position's owner for automated order lifecycle work.
+
+        User-initiated submissions still go through
+        ``_selected_order_account_for_item``.  This lookup is intentionally
+        separate so an account-combo change cannot make the EOD/reprice monitor
+        lose sight of an already submitted order in its owning account.
+        """
+        assigned_account = str(getattr(item, "kis_account_no", "") or "").strip()
+        if assigned_account:
+            return assigned_account
+        return self._first_account_no_for_environment(environment) or ""
+
+    def _warn_order_account_unavailable(self, item, environment: str) -> None:
+        assigned_account = str(getattr(item, "kis_account_no", "") or "").strip()
+        selected_account = self._first_account_no_for_environment(environment)
+        if assigned_account and selected_account and assigned_account != selected_account:
+            message = (
+                f"{getattr(item, 'symbol', 'This position')} belongs to KIS account "
+                f"{assigned_account}, but account {selected_account} is selected. "
+                "Switch back to the owning account before submitting an order."
+            )
+        else:
+            message = (
+                "Select a configured KIS account for this environment before "
+                "submitting an order."
+            )
+        self.append_log(f"KIS order blocked: {message}")
+        QMessageBox.warning(self, "KIS account required", message)
 
     @staticmethod
     def _sell_intent_for_reason(reason: str) -> OrderIntent:
@@ -3320,7 +3466,10 @@ class BuylistMixin:
         )
 
     def _warn_if_open_sell_order(self, item, env: str) -> bool:
-        account_no = self._first_account_no_for_environment(env) or ""
+        account_no = self._selected_order_account_for_item(item, env) or ""
+        if not account_no:
+            self._warn_order_account_unavailable(item, env)
+            return True
         if not self._has_open_sell_order(env, account_no, item.symbol):
             return False
         QMessageBox.warning(
@@ -3358,9 +3507,9 @@ class BuylistMixin:
         ):
             try:
                 price = float(value or 0.0)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
-            if price > 0:
+            if math.isfinite(price) and price > 0:
                 return max(0.01, price)
         return 0.01
 
@@ -3377,7 +3526,7 @@ class BuylistMixin:
     ) -> int:
         try:
             qty = int(quantity or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             qty = 0
         if qty > 0:
             return qty
@@ -3391,6 +3540,25 @@ class BuylistMixin:
         if account_size > 0 and position_percent > 0 and order_price > 0:
             return max(1, int((account_size * position_percent / 100.0) // order_price))
         return max(1, int(getattr(item, "shares_held", 0) or 1))
+
+    @staticmethod
+    def _coerce_positive_order_quantity(value: Any) -> Optional[int]:
+        """Accept only whole, finite, positive share quantities."""
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(number) or number <= 0 or not number.is_integer():
+            return None
+        try:
+            quantity = int(number)
+        except (ValueError, OverflowError):
+            return None
+        return quantity if quantity > 0 else None
+
+    def _warn_invalid_order_value(self, item, message: str) -> None:
+        self.append_log(f"KIS order blocked for {getattr(item, 'symbol', '')}: {message}")
+        QMessageBox.warning(self, "Invalid order", message)
 
     @staticmethod
     def _us_regular_market_is_open(
@@ -3428,7 +3596,23 @@ class BuylistMixin:
     ) -> None:
         """Submit a KIS buy order without treating broker acceptance as a fill."""
         env = self._buylist_order_environment(item)
-        account_no = self._first_account_no_for_environment(env) or ""
+        account_no = self._selected_order_account_for_item(item, env)
+        if not account_no:
+            item._buy_order_pending = False
+            manager = self.__dict__.get("execution_queue_manager")
+            if manager is not None:
+                manager.mark_order_failed(
+                    item.symbol, order_status="NO_ACCOUNT", environment=env
+                )
+                queue_status = self._execution_queue_status_for_buylist_item(item)
+                if queue_status:
+                    item.monitoring_status = queue_status
+                    item.status = queue_status
+                self._save_execution_queue_state()
+            self._save_buylist_state()
+            self.populate_buylist_dashboard()
+            self._warn_order_account_unavailable(item, env)
+            return
         intent = OrderIntent.ENTRY
         if self._is_pre_entry_execution_queue_buylist_item(item):
             manager = self.__dict__.get("execution_queue_manager")
@@ -3478,23 +3662,46 @@ class BuylistMixin:
             )
             return
 
+        if quantity is not None:
+            quantity = self._coerce_positive_order_quantity(quantity)
+            if quantity is None:
+                self._warn_invalid_order_value(
+                    item, "Share quantity must be a positive whole finite number."
+                )
+                return
+
         explicit_price = None
+        invalid_explicit_price = False
         for value in (order_price, limit_price):
+            if value is None:
+                continue
             try:
                 price = float(value or 0.0)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
+                invalid_explicit_price = True
                 continue
-            if price > 0:
+            if math.isfinite(price) and price > 0:
                 explicit_price = price
                 break
+            invalid_explicit_price = True
+        if invalid_explicit_price:
+            self._warn_invalid_order_value(
+                item, "Limit price must be a positive finite number."
+            )
+            return
         order_price = (
             max(0.01, explicit_price)
             if explicit_price is not None
             else self._buylist_order_price(item)
         )
         quantity = self._buylist_order_quantity(item, order_price, quantity)
+        if quantity <= 0 or not math.isfinite(float(order_price)) or order_price <= 0:
+            self._warn_invalid_order_value(
+                item, "Order price and share quantity must be positive finite values."
+            )
+            return
         try:
-            self.kis_order_worker = KisOrderWorker(
+            worker = KisOrderWorker(
                 env,
                 item.symbol,
                 quantity,
@@ -3504,13 +3711,15 @@ class BuylistMixin:
                 intent=intent,
                 buylist_symbol_key=f"{env}:{item.symbol}",
             )
-            self.kis_order_worker.finished_order.connect(
+            self.kis_order_worker = worker
+            self._track_buylist_order_worker(worker)
+            worker.finished_order.connect(
                 lambda order, it=item: self._on_buy_order_accepted(it, order)
             )
-            self.kis_order_worker.error_occurred.connect(
+            worker.error_occurred.connect(
                 lambda error, it=item: self._on_order_error(it.symbol, "buy", error, it)
             )
-            self.kis_order_worker.start()
+            worker.start()
             self.append_log(
                 f"BUY submitted for {item.symbol}: {quantity} shares @ limit ${order_price:.2f}"
             )
@@ -3546,7 +3755,20 @@ class BuylistMixin:
     ) -> None:
         """Submit a KIS sell order without reducing local position until fill confirmation."""
         env = self._buylist_order_environment(item)
-        account_no = self._first_account_no_for_environment(env) or ""
+        account_no = self._selected_order_account_for_item(item, env)
+        if not account_no:
+            item._stop_order_pending = False
+            item._exit_order_pending = False
+            self._save_buylist_state()
+            self.populate_buylist_dashboard()
+            self._warn_order_account_unavailable(item, env)
+            return
+        quantity = self._coerce_positive_order_quantity(quantity)
+        if quantity is None:
+            self._warn_invalid_order_value(
+                item, "Share quantity must be a positive whole finite number."
+            )
+            return
         intent = self._sell_intent_for_reason(reason)
         manual_exit = intent in {
             OrderIntent.PARTIAL_EXIT,
@@ -3568,14 +3790,24 @@ class BuylistMixin:
             return
 
         explicit_price = None
+        invalid_explicit_price = False
         for value in (order_price, limit_price):
+            if value is None:
+                continue
             try:
                 price = float(value or 0.0)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
+                invalid_explicit_price = True
                 continue
-            if price > 0:
+            if math.isfinite(price) and price > 0:
                 explicit_price = price
                 break
+            invalid_explicit_price = True
+        if invalid_explicit_price:
+            self._warn_invalid_order_value(
+                item, "Limit price must be a positive finite number."
+            )
+            return
         if execution_policy == RESERVED_MOO_EXECUTION:
             order_price = 0.0
         else:
@@ -3584,6 +3816,14 @@ class BuylistMixin:
                 if explicit_price is not None
                 else self._buylist_order_price(item)
             )
+        if (
+            execution_policy != RESERVED_MOO_EXECUTION
+            and (not math.isfinite(float(order_price)) or order_price <= 0)
+        ):
+            self._warn_invalid_order_value(
+                item, "Order price must be a positive finite number."
+            )
+            return
         try:
             worker_kwargs = {
                 "account_no": account_no,
@@ -3592,7 +3832,7 @@ class BuylistMixin:
             }
             if execution_policy == RESERVED_MOO_EXECUTION:
                 worker_kwargs["execution_policy"] = execution_policy
-            self.kis_order_worker = KisOrderWorker(
+            worker = KisOrderWorker(
                 env,
                 item.symbol,
                 quantity,
@@ -3600,17 +3840,19 @@ class BuylistMixin:
                 "sell",
                 **worker_kwargs,
             )
-            self.kis_order_worker.finished_order.connect(
+            self.kis_order_worker = worker
+            self._track_buylist_order_worker(worker)
+            worker.finished_order.connect(
                 lambda order, it=item, rsn=reason: self._on_sell_order_accepted(
                     it, quantity, rsn, order
                 )
             )
-            self.kis_order_worker.error_occurred.connect(
+            worker.error_occurred.connect(
                 lambda error, it=item: self._on_order_error(
                     it.symbol, "sell", error, it
                 )
             )
-            self.kis_order_worker.start()
+            worker.start()
             if execution_policy == RESERVED_MOO_EXECUTION:
                 self.append_log(
                     f"SELL reservation submitted for {item.symbol}: {quantity} shares "
@@ -3637,6 +3879,8 @@ class BuylistMixin:
 
     def _on_buy_order_accepted(self, item, order: BrokerOrder) -> None:
         self._record_broker_order(order)
+        if order.account_no:
+            item.kis_account_no = str(order.account_no)
         manager = self.__dict__.get("execution_queue_manager")
         queue_item = (
             self._execution_queue_item_for_buylist_item(item)
@@ -3735,6 +3979,8 @@ class BuylistMixin:
         item._stop_order_pending = False
         item._exit_order_pending = False
         self._record_broker_order(order)
+        if order.account_no:
+            item.kis_account_no = str(order.account_no)
 
         if order.status == OrderStatus.UNKNOWN_SUBMISSION_STATE:
             item._stop_order_pending = True
@@ -3983,8 +4229,6 @@ class BuylistMixin:
     ) -> None:
         changed = False
         for order in updated_orders:
-            if order.status not in {OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED}:
-                continue
             try:
                 item = self.buylist_manager.get(order.symbol, order.environment)
             except TypeError:
@@ -3992,13 +4236,23 @@ class BuylistMixin:
             if not item:
                 continue
 
-            filled_qty = max(0, int(order.filled_quantity or 0))
-            applied_qty = max(0, int(getattr(order, "applied_filled_quantity", 0) or 0))
+            try:
+                filled_qty = max(0, int(order.filled_quantity or 0))
+            except (TypeError, ValueError, OverflowError):
+                filled_qty = 0
+            try:
+                applied_qty = max(
+                    0, int(getattr(order, "applied_filled_quantity", 0) or 0)
+                )
+            except (TypeError, ValueError, OverflowError):
+                applied_qty = 0
             newly_filled_qty = max(0, filled_qty - applied_qty)
             if filled_qty <= 0 or newly_filled_qty <= 0:
                 continue
 
             if order.side == OrderSide.BUY:
+                if order.account_no:
+                    item.kis_account_no = str(order.account_no)
                 manager = self.__dict__.get("execution_queue_manager")
                 if manager is None and self._is_execution_queue_buylist_item(item):
                     manager = self._ensure_execution_queue_manager()
@@ -4037,6 +4291,8 @@ class BuylistMixin:
                 continue
 
             previous_shares = max(0, int(getattr(item, "shares_held", 0) or 0))
+            if order.account_no:
+                item.kis_account_no = str(order.account_no)
             remaining_shares = max(0, previous_shares - newly_filled_qty)
             item.shares_held = remaining_shares
             item.kis_order_id = order.broker_order_id or order.client_order_id
@@ -4049,7 +4305,7 @@ class BuylistMixin:
                     item.stop_loss = max(
                         float(item.stop_loss or 0), float(item.avg_cost)
                     )
-            if remaining_shares <= 0 and order.status == OrderStatus.FILLED:
+            if remaining_shares <= 0:
                 item.monitoring_status = "SOLD"
             else:
                 item.monitoring_status = "BOUGHT"
@@ -4103,6 +4359,7 @@ class BuylistMixin:
             )
             return False
         self.order_ledger = load_fn()
+        self.apply_confirmed_order_fills_to_buylist([updated])
         self._apply_broker_order_status_updates_to_buylist([updated])
         self.populate_buylist_dashboard()
         self.append_log(
@@ -4165,6 +4422,44 @@ class BuylistMixin:
             self, f"Order Failed — {symbol}", f"{side.upper()} order error:\n{error}"
         )
 
+    def _track_buylist_order_worker(self, worker: QThread) -> None:
+        """Keep every live order worker reachable until it has actually finished."""
+        workers = self.__dict__.get("_buylist_order_workers")
+        if workers is None:
+            workers = []
+            self._buylist_order_workers = workers
+        if worker not in workers:
+            workers.append(worker)
+        finished = getattr(worker, "finished", None)
+        if hasattr(finished, "connect"):
+            finished.connect(lambda current=worker: self._cleanup_order_worker(current))
+
+    def _track_buylist_aux_worker(self, worker: QThread, attribute_name: str) -> None:
+        """Track cancel/query workers without allowing an old finish to clear a new one."""
+        workers = self.__dict__.get("_buylist_aux_workers")
+        if workers is None:
+            workers = []
+            self._buylist_aux_workers = workers
+        if worker not in workers:
+            workers.append(worker)
+        finished = getattr(worker, "finished", None)
+        if hasattr(finished, "connect"):
+            finished.connect(
+                lambda current=worker, attr=attribute_name: self._cleanup_aux_worker(
+                    attr, current
+                )
+            )
+
     def _cleanup_order_worker(self, worker: QThread) -> None:
-        if worker in self._buylist_order_workers:
-            self._buylist_order_workers.remove(worker)
+        workers = self.__dict__.get("_buylist_order_workers", [])
+        if worker in workers:
+            workers.remove(worker)
+        if self.__dict__.get("kis_order_worker") is worker:
+            self.kis_order_worker = None
+
+    def _cleanup_aux_worker(self, attribute_name: str, worker: QThread) -> None:
+        workers = self.__dict__.get("_buylist_aux_workers", [])
+        if worker in workers:
+            workers.remove(worker)
+        if self.__dict__.get(attribute_name) is worker:
+            setattr(self, attribute_name, None)

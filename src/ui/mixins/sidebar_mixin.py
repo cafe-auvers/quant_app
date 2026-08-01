@@ -117,7 +117,7 @@ class SidebarMixin:
         add_button.clicked.connect(self.sidebar_add_selected_to_watchlist)
         sidebar_layout.addWidget(add_button)
 
-        trade_button = QPushButton("Use in Trade Plan")
+        trade_button = QPushButton("Open ORB Plan")
         trade_button.clicked.connect(self.sidebar_load_trade_plan)
         sidebar_layout.addWidget(trade_button)
 

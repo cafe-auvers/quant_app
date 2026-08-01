@@ -149,3 +149,16 @@ def test_default_universe_falls_back_to_sp500_when_kis_empty(monkeypatch):
     monkeypatch.setattr(data_loader, "get_sp500_tickers", lambda max_symbols=None: ["AAPL", "MSFT"])
 
     assert data_loader.get_default_universe(max_symbols=2) == ["AAPL", "MSFT"]
+
+
+def test_sp500_cache_normalizes_class_share_symbols(tmp_path, monkeypatch):
+    cache_path = tmp_path / "sp500_tickers.csv"
+    pd.DataFrame({"Symbol": ["BRK.B", "BF/B", "AAPL"]}).to_csv(cache_path, index=False)
+    monkeypatch.setattr(data_loader, "SP500_UNIVERSE_CACHE", cache_path)
+
+    assert data_loader.get_sp500_tickers(max_symbols=None) == ["BRK-B", "BF-B", "AAPL"]
+
+
+def test_yfinance_symbol_normalizer_accepts_slash_and_dot_class_shares():
+    assert data_loader.normalize_yahoo_symbol("brk/b") == "BRK-B"
+    assert data_loader.normalize_yahoo_symbol("bf.b") == "BF-B"

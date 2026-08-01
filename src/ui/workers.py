@@ -25,7 +25,11 @@ from src.ui.order_workers import (
     KisOrderWorker,
     OrderReconciliationWorker,
 )
-from src.utils.data_loader import download_price_history, _extract_symbol_history
+from src.utils.data_loader import (
+    download_price_history,
+    download_single_symbol_history,
+    _extract_symbol_history,
+)
 from src.utils.db_loader import (
     load_symbol_history_from_db,
     prune_intraday_history,
@@ -395,6 +399,7 @@ class IntradayBulkFetchWorker(QThread):
 
 class ScannerWorker(QThread):
     finished_scan = pyqtSignal(list, object)
+    universe_loaded = pyqtSignal(list)
     log_message = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
 
@@ -407,15 +412,17 @@ class ScannerWorker(QThread):
         min_adr: float,
         min_growth_rank: float,
         min_trend_intensity: float,
+        universe_limit: Optional[int] = None,
     ):
         super().__init__()
-        self.tickers = tickers
+        self.tickers = list(tickers or [])
         self.engine = engine
         self.min_volume = min_volume
         self.min_dollar_volume = min_dollar_volume
         self.min_adr = min_adr
         self.min_growth_rank = min_growth_rank
         self.min_trend_intensity = min_trend_intensity
+        self.universe_limit = universe_limit
 
     def run(self) -> None:
         try:
@@ -425,6 +432,17 @@ class ScannerWorker(QThread):
                 raise RuntimeError(
                     "MySQL cache is unavailable. Configure MySQL, then refresh the cache before scanning."
                 )
+
+            if not self.tickers:
+                from src.utils.data_loader import get_default_universe
+
+                self.log_message.emit("Loading scanner universe in the background...")
+                self.tickers = get_default_universe(max_symbols=self.universe_limit)
+                if not self.tickers:
+                    raise RuntimeError("Scanner universe is empty.")
+                self.universe_loaded.emit(list(self.tickers))
+            if self.isInterruptionRequested():
+                return
 
             self.log_message.emit("Running scanner using MySQL cache...")
             stock_metrics = get_universe_stock_metrics_from_db(
@@ -591,7 +609,6 @@ class WatchlistAiWorker(QThread):
         import datetime as dt
         from src.core.scoring import calculate_deterministic_scores, run_ai_review
         from src.utils.db_loader import load_symbol_history_from_db
-        from src.utils.data_loader import download_price_history
         from src.core.orb import calculate_orb_range
 
         total_items = len(self.watchlist_items)
@@ -621,8 +638,8 @@ class WatchlistAiWorker(QThread):
                 self.log_message.emit(
                     f"Cache miss for {symbol}. Fetching daily history from yfinance..."
                 )
-                history = download_price_history(
-                    [symbol], period="6mo", interval="1d", max_symbols=1
+                history = download_single_symbol_history(
+                    symbol, period="6mo", interval="1d"
                 )
 
             histories[symbol] = history
@@ -1026,7 +1043,6 @@ class SingleStockAiWorker(QThread):
             fetch_recent_news_headlines,
         )
         from src.utils.db_loader import load_symbol_history_from_db
-        from src.utils.data_loader import download_price_history
 
         symbol = self.symbol
         item = self.item
@@ -1036,8 +1052,8 @@ class SingleStockAiWorker(QThread):
         if self.db_engine is not None:
             history = load_symbol_history_from_db(symbol, self.db_engine, interval="1d")
         if history.empty:
-            history = download_price_history(
-                [symbol], period="6mo", interval="1d", max_symbols=1
+            history = download_single_symbol_history(
+                symbol, period="6mo", interval="1d"
             )
 
         if history.empty:

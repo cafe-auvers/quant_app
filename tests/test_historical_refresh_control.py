@@ -7,6 +7,7 @@ throughout, and all status/lock/log paths are redirected into a tmp_path.
 from __future__ import annotations
 
 import subprocess
+import threading
 import uuid
 
 import pytest
@@ -260,6 +261,56 @@ def test_launch_refresh_writes_starting_when_child_has_not_reported_yet(monkeypa
     status = hrc.read_status(hrc.MODE_1D)
     assert status["status"] == "starting"
     assert status["run_id"] == "run789"
+
+
+def test_launch_refresh_serializes_parallel_launch_attempts(monkeypatch):
+    entered_popen = threading.Event()
+    release_popen = threading.Event()
+    popen_calls = []
+    outcomes = []
+
+    def slow_popen(cmd, **kwargs):
+        popen_calls.append(cmd)
+        entered_popen.set()
+        assert release_popen.wait(timeout=2)
+        return _FakePopen(cmd, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", slow_popen)
+    monkeypatch.setattr(hrc, "is_process_alive", lambda pid: pid == 424242)
+
+    def launch():
+        try:
+            outcomes.append(("ok", hrc.launch_refresh(hrc.MODE_1D).run_id))
+        except Exception as exc:
+            outcomes.append(("error", str(exc)))
+
+    first = threading.Thread(target=launch)
+    second = threading.Thread(target=launch)
+    first.start()
+    assert entered_popen.wait(timeout=2)
+    second.start()
+    release_popen.set()
+    first.join(timeout=3)
+    second.join(timeout=3)
+
+    assert len(popen_calls) == 1
+    assert [outcome[0] for outcome in outcomes].count("ok") == 1
+    assert any("already running" in outcome[1] for outcome in outcomes if outcome[0] == "error")
+
+
+def test_launch_refresh_marks_startup_error_when_popen_fails(monkeypatch):
+    def failing_popen(*_args, **_kwargs):
+        raise OSError("launch failed")
+
+    monkeypatch.setattr(subprocess, "Popen", failing_popen)
+    monkeypatch.setattr(hrc, "is_process_alive", lambda _pid: False)
+
+    with pytest.raises(OSError, match="launch failed"):
+        hrc.launch_refresh(hrc.MODE_1D)
+
+    status = hrc.read_status(hrc.MODE_1D)
+    assert status["status"] == "error"
+    assert "Could not launch refresh" in status["result"]["error_message"]
 
 
 # --- "starting" liveness: PID alive always wins over age --------------------

@@ -1,4 +1,5 @@
 """AI-powered trade review against markdown rulebooks."""
+import math
 from typing import Dict, List, Optional
 from pathlib import Path
 from dataclasses import dataclass
@@ -64,9 +65,14 @@ class TradeReviewer:
             TradeReview with approval status and feedback
         """
         if use_ai and self.rulebooks:
-            return self._review_with_ai(setup)
-        else:
-            return self._review_with_rules(setup)
+            try:
+                return self._review_with_ai(setup)
+            except NotImplementedError:
+                # Rulebooks ship with the app while the optional AI adapter is
+                # intentionally not configured.  Never let that optional path
+                # block a user from receiving the deterministic safety review.
+                pass
+        return self._review_with_rules(setup)
     
     def _review_with_rules(self, setup: TradeSetup) -> TradeReview:
         """
@@ -80,22 +86,52 @@ class TradeReviewer:
         """
         violations = []
         recommendations = []
+
+        def finite_float(value) -> Optional[float]:
+            try:
+                number = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return number if math.isfinite(number) else None
+
+        entry_price = finite_float(setup.entry_price)
+        stop_loss = finite_float(setup.stop_loss)
+        risk_amount = finite_float(setup.risk_amount)
+        try:
+            size_shares = int(setup.size_shares)
+        except (TypeError, ValueError):
+            size_shares = 0
+        reasoning = str(setup.reasoning or "").strip()
         
         # Basic checks
-        if setup.size_shares <= 0:
+        if size_shares <= 0:
             violations.append("Position size must be greater than zero")
-        
-        if setup.stop_loss >= setup.entry_price:
+
+        if entry_price is None or entry_price <= 0:
+            violations.append("Entry price must be a finite positive value")
+        if stop_loss is None or stop_loss <= 0:
+            violations.append("Stop loss must be a finite positive value")
+        elif entry_price is not None and entry_price > 0 and stop_loss >= entry_price:
             violations.append("Stop loss must be below entry")
 
-        if not setup.reasoning.strip():
+        if risk_amount is None or risk_amount < 0:
+            violations.append("Risk amount must be a finite non-negative value")
+
+        if not reasoning:
             recommendations.append("Add a trade thesis before execution")
         
         # Profit management is rule-based for this strategy; fixed take-profit
         # prices and R/R targets are intentionally not required.
-        risk = setup.entry_price - setup.stop_loss
+        risk = (
+            entry_price - stop_loss
+            if entry_price is not None
+            and entry_price > 0
+            and stop_loss is not None
+            and 0 < stop_loss < entry_price
+            else 0.0
+        )
 
-        stop_distance = risk / setup.entry_price if setup.entry_price > 0 and risk > 0 else 0
+        stop_distance = risk / entry_price if entry_price and risk > 0 else 0
         if stop_distance > 0.15:
             recommendations.append(f"Stop is {stop_distance * 100:.1f}% below entry; consider whether the setup is too wide")
         elif 0 < stop_distance < 0.02:
@@ -106,7 +142,7 @@ class TradeReviewer:
         )
         
         approved = len(violations) == 0
-        confidence = 0.85 if approved and setup.reasoning.strip() else 0.65 if approved else 0.25
+        confidence = 0.85 if approved and reasoning else 0.65 if approved else 0.25
         
         return TradeReview(
             approved=approved,

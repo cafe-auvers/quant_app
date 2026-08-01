@@ -80,7 +80,6 @@ from src.core.watchlist import (
 from src.core.trade_reviewer import TradeReviewer, TradeSetup
 from src.utils.data_loader import (
     download_price_history,
-    get_default_universe,
     _extract_symbol_history,
 )
 from src.utils.db_loader import (
@@ -689,6 +688,13 @@ class ScannerMixin:
                 )
             return False
 
+        if getattr(self, "db_initializing", False):
+            message = "MySQL cache connection is still initializing. Please try again in a moment."
+            self.append_log(f"Scanner blocked: {message}")
+            if show_warnings:
+                QMessageBox.information(self, "Database initializing", message)
+            return False
+
         if not self.db_enabled or self.db_engine is None:
             message = "MySQL cache is not configured or cannot be reached. Use Update 1D Data after configuring the database."
             self.append_log(f"Scanner blocked: {message}")
@@ -700,19 +706,20 @@ class ScannerMixin:
 
     def _start_scanner_worker(self) -> None:
         """Start the worker that loads scanner metrics from MySQL."""
-        self.universe_tickers = get_default_universe(max_symbols=self.universe_limit)
         self.progress_label.setText("Scanning MySQL cache...")
         self.progress_bar.setValue(0)
 
         self.scanner_worker = ScannerWorker(
-            tickers=self.universe_tickers,
+            tickers=self.universe_tickers or None,
             engine=self.db_engine,
             min_volume=0,
             min_dollar_volume=0,
             min_adr=0,
             min_growth_rank=0,
             min_trend_intensity=0,
+            universe_limit=self.universe_limit,
         )
+        self.scanner_worker.universe_loaded.connect(self._on_scanner_universe_loaded)
         self.scanner_worker.log_message.connect(self.append_log)
         self.scanner_worker.finished_scan.connect(self._on_scanner_finished)
         self.scanner_worker.error_occurred.connect(self._on_scanner_error)
@@ -722,6 +729,11 @@ class ScannerMixin:
             )
         )
         self.scanner_worker.start()
+
+    def _on_scanner_universe_loaded(self, tickers: List[str]) -> None:
+        """Retain the asynchronously loaded universe for future scans/searches."""
+        self.universe_tickers = list(tickers or [])
+        self.append_log(f"Loaded {len(self.universe_tickers):,} scanner universe symbols.")
 
     def run_all_scanners(
         self, checked: bool = False, show_warnings: bool = True
