@@ -7,8 +7,11 @@ setup_pc_morning_task.ps1). Chains, in order:
      deployment target, not a dev workspace: nobody should be editing code
      here, so discarding local state is intentional and safe (see
      docs/pc_sync_data_pipeline.md).
-  2. scripts/run_daily_refresh.py -- gates on "was there a new US trading
-     session" and, if so, runs historical.py --mode 1d then --mode 1h.
+  2. scripts/run_daily_refresh.py -- gates on whether the database's actual
+     latest stored date is behind what's expected (same check the dashboard
+     itself shows as "Needs refresh"), and if so, runs historical.py
+     --mode 1d then --mode 1h. This self-heals multi-day gaps, not just
+     "yesterday."
   3. Launches main.py (detached) so the dashboard is visible if you check
      in during the PC's short on-window.
 

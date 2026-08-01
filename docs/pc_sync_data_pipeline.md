@@ -28,15 +28,19 @@ below.
            -> Windows auto-login (registry AutoAdminLogon)
            -> Task Scheduler "at logon" task runs a wrapper script that:
                 1. git fetch + reset the PC's repo clone to origin/master
-                2. python historical.py --mode 1d   (prior session's daily bars)
-                3. python historical.py --mode 1h   (prior session's hourly bars)
-                4. launches main.py so the dashboard is visible if you check in
+                2. compares the DB's actual latest stored date against the
+                   date the dashboard itself would expect (same check as
+                   "Needs refresh" in the UI) -- if behind, runs
+                   historical.py --mode 1d then --mode 1h; a multi-day gap
+                   self-heals in one go since historical.py refetches a wide
+                   window (1y), not just "yesterday"
+                3. launches main.py so the dashboard is visible if you check in
 10:00 KST  Scheduled shutdown (guarded so it won't kill an in-progress refresh)
 ```
 
 Built:
 - `scripts/pc_morning_routine.ps1` — steps 1–4 above (git sync, refresh, launch).
-- `scripts/run_daily_refresh.py` — the trading-day gate + `historical.py` calls.
+- `scripts/run_daily_refresh.py` — the DB-freshness gate (compares actual latest stored date vs. expected, same as the dashboard's "Needs refresh") + `historical.py` calls.
 - `scripts/setup_pc_autologin.ps1` — configures Windows `AutoAdminLogon`.
 - `scripts/setup_pc_morning_task.ps1` — registers the "at logon" Task Scheduler task.
 - `scripts/setup_mysql_lan_access.ps1` (from earlier) — LAN firewall rule + prints the `my.ini`/`GRANT` steps.
