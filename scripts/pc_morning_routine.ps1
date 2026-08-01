@@ -31,11 +31,23 @@ function Write-Log {
     Write-Host $line
 }
 
-$PythonExe = (Get-Command python -ErrorAction SilentlyContinue).Source
+# Prefer this repo's own venv over a bare "python" on PATH. Task Scheduler
+# runs this in a fresh process that never had venv\Scripts\Activate.ps1 run
+# in it, so Get-Command python here can silently resolve to a system Python
+# that's missing every package installed into the venv (PyQt5 included) --
+# main.py would then crash on import with no visible error, since nothing
+# downstream captures its output. Fall back to PATH only if there's no venv.
+$VenvPython = Join-Path $RepoRoot "venv\Scripts\python.exe"
+if (Test-Path $VenvPython) {
+    $PythonExe = $VenvPython
+} else {
+    $PythonExe = (Get-Command python -ErrorAction SilentlyContinue).Source
+}
 if (-not $PythonExe) {
-    Write-Log "ERROR: python.exe not found on PATH -- cannot run refresh or launch main.py. Fix PATH/venv activation, then re-run this script or Start-ScheduledTask."
+    Write-Log "ERROR: no venv at $VenvPython and no python.exe on PATH -- cannot run refresh or launch main.py."
     exit 1
 }
+Write-Log "Using Python: $PythonExe"
 
 Write-Log "=== Morning routine starting ==="
 
@@ -67,10 +79,22 @@ try {
 }
 
 # --- 3. Launch main.py (detached, so this task can finish while the GUI stays open) ---
+# stdout/stderr are captured to their own file (not this log) since main.py
+# keeps running after this script exits -- if it crashes on startup (e.g. a
+# missing dependency), that's the only place the error will show up.
+
+$MainPyOutLog = Join-Path $LogDir "main_py_stdout.log"
+$MainPyErrLog = Join-Path $LogDir "main_py_stderr.log"
 
 try {
-    Start-Process -FilePath $PythonExe -ArgumentList (Join-Path $RepoRoot "main.py") -WorkingDirectory $RepoRoot
-    Write-Log "main.py launched."
+    $proc = Start-Process -FilePath $PythonExe -ArgumentList (Join-Path $RepoRoot "main.py") -WorkingDirectory $RepoRoot `
+        -RedirectStandardOutput $MainPyOutLog -RedirectStandardError $MainPyErrLog -PassThru
+    Start-Sleep -Seconds 5
+    if ($proc.HasExited) {
+        Write-Log "ERROR: main.py exited almost immediately (code $($proc.ExitCode)) -- see $MainPyErrLog"
+    } else {
+        Write-Log "main.py launched (PID $($proc.Id)) and is still running after 5s."
+    }
 } catch {
     Write-Log "ERROR: could not launch main.py: $($_.Exception.Message)"
 }
