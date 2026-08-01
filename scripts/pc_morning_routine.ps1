@@ -69,6 +69,19 @@ try {
     Pop-Location
 }
 
+# --- 1.5. Keep the venv's packages in sync with requirements.txt -----------
+# Cheap/idempotent when nothing changed; catches cases like this one where a
+# dependency (e.g. tzdata) got added on the laptop after the venv here was
+# first created, so a code-only git sync would otherwise leave it missing.
+
+try {
+    $pipOutput = & $PythonExe -m pip install -q -r (Join-Path $RepoRoot "requirements.txt") 2>&1
+    Write-Log "pip install -r requirements.txt: exit code $LASTEXITCODE"
+    if ($LASTEXITCODE -ne 0) { Write-Log "pip output: $pipOutput" }
+} catch {
+    Write-Log "WARN: pip sync failed ($($_.Exception.Message)) -- continuing with whatever packages are already installed."
+}
+
 # --- 2. Data refresh (trading-day gated inside the script) -----------------
 
 try {
