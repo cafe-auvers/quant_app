@@ -4,13 +4,18 @@
     that shuts this PC down at a configured time on configured days.
 
 .DESCRIPTION
-    The scheduled task's action is a direct call to the built-in shutdown.exe
-    with /t <WarningSeconds>, which makes Windows show its own "this PC will
-    shut down in N seconds" notification to whoever is logged in -- that IS
-    the warning, and it's what makes `shutdown.exe /a` able to cancel it.
-    /f (force-close applications) is never passed unless -ForceCloseApplications
-    is explicitly given, so by default apps with unsaved work can block/delay
-    shutdown rather than losing data silently.
+    The scheduled task first runs Invoke-GuardedShutdown.ps1. It waits for a
+    live historical.py refresh to finish before calling the built-in
+    shutdown.exe with /t <WarningSeconds>. If the refresh is still active
+    after -MaxRefreshWaitMinutes, the guard exits without shutting down, so
+    it never kills a partial data refresh or waits forever in Task Scheduler.
+
+    shutdown.exe shows Windows' own "this PC will shut down in N seconds"
+    notification to whoever is logged in; that is the warning, and it makes
+    `shutdown.exe /a` able to cancel the pending shutdown. /f
+    (force-close applications) is never passed unless
+    -ForceCloseApplications is explicitly given, so by default apps with
+    unsaved work can block/delay shutdown rather than losing data silently.
 
     The task runs as SYSTEM with the highest run level so it fires whether or
     not anyone is logged in, and re-running this script with the same
@@ -39,11 +44,17 @@
     Passes /f to shutdown.exe, force-closing apps that would otherwise block
     shutdown (risk of unsaved work loss). Off by default.
 
+.PARAMETER MaxRefreshWaitMinutes
+    After the scheduled shutdown time, wait this long for a live historical.py
+    refresh. If it is still running at the limit, cancel shutdown rather than
+    interrupting the refresh. Default 180 minutes.
+
 .PARAMETER TestMode
     Instead of the normal weekly trigger, schedules a ONE-TIME shutdown
     ~3 minutes from now (as "<TaskName>-Test") so you can watch the full
-    warning/shutdown flow without waiting for the real scheduled time. This
-    will actually shut the PC down unless you cancel it with `shutdown /a`.
+    warning/shutdown flow without waiting for the real scheduled time. It
+    uses the same refresh guard as the normal task, then actually shuts the
+    PC down unless you cancel it with `shutdown /a`.
 
 .PARAMETER RemoveTask
     Deletes the named scheduled task.
@@ -86,6 +97,8 @@ param(
     [string]$TaskName = "Automatic-PC-Shutdown",
 
     [switch]$ForceCloseApplications,
+    [ValidateRange(0, 1440)]
+    [int]$MaxRefreshWaitMinutes = 180,
     [switch]$TestMode,
     [switch]$RemoveTask,
     [switch]$DisableTask,
@@ -153,19 +166,21 @@ try {
     exit 1
 }
 
-# --- build the shutdown action (shared by normal mode and test mode) -------
+# --- build the guarded shutdown action (shared by normal and test mode) ----
 
-$warningMinutesText = if ($WarningSeconds -ge 60) { "{0:N1} min" -f ($WarningSeconds / 60) } else { "$WarningSeconds sec" }
-$message = "Automatic scheduled shutdown in $WarningSeconds seconds ($warningMinutesText). Save your work now. " +
-           "To cancel, open an elevated Command Prompt or PowerShell and run:  shutdown /a"
-
-$shutdownArgs = "/s /t $WarningSeconds /c `"$message`""
-if ($ForceCloseApplications) {
-    $shutdownArgs += " /f"
-    Write-Log "ForceCloseApplications is ON: shutdown.exe will force-close apps that would otherwise block shutdown. Unsaved work in those apps can be lost." "WARN"
+$GuardScript = Join-Path $PSScriptRoot "Invoke-GuardedShutdown.ps1"
+if (-not (Test-Path $GuardScript)) {
+    Write-Log "Required shutdown guard script is missing: $GuardScript" "ERROR"
+    exit 1
 }
 
-$action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\shutdown.exe" -Argument $shutdownArgs
+$guardArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$GuardScript`" -WarningSeconds $WarningSeconds -MaxRefreshWaitMinutes $MaxRefreshWaitMinutes"
+if ($ForceCloseApplications) {
+    $guardArgs += " -ForceCloseApplications"
+    Write-Log "ForceCloseApplications is ON: shutdown.exe will force-close apps after any active refresh finishes. Unsaved work in those apps can be lost." "WARN"
+}
+
+$action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument $guardArgs
 $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew
 
@@ -179,7 +194,7 @@ if ($TestMode) {
     if ($PSCmdlet.ShouldProcess($testTaskName, "Register one-time test shutdown task")) {
         Register-ScheduledTask -TaskName $testTaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
             -Description "One-time test run created by Configure-AutomaticShutdown.ps1 -TestMode." -Force | Out-Null
-        Write-Log "TEST MODE: task '$testTaskName' registered. THIS PC WILL SHUT DOWN at $($fireAt.ToString('HH:mm:ss')) (in ~3 minutes) unless cancelled." "WARN"
+        Write-Log "TEST MODE: task '$testTaskName' registered. It will start the guarded shutdown at $($fireAt.ToString('HH:mm:ss')) (in ~3 minutes); a live refresh may defer or cancel it." "WARN"
         Write-Log "To cancel once the warning appears: shutdown /a" "WARN"
         Write-Log "To remove this test task afterward: Unregister-ScheduledTask -TaskName '$testTaskName' -Confirm:`$false"
     }
@@ -209,7 +224,7 @@ $atTime = (Get-Date -Hour ([int]$timeParts[0]) -Minute ([int]$timeParts[1]) -Sec
 $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $dayEnums -At $atTime
 
 $description = "Automatic shutdown at $ShutdownTime on $($resolvedDays -join ', '). " +
-               "Warning: $WarningSeconds sec. ForceClose: $($ForceCloseApplications.IsPresent). " +
+               "Warning: $WarningSeconds sec. Refresh wait: $MaxRefreshWaitMinutes min. ForceClose: $($ForceCloseApplications.IsPresent). " +
                "Managed by Configure-AutomaticShutdown.ps1 -- re-run that script to change, or -RemoveTask to delete."
 
 try {
@@ -219,7 +234,7 @@ try {
     if ($PSCmdlet.ShouldProcess($TaskName, "$verb scheduled shutdown task")) {
         Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
             -Description $description -Force | Out-Null
-        Write-Log "$verb scheduled task '$TaskName': shuts down at $ShutdownTime on $($resolvedDays -join ', '), $WarningSeconds sec warning, ForceClose=$($ForceCloseApplications.IsPresent)."
+        Write-Log "$verb scheduled task '$TaskName': shuts down at $ShutdownTime on $($resolvedDays -join ', '), $WarningSeconds sec warning, waits up to $MaxRefreshWaitMinutes min for active refreshes, ForceClose=$($ForceCloseApplications.IsPresent)."
     }
 } catch {
     Write-Log "Failed to register scheduled task '$TaskName': $($_.Exception.Message)" "ERROR"

@@ -95,6 +95,10 @@ from src.utils.db_loader import (
     save_symbol_history_to_db,
     delete_intraday_history_for_symbol,
 )
+from src.utils.market_calendar import (
+    expected_latest_market_data_date,
+    previous_nyse_trading_day,
+)
 from src.utils.storage import load_json, save_json
 from src.api.kis_account_snapshot_dual import (
     KisEnvironment,
@@ -1217,24 +1221,12 @@ class DashboardMixin:
 
     @staticmethod
     def _expected_latest_market_data_date(now: Optional[dt.datetime] = None) -> dt.date:
-        if now is None:
-            kst_now = dt.datetime.now(KST_ZONE)
-        elif now.tzinfo is None:
-            kst_now = now.replace(tzinfo=KST_ZONE)
-        else:
-            kst_now = now.astimezone(KST_ZONE)
-
-        candidate = kst_now.date() - dt.timedelta(days=1)
-        if kst_now.time() < MARKET_DATA_READY_TIME_KST:
-            candidate -= dt.timedelta(days=1)
-
-        return DashboardMixin._previous_weekday(candidate)
+        return expected_latest_market_data_date(now)
 
     @staticmethod
     def _previous_weekday(day: dt.date) -> dt.date:
-        while day.weekday() >= 5:
-            day -= dt.timedelta(days=1)
-        return day
+        """Backward-compatible name for callers of the old dashboard helper."""
+        return previous_nyse_trading_day(day)
 
     def run_single_stock_ai_analysis(self) -> None:
         """Run the new detailed single stock AI quantitative analysis."""

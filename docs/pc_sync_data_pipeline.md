@@ -56,14 +56,16 @@ flowchart LR
                 1. git fetch + reset --hard origin/master
                 2. venv python -m pip install -r requirements.txt (keeps
                    dependencies in sync with the laptop, not just code)
-                3. scripts/run_daily_refresh.py: compares the DB's actual
-                   latest stored date against the date the dashboard itself
-                   would expect (same check as "Needs refresh" in the UI) --
-                   if behind, runs historical.py --mode 1d then --mode 1h;
-                   a multi-day gap self-heals in one go since historical.py
-                   refetches a wide window (1y), not just "yesterday"
+                3. scripts/run_daily_refresh.py: checks every symbol and
+                   both daily/1H tables against the dashboard's expected
+                   latest NYSE trading date (including regular holidays),
+                   then runs only stale historical.py modes; a multi-day gap
+                   self-heals because historical.py refetches a wide window
+                   (1y), not just "yesterday"
                 4. launches main.py so the dashboard is visible if you check in
-10:00 KST  "Automatic-PC-Shutdown" scheduled task shuts the PC down
+10:00 KST  "Automatic-PC-Shutdown" waits for any live historical refresh,
+           then shuts the PC down; after its configured wait limit it exits
+           safely without killing a partial refresh
 ```
 
 Note: the `AtLogOn` trigger fires on *any* logon, not only the scheduled
@@ -174,10 +176,9 @@ morning) for dependencies:
   staleness banner exists in the UI.
 - **Recovery is automatic once the PC is back**, no manual backfill needed
   -- `historical.py` pulls a wide window each run (`1y` daily, `730d`
-  hourly), and `run_daily_refresh.py`'s gate compares against the DB's
-  actual latest date rather than assuming "yesterday," so any gap (a
-  missed wake, a failed run, several days off) self-heals on the next
-  successful run.
+  hourly), and `run_daily_refresh.py` checks every scheduled symbol in both
+  tables rather than trusting one global latest date. Any gap (a missed wake,
+  a failed mode, several days off) self-heals on the next successful run.
 - **Root causes worth checking**: BIOS RTC alarm didn't fire (power/PSU
   prerequisites), Windows didn't auto-login, or a step in
   `pc_morning_routine.ps1` failed -- check `data/logs/pc_morning_routine.log`

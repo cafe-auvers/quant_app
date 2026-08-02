@@ -1892,6 +1892,15 @@ def test_market_data_status_rolls_weekends_back_to_friday():
     assert MainWindow._expected_latest_market_data_date(monday_before_cutoff) == dt.date(2026, 6, 26)
 
 
+def test_market_data_status_rolls_regular_nyse_holidays_back_to_prior_session():
+    kst = dt.timezone(dt.timedelta(hours=9))
+    day_after_labor_day = dt.datetime(2026, 9, 8, 8, 0, tzinfo=kst)
+    day_after_new_years_observed = dt.datetime(2022, 1, 1, 8, 0, tzinfo=kst)
+
+    assert MainWindow._expected_latest_market_data_date(day_after_labor_day) == dt.date(2026, 9, 4)
+    assert MainWindow._expected_latest_market_data_date(day_after_new_years_observed) == dt.date(2021, 12, 30)
+
+
 def test_live_intraday_refresh_uses_us_regular_market_hours():
     eastern = dt.timezone(dt.timedelta(hours=-4))
     market_open = dt.datetime(2026, 6, 24, 10, 0, tzinfo=eastern)

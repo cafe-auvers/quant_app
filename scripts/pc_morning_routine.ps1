@@ -59,12 +59,24 @@ Write-Log "=== Morning routine starting ==="
 Push-Location $RepoRoot
 try {
     $fetchOutput = git fetch origin 2>&1
-    Write-Log "git fetch origin: $fetchOutput"
+    $fetchExitCode = $LASTEXITCODE
+    Write-Log "git fetch origin (exit code $fetchExitCode): $fetchOutput"
+    if ($fetchExitCode -ne 0) {
+        throw "git fetch origin exited with code $fetchExitCode; leaving the current checkout untouched."
+    }
 
     $resetOutput = git reset --hard origin/master 2>&1
-    Write-Log "git reset --hard origin/master: $resetOutput"
+    $resetExitCode = $LASTEXITCODE
+    Write-Log "git reset --hard origin/master (exit code $resetExitCode): $resetOutput"
+    if ($resetExitCode -ne 0) {
+        throw "git reset --hard origin/master exited with code $resetExitCode."
+    }
 
     $headCommit = (git rev-parse --short HEAD 2>&1)
+    $headExitCode = $LASTEXITCODE
+    if ($headExitCode -ne 0) {
+        throw "git rev-parse --short HEAD exited with code $headExitCode."
+    }
     Write-Log "Now at commit $headCommit"
 } catch {
     Write-Log "WARN: git sync failed ($($_.Exception.Message)) -- continuing with whatever code is already on disk."
