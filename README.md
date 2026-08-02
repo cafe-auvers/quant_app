@@ -56,6 +56,11 @@ UI mixins keep PyQt tab construction, widget callbacks, table refreshes, and log
 
 The app can run without MySQL. Database-backed scanning and cache freshness features require valid `MYSQL_*` settings.
 
+If you're running this across two machines (a dev laptop + an always-on
+data-refresh PC, sharing one MySQL database over LAN/Tailscale), see
+[docs/pc_sync_data_pipeline.md](docs/pc_sync_data_pipeline.md) for the full
+architecture and automation.
+
 ## Configuration
 
 Database and API credentials are local-only and belong in `.env`.
