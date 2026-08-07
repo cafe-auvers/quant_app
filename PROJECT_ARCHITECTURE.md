@@ -25,6 +25,167 @@ main.py
 
 Long-running work runs in `QThread` workers so the PyQt UI remains responsive.
 
+## Overall Workflow
+
+The diagram below is the high-level operational map. It distinguishes market-data
+and review work from the guarded broker-order lifecycle: an `ACCEPTED` broker
+response is deliberately **not** a fill. Only reconciliation can update a
+buylist position as filled.
+
+```mermaid
+flowchart TB
+    Start([Launch: python main.py]) --> Qt[QApplication]
+    Qt --> Window[MainWindow]
+
+    subgraph Startup[Startup and recovery]
+        direction LR
+        Window --> State[Load local JSON state\nwatchlist, buylist, queue, orders, drawings, settings]
+        Window --> UI[Build tabs, menus, sidebar, and status log]
+        Window --> DBInit[Start optional MySQL initialization in a worker]
+        Window --> AccountPreload[Preload KIS account profiles and snapshots]
+        Window --> StartupReconcile[Restore unresolved local order state\nand schedule reconciliation]
+    end
+
+    subgraph Data[Market-data acquisition and cache]
+        direction LR
+        Universe[Ticker universe\nKIS master with S&P 500 fallback] --> Daily[Daily and hourly history\nYahoo / KIS]
+        Daily --> Metrics[Technical metrics and indicators]
+        Intraday[Intraday request] --> KISIntraday[KIS provider when configured]
+        KISIntraday --> IntradayCache[Source-aware intraday cache]
+        KISIntraday -. unavailable or no usable bars .-> YF[yfinance fallback]
+        YF --> IntradayCache
+        Daily --> MySQL[(Optional MySQL cache)]
+        Metrics --> MySQL
+        IntradayCache --> MySQL
+    end
+
+    subgraph Review[Research, planning, and monitoring]
+        direction TB
+        MySQL --> Scanner[Scanner rules and results]
+        Daily --> Scanner
+        Scanner --> Watchlist[Watchlist]
+        Watchlist --> Analysis[Rulebook review and deterministic / optional AI score]
+        Watchlist --> ORB[ORB range, breakout validation, and position sizing]
+        IntradayCache --> ORB
+        Analysis --> Buylist[Buy Dashboard / Buylist]
+        ORB --> Buylist
+        Scanner -. optional add .-> Buylist
+        Daily --> Charts[Daily, hourly, and TradingView charts]
+        IntradayCache --> Charts
+        Watchlist --> Charts
+    end
+
+    subgraph Execution[Guarded order lifecycle]
+        direction TB
+        Buylist --> Queue[Execution queue refresh]
+        Queue --> Ready{Status is\nEXECUTE_READY?}
+        Ready -- No --> Monitor[Keep monitoring / refresh data]
+        Monitor --> Queue
+        Ready -- Yes --> Validate[Validate account, quantity, risk,\nand duplicate-open-order guard]
+        Validate --> Reserve[Persist local intent and\nUNKNOWN_SUBMISSION_STATE]
+        Reserve --> KISOrder[KIS overseas order API]
+        KISOrder --> Result{Broker response}
+        Result -- Rejected --> Rejected[Persist REJECTED\nand show UI result]
+        Result -- Ambiguous --> Unknown[Keep UNKNOWN_SUBMISSION_STATE\nblock resubmission]
+        Result -- Accepted --> Accepted[Persist ACCEPTED\nsubmission only, not a fill]
+        Accepted --> Reconcile[Reconcile against KIS account snapshots]
+        Unknown --> Reconcile
+        Reconcile --> Fill{Conservative fill\nevidence?}
+        Fill -- No / ambiguous --> Working[Keep WORKING or pending]
+        Fill -- Yes --> Position[Apply filled quantity to buylist\nshares, cost, and exit state]
+    end
+
+    subgraph Persistence[Durable local state]
+        direction LR
+        StateStore[(data/*.json)]
+        Backup[Atomic write + rolling .bak recovery]
+        Metadata[state_metadata.json\nsave status]
+        StateStore --> Backup
+        StateStore --> Metadata
+    end
+
+    Watchlist --> StateStore
+    Buylist --> StateStore
+    Queue --> StateStore
+    Reserve --> StateStore
+    Rejected --> StateStore
+    Unknown --> StateStore
+    Accepted --> StateStore
+    Working --> StateStore
+    Position --> StateStore
+    Charts --> StateStore
+
+    classDef safety fill:#fff3cd,stroke:#b7791f,color:#3d2b00;
+    classDef critical fill:#fde2e1,stroke:#c53030,color:#4a0808;
+    class Ready,Validate,Reserve,Accepted,Reconcile,Fill safety;
+    class Unknown,Rejected critical;
+```
+
+Reading guide:
+
+- Solid arrows are the normal flow; the dashed arrow is the explicit KIS-to-yfinance intraday fallback.
+- MySQL improves freshness and speed but is optional: Yahoo/KIS sources and local state keep the desktop application usable without it.
+- The persistence area is shared by user edits, the execution queue, chart drawings, and every meaningful order-status transition.
+
+## System Architecture
+
+This companion diagram shows the code-level boundaries behind the workflow. UI
+controllers coordinate work; core modules contain trading rules; services own
+cross-cutting lifecycle behavior; and adapters isolate external systems.
+
+```mermaid
+flowchart LR
+    User([Trader]) --> UI
+
+    subgraph Desktop[PyQt5 desktop application]
+        direction TB
+        UI[MainWindow and tab mixins\nwidgets, tables, dialogs, charts]
+        Controllers[UI controllers\naccount, scanner, watchlist, chart, execution]
+        Workers[QThread workers\nnetwork, refresh, scanner, review, reconciliation]
+        Core[Core domain\nscanner, watchlist, ORB, sizing, scoring,\nexecution queue, order state]
+        Services[Services\napp state, intraday orchestration,\norder ledger, guarded execution, reconciliation]
+        Utils[Utilities\nconfig, storage, calendar, loaders, DB helpers]
+
+        UI <--> Controllers
+        Controllers --> Workers
+        Controllers <--> Core
+        Workers <--> Core
+        Controllers <--> Services
+        Workers <--> Services
+        Core --> Utils
+        Services --> Utils
+    end
+
+    subgraph Local[Local machine]
+        direction TB
+        Json[(data/*.json\nstate, queue, order ledger, drawings)]
+        Rulebooks[rulebooks/*.md]
+        Env[.env\nlocal secrets and settings]
+        MySQL[(Optional MySQL\nprices, indicators, scanner metrics)]
+    end
+
+    subgraph External[External providers]
+        direction TB
+        KIS[KIS APIs\naccounts, orders, market data]
+        Yahoo[Yahoo Finance\nmarket and intraday data]
+        OpenAI[OpenAI API\noptional trade review]
+    end
+
+    UI <--> Json
+    Services <--> Json
+    Core --> Rulebooks
+    Utils --> Env
+    Utils <--> MySQL
+    Workers <--> KIS
+    Workers <--> Yahoo
+    Core -. optional review .-> OpenAI
+
+    classDef boundary fill:#eaf2ff,stroke:#2b6cb0,color:#102a43;
+    classDef store fill:#f0fff4,stroke:#2f855a,color:#1c4532;
+    class UI,Controllers,Workers,Core,Services,Utils boundary;
+    class Json,Rulebooks,Env,MySQL,KIS,Yahoo,OpenAI store;
+```
+
 ## Directory Layout
 
 ```text
