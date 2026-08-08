@@ -9,6 +9,8 @@ and docs/historical_refactor_plan.md for the full design.
 Usage:
     python historical.py --mode 1d
     python historical.py --mode 1h [--backfill]
+    @("AAPL", "MSFT") | python historical.py --mode 1d --symbols-stdin
+    python historical.py --mode 1d --derived-only
 """
 from __future__ import annotations
 
@@ -32,12 +34,17 @@ from src.services.historical_refresh_control import (
 )
 from src.utils.data_loader import get_default_universe
 from src.utils.db_loader import (
+    get_chart_indicator_refresh_plan,
+    get_latest_hourly_price_history_timestamps,
+    get_latest_price_history_dates,
     init_mysql_engine,
+    is_scanner_metrics_snapshot_current,
     refresh_chart_indicators_to_db,
     refresh_scanner_metrics_to_db,
     refresh_universe_history_to_db,
     refresh_universe_hourly_history_to_db,
 )
+from src.utils.market_calendar import expected_latest_market_data_date
 from src.utils.storage import save_json
 
 REFERENCE_SYMBOL = "SPY"
@@ -161,42 +168,124 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Standalone 1D/1H historical data refresh.")
     parser.add_argument("--mode", required=True, choices=[MODE_1D, MODE_1H])
     parser.add_argument("--backfill", action="store_true", help="Full 730d backfill (1H mode only).")
-    parser.add_argument("--universe-limit", type=int, default=None)
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--universe-limit", type=int, default=None)
+    selection.add_argument(
+        "--symbols-stdin",
+        action="store_true",
+        help="Read the exact non-empty history-refresh symbol list from stdin.",
+    )
+    selection.add_argument(
+        "--derived-only",
+        action="store_true",
+        help="Run 1D derived-cache checks without downloading price history.",
+    )
+    parser.add_argument(
+        "--force-derived",
+        action="store_true",
+        help="Explicitly rebuild chart indicators and scanner metrics even when cached.",
+    )
     parser.add_argument("--run-id", default=None)
     return parser.parse_args(argv)
 
 
-def build_refresh_tickers(universe_limit: Optional[int]) -> List[str]:
-    universe_tickers = get_default_universe(max_symbols=universe_limit, refresh=True)
-    return list(dict.fromkeys([REFERENCE_SYMBOL, *universe_tickers]))
-
-
-def run_1d(engine, tickers: List[str], state: RunState) -> None:
-    state.set_phase("daily_history")
-    updated = refresh_universe_history_to_db(
-        tickers,
-        engine,
-        period="1y",
-        interval="1d",
-        progress_callback=state.update_progress,
-        log_callback=state.log,
+def build_refresh_tickers(
+    universe_limit: Optional[int], *, refresh: bool = True
+) -> List[str]:
+    universe_tickers = get_default_universe(
+        max_symbols=universe_limit, refresh=refresh
     )
+    normalized = [
+        str(symbol).strip().upper()
+        for symbol in universe_tickers
+        if str(symbol).strip()
+    ]
+    return list(dict.fromkeys([REFERENCE_SYMBOL, *normalized]))
+
+
+def read_refresh_symbols_from_stdin() -> List[str]:
+    symbols = [line.strip().upper() for line in sys.stdin.read().splitlines() if line.strip()]
+    return list(dict.fromkeys(symbols))
+
+
+def select_stale_history_symbols(engine, symbols: List[str], mode: str) -> List[str]:
+    """Recheck a selective payload immediately before any network download."""
+    expected_date = expected_latest_market_data_date()
+    if mode == MODE_1D:
+        latest_by_symbol = get_latest_price_history_dates(
+            engine, symbols, interval="1d"
+        )
+    else:
+        latest_by_symbol = get_latest_hourly_price_history_timestamps(
+            engine, symbols
+        )
+
+    stale = []
+    for symbol in symbols:
+        latest = latest_by_symbol.get(symbol)
+        latest_date = latest.date() if hasattr(latest, "date") else latest
+        if latest_date is None or latest_date < expected_date:
+            stale.append(symbol)
+    return stale
+
+
+def run_1d(
+    engine,
+    tickers: List[str],
+    state: RunState,
+    universe_tickers: Optional[List[str]] = None,
+    force_derived: bool = False,
+) -> None:
+    universe_tickers = universe_tickers or tickers
+    state.set_phase("daily_history")
+    if tickers:
+        updated = refresh_universe_history_to_db(
+            tickers,
+            engine,
+            period="1y",
+            interval="1d",
+            progress_callback=state.update_progress,
+            log_callback=state.log,
+        )
+    else:
+        updated = []
+        state.log("Daily price history is already current -- skipping downloads.")
     state.updated_count = len(updated)
     state.complete_phase("daily_history")
 
     state.set_phase("chart_indicators")
     refresh_chart_indicators_to_db(
-        tickers, engine, reference_symbol=REFERENCE_SYMBOL, log_callback=state.log,
+        universe_tickers,
+        engine,
+        reference_symbol=REFERENCE_SYMBOL,
+        log_callback=state.log,
+        force=force_derived,
     )
+    remaining_chart_work = get_chart_indicator_refresh_plan(
+        engine, universe_tickers, reference_symbol=REFERENCE_SYMBOL
+    )
+    if remaining_chart_work:
+        raise RuntimeError(
+            f"Chart indicators remain incomplete for {len(remaining_chart_work)} symbol(s)."
+        )
     state.complete_phase("chart_indicators")
 
     state.set_phase("scanner_metrics")
-    refresh_scanner_metrics_to_db(tickers, engine, log_callback=state.log)
+    refresh_scanner_metrics_to_db(
+        universe_tickers, engine, log_callback=state.log, force=force_derived
+    )
+    if not is_scanner_metrics_snapshot_current(engine, universe_tickers):
+        raise RuntimeError("Scanner metrics snapshot remains incomplete.")
     state.complete_phase("scanner_metrics")
 
 
 def run_1h(engine, tickers: List[str], backfill: bool, state: RunState) -> None:
     state.set_phase("hourly_history")
+    if not tickers:
+        state.log("Hourly price history is already current -- skipping downloads.")
+        state.updated_count = 0
+        state.complete_phase("hourly_history")
+        return
     updated = refresh_universe_hourly_history_to_db(
         tickers,
         engine,
@@ -227,11 +316,52 @@ def main(argv: Optional[List[str]] = None) -> int:
         if engine is None:
             raise RuntimeError("MySQL cache is not configured or cannot be reached.")
 
-        tickers = build_refresh_tickers(args.universe_limit)
-        state.log(f"Starting {mode} refresh for {len(tickers)} symbols...")
+        if args.derived_only and mode != MODE_1D:
+            raise ValueError("--derived-only is supported only for --mode 1d.")
+
+        selective = bool(args.symbols_stdin or args.derived_only)
+        universe_tickers = build_refresh_tickers(
+            args.universe_limit, refresh=not selective
+        )
+        if args.symbols_stdin:
+            requested_symbols = read_refresh_symbols_from_stdin()
+            if not requested_symbols:
+                raise ValueError(
+                    "--symbols-stdin requires at least one symbol; use --derived-only for an empty 1D history plan."
+                )
+            universe_set = set(universe_tickers)
+            tickers = [symbol for symbol in requested_symbols if symbol in universe_set]
+            dropped = len(requested_symbols) - len(tickers)
+            if dropped:
+                state.log(f"Ignored {dropped} refresh symbol(s) no longer in the universe.")
+            stale_tickers = select_stale_history_symbols(engine, tickers, mode)
+            newly_current = len(tickers) - len(stale_tickers)
+            tickers = stale_tickers
+            if newly_current:
+                state.log(
+                    f"Skipped {newly_current} symbol(s) that became current before download."
+                )
+            state.log(
+                f"Starting selective {mode} refresh for {len(tickers)} of "
+                f"{len(universe_tickers)} universe symbols..."
+            )
+        elif args.derived_only:
+            tickers = []
+            state.log(
+                f"Starting derived-only 1d refresh for {len(universe_tickers)} universe symbols..."
+            )
+        else:
+            tickers = universe_tickers
+            state.log(f"Starting {mode} refresh for {len(tickers)} symbols...")
 
         if mode == MODE_1D:
-            run_1d(engine, tickers, state)
+            run_1d(
+                engine,
+                tickers,
+                state,
+                universe_tickers=universe_tickers,
+                force_derived=bool(args.force_derived),
+            )
         else:
             run_1h(engine, tickers, bool(args.backfill), state)
 

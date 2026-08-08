@@ -1,5 +1,6 @@
 import os
 import datetime as dt
+import hashlib
 import logging
 import re
 import time
@@ -41,6 +42,9 @@ MYSQL_CONNECT_TIMEOUT_SECONDS = 3
 MYSQL_READ_WRITE_TIMEOUT_SECONDS = 15
 MYSQL_POOL_RECYCLE_SECONDS = 1800
 logger = logging.getLogger(__name__)
+
+SCANNER_METRICS_CACHE_VERSION = 1
+REFERENCE_SYMBOL = "SPY"
 
 
 def validate_mysql_identifier(value: str, *, label: str = "database name") -> str:
@@ -160,6 +164,7 @@ def init_mysql_engine(db_name: Optional[str] = None) -> Optional[Engine]:
         _ensure_chart_indicators_table(engine)
         _ensure_intraday_price_history_table(engine)
         _ensure_scanner_metrics_table(engine)
+        _ensure_scanner_metric_snapshots_table(engine)
         return engine
     except (ImportError, OSError, SQLAlchemyError, ValueError, TypeError) as exc:
         if engine is not None:
@@ -468,6 +473,24 @@ def _get_scanner_metrics_table(metadata: MetaData) -> Table:
 def _ensure_scanner_metrics_table(engine: Engine) -> Table:
     metadata = MetaData()
     table = _get_scanner_metrics_table(metadata)
+    metadata.create_all(engine)
+    return table
+
+
+def _get_scanner_metric_snapshots_table(metadata: MetaData) -> Table:
+    return Table(
+        "scanner_metric_snapshots",
+        metadata,
+        Column("snapshot_date", DateTime, primary_key=True),
+        Column("input_fingerprint", String(64), nullable=False),
+        Column("metric_count", Integer, nullable=False),
+        Column("completed_at", DateTime, nullable=False, default=_utcnow_naive),
+    )
+
+
+def _ensure_scanner_metric_snapshots_table(engine: Engine) -> Table:
+    metadata = MetaData()
+    table = _get_scanner_metric_snapshots_table(metadata)
     metadata.create_all(engine)
     return table
 
@@ -1064,12 +1087,120 @@ def calculate_chart_indicators(
     return indicators
 
 
+def calculate_chart_indicators_since(
+    symbol: str,
+    history: pd.DataFrame,
+    spy_history: pd.DataFrame,
+    start_date: dt.datetime,
+    rs_sma_period: int = 50,
+    rs_score_lookback: int = 252,
+) -> pd.DataFrame:
+    """Calculate only indicator rows at or after ``start_date``.
+
+    Rolling outputs before the requested date are dependencies, not outputs.
+    Computing the handful of required windows directly avoids repeating the
+    expensive rolling-percent-rank calculation for every already-persisted
+    row on each new market session.
+    """
+    if history.empty or spy_history.empty:
+        return pd.DataFrame()
+
+    symbol_history = history.copy()
+    spy = spy_history.copy()
+    symbol_history.index = pd.to_datetime(symbol_history.index).tz_localize(None)
+    spy.index = pd.to_datetime(spy.index).tz_localize(None)
+    df = symbol_history[["Close", "Volume"]].rename(
+        columns={"Close": "close", "Volume": "volume"}
+    )
+    df["spy_close"] = spy["Close"].astype(float)
+    df = df.dropna(subset=["close", "spy_close"]).sort_index()
+    if df.empty:
+        return pd.DataFrame()
+
+    first_output = pd.Timestamp(start_date)
+    if first_output.tzinfo is not None:
+        first_output = first_output.tz_localize(None)
+    target_positions = np.flatnonzero(df.index >= first_output)
+    if len(target_positions) == 0:
+        return pd.DataFrame()
+
+    close = df["close"].astype(float).to_numpy()
+    volume = df["volume"].fillna(0).astype(float).to_numpy()
+    spy_close = df["spy_close"].astype(float).to_numpy()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        relative_strength = np.where(spy_close != 0, close / spy_close, np.nan)
+
+    def window_mean(values: np.ndarray, position: int, size: int) -> float:
+        window = values[max(0, position - size + 1):position + 1]
+        valid = window[~np.isnan(window)]
+        return float(valid.mean()) if len(valid) else float("nan")
+
+    def rs_score(position: int) -> float:
+        if position < 0 or np.isnan(relative_strength[position]):
+            return float("nan")
+        window = relative_strength[
+            max(0, position - rs_score_lookback + 1):position + 1
+        ]
+        valid = window[~np.isnan(window)]
+        if len(valid) == 0:
+            return float("nan")
+        return float(np.count_nonzero(valid <= relative_strength[position]) / len(valid) * 100.0)
+
+    now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+    rows = []
+    for position in target_positions:
+        position = int(position)
+        current_rs = float(relative_strength[position])
+        rs_sma_50 = window_mean(relative_strength, position, rs_sma_period)
+        avg_7 = window_mean(close, position, 7)
+        avg_65 = window_mean(close, position, 65)
+        ti65 = avg_7 / avg_65 if avg_65 != 0 else float("nan")
+        if position > 0:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                pct_change_today = float((close[position] / close[position - 1] - 1.0) * 100.0)
+            previous_rs = float(relative_strength[position - 1])
+            previous_rs_sma = window_mean(relative_strength, position - 1, rs_sma_period)
+        else:
+            pct_change_today = float("nan")
+            previous_rs = float("nan")
+            previous_rs_sma = float("nan")
+
+        rows.append(
+            {
+                "symbol": symbol.strip().upper(),
+                "date": df.index[position],
+                "relative_strength": current_rs,
+                "rs_sma_50": rs_sma_50,
+                "rs_score_current": rs_score(position),
+                "rs_score_yesterday": rs_score(position - 1),
+                "rs_score_week": rs_score(position - 5),
+                "rs_score_month": rs_score(position - 21),
+                "pct_change_today": pct_change_today,
+                "avg_7": avg_7,
+                "avg_65": avg_65,
+                "ti65": ti65,
+                "is_ti65_bullish": bool(ti65 >= 1.05),
+                "is_ti65_bearish": bool(ti65 <= 0.95),
+                "is_9m_volume": bool(volume[position] >= 9000000),
+                "is_plus_4pct_change": bool(pct_change_today >= 4.0),
+                "is_minus_4pct_change": bool(pct_change_today <= -4.0),
+                "is_rs_cross_up": bool(
+                    current_rs > rs_sma_50 and previous_rs <= previous_rs_sma
+                ),
+                "updated_at": now,
+            }
+        )
+
+    return pd.DataFrame.from_records(rows)
+
+
 def save_chart_indicators_to_db(symbol: str, indicators: pd.DataFrame, engine: Engine) -> bool:
     if indicators.empty:
         return False
 
     metadata = MetaData()
     chart_indicators = _get_chart_indicators_table(metadata)
+    _ensure_chart_indicators_table(engine)
     records = _chart_indicator_records(indicators, chart_indicators)
     if not records:
         return False
@@ -1129,6 +1260,131 @@ def save_chart_indicators_batch_to_db(records: List[dict], engine: Engine) -> in
         return 0
 
 
+def get_latest_chart_indicator_dates(
+    engine: Engine, symbols: List[str]
+) -> Dict[str, dt.datetime]:
+    """Return the latest persisted chart-indicator date for each symbol."""
+    cleaned_symbols = _clean_symbols(symbols)
+    if not cleaned_symbols:
+        return {}
+
+    try:
+        table = _ensure_chart_indicators_table(engine)
+        stmt = (
+            select(table.c.symbol, func.max(table.c.date).label("latest_date"))
+            .where(table.c.symbol.in_(cleaned_symbols))
+            .group_by(table.c.symbol)
+        )
+        with engine.connect() as conn:
+            rows = conn.execute(stmt).all()
+    except SQLAlchemyError:
+        return {}
+    return {str(row.symbol).upper(): row.latest_date for row in rows if row.latest_date is not None}
+
+
+def get_latest_chart_indicator_source_dates(
+    engine: Engine,
+    symbols: List[str],
+    reference_symbol: str = "SPY",
+) -> Dict[str, dt.datetime]:
+    """Return each symbol's latest daily date that is also present for SPY."""
+    reference_symbol = reference_symbol.strip().upper()
+    cleaned_symbols = [symbol for symbol in _clean_symbols(symbols) if symbol != reference_symbol]
+    if not cleaned_symbols:
+        return {}
+
+    metadata = MetaData()
+    prices = _get_price_history_table(metadata)
+    reference_prices = prices.alias("reference_prices")
+    join_condition = (
+        (prices.c.date == reference_prices.c.date)
+        & (reference_prices.c.symbol == reference_symbol)
+        & (reference_prices.c.interval == "1d")
+    )
+    stmt = (
+        select(prices.c.symbol, func.max(prices.c.date).label("latest_date"))
+        .select_from(prices.join(reference_prices, join_condition))
+        .where(prices.c.symbol.in_(cleaned_symbols), prices.c.interval == "1d")
+        .group_by(prices.c.symbol)
+    )
+    try:
+        _ensure_price_history_table(engine)
+        with engine.connect() as conn:
+            rows = conn.execute(stmt).all()
+    except SQLAlchemyError:
+        return {}
+    return {str(row.symbol).upper(): row.latest_date for row in rows if row.latest_date is not None}
+
+
+def get_chart_indicator_refresh_plan(
+    engine: Engine,
+    tickers: List[str],
+    reference_symbol: str = "SPY",
+    force: bool = False,
+) -> Dict[str, dt.datetime]:
+    """Map symbols to the earliest common price date missing an indicator row.
+
+    Checking only ``MAX(chart_indicators.date)`` is not sufficient after an
+    interrupted run: a latest row can exist while an older batch or a middle
+    row is absent.  The anti-join below treats the symbol/SPY daily-date
+    intersection as the source of truth and finds the first uncovered date.
+    """
+    reference_symbol = reference_symbol.strip().upper()
+    symbols = [symbol for symbol in _clean_symbols(tickers) if symbol != reference_symbol]
+    if not symbols:
+        return {}
+
+    metadata = MetaData()
+    prices = _get_price_history_table(metadata)
+    reference_prices = prices.alias("chart_reference_prices")
+    indicators = _get_chart_indicators_table(metadata)
+    source = prices.join(
+        reference_prices,
+        (prices.c.date == reference_prices.c.date)
+        & (reference_prices.c.symbol == reference_symbol)
+        & (reference_prices.c.interval == "1d"),
+    )
+
+    if force:
+        stmt = (
+            select(prices.c.symbol, func.min(prices.c.date).label("first_missing"))
+            .select_from(source)
+            .where(prices.c.symbol.in_(symbols), prices.c.interval == "1d")
+            .group_by(prices.c.symbol)
+        )
+    else:
+        source_with_indicators = source.outerjoin(
+            indicators,
+            (indicators.c.symbol == prices.c.symbol)
+            & (indicators.c.date == prices.c.date),
+        )
+        stmt = (
+            select(prices.c.symbol, func.min(prices.c.date).label("first_missing"))
+            .select_from(source_with_indicators)
+            .where(
+                prices.c.symbol.in_(symbols),
+                prices.c.interval == "1d",
+                indicators.c.date.is_(None),
+            )
+            .group_by(prices.c.symbol)
+        )
+
+    try:
+        _ensure_price_history_table(engine)
+        _ensure_chart_indicators_table(engine)
+        with engine.connect() as conn:
+            rows = conn.execute(stmt).all()
+    except SQLAlchemyError as exc:
+        # A failed cache-decision query must never be interpreted as a hit.
+        raise RuntimeError("Unable to verify chart-indicator cache coverage") from exc
+
+    return {
+        str(row.symbol).upper(): row.first_missing
+        for row in rows
+        if row.first_missing is not None
+    }
+
+
 def refresh_chart_indicators_for_symbol(symbol: str, engine: Engine, reference_symbol: str = "SPY") -> bool:
     history = load_symbol_history_from_db(symbol, engine)
     spy_history = load_symbol_history_from_db(reference_symbol, engine)
@@ -1141,18 +1397,29 @@ def refresh_chart_indicators_to_db(
     engine: Engine,
     reference_symbol: str = "SPY",
     log_callback: Optional[Callable[[str], None]] = None,
+    force: bool = False,
 ) -> List[str]:
     updated = []
-    symbols = [
-        symbol.strip().upper()
-        for symbol in tickers
-        if symbol.strip() and symbol.strip().upper() != reference_symbol
-    ]
+    reference_symbol = reference_symbol.strip().upper()
+    all_symbols = [symbol for symbol in _clean_symbols(tickers) if symbol != reference_symbol]
+    refresh_plan = get_chart_indicator_refresh_plan(
+        engine, all_symbols, reference_symbol=reference_symbol, force=force
+    )
+    symbols = list(refresh_plan)
+    cached_count = len(all_symbols) - len(symbols)
+    if not symbols:
+        if log_callback:
+            log_callback(f"Chart indicators already current for {len(all_symbols)} symbols -- skipping.")
+        return []
+
     total = len(symbols)
     start_ts = time.time()
     progress_every = max(1, min(100, total // 20 or 1))
     if log_callback:
-        log_callback(f"Calculating chart indicators: 0/{total} (0%) - ETA calculating...")
+        log_callback(
+            f"Calculating chart indicators: 0/{total} (0%) - "
+            f"cached={cached_count}, ETA calculating..."
+        )
 
     histories = load_universe_history_from_db(list(dict.fromkeys([reference_symbol, *symbols])), engine)
     if not histories:
@@ -1198,7 +1465,12 @@ def refresh_chart_indicators_to_db(
             if log_callback:
                 log_callback(f"  {symbol}: unable to calculate chart indicators")
         else:
-            indicators = calculate_chart_indicators(symbol, history, spy_history)
+            indicators = calculate_chart_indicators_since(
+                symbol,
+                history,
+                spy_history,
+                start_date=refresh_plan[symbol],
+            )
             records = _chart_indicator_records(indicators, chart_indicators)
             if records:
                 pending_records.extend(records)
@@ -1292,6 +1564,42 @@ def get_latest_price_history_dates(
         return {}
 
     return {str(row.symbol).upper(): row.latest_date for row in rows if row.latest_date is not None}
+
+
+def get_price_history_watermarks(
+    engine: Engine,
+    symbols: List[str],
+    interval: str = "1d",
+) -> Dict[str, Tuple[Optional[dt.datetime], int]]:
+    """Return causal cache watermarks (latest date and row count) by symbol."""
+    cleaned_symbols = _clean_symbols(symbols)
+    if not cleaned_symbols:
+        return {}
+
+    metadata = MetaData()
+    price_history = _get_price_history_table(metadata)
+    _ensure_price_history_table(engine)
+    stmt = (
+        select(
+            price_history.c.symbol,
+            func.max(price_history.c.date).label("latest_date"),
+            func.count().label("row_count"),
+        )
+        .where(
+            price_history.c.symbol.in_(cleaned_symbols),
+            price_history.c.interval == interval.strip().lower(),
+        )
+        .group_by(price_history.c.symbol)
+    )
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(stmt).all()
+    except SQLAlchemyError:
+        return {}
+    return {
+        str(row.symbol).upper(): (row.latest_date, int(row.row_count or 0))
+        for row in rows
+    }
 
 
 def get_latest_hourly_price_history_timestamps(
@@ -1776,24 +2084,109 @@ def refresh_universe_hourly_history_to_db(
     return deduped_updated
 
 
+def scanner_metrics_snapshot_date(expected_date: Optional[dt.date] = None) -> dt.datetime:
+    """Database key for metrics derived from the latest completed market session."""
+    market_date = expected_date or expected_latest_market_data_date()
+    if isinstance(market_date, dt.datetime):
+        market_date = market_date.date()
+    return dt.datetime.combine(market_date, dt.time.min)
+
+
+def _scanner_metric_and_input_symbols(tickers: List[str]) -> Tuple[List[str], List[str]]:
+    metric_symbols = [
+        symbol for symbol in _clean_symbols(tickers) if symbol != REFERENCE_SYMBOL
+    ]
+    return metric_symbols, [REFERENCE_SYMBOL, *metric_symbols]
+
+
+def scanner_metrics_input_fingerprint(
+    tickers: List[str], history_watermarks: Dict[str, object]
+) -> str:
+    """Hash the calculation version, universe, and causal daily inputs."""
+    entries = [f"version={SCANNER_METRICS_CACHE_VERSION}"]
+    for symbol in sorted(_clean_symbols(tickers)):
+        watermark = history_watermarks.get(symbol)
+        if isinstance(watermark, dict):
+            latest = watermark.get("latest_date")
+            row_count = int(watermark.get("row_count") or 0)
+        elif isinstance(watermark, (tuple, list)) and len(watermark) >= 2:
+            latest, row_count = watermark[0], int(watermark[1] or 0)
+        else:
+            # Retain a tolerant public helper for callers/tests supplying the
+            # former latest-date-only shape. New cache decisions always pass
+            # the stronger (latest date, row count) watermark.
+            latest, row_count = watermark, 0
+        if latest is None or pd.isna(latest):
+            latest_text = ""
+        else:
+            latest_text = pd.Timestamp(latest).date().isoformat()
+        entries.append(f"{symbol}|{latest_text}|{row_count}")
+    return hashlib.sha256("\n".join(entries).encode("utf-8")).hexdigest()
+
+
+def is_scanner_metrics_snapshot_current(
+    engine: Engine,
+    tickers: List[str],
+    history_watermarks: Optional[Dict[str, object]] = None,
+    snapshot_date: Optional[dt.datetime] = None,
+) -> bool:
+    """Whether a complete scanner snapshot matches the current daily inputs."""
+    metric_symbols, input_symbols = _scanner_metric_and_input_symbols(tickers)
+    if not metric_symbols:
+        return False
+    if history_watermarks is None:
+        history_watermarks = get_price_history_watermarks(
+            engine, input_symbols, interval="1d"
+        )
+    fingerprint = scanner_metrics_input_fingerprint(input_symbols, history_watermarks)
+    snapshot_date = snapshot_date or scanner_metrics_snapshot_date()
+
+    try:
+        metrics_table = _ensure_scanner_metrics_table(engine)
+        snapshots_table = _ensure_scanner_metric_snapshots_table(engine)
+        snapshot_stmt = select(
+            snapshots_table.c.input_fingerprint,
+            snapshots_table.c.metric_count,
+        ).where(snapshots_table.c.snapshot_date == snapshot_date)
+        count_stmt = select(func.count()).select_from(metrics_table).where(
+            metrics_table.c.date == snapshot_date
+        )
+        with engine.connect() as conn:
+            snapshot = conn.execute(snapshot_stmt).one_or_none()
+            if snapshot is None or snapshot.input_fingerprint != fingerprint:
+                return False
+            actual_count = int(conn.execute(count_stmt).scalar_one())
+    except SQLAlchemyError:
+        return False
+    return int(snapshot.metric_count) > 0 and actual_count == int(snapshot.metric_count)
+
+
 def get_universe_stock_metrics_from_db(
     tickers: List[str],
     engine: Engine,
     min_history_days: int = 1,
     lookback_days: int = 380,
 ) -> List[dict]:
-    # Check if we have pre-calculated metrics in the database first
-    today = _utcnow_naive().replace(hour=0, minute=0, second=0, microsecond=0)
-    cached = load_scanner_metrics_from_db(tickers, engine, today)
-    if len(cached) >= max(1, int(len(tickers) * 0.8)):
-        return cached
+    metric_symbols, input_symbols = _scanner_metric_and_input_symbols(tickers)
+    if not metric_symbols:
+        return []
+    snapshot_date = scanner_metrics_snapshot_date()
+    history_watermarks = get_price_history_watermarks(
+        engine, input_symbols, interval="1d"
+    )
+    if is_scanner_metrics_snapshot_current(
+        engine,
+        metric_symbols,
+        history_watermarks=history_watermarks,
+        snapshot_date=snapshot_date,
+    ):
+        return load_scanner_metrics_from_db(metric_symbols, engine, snapshot_date)
 
     from src.utils.data_loader import compute_stock_metrics
 
     metrics = []
     start_date = _utcnow_naive() - dt.timedelta(days=lookback_days)
-    db_tickers = list(dict.fromkeys(["SPY", *tickers]))
-    histories = load_universe_history_from_db(db_tickers, engine, start=start_date)
+    histories = load_universe_history_from_db(input_symbols, engine, start=start_date)
     if not histories:
         return []
 
@@ -1804,7 +2197,7 @@ def get_universe_stock_metrics_from_db(
         except Exception:
             spy_history = None
 
-    for symbol in tickers:
+    for symbol in metric_symbols:
         history = histories.get(symbol)
         if history is None or history.empty:
             continue
@@ -1901,10 +2294,53 @@ def save_scanner_metrics_batch_to_db(metrics_list: List[dict], date: dt.datetime
         return []
 
 
+def save_scanner_metrics_snapshot_to_db(
+    metrics_list: List[dict],
+    snapshot_date: dt.datetime,
+    input_fingerprint: str,
+    engine: Engine,
+) -> List[str]:
+    """Atomically replace a complete scanner snapshot and its cache manifest."""
+    if not metrics_list:
+        return []
+    try:
+        metrics_table = _ensure_scanner_metrics_table(engine)
+        snapshots_table = _ensure_scanner_metric_snapshots_table(engine)
+        records = [
+            _scanner_metric_record(item["symbol"], item, snapshot_date, metrics_table)
+            for item in metrics_list
+            if item.get("symbol")
+        ]
+        if not records:
+            return []
+        manifest = {
+            "snapshot_date": snapshot_date,
+            "input_fingerprint": input_fingerprint,
+            "metric_count": len(records),
+            "completed_at": _utcnow_naive(),
+        }
+        dialect_name = engine.dialect.name
+        with engine.begin() as conn:
+            conn.execute(delete(metrics_table).where(metrics_table.c.date == snapshot_date))
+            _execute_bulk_upsert(
+                conn, metrics_table, records, ("symbol", "date"), dialect_name
+            )
+            _execute_bulk_upsert(
+                conn,
+                snapshots_table,
+                [manifest],
+                ("snapshot_date",),
+                dialect_name,
+            )
+    except SQLAlchemyError:
+        return []
+    return [record["symbol"] for record in records]
+
+
 def load_scanner_metrics_from_db(tickers: List[str], engine: Engine, date: Optional[dt.datetime] = None) -> List[dict]:
     """Load cached scanner metrics from MySQL."""
     if date is None:
-        date = _utcnow_naive().replace(hour=0, minute=0, second=0, microsecond=0)
+        date = scanner_metrics_snapshot_date()
 
     metadata = MetaData()
     table = _get_scanner_metrics_table(metadata)
@@ -1934,22 +2370,39 @@ def refresh_scanner_metrics_to_db(
     tickers: List[str],
     engine: Engine,
     log_callback: Optional[Callable[[str], None]] = None,
+    force: bool = False,
 ) -> List[str]:
     """Calculate and store scanner metrics for the universe in MySQL."""
+    symbols, input_symbols = _scanner_metric_and_input_symbols(tickers)
+    if not symbols:
+        return []
+    snapshot_date = scanner_metrics_snapshot_date()
+    history_watermarks = get_price_history_watermarks(
+        engine, input_symbols, interval="1d"
+    )
+    input_fingerprint = scanner_metrics_input_fingerprint(
+        input_symbols, history_watermarks
+    )
+    if not force and is_scanner_metrics_snapshot_current(
+        engine,
+        symbols,
+        history_watermarks=history_watermarks,
+        snapshot_date=snapshot_date,
+    ):
+        if log_callback:
+            log_callback(
+                f"Scanner metrics already current for {snapshot_date.date()} -- skipping."
+            )
+        return []
+
     if log_callback:
         log_callback("Pre-calculating and saving scanner metrics to MySQL...")
-        
+
     try:
-        # Force a bypass of the cache lookup during generation by querying history
-        # We need to temporarily mock/disable cache check or compute directly
-        # Easiest way: call get_universe_stock_metrics_from_db with lookback_days
-        # But wait, to prevent infinite recursion, we check if cached is loaded.
-        # Since we haven't written to DB yet, cached should be empty anyway!
-        # Just to be 100% sure we don't load stale cache, we can query on-the-fly:
+        # Compute directly so a stale snapshot is never read during generation.
         metrics_list = []
         start_date = _utcnow_naive() - dt.timedelta(days=380)
-        db_tickers = list(dict.fromkeys(["SPY", *tickers]))
-        histories = load_universe_history_from_db(db_tickers, engine, start=start_date)
+        histories = load_universe_history_from_db(input_symbols, engine, start=start_date)
         if not histories:
             if log_callback:
                 log_callback("  Failed to load history for calculation.")
@@ -1963,7 +2416,6 @@ def refresh_scanner_metrics_to_db(
                 spy_history = None
 
         from src.utils.data_loader import compute_stock_metrics
-        symbols = _clean_symbols(tickers)
         total_symbols = len(symbols)
         metric_start_ts = time.time()
         metric_progress_every = max(1, min(100, total_symbols // 20 or 1))
@@ -2004,13 +2456,23 @@ def refresh_scanner_metrics_to_db(
         for idx, item in enumerate(metrics_list):
             item["growth_rank_3m"] = float(ranks_3m.iloc[idx])
 
-        today = _utcnow_naive().replace(hour=0, minute=0, second=0, microsecond=0)
         save_total = len(metrics_list)
         save_start_ts = time.time()
         if log_callback:
             log_callback(f"Saving scanner metrics: 0/{save_total} (0%) - ETA calculating...")
 
-        saved = save_scanner_metrics_batch_to_db(metrics_list, today, engine)
+        saved = save_scanner_metrics_snapshot_to_db(
+            metrics_list, snapshot_date, input_fingerprint, engine
+        )
+        snapshot_complete = (
+            len(saved) == len(metrics_list)
+            and is_scanner_metrics_snapshot_current(
+                engine,
+                symbols,
+                history_watermarks=history_watermarks,
+                snapshot_date=snapshot_date,
+            )
+        )
         if log_callback:
             elapsed = time.time() - save_start_ts
             log_callback(
@@ -2019,8 +2481,13 @@ def refresh_scanner_metrics_to_db(
             )
                 
         if log_callback:
-            log_callback(f"  Successfully saved scanner metrics for {len(saved)} symbols to MySQL.")
-        return saved
+            if snapshot_complete:
+                log_callback(
+                    f"  Successfully saved scanner metrics for {len(saved)} symbols to MySQL."
+                )
+            else:
+                log_callback("  Failed to commit a complete scanner metrics snapshot.")
+        return saved if snapshot_complete else []
     except Exception as exc:
         if log_callback:
             log_callback(f"  Failed to save scanner metrics: {exc}")
