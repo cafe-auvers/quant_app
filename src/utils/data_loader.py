@@ -443,6 +443,39 @@ def _normalize_batch_download_columns(history: pd.DataFrame, symbols: List[str])
     return normalized
 
 
+def _normalize_refresh_history_index(
+    history: pd.DataFrame, interval: str
+) -> pd.DataFrame:
+    """Use one storage-safe index shape across batch and chart responses.
+
+    Yahoo's batch daily history commonly uses a naive midnight session date,
+    while its chart endpoint uses an exchange-timezone timestamp. Intraday
+    responses can likewise disagree between exchange time and UTC. Normalize
+    only freshness-constrained refresh downloads so generic chart callers keep
+    their existing timezone behavior.
+    """
+    if history.empty:
+        return history
+    try:
+        index = pd.DatetimeIndex(pd.to_datetime(history.index))
+    except (TypeError, ValueError):
+        return history
+
+    normalized = history.copy()
+    if (interval or "1d").strip().lower() == "1d":
+        # Preserve the exchange-local calendar date before dropping timezone
+        # information. Converting a 09:30 America/New_York daily bar to UTC is
+        # unnecessary and can no longer join a naive midnight batch row.
+        normalized.index = pd.DatetimeIndex(
+            [pd.Timestamp(timestamp.date()) for timestamp in index]
+        )
+    else:
+        if index.tz is not None:
+            index = index.tz_convert("UTC").tz_localize(None)
+        normalized.index = index
+    return normalized
+
+
 def _find_symbol_column_level(
     columns: pd.MultiIndex,
     symbols: List[str],
@@ -515,14 +548,27 @@ def _coalesce_ohlcv_columns(history: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def _symbols_with_downloaded_history(history: pd.DataFrame, symbols: List[str]) -> List[str]:
+def _symbols_with_downloaded_history(
+    history: pd.DataFrame,
+    symbols: List[str],
+    required_latest_date: Optional[dt.date] = None,
+) -> List[str]:
+    """Return symbols with usable history, optionally through a required date."""
     if history.empty:
         return []
     available = []
     for symbol in symbols:
         symbol_history = _extract_symbol_history(history, symbol)
-        if symbol_history is not None and not symbol_history.empty:
-            available.append(symbol)
+        if symbol_history is None or symbol_history.empty:
+            continue
+        if required_latest_date is not None:
+            try:
+                latest = pd.Timestamp(symbol_history.index.max())
+            except (TypeError, ValueError):
+                continue
+            if pd.isna(latest) or latest.date() < required_latest_date:
+                continue
+        available.append(symbol)
     return available
 
 
@@ -584,13 +630,16 @@ def download_price_history(
     max_retries: int = 1,
     fallback_to_single: bool = True,
     chart_fallback: bool = True,
+    required_latest_date: Optional[dt.date] = None,
 ) -> pd.DataFrame:
     """Download price history for a universe of tickers.
 
     Uses yfinance batch downloads by default and keeps the existing MultiIndex
     return shape for callers that extract one symbol at a time. Partial batch
     failures are retried with smaller chunks, then optionally with the existing
-    single-symbol fallback.
+    single-symbol fallback. When ``required_latest_date`` is provided, a
+    nonempty response that stops before that session remains eligible for the
+    direct-chart fallback instead of being mistaken for a successful refresh.
     """
     universe = _clean_download_tickers(tickers, max_symbols)
     if not universe:
@@ -607,11 +656,16 @@ def download_price_history(
         except Exception:
             data = pd.DataFrame()
         data = _normalize_batch_download_columns(data, batch)
+        if required_latest_date is not None:
+            data = _normalize_refresh_history_index(data, interval)
 
         available = _symbols_with_downloaded_history(data, batch)
+        satisfied = _symbols_with_downloaded_history(
+            data, batch, required_latest_date=required_latest_date
+        )
         if not data.empty and available:
             frames.append(data)
-        failed_symbols.extend([symbol for symbol in batch if symbol not in available])
+        failed_symbols.extend([symbol for symbol in batch if symbol not in satisfied])
 
         if batch_sleep > 0 and batch_index < len(batches) - 1:
             time.sleep(batch_sleep + random.uniform(0.0, 0.5))
@@ -632,11 +686,16 @@ def download_price_history(
             except Exception:
                 data = pd.DataFrame()
             data = _normalize_batch_download_columns(data, batch)
+            if required_latest_date is not None:
+                data = _normalize_refresh_history_index(data, interval)
 
             available = _symbols_with_downloaded_history(data, batch)
+            satisfied = _symbols_with_downloaded_history(
+                data, batch, required_latest_date=required_latest_date
+            )
             if not data.empty and available:
                 frames.append(data)
-            next_retry.extend([symbol for symbol in batch if symbol not in available])
+            next_retry.extend([symbol for symbol in batch if symbol not in satisfied])
 
         retry_symbols = list(dict.fromkeys(next_retry))
 
@@ -648,10 +707,20 @@ def download_price_history(
             threads=threads,
         )
         chart_data = _normalize_batch_download_columns(chart_data, retry_symbols)
+        if required_latest_date is not None:
+            chart_data = _normalize_refresh_history_index(chart_data, interval)
         available = _symbols_with_downloaded_history(chart_data, retry_symbols)
+        satisfied = _symbols_with_downloaded_history(
+            chart_data,
+            retry_symbols,
+            required_latest_date=required_latest_date,
+        )
         if not chart_data.empty and available:
             frames.append(chart_data)
-        retry_symbols = [symbol for symbol in retry_symbols if symbol not in set(available)]
+        satisfied_set = set(satisfied)
+        retry_symbols = [
+            symbol for symbol in retry_symbols if symbol not in satisfied_set
+        ]
 
     if fallback_to_single and retry_symbols:
         for symbol in retry_symbols:
@@ -664,7 +733,14 @@ def download_price_history(
                 )
                 if symbol_history.empty:
                     continue
-                frames.append(_normalize_batch_download_columns(symbol_history, [symbol]))
+                symbol_history = _normalize_batch_download_columns(
+                    symbol_history, [symbol]
+                )
+                if required_latest_date is not None:
+                    symbol_history = _normalize_refresh_history_index(
+                        symbol_history, interval
+                    )
+                frames.append(symbol_history)
             except Exception:
                 continue
 

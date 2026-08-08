@@ -58,6 +58,50 @@ def test_daily_refresh_counts_old_nonempty_history_as_failure(monkeypatch, sqlit
     assert db_loader.get_chronically_failing_symbols(engine, "1d") == set()
 
 
+def test_daily_refresh_retries_nonempty_stale_history_and_accepts_fresh_retry(
+    monkeypatch, sqlite_engine
+):
+    engine = sqlite_engine
+    expected_date = dt.date(2026, 6, 23)
+    responses = iter(
+        [
+            _single_symbol_history("2026-06-20"),
+            _single_symbol_history("2026-06-23"),
+        ]
+    )
+    calls = []
+    logs = []
+
+    def download(*args, **kwargs):
+        calls.append((args, kwargs))
+        return next(responses)
+
+    monkeypatch.setattr(db_loader, "expected_latest_market_data_date", lambda: expected_date)
+    monkeypatch.setattr(db_loader, "download_price_history", download)
+    monkeypatch.setattr(db_loader.time, "sleep", lambda _seconds: None)
+
+    for _ in range(db_loader.CHRONIC_FAILURE_THRESHOLD):
+        db_loader.record_symbol_refresh_outcomes(engine, "1d", [], ["STALE"])
+    assert db_loader.get_chronically_failing_symbols(engine, "1d") == {"STALE"}
+
+    updated = db_loader.refresh_universe_history_to_db(
+        ["STALE"],
+        engine,
+        chunk_size=1,
+        batch_sleep=0,
+        retry_attempts=1,
+        log_callback=logs.append,
+    )
+
+    assert updated == ["STALE"]
+    assert len(calls) == 2
+    assert any("Retry 1/1 for 1 1d symbols" in message for message in logs)
+    latest, row_count = db_loader.get_price_history_watermarks(engine, ["STALE"])["STALE"]
+    assert latest.date() == expected_date
+    assert row_count == 2
+    assert db_loader.get_chronically_failing_symbols(engine, "1d") == set()
+
+
 def test_hourly_refresh_counts_old_nonempty_history_as_failure(monkeypatch, sqlite_engine):
     engine = sqlite_engine
     expected_date = dt.date(2026, 6, 23)
@@ -81,6 +125,31 @@ def test_hourly_refresh_counts_old_nonempty_history_as_failure(monkeypatch, sqli
     )
 
     assert db_loader.get_chronically_failing_symbols(engine, "1h") == set()
+
+
+def test_provider_outage_only_advances_reference_symbol_failure_streak(
+    monkeypatch, sqlite_engine
+):
+    expected_date = dt.date(2026, 6, 23)
+    monkeypatch.setattr(
+        db_loader, "expected_latest_market_data_date", lambda: expected_date
+    )
+    monkeypatch.setattr(
+        db_loader, "download_price_history", lambda *args, **kwargs: pd.DataFrame()
+    )
+
+    for _ in range(db_loader.CHRONIC_FAILURE_THRESHOLD):
+        db_loader.refresh_universe_history_to_db(
+            ["SPY", "AAPL"],
+            sqlite_engine,
+            chunk_size=2,
+            batch_sleep=0,
+            retry_attempts=0,
+        )
+
+    assert db_loader.get_chronically_failing_symbols(sqlite_engine, "1d") == {
+        "SPY"
+    }
 
 
 @pytest.mark.parametrize(

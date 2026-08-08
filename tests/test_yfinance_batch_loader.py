@@ -89,6 +89,81 @@ def test_download_price_history_uses_chart_fallback_for_empty_batch(monkeypatch)
     assert data_loader._extract_symbol_history(history, "AAPL") is not None
 
 
+def test_download_price_history_uses_chart_fallback_for_nonempty_stale_batch(monkeypatch):
+    stale = _multi_symbol_history(
+        ["AAA"],
+        dates=pd.to_datetime(["2026-08-06"]),
+    )
+    fallback_calls = []
+
+    def fake_batch(symbols, **_kwargs):
+        assert symbols == ["AAA"]
+        return stale
+
+    def fake_chart_batch(symbols, **_kwargs):
+        fallback_calls.append(list(symbols))
+        fresh = _multi_symbol_history(
+            symbols,
+            dates=pd.to_datetime(["2026-08-06", "2026-08-07"]),
+        )
+        fresh.index = fresh.index.tz_localize("America/New_York")
+        return fresh
+
+    monkeypatch.setattr(data_loader, "_download_yfinance_batch", fake_batch)
+    monkeypatch.setattr(data_loader, "_download_chart_fallback_batch", fake_chart_batch)
+
+    history = data_loader.download_price_history(
+        ["AAA"],
+        batch_sleep=0,
+        max_retries=0,
+        fallback_to_single=False,
+        required_latest_date=dt.date(2026, 8, 7),
+    )
+
+    symbol_history = data_loader._extract_symbol_history(history, "AAA")
+    assert fallback_calls == [["AAA"]]
+    assert symbol_history is not None
+    assert [timestamp.date() for timestamp in symbol_history.index] == [
+        dt.date(2026, 8, 6),
+        dt.date(2026, 8, 7),
+    ]
+    assert symbol_history.index.tz is None
+    assert symbol_history.index.is_unique
+
+
+def test_download_price_history_does_not_fallback_when_batch_is_current(monkeypatch):
+    current = _multi_symbol_history(
+        ["AAA"],
+        dates=pd.to_datetime(["2026-08-07"]),
+    )
+    fallback_calls = []
+
+    monkeypatch.setattr(
+        data_loader,
+        "_download_yfinance_batch",
+        lambda symbols, **_kwargs: current,
+    )
+
+    def fake_chart_batch(symbols, **_kwargs):
+        fallback_calls.append(list(symbols))
+        return pd.DataFrame()
+
+    monkeypatch.setattr(data_loader, "_download_chart_fallback_batch", fake_chart_batch)
+
+    history = data_loader.download_price_history(
+        ["AAA"],
+        batch_sleep=0,
+        max_retries=0,
+        fallback_to_single=False,
+        required_latest_date=dt.date(2026, 8, 7),
+    )
+
+    symbol_history = data_loader._extract_symbol_history(history, "AAA")
+    assert fallback_calls == []
+    assert symbol_history is not None
+    assert pd.Timestamp(symbol_history.index[-1]).date() == dt.date(2026, 8, 7)
+
+
 def test_daily_period_selection_uses_incremental_for_recent_cache():
     now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
 

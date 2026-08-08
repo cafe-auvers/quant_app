@@ -79,10 +79,10 @@ def _refresh_targets_needed() -> Tuple[Dict[str, List[str]], str]:
     unsupported preferred-share class can never become "current," so letting
     it count here would trigger a full 5000+-symbol refresh on every single
     PC restart forever, even once every fetchable symbol is already caught
-    up. historical.py still retries them opportunistically whenever a
-    refresh runs for any other reason -- they just can't force one on their
-    own past the threshold. SPY remains an always-actionable canary so a broad
-    provider outage cannot quarantine the entire universe permanently.
+    up. Once they cross the threshold they are also omitted from automatic
+    refresh payloads; a manual/full refresh can still retry them. SPY remains
+    an always-actionable canary so a broad provider outage cannot quarantine
+    the entire universe permanently.
 
     Derived 1D artifacts are checked independently. An interrupted indicator
     or scanner phase can therefore resume without downloading already-current
@@ -110,16 +110,32 @@ def _refresh_targets_needed() -> Tuple[Dict[str, List[str]], str]:
         tickers,
         expected_date,
     )
-    daily_stale = [
-        symbol
-        for symbol in daily_stale_all
-        if symbol == REFERENCE_SYMBOL or symbol not in chronic_daily
-    ]
-    hourly_stale = [
-        symbol
-        for symbol in hourly_stale_all
-        if symbol == REFERENCE_SYMBOL or symbol not in chronic_hourly
-    ]
+    daily_canary_backoff = (
+        REFERENCE_SYMBOL in daily_stale_all
+        and REFERENCE_SYMBOL in chronic_daily
+    )
+    hourly_canary_backoff = (
+        REFERENCE_SYMBOL in hourly_stale_all
+        and REFERENCE_SYMBOL in chronic_hourly
+    )
+    daily_stale = (
+        [REFERENCE_SYMBOL]
+        if daily_canary_backoff
+        else [
+            symbol
+            for symbol in daily_stale_all
+            if symbol == REFERENCE_SYMBOL or symbol not in chronic_daily
+        ]
+    )
+    hourly_stale = (
+        [REFERENCE_SYMBOL]
+        if hourly_canary_backoff
+        else [
+            symbol
+            for symbol in hourly_stale_all
+            if symbol == REFERENCE_SYMBOL or symbol not in chronic_hourly
+        ]
+    )
 
     # A daily history run always validates derived caches after its writes, so
     # avoid querying them twice when price staleness already guarantees 1D.
@@ -143,7 +159,7 @@ def _refresh_targets_needed() -> Tuple[Dict[str, List[str]], str]:
     reasons = []
     derived_daily_needed = bool(chart_refresh_plan) or not scanner_current
     if daily_stale or derived_daily_needed:
-        targets["1d"] = daily_stale_all
+        targets["1d"] = daily_stale
     if daily_stale:
         reasons.append(_describe_stale("1D", daily_stale, expected_date))
     if chart_refresh_plan:
@@ -153,16 +169,40 @@ def _refresh_targets_needed() -> Tuple[Dict[str, List[str]], str]:
     if not scanner_current:
         reasons.append("Scanner metrics snapshot is missing or stale.")
     if hourly_stale:
-        targets["1h"] = hourly_stale_all
+        targets["1h"] = hourly_stale
         reasons.append(_describe_stale("1H", hourly_stale, expected_date))
 
-    excluded_daily = len(daily_stale_all) - len(daily_stale)
-    excluded_hourly = len(hourly_stale_all) - len(hourly_stale)
+    daily_target_set = set(daily_stale)
+    hourly_target_set = set(hourly_stale)
+    excluded_daily = sum(
+        symbol != REFERENCE_SYMBOL
+        and symbol in chronic_daily
+        and symbol not in daily_target_set
+        for symbol in daily_stale_all
+    )
+    excluded_hourly = sum(
+        symbol != REFERENCE_SYMBOL
+        and symbol in chronic_hourly
+        and symbol not in hourly_target_set
+        for symbol in hourly_stale_all
+    )
+    deferred_daily = sum(
+        symbol not in chronic_daily and symbol not in daily_target_set
+        for symbol in daily_stale_all
+    )
+    deferred_hourly = sum(
+        symbol not in chronic_hourly and symbol not in hourly_target_set
+        for symbol in hourly_stale_all
+    )
     if excluded_daily or excluded_hourly:
         reasons.append(
-            f"({excluded_daily} 1D / {excluded_hourly} 1H chronic symbol(s) cannot trigger "
-            f"a run alone after {CHRONIC_FAILURE_THRESHOLD}+ stale runs; they are retried "
-            "when that mode runs for another reason.)"
+            f"({excluded_daily} 1D / {excluded_hourly} 1H chronic symbol(s) are excluded "
+            f"from automatic refresh after {CHRONIC_FAILURE_THRESHOLD}+ stale runs.)"
+        )
+    if deferred_daily or deferred_hourly:
+        reasons.append(
+            f"({deferred_daily} 1D / {deferred_hourly} 1H stale symbol(s) are deferred "
+            "while the SPY provider canary is failing.)"
         )
 
     if not targets:

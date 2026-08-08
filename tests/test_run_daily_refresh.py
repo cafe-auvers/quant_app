@@ -202,6 +202,37 @@ def test_refresh_gate_keeps_reference_symbol_actionable_during_broad_outage(monk
     assert "1 1D / 1 1H chronic symbol" in reason
 
 
+def test_refresh_gate_defers_universe_while_provider_canary_is_failing(monkeypatch):
+    refresh = _load_refresh_module()
+    expected_date = dt.date(2026, 6, 23)
+    tickers = ["SPY", "AAPL"]
+
+    monkeypatch.setattr(refresh, "init_mysql_engine", lambda: object())
+    monkeypatch.setattr(refresh, "_refresh_tickers", lambda: tickers)
+    monkeypatch.setattr(
+        refresh, "expected_latest_market_data_date", lambda: expected_date
+    )
+    monkeypatch.setattr(
+        refresh,
+        "get_chronically_failing_symbols",
+        lambda _engine, interval: {"SPY"},
+    )
+    _set_derived_current(monkeypatch, refresh)
+    monkeypatch.setattr(
+        refresh, "get_price_history_watermarks", lambda *args, **kwargs: {}
+    )
+    monkeypatch.setattr(
+        refresh,
+        "get_latest_hourly_price_history_timestamps",
+        lambda *args, **kwargs: {},
+    )
+
+    targets, reason = refresh._refresh_targets_needed()
+
+    assert targets == {"1d": ["SPY"], "1h": ["SPY"]}
+    assert "1 1D / 1 1H stale symbol(s) are deferred" in reason
+
+
 def test_refresh_gate_passes_only_stale_symbols_to_each_mode(monkeypatch):
     refresh = _load_refresh_module()
     expected_date = dt.date(2026, 6, 23)
@@ -234,9 +265,8 @@ def test_refresh_gate_passes_only_stale_symbols_to_each_mode(monkeypatch):
 
     targets, _ = refresh._refresh_targets_needed()
 
-    # MSFT and the hourly-current names never enter a yfinance batch. The
-    # chronic symbol is retried only because AAPL made the daily run useful.
-    assert targets == {"1d": ["AAPL", "GDV-H"], "1h": ["MSFT"]}
+    # Current and chronic names never enter an automatic yfinance batch.
+    assert targets == {"1d": ["AAPL"], "1h": ["MSFT"]}
 
 
 def test_refresh_gate_can_resume_derived_work_without_price_downloads(monkeypatch):
@@ -274,6 +304,54 @@ def test_refresh_gate_can_resume_derived_work_without_price_downloads(monkeypatc
 
     assert targets == {"1d": []}
     assert "Chart indicators need refresh for 1 symbol" in reason
+
+
+def test_derived_only_refresh_does_not_retry_chronic_history(monkeypatch):
+    refresh = _load_refresh_module()
+    expected_date = dt.date(2026, 6, 23)
+    tickers = ["SPY", "AAPL", "GDV-H"]
+
+    monkeypatch.setattr(refresh, "init_mysql_engine", lambda: object())
+    monkeypatch.setattr(refresh, "_refresh_tickers", lambda: tickers)
+    monkeypatch.setattr(
+        refresh, "expected_latest_market_data_date", lambda: expected_date
+    )
+    monkeypatch.setattr(
+        refresh,
+        "get_chronically_failing_symbols",
+        lambda _engine, interval: {"GDV-H"} if interval == "1d" else set(),
+    )
+    monkeypatch.setattr(
+        refresh,
+        "get_price_history_watermarks",
+        lambda *args, **kwargs: {
+            "SPY": (dt.datetime(2026, 6, 23), 250),
+            "AAPL": (dt.datetime(2026, 6, 23), 250),
+        },
+    )
+    monkeypatch.setattr(
+        refresh,
+        "get_latest_hourly_price_history_timestamps",
+        lambda *args, **kwargs: {
+            symbol: dt.datetime(2026, 6, 23, 20, 30) for symbol in tickers
+        },
+    )
+    monkeypatch.setattr(
+        refresh,
+        "get_chart_indicator_refresh_plan",
+        lambda *args, **kwargs: {"AAPL": dt.datetime(2026, 6, 20)},
+    )
+    monkeypatch.setattr(
+        refresh,
+        "is_scanner_metrics_snapshot_current",
+        lambda *args, **kwargs: True,
+    )
+
+    targets, reason = refresh._refresh_targets_needed()
+
+    assert targets == {"1d": []}
+    assert "Chart indicators need refresh" in reason
+    assert "1 1D / 0 1H chronic symbol" in reason
 
 
 def test_refresh_gate_skips_derived_queries_when_daily_history_is_stale(monkeypatch):

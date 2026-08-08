@@ -276,7 +276,10 @@ def _ensure_symbol_refresh_failures_table(engine: Engine) -> Table:
 # "is anything stale?" check return
 # true on every PC restart, re-running the full 5000+-symbol refresh each
 # time even though every fetchable symbol is already current.
-CHRONIC_FAILURE_THRESHOLD = 3
+# Existing installations may already have three failures recorded from the
+# old nonempty-is-success fetch logic. Four gives those symbols one recovery
+# run through the freshness-aware chart fallback before they are quarantined.
+CHRONIC_FAILURE_THRESHOLD = 4
 
 
 def record_symbol_refresh_outcomes(
@@ -2028,14 +2031,26 @@ def _chunk_symbols(symbols: List[str], chunk_size: int) -> List[List[str]]:
     return [symbols[index:index + size] for index in range(0, len(symbols), size)]
 
 
-def _symbols_with_history(history: pd.DataFrame, symbols: List[str]) -> List[str]:
+def _symbols_with_history(
+    history: pd.DataFrame,
+    symbols: List[str],
+    required_latest_date: Optional[dt.date] = None,
+) -> List[str]:
     if history.empty:
         return []
     available = []
     for symbol in symbols:
         symbol_history = _extract_symbol_history(history, symbol)
-        if symbol_history is not None and not symbol_history.empty:
-            available.append(symbol)
+        if symbol_history is None or symbol_history.empty:
+            continue
+        if required_latest_date is not None:
+            try:
+                latest = pd.Timestamp(symbol_history.index.max())
+            except (TypeError, ValueError):
+                continue
+            if pd.isna(latest) or latest.date() < required_latest_date:
+                continue
+        available.append(symbol)
     return available
 
 
@@ -2059,6 +2074,28 @@ def _partition_symbols_by_freshness(
             continue
         (current if latest_date >= expected_date else stale).append(symbol)
     return current, stale
+
+
+def _record_history_refresh_outcomes(
+    engine: Engine,
+    interval: str,
+    current_symbols: List[str],
+    stale_symbols: List[str],
+) -> None:
+    """Record symbol failures without mistaking a provider outage for bad tickers.
+
+    If SPY itself could not reach the expected session, failures for the rest
+    of that payload are not evidence that each individual symbol is unusable.
+    Only advance the canary's streak; current symbols still reset normally.
+    """
+    failures = (
+        [REFERENCE_SYMBOL]
+        if REFERENCE_SYMBOL in set(stale_symbols)
+        else stale_symbols
+    )
+    record_symbol_refresh_outcomes(
+        engine, interval, current_symbols, failures
+    )
 
 
 def _period_for_daily_refresh(
@@ -2129,6 +2166,8 @@ def refresh_universe_history_to_db(
     start_ts = time.time()
     updated: List[str] = []
     failed: List[str] = []
+    current_from_download: Set[str] = set()
+    expected_date = expected_latest_market_data_date()
 
     latest_by_symbol = {} if full_backfill else get_latest_price_history_dates(engine, symbols, interval=interval)
     period_by_symbol = {
@@ -2173,27 +2212,36 @@ def refresh_universe_history_to_db(
                 max_retries=0,
                 fallback_to_single=False,
                 chart_fallback=True,
+                required_latest_date=expected_date,
             )
             available = _symbols_with_history(history, batch)
-            missing = [symbol for symbol in batch if symbol not in available]
+            current = _symbols_with_history(
+                history, batch, required_latest_date=expected_date
+            )
+            current_from_download.update(current)
+            not_current = [symbol for symbol in batch if symbol not in current]
             rows_saved = save_universe_history_batch_to_db(history, available, engine, interval=interval)
 
             if rows_saved:
                 updated.extend(available)
-            failed.extend(missing)
+            failed.extend(not_current)
             processed += len(batch)
 
             if log_callback:
                 log_callback(
                     f"Batch {batch_number}/{total_batches} {interval}: rows_saved={rows_saved}, "
-                    f"failed={', '.join(missing) if missing else 'none'}"
+                    f"not_current={', '.join(not_current) if not_current else 'none'}"
                 )
             _emit_batch_progress(progress_callback, batch, processed, total, start_ts)
 
             if batch_number < total_batches:
                 _sleep_between_batches(batch_sleep)
 
-    retry_symbols = [symbol for symbol in dict.fromkeys(failed) if symbol not in set(updated)]
+    retry_symbols = [
+        symbol
+        for symbol in dict.fromkeys(failed)
+        if symbol not in current_from_download
+    ]
     for retry_index in range(1, max(0, int(retry_attempts)) + 1):
         if not retry_symbols:
             break
@@ -2222,24 +2270,35 @@ def refresh_universe_history_to_db(
                     batch_sleep=0,
                     max_retries=0,
                     fallback_to_single=False,
+                    chart_fallback=True,
+                    required_latest_date=expected_date,
                 )
                 available = _symbols_with_history(history, batch)
-                missing = [symbol for symbol in batch if symbol not in available]
+                current = _symbols_with_history(
+                    history, batch, required_latest_date=expected_date
+                )
+                current_from_download.update(current)
+                not_current = [symbol for symbol in batch if symbol not in current]
                 rows_saved = save_universe_history_batch_to_db(history, available, engine, interval=interval)
                 if rows_saved:
                     updated.extend(available)
-                next_retry.extend(missing)
+                next_retry.extend(not_current)
                 if log_callback:
                     log_callback(
                         f"Retry {retry_index} {interval}: rows_saved={rows_saved}, "
-                        f"failed={', '.join(missing) if missing else 'none'}"
+                        f"not_current={', '.join(not_current) if not_current else 'none'}"
                     )
                 _sleep_between_batches(batch_sleep)
-        retry_symbols = [symbol for symbol in dict.fromkeys(next_retry) if symbol not in set(updated)]
+        retry_symbols = [
+            symbol
+            for symbol in dict.fromkeys(next_retry)
+            if symbol not in current_from_download
+        ]
 
     if retry_symbols and log_callback:
         log_callback(
-            f"{len(retry_symbols)} {interval} symbol(s) remained unavailable after "
+            f"{len(retry_symbols)} {interval} symbol(s) remained unavailable or stale "
+            f"through {expected_date} after "
             "batch retries and concurrent chart fallback; skipping redundant "
             "serial retries."
         )
@@ -2247,7 +2306,7 @@ def refresh_universe_history_to_db(
     deduped_updated = list(dict.fromkeys(updated))
     latest_after_refresh = get_latest_price_history_dates(engine, symbols, interval=interval)
     current_symbols, stale_symbols = _partition_symbols_by_freshness(
-        latest_after_refresh, symbols, expected_latest_market_data_date()
+        latest_after_refresh, symbols, expected_date
     )
     if log_callback:
         log_callback(
@@ -2259,7 +2318,9 @@ def refresh_universe_history_to_db(
         if stale_symbols:
             log_callback(f"Still-stale {interval} symbols: {', '.join(stale_symbols)}")
 
-    record_symbol_refresh_outcomes(engine, interval, current_symbols, stale_symbols)
+    _record_history_refresh_outcomes(
+        engine, interval, current_symbols, stale_symbols
+    )
 
     return deduped_updated
 
@@ -2297,6 +2358,8 @@ def refresh_universe_hourly_history_to_db(
     start_ts = time.time()
     updated: List[str] = []
     failed: List[str] = []
+    current_from_download: Set[str] = set()
+    expected_date = expected_latest_market_data_date()
 
     latest_by_symbol = get_latest_hourly_price_history_timestamps(engine, symbols, source=source)
     period_by_symbol = {
@@ -2341,27 +2404,36 @@ def refresh_universe_hourly_history_to_db(
                 max_retries=0,
                 fallback_to_single=False,
                 chart_fallback=True,
+                required_latest_date=expected_date,
             )
             available = _symbols_with_history(history, batch)
-            missing = [symbol for symbol in batch if symbol not in available]
+            current = _symbols_with_history(
+                history, batch, required_latest_date=expected_date
+            )
+            current_from_download.update(current)
+            not_current = [symbol for symbol in batch if symbol not in current]
             rows_saved = save_universe_hourly_history_batch_to_db(history, available, engine, source=source)
 
             if rows_saved:
                 updated.extend(available)
-            failed.extend(missing)
+            failed.extend(not_current)
             processed += len(batch)
 
             if log_callback:
                 log_callback(
                     f"Batch {batch_number}/{total_batches} 1h: rows_saved={rows_saved}, "
-                    f"failed={', '.join(missing) if missing else 'none'}"
+                    f"not_current={', '.join(not_current) if not_current else 'none'}"
                 )
             _emit_batch_progress(progress_callback, batch, processed, total, start_ts)
 
             if batch_number < total_batches:
                 _sleep_between_batches(batch_sleep)
 
-    retry_symbols = [symbol for symbol in dict.fromkeys(failed) if symbol not in set(updated)]
+    retry_symbols = [
+        symbol
+        for symbol in dict.fromkeys(failed)
+        if symbol not in current_from_download
+    ]
     for retry_index in range(1, max(0, int(retry_attempts)) + 1):
         if not retry_symbols:
             break
@@ -2391,24 +2463,34 @@ def refresh_universe_hourly_history_to_db(
                     max_retries=0,
                     fallback_to_single=False,
                     chart_fallback=True,
+                    required_latest_date=expected_date,
                 )
                 available = _symbols_with_history(history, batch)
-                missing = [symbol for symbol in batch if symbol not in available]
+                current = _symbols_with_history(
+                    history, batch, required_latest_date=expected_date
+                )
+                current_from_download.update(current)
+                not_current = [symbol for symbol in batch if symbol not in current]
                 rows_saved = save_universe_hourly_history_batch_to_db(history, available, engine, source=source)
                 if rows_saved:
                     updated.extend(available)
-                next_retry.extend(missing)
+                next_retry.extend(not_current)
                 if log_callback:
                     log_callback(
                         f"Retry {retry_index} 1h: rows_saved={rows_saved}, "
-                        f"failed={', '.join(missing) if missing else 'none'}"
+                        f"not_current={', '.join(not_current) if not_current else 'none'}"
                     )
                 _sleep_between_batches(batch_sleep)
-        retry_symbols = [symbol for symbol in dict.fromkeys(next_retry) if symbol not in set(updated)]
+        retry_symbols = [
+            symbol
+            for symbol in dict.fromkeys(next_retry)
+            if symbol not in current_from_download
+        ]
 
     if retry_symbols and log_callback:
         log_callback(
-            f"{len(retry_symbols)} 1h symbol(s) remained unavailable after batch "
+            f"{len(retry_symbols)} 1h symbol(s) remained unavailable or stale through "
+            f"{expected_date} after batch "
             "retries and concurrent chart fallback; skipping redundant serial retries."
         )
 
@@ -2416,7 +2498,7 @@ def refresh_universe_hourly_history_to_db(
     # Match the gate: current data from any hourly source satisfies freshness.
     latest_after_refresh = get_latest_hourly_price_history_timestamps(engine, symbols)
     current_symbols, stale_symbols = _partition_symbols_by_freshness(
-        latest_after_refresh, symbols, expected_latest_market_data_date()
+        latest_after_refresh, symbols, expected_date
     )
     if log_callback:
         log_callback(
@@ -2428,7 +2510,9 @@ def refresh_universe_hourly_history_to_db(
         if stale_symbols:
             log_callback(f"Still-stale 1h symbols: {', '.join(stale_symbols)}")
 
-    record_symbol_refresh_outcomes(engine, "1h", current_symbols, stale_symbols)
+    _record_history_refresh_outcomes(
+        engine, "1h", current_symbols, stale_symbols
+    )
 
     return deduped_updated
 
