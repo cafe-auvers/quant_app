@@ -4,7 +4,7 @@ import logging
 import re
 import time
 import random
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 import numpy as np
@@ -237,6 +237,117 @@ def _ensure_hourly_price_history_table(engine: Engine) -> Table:
     hourly_history = _get_hourly_price_history_table(metadata)
     metadata.create_all(engine)
     return hourly_history
+
+
+def _get_symbol_refresh_failures_table(metadata: MetaData) -> Table:
+    return Table(
+        "symbol_refresh_failures",
+        metadata,
+        Column("symbol", String(20), primary_key=True),
+        Column("interval", String(10), primary_key=True),
+        Column("consecutive_failures", Integer, nullable=False, default=0),
+        Column("last_attempt_at", DateTime, nullable=False, default=_utcnow_naive),
+    )
+
+
+def _ensure_symbol_refresh_failures_table(engine: Engine) -> Table:
+    metadata = MetaData()
+    table = _get_symbol_refresh_failures_table(metadata)
+    metadata.create_all(engine)
+    return table
+
+
+# Consecutive failed refresh attempts (across separate historical.py runs)
+# before a symbol stops gating scripts/run_daily_refresh.py's staleness
+# check. A handful of tickers (delisted symbols, preferred-share classes
+# yfinance doesn't carry, etc.) can fail every single attempt forever; without
+# this, one such symbol makes the daily "is anything stale?" check return
+# true on every PC restart, re-running the full 5000+-symbol refresh each
+# time even though every fetchable symbol is already current.
+CHRONIC_FAILURE_THRESHOLD = 3
+
+
+def record_symbol_refresh_outcomes(
+    engine: Engine,
+    interval: str,
+    succeeded: List[str],
+    failed: List[str],
+) -> None:
+    """Persist per-symbol pass/fail streaks from a refresh_universe_*_to_db run.
+
+    A success resets the streak to 0 (so a symbol that starts working again
+    stops being excluded). A failure increments it. See
+    get_chronically_failing_symbols for how the streak is consumed.
+    """
+    succeeded_symbols = _clean_symbols(succeeded)
+    failed_symbols = [s for s in _clean_symbols(failed) if s not in set(succeeded_symbols)]
+    if not succeeded_symbols and not failed_symbols:
+        return
+
+    interval = interval.strip().lower()
+    now = _utcnow_naive()
+
+    metadata = MetaData()
+    table = _get_symbol_refresh_failures_table(metadata)
+    _ensure_symbol_refresh_failures_table(engine)
+    dialect_name = engine.dialect.name
+
+    try:
+        with engine.begin() as conn:
+            if succeeded_symbols:
+                reset_records = [
+                    {"symbol": symbol, "interval": interval, "consecutive_failures": 0, "last_attempt_at": now}
+                    for symbol in succeeded_symbols
+                ]
+                _execute_bulk_upsert(conn, table, reset_records, ("symbol", "interval"), dialect_name)
+            if failed_symbols:
+                fail_records = [
+                    {"symbol": symbol, "interval": interval, "consecutive_failures": 1, "last_attempt_at": now}
+                    for symbol in failed_symbols
+                ]
+                if dialect_name == "mysql":
+                    stmt = mysql_insert(table).values(fail_records)
+                    conn.execute(
+                        stmt.on_duplicate_key_update(
+                            consecutive_failures=table.c.consecutive_failures + 1,
+                            last_attempt_at=stmt.inserted.last_attempt_at,
+                        )
+                    )
+                elif dialect_name == "sqlite":
+                    stmt = sqlite_insert(table).values(fail_records)
+                    conn.execute(
+                        stmt.on_conflict_do_update(
+                            index_elements=["symbol", "interval"],
+                            set_={
+                                "consecutive_failures": table.c.consecutive_failures + 1,
+                                "last_attempt_at": stmt.excluded.last_attempt_at,
+                            },
+                        )
+                    )
+                else:
+                    conn.execute(insert(table), fail_records)
+    except SQLAlchemyError:
+        # Best-effort bookkeeping only -- never let this fail the refresh run.
+        pass
+
+
+def get_chronically_failing_symbols(
+    engine: Engine, interval: str, threshold: int = CHRONIC_FAILURE_THRESHOLD
+) -> Set[str]:
+    """Symbols that have failed every fetch attempt for `threshold`+ runs in a row."""
+    metadata = MetaData()
+    table = _get_symbol_refresh_failures_table(metadata)
+    _ensure_symbol_refresh_failures_table(engine)
+    interval = interval.strip().lower()
+    stmt = select(table.c.symbol).where(
+        table.c.interval == interval, table.c.consecutive_failures >= threshold
+    )
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(stmt).all()
+    except SQLAlchemyError:
+        return set()
+    return {str(row.symbol).upper() for row in rows}
 
 
 def _get_chart_indicators_table(metadata: MetaData) -> Table:
@@ -1444,14 +1555,16 @@ def refresh_universe_history_to_db(
             log_callback(f"Fallback {interval}: {symbol} failed")
 
     deduped_updated = list(dict.fromkeys(updated))
+    unresolved = [symbol for symbol in retry_symbols if symbol not in set(deduped_updated)]
     if log_callback:
-        unresolved = [symbol for symbol in retry_symbols if symbol not in set(deduped_updated)]
         log_callback(
             f"Completed {interval} yfinance refresh: updated={len(deduped_updated)}, "
             f"failed={len(unresolved)}, elapsed={_format_elapsed(time.time() - start_ts)}"
         )
         if unresolved:
             log_callback(f"Failed {interval} symbols: {', '.join(unresolved)}")
+
+    record_symbol_refresh_outcomes(engine, interval, deduped_updated, unresolved)
 
     return deduped_updated
 
@@ -1623,14 +1736,16 @@ def refresh_universe_hourly_history_to_db(
             log_callback(f"Fallback 1h: {symbol} failed")
 
     deduped_updated = list(dict.fromkeys(updated))
+    unresolved = [symbol for symbol in retry_symbols if symbol not in set(deduped_updated)]
     if log_callback:
-        unresolved = [symbol for symbol in retry_symbols if symbol not in set(deduped_updated)]
         log_callback(
             f"Completed 1h yfinance refresh: updated={len(deduped_updated)}, "
             f"failed={len(unresolved)}, elapsed={_format_elapsed(time.time() - start_ts)}"
         )
         if unresolved:
             log_callback(f"Failed 1h symbols: {', '.join(unresolved)}")
+
+    record_symbol_refresh_outcomes(engine, "1h", deduped_updated, unresolved)
 
     return deduped_updated
 
