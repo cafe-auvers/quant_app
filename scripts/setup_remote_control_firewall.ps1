@@ -15,6 +15,16 @@ Usage:
 
 $ErrorActionPreference = "Stop"
 
+# New-NetFirewallRule's access-denied failure comes through as a non-terminating
+# CIM error that $ErrorActionPreference = "Stop" does not reliably catch, so an
+# unelevated run can print a false "created" success message. Check explicitly
+# up front instead of trusting that a failed call will stop the script.
+$IsElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $IsElevated) {
+    throw "Run this from an elevated (Administrator) PowerShell window -- creating a firewall rule requires it. Right-click PowerShell -> Run as administrator, then re-run this command."
+}
+
 $Port = if ($env:REMOTE_CONTROL_PORT) { $env:REMOTE_CONTROL_PORT } else { 47821 }
 
 $adapter = Get-NetAdapter | Where-Object { $_.InterfaceDescription -match "Tailscale" -or $_.Name -match "Tailscale" } | Select-Object -First 1
@@ -25,7 +35,10 @@ if (-not $adapter) {
 $RuleName = "PC Remote Control (quant_app)"
 if (-not (Get-NetFirewallRule -DisplayName $RuleName -ErrorAction SilentlyContinue)) {
     New-NetFirewallRule -DisplayName $RuleName -Direction Inbound -Protocol TCP -LocalPort $Port `
-        -InterfaceAlias $adapter.Name -Action Allow | Out-Null
+        -InterfaceAlias $adapter.Name -Action Allow -ErrorAction Stop | Out-Null
+    if (-not (Get-NetFirewallRule -DisplayName $RuleName -ErrorAction SilentlyContinue)) {
+        throw "New-NetFirewallRule did not report an error, but the rule doesn't exist afterward -- something silently failed. Try again from an elevated window."
+    }
     Write-Host "Firewall rule '$RuleName' created (TCP $Port, inbound, Tailscale adapter '$($adapter.Name)' only)."
 } else {
     Write-Host "Firewall rule '$RuleName' already exists -- skipping."
