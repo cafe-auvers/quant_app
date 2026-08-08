@@ -1195,3 +1195,28 @@ class SingleStockAiWorker(QThread):
             item.ai_analysis = ai_res
 
         self.finished_analysis.emit(ai_res)
+
+
+class PcRemoteStatusWorker(QThread):
+    """Checks the always-on PC's reachability (over Tailscale) and, if it's
+    on, whether its MySQL is actually ready to serve data. Two separate
+    checks because a PC that just powered on can be pingable for a while
+    before MySQL and the rest of its boot sequence finish -- that gap is
+    exactly what the "booting/preparing" status represents."""
+
+    finished_status = pyqtSignal(object, bool)  # PcStatus, db_ready
+
+    def run(self) -> None:
+        from src.services.pc_remote_control import PcStatus, check_pc_status
+        from src.utils.db_loader import init_mysql_engine
+
+        pc_status = check_pc_status()
+        db_ready = False
+        if pc_status == PcStatus.ON:
+            try:
+                engine = init_mysql_engine()
+                db_ready = engine is not None
+            except Exception:
+                db_ready = False
+
+        self.finished_status.emit(pc_status, db_ready)

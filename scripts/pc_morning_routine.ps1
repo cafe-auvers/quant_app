@@ -127,4 +127,27 @@ try {
     Write-Log "ERROR: could not launch main.py: $($_.Exception.Message)"
 }
 
+# --- 4. Launch the remote-control listener (detached) -----------------------
+# Lets the laptop check "is the PC on" and send an authenticated remote
+# shutdown signal over Tailscale (see pc_remote_control_listener.py). Started
+# fresh on every logon, same as main.py -- if a prior instance is somehow
+# still around, the new one will fail to bind the port and exit; that's
+# surfaced in its own log rather than blocking anything here.
+
+$ListenerOutLog = Join-Path $LogDir "pc_remote_control_listener_stdout.log"
+$ListenerErrLog = Join-Path $LogDir "pc_remote_control_listener_stderr.log"
+
+try {
+    $listenerProc = Start-Process -FilePath $PythonExe -ArgumentList (Join-Path $RepoRoot "scripts\pc_remote_control_listener.py") `
+        -WorkingDirectory $RepoRoot -RedirectStandardOutput $ListenerOutLog -RedirectStandardError $ListenerErrLog -PassThru
+    Start-Sleep -Seconds 2
+    if ($listenerProc.HasExited) {
+        Write-Log "ERROR: remote control listener exited almost immediately (code $($listenerProc.ExitCode)) -- see $ListenerErrLog"
+    } else {
+        Write-Log "Remote control listener launched (PID $($listenerProc.Id))."
+    }
+} catch {
+    Write-Log "ERROR: could not launch remote control listener: $($_.Exception.Message)"
+}
+
 Write-Log "=== Morning routine finished ==="

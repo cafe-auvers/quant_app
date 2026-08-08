@@ -2,8 +2,10 @@
 
 import datetime as dt
 import math
+import os
 import threading
 import time
+import webbrowser
 from typing import Any, Dict, Optional, List, Tuple
 from zoneinfo import ZoneInfo
 
@@ -21,6 +23,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QSizePolicy,
     QDialog,
+    QPushButton,
 )
 from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QKeySequence
@@ -75,7 +78,7 @@ from src.ui.filter_catalog import (
     DEFAULT_SETTINGS,
     DEFAULT_TAB_OPTIONS,
 )
-from src.ui.workers import WatchlistAiWorker
+from src.ui.workers import PcRemoteStatusWorker, WatchlistAiWorker
 from src.services.order_ledger import (
     append_order,
     find_open_orders,
@@ -989,10 +992,39 @@ class MainWindow(
         about_action = help_menu.addAction("About")
         about_action.triggered.connect(self.show_about)
 
-        # Create a container widget for the US market status in the top right corner
+        # Combined container for the PC remote-control status + US market
+        # status, both shown in the top-right corner (setCornerWidget only
+        # accepts one widget per corner, so both sections live inside a
+        # shared outer container).
+        self.corner_status_widget = QWidget()
+        outer_corner_layout = QHBoxLayout()
+        outer_corner_layout.setContentsMargins(0, 0, 10, 0)
+        outer_corner_layout.setSpacing(16)
+
+        # -- PC remote-control status (always-on PC: off / booting / on) --
+        self.pc_status_dot = QLabel()
+        self.pc_status_dot.setFixedSize(10, 10)
+        self.pc_status_dot.setStyleSheet(
+            "border-radius: 5px; background-color: #f23645;"
+        )  # Default red (off)
+
+        self.pc_status_label = QLabel("PC: Off")
+        self.pc_status_label.setStyleSheet(
+            "font-size: 14px; font-weight: bold; color: #131722;"
+        )
+
+        self.pc_status_button = QPushButton("Wake PC")
+        self.pc_status_button.setFixedHeight(24)
+        self.pc_status_button.clicked.connect(self._on_pc_status_button_clicked)
+
+        outer_corner_layout.addWidget(self.pc_status_dot)
+        outer_corner_layout.addWidget(self.pc_status_label)
+        outer_corner_layout.addWidget(self.pc_status_button)
+
+        # -- US market status (existing) --
         self.market_status_widget = QWidget()
         corner_layout = QHBoxLayout()
-        corner_layout.setContentsMargins(0, 0, 10, 0)
+        corner_layout.setContentsMargins(0, 0, 0, 0)
         corner_layout.setSpacing(6)
 
         # Indicator circle (colored dot)
@@ -1012,7 +1044,20 @@ class MainWindow(
         corner_layout.addWidget(self.market_status_label)
         self.market_status_widget.setLayout(corner_layout)
 
-        menubar.setCornerWidget(self.market_status_widget, Qt.TopRightCorner)
+        outer_corner_layout.addWidget(self.market_status_widget)
+        self.corner_status_widget.setLayout(outer_corner_layout)
+
+        menubar.setCornerWidget(self.corner_status_widget, Qt.TopRightCorner)
+
+        # Poll the always-on PC's status periodically. Runs on a background
+        # QThread (network I/O -- PING over Tailscale, plus a MySQL
+        # connectivity check) so it never blocks the UI thread.
+        self._pc_status_worker: Optional[PcRemoteStatusWorker] = None
+        self.pc_status_timer = QTimer(self)
+        self.pc_status_timer.setInterval(15000)
+        self.pc_status_timer.timeout.connect(self._poll_pc_status)
+        self.pc_status_timer.start()
+        QTimer.singleShot(0, self._poll_pc_status)
 
         # Set up a 1-second timer to update the countdown
         self.market_status_timer = QTimer(self)
@@ -1223,6 +1268,82 @@ class MainWindow(
                 self.market_status_label.setText(
                     "<b>Market Status:</b> Closed (After Hours)"
                 )
+
+    def _poll_pc_status(self) -> None:
+        """Kick off a background check of the always-on PC's status.
+
+        Skips this tick rather than queuing up if the previous check hasn't
+        returned yet -- a slow/hung network call should never pile up
+        multiple in-flight workers.
+        """
+        if self._pc_status_worker is not None and self._pc_status_worker.isRunning():
+            return
+        self._pc_status_worker = PcRemoteStatusWorker()
+        self._pc_status_worker.finished_status.connect(self._on_pc_status_result)
+        self._pc_status_worker.start()
+
+    def _on_pc_status_result(self, pc_status, db_ready: bool) -> None:
+        from src.services.pc_remote_control import PcStatus
+
+        dot = getattr(self, "pc_status_dot", None)
+        label = getattr(self, "pc_status_label", None)
+        button = getattr(self, "pc_status_button", None)
+        if dot is None or label is None or button is None:
+            return
+
+        self._pc_is_on = pc_status == PcStatus.ON
+        button.setText("Turn Off" if self._pc_is_on else "Wake PC")
+
+        if pc_status == PcStatus.ON and db_ready:
+            dot.setStyleSheet("border-radius: 5px; background-color: #26a69a;")  # green
+            label.setText("PC: On")
+        elif pc_status == PcStatus.ON:
+            dot.setStyleSheet("border-radius: 5px; background-color: #ffb300;")  # yellow
+            label.setText("PC: Booting...")
+        else:
+            dot.setStyleSheet("border-radius: 5px; background-color: #f23645;")  # red
+            label.setText("PC: Off")
+
+    def _on_pc_status_button_clicked(self) -> None:
+        if getattr(self, "_pc_is_on", False):
+            self._confirm_and_send_pc_shutdown()
+        else:
+            self._open_pc_wake_page()
+
+    def _open_pc_wake_page(self) -> None:
+        """Open the router's admin login in a browser for the user to log
+        in and trigger Wake On LAN by hand -- deliberately not automated,
+        so no router credentials are ever stored in this app and nothing
+        here depends on scripting an undocumented, ISP-specific web form."""
+        url = os.getenv("PC_WAKE_URL", "").strip()
+        if not url:
+            QMessageBox.warning(
+                self, "Not configured",
+                "PC_WAKE_URL is not set in .env (e.g. http://tonyhdkim.ddns.net:88/).",
+            )
+            return
+        webbrowser.open(url)
+
+    def _confirm_and_send_pc_shutdown(self) -> None:
+        reply = QMessageBox.question(
+            self,
+            "Turn off PC",
+            "Send a shutdown signal to the always-on PC?\n\n"
+            "It will wait for any in-progress data refresh to finish before "
+            "actually powering off.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        from src.services.pc_remote_control import send_shutdown_signal
+
+        result = send_shutdown_signal()
+        if result.accepted:
+            QMessageBox.information(self, "Shutdown requested", result.message)
+        else:
+            QMessageBox.warning(self, "Shutdown request failed", result.message)
 
     def show_settings_placeholder(self) -> None:
         QMessageBox.information(self, "Settings", "Settings are not implemented yet.")
