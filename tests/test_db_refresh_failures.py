@@ -167,7 +167,7 @@ def test_provider_outage_only_advances_reference_symbol_failure_streak(
         ),
     ],
 )
-def test_refresh_does_not_repeat_failed_batch_as_serial_fallback(
+def test_refresh_does_not_immediately_repeat_failed_batch(
     monkeypatch,
     sqlite_engine,
     refresh,
@@ -187,7 +187,6 @@ def test_refresh_does_not_repeat_failed_batch_as_serial_fallback(
         sqlite_engine,
         chunk_size=1,
         batch_sleep=0,
-        retry_attempts=0,
         log_callback=logs.append,
         **extra_kwargs,
     )

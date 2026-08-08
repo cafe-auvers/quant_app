@@ -164,6 +164,64 @@ def test_download_price_history_does_not_fallback_when_batch_is_current(monkeypa
     assert pd.Timestamp(symbol_history.index[-1]).date() == dt.date(2026, 8, 7)
 
 
+def test_daily_chart_fallback_aligns_different_session_timestamp_conventions(
+    monkeypatch,
+):
+    stale = _multi_symbol_history(
+        ["AAA", "BBB"], dates=pd.to_datetime(["2026-08-06"])
+    )
+
+    monkeypatch.setattr(
+        data_loader,
+        "_download_yfinance_batch",
+        lambda symbols, **_kwargs: stale,
+    )
+
+    def fake_chart(symbol, *_args, **_kwargs):
+        hour = "09:30" if symbol == "AAA" else "00:00"
+        dates = pd.DatetimeIndex(
+            [f"2026-08-06 {hour}", f"2026-08-07 {hour}"],
+            tz="America/New_York",
+        )
+        history = _multi_symbol_history([symbol], dates=dates)
+        history = data_loader._extract_symbol_history(history, symbol)
+        assert history is not None
+        for column in ("Open", "High", "Low", "Close"):
+            history[column] += 100.0
+        history["Volume"] += 100.0
+        return history
+
+    monkeypatch.setattr(data_loader, "_download_symbol_history_chart", fake_chart)
+
+    history = data_loader.download_price_history(
+        ["AAA", "BBB"],
+        interval="1d",
+        batch_sleep=0,
+        max_retries=0,
+        fallback_to_single=False,
+        threads=1,
+        required_latest_date=dt.date(2026, 8, 7),
+    )
+
+    expected_closes = {
+        "AAA": [10.5, 111.5],
+        "BBB": [11.5, 111.5],
+    }
+    assert history.index.is_unique
+    assert len(history.index) == 2
+    assert history.columns.is_unique
+    for symbol in ("AAA", "BBB"):
+        symbol_history = data_loader._extract_symbol_history(history, symbol)
+        assert symbol_history is not None
+        assert symbol_history.index.is_unique
+        assert symbol_history.index.tz is None
+        assert [timestamp.date() for timestamp in symbol_history.index] == [
+            dt.date(2026, 8, 6),
+            dt.date(2026, 8, 7),
+        ]
+        assert symbol_history["Close"].tolist() == expected_closes[symbol]
+
+
 def test_daily_period_selection_uses_incremental_for_recent_cache():
     now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
 

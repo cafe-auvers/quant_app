@@ -2150,7 +2150,7 @@ def refresh_universe_history_to_db(
     chunk_size: int = 200,
     threads: int = 8,
     batch_sleep: float = 1.5,
-    retry_attempts: int = 1,
+    retry_attempts: int = 0,
     full_backfill: bool = False,
     incremental_period: str = "1mo",
     recent_days: int = 45,
@@ -2298,9 +2298,8 @@ def refresh_universe_history_to_db(
     if retry_symbols and log_callback:
         log_callback(
             f"{len(retry_symbols)} {interval} symbol(s) remained unavailable or stale "
-            f"through {expected_date} after "
-            "batch retries and concurrent chart fallback; skipping redundant "
-            "serial retries."
+            f"through {expected_date} after batch and concurrent chart fallback; "
+            "skipping redundant serial retries."
         )
 
     deduped_updated = list(dict.fromkeys(updated))
@@ -2344,7 +2343,7 @@ def refresh_universe_hourly_history_to_db(
     chunk_size: int = 100,
     threads: int = 8,
     batch_sleep: float = 1.5,
-    retry_attempts: int = 1,
+    retry_attempts: int = 0,
     backfill: bool = False,
     incremental_period: str = "10d",
     progress_callback: Optional[Callable[[str, int, int, int, str], None]] = None,
@@ -2490,8 +2489,8 @@ def refresh_universe_hourly_history_to_db(
     if retry_symbols and log_callback:
         log_callback(
             f"{len(retry_symbols)} 1h symbol(s) remained unavailable or stale through "
-            f"{expected_date} after batch "
-            "retries and concurrent chart fallback; skipping redundant serial retries."
+            f"{expected_date} after batch and concurrent chart fallback; "
+            "skipping redundant serial retries."
         )
 
     deduped_updated = list(dict.fromkeys(updated))

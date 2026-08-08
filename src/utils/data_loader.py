@@ -473,7 +473,15 @@ def _normalize_refresh_history_index(
         if index.tz is not None:
             index = index.tz_convert("UTC").tz_localize(None)
         normalized.index = index
-    return normalized
+
+    # A multi-symbol chart response can contain the same daily session at
+    # different timestamp conventions (for example midnight for one symbol
+    # and 09:30 for another). Normalization maps those rows to one key. Merge
+    # their non-null columns instead of leaving a duplicate index that pandas
+    # cannot align with the batch frame later.
+    if normalized.index.has_duplicates:
+        normalized = normalized.groupby(level=0, sort=True).last()
+    return normalized.sort_index()
 
 
 def _find_symbol_column_level(
@@ -586,6 +594,7 @@ def _download_chart_fallback_batch(
     period: str,
     interval: str,
     threads: bool | int,
+    normalize_for_refresh: bool = False,
 ) -> pd.DataFrame:
     if not symbols:
         return pd.DataFrame()
@@ -612,6 +621,14 @@ def _download_chart_fallback_batch(
             if symbol_history.empty:
                 continue
             symbol_history = _normalize_batch_download_columns(symbol_history, [symbol])
+            if normalize_for_refresh:
+                symbol_history = _normalize_refresh_history_index(
+                    symbol_history, interval
+                )
+            elif symbol_history.index.has_duplicates:
+                symbol_history = symbol_history[
+                    ~symbol_history.index.duplicated(keep="last")
+                ].sort_index()
             frames.append(symbol_history)
 
     if not frames:
@@ -705,6 +722,7 @@ def download_price_history(
             period=period,
             interval=interval,
             threads=threads,
+            normalize_for_refresh=required_latest_date is not None,
         )
         chart_data = _normalize_batch_download_columns(chart_data, retry_symbols)
         if required_latest_date is not None:
