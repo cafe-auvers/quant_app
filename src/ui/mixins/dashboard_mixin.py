@@ -251,6 +251,11 @@ class DashboardMixin:
         scan_button.clicked.connect(self.run_all_scanners)
         button_layout.addWidget(scan_button)
 
+        self.pc_status_button = QPushButton("Wake PC")
+        self.pc_status_button.setObjectName("pcStatusButton")
+        self.pc_status_button.clicked.connect(self._on_pc_status_button_clicked)
+        button_layout.addWidget(self.pc_status_button)
+
         refresh_button = QPushButton("Refresh Summary")
         refresh_button.setObjectName("refreshSummaryButton")
         refresh_button.clicked.connect(self.update_dashboard_summary)

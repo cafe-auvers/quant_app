@@ -1013,13 +1013,8 @@ class MainWindow(
             "font-size: 14px; font-weight: bold; color: #131722;"
         )
 
-        self.pc_status_button = QPushButton("Wake PC")
-        self.pc_status_button.setFixedHeight(24)
-        self.pc_status_button.clicked.connect(self._on_pc_status_button_clicked)
-
         outer_corner_layout.addWidget(self.pc_status_dot)
         outer_corner_layout.addWidget(self.pc_status_label)
-        outer_corner_layout.addWidget(self.pc_status_button)
 
         # -- US market status (existing) --
         self.market_status_widget = QWidget()
