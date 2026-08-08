@@ -1,0 +1,119 @@
+import datetime as dt
+
+import pandas as pd
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.exc import OperationalError
+
+import src.utils.db_loader as db_loader
+
+
+@pytest.fixture
+def sqlite_engine():
+    engine = create_engine("sqlite:///:memory:", future=True)
+    db_loader._ensured_engines.discard(id(engine))
+    try:
+        yield engine
+    finally:
+        db_loader._ensured_engines.discard(id(engine))
+        engine.dispose()
+
+
+def _single_symbol_history(timestamp: str) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "Open": [10.0],
+            "High": [11.0],
+            "Low": [9.0],
+            "Close": [10.5],
+            "Volume": [1000.0],
+        },
+        index=[pd.Timestamp(timestamp)],
+    )
+
+
+def test_daily_refresh_counts_old_nonempty_history_as_failure(monkeypatch, sqlite_engine):
+    engine = sqlite_engine
+    expected_date = dt.date(2026, 6, 23)
+    old_history = _single_symbol_history("2026-06-20")
+
+    monkeypatch.setattr(db_loader, "expected_latest_market_data_date", lambda: expected_date)
+    monkeypatch.setattr(db_loader, "download_price_history", lambda *args, **kwargs: old_history)
+
+    for _ in range(db_loader.CHRONIC_FAILURE_THRESHOLD):
+        updated = db_loader.refresh_universe_history_to_db(
+            ["OLD"], engine, chunk_size=1, batch_sleep=0, retry_attempts=0
+        )
+        assert updated == ["OLD"]
+
+    assert db_loader.get_chronically_failing_symbols(engine, "1d") == {"OLD"}
+    assert db_loader.get_chronically_failing_symbols(engine, "1h") == set()
+
+    fresh_history = _single_symbol_history("2026-06-23")
+    monkeypatch.setattr(db_loader, "download_price_history", lambda *args, **kwargs: fresh_history)
+    db_loader.refresh_universe_history_to_db(
+        ["OLD"], engine, chunk_size=1, batch_sleep=0, retry_attempts=0
+    )
+
+    assert db_loader.get_chronically_failing_symbols(engine, "1d") == set()
+
+
+def test_hourly_refresh_counts_old_nonempty_history_as_failure(monkeypatch, sqlite_engine):
+    engine = sqlite_engine
+    expected_date = dt.date(2026, 6, 23)
+    old_history = _single_symbol_history("2026-06-20 15:30:00")
+
+    monkeypatch.setattr(db_loader, "expected_latest_market_data_date", lambda: expected_date)
+    monkeypatch.setattr(db_loader, "download_price_history", lambda *args, **kwargs: old_history)
+
+    for _ in range(db_loader.CHRONIC_FAILURE_THRESHOLD):
+        updated = db_loader.refresh_universe_hourly_history_to_db(
+            ["OLD"], engine, chunk_size=1, batch_sleep=0, retry_attempts=0
+        )
+        assert updated == ["OLD"]
+
+    assert db_loader.get_chronically_failing_symbols(engine, "1h") == {"OLD"}
+
+    fresh_history = _single_symbol_history("2026-06-23 15:30:00")
+    monkeypatch.setattr(db_loader, "download_price_history", lambda *args, **kwargs: fresh_history)
+    db_loader.refresh_universe_hourly_history_to_db(
+        ["OLD"], engine, chunk_size=1, batch_sleep=0, retry_attempts=0
+    )
+
+    assert db_loader.get_chronically_failing_symbols(engine, "1h") == set()
+
+
+def test_daily_refresh_resets_streak_when_existing_cache_is_current(monkeypatch, sqlite_engine):
+    engine = sqlite_engine
+    expected_date = dt.date(2026, 6, 23)
+    current_history = _single_symbol_history("2026-06-23")
+    assert db_loader.save_symbol_history_to_db("CACHED", current_history, engine, interval="1d")
+
+    for _ in range(db_loader.CHRONIC_FAILURE_THRESHOLD):
+        db_loader.record_symbol_refresh_outcomes(engine, "1d", [], ["CACHED"])
+    assert db_loader.get_chronically_failing_symbols(engine, "1d") == {"CACHED"}
+
+    monkeypatch.setattr(db_loader, "expected_latest_market_data_date", lambda: expected_date)
+    monkeypatch.setattr(
+        db_loader, "download_price_history", lambda *args, **kwargs: pd.DataFrame()
+    )
+
+    updated = db_loader.refresh_universe_history_to_db(
+        ["CACHED"], engine, chunk_size=1, batch_sleep=0, retry_attempts=0
+    )
+
+    assert updated == []
+    assert db_loader.get_chronically_failing_symbols(engine, "1d") == set()
+
+
+def test_refresh_failure_bookkeeping_ignores_table_creation_errors(monkeypatch, sqlite_engine):
+    engine = sqlite_engine
+
+    def fail_table_creation(_engine):
+        raise OperationalError("CREATE TABLE", {}, RuntimeError("permission denied"))
+
+    monkeypatch.setattr(db_loader, "_ensure_symbol_refresh_failures_table", fail_table_creation)
+
+    db_loader.record_symbol_refresh_outcomes(engine, "1d", [], ["AAPL"])
+
+    assert db_loader.get_chronically_failing_symbols(engine, "1d") == set()

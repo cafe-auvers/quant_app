@@ -32,6 +32,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from src.utils.config import get_mysql_config
 from src.utils.data_loader import download_price_history, _extract_symbol_history, compute_stock_metrics
+from src.utils.market_calendar import expected_latest_market_data_date
 
 _ensured_engines: set = set()
 _MYSQL_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
@@ -257,11 +258,11 @@ def _ensure_symbol_refresh_failures_table(engine: Engine) -> Table:
     return table
 
 
-# Consecutive failed refresh attempts (across separate historical.py runs)
-# before a symbol stops gating scripts/run_daily_refresh.py's staleness
-# check. A handful of tickers (delisted symbols, preferred-share classes
-# yfinance doesn't carry, etc.) can fail every single attempt forever; without
-# this, one such symbol makes the daily "is anything stale?" check return
+# Consecutive refresh runs that leave a symbol stale before it stops gating
+# scripts/run_daily_refresh.py's staleness check. A handful of tickers
+# (delisted symbols, preferred-share classes yfinance doesn't carry, etc.)
+# can remain stale forever. Without this, one such symbol makes the daily
+# "is anything stale?" check return
 # true on every PC restart, re-running the full 5000+-symbol refresh each
 # time even though every fetchable symbol is already current.
 CHRONIC_FAILURE_THRESHOLD = 3
@@ -273,26 +274,24 @@ def record_symbol_refresh_outcomes(
     succeeded: List[str],
     failed: List[str],
 ) -> None:
-    """Persist per-symbol pass/fail streaks from a refresh_universe_*_to_db run.
+    """Persist whether each symbol's cache was current after a refresh run.
 
-    A success resets the streak to 0 (so a symbol that starts working again
-    stops being excluded). A failure increments it. See
+    A current cache resets the streak to 0 (so a symbol that starts working
+    again stops being excluded). A stale cache increments it. See
     get_chronically_failing_symbols for how the streak is consumed.
     """
     succeeded_symbols = _clean_symbols(succeeded)
-    failed_symbols = [s for s in _clean_symbols(failed) if s not in set(succeeded_symbols)]
+    succeeded_set = set(succeeded_symbols)
+    failed_symbols = [s for s in _clean_symbols(failed) if s not in succeeded_set]
     if not succeeded_symbols and not failed_symbols:
         return
 
     interval = interval.strip().lower()
     now = _utcnow_naive()
 
-    metadata = MetaData()
-    table = _get_symbol_refresh_failures_table(metadata)
-    _ensure_symbol_refresh_failures_table(engine)
-    dialect_name = engine.dialect.name
-
     try:
+        table = _ensure_symbol_refresh_failures_table(engine)
+        dialect_name = engine.dialect.name
         with engine.begin() as conn:
             if succeeded_symbols:
                 reset_records = [
@@ -328,21 +327,19 @@ def record_symbol_refresh_outcomes(
                     conn.execute(insert(table), fail_records)
     except SQLAlchemyError:
         # Best-effort bookkeeping only -- never let this fail the refresh run.
-        pass
+        return
 
 
 def get_chronically_failing_symbols(
     engine: Engine, interval: str, threshold: int = CHRONIC_FAILURE_THRESHOLD
 ) -> Set[str]:
-    """Symbols that have failed every fetch attempt for `threshold`+ runs in a row."""
-    metadata = MetaData()
-    table = _get_symbol_refresh_failures_table(metadata)
-    _ensure_symbol_refresh_failures_table(engine)
+    """Symbols left stale by `threshold`+ consecutive refresh runs."""
     interval = interval.strip().lower()
-    stmt = select(table.c.symbol).where(
-        table.c.interval == interval, table.c.consecutive_failures >= threshold
-    )
     try:
+        table = _ensure_symbol_refresh_failures_table(engine)
+        stmt = select(table.c.symbol).where(
+            table.c.interval == interval, table.c.consecutive_failures >= threshold
+        )
         with engine.connect() as conn:
             rows = conn.execute(stmt).all()
     except SQLAlchemyError:
@@ -1354,6 +1351,28 @@ def _symbols_with_history(history: pd.DataFrame, symbols: List[str]) -> List[str
     return available
 
 
+def _partition_symbols_by_freshness(
+    latest_by_symbol: Dict[str, object],
+    symbols: List[str],
+    expected_date: dt.date,
+) -> Tuple[List[str], List[str]]:
+    """Split symbols by whether their cached data reaches the expected session."""
+    current: List[str] = []
+    stale: List[str] = []
+    for symbol in _clean_symbols(symbols):
+        latest = latest_by_symbol.get(symbol)
+        if latest is None or pd.isna(latest):
+            stale.append(symbol)
+            continue
+        try:
+            latest_date = pd.Timestamp(latest).date()
+        except (TypeError, ValueError):
+            stale.append(symbol)
+            continue
+        (current if latest_date >= expected_date else stale).append(symbol)
+    return current, stale
+
+
 def _period_for_daily_refresh(
     latest_date: Optional[dt.datetime],
     full_period: str = "1y",
@@ -1555,16 +1574,19 @@ def refresh_universe_history_to_db(
             log_callback(f"Fallback {interval}: {symbol} failed")
 
     deduped_updated = list(dict.fromkeys(updated))
-    unresolved = [symbol for symbol in retry_symbols if symbol not in set(deduped_updated)]
+    latest_after_refresh = get_latest_price_history_dates(engine, symbols, interval=interval)
+    current_symbols, stale_symbols = _partition_symbols_by_freshness(
+        latest_after_refresh, symbols, expected_latest_market_data_date()
+    )
     if log_callback:
         log_callback(
             f"Completed {interval} yfinance refresh: updated={len(deduped_updated)}, "
-            f"failed={len(unresolved)}, elapsed={_format_elapsed(time.time() - start_ts)}"
+            f"failed={len(stale_symbols)}, elapsed={_format_elapsed(time.time() - start_ts)}"
         )
-        if unresolved:
-            log_callback(f"Failed {interval} symbols: {', '.join(unresolved)}")
+        if stale_symbols:
+            log_callback(f"Failed {interval} symbols: {', '.join(stale_symbols)}")
 
-    record_symbol_refresh_outcomes(engine, interval, deduped_updated, unresolved)
+    record_symbol_refresh_outcomes(engine, interval, current_symbols, stale_symbols)
 
     return deduped_updated
 
@@ -1736,16 +1758,20 @@ def refresh_universe_hourly_history_to_db(
             log_callback(f"Fallback 1h: {symbol} failed")
 
     deduped_updated = list(dict.fromkeys(updated))
-    unresolved = [symbol for symbol in retry_symbols if symbol not in set(deduped_updated)]
+    # Match the gate: current data from any hourly source satisfies freshness.
+    latest_after_refresh = get_latest_hourly_price_history_timestamps(engine, symbols)
+    current_symbols, stale_symbols = _partition_symbols_by_freshness(
+        latest_after_refresh, symbols, expected_latest_market_data_date()
+    )
     if log_callback:
         log_callback(
             f"Completed 1h yfinance refresh: updated={len(deduped_updated)}, "
-            f"failed={len(unresolved)}, elapsed={_format_elapsed(time.time() - start_ts)}"
+            f"failed={len(stale_symbols)}, elapsed={_format_elapsed(time.time() - start_ts)}"
         )
-        if unresolved:
-            log_callback(f"Failed 1h symbols: {', '.join(unresolved)}")
+        if stale_symbols:
+            log_callback(f"Failed 1h symbols: {', '.join(stale_symbols)}")
 
-    record_symbol_refresh_outcomes(engine, "1h", deduped_updated, unresolved)
+    record_symbol_refresh_outcomes(engine, "1h", current_symbols, stale_symbols)
 
     return deduped_updated
 

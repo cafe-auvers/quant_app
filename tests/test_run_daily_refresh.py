@@ -150,3 +150,29 @@ def test_refresh_gate_still_refreshes_non_chronic_stale_symbols(monkeypatch):
     assert modes == ["1d"]
     assert "AAPL" in reason
     assert "GDV-H" not in reason.split("(ignoring")[0]
+
+
+def test_refresh_gate_keeps_reference_symbol_actionable_during_broad_outage(monkeypatch):
+    """A provider-wide outage must not quarantine every possible refresh trigger."""
+    refresh = _load_refresh_module()
+    expected_date = dt.date(2026, 6, 23)
+    tickers = ["SPY", "AAPL"]
+
+    monkeypatch.setattr(refresh, "init_mysql_engine", lambda: object())
+    monkeypatch.setattr(refresh, "_refresh_tickers", lambda: tickers)
+    monkeypatch.setattr(refresh, "expected_latest_market_data_date", lambda: expected_date)
+    monkeypatch.setattr(
+        refresh, "get_chronically_failing_symbols", lambda *args, **kwargs: set(tickers)
+    )
+    monkeypatch.setattr(refresh, "get_latest_price_history_dates", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        refresh, "get_latest_hourly_price_history_timestamps", lambda *args, **kwargs: {}
+    )
+
+    modes, reason = refresh._refresh_modes_needed()
+
+    assert modes == ["1d", "1h"]
+    assert "1D data is stale for 1" in reason
+    assert "1H data is stale for 1" in reason
+    assert "SPY" in reason.split("(ignoring")[0]
+    assert "ignoring 1 1D / 1 1H symbol" in reason

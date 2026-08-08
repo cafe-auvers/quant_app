@@ -71,7 +71,7 @@ def _refresh_modes_needed() -> Tuple[List[str], str]:
     can make the database look current while other symbols or the 1H table
     are still stale after a partial refresh.
 
-    Symbols that have failed every fetch attempt for several runs in a row
+    Symbols that have remained stale after several refresh runs in a row
     (see get_chronically_failing_symbols / record_symbol_refresh_outcomes in
     db_loader.py) are excluded from gating: a delisted ticker or an
     unsupported preferred-share class can never become "current," so letting
@@ -79,7 +79,8 @@ def _refresh_modes_needed() -> Tuple[List[str], str]:
     PC restart forever, even once every fetchable symbol is already caught
     up. historical.py still retries them opportunistically whenever a
     refresh runs for any other reason -- they just can't force one on their
-    own past the threshold.
+    own past the threshold. SPY remains an always-actionable canary so a broad
+    provider outage cannot quarantine the entire universe permanently.
     """
     engine = init_mysql_engine()
     if engine is None:
@@ -96,8 +97,16 @@ def _refresh_modes_needed() -> Tuple[List[str], str]:
     hourly_stale_all = _stale_symbols(
         get_latest_hourly_price_history_timestamps(engine, tickers), tickers, expected_date
     )
-    daily_stale = [symbol for symbol in daily_stale_all if symbol not in chronic_daily]
-    hourly_stale = [symbol for symbol in hourly_stale_all if symbol not in chronic_hourly]
+    daily_stale = [
+        symbol
+        for symbol in daily_stale_all
+        if symbol == REFERENCE_SYMBOL or symbol not in chronic_daily
+    ]
+    hourly_stale = [
+        symbol
+        for symbol in hourly_stale_all
+        if symbol == REFERENCE_SYMBOL or symbol not in chronic_hourly
+    ]
 
     modes = []
     reasons = []
@@ -112,8 +121,8 @@ def _refresh_modes_needed() -> Tuple[List[str], str]:
     excluded_hourly = len(hourly_stale_all) - len(hourly_stale)
     if excluded_daily or excluded_hourly:
         reasons.append(
-            f"(ignoring {excluded_daily} 1D / {excluded_hourly} 1H symbol(s) that have failed "
-            f"{CHRONIC_FAILURE_THRESHOLD}+ consecutive refresh attempts.)"
+            f"(ignoring {excluded_daily} 1D / {excluded_hourly} 1H symbol(s) left stale by "
+            f"{CHRONIC_FAILURE_THRESHOLD}+ consecutive refresh runs.)"
         )
 
     if not modes:
