@@ -3,9 +3,8 @@ scripts/pc_remote_control_listener.py), reached over Tailscale.
 
 Two operations only:
   - check_pc_status(): is the listener reachable right now ("PING" -> "PONG").
-    This answers "is the PC powered on and past logon," not "is the app
-    ready" -- callers that also care about the database should check that
-    separately (e.g. via init_mysql_engine()).
+    This reports only the listener, not the PC's physical power, database, or
+    main.py state. Callers must display those signals separately.
   - send_shutdown_signal(): sends the shared-secret-authenticated "SHUTDOWN"
     command. The listener replies immediately once it has *launched* the
     guarded shutdown script, not once the PC has actually powered off --
@@ -19,10 +18,12 @@ app, no scripting of the router's undocumented web UI).
 """
 from __future__ import annotations
 
-import os
 import socket
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
+
+from src.utils.config import get_env_value
 
 DEFAULT_PORT = 47821
 CONNECT_TIMEOUT_SECONDS = 3.0
@@ -34,23 +35,32 @@ class PcStatus(Enum):
     UNKNOWN = "unknown"  # host reachable but didn't speak the expected protocol
 
 
+@dataclass(frozen=True)
+class PcServiceStatus:
+    """Independent health signals for the shared-data PC and its programs."""
+
+    listener_status: PcStatus
+    database_ready: bool
+    database_hostname: str = ""
+    main_app_active: Optional[bool] = None
+    main_app_last_seen_seconds: Optional[float] = None
+
+
 def _pc_host() -> Optional[str]:
-    host = os.getenv("PC_REMOTE_CONTROL_HOST", "").strip()
+    host = (get_env_value("PC_REMOTE_CONTROL_HOST", "") or "").strip()
     return host or None
 
 
 def _pc_port() -> int:
-    return int(os.getenv("REMOTE_CONTROL_PORT", str(DEFAULT_PORT)))
+    return int(get_env_value("REMOTE_CONTROL_PORT", str(DEFAULT_PORT)) or DEFAULT_PORT)
 
 
 def _token() -> str:
-    return os.getenv("REMOTE_CONTROL_TOKEN", "")
+    return get_env_value("REMOTE_CONTROL_TOKEN", "") or ""
 
 
 def check_pc_status(timeout: float = CONNECT_TIMEOUT_SECONDS) -> PcStatus:
-    """Ping the listener. Returns OFF for both 'unreachable' and 'refused' --
-    callers don't need to distinguish a powered-off PC from a not-yet-started
-    listener; both mean "nothing usable is there right now."""
+    """Ping the listener; OFF means only that this listener is unavailable."""
     host = _pc_host()
     if not host:
         return PcStatus.OFF

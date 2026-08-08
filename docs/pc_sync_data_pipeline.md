@@ -63,6 +63,7 @@ flowchart LR
                    self-heals because historical.py refetches a wide window
                    (1y), not just "yesterday"
                 4. launches main.py so the dashboard is visible if you check in
+                5. launches pc_remote_control_listener.py for remote shutdown
 10:00 KST  "Automatic-PC-Shutdown" waits for any live historical refresh,
            then shuts the PC down; after its configured wait limit it exits
            safely without killing a partial refresh
@@ -122,6 +123,14 @@ silently break the connection).
 `.env`'s `MYSQL_HOST` is set to the Tailscale address permanently (not
 switched depending on location) -- confirmed working both on the home LAN
 and from a mobile hotspot genuinely off the home network.
+
+The dashboard reports three independent runtime signals. `PC: On` means
+either MySQL or the listener responded; `DB` reports whether shared data is
+usable; `Listener` reports remote-shutdown availability. Each running
+`main.py` also writes a short heartbeat to MySQL, so the laptop can report the
+database PC's `main.py` state even when the listener is stopped. A missing
+heartbeat is `Unknown`; an explicit stop or a heartbeat older than 60 seconds
+is `Off`.
 
 ## Known gotchas hit during setup (fixed, documented so they don't recur)
 

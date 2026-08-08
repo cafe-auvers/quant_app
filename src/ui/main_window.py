@@ -1098,6 +1098,8 @@ class MainWindow(
             self.live_data_timer.stop()
         if getattr(self, "state_sync_timer", None) is not None:
             self.state_sync_timer.stop()
+        if getattr(self, "pc_status_timer", None) is not None:
+            self.pc_status_timer.stop()
         if (
             hasattr(self, "market_status_timer")
             and self.market_status_timer is not None
@@ -1111,6 +1113,7 @@ class MainWindow(
         candidate_workers = [
             getattr(self, "database_init_worker", None),
             getattr(self, "state_sync_worker", None),
+            getattr(self, "_pc_status_worker", None),
             self.scanner_worker,
             self.watchlist_worker,
             self.single_ai_worker,
@@ -1144,6 +1147,9 @@ class MainWindow(
             )
             event.ignore()
             return
+        from src.services.runtime_status import safe_mark_runtime_process_stopped
+
+        safe_mark_runtime_process_stopped(self.db_engine)
         save_result = self._flush_state_saves_for_shutdown(timeout=5.0)
         if not save_result.success:
             message = save_result.error or "Unknown local state save error."
@@ -1241,20 +1247,37 @@ class MainWindow(
         outer_corner_layout.setContentsMargins(0, 0, 10, 0)
         outer_corner_layout.setSpacing(16)
 
-        # -- PC remote-control status (always-on PC: off / booting / on) --
+        # -- Shared-data PC and service status --
+        self.pc_status_widget = QWidget()
+        pc_status_layout = QHBoxLayout()
+        pc_status_layout.setContentsMargins(0, 0, 0, 0)
+        pc_status_layout.setSpacing(6)
+
         self.pc_status_dot = QLabel()
         self.pc_status_dot.setFixedSize(10, 10)
         self.pc_status_dot.setStyleSheet(
-            "border-radius: 5px; background-color: #f23645;"
-        )  # Default red (off)
-
-        self.pc_status_label = QLabel("PC: Off")
-        self.pc_status_label.setStyleSheet(
-            "font-size: 14px; font-weight: bold; color: #131722;"
+            "border-radius: 5px; background-color: #787b86;"
         )
 
-        outer_corner_layout.addWidget(self.pc_status_dot)
-        outer_corner_layout.addWidget(self.pc_status_label)
+        self.pc_status_label = QLabel("PC: Checking...")
+        self.pc_status_label.setStyleSheet(
+            "font-size: 13px; font-weight: bold; color: #131722;"
+        )
+        self.pc_services_label = QLabel(
+            "DB: Checking | Listener: Checking | main.py: Checking"
+        )
+        self.pc_services_label.setStyleSheet("font-size: 10px; color: #555555;")
+
+        pc_status_text_layout = QVBoxLayout()
+        pc_status_text_layout.setContentsMargins(0, 0, 0, 0)
+        pc_status_text_layout.setSpacing(0)
+        pc_status_text_layout.addWidget(self.pc_status_label)
+        pc_status_text_layout.addWidget(self.pc_services_label)
+        pc_status_layout.addWidget(self.pc_status_dot)
+        pc_status_layout.addLayout(pc_status_text_layout)
+        self.pc_status_widget.setLayout(pc_status_layout)
+
+        outer_corner_layout.addWidget(self.pc_status_widget)
 
         # -- US market status (existing) --
         self.market_status_widget = QWidget()
@@ -1284,9 +1307,8 @@ class MainWindow(
 
         menubar.setCornerWidget(self.corner_status_widget, Qt.TopRightCorner)
 
-        # Poll the always-on PC's status periodically. Runs on a background
-        # QThread (network I/O -- PING over Tailscale, plus a MySQL
-        # connectivity check) so it never blocks the UI thread.
+        # Poll DB, remote-control listener, and main.py independently. Network
+        # and database I/O stay on a worker so the UI thread never blocks.
         self._pc_status_worker: Optional[PcRemoteStatusWorker] = None
         self.pc_status_timer = QTimer(self)
         self.pc_status_timer.setInterval(15000)
@@ -1528,35 +1550,84 @@ class MainWindow(
         """
         if self._pc_status_worker is not None and self._pc_status_worker.isRunning():
             return
-        self._pc_status_worker = PcRemoteStatusWorker()
+        self._pc_status_worker = PcRemoteStatusWorker(self.db_engine)
         self._pc_status_worker.finished_status.connect(self._on_pc_status_result)
         self._pc_status_worker.start()
 
-    def _on_pc_status_result(self, pc_status, db_ready: bool) -> None:
+    def _on_pc_status_result(self, status) -> None:
         from src.services.pc_remote_control import PcStatus
 
         dot = getattr(self, "pc_status_dot", None)
         label = getattr(self, "pc_status_label", None)
+        services_label = getattr(self, "pc_services_label", None)
         button = getattr(self, "pc_status_button", None)
-        if dot is None or label is None or button is None:
+        if dot is None or label is None or services_label is None:
             return
 
-        self._pc_is_on = pc_status == PcStatus.ON
-        button.setText("Turn Off" if self._pc_is_on else "Wake PC")
+        listener_on = status.listener_status == PcStatus.ON
+        db_ready = bool(status.database_ready)
+        self._pc_is_on = db_ready or listener_on
+        self._pc_remote_control_available = listener_on
 
-        if pc_status == PcStatus.ON and db_ready:
+        if db_ready:
             dot.setStyleSheet("border-radius: 5px; background-color: #26a69a;")  # green
             label.setText("PC: On")
-        elif pc_status == PcStatus.ON:
+        elif listener_on:
             dot.setStyleSheet("border-radius: 5px; background-color: #ffb300;")  # yellow
-            label.setText("PC: Booting...")
+            label.setText("PC: On (DB unavailable)")
         else:
             dot.setStyleSheet("border-radius: 5px; background-color: #f23645;")  # red
-            label.setText("PC: Off")
+            label.setText("PC: Unreachable")
+
+        listener_text = {
+            PcStatus.ON: "On",
+            PcStatus.OFF: "Off",
+            PcStatus.UNKNOWN: "Unknown",
+        }.get(status.listener_status, "Unknown")
+        if status.main_app_active is True:
+            main_app_text = "On"
+        elif status.main_app_active is False:
+            main_app_text = "Off"
+        else:
+            main_app_text = "Unknown"
+        services_text = (
+            f"DB: {'On' if db_ready else 'Off'} | "
+            f"Listener: {listener_text} | main.py: {main_app_text}"
+        )
+        services_label.setText(services_text)
+        tooltip = (
+            "The PC is considered online when either MySQL or the remote-control "
+            "listener responds. main.py is reported from its database heartbeat.\n"
+            + services_text
+        )
+        label.setToolTip(tooltip)
+        services_label.setToolTip(tooltip)
+
+        if button is not None:
+            if listener_on:
+                button.setEnabled(True)
+                button.setText("Turn Off")
+                button.setToolTip("Ask the PC's remote-control listener to shut down safely.")
+            elif self._pc_is_on:
+                button.setEnabled(False)
+                button.setText("Remote Control Offline")
+                button.setToolTip(
+                    "The PC/database is online, but the remote-control listener is not available."
+                )
+            else:
+                button.setEnabled(True)
+                button.setText("Wake PC")
+                button.setToolTip("Open the router page used to wake the PC.")
 
     def _on_pc_status_button_clicked(self) -> None:
-        if getattr(self, "_pc_is_on", False):
+        if getattr(self, "_pc_remote_control_available", False):
             self._confirm_and_send_pc_shutdown()
+        elif getattr(self, "_pc_is_on", False):
+            QMessageBox.information(
+                self,
+                "Remote control unavailable",
+                "The PC and database are online, but the remote-control listener is not running.",
+            )
         else:
             self._open_pc_wake_page()
 

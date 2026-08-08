@@ -1198,25 +1198,77 @@ class SingleStockAiWorker(QThread):
 
 
 class PcRemoteStatusWorker(QThread):
-    """Checks the always-on PC's reachability (over Tailscale) and, if it's
-    on, whether its MySQL is actually ready to serve data. Two separate
-    checks because a PC that just powered on can be pingable for a while
-    before MySQL and the rest of its boot sequence finish -- that gap is
-    exactly what the "booting/preparing" status represents."""
+    """Check database, remote-control, and remote main-app health separately."""
 
-    finished_status = pyqtSignal(object, bool)  # PcStatus, db_ready
+    finished_status = pyqtSignal(object)  # PcServiceStatus
+
+    def __init__(self, engine=None, parent=None) -> None:
+        super().__init__(parent)
+        self.engine = engine
 
     def run(self) -> None:
-        from src.services.pc_remote_control import PcStatus, check_pc_status
+        from sqlalchemy import text
+
+        from src.services.pc_remote_control import (
+            PcServiceStatus,
+            PcStatus,
+            check_pc_status,
+        )
+        from src.services.runtime_status import (
+            database_server_hostname,
+            get_runtime_process_status,
+            record_runtime_heartbeat,
+        )
         from src.utils.db_loader import init_mysql_engine
 
-        pc_status = check_pc_status()
+        try:
+            listener_status = check_pc_status()
+        except Exception:
+            listener_status = PcStatus.UNKNOWN
         db_ready = False
-        if pc_status == PcStatus.ON:
-            try:
+        db_hostname = ""
+        main_app_active = None
+        main_app_last_seen_seconds = None
+        engine = self.engine
+        owns_engine = False
+        try:
+            if engine is None:
                 engine = init_mysql_engine()
-                db_ready = engine is not None
-            except Exception:
-                db_ready = False
+                owns_engine = engine is not None
+            if engine is not None:
+                with engine.connect() as conn:
+                    conn.execute(text("SELECT 1"))
+                db_ready = True
+        except Exception:
+            db_ready = False
 
-        self.finished_status.emit(pc_status, db_ready)
+        if db_ready and engine is not None:
+            try:
+                record_runtime_heartbeat(engine)
+                db_hostname = database_server_hostname(engine)
+                runtime_status = get_runtime_process_status(engine, db_hostname)
+                if runtime_status.observed:
+                    main_app_active = runtime_status.active
+                    main_app_last_seen_seconds = runtime_status.age_seconds
+            except Exception:
+                # Runtime monitoring must never turn a successful database
+                # connectivity result into a false "DB: Off" report.
+                db_hostname = ""
+                main_app_active = None
+                main_app_last_seen_seconds = None
+
+        if owns_engine and engine is not None:
+            try:
+                engine.dispose()
+            except Exception:
+                pass
+
+        self.finished_status.emit(
+            PcServiceStatus(
+                listener_status=listener_status,
+                database_ready=db_ready,
+                database_hostname=db_hostname,
+                main_app_active=main_app_active,
+                main_app_last_seen_seconds=main_app_last_seen_seconds,
+            )
+        )
