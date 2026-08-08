@@ -44,6 +44,7 @@ MYSQL_POOL_RECYCLE_SECONDS = 1800
 CACHE_QUERY_SYMBOL_CHUNK_SIZE = 200
 HOURLY_CACHE_QUERY_SYMBOL_CHUNK_SIZE = 100
 SCANNER_QUERY_SYMBOL_CHUNK_SIZE = 500
+SCANNER_METRIC_WRITE_CHUNK_SIZE = 250
 logger = logging.getLogger(__name__)
 
 SCANNER_METRICS_CACHE_VERSION = 1
@@ -2237,28 +2238,11 @@ def refresh_universe_history_to_db(
         retry_symbols = [symbol for symbol in dict.fromkeys(next_retry) if symbol not in set(updated)]
 
     if retry_symbols and log_callback:
-        log_callback(f"Single-symbol fallback for {len(retry_symbols)} {interval} symbols...")
-
-    for index, symbol in enumerate(retry_symbols, start=1):
-        fetch_period = period_by_symbol[symbol]
-        if log_callback:
-            log_callback(f"Fallback {index}/{len(retry_symbols)} {interval}: {symbol}, period={fetch_period}")
-        history = download_price_history(
-            [symbol],
-            period=fetch_period,
-            interval=interval,
-            max_symbols=1,
-            chunk_size=1,
-            threads=1,
-            batch_sleep=0,
-            max_retries=1,
-            fallback_to_single=True,
+        log_callback(
+            f"{len(retry_symbols)} {interval} symbol(s) remained unavailable after "
+            "batch retries and concurrent chart fallback; skipping redundant "
+            "serial retries."
         )
-        symbol_df = _extract_symbol_history(history, symbol)
-        if symbol_df is not None and not symbol_df.empty and save_symbol_history_to_db(symbol, symbol_df, engine, interval=interval):
-            updated.append(symbol)
-        elif log_callback:
-            log_callback(f"Fallback {interval}: {symbol} failed")
 
     deduped_updated = list(dict.fromkeys(updated))
     latest_after_refresh = get_latest_price_history_dates(engine, symbols, interval=interval)
@@ -2267,11 +2251,13 @@ def refresh_universe_history_to_db(
     )
     if log_callback:
         log_callback(
-            f"Completed {interval} yfinance refresh: updated={len(deduped_updated)}, "
-            f"failed={len(stale_symbols)}, elapsed={_format_elapsed(time.time() - start_ts)}"
+            f"Completed {interval} yfinance refresh: "
+            f"received_rows_for={len(deduped_updated)}, "
+            f"current={len(current_symbols)}, still_stale={len(stale_symbols)}, "
+            f"elapsed={_format_elapsed(time.time() - start_ts)}"
         )
         if stale_symbols:
-            log_callback(f"Failed {interval} symbols: {', '.join(stale_symbols)}")
+            log_callback(f"Still-stale {interval} symbols: {', '.join(stale_symbols)}")
 
     record_symbol_refresh_outcomes(engine, interval, current_symbols, stale_symbols)
 
@@ -2421,28 +2407,10 @@ def refresh_universe_hourly_history_to_db(
         retry_symbols = [symbol for symbol in dict.fromkeys(next_retry) if symbol not in set(updated)]
 
     if retry_symbols and log_callback:
-        log_callback(f"Single-symbol fallback for {len(retry_symbols)} 1h symbols...")
-
-    for index, symbol in enumerate(retry_symbols, start=1):
-        fetch_period = period_by_symbol[symbol]
-        if log_callback:
-            log_callback(f"Fallback {index}/{len(retry_symbols)} 1h: {symbol}, period={fetch_period}")
-        history = download_price_history(
-            [symbol],
-            period=fetch_period,
-            interval="1h",
-            max_symbols=1,
-            chunk_size=1,
-            threads=1,
-            batch_sleep=0,
-            max_retries=1,
-            fallback_to_single=True,
+        log_callback(
+            f"{len(retry_symbols)} 1h symbol(s) remained unavailable after batch "
+            "retries and concurrent chart fallback; skipping redundant serial retries."
         )
-        symbol_df = _extract_symbol_history(history, symbol)
-        if symbol_df is not None and not symbol_df.empty and save_hourly_history_to_db(symbol, symbol_df, engine, source=source):
-            updated.append(symbol)
-        elif log_callback:
-            log_callback(f"Fallback 1h: {symbol} failed")
 
     deduped_updated = list(dict.fromkeys(updated))
     # Match the gate: current data from any hourly source satisfies freshness.
@@ -2452,11 +2420,13 @@ def refresh_universe_hourly_history_to_db(
     )
     if log_callback:
         log_callback(
-            f"Completed 1h yfinance refresh: updated={len(deduped_updated)}, "
-            f"failed={len(stale_symbols)}, elapsed={_format_elapsed(time.time() - start_ts)}"
+            f"Completed 1h yfinance refresh: "
+            f"received_rows_for={len(deduped_updated)}, "
+            f"current={len(current_symbols)}, still_stale={len(stale_symbols)}, "
+            f"elapsed={_format_elapsed(time.time() - start_ts)}"
         )
         if stale_symbols:
-            log_callback(f"Failed 1h symbols: {', '.join(stale_symbols)}")
+            log_callback(f"Still-stale 1h symbols: {', '.join(stale_symbols)}")
 
     record_symbol_refresh_outcomes(engine, "1h", current_symbols, stale_symbols)
 
@@ -2670,13 +2640,16 @@ def save_scanner_metrics_batch_to_db(metrics_list: List[dict], date: dt.datetime
 
     try:
         with engine.begin() as conn:
-            _execute_bulk_upsert(
-                conn,
-                table,
-                records,
-                ("symbol", "date"),
-                engine.dialect.name,
-            )
+            for chunk in _record_chunks(
+                records, SCANNER_METRIC_WRITE_CHUNK_SIZE
+            ):
+                _execute_bulk_upsert(
+                    conn,
+                    table,
+                    chunk,
+                    ("symbol", "date"),
+                    engine.dialect.name,
+                )
         return [record["symbol"] for record in records]
     except SQLAlchemyError:
         return []
@@ -2687,8 +2660,10 @@ def save_scanner_metrics_snapshot_to_db(
     snapshot_date: dt.datetime,
     input_fingerprint: str,
     engine: Engine,
+    snapshot_symbols: Optional[List[str]] = None,
+    strict: bool = False,
 ) -> List[str]:
-    """Atomically replace a complete scanner snapshot and its cache manifest."""
+    """Atomically replace a complete scanner snapshot in bounded statements."""
     if not metrics_list:
         return []
     try:
@@ -2707,12 +2682,35 @@ def save_scanner_metrics_snapshot_to_db(
             "metric_count": len(records),
             "completed_at": _utcnow_naive(),
         }
+        delete_symbols = _clean_symbols(
+            snapshot_symbols
+            or [record["symbol"] for record in records]
+        )
         dialect_name = engine.dialect.name
         with engine.begin() as conn:
-            conn.execute(delete(metrics_table).where(metrics_table.c.date == snapshot_date))
-            _execute_bulk_upsert(
-                conn, metrics_table, records, ("symbol", "date"), dialect_name
-            )
+            # The primary key starts with symbol, so a date-only delete can
+            # scan the entire historical metrics table and hit the socket
+            # timeout. Keep every statement indexed and bounded while the
+            # surrounding transaction preserves all-or-nothing replacement.
+            for chunk in _record_chunks(
+                delete_symbols, SCANNER_QUERY_SYMBOL_CHUNK_SIZE
+            ):
+                conn.execute(
+                    delete(metrics_table).where(
+                        metrics_table.c.symbol.in_(chunk),
+                        metrics_table.c.date == snapshot_date,
+                    )
+                )
+            for chunk in _record_chunks(
+                records, SCANNER_METRIC_WRITE_CHUNK_SIZE
+            ):
+                _execute_bulk_upsert(
+                    conn,
+                    metrics_table,
+                    chunk,
+                    ("symbol", "date"),
+                    dialect_name,
+                )
             _execute_bulk_upsert(
                 conn,
                 snapshots_table,
@@ -2720,7 +2718,13 @@ def save_scanner_metrics_snapshot_to_db(
                 ("snapshot_date",),
                 dialect_name,
             )
-    except SQLAlchemyError:
+    except SQLAlchemyError as exc:
+        if strict:
+            driver_error = getattr(exc, "orig", None)
+            detail = f": {driver_error}" if driver_error is not None else ""
+            raise RuntimeError(
+                f"Unable to save scanner metrics snapshot{detail}"
+            ) from exc
         return []
     return [record["symbol"] for record in records]
 
@@ -2860,7 +2864,12 @@ def refresh_scanner_metrics_to_db(
             log_callback(f"Saving scanner metrics: 0/{save_total} (0%) - ETA calculating...")
 
         saved = save_scanner_metrics_snapshot_to_db(
-            metrics_list, snapshot_date, input_fingerprint, engine
+            metrics_list,
+            snapshot_date,
+            input_fingerprint,
+            engine,
+            snapshot_symbols=symbols,
+            strict=True,
         )
         snapshot_complete = (
             len(saved) == len(metrics_list)

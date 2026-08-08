@@ -3,7 +3,8 @@ import datetime as dt
 import numpy as np
 import pandas as pd
 import pytest
-from sqlalchemy import create_engine, delete, event
+from sqlalchemy import create_engine, delete, event, select
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 import src.utils.db_loader as db_loader
 
@@ -422,6 +423,135 @@ def test_scanner_snapshot_is_authoritative_and_detects_partial_rows(engine, monk
         history_watermarks=watermarks,
         snapshot_date=snapshot_date,
     )
+
+
+def test_scanner_snapshot_uses_bounded_atomic_statements(engine, monkeypatch):
+    symbols = ["AAA", "BBB", "CCC", "DDD", "EEE"]
+    snapshot_date = dt.datetime(2026, 1, 9)
+    metrics = [
+        {"symbol": symbol, "return_1m": float(index)}
+        for index, symbol in enumerate(symbols)
+    ]
+    monkeypatch.setattr(db_loader, "SCANNER_QUERY_SYMBOL_CHUNK_SIZE", 2)
+    monkeypatch.setattr(db_loader, "SCANNER_METRIC_WRITE_CHUNK_SIZE", 2)
+    original_upsert = db_loader._execute_bulk_upsert
+    metric_write_sizes = []
+
+    def recording_upsert(conn, table, records, key_columns, dialect_name):
+        if table.name == "scanner_metrics":
+            metric_write_sizes.append(len(records))
+        return original_upsert(conn, table, records, key_columns, dialect_name)
+
+    statements = []
+
+    def record_statement(_conn, _cursor, statement, parameters, _context, _many):
+        statements.append((" ".join(statement.lower().split()), parameters))
+
+    monkeypatch.setattr(db_loader, "_execute_bulk_upsert", recording_upsert)
+    event.listen(engine, "before_cursor_execute", record_statement)
+    try:
+        saved = db_loader.save_scanner_metrics_snapshot_to_db(
+            metrics,
+            snapshot_date,
+            "fingerprint",
+            engine,
+            snapshot_symbols=symbols,
+            strict=True,
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", record_statement)
+
+    delete_queries = [
+        item
+        for item in statements
+        if item[0].startswith("delete from scanner_metrics ")
+    ]
+    assert saved == symbols
+    assert metric_write_sizes == [2, 2, 1]
+    assert len(delete_queries) == 3
+    assert all(len(parameters) <= 3 for _, parameters in delete_queries)
+
+
+def test_scanner_snapshot_chunk_failure_rolls_back_replacement(engine, monkeypatch):
+    snapshot_date = dt.datetime(2026, 1, 9)
+    original_metrics = [
+        {"symbol": "AAPL", "return_1m": 1.0},
+        {"symbol": "MSFT", "return_1m": 2.0},
+    ]
+    assert db_loader.save_scanner_metrics_snapshot_to_db(
+        original_metrics,
+        snapshot_date,
+        "old-fingerprint",
+        engine,
+    ) == ["AAPL", "MSFT"]
+
+    monkeypatch.setattr(db_loader, "SCANNER_METRIC_WRITE_CHUNK_SIZE", 1)
+    original_upsert = db_loader._execute_bulk_upsert
+    metric_writes = 0
+
+    def fail_second_metric_chunk(conn, table, records, key_columns, dialect_name):
+        nonlocal metric_writes
+        if table.name == "scanner_metrics":
+            metric_writes += 1
+            if metric_writes == 2:
+                raise SQLAlchemyError("simulated scanner write failure")
+        return original_upsert(conn, table, records, key_columns, dialect_name)
+
+    monkeypatch.setattr(
+        db_loader, "_execute_bulk_upsert", fail_second_metric_chunk
+    )
+    saved = db_loader.save_scanner_metrics_snapshot_to_db(
+        [
+            {"symbol": "AAPL", "return_1m": 10.0},
+            {"symbol": "GOOG", "return_1m": 20.0},
+        ],
+        snapshot_date,
+        "new-fingerprint",
+        engine,
+        snapshot_symbols=["AAPL", "MSFT", "GOOG"],
+    )
+
+    assert saved == []
+    loaded = db_loader.load_scanner_metrics_from_db(
+        ["AAPL", "MSFT", "GOOG"], engine, snapshot_date
+    )
+    assert {row["symbol"]: row["return_1m"] for row in loaded} == {
+        "AAPL": 1.0,
+        "MSFT": 2.0,
+    }
+    snapshots = db_loader._ensure_scanner_metric_snapshots_table(engine)
+    with engine.connect() as conn:
+        fingerprint = conn.execute(
+            select(snapshots.c.input_fingerprint).where(
+                snapshots.c.snapshot_date == snapshot_date
+            )
+        ).scalar_one()
+    assert fingerprint == "old-fingerprint"
+
+
+def test_scanner_snapshot_strict_error_keeps_driver_message(engine, monkeypatch):
+    monkeypatch.setattr(
+        db_loader,
+        "_execute_bulk_upsert",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OperationalError(
+                "INSERT",
+                {},
+                RuntimeError("driver write timed out"),
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="driver write timed out") as error:
+        db_loader.save_scanner_metrics_snapshot_to_db(
+            [{"symbol": "AAPL", "return_1m": 1.0}],
+            dt.datetime(2026, 1, 9),
+            "fingerprint",
+            engine,
+            strict=True,
+        )
+
+    assert isinstance(error.value.__cause__, OperationalError)
 
 
 def test_scanner_cache_hit_skips_history_loading_and_calculation(engine, monkeypatch):

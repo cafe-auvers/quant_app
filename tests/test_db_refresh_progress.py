@@ -89,7 +89,7 @@ def test_scanner_metrics_refresh_logs_calculate_and_save_progress(monkeypatch):
     monkeypatch.setattr(
         db_loader,
         "save_scanner_metrics_snapshot_to_db",
-        lambda metrics_list, date, fingerprint, engine: [
+        lambda metrics_list, date, fingerprint, engine, **kwargs: [
             item["symbol"] for item in metrics_list
         ],
     )

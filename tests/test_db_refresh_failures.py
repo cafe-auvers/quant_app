@@ -83,6 +83,51 @@ def test_hourly_refresh_counts_old_nonempty_history_as_failure(monkeypatch, sqli
     assert db_loader.get_chronically_failing_symbols(engine, "1h") == set()
 
 
+@pytest.mark.parametrize(
+    ("refresh", "extra_kwargs", "expected_log"),
+    [
+        (
+            db_loader.refresh_universe_history_to_db,
+            {"interval": "1d"},
+            "1d symbol(s) remained unavailable",
+        ),
+        (
+            db_loader.refresh_universe_hourly_history_to_db,
+            {},
+            "1h symbol(s) remained unavailable",
+        ),
+    ],
+)
+def test_refresh_does_not_repeat_failed_batch_as_serial_fallback(
+    monkeypatch,
+    sqlite_engine,
+    refresh,
+    extra_kwargs,
+    expected_log,
+):
+    calls = []
+    logs = []
+    monkeypatch.setattr(
+        db_loader,
+        "download_price_history",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or pd.DataFrame(),
+    )
+
+    updated = refresh(
+        ["MISSING"],
+        sqlite_engine,
+        chunk_size=1,
+        batch_sleep=0,
+        retry_attempts=0,
+        log_callback=logs.append,
+        **extra_kwargs,
+    )
+
+    assert updated == []
+    assert len(calls) == 1
+    assert any(expected_log in message for message in logs)
+
+
 def test_daily_refresh_resets_streak_when_existing_cache_is_current(monkeypatch, sqlite_engine):
     engine = sqlite_engine
     expected_date = dt.date(2026, 6, 23)
