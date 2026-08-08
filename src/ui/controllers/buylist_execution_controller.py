@@ -252,6 +252,11 @@ class BuylistExecutionController(WindowController):
                 existing.warnings = warnings
 
     def submit_selected_queue_order(self, env: str) -> None:
+        submission_guard = getattr(
+            self.window, "_state_sync_allows_order_submission", None
+        )
+        if callable(submission_guard) and not submission_guard():
+            return
         item = self._buylist_selected_item(env)
         if not item:
             QMessageBox.warning(self.window, "No selection", "Select an execution queue row first.")

@@ -3595,6 +3595,12 @@ class BuylistMixin:
         order_price: Optional[float] = None,
     ) -> None:
         """Submit a KIS buy order without treating broker acceptance as a fill."""
+        submission_guard = getattr(
+            self, "_state_sync_allows_order_submission", None
+        )
+        if callable(submission_guard) and not submission_guard():
+            item._buy_order_pending = False
+            return
         env = self._buylist_order_environment(item)
         account_no = self._selected_order_account_for_item(item, env)
         if not account_no:
@@ -3754,6 +3760,13 @@ class BuylistMixin:
         limit_price: Optional[float] = None,
     ) -> None:
         """Submit a KIS sell order without reducing local position until fill confirmation."""
+        submission_guard = getattr(
+            self, "_state_sync_allows_order_submission", None
+        )
+        if callable(submission_guard) and not submission_guard():
+            item._stop_order_pending = False
+            item._exit_order_pending = False
+            return
         env = self._buylist_order_environment(item)
         account_no = self._selected_order_account_for_item(item, env)
         if not account_no:

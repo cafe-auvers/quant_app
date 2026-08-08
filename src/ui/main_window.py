@@ -1,6 +1,7 @@
 """Main application window for the stock dashboard."""
 
 import datetime as dt
+import logging
 import math
 import os
 import threading
@@ -49,6 +50,8 @@ from src.services.historical_refresh_control import (
 from src.services.app_state import (
     SETTINGS_FILE,
     SaveResult,
+    StateReconcileResult,
+    activate_device_as_main,
     get_state_save_manager,
     load_buylist_state,
     load_chart_drawings_state,
@@ -56,8 +59,10 @@ from src.services.app_state import (
     load_tab_options_state,
     load_trade_plans_state,
     load_watchlist_state,
+    reconcile_state_with_remote,
     save_app_state,
 )
+from src.services.state_sync import LocalDeviceRole, load_local_device_role
 from src.ui.controllers import (
     AccountController,
     BuylistExecutionController,
@@ -108,6 +113,8 @@ __all__ = [
 ]
 
 
+logger = logging.getLogger(__name__)
+
 REFERENCE_SYMBOL = "SPY"
 KST_ZONE = ZoneInfo("Asia/Seoul")
 US_MARKET_ZONE = ZoneInfo("America/New_York")
@@ -134,6 +141,51 @@ class DatabaseInitWorker(QThread):
             # but the UI must also remain usable if an unexpected driver error
             # escapes it.
             self.initialized.emit(None, str(exc))
+
+
+class StateSyncWorker(QThread):
+    """Reconcile shared state without blocking the Qt event loop."""
+
+    completed = pyqtSignal(object)
+
+    def __init__(
+        self,
+        engine,
+        role: LocalDeviceRole,
+        save_lock: threading.Lock,
+        *,
+        activate: bool = False,
+        ownership_only_when_main: bool = False,
+    ) -> None:
+        super().__init__()
+        self.engine = engine
+        self.role = role
+        self.save_lock = save_lock
+        self.activate = activate
+        self.ownership_only_when_main = ownership_only_when_main
+
+    def run(self) -> None:
+        try:
+            if self.activate:
+                result = activate_device_as_main(
+                    self.engine,
+                    self.role,
+                    save_lock=self.save_lock,
+                )
+            else:
+                result = reconcile_state_with_remote(
+                    self.engine,
+                    self.role,
+                    save_lock=self.save_lock,
+                    ownership_only_when_main=self.ownership_only_when_main,
+                )
+        except Exception as exc:
+            logger.exception("State sync worker failed")
+            result = StateReconcileResult(
+                errors=[f"State sync failed: {exc}"],
+                local_role=self.role,
+            )
+        self.completed.emit(result)
 
 
 class MainWindow(
@@ -183,6 +235,10 @@ class MainWindow(
         self.db_enabled = False
         self.db_initializing = True
         self.database_init_worker = None
+        self.state_sync_role = load_local_device_role()
+        self.state_sync_worker = None
+        self._last_state_sync_notice = ""
+        self._initial_state_sync_complete = False
         self.kis_account_snapshots: dict[tuple[str, str], dict] = {}
         self.latest_intraday_prices: dict[str, float] = {}
         self.latest_intraday_sources: dict[tuple[str, str], str] = {}
@@ -223,6 +279,11 @@ class MainWindow(
         self.kis_daily_chart_unavailable_key: str = ""
         self.kis_daily_chart_last_error: str = ""
         self.state_save_manager = get_state_save_manager()
+        self.state_save_manager.set_engine(
+            None,
+            device_id=self.state_sync_role.device_id,
+            is_main_device=self.state_sync_role.is_main,
+        )
         self._init_controllers()
 
         # Create central widget
@@ -300,8 +361,14 @@ class MainWindow(
         self.db_engine = engine
         self.db_enabled = engine is not None
         self.db_initializing = False
+        self._state_save_manager().set_engine(
+            engine,
+            device_id=self.state_sync_role.device_id,
+            is_main_device=self.state_sync_role.is_main,
+        )
         if self.db_enabled:
             self.append_log("MySQL cache connected; starting initial scanner refresh.")
+            self._start_state_sync()
             self.run_all_scanners(show_warnings=False)
         elif error:
             self.append_log(f"MySQL cache unavailable: {error}")
@@ -310,6 +377,176 @@ class MainWindow(
                 "MySQL cache is unavailable; scanner and cached intraday features remain disabled."
             )
         self.update_dashboard_summary()
+
+    def _start_state_sync(self, *, activate: bool = False) -> None:
+        """Start one ownership/state reconciliation in a background worker."""
+        if self.db_engine is None:
+            return
+        worker = self.state_sync_worker
+        if worker is not None and worker.isRunning():
+            if activate:
+                QMessageBox.information(
+                    self,
+                    "State sync busy",
+                    "Wait for the current state synchronization to finish, then try again.",
+                )
+            return
+        worker = StateSyncWorker(
+            self.db_engine,
+            self.state_sync_role,
+            self._ensure_save_lock(),
+            activate=activate,
+            ownership_only_when_main=(
+                not activate
+                and self.state_sync_role.is_main
+                and self._initial_state_sync_complete
+            ),
+        )
+        self.state_sync_worker = worker
+        self._state_sync_action = "activate" if activate else "reconcile"
+        worker.completed.connect(self._on_state_sync_completed)
+        worker.finished.connect(
+            lambda finished_worker=worker: self._clear_worker_reference(
+                "state_sync_worker", finished_worker
+            )
+        )
+        if activate and hasattr(self, "main_device_button"):
+            self.main_device_button.setEnabled(False)
+            self.main_device_button.setText("Activating Main Device...")
+        worker.start()
+
+    def _sync_state_with_remote(self) -> None:
+        """Compatibility wrapper for callers requesting an immediate sync."""
+        self._start_state_sync()
+
+    def _on_state_sync_completed(self, result: StateReconcileResult) -> None:
+        previous_main = bool(self.state_sync_role.is_main)
+        if result.local_role is not None:
+            self.state_sync_role = result.local_role
+        else:
+            self.state_sync_role = LocalDeviceRole(
+                self.state_sync_role.device_id,
+                self.state_sync_role.hostname,
+                result.is_main_device,
+            )
+        self._state_save_manager().set_main_device(result.is_main_device)
+        if not result.errors:
+            self._initial_state_sync_complete = True
+        self._update_main_device_button(
+            main_hostname=result.main_device_hostname,
+        )
+
+        action = getattr(self, "_state_sync_action", "reconcile")
+        if action == "activate" and result.is_main_device:
+            self.append_log(
+                "This device is now the exclusive main device; the other device is pull-only."
+            )
+        elif previous_main and not result.is_main_device:
+            owner = result.main_device_hostname or "another device"
+            self.append_log(
+                f"Main-device ownership moved to {owner}; this device is now pull-only."
+            )
+
+        updated_keys = set(result.updated_keys)
+        if updated_keys:
+            self.append_log(
+                f"Pulled newer shared state: {', '.join(sorted(updated_keys))}."
+            )
+        if "watchlist" in updated_keys:
+            self.watchlist = self._load_watchlist()
+            self.populate_watchlist_table()
+        if "buylist" in updated_keys:
+            self.buylist_manager = self._load_buylist()
+            self.populate_buylist_dashboard()
+        if "trade_plans" in updated_keys:
+            self.trade_manager = self._load_trade_plans()
+            self.populate_trade_plan_table()
+
+        notices = []
+        if result.conflict_keys:
+            notices.append(
+                "Sync conflict preserved local and remote copies for: "
+                + ", ".join(sorted(result.conflict_keys))
+            )
+        if result.errors:
+            notices.append("; ".join(result.errors))
+        notice = " | ".join(notices)
+        if notice and notice != self._last_state_sync_notice:
+            self.append_log(notice)
+        self._last_state_sync_notice = notice
+        self.update_dashboard_summary()
+
+    def _update_main_device_button(self, *, main_hostname: str = "") -> None:
+        button = getattr(self, "main_device_button", None)
+        if button is None:
+            return
+        is_main = bool(self.state_sync_role.is_main)
+        button.setEnabled(self.db_engine is not None or self.db_initializing)
+        if is_main:
+            button.setText("Main Device: ON")
+            button.setStyleSheet(
+                "background-color: #137333; color: white; font-weight: bold;"
+            )
+            button.setToolTip(
+                "This device is the only device allowed to push shared app state."
+            )
+        else:
+            button.setText("Use This Device as Main")
+            button.setStyleSheet("")
+            owner_text = main_hostname or "the other device"
+            button.setToolTip(
+                f"This device is pull-only. Click to transfer main ownership from {owner_text}."
+            )
+
+    def _on_main_device_button_clicked(self) -> None:
+        if self.state_sync_role.is_main:
+            QMessageBox.information(
+                self,
+                "Main device",
+                "This device is already the exclusive main device.",
+            )
+            return
+        if self.db_engine is None:
+            QMessageBox.warning(
+                self,
+                "State sync unavailable",
+                "Connect to the shared MySQL database before transferring main-device ownership.",
+            )
+            return
+        reply = QMessageBox.question(
+            self,
+            "Use This Device as Main",
+            "Transfer main-device ownership to this device?\n\n"
+            "The other device will become pull-only. Remote revisions are checked so "
+            "stale state cannot overwrite newer data.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            self._start_state_sync(activate=True)
+
+    def _state_sync_allows_order_submission(self) -> bool:
+        """Allow broker submissions only from the active main device."""
+        role = self.__dict__.get("state_sync_role")
+        if role is None:
+            # Lightweight test/dummy windows do not initialize sync state.
+            return True
+        manager = self._state_save_manager()
+        allowed = bool(
+            role.is_main and getattr(manager, "_is_main_device", role.is_main)
+        )
+        if allowed:
+            return True
+        self.append_log(
+            "KIS order submission blocked because this device is pull-only."
+        )
+        QMessageBox.warning(
+            self,
+            "Pull-only device",
+            "Only the active main device may submit KIS orders. "
+            "Click 'Use This Device as Main' before trading from this device.",
+        )
+        return False
 
     def _apply_unresolved_order_startup_state(self) -> None:
         """Reflect durable unresolved broker orders in the UI after startup."""
@@ -859,6 +1096,8 @@ class MainWindow(
     def closeEvent(self, event) -> None:
         if self.live_data_timer is not None:
             self.live_data_timer.stop()
+        if getattr(self, "state_sync_timer", None) is not None:
+            self.state_sync_timer.stop()
         if (
             hasattr(self, "market_status_timer")
             and self.market_status_timer is not None
@@ -871,6 +1110,7 @@ class MainWindow(
             self._refresh_poll_timer.stop()
         candidate_workers = [
             getattr(self, "database_init_worker", None),
+            getattr(self, "state_sync_worker", None),
             self.scanner_worker,
             self.watchlist_worker,
             self.single_ai_worker,
@@ -1077,8 +1317,15 @@ class MainWindow(
         self.progress_bar.setMaximumHeight(16)
         self.progress_label = QLabel("Ready.")
         self.progress_label.setMaximumHeight(22)
+        self.main_device_button = QPushButton()
+        self.main_device_button.setObjectName("mainDeviceButton")
+        self.main_device_button.setMaximumWidth(210)
+        self.main_device_button.clicked.connect(
+            self._on_main_device_button_clicked
+        )
         progress_layout.addWidget(self.progress_bar, 3)
         progress_layout.addWidget(self.progress_label, 1)
+        progress_layout.addWidget(self.main_device_button)
 
         self.log_output = QTextEdit()
         self.log_output.setReadOnly(True)
@@ -1093,6 +1340,14 @@ class MainWindow(
         status_layout.addWidget(self.log_output)
         status_widget.setLayout(status_layout)
         parent_layout.addWidget(status_widget)
+        self._update_main_device_button()
+
+        # Pull-only devices stay current while both applications remain open,
+        # and former main devices promptly notice an ownership transfer.
+        self.state_sync_timer = QTimer(self)
+        self.state_sync_timer.setInterval(15_000)
+        self.state_sync_timer.timeout.connect(self._start_state_sync)
+        self.state_sync_timer.start()
 
     def append_log(self, message: str) -> None:
         if not hasattr(self, "log_output"):

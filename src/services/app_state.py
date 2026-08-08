@@ -1,6 +1,8 @@
 """Local JSON state loading and saving for the dashboard."""
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import threading
 import time
@@ -10,6 +12,23 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from src.core.watchlist import BuylistManager, TradePlanManager, Watchlist
+from src.services.state_sync import (
+    BUYLIST_KEY,
+    PULL_ERROR,
+    PULL_OK,
+    PUSH_CONFLICT,
+    PUSH_NOT_MAIN,
+    PUSH_WRITTEN,
+    SYNCED_STATE_KEYS,
+    TRADE_PLANS_KEY,
+    WATCHLIST_KEY,
+    LocalDeviceRole,
+    claim_main_device,
+    get_main_device,
+    pull_state,
+    push_state,
+    set_local_device_main,
+)
 from src.utils.config import DATA_DIR
 from src.utils.storage import load_json, save_json
 
@@ -113,6 +132,30 @@ class StateSaveManager:
         self.last_save_started_at: datetime | None = None
         self.last_save_finished_at: datetime | None = None
         self.last_result: SaveResult | None = None
+        self._engine = None
+        self._device_id = ""
+        self._is_main_device = False
+
+    def set_engine(
+        self,
+        engine,
+        *,
+        device_id: str = "",
+        is_main_device: bool = False,
+    ) -> None:
+        """Attach the (optional) shared MySQL engine used for cross-machine sync.
+
+        Called once the app's async DB-init worker finishes. Before that,
+        or if the DB is unreachable, `engine` stays None and pushes are
+        skipped -- saves still work locally exactly as before.
+        """
+        self._engine = engine
+        self._device_id = str(device_id or "")
+        self._is_main_device = bool(is_main_device)
+
+    def set_main_device(self, is_main_device: bool) -> None:
+        """Update whether this process may attempt remote state writes."""
+        self._is_main_device = bool(is_main_device)
 
     def schedule_save(
         self,
@@ -229,14 +272,96 @@ class StateSaveManager:
                     finished_at=datetime.now(timezone.utc),
                     files_written=files_written,
                 )
+                try:
+                    self._push_to_remote(
+                        watchlist_dict,
+                        buylist_dict,
+                        trade_manager_dict,
+                        append_log=append_log,
+                    )
+                except Exception:
+                    logger.debug("Remote state push failed", exc_info=True)
+                    _append_sync_message(
+                        append_log,
+                        "Remote state save failed; the local copy remains safe.",
+                    )
+
+            self._store_result(result)
+            self._write_metadata(result, append_log=append_log)
+            if not result.success:
+                self._log_failure(result, append_log)
+            return result
         finally:
             lock.release()
 
-        self._store_result(result)
-        self._write_metadata(result, append_log=append_log)
-        if not result.success:
-            self._log_failure(result, append_log)
-        return result
+    def _push_to_remote(
+        self,
+        watchlist_dict: Dict[str, Any],
+        buylist_dict: Dict[str, Any],
+        trade_manager_dict: Dict[str, Any],
+        *,
+        append_log: Callable[[str], None] | None = None,
+    ) -> None:
+        """Best-effort push of the just-saved state to the shared MySQL sync table.
+
+        Silently does nothing if no engine is attached yet or the DB is
+        unreachable -- local save has already succeeded regardless.
+        """
+        engine = self._engine
+        if engine is None or not self._is_main_device or not self._device_id:
+            return
+        payloads = {
+            WATCHLIST_KEY: watchlist_dict,
+            BUYLIST_KEY: buylist_dict,
+            TRADE_PLANS_KEY: trade_manager_dict,
+        }
+        sync_entries = _read_sync_entries(self._metadata_path())
+        written_entries: Dict[str, Dict[str, Any]] = {}
+
+        for state_key, payload in payloads.items():
+            entry = sync_entries.get(state_key)
+            has_base, base_revision, base_hash = _base_sync_values(entry)
+            if not has_base:
+                # Startup reconciliation establishes the first safe base
+                # revision.  Never guess and overwrite a pre-existing row.
+                continue
+            payload_hash = _state_payload_hash(payload)
+            if payload_hash == base_hash:
+                continue
+            result = push_state(
+                engine,
+                state_key,
+                payload,
+                device_id=self._device_id,
+                expected_revision=base_revision,
+            )
+            if result.status == PUSH_WRITTEN:
+                written_entries[state_key] = _sync_entry(
+                    result.revision,
+                    payload_hash,
+                    result.updated_at,
+                )
+                continue
+            if result.status == PUSH_NOT_MAIN:
+                self._is_main_device = False
+                _append_sync_message(
+                    append_log,
+                    "Remote state save stopped because another device is now main.",
+                )
+                break
+            if result.status == PUSH_CONFLICT:
+                _append_sync_message(
+                    append_log,
+                    f"Remote {state_key} was not overwritten because it changed on another device.",
+                )
+            else:
+                _append_sync_message(
+                    append_log,
+                    f"Remote {state_key} save failed; the local copy remains safe.",
+                )
+
+        if written_entries:
+            _update_sync_entries(written_entries, self._metadata_path())
 
     def wait_for_pending_saves(self, timeout: float | None = None) -> bool:
         """Wait for currently scheduled saves, returning False on timeout."""
@@ -531,6 +656,335 @@ def load_chart_drawings_state() -> Dict[str, Any]:
             normalized[symbol_key] = clean_drawings
     quarantine_rejected_records(CHART_DRAWINGS_FILE, rejected)
     return normalized
+
+
+def _state_payload_hash(payload: Dict[str, Any]) -> str:
+    encoded = json.dumps(
+        payload,
+        default=str,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _read_sync_entries(metadata_path: Path | None = None) -> Dict[str, Dict[str, Any]]:
+    metadata = load_json(metadata_path or STATE_METADATA_FILE, {})
+    entries = metadata.get("state_sync")
+    if not isinstance(entries, dict):
+        return {}
+    return {
+        str(key): dict(value)
+        for key, value in entries.items()
+        if isinstance(value, dict)
+    }
+
+
+def _sync_entry(
+    revision: int | None,
+    content_hash: str,
+    updated_at: datetime | None,
+) -> Dict[str, Any]:
+    return {
+        "revision": int(revision or 0),
+        "content_hash": content_hash,
+        "updated_at": updated_at.isoformat() if updated_at else "",
+    }
+
+
+def _base_sync_values(entry: Any) -> tuple[bool, int, str]:
+    if not isinstance(entry, dict):
+        return False, 0, ""
+    try:
+        revision = int(entry.get("revision") or 0)
+    except (TypeError, ValueError):
+        return False, 0, ""
+    content_hash = str(entry.get("content_hash") or "")
+    return bool(revision > 0 and content_hash), revision, content_hash
+
+
+def _update_sync_entries(
+    updates: Dict[str, Dict[str, Any]],
+    metadata_path: Path | None = None,
+) -> None:
+    path = metadata_path or STATE_METADATA_FILE
+    metadata = load_json(path, {})
+    entries = metadata.get("state_sync")
+    entries = dict(entries) if isinstance(entries, dict) else {}
+    entries.update(updates)
+    metadata["state_sync"] = entries
+    try:
+        save_json(path, metadata)
+    except Exception:
+        logger.debug("Could not persist state-sync bookkeeping", exc_info=True)
+
+
+def _append_sync_message(
+    append_log: Callable[[str], None] | None,
+    message: str,
+) -> None:
+    logger.info(message)
+    if append_log is None:
+        return
+    try:
+        append_log(message)
+    except Exception:
+        logger.debug("append_log failed while reporting state sync", exc_info=True)
+
+
+def _synced_key_to_file() -> Dict[str, Path]:
+    # Read the module-level FILE constants at call time (rather than caching
+    # them at import time) so tests that monkeypatch e.g. app_state.WATCHLIST_FILE
+    # are respected.
+    return {
+        WATCHLIST_KEY: WATCHLIST_FILE,
+        BUYLIST_KEY: BUYLIST_FILE,
+        TRADE_PLANS_KEY: TRADE_PLANS_FILE,
+    }
+
+
+@dataclass
+class StateReconcileResult:
+    updated_keys: set[str] = field(default_factory=set)
+    conflict_keys: set[str] = field(default_factory=set)
+    errors: list[str] = field(default_factory=list)
+    is_main_device: bool = False
+    main_device_hostname: str = ""
+    local_role: LocalDeviceRole | None = None
+
+
+def _demote_after_lost_ownership(
+    role: LocalDeviceRole,
+    result: StateReconcileResult,
+) -> LocalDeviceRole:
+    result.is_main_device = False
+    try:
+        role = set_local_device_main(role, False)
+    except Exception as exc:
+        result.errors.append(f"Could not persist pull-only device role: {exc}")
+        role = LocalDeviceRole(role.device_id, role.hostname, False)
+    result.local_role = role
+    return role
+
+
+def _apply_remote_state(
+    state_key: str,
+    path: Path,
+    remote,
+    result: StateReconcileResult,
+    metadata_updates: Dict[str, Dict[str, Any]],
+) -> None:
+    try:
+        save_json(path, remote.payload)
+    except Exception as exc:
+        logger.exception("Failed writing synced %s state to %s", state_key, path)
+        result.errors.append(f"Could not save pulled {state_key}: {exc}")
+        return
+    payload_hash = _state_payload_hash(remote.payload)
+    metadata_updates[state_key] = _sync_entry(
+        remote.revision,
+        payload_hash,
+        remote.updated_at,
+    )
+    result.updated_keys.add(state_key)
+
+
+def reconcile_state_with_remote(
+    engine,
+    role: LocalDeviceRole,
+    *,
+    save_lock: threading.Lock | None = None,
+    ownership_only_when_main: bool = False,
+) -> StateReconcileResult:
+    """Reconcile local files using ownership, hashes, and conditional revisions."""
+    result = StateReconcileResult(local_role=role)
+    if engine is None:
+        result.errors.append("State sync database is unavailable.")
+        return result
+
+    lock = save_lock
+    if lock is not None:
+        lock.acquire()
+    try:
+        ownership = get_main_device(engine)
+        if not ownership.success:
+            result.errors.append(ownership.error or "Could not read main-device ownership.")
+            return result
+
+        main_device = ownership.main_device
+        if main_device is None and role.is_main:
+            ownership = claim_main_device(engine, role)
+            if not ownership.success:
+                result.errors.append(ownership.error or "Could not claim main-device ownership.")
+                return result
+            main_device = ownership.main_device
+
+        is_main = bool(main_device and main_device.device_id == role.device_id)
+        if role.is_main != is_main:
+            try:
+                role = set_local_device_main(role, is_main)
+            except Exception as exc:
+                result.errors.append(f"Could not persist this device's sync role: {exc}")
+                role = LocalDeviceRole(role.device_id, role.hostname, is_main)
+        result.local_role = role
+        result.is_main_device = is_main
+        result.main_device_hostname = main_device.hostname if main_device else ""
+
+        # Once startup reconciliation has established the base revisions, the
+        # exclusive writer only needs to verify that it still owns the lease.
+        # Normal saves already push changed keys.  Avoiding redundant pulls
+        # also avoids racing a user edit made while the background poll runs.
+        if is_main and ownership_only_when_main:
+            return result
+
+        sync_entries = _read_sync_entries()
+        metadata_updates: Dict[str, Dict[str, Any]] = {}
+        key_to_file = _synced_key_to_file()
+
+        for state_key in SYNCED_STATE_KEYS:
+            path = key_to_file[state_key]
+            local_payload = load_json(path, {})
+            local_hash = _state_payload_hash(local_payload)
+            base_entry = sync_entries.get(state_key)
+            has_base, base_revision, base_hash = _base_sync_values(base_entry)
+            local_dirty = has_base and local_hash != base_hash
+
+            pulled = pull_state(engine, state_key)
+            if pulled.status == PULL_ERROR:
+                result.errors.append(
+                    f"Could not read remote {state_key}: {pulled.error or 'unknown error'}"
+                )
+                continue
+            remote = pulled.state if pulled.status == PULL_OK else None
+
+            if not is_main:
+                if remote is None:
+                    continue
+                if not has_base:
+                    _apply_remote_state(
+                        state_key, path, remote, result, metadata_updates
+                    )
+                    continue
+                if remote.revision == base_revision:
+                    continue
+                if local_dirty:
+                    result.conflict_keys.add(state_key)
+                    continue
+                _apply_remote_state(state_key, path, remote, result, metadata_updates)
+                continue
+
+            if not has_base:
+                expected_revision = remote.revision if remote is not None else 0
+                pushed = push_state(
+                    engine,
+                    state_key,
+                    local_payload,
+                    device_id=role.device_id,
+                    expected_revision=expected_revision,
+                )
+                if pushed.status == PUSH_WRITTEN:
+                    metadata_updates[state_key] = _sync_entry(
+                        pushed.revision,
+                        local_hash,
+                        pushed.updated_at,
+                    )
+                elif pushed.status == PUSH_NOT_MAIN:
+                    role = _demote_after_lost_ownership(role, result)
+                    result.errors.append(pushed.error)
+                    break
+                elif pushed.status == PUSH_CONFLICT:
+                    result.conflict_keys.add(state_key)
+                else:
+                    result.errors.append(
+                        f"Could not publish local {state_key}: {pushed.error}"
+                    )
+                continue
+
+            if remote is None:
+                # A remotely deleted row is a conflict, not permission to
+                # recreate it from a possibly stale local snapshot.
+                result.conflict_keys.add(state_key)
+                continue
+
+            remote_changed = remote.revision != base_revision
+            if remote_changed and local_dirty:
+                result.conflict_keys.add(state_key)
+            elif remote_changed:
+                _apply_remote_state(state_key, path, remote, result, metadata_updates)
+            elif local_dirty:
+                pushed = push_state(
+                    engine,
+                    state_key,
+                    local_payload,
+                    device_id=role.device_id,
+                    expected_revision=base_revision,
+                )
+                if pushed.status == PUSH_WRITTEN:
+                    metadata_updates[state_key] = _sync_entry(
+                        pushed.revision,
+                        local_hash,
+                        pushed.updated_at,
+                    )
+                elif pushed.status == PUSH_CONFLICT:
+                    result.conflict_keys.add(state_key)
+                else:
+                    if pushed.status == PUSH_NOT_MAIN:
+                        role = _demote_after_lost_ownership(role, result)
+                    result.errors.append(
+                        f"Could not publish local {state_key}: {pushed.error}"
+                    )
+                    if pushed.status == PUSH_NOT_MAIN:
+                        break
+
+        if metadata_updates:
+            _update_sync_entries(metadata_updates)
+        return result
+    finally:
+        if lock is not None:
+            lock.release()
+
+
+def activate_device_as_main(
+    engine,
+    role: LocalDeviceRole,
+    *,
+    save_lock: threading.Lock | None = None,
+) -> StateReconcileResult:
+    """Explicitly transfer main-device ownership, then reconcile safely."""
+    if engine is None:
+        return StateReconcileResult(
+            errors=["State sync database is unavailable."],
+            local_role=role,
+        )
+
+    # Establish a remote base before taking ownership.  A device that missed
+    # its startup pull must never turn an explicit activation into a blind
+    # overwrite of an existing remote row.
+    pull_only_role = LocalDeviceRole(role.device_id, role.hostname, False)
+    prepared = reconcile_state_with_remote(
+        engine,
+        pull_only_role,
+        save_lock=save_lock,
+    )
+    if prepared.errors or prepared.conflict_keys:
+        return prepared
+
+    ownership = claim_main_device(engine, role)
+    if not ownership.success:
+        return StateReconcileResult(
+            errors=[ownership.error or "Could not activate this device as main."],
+            local_role=role,
+        )
+    try:
+        role = set_local_device_main(role, True)
+    except Exception as exc:
+        return StateReconcileResult(
+            errors=[f"Main ownership changed, but the local role could not be saved: {exc}"],
+            is_main_device=True,
+            main_device_hostname=role.hostname,
+            local_role=LocalDeviceRole(role.device_id, role.hostname, True),
+        )
+    return reconcile_state_with_remote(engine, role, save_lock=save_lock)
 
 
 def save_app_state(
