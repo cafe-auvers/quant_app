@@ -97,14 +97,18 @@ def _refresh_targets_needed() -> Tuple[Dict[str, List[str]], str]:
     chronic_daily = get_chronically_failing_symbols(engine, interval="1d")
     chronic_hourly = get_chronically_failing_symbols(engine, interval="1h")
 
-    daily_watermarks = get_price_history_watermarks(engine, tickers, interval="1d")
+    daily_watermarks = get_price_history_watermarks(
+        engine, tickers, interval="1d", strict=True
+    )
     daily_latest = {
         symbol: watermark[0]
         for symbol, watermark in daily_watermarks.items()
     }
     daily_stale_all = _stale_symbols(daily_latest, tickers, expected_date)
     hourly_stale_all = _stale_symbols(
-        get_latest_hourly_price_history_timestamps(engine, tickers), tickers, expected_date
+        get_latest_hourly_price_history_timestamps(engine, tickers, strict=True),
+        tickers,
+        expected_date,
     )
     daily_stale = [
         symbol
@@ -117,12 +121,23 @@ def _refresh_targets_needed() -> Tuple[Dict[str, List[str]], str]:
         if symbol == REFERENCE_SYMBOL or symbol not in chronic_hourly
     ]
 
-    chart_refresh_plan = get_chart_indicator_refresh_plan(
-        engine, tickers, reference_symbol=REFERENCE_SYMBOL
-    )
-    scanner_current = is_scanner_metrics_snapshot_current(
-        engine, tickers, history_watermarks=daily_watermarks
-    )
+    # A daily history run always validates derived caches after its writes, so
+    # avoid querying them twice when price staleness already guarantees 1D.
+    chart_refresh_plan = {}
+    scanner_current = True
+    if not daily_stale:
+        chart_refresh_plan = get_chart_indicator_refresh_plan(
+            engine,
+            tickers,
+            reference_symbol=REFERENCE_SYMBOL,
+            history_watermarks=daily_watermarks,
+        )
+        scanner_current = is_scanner_metrics_snapshot_current(
+            engine,
+            tickers,
+            history_watermarks=daily_watermarks,
+            strict=True,
+        )
 
     targets: Dict[str, List[str]] = {}
     reasons = []
@@ -190,7 +205,16 @@ def _run_mode(mode: str, symbols: List[str]) -> int:
 
 
 def main() -> int:
-    targets, reason = _refresh_targets_needed()
+    try:
+        targets, reason = _refresh_targets_needed()
+    except Exception as exc:
+        print(
+            f"[{dt.datetime.now(KST_ZONE).isoformat()}] "
+            f"Refresh cache verification failed: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 1
     print(f"[{dt.datetime.now(KST_ZONE).isoformat()}] {reason}")
     if not targets:
         return 0

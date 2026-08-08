@@ -72,28 +72,54 @@ def test_selective_child_rechecks_and_drops_symbols_that_are_now_current(monkeyp
 def test_run_1d_downloads_only_stale_payload_but_checks_full_derived_universe(monkeypatch):
     state = _State()
     calls = {}
+    watermarks = {
+        "SPY": (historical.dt.datetime(2026, 6, 23), 250),
+        "AAPL": (historical.dt.datetime(2026, 6, 23), 250),
+        "MSFT": (historical.dt.datetime(2026, 6, 23), 250),
+    }
 
     def refresh_history(tickers, engine, **kwargs):
         calls["history"] = list(tickers)
         return list(tickers)
 
     def refresh_chart(tickers, engine, **kwargs):
-        calls["chart"] = (list(tickers), kwargs["force"])
+        calls["chart"] = (
+            list(tickers),
+            kwargs["force"],
+            kwargs["history_watermarks"],
+        )
         return []
 
     def refresh_scanner(tickers, engine, **kwargs):
-        calls["scanner"] = (list(tickers), kwargs["force"])
+        calls["scanner"] = (
+            list(tickers),
+            kwargs["force"],
+            kwargs["history_watermarks"],
+        )
         return []
 
+    def chart_plan(*args, **kwargs):
+        calls["chart_plan_watermarks"] = kwargs["history_watermarks"]
+        return {}
+
+    def scanner_current(*args, **kwargs):
+        calls["scanner_current_watermarks"] = kwargs["history_watermarks"]
+        return True
+
+    def load_watermarks(*args, **kwargs):
+        calls["watermark_kwargs"] = kwargs
+        return watermarks
+
     monkeypatch.setattr(historical, "refresh_universe_history_to_db", refresh_history)
+    monkeypatch.setattr(
+        historical,
+        "get_price_history_watermarks",
+        load_watermarks,
+    )
     monkeypatch.setattr(historical, "refresh_chart_indicators_to_db", refresh_chart)
     monkeypatch.setattr(historical, "refresh_scanner_metrics_to_db", refresh_scanner)
-    monkeypatch.setattr(
-        historical, "get_chart_indicator_refresh_plan", lambda *args, **kwargs: {}
-    )
-    monkeypatch.setattr(
-        historical, "is_scanner_metrics_snapshot_current", lambda *args, **kwargs: True
-    )
+    monkeypatch.setattr(historical, "get_chart_indicator_refresh_plan", chart_plan)
+    monkeypatch.setattr(historical, "is_scanner_metrics_snapshot_current", scanner_current)
 
     historical.run_1d(
         object(),
@@ -103,8 +129,11 @@ def test_run_1d_downloads_only_stale_payload_but_checks_full_derived_universe(mo
     )
 
     assert calls["history"] == ["AAPL"]
-    assert calls["chart"] == (["SPY", "AAPL", "MSFT"], False)
-    assert calls["scanner"] == (["SPY", "AAPL", "MSFT"], False)
+    assert calls["watermark_kwargs"] == {"interval": "1d", "strict": True}
+    assert calls["chart"] == (["SPY", "AAPL", "MSFT"], False, watermarks)
+    assert calls["chart_plan_watermarks"] is watermarks
+    assert calls["scanner"] == (["SPY", "AAPL", "MSFT"], False, watermarks)
+    assert calls["scanner_current_watermarks"] is watermarks
     assert state.updated_count == 1
     assert state.completed == ["daily_history", "chart_indicators", "scanner_metrics"]
 
@@ -117,6 +146,9 @@ def test_derived_only_run_never_calls_price_downloader(monkeypatch):
         raise AssertionError("price history must not be fetched")
 
     monkeypatch.setattr(historical, "refresh_universe_history_to_db", unexpected_download)
+    monkeypatch.setattr(
+        historical, "get_price_history_watermarks", lambda *args, **kwargs: {}
+    )
     monkeypatch.setattr(
         historical,
         "refresh_chart_indicators_to_db",
@@ -148,6 +180,9 @@ def test_derived_only_run_never_calls_price_downloader(monkeypatch):
 def test_run_1d_does_not_mark_failed_derived_cache_complete(monkeypatch):
     state = _State()
     monkeypatch.setattr(
+        historical, "get_price_history_watermarks", lambda *args, **kwargs: {}
+    )
+    monkeypatch.setattr(
         historical, "refresh_chart_indicators_to_db", lambda *args, **kwargs: []
     )
     monkeypatch.setattr(
@@ -168,6 +203,9 @@ def test_run_1d_does_not_mark_failed_derived_cache_complete(monkeypatch):
 
 def test_run_1d_does_not_mark_failed_scanner_snapshot_complete(monkeypatch):
     state = _State()
+    monkeypatch.setattr(
+        historical, "get_price_history_watermarks", lambda *args, **kwargs: {}
+    )
     monkeypatch.setattr(
         historical, "refresh_chart_indicators_to_db", lambda *args, **kwargs: []
     )

@@ -41,9 +41,13 @@ _MYSQL_HOST_FORBIDDEN_CHARACTERS = frozenset("/\\@?#")
 MYSQL_CONNECT_TIMEOUT_SECONDS = 3
 MYSQL_READ_WRITE_TIMEOUT_SECONDS = 15
 MYSQL_POOL_RECYCLE_SECONDS = 1800
+CACHE_QUERY_SYMBOL_CHUNK_SIZE = 200
+HOURLY_CACHE_QUERY_SYMBOL_CHUNK_SIZE = 100
+SCANNER_QUERY_SYMBOL_CHUNK_SIZE = 500
 logger = logging.getLogger(__name__)
 
 SCANNER_METRICS_CACHE_VERSION = 1
+CHART_INDICATOR_CACHE_VERSION = 1
 REFERENCE_SYMBOL = "SPY"
 
 
@@ -162,6 +166,7 @@ def init_mysql_engine(db_name: Optional[str] = None) -> Optional[Engine]:
         _ensure_price_history_table(engine)
         _ensure_hourly_price_history_table(engine)
         _ensure_chart_indicators_table(engine)
+        _ensure_chart_indicator_manifests_table(engine)
         _ensure_intraday_price_history_table(engine)
         _ensure_scanner_metrics_table(engine)
         _ensure_scanner_metric_snapshots_table(engine)
@@ -383,6 +388,28 @@ def _ensure_chart_indicators_table(engine: Engine) -> Table:
     chart_indicators = _get_chart_indicators_table(metadata)
     metadata.create_all(engine)
     return chart_indicators
+
+
+def _get_chart_indicator_manifests_table(metadata: MetaData) -> Table:
+    return Table(
+        "chart_indicator_manifests",
+        metadata,
+        Column("symbol", String(20), primary_key=True),
+        Column("reference_symbol", String(20), nullable=False),
+        Column("source_latest_date", DateTime, nullable=False),
+        Column("source_row_count", Integer, nullable=False),
+        Column("reference_latest_date", DateTime, nullable=False),
+        Column("reference_row_count", Integer, nullable=False),
+        Column("cache_version", Integer, nullable=False),
+        Column("completed_at", DateTime, default=_utcnow_naive, nullable=False),
+    )
+
+
+def _ensure_chart_indicator_manifests_table(engine: Engine) -> Table:
+    metadata = MetaData()
+    table = _get_chart_indicator_manifests_table(metadata)
+    metadata.create_all(engine)
+    return table
 
 
 def _get_intraday_price_history_table(metadata: MetaData) -> Table:
@@ -984,20 +1011,24 @@ def load_universe_history_from_db(
     metadata = MetaData()
     price_history = _get_price_history_table(metadata)
     _ensure_price_history_table(engine)
-    symbols = [ticker.strip().upper() for ticker in tickers if ticker.strip()]
-    stmt = select(price_history).where(
-        price_history.c.symbol.in_(symbols),
-        price_history.c.interval == interval.strip().lower(),
-    )
-    if start is not None:
-        stmt = stmt.where(price_history.c.date >= start)
-    if end is not None:
-        stmt = stmt.where(price_history.c.date <= end)
-    stmt = stmt.order_by(price_history.c.symbol, price_history.c.date)
+    symbols = _clean_symbols(tickers)
+    if not symbols:
+        return {}
 
+    rows = []
     try:
         with engine.connect() as conn:
-            rows = conn.execute(stmt).all()
+            for chunk in _record_chunks(symbols, CACHE_QUERY_SYMBOL_CHUNK_SIZE):
+                stmt = select(price_history).where(
+                    price_history.c.symbol.in_(chunk),
+                    price_history.c.interval == interval.strip().lower(),
+                )
+                if start is not None:
+                    stmt = stmt.where(price_history.c.date >= start)
+                if end is not None:
+                    stmt = stmt.where(price_history.c.date <= end)
+                stmt = stmt.order_by(price_history.c.symbol, price_history.c.date)
+                rows.extend(conn.execute(stmt).all())
     except SQLAlchemyError:
         return {}
 
@@ -1200,13 +1231,18 @@ def save_chart_indicators_to_db(symbol: str, indicators: pd.DataFrame, engine: E
 
     metadata = MetaData()
     chart_indicators = _get_chart_indicators_table(metadata)
+    manifest_table = _get_chart_indicator_manifests_table(metadata)
     _ensure_chart_indicators_table(engine)
+    _ensure_chart_indicator_manifests_table(engine)
     records = _chart_indicator_records(indicators, chart_indicators)
     if not records:
         return False
 
     try:
         with engine.begin() as conn:
+            _invalidate_chart_indicator_manifests(
+                conn, manifest_table, [symbol]
+            )
             if engine.dialect.name not in ("mysql", "sqlite"):
                 conn.execute(delete(chart_indicators).where(chart_indicators.c.symbol == symbol.strip().upper()))
             _execute_bulk_upsert(
@@ -1240,15 +1276,35 @@ def _chart_indicator_records(indicators: pd.DataFrame, chart_indicators: Table) 
     return records
 
 
-def save_chart_indicators_batch_to_db(records: List[dict], engine: Engine) -> int:
+def save_chart_indicators_batch_to_db(
+    records: List[dict],
+    engine: Engine,
+    replace_symbols: Optional[List[str]] = None,
+) -> int:
     if not records:
         return 0
 
     metadata = MetaData()
     chart_indicators = _get_chart_indicators_table(metadata)
+    manifest_table = _get_chart_indicator_manifests_table(metadata)
     _ensure_chart_indicators_table(engine)
+    _ensure_chart_indicator_manifests_table(engine)
+    replacement_symbols = _clean_symbols(replace_symbols or [])
     try:
         with engine.begin() as conn:
+            _invalidate_chart_indicator_manifests(
+                conn,
+                manifest_table,
+                [record["symbol"] for record in records if record.get("symbol")],
+            )
+            for chunk in _record_chunks(
+                replacement_symbols, CACHE_QUERY_SYMBOL_CHUNK_SIZE
+            ):
+                conn.execute(
+                    delete(chart_indicators).where(
+                        chart_indicators.c.symbol.in_(chunk)
+                    )
+                )
             return _execute_bulk_upsert(
                 conn,
                 chart_indicators,
@@ -1267,19 +1323,181 @@ def get_latest_chart_indicator_dates(
     cleaned_symbols = _clean_symbols(symbols)
     if not cleaned_symbols:
         return {}
-
+    table = _ensure_chart_indicators_table(engine)
+    rows = []
     try:
-        table = _ensure_chart_indicators_table(engine)
-        stmt = (
-            select(table.c.symbol, func.max(table.c.date).label("latest_date"))
-            .where(table.c.symbol.in_(cleaned_symbols))
-            .group_by(table.c.symbol)
-        )
         with engine.connect() as conn:
-            rows = conn.execute(stmt).all()
+            for chunk in _record_chunks(
+                cleaned_symbols, CACHE_QUERY_SYMBOL_CHUNK_SIZE
+            ):
+                stmt = (
+                    select(table.c.symbol, func.max(table.c.date).label("latest_date"))
+                    .where(table.c.symbol.in_(chunk))
+                    .group_by(table.c.symbol)
+                )
+                rows.extend(conn.execute(stmt).all())
     except SQLAlchemyError:
         return {}
-    return {str(row.symbol).upper(): row.latest_date for row in rows if row.latest_date is not None}
+    return {
+        str(row.symbol).upper(): row.latest_date
+        for row in rows
+        if row.latest_date is not None
+    }
+
+
+def _history_watermark_values(
+    watermark: object,
+) -> Optional[Tuple[dt.datetime, int]]:
+    if isinstance(watermark, dict):
+        latest = watermark.get("latest_date")
+        row_count = int(watermark.get("row_count") or 0)
+    elif isinstance(watermark, (tuple, list)) and len(watermark) >= 2:
+        latest = watermark[0]
+        row_count = int(watermark[1] or 0)
+    else:
+        return None
+    if latest is None or pd.isna(latest) or row_count <= 0:
+        return None
+    return _normalize_timestamp(pd.Timestamp(latest)), row_count
+
+
+def _get_chart_indicator_manifests(
+    engine: Engine, symbols: List[str]
+) -> Dict[str, Dict[str, object]]:
+    cleaned_symbols = _clean_symbols(symbols)
+    if not cleaned_symbols:
+        return {}
+    table = _ensure_chart_indicator_manifests_table(engine)
+    rows = []
+    try:
+        with engine.connect() as conn:
+            for chunk in _record_chunks(
+                cleaned_symbols, CACHE_QUERY_SYMBOL_CHUNK_SIZE
+            ):
+                stmt = select(table).where(table.c.symbol.in_(chunk))
+                rows.extend(conn.execute(stmt).all())
+    except SQLAlchemyError as exc:
+        raise RuntimeError("Unable to verify chart-indicator manifests") from exc
+    return {
+        str(row.symbol).upper(): {
+            "reference_symbol": str(row.reference_symbol).upper(),
+            "source_latest_date": row.source_latest_date,
+            "source_row_count": int(row.source_row_count or 0),
+            "reference_latest_date": row.reference_latest_date,
+            "reference_row_count": int(row.reference_row_count or 0),
+            "cache_version": int(row.cache_version or 0),
+        }
+        for row in rows
+    }
+
+
+def _save_chart_indicator_manifests(
+    engine: Engine,
+    symbols: List[str],
+    history_watermarks: Dict[str, object],
+    reference_symbol: str,
+) -> None:
+    reference_values = _history_watermark_values(
+        history_watermarks.get(reference_symbol)
+    )
+    if reference_values is None:
+        return
+    reference_latest, reference_count = reference_values
+    now = _utcnow_naive()
+    records = []
+    for symbol in _clean_symbols(symbols):
+        source_values = _history_watermark_values(history_watermarks.get(symbol))
+        if source_values is None:
+            continue
+        source_latest, source_count = source_values
+        records.append(
+            {
+                "symbol": symbol,
+                "reference_symbol": reference_symbol,
+                "source_latest_date": source_latest,
+                "source_row_count": source_count,
+                "reference_latest_date": reference_latest,
+                "reference_row_count": reference_count,
+                "cache_version": CHART_INDICATOR_CACHE_VERSION,
+                "completed_at": now,
+            }
+        )
+    if not records:
+        return
+    table = _ensure_chart_indicator_manifests_table(engine)
+    try:
+        with engine.begin() as conn:
+            for chunk in _record_chunks(
+                records, CACHE_QUERY_SYMBOL_CHUNK_SIZE
+            ):
+                _execute_bulk_upsert(
+                    conn,
+                    table,
+                    chunk,
+                    ("symbol",),
+                    engine.dialect.name,
+                )
+    except SQLAlchemyError as exc:
+        raise RuntimeError("Unable to save chart-indicator manifests") from exc
+
+
+def _chart_indicator_manifest_matches(
+    manifest: Optional[Dict[str, object]],
+    source_values: Tuple[dt.datetime, int],
+    reference_values: Tuple[dt.datetime, int],
+    reference_symbol: str,
+) -> bool:
+    if manifest is None:
+        return False
+    source_latest, source_count = source_values
+    reference_latest, reference_count = reference_values
+    return (
+        manifest["reference_symbol"] == reference_symbol
+        and manifest["cache_version"] == CHART_INDICATOR_CACHE_VERSION
+        and manifest["source_latest_date"] == source_latest
+        and manifest["source_row_count"] == source_count
+        and manifest["reference_latest_date"] == reference_latest
+        and manifest["reference_row_count"] == reference_count
+    )
+
+
+def _invalidate_chart_indicator_manifests(
+    conn, table: Table, symbols: List[str]
+) -> None:
+    """Invalidate completion metadata in the same transaction as cache DML.
+
+    All application writes to ``chart_indicators`` must use the save helpers
+    above so a matching manifest remains proof that no app write was
+    interrupted or partially committed.
+    """
+    for chunk in _record_chunks(
+        _clean_symbols(symbols), CACHE_QUERY_SYMBOL_CHUNK_SIZE
+    ):
+        conn.execute(delete(table).where(table.c.symbol.in_(chunk)))
+
+
+def _clear_chart_indicator_cache(engine: Engine, symbols: List[str]) -> None:
+    cleaned_symbols = _clean_symbols(symbols)
+    if not cleaned_symbols:
+        return
+    metadata = MetaData()
+    indicators = _get_chart_indicators_table(metadata)
+    manifests = _get_chart_indicator_manifests_table(metadata)
+    _ensure_chart_indicators_table(engine)
+    _ensure_chart_indicator_manifests_table(engine)
+    try:
+        with engine.begin() as conn:
+            _invalidate_chart_indicator_manifests(
+                conn, manifests, cleaned_symbols
+            )
+            for chunk in _record_chunks(
+                cleaned_symbols, CACHE_QUERY_SYMBOL_CHUNK_SIZE
+            ):
+                conn.execute(
+                    delete(indicators).where(indicators.c.symbol.in_(chunk))
+                )
+    except SQLAlchemyError as exc:
+        raise RuntimeError("Unable to clear stale chart-indicator cache") from exc
 
 
 def get_latest_chart_indicator_source_dates(
@@ -1301,39 +1519,37 @@ def get_latest_chart_indicator_source_dates(
         & (reference_prices.c.symbol == reference_symbol)
         & (reference_prices.c.interval == "1d")
     )
-    stmt = (
-        select(prices.c.symbol, func.max(prices.c.date).label("latest_date"))
-        .select_from(prices.join(reference_prices, join_condition))
-        .where(prices.c.symbol.in_(cleaned_symbols), prices.c.interval == "1d")
-        .group_by(prices.c.symbol)
-    )
+    rows = []
     try:
         _ensure_price_history_table(engine)
         with engine.connect() as conn:
-            rows = conn.execute(stmt).all()
-    except SQLAlchemyError:
-        return {}
+            for chunk in _record_chunks(cleaned_symbols, CACHE_QUERY_SYMBOL_CHUNK_SIZE):
+                stmt = (
+                    select(
+                        prices.c.symbol,
+                        func.max(prices.c.date).label("latest_date"),
+                    )
+                    .select_from(prices.join(reference_prices, join_condition))
+                    .where(
+                        prices.c.symbol.in_(chunk), prices.c.interval == "1d"
+                    )
+                    .group_by(prices.c.symbol)
+                )
+                rows.extend(conn.execute(stmt).all())
+    except SQLAlchemyError as exc:
+        raise RuntimeError("Unable to verify chart-indicator source dates") from exc
     return {str(row.symbol).upper(): row.latest_date for row in rows if row.latest_date is not None}
 
 
-def get_chart_indicator_refresh_plan(
+def _exact_chart_indicator_refresh_dates(
     engine: Engine,
-    tickers: List[str],
-    reference_symbol: str = "SPY",
-    force: bool = False,
+    symbols: List[str],
+    reference_symbol: str,
+    force: bool,
 ) -> Dict[str, dt.datetime]:
-    """Map symbols to the earliest common price date missing an indicator row.
-
-    Checking only ``MAX(chart_indicators.date)`` is not sufficient after an
-    interrupted run: a latest row can exist while an older batch or a middle
-    row is absent.  The anti-join below treats the symbol/SPY daily-date
-    intersection as the source of truth and finds the first uncovered date.
-    """
-    reference_symbol = reference_symbol.strip().upper()
-    symbols = [symbol for symbol in _clean_symbols(tickers) if symbol != reference_symbol]
+    """Run exact source/indicator coverage checks in bounded symbol chunks."""
     if not symbols:
         return {}
-
     metadata = MetaData()
     prices = _get_price_history_table(metadata)
     reference_prices = prices.alias("chart_reference_prices")
@@ -1344,45 +1560,145 @@ def get_chart_indicator_refresh_plan(
         & (reference_prices.c.symbol == reference_symbol)
         & (reference_prices.c.interval == "1d"),
     )
-
-    if force:
-        stmt = (
-            select(prices.c.symbol, func.min(prices.c.date).label("first_missing"))
-            .select_from(source)
-            .where(prices.c.symbol.in_(symbols), prices.c.interval == "1d")
-            .group_by(prices.c.symbol)
-        )
-    else:
-        source_with_indicators = source.outerjoin(
-            indicators,
-            (indicators.c.symbol == prices.c.symbol)
-            & (indicators.c.date == prices.c.date),
-        )
-        stmt = (
-            select(prices.c.symbol, func.min(prices.c.date).label("first_missing"))
-            .select_from(source_with_indicators)
-            .where(
-                prices.c.symbol.in_(symbols),
-                prices.c.interval == "1d",
-                indicators.c.date.is_(None),
-            )
-            .group_by(prices.c.symbol)
-        )
-
+    _ensure_price_history_table(engine)
+    _ensure_chart_indicators_table(engine)
+    rows = []
     try:
-        _ensure_price_history_table(engine)
-        _ensure_chart_indicators_table(engine)
         with engine.connect() as conn:
-            rows = conn.execute(stmt).all()
+            for chunk in _record_chunks(symbols, CACHE_QUERY_SYMBOL_CHUNK_SIZE):
+                if force:
+                    stmt = (
+                        select(
+                            prices.c.symbol,
+                            func.min(prices.c.date).label("first_missing"),
+                        )
+                        .select_from(source)
+                        .where(
+                            prices.c.symbol.in_(chunk), prices.c.interval == "1d"
+                        )
+                        .group_by(prices.c.symbol)
+                    )
+                else:
+                    source_with_indicators = source.outerjoin(
+                        indicators,
+                        (indicators.c.symbol == prices.c.symbol)
+                        & (indicators.c.date == prices.c.date),
+                    )
+                    stmt = (
+                        select(
+                            prices.c.symbol,
+                            func.min(prices.c.date).label("first_missing"),
+                        )
+                        .select_from(source_with_indicators)
+                        .where(
+                            prices.c.symbol.in_(chunk),
+                            prices.c.interval == "1d",
+                            indicators.c.date.is_(None),
+                        )
+                        .group_by(prices.c.symbol)
+                    )
+                rows.extend(conn.execute(stmt).all())
     except SQLAlchemyError as exc:
-        # A failed cache-decision query must never be interpreted as a hit.
         raise RuntimeError("Unable to verify chart-indicator cache coverage") from exc
-
     return {
         str(row.symbol).upper(): row.first_missing
         for row in rows
         if row.first_missing is not None
     }
+
+
+def get_chart_indicator_refresh_plan(
+    engine: Engine,
+    tickers: List[str],
+    reference_symbol: str = "SPY",
+    force: bool = False,
+    history_watermarks: Optional[Dict[str, object]] = None,
+) -> Dict[str, dt.datetime]:
+    """Map symbols to their earliest missing indicator source date.
+
+    A persisted completion manifest makes the normal restart path a small
+    metadata lookup. Symbols without a matching manifest use the exact
+    price/SPY/indicator anti-join in bounded chunks. Exact cache hits backfill
+    the manifest, so upgrading an existing database requires the audit only
+    once and never recalculates already-complete indicators.
+    """
+    reference_symbol = reference_symbol.strip().upper()
+    symbols = [symbol for symbol in _clean_symbols(tickers) if symbol != reference_symbol]
+    if not symbols:
+        return {}
+    if history_watermarks is None:
+        history_watermarks = get_price_history_watermarks(
+            engine, [reference_symbol, *symbols], interval="1d", strict=True
+        )
+    if force:
+        refresh_dates = _exact_chart_indicator_refresh_dates(
+            engine,
+            symbols,
+            reference_symbol=reference_symbol,
+            force=True,
+        )
+        return refresh_dates
+    else:
+        reference_values = _history_watermark_values(
+            history_watermarks.get(reference_symbol)
+        )
+        if reference_values is None:
+            return {}
+        manifests = _get_chart_indicator_manifests(engine, symbols)
+        semantic_stale = []
+        coverage_unknown = []
+        for symbol in symbols:
+            source_values = _history_watermark_values(
+                history_watermarks.get(symbol)
+            )
+            if source_values is None:
+                continue
+            manifest = manifests.get(symbol)
+            if manifest is not None and (
+                manifest["reference_symbol"] != reference_symbol
+                or manifest["cache_version"] != CHART_INDICATOR_CACHE_VERSION
+            ):
+                semantic_stale.append(symbol)
+            elif not _chart_indicator_manifest_matches(
+                manifest,
+                source_values,
+                reference_values,
+                reference_symbol,
+            ):
+                coverage_unknown.append(symbol)
+
+    refresh_dates = _exact_chart_indicator_refresh_dates(
+        engine,
+        coverage_unknown,
+        reference_symbol=reference_symbol,
+        force=False,
+    )
+    semantic_refresh_dates = _exact_chart_indicator_refresh_dates(
+        engine,
+        semantic_stale,
+        reference_symbol=reference_symbol,
+        force=True,
+    )
+    refresh_dates.update(semantic_refresh_dates)
+    semantic_empty = [
+        symbol
+        for symbol in semantic_stale
+        if symbol not in semantic_refresh_dates
+    ]
+    _clear_chart_indicator_cache(engine, semantic_empty)
+    complete_symbols = [
+        symbol
+        for symbol in coverage_unknown
+        if symbol not in refresh_dates
+    ]
+    complete_symbols.extend(semantic_empty)
+    _save_chart_indicator_manifests(
+        engine,
+        complete_symbols,
+        history_watermarks,
+        reference_symbol,
+    )
+    return refresh_dates
 
 
 def refresh_chart_indicators_for_symbol(symbol: str, engine: Engine, reference_symbol: str = "SPY") -> bool:
@@ -1398,19 +1714,49 @@ def refresh_chart_indicators_to_db(
     reference_symbol: str = "SPY",
     log_callback: Optional[Callable[[str], None]] = None,
     force: bool = False,
+    history_watermarks: Optional[Dict[str, object]] = None,
+    refresh_plan: Optional[Dict[str, dt.datetime]] = None,
 ) -> List[str]:
     updated = []
     reference_symbol = reference_symbol.strip().upper()
     all_symbols = [symbol for symbol in _clean_symbols(tickers) if symbol != reference_symbol]
-    refresh_plan = get_chart_indicator_refresh_plan(
-        engine, all_symbols, reference_symbol=reference_symbol, force=force
-    )
+    if refresh_plan is None:
+        refresh_plan = get_chart_indicator_refresh_plan(
+            engine,
+            all_symbols,
+            reference_symbol=reference_symbol,
+            force=force,
+            history_watermarks=history_watermarks,
+        )
+    else:
+        allowed_symbols = set(all_symbols)
+        refresh_plan = {
+            symbol: start_date
+            for raw_symbol, start_date in refresh_plan.items()
+            if (symbol := str(raw_symbol).strip().upper()) in allowed_symbols
+        }
     symbols = list(refresh_plan)
     cached_count = len(all_symbols) - len(symbols)
     if not symbols:
         if log_callback:
             log_callback(f"Chart indicators already current for {len(all_symbols)} symbols -- skipping.")
         return []
+
+    replacement_symbols = set(symbols if force else [])
+    if not force:
+        manifests = _get_chart_indicator_manifests(engine, symbols)
+        replacement_symbols.update(
+            symbol
+            for symbol in symbols
+            if (
+                (manifest := manifests.get(symbol)) is not None
+                and (
+                    manifest["reference_symbol"] != reference_symbol
+                    or manifest["cache_version"]
+                    != CHART_INDICATOR_CACHE_VERSION
+                )
+            )
+        )
 
     total = len(symbols)
     start_ts = time.time()
@@ -1450,7 +1796,21 @@ def refresh_chart_indicators_to_db(
         nonlocal pending_records, pending_symbols, rows_saved, updated
         if not pending_records:
             return
-        saved_count = save_chart_indicators_batch_to_db(pending_records, engine)
+        pending_replacements = [
+            symbol
+            for symbol in pending_symbols
+            if symbol in replacement_symbols
+        ]
+        if pending_replacements:
+            saved_count = save_chart_indicators_batch_to_db(
+                pending_records,
+                engine,
+                replace_symbols=pending_replacements,
+            )
+        else:
+            saved_count = save_chart_indicators_batch_to_db(
+                pending_records, engine
+            )
         if saved_count:
             rows_saved += saved_count
             updated.extend(pending_symbols)
@@ -1539,6 +1899,7 @@ def get_latest_price_history_dates(
     engine: Engine,
     symbols: List[str],
     interval: str = "1d",
+    strict: bool = False,
 ) -> Dict[str, dt.datetime]:
     """Return latest cached daily/intraday price_history date per symbol."""
     cleaned_symbols = _clean_symbols(symbols)
@@ -1548,19 +1909,25 @@ def get_latest_price_history_dates(
     metadata = MetaData()
     price_history = _get_price_history_table(metadata)
     _ensure_price_history_table(engine)
-    stmt = (
-        select(price_history.c.symbol, func.max(price_history.c.date).label("latest_date"))
-        .where(
-            price_history.c.symbol.in_(cleaned_symbols),
-            price_history.c.interval == interval.strip().lower(),
-        )
-        .group_by(price_history.c.symbol)
-    )
-
+    rows = []
     try:
         with engine.connect() as conn:
-            rows = conn.execute(stmt).all()
-    except SQLAlchemyError:
+            for chunk in _record_chunks(cleaned_symbols, CACHE_QUERY_SYMBOL_CHUNK_SIZE):
+                stmt = (
+                    select(
+                        price_history.c.symbol,
+                        func.max(price_history.c.date).label("latest_date"),
+                    )
+                    .where(
+                        price_history.c.symbol.in_(chunk),
+                        price_history.c.interval == interval.strip().lower(),
+                    )
+                    .group_by(price_history.c.symbol)
+                )
+                rows.extend(conn.execute(stmt).all())
+    except SQLAlchemyError as exc:
+        if strict:
+            raise RuntimeError("Unable to verify latest price-history dates") from exc
         return {}
 
     return {str(row.symbol).upper(): row.latest_date for row in rows if row.latest_date is not None}
@@ -1570,6 +1937,7 @@ def get_price_history_watermarks(
     engine: Engine,
     symbols: List[str],
     interval: str = "1d",
+    strict: bool = False,
 ) -> Dict[str, Tuple[Optional[dt.datetime], int]]:
     """Return causal cache watermarks (latest date and row count) by symbol."""
     cleaned_symbols = _clean_symbols(symbols)
@@ -1579,22 +1947,26 @@ def get_price_history_watermarks(
     metadata = MetaData()
     price_history = _get_price_history_table(metadata)
     _ensure_price_history_table(engine)
-    stmt = (
-        select(
-            price_history.c.symbol,
-            func.max(price_history.c.date).label("latest_date"),
-            func.count().label("row_count"),
-        )
-        .where(
-            price_history.c.symbol.in_(cleaned_symbols),
-            price_history.c.interval == interval.strip().lower(),
-        )
-        .group_by(price_history.c.symbol)
-    )
+    rows = []
     try:
         with engine.connect() as conn:
-            rows = conn.execute(stmt).all()
-    except SQLAlchemyError:
+            for chunk in _record_chunks(cleaned_symbols, CACHE_QUERY_SYMBOL_CHUNK_SIZE):
+                stmt = (
+                    select(
+                        price_history.c.symbol,
+                        func.max(price_history.c.date).label("latest_date"),
+                        func.count().label("row_count"),
+                    )
+                    .where(
+                        price_history.c.symbol.in_(chunk),
+                        price_history.c.interval == interval.strip().lower(),
+                    )
+                    .group_by(price_history.c.symbol)
+                )
+                rows.extend(conn.execute(stmt).all())
+    except SQLAlchemyError as exc:
+        if strict:
+            raise RuntimeError("Unable to verify price-history watermarks") from exc
         return {}
     return {
         str(row.symbol).upper(): (row.latest_date, int(row.row_count or 0))
@@ -1606,6 +1978,7 @@ def get_latest_hourly_price_history_timestamps(
     engine: Engine,
     symbols: List[str],
     source: Optional[str] = None,
+    strict: bool = False,
 ) -> Dict[str, dt.datetime]:
     """Return latest cached 1-hour timestamp per symbol."""
     cleaned_symbols = _clean_symbols(symbols)
@@ -1615,17 +1988,23 @@ def get_latest_hourly_price_history_timestamps(
     metadata = MetaData()
     hourly_history = _get_hourly_price_history_table(metadata)
     _ensure_hourly_price_history_table(engine)
-    stmt = select(hourly_history.c.symbol, func.max(hourly_history.c.timestamp).label("latest_timestamp")).where(
-        hourly_history.c.symbol.in_(cleaned_symbols)
-    )
-    if source:
-        stmt = stmt.where(hourly_history.c.source == source)
-    stmt = stmt.group_by(hourly_history.c.symbol)
-
+    rows = []
     try:
         with engine.connect() as conn:
-            rows = conn.execute(stmt).all()
-    except SQLAlchemyError:
+            for chunk in _record_chunks(
+                cleaned_symbols, HOURLY_CACHE_QUERY_SYMBOL_CHUNK_SIZE
+            ):
+                stmt = select(
+                    hourly_history.c.symbol,
+                    func.max(hourly_history.c.timestamp).label("latest_timestamp"),
+                ).where(hourly_history.c.symbol.in_(chunk))
+                if source:
+                    stmt = stmt.where(hourly_history.c.source == source)
+                stmt = stmt.group_by(hourly_history.c.symbol)
+                rows.extend(conn.execute(stmt).all())
+    except SQLAlchemyError as exc:
+        if strict:
+            raise RuntimeError("Unable to verify latest hourly-history timestamps") from exc
         return {}
 
     return {str(row.symbol).upper(): row.latest_timestamp for row in rows if row.latest_timestamp is not None}
@@ -2129,6 +2508,7 @@ def is_scanner_metrics_snapshot_current(
     tickers: List[str],
     history_watermarks: Optional[Dict[str, object]] = None,
     snapshot_date: Optional[dt.datetime] = None,
+    strict: bool = False,
 ) -> bool:
     """Whether a complete scanner snapshot matches the current daily inputs."""
     metric_symbols, input_symbols = _scanner_metric_and_input_symbols(tickers)
@@ -2136,7 +2516,7 @@ def is_scanner_metrics_snapshot_current(
         return False
     if history_watermarks is None:
         history_watermarks = get_price_history_watermarks(
-            engine, input_symbols, interval="1d"
+            engine, input_symbols, interval="1d", strict=strict
         )
     fingerprint = scanner_metrics_input_fingerprint(input_symbols, history_watermarks)
     snapshot_date = snapshot_date or scanner_metrics_snapshot_date()
@@ -2148,15 +2528,22 @@ def is_scanner_metrics_snapshot_current(
             snapshots_table.c.input_fingerprint,
             snapshots_table.c.metric_count,
         ).where(snapshots_table.c.snapshot_date == snapshot_date)
-        count_stmt = select(func.count()).select_from(metrics_table).where(
-            metrics_table.c.date == snapshot_date
-        )
         with engine.connect() as conn:
             snapshot = conn.execute(snapshot_stmt).one_or_none()
             if snapshot is None or snapshot.input_fingerprint != fingerprint:
                 return False
-            actual_count = int(conn.execute(count_stmt).scalar_one())
-    except SQLAlchemyError:
+            actual_count = 0
+            for chunk in _record_chunks(
+                metric_symbols, SCANNER_QUERY_SYMBOL_CHUNK_SIZE
+            ):
+                count_stmt = select(func.count()).select_from(metrics_table).where(
+                    metrics_table.c.symbol.in_(chunk),
+                    metrics_table.c.date == snapshot_date,
+                )
+                actual_count += int(conn.execute(count_stmt).scalar_one())
+    except SQLAlchemyError as exc:
+        if strict:
+            raise RuntimeError("Unable to verify scanner-metrics snapshot") from exc
         return False
     return int(snapshot.metric_count) > 0 and actual_count == int(snapshot.metric_count)
 
@@ -2172,13 +2559,14 @@ def get_universe_stock_metrics_from_db(
         return []
     snapshot_date = scanner_metrics_snapshot_date()
     history_watermarks = get_price_history_watermarks(
-        engine, input_symbols, interval="1d"
+        engine, input_symbols, interval="1d", strict=True
     )
     if is_scanner_metrics_snapshot_current(
         engine,
         metric_symbols,
         history_watermarks=history_watermarks,
         snapshot_date=snapshot_date,
+        strict=True,
     ):
         return load_scanner_metrics_from_db(metric_symbols, engine, snapshot_date)
 
@@ -2341,16 +2729,23 @@ def load_scanner_metrics_from_db(tickers: List[str], engine: Engine, date: Optio
     """Load cached scanner metrics from MySQL."""
     if date is None:
         date = scanner_metrics_snapshot_date()
+    symbols = _clean_symbols(tickers)
+    if not symbols:
+        return []
 
     metadata = MetaData()
     table = _get_scanner_metrics_table(metadata)
 
     try:
         with engine.connect() as conn:
-            stmt = select(table).where(
-                (table.c.symbol.in_(tickers)) & (table.c.date == date)
-            )
-            rows = conn.execute(stmt).fetchall()
+            rows = []
+            for chunk in _record_chunks(
+                symbols, SCANNER_QUERY_SYMBOL_CHUNK_SIZE
+            ):
+                stmt = select(table).where(
+                    table.c.symbol.in_(chunk), table.c.date == date
+                )
+                rows.extend(conn.execute(stmt).fetchall())
 
             results = []
             for row in rows:
@@ -2371,15 +2766,17 @@ def refresh_scanner_metrics_to_db(
     engine: Engine,
     log_callback: Optional[Callable[[str], None]] = None,
     force: bool = False,
+    history_watermarks: Optional[Dict[str, object]] = None,
 ) -> List[str]:
     """Calculate and store scanner metrics for the universe in MySQL."""
     symbols, input_symbols = _scanner_metric_and_input_symbols(tickers)
     if not symbols:
         return []
     snapshot_date = scanner_metrics_snapshot_date()
-    history_watermarks = get_price_history_watermarks(
-        engine, input_symbols, interval="1d"
-    )
+    if history_watermarks is None:
+        history_watermarks = get_price_history_watermarks(
+            engine, input_symbols, interval="1d", strict=True
+        )
     input_fingerprint = scanner_metrics_input_fingerprint(
         input_symbols, history_watermarks
     )
@@ -2388,6 +2785,7 @@ def refresh_scanner_metrics_to_db(
         symbols,
         history_watermarks=history_watermarks,
         snapshot_date=snapshot_date,
+        strict=True,
     ):
         if log_callback:
             log_callback(
@@ -2471,6 +2869,7 @@ def refresh_scanner_metrics_to_db(
                 symbols,
                 history_watermarks=history_watermarks,
                 snapshot_date=snapshot_date,
+                strict=True,
             )
         )
         if log_callback:

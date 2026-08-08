@@ -37,6 +37,7 @@ from src.utils.db_loader import (
     get_chart_indicator_refresh_plan,
     get_latest_hourly_price_history_timestamps,
     get_latest_price_history_dates,
+    get_price_history_watermarks,
     init_mysql_engine,
     is_scanner_metrics_snapshot_current,
     refresh_chart_indicators_to_db,
@@ -213,11 +214,11 @@ def select_stale_history_symbols(engine, symbols: List[str], mode: str) -> List[
     expected_date = expected_latest_market_data_date()
     if mode == MODE_1D:
         latest_by_symbol = get_latest_price_history_dates(
-            engine, symbols, interval="1d"
+            engine, symbols, interval="1d", strict=True
         )
     else:
         latest_by_symbol = get_latest_hourly_price_history_timestamps(
-            engine, symbols
+            engine, symbols, strict=True
         )
 
     stale = []
@@ -253,17 +254,35 @@ def run_1d(
     state.updated_count = len(updated)
     state.complete_phase("daily_history")
 
+    derived_watermarks = get_price_history_watermarks(
+        engine, universe_tickers, interval="1d", strict=True
+    )
+
     state.set_phase("chart_indicators")
+    chart_refresh_plan = get_chart_indicator_refresh_plan(
+        engine,
+        universe_tickers,
+        reference_symbol=REFERENCE_SYMBOL,
+        force=force_derived,
+        history_watermarks=derived_watermarks,
+    )
     refresh_chart_indicators_to_db(
         universe_tickers,
         engine,
         reference_symbol=REFERENCE_SYMBOL,
         log_callback=state.log,
         force=force_derived,
+        history_watermarks=derived_watermarks,
+        refresh_plan=chart_refresh_plan,
     )
-    remaining_chart_work = get_chart_indicator_refresh_plan(
-        engine, universe_tickers, reference_symbol=REFERENCE_SYMBOL
-    )
+    remaining_chart_work = {}
+    if chart_refresh_plan:
+        remaining_chart_work = get_chart_indicator_refresh_plan(
+            engine,
+            list(chart_refresh_plan),
+            reference_symbol=REFERENCE_SYMBOL,
+            history_watermarks=derived_watermarks,
+        )
     if remaining_chart_work:
         raise RuntimeError(
             f"Chart indicators remain incomplete for {len(remaining_chart_work)} symbol(s)."
@@ -272,9 +291,18 @@ def run_1d(
 
     state.set_phase("scanner_metrics")
     refresh_scanner_metrics_to_db(
-        universe_tickers, engine, log_callback=state.log, force=force_derived
+        universe_tickers,
+        engine,
+        log_callback=state.log,
+        force=force_derived,
+        history_watermarks=derived_watermarks,
     )
-    if not is_scanner_metrics_snapshot_current(engine, universe_tickers):
+    if not is_scanner_metrics_snapshot_current(
+        engine,
+        universe_tickers,
+        history_watermarks=derived_watermarks,
+        strict=True,
+    ):
         raise RuntimeError("Scanner metrics snapshot remains incomplete.")
     state.complete_phase("scanner_metrics")
 

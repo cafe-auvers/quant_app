@@ -3,7 +3,7 @@ import datetime as dt
 import numpy as np
 import pandas as pd
 import pytest
-from sqlalchemy import create_engine, delete
+from sqlalchemy import create_engine, delete, event
 
 import src.utils.db_loader as db_loader
 
@@ -38,6 +38,121 @@ def _history(dates, start_price=100.0):
 def _seed_daily_history(engine, dates):
     assert db_loader.save_symbol_history_to_db("SPY", _history(dates, 200), engine)
     assert db_loader.save_symbol_history_to_db("AAPL", _history(dates, 100), engine)
+
+
+def _capture_selects(engine):
+    captured = []
+
+    def record(_conn, _cursor, statement, parameters, _context, _executemany):
+        normalized = " ".join(statement.lower().split())
+        if normalized.startswith("select"):
+            captured.append((normalized, parameters))
+
+    event.listen(engine, "before_cursor_execute", record)
+    return captured, record
+
+
+def test_price_history_watermarks_use_bounded_symbol_batches(engine, monkeypatch):
+    symbols = ["SPY", "AAA", "BBB", "CCC", "DDD"]
+    dates = pd.bdate_range("2026-01-05", periods=2)
+    for offset, symbol in enumerate(symbols):
+        assert db_loader.save_symbol_history_to_db(
+            symbol, _history(dates, 100 + offset), engine
+        )
+
+    monkeypatch.setattr(db_loader, "CACHE_QUERY_SYMBOL_CHUNK_SIZE", 2)
+    captured, listener = _capture_selects(engine)
+    try:
+        watermarks = db_loader.get_price_history_watermarks(
+            engine, symbols, strict=True
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", listener)
+
+    queries = [
+        item
+        for item in captured
+        if " from price_history " in item[0] and " group by " in item[0]
+    ]
+    assert set(watermarks) == set(symbols)
+    assert len(queries) == 3
+    assert all(len(parameters) <= 3 for _, parameters in queries)
+
+
+def test_complete_chart_cache_uses_manifest_without_indicator_scan(
+    engine, monkeypatch
+):
+    symbols = ["AAA", "BBB", "CCC", "DDD", "EEE"]
+    dates = pd.bdate_range("2026-01-05", periods=3)
+    spy_history = _history(dates, 200)
+    assert db_loader.save_symbol_history_to_db("SPY", spy_history, engine)
+    for offset, symbol in enumerate(symbols):
+        history = _history(dates, 100 + offset)
+        assert db_loader.save_symbol_history_to_db(symbol, history, engine)
+        indicators = db_loader.calculate_chart_indicators(symbol, history, spy_history)
+        assert db_loader.save_chart_indicators_to_db(symbol, indicators, engine)
+    watermarks = db_loader.get_price_history_watermarks(engine, ["SPY", *symbols])
+
+    monkeypatch.setattr(db_loader, "CACHE_QUERY_SYMBOL_CHUNK_SIZE", 2)
+    assert db_loader.get_chart_indicator_refresh_plan(
+        engine,
+        ["SPY", *symbols],
+        history_watermarks=watermarks,
+    ) == {}
+
+    captured, listener = _capture_selects(engine)
+    try:
+        plan = db_loader.get_chart_indicator_refresh_plan(
+            engine,
+            ["SPY", *symbols],
+            history_watermarks=watermarks,
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", listener)
+
+    manifest_queries = [
+        item for item in captured if " from chart_indicator_manifests " in item[0]
+    ]
+    exact_queries = [
+        item for item in captured if "chart_reference_prices" in item[0]
+    ]
+    indicator_queries = [
+        item for item in captured if " from chart_indicators " in item[0]
+    ]
+    assert plan == {}
+    assert len(manifest_queries) == 3
+    assert all(len(parameters) <= 2 for _, parameters in manifest_queries)
+    assert exact_queries == []
+    assert indicator_queries == []
+
+
+def test_ambiguous_chart_gap_checks_use_bounded_symbol_batches(engine, monkeypatch):
+    symbols = ["AAA", "BBB", "CCC", "DDD", "EEE"]
+    dates = pd.bdate_range("2026-01-05", periods=2)
+    assert db_loader.save_symbol_history_to_db("SPY", _history(dates, 200), engine)
+    for offset, symbol in enumerate(symbols):
+        assert db_loader.save_symbol_history_to_db(
+            symbol, _history(dates, 100 + offset), engine
+        )
+    watermarks = db_loader.get_price_history_watermarks(engine, ["SPY", *symbols])
+
+    monkeypatch.setattr(db_loader, "CACHE_QUERY_SYMBOL_CHUNK_SIZE", 2)
+    captured, listener = _capture_selects(engine)
+    try:
+        plan = db_loader.get_chart_indicator_refresh_plan(
+            engine,
+            ["SPY", *symbols],
+            history_watermarks=watermarks,
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", listener)
+
+    exact_queries = [
+        item for item in captured if "chart_reference_prices" in item[0]
+    ]
+    assert set(plan) == set(symbols)
+    assert len(exact_queries) == 3
+    assert all(len(parameters) <= 5 for _, parameters in exact_queries)
 
 
 def test_chart_plan_finds_middle_gap_and_refresh_repairs_it(engine, monkeypatch):
@@ -77,6 +192,169 @@ def test_chart_plan_does_not_accept_a_latest_only_row_as_complete(engine):
     plan = db_loader.get_chart_indicator_refresh_plan(engine, ["SPY", "AAPL"])
 
     assert plan == {"AAPL": pd.Timestamp(dates[0]).to_pydatetime()}
+
+
+def test_chart_plan_does_not_let_orphan_row_hide_middle_gap(engine):
+    dates = pd.bdate_range("2026-01-05", periods=3)
+    _seed_daily_history(engine, dates)
+    indicators = db_loader.calculate_chart_indicators(
+        "AAPL", _history(dates, 100), _history(dates, 200)
+    )
+    missing_date = pd.Timestamp(dates[1]).to_pydatetime()
+    orphan = indicators.tail(1).copy()
+    orphan["date"] = pd.Timestamp("2026-01-08")
+    partial = pd.concat(
+        [
+            indicators.loc[
+                pd.to_datetime(indicators["date"]) != pd.Timestamp(missing_date)
+            ],
+            orphan,
+        ],
+        ignore_index=True,
+    )
+    assert db_loader.save_chart_indicators_to_db("AAPL", partial, engine)
+
+    plan = db_loader.get_chart_indicator_refresh_plan(engine, ["SPY", "AAPL"])
+
+    assert plan == {"AAPL": missing_date}
+
+
+def test_chart_manifest_version_change_forces_recalculation(engine, monkeypatch):
+    dates = pd.bdate_range("2026-01-05", periods=3)
+    _seed_daily_history(engine, dates)
+    indicators = db_loader.calculate_chart_indicators(
+        "AAPL", _history(dates, 100), _history(dates, 200)
+    )
+    assert db_loader.save_chart_indicators_to_db("AAPL", indicators, engine)
+    watermarks = db_loader.get_price_history_watermarks(
+        engine, ["SPY", "AAPL"]
+    )
+    assert db_loader.get_chart_indicator_refresh_plan(
+        engine,
+        ["SPY", "AAPL"],
+        history_watermarks=watermarks,
+    ) == {}
+
+    monkeypatch.setattr(
+        db_loader,
+        "CHART_INDICATOR_CACHE_VERSION",
+        db_loader.CHART_INDICATOR_CACHE_VERSION + 1,
+    )
+
+    plan = db_loader.get_chart_indicator_refresh_plan(
+        engine,
+        ["SPY", "AAPL"],
+        history_watermarks=watermarks,
+    )
+
+    assert plan == {"AAPL": pd.Timestamp(dates[0]).to_pydatetime()}
+
+
+def test_chart_indicator_write_invalidates_completion_manifest(engine):
+    dates = pd.bdate_range("2026-01-05", periods=3)
+    _seed_daily_history(engine, dates)
+    indicators = db_loader.calculate_chart_indicators(
+        "AAPL", _history(dates, 100), _history(dates, 200)
+    )
+    assert db_loader.save_chart_indicators_to_db("AAPL", indicators, engine)
+    watermarks = db_loader.get_price_history_watermarks(
+        engine, ["SPY", "AAPL"]
+    )
+    assert db_loader.get_chart_indicator_refresh_plan(
+        engine,
+        ["SPY", "AAPL"],
+        history_watermarks=watermarks,
+    ) == {}
+    assert set(db_loader._get_chart_indicator_manifests(engine, ["AAPL"])) == {
+        "AAPL"
+    }
+
+    assert db_loader.save_chart_indicators_to_db(
+        "AAPL", indicators.tail(1), engine
+    )
+
+    assert db_loader._get_chart_indicator_manifests(engine, ["AAPL"]) == {}
+
+
+def test_chart_reference_change_replaces_old_reference_rows(engine):
+    dates = pd.bdate_range("2026-01-05", periods=3)
+    _seed_daily_history(engine, dates)
+    indicators = db_loader.calculate_chart_indicators(
+        "AAPL", _history(dates, 100), _history(dates, 200)
+    )
+    assert db_loader.save_chart_indicators_to_db("AAPL", indicators, engine)
+    spy_watermarks = db_loader.get_price_history_watermarks(
+        engine, ["SPY", "AAPL"]
+    )
+    assert db_loader.get_chart_indicator_refresh_plan(
+        engine,
+        ["SPY", "AAPL"],
+        history_watermarks=spy_watermarks,
+    ) == {}
+
+    qqq_dates = dates.delete(1)
+    assert db_loader.save_symbol_history_to_db(
+        "QQQ", _history(qqq_dates, 300), engine
+    )
+    qqq_watermarks = db_loader.get_price_history_watermarks(
+        engine, ["QQQ", "AAPL"]
+    )
+    plan = db_loader.get_chart_indicator_refresh_plan(
+        engine,
+        ["QQQ", "AAPL"],
+        reference_symbol="QQQ",
+        history_watermarks=qqq_watermarks,
+    )
+
+    assert plan == {"AAPL": pd.Timestamp(dates[0]).to_pydatetime()}
+    assert db_loader.refresh_chart_indicators_to_db(
+        ["QQQ", "AAPL"],
+        engine,
+        reference_symbol="QQQ",
+        history_watermarks=qqq_watermarks,
+        refresh_plan=plan,
+    ) == ["AAPL"]
+    saved = db_loader.load_chart_indicators_from_db("AAPL", engine)
+    assert list(saved.index) == list(pd.DatetimeIndex(qqq_dates))
+    assert db_loader.get_chart_indicator_refresh_plan(
+        engine,
+        ["QQQ", "AAPL"],
+        reference_symbol="QQQ",
+        history_watermarks=qqq_watermarks,
+    ) == {}
+
+
+def test_chart_reference_change_clears_rows_when_calendars_do_not_overlap(engine):
+    dates = pd.bdate_range("2026-01-05", periods=2)
+    _seed_daily_history(engine, dates)
+    indicators = db_loader.calculate_chart_indicators(
+        "AAPL", _history(dates, 100), _history(dates, 200)
+    )
+    assert db_loader.save_chart_indicators_to_db("AAPL", indicators, engine)
+    spy_watermarks = db_loader.get_price_history_watermarks(
+        engine, ["SPY", "AAPL"]
+    )
+    assert db_loader.get_chart_indicator_refresh_plan(
+        engine,
+        ["SPY", "AAPL"],
+        history_watermarks=spy_watermarks,
+    ) == {}
+
+    qqq_dates = pd.bdate_range("2027-01-05", periods=2)
+    assert db_loader.save_symbol_history_to_db(
+        "QQQ", _history(qqq_dates, 300), engine
+    )
+    qqq_watermarks = db_loader.get_price_history_watermarks(
+        engine, ["QQQ", "AAPL"]
+    )
+
+    assert db_loader.get_chart_indicator_refresh_plan(
+        engine,
+        ["QQQ", "AAPL"],
+        reference_symbol="QQQ",
+        history_watermarks=qqq_watermarks,
+    ) == {}
+    assert db_loader.load_chart_indicators_from_db("AAPL", engine).empty
 
 
 def test_incremental_chart_calculation_matches_full_calculation():

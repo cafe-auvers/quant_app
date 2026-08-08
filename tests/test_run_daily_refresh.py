@@ -276,6 +276,75 @@ def test_refresh_gate_can_resume_derived_work_without_price_downloads(monkeypatc
     assert "Chart indicators need refresh for 1 symbol" in reason
 
 
+def test_refresh_gate_skips_derived_queries_when_daily_history_is_stale(monkeypatch):
+    refresh = _load_refresh_module()
+    expected_date = dt.date(2026, 6, 23)
+    tickers = ["SPY", "AAPL"]
+
+    monkeypatch.setattr(refresh, "init_mysql_engine", lambda: object())
+    monkeypatch.setattr(refresh, "_refresh_tickers", lambda: tickers)
+    monkeypatch.setattr(refresh, "expected_latest_market_data_date", lambda: expected_date)
+    monkeypatch.setattr(
+        refresh, "get_chronically_failing_symbols", lambda *args, **kwargs: set()
+    )
+    monkeypatch.setattr(
+        refresh,
+        "get_price_history_watermarks",
+        lambda *args, **kwargs: {"SPY": (dt.datetime(2026, 6, 23), 250)},
+    )
+    monkeypatch.setattr(
+        refresh,
+        "get_latest_hourly_price_history_timestamps",
+        lambda *args, **kwargs: {
+            symbol: dt.datetime(2026, 6, 23, 20, 30) for symbol in tickers
+        },
+    )
+    monkeypatch.setattr(
+        refresh,
+        "get_chart_indicator_refresh_plan",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("daily staleness must bypass chart cache verification")
+        ),
+    )
+    monkeypatch.setattr(
+        refresh,
+        "is_scanner_metrics_snapshot_current",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("daily staleness must bypass scanner cache verification")
+        ),
+    )
+
+    targets, reason = refresh._refresh_targets_needed()
+
+    assert targets == {"1d": ["AAPL"]}
+    assert "1D data is stale for 1" in reason
+
+
+def test_main_reports_cache_verification_failure_without_starting_refresh(
+    monkeypatch, capsys
+):
+    refresh = _load_refresh_module()
+    monkeypatch.setattr(
+        refresh,
+        "_refresh_targets_needed",
+        lambda: (_ for _ in ()).throw(RuntimeError("database read timed out")),
+    )
+    monkeypatch.setattr(
+        refresh,
+        "_run_mode",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("a failed cache gate must not launch historical.py")
+        ),
+    )
+
+    assert refresh.main() == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Refresh cache verification failed: database read timed out" in captured.err
+    assert "Traceback" not in captured.err
+
+
 def test_run_mode_sends_symbols_over_stdin_without_expanding_argv(monkeypatch):
     refresh = _load_refresh_module()
     captured = {}
