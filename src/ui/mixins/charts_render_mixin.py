@@ -857,7 +857,73 @@ class ChartsRenderMixin:
                         priceLineVisible: false
                     }});
                     rsSeries.setData(rsPoints.concat(futureWhitespace));
-                    rsSeries.setMarkers(rsMarkers);
+
+                    // Custom fixed-size spike marker primitive (dots on the RS line, zoom-invariant)
+                    class RsSpikePrimitive {{
+                        constructor(markers) {{
+                            this._markers = markers;
+                            this._series = null;
+                            this._chart = null;
+                        }}
+                        attached({{ series, chart }}) {{
+                            this._series = series;
+                            this._chart = chart;
+                        }}
+                        detached() {{
+                            this._series = null;
+                            this._chart = null;
+                        }}
+                        updateAllViews() {{}}
+                        paneViews() {{
+                            const self = this;
+                            return [{{
+                                renderer() {{
+                                    return {{
+                                        draw(target) {{
+                                            if (!self._series || !self._chart) return;
+                                            target.useBitmapCoordinateSpace(scope => {{
+                                                const ctx = scope.context;
+                                                const ratio = scope.bitmapSize.width / scope.mediaSize.width;
+                                                const RADIUS = 5 * ratio;
+                                                const FONT_SIZE = Math.round(10 * ratio);
+                                                ctx.font = `bold ${{FONT_SIZE}}px sans-serif`;
+                                                ctx.textAlign = 'center';
+                                                for (const m of self._markers) {{
+                                                    const x = self._chart.timeScale().timeToCoordinate(m.time);
+                                                    const y = self._series.priceToCoordinate(m.value);
+                                                    if (x == null || y == null) continue;
+                                                    const bx = x * ratio;
+                                                    const by = y * ratio;
+                                                    // Draw filled circle
+                                                    ctx.beginPath();
+                                                    ctx.arc(bx, by, RADIUS, 0, 2 * Math.PI);
+                                                    ctx.fillStyle = m.color;
+                                                    ctx.fill();
+                                                    // Draw label centered above the dot
+                                                    ctx.fillStyle = m.color;
+                                                    ctx.fillText(m.text, bx, by - RADIUS - 3 * ratio);
+                                                }}
+                                            }});
+                                        }}
+                                    }};
+                                }}
+                            }}];
+                        }}
+                    }}
+
+                    // Build primitive markers: look up the RS value for each marker time
+                    const rsPointMap = {{}};
+                    for (const p of rsPoints) {{ rsPointMap[String(p.time)] = p.value; }}
+                    const primitiveMarkers = rsMarkers.map(m => ({{
+                        time: m.time,
+                        value: rsPointMap[String(m.time)] ?? null,
+                        color: m.color,
+                        text: m.text
+                    }})).filter(m => m.value !== null);
+                    if (primitiveMarkers.length > 0) {{
+                        const spikePrimitive = new RsSpikePrimitive(primitiveMarkers);
+                        rsSeries.attachPrimitive(spikePrimitive);
+                    }}
                     const rsSmaSeries = rsChart.addLineSeries({{
                         title: 'RS SMA 50',
                         color: '#e5e7eb',
