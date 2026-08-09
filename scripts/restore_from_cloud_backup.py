@@ -1,10 +1,9 @@
 """Restore data/*.json user-state files from the Google Drive cloud backup.
 
 Run this after a laptop crash, a fresh install, or a new/replacement machine
-to recover watchlist.json, buylist.json, trade_plans.json, scanner_setups.json,
-chart_drawings.json, tab_options.json, and settings.json from whatever this
-machine's synced Google Drive folder last received (see docs/cloud_backup.md
-for how those backups are produced).
+to recover the allowlisted user-state and trading JSON files from whatever
+this machine's synced Google Drive folder last received. See
+docs/cloud_backup.md for the exact list and how backups are produced.
 
 Usage:
     python scripts/restore_from_cloud_backup.py                  # latest (current/)

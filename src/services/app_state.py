@@ -12,7 +12,12 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from src.core.watchlist import BuylistManager, TradePlanManager, Watchlist
-from src.services.cloud_backup import BackupResult, backup_state_files, resolve_backup_root
+from src.services.cloud_backup import (
+    STATE_BACKUP_FILENAMES,
+    BackupResult,
+    backup_state_files,
+    resolve_backup_root,
+)
 from src.services.state_sync import (
     BUYLIST_KEY,
     PULL_ERROR,
@@ -48,13 +53,6 @@ LEGACY_NON_PRODUCTION_BUYLIST_FILE = DATA_DIR / "legacy_non_prod_buylist.json"
 LEGACY_NON_PRODUCTION_EXECUTION_QUEUE_FILE = (
     DATA_DIR / "legacy_non_prod_execution_queue.json"
 )
-# Path constants duplicated (not imported) from their owning modules --
-# order_ledger.py's ORDERS_FILE and buylist_mixin.py's EXECUTION_QUEUE_FILE
-# -- to avoid a circular import (buylist_mixin already imports from this
-# module). Keep these in sync with those modules if either path ever moves.
-ORDERS_FILE = DATA_DIR / "orders.json"
-EXECUTION_QUEUE_FILE = DATA_DIR / "execution_queue.json"
-
 # Every gitignored user-state file worth recovering after a lost disk --
 # read fresh from disk at backup time rather than passed in-memory, so this
 # stays correct regardless of which save path (StateSaveManager vs. a direct
@@ -70,19 +68,7 @@ EXECUTION_QUEUE_FILE = DATA_DIR / "execution_queue.json"
 # (watchlist_snapshot_*.json) are deliberately left out, same reasoning as
 # local_mirror.db: nothing there can't be recreated or wasn't optional in
 # the first place.
-CLOUD_BACKUP_FILES = (
-    WATCHLIST_FILE,
-    BUYLIST_FILE,
-    TRADE_PLANS_FILE,
-    SCANNER_SETUPS_FILE,
-    CHART_DRAWINGS_FILE,
-    TAB_OPTIONS_FILE,
-    SETTINGS_FILE,
-    ORDERS_FILE,
-    EXECUTION_QUEUE_FILE,
-    LEGACY_NON_PRODUCTION_BUYLIST_FILE,
-    LEGACY_NON_PRODUCTION_EXECUTION_QUEUE_FILE,
-)
+CLOUD_BACKUP_FILES = tuple(DATA_DIR / name for name in STATE_BACKUP_FILENAMES)
 CLOUD_BACKUP_THROTTLE_SECONDS = 600  # at most one backup pass per 10 minutes
 
 

@@ -51,10 +51,11 @@ def main() -> int:
     passphrase = getpass.getpass("Passphrase to encrypt .env with (not stored anywhere -- remember it): ")
     if len(passphrase) < MIN_RECOMMENDED_PASSPHRASE_LENGTH:
         print(
-            f"Warning: that's shorter than the recommended "
-            f"{MIN_RECOMMENDED_PASSPHRASE_LENGTH} characters.",
+            f"Passphrase must be at least "
+            f"{MIN_RECOMMENDED_PASSPHRASE_LENGTH} characters. Aborted.",
             file=sys.stderr,
         )
+        return 1
     confirm = getpass.getpass("Confirm passphrase: ")
     if passphrase != confirm:
         print("Passphrases did not match. Aborted.", file=sys.stderr)

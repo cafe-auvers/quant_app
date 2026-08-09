@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Optional
-
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGroupBox, QFormLayout, QPushButton,
     QLineEdit, QKeySequenceEdit, QMessageBox, QLabel, QTreeWidget,
@@ -13,10 +11,8 @@ from PyQt5.QtGui import QColor, QKeySequence
 from src.services.app_state import SETTINGS_FILE
 from src.services.cloud_backup import (
     CURRENT_DIRNAME,
-    RestoreResult,
     list_daily_snapshots,
     resolve_backup_root,
-    restore_state_files,
 )
 from src.services.env_backup import (
     MIN_RECOMMENDED_PASSPHRASE_LENGTH,
@@ -25,7 +21,7 @@ from src.services.env_backup import (
     restore_env_file,
 )
 from src.ui.filter_catalog import DEFAULT_SETTINGS, FILTER_CATALOG
-from src.utils.config import DATA_DIR, ENV_FILE
+from src.utils.config import ENV_FILE
 from src.utils.storage import load_json, save_json
 
 class SettingsDialog(QDialog):
@@ -136,18 +132,13 @@ class SettingsDialog(QDialog):
 
 
 class RestoreBackupDialog(QDialog):
-    """File > Restore from Cloud Backup -- pick a snapshot date and restore it.
-
-    Only handles the file copy itself; ``result_summary`` is set on success
-    so the caller (MainWindow) can log it, report it, and offer to restart
-    the app so the restored state actually gets loaded.
-    """
+    """Collect and confirm the snapshot selected for a staged restore."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Restore from Cloud Backup")
         self.setMinimumWidth(440)
-        self.result_summary: Optional[RestoreResult] = None
+        self.selected_snapshot: str | None = None
         self.backup_root = resolve_backup_root()
 
         layout = QVBoxLayout()
@@ -176,10 +167,10 @@ class RestoreBackupDialog(QDialog):
 
         note = QLabel(
             "Restores watchlist, buylist, trade plans, scanner setups, chart\n"
-            "drawings, tab options, and settings. Any existing local file with\n"
-            "the same name is preserved first in a timestamped backup folder,\n"
-            "then overwritten. A restart is required afterward to load the\n"
-            "restored data into the running app."
+            "drawings, tab options, settings, and trading records. The chosen\n"
+            "snapshot is validated and staged first. The app then closes, saves\n"
+            "your current files into a timestamped preservation folder, applies\n"
+            "the staged snapshot, and restarts."
         )
         note.setStyleSheet("color: #787b86; font-size: 11px;")
         layout.addWidget(note)
@@ -204,22 +195,15 @@ class RestoreBackupDialog(QDialog):
             "Confirm Restore",
             f"Restore '{label}'?\n\n"
             "Any existing local files with the same names will be preserved "
-            "in a pre_restore_backup folder, then overwritten.",
+            "in a pre_restore_backup folder. The app will close and restart "
+            "to apply the staged restore safely.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
         if confirm != QMessageBox.Yes:
             return
 
-        result = restore_state_files(self.backup_root, DATA_DIR, snapshot=snapshot)
-        if not result.success:
-            QMessageBox.warning(self, "Restore Failed", result.error or "Unknown error.")
-            return
-        if not result.restored:
-            QMessageBox.information(self, "Nothing to Restore", "That snapshot was empty.")
-            return
-
-        self.result_summary = result
+        self.selected_snapshot = str(snapshot)
         self.accept()
 
 
@@ -304,16 +288,12 @@ class BackupEnvDialog(QDialog):
             QMessageBox.warning(self, "Mismatch", "Passphrase and confirmation don't match.")
             return
         if len(passphrase) < MIN_RECOMMENDED_PASSPHRASE_LENGTH:
-            proceed = QMessageBox.question(
+            QMessageBox.warning(
                 self,
                 "Short Passphrase",
-                f"That's shorter than the recommended "
-                f"{MIN_RECOMMENDED_PASSPHRASE_LENGTH} characters. Use it anyway?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
+                f"Use at least {MIN_RECOMMENDED_PASSPHRASE_LENGTH} characters.",
             )
-            if proceed != QMessageBox.Yes:
-                return
+            return
 
         result = backup_env_file(ENV_FILE, self.backup_root, passphrase)
         if not result.success:

@@ -1,10 +1,9 @@
 """Best-effort offsite backup of gitignored user-state files to Google Drive.
 
-``data/*.json`` (watchlist, buylist, trade plans, scanner setups, chart
-drawings, tab options, settings) is intentionally gitignored -- it's runtime
-state, not code, and churns on every edit. That also means it exists nowhere
-but the machine that wrote it: a dead disk or an accidental delete has no
-recovery path.
+The allowlisted ``data/*.json`` files are intentionally gitignored -- they
+are runtime state, not code, and churn on every edit. That also means most of
+them exist nowhere but the machine that wrote them: a dead disk or an
+accidental delete otherwise has no recovery path.
 
 This module copies those files into a local folder synced by Google Drive
 for Desktop (or any similar sync client -- OneDrive, Dropbox, etc. all work
@@ -13,22 +12,22 @@ never talks to a cloud API directly; the sync client already running on the
 machine is what actually uploads the copies. Two tiers are kept:
 
 - ``current/`` -- always the latest copy of each file, overwritten in place.
-- ``daily/<YYYY-MM-DD>/`` -- one snapshot per calendar day, pruned after
-  ``keep_daily_snapshots`` days, so a bad edit noticed days later is still
-  recoverable (the single ``.bak`` generation next to each file on disk only
-  survives one bad write).
+- ``daily/<YYYY-MM-DD>/`` -- one snapshot per calendar day, retaining the
+  latest ``keep_daily_snapshots`` snapshot directories, so a bad edit is
+  still recoverable (the single ``.bak`` generation next to each file on disk
+  only survives one bad write).
 
-Safe by construction: every write is best-effort and wrapped by the caller,
-a missing/unmounted Drive folder just means backups are skipped (never an
-error the rest of the app has to handle), and nothing here is ever read back
-by the running app -- it is pure write-only insurance for a human to recover
-from later.
+Automatic writes are best-effort and wrapped by the caller, so a missing or
+unmounted Drive folder never breaks the preceding local save. Reads happen
+only during an explicit restore requested by the user.
 """
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 import string
+import tempfile
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
@@ -43,6 +42,25 @@ BACKUP_SUBDIR_NAME = "quant_app_backup"
 CURRENT_DIRNAME = "current"
 DAILY_DIRNAME = "daily"
 DEFAULT_KEEP_DAILY_SNAPSHOTS = 21
+
+# The only plaintext files this feature may copy to or restore from the
+# synced folder. Keeping the allowlist here makes both backup and restore use
+# the same boundary and prevents an unexpected file placed in Drive from
+# being written into data/ during recovery.
+STATE_BACKUP_FILENAMES = (
+    "watchlist.json",
+    "buylist.json",
+    "trade_plans.json",
+    "scanner_setups.json",
+    "chart_drawings.json",
+    "tab_options.json",
+    "settings.json",
+    "orders.json",
+    "execution_queue.json",
+    "legacy_non_prod_buylist.json",
+    "legacy_non_prod_execution_queue.json",
+)
+_STATE_BACKUP_FILENAME_SET = frozenset(STATE_BACKUP_FILENAMES)
 
 # Common local sync-folder locations, checked in order when no explicit
 # QUANT_BACKUP_DIR is configured. Google Drive for Desktop's default
@@ -87,25 +105,59 @@ class BackupResult:
     success: bool
     root: Optional[Path] = None
     backed_up: List[str] = field(default_factory=list)
+    failed: List[str] = field(default_factory=list)
     daily_snapshot_created: bool = False
     error: str = ""
 
 
 def _atomic_copy(src: Path, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp_dest = dest.with_name(f".{dest.name}.tmp")
-    shutil.copy2(src, tmp_dest)
-    tmp_dest.replace(dest)
+    tmp_dest: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=dest.parent,
+            prefix=f".{dest.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp_file:
+            tmp_dest = Path(tmp_file.name)
+        shutil.copy2(src, tmp_dest)
+        tmp_dest.replace(dest)
+    except Exception:
+        if tmp_dest is not None:
+            try:
+                tmp_dest.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+
+
+def _is_snapshot_date(value: str) -> bool:
+    try:
+        return date.fromisoformat(value).isoformat() == value
+    except (TypeError, ValueError):
+        return False
+
+
+def _validate_json_object(path: Path) -> None:
+    with path.open("r", encoding="utf-8") as file:
+        payload = json.load(file)
+    if not isinstance(payload, dict):
+        raise ValueError("top-level JSON value is not an object")
 
 
 def _prune_daily_snapshots(daily_root: Path, keep: int) -> None:
-    if not daily_root.is_dir() or keep <= 0:
+    if not daily_root.is_dir():
         return
     snapshot_dirs = sorted(
-        (entry for entry in daily_root.iterdir() if entry.is_dir()),
+        (
+            entry
+            for entry in daily_root.iterdir()
+            if entry.is_dir() and _is_snapshot_date(entry.name)
+        ),
         key=lambda entry: entry.name,
     )
-    excess = len(snapshot_dirs) - keep
+    excess = len(snapshot_dirs) - max(keep, 0)
     for stale_dir in snapshot_dirs[:max(excess, 0)]:
         try:
             shutil.rmtree(stale_dir)
@@ -130,35 +182,47 @@ def backup_state_files(
     root = Path(backup_root) / BACKUP_SUBDIR_NAME
     current_dir = root / CURRENT_DIRNAME
     today_dir = root / DAILY_DIRNAME / date.today().isoformat()
-    daily_snapshot_created = not today_dir.exists()
+    daily_snapshot_created = not today_dir.is_dir()
 
     backed_up: List[str] = []
-    try:
-        for src in files:
-            src = Path(src)
-            if not src.is_file():
-                continue
+    failures: List[str] = []
+    seen_names: set[str] = set()
+    for src in files:
+        src = Path(src)
+        if (
+            src.name not in _STATE_BACKUP_FILENAME_SET
+            or src.name in seen_names
+            or not src.is_file()
+        ):
+            continue
+        seen_names.add(src.name)
+        try:
+            _validate_json_object(src)
             _atomic_copy(src, current_dir / src.name)
-            if daily_snapshot_created:
+            # A first attempt can be interrupted after creating only part of
+            # today's directory. Fill any missing files on later attempts,
+            # while never changing files already captured earlier that day.
+            if not (today_dir / src.name).is_file():
                 _atomic_copy(src, today_dir / src.name)
             backed_up.append(src.name)
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+            message = f"{src.name}: {exc}"
+            failures.append(message)
+            logger.warning("Cloud backup skipped invalid/unreadable state file %s", message)
 
+    try:
         _prune_daily_snapshots(root / DAILY_DIRNAME, keep_daily_snapshots)
     except OSError as exc:
-        logger.info("Cloud backup failed: %s", exc)
-        return BackupResult(
-            success=False,
-            root=root,
-            backed_up=backed_up,
-            daily_snapshot_created=daily_snapshot_created and bool(backed_up),
-            error=str(exc),
-        )
+        failures.append(f"snapshot pruning: {exc}")
+        logger.info("Cloud backup pruning failed: %s", exc)
 
     return BackupResult(
-        success=True,
+        success=not failures,
         root=root,
         backed_up=backed_up,
+        failed=failures,
         daily_snapshot_created=daily_snapshot_created and bool(backed_up),
+        error="; ".join(failures),
     )
 
 
@@ -174,7 +238,14 @@ def list_daily_snapshots(backup_root: Path) -> List[str]:
     daily_root = Path(backup_root) / BACKUP_SUBDIR_NAME / DAILY_DIRNAME
     if not daily_root.is_dir():
         return []
-    return sorted(entry.name for entry in daily_root.iterdir() if entry.is_dir())
+    try:
+        return sorted(
+            entry.name
+            for entry in daily_root.iterdir()
+            if entry.is_dir() and _is_snapshot_date(entry.name)
+        )
+    except OSError:
+        return []
 
 
 @dataclass
@@ -203,29 +274,73 @@ def restore_state_files(
     would be its own kind of data loss.
     """
     root = Path(backup_root) / BACKUP_SUBDIR_NAME
-    source_dir = root / CURRENT_DIRNAME if snapshot == CURRENT_DIRNAME else root / DAILY_DIRNAME / snapshot
+    if snapshot == CURRENT_DIRNAME:
+        source_dir = root / CURRENT_DIRNAME
+    elif _is_snapshot_date(snapshot):
+        source_dir = root / DAILY_DIRNAME / snapshot
+    else:
+        return RestoreResult(
+            success=False,
+            error="Snapshot must be 'current' or a valid YYYY-MM-DD date.",
+        )
     if not source_dir.is_dir():
         return RestoreResult(success=False, source=source_dir, error=f"No backup found at {source_dir}")
+
+    return restore_state_directory(
+        source_dir,
+        target_dir,
+        preserve_existing=preserve_existing,
+    )
+
+
+def restore_state_directory(
+    source_dir: Path,
+    target_dir: Path,
+    *,
+    preserve_existing: bool = True,
+) -> RestoreResult:
+    """Restore an already-selected snapshot directory into ``target_dir``.
+
+    This is also used by the UI's staged-restore flow: it first copies and
+    validates the Drive snapshot into a temporary local directory, shuts the
+    running app down cleanly, then applies that immutable staged copy.
+    """
+    source_dir = Path(source_dir)
+    if not source_dir.is_dir():
+        return RestoreResult(
+            success=False,
+            source=source_dir,
+            error=f"No backup found at {source_dir}",
+        )
 
     target_dir = Path(target_dir)
     restored: List[str] = []
     preserved_dir: Optional[Path] = None
 
     try:
+        source_files = sorted(
+            p
+            for p in source_dir.iterdir()
+            if p.is_file() and p.name in _STATE_BACKUP_FILENAME_SET
+        )
+        # Validate the complete selection before touching local state. One
+        # corrupt cloud file should not produce a silently mixed restore.
+        for source_file in source_files:
+            _validate_json_object(source_file)
+
         target_dir.mkdir(parents=True, exist_ok=True)
-        source_files = sorted(p for p in source_dir.iterdir() if p.is_file())
 
         if preserve_existing:
             existing = [target_dir / p.name for p in source_files if (target_dir / p.name).exists()]
             if existing:
-                preserved_dir = target_dir / f"pre_restore_backup_{datetime.now():%Y%m%d_%H%M%S}"
+                preserved_dir = target_dir / f"pre_restore_backup_{datetime.now():%Y%m%d_%H%M%S_%f}"
                 for existing_file in existing:
                     _atomic_copy(existing_file, preserved_dir / existing_file.name)
 
         for src in source_files:
             _atomic_copy(src, target_dir / src.name)
             restored.append(src.name)
-    except OSError as exc:
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
         logger.info("Cloud restore failed: %s", exc)
         return RestoreResult(
             success=False,

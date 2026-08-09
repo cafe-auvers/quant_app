@@ -6,9 +6,11 @@ import math
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
+from pathlib import Path
 from typing import Any, Dict, Optional, List, Tuple
 from zoneinfo import ZoneInfo
 
@@ -41,7 +43,7 @@ from src.core.order_state import BrokerOrder, OrderIntent, OrderSide, OrderStatu
 from src.core.scanner import StockScanner
 from src.core.watchlist import Watchlist, TradePlanManager, BuylistManager
 from src.core.trade_reviewer import TradeReviewer
-from src.utils.config import ROOT_DIR, RULEBOOK_DIR
+from src.utils.config import DATA_DIR, ROOT_DIR, RULEBOOK_DIR
 from src.utils.db_loader import local_mirror_is_stale, resolve_data_engine
 from src.utils.market_calendar import expected_latest_market_data_date
 from src.utils.storage import load_json
@@ -68,6 +70,7 @@ from src.services.app_state import (
     save_app_state,
 )
 from src.services.state_sync import LocalDeviceRole, load_local_device_role
+from src.services.cloud_backup import restore_state_directory, restore_state_files
 from src.ui.controllers import (
     AccountController,
     BuylistExecutionController,
@@ -1983,35 +1986,69 @@ class MainWindow(
         )
 
     def show_restore_backup_dialog(self) -> None:
-        """File > Restore from Cloud Backup -- pick a snapshot, restore it, offer to restart."""
+        """Stage a cloud snapshot, shut down safely, apply it, and restart."""
         dialog = RestoreBackupDialog(self)
-        if dialog.exec_() != QDialog.Accepted or dialog.result_summary is None:
+        if dialog.exec_() != QDialog.Accepted or dialog.selected_snapshot is None:
             return
 
-        result = dialog.result_summary
-        self.append_log(
-            f"Restored {len(result.restored)} file(s) from cloud backup "
-            f"({result.source}): {', '.join(result.restored)}"
-        )
-
-        message = f"Restored {len(result.restored)} file(s):\n" + "\n".join(result.restored)
-        if result.preserved_originals_dir:
-            message += (
-                "\n\nYour previous local copies were preserved at:\n"
-                f"{result.preserved_originals_dir}"
+        # A non-daemon save thread that outlives closeEvent could otherwise
+        # finish after the restore and put stale state back on disk.
+        if not self._state_save_manager().wait_for_pending_saves(timeout=5.0):
+            QMessageBox.warning(
+                self,
+                "Restore Paused",
+                "A local state save is still running. Wait a moment and try again; "
+                "no files were changed.",
             )
-        message += (
-            "\n\nThe app needs to restart to load the restored data. "
-            "Restart now?"
-        )
-        reply = QMessageBox.question(
-            self,
-            "Restore Complete",
-            message,
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes,
-        )
-        if reply == QMessageBox.Yes:
+            return
+
+        # Copy and validate the selected snapshot before closing. This also
+        # freezes "current" so the final shutdown save cannot change the
+        # restore source underneath us.
+        with tempfile.TemporaryDirectory(prefix="quant_app_cloud_restore_") as staging:
+            staging_dir = Path(staging)
+            staged = restore_state_files(
+                dialog.backup_root,
+                staging_dir,
+                snapshot=dialog.selected_snapshot,
+                preserve_existing=False,
+            )
+            if not staged.success:
+                QMessageBox.warning(
+                    self,
+                    "Restore Failed",
+                    staged.error or "The selected backup could not be staged.",
+                )
+                return
+            if not staged.restored:
+                QMessageBox.information(
+                    self,
+                    "Nothing to Restore",
+                    "That snapshot contains no recognized state files.",
+                )
+                return
+
+            # close() synchronously stops workers and performs the normal
+            # final local save. Apply only after it succeeds, otherwise a
+            # stale in-memory shutdown save could overwrite restored data.
+            if not self.close():
+                QMessageBox.warning(
+                    self,
+                    "Restore Paused",
+                    "The app could not close cleanly, so no local files were changed.",
+                )
+                return
+
+            result = restore_state_directory(staging_dir, DATA_DIR)
+            if not result.success:
+                QMessageBox.warning(
+                    None,
+                    "Restore Failed",
+                    (result.error or "The staged backup could not be applied.")
+                    + "\n\nThe app is closed; restart it manually after checking data/.",
+                )
+                return
+
             self._restart_application()
 
     def show_backup_env_dialog(self) -> None:
@@ -2041,8 +2078,10 @@ class MainWindow(
         if reply == QMessageBox.Yes:
             self._restart_application()
 
-    def _restart_application(self) -> None:
-        """Relaunch main.py in a new process, then quit this one."""
+    def _restart_application(self) -> bool:
+        """Close cleanly, relaunch main.py, and report whether it started."""
+        if self.isVisible() and not self.close():
+            return False
         main_py = ROOT_DIR / "main.py"
         try:
             subprocess.Popen([sys.executable, str(main_py)], cwd=str(ROOT_DIR))
@@ -2052,8 +2091,11 @@ class MainWindow(
                 "Restart Failed",
                 f"Could not relaunch automatically: {exc}\nPlease restart the app manually.",
             )
-            return
-        QApplication.instance().quit()
+            return False
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+        return True
 
     def _parse_float(self, value: QLineEdit, default: float) -> float:
         try:

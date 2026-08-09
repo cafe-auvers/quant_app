@@ -11,8 +11,8 @@ shared MySQL (`app_state_sync` table, see
 reachable, but the rest never do. A dead disk or an accidental delete on
 the laptop has no recovery path without this.
 
-**11 files are backed up** -- `CLOUD_BACKUP_FILES` in
-`src/services/app_state.py` is the source of truth for the exact list:
+**11 files are backed up** -- `STATE_BACKUP_FILENAMES` in
+`src/services/cloud_backup.py` is the source of truth for the exact list:
 
 | File | What it is |
 |---|---|
@@ -51,9 +51,9 @@ genuinely optional):
 that a sync client (Google Drive for Desktop, OneDrive, Dropbox -- anything
 that mirrors a cloud folder to a local path) is already watching. It never
 talks to a cloud API itself; the sync client already running on the machine
-does the actual upload. Runs automatically after every successful local
-save (`StateSaveManager.save_now`, throttled to at most once per 10 minutes
-so it doesn't spam the sync client on rapid edits), fully best-effort --
+does the actual upload. It runs after every successful `StateSaveManager`
+save and is throttled to at most once per 10 minutes so it doesn't spam the
+sync client on rapid edits. The backup is fully best-effort --
 if the destination folder isn't found, or the copy fails, the local save
 that already happened is unaffected and the app keeps working normally.
 
@@ -63,23 +63,31 @@ Two tiers are kept under `<synced folder>/quant_app_backup/`:
 - `daily/<YYYY-MM-DD>/` -- one full snapshot per calendar day, so a bad
   edit noticed days later is still recoverable (the single `.bak` generation
   that `save_json` keeps next to each file on disk only survives one bad
-  write). Kept for 21 days by default, then pruned automatically.
+  write). The latest 21 daily snapshot directories are kept by default,
+  then older dated snapshots are pruned automatically.
+
+Each JSON file is parsed before it replaces a good cloud copy. A malformed
+local file is reported and skipped, and later backup passes fill any files
+missing from an interrupted daily snapshot without changing the files that
+were already captured that day.
 
 ## Setup
 
 1. Install **Google Drive for Desktop** and sign in:
    https://www.google.com/drive/download/
-2. During setup, either mode works since this only ever *writes* new files
-   into the folder (it never reads existing Drive content back):
+2. During normal automatic backup, the app only writes into this folder.
+   Reading from it happens only when you explicitly choose a restore. Either
+   Google Drive mode works:
    - **Mirror files** (recommended) -- creates a real local folder with
      actual file contents, usually mounted as a drive letter (`G:\My Drive`
      by default).
    - **Stream files** -- files show as on-demand placeholders until opened,
      but writing new files into the folder still works and still uploads.
-3. That's it -- `resolve_backup_root()` auto-detects the folder on the next
-   save (checks drive letters `G:` through `Z:` for a `My Drive` folder,
-   then a few common home-folder locations). No restart needed; it's
-   re-checked once per app run.
+3. That's it -- `resolve_backup_root()` auto-detects the folder on the first
+   backup attempt in each app run (checks drive letters `A:` through `Z:` for
+   a `My Drive` folder, then a few common home-folder locations). If Drive is
+   installed after the app has already logged that no destination was found,
+   restart the app.
 4. To point at a specific folder instead of relying on auto-detection (a
    renamed Drive folder, OneDrive, a different drive letter, testing),
    set `QUANT_BACKUP_DIR` in `.env`:
@@ -93,11 +101,11 @@ Two tiers are kept under `<synced folder>/quant_app_backup/`:
 
 **File > Restore from Cloud Backup...** -- lists "Latest" plus every
 available daily snapshot date, restores the one you pick into `data/`
-(existing files preserved first into a timestamped `pre_restore_backup_...`
-folder, never blindly overwritten), then offers to restart the app so the
-restored state actually loads. This is the normal path any time you want to
-roll back, not just after a crash -- e.g. undoing a bad edit from a few days
-ago.
+by first validating and staging an immutable local copy. The app then closes
+cleanly, preserves existing files into a timestamped
+`pre_restore_backup_...` folder, applies the staged copy, and restarts. This
+ordering prevents shutdown saves from overwriting the restored files. It is
+the normal path any time you want to roll back, not just after a crash.
 
 ### From scratch (the laptop itself is gone -- nothing installed yet)
 
@@ -109,8 +117,9 @@ On the replacement machine, before the app can even run:
    tied to the machine that uploaded them; any device signed into that
    account sees the same `My Drive`).
 2. `git clone` the repo, run `pip install -r requirements.txt`.
-3. Recreate `.env` -- see "What this does NOT recover" below, this is the
-   one piece the cloud backup deliberately never touches.
+3. Restore `.env` with the encrypted backup command described below, or
+   recreate it manually. If `QUANT_BACKUP_DIR` was only stored in the lost
+   `.env`, pass `--backup-dir` explicitly for this first restore.
 4. Run `python scripts/restore_from_cloud_backup.py` (the same restore
    logic as the in-app dialog, usable before the GUI can even launch --
    e.g. to sanity-check the data landed correctly, or in case a broken
@@ -156,7 +165,7 @@ rebuild or reconcile on their own.
 
 ## Backing up `.env`
 
-Unlike the seven JSON files, `.env` holds real secrets -- MySQL password,
+Unlike the 11 JSON files, `.env` holds real secrets -- MySQL password,
 KIS trading keys, OpenAI key -- so it is **never** written in plaintext to
 the Drive folder, and it is **never** backed up automatically. Both are
 deliberate: a consumer sync folder is a bad place for plaintext secrets,
@@ -166,9 +175,10 @@ bad UX and arguably bad security practice.
 `src/services/env_backup.py` encrypts `.env` with a key derived
 (PBKDF2-HMAC-SHA256, 600,000 iterations) from a passphrase you type and a
 random salt, using Fernet (AES-128-CBC + HMAC) for the actual encryption.
-The salt isn't secret and is stored next to the ciphertext under
-`<synced folder>/quant_app_backup/secrets/`; the passphrase is never stored
-anywhere -- not in `.env`, not next to the backup, not in this repo. A
+The non-secret salt, KDF parameters, and ciphertext are stored together in
+one atomically replaced `secrets/env.enc` envelope, avoiding a broken
+salt/ciphertext pair if a write is interrupted. The passphrase is never
+stored anywhere -- not in `.env`, not next to the backup, not in this repo. A
 compromised Google account alone can't read your secrets back; the
 passphrase is also required, and only you hold it. **Losing the passphrase
 means the backup is permanently unrecoverable -- there is no backdoor.**
@@ -179,7 +189,8 @@ Keep it in a password manager.
 passphrase (twice, to confirm), then encrypts and writes. Do this again
 any time you rotate a credential -- only the latest copy is kept, there's
 no daily history for this one (no value in an old copy of rotated-out
-credentials).
+credentials). A minimum of 12 characters is enforced; use a long, unique
+password-manager-generated passphrase.
 
 **Restore:** File > Restore .env from Cloud (Encrypted)... (or
 `python scripts/restore_env_from_cloud.py`, usable before the GUI can even
@@ -193,7 +204,15 @@ local `.env` is preserved first, same rule as the JSON restore.
 Check the in-app log panel after your first save of a session -- it logs
 either the resolved backup destination or an explicit note that none was
 found. From then on, look under `<synced folder>/quant_app_backup/current/`
-in Drive (web or desktop) to confirm the files are actually arriving.
+in Drive on the web to confirm the files are actually arriving. The app can
+confirm only the local synced-folder write; Google Drive for Desktop is
+responsible for the upload and this feature cannot prove that upload
+completed.
+
+The 11 state JSON files are plaintext in Drive and can contain positions,
+orders, and strategy state. Protect the Google account with a strong unique
+password and multi-factor authentication. Only `.env` receives the
+additional passphrase encryption described above.
 
 ## What's intentionally out of scope
 
@@ -204,5 +223,6 @@ in Drive (web or desktop) to confirm the files are actually arriving.
 - `data/device_role.json` -- per-machine sync identity. Backing it up would
   be meaningless (and `state_sync.py` already resets a copied role file by
   design if its stored hostname doesn't match).
-- `.env`, token caches, KIS credentials -- secrets, never belong in a synced
-  folder. Not touched by this module.
+- Plaintext `.env`, token caches, and loose credential files -- never copied
+  by the automatic state backup. `.env` is supported only through the
+  separate manual encrypted-envelope workflow above.
