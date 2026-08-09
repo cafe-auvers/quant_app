@@ -75,6 +75,10 @@ def test_dashboard_snapshot_callback_keeps_the_profile_that_started_request():
         populate_kis_holdings_table=lambda _holdings: None,
         _flatten_kis_holdings=lambda _snapshot: [],
         apply_cached_trade_account_size=lambda: None,
+        # _on_kis_snapshot_finished now also refreshes FX (which itself calls
+        # apply_cached_trade_account_size once the fresh rate lands), so a
+        # single click on "Refresh KIS Snapshot" leaves sizing ready too.
+        refresh_usd_krw_rate=lambda show_messages=False: None,
         append_log=lambda _message: None,
         reconcile_open_orders=lambda: None,
     )

@@ -216,34 +216,35 @@ class DashboardMixin:
         kis_form.addRow("Sections", kis_options_layout)
 
         # Trade sizing inputs — used by the Watchlist ORB Position Plan panel
-        # and Buy Dashboard for share/capital-% math (moved here from the
-        # Watchlist tab since the capital base is account-level, not per-stock).
+        # and Buy Dashboard for share/capital-% math. Not shown in the UI:
+        # the "Total (est.)" line in kis_account_summary_label already
+        # displays this same USD figure and the USD/KRW rate together, and
+        # both are auto-populated (account combo change / "Use KIS Balance" /
+        # startup preload) — there's nothing to manually type here. The
+        # widgets still have to exist though: ~10 call sites across
+        # watchlist/buylist/scanner read account_size_input directly for
+        # real position sizing and order routing.
         self.account_size_input = QLineEdit("100000")
         account_size_validator = QDoubleValidator(
             0.0, 1_000_000_000_000.0, 2, self.account_size_input
         )
         account_size_validator.setNotation(QDoubleValidator.StandardNotation)
         self.account_size_input.setValidator(account_size_validator)
-        self.account_size_input.setMaximumWidth(120)
-        kis_form.addRow("Sizing Account USD", self.account_size_input)
+        self.account_size_input.setVisible(False)
 
-        fx_row_layout = QHBoxLayout()
         self.usd_krw_rate_input = QLineEdit()
-        self.usd_krw_rate_input.setPlaceholderText("Fetching...")
         self.usd_krw_rate_input.setReadOnly(True)
-        self.usd_krw_rate_input.setMaximumWidth(75)
-        fx_row_layout.addWidget(self.usd_krw_rate_input)
+        self.usd_krw_rate_input.setVisible(False)
+        # "Use KIS Balance" (below) already triggers a fresh USD/KRW fetch
+        # after loading the snapshot, so a standalone Refresh FX trigger
+        # isn't needed as a separate visible control.
         self.usd_krw_rate_refresh_button = QPushButton("Refresh FX")
         self.usd_krw_rate_refresh_button.clicked.connect(
             lambda: self.refresh_usd_krw_rate(show_messages=True)
         )
-        fx_row_layout.addWidget(self.usd_krw_rate_refresh_button)
-        fx_row_layout.addStretch()
-        kis_form.addRow("USD/KRW", fx_row_layout)
-
+        self.usd_krw_rate_refresh_button.setVisible(False)
         self.usd_krw_rate_status_label = QLabel("USD/KRW not refreshed")
-        self.usd_krw_rate_status_label.setWordWrap(True)
-        kis_form.addRow("FX Status", self.usd_krw_rate_status_label)
+        self.usd_krw_rate_status_label.setVisible(False)
 
         kis_layout.addLayout(kis_form)
 
@@ -285,15 +286,12 @@ class DashboardMixin:
         kis_button_layout = QHBoxLayout()
         self.kis_refresh_button = QPushButton("Refresh KIS Snapshot")
         self.kis_refresh_button.setObjectName("kisRefreshButton")
+        self.kis_refresh_button.setToolTip(
+            "Fetches the account snapshot and refreshes USD/KRW, so position "
+            "sizing (Account USD) is ready off this same click — no separate step."
+        )
         self.kis_refresh_button.clicked.connect(self.refresh_kis_account_snapshot)
         kis_button_layout.addWidget(self.kis_refresh_button)
-        kis_balance_btn = QPushButton("Use KIS Balance")
-        kis_balance_btn.setToolTip(
-            "Fetch the selected account's balance and use it as the sizing "
-            "Account USD (also refreshes USD/KRW)."
-        )
-        kis_balance_btn.clicked.connect(self.refresh_trade_account_size)
-        kis_button_layout.addWidget(kis_balance_btn)
         kis_button_layout.addStretch()
         kis_layout.addLayout(kis_button_layout)
 
@@ -695,7 +693,11 @@ class DashboardMixin:
                 self._format_kis_snapshot_summary(snapshot, fx_rate=fx)
             )
             self.populate_kis_holdings_table(self._flatten_kis_holdings(snapshot))
-            self.apply_cached_trade_account_size()
+            # Refresh USD/KRW too, so position sizing (account_size_input) is
+            # ready off this same snapshot without a separate "Use KIS
+            # Balance" step. refresh_usd_krw_rate's completion callback calls
+            # apply_cached_trade_account_size() once the fresh rate lands.
+            self.refresh_usd_krw_rate(show_messages=False)
             self.append_log("Loaded KIS account snapshot.")
         self.reconcile_open_orders()
 
@@ -771,39 +773,50 @@ class DashboardMixin:
     def _format_kis_snapshot_summary(
         snapshot: Dict[str, Any], fx_rate: float = 0.0
     ) -> str:
-        """Format a human-readable KIS account snapshot summary."""
+        """Format a human-readable KIS account snapshot summary.
+
+        Cash/stock/total figures come from _extract_kis_account_value_krw —
+        the same function apply_cached_trade_account_size() uses to set
+        Account USD — so "Total (est.)" below is guaranteed to be the exact
+        number driving position sizing, not a second, independently
+        maintained calculation that could quietly drift from it. Only P/L
+        and holding-count stats (irrelevant to sizing) are computed locally.
+        Stays a staticmethod (calls the other by class name) so it remains
+        callable without a MainWindow instance, e.g. in tests.
+        """
         env = snapshot.get("environment", "")
         acct = snapshot.get("account", "")
         fetched = snapshot.get("fetched_at", "")
         parts = [f"Fetched: {fetched}  |  Profile: {env}  |  Account: {acct}"]
 
-        # Domestic KRW cash and KR stocks
-        cash_krw = 0.0
-        kr_stock_krw = 0.0
+        breakdown = (
+            DashboardMixin._extract_kis_account_value_krw(
+                snapshot, fx_rate=fx_rate, return_breakdown=True
+            )
+            or {}
+        )
+        cash_krw = breakdown.get("cash_krw", 0.0)
+        kr_stock_krw = breakdown.get("kr_stock_krw", 0.0)
+        ovrs_stock_usd = breakdown.get("ovrs_stock_usd", 0.0)
+        ovrs_cash_usd = breakdown.get("ovrs_cash_usd", 0.0)  # frcr fallback already folded in
+        frcr_evlu_tota_krw = breakdown.get("frcr_evlu_tota_krw", 0.0)
+        total_krw = breakdown.get("total_krw", 0.0)
+
+        # P/L and holding-count stats — display-only, not part of sizing math
         kr_pnl_krw = 0.0
         domestic = snapshot.get("domestic")
         if isinstance(domestic, dict):
-            dom_summary = domestic.get("summary", {})
+            try:
+                kr_pnl_krw = float(
+                    domestic.get("summary", {}).get("evaluation_profit_loss_krw") or 0
+                )
+            except (TypeError, ValueError):
+                kr_pnl_krw = 0.0
 
-            def _f(key: str) -> float:
-                try:
-                    return float(dom_summary.get(key) or 0)
-                except (TypeError, ValueError):
-                    return 0.0
-
-            cash_krw = _f("cash_total_krw") or _f("d2_deposit_krw")
-            kr_stock_krw = _f("stock_evaluation_krw")
-            kr_pnl_krw = _f("evaluation_profit_loss_krw")
-
-        # Overseas USD stocks (deduped by symbol) and cash
-        ovrs_stock_usd = 0.0
-        ovrs_cash_usd = 0.0
         ovrs_pnl_usd = 0.0
         ovrs_count = 0
-        frcr_evlu_tota_krw = 0.0  # from CTRP6548R: total foreign value in KRW
         overseas = snapshot.get("overseas")
         if isinstance(overseas, dict):
-            frcr_evlu_tota_krw = float(overseas.get("frcr_evlu_tota_krw") or 0)
             seen_syms: set = set()
             for h in overseas.get("holdings", []):
                 if not isinstance(h, dict):
@@ -813,19 +826,9 @@ class DashboardMixin:
                     seen_syms.add(sym)
                     ovrs_count += 1
                     try:
-                        ovrs_stock_usd += float(h.get("evaluation_amount") or 0)
                         ovrs_pnl_usd += float(h.get("profit_loss") or 0)
                     except (TypeError, ValueError):
                         pass
-            for exch_summary in overseas.get("summary_by_exchange", {}).values():
-                if not isinstance(exch_summary, dict):
-                    continue
-                try:
-                    v = float(exch_summary.get("cash_balance_usd") or 0)
-                    if v > ovrs_cash_usd:
-                        ovrs_cash_usd = v
-                except (TypeError, ValueError):
-                    pass
 
         # Breakdown line
         pnl_sign = "+" if ovrs_pnl_usd >= 0 else ""
@@ -837,27 +840,21 @@ class DashboardMixin:
         # Cash summary — KRW deposit + USD assets
         cash_line = f"Cash: {cash_krw:,.0f} KRW"
         if ovrs_cash_usd > 0:
-            cash_line += f"  +  ${ovrs_cash_usd:,.2f} USD"
-        if frcr_evlu_tota_krw > 0 and ovrs_stock_usd == 0 and ovrs_cash_usd == 0:
-            # Per-exchange holdings not settled yet; show CTRP6548R total instead
-            if fx_rate > 0:
-                cash_line += f"  +  ${frcr_evlu_tota_krw / fx_rate:,.2f} USD (frcr, pre-settlement)"
-            else:
-                cash_line += f"  +  {frcr_evlu_tota_krw:,.0f} KRW (frcr, pre-settlement)"
+            note = (
+                " (frcr, pre-settlement)"
+                if frcr_evlu_tota_krw > 0 and ovrs_stock_usd == 0
+                else ""
+            )
+            cash_line += f"  +  ${ovrs_cash_usd:,.2f} USD{note}"
         parts.append(cash_line)
         parts.append(f"Overseas: {ovrs_count} holdings loaded.")
         if kr_stock_krw > 0 and kr_pnl_krw != 0:
             kr_pnl_sign = "+" if kr_pnl_krw >= 0 else ""
             parts.append(f"KR stock P/L: {kr_pnl_sign}{kr_pnl_krw:,.0f} KRW")
 
-        # Total in KRW and USD if FX rate is known
-        if fx_rate > 0:
-            ovrs_krw = (
-                (ovrs_stock_usd + ovrs_cash_usd) * fx_rate
-                if (ovrs_stock_usd > 0 or ovrs_cash_usd > 0)
-                else frcr_evlu_tota_krw
-            )
-            total_krw = cash_krw + kr_stock_krw + ovrs_krw
+        # Total in KRW and USD if FX rate is known — identical figure to
+        # what Account USD (position sizing) uses.
+        if fx_rate > 0 and total_krw > 0:
             total_usd = total_krw / fx_rate
             parts.append(
                 f"Total (est.): {total_krw:,.0f} KRW = ${total_usd:,.2f} USD  @ {fx_rate:.2f} KRW/USD"
