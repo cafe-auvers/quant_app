@@ -29,7 +29,11 @@ def test_refresh_gate_retries_hourly_when_daily_data_is_current(monkeypatch):
     expected_date = dt.date(2026, 6, 23)
     tickers = ["SPY", "AAPL"]
 
-    monkeypatch.setattr(refresh, "init_mysql_engine", lambda: object())
+    monkeypatch.setattr(
+        refresh,
+        "resolve_data_engine",
+        lambda: SimpleNamespace(engine=object(), source="pc", pc_engine=object()),
+    )
     monkeypatch.setattr(refresh, "_refresh_tickers", lambda: tickers)
     monkeypatch.setattr(refresh, "expected_latest_market_data_date", lambda: expected_date)
     monkeypatch.setattr(refresh, "get_chronically_failing_symbols", lambda *args, **kwargs: set())
@@ -58,7 +62,11 @@ def test_refresh_gate_retries_daily_when_only_some_symbols_are_stale(monkeypatch
     expected_date = dt.date(2026, 6, 23)
     tickers = ["SPY", "AAPL"]
 
-    monkeypatch.setattr(refresh, "init_mysql_engine", lambda: object())
+    monkeypatch.setattr(
+        refresh,
+        "resolve_data_engine",
+        lambda: SimpleNamespace(engine=object(), source="pc", pc_engine=object()),
+    )
     monkeypatch.setattr(refresh, "_refresh_tickers", lambda: tickers)
     monkeypatch.setattr(refresh, "expected_latest_market_data_date", lambda: expected_date)
     monkeypatch.setattr(refresh, "get_chronically_failing_symbols", lambda *args, **kwargs: set())
@@ -85,7 +93,11 @@ def test_refresh_gate_skips_only_when_every_symbol_and_mode_is_current(monkeypat
     expected_date = dt.date(2026, 6, 23)
     tickers = ["SPY", "AAPL"]
 
-    monkeypatch.setattr(refresh, "init_mysql_engine", lambda: object())
+    monkeypatch.setattr(
+        refresh,
+        "resolve_data_engine",
+        lambda: SimpleNamespace(engine=object(), source="pc", pc_engine=object()),
+    )
     monkeypatch.setattr(refresh, "_refresh_tickers", lambda: tickers)
     monkeypatch.setattr(refresh, "expected_latest_market_data_date", lambda: expected_date)
     monkeypatch.setattr(refresh, "get_chronically_failing_symbols", lambda *args, **kwargs: set())
@@ -117,7 +129,11 @@ def test_refresh_gate_skips_when_only_chronically_failing_symbols_are_stale(monk
     expected_date = dt.date(2026, 6, 23)
     tickers = ["SPY", "AAPL", "GDV-H"]
 
-    monkeypatch.setattr(refresh, "init_mysql_engine", lambda: object())
+    monkeypatch.setattr(
+        refresh,
+        "resolve_data_engine",
+        lambda: SimpleNamespace(engine=object(), source="pc", pc_engine=object()),
+    )
     monkeypatch.setattr(refresh, "_refresh_tickers", lambda: tickers)
     monkeypatch.setattr(refresh, "expected_latest_market_data_date", lambda: expected_date)
     monkeypatch.setattr(
@@ -150,7 +166,11 @@ def test_refresh_gate_still_refreshes_non_chronic_stale_symbols(monkeypatch):
     expected_date = dt.date(2026, 6, 23)
     tickers = ["SPY", "AAPL", "GDV-H"]
 
-    monkeypatch.setattr(refresh, "init_mysql_engine", lambda: object())
+    monkeypatch.setattr(
+        refresh,
+        "resolve_data_engine",
+        lambda: SimpleNamespace(engine=object(), source="pc", pc_engine=object()),
+    )
     monkeypatch.setattr(refresh, "_refresh_tickers", lambda: tickers)
     monkeypatch.setattr(refresh, "expected_latest_market_data_date", lambda: expected_date)
     monkeypatch.setattr(
@@ -181,7 +201,11 @@ def test_refresh_gate_keeps_reference_symbol_actionable_during_broad_outage(monk
     expected_date = dt.date(2026, 6, 23)
     tickers = ["SPY", "AAPL"]
 
-    monkeypatch.setattr(refresh, "init_mysql_engine", lambda: object())
+    monkeypatch.setattr(
+        refresh,
+        "resolve_data_engine",
+        lambda: SimpleNamespace(engine=object(), source="pc", pc_engine=object()),
+    )
     monkeypatch.setattr(refresh, "_refresh_tickers", lambda: tickers)
     monkeypatch.setattr(refresh, "expected_latest_market_data_date", lambda: expected_date)
     monkeypatch.setattr(
@@ -207,7 +231,11 @@ def test_refresh_gate_defers_universe_while_provider_canary_is_failing(monkeypat
     expected_date = dt.date(2026, 6, 23)
     tickers = ["SPY", "AAPL"]
 
-    monkeypatch.setattr(refresh, "init_mysql_engine", lambda: object())
+    monkeypatch.setattr(
+        refresh,
+        "resolve_data_engine",
+        lambda: SimpleNamespace(engine=object(), source="pc", pc_engine=object()),
+    )
     monkeypatch.setattr(refresh, "_refresh_tickers", lambda: tickers)
     monkeypatch.setattr(
         refresh, "expected_latest_market_data_date", lambda: expected_date
@@ -238,7 +266,11 @@ def test_refresh_gate_passes_only_stale_symbols_to_each_mode(monkeypatch):
     expected_date = dt.date(2026, 6, 23)
     tickers = ["SPY", "AAPL", "MSFT", "GDV-H"]
 
-    monkeypatch.setattr(refresh, "init_mysql_engine", lambda: object())
+    monkeypatch.setattr(
+        refresh,
+        "resolve_data_engine",
+        lambda: SimpleNamespace(engine=object(), source="pc", pc_engine=object()),
+    )
     monkeypatch.setattr(refresh, "_refresh_tickers", lambda: tickers)
     monkeypatch.setattr(refresh, "expected_latest_market_data_date", lambda: expected_date)
     monkeypatch.setattr(
@@ -275,7 +307,11 @@ def test_refresh_gate_can_resume_derived_work_without_price_downloads(monkeypatc
     tickers = ["SPY", "AAPL", "MSFT"]
     latest = {symbol: dt.datetime(2026, 6, 23) for symbol in tickers}
 
-    monkeypatch.setattr(refresh, "init_mysql_engine", lambda: object())
+    monkeypatch.setattr(
+        refresh,
+        "resolve_data_engine",
+        lambda: SimpleNamespace(engine=object(), source="pc", pc_engine=object()),
+    )
     monkeypatch.setattr(refresh, "_refresh_tickers", lambda: tickers)
     monkeypatch.setattr(refresh, "expected_latest_market_data_date", lambda: expected_date)
     monkeypatch.setattr(refresh, "get_chronically_failing_symbols", lambda *args, **kwargs: set())
@@ -311,7 +347,11 @@ def test_derived_only_refresh_does_not_retry_chronic_history(monkeypatch):
     expected_date = dt.date(2026, 6, 23)
     tickers = ["SPY", "AAPL", "GDV-H"]
 
-    monkeypatch.setattr(refresh, "init_mysql_engine", lambda: object())
+    monkeypatch.setattr(
+        refresh,
+        "resolve_data_engine",
+        lambda: SimpleNamespace(engine=object(), source="pc", pc_engine=object()),
+    )
     monkeypatch.setattr(refresh, "_refresh_tickers", lambda: tickers)
     monkeypatch.setattr(
         refresh, "expected_latest_market_data_date", lambda: expected_date
@@ -359,7 +399,11 @@ def test_refresh_gate_skips_derived_queries_when_daily_history_is_stale(monkeypa
     expected_date = dt.date(2026, 6, 23)
     tickers = ["SPY", "AAPL"]
 
-    monkeypatch.setattr(refresh, "init_mysql_engine", lambda: object())
+    monkeypatch.setattr(
+        refresh,
+        "resolve_data_engine",
+        lambda: SimpleNamespace(engine=object(), source="pc", pc_engine=object()),
+    )
     monkeypatch.setattr(refresh, "_refresh_tickers", lambda: tickers)
     monkeypatch.setattr(refresh, "expected_latest_market_data_date", lambda: expected_date)
     monkeypatch.setattr(

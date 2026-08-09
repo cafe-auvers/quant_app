@@ -39,7 +39,8 @@ from src.core.scanner import StockScanner
 from src.core.watchlist import Watchlist, TradePlanManager, BuylistManager
 from src.core.trade_reviewer import TradeReviewer
 from src.utils.config import RULEBOOK_DIR
-from src.utils.db_loader import init_mysql_engine
+from src.utils.db_loader import local_mirror_is_stale, resolve_data_engine
+from src.utils.market_calendar import expected_latest_market_data_date
 from src.utils.storage import load_json
 from src.services.historical_refresh_control import (
     MODE_1D,
@@ -128,19 +129,42 @@ US_MARKET_CLOSE_TIME = dt.time(16, 0)
 
 
 class DatabaseInitWorker(QThread):
-    """Open the optional MySQL cache without delaying the first UI frame."""
+    """Resolve the market-data engine (PC MySQL, local mirror, or none)
+    without delaying the first UI frame."""
 
-    initialized = pyqtSignal(object, str)
+    initialized = pyqtSignal(object, str, object, str)
 
     def run(self) -> None:
         try:
-            engine = init_mysql_engine()
-            self.initialized.emit(engine, "")
+            resolution = resolve_data_engine()
+            self.initialized.emit(
+                resolution.engine, resolution.source, resolution.pc_engine, ""
+            )
         except Exception as exc:
-            # init_mysql_engine normally returns None on optional-db failures,
-            # but the UI must also remain usable if an unexpected driver error
-            # escapes it.
-            self.initialized.emit(None, str(exc))
+            # resolve_data_engine normally returns a "none" resolution on
+            # optional-db failures, but the UI must also remain usable if an
+            # unexpected driver error escapes it.
+            self.initialized.emit(None, "none", None, str(exc))
+
+
+class LocalMirrorSyncWorker(QThread):
+    """Best-effort, silent PC -> laptop local-mirror top-up in the background."""
+
+    completed = pyqtSignal(dict, str)
+
+    def __init__(self, pc_engine, local_engine) -> None:
+        super().__init__()
+        self.pc_engine = pc_engine
+        self.local_engine = local_engine
+
+    def run(self) -> None:
+        from src.utils.db_loader import sync_local_mirror_from_pc
+
+        try:
+            written = sync_local_mirror_from_pc(self.pc_engine, self.local_engine)
+            self.completed.emit(written, "")
+        except Exception as exc:
+            self.completed.emit({}, str(exc))
 
 
 class StateSyncWorker(QThread):
@@ -232,9 +256,12 @@ class MainWindow(
         # desktop window from appearing.  A short-lived worker finishes setup
         # after the event loop begins.
         self.db_engine = None
+        self.pc_db_engine = None
+        self.db_engine_source = "none"
         self.db_enabled = False
         self.db_initializing = True
         self.database_init_worker = None
+        self._local_mirror_sync_worker = None
         self.state_sync_role = load_local_device_role()
         self.state_sync_worker = None
         self._last_state_sync_notice = ""
@@ -357,19 +384,27 @@ class MainWindow(
         )
         worker.start()
 
-    def _on_optional_database_initialized(self, engine, error: str = "") -> None:
+    def _on_optional_database_initialized(
+        self, engine, source: str = "none", pc_engine=None, error: str = ""
+    ) -> None:
         self.db_engine = engine
+        self.pc_db_engine = pc_engine
+        self.db_engine_source = source
         self.db_enabled = engine is not None
         self.db_initializing = False
         self._state_save_manager().set_engine(
-            engine,
+            pc_engine,
             device_id=self.state_sync_role.device_id,
             is_main_device=self.state_sync_role.is_main,
         )
-        if self.db_enabled:
+
+        if source == "pc":
             self.append_log("MySQL cache connected; starting initial scanner refresh.")
             self._start_state_sync()
             self.run_all_scanners(show_warnings=False)
+            self._start_background_local_mirror_sync(pc_engine)
+        elif source == "local_mirror":
+            self._handle_local_mirror_startup(engine)
         elif error:
             self.append_log(f"MySQL cache unavailable: {error}")
         else:
@@ -378,9 +413,66 @@ class MainWindow(
             )
         self.update_dashboard_summary()
 
+    def _start_background_local_mirror_sync(self, pc_engine) -> None:
+        """Best-effort, silent PC -> laptop mirror top-up once connected to the PC."""
+        from src.utils.db_loader import init_local_mirror_engine
+
+        local_engine = init_local_mirror_engine()
+        if local_engine is None:
+            return
+        worker = LocalMirrorSyncWorker(pc_engine, local_engine)
+        self._local_mirror_sync_worker = worker
+        worker.completed.connect(self._on_local_mirror_sync_completed)
+        worker.finished.connect(
+            lambda finished_worker=worker: self._clear_worker_reference(
+                "_local_mirror_sync_worker", finished_worker
+            )
+        )
+        worker.start()
+
+    def _on_local_mirror_sync_completed(self, written: dict, error: str) -> None:
+        if error:
+            self.append_log(f"Local data mirror sync failed: {error}")
+            return
+        total = sum(written.values())
+        if total:
+            self.append_log(f"Local data mirror updated ({total} row(s)) for offline fallback.")
+
+    def _handle_local_mirror_startup(self, engine) -> None:
+        """PC unreachable; decide whether to use the local mirror silently or ask first."""
+        expected_date = expected_latest_market_data_date()
+        if not local_mirror_is_stale(engine, expected_date):
+            self.append_log("PC unreachable; using local data mirror (up to date).")
+            self.run_all_scanners(show_warnings=False)
+            return
+
+        self.append_log(
+            f"PC unreachable and the local data mirror is stale "
+            f"(market data expected through {expected_date})."
+        )
+        reply = QMessageBox.question(
+            self,
+            "Local data is out of date",
+            "The PC is unreachable and this laptop's local data mirror is stale "
+            f"(market data expected through {expected_date}).\n\n"
+            "Fetch fresh data now directly from Yahoo Finance? This only updates "
+            "this laptop's local copy and may take several minutes.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            self.append_log("Fetching fresh data into the local mirror ...")
+            self.refresh_data_to_db()
+            self.refresh_hourly_data_to_db()
+        else:
+            self.append_log(
+                "Continuing with stale local data. Use 'Update 1D/1H Data' to refresh manually."
+            )
+            self.run_all_scanners(show_warnings=False)
+
     def _start_state_sync(self, *, activate: bool = False) -> None:
         """Start one ownership/state reconciliation in a background worker."""
-        if self.db_engine is None:
+        if self.pc_db_engine is None:
             return
         worker = self.state_sync_worker
         if worker is not None and worker.isRunning():
@@ -392,7 +484,7 @@ class MainWindow(
                 )
             return
         worker = StateSyncWorker(
-            self.db_engine,
+            self.pc_db_engine,
             self.state_sync_role,
             self._ensure_save_lock(),
             activate=activate,
@@ -481,7 +573,7 @@ class MainWindow(
         if button is None:
             return
         is_main = bool(self.state_sync_role.is_main)
-        button.setEnabled(self.db_engine is not None or self.db_initializing)
+        button.setEnabled(self.pc_db_engine is not None or self.db_initializing)
         if is_main:
             button.setText("Main Device: ON")
             button.setStyleSheet(
@@ -506,7 +598,7 @@ class MainWindow(
                 "This device is already the exclusive main device.",
             )
             return
-        if self.db_engine is None:
+        if self.pc_db_engine is None:
             QMessageBox.warning(
                 self,
                 "State sync unavailable",
@@ -1149,7 +1241,7 @@ class MainWindow(
             return
         from src.services.runtime_status import safe_mark_runtime_process_stopped
 
-        safe_mark_runtime_process_stopped(self.db_engine)
+        safe_mark_runtime_process_stopped(self.pc_db_engine)
         save_result = self._flush_state_saves_for_shutdown(timeout=5.0)
         if not save_result.success:
             message = save_result.error or "Unknown local state save error."
@@ -1550,7 +1642,7 @@ class MainWindow(
         """
         if self._pc_status_worker is not None and self._pc_status_worker.isRunning():
             return
-        self._pc_status_worker = PcRemoteStatusWorker(self.db_engine)
+        self._pc_status_worker = PcRemoteStatusWorker(self.pc_db_engine)
         self._pc_status_worker.finished_status.connect(self._on_pc_status_result)
         self._pc_status_worker.start()
 

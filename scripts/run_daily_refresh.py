@@ -30,8 +30,8 @@ from src.utils.db_loader import (
     get_chronically_failing_symbols,
     get_latest_hourly_price_history_timestamps,
     get_price_history_watermarks,
-    init_mysql_engine,
     is_scanner_metrics_snapshot_current,
+    resolve_data_engine,
 )
 from src.utils.market_calendar import KST_ZONE, expected_latest_market_data_date
 
@@ -88,9 +88,15 @@ def _refresh_targets_needed() -> Tuple[Dict[str, List[str]], str]:
     or scanner phase can therefore resume without downloading already-current
     price history.
     """
-    engine = init_mysql_engine()
+    resolution = resolve_data_engine()
+    engine = resolution.engine
     if engine is None:
         return {}, "MySQL is not reachable -- skipping (historical.py would fail the same way)."
+    if resolution.source == "local_mirror":
+        print(
+            "PC MySQL unreachable; checking/refreshing this laptop's local data mirror instead.",
+            flush=True,
+        )
 
     tickers = _refresh_tickers()
     expected_date = expected_latest_market_data_date()

@@ -498,7 +498,7 @@ def test_main_device_button_reflects_exclusive_role():
 
     window = MainWindow.__new__(MainWindow)
     window.main_device_button = Button()
-    window.db_engine = object()
+    window.pc_db_engine = object()
     window.db_initializing = False
     window.state_sync_role = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
 

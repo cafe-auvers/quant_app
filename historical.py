@@ -38,8 +38,8 @@ from src.utils.db_loader import (
     get_latest_hourly_price_history_timestamps,
     get_latest_price_history_dates,
     get_price_history_watermarks,
-    init_mysql_engine,
     is_scanner_metrics_snapshot_current,
+    resolve_data_engine,
     refresh_chart_indicators_to_db,
     refresh_scanner_metrics_to_db,
     refresh_universe_history_to_db,
@@ -340,9 +340,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     state.mark_started()
 
     try:
-        engine = init_mysql_engine()
+        resolution = resolve_data_engine()
+        engine = resolution.engine
         if engine is None:
             raise RuntimeError("MySQL cache is not configured or cannot be reached.")
+        if resolution.source == "local_mirror":
+            print(
+                "PC MySQL unreachable; writing to this laptop's local data mirror instead.",
+                flush=True,
+            )
 
         if args.derived_only and mode != MODE_1D:
             raise ValueError("--derived-only is supported only for --mode 1d.")

@@ -5,12 +5,14 @@ import logging
 import re
 import time
 import random
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 import numpy as np
 from sqlalchemy import (
     create_engine,
+    event,
     MetaData,
     Table,
     Column,
@@ -31,7 +33,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from src.utils.config import get_mysql_config
+from src.utils.config import DATA_DIR, get_mysql_config
 from src.utils.data_loader import download_price_history, _extract_symbol_history, compute_stock_metrics
 from src.utils.market_calendar import expected_latest_market_data_date
 
@@ -177,6 +179,199 @@ def init_mysql_engine(db_name: Optional[str] = None) -> Optional[Engine]:
             engine.dispose()
         logger.info("MySQL cache disabled: %s", exc)
         return None
+
+
+# --- Local mirror (offline fallback when the PC's MySQL is unreachable) -----
+#
+# The PC's MySQL database is the single source of truth for the market-data
+# cache (see docs/pc_sync_data_pipeline.md). This SQLite file is a laptop-only,
+# one-directional (PC -> laptop) mirror of a subset of that data, used only
+# when the PC cannot be reached at all. It is never written back to the PC.
+
+LOCAL_MIRROR_DB_PATH = DATA_DIR / "local_mirror.db"
+
+# (table_name, watermark_column) -- the column used both to decide what a
+# resumed sync still needs to pull and to judge staleness. Deliberately
+# excludes intraday_price_history (7-day-pruned, live-trading-only, low value
+# offline) and app_state_sync / app_runtime_status (cross-machine
+# coordination rows tied to the one shared PC database, not market data --
+# mirroring them would be meaningless and could confuse main-device
+# ownership).
+MIRRORED_TABLES: Tuple[Tuple[str, str], ...] = (
+    ("price_history", "date"),
+    ("hourly_price_history", "timestamp"),
+    ("chart_indicators", "date"),
+    ("chart_indicator_manifests", "completed_at"),
+    ("scanner_metrics", "date"),
+    ("scanner_metric_snapshots", "snapshot_date"),
+    ("symbol_refresh_failures", "last_attempt_at"),
+)
+
+
+def init_local_mirror_engine(db_path=None) -> Optional[Engine]:
+    """Open (creating if needed) the laptop-local SQLite market-data mirror."""
+    path = db_path or LOCAL_MIRROR_DB_PATH
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        engine = create_engine(
+            f"sqlite:///{path}",
+            future=True,
+            connect_args={"check_same_thread": False},
+        )
+
+        @event.listens_for(engine, "connect")
+        def _set_sqlite_pragmas(dbapi_connection, connection_record) -> None:
+            # WAL lets the GUI thread read while a background sync worker (or
+            # a separate historical.py process) writes at the same time.
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.close()
+
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        _ensure_price_history_table(engine)
+        _ensure_hourly_price_history_table(engine)
+        _ensure_chart_indicators_table(engine)
+        _ensure_chart_indicator_manifests_table(engine)
+        _ensure_scanner_metrics_table(engine)
+        _ensure_scanner_metric_snapshots_table(engine)
+        _ensure_symbol_refresh_failures_table(engine)
+        return engine
+    except (ImportError, OSError, SQLAlchemyError, ValueError, TypeError) as exc:
+        logger.info("Local data mirror unavailable: %s", exc)
+        return None
+
+
+@dataclass(frozen=True)
+class DataEngineResolution:
+    """Which engine the app should use for market-data reads/writes.
+
+    ``engine`` is PC MySQL when reachable, otherwise the local SQLite mirror
+    (or None if neither is available) -- callers that only care about market
+    data (scanner, charts, historical refresh) should always use ``engine``.
+    ``pc_engine`` is PC MySQL only, always None when the PC is unreachable --
+    callers doing cross-machine state coordination (state sync, runtime
+    heartbeats, main-device ownership) must use ``pc_engine``, never the
+    local-mirror fallback.
+    """
+
+    engine: Optional[Engine]
+    source: str  # "pc" | "local_mirror" | "none"
+    pc_engine: Optional[Engine]
+
+
+def resolve_data_engine() -> DataEngineResolution:
+    """Resolve the market-data engine: PC MySQL first, local mirror fallback."""
+    pc_engine = init_mysql_engine()
+    if pc_engine is not None:
+        return DataEngineResolution(pc_engine, "pc", pc_engine)
+    local_engine = init_local_mirror_engine()
+    if local_engine is not None:
+        return DataEngineResolution(local_engine, "local_mirror", None)
+    return DataEngineResolution(None, "none", None)
+
+
+def mirror_table_stats(engine: Engine, table_name: str, watermark_column: str) -> Dict[str, object]:
+    """Row count and latest watermark value for one table, for reporting."""
+    try:
+        with engine.connect() as conn:
+            if not inspect(engine).has_table(table_name):
+                return {"row_count": 0, "latest": None}
+            count = conn.execute(text(f"SELECT COUNT(*) FROM `{table_name}`")).scalar()
+            latest = conn.execute(
+                text(f"SELECT MAX(`{watermark_column}`) FROM `{table_name}`")
+            ).scalar()
+        return {"row_count": int(count or 0), "latest": latest}
+    except SQLAlchemyError as exc:
+        return {"row_count": 0, "latest": None, "error": str(exc)}
+
+
+def sync_mirror_table(
+    pc_engine: Engine,
+    local_engine: Engine,
+    table_name: str,
+    watermark_column: str,
+    chunk_size: int = 5000,
+) -> int:
+    """Incrementally upsert rows newer than the local watermark from PC -> local.
+
+    Reflection-based (autoload from ``pc_engine``) so every mirrored table is
+    handled generically instead of re-declaring each table's columns here.
+    """
+    pc_metadata = MetaData()
+    pc_table = Table(table_name, pc_metadata, autoload_with=pc_engine)
+    pc_metadata.create_all(local_engine, tables=[pc_table])
+
+    local_metadata = MetaData()
+    local_table = Table(table_name, local_metadata, autoload_with=local_engine)
+
+    since = None
+    if watermark_column in local_table.columns:
+        with local_engine.connect() as conn:
+            since = conn.execute(select(func.max(local_table.c[watermark_column]))).scalar()
+
+    pk_columns = tuple(column.name for column in pc_table.primary_key.columns)
+    if not pk_columns:
+        pk_columns = tuple(pc_table.columns.keys())
+
+    stmt = select(pc_table)
+    if since is not None and watermark_column in pc_table.columns:
+        stmt = stmt.where(pc_table.c[watermark_column] > since)
+    stmt = stmt.order_by(*[pc_table.c[name] for name in pk_columns])
+
+    rows_written = 0
+    with pc_engine.connect() as pc_conn:
+        pc_conn = pc_conn.execution_options(stream_results=True)
+        result = pc_conn.execute(stmt)
+        while True:
+            batch = result.fetchmany(chunk_size)
+            if not batch:
+                break
+            records = [dict(row._mapping) for row in batch]
+            with local_engine.begin() as local_conn:
+                rows_written += _execute_bulk_upsert(
+                    local_conn, local_table, records, pk_columns, "sqlite"
+                )
+    return rows_written
+
+
+def sync_local_mirror_from_pc(
+    pc_engine: Engine,
+    local_engine: Engine,
+    tables: Tuple[Tuple[str, str], ...] = MIRRORED_TABLES,
+    log_callback: Optional[Callable[[str], None]] = None,
+) -> Dict[str, int]:
+    """Best-effort PC -> laptop mirror sync; one table's failure doesn't abort the rest."""
+    written: Dict[str, int] = {}
+    for table_name, watermark_column in tables:
+        try:
+            count = sync_mirror_table(
+                pc_engine, local_engine, table_name, watermark_column
+            )
+            written[table_name] = count
+            if log_callback and count:
+                log_callback(f"Local mirror: synced {count} row(s) for {table_name}.")
+        except (SQLAlchemyError, ValueError, TypeError) as exc:
+            if log_callback:
+                log_callback(f"Local mirror: could not sync {table_name}: {exc}")
+    return written
+
+
+def local_mirror_is_stale(engine: Engine, expected_date: dt.date) -> bool:
+    """True if the local mirror's daily price history is missing or behind."""
+    stats = mirror_table_stats(engine, "price_history", "date")
+    latest = stats.get("latest")
+    if not stats.get("row_count") or latest is None:
+        return True
+    if hasattr(latest, "date"):
+        latest = latest.date()
+    elif isinstance(latest, str):
+        try:
+            latest = dt.date.fromisoformat(latest[:10])
+        except ValueError:
+            return True
+    return latest < expected_date
 
 
 def _get_price_history_table(metadata: MetaData) -> Table:

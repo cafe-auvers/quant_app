@@ -121,14 +121,20 @@ def test_scanner_worker_loads_cold_universe_off_the_calling_ui_path(monkeypatch)
 def test_database_init_worker_never_raises_connection_errors_into_the_ui(monkeypatch):
     import src.ui.main_window as main_window
 
-    monkeypatch.setattr(main_window, "init_mysql_engine", lambda: (_ for _ in ()).throw(RuntimeError("offline")))
+    monkeypatch.setattr(
+        main_window,
+        "resolve_data_engine",
+        lambda: (_ for _ in ()).throw(RuntimeError("offline")),
+    )
     results = []
     worker = main_window.DatabaseInitWorker()
-    worker.initialized.connect(lambda engine, error: results.append((engine, error)))
+    worker.initialized.connect(
+        lambda engine, source, pc_engine, error: results.append((engine, source, pc_engine, error))
+    )
 
     worker.run()
 
-    assert results == [(None, "offline")]
+    assert results == [(None, "none", None, "offline")]
 
 
 def test_app_state_save_preserves_json_shapes(tmp_path, monkeypatch):

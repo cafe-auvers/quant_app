@@ -1183,7 +1183,12 @@ class DashboardMixin:
             self._cached_market_data_status = None
 
         symbols = [stock["symbol"] for stock in self.scanner_results]
-        db_status = "enabled" if self.db_enabled else "disabled"
+        _db_source_labels = {"pc": "PC", "local_mirror": "local mirror"}
+        db_status = (
+            f"enabled ({_db_source_labels.get(getattr(self, 'db_engine_source', ''), 'unknown')})"
+            if self.db_enabled
+            else "disabled"
+        )
         market_data_status = self._format_market_data_status()
 
         buylist_lines = []
