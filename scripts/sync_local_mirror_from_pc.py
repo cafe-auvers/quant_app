@@ -60,18 +60,35 @@ def main() -> int:
     local_engine = init_local_mirror_engine()
     if local_engine is None:
         print("Could not open/create the local SQLite mirror.", file=sys.stderr)
+        pc_engine.dispose()
         return 1
 
-    _print_stats_table("PC (source)", pc_engine)
-    _print_stats_table("Local mirror (before sync)", local_engine)
+    try:
+        _print_stats_table("PC (source)", pc_engine)
+        _print_stats_table("Local mirror (before sync)", local_engine)
 
-    print("\nSyncing PC -> local mirror ...")
-    written = sync_local_mirror_from_pc(pc_engine, local_engine, log_callback=print)
-    total = sum(written.values())
-    print(f"\nDone. {total} row(s) written across {len(written)} table(s).")
+        print("\nSyncing PC -> local mirror ...")
+        errors = []
+        written = sync_local_mirror_from_pc(
+            pc_engine,
+            local_engine,
+            log_callback=print,
+            error_callback=errors.append,
+        )
+        total = sum(written.values())
+        print(f"\nDone. {total} row(s) written across {len(written)} table(s).")
 
-    _print_stats_table("Local mirror (after sync)", local_engine)
-    return 0
+        _print_stats_table("Local mirror (after sync)", local_engine)
+        if errors:
+            print(
+                f"Mirror sync completed with {len(errors)} table error(s).",
+                file=sys.stderr,
+            )
+            return 1
+        return 0
+    finally:
+        local_engine.dispose()
+        pc_engine.dispose()
 
 
 if __name__ == "__main__":

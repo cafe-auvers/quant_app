@@ -91,7 +91,7 @@ def _refresh_targets_needed() -> Tuple[Dict[str, List[str]], str]:
     resolution = resolve_data_engine()
     engine = resolution.engine
     if engine is None:
-        return {}, "MySQL is not reachable -- skipping (historical.py would fail the same way)."
+        return {}, "No PC MySQL or local market-data cache is available -- skipping."
     if resolution.source == "local_mirror":
         print(
             "PC MySQL unreachable; checking/refreshing this laptop's local data mirror instead.",

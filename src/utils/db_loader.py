@@ -6,6 +6,7 @@ import re
 import time
 import random
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
@@ -189,6 +190,7 @@ def init_mysql_engine(db_name: Optional[str] = None) -> Optional[Engine]:
 # when the PC cannot be reached at all. It is never written back to the PC.
 
 LOCAL_MIRROR_DB_PATH = DATA_DIR / "local_mirror.db"
+LOCAL_MIRROR_ENABLED_ENV = "QUANT_LOCAL_MIRROR_ENABLED"
 
 # (table_name, watermark_column) -- the column used both to decide what a
 # resumed sync still needs to pull and to judge staleness. Deliberately
@@ -210,13 +212,14 @@ MIRRORED_TABLES: Tuple[Tuple[str, str], ...] = (
 
 def init_local_mirror_engine(db_path=None) -> Optional[Engine]:
     """Open (creating if needed) the laptop-local SQLite market-data mirror."""
-    path = db_path or LOCAL_MIRROR_DB_PATH
+    engine: Optional[Engine] = None
     try:
+        path = Path(db_path or LOCAL_MIRROR_DB_PATH)
         path.parent.mkdir(parents=True, exist_ok=True)
         engine = create_engine(
             f"sqlite:///{path}",
             future=True,
-            connect_args={"check_same_thread": False},
+            connect_args={"check_same_thread": False, "timeout": 30.0},
         )
 
         @event.listens_for(engine, "connect")
@@ -226,6 +229,7 @@ def init_local_mirror_engine(db_path=None) -> Optional[Engine]:
             cursor = dbapi_connection.cursor()
             cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA busy_timeout=30000")
             cursor.close()
 
         with engine.connect() as conn:
@@ -239,6 +243,8 @@ def init_local_mirror_engine(db_path=None) -> Optional[Engine]:
         _ensure_symbol_refresh_failures_table(engine)
         return engine
     except (ImportError, OSError, SQLAlchemyError, ValueError, TypeError) as exc:
+        if engine is not None:
+            engine.dispose()
         logger.info("Local data mirror unavailable: %s", exc)
         return None
 
@@ -261,11 +267,18 @@ class DataEngineResolution:
     pc_engine: Optional[Engine]
 
 
+def _local_mirror_enabled() -> bool:
+    value = os.environ.get(LOCAL_MIRROR_ENABLED_ENV, "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
 def resolve_data_engine() -> DataEngineResolution:
     """Resolve the market-data engine: PC MySQL first, local mirror fallback."""
     pc_engine = init_mysql_engine()
     if pc_engine is not None:
         return DataEngineResolution(pc_engine, "pc", pc_engine)
+    if not _local_mirror_enabled():
+        return DataEngineResolution(None, "none", None)
     local_engine = init_local_mirror_engine()
     if local_engine is not None:
         return DataEngineResolution(local_engine, "local_mirror", None)
@@ -299,8 +312,13 @@ def sync_mirror_table(
     Reflection-based (autoload from ``pc_engine``) so every mirrored table is
     handled generically instead of re-declaring each table's columns here.
     """
+    fetch_size = max(1, int(chunk_size or 1))
     pc_metadata = MetaData()
     pc_table = Table(table_name, pc_metadata, autoload_with=pc_engine)
+    if watermark_column not in pc_table.columns:
+        raise ValueError(
+            f"Mirror watermark column {watermark_column!r} is missing from {table_name!r}."
+        )
     pc_metadata.create_all(local_engine, tables=[pc_table])
 
     local_metadata = MetaData()
@@ -313,19 +331,31 @@ def sync_mirror_table(
 
     pk_columns = tuple(column.name for column in pc_table.primary_key.columns)
     if not pk_columns:
-        pk_columns = tuple(pc_table.columns.keys())
+        raise ValueError(f"Mirrored table {table_name!r} has no primary key.")
 
     stmt = select(pc_table)
-    if since is not None and watermark_column in pc_table.columns:
-        stmt = stmt.where(pc_table.c[watermark_column] > since)
-    stmt = stmt.order_by(*[pc_table.c[name] for name in pk_columns])
+    if since is not None:
+        # Re-read the current boundary as well as newer rows.  A previous run
+        # may have stopped halfway through a group of rows sharing the same
+        # date/timestamp; the upsert makes replaying that boundary harmless.
+        stmt = stmt.where(pc_table.c[watermark_column] >= since)
+
+    # The watermark must lead the ordering.  If rows were streamed in primary
+    # key order, the first committed chunk could contain a table-wide maximum
+    # timestamp for one symbol.  A resumed run would then infer that later
+    # symbols were already copied and skip their older rows permanently.
+    order_columns = [pc_table.c[watermark_column]]
+    order_columns.extend(
+        pc_table.c[name] for name in pk_columns if name != watermark_column
+    )
+    stmt = stmt.order_by(*order_columns)
 
     rows_written = 0
     with pc_engine.connect() as pc_conn:
         pc_conn = pc_conn.execution_options(stream_results=True)
         result = pc_conn.execute(stmt)
         while True:
-            batch = result.fetchmany(chunk_size)
+            batch = result.fetchmany(fetch_size)
             if not batch:
                 break
             records = [dict(row._mapping) for row in batch]
@@ -341,6 +371,7 @@ def sync_local_mirror_from_pc(
     local_engine: Engine,
     tables: Tuple[Tuple[str, str], ...] = MIRRORED_TABLES,
     log_callback: Optional[Callable[[str], None]] = None,
+    error_callback: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, int]:
     """Best-effort PC -> laptop mirror sync; one table's failure doesn't abort the rest."""
     written: Dict[str, int] = {}
@@ -353,25 +384,58 @@ def sync_local_mirror_from_pc(
             if log_callback and count:
                 log_callback(f"Local mirror: synced {count} row(s) for {table_name}.")
         except (SQLAlchemyError, ValueError, TypeError) as exc:
+            message = f"Local mirror: could not sync {table_name}: {exc}"
+            logger.warning(message)
             if log_callback:
-                log_callback(f"Local mirror: could not sync {table_name}: {exc}")
+                log_callback(message)
+            if error_callback:
+                error_callback(message)
     return written
 
 
 def local_mirror_is_stale(engine: Engine, expected_date: dt.date) -> bool:
-    """True if the local mirror's daily price history is missing or behind."""
-    stats = mirror_table_stats(engine, "price_history", "date")
-    latest = stats.get("latest")
-    if not stats.get("row_count") or latest is None:
+    """True when any actionable symbol's daily history is missing or behind.
+
+    A table-wide ``MAX(date)`` is not sufficient: one current symbol could
+    hide an interrupted mirror sync that omitted the same date for thousands
+    of later symbols.  Match the daily-refresh gate by ignoring symbols that
+    have already crossed the chronic-failure threshold, while SPY remains an
+    always-actionable provider canary.
+    """
+    if isinstance(expected_date, dt.datetime):
+        expected_date = expected_date.date()
+    expected_timestamp = dt.datetime.combine(expected_date, dt.time.min)
+    try:
+        table = _ensure_price_history_table(engine)
+        chronic = get_chronically_failing_symbols(engine, interval="1d")
+        stmt = (
+            select(
+                table.c.symbol,
+                func.max(table.c.date).label("latest_date"),
+            )
+            .where(table.c.interval == "1d")
+            .group_by(table.c.symbol)
+        )
+        with engine.connect() as conn:
+            rows = conn.execute(stmt).all()
+    except (SQLAlchemyError, ValueError, TypeError):
         return True
-    if hasattr(latest, "date"):
-        latest = latest.date()
-    elif isinstance(latest, str):
-        try:
-            latest = dt.date.fromisoformat(latest[:10])
-        except ValueError:
-            return True
-    return latest < expected_date
+    if not rows:
+        return True
+
+    latest_by_symbol = {
+        str(row.symbol).upper(): row.latest_date
+        for row in rows
+        if row.latest_date is not None
+    }
+    reference_latest = latest_by_symbol.get(REFERENCE_SYMBOL)
+    if reference_latest is None or reference_latest < expected_timestamp:
+        return True
+    return any(
+        latest < expected_timestamp and symbol not in chronic
+        for symbol, latest in latest_by_symbol.items()
+        if symbol != REFERENCE_SYMBOL
+    )
 
 
 def _get_price_history_table(metadata: MetaData) -> Table:
@@ -3008,7 +3072,7 @@ def save_scanner_metrics_snapshot_to_db(
 
 
 def load_scanner_metrics_from_db(tickers: List[str], engine: Engine, date: Optional[dt.datetime] = None) -> List[dict]:
-    """Load cached scanner metrics from MySQL."""
+    """Load cached scanner metrics from the active data engine."""
     if date is None:
         date = scanner_metrics_snapshot_date()
     symbols = _clean_symbols(tickers)
@@ -3050,7 +3114,7 @@ def refresh_scanner_metrics_to_db(
     force: bool = False,
     history_watermarks: Optional[Dict[str, object]] = None,
 ) -> List[str]:
-    """Calculate and store scanner metrics for the universe in MySQL."""
+    """Calculate and store scanner metrics for the universe."""
     symbols, input_symbols = _scanner_metric_and_input_symbols(tickers)
     if not symbols:
         return []
@@ -3076,7 +3140,7 @@ def refresh_scanner_metrics_to_db(
         return []
 
     if log_callback:
-        log_callback("Pre-calculating and saving scanner metrics to MySQL...")
+        log_callback("Pre-calculating and saving scanner metrics...")
 
     try:
         # Compute directly so a stale snapshot is never read during generation.
@@ -3169,7 +3233,7 @@ def refresh_scanner_metrics_to_db(
         if log_callback:
             if snapshot_complete:
                 log_callback(
-                    f"  Successfully saved scanner metrics for {len(saved)} symbols to MySQL."
+                    f"  Successfully saved scanner metrics for {len(saved)} symbols."
                 )
             else:
                 log_callback("  Failed to commit a complete scanner metrics snapshot.")

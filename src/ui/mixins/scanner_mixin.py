@@ -689,14 +689,14 @@ class ScannerMixin:
             return False
 
         if getattr(self, "db_initializing", False):
-            message = "MySQL cache connection is still initializing. Please try again in a moment."
+            message = "Market-data cache connection is still initializing. Please try again in a moment."
             self.append_log(f"Scanner blocked: {message}")
             if show_warnings:
                 QMessageBox.information(self, "Database initializing", message)
             return False
 
         if not self.db_enabled or self.db_engine is None:
-            message = "MySQL cache is not configured or cannot be reached. Use Update 1D Data after configuring the database."
+            message = "No market-data cache is available. Check the PC connection or local mirror."
             self.append_log(f"Scanner blocked: {message}")
             if show_warnings:
                 QMessageBox.warning(self, "Database unavailable", message)
@@ -705,8 +705,8 @@ class ScannerMixin:
         return True
 
     def _start_scanner_worker(self) -> None:
-        """Start the worker that loads scanner metrics from MySQL."""
-        self.progress_label.setText("Scanning MySQL cache...")
+        """Start the worker that loads cached scanner metrics."""
+        self.progress_label.setText("Scanning market-data cache...")
         self.progress_bar.setValue(0)
 
         self.scanner_worker = ScannerWorker(
@@ -738,7 +738,7 @@ class ScannerMixin:
     def run_all_scanners(
         self, checked: bool = False, show_warnings: bool = True
     ) -> None:
-        """Run all configured scanner setups against the MySQL cache."""
+        """Run all configured scanner setups against the market-data cache."""
         from src.ui.controllers.base import get_controller
         from src.ui.controllers.scanner_controller import ScannerController
 
@@ -1072,20 +1072,20 @@ class ScannerMixin:
         self.running_scanner_setup_name = None
         self.running_scanner_show_warnings = True
 
-    def refresh_data_to_db(self) -> None:
+    def refresh_data_to_db(self) -> bool:
         """Launch (or terminate) the standalone 1D historical.py refresh process."""
         if not self.db_enabled:
             QMessageBox.warning(
                 self,
                 "Database unavailable",
-                "MySQL cache is not configured or cannot be reached.",
+                "No market-data cache is available.",
             )
-            return
+            return False
 
         running, _ = is_refresh_running(MODE_1D)
         if running:
             self._confirm_and_terminate_refresh(MODE_1D, "1D Data")
-            return
+            return False
 
         self.append_log(
             "Launching 1D data refresh as a background process (historical.py)..."
@@ -1098,24 +1098,25 @@ class ScannerMixin:
             QMessageBox.warning(
                 self, "Launch failed", f"Could not start historical.py: {exc}"
             )
-            return
+            return False
         self._refresh_active_run_id[MODE_1D] = result.run_id
         self._poll_refresh_status()
+        return True
 
-    def refresh_hourly_data_to_db(self) -> None:
+    def refresh_hourly_data_to_db(self) -> bool:
         """Launch (or terminate) the standalone 1H historical.py refresh process."""
         if not self.db_enabled:
             QMessageBox.warning(
                 self,
                 "Database unavailable",
-                "MySQL cache is not configured or cannot be reached.",
+                "No market-data cache is available.",
             )
-            return
+            return False
 
         running, _ = is_refresh_running(MODE_1H)
         if running:
             self._confirm_and_terminate_refresh(MODE_1H, "1H Data")
-            return
+            return False
 
         self.append_log(
             "Launching 1H data refresh as a background process (historical.py)..."
@@ -1128,16 +1129,17 @@ class ScannerMixin:
             QMessageBox.warning(
                 self, "Launch failed", f"Could not start historical.py: {exc}"
             )
-            return
+            return False
         self._refresh_active_run_id[MODE_1H] = result.run_id
         self._poll_refresh_status()
+        return True
 
     def _confirm_and_terminate_refresh(self, mode: str, label: str) -> None:
         reply = QMessageBox.question(
             self,
             f"Terminate {label} refresh?",
             f"A {label} refresh is currently running. Are you sure you want to terminate it?\n\n"
-            "Data already saved to MySQL for symbols processed so far will NOT be lost. "
+            "Data already saved to the active market-data cache will NOT be lost. "
             "The next refresh will resume from where this one left off.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
@@ -1255,6 +1257,35 @@ class ScannerMixin:
                 self.append_log(derived_note)
             self.progress_label.setText(f"{mode.upper()} refresh terminated.")
             self.update_dashboard_summary(force=True)
+
+        if mode == MODE_1D and getattr(
+            self, "_pending_local_mirror_hourly_refresh", False
+        ):
+            self._pending_local_mirror_hourly_refresh = False
+            if outcome == "completed":
+                hourly_running, _ = is_refresh_running(MODE_1H)
+                if hourly_running:
+                    self.append_log(
+                        "The 1H refresh is already running; no duplicate was launched."
+                    )
+                else:
+                    self.append_log("Starting the queued 1H local-mirror refresh ...")
+                    if not self.refresh_hourly_data_to_db():
+                        self._run_scanners_after_local_mirror_refresh = False
+                        self.run_all_scanners(show_warnings=False)
+            else:
+                self.append_log(
+                    "The queued 1H refresh was not started because the 1D refresh did not complete."
+                )
+
+        should_resume_scanners = getattr(
+            self, "_run_scanners_after_local_mirror_refresh", False
+        ) and (
+            mode == MODE_1H or (mode == MODE_1D and outcome != "completed")
+        )
+        if should_resume_scanners:
+            self._run_scanners_after_local_mirror_refresh = False
+            self.run_all_scanners(show_warnings=False)
 
     def _refresh_derived_data_note(self, mode: str, status: dict) -> str:
         """Explain when 1D price data was saved but indicators/scanner metrics didn't finish."""

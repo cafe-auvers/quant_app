@@ -137,6 +137,58 @@ def test_database_init_worker_never_raises_connection_errors_into_the_ui(monkeyp
     assert results == [(None, "none", None, "offline")]
 
 
+def test_completed_daily_fallback_refresh_starts_queued_hourly_refresh(monkeypatch):
+    import src.ui.mixins.scanner_mixin as scanner_mixin
+
+    class Window(scanner_mixin.ScannerMixin):
+        def __init__(self):
+            self._pending_local_mirror_hourly_refresh = True
+            self._run_scanners_after_local_mirror_refresh = True
+            self.logs = []
+            self.hourly_starts = 0
+            self.scanner_starts = 0
+
+        def show_refresh_complete(self, updated_count):
+            self.updated_count = updated_count
+
+        def update_dashboard_summary(self, **kwargs):
+            self.dashboard_updated = kwargs
+
+        def append_log(self, message):
+            self.logs.append(message)
+
+        def refresh_hourly_data_to_db(self):
+            self.hourly_starts += 1
+            return True
+
+        def run_all_scanners(self, **kwargs):
+            self.scanner_starts += 1
+
+    monkeypatch.setattr(
+        scanner_mixin, "is_refresh_running", lambda mode: (False, {})
+    )
+    window = Window()
+
+    window._handle_refresh_terminal_status(
+        scanner_mixin.MODE_1D,
+        {"status": "completed", "result": {"updated_count": 12}},
+    )
+
+    assert window.updated_count == 12
+    assert window._pending_local_mirror_hourly_refresh is False
+    assert window.hourly_starts == 1
+    assert window.scanner_starts == 0
+    assert "queued 1H" in window.logs[-1]
+
+    window._handle_refresh_terminal_status(
+        scanner_mixin.MODE_1H,
+        {"status": "completed", "result": {"updated_count": 4}},
+    )
+
+    assert window._run_scanners_after_local_mirror_refresh is False
+    assert window.scanner_starts == 1
+
+
 def test_app_state_save_preserves_json_shapes(tmp_path, monkeypatch):
     import src.services.app_state as app_state
 

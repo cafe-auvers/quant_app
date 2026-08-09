@@ -7,8 +7,9 @@ access confirmed from a mobile hotspot (genuinely off the home network).
 ## Roles
 
 - **Laptop** (`DESKTOP-T5V57VV`) — where development happens (edits,
-  commits, `git push`). Also a normal client of the app: `main.py` runs here
-  and reads from the shared database, same as it would run on the PC.
+  commits, `git push`). `main.py` normally reads from the shared database and
+  keeps a one-way SQLite market-data mirror in `data/local_mirror.db` for the
+  periods when the PC cannot be reached.
 - **Always-on PC** (`DESKTOP-E42GSKJ`) — never used for development. Two
   jobs only:
   1. Host the single shared MySQL database (`quant_app`) that both machines
@@ -16,10 +17,12 @@ access confirmed from a mobile hotspot (genuinely off the home network).
   2. Run `historical.py` on a schedule to keep that database's price
      history, hourly bars, chart indicators, and scanner metrics fresh.
 
-There is exactly **one** database, living only on the PC. The laptop does
-not have its own local copy — its `.env` `MYSQL_HOST` points at the PC, so
-"the data" and "the PC's data" are the same thing, always, regardless of
-which network path is used to reach it (see below).
+There is exactly **one authoritative database**, living on the PC. The
+laptop's SQLite file is a disposable, one-way market-data mirror rather than
+a second authority: cross-machine application state, ownership, runtime
+heartbeats, and intraday trading data continue to use only PC MySQL. The app
+prefers MySQL whenever it is reachable and never writes mirror data back to
+the PC.
 
 ## Architecture
 
@@ -30,6 +33,8 @@ flowchart LR
   subgraph LAP["Laptop - DESKTOP-T5V57VV"]
     direction TB
     mainL["main.py (dev + client)"]
+    mirror[("SQLite offline mirror")]
+    mainL --> mirror
   end
 
   subgraph PCBOX["Always-on PC - DESKTOP-E42GSKJ"]
@@ -45,6 +50,7 @@ flowchart LR
   repo -- "git fetch + reset --hard, each morning routine run" --> sched
   mainL -- "LAN: 192.168.219.111:3306, home Wi-Fi only" --> db
   mainL -- "Tailscale: 100.121.30.45:3306, works anywhere" --> db
+  db -- "incremental market-data sync" --> mirror
 ```
 
 ## Daily workflow (as actually configured)
@@ -84,8 +90,13 @@ completed session's data, never watch positions in real time.
   sync, DB-freshness-gated refresh, launch `main.py`). Logs to
   `data/logs/pc_morning_routine.log`; `main.py`'s own stdout/stderr are
   captured separately to `data/logs/main_py_stdout.log` /
-  `main_py_stderr.log`.
+  `main_py_stderr.log`. The routine sets `QUANT_LOCAL_MIRROR_ENABLED=0` so a
+  MySQL outage fails visibly on the authoritative PC instead of being masked
+  by a machine-local fallback there.
 - `scripts/run_daily_refresh.py` — the DB-freshness gate.
+- `scripts/sync_local_mirror_from_pc.py` — repeatable PC-to-laptop mirror
+  top-up and before/after report. The dashboard also runs this sync quietly
+  in the background whenever it starts with PC MySQL available.
 - `scripts/setup_pc_autologin.ps1` — configures Windows `AutoAdminLogon`.
 - `scripts/setup_pc_morning_task.ps1` — registers the `AtLogOn` Task
   Scheduler task.
@@ -174,15 +185,14 @@ morning) for dependencies:
 
 ## What happens if the PC doesn't work one day?
 
-- **The laptop's `main.py` doesn't crash.** `init_mysql_engine()` catches
-  connection failures and returns `None`; the app logs "MySQL cache
-  disabled" and keeps running with database-backed features degraded.
-  Per-symbol chart lookups still work via a live Yahoo Finance fallback
-  (`download_price_history` in `chart_data_controller.py`); bulk/cache-wide
-  features (scanner, indicators across the whole universe) don't have an
-  equivalent fallback and just have no data until the PC's back.
-- **Data goes stale for however many days the PC is down**, silently -- no
-  staleness banner exists in the UI.
+- **The laptop's `main.py` doesn't crash.** It falls back to
+  `data/local_mirror.db`, while keeping PC-only state synchronization and
+  runtime coordination disabled. Scanner and chart cache reads continue to
+  work from the mirror.
+- **Staleness is explicit.** If the mirror is current through the latest
+  completed market session, the dashboard uses it silently. If it is stale,
+  the dashboard asks whether to refresh the laptop copy directly from Yahoo
+  Finance; declining continues with the stale mirror.
 - **Recovery is automatic once the PC is back**, no manual backfill needed
   -- `historical.py` pulls a wide window each run (`1y` daily, `730d`
   hourly), and `run_daily_refresh.py` checks every scheduled symbol in both
@@ -195,18 +205,14 @@ morning) for dependencies:
 
 ## If I run `historical.py` (or `run_daily_refresh.py`) manually on the laptop, is that valid?
 
-Yes, **as long as the PC/MySQL is reachable when you do it** (LAN or
-Tailscale) -- the laptop's `.env` points at the same central database, so a
-manual run writes to the exact same tables the PC's scheduled run does.
-Prefer `python scripts\run_daily_refresh.py` over calling `historical.py`
-directly -- it checks the DB's actual freshness first and skips cleanly if
-already up to date, instead of always re-fetching.
+Yes. When PC MySQL is reachable, a manual run writes to the authoritative
+tables there. When it is unreachable, `historical.py` and
+`scripts/run_daily_refresh.py` resolve the local SQLite mirror instead and
+refresh that copy only. Prefer `python scripts\run_daily_refresh.py` over
+calling `historical.py` directly because it checks per-symbol freshness and
+runs only the necessary modes.
 
-This can't serve as an offline fallback while the PC is fully down --
-without Tailscale/LAN reachability there's no database for the laptop to
-write to either, same degraded state as above. There's still no
-laptop-local mirror of the data; that would be a separate design decision
-(true MySQL replication vs. a periodic dump-and-restore) if ever needed --
-discussed and deliberately deferred, since the actual update cadence here
-(once daily) doesn't justify the operational complexity of either approach
-today.
+Run `python scripts\sync_local_mirror_from_pc.py` while the PC is reachable
+to force an immediate mirror top-up and print per-table row counts and
+watermarks. The local database and its WAL/SHM sidecars are runtime data and
+must not be committed.

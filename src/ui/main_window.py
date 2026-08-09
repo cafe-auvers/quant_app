@@ -45,6 +45,7 @@ from src.utils.storage import load_json
 from src.services.historical_refresh_control import (
     MODE_1D,
     MODE_1H,
+    is_refresh_running,
     read_status,
     reconcile_stale_status,
 )
@@ -161,10 +162,20 @@ class LocalMirrorSyncWorker(QThread):
         from src.utils.db_loader import sync_local_mirror_from_pc
 
         try:
-            written = sync_local_mirror_from_pc(self.pc_engine, self.local_engine)
-            self.completed.emit(written, "")
+            errors = []
+            written = sync_local_mirror_from_pc(
+                self.pc_engine,
+                self.local_engine,
+                error_callback=errors.append,
+            )
+            self.completed.emit(written, "; ".join(errors))
         except Exception as exc:
             self.completed.emit({}, str(exc))
+        finally:
+            try:
+                self.local_engine.dispose()
+            except Exception:
+                pass
 
 
 class StateSyncWorker(QThread):
@@ -289,6 +300,8 @@ class MainWindow(
         self._refresh_last_finished_at: Dict[str, Optional[str]] = {}
         self._refresh_last_log_count: Dict[str, int] = {}
         self._refresh_active_run_id: Dict[str, Optional[str]] = {}
+        self._pending_local_mirror_hourly_refresh = False
+        self._run_scanners_after_local_mirror_refresh = False
         self.kis_account_worker = None
         self.kis_startup_worker = None
         self.order_reconciliation_worker = None
@@ -431,10 +444,12 @@ class MainWindow(
         worker.start()
 
     def _on_local_mirror_sync_completed(self, written: dict, error: str) -> None:
-        if error:
-            self.append_log(f"Local data mirror sync failed: {error}")
-            return
         total = sum(written.values())
+        if error:
+            self.append_log(
+                f"Local data mirror sync incomplete ({total} row(s) written): {error}"
+            )
+            return
         if total:
             self.append_log(f"Local data mirror updated ({total} row(s)) for offline fallback.")
 
@@ -462,8 +477,17 @@ class MainWindow(
         )
         if reply == QMessageBox.Yes:
             self.append_log("Fetching fresh data into the local mirror ...")
-            self.refresh_data_to_db()
-            self.refresh_hourly_data_to_db()
+            self._pending_local_mirror_hourly_refresh = True
+            self._run_scanners_after_local_mirror_refresh = True
+            daily_running, _ = is_refresh_running(MODE_1D)
+            if daily_running:
+                self.append_log(
+                    "A 1D refresh is already running; the 1H refresh will start after it completes."
+                )
+            elif not self.refresh_data_to_db():
+                self._pending_local_mirror_hourly_refresh = False
+                self._run_scanners_after_local_mirror_refresh = False
+                self.run_all_scanners(show_warnings=False)
         else:
             self.append_log(
                 "Continuing with stale local data. Use 'Update 1D/1H Data' to refresh manually."

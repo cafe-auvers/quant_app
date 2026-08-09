@@ -99,6 +99,11 @@ try {
 
 # --- 2. Data refresh (trading-day gated inside the script) -----------------
 
+# This machine hosts the authoritative MySQL database. If MySQL is down, fail
+# visibly instead of creating/refreshing the laptop-only SQLite fallback here.
+# Start-Process below inherits this setting, so main.py follows the same rule.
+$env:QUANT_LOCAL_MIRROR_ENABLED = "0"
+
 try {
     & $PythonExe (Join-Path $RepoRoot "scripts\run_daily_refresh.py") 2>&1 | ForEach-Object { Write-Log "[refresh] $_" }
     Write-Log "Data refresh step finished (exit code $LASTEXITCODE)."

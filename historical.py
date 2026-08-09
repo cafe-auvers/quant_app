@@ -81,7 +81,7 @@ class RunState:
         self._write(force=True)
 
     def complete_phase(self, phase: str) -> None:
-        """Record a phase as durably finished (its own work is already committed to MySQL)."""
+        """Record a phase as durably finished after its database commit."""
         if phase not in self.completed_phases:
             self.completed_phases.append(phase)
         self._write(force=True)
@@ -343,7 +343,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         resolution = resolve_data_engine()
         engine = resolution.engine
         if engine is None:
-            raise RuntimeError("MySQL cache is not configured or cannot be reached.")
+            raise RuntimeError("No PC MySQL or local market-data cache is available.")
         if resolution.source == "local_mirror":
             print(
                 "PC MySQL unreachable; writing to this laptop's local data mirror instead.",
