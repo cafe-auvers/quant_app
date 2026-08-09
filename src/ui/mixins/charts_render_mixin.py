@@ -411,6 +411,7 @@ class ChartsRenderMixin:
         latest = chart_history.iloc[-1]
         safe_symbol = html.escape(symbol)
         header_metrics = ChartsRenderMixin._format_chart_header_metrics(chart_history, options)
+        adr_chips = ChartsRenderMixin._format_chart_adr_metrics(chart_history, options)
         candles_json = json.dumps(candles)
         volumes_json = json.dumps(volumes)
         future_whitespace_json = json.dumps([{"time": value} for value in future_time_values()])
@@ -518,9 +519,9 @@ class ChartsRenderMixin:
                     return "N/A" if pd.isna(value) else str(int(round(float(value))))
                 score_summary = (
                     f"RS Score C {score_text(latest_score.get('rs_score_current'))} | "
-                    f"Y {score_text(latest_score.get('rs_score_yesterday'))} | "
                     f"W {score_text(latest_score.get('rs_score_week'))} | "
-                    f"M {score_text(latest_score.get('rs_score_month'))}"
+                    f"M {score_text(latest_score.get('rs_score_month'))} | "
+                    f"Y {score_text(latest_score.get('rs_score_yesterday'))}"
                 )
         rs_points_json = json.dumps(rs_points)
         rs_sma_points_json = json.dumps(rs_sma_points)
@@ -561,14 +562,23 @@ class ChartsRenderMixin:
                     overflow: hidden;
                 }}
                 #header {{
-                    height: 38px;
                     display: flex;
-                    align-items: center;
-                    gap: 14px;
-                    padding: 0 12px;
+                    flex-direction: column;
+                    padding: 4px 12px 4px 12px;
                     box-sizing: border-box;
                     border-bottom: 1px solid #263241;
                     background: #111827;
+                    gap: 2px;
+                }}
+                #header-row1 {{
+                    display: flex;
+                    align-items: center;
+                    gap: 14px;
+                }}
+                #header-row2 {{
+                    display: flex;
+                    align-items: center;
+                    gap: 10px;
                 }}
                 #symbol {{
                     color: #f9fafb;
@@ -579,9 +589,25 @@ class ChartsRenderMixin:
                     color: #9ca3af;
                     font-size: 12px;
                 }}
+                #adr-metrics {{
+                    display: flex;
+                    gap: 12px;
+                }}
+                .adr-chip {{
+                    color: #e2e8f0;
+                    font-size: 13.5px;
+                    font-weight: 600;
+                    letter-spacing: 0.01em;
+                }}
+                .adr-chip span.label {{
+                    color: #6b7280;
+                    font-weight: 400;
+                    font-size: 11px;
+                    margin-right: 3px;
+                }}
                 #chart-area {{
                     width: 100%;
-                    height: calc(100% - 38px);
+                    height: calc(100% - 56px);
                 }}
                 #price-panel {{
                     width: 100%;
@@ -621,8 +647,13 @@ class ChartsRenderMixin:
         </head>
         <body>
             <div id="header">
-                <div id="symbol">{safe_symbol}</div>
-                <div id="metrics">{html.escape(header_metrics)} | {html.escape(str(options.get("timeframe", "1D")))} | {html.escape(str(options.get("data_latest_text", "")))} | {html.escape(score_summary)} | TradingView Lightweight Charts</div>
+                <div id="header-row1">
+                    <div id="symbol">{safe_symbol}</div>
+                    <div id="metrics">{html.escape(header_metrics)} | {html.escape(str(options.get("timeframe", "1D")))} | {html.escape(score_summary)}</div>
+                </div>
+                <div id="header-row2">
+                    <div id="adr-metrics">{adr_chips}</div>
+                </div>
             </div>
             <div id="chart-area">
                 <div id="price-panel">
@@ -2524,18 +2555,26 @@ class ChartsRenderMixin:
         return defaults
     @staticmethod
     def _format_chart_header_metrics(history: pd.DataFrame, options: Optional[dict] = None) -> str:
+        """Returns Close price metric for the top header row."""
+        close = history["Close"].astype(float)
+        latest_close = float(close.iloc[-1])
+        return f"Close {latest_close:.2f}"
+
+    @staticmethod
+    def _format_chart_adr_metrics(history: pd.DataFrame, options: Optional[dict] = None) -> str:
+        """Returns ADR and growth metrics as HTML chips for the second header row."""
         options = ChartsRenderMixin._normalize_chart_options(options)
         close = history["Close"].astype(float)
         high = history["High"].astype(float)
         low = history["Low"].astype(float)
-        latest_close = float(close.iloc[-1])
-        metrics = [f"Close {latest_close:.2f}"]
+        chips = []
 
         if options["show_adr"]:
             prev_close = close.shift(1)
             adr = ((high - low) / prev_close).replace([float("inf"), float("-inf")], pd.NA)
             adr_value = adr.rolling(20, min_periods=5).mean().iloc[-1] * 100
-            metrics.append(f"ADR {ChartsRenderMixin._format_percent_metric(adr_value)}")
+            val = ChartsRenderMixin._format_percent_metric(adr_value)
+            chips.append(f'<span class="adr-chip"><span class="label">ADR</span>{val}</span>')
 
         growth_periods = [
             ("1M", 21, options["show_growth_1m"]),
@@ -2546,9 +2585,14 @@ class ChartsRenderMixin:
             if not enabled:
                 continue
             value = ChartsRenderMixin._growth_percent(close, bars)
-            metrics.append(f"{label} {ChartsRenderMixin._format_percent_metric(value)}")
+            val = ChartsRenderMixin._format_percent_metric(value)
+            color = "#22c55e" if value is not None and value >= 0 else "#ef4444"
+            chips.append(
+                f'<span class="adr-chip"><span class="label">{label}</span>'
+                f'<span style="color:{color}">{val}</span></span>'
+            )
 
-        return " | ".join(metrics)
+        return "".join(chips)
     @staticmethod
     def _growth_percent(close: pd.Series, bars: int) -> Optional[float]:
         if len(close) <= bars:
