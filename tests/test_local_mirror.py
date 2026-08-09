@@ -221,6 +221,80 @@ def test_local_mirror_staleness_uses_latest_daily_market_date():
     assert not db_loader.local_mirror_is_stale(engine, dt.date(2026, 1, 2))
 
 
+def test_local_mirror_staleness_ignores_symbols_outside_the_tracked_universe():
+    """A symbol dropped from the universe never accumulates chronic-failure
+    attempts (historical.py stops trying it), so its old leftover rows must
+    not be able to flag the whole mirror stale forever -- unlike CHRONIC
+    above, this covers a symbol that was simply never (and will never be)
+    retried, not one that failed repeatedly."""
+    engine = create_engine("sqlite:///:memory:", future=True)
+    table = db_loader._ensure_price_history_table(engine)
+    with engine.begin() as conn:
+        conn.execute(
+            insert(table),
+            [
+                {
+                    "symbol": "SPY",
+                    "date": dt.datetime(2026, 1, 2),
+                    "interval": "1d",
+                    "close": 100.0,
+                    "updated_at": dt.datetime(2026, 1, 2),
+                },
+                {
+                    "symbol": "AAPL",
+                    "date": dt.datetime(2026, 1, 2),
+                    "interval": "1d",
+                    "close": 200.0,
+                    "updated_at": dt.datetime(2026, 1, 2),
+                },
+                {
+                    "symbol": "DELISTED",
+                    "date": dt.datetime(2025, 6, 1),
+                    "interval": "1d",
+                    "close": 10.0,
+                    "updated_at": dt.datetime(2025, 6, 1),
+                },
+            ],
+        )
+
+    # Without a universe filter, the leftover DELISTED row still flags staleness.
+    assert db_loader.local_mirror_is_stale(engine, dt.date(2026, 1, 2))
+    # Restricting to the current universe (which no longer includes it) fixes that.
+    assert not db_loader.local_mirror_is_stale(
+        engine, dt.date(2026, 1, 2), tickers=["SPY", "AAPL"]
+    )
+    # A ticker still in the tracked universe is not exempted this way.
+    assert db_loader.local_mirror_is_stale(
+        engine, dt.date(2026, 1, 2), tickers=["SPY", "DELISTED"]
+    )
+
+
+def test_local_mirror_staleness_detects_missing_tracked_symbols():
+    engine = create_engine("sqlite:///:memory:", future=True)
+    table = db_loader._ensure_price_history_table(engine)
+    with engine.begin() as conn:
+        conn.execute(
+            insert(table),
+            {
+                "symbol": "SPY",
+                "date": dt.datetime(2026, 1, 2),
+                "interval": "1d",
+                "close": 100.0,
+                "updated_at": dt.datetime(2026, 1, 2),
+            },
+        )
+
+    assert db_loader.local_mirror_is_stale(
+        engine, dt.date(2026, 1, 2), tickers=["SPY", "MISSING"]
+    )
+
+    for _ in range(db_loader.CHRONIC_FAILURE_THRESHOLD):
+        db_loader.record_symbol_refresh_outcomes(engine, "1d", [], ["MISSING"])
+    assert not db_loader.local_mirror_is_stale(
+        engine, dt.date(2026, 1, 2), tickers=["SPY", "MISSING"]
+    )
+
+
 def test_sync_cli_reports_and_runs_all_phases(monkeypatch, capsys):
     import scripts.sync_local_mirror_from_pc as sync_cli
 

@@ -393,7 +393,11 @@ def sync_local_mirror_from_pc(
     return written
 
 
-def local_mirror_is_stale(engine: Engine, expected_date: dt.date) -> bool:
+def local_mirror_is_stale(
+    engine: Engine,
+    expected_date: dt.date,
+    tickers: Optional[List[str]] = None,
+) -> bool:
     """True when any actionable symbol's daily history is missing or behind.
 
     A table-wide ``MAX(date)`` is not sufficient: one current symbol could
@@ -401,6 +405,16 @@ def local_mirror_is_stale(engine: Engine, expected_date: dt.date) -> bool:
     of later symbols.  Match the daily-refresh gate by ignoring symbols that
     have already crossed the chronic-failure threshold, while SPY remains an
     always-actionable provider canary.
+
+    ``tickers``, when given, restricts the check to that set (plus the
+    reference symbol) -- normally the current scanner/refresh universe. A
+    symbol dropped from the tracked universe (delisted, ticker change, no
+    longer in the S&P 500/KIS list) stops being refreshed by
+    ``historical.py`` and therefore never accumulates chronic-failure
+    attempts either; without this filter its old, permanently-lagging
+    ``price_history`` rows would flag the entire mirror stale forever even
+    though every symbol still being maintained is current. Omitting
+    ``tickers`` preserves the old table-wide behavior.
     """
     if isinstance(expected_date, dt.datetime):
         expected_date = expected_date.date()
@@ -431,6 +445,23 @@ def local_mirror_is_stale(engine: Engine, expected_date: dt.date) -> bool:
     reference_latest = latest_by_symbol.get(REFERENCE_SYMBOL)
     if reference_latest is None or reference_latest < expected_timestamp:
         return True
+
+    if tickers is not None:
+        tracked = {
+            str(symbol).strip().upper()
+            for symbol in tickers
+            if symbol is not None and str(symbol).strip()
+        }
+        tracked.discard(REFERENCE_SYMBOL)
+        return any(
+            symbol not in chronic
+            and (
+                symbol not in latest_by_symbol
+                or latest_by_symbol[symbol] < expected_timestamp
+            )
+            for symbol in tracked
+        )
+
     return any(
         latest < expected_timestamp and symbol not in chronic
         for symbol, latest in latest_by_symbol.items()

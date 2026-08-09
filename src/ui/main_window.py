@@ -44,6 +44,7 @@ from src.core.scanner import StockScanner
 from src.core.watchlist import Watchlist, TradePlanManager, BuylistManager
 from src.core.trade_reviewer import TradeReviewer
 from src.utils.config import DATA_DIR, ROOT_DIR, RULEBOOK_DIR
+from src.utils.data_loader import get_default_universe
 from src.utils.db_loader import local_mirror_is_stale, resolve_data_engine
 from src.utils.market_calendar import expected_latest_market_data_date
 from src.utils.storage import load_json
@@ -461,8 +462,33 @@ class MainWindow(
 
     def _handle_local_mirror_startup(self, engine) -> None:
         """PC unreachable; decide whether to use the local mirror silently or ask first."""
+        try:
+            self._handle_local_mirror_startup_inner(engine)
+        except Exception:
+            # This runs synchronously from a Qt slot invoked across a QThread
+            # signal boundary -- an uncaught exception here can silently kill
+            # the whole app (no dialog, no traceback) instead of just failing
+            # this one startup step. Log it and keep the window usable.
+            logger.exception("Local mirror startup handling failed")
+            self.append_log(
+                "Local data mirror startup check failed; continuing without it "
+                "(see quant_app.log for details)."
+            )
+
+    def _handle_local_mirror_startup_inner(self, engine) -> None:
         expected_date = expected_latest_market_data_date()
-        if not local_mirror_is_stale(engine, expected_date):
+        # Restrict staleness to the currently tracked universe. A symbol
+        # dropped from the S&P 500/KIS list (delisted, ticker change, etc.)
+        # stops being refreshed by historical.py and never accumulates
+        # chronic-failure attempts either -- its old, permanently-lagging
+        # price_history rows would otherwise flag the entire mirror stale
+        # forever even when every actively tracked symbol is current.
+        try:
+            tickers = get_default_universe()
+        except Exception:
+            logger.exception("Could not load default universe for staleness check")
+            tickers = None
+        if not local_mirror_is_stale(engine, expected_date, tickers=tickers):
             self.append_log("PC unreachable; using local data mirror (up to date).")
             self.run_all_scanners(show_warnings=False)
             return
@@ -477,7 +503,8 @@ class MainWindow(
             "The PC is unreachable and this laptop's local data mirror is stale "
             f"(market data expected through {expected_date}).\n\n"
             "Fetch fresh data now directly from Yahoo Finance? This only updates "
-            "this laptop's local copy and may take several minutes.",
+            "this laptop's local copy and may take several minutes.\n\n"
+            "Choose No to keep working with the existing (slightly stale) local data.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
