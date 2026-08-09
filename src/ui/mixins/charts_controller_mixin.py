@@ -722,6 +722,7 @@ class ChartsControllerMixin:
         controls_layout.addWidget(QLabel("5M window:"))
         controls_layout.addWidget(self.tradingview_window_combo)
         self.tradingview_split_screen_checkbox = QCheckBox("Split 1D / 1H")
+        self.tradingview_split_screen_checkbox.setChecked(True)
         self.tradingview_split_screen_checkbox.stateChanged.connect(
             lambda _state: self.load_tradingview_chart(force=True)
         )
