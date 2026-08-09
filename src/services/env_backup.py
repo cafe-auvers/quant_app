@@ -186,12 +186,6 @@ def backup_env_file(env_path: Path, backup_root: Path, passphrase: str) -> EnvBa
             secrets_dir / ENV_BACKUP_FILENAME,
             _encode_envelope(salt, ciphertext),
         )
-        try:
-            (secrets_dir / SALT_FILENAME).unlink(missing_ok=True)
-        except OSError:
-            # A stale legacy salt is harmless because the envelope is
-            # self-contained and always takes precedence during restore.
-            pass
     except OSError as exc:
         logger.info("Env backup failed: %s", exc)
         return EnvBackupResult(success=False, error=str(exc))

@@ -95,7 +95,7 @@ def main() -> int:
         return 1
 
     if not result.restored:
-        print("Nothing to restore -- the snapshot folder was empty.")
+        print("Nothing to restore -- the snapshot has no recognized state files.")
         return 0
 
     print(f"Restored {len(result.restored)} file(s): {', '.join(result.restored)}")

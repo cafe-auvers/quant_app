@@ -213,6 +213,13 @@ orders, and strategy state. Protect the Google account with a strong unique
 password and multi-factor authentication. Only `.env` receives the
 additional passphrase encryption described above.
 
+This is off-device crash protection, not an immutable or air-gapped backup.
+Drive for Desktop sync is bidirectional, so deleting the entire
+`quant_app_backup` folder locally (or through a compromised account) can
+propagate that deletion. The daily folders protect against ordinary bad
+file edits; for ransomware/account-compromise protection, also keep a
+separately versioned export or use storage with retention/immutability.
+
 ## What's intentionally out of scope
 
 - `data/local_mirror.db` (and its `.db-wal`/`.db-shm`) -- disposable market-data
