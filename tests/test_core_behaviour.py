@@ -2028,7 +2028,7 @@ def test_kis_snapshot_helpers_format_summary_and_holdings():
     holdings = MainWindow._flatten_kis_holdings(snapshot)
 
     assert "Profile: PROD" in summary
-    assert "cash 1,000,000 KRW" in summary
+    assert "Cash: 1,000,000 KRW" in summary
     assert "Overseas: 1 holdings loaded." in summary
     assert [item["symbol"] for item in holdings] == ["005930", "AAPL"]
 

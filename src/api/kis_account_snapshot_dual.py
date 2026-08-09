@@ -73,6 +73,11 @@ KIS_PROD_BASE_URL = "https://openapi.koreainvestment.com:9443"
 TOKEN_ENDPOINT = "/oauth2/tokenP"
 DOMESTIC_BALANCE_ENDPOINT = "/uapi/domestic-stock/v1/trading/inquire-balance"
 OVERSEAS_BALANCE_ENDPOINT = "/uapi/overseas-stock/v1/trading/inquire-balance"
+# CTRP6548R: overseas present balance — returns frcr_evlu_tota (total foreign
+# asset value in KRW) and dncl_amt (KRW deposit). Used as fallback when the
+# per-exchange TTTS3012R query returns no holdings (e.g. pre-settlement).
+OVERSEAS_PRESENT_BALANCE_ENDPOINT = "/uapi/overseas-stock/v1/trading/inquire-present-balance"
+OVERSEAS_PRESENT_BALANCE_TR_ID = "CTRP6548R"
 
 DOMESTIC_BALANCE_TR_ID = {
     "PROD": "TTTC8434R",
@@ -464,10 +469,39 @@ class KisAccountClient:
                 by_key[key] = h
         all_holdings = list(by_key.values())
 
+        # Fetch CTRP6548R (overseas present balance) which reliably returns
+        # frcr_evlu_tota: total foreign asset value in KRW (stocks + cash).
+        # This is used as a fallback account value when per-exchange holdings
+        # are not yet settled (TTTS3012R returns empty output1).
+        frcr_evlu_tota_krw = 0.0
+        tot_asst_krw = 0.0
+        try:
+            time.sleep(0.3)
+            present_data = self._get(
+                OVERSEAS_PRESENT_BALANCE_ENDPOINT,
+                tr_id=OVERSEAS_PRESENT_BALANCE_TR_ID,
+                params={
+                    "CANO": self.config.cano,
+                    "ACNT_PRDT_CD": self.config.account_product_code,
+                    "WCRC_FRCR_DVSN_CD": "02",
+                    "NATN_CD": "840",
+                    "TR_MKET_CD": "00",
+                    "INQR_DVSN_CD": "00",
+                },
+            )
+            pb_summary = first_dict(present_data.get("output2"))
+            frcr_evlu_tota_krw = to_number(pb_summary.get("frcr_evlu_tota"))
+            tot_asst_krw = to_number(pb_summary.get("tot_asst_amt"))
+        except Exception:  # non-fatal: keep going with what we have
+            pass
+
         return {
             "summary_by_exchange": summaries,
             "holdings": all_holdings,
             "raw_by_exchange": raw_by_exchange,
+            # KRW totals from CTRP6548R (0.0 if call failed)
+            "frcr_evlu_tota_krw": frcr_evlu_tota_krw,
+            "tot_asst_krw": tot_asst_krw,
         }
 
     def get_account_snapshot(
@@ -725,10 +759,21 @@ class KisAccountClient:
         return {
             "cash_balance_usd": first_number(
                 summary,
-                # frcr_dncl_amt  = foreign currency deposit (available USD cash)
-                # frcr_drwg_psbl_amt = withdrawal-available foreign currency
-                # frcr_evlu_tota  = total foreign evaluation (fallback)
-                ["frcr_dncl_amt", "frcr_drwg_psbl_amt", "ord_psbl_frcr_amt"],
+                # frcr_dncl_amt         = foreign currency deposit (primary USD cash)
+                # frcr_drwg_psbl_amt    = withdrawal-available foreign currency
+                # ord_psbl_frcr_amt     = order-available foreign currency
+                # nxdy_frcr_drwg_psbl_amt = next-day withdrawal-available (some account types)
+                # NOTE: frcr_evlu_tota is intentionally excluded here — it also appears in
+                # the foreign_stock_evaluation fallback, so using it for cash would
+                # double-count stock value when explicit deposit fields are absent.
+                # The CTRP6548R path (frcr_evlu_tota_krw in get_overseas_balance) already
+                # handles the pre-settlement fallback safely with an explicit guard.
+                [
+                    "frcr_dncl_amt",
+                    "frcr_drwg_psbl_amt",
+                    "ord_psbl_frcr_amt",
+                    "nxdy_frcr_drwg_psbl_amt",
+                ],
             ),
             "foreign_stock_evaluation": first_number(
                 summary,

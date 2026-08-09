@@ -745,8 +745,10 @@ class DashboardMixin:
         ovrs_cash_usd = 0.0
         ovrs_pnl_usd = 0.0
         ovrs_count = 0
+        frcr_evlu_tota_krw = 0.0  # from CTRP6548R: total foreign value in KRW
         overseas = snapshot.get("overseas")
         if isinstance(overseas, dict):
+            frcr_evlu_tota_krw = float(overseas.get("frcr_evlu_tota_krw") or 0)
             seen_syms: set = set()
             for h in overseas.get("holdings", []):
                 if not isinstance(h, dict):
@@ -770,14 +772,24 @@ class DashboardMixin:
                 except (TypeError, ValueError):
                     pass
 
-        # Breakdown line — mirrors the log message from apply_cached_trade_account_size
+        # Breakdown line
         pnl_sign = "+" if ovrs_pnl_usd >= 0 else ""
         parts.append(
             f"KRW cash: {cash_krw:,.0f}  |  KR stocks: {kr_stock_krw:,.0f}  |  "
             f"US stocks: ${ovrs_stock_usd:,.2f} ({ovrs_count} holding(s), P/L {pnl_sign}${ovrs_pnl_usd:,.2f})  |  "
             f"USD cash: ${ovrs_cash_usd:,.2f}"
         )
-        parts.append(f"Domestic: cash {cash_krw:,.0f} KRW")
+        # Cash summary — KRW deposit + USD assets
+        cash_line = f"Cash: {cash_krw:,.0f} KRW"
+        if ovrs_cash_usd > 0:
+            cash_line += f"  +  ${ovrs_cash_usd:,.2f} USD"
+        if frcr_evlu_tota_krw > 0 and ovrs_stock_usd == 0 and ovrs_cash_usd == 0:
+            # Per-exchange holdings not settled yet; show CTRP6548R total instead
+            if fx_rate > 0:
+                cash_line += f"  +  ${frcr_evlu_tota_krw / fx_rate:,.2f} USD (frcr, pre-settlement)"
+            else:
+                cash_line += f"  +  {frcr_evlu_tota_krw:,.0f} KRW (frcr, pre-settlement)"
+        parts.append(cash_line)
         parts.append(f"Overseas: {ovrs_count} holdings loaded.")
         if kr_stock_krw > 0 and kr_pnl_krw != 0:
             kr_pnl_sign = "+" if kr_pnl_krw >= 0 else ""
@@ -785,9 +797,12 @@ class DashboardMixin:
 
         # Total in KRW and USD if FX rate is known
         if fx_rate > 0:
-            total_krw = (
-                cash_krw + kr_stock_krw + (ovrs_stock_usd + ovrs_cash_usd) * fx_rate
+            ovrs_krw = (
+                (ovrs_stock_usd + ovrs_cash_usd) * fx_rate
+                if (ovrs_stock_usd > 0 or ovrs_cash_usd > 0)
+                else frcr_evlu_tota_krw
             )
+            total_krw = cash_krw + kr_stock_krw + ovrs_krw
             total_usd = total_krw / fx_rate
             parts.append(
                 f"Total (est.): {total_krw:,.0f} KRW = ${total_usd:,.2f} USD  @ {fx_rate:.2f} KRW/USD"
@@ -996,13 +1011,19 @@ class DashboardMixin:
                 self.account_size_input.blockSignals(old_block)
                 ovrs_cash = breakdown["ovrs_cash_usd"]
                 ovrs_stock = breakdown["ovrs_stock_usd"]
+                frcr_krw = breakdown.get("frcr_evlu_tota_krw", 0.0)
+                frcr_note = (
+                    f" [via frcr_evlu_tota {frcr_krw:,.0f} KRW — pre-settlement]"
+                    if frcr_krw > 0 and ovrs_stock == 0
+                    else ""
+                )
                 self.append_log(
                     f"Using {environment} account value: {account_value_krw:,.0f} KRW "
                     f"= {account_value_usd:,.2f} USD "
                     f"[KRW cash: {breakdown['cash_krw']:,.0f} | "
                     f"KR stocks: {breakdown['kr_stock_krw']:,.0f} | "
                     f"US stocks: ${ovrs_stock:,.2f} | "
-                    f"USD cash: ${ovrs_cash:,.2f}]"
+                    f"USD cash: ${ovrs_cash:,.2f}]{frcr_note}"
                 )
                 self.update_trade_plan_feedback()
                 self.recalculate_watchlist_scoreboard_sizes()  # also refreshes ORB panel
@@ -1081,9 +1102,12 @@ class DashboardMixin:
         # a single global deposit figure, not a per-exchange split.
         ovrs_stock_usd = 0.0
         ovrs_cash_usd = 0.0
+        frcr_evlu_tota_krw = 0.0  # from CTRP6548R; used when holdings not yet settled
         if fx_rate > 0:
             overseas = snapshot.get("overseas")
             if isinstance(overseas, dict):
+                frcr_evlu_tota_krw = float(overseas.get("frcr_evlu_tota_krw") or 0)
+
                 for holding in overseas.get("holdings", []):
                     if not isinstance(holding, dict):
                         continue
@@ -1102,7 +1126,7 @@ class DashboardMixin:
                     except (TypeError, ValueError):
                         pass
 
-                if ovrs_cash_usd == 0.0:
+                if ovrs_cash_usd == 0.0 and ovrs_stock_usd == 0.0 and frcr_evlu_tota_krw == 0.0:
                     # Log raw summary fields to identify which field carries USD cash
                     raw_summaries = {
                         exch: s.get("raw_summary", {})
@@ -1111,24 +1135,35 @@ class DashboardMixin:
                     }
                     import logging
 
-                    logging.getLogger(__name__).debug(
-                        "USD cash=0; overseas output2 raw_summary: %s", raw_summaries
+                    logging.getLogger(__name__).warning(
+                        "USD cash resolved to 0; overseas output2 raw_summary: %s",
+                        raw_summaries,
                     )
 
         domestic_total_krw = (
             gross_domestic_krw if gross_domestic_krw > 0 else cash_krw + kr_stock_krw
         )
-        total_krw = domestic_total_krw + (ovrs_stock_usd + ovrs_cash_usd) * fx_rate
+        # Use per-exchange USD values if available; fall back to frcr_evlu_tota_krw
+        # (CTRP6548R, already in KRW) when holdings are unsettled.
+        if ovrs_stock_usd > 0 or ovrs_cash_usd > 0:
+            ovrs_krw = (ovrs_stock_usd + ovrs_cash_usd) * fx_rate
+        else:
+            ovrs_krw = frcr_evlu_tota_krw
+        total_krw = domestic_total_krw + ovrs_krw
         if total_krw <= 0:
             return None
 
         if return_breakdown:
+            # Express frcr_evlu_tota_krw as USD for the log/display breakdown
+            frcr_usd = (frcr_evlu_tota_krw / fx_rate) if fx_rate > 0 else 0.0
             return {
                 "total_krw": total_krw,
                 "cash_krw": cash_krw,
                 "kr_stock_krw": kr_stock_krw,
                 "ovrs_stock_usd": ovrs_stock_usd,
-                "ovrs_cash_usd": ovrs_cash_usd,
+                # When holdings not settled, expose frcr_evlu as ovrs_cash_usd
+                "ovrs_cash_usd": ovrs_cash_usd if ovrs_cash_usd > 0 else frcr_usd,
+                "frcr_evlu_tota_krw": frcr_evlu_tota_krw,
             }
         return total_krw
 
