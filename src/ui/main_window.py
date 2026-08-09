@@ -432,6 +432,10 @@ class MainWindow(
                 "MySQL cache is unavailable; scanner and cached intraday features remain disabled."
             )
         self.update_dashboard_summary()
+        # The startup resolver already performed the first PC database probe.
+        # Start service polling only after that probe has completed so startup
+        # never launches duplicate connection attempts in separate QThreads.
+        self._poll_pc_status()
 
     def _start_background_local_mirror_sync(self, pc_engine) -> None:
         """Best-effort, silent PC -> laptop mirror top-up once connected to the PC."""
@@ -1701,15 +1705,27 @@ class MainWindow(
     def _poll_pc_status(self) -> None:
         """Kick off a background check of the always-on PC's status.
 
-        Skips this tick rather than queuing up if the previous check hasn't
-        returned yet -- a slow/hung network call should never pile up
-        multiple in-flight workers.
+        Keep the completed worker referenced until Qt delivers ``finished``.
+        Replacing a QThread merely because ``isRunning()`` became false can
+        destroy its wrapper while queued signals are still being dispatched.
         """
-        if self._pc_status_worker is not None and self._pc_status_worker.isRunning():
+        if getattr(self, "db_initializing", False):
             return
-        self._pc_status_worker = PcRemoteStatusWorker(self.pc_db_engine)
-        self._pc_status_worker.finished_status.connect(self._on_pc_status_result)
-        self._pc_status_worker.start()
+        if self._pc_status_worker is not None:
+            return
+        worker = PcRemoteStatusWorker(self.pc_db_engine, parent=self)
+        self._pc_status_worker = worker
+        worker.finished_status.connect(self._on_pc_status_result)
+        worker.finished.connect(self._on_pc_status_worker_finished)
+        worker.start()
+
+    def _on_pc_status_worker_finished(self, worker=None) -> None:
+        """Release a status worker only after Qt has finished its thread."""
+        worker = worker or self.sender()
+        if worker is self._pc_status_worker:
+            self._pc_status_worker = None
+        if worker is not None:
+            worker.deleteLater()
 
     def _on_pc_status_result(self, status) -> None:
         from src.services.pc_remote_control import PcStatus

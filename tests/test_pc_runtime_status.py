@@ -121,6 +121,72 @@ def test_pc_status_worker_silences_expected_mysql_probe_failures(monkeypatch):
     assert results[0].database_ready is False
 
 
+class _SignalStub:
+    def __init__(self):
+        self.callbacks = []
+
+    def connect(self, callback):
+        self.callbacks.append(callback)
+
+
+class _StatusWorkerStub:
+    instances = []
+
+    def __init__(self, engine=None, parent=None):
+        self.engine = engine
+        self.parent = parent
+        self.finished_status = _SignalStub()
+        self.finished = _SignalStub()
+        self.started = False
+        self.deleted = False
+        self.__class__.instances.append(self)
+
+    def start(self):
+        self.started = True
+
+    def deleteLater(self):
+        self.deleted = True
+
+
+def test_pc_status_poll_waits_for_database_initialization(monkeypatch):
+    import src.ui.main_window as main_window
+
+    _StatusWorkerStub.instances = []
+    monkeypatch.setattr(main_window, "PcRemoteStatusWorker", _StatusWorkerStub)
+    window = MainWindow.__new__(MainWindow)
+    window.db_initializing = True
+    window.pc_db_engine = None
+    window._pc_status_worker = None
+
+    window._poll_pc_status()
+
+    assert _StatusWorkerStub.instances == []
+
+
+def test_pc_status_poll_retains_worker_until_finished(monkeypatch):
+    import src.ui.main_window as main_window
+
+    _StatusWorkerStub.instances = []
+    monkeypatch.setattr(main_window, "PcRemoteStatusWorker", _StatusWorkerStub)
+    window = MainWindow.__new__(MainWindow)
+    window.db_initializing = False
+    window.pc_db_engine = object()
+    window._pc_status_worker = None
+
+    window._poll_pc_status()
+    worker = _StatusWorkerStub.instances[0]
+
+    assert worker.parent is window
+    assert worker.started is True
+    window._poll_pc_status()
+    assert _StatusWorkerStub.instances == [worker]
+
+    window._on_pc_status_worker_finished(worker)
+
+    assert window._pc_status_worker is None
+    assert worker.deleted is True
+
+
 class _WidgetStub:
     def __init__(self):
         self.text = ""
