@@ -1,0 +1,1393 @@
+{
+  "name": "Default",
+  "created_date": "2026-08-02T06:16:07.924271+00:00",
+  "items": [
+    {
+      "symbol": "STIM",
+      "name": "STIM",
+      "entry_price": null,
+      "breakout_price": null,
+      "target_price": null,
+      "stop_loss": null,
+      "notes": "",
+      "added_date": "2026-08-02T06:22:51.210618+00:00",
+      "ai_analysis": {
+        "summary": "Decision: BUYLIST_READY (BUY_READY)\nAction: ADD_TO_BUYLIST\nEntry: Breakout above recent consolidation level near $2.38.\nSummary: [API Error 429] Clean consolidation setup above key EMAs.",
+        "catalyst": "- $STIM stock is up 10% today. Here's what we see in our data.",
+        "news_score": 80.0,
+        "status": "BUY_READY",
+        "total_score": 70,
+        "full_json": {
+          "symbol": "STIM",
+          "as_of_date": "2026-08-09",
+          "decision": "BUYLIST_READY",
+          "setup_type": "BREAKOUT",
+          "total_score": 70,
+          "score_breakdown": {
+            "technical_setup_quality": 20,
+            "relative_strength_momentum": 15,
+            "volume_liquidity_execution": 12,
+            "catalyst_fundamental_support": 12,
+            "risk_stop_exit_quality": 12
+          },
+          "confidence": 0.85,
+          "summary": "[API Error 429] Clean consolidation setup above key EMAs.",
+          "technical_assessment": {
+            "trend_status": "UPTREND",
+            "relative_strength_status": "STRONG",
+            "volume_status": "NORMAL",
+            "setup_structure": "TIGHT",
+            "entry_trigger_status": "CONFIRMED",
+            "extension_risk": "LOW"
+          },
+          "risk_assessment": {
+            "entry_price": 2.38,
+            "stop_loss": 2.1800547542526516,
+            "take_profit": null,
+            "stop_distance_pct": 8.4,
+            "adr_20_pct": 11.20141432758253,
+            "position_size_pct": 17.9,
+            "account_risk_pct": 1.5,
+            "risk_valid": true,
+            "risk_comments": "Risk profile acceptable."
+          },
+          "catalyst_assessment": {
+            "has_verified_catalyst": true,
+            "catalyst_strength": "MODERATE",
+            "catalyst_summary": "$STIM stock is up 10% today. Here's what we see in our data.",
+            "source_quality": "SECONDARY"
+          },
+          "hard_disqualifiers": [],
+          "soft_warnings": [],
+          "missing_data": [],
+          "recommended_action": {
+            "action": "ADD_TO_BUYLIST",
+            "entry_condition": "Breakout above recent consolidation level near $2.38.",
+            "stop_condition": "Close below $2.18.",
+            "exit_logic": "No fixed target. Sell 1/3 to 1/2 after 3-5 working days if the trade has worked; exit the rest on a close below the selected 10 EMA or 20 EMA.",
+            "next_check": "Next daily close."
+          },
+          "ai_notes_for_user": [
+            "Generated via rulebook-based fallback scoring model.",
+            "Please verify trend intensity and volume breakout metrics on daily chart."
+          ]
+        }
+      },
+      "selected_orb_plan": null
+    },
+    {
+      "symbol": "HLP",
+      "name": "HLP",
+      "entry_price": null,
+      "breakout_price": null,
+      "target_price": null,
+      "stop_loss": null,
+      "notes": "",
+      "added_date": "2026-08-02T06:23:46.498980+00:00",
+      "ai_analysis": {
+        "summary": "Decision: BUYLIST_READY (BUY_READY)\nAction: ADD_TO_BUYLIST\nEntry: Breakout above recent consolidation level near $1.30.\nSummary: [API Error 429] Clean consolidation setup above key EMAs.",
+        "catalyst": "- Short interest alert: Most and least shorted sub-$2B materials stocks in July 2026",
+        "news_score": 80.0,
+        "status": "BUY_READY",
+        "total_score": 70,
+        "full_json": {
+          "symbol": "HLP",
+          "as_of_date": "2026-08-09",
+          "decision": "BUYLIST_READY",
+          "setup_type": "BREAKOUT",
+          "total_score": 70,
+          "score_breakdown": {
+            "technical_setup_quality": 20,
+            "relative_strength_momentum": 15,
+            "volume_liquidity_execution": 12,
+            "catalyst_fundamental_support": 12,
+            "risk_stop_exit_quality": 12
+          },
+          "confidence": 0.85,
+          "summary": "[API Error 429] Clean consolidation setup above key EMAs.",
+          "technical_assessment": {
+            "trend_status": "UPTREND",
+            "relative_strength_status": "STRONG",
+            "volume_status": "NORMAL",
+            "setup_structure": "TIGHT",
+            "entry_trigger_status": "CONFIRMED",
+            "extension_risk": "LOW"
+          },
+          "risk_assessment": {
+            "entry_price": 1.3,
+            "stop_loss": 1.2198543767614276,
+            "take_profit": null,
+            "stop_distance_pct": 6.17,
+            "adr_20_pct": 8.220063921904865,
+            "position_size_pct": 16.2,
+            "account_risk_pct": 1.0,
+            "risk_valid": true,
+            "risk_comments": "Risk profile acceptable."
+          },
+          "catalyst_assessment": {
+            "has_verified_catalyst": true,
+            "catalyst_strength": "MODERATE",
+            "catalyst_summary": "Short interest alert: Most and least shorted sub-$2B materials stocks in July 2026",
+            "source_quality": "SECONDARY"
+          },
+          "hard_disqualifiers": [],
+          "soft_warnings": [],
+          "missing_data": [],
+          "recommended_action": {
+            "action": "ADD_TO_BUYLIST",
+            "entry_condition": "Breakout above recent consolidation level near $1.30.",
+            "stop_condition": "Close below $1.22.",
+            "exit_logic": "No fixed target. Sell 1/3 to 1/2 after 3-5 working days if the trade has worked; exit the rest on a close below the selected 10 EMA or 20 EMA.",
+            "next_check": "Next daily close."
+          },
+          "ai_notes_for_user": [
+            "Generated via rulebook-based fallback scoring model.",
+            "Please verify trend intensity and volume breakout metrics on daily chart."
+          ]
+        }
+      },
+      "selected_orb_plan": null
+    },
+    {
+      "symbol": "COAG",
+      "name": "COAG",
+      "entry_price": null,
+      "breakout_price": null,
+      "target_price": null,
+      "stop_loss": null,
+      "notes": "",
+      "added_date": "2026-08-02T06:24:10.822234+00:00",
+      "ai_analysis": {
+        "summary": "Decision: BUYLIST_READY (BUY_READY)\nAction: ADD_TO_BUYLIST\nEntry: Breakout above recent consolidation level near $49.66.\nSummary: [API Error 429] Clean consolidation setup above key EMAs.",
+        "catalyst": "- Hemab Therapeutics (NASDAQ: COAG) investors detail 5.1% passive ownership stake",
+        "news_score": 80.0,
+        "status": "BUY_READY",
+        "total_score": 70,
+        "full_json": {
+          "symbol": "COAG",
+          "as_of_date": "2026-08-09",
+          "decision": "BUYLIST_READY",
+          "setup_type": "BREAKOUT",
+          "total_score": 70,
+          "score_breakdown": {
+            "technical_setup_quality": 20,
+            "relative_strength_momentum": 15,
+            "volume_liquidity_execution": 12,
+            "catalyst_fundamental_support": 12,
+            "risk_stop_exit_quality": 12
+          },
+          "confidence": 0.85,
+          "summary": "[API Error 429] Clean consolidation setup above key EMAs.",
+          "technical_assessment": {
+            "trend_status": "UPTREND",
+            "relative_strength_status": "STRONG",
+            "volume_status": "NORMAL",
+            "setup_structure": "TIGHT",
+            "entry_trigger_status": "CONFIRMED",
+            "extension_risk": "LOW"
+          },
+          "risk_assessment": {
+            "entry_price": 49.66,
+            "stop_loss": 46.01420491972577,
+            "take_profit": null,
+            "stop_distance_pct": 7.34,
+            "adr_20_pct": 9.788683260234198,
+            "position_size_pct": 17.3,
+            "account_risk_pct": 1.27,
+            "risk_valid": true,
+            "risk_comments": "Risk profile acceptable."
+          },
+          "catalyst_assessment": {
+            "has_verified_catalyst": true,
+            "catalyst_strength": "MODERATE",
+            "catalyst_summary": "Hemab Therapeutics (NASDAQ: COAG) investors detail 5.1% passive ownership stake",
+            "source_quality": "SECONDARY"
+          },
+          "hard_disqualifiers": [],
+          "soft_warnings": [],
+          "missing_data": [],
+          "recommended_action": {
+            "action": "ADD_TO_BUYLIST",
+            "entry_condition": "Breakout above recent consolidation level near $49.66.",
+            "stop_condition": "Close below $46.01.",
+            "exit_logic": "No fixed target. Sell 1/3 to 1/2 after 3-5 working days if the trade has worked; exit the rest on a close below the selected 10 EMA or 20 EMA.",
+            "next_check": "Next daily close."
+          },
+          "ai_notes_for_user": [
+            "Generated via rulebook-based fallback scoring model.",
+            "Please verify trend intensity and volume breakout metrics on daily chart."
+          ]
+        }
+      },
+      "selected_orb_plan": null
+    },
+    {
+      "symbol": "XNCR",
+      "name": "XNCR",
+      "entry_price": null,
+      "breakout_price": null,
+      "target_price": null,
+      "stop_loss": null,
+      "notes": "",
+      "added_date": "2026-08-02T06:24:45.580808+00:00",
+      "ai_analysis": {
+        "summary": "Decision: BUYLIST_READY (BUY_READY)\nAction: ADD_TO_BUYLIST\nEntry: Breakout above recent consolidation level near $20.81.\nSummary: [API Error 429] Clean consolidation setup above key EMAs.",
+        "catalyst": "- How Investors May Respond To Xencor (XNCR) Narrowing Quarterly Losses Amid Deeper First\u2011Half Deficit",
+        "news_score": 80.0,
+        "status": "BUY_READY",
+        "total_score": 70,
+        "full_json": {
+          "symbol": "XNCR",
+          "as_of_date": "2026-08-09",
+          "decision": "BUYLIST_READY",
+          "setup_type": "BREAKOUT",
+          "total_score": 70,
+          "score_breakdown": {
+            "technical_setup_quality": 20,
+            "relative_strength_momentum": 15,
+            "volume_liquidity_execution": 12,
+            "catalyst_fundamental_support": 12,
+            "risk_stop_exit_quality": 12
+          },
+          "confidence": 0.85,
+          "summary": "[API Error 429] Clean consolidation setup above key EMAs.",
+          "technical_assessment": {
+            "trend_status": "UPTREND",
+            "relative_strength_status": "STRONG",
+            "volume_status": "NORMAL",
+            "setup_structure": "TIGHT",
+            "entry_trigger_status": "CONFIRMED",
+            "extension_risk": "LOW"
+          },
+          "risk_assessment": {
+            "entry_price": 20.81,
+            "stop_loss": 19.605788637281606,
+            "take_profit": null,
+            "stop_distance_pct": 5.79,
+            "adr_20_pct": 7.715594186887033,
+            "position_size_pct": 17.3,
+            "account_risk_pct": 1.0,
+            "risk_valid": true,
+            "risk_comments": "Risk profile acceptable."
+          },
+          "catalyst_assessment": {
+            "has_verified_catalyst": true,
+            "catalyst_strength": "MODERATE",
+            "catalyst_summary": "How Investors May Respond To Xencor (XNCR) Narrowing Quarterly Losses Amid Deeper First\u2011Half Deficit",
+            "source_quality": "SECONDARY"
+          },
+          "hard_disqualifiers": [],
+          "soft_warnings": [],
+          "missing_data": [],
+          "recommended_action": {
+            "action": "ADD_TO_BUYLIST",
+            "entry_condition": "Breakout above recent consolidation level near $20.81.",
+            "stop_condition": "Close below $19.61.",
+            "exit_logic": "No fixed target. Sell 1/3 to 1/2 after 3-5 working days if the trade has worked; exit the rest on a close below the selected 10 EMA or 20 EMA.",
+            "next_check": "Next daily close."
+          },
+          "ai_notes_for_user": [
+            "Generated via rulebook-based fallback scoring model.",
+            "Please verify trend intensity and volume breakout metrics on daily chart."
+          ]
+        }
+      },
+      "selected_orb_plan": null
+    },
+    {
+      "symbol": "CURV",
+      "name": "CURV",
+      "entry_price": null,
+      "breakout_price": null,
+      "target_price": null,
+      "stop_loss": null,
+      "notes": "",
+      "added_date": "2026-08-02T06:25:09.916998+00:00",
+      "ai_analysis": {
+        "summary": "Decision: BUYLIST_READY (BUY_READY)\nAction: ADD_TO_BUYLIST\nEntry: Breakout above recent consolidation level near $2.61.\nSummary: [API Error 429] Clean consolidation setup above key EMAs.",
+        "catalyst": "- Torrid (NYSE:CURV) Beats Q1 CY2026 Sales Expectations, Stock Soars",
+        "news_score": 80.0,
+        "status": "BUY_READY",
+        "total_score": 70,
+        "full_json": {
+          "symbol": "CURV",
+          "as_of_date": "2026-08-09",
+          "decision": "BUYLIST_READY",
+          "setup_type": "BREAKOUT",
+          "total_score": 70,
+          "score_breakdown": {
+            "technical_setup_quality": 20,
+            "relative_strength_momentum": 15,
+            "volume_liquidity_execution": 12,
+            "catalyst_fundamental_support": 12,
+            "risk_stop_exit_quality": 12
+          },
+          "confidence": 0.85,
+          "summary": "[API Error 429] Clean consolidation setup above key EMAs.",
+          "technical_assessment": {
+            "trend_status": "UPTREND",
+            "relative_strength_status": "STRONG",
+            "volume_status": "NORMAL",
+            "setup_structure": "TIGHT",
+            "entry_trigger_status": "CONFIRMED",
+            "extension_risk": "LOW"
+          },
+          "risk_assessment": {
+            "entry_price": 2.61,
+            "stop_loss": 2.4721540330587457,
+            "take_profit": null,
+            "stop_distance_pct": 5.28,
+            "adr_20_pct": 7.041939562771607,
+            "position_size_pct": 19.0,
+            "account_risk_pct": 1.0,
+            "risk_valid": true,
+            "risk_comments": "Risk profile acceptable."
+          },
+          "catalyst_assessment": {
+            "has_verified_catalyst": true,
+            "catalyst_strength": "MODERATE",
+            "catalyst_summary": "Torrid (NYSE:CURV) Beats Q1 CY2026 Sales Expectations, Stock Soars",
+            "source_quality": "SECONDARY"
+          },
+          "hard_disqualifiers": [],
+          "soft_warnings": [],
+          "missing_data": [],
+          "recommended_action": {
+            "action": "ADD_TO_BUYLIST",
+            "entry_condition": "Breakout above recent consolidation level near $2.61.",
+            "stop_condition": "Close below $2.47.",
+            "exit_logic": "No fixed target. Sell 1/3 to 1/2 after 3-5 working days if the trade has worked; exit the rest on a close below the selected 10 EMA or 20 EMA.",
+            "next_check": "Next daily close."
+          },
+          "ai_notes_for_user": [
+            "Generated via rulebook-based fallback scoring model.",
+            "Please verify trend intensity and volume breakout metrics on daily chart."
+          ]
+        }
+      },
+      "selected_orb_plan": null
+    },
+    {
+      "symbol": "UFI",
+      "name": "UFI",
+      "entry_price": null,
+      "breakout_price": null,
+      "target_price": null,
+      "stop_loss": null,
+      "notes": "",
+      "added_date": "2026-08-02T06:25:32.812940+00:00",
+      "ai_analysis": {
+        "summary": "Decision: BUYLIST_READY (BUY_READY)\nAction: ADD_TO_BUYLIST\nEntry: Breakout above recent consolidation level near $7.19.\nSummary: [API Error 429] Clean consolidation setup above key EMAs.",
+        "catalyst": "- Unifi (NYSE:UFI) Stock Passes Above Two Hundred Day Moving Average - Here's Why",
+        "news_score": 80.0,
+        "status": "BUY_READY",
+        "total_score": 70,
+        "full_json": {
+          "symbol": "UFI",
+          "as_of_date": "2026-08-09",
+          "decision": "BUYLIST_READY",
+          "setup_type": "BREAKOUT",
+          "total_score": 70,
+          "score_breakdown": {
+            "technical_setup_quality": 20,
+            "relative_strength_momentum": 15,
+            "volume_liquidity_execution": 12,
+            "catalyst_fundamental_support": 12,
+            "risk_stop_exit_quality": 12
+          },
+          "confidence": 0.85,
+          "summary": "[API Error 429] Clean consolidation setup above key EMAs.",
+          "technical_assessment": {
+            "trend_status": "UPTREND",
+            "relative_strength_status": "STRONG",
+            "volume_status": "NORMAL",
+            "setup_structure": "TIGHT",
+            "entry_trigger_status": "CONFIRMED",
+            "extension_risk": "LOW"
+          },
+          "risk_assessment": {
+            "entry_price": 7.19,
+            "stop_loss": 6.871404006667468,
+            "take_profit": null,
+            "stop_distance_pct": 4.43,
+            "adr_20_pct": 5.9081315407052735,
+            "position_size_pct": 17.0,
+            "account_risk_pct": 0.75,
+            "risk_valid": true,
+            "risk_comments": "Risk profile acceptable."
+          },
+          "catalyst_assessment": {
+            "has_verified_catalyst": true,
+            "catalyst_strength": "MODERATE",
+            "catalyst_summary": "Unifi (NYSE:UFI) Stock Passes Above Two Hundred Day Moving Average - Here's Why",
+            "source_quality": "SECONDARY"
+          },
+          "hard_disqualifiers": [],
+          "soft_warnings": [],
+          "missing_data": [],
+          "recommended_action": {
+            "action": "ADD_TO_BUYLIST",
+            "entry_condition": "Breakout above recent consolidation level near $7.19.",
+            "stop_condition": "Close below $6.87.",
+            "exit_logic": "No fixed target. Sell 1/3 to 1/2 after 3-5 working days if the trade has worked; exit the rest on a close below the selected 10 EMA or 20 EMA.",
+            "next_check": "Next daily close."
+          },
+          "ai_notes_for_user": [
+            "Generated via rulebook-based fallback scoring model.",
+            "Please verify trend intensity and volume breakout metrics on daily chart."
+          ]
+        }
+      },
+      "selected_orb_plan": null
+    },
+    {
+      "symbol": "CORT",
+      "name": "CORT",
+      "entry_price": null,
+      "breakout_price": null,
+      "target_price": null,
+      "stop_loss": null,
+      "notes": "",
+      "added_date": "2026-08-02T06:25:54.901956+00:00",
+      "ai_analysis": {
+        "summary": "Decision: BUYLIST_READY (BUY_READY)\nAction: ADD_TO_BUYLIST\nEntry: Breakout above recent consolidation level near $110.77.\nSummary: [API Error 429] Clean consolidation setup above key EMAs.",
+        "catalyst": "- Corcept Therapeutics (CORT) Stock May Trade At A Discount Yet A Premium On Sales",
+        "news_score": 80.0,
+        "status": "BUY_READY",
+        "total_score": 70,
+        "full_json": {
+          "symbol": "CORT",
+          "as_of_date": "2026-08-09",
+          "decision": "BUYLIST_READY",
+          "setup_type": "BREAKOUT",
+          "total_score": 70,
+          "score_breakdown": {
+            "technical_setup_quality": 20,
+            "relative_strength_momentum": 15,
+            "volume_liquidity_execution": 12,
+            "catalyst_fundamental_support": 12,
+            "risk_stop_exit_quality": 12
+          },
+          "confidence": 0.85,
+          "summary": "[API Error 429] Clean consolidation setup above key EMAs.",
+          "technical_assessment": {
+            "trend_status": "UPTREND",
+            "relative_strength_status": "STRONG",
+            "volume_status": "NORMAL",
+            "setup_structure": "TIGHT",
+            "entry_trigger_status": "CONFIRMED",
+            "extension_risk": "LOW"
+          },
+          "risk_assessment": {
+            "entry_price": 110.77,
+            "stop_loss": 106.36587181195607,
+            "take_profit": null,
+            "stop_distance_pct": 3.98,
+            "adr_20_pct": 5.3012285974468645,
+            "position_size_pct": 19.8,
+            "account_risk_pct": 0.79,
+            "risk_valid": true,
+            "risk_comments": "Risk profile acceptable."
+          },
+          "catalyst_assessment": {
+            "has_verified_catalyst": true,
+            "catalyst_strength": "MODERATE",
+            "catalyst_summary": "Corcept Therapeutics (CORT) Stock May Trade At A Discount Yet A Premium On Sales",
+            "source_quality": "SECONDARY"
+          },
+          "hard_disqualifiers": [],
+          "soft_warnings": [],
+          "missing_data": [],
+          "recommended_action": {
+            "action": "ADD_TO_BUYLIST",
+            "entry_condition": "Breakout above recent consolidation level near $110.77.",
+            "stop_condition": "Close below $106.37.",
+            "exit_logic": "No fixed target. Sell 1/3 to 1/2 after 3-5 working days if the trade has worked; exit the rest on a close below the selected 10 EMA or 20 EMA.",
+            "next_check": "Next daily close."
+          },
+          "ai_notes_for_user": [
+            "Generated via rulebook-based fallback scoring model.",
+            "Please verify trend intensity and volume breakout metrics on daily chart."
+          ]
+        }
+      },
+      "selected_orb_plan": null
+    },
+    {
+      "symbol": "KARO",
+      "name": "KARO",
+      "entry_price": null,
+      "breakout_price": null,
+      "target_price": null,
+      "stop_loss": null,
+      "notes": "",
+      "added_date": "2026-08-02T06:26:24.668298+00:00",
+      "ai_analysis": {
+        "summary": "Decision: BUYLIST_READY (BUY_READY)\nAction: ADD_TO_BUYLIST\nEntry: Breakout above recent consolidation level near $64.71.\nSummary: [API Error 429] Clean consolidation setup above key EMAs.",
+        "catalyst": "- Karooooo Ltd. (KARO) Stock Price, News, Quote & History",
+        "news_score": 80.0,
+        "status": "BUY_READY",
+        "total_score": 70,
+        "full_json": {
+          "symbol": "KARO",
+          "as_of_date": "2026-08-09",
+          "decision": "BUYLIST_READY",
+          "setup_type": "BREAKOUT",
+          "total_score": 70,
+          "score_breakdown": {
+            "technical_setup_quality": 20,
+            "relative_strength_momentum": 15,
+            "volume_liquidity_execution": 12,
+            "catalyst_fundamental_support": 12,
+            "risk_stop_exit_quality": 12
+          },
+          "confidence": 0.85,
+          "summary": "[API Error 429] Clean consolidation setup above key EMAs.",
+          "technical_assessment": {
+            "trend_status": "UPTREND",
+            "relative_strength_status": "STRONG",
+            "volume_status": "NORMAL",
+            "setup_structure": "TIGHT",
+            "entry_trigger_status": "CONFIRMED",
+            "extension_risk": "LOW"
+          },
+          "risk_assessment": {
+            "entry_price": 64.7066,
+            "stop_loss": 62.97,
+            "take_profit": null,
+            "stop_distance_pct": 2.68,
+            "adr_20_pct": 4.495146194314568,
+            "position_size_pct": 19.1,
+            "account_risk_pct": 0.51,
+            "risk_valid": true,
+            "risk_comments": "Risk profile acceptable."
+          },
+          "catalyst_assessment": {
+            "has_verified_catalyst": true,
+            "catalyst_strength": "MODERATE",
+            "catalyst_summary": "Karooooo Ltd. (KARO) Stock Price, News, Quote & History",
+            "source_quality": "SECONDARY"
+          },
+          "hard_disqualifiers": [],
+          "soft_warnings": [],
+          "missing_data": [],
+          "recommended_action": {
+            "action": "ADD_TO_BUYLIST",
+            "entry_condition": "Breakout above recent consolidation level near $64.71.",
+            "stop_condition": "Close below $62.97.",
+            "exit_logic": "No fixed target. Sell 1/3 to 1/2 after 3-5 working days if the trade has worked; exit the rest on a close below the selected 10 EMA or 20 EMA.",
+            "next_check": "Next daily close."
+          },
+          "ai_notes_for_user": [
+            "Generated via rulebook-based fallback scoring model.",
+            "Please verify trend intensity and volume breakout metrics on daily chart."
+          ]
+        }
+      },
+      "selected_orb_plan": null
+    },
+    {
+      "symbol": "GCT",
+      "name": "GCT",
+      "entry_price": null,
+      "breakout_price": null,
+      "target_price": null,
+      "stop_loss": null,
+      "notes": "",
+      "added_date": "2026-08-02T06:27:02.342379+00:00",
+      "ai_analysis": {
+        "summary": "Decision: BUYLIST_READY (BUY_READY)\nAction: ADD_TO_BUYLIST\nEntry: Breakout above recent consolidation level near $53.25.\nSummary: [API Error 429] Clean consolidation setup above key EMAs.",
+        "catalyst": "- GigaCloud Technology (NASDAQ:GCT) Releases Earnings Results, Beats Estimates By $0.26 EPS",
+        "news_score": 80.0,
+        "status": "BUY_READY",
+        "total_score": 70,
+        "full_json": {
+          "symbol": "GCT",
+          "as_of_date": "2026-08-09",
+          "decision": "BUYLIST_READY",
+          "setup_type": "BREAKOUT",
+          "total_score": 70,
+          "score_breakdown": {
+            "technical_setup_quality": 20,
+            "relative_strength_momentum": 15,
+            "volume_liquidity_execution": 12,
+            "catalyst_fundamental_support": 12,
+            "risk_stop_exit_quality": 12
+          },
+          "confidence": 0.85,
+          "summary": "[API Error 429] Clean consolidation setup above key EMAs.",
+          "technical_assessment": {
+            "trend_status": "UPTREND",
+            "relative_strength_status": "STRONG",
+            "volume_status": "NORMAL",
+            "setup_structure": "TIGHT",
+            "entry_trigger_status": "CONFIRMED",
+            "extension_risk": "LOW"
+          },
+          "risk_assessment": {
+            "entry_price": 53.25,
+            "stop_loss": 50.955382131803105,
+            "take_profit": null,
+            "stop_distance_pct": 4.31,
+            "adr_20_pct": 5.7455220486933225,
+            "position_size_pct": 17.6,
+            "account_risk_pct": 0.76,
+            "risk_valid": true,
+            "risk_comments": "Risk profile acceptable."
+          },
+          "catalyst_assessment": {
+            "has_verified_catalyst": true,
+            "catalyst_strength": "MODERATE",
+            "catalyst_summary": "GigaCloud Technology (NASDAQ:GCT) Releases Earnings Results, Beats Estimates By $0.26 EPS",
+            "source_quality": "SECONDARY"
+          },
+          "hard_disqualifiers": [],
+          "soft_warnings": [],
+          "missing_data": [],
+          "recommended_action": {
+            "action": "ADD_TO_BUYLIST",
+            "entry_condition": "Breakout above recent consolidation level near $53.25.",
+            "stop_condition": "Close below $50.96.",
+            "exit_logic": "No fixed target. Sell 1/3 to 1/2 after 3-5 working days if the trade has worked; exit the rest on a close below the selected 10 EMA or 20 EMA.",
+            "next_check": "Next daily close."
+          },
+          "ai_notes_for_user": [
+            "Generated via rulebook-based fallback scoring model.",
+            "Please verify trend intensity and volume breakout metrics on daily chart."
+          ]
+        }
+      },
+      "selected_orb_plan": null
+    },
+    {
+      "symbol": "ATRC",
+      "name": "ATRC",
+      "entry_price": null,
+      "breakout_price": null,
+      "target_price": null,
+      "stop_loss": null,
+      "notes": "",
+      "added_date": "2026-08-02T06:27:07.246195+00:00",
+      "ai_analysis": {
+        "summary": "Decision: BUYLIST_READY (BUY_READY)\nAction: ADD_TO_BUYLIST\nEntry: Breakout above recent consolidation level near $41.39.\nSummary: [API Error 429] Clean consolidation setup above key EMAs.",
+        "catalyst": "- Discipline and Rules-Based Execution in ATRC Response",
+        "news_score": 80.0,
+        "status": "BUY_READY",
+        "total_score": 70,
+        "full_json": {
+          "symbol": "ATRC",
+          "as_of_date": "2026-08-09",
+          "decision": "BUYLIST_READY",
+          "setup_type": "BREAKOUT",
+          "total_score": 70,
+          "score_breakdown": {
+            "technical_setup_quality": 20,
+            "relative_strength_momentum": 15,
+            "volume_liquidity_execution": 12,
+            "catalyst_fundamental_support": 12,
+            "risk_stop_exit_quality": 12
+          },
+          "confidence": 0.85,
+          "summary": "[API Error 429] Clean consolidation setup above key EMAs.",
+          "technical_assessment": {
+            "trend_status": "UPTREND",
+            "relative_strength_status": "STRONG",
+            "volume_status": "NORMAL",
+            "setup_structure": "TIGHT",
+            "entry_trigger_status": "CONFIRMED",
+            "extension_risk": "LOW"
+          },
+          "risk_assessment": {
+            "entry_price": 41.39,
+            "stop_loss": 40.0457542157089,
+            "take_profit": null,
+            "stop_distance_pct": 3.25,
+            "adr_20_pct": 4.330339967113169,
+            "position_size_pct": 15.5,
+            "account_risk_pct": 0.5,
+            "risk_valid": true,
+            "risk_comments": "Risk profile acceptable."
+          },
+          "catalyst_assessment": {
+            "has_verified_catalyst": true,
+            "catalyst_strength": "MODERATE",
+            "catalyst_summary": "Discipline and Rules-Based Execution in ATRC Response",
+            "source_quality": "SECONDARY"
+          },
+          "hard_disqualifiers": [],
+          "soft_warnings": [],
+          "missing_data": [],
+          "recommended_action": {
+            "action": "ADD_TO_BUYLIST",
+            "entry_condition": "Breakout above recent consolidation level near $41.39.",
+            "stop_condition": "Close below $40.05.",
+            "exit_logic": "No fixed target. Sell 1/3 to 1/2 after 3-5 working days if the trade has worked; exit the rest on a close below the selected 10 EMA or 20 EMA.",
+            "next_check": "Next daily close."
+          },
+          "ai_notes_for_user": [
+            "Generated via rulebook-based fallback scoring model.",
+            "Please verify trend intensity and volume breakout metrics on daily chart."
+          ]
+        }
+      },
+      "selected_orb_plan": null
+    },
+    {
+      "symbol": "LAD",
+      "name": "LAD",
+      "entry_price": null,
+      "breakout_price": null,
+      "target_price": null,
+      "stop_loss": null,
+      "notes": "",
+      "added_date": "2026-08-02T06:27:14.808935+00:00",
+      "ai_analysis": {
+        "summary": "Decision: BUYLIST_READY (BUY_READY)\nAction: ADD_TO_BUYLIST\nEntry: Breakout above recent consolidation level near $375.63.\nSummary: [API Error 429] Clean consolidation setup above key EMAs.",
+        "catalyst": "- Lithia Motors (LAD) Stock Looks Near Fair Value While Earnings Look Cheap",
+        "news_score": 80.0,
+        "status": "BUY_READY",
+        "total_score": 70,
+        "full_json": {
+          "symbol": "LAD",
+          "as_of_date": "2026-08-09",
+          "decision": "BUYLIST_READY",
+          "setup_type": "BREAKOUT",
+          "total_score": 70,
+          "score_breakdown": {
+            "technical_setup_quality": 20,
+            "relative_strength_momentum": 15,
+            "volume_liquidity_execution": 12,
+            "catalyst_fundamental_support": 12,
+            "risk_stop_exit_quality": 12
+          },
+          "confidence": 0.85,
+          "summary": "[API Error 429] Clean consolidation setup above key EMAs.",
+          "technical_assessment": {
+            "trend_status": "UPTREND",
+            "relative_strength_status": "STRONG",
+            "volume_status": "NORMAL",
+            "setup_structure": "TIGHT",
+            "entry_trigger_status": "CONFIRMED",
+            "extension_risk": "LOW"
+          },
+          "risk_assessment": {
+            "entry_price": 375.63,
+            "stop_loss": 363.2291419519843,
+            "take_profit": null,
+            "stop_distance_pct": 3.3,
+            "adr_20_pct": 4.4017989503911465,
+            "position_size_pct": 16.8,
+            "account_risk_pct": 0.55,
+            "risk_valid": true,
+            "risk_comments": "Risk profile acceptable."
+          },
+          "catalyst_assessment": {
+            "has_verified_catalyst": true,
+            "catalyst_strength": "MODERATE",
+            "catalyst_summary": "Lithia Motors (LAD) Stock Looks Near Fair Value While Earnings Look Cheap",
+            "source_quality": "SECONDARY"
+          },
+          "hard_disqualifiers": [],
+          "soft_warnings": [],
+          "missing_data": [],
+          "recommended_action": {
+            "action": "ADD_TO_BUYLIST",
+            "entry_condition": "Breakout above recent consolidation level near $375.63.",
+            "stop_condition": "Close below $363.23.",
+            "exit_logic": "No fixed target. Sell 1/3 to 1/2 after 3-5 working days if the trade has worked; exit the rest on a close below the selected 10 EMA or 20 EMA.",
+            "next_check": "Next daily close."
+          },
+          "ai_notes_for_user": [
+            "Generated via rulebook-based fallback scoring model.",
+            "Please verify trend intensity and volume breakout metrics on daily chart."
+          ]
+        }
+      },
+      "selected_orb_plan": null
+    },
+    {
+      "symbol": "DK",
+      "name": "DK",
+      "entry_price": null,
+      "breakout_price": null,
+      "target_price": null,
+      "stop_loss": null,
+      "notes": "",
+      "added_date": "2026-08-02T06:27:19.506292+00:00",
+      "ai_analysis": {
+        "summary": "Decision: BUYLIST_READY (BUY_READY)\nAction: ADD_TO_BUYLIST\nEntry: Breakout above recent consolidation level near $58.46.\nSummary: [API Error 429] Clean consolidation setup above key EMAs.",
+        "catalyst": "- Delek (DK) Stock Looks Reasonable On Sales While Returns Look Stretched",
+        "news_score": 80.0,
+        "status": "BUY_READY",
+        "total_score": 70,
+        "full_json": {
+          "symbol": "DK",
+          "as_of_date": "2026-08-09",
+          "decision": "BUYLIST_READY",
+          "setup_type": "BREAKOUT",
+          "total_score": 70,
+          "score_breakdown": {
+            "technical_setup_quality": 20,
+            "relative_strength_momentum": 15,
+            "volume_liquidity_execution": 12,
+            "catalyst_fundamental_support": 12,
+            "risk_stop_exit_quality": 12
+          },
+          "confidence": 0.85,
+          "summary": "[API Error 429] Clean consolidation setup above key EMAs.",
+          "technical_assessment": {
+            "trend_status": "UPTREND",
+            "relative_strength_status": "STRONG",
+            "volume_status": "NORMAL",
+            "setup_structure": "TIGHT",
+            "entry_trigger_status": "CONFIRMED",
+            "extension_risk": "LOW"
+          },
+          "risk_assessment": {
+            "entry_price": 58.46,
+            "stop_loss": 56.31017359764281,
+            "take_profit": null,
+            "stop_distance_pct": 3.68,
+            "adr_20_pct": 4.903241880162364,
+            "position_size_pct": 14.1,
+            "account_risk_pct": 0.52,
+            "risk_valid": true,
+            "risk_comments": "Risk profile acceptable."
+          },
+          "catalyst_assessment": {
+            "has_verified_catalyst": true,
+            "catalyst_strength": "MODERATE",
+            "catalyst_summary": "Delek (DK) Stock Looks Reasonable On Sales While Returns Look Stretched",
+            "source_quality": "SECONDARY"
+          },
+          "hard_disqualifiers": [],
+          "soft_warnings": [],
+          "missing_data": [],
+          "recommended_action": {
+            "action": "ADD_TO_BUYLIST",
+            "entry_condition": "Breakout above recent consolidation level near $58.46.",
+            "stop_condition": "Close below $56.31.",
+            "exit_logic": "No fixed target. Sell 1/3 to 1/2 after 3-5 working days if the trade has worked; exit the rest on a close below the selected 10 EMA or 20 EMA.",
+            "next_check": "Next daily close."
+          },
+          "ai_notes_for_user": [
+            "Generated via rulebook-based fallback scoring model.",
+            "Please verify trend intensity and volume breakout metrics on daily chart."
+          ]
+        }
+      },
+      "selected_orb_plan": null
+    },
+    {
+      "symbol": "WEX",
+      "name": "WEX",
+      "entry_price": null,
+      "breakout_price": null,
+      "target_price": null,
+      "stop_loss": null,
+      "notes": "",
+      "added_date": "2026-08-02T06:27:31.961744+00:00",
+      "ai_analysis": {
+        "summary": "Decision: BUYLIST_READY (BUY_READY)\nAction: ADD_TO_BUYLIST\nEntry: Breakout above recent consolidation level near $189.89.\nSummary: [API Error 429] Clean consolidation setup above key EMAs.",
+        "catalyst": "- WEX Inc. (WEX) Stock Forecasts",
+        "news_score": 80.0,
+        "status": "BUY_READY",
+        "total_score": 70,
+        "full_json": {
+          "symbol": "WEX",
+          "as_of_date": "2026-08-09",
+          "decision": "BUYLIST_READY",
+          "setup_type": "BREAKOUT",
+          "total_score": 70,
+          "score_breakdown": {
+            "technical_setup_quality": 20,
+            "relative_strength_momentum": 15,
+            "volume_liquidity_execution": 12,
+            "catalyst_fundamental_support": 12,
+            "risk_stop_exit_quality": 12
+          },
+          "confidence": 0.85,
+          "summary": "[API Error 429] Clean consolidation setup above key EMAs.",
+          "technical_assessment": {
+            "trend_status": "UPTREND",
+            "relative_strength_status": "STRONG",
+            "volume_status": "NORMAL",
+            "setup_structure": "TIGHT",
+            "entry_trigger_status": "CONFIRMED",
+            "extension_risk": "LOW"
+          },
+          "risk_assessment": {
+            "entry_price": 189.89,
+            "stop_loss": 187.6,
+            "take_profit": null,
+            "stop_distance_pct": 1.21,
+            "adr_20_pct": 3.853263544074491,
+            "position_size_pct": 22.1,
+            "account_risk_pct": 0.27,
+            "risk_valid": true,
+            "risk_comments": "Risk profile acceptable."
+          },
+          "catalyst_assessment": {
+            "has_verified_catalyst": true,
+            "catalyst_strength": "MODERATE",
+            "catalyst_summary": "WEX Inc. (WEX) Stock Forecasts",
+            "source_quality": "SECONDARY"
+          },
+          "hard_disqualifiers": [],
+          "soft_warnings": [],
+          "missing_data": [],
+          "recommended_action": {
+            "action": "ADD_TO_BUYLIST",
+            "entry_condition": "Breakout above recent consolidation level near $189.89.",
+            "stop_condition": "Close below $187.60.",
+            "exit_logic": "No fixed target. Sell 1/3 to 1/2 after 3-5 working days if the trade has worked; exit the rest on a close below the selected 10 EMA or 20 EMA.",
+            "next_check": "Next daily close."
+          },
+          "ai_notes_for_user": [
+            "Generated via rulebook-based fallback scoring model.",
+            "Please verify trend intensity and volume breakout metrics on daily chart."
+          ]
+        }
+      },
+      "selected_orb_plan": null
+    },
+    {
+      "symbol": "LPG",
+      "name": "LPG",
+      "entry_price": null,
+      "breakout_price": null,
+      "target_price": null,
+      "stop_loss": null,
+      "notes": "",
+      "added_date": "2026-08-02T06:27:37.513412+00:00",
+      "ai_analysis": {
+        "summary": "Decision: BUYLIST_READY (BUY_READY)\nAction: ADD_TO_BUYLIST\nEntry: Breakout above recent consolidation level near $45.76.\nSummary: [API Error 429] Clean consolidation setup above key EMAs.",
+        "catalyst": "- Dorian LPG (NYSE:LPG) Displays High Growth Momentum and a Breakout Setup",
+        "news_score": 80.0,
+        "status": "BUY_READY",
+        "total_score": 70,
+        "full_json": {
+          "symbol": "LPG",
+          "as_of_date": "2026-08-09",
+          "decision": "BUYLIST_READY",
+          "setup_type": "BREAKOUT",
+          "total_score": 70,
+          "score_breakdown": {
+            "technical_setup_quality": 20,
+            "relative_strength_momentum": 15,
+            "volume_liquidity_execution": 12,
+            "catalyst_fundamental_support": 12,
+            "risk_stop_exit_quality": 12
+          },
+          "confidence": 0.85,
+          "summary": "[API Error 429] Clean consolidation setup above key EMAs.",
+          "technical_assessment": {
+            "trend_status": "UPTREND",
+            "relative_strength_status": "STRONG",
+            "volume_status": "NORMAL",
+            "setup_structure": "TIGHT",
+            "entry_trigger_status": "CONFIRMED",
+            "extension_risk": "LOW"
+          },
+          "risk_assessment": {
+            "entry_price": 45.76,
+            "stop_loss": 44.36092599295293,
+            "take_profit": null,
+            "stop_distance_pct": 3.06,
+            "adr_20_pct": 4.07655596458935,
+            "position_size_pct": 16.4,
+            "account_risk_pct": 0.5,
+            "risk_valid": true,
+            "risk_comments": "Risk profile acceptable."
+          },
+          "catalyst_assessment": {
+            "has_verified_catalyst": true,
+            "catalyst_strength": "MODERATE",
+            "catalyst_summary": "Dorian LPG (NYSE:LPG) Displays High Growth Momentum and a Breakout Setup",
+            "source_quality": "SECONDARY"
+          },
+          "hard_disqualifiers": [],
+          "soft_warnings": [],
+          "missing_data": [],
+          "recommended_action": {
+            "action": "ADD_TO_BUYLIST",
+            "entry_condition": "Breakout above recent consolidation level near $45.76.",
+            "stop_condition": "Close below $44.36.",
+            "exit_logic": "No fixed target. Sell 1/3 to 1/2 after 3-5 working days if the trade has worked; exit the rest on a close below the selected 10 EMA or 20 EMA.",
+            "next_check": "Next daily close."
+          },
+          "ai_notes_for_user": [
+            "Generated via rulebook-based fallback scoring model.",
+            "Please verify trend intensity and volume breakout metrics on daily chart."
+          ]
+        }
+      },
+      "selected_orb_plan": null
+    },
+    {
+      "symbol": "ATHM",
+      "name": "ATHM",
+      "entry_price": null,
+      "breakout_price": null,
+      "target_price": null,
+      "stop_loss": null,
+      "notes": "",
+      "added_date": "2026-08-02T06:28:29.477316+00:00",
+      "ai_analysis": {
+        "summary": "Decision: BUYLIST_READY (BUY_READY)\nAction: ADD_TO_BUYLIST\nEntry: Breakout above recent consolidation level near $22.72.\nSummary: [API Error 429] Clean consolidation setup above key EMAs.",
+        "catalyst": "- Trading Systems Reacting to (ATHM) Volatility",
+        "news_score": 80.0,
+        "status": "BUY_READY",
+        "total_score": 70,
+        "full_json": {
+          "symbol": "ATHM",
+          "as_of_date": "2026-08-09",
+          "decision": "BUYLIST_READY",
+          "setup_type": "BREAKOUT",
+          "total_score": 70,
+          "score_breakdown": {
+            "technical_setup_quality": 20,
+            "relative_strength_momentum": 15,
+            "volume_liquidity_execution": 12,
+            "catalyst_fundamental_support": 12,
+            "risk_stop_exit_quality": 12
+          },
+          "confidence": 0.85,
+          "summary": "[API Error 429] Clean consolidation setup above key EMAs.",
+          "technical_assessment": {
+            "trend_status": "UPTREND",
+            "relative_strength_status": "STRONG",
+            "volume_status": "NORMAL",
+            "setup_structure": "TIGHT",
+            "entry_trigger_status": "CONFIRMED",
+            "extension_risk": "LOW"
+          },
+          "risk_assessment": {
+            "entry_price": 22.72,
+            "stop_loss": 22.144413061424704,
+            "take_profit": null,
+            "stop_distance_pct": 2.53,
+            "adr_20_pct": 3.377857620747033,
+            "position_size_pct": 19.9,
+            "account_risk_pct": 0.5,
+            "risk_valid": true,
+            "risk_comments": "Risk profile acceptable."
+          },
+          "catalyst_assessment": {
+            "has_verified_catalyst": true,
+            "catalyst_strength": "MODERATE",
+            "catalyst_summary": "Trading Systems Reacting to (ATHM) Volatility",
+            "source_quality": "SECONDARY"
+          },
+          "hard_disqualifiers": [],
+          "soft_warnings": [],
+          "missing_data": [],
+          "recommended_action": {
+            "action": "ADD_TO_BUYLIST",
+            "entry_condition": "Breakout above recent consolidation level near $22.72.",
+            "stop_condition": "Close below $22.14.",
+            "exit_logic": "No fixed target. Sell 1/3 to 1/2 after 3-5 working days if the trade has worked; exit the rest on a close below the selected 10 EMA or 20 EMA.",
+            "next_check": "Next daily close."
+          },
+          "ai_notes_for_user": [
+            "Generated via rulebook-based fallback scoring model.",
+            "Please verify trend intensity and volume breakout metrics on daily chart."
+          ]
+        }
+      },
+      "selected_orb_plan": null
+    },
+    {
+      "symbol": "MCS",
+      "name": "MCS",
+      "entry_price": null,
+      "breakout_price": null,
+      "target_price": null,
+      "stop_loss": null,
+      "notes": "",
+      "added_date": "2026-08-02T06:29:05.269960+00:00",
+      "ai_analysis": {
+        "summary": "Decision: BUYLIST_READY (BUY_READY)\nAction: ADD_TO_BUYLIST\nEntry: Breakout above recent consolidation level near $30.65.\nSummary: [API Error 429] Clean consolidation setup above key EMAs.",
+        "catalyst": "- 3 Reasons Why Marcus (MCS) Is a Great Growth Stock",
+        "news_score": 80.0,
+        "status": "BUY_READY",
+        "total_score": 70,
+        "full_json": {
+          "symbol": "MCS",
+          "as_of_date": "2026-08-09",
+          "decision": "BUYLIST_READY",
+          "setup_type": "BREAKOUT",
+          "total_score": 70,
+          "score_breakdown": {
+            "technical_setup_quality": 20,
+            "relative_strength_momentum": 15,
+            "volume_liquidity_execution": 12,
+            "catalyst_fundamental_support": 12,
+            "risk_stop_exit_quality": 12
+          },
+          "confidence": 0.85,
+          "summary": "[API Error 429] Clean consolidation setup above key EMAs.",
+          "technical_assessment": {
+            "trend_status": "UPTREND",
+            "relative_strength_status": "STRONG",
+            "volume_status": "NORMAL",
+            "setup_structure": "TIGHT",
+            "entry_trigger_status": "CONFIRMED",
+            "extension_risk": "LOW"
+          },
+          "risk_assessment": {
+            "entry_price": 30.65,
+            "stop_loss": 29.75784860544024,
+            "take_profit": null,
+            "stop_distance_pct": 2.91,
+            "adr_20_pct": 3.8810283613257544,
+            "position_size_pct": 17.3,
+            "account_risk_pct": 0.5,
+            "risk_valid": true,
+            "risk_comments": "Risk profile acceptable."
+          },
+          "catalyst_assessment": {
+            "has_verified_catalyst": true,
+            "catalyst_strength": "MODERATE",
+            "catalyst_summary": "3 Reasons Why Marcus (MCS) Is a Great Growth Stock",
+            "source_quality": "SECONDARY"
+          },
+          "hard_disqualifiers": [],
+          "soft_warnings": [],
+          "missing_data": [],
+          "recommended_action": {
+            "action": "ADD_TO_BUYLIST",
+            "entry_condition": "Breakout above recent consolidation level near $30.65.",
+            "stop_condition": "Close below $29.76.",
+            "exit_logic": "No fixed target. Sell 1/3 to 1/2 after 3-5 working days if the trade has worked; exit the rest on a close below the selected 10 EMA or 20 EMA.",
+            "next_check": "Next daily close."
+          },
+          "ai_notes_for_user": [
+            "Generated via rulebook-based fallback scoring model.",
+            "Please verify trend intensity and volume breakout metrics on daily chart."
+          ]
+        }
+      },
+      "selected_orb_plan": null
+    },
+    {
+      "symbol": "LNC",
+      "name": "LNC",
+      "entry_price": null,
+      "breakout_price": null,
+      "target_price": null,
+      "stop_loss": null,
+      "notes": "",
+      "added_date": "2026-08-02T06:29:12.120026+00:00",
+      "ai_analysis": {
+        "summary": "Decision: BUYLIST_READY (BUY_READY)\nAction: ADD_TO_BUYLIST\nEntry: Breakout above recent consolidation level near $46.03.\nSummary: [API Error 429] Clean consolidation setup above key EMAs.",
+        "catalyst": "- Jackson Financial Inc. (JXN) stock price, news, quote and history",
+        "news_score": 80.0,
+        "status": "BUY_READY",
+        "total_score": 70,
+        "full_json": {
+          "symbol": "LNC",
+          "as_of_date": "2026-08-09",
+          "decision": "BUYLIST_READY",
+          "setup_type": "BREAKOUT",
+          "total_score": 70,
+          "score_breakdown": {
+            "technical_setup_quality": 20,
+            "relative_strength_momentum": 15,
+            "volume_liquidity_execution": 12,
+            "catalyst_fundamental_support": 12,
+            "risk_stop_exit_quality": 12
+          },
+          "confidence": 0.85,
+          "summary": "[API Error 429] Clean consolidation setup above key EMAs.",
+          "technical_assessment": {
+            "trend_status": "UPTREND",
+            "relative_strength_status": "STRONG",
+            "volume_status": "NORMAL",
+            "setup_structure": "TIGHT",
+            "entry_trigger_status": "CONFIRMED",
+            "extension_risk": "LOW"
+          },
+          "risk_assessment": {
+            "entry_price": 46.03,
+            "stop_loss": 45.01344464546987,
+            "take_profit": null,
+            "stop_distance_pct": 2.21,
+            "adr_20_pct": 2.9446168572094598,
+            "position_size_pct": 11.5,
+            "account_risk_pct": 0.25,
+            "risk_valid": true,
+            "risk_comments": "Risk profile acceptable."
+          },
+          "catalyst_assessment": {
+            "has_verified_catalyst": true,
+            "catalyst_strength": "MODERATE",
+            "catalyst_summary": "Jackson Financial Inc. (JXN) stock price, news, quote and history",
+            "source_quality": "SECONDARY"
+          },
+          "hard_disqualifiers": [],
+          "soft_warnings": [],
+          "missing_data": [],
+          "recommended_action": {
+            "action": "ADD_TO_BUYLIST",
+            "entry_condition": "Breakout above recent consolidation level near $46.03.",
+            "stop_condition": "Close below $45.01.",
+            "exit_logic": "No fixed target. Sell 1/3 to 1/2 after 3-5 working days if the trade has worked; exit the rest on a close below the selected 10 EMA or 20 EMA.",
+            "next_check": "Next daily close."
+          },
+          "ai_notes_for_user": [
+            "Generated via rulebook-based fallback scoring model.",
+            "Please verify trend intensity and volume breakout metrics on daily chart."
+          ]
+        }
+      },
+      "selected_orb_plan": null
+    },
+    {
+      "symbol": "BWLP",
+      "name": "BWLP",
+      "entry_price": null,
+      "breakout_price": null,
+      "target_price": null,
+      "stop_loss": null,
+      "notes": "",
+      "added_date": "2026-08-02T06:29:44.849507+00:00",
+      "ai_analysis": {
+        "summary": "Decision: BUYLIST_READY (BUY_READY)\nAction: ADD_TO_BUYLIST\nEntry: Breakout above recent consolidation level near $21.75.\nSummary: [API Error 429] Clean consolidation setup above key EMAs.",
+        "catalyst": "- BW LPG Ltd (BWLP) Stock Up 3.5% but GF Value Says Overvalued -- GF Score: 83/100",
+        "news_score": 80.0,
+        "status": "BUY_READY",
+        "total_score": 70,
+        "full_json": {
+          "symbol": "BWLP",
+          "as_of_date": "2026-08-09",
+          "decision": "BUYLIST_READY",
+          "setup_type": "BREAKOUT",
+          "total_score": 70,
+          "score_breakdown": {
+            "technical_setup_quality": 20,
+            "relative_strength_momentum": 15,
+            "volume_liquidity_execution": 12,
+            "catalyst_fundamental_support": 12,
+            "risk_stop_exit_quality": 12
+          },
+          "confidence": 0.85,
+          "summary": "[API Error 429] Clean consolidation setup above key EMAs.",
+          "technical_assessment": {
+            "trend_status": "UPTREND",
+            "relative_strength_status": "STRONG",
+            "volume_status": "NORMAL",
+            "setup_structure": "TIGHT",
+            "entry_trigger_status": "CONFIRMED",
+            "extension_risk": "LOW"
+          },
+          "risk_assessment": {
+            "entry_price": 21.75,
+            "stop_loss": 21.326566588487953,
+            "take_profit": null,
+            "stop_distance_pct": 1.95,
+            "adr_20_pct": 2.5957603770853472,
+            "position_size_pct": 13.0,
+            "account_risk_pct": 0.25,
+            "risk_valid": true,
+            "risk_comments": "Risk profile acceptable."
+          },
+          "catalyst_assessment": {
+            "has_verified_catalyst": true,
+            "catalyst_strength": "MODERATE",
+            "catalyst_summary": "BW LPG Ltd (BWLP) Stock Up 3.5% but GF Value Says Overvalued -- GF Score: 83/100",
+            "source_quality": "SECONDARY"
+          },
+          "hard_disqualifiers": [],
+          "soft_warnings": [],
+          "missing_data": [],
+          "recommended_action": {
+            "action": "ADD_TO_BUYLIST",
+            "entry_condition": "Breakout above recent consolidation level near $21.75.",
+            "stop_condition": "Close below $21.33.",
+            "exit_logic": "No fixed target. Sell 1/3 to 1/2 after 3-5 working days if the trade has worked; exit the rest on a close below the selected 10 EMA or 20 EMA.",
+            "next_check": "Next daily close."
+          },
+          "ai_notes_for_user": [
+            "Generated via rulebook-based fallback scoring model.",
+            "Please verify trend intensity and volume breakout metrics on daily chart."
+          ]
+        }
+      },
+      "selected_orb_plan": null
+    },
+    {
+      "symbol": "UGP",
+      "name": "UGP",
+      "entry_price": null,
+      "breakout_price": null,
+      "target_price": null,
+      "stop_loss": null,
+      "notes": "",
+      "added_date": "2026-08-02T06:30:37.250195+00:00",
+      "ai_analysis": {
+        "summary": "Decision: BUYLIST_READY (BUY_READY)\nAction: ADD_TO_BUYLIST\nEntry: Breakout above recent consolidation level near $6.12.\nSummary: [API Error 429] Clean consolidation setup above key EMAs.",
+        "catalyst": "- Ultrapar Participacoes S.A. (UGP) Recently Broke Out Above the 20-Day Moving Average",
+        "news_score": 80.0,
+        "status": "BUY_READY",
+        "total_score": 70,
+        "full_json": {
+          "symbol": "UGP",
+          "as_of_date": "2026-08-09",
+          "decision": "BUYLIST_READY",
+          "setup_type": "BREAKOUT",
+          "total_score": 70,
+          "score_breakdown": {
+            "technical_setup_quality": 20,
+            "relative_strength_momentum": 15,
+            "volume_liquidity_execution": 12,
+            "catalyst_fundamental_support": 12,
+            "risk_stop_exit_quality": 12
+          },
+          "confidence": 0.85,
+          "summary": "[API Error 429] Clean consolidation setup above key EMAs.",
+          "technical_assessment": {
+            "trend_status": "UPTREND",
+            "relative_strength_status": "STRONG",
+            "volume_status": "NORMAL",
+            "setup_structure": "TIGHT",
+            "entry_trigger_status": "CONFIRMED",
+            "extension_risk": "LOW"
+          },
+          "risk_assessment": {
+            "entry_price": 6.12,
+            "stop_loss": 6.0046043881567215,
+            "take_profit": null,
+            "stop_distance_pct": 1.89,
+            "adr_20_pct": 2.5140656175006333,
+            "position_size_pct": 13.3,
+            "account_risk_pct": 0.25,
+            "risk_valid": true,
+            "risk_comments": "Risk profile acceptable."
+          },
+          "catalyst_assessment": {
+            "has_verified_catalyst": true,
+            "catalyst_strength": "MODERATE",
+            "catalyst_summary": "Ultrapar Participacoes S.A. (UGP) Recently Broke Out Above the 20-Day Moving Average",
+            "source_quality": "SECONDARY"
+          },
+          "hard_disqualifiers": [],
+          "soft_warnings": [],
+          "missing_data": [],
+          "recommended_action": {
+            "action": "ADD_TO_BUYLIST",
+            "entry_condition": "Breakout above recent consolidation level near $6.12.",
+            "stop_condition": "Close below $6.00.",
+            "exit_logic": "No fixed target. Sell 1/3 to 1/2 after 3-5 working days if the trade has worked; exit the rest on a close below the selected 10 EMA or 20 EMA.",
+            "next_check": "Next daily close."
+          },
+          "ai_notes_for_user": [
+            "Generated via rulebook-based fallback scoring model.",
+            "Please verify trend intensity and volume breakout metrics on daily chart."
+          ]
+        }
+      },
+      "selected_orb_plan": null
+    }
+  ]
+}
