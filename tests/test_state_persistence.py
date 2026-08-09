@@ -208,6 +208,39 @@ def test_wait_for_pending_saves_waits_for_scheduled_save_completion(tmp_path, mo
     assert load_json(paths["WATCHLIST_FILE"], {})["items"][0]["symbol"] == "AAPL"
 
 
+def test_cloud_backup_retries_destination_discovery_after_throttle(tmp_path, monkeypatch):
+    manager = StateSaveManager()
+    clock = {"now": 100.0}
+    resolutions = iter([None, tmp_path / "drive"])
+    resolve_calls = []
+    backup_calls = []
+
+    def resolve():
+        resolve_calls.append(clock["now"])
+        return next(resolutions)
+
+    def backup(files, root):
+        backup_calls.append(root)
+        return app_state.BackupResult(success=True, root=root / "quant_app_backup")
+
+    monkeypatch.setattr(app_state.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(app_state, "CLOUD_BACKUP_THROTTLE_SECONDS", 10)
+    monkeypatch.setattr(app_state, "resolve_backup_root", resolve)
+    monkeypatch.setattr(app_state, "backup_state_files", backup)
+
+    assert manager._backup_to_cloud() is None
+    clock["now"] = 105.0
+    assert manager._backup_to_cloud() is None
+    assert resolve_calls == [100.0]
+
+    clock["now"] = 110.0
+    result = manager._backup_to_cloud()
+
+    assert result is not None and result.success
+    assert resolve_calls == [100.0, 110.0]
+    assert backup_calls == [tmp_path / "drive"]
+
+
 def test_superseded_scheduled_save_does_not_leave_status_running(tmp_path, monkeypatch):
     _patch_app_state_paths(monkeypatch, tmp_path)
     manager = StateSaveManager()
