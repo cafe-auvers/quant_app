@@ -45,7 +45,7 @@ from PyQt5.QtWidgets import (
     QMenu,
 )
 from PyQt5.QtCore import Qt, QThread, QTimer, QUrl
-from PyQt5.QtGui import QColor, QKeySequence
+from PyQt5.QtGui import QColor, QDoubleValidator, QKeySequence
 
 try:
     from PyQt5.QtWebEngineWidgets import QWebEngineView
@@ -195,6 +195,15 @@ class DashboardMixin:
             self.update_kis_account_status
         )
         kis_form.addRow("Account", self.kis_account_combo)
+        # This one account selector also drives trade sizing and order routing
+        # (Watchlist ORB panel, Buy Dashboard, real KIS order submission) — it
+        # used to be a second, independently-selectable combo on the Watchlist
+        # tab (trade_kis_account_combo). Aliasing removes the risk of viewing
+        # one account here while orders silently route to a different one.
+        self.trade_kis_account_combo = self.kis_account_combo
+        self.kis_account_combo.currentIndexChanged.connect(
+            self.apply_cached_trade_account_size
+        )
 
         kis_options_layout = QHBoxLayout()
         self.kis_domestic_checkbox = QCheckBox("Domestic")
@@ -205,7 +214,46 @@ class DashboardMixin:
         kis_options_layout.addWidget(self.kis_overseas_checkbox)
         kis_options_layout.addStretch()
         kis_form.addRow("Sections", kis_options_layout)
+
+        # Trade sizing inputs — used by the Watchlist ORB Position Plan panel
+        # and Buy Dashboard for share/capital-% math (moved here from the
+        # Watchlist tab since the capital base is account-level, not per-stock).
+        self.account_size_input = QLineEdit("100000")
+        account_size_validator = QDoubleValidator(
+            0.0, 1_000_000_000_000.0, 2, self.account_size_input
+        )
+        account_size_validator.setNotation(QDoubleValidator.StandardNotation)
+        self.account_size_input.setValidator(account_size_validator)
+        self.account_size_input.setMaximumWidth(120)
+        kis_form.addRow("Sizing Account USD", self.account_size_input)
+
+        fx_row_layout = QHBoxLayout()
+        self.usd_krw_rate_input = QLineEdit()
+        self.usd_krw_rate_input.setPlaceholderText("Fetching...")
+        self.usd_krw_rate_input.setReadOnly(True)
+        self.usd_krw_rate_input.setMaximumWidth(75)
+        fx_row_layout.addWidget(self.usd_krw_rate_input)
+        self.usd_krw_rate_refresh_button = QPushButton("Refresh FX")
+        self.usd_krw_rate_refresh_button.clicked.connect(
+            lambda: self.refresh_usd_krw_rate(show_messages=True)
+        )
+        fx_row_layout.addWidget(self.usd_krw_rate_refresh_button)
+        fx_row_layout.addStretch()
+        kis_form.addRow("USD/KRW", fx_row_layout)
+
+        self.usd_krw_rate_status_label = QLabel("USD/KRW not refreshed")
+        self.usd_krw_rate_status_label.setWordWrap(True)
+        kis_form.addRow("FX Status", self.usd_krw_rate_status_label)
+
         kis_layout.addLayout(kis_form)
+
+        self.account_size_input.textChanged.connect(self.on_account_size_text_changed)
+        self.account_size_input.textChanged.connect(
+            self.recalculate_watchlist_scoreboard_sizes
+        )
+        self.usd_krw_rate_input.textChanged.connect(
+            self.apply_cached_trade_account_size
+        )
 
         self.kis_account_status_label = QLabel()
         self.kis_account_status_label.setWordWrap(True)
@@ -239,6 +287,13 @@ class DashboardMixin:
         self.kis_refresh_button.setObjectName("kisRefreshButton")
         self.kis_refresh_button.clicked.connect(self.refresh_kis_account_snapshot)
         kis_button_layout.addWidget(self.kis_refresh_button)
+        kis_balance_btn = QPushButton("Use KIS Balance")
+        kis_balance_btn.setToolTip(
+            "Fetch the selected account's balance and use it as the sizing "
+            "Account USD (also refreshes USD/KRW)."
+        )
+        kis_balance_btn.clicked.connect(self.refresh_trade_account_size)
+        kis_button_layout.addWidget(kis_balance_btn)
         kis_button_layout.addStretch()
         kis_layout.addLayout(kis_button_layout)
 
@@ -998,7 +1053,14 @@ class DashboardMixin:
         ):
             return
 
-        environment = self.trade_kis_environment_combo.currentText()
+        # trade_kis_environment_combo is built later, in _build_watchlist_tab
+        # (Dashboard is built first). This can fire during Dashboard's own
+        # startup population, before that widget exists yet.
+        environment = (
+            self.trade_kis_environment_combo.currentText()
+            if hasattr(self, "trade_kis_environment_combo")
+            else "PROD"
+        )
         profile = self.trade_kis_account_combo.currentData()
         snapshot = None
         fallback_reason = "no KIS profile selected"

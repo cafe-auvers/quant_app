@@ -171,27 +171,18 @@ class WatchlistMixin:
         left_layout = QVBoxLayout()
         left_layout.setContentsMargins(10, 10, 10, 10)
 
-        # Environment + Account Settings (migrated from Trade Plan tab)
-        env_layout = QHBoxLayout()
-        env_layout.addWidget(QLabel("Trading: PROD — Live"))
+        # Environment combo kept for compatibility (buylist environment tagging
+        # and other callers key off trade_kis_environment_combo). KIS account
+        # selection, Account USD, and USD/KRW now live on the Dashboard tab
+        # (see _build_dashboard_tab) — trade_kis_account_combo, account_size_input,
+        # and usd_krw_rate_input are built there (Dashboard is built first in
+        # _setup_tabs) and reused here under the same attribute names, so this
+        # tab's sizing math is unchanged.
         self.watchlist_env_combo = QComboBox()
         self.watchlist_env_combo.addItem("PROD")
         self.watchlist_env_combo.setVisible(False)
         # trade_kis_environment_combo is the same widget — no separate combo needed
         self.trade_kis_environment_combo = self.watchlist_env_combo
-        env_layout.addSpacing(12)
-        env_layout.addWidget(QLabel("KIS Account:"))
-        self.trade_kis_account_combo = QComboBox()
-        self.trade_kis_account_combo.setMinimumWidth(140)
-        self.trade_kis_account_combo.currentIndexChanged.connect(
-            self.apply_cached_trade_account_size
-        )
-        env_layout.addWidget(self.trade_kis_account_combo)
-        kis_balance_btn = QPushButton("Use KIS Balance")
-        kis_balance_btn.clicked.connect(self.refresh_trade_account_size)
-        env_layout.addWidget(kis_balance_btn)
-        env_layout.addStretch()
-        left_layout.addLayout(env_layout, 0)
 
         sizing_layout = QHBoxLayout()
         sizing_layout.addWidget(QLabel("Buffer %:"))
@@ -210,52 +201,19 @@ class WatchlistMixin:
             self._on_watchlist_orb_filter_changed
         )
         sizing_layout.addWidget(self.watchlist_buffer_pct_input)
-        sizing_layout.addSpacing(10)
-        sizing_layout.addWidget(QLabel("Account USD:"))
-        self.account_size_input = QLineEdit("100000")
-        account_size_validator = QDoubleValidator(
-            0.0, 1_000_000_000_000.0, 2, self.account_size_input
-        )
-        account_size_validator.setNotation(QDoubleValidator.StandardNotation)
-        self.account_size_input.setValidator(account_size_validator)
-        self.account_size_input.setMaximumWidth(90)
-        sizing_layout.addWidget(self.account_size_input)
-        sizing_layout.addSpacing(10)
-        sizing_layout.addWidget(QLabel("Risk %:"))
-        self.risk_percent_input = QLineEdit("1")
-        risk_validator = QDoubleValidator(0.0, 100.0, 4, self.risk_percent_input)
-        risk_validator.setNotation(QDoubleValidator.StandardNotation)
-        self.risk_percent_input.setValidator(risk_validator)
-        self.risk_percent_input.setMaximumWidth(45)
-        sizing_layout.addWidget(self.risk_percent_input)
-        sizing_layout.addSpacing(10)
-        sizing_layout.addWidget(QLabel("USD/KRW:"))
-        self.usd_krw_rate_input = QLineEdit()
-        self.usd_krw_rate_input.setPlaceholderText("Fetching...")
-        self.usd_krw_rate_input.setReadOnly(True)
-        self.usd_krw_rate_input.setMaximumWidth(75)
-        sizing_layout.addWidget(self.usd_krw_rate_input)
-        self.usd_krw_rate_refresh_button = QPushButton("Refresh FX")
-        self.usd_krw_rate_refresh_button.clicked.connect(
-            lambda: self.refresh_usd_krw_rate(show_messages=True)
-        )
-        sizing_layout.addWidget(self.usd_krw_rate_refresh_button)
-        self.usd_krw_rate_status_label = QLabel("USD/KRW not refreshed")
-        self.usd_krw_rate_status_label.setMinimumWidth(190)
-        sizing_layout.addWidget(self.usd_krw_rate_status_label)
         sizing_layout.addStretch()
         left_layout.addLayout(sizing_layout, 0)
-
-        self.account_size_input.textChanged.connect(self.on_account_size_text_changed)
-        self.account_size_input.textChanged.connect(
-            self.recalculate_watchlist_scoreboard_sizes
-        )
-        self.risk_percent_input.textChanged.connect(
-            self.recalculate_watchlist_scoreboard_sizes
-        )
-        self.usd_krw_rate_input.textChanged.connect(
-            self.apply_cached_trade_account_size
-        )
+        # risk_percent_input was removed entirely (2026-08-09): the ORB Position
+        # Plan table already sweeps every risk case (0.25%-2%), and a selected
+        # column's risk_percent is locked in and used for real order sizing
+        # (see execution_queue.py: build_or_update_from_watchlist_item /
+        # lock_risk_percent) — a single global override added no value. Every
+        # read site (buylist_mixin.py, scanner_mixin.py, workers.py, and the
+        # rest of this file) already guards with hasattr(self, "risk_percent_input")
+        # and falls back to 1%, so no widget needs to exist.
+        # account_size_input / usd_krw_rate_input / trade_kis_account_combo are
+        # built on the Dashboard tab (_build_dashboard_tab) along with their
+        # signal wiring — see the "KIS Account Snapshot" group there.
         # NOTE: initial population of trade_kis_account_combo happens in _setup_tabs via an
         # explicit populate_trade_account_combo() call after the signal wiring. Do NOT add a
         # duplicate currentTextChanged connection here.
@@ -1381,7 +1339,11 @@ class WatchlistMixin:
             else "PROD"
         )
         account_size = self._get_account_balance_for_env(env)
-        risk_percent = self._parse_float(self.risk_percent_input, 1.0) / 100.0
+        risk_percent = (
+            self._parse_float(self.risk_percent_input, 1.0) / 100.0
+            if hasattr(self, "risk_percent_input")
+            else 0.01
+        )
 
         active_plans = (
             {

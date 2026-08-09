@@ -1031,7 +1031,11 @@ class SingleStockAiWorker(QThread):
             else "PROD"
         )
         self.account_size = parent._get_account_balance_for_env(self.env)
-        self.risk_percent = parent._parse_float(parent.risk_percent_input, 1.0) / 100.0
+        self.risk_percent = (
+            parent._parse_float(parent.risk_percent_input, 1.0) / 100.0
+            if hasattr(parent, "risk_percent_input")
+            else 0.01
+        )
 
     def run(self) -> None:
         import pandas as pd
