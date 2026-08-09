@@ -78,9 +78,13 @@ KIS_PROD_ACCOUNT_NO=87654321-01
 
 KIS_INTRADAY_ENABLED=false
 OPENAI_API_KEY=
+
+QUANT_BACKUP_DIR=G:\My Drive
 ```
 
 Only enable KIS intraday after the endpoint, TR ID, request parameters, output field, and raw OHLCV field mappings have been verified.
+
+`QUANT_BACKUP_DIR` is optional -- see [docs/cloud_backup.md](docs/cloud_backup.md) for what it does and why (offsite backup of the gitignored `data/*.json` state files). Auto-detected if unset and a Google Drive for Desktop folder is present.
 
 ## Production Safety
 

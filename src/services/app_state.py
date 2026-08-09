@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from src.core.watchlist import BuylistManager, TradePlanManager, Watchlist
+from src.services.cloud_backup import BackupResult, backup_state_files, resolve_backup_root
 from src.services.state_sync import (
     BUYLIST_KEY,
     PULL_ERROR,
@@ -47,6 +48,42 @@ LEGACY_NON_PRODUCTION_BUYLIST_FILE = DATA_DIR / "legacy_non_prod_buylist.json"
 LEGACY_NON_PRODUCTION_EXECUTION_QUEUE_FILE = (
     DATA_DIR / "legacy_non_prod_execution_queue.json"
 )
+# Path constants duplicated (not imported) from their owning modules --
+# order_ledger.py's ORDERS_FILE and buylist_mixin.py's EXECUTION_QUEUE_FILE
+# -- to avoid a circular import (buylist_mixin already imports from this
+# module). Keep these in sync with those modules if either path ever moves.
+ORDERS_FILE = DATA_DIR / "orders.json"
+EXECUTION_QUEUE_FILE = DATA_DIR / "execution_queue.json"
+
+# Every gitignored user-state file worth recovering after a lost disk --
+# read fresh from disk at backup time rather than passed in-memory, so this
+# stays correct regardless of which save path (StateSaveManager vs. a direct
+# save_json elsewhere, e.g. settings.json) last wrote each one.
+#
+# orders.json (order ledger) and execution_queue.json (live execution
+# queue) were missed in the first pass of this list -- both are real,
+# actively-written trading state, not the cosmetic files they were
+# initially grouped with. The legacy_non_prod_* archives are lower-value
+# but still real historical records, so they're included too. Regenerable
+# caches (sp500_tickers.csv, us_kis_tickers.csv -- re-fetched automatically
+# when missing, see data_loader.py) and one-off debug snapshots
+# (watchlist_snapshot_*.json) are deliberately left out, same reasoning as
+# local_mirror.db: nothing there can't be recreated or wasn't optional in
+# the first place.
+CLOUD_BACKUP_FILES = (
+    WATCHLIST_FILE,
+    BUYLIST_FILE,
+    TRADE_PLANS_FILE,
+    SCANNER_SETUPS_FILE,
+    CHART_DRAWINGS_FILE,
+    TAB_OPTIONS_FILE,
+    SETTINGS_FILE,
+    ORDERS_FILE,
+    EXECUTION_QUEUE_FILE,
+    LEGACY_NON_PRODUCTION_BUYLIST_FILE,
+    LEGACY_NON_PRODUCTION_EXECUTION_QUEUE_FILE,
+)
+CLOUD_BACKUP_THROTTLE_SECONDS = 600  # at most one backup pass per 10 minutes
 
 
 def _rejection_collector() -> tuple[
@@ -135,6 +172,9 @@ class StateSaveManager:
         self._engine = None
         self._device_id = ""
         self._is_main_device = False
+        self._backup_root: Path | None = None
+        self._backup_root_resolved = False
+        self._last_backup_attempt_at: float | None = None
 
     def set_engine(
         self,
@@ -285,6 +325,10 @@ class StateSaveManager:
                         append_log,
                         "Remote state save failed; the local copy remains safe.",
                     )
+                try:
+                    self._backup_to_cloud(append_log=append_log)
+                except Exception:
+                    logger.debug("Cloud backup failed", exc_info=True)
 
             self._store_result(result)
             self._write_metadata(result, append_log=append_log)
@@ -362,6 +406,62 @@ class StateSaveManager:
 
         if written_entries:
             _update_sync_entries(written_entries, self._metadata_path())
+
+    def _backup_to_cloud(
+        self,
+        *,
+        append_log: Callable[[str], None] | None = None,
+    ) -> Optional[BackupResult]:
+        """Best-effort copy of user-state files into a synced Drive folder.
+
+        Runs after every successful local save, but throttled to at most
+        once per `CLOUD_BACKUP_THROTTLE_SECONDS` -- the local write already
+        happened regardless, this is purely extra offsite insurance and
+        shouldn't spam the sync client on every keystroke-driven save.
+        """
+        if not self._backup_root_resolved:
+            self._backup_root = resolve_backup_root()
+            self._backup_root_resolved = True
+            if self._backup_root is None:
+                _append_sync_message(
+                    append_log,
+                    "Cloud backup destination not found (no synced Drive folder "
+                    "detected); local saves remain safe but unmirrored offsite.",
+                )
+            else:
+                _append_sync_message(
+                    append_log,
+                    f"Cloud backup destination: {self._backup_root}",
+                )
+
+        if self._backup_root is None:
+            return None
+
+        now = time.monotonic()
+        if (
+            self._last_backup_attempt_at is not None
+            and now - self._last_backup_attempt_at < CLOUD_BACKUP_THROTTLE_SECONDS
+        ):
+            return None
+        self._last_backup_attempt_at = now
+
+        result = backup_state_files(CLOUD_BACKUP_FILES, self._backup_root)
+        if not result.success:
+            _append_sync_message(
+                append_log,
+                f"Cloud backup failed; the local copy remains safe: {result.error}",
+            )
+        elif result.backed_up:
+            # Always goes to the persistent rotating log file (logger.info);
+            # only echoed to the in-app panel on the (rarer) day a fresh
+            # daily snapshot is cut, so routine 10-minute passes don't spam
+            # the on-screen log the way every failure or the daily cut does.
+            suffix = " (new daily snapshot)" if result.daily_snapshot_created else ""
+            message = f"Cloud backup: {len(result.backed_up)} file(s) -> {result.root}{suffix}"
+            logger.info(message)
+            if result.daily_snapshot_created:
+                _append_sync_message(append_log, message)
+        return result
 
     def wait_for_pending_saves(self, timeout: float | None = None) -> bool:
         """Wait for currently scheduled saves, returning False on timeout."""

@@ -4,6 +4,8 @@ import datetime as dt
 import logging
 import math
 import os
+import subprocess
+import sys
 import threading
 import time
 import webbrowser
@@ -12,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 from PyQt5.QtWidgets import (
+    QApplication,
     QMainWindow,
     QWidget,
     QVBoxLayout,
@@ -38,7 +41,7 @@ from src.core.order_state import BrokerOrder, OrderIntent, OrderSide, OrderStatu
 from src.core.scanner import StockScanner
 from src.core.watchlist import Watchlist, TradePlanManager, BuylistManager
 from src.core.trade_reviewer import TradeReviewer
-from src.utils.config import RULEBOOK_DIR
+from src.utils.config import ROOT_DIR, RULEBOOK_DIR
 from src.utils.db_loader import local_mirror_is_stale, resolve_data_engine
 from src.utils.market_calendar import expected_latest_market_data_date
 from src.utils.storage import load_json
@@ -72,7 +75,7 @@ from src.ui.controllers import (
     ScannerController,
     WatchlistController,
 )
-from src.ui.dialogs import SettingsDialog
+from src.ui.dialogs import BackupEnvDialog, RestoreBackupDialog, RestoreEnvDialog, SettingsDialog
 from src.ui.mixins.sidebar_mixin import SidebarMixin
 from src.ui.mixins.dashboard_mixin import DashboardMixin
 from src.ui.mixins.scanner_mixin import ScannerMixin
@@ -1339,6 +1342,14 @@ class MainWindow(
         settings_action.triggered.connect(self.show_settings_dialog)
         save_action = file_menu.addAction("Save Local Data")
         save_action.triggered.connect(self.save_local_data)
+        restore_action = file_menu.addAction("Restore from Cloud Backup...")
+        restore_action.triggered.connect(self.show_restore_backup_dialog)
+        file_menu.addSeparator()
+        backup_env_action = file_menu.addAction("Backup .env to Cloud (Encrypted)...")
+        backup_env_action.triggered.connect(self.show_backup_env_dialog)
+        restore_env_action = file_menu.addAction("Restore .env from Cloud (Encrypted)...")
+        restore_env_action.triggered.connect(self.show_restore_env_dialog)
+        file_menu.addSeparator()
         exit_action = file_menu.addAction("Exit")
         exit_action.triggered.connect(self.close)
 
@@ -1970,6 +1981,79 @@ class MainWindow(
             "Saved",
             "Local watchlist, trade plans, and scanner setups have been saved.",
         )
+
+    def show_restore_backup_dialog(self) -> None:
+        """File > Restore from Cloud Backup -- pick a snapshot, restore it, offer to restart."""
+        dialog = RestoreBackupDialog(self)
+        if dialog.exec_() != QDialog.Accepted or dialog.result_summary is None:
+            return
+
+        result = dialog.result_summary
+        self.append_log(
+            f"Restored {len(result.restored)} file(s) from cloud backup "
+            f"({result.source}): {', '.join(result.restored)}"
+        )
+
+        message = f"Restored {len(result.restored)} file(s):\n" + "\n".join(result.restored)
+        if result.preserved_originals_dir:
+            message += (
+                "\n\nYour previous local copies were preserved at:\n"
+                f"{result.preserved_originals_dir}"
+            )
+        message += (
+            "\n\nThe app needs to restart to load the restored data. "
+            "Restart now?"
+        )
+        reply = QMessageBox.question(
+            self,
+            "Restore Complete",
+            message,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if reply == QMessageBox.Yes:
+            self._restart_application()
+
+    def show_backup_env_dialog(self) -> None:
+        """File > Backup .env to Cloud (Encrypted) -- manual, passphrase-gated."""
+        dialog = BackupEnvDialog(self)
+        if dialog.exec_() == QDialog.Accepted:
+            self.append_log("Encrypted .env backup written to cloud backup destination.")
+
+    def show_restore_env_dialog(self) -> None:
+        """File > Restore .env from Cloud (Encrypted) -- manual, passphrase-gated."""
+        dialog = RestoreEnvDialog(self)
+        if dialog.exec_() != QDialog.Accepted or not dialog.restored:
+            return
+
+        self.append_log("Restored .env from encrypted cloud backup.")
+        message = ".env restored from the encrypted cloud backup."
+        if dialog.preserved_original:
+            message += f"\n\nYour previous local .env was preserved at:\n{dialog.preserved_original}"
+        message += "\n\nThe app needs to restart to load the restored credentials. Restart now?"
+        reply = QMessageBox.question(
+            self,
+            "Restore Complete",
+            message,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if reply == QMessageBox.Yes:
+            self._restart_application()
+
+    def _restart_application(self) -> None:
+        """Relaunch main.py in a new process, then quit this one."""
+        main_py = ROOT_DIR / "main.py"
+        try:
+            subprocess.Popen([sys.executable, str(main_py)], cwd=str(ROOT_DIR))
+        except OSError as exc:
+            QMessageBox.warning(
+                self,
+                "Restart Failed",
+                f"Could not relaunch automatically: {exc}\nPlease restart the app manually.",
+            )
+            return
+        QApplication.instance().quit()
 
     def _parse_float(self, value: QLineEdit, default: float) -> float:
         try:

@@ -10,6 +10,7 @@ yfinance>=0.2.0
 SQLAlchemy>=2.0.0
 PyMySQL>=1.1.0
 python-dotenv>=0.20.0
+cryptography>=42.0.0
 pydantic>=1.10.0
 pytest>=7.0.0
 pytest-qt>=4.0.0
