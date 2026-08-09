@@ -1367,11 +1367,7 @@ class WatchlistMixin:
         self.watchlist_worker.finished_analysis_df.connect(
             self.on_watchlist_df_finished
         )
-        self.watchlist_worker.finished.connect(
-            lambda worker=self.watchlist_worker: self._clear_worker_reference(
-                "watchlist_worker", worker
-            )
-        )
+        self._track_worker("watchlist_worker", self.watchlist_worker)
         self.watchlist_worker.start()
 
     def on_watchlist_df_finished(self, df: pd.DataFrame) -> None:

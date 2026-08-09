@@ -723,11 +723,7 @@ class ScannerMixin:
         self.scanner_worker.log_message.connect(self.append_log)
         self.scanner_worker.finished_scan.connect(self._on_scanner_finished)
         self.scanner_worker.error_occurred.connect(self._on_scanner_error)
-        self.scanner_worker.finished.connect(
-            lambda worker=self.scanner_worker: self._clear_worker_reference(
-                "scanner_worker", worker
-            )
-        )
+        self._track_worker("scanner_worker", self.scanner_worker)
         self.scanner_worker.start()
 
     def _on_scanner_universe_loaded(self, tickers: List[str]) -> None:
@@ -892,11 +888,7 @@ class ScannerMixin:
             self._log_intraday_provider_warning
         )
         self.intraday_bulk_worker.finished_bulk.connect(self._on_intraday_bulk_finished)
-        self.intraday_bulk_worker.finished.connect(
-            lambda worker=self.intraday_bulk_worker: self._clear_worker_reference(
-                "intraday_bulk_worker", worker
-            )
-        )
+        self._track_worker("intraday_bulk_worker", self.intraday_bulk_worker)
         self.intraday_bulk_worker.start()
 
     def _finish_scanner_after_orb_phase(self, selected_source: Optional[dict]) -> None:

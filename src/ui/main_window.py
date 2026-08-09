@@ -31,7 +31,7 @@ from PyQt5.QtWidgets import (
     QDialog,
     QPushButton,
 )
-from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QKeySequence
 
 try:
@@ -242,9 +242,18 @@ class MainWindow(
 ):
     """Main dashboard window."""
 
+    log_message_requested = pyqtSignal(str)
+    worker_cleanup_requested = pyqtSignal(object)
+
     def __init__(self):
         """Initialize the main window."""
         super().__init__()
+        # ``append_log`` is also passed to the plain Python thread used for
+        # background state saves.  Always cross back through a Qt signal before
+        # touching the QTextEdit so that every widget mutation runs on the GUI
+        # thread.
+        self.log_message_requested.connect(self._append_log_on_ui_thread)
+        self.worker_cleanup_requested.connect(self._on_tracked_worker_finished)
         self.setWindowTitle("Stock Dashboard")
         self._apply_global_stylesheet()
         self.setGeometry(100, 100, 1600, 900)
@@ -315,6 +324,7 @@ class MainWindow(
         self._pending_reconciliation_groups: List[Tuple[str, str]] = []
         self.kis_retry_timer = None
         self.fx_rate_worker = None
+        self._tracked_workers: dict[QThread, tuple[str, Optional[str]]] = {}
         self.usd_krw_rate_source = ""
         self.intraday_fetch_worker = None
         self.intraday_bulk_worker = None
@@ -397,11 +407,7 @@ class MainWindow(
         worker = DatabaseInitWorker()
         self.database_init_worker = worker
         worker.initialized.connect(self._on_optional_database_initialized)
-        worker.finished.connect(
-            lambda finished_worker=worker: self._clear_worker_reference(
-                "database_init_worker", finished_worker
-            )
-        )
+        self._track_worker("database_init_worker", worker)
         worker.start()
 
     def _on_optional_database_initialized(
@@ -447,11 +453,7 @@ class MainWindow(
         worker = LocalMirrorSyncWorker(pc_engine, local_engine)
         self._local_mirror_sync_worker = worker
         worker.completed.connect(self._on_local_mirror_sync_completed)
-        worker.finished.connect(
-            lambda finished_worker=worker: self._clear_worker_reference(
-                "_local_mirror_sync_worker", finished_worker
-            )
-        )
+        self._track_worker("_local_mirror_sync_worker", worker)
         worker.start()
 
     def _on_local_mirror_sync_completed(self, written: dict, error: str) -> None:
@@ -558,11 +560,7 @@ class MainWindow(
         self.state_sync_worker = worker
         self._state_sync_action = "activate" if activate else "reconcile"
         worker.completed.connect(self._on_state_sync_completed)
-        worker.finished.connect(
-            lambda finished_worker=worker: self._clear_worker_reference(
-                "state_sync_worker", finished_worker
-            )
-        )
+        self._track_worker("state_sync_worker", worker)
         if activate and hasattr(self, "main_device_button"):
             self.main_device_button.setEnabled(False)
             self.main_device_button.setText("Activating Main Device...")
@@ -1265,6 +1263,7 @@ class MainWindow(
             self._refresh_poll_timer.stop()
         candidate_workers = [
             getattr(self, "database_init_worker", None),
+            getattr(self, "_local_mirror_sync_worker", None),
             getattr(self, "state_sync_worker", None),
             getattr(self, "_pc_status_worker", None),
             self.scanner_worker,
@@ -1281,6 +1280,7 @@ class MainWindow(
             getattr(self, "broker_order_cancel_worker", None),
             *getattr(self, "_buylist_order_workers", []),
             *getattr(self, "_buylist_aux_workers", []),
+            *list(getattr(self, "_tracked_workers", {})),
         ]
         seen_workers: set[int] = set()
         running_workers = []
@@ -1314,9 +1314,60 @@ class MainWindow(
             )
         super().closeEvent(event)
 
+    def _track_worker(
+        self,
+        attribute_name: str,
+        worker: QThread,
+        *,
+        collection_name: Optional[str] = None,
+    ) -> None:
+        """Keep a QThread alive and request cleanup without using sender()."""
+        if not isinstance(worker, QThread):
+            # Lightweight test doubles do not have Qt ownership or affinity.
+            worker.finished.connect(
+                lambda current=worker: self._clear_worker_reference(
+                    attribute_name, current
+                )
+            )
+            return
+
+        if worker.parent() is None:
+            worker.setParent(self)
+        tracked = getattr(self, "_tracked_workers", None)
+        if tracked is None:
+            tracked = {}
+            self._tracked_workers = tracked
+        if worker in tracked:
+            return
+        tracked[worker] = (attribute_name, collection_name)
+        # A receiver-less lambda may run on the worker thread.  It only emits
+        # a Qt signal; all object/reference mutation happens in the slot on the
+        # MainWindow thread.  Passing the worker explicitly also avoids the
+        # fragile QObject.sender() wrapper path seen in the native crash.
+        worker.finished.connect(
+            lambda current=worker: self.worker_cleanup_requested.emit(current)
+        )
+
+    @pyqtSlot(object)
+    def _on_tracked_worker_finished(self, worker: QThread) -> None:
+        tracked = getattr(self, "_tracked_workers", {})
+        details = tracked.pop(worker, None)
+        if details is None:
+            return
+        attribute_name, collection_name = details
+        if collection_name:
+            collection = getattr(self, collection_name, [])
+            if worker in collection:
+                collection.remove(worker)
+        self._clear_worker_reference(attribute_name, worker)
+
     def _clear_worker_reference(self, attribute_name: str, worker: QThread) -> None:
         if getattr(self, attribute_name, None) is worker:
             setattr(self, attribute_name, None)
+        try:
+            worker.deleteLater()
+        except (AttributeError, RuntimeError):
+            pass
 
     def _setup_tabs(self):
         """Set up the tab views."""
@@ -1533,6 +1584,12 @@ class MainWindow(
         self.state_sync_timer.start()
 
     def append_log(self, message: str) -> None:
+        """Request an in-app log update from any thread."""
+        self.log_message_requested.emit(str(message))
+
+    @pyqtSlot(str)
+    def _append_log_on_ui_thread(self, message: str) -> None:
+        """Append a log line on the window's Qt thread."""
         if not hasattr(self, "log_output"):
             return
         timestamp = pd.Timestamp.now().strftime("%H:%M:%S")
@@ -1716,16 +1773,12 @@ class MainWindow(
         worker = PcRemoteStatusWorker(self.pc_db_engine, parent=self)
         self._pc_status_worker = worker
         worker.finished_status.connect(self._on_pc_status_result)
-        worker.finished.connect(self._on_pc_status_worker_finished)
+        self._track_worker("_pc_status_worker", worker)
         worker.start()
 
-    def _on_pc_status_worker_finished(self, worker=None) -> None:
+    def _on_pc_status_worker_finished(self, worker) -> None:
         """Release a status worker only after Qt has finished its thread."""
-        worker = worker or self.sender()
-        if worker is self._pc_status_worker:
-            self._pc_status_worker = None
-        if worker is not None:
-            worker.deleteLater()
+        self._clear_worker_reference("_pc_status_worker", worker)
 
     def _on_pc_status_result(self, status) -> None:
         from src.services.pc_remote_control import PcStatus

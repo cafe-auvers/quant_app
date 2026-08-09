@@ -2037,11 +2037,7 @@ class ChartsControllerMixin:
             self._log_intraday_provider_warning
         )
         self.intraday_fetch_worker.error_occurred.connect(self._on_intraday_fetch_error)
-        self.intraday_fetch_worker.finished.connect(
-            lambda worker=self.intraday_fetch_worker: self._clear_worker_reference(
-                "intraday_fetch_worker", worker
-            )
-        )
+        self._track_worker("intraday_fetch_worker", self.intraday_fetch_worker)
         self.intraday_fetch_worker.start()
         return True
 
@@ -2170,11 +2166,7 @@ class ChartsControllerMixin:
             self._log_intraday_provider_warning
         )
         self.intraday_bulk_worker.finished_bulk.connect(self._on_intraday_bulk_finished)
-        self.intraday_bulk_worker.finished.connect(
-            lambda worker=self.intraday_bulk_worker: self._clear_worker_reference(
-                "intraday_bulk_worker", worker
-            )
-        )
+        self._track_worker("intraday_bulk_worker", self.intraday_bulk_worker)
         self.intraday_bulk_worker.start()
 
     def _on_intraday_bulk_progress(self, symbol: str, index: int, total: int) -> None:

@@ -4165,8 +4165,8 @@ class BuylistMixin:
         self.order_reconciliation_worker.error_occurred.connect(
             lambda message: self.append_log(f"Order reconciliation failed: {message}")
         )
-        self.order_reconciliation_worker.finished.connect(
-            lambda: setattr(self, "order_reconciliation_worker", None)
+        self._track_worker(
+            "order_reconciliation_worker", self.order_reconciliation_worker
         )
         self.order_reconciliation_worker.start()
         self.append_log(
@@ -4443,6 +4443,13 @@ class BuylistMixin:
             self._buylist_order_workers = workers
         if worker not in workers:
             workers.append(worker)
+        if isinstance(worker, QThread):
+            self._track_worker(
+                "kis_order_worker",
+                worker,
+                collection_name="_buylist_order_workers",
+            )
+            return
         finished = getattr(worker, "finished", None)
         if hasattr(finished, "connect"):
             finished.connect(lambda current=worker: self._cleanup_order_worker(current))
@@ -4455,6 +4462,13 @@ class BuylistMixin:
             self._buylist_aux_workers = workers
         if worker not in workers:
             workers.append(worker)
+        if isinstance(worker, QThread):
+            self._track_worker(
+                attribute_name,
+                worker,
+                collection_name="_buylist_aux_workers",
+            )
+            return
         finished = getattr(worker, "finished", None)
         if hasattr(finished, "connect"):
             finished.connect(

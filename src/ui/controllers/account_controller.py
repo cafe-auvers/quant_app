@@ -112,11 +112,7 @@ class AccountController(WindowController):
                 error, requested
             )
         )
-        self.kis_account_worker.finished.connect(
-            lambda worker=self.kis_account_worker: self._clear_worker_reference(
-                "kis_account_worker", worker
-            )
-        )
+        self._track_worker("kis_account_worker", self.kis_account_worker)
         self.kis_account_worker.start()
 
     def sync_positions_from_kis(

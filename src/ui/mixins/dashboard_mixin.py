@@ -535,11 +535,7 @@ class DashboardMixin:
         self.kis_startup_worker.finished_profiles.connect(
             self._on_startup_kis_accounts_finished
         )
-        self.kis_startup_worker.finished.connect(
-            lambda worker=self.kis_startup_worker: self._clear_worker_reference(
-                "kis_startup_worker", worker
-            )
-        )
+        self._track_worker("kis_startup_worker", self.kis_startup_worker)
         self.kis_startup_worker.start()
 
     def _on_startup_kis_accounts_finished(self, snapshots: dict, errors: list) -> None:
@@ -644,11 +640,7 @@ class DashboardMixin:
                 error, requested
             )
         )
-        self.kis_account_worker.finished.connect(
-            lambda worker=self.kis_account_worker: self._clear_worker_reference(
-                "kis_account_worker", worker
-            )
-        )
+        self._track_worker("kis_account_worker", self.kis_account_worker)
         self.kis_account_worker.start()
 
     def _on_kis_snapshot_finished(
@@ -996,11 +988,7 @@ class DashboardMixin:
         self.fx_rate_worker = FxRateWorker(snapshot=snapshot)
         self.fx_rate_worker.finished_rate.connect(self._on_usd_krw_rate_finished)
         self.fx_rate_worker.error_occurred.connect(self._on_usd_krw_rate_error)
-        self.fx_rate_worker.finished.connect(
-            lambda worker=self.fx_rate_worker: self._clear_worker_reference(
-                "fx_rate_worker", worker
-            )
-        )
+        self._track_worker("fx_rate_worker", self.fx_rate_worker)
         self.fx_rate_worker.start()
 
     def _selected_trade_account_snapshot(self) -> Optional[dict]:
@@ -1433,11 +1421,7 @@ class DashboardMixin:
         self.single_ai_worker.finished_analysis.connect(
             self.on_single_stock_ai_finished
         )
-        self.single_ai_worker.finished.connect(
-            lambda worker=self.single_ai_worker: self._clear_worker_reference(
-                "single_ai_worker", worker
-            )
-        )
+        self._track_worker("single_ai_worker", self.single_ai_worker)
         self.single_ai_worker.start()
 
     def on_single_stock_ai_finished(self, ai_res: dict) -> None:

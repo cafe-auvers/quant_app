@@ -1,11 +1,25 @@
 """
 PyQt5 Stock Dashboard - Main Application Entry Point
 """
+import faulthandler
 import logging
+import os
 import sys
 import traceback
-from PyQt5.QtCore import qInstallMessageHandler
-from PyQt5.QtWidgets import QApplication
+
+
+def _configure_qt_rendering_environment(platform: str | None = None) -> None:
+    """Use Qt's software renderer by default on Windows driver stacks."""
+    if (platform or sys.platform) != "win32":
+        return
+    # These must be present before importing PyQt/QtWebEngine.  Explicit user
+    # values still win, which keeps hardware acceleration opt-in for machines
+    # with a current, stable graphics driver.
+    os.environ.setdefault("QT_OPENGL", "software")
+    os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu")
+
+
+_configure_qt_rendering_environment()
 
 from src.utils.logging_config import configure_logging
 
@@ -45,7 +59,14 @@ def _install_global_excepthook():
 
 def main():
     """Initialize and run the application."""
+    from PyQt5.QtCore import qInstallMessageHandler
+    from PyQt5.QtWidgets import QApplication
+
     configure_logging()
+    try:
+        faulthandler.enable(all_threads=True)
+    except (OSError, RuntimeError):
+        logger.warning("Native Python fault tracing could not be enabled.")
     _install_global_excepthook()
     qInstallMessageHandler(_qt_message_handler)
     from src.ui.main_window import MainWindow
