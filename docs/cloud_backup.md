@@ -83,11 +83,10 @@ were already captured that day.
      by default).
    - **Stream files** -- files show as on-demand placeholders until opened,
      but writing new files into the folder still works and still uploads.
-3. That's it -- `resolve_backup_root()` auto-detects the folder on the first
-   backup attempt in each app run (checks drive letters `A:` through `Z:` for
-   a `My Drive` folder, then a few common home-folder locations). If Drive is
-   installed after the app has already logged that no destination was found,
-   restart the app.
+3. That's it -- `resolve_backup_root()` auto-detects the folder on a backup
+   attempt (checks drive letters `A:` through `Z:` for a `My Drive` folder,
+   then a few common home-folder locations). If Drive is not mounted yet,
+   the app retries discovery on later saves, at most once per 10 minutes.
 4. To point at a specific folder instead of relying on auto-detection (a
    renamed Drive folder, OneDrive, a different drive letter, testing),
    set `QUANT_BACKUP_DIR` in `.env`:

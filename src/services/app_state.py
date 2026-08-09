@@ -159,7 +159,7 @@ class StateSaveManager:
         self._device_id = ""
         self._is_main_device = False
         self._backup_root: Path | None = None
-        self._backup_root_resolved = False
+        self._backup_destination_missing_logged = False
         self._last_backup_attempt_at: float | None = None
 
     def set_engine(
@@ -405,24 +405,6 @@ class StateSaveManager:
         happened regardless, this is purely extra offsite insurance and
         shouldn't spam the sync client on every keystroke-driven save.
         """
-        if not self._backup_root_resolved:
-            self._backup_root = resolve_backup_root()
-            self._backup_root_resolved = True
-            if self._backup_root is None:
-                _append_sync_message(
-                    append_log,
-                    "Cloud backup destination not found (no synced Drive folder "
-                    "detected); local saves remain safe but unmirrored offsite.",
-                )
-            else:
-                _append_sync_message(
-                    append_log,
-                    f"Cloud backup destination: {self._backup_root}",
-                )
-
-        if self._backup_root is None:
-            return None
-
         now = time.monotonic()
         if (
             self._last_backup_attempt_at is not None
@@ -431,12 +413,35 @@ class StateSaveManager:
             return None
         self._last_backup_attempt_at = now
 
+        if self._backup_root is None:
+            self._backup_root = resolve_backup_root()
+            if self._backup_root is None:
+                if not self._backup_destination_missing_logged:
+                    _append_sync_message(
+                        append_log,
+                        "Cloud backup destination not found (no synced Drive folder "
+                        "detected); local saves remain safe but unmirrored offsite.",
+                    )
+                    self._backup_destination_missing_logged = True
+            else:
+                self._backup_destination_missing_logged = False
+                _append_sync_message(
+                    append_log,
+                    f"Cloud backup destination: {self._backup_root}",
+                )
+
+        if self._backup_root is None:
+            return None
+
         result = backup_state_files(CLOUD_BACKUP_FILES, self._backup_root)
         if not result.success:
             _append_sync_message(
                 append_log,
                 f"Cloud backup failed; the local copy remains safe: {result.error}",
             )
+            # Re-resolve next time in case a streamed/mirrored Drive was
+            # temporarily unmounted or its drive letter changed.
+            self._backup_root = None
         elif result.backed_up:
             # Always goes to the persistent rotating log file (logger.info);
             # only echoed to the in-app panel on the (rarer) day a fresh
