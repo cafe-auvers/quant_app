@@ -145,7 +145,15 @@ def get_mysql_connection_url(db_name: Optional[str] = None) -> URL:
     )
 
 
-def init_mysql_engine(db_name: Optional[str] = None) -> Optional[Engine]:
+def init_mysql_engine(
+    db_name: Optional[str] = None, *, log_unavailable: bool = True
+) -> Optional[Engine]:
+    """Open the optional MySQL cache, returning ``None`` when unavailable.
+
+    Periodic connectivity probes can set ``log_unavailable=False`` to keep an
+    expected offline PC from producing the same INFO message on every poll.
+    The failure remains available at DEBUG level for diagnostics.
+    """
     engine: Optional[Engine] = None
     try:
         if db_name is None:
@@ -178,7 +186,8 @@ def init_mysql_engine(db_name: Optional[str] = None) -> Optional[Engine]:
     except (ImportError, OSError, SQLAlchemyError, ValueError, TypeError) as exc:
         if engine is not None:
             engine.dispose()
-        logger.info("MySQL cache disabled: %s", exc)
+        log = logger.info if log_unavailable else logger.debug
+        log("MySQL cache disabled: %s", exc)
         return None
 
 

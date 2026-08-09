@@ -96,6 +96,31 @@ def test_runtime_monitoring_failure_does_not_hide_database_connectivity(monkeypa
     assert results[0].main_app_active is None
 
 
+def test_pc_status_worker_silences_expected_mysql_probe_failures(monkeypatch):
+    monkeypatch.setattr(
+        "src.services.pc_remote_control.check_pc_status",
+        lambda: PcStatus.OFF,
+    )
+    probe_calls = []
+
+    def unavailable_engine(*, log_unavailable=True):
+        probe_calls.append(log_unavailable)
+        return None
+
+    monkeypatch.setattr(
+        "src.utils.db_loader.init_mysql_engine",
+        unavailable_engine,
+    )
+    results = []
+    worker = PcRemoteStatusWorker()
+    worker.finished_status.connect(results.append)
+
+    worker.run()
+
+    assert probe_calls == [False]
+    assert results[0].database_ready is False
+
+
 class _WidgetStub:
     def __init__(self):
         self.text = ""
