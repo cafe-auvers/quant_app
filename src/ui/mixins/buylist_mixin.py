@@ -479,9 +479,9 @@ class BuylistMixin:
                 capital_pct = queue_display.capital_percent
             else:
                 account_size = (
-                    self._parse_float(self.account_size_input, 100000.0)
+                    self._parse_float(self.account_size_input, 0.0)
                     if hasattr(self, "account_size_input")
-                    else 100000.0
+                    else 0.0
                 )
                 capital_pct = (
                     item.shares_held * item.avg_cost / account_size * 100.0

@@ -120,7 +120,7 @@ def test_live_fx_callback_updates_watchlist_and_dashboard_snapshot():
     assert "@ 1450.00 KRW/USD" in window.kis_account_summary_label.text
 
 
-def test_kis_account_conversion_waits_for_live_fx_rate():
+def test_kis_account_conversion_clears_stale_size_without_live_fx_rate():
     profile = {"environment": "PROD", "account_no": "11111111-01"}
     account_input = _TextInput("25000.00")
     logs = []
@@ -138,14 +138,83 @@ def test_kis_account_conversion_waits_for_live_fx_rate():
             float(input_widget.text()) if input_widget.text() else default
         ),
         append_log=logs.append,
+        update_trade_plan_feedback=lambda: None,
+        recalculate_watchlist_scoreboard_sizes=lambda: None,
     )
 
     DashboardMixin.apply_cached_trade_account_size(window)
 
-    assert account_input.text() == "25000.00"
+    assert account_input.text() == ""
     assert logs == [
-        "KIS account conversion deferred until a live USD/KRW rate is available."
+        "KIS position sizing unavailable for PROD: live USD/KRW rate is unavailable."
     ]
+
+
+def test_kis_account_conversion_clears_stale_size_without_snapshot():
+    profile = {"environment": "PROD", "account_no": "11111111-01"}
+    account_input = _TextInput("25000.00")
+    logs = []
+    window = SimpleNamespace(
+        trade_kis_environment_combo=_Combo(text="PROD"),
+        trade_kis_account_combo=_Combo(data=profile),
+        account_size_input=account_input,
+        usd_krw_rate_input=_TextInput("1450.00"),
+        kis_account_snapshots={},
+        _parse_float=lambda input_widget, default: (
+            float(input_widget.text()) if input_widget.text() else default
+        ),
+        append_log=logs.append,
+        update_trade_plan_feedback=lambda: None,
+        recalculate_watchlist_scoreboard_sizes=lambda: None,
+    )
+
+    DashboardMixin.apply_cached_trade_account_size(window)
+
+    assert account_input.text() == ""
+    assert logs == [
+        "KIS position sizing unavailable for PROD: "
+        "snapshot not loaded for (PROD, 11111111-01)."
+    ]
+
+
+def test_configured_kis_account_balance_does_not_use_stale_widget_without_fx():
+    profile = {
+        "environment": "PROD",
+        "account_no": "11111111-01",
+    }
+    window = MainWindow.__new__(MainWindow)
+    window.trade_kis_account_combo = _Combo(data=profile)
+    window.account_size_input = _TextInput("25000.00")
+    window.usd_krw_rate_input = _TextInput("")
+    window.kis_account_snapshots = {
+        ("PROD", "11111111-01"): {
+            "domestic": {"summary": {"total_evaluation_krw": 10_000_000}}
+        }
+    }
+
+    assert MainWindow._get_account_balance_for_env(window, "PROD") == 0.0
+
+
+def test_kis_account_value_rejects_nonfinite_broker_totals():
+    snapshot = {
+        "domestic": {"summary": {"total_evaluation_krw": float("inf")}},
+        "overseas": {"frcr_evlu_tota_krw": "not-a-number"},
+    }
+
+    assert MainWindow._extract_kis_account_value_krw(snapshot, fx_rate=1450.0) is None
+
+
+@pytest.mark.parametrize("fx_rate", [0.0, float("inf")])
+def test_snapshot_summary_marks_sizing_unavailable_without_valid_fx(fx_rate):
+    snapshot = {
+        "environment": "PROD",
+        "account": "11******-01",
+        "domestic": {"summary": {"total_evaluation_krw": 10_000_000}},
+    }
+
+    summary = MainWindow._format_kis_snapshot_summary(snapshot, fx_rate=fx_rate)
+
+    assert "Position sizing: unavailable until USD/KRW is refreshed." in summary
 
 
 def test_trade_snapshot_callback_keeps_the_profile_that_started_request():
@@ -160,6 +229,7 @@ def test_trade_snapshot_callback_keeps_the_profile_that_started_request():
         sync_buylist_positions_from_kis_snapshots=lambda snapshots: stored_syncs.append(
             snapshots
         ),
+        apply_cached_trade_account_size=lambda: None,
         refresh_usd_krw_rate=lambda show_messages=False: None,
         append_log=lambda _message: None,
         reconcile_open_orders=lambda: None,

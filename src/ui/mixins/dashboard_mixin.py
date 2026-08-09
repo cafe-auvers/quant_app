@@ -563,6 +563,10 @@ class DashboardMixin:
                     self._flatten_kis_holdings(selected_snapshot)
                 )
         if selected_profile:
+            # Re-evaluate sizing immediately.  This deliberately clears any
+            # stale/default USD value while FX is still unavailable; the FX
+            # callback will populate the verified value once it succeeds.
+            self.apply_cached_trade_account_size()
             self.refresh_usd_krw_rate(show_messages=False)
         else:
             self.apply_cached_trade_account_size()
@@ -693,10 +697,12 @@ class DashboardMixin:
                 self._format_kis_snapshot_summary(snapshot, fx_rate=fx)
             )
             self.populate_kis_holdings_table(self._flatten_kis_holdings(snapshot))
+            # Invalidate/recalculate sizing before the asynchronous FX refresh
+            # so an old account value cannot remain actionable while it runs.
+            self.apply_cached_trade_account_size()
             # Refresh USD/KRW too, so position sizing (account_size_input) is
-            # ready off this same snapshot without a separate "Use KIS
-            # Balance" step. refresh_usd_krw_rate's completion callback calls
-            # apply_cached_trade_account_size() once the fresh rate lands.
+            # ready off this same snapshot without a separate step.  The FX
+            # completion callback recalculates with the verified rate.
             self.refresh_usd_krw_rate(show_messages=False)
             self.append_log("Loaded KIS account snapshot.")
         self.reconcile_open_orders()
@@ -784,6 +790,13 @@ class DashboardMixin:
         Stays a staticmethod (calls the other by class name) so it remains
         callable without a MainWindow instance, e.g. in tests.
         """
+        try:
+            fx_rate = float(fx_rate)
+        except (TypeError, ValueError, OverflowError):
+            fx_rate = 0.0
+        if not math.isfinite(fx_rate) or fx_rate <= 0:
+            fx_rate = 0.0
+
         env = snapshot.get("environment", "")
         acct = snapshot.get("account", "")
         fetched = snapshot.get("fetched_at", "")
@@ -859,6 +872,10 @@ class DashboardMixin:
             parts.append(
                 f"Total (est.): {total_krw:,.0f} KRW = ${total_usd:,.2f} USD  @ {fx_rate:.2f} KRW/USD"
             )
+        elif fx_rate <= 0:
+            parts.append("Position sizing: unavailable until USD/KRW is refreshed.")
+        else:
+            parts.append("Position sizing: unavailable because account value is invalid.")
 
         return "\n".join(parts)
 
@@ -944,6 +961,10 @@ class DashboardMixin:
             self.sync_buylist_positions_from_kis_snapshots(
                 {(environment, profile.get("account_no", "")): snapshot}
             )
+        # Clear/recalculate against the newly stored snapshot before starting
+        # the asynchronous FX refresh.  This prevents a previous account's
+        # value from remaining active if that refresh fails.
+        self.apply_cached_trade_account_size()
         self.refresh_usd_krw_rate(show_messages=False)
         label = str(profile.get("label") or environment) if profile else environment
         self.append_log(f"Loaded KIS account value for {label} trade sizing.")
@@ -1070,46 +1091,60 @@ class DashboardMixin:
                     f"snapshot not loaded for ({environment}, {account_no})"
                 )
 
-        if snapshot:
+        if snapshot is not None:
             usd_krw_rate = self._parse_float(self.usd_krw_rate_input, 0.0)
             if usd_krw_rate <= 0:
-                self.append_log(
-                    "KIS account conversion deferred until a live USD/KRW rate is available."
+                fallback_reason = "live USD/KRW rate is unavailable"
+            else:
+                breakdown = self._extract_kis_account_value_krw(
+                    snapshot,
+                    fx_rate=usd_krw_rate,
+                    return_breakdown=True,
                 )
-                return
-            breakdown = self._extract_kis_account_value_krw(
-                snapshot,
-                fx_rate=usd_krw_rate,
-                return_breakdown=True,
+                if breakdown:
+                    account_value_krw = breakdown["total_krw"]
+                    account_value_usd = account_value_krw / usd_krw_rate
+                    old_block = self.account_size_input.blockSignals(True)
+                    self.account_size_input.setText(f"{account_value_usd:.2f}")
+                    self.account_size_input.blockSignals(old_block)
+                    ovrs_cash = breakdown["ovrs_cash_usd"]
+                    ovrs_stock = breakdown["ovrs_stock_usd"]
+                    frcr_krw = breakdown.get("frcr_evlu_tota_krw", 0.0)
+                    frcr_note = (
+                        f" [via frcr_evlu_tota {frcr_krw:,.0f} KRW — pre-settlement]"
+                        if frcr_krw > 0 and ovrs_stock == 0
+                        else ""
+                    )
+                    self.append_log(
+                        f"Using {environment} account value: {account_value_krw:,.0f} KRW "
+                        f"= {account_value_usd:,.2f} USD "
+                        f"[KRW cash: {breakdown['cash_krw']:,.0f} | "
+                        f"KR stocks: {breakdown['kr_stock_krw']:,.0f} | "
+                        f"US stocks: ${ovrs_stock:,.2f} | "
+                        f"USD cash: ${ovrs_cash:,.2f}]{frcr_note}"
+                    )
+                    self.update_trade_plan_feedback()
+                    self.recalculate_watchlist_scoreboard_sizes()  # also refreshes ORB panel
+                    if hasattr(self, "refresh_execution_queue"):
+                        self.refresh_execution_queue(environment, show_log=False)
+                    return
+                fallback_reason = "account value is zero or invalid in snapshot"
+
+        if profile:
+            # A configured live account must never fall back to a hidden manual
+            # or hard-coded balance.  Empty text parses as zero throughout the
+            # sizing pipeline and makes execution-queue candidates unavailable.
+            old_block = self.account_size_input.blockSignals(True)
+            self.account_size_input.setText("")
+            self.account_size_input.blockSignals(old_block)
+            self.append_log(
+                f"KIS position sizing unavailable for {environment}: {fallback_reason}."
             )
-            if breakdown:
-                account_value_krw = breakdown["total_krw"]
-                account_value_usd = account_value_krw / usd_krw_rate
-                old_block = self.account_size_input.blockSignals(True)
-                self.account_size_input.setText(f"{account_value_usd:.2f}")
-                self.account_size_input.blockSignals(old_block)
-                ovrs_cash = breakdown["ovrs_cash_usd"]
-                ovrs_stock = breakdown["ovrs_stock_usd"]
-                frcr_krw = breakdown.get("frcr_evlu_tota_krw", 0.0)
-                frcr_note = (
-                    f" [via frcr_evlu_tota {frcr_krw:,.0f} KRW — pre-settlement]"
-                    if frcr_krw > 0 and ovrs_stock == 0
-                    else ""
-                )
-                self.append_log(
-                    f"Using {environment} account value: {account_value_krw:,.0f} KRW "
-                    f"= {account_value_usd:,.2f} USD "
-                    f"[KRW cash: {breakdown['cash_krw']:,.0f} | "
-                    f"KR stocks: {breakdown['kr_stock_krw']:,.0f} | "
-                    f"US stocks: ${ovrs_stock:,.2f} | "
-                    f"USD cash: ${ovrs_cash:,.2f}]{frcr_note}"
-                )
-                self.update_trade_plan_feedback()
-                self.recalculate_watchlist_scoreboard_sizes()  # also refreshes ORB panel
-                if hasattr(self, "refresh_execution_queue"):
-                    self.refresh_execution_queue(environment, show_log=False)
-                return
-            fallback_reason = "account value is zero in snapshot"
+            self.update_trade_plan_feedback()
+            self.recalculate_watchlist_scoreboard_sizes()
+            if hasattr(self, "refresh_execution_queue"):
+                self.refresh_execution_queue(environment, show_log=False)
+            return
 
         # Fallback if no profile, no snapshot, or account value is invalid
         if not hasattr(self, "manual_account_sizes"):
@@ -1153,11 +1188,22 @@ class DashboardMixin:
         if not isinstance(summary, dict):
             summary = {}
 
-        def _f(key: str) -> float:
+        def _number(value: Any) -> float:
             try:
-                return float(summary.get(key) or 0)
-            except (TypeError, ValueError):
+                number = float(value or 0)
+            except (TypeError, ValueError, OverflowError):
                 return 0.0
+            return number if math.isfinite(number) else 0.0
+
+        def _f(key: str) -> float:
+            return _number(summary.get(key))
+
+        try:
+            fx_rate = float(fx_rate)
+        except (TypeError, ValueError, OverflowError):
+            fx_rate = 0.0
+        if not math.isfinite(fx_rate) or fx_rate <= 0:
+            fx_rate = 0.0
 
         # cash_total_krw (dnca_tot_amt) = total KRW deposit, not gross account value.
         # d2_deposit_krw (prvs_rcdl_excc_amt) is the *previous-day settlement amount*,
@@ -1185,25 +1231,21 @@ class DashboardMixin:
         if fx_rate > 0:
             overseas = snapshot.get("overseas")
             if isinstance(overseas, dict):
-                frcr_evlu_tota_krw = float(overseas.get("frcr_evlu_tota_krw") or 0)
+                frcr_evlu_tota_krw = _number(overseas.get("frcr_evlu_tota_krw"))
 
                 for holding in overseas.get("holdings", []):
                     if not isinstance(holding, dict):
                         continue
-                    try:
-                        ovrs_stock_usd += float(holding.get("evaluation_amount") or 0)
-                    except (TypeError, ValueError):
-                        pass
+                    holding_value = _number(holding.get("evaluation_amount"))
+                    if holding_value > 0:
+                        ovrs_stock_usd += holding_value
 
                 for exch_summary in overseas.get("summary_by_exchange", {}).values():
                     if not isinstance(exch_summary, dict):
                         continue
-                    try:
-                        v = float(exch_summary.get("cash_balance_usd") or 0)
-                        if v > ovrs_cash_usd:
-                            ovrs_cash_usd = v
-                    except (TypeError, ValueError):
-                        pass
+                    value = _number(exch_summary.get("cash_balance_usd"))
+                    if value > ovrs_cash_usd:
+                        ovrs_cash_usd = value
 
                 if ovrs_cash_usd == 0.0 and ovrs_stock_usd == 0.0 and frcr_evlu_tota_krw == 0.0:
                     # Log raw summary fields to identify which field carries USD cash
@@ -1229,7 +1271,7 @@ class DashboardMixin:
         else:
             ovrs_krw = frcr_evlu_tota_krw
         total_krw = domestic_total_krw + ovrs_krw
-        if total_krw <= 0:
+        if not math.isfinite(total_krw) or total_krw <= 0:
             return None
 
         if return_breakdown:

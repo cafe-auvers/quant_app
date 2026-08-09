@@ -420,52 +420,48 @@ class WatchlistMixin:
     def _get_account_balance_for_env(self, env: str) -> float:
         """Get the active account balance for the given environment.
 
-        Lookup order mirrors apply_cached_trade_account_size exactly:
-        1. account_size_input — always kept current by apply_cached_trade_account_size
-           (KIS-sourced or manually typed, already converted to USD).  The watchlist
-           env and Trade Plan env are kept in sync, so this field is the single source
-           of truth regardless of which env is active.
-        2. KIS snapshot keyed by the currently-selected profile (not first-match iteration).
-        3. Manually-cached account size (manual_account_sizes dict).
-        4. Hard defaults.
+        A configured KIS account is fail-closed: both its selected snapshot and
+        a valid USD/KRW rate are required.  Manual/default values are available
+        only when there is no configured account selection.
         """
-        # 1. account_size_input is always written by apply_cached_trade_account_size in USD,
-        #    covering both KIS-loaded and manually-entered values.  Read it unconditionally —
-        #    the Watchlist env combo and the Trade Plan env combo are kept in sync, so this
-        #    field always reflects the correct balance for the active environment.
-        if hasattr(self, "account_size_input"):
-            val = self._parse_float(self.account_size_input, 0.0)
-            if val > 0:
-                return val
-
-        # 2. Try the KIS snapshot for the *selected* profile (not first-match iteration),
-        #    mirroring apply_cached_trade_account_size exactly.
+        # Never let a stale widget value from another account outrank the
+        # currently selected account's source data.
         if hasattr(self, "trade_kis_account_combo") and hasattr(
             self, "kis_account_snapshots"
         ):
             profile = self.trade_kis_account_combo.currentData()
             if profile:
+                profile_env = str(profile.get("environment") or env).upper()
+                if profile_env != str(env or "").upper():
+                    return 0.0
                 snapshot = self.kis_account_snapshots.get(
                     (env, profile.get("account_no", ""))
                 )
-                if snapshot:
-                    account_value_krw = self._extract_kis_account_value_krw(snapshot)
-                    if account_value_krw and account_value_krw > 0:
-                        usd_krw_rate = (
-                            self._parse_float(self.usd_krw_rate_input, 0.0)
-                            if hasattr(self, "usd_krw_rate_input")
-                            else 0.0
-                        )
-                        if usd_krw_rate > 0:
-                            return account_value_krw / usd_krw_rate
+                usd_krw_rate = (
+                    self._parse_float(self.usd_krw_rate_input, 0.0)
+                    if hasattr(self, "usd_krw_rate_input")
+                    else 0.0
+                )
+                if snapshot is None or usd_krw_rate <= 0:
+                    return 0.0
+                account_value_krw = self._extract_kis_account_value_krw(
+                    snapshot, fx_rate=usd_krw_rate
+                )
+                if account_value_krw and account_value_krw > 0:
+                    return account_value_krw / usd_krw_rate
+                return 0.0
 
-        # 3. Use manually cached account size for this environment
+        if hasattr(self, "account_size_input"):
+            val = self._parse_float(self.account_size_input, 0.0)
+            if val > 0:
+                return val
+
+        # Offline/manual planning fallback when no KIS account is selected.
         if hasattr(self, "manual_account_sizes"):
             val = self.manual_account_sizes.get(env, 0.0)
             if val > 0:
                 return val
 
-        # 4. Hard defaults
         return 10000.0 if env == "PROD" else 100000.0
 
     def _calculate_item_scores(self, item) -> dict:
