@@ -194,6 +194,23 @@ class WatchlistMixin:
         left_layout.addLayout(env_layout, 0)
 
         sizing_layout = QHBoxLayout()
+        sizing_layout.addWidget(QLabel("Buffer %:"))
+        self.watchlist_buffer_pct_input = QLineEdit("0.10")
+        buffer_validator = QDoubleValidator(
+            0.0, 100.0, 4, self.watchlist_buffer_pct_input
+        )
+        buffer_validator.setNotation(QDoubleValidator.StandardNotation)
+        self.watchlist_buffer_pct_input.setValidator(buffer_validator)
+        self.watchlist_buffer_pct_input.setMaximumWidth(50)
+        self.watchlist_buffer_pct_input.setToolTip(
+            "Small buffer above breakout_price to avoid false touches (default 0.10%). "
+            "Global — applies the same to all stocks."
+        )
+        self.watchlist_buffer_pct_input.textChanged.connect(
+            self._on_watchlist_orb_filter_changed
+        )
+        sizing_layout.addWidget(self.watchlist_buffer_pct_input)
+        sizing_layout.addSpacing(10)
         sizing_layout.addWidget(QLabel("Account USD:"))
         self.account_size_input = QLineEdit("100000")
         account_size_validator = QDoubleValidator(
@@ -320,22 +337,6 @@ class WatchlistMixin:
             self._on_watchlist_orb_filter_changed
         )
         orb_breakout_layout.addWidget(self.watchlist_breakout_price_input)
-        orb_breakout_layout.addSpacing(12)
-        orb_breakout_layout.addWidget(QLabel("Buffer %:"))
-        self.watchlist_buffer_pct_input = QLineEdit("0.10")
-        buffer_validator = QDoubleValidator(
-            0.0, 100.0, 4, self.watchlist_buffer_pct_input
-        )
-        buffer_validator.setNotation(QDoubleValidator.StandardNotation)
-        self.watchlist_buffer_pct_input.setValidator(buffer_validator)
-        self.watchlist_buffer_pct_input.setMaximumWidth(50)
-        self.watchlist_buffer_pct_input.setToolTip(
-            "Small buffer above breakout_price to avoid false touches (default 0.10%)"
-        )
-        self.watchlist_buffer_pct_input.textChanged.connect(
-            self._on_watchlist_orb_filter_changed
-        )
-        orb_breakout_layout.addWidget(self.watchlist_buffer_pct_input)
         orb_breakout_layout.addStretch()
         orb_group_layout.addLayout(orb_breakout_layout)
 
