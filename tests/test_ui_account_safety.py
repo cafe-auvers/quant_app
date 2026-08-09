@@ -13,6 +13,32 @@ class _TextInput:
     def text(self):
         return self._text
 
+    def setText(self, text: str):
+        self._text = text
+
+    def blockSignals(self, _blocked: bool):
+        return False
+
+
+class _Label:
+    def __init__(self):
+        self.text = ""
+
+    def setText(self, text: str):
+        self.text = text
+
+
+class _Combo:
+    def __init__(self, *, text: str = "", data=None):
+        self._text = text
+        self._data = data
+
+    def currentText(self):
+        return self._text
+
+    def currentData(self):
+        return self._data
+
 
 def test_numeric_parsers_reject_nonfinite_and_negative_values():
     window = MainWindow.__new__(MainWindow)
@@ -42,7 +68,7 @@ def test_dashboard_snapshot_callback_keeps_the_profile_that_started_request():
             snapshots
         ),
         kis_account_status_label=SimpleNamespace(setText=lambda _text: None),
-        usd_krw_rate_input=_TextInput("1388.89"),
+        usd_krw_rate_input=_TextInput("1450.00"),
         _parse_float=lambda _input, default: default,
         kis_account_summary_label=SimpleNamespace(setText=lambda _text: None),
         _format_kis_snapshot_summary=lambda snapshot, fx_rate=0.0: "summary",
@@ -58,6 +84,64 @@ def test_dashboard_snapshot_callback_keeps_the_profile_that_started_request():
     key = ("PROD", "11111111-01")
     assert key in window.kis_account_snapshots
     assert stored_syncs == [{key: {"account": "ignored"}}]
+
+
+def test_live_fx_callback_updates_watchlist_and_dashboard_snapshot():
+    profile = {
+        "environment": "PROD",
+        "account_no": "11111111-01",
+        "label": "PROD 11******-01",
+    }
+    snapshot = {
+        "environment": "PROD",
+        "account": "11******-01",
+        "domestic": {"summary": {"cash_total_krw": 1_450_000}},
+    }
+    window = MainWindow.__new__(MainWindow)
+    window.usd_krw_rate_input = _TextInput("")
+    window.usd_krw_rate_status_label = _Label()
+    window.kis_environment_combo = _Combo(text="PROD")
+    window.kis_account_combo = _Combo(data=profile)
+    window.kis_account_snapshots = {("PROD", "11111111-01"): snapshot}
+    window.kis_account_summary_label = _Label()
+    window.append_log = lambda _message: None
+    window.apply_cached_trade_account_size = lambda: None
+
+    MainWindow._on_usd_krw_rate_finished(
+        window, 1450.0, "yfinance KRW=X", "2026-08-09 12:00"
+    )
+
+    assert window.usd_krw_rate_input.text() == "1450.00"
+    assert "1450.00" in window.usd_krw_rate_status_label.text
+    assert "@ 1450.00 KRW/USD" in window.kis_account_summary_label.text
+
+
+def test_kis_account_conversion_waits_for_live_fx_rate():
+    profile = {"environment": "PROD", "account_no": "11111111-01"}
+    account_input = _TextInput("25000.00")
+    logs = []
+    window = SimpleNamespace(
+        trade_kis_environment_combo=_Combo(text="PROD"),
+        trade_kis_account_combo=_Combo(data=profile),
+        account_size_input=account_input,
+        usd_krw_rate_input=_TextInput(""),
+        kis_account_snapshots={
+            ("PROD", "11111111-01"): {
+                "domestic": {"summary": {"total_evaluation_krw": 10_000_000}}
+            }
+        },
+        _parse_float=lambda input_widget, default: (
+            float(input_widget.text()) if input_widget.text() else default
+        ),
+        append_log=logs.append,
+    )
+
+    DashboardMixin.apply_cached_trade_account_size(window)
+
+    assert account_input.text() == "25000.00"
+    assert logs == [
+        "KIS account conversion deferred until a live USD/KRW rate is available."
+    ]
 
 
 def test_trade_snapshot_callback_keeps_the_profile_that_started_request():

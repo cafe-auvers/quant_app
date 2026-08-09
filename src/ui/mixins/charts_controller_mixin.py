@@ -178,7 +178,8 @@ class ChartsControllerMixin:
         self.take_profit_input = QLineEdit()
         self.position_size_input = QLineEdit()
         self.account_size_input = QLineEdit("100000")
-        self.usd_krw_rate_input = QLineEdit("1388.89")
+        self.usd_krw_rate_input = QLineEdit()
+        self.usd_krw_rate_input.setPlaceholderText("Fetching...")
         self.usd_krw_rate_input.setReadOnly(True)
         self.risk_percent_input = QLineEdit("1")
         for input_widget in (

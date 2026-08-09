@@ -953,7 +953,24 @@ class DashboardMixin:
             self.usd_krw_rate_input.blockSignals(old_block)
         self._set_usd_krw_rate_status(f"USD/KRW {rate:.2f} from {source} ({timestamp})")
         self.append_log(f"USD/KRW updated: {rate:.2f} from {source}.")
+        self._refresh_dashboard_snapshot_fx(rate)
         self.apply_cached_trade_account_size()
+
+    def _refresh_dashboard_snapshot_fx(self, rate: float) -> None:
+        """Re-render the selected Dashboard snapshot with the latest live FX rate."""
+        selected_profile = self._selected_dashboard_kis_profile()
+        summary_label = self.__dict__.get("kis_account_summary_label")
+        if not selected_profile or summary_label is None:
+            return
+        key = (
+            str(selected_profile.get("environment") or "").upper(),
+            str(selected_profile.get("account_no") or ""),
+        )
+        snapshot = self.kis_account_snapshots.get(key)
+        if snapshot:
+            summary_label.setText(
+                self._format_kis_snapshot_summary(snapshot, fx_rate=rate)
+            )
 
     def _on_usd_krw_rate_error(self, error_message: str) -> None:
         current_rate = (
@@ -995,9 +1012,12 @@ class DashboardMixin:
                 )
 
         if snapshot:
-            usd_krw_rate = self._parse_float(self.usd_krw_rate_input, 1388.89)
+            usd_krw_rate = self._parse_float(self.usd_krw_rate_input, 0.0)
             if usd_krw_rate <= 0:
-                usd_krw_rate = 1388.89
+                self.append_log(
+                    "KIS account conversion deferred until a live USD/KRW rate is available."
+                )
+                return
             breakdown = self._extract_kis_account_value_krw(
                 snapshot,
                 fx_rate=usd_krw_rate,

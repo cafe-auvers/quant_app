@@ -213,7 +213,8 @@ class WatchlistMixin:
         sizing_layout.addWidget(self.risk_percent_input)
         sizing_layout.addSpacing(10)
         sizing_layout.addWidget(QLabel("USD/KRW:"))
-        self.usd_krw_rate_input = QLineEdit("1388.89")
+        self.usd_krw_rate_input = QLineEdit()
+        self.usd_krw_rate_input.setPlaceholderText("Fetching...")
         self.usd_krw_rate_input.setReadOnly(True)
         self.usd_krw_rate_input.setMaximumWidth(75)
         sizing_layout.addWidget(self.usd_krw_rate_input)
@@ -492,13 +493,12 @@ class WatchlistMixin:
                     account_value_krw = self._extract_kis_account_value_krw(snapshot)
                     if account_value_krw and account_value_krw > 0:
                         usd_krw_rate = (
-                            self._parse_float(self.usd_krw_rate_input, 1388.89)
+                            self._parse_float(self.usd_krw_rate_input, 0.0)
                             if hasattr(self, "usd_krw_rate_input")
-                            else 1388.89
+                            else 0.0
                         )
-                        if usd_krw_rate <= 0:
-                            usd_krw_rate = 1388.89
-                        return account_value_krw / usd_krw_rate
+                        if usd_krw_rate > 0:
+                            return account_value_krw / usd_krw_rate
 
         # 3. Use manually cached account size for this environment
         if hasattr(self, "manual_account_sizes"):
