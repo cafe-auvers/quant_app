@@ -493,9 +493,13 @@ class ChartsRenderMixin:
                 if pd.notna(rs_value):
                     rs_points.append({"time": time_value, "value": float(rs_value)})
                     if bool(row.get("is_plus_4pct_change")):
-                        rs_markers.append({"time": time_value, "position": "aboveBar", "color": "#22c55e", "shape": "circle", "text": "+4%"})
+                        pct_val = row.get("pct_change_today")
+                        pct_label = f"+{round(float(pct_val))}%" if pd.notna(pct_val) else "+4%"
+                        rs_markers.append({"time": time_value, "position": "aboveBar", "color": "#22c55e", "shape": "circle", "text": pct_label})
                     if bool(row.get("is_minus_4pct_change")):
-                        rs_markers.append({"time": time_value, "position": "belowBar", "color": "#ef4444", "shape": "circle", "text": "-4%"})
+                        pct_val = row.get("pct_change_today")
+                        pct_label = f"{round(float(pct_val))}%" if pd.notna(pct_val) else "-4%"
+                        rs_markers.append({"time": time_value, "position": "belowBar", "color": "#ef4444", "shape": "circle", "text": pct_label})
                 if pd.notna(sma_value):
                     rs_sma_points.append({"time": time_value, "value": float(sma_value)})
                 if bool(row.get("is_ti65_bullish")):

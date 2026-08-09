@@ -717,6 +717,7 @@ def test_tradingview_lightweight_chart_html_includes_rs_ti65_indicator():
             "rs_score_yesterday": [None, 50.0, 75.0],
             "rs_score_week": [None, None, None],
             "rs_score_month": [None, None, None],
+            "pct_change_today": [0.0, 0.0, 5.0],
             "is_ti65_bullish": [False, True, True],
             "is_ti65_bearish": [False, False, False],
             "is_9m_volume": [False, False, True],
@@ -738,7 +739,7 @@ def test_tradingview_lightweight_chart_html_includes_rs_ti65_indicator():
     assert "RS SMA 50" in chart_html
     assert 'id="rs-chart"' in chart_html
     assert "RS Score C 90" in chart_html
-    assert "+4%" in chart_html
+    assert "+5%" in chart_html
     assert '"text": "Cross"' not in chart_html
     assert '"shape": "arrowUp"' not in chart_html
 
