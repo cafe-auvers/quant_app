@@ -104,8 +104,8 @@ def test_pc_status_worker_silences_expected_mysql_probe_failures(monkeypatch):
     )
     probe_calls = []
 
-    def unavailable_engine(*, log_unavailable=True):
-        probe_calls.append(log_unavailable)
+    def unavailable_engine(*, log_unavailable=True, ensure_schema=True):
+        probe_calls.append((log_unavailable, ensure_schema))
         return None
 
     monkeypatch.setattr(
@@ -118,7 +118,7 @@ def test_pc_status_worker_silences_expected_mysql_probe_failures(monkeypatch):
 
     worker.run()
 
-    assert probe_calls == [False]
+    assert probe_calls == [(False, False)]
     assert results[0].database_ready is False
 
 
@@ -415,15 +415,17 @@ def test_repeated_online_probe_starts_only_one_database_recovery(monkeypatch):
     assert len(_RecoveryWorkerStub.instances) == 1
     worker = _RecoveryWorkerStub.instances[0]
     assert worker.generation == 1
-    assert worker.kwargs["local_engine"] is local_engine
+    assert worker.kwargs == {"pc_engine": None}
     assert worker.started is True
     assert window.database_recovery_worker is worker
     assert window.db_engine is local_engine
     assert window.db_engine_source == "local_mirror"
-    assert window.database_source_label.text == "DB: Local (Syncing...)"
+    assert window.database_source_label.text == "DB: Local"
 
 
-def test_local_mirror_to_pc_recovery_is_staged_and_idempotent(monkeypatch):
+def test_local_mirror_to_pc_recovery_switches_immediately_and_starts_backup(
+    monkeypatch,
+):
     import src.ui.main_window as main_window
 
     pc_engine = object()
@@ -444,27 +446,6 @@ def test_local_mirror_to_pc_recovery_is_staged_and_idempotent(monkeypatch):
     window._on_pc_status_result(status)
     window._on_pc_status_result(status)
 
-    assert window.db_engine is local_engine
-    assert window.pc_db_engine is None
-    assert window.db_engine_source == "local_mirror"
-    assert window.database_source_label.text == "DB: Local (Syncing...)"
-    assert len(_RecoveryWorkerStub.instances) == 1
-    assert manager.engine_bindings == [(None, "laptop-id", False)]
-    assert state_sync_starts == []
-
-    reconciliation = SimpleNamespace(
-        total_local_to_pc_rows=3,
-        total_pc_to_local_rows=8,
-    )
-    outcome = main_window.DatabaseRecoveryOutcome(
-        pc_engine,
-        True,
-        reconciled_local_mirror=True,
-        reconciliation_result=reconciliation,
-    )
-    window._on_database_recovery_finished(outcome, generation=1)
-    window._on_pc_status_result(status)
-
     assert window.db_engine is pc_engine
     assert window.pc_db_engine is pc_engine
     assert window.db_engine_source == "pc"
@@ -478,13 +459,14 @@ def test_local_mirror_to_pc_recovery_is_staged_and_idempotent(monkeypatch):
         (pc_engine, "laptop-id", False),
     ]
     assert state_sync_starts == [True]
-    assert mirror_sync_starts == []
+    assert mirror_sync_starts == [pc_engine]
+    assert _RecoveryWorkerStub.instances == []
     assert summary_updates == [True, True]
     assert sum("back online" in line for line in logs) == 1
-    assert sum("market data synchronized" in line for line in logs) == 1
+    assert not any("synchronized before switching" in line for line in logs)
 
 
-def test_active_pc_dirty_mirror_stages_local_until_normal_recovery_starts(
+def test_background_backup_error_never_changes_active_pc_routing(
     monkeypatch,
 ):
     import src.ui.main_window as main_window
@@ -506,72 +488,23 @@ def test_active_pc_dirty_mirror_stages_local_until_normal_recovery_starts(
         True,
     )
 
-    assert window.db_engine is local_engine
-    assert window.db_engine_source == "local_mirror"
+    assert window.db_engine is pc_engine
+    assert window.db_engine_source == "pc"
     assert window.db_enabled is True
-    assert window.database_source_label.text == "DB: Local (Syncing...)"
-    assert "#ffb300" in window.database_source_dot.stylesheet
-    assert window.pc_db_engine is None
+    assert window.pc_db_engine is pc_engine
     assert window._pc_probe_engine is pc_engine
-    assert window._pc_database_ready is False
-    assert window._database_transition_generation == 1
-    assert manager.engine_bindings == [(None, "laptop-id", False)]
-    assert summary_updates == [True]
+    assert window._pc_database_ready is True
+    assert window._database_transition_generation == 0
+    assert manager.engine_bindings == []
+    assert summary_updates == []
     assert _RecoveryWorkerStub.instances == []
-    assert any("before switching back to PC" in line for line in logs)
+    assert any("mirror sync incomplete" in line for line in logs)
 
     window._clear_worker_reference("_local_mirror_sync_worker", mirror_worker)
 
     assert mirror_worker.deleted is True
     assert window._local_mirror_sync_worker is None
-    assert len(_RecoveryWorkerStub.instances) == 1
-    recovery_worker = _RecoveryWorkerStub.instances[0]
-    assert recovery_worker.kwargs["pc_engine"] is pc_engine
-    assert recovery_worker.kwargs["local_engine"] is local_engine
-    assert recovery_worker.generation == 1
-    assert recovery_worker.started is True
-
-
-def test_active_pc_dirty_mirror_then_verified_recovery_switches_green(monkeypatch):
-    import src.ui.main_window as main_window
-
-    pc_engine = object()
-    local_engine = object()
-    window, manager, _logs, _summary_updates = _runtime_transition_window(
-        pc_engine,
-        local_engine=local_engine,
-    )
-    state_sync_starts = []
-    window._start_state_sync = lambda: state_sync_starts.append(True)
-    mirror_worker = _CompletedMirrorWorkerStub(pc_engine, local_engine)
-    window._local_mirror_sync_worker = mirror_worker
-    _RecoveryWorkerStub.instances = []
-    monkeypatch.setattr(main_window, "DatabaseRecoveryWorker", _RecoveryWorkerStub)
-
-    window._on_local_mirror_sync_completed({}, "Local mirror is dirty.", True)
-    window._clear_worker_reference("_local_mirror_sync_worker", mirror_worker)
-    reconciliation = SimpleNamespace(
-        total_local_to_pc_rows=2,
-        total_pc_to_local_rows=5,
-    )
-    outcome = main_window.DatabaseRecoveryOutcome(
-        pc_engine,
-        True,
-        reconciled_local_mirror=True,
-        reconciliation_result=reconciliation,
-    )
-    window._on_database_recovery_finished(outcome, generation=1)
-
-    assert window.db_engine is pc_engine
-    assert window.db_engine_source == "pc"
-    assert window.database_source_label.text == "DB: PC"
-    assert "#26a69a" in window.database_source_dot.stylesheet
-    assert window._database_transition_generation == 2
-    assert manager.engine_bindings == [
-        (None, "laptop-id", False),
-        (pc_engine, "laptop-id", False),
-    ]
-    assert state_sync_starts == [True]
+    assert _RecoveryWorkerStub.instances == []
 
 
 def test_stale_active_mirror_result_cannot_change_current_database_routing():
@@ -599,7 +532,7 @@ def test_stale_active_mirror_result_cannot_change_current_database_routing():
     assert summary_updates == []
 
 
-def test_local_write_after_reconciliation_cancels_pc_handoff(monkeypatch):
+def test_local_backup_changes_cannot_block_pc_recovery(monkeypatch):
     import src.ui.main_window as main_window
     import src.utils.db_loader as db_loader
 
@@ -611,6 +544,10 @@ def test_local_write_after_reconciliation_cancels_pc_handoff(monkeypatch):
     )
     _RecoveryWorkerStub.instances = []
     monkeypatch.setattr(main_window, "DatabaseRecoveryWorker", _RecoveryWorkerStub)
+    state_sync_starts = []
+    backup_starts = []
+    window._start_state_sync = lambda: state_sync_starts.append(True)
+    window._start_background_local_mirror_sync = backup_starts.append
     monkeypatch.setattr(
         db_loader,
         "acquire_local_mirror_handoff_guard",
@@ -621,28 +558,20 @@ def test_local_write_after_reconciliation_cancels_pc_handoff(monkeypatch):
 
     window._on_pc_status_result(_offline_pc_status())
     window._on_pc_status_result(_online_pc_status())
-    reconciliation = SimpleNamespace(
-        total_local_to_pc_rows=1,
-        total_pc_to_local_rows=2,
-        local_handoff_ready=True,
-    )
-    outcome = main_window.DatabaseRecoveryOutcome(
-        pc_engine,
-        True,
-        reconciled_local_mirror=True,
-        reconciliation_result=reconciliation,
-    )
 
-    window._on_database_recovery_finished(outcome, generation=1)
-
-    assert window.db_engine is local_engine
-    assert window.db_engine_source == "local_mirror"
-    assert window.pc_db_engine is None
-    assert manager.engine_bindings == [(None, "laptop-id", False)]
-    assert any("handoff changed" in line for line in logs)
+    assert window.db_engine is pc_engine
+    assert window.db_engine_source == "pc"
+    assert window.pc_db_engine is pc_engine
+    assert manager.engine_bindings == [
+        (None, "laptop-id", False),
+        (pc_engine, "laptop-id", False),
+    ]
+    assert state_sync_starts == [True]
+    assert backup_starts == [pc_engine]
+    assert not any("handoff" in line for line in logs)
 
 
-def test_failed_reconciliation_stays_on_local_and_keeps_state_detached(monkeypatch):
+def test_failed_pc_connection_check_stays_local_and_retries(monkeypatch):
     import src.ui.main_window as main_window
 
     pc_engine = object()
@@ -657,11 +586,12 @@ def test_failed_reconciliation_stays_on_local_and_keeps_state_detached(monkeypat
     monkeypatch.setattr(main_window, "DatabaseRecoveryWorker", _RecoveryWorkerStub)
 
     window._on_pc_status_result(_offline_pc_status())
+    window._pc_probe_engine = None
     window._on_pc_status_result(_online_pc_status())
     outcome = main_window.DatabaseRecoveryOutcome(
-        pc_engine,
+        None,
         False,
-        error="price_history did not converge",
+        error="PC MySQL is no longer reachable.",
     )
 
     window._on_database_recovery_finished(outcome, generation=1)
@@ -674,7 +604,7 @@ def test_failed_reconciliation_stays_on_local_and_keeps_state_detached(monkeypat
     assert manager.engine_bindings == [(None, "laptop-id", False)]
     assert state_sync_starts == []
     assert summary_updates == [True]
-    assert any("staying on the local database" in line for line in logs)
+    assert any("connection is unavailable" in line for line in logs)
 
     first_worker = window.database_recovery_worker
     window._clear_worker_reference("database_recovery_worker", first_worker)
@@ -682,7 +612,7 @@ def test_failed_reconciliation_stays_on_local_and_keeps_state_detached(monkeypat
     assert len(_RecoveryWorkerStub.instances) == 2
 
 
-def test_recovery_waits_for_existing_pc_to_local_mirror_writer(monkeypatch):
+def test_existing_backup_writer_does_not_delay_pc_recovery(monkeypatch):
     import src.ui.main_window as main_window
 
     pc_engine = object()
@@ -693,6 +623,8 @@ def test_recovery_waits_for_existing_pc_to_local_mirror_writer(monkeypatch):
     )
     _RecoveryWorkerStub.instances = []
     monkeypatch.setattr(main_window, "DatabaseRecoveryWorker", _RecoveryWorkerStub)
+    state_sync_starts = []
+    window._start_state_sync = lambda: state_sync_starts.append(True)
     window._on_pc_status_result(_offline_pc_status())
     previous_mirror_worker = object()
     window._local_mirror_sync_worker = previous_mirror_worker
@@ -700,15 +632,12 @@ def test_recovery_waits_for_existing_pc_to_local_mirror_writer(monkeypatch):
     window._on_pc_status_result(_online_pc_status())
 
     assert _RecoveryWorkerStub.instances == []
-    assert window.db_engine is local_engine
-    assert window.db_engine_source == "local_mirror"
-
-    window._local_mirror_sync_worker = None
-    window._on_pc_status_result(_online_pc_status())
-    assert len(_RecoveryWorkerStub.instances) == 1
+    assert window.db_engine is pc_engine
+    assert window.db_engine_source == "pc"
+    assert state_sync_starts == [True]
 
 
-def test_failed_startup_reconciliation_skips_pc_unreachable_local_prompt():
+def test_local_startup_uses_normal_offline_prompt_path():
     pc_engine = object()
     local_engine = object()
     window, _manager, logs, _summary_updates = _runtime_transition_window(
@@ -717,8 +646,8 @@ def test_failed_startup_reconciliation_skips_pc_unreachable_local_prompt():
     )
     window.database_init_worker = SimpleNamespace(
         local_engine=local_engine,
-        pc_candidate_engine=pc_engine,
-        reconciliation_result=SimpleNamespace(success=False),
+        pc_candidate_engine=None,
+        reconciliation_result=None,
     )
     prompt_calls = []
     scanner_calls = []
@@ -734,55 +663,77 @@ def test_failed_startup_reconciliation_skips_pc_unreachable_local_prompt():
         "daily history mismatch",
     )
 
-    assert prompt_calls == []
-    assert scanner_calls == [{"show_warnings": False}]
+    assert prompt_calls == [True]
+    assert scanner_calls == []
     assert poll_calls == [True]
     assert window.db_engine is local_engine
     assert window.db_engine_source == "local_mirror"
-    assert window._pc_probe_engine is pc_engine
-    assert any("retrying automatically" in line for line in logs)
+    assert window._pc_probe_engine is None
 
 
-def test_database_recovery_worker_emits_verified_reconciliation(monkeypatch):
+def test_pc_startup_routes_immediately_then_starts_backup_in_background():
+    pc_engine = object()
+    window, manager, logs, summary_updates = _runtime_transition_window(
+        pc_engine
+    )
+    window.database_init_worker = SimpleNamespace(
+        local_engine=None,
+        pc_candidate_engine=None,
+        reconciliation_result=None,
+    )
+    state_sync_starts = []
+    scanner_starts = []
+    backup_starts = []
+    poll_starts = []
+    window._start_state_sync = lambda: state_sync_starts.append(True)
+    window.run_all_scanners = lambda **kwargs: scanner_starts.append(kwargs)
+    window._start_background_local_mirror_sync = backup_starts.append
+    window._poll_pc_status = lambda: poll_starts.append(True)
+
+    window._on_optional_database_initialized(
+        pc_engine,
+        "pc",
+        pc_engine,
+        "",
+    )
+
+    assert window.db_engine is pc_engine
+    assert window.db_engine_source == "pc"
+    assert window._local_mirror_engine is None
+    assert manager.engine_bindings == [(pc_engine, "laptop-id", False)]
+    assert state_sync_starts == [True]
+    assert scanner_starts == [{"show_warnings": False}]
+    assert backup_starts == [pc_engine]
+    assert poll_starts == [True]
+    assert summary_updates == [True]
+    assert any("using it immediately" in line for line in logs)
+
+
+def test_database_recovery_worker_only_checks_pc_connectivity(monkeypatch):
     import src.ui.main_window as main_window
     import src.utils.db_loader as db_loader
 
-    pc_engine = object()
-    local_engine = object()
-    reconciliation = SimpleNamespace(success=True, errors=())
+    pc_engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     calls = []
     monkeypatch.setattr(
         db_loader,
         "reconcile_local_mirror_with_pc",
-        lambda pc, local, **kwargs: calls.append((pc, local, kwargs))
-        or reconciliation,
+        lambda pc, local, **kwargs: calls.append((pc, local, kwargs)),
     )
     emitted = []
     worker = main_window.DatabaseRecoveryWorker(
         9,
         pc_engine=pc_engine,
-        local_engine=local_engine,
-        tickers=["AAPL"],
     )
     worker.recovered.connect(lambda outcome, generation: emitted.append((outcome, generation)))
 
     worker.run()
 
-    assert calls == [
-        (
-            pc_engine,
-            local_engine,
-            {
-                "tickers": ["AAPL"],
-                "tables": db_loader.ROUTING_CRITICAL_MIRROR_TABLES,
-            },
-        )
-    ]
+    assert calls == []
     outcome, generation = emitted[0]
     assert generation == 9
     assert outcome.success is True
-    assert outcome.reconciled_local_mirror is True
-    assert outcome.reconciliation_result is reconciliation
+    assert outcome.error == ""
 
 
 def test_relevant_hourly_symbols_include_scan_watchlist_and_buylist():
@@ -809,29 +760,33 @@ def test_relevant_hourly_symbols_include_scan_watchlist_and_buylist():
     ]
 
 
-def test_hourly_reconciliation_worker_is_scoped_and_non_derived(monkeypatch):
+def test_backup_worker_initializes_local_mirror_and_uses_pc_as_authority(monkeypatch):
     import src.ui.main_window as main_window
     import src.utils.db_loader as db_loader
 
-    report = SimpleNamespace(success=True, errors=())
+    local_engine = object()
     calls = []
     monkeypatch.setattr(
         db_loader,
-        "reconcile_local_mirror_with_pc",
-        lambda pc, local, **kwargs: calls.append((pc, local, kwargs)) or report,
+        "init_local_mirror_engine",
+        lambda: local_engine,
+    )
+    monkeypatch.setattr(
+        db_loader,
+        "sync_local_mirror_from_pc_atomic",
+        lambda pc, local, **kwargs: calls.append((pc, local, kwargs)) or {},
     )
     emitted = []
     pc_engine = object()
-    local_engine = object()
-    worker = main_window.HourlyMirrorReconciliationWorker(
+    worker = main_window.LocalMirrorSyncWorker(
         pc_engine,
-        local_engine,
-        ["SPY", "AAPL"],
+        None,
+        hourly_symbols=["SPY", "AAPL"],
         generation=12,
     )
     worker.completed.connect(
-        lambda result, error, generation: emitted.append(
-            (result, error, generation)
+        lambda written, error, needs_reconciliation, generation: emitted.append(
+            (written, error, needs_reconciliation, generation)
         )
     )
 
@@ -843,32 +798,28 @@ def test_hourly_reconciliation_worker_is_scoped_and_non_derived(monkeypatch):
             local_engine,
             {
                 "hourly_symbols": ["SPY", "AAPL"],
+                "tickers": None,
                 "verify_derived": False,
-                "tables": db_loader.HOURLY_MIRROR_TABLES,
+                "pc_authoritative": True,
             },
         )
     ]
-    assert emitted == [(report, "", 12)]
+    assert worker.local_engine is local_engine
+    assert emitted == [({}, "", False, 12)]
 
 
-def test_database_recovery_worker_contains_reconciliation_failure(monkeypatch):
+def test_database_recovery_worker_contains_connection_failure(monkeypatch):
     import src.ui.main_window as main_window
     import src.utils.db_loader as db_loader
 
-    reconciliation = SimpleNamespace(
-        success=False,
-        errors=("price_history mismatch",),
-    )
     monkeypatch.setattr(
         db_loader,
-        "reconcile_local_mirror_with_pc",
-        lambda *_args, **_kwargs: reconciliation,
+        "init_mysql_engine",
+        lambda **_kwargs: None,
     )
     emitted = []
     worker = main_window.DatabaseRecoveryWorker(
         3,
-        pc_engine=object(),
-        local_engine=object(),
     )
     worker.recovered.connect(lambda outcome, generation: emitted.append((outcome, generation)))
 
@@ -877,10 +828,10 @@ def test_database_recovery_worker_contains_reconciliation_failure(monkeypatch):
     outcome, generation = emitted[0]
     assert generation == 3
     assert outcome.success is False
-    assert outcome.error == "price_history mismatch"
+    assert outcome.error == "PC MySQL is no longer reachable."
 
 
-def test_active_mirror_worker_emits_typed_staged_reconciliation(monkeypatch):
+def test_backup_worker_reports_error_without_requesting_reroute(monkeypatch):
     import src.ui.main_window as main_window
     import src.utils.db_loader as db_loader
 
@@ -909,7 +860,7 @@ def test_active_mirror_worker_emits_typed_staged_reconciliation(monkeypatch):
     worker.run()
 
     assert emitted == [
-        ({}, "Local mirror contains laptop-side writes.", True, 7)
+        ({}, "Local mirror contains laptop-side writes.", False, 7)
     ]
 
 
@@ -945,10 +896,12 @@ def test_active_mirror_worker_forwards_relevant_hourly_symbols(monkeypatch):
         (
             pc_engine,
             local_engine,
-            {
-                "tickers": ["AAPL", "MSFT"],
-                "hourly_symbols": ["SPY", "AAPL"],
-            },
+                {
+                    "tickers": ["AAPL", "MSFT"],
+                    "hourly_symbols": ["SPY", "AAPL"],
+                    "verify_derived": False,
+                    "pc_authoritative": True,
+                },
         )
     ]
     assert emitted == [({}, "", False, 8)]
@@ -974,7 +927,6 @@ def test_database_recovery_result_is_disposed_while_window_is_closing():
     outcome = main_window.DatabaseRecoveryOutcome(
         candidate,
         True,
-        reconciled_local_mirror=True,
     )
     window._on_database_recovery_finished(outcome, generation=0)
 

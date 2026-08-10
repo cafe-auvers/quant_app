@@ -124,7 +124,7 @@ def test_database_init_worker_never_raises_connection_errors_into_the_ui(monkeyp
     monkeypatch.setattr(
         main_window,
         "resolve_data_engine",
-        lambda: (_ for _ in ()).throw(RuntimeError("offline")),
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("offline")),
     )
     results = []
     worker = main_window.DatabaseInitWorker()
@@ -137,17 +137,18 @@ def test_database_init_worker_never_raises_connection_errors_into_the_ui(monkeyp
     assert results == [(None, "none", None, "offline")]
 
 
-def test_database_init_worker_reconciles_existing_local_mirror_before_pc(monkeypatch):
+def test_database_init_worker_routes_to_pc_without_opening_local_mirror(monkeypatch):
     import src.ui.main_window as main_window
     import src.utils.db_loader as db_loader
 
     pc_engine = object()
     local_engine = object()
     report = SimpleNamespace(success=True, errors=())
+    resolve_calls = []
     monkeypatch.setattr(
         main_window,
         "resolve_data_engine",
-        lambda: SimpleNamespace(
+        lambda **kwargs: resolve_calls.append(kwargs) or SimpleNamespace(
             engine=pc_engine,
             source="pc",
             pc_engine=pc_engine,
@@ -170,19 +171,10 @@ def test_database_init_worker_reconciles_existing_local_mirror_before_pc(monkeyp
 
     worker.run()
 
-    assert calls == [
-        (
-            pc_engine,
-            local_engine,
-            {"tables": db_loader.ROUTING_CRITICAL_MIRROR_TABLES},
-        )
-    ]
-    assert "hourly_price_history" not in {
-        table_name for table_name, _watermark in calls[0][2]["tables"]
-    }
+    assert resolve_calls == [{"ensure_pc_schema": False}]
+    assert calls == []
     assert results == [(pc_engine, "pc", pc_engine, "")]
-    assert worker.local_engine is local_engine
-    assert worker.reconciliation_result is report
+    assert not hasattr(worker, "local_engine")
 
 
 def test_database_init_worker_respects_disabled_local_mirror_on_pc(monkeypatch):
@@ -193,7 +185,7 @@ def test_database_init_worker_respects_disabled_local_mirror_on_pc(monkeypatch):
     monkeypatch.setattr(
         main_window,
         "resolve_data_engine",
-        lambda: SimpleNamespace(
+        lambda **_kwargs: SimpleNamespace(
             engine=pc_engine,
             source="pc",
             pc_engine=pc_engine,
@@ -225,10 +217,10 @@ def test_database_init_worker_respects_disabled_local_mirror_on_pc(monkeypatch):
     worker.run()
 
     assert results == [(pc_engine, "pc", pc_engine, "")]
-    assert worker.local_engine is None
+    assert not hasattr(worker, "local_engine")
 
 
-def test_database_init_worker_stays_local_when_startup_reconciliation_fails(
+def test_database_init_worker_does_not_wait_for_backup_reconciliation(
     monkeypatch,
 ):
     import src.ui.main_window as main_window
@@ -243,7 +235,7 @@ def test_database_init_worker_stays_local_when_startup_reconciliation_fails(
     monkeypatch.setattr(
         main_window,
         "resolve_data_engine",
-        lambda: SimpleNamespace(
+        lambda **_kwargs: SimpleNamespace(
             engine=pc_engine,
             source="pc",
             pc_engine=pc_engine,
@@ -265,13 +257,11 @@ def test_database_init_worker_stays_local_when_startup_reconciliation_fails(
 
     worker.run()
 
-    assert results == [
-        (local_engine, "local_mirror", None, "daily history mismatch")
-    ]
-    assert worker.pc_candidate_engine is pc_engine
+    assert results == [(pc_engine, "pc", pc_engine, "")]
+    assert not hasattr(worker, "pc_candidate_engine")
 
 
-def test_database_init_worker_contains_unexpected_reconciliation_error(monkeypatch):
+def test_database_init_worker_never_starts_backup_reconciliation(monkeypatch):
     import src.ui.main_window as main_window
     import src.utils.db_loader as db_loader
 
@@ -280,7 +270,7 @@ def test_database_init_worker_contains_unexpected_reconciliation_error(monkeypat
     monkeypatch.setattr(
         main_window,
         "resolve_data_engine",
-        lambda: SimpleNamespace(
+        lambda **_kwargs: SimpleNamespace(
             engine=pc_engine,
             source="pc",
             pc_engine=pc_engine,
@@ -304,14 +294,7 @@ def test_database_init_worker_contains_unexpected_reconciliation_error(monkeypat
 
     worker.run()
 
-    assert results == [
-        (
-            local_engine,
-            "local_mirror",
-            None,
-            "Unexpected reconciliation failure: sync exploded",
-        )
-    ]
+    assert results == [(pc_engine, "pc", pc_engine, "")]
 
 
 def test_completed_daily_fallback_refresh_starts_queued_hourly_refresh(monkeypatch):

@@ -21,13 +21,11 @@ There is exactly **one canonical database**, living on the PC. The laptop's
 SQLite file is an offline market-data mirror rather than a peer database:
 cross-machine application state, ownership, runtime heartbeats, and intraday
 trading data continue to use only PC MySQL. Normal synchronization is PC to
-laptop, and the active-PC background copy never promotes laptop data. If a
-completed daily/hourly refresh was written locally while the PC was
-unavailable, normal recovery performs a guarded exception: valid completed
-raw bars that are missing on the PC are inserted without overwriting an
-existing PC key. Daily history and derived chart/scanner caches are reconciled
-before the dashboard switches back. Hourly history is not routing-critical; it
-continues in the background after the dashboard is usable on PC MySQL.
+laptop, and laptop market data is never promoted back to the PC. Startup and
+reconnect wait only for a successful MySQL connection check, then use the PC
+database immediately. The SQLite safety backup is disposable and updates in
+the background; it never blocks PC routing. Full hourly backup is limited to
+SPY and symbols in scanner results, watchlist, or buylist.
 
 ## Architecture
 
@@ -56,7 +54,6 @@ flowchart LR
   mainL -- "LAN: 192.168.219.111:3306, home Wi-Fi only" --> db
   mainL -- "Tailscale: 100.121.30.45:3306, works anywhere" --> db
   db -- "canonical market-data mirror" --> mirror
-  mirror -. "validated missing raw bars on reconnect" .-> db
 ```
 
 ## Daily workflow (as actually configured)
@@ -256,20 +253,16 @@ morning) for dependencies:
   than trusting one global latest date. Routine hourly gaps inside D-10
   self-heal on the next successful run; older hourly repairs use the explicit
   one-time D-200 script below.
-- **Switching is transactional from the dashboard's point of view.** While
-  reconnect reconciliation runs, the status remains yellow as
-  `DB: Local (Syncing...)` and all market-data reads continue using SQLite.
-  The status becomes green `DB: PC` after daily history and PC-derived caches
-  converge. Hourly synchronization then runs in the background only for SPY
-  and symbols in scanner results, watchlist, or buylist. A routing-critical
-  failure leaves the app on local data and is retried automatically; an hourly
-  failure does not block startup and retries in the background.
+- **Switching is connection-gated only.** Once `SELECT 1` succeeds, the status
+  becomes green `DB: PC` and market-data reads use MySQL immediately. The app
+  does not compare PC and laptop market tables before switching.
 - **The active-PC safety copy is exact and atomic.** Full keys and values are
   compared for daily/derived data, including old corrections and PC-side
   removal of derived/operational rows. Hourly comparison is deliberately
-  limited to relevant scanner/watchlist/buylist symbols. It is strictly
-  PC-to-local and runs only while the mirror is clean. A dirty flag or any
-  local-only change cancels that copy and forces staged reconciliation.
+  limited to relevant scanner/watchlist/buylist symbols. It runs in a worker
+  after the dashboard is usable, is strictly PC-to-local, and treats MySQL as
+  authoritative even when the laptop cache has local changes. Backup failure
+  is logged and retried without changing active database routing.
 - **Root causes worth checking**: BIOS RTC alarm didn't fire (power/PSU
   prerequisites), Windows didn't auto-login, or a step in
   `pc_morning_routine.ps1` failed -- check `data/logs/pc_morning_routine.log`
@@ -280,10 +273,10 @@ morning) for dependencies:
 Yes. When PC MySQL is reachable, a manual run writes to the authoritative
 tables there. When it is unreachable, `historical.py` and
 `scripts/run_daily_refresh.py` resolve the local SQLite mirror instead and
-refresh that copy. On the next local-to-PC transition, completed missing daily
-bars are inserted into missing PC keys, existing PC values win all conflicts,
-and PC-derived caches are rebuilt before routing changes. Relevant hourly bars
-are reconciled immediately afterward in the background. Prefer
+refresh that copy. When the PC becomes reachable again, those laptop-only
+daily or hourly bars are not uploaded to MySQL. The dashboard switches to the
+PC immediately, and its background backup eventually replaces the laptop
+cache with authoritative PC data. Prefer
 `python scripts\run_daily_refresh.py` over
 calling `historical.py` directly because it checks per-symbol freshness and
 runs only the necessary modes.

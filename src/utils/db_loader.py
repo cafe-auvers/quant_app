@@ -147,13 +147,18 @@ def get_mysql_connection_url(db_name: Optional[str] = None) -> URL:
 
 
 def init_mysql_engine(
-    db_name: Optional[str] = None, *, log_unavailable: bool = True
+    db_name: Optional[str] = None,
+    *,
+    log_unavailable: bool = True,
+    ensure_schema: bool = True,
 ) -> Optional[Engine]:
     """Open the optional MySQL cache, returning ``None`` when unavailable.
 
     Periodic connectivity probes can set ``log_unavailable=False`` to keep an
     expected offline PC from producing the same INFO message on every poll.
-    The failure remains available at DEBUG level for diagnostics.
+    The failure remains available at DEBUG level for diagnostics. Routing
+    probes use ``ensure_schema=False`` because the refresh workflow provisions
+    the PC database and table inspection must not delay the dashboard.
     """
     engine: Optional[Engine] = None
     try:
@@ -176,13 +181,14 @@ def init_mysql_engine(
         # action.  The configured account must already have access to DB_NAME.
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-        _ensure_price_history_table(engine)
-        _ensure_hourly_price_history_table(engine)
-        _ensure_chart_indicators_table(engine)
-        _ensure_chart_indicator_manifests_table(engine)
-        _ensure_intraday_price_history_table(engine)
-        _ensure_scanner_metrics_table(engine)
-        _ensure_scanner_metric_snapshots_table(engine)
+        if ensure_schema:
+            _ensure_price_history_table(engine)
+            _ensure_hourly_price_history_table(engine)
+            _ensure_chart_indicators_table(engine)
+            _ensure_chart_indicator_manifests_table(engine)
+            _ensure_intraday_price_history_table(engine)
+            _ensure_scanner_metrics_table(engine)
+            _ensure_scanner_metric_snapshots_table(engine)
         return engine
     except (ImportError, OSError, SQLAlchemyError, ValueError, TypeError) as exc:
         if engine is not None:
@@ -196,10 +202,10 @@ def init_mysql_engine(
 #
 # The PC's MySQL database remains the canonical market-data cache (see
 # docs/pc_sync_data_pipeline.md).  The SQLite file is the laptop's offline
-# mirror.  Normal mirroring is PC -> laptop.  On a local -> PC runtime
-# transition, a deliberately narrow reconciliation may promote *missing,
-# completed raw bars* from the mirror without ever overwriting an existing PC
-# bar; derived caches are rebuilt on the PC and then mirrored back down.
+# mirror. Runtime mirroring is strictly PC -> laptop and MySQL is
+# authoritative. The explicit reconciliation helper below remains available
+# for maintenance/tests, but normal app startup and recovery never promote
+# laptop market data or wait for mirror equality.
 
 LOCAL_MIRROR_DB_PATH = DATA_DIR / "local_mirror.db"
 LOCAL_MIRROR_ENABLED_ENV = "QUANT_LOCAL_MIRROR_ENABLED"
@@ -219,9 +225,6 @@ MIRRORED_TABLES: Tuple[Tuple[str, str], ...] = (
     ("scanner_metrics", "date"),
     ("scanner_metric_snapshots", "snapshot_date"),
     ("symbol_refresh_failures", "last_attempt_at"),
-)
-ROUTING_CRITICAL_MIRROR_TABLES: Tuple[Tuple[str, str], ...] = tuple(
-    item for item in MIRRORED_TABLES if item[0] != "hourly_price_history"
 )
 HOURLY_MIRROR_TABLES: Tuple[Tuple[str, str], ...] = (
     ("hourly_price_history", "timestamp"),
@@ -522,9 +525,9 @@ def _local_mirror_enabled() -> bool:
     return value not in {"0", "false", "no", "off"}
 
 
-def resolve_data_engine() -> DataEngineResolution:
+def resolve_data_engine(*, ensure_pc_schema: bool = True) -> DataEngineResolution:
     """Resolve the market-data engine: PC MySQL first, local mirror fallback."""
-    pc_engine = init_mysql_engine()
+    pc_engine = init_mysql_engine(ensure_schema=ensure_pc_schema)
     if pc_engine is not None:
         return DataEngineResolution(pc_engine, "pc", pc_engine)
     if not _local_mirror_enabled():
@@ -1394,6 +1397,7 @@ def _sync_clean_local_mirror_from_pc_exactly(
     tickers: Optional[List[str]],
     hourly_symbols: Optional[List[str]],
     verify_derived: bool,
+    pc_authoritative: bool,
 ) -> Dict[str, int]:
     """Implement the PC-read-only active mirror under one SQLite write lock."""
     if local_engine is None or local_engine.dialect.name != "sqlite":
@@ -1425,7 +1429,7 @@ def _sync_clean_local_mirror_from_pc_exactly(
         dirty = local_conn.execute(
             select(handoff.c.dirty).where(handoff.c.id == 1)
         ).scalar_one()
-        if bool(dirty):
+        if bool(dirty) and not pc_authoritative:
             raise LocalMirrorNeedsReconciliationError(
                 "Local mirror contains changes that require staged reconciliation."
             )
@@ -1553,13 +1557,14 @@ def sync_local_mirror_from_pc_atomic(
     tickers: Optional[List[str]] = None,
     hourly_symbols: Optional[List[str]] = None,
     verify_derived: bool = True,
+    pc_authoritative: bool = False,
 ) -> Dict[str, int]:
-    """Publish an exact PC generation only when the local mirror is clean.
+    """Publish an exact PC generation to the local mirror atomically.
 
-    All keys and values are compared, causal derived caches are verified, and
-    every local change shares one SQLite transaction. The PC is read-only in
-    this active-dashboard path; tracked local writes raise a typed exception
-    so the UI can stage the normal guarded reconciliation. Readers see the old
+    All keys and values are compared and every local change shares one SQLite
+    transaction. With ``pc_authoritative=True``, tracked laptop writes do not
+    block the backup: PC partitions replace the scoped local cache and nothing
+    is written back to MySQL. Readers see the old
     generation or the new one—never a partially copied collection of tables.
 
     Full content comparison is deletion-aware and deliberately avoids a
@@ -1573,6 +1578,7 @@ def sync_local_mirror_from_pc_atomic(
         tickers=tickers,
         hourly_symbols=hourly_symbols,
         verify_derived=verify_derived,
+        pc_authoritative=pc_authoritative,
     )
 
 def _reconciliation_universe(

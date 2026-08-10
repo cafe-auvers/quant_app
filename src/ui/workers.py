@@ -1240,7 +1240,10 @@ class PcRemoteStatusWorker(QThread):
                 # This worker runs every 15 seconds while the PC is offline.
                 # Keep probing so the status indicator notices recovery, but
                 # leave the user-facing failure log to the startup attempt.
-                engine = init_mysql_engine(log_unavailable=False)
+                engine = init_mysql_engine(
+                    log_unavailable=False,
+                    ensure_schema=False,
+                )
                 owns_engine = engine is not None
             if engine is not None:
                 with engine.connect() as conn:

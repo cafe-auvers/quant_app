@@ -154,7 +154,12 @@ def test_resolve_data_engine_prefers_pc_and_falls_back_to_local(monkeypatch):
     pc_engine = object()
     local_engine = object()
 
-    monkeypatch.setattr(db_loader, "init_mysql_engine", lambda: pc_engine)
+    mysql_calls = []
+    monkeypatch.setattr(
+        db_loader,
+        "init_mysql_engine",
+        lambda **kwargs: mysql_calls.append(kwargs) or pc_engine,
+    )
     monkeypatch.setattr(
         db_loader,
         "init_local_mirror_engine",
@@ -164,8 +169,9 @@ def test_resolve_data_engine_prefers_pc_and_falls_back_to_local(monkeypatch):
     assert resolution.engine is pc_engine
     assert resolution.pc_engine is pc_engine
     assert resolution.source == "pc"
+    assert mysql_calls == [{"ensure_schema": True}]
 
-    monkeypatch.setattr(db_loader, "init_mysql_engine", lambda: None)
+    monkeypatch.setattr(db_loader, "init_mysql_engine", lambda **_kwargs: None)
     monkeypatch.setattr(db_loader, "init_local_mirror_engine", lambda: local_engine)
     resolution = db_loader.resolve_data_engine()
     assert resolution.engine is local_engine
@@ -175,7 +181,7 @@ def test_resolve_data_engine_prefers_pc_and_falls_back_to_local(monkeypatch):
 
 def test_resolve_data_engine_can_disable_laptop_only_fallback(monkeypatch):
     monkeypatch.setenv(db_loader.LOCAL_MIRROR_ENABLED_ENV, "0")
-    monkeypatch.setattr(db_loader, "init_mysql_engine", lambda: None)
+    monkeypatch.setattr(db_loader, "init_mysql_engine", lambda **_kwargs: None)
     monkeypatch.setattr(
         db_loader,
         "init_local_mirror_engine",
@@ -491,6 +497,32 @@ def test_atomic_mirror_sync_requests_reconciliation_for_unobserved_local_write()
         assert conn.execute(
             select(pc_daily.c.symbol).order_by(pc_daily.c.symbol)
         ).scalars().all() == ["A", "B"]
+
+
+def test_pc_authoritative_mirror_replaces_dirty_local_rows_without_pc_write():
+    pc, local, pc_daily, local_daily, _pc_hourly, _local_hourly = _raw_engines()
+    with pc.begin() as conn:
+        conn.execute(insert(pc_daily), _daily_bar("A", 1, 100))
+    with local.begin() as conn:
+        conn.execute(insert(local_daily), _daily_bar("B", 2, 200))
+
+    written = db_loader.sync_local_mirror_from_pc_atomic(
+        pc,
+        local,
+        tables=(("price_history", "date"),),
+        verify_derived=False,
+        pc_authoritative=True,
+    )
+
+    assert written["price_history"] == 2
+    with pc.connect() as conn:
+        assert conn.execute(
+            select(pc_daily.c.symbol).order_by(pc_daily.c.symbol)
+        ).scalars().all() == ["A"]
+    with local.connect() as conn:
+        assert conn.execute(
+            select(local_daily.c.symbol).order_by(local_daily.c.symbol)
+        ).scalars().all() == ["A"]
 
 
 def test_atomic_mirror_sync_rolls_back_all_tables_on_later_failure(monkeypatch):
