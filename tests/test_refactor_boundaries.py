@@ -137,6 +137,172 @@ def test_database_init_worker_never_raises_connection_errors_into_the_ui(monkeyp
     assert results == [(None, "none", None, "offline")]
 
 
+def test_database_init_worker_reconciles_existing_local_mirror_before_pc(monkeypatch):
+    import src.ui.main_window as main_window
+    import src.utils.db_loader as db_loader
+
+    pc_engine = object()
+    local_engine = object()
+    report = SimpleNamespace(success=True, errors=())
+    monkeypatch.setattr(
+        main_window,
+        "resolve_data_engine",
+        lambda: SimpleNamespace(
+            engine=pc_engine,
+            source="pc",
+            pc_engine=pc_engine,
+        ),
+    )
+    monkeypatch.setattr(db_loader, "init_local_mirror_engine", lambda: local_engine)
+    calls = []
+    monkeypatch.setattr(
+        db_loader,
+        "reconcile_local_mirror_with_pc",
+        lambda pc, local: calls.append((pc, local)) or report,
+    )
+    results = []
+    worker = main_window.DatabaseInitWorker()
+    worker.initialized.connect(
+        lambda engine, source, pc, error: results.append(
+            (engine, source, pc, error)
+        )
+    )
+
+    worker.run()
+
+    assert calls == [(pc_engine, local_engine)]
+    assert results == [(pc_engine, "pc", pc_engine, "")]
+    assert worker.local_engine is local_engine
+    assert worker.reconciliation_result is report
+
+
+def test_database_init_worker_respects_disabled_local_mirror_on_pc(monkeypatch):
+    import src.ui.main_window as main_window
+    import src.utils.db_loader as db_loader
+
+    pc_engine = object()
+    monkeypatch.setattr(
+        main_window,
+        "resolve_data_engine",
+        lambda: SimpleNamespace(
+            engine=pc_engine,
+            source="pc",
+            pc_engine=pc_engine,
+        ),
+    )
+    monkeypatch.setattr(db_loader, "_local_mirror_enabled", lambda: False)
+    monkeypatch.setattr(
+        db_loader,
+        "init_local_mirror_engine",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("disabled mirror must not be opened")
+        ),
+    )
+    monkeypatch.setattr(
+        db_loader,
+        "reconcile_local_mirror_with_pc",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("disabled mirror must not be reconciled")
+        ),
+    )
+    results = []
+    worker = main_window.DatabaseInitWorker()
+    worker.initialized.connect(
+        lambda engine, source, pc, error: results.append(
+            (engine, source, pc, error)
+        )
+    )
+
+    worker.run()
+
+    assert results == [(pc_engine, "pc", pc_engine, "")]
+    assert worker.local_engine is None
+
+
+def test_database_init_worker_stays_local_when_startup_reconciliation_fails(
+    monkeypatch,
+):
+    import src.ui.main_window as main_window
+    import src.utils.db_loader as db_loader
+
+    pc_engine = object()
+    local_engine = object()
+    report = SimpleNamespace(
+        success=False,
+        errors=("daily history mismatch",),
+    )
+    monkeypatch.setattr(
+        main_window,
+        "resolve_data_engine",
+        lambda: SimpleNamespace(
+            engine=pc_engine,
+            source="pc",
+            pc_engine=pc_engine,
+        ),
+    )
+    monkeypatch.setattr(db_loader, "init_local_mirror_engine", lambda: local_engine)
+    monkeypatch.setattr(
+        db_loader,
+        "reconcile_local_mirror_with_pc",
+        lambda *_args: report,
+    )
+    results = []
+    worker = main_window.DatabaseInitWorker()
+    worker.initialized.connect(
+        lambda engine, source, pc, error: results.append(
+            (engine, source, pc, error)
+        )
+    )
+
+    worker.run()
+
+    assert results == [
+        (local_engine, "local_mirror", None, "daily history mismatch")
+    ]
+    assert worker.pc_candidate_engine is pc_engine
+
+
+def test_database_init_worker_contains_unexpected_reconciliation_error(monkeypatch):
+    import src.ui.main_window as main_window
+    import src.utils.db_loader as db_loader
+
+    pc_engine = object()
+    local_engine = object()
+    monkeypatch.setattr(
+        main_window,
+        "resolve_data_engine",
+        lambda: SimpleNamespace(
+            engine=pc_engine,
+            source="pc",
+            pc_engine=pc_engine,
+        ),
+    )
+    monkeypatch.setattr(db_loader, "init_local_mirror_engine", lambda: local_engine)
+    monkeypatch.setattr(
+        db_loader,
+        "reconcile_local_mirror_with_pc",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("sync exploded")),
+    )
+    results = []
+    worker = main_window.DatabaseInitWorker()
+    worker.initialized.connect(
+        lambda engine, source, pc, error: results.append(
+            (engine, source, pc, error)
+        )
+    )
+
+    worker.run()
+
+    assert results == [
+        (
+            local_engine,
+            "local_mirror",
+            None,
+            "Unexpected reconciliation failure: sync exploded",
+        )
+    ]
+
+
 def test_completed_daily_fallback_refresh_starts_queued_hourly_refresh(monkeypatch):
     import src.ui.mixins.scanner_mixin as scanner_mixin
 
@@ -187,6 +353,63 @@ def test_completed_daily_fallback_refresh_starts_queued_hourly_refresh(monkeypat
 
     assert window._run_scanners_after_local_mirror_refresh is False
     assert window.scanner_starts == 1
+
+
+def test_manual_refresh_cannot_start_during_database_reconciliation(monkeypatch):
+    import src.ui.mixins.scanner_mixin as scanner_mixin
+
+    class Window(scanner_mixin.ScannerMixin):
+        _database_reconciliation_in_progress = True
+        db_enabled = True
+
+    messages = []
+    launches = []
+    monkeypatch.setattr(
+        scanner_mixin.QMessageBox,
+        "information",
+        lambda *args: messages.append(args),
+    )
+    monkeypatch.setattr(
+        scanner_mixin,
+        "launch_refresh",
+        lambda *args, **kwargs: launches.append((args, kwargs)),
+    )
+    window = Window()
+
+    assert window.refresh_data_to_db() is False
+    assert window.refresh_hourly_data_to_db() is False
+    assert launches == []
+    assert len(messages) == 2
+
+
+def test_completed_pc_refresh_immediately_tops_up_local_mirror():
+    import src.ui.mixins.scanner_mixin as scanner_mixin
+
+    class Window(scanner_mixin.ScannerMixin):
+        db_engine_source = "pc"
+        _pending_local_mirror_hourly_refresh = False
+        _run_scanners_after_local_mirror_refresh = False
+
+        def __init__(self):
+            self.mirror_syncs = 0
+
+        def show_refresh_complete(self, _updated_count):
+            pass
+
+        def update_dashboard_summary(self, **_kwargs):
+            pass
+
+        def _sync_active_pc_to_local_mirror(self):
+            self.mirror_syncs += 1
+
+    window = Window()
+
+    window._handle_refresh_terminal_status(
+        scanner_mixin.MODE_1D,
+        {"status": "completed", "result": {"updated_count": 12}},
+    )
+
+    assert window.mirror_syncs == 1
 
 
 def test_app_state_save_preserves_json_shapes(tmp_path, monkeypatch):

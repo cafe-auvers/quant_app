@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import webbrowser
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, List, Tuple
 from zoneinfo import ZoneInfo
@@ -129,6 +130,7 @@ KST_ZONE = ZoneInfo("Asia/Seoul")
 US_MARKET_ZONE = ZoneInfo("America/New_York")
 MARKET_DATA_READY_TIME_KST = dt.time(7, 0)
 LIVE_INTRADAY_REFRESH_INTERVAL_MS = 5 * 60 * 1000
+LOCAL_MIRROR_SYNC_INTERVAL_MS = 15 * 60 * 1000
 TRADINGVIEW_REFRESH_INTERVAL_SECONDS = 5 * 60
 KIS_DAILY_CHART_FAILURE_COOLDOWN_SECONDS = 30 * 60
 WORKER_SHUTDOWN_TIMEOUT_MS = 30_000
@@ -142,9 +144,54 @@ class DatabaseInitWorker(QThread):
 
     initialized = pyqtSignal(object, str, object, str)
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.local_engine = None
+        self.pc_candidate_engine = None
+        self.reconciliation_result = None
+
     def run(self) -> None:
         try:
             resolution = resolve_data_engine()
+            if resolution.source == "pc" and resolution.pc_engine is not None:
+                from src.utils.db_loader import (
+                    _local_mirror_enabled,
+                    init_local_mirror_engine,
+                    reconcile_local_mirror_with_pc,
+                )
+
+                self.local_engine = (
+                    init_local_mirror_engine()
+                    if _local_mirror_enabled()
+                    else None
+                )
+                if self.local_engine is not None:
+                    try:
+                        self.reconciliation_result = reconcile_local_mirror_with_pc(
+                            resolution.pc_engine,
+                            self.local_engine,
+                        )
+                    except Exception as exc:
+                        self.pc_candidate_engine = resolution.pc_engine
+                        self.initialized.emit(
+                            self.local_engine,
+                            "local_mirror",
+                            None,
+                            f"Unexpected reconciliation failure: {exc}",
+                        )
+                        return
+                    if not self.reconciliation_result.success:
+                        # A reachable PC is not adopted until its market data
+                        # converges.  Start on the usable local mirror and let
+                        # the normal recovery loop retry in the background.
+                        self.pc_candidate_engine = resolution.pc_engine
+                        self.initialized.emit(
+                            self.local_engine,
+                            "local_mirror",
+                            None,
+                            "; ".join(self.reconciliation_result.errors),
+                        )
+                        return
             self.initialized.emit(
                 resolution.engine, resolution.source, resolution.pc_engine, ""
             )
@@ -155,49 +202,116 @@ class DatabaseInitWorker(QThread):
             self.initialized.emit(None, "none", None, str(exc))
 
 
+@dataclass(frozen=True)
+class DatabaseRecoveryOutcome:
+    engine: object
+    success: bool
+    reconciled_local_mirror: bool = False
+    reconciliation_result: object = None
+    error: str = ""
+
+
 class DatabaseRecoveryWorker(QThread):
-    """Recreate the PC MySQL engine after recovery from an offline startup."""
+    """Resolve and reconcile PC MySQL without changing live UI routing."""
 
     recovered = pyqtSignal(object, int)
 
-    def __init__(self, generation: int) -> None:
+    def __init__(
+        self,
+        generation: int,
+        pc_engine=None,
+        local_engine=None,
+        tickers: Optional[List[str]] = None,
+    ) -> None:
         super().__init__()
         self.generation = int(generation)
+        self.pc_engine = pc_engine
+        self.local_engine = local_engine
+        self.tickers = list(tickers or [])
 
     def run(self) -> None:
-        from src.utils.db_loader import init_mysql_engine
+        from src.utils.db_loader import (
+            init_mysql_engine,
+            reconcile_local_mirror_with_pc,
+        )
 
+        engine = self.pc_engine
         try:
-            engine = init_mysql_engine(log_unavailable=False)
-        except Exception:
+            if engine is None:
+                engine = init_mysql_engine(log_unavailable=False)
+            if engine is None:
+                outcome = DatabaseRecoveryOutcome(
+                    None, False, error="PC MySQL is no longer reachable."
+                )
+            elif self.isInterruptionRequested():
+                outcome = DatabaseRecoveryOutcome(
+                    engine, False, error="Database reconciliation was interrupted."
+                )
+            elif self.local_engine is not None:
+                result = reconcile_local_mirror_with_pc(
+                    engine,
+                    self.local_engine,
+                    tickers=self.tickers or None,
+                )
+                error = "; ".join(result.errors)
+                outcome = DatabaseRecoveryOutcome(
+                    engine,
+                    bool(result.success and not self.isInterruptionRequested()),
+                    reconciled_local_mirror=bool(result.success),
+                    reconciliation_result=result,
+                    error=(
+                        "Database reconciliation was interrupted."
+                        if result.success and self.isInterruptionRequested()
+                        else error
+                    ),
+                )
+            else:
+                outcome = DatabaseRecoveryOutcome(engine, True)
+        except Exception as exc:
             logger.exception("Runtime MySQL recovery failed unexpectedly")
-            engine = None
-        self.recovered.emit(engine, self.generation)
+            outcome = DatabaseRecoveryOutcome(engine, False, error=str(exc))
+        self.recovered.emit(outcome, self.generation)
 
 
 class LocalMirrorSyncWorker(QThread):
     """Best-effort, silent PC -> laptop local-mirror top-up in the background."""
 
-    completed = pyqtSignal(dict, str)
+    completed = pyqtSignal(dict, str, bool, int)
 
-    def __init__(self, pc_engine, local_engine) -> None:
+    def __init__(
+        self,
+        pc_engine,
+        local_engine,
+        tickers: Optional[List[str]] = None,
+        *,
+        generation: int = 0,
+    ) -> None:
         super().__init__()
         self.pc_engine = pc_engine
         self.local_engine = local_engine
+        self.tickers = list(tickers or [])
+        self.generation = int(generation)
 
     def run(self) -> None:
-        from src.utils.db_loader import sync_local_mirror_from_pc
+        from src.utils.db_loader import (
+            LocalMirrorNeedsReconciliationError,
+            sync_local_mirror_from_pc_atomic,
+        )
 
         try:
-            errors = []
-            written = sync_local_mirror_from_pc(
+            written = sync_local_mirror_from_pc_atomic(
                 self.pc_engine,
                 self.local_engine,
-                error_callback=errors.append,
+                tickers=self.tickers or None,
             )
-            self.completed.emit(written, "; ".join(errors))
+            self.completed.emit(written, "", False, self.generation)
+        except LocalMirrorNeedsReconciliationError as exc:
+            # The local mirror contains laptop-side writes.  They must be
+            # reconciled while the UI is routed to local data; an active-PC
+            # background mirror is intentionally never allowed to write PC.
+            self.completed.emit({}, str(exc), True, self.generation)
         except Exception as exc:
-            self.completed.emit({}, str(exc))
+            self.completed.emit({}, str(exc), False, self.generation)
 
 
 class StateSyncWorker(QThread):
@@ -313,7 +427,12 @@ class MainWindow(
         self._last_pc_database_probe_ready = False
         self._database_transition_generation = 0
         self._database_shutting_down = False
+        self._database_reconciliation_in_progress = False
+        self._last_database_reconciliation_notice = ""
         self._local_mirror_sync_worker = None
+        self._local_mirror_sync_log_completion = True
+        self._pending_local_mirror_reconciliation_engine = None
+        self._last_pc_main_app_active = None
         self.state_sync_role = load_local_device_role()
         self.state_sync_worker = None
         self._last_state_sync_notice = ""
@@ -451,26 +570,87 @@ class MainWindow(
                 except Exception:
                     pass
             return
-        self.db_engine = engine
-        self.pc_db_engine = pc_engine
-        self._pc_probe_engine = pc_engine
-        self._local_mirror_engine = engine if source == "local_mirror" else None
-        self.db_engine_source = source
-        self.db_enabled = engine is not None
-        self.db_initializing = False
-        self._pc_database_ready = bool(source == "pc" and pc_engine is not None)
-        self._pc_database_coordination_ready = False
-        self._last_pc_database_probe_ready = self._pc_database_ready
-        self._bind_remote_state_engine(pc_engine, is_main_device=False)
-        self._update_database_source_indicator()
+        init_worker = self.__dict__.get("database_init_worker")
+        startup_local_engine = getattr(init_worker, "local_engine", None)
+        startup_pc_candidate = getattr(init_worker, "pc_candidate_engine", None)
+        startup_reconciliation = getattr(
+            init_worker, "reconciliation_result", None
+        )
+        startup_handoff_guard = None
+        if (
+            source == "pc"
+            and startup_local_engine is not None
+            and startup_reconciliation is not None
+            and hasattr(startup_reconciliation, "local_handoff_ready")
+        ):
+            candidate_engine = pc_engine
+            try:
+                if not startup_reconciliation.local_handoff_ready:
+                    raise RuntimeError("Startup local handoff was not prepared.")
+                from src.utils.db_loader import acquire_local_mirror_handoff_guard
+
+                startup_handoff_guard = acquire_local_mirror_handoff_guard(
+                    startup_local_engine
+                )
+                if any(
+                    is_refresh_running(mode)[0] for mode in (MODE_1D, MODE_1H)
+                ):
+                    raise RuntimeError(
+                        "A local historical refresh started during startup handoff."
+                    )
+            except Exception as exc:
+                logger.warning("Startup database handoff will retry: %s", exc)
+                startup_pc_candidate = candidate_engine
+                if init_worker is not None:
+                    init_worker.pc_candidate_engine = candidate_engine
+                engine = startup_local_engine
+                source = "local_mirror"
+                pc_engine = None
+                error = str(exc)
+
+        try:
+            self.db_engine = engine
+            self.pc_db_engine = pc_engine
+            self._pc_probe_engine = pc_engine or startup_pc_candidate
+            self._local_mirror_engine = (
+                engine if source == "local_mirror" else startup_local_engine
+            )
+            self.db_engine_source = source
+            self.db_enabled = engine is not None
+            self.db_initializing = False
+            self._pc_database_ready = bool(source == "pc" and pc_engine is not None)
+            self._pc_database_coordination_ready = False
+            self._last_pc_database_probe_ready = self._pc_database_ready
+            self._bind_remote_state_engine(pc_engine, is_main_device=False)
+            self._update_database_source_indicator()
+        finally:
+            if startup_handoff_guard is not None:
+                from src.utils.db_loader import release_local_mirror_handoff_guard
+
+                release_local_mirror_handoff_guard(startup_handoff_guard)
 
         if source == "pc":
+            if startup_reconciliation is not None:
+                self.append_log(
+                    "Startup PC/local market data synchronized "
+                    f"(local -> PC: {startup_reconciliation.total_local_to_pc_rows} "
+                    f"row(s), PC -> local: "
+                    f"{startup_reconciliation.total_pc_to_local_rows} row(s))."
+                )
             self.append_log("MySQL cache connected; starting initial scanner refresh.")
             self._start_state_sync()
             self.run_all_scanners(show_warnings=False)
-            self._start_background_local_mirror_sync(pc_engine)
+            if startup_reconciliation is None:
+                self._start_background_local_mirror_sync(pc_engine)
         elif source == "local_mirror":
-            self._handle_local_mirror_startup(engine)
+            if startup_pc_candidate is not None:
+                self.append_log(
+                    "PC/local startup synchronization is incomplete; using "
+                    f"the local database and retrying automatically. {error}"
+                )
+                self.run_all_scanners(show_warnings=False)
+            else:
+                self._handle_local_mirror_startup(engine)
         elif error:
             self.append_log(f"MySQL cache unavailable: {error}")
         else:
@@ -483,11 +663,36 @@ class MainWindow(
         # never launches duplicate connection attempts in separate QThreads.
         self._poll_pc_status()
 
-    def _start_background_local_mirror_sync(self, pc_engine) -> None:
+    def _sync_active_pc_to_local_mirror(self) -> None:
+        """Periodically preserve the active PC database for sudden failover."""
+        if (
+            self.__dict__.get("db_engine_source", "none") != "pc"
+            or not self.__dict__.get("_pc_database_ready", False)
+        ):
+            return
+        try:
+            if any(is_refresh_running(mode)[0] for mode in (MODE_1D, MODE_1H)):
+                return
+        except Exception:
+            # Exact content/causality fences in the worker remain authoritative
+            # if the optional refresh-status file cannot be read.
+            pass
+        self._start_background_local_mirror_sync(
+            self.__dict__.get("pc_db_engine"), log_completion=False
+        )
+
+    def _start_background_local_mirror_sync(
+        self, pc_engine, *, log_completion: bool = True
+    ) -> None:
         """Best-effort, silent PC -> laptop mirror top-up once connected to the PC."""
-        from src.utils.db_loader import init_local_mirror_engine
+        from src.utils.db_loader import (
+            _local_mirror_enabled,
+            init_local_mirror_engine,
+        )
 
         if self.__dict__.get("_database_shutting_down", False):
+            return
+        if not _local_mirror_enabled():
             return
         if (
             pc_engine is None
@@ -500,23 +705,131 @@ class MainWindow(
         if local_engine is None:
             return
         self._local_mirror_engine = local_engine
-        worker = LocalMirrorSyncWorker(pc_engine, local_engine)
+        worker = LocalMirrorSyncWorker(
+            pc_engine,
+            local_engine,
+            tickers=list(self.__dict__.get("universe_tickers", []) or []),
+            generation=self.__dict__.get("_database_transition_generation", 0),
+        )
         self._local_mirror_sync_worker = worker
+        self._local_mirror_sync_log_completion = bool(log_completion)
         worker.completed.connect(self._on_local_mirror_sync_completed)
         self._track_worker("_local_mirror_sync_worker", worker)
         worker.start()
 
-    def _on_local_mirror_sync_completed(self, written: dict, error: str) -> None:
+    def _on_local_mirror_sync_completed(
+        self,
+        written: dict,
+        error: str,
+        needs_reconciliation: bool = False,
+        generation: Optional[int] = None,
+    ) -> None:
         if self.__dict__.get("_database_shutting_down", False):
             return
+        if (
+            generation is not None
+            and generation
+            != self.__dict__.get("_database_transition_generation", 0)
+        ):
+            return
         total = sum(written.values())
+        if needs_reconciliation:
+            self._stage_active_pc_local_mirror_reconciliation(error)
+            return
         if error:
             self.append_log(
                 f"Local data mirror sync incomplete ({total} row(s) written): {error}"
             )
             return
-        if total:
+        if total and self.__dict__.get("_local_mirror_sync_log_completion", True):
             self.append_log(f"Local data mirror updated ({total} row(s)) for offline fallback.")
+
+    def _stage_active_pc_local_mirror_reconciliation(self, detail: str = "") -> None:
+        """Temporarily route to local before merging laptop writes into PC.
+
+        A clean active-PC mirror pass is PC-source-read-only.  If its guarded
+        dirty check finds local writes, keep the reachable PC engine only as a
+        recovery candidate, detach shared-state writes, and let the normal
+        two-way recovery worker perform the merge.  This keeps the database
+        indicator yellow until the same verified handoff used after an outage
+        has completed.
+        """
+        if self.__dict__.get("_database_shutting_down", False):
+            return
+        if self.__dict__.get("db_engine_source", "none") != "pc":
+            # The PC may have gone offline while the mirror worker was
+            # finishing.  Runtime failover already owns that transition.
+            return
+
+        pc_engine = self.__dict__.get("pc_db_engine")
+        if pc_engine is None:
+            pc_engine = self.__dict__.get("_pc_probe_engine")
+        local_engine = self.__dict__.get("_local_mirror_engine")
+        if pc_engine is None or local_engine is None:
+            self.append_log(
+                "Local data changes need synchronization, but a staged "
+                "PC/local handoff could not be prepared; retrying automatically."
+            )
+            return
+
+        self._database_transition_generation = (
+            self.__dict__.get("_database_transition_generation", 0) + 1
+        )
+        self._pc_probe_engine = pc_engine
+        self.pc_db_engine = None
+        self._pc_database_ready = False
+        self._pc_database_coordination_ready = False
+        self._last_pc_database_probe_ready = True
+        self.db_engine = local_engine
+        self.db_engine_source = "local_mirror"
+        self.db_enabled = True
+        self._database_reconciliation_in_progress = True
+        self._last_database_reconciliation_notice = "active-local-writes"
+        self._pending_local_mirror_reconciliation_engine = pc_engine
+        self._initial_state_sync_complete = False
+        self._cached_market_data_status = None
+        try:
+            self._bind_remote_state_engine(None, is_main_device=False)
+        except Exception:
+            logger.exception(
+                "Could not detach remote state persistence before PC/local reconciliation"
+            )
+
+        self._update_database_source_indicator()
+        suffix = f" {detail}" if detail else ""
+        self.append_log(
+            "Local market-data changes were detected; using the local database "
+            "while PC/local data is checked and synchronized before switching "
+            f"back to PC.{suffix}"
+        )
+        self._update_main_device_button()
+        self.update_dashboard_summary()
+        if self.__dict__.get("_local_mirror_sync_worker") is None:
+            # Queued Qt signals normally deliver ``completed`` before
+            # ``finished``.  If cleanup won that race, the worker has already
+            # released SQLite and recovery can start immediately.
+            self._resume_staged_local_mirror_reconciliation()
+
+    def _resume_staged_local_mirror_reconciliation(self) -> None:
+        """Start normal recovery after the active-PC mirror worker releases SQLite."""
+        pc_engine = self.__dict__.get(
+            "_pending_local_mirror_reconciliation_engine"
+        )
+        if pc_engine is None:
+            return
+        self._pending_local_mirror_reconciliation_engine = None
+        if (
+            self.__dict__.get("_database_shutting_down", False)
+            or self.__dict__.get("db_engine_source", "none") != "local_mirror"
+        ):
+            return
+        if not self.__dict__.get("_last_pc_database_probe_ready", False):
+            # PC disappeared before the staged handoff began.  Local remains
+            # authoritative and the ordinary status loop retries on recovery.
+            self._database_reconciliation_in_progress = False
+            self._update_database_source_indicator()
+            return
+        self._start_database_recovery(pc_engine=pc_engine)
 
     def _handle_local_mirror_startup(self, engine) -> None:
         """PC unreachable; decide whether to use the local mirror silently or ask first."""
@@ -1353,6 +1666,7 @@ class MainWindow(
             self.__dict__.get("live_data_timer"),
             self.__dict__.get("state_sync_timer"),
             self.__dict__.get("pc_status_timer"),
+            self.__dict__.get("local_mirror_sync_timer"),
             self.__dict__.get("market_status_timer"),
             self.__dict__.get("_refresh_poll_timer"),
         ]
@@ -1476,12 +1790,18 @@ class MainWindow(
         self._clear_worker_reference(attribute_name, worker)
 
     def _clear_worker_reference(self, attribute_name: str, worker: QThread) -> None:
-        if getattr(self, attribute_name, None) is worker:
+        cleared = getattr(self, attribute_name, None) is worker
+        if cleared:
             setattr(self, attribute_name, None)
         try:
             worker.deleteLater()
         except (AttributeError, RuntimeError):
             pass
+        if cleared and attribute_name == "_local_mirror_sync_worker":
+            # A dirty active-PC mirror result stages the UI immediately, but
+            # recovery must wait until this worker has released its SQLite
+            # transaction and fully stopped.
+            self._resume_staged_local_mirror_reconciliation()
 
     def _setup_tabs(self):
         """Set up the tab views."""
@@ -1658,6 +1978,15 @@ class MainWindow(
         self.pc_status_timer.timeout.connect(self._poll_pc_status)
         self.pc_status_timer.start()
         QTimer.singleShot(0, self._poll_pc_status)
+
+        # Keep the offline copy close behind PC MySQL even when the PC's
+        # scheduled refresh finishes after this dashboard first reconnects.
+        self.local_mirror_sync_timer = QTimer(self)
+        self.local_mirror_sync_timer.setInterval(LOCAL_MIRROR_SYNC_INTERVAL_MS)
+        self.local_mirror_sync_timer.timeout.connect(
+            self._sync_active_pc_to_local_mirror
+        )
+        self.local_mirror_sync_timer.start()
 
         # Set up a 1-second timer to update the countdown
         self.market_status_timer = QTimer(self)
@@ -1913,10 +2242,18 @@ class MainWindow(
             text_color = "#137333"
             tooltip = "Market-data reads are using the PC MySQL database."
         elif enabled and source == "local_mirror":
-            text_value = "DB: Local"
+            reconciling = bool(
+                self.__dict__.get("_database_reconciliation_in_progress", False)
+            )
+            text_value = "DB: Local (Syncing...)" if reconciling else "DB: Local"
             dot_color = "#ffb300"
             text_color = "#9a6700"
-            tooltip = "Market-data reads are using the laptop's local SQLite mirror."
+            tooltip = (
+                "Market-data reads remain on the laptop's local SQLite mirror "
+                "while PC/local market data is reconciled."
+                if reconciling
+                else "Market-data reads are using the laptop's local SQLite mirror."
+            )
         else:
             text_value = "DB: Offline"
             dot_color = "#f23645"
@@ -1950,6 +2287,7 @@ class MainWindow(
             self._pc_probe_engine = current_pc_engine
         self._pc_database_ready = False
         self._pc_database_coordination_ready = False
+        self._database_reconciliation_in_progress = False
         self.pc_db_engine = None
         self.db_engine = None
         self.db_engine_source = "none"
@@ -1966,9 +2304,13 @@ class MainWindow(
 
         local_engine = self.__dict__.get("_local_mirror_engine")
         if local_engine is None:
-            from src.utils.db_loader import init_local_mirror_engine
+            from src.utils.db_loader import (
+                _local_mirror_enabled,
+                init_local_mirror_engine,
+            )
 
-            local_engine = init_local_mirror_engine()
+            if _local_mirror_enabled():
+                local_engine = init_local_mirror_engine()
             self._local_mirror_engine = local_engine
 
         if local_engine is not None:
@@ -1992,8 +2334,10 @@ class MainWindow(
         self._update_main_device_button()
         self.update_dashboard_summary()
 
-    def _activate_recovered_pc_database(self, engine) -> None:
-        """Restore PC-backed routing after a successful background probe."""
+    def _activate_recovered_pc_database(
+        self, engine, *, local_mirror_reconciled: bool = False
+    ) -> None:
+        """Restore PC routing only after any active local mirror converged."""
         if engine is None or self.__dict__.get("_database_shutting_down", False):
             return
         if (
@@ -2004,9 +2348,16 @@ class MainWindow(
             return
 
         previous_source = self.__dict__.get("db_engine_source", "none")
+        if previous_source == "local_mirror" and not local_mirror_reconciled:
+            # Central invariant: no caller may bypass reconciliation merely
+            # because a connectivity probe succeeded.
+            self._start_database_recovery(pc_engine=engine)
+            return
         self._database_transition_generation = (
             self.__dict__.get("_database_transition_generation", 0) + 1
         )
+        self._database_reconciliation_in_progress = False
+        self._last_database_reconciliation_notice = ""
         self._pc_probe_engine = engine
         self.pc_db_engine = engine
         self.db_engine = engine
@@ -2033,29 +2384,80 @@ class MainWindow(
             self._update_main_device_button()
             self.update_dashboard_summary()
             self._start_state_sync()
-            self._start_background_local_mirror_sync(engine)
+            if not local_mirror_reconciled:
+                self._start_background_local_mirror_sync(engine)
         except Exception:
             # This method runs from Qt signal handlers.  A secondary UI or
             # worker-start failure must not unwind through Qt and close the app.
             logger.exception("PC database recovery follow-up failed")
 
-    def _start_database_recovery(self) -> None:
-        """Resolve a new PC engine without blocking the GUI after offline startup."""
+    def _start_database_recovery(self, pc_engine=None) -> None:
+        """Resolve/reconcile PC data without blocking or leaving local routing."""
         if self.__dict__.get("_database_shutting_down", False):
+            return
+        if self.__dict__.get("db_engine_source", "none") == "pc":
             return
         worker = self.__dict__.get("database_recovery_worker")
         if worker is not None:
             return
+        if self.__dict__.get("_local_mirror_sync_worker") is not None:
+            # A PC -> local top-up from the previous PC-active generation may
+            # still be finishing after failover.  Never let two workers write
+            # the SQLite mirror concurrently; the next status poll retries.
+            return
+
+        local_engine = None
+        if self.__dict__.get("db_engine_source", "none") == "local_mirror":
+            local_engine = self.__dict__.get("_local_mirror_engine")
+            if local_engine is None:
+                local_engine = self.__dict__.get("db_engine")
+                self._local_mirror_engine = local_engine
+            try:
+                running_modes = [
+                    mode for mode in (MODE_1D, MODE_1H) if is_refresh_running(mode)[0]
+                ]
+            except Exception:
+                running_modes = []
+            if running_modes:
+                notice = "local-refresh-running"
+                if self.__dict__.get("_last_database_reconciliation_notice") != notice:
+                    self._last_database_reconciliation_notice = notice
+                    self.append_log(
+                        "PC database is online; waiting for the local historical "
+                        "refresh to finish before synchronizing and switching."
+                    )
+                return
+
         generation = self.__dict__.get("_database_transition_generation", 0)
-        worker = DatabaseRecoveryWorker(generation)
+        if pc_engine is not None:
+            self._pc_probe_engine = pc_engine
+        worker = DatabaseRecoveryWorker(
+            generation,
+            pc_engine=pc_engine,
+            local_engine=local_engine,
+            tickers=list(self.__dict__.get("universe_tickers", []) or []),
+        )
         self.database_recovery_worker = worker
+        if local_engine is not None:
+            self._database_reconciliation_in_progress = True
+            self._update_database_source_indicator()
+            notice = "reconciling"
+            if self.__dict__.get("_last_database_reconciliation_notice") != notice:
+                self._last_database_reconciliation_notice = notice
+                self.append_log(
+                    "PC database is online; checking and synchronizing PC/local "
+                    "market data before switching."
+                )
         worker.recovered.connect(self._on_database_recovery_finished)
         self._track_worker("database_recovery_worker", worker)
         worker.start()
 
-    def _on_database_recovery_finished(self, engine, generation: int) -> None:
-        if engine is None:
-            return
+    def _on_database_recovery_finished(self, outcome, generation: int) -> None:
+        if not isinstance(outcome, DatabaseRecoveryOutcome):
+            outcome = DatabaseRecoveryOutcome(outcome, outcome is not None)
+        engine = outcome.engine
+        self._database_reconciliation_in_progress = False
+        self._update_database_source_indicator()
         current_generation = self.__dict__.get(
             "_database_transition_generation", 0
         )
@@ -2064,15 +2466,78 @@ class MainWindow(
             or generation != current_generation
             or not self.__dict__.get("_last_pc_database_probe_ready", False)
         ):
-            try:
-                engine.dispose()
-            except Exception:
-                pass
+            if engine is not None:
+                try:
+                    engine.dispose()
+                except Exception:
+                    pass
             return
+        if not outcome.success or engine is None:
+            if engine is not None:
+                self._pc_probe_engine = engine
+            detail = outcome.error or "PC/local market data did not converge."
+            notice = f"failed:{detail}"
+            if self.__dict__.get("_last_database_reconciliation_notice") != notice:
+                self._last_database_reconciliation_notice = notice
+                self.append_log(
+                    "PC/local data synchronization is incomplete; staying on "
+                    f"the local database and retrying automatically. {detail}"
+                )
+            return
+        handoff_guard = None
         try:
-            self._activate_recovered_pc_database(engine)
+            result = outcome.reconciliation_result
+            if result is not None:
+                self.append_log(
+                    "PC/local market data synchronized "
+                    f"(local -> PC: {result.total_local_to_pc_rows} row(s), "
+                    f"PC -> local: {result.total_pc_to_local_rows} row(s))."
+                )
+            local_engine = self.__dict__.get("_local_mirror_engine")
+            if (
+                outcome.reconciled_local_mirror
+                and result is not None
+                and hasattr(result, "local_handoff_ready")
+            ):
+                if not result.local_handoff_ready or local_engine is None:
+                    raise RuntimeError(
+                        "Local mirror handoff was not prepared; retrying reconciliation."
+                    )
+                from src.utils.db_loader import (
+                    acquire_local_mirror_handoff_guard,
+                    release_local_mirror_handoff_guard,
+                )
+
+                handoff_guard = acquire_local_mirror_handoff_guard(local_engine)
+                if any(
+                    is_refresh_running(mode)[0] for mode in (MODE_1D, MODE_1H)
+                ):
+                    raise RuntimeError(
+                        "A local historical refresh started during database handoff."
+                    )
+            try:
+                self._activate_recovered_pc_database(
+                    engine,
+                    local_mirror_reconciled=outcome.reconciled_local_mirror,
+                )
+            finally:
+                if handoff_guard is not None:
+                    release_local_mirror_handoff_guard(handoff_guard)
+                    handoff_guard = None
         except Exception:
+            if handoff_guard is not None:
+                try:
+                    from src.utils.db_loader import release_local_mirror_handoff_guard
+
+                    release_local_mirror_handoff_guard(handoff_guard)
+                except Exception:
+                    pass
             logger.exception("Could not adopt recovered PC database engine")
+            self._pc_probe_engine = engine
+            self.append_log(
+                "PC/local handoff changed before activation; staying on the "
+                "local database and retrying automatically."
+            )
             if self.__dict__.get("pc_db_engine") is not engine:
                 try:
                     engine.dispose()
@@ -2121,6 +2586,9 @@ class MainWindow(
 
         listener_on = status.listener_status == PcStatus.ON
         db_ready = bool(status.database_ready)
+        previous_main_app_active = self.__dict__.get(
+            "_last_pc_main_app_active"
+        )
         self._last_pc_database_probe_ready = db_ready
         if "db_engine_source" in self.__dict__:
             try:
@@ -2180,6 +2648,16 @@ class MainWindow(
         label.setToolTip(tooltip)
         services_label.setToolTip(tooltip)
         self._update_database_source_indicator()
+        self._last_pc_main_app_active = status.main_app_active
+        if (
+            status.main_app_active is True
+            and previous_main_app_active is not True
+            and self.__dict__.get("db_engine_source", "none") == "pc"
+        ):
+            # The PC morning routine launches main.py only after its scheduled
+            # refresh.  This edge is therefore a useful immediate mirror
+            # top-up in addition to the periodic safety timer.
+            self._sync_active_pc_to_local_mirror()
 
         if button is not None:
             if listener_on:

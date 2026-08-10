@@ -1066,6 +1066,14 @@ class ScannerMixin:
 
     def refresh_data_to_db(self) -> bool:
         """Launch (or terminate) the standalone 1D historical.py refresh process."""
+        if getattr(self, "_database_reconciliation_in_progress", False):
+            QMessageBox.information(
+                self,
+                "Database synchronization in progress",
+                "PC/local data is being synchronized. The 1D refresh can start "
+                "after the database switch finishes or retries.",
+            )
+            return False
         if not self.db_enabled:
             QMessageBox.warning(
                 self,
@@ -1097,6 +1105,14 @@ class ScannerMixin:
 
     def refresh_hourly_data_to_db(self) -> bool:
         """Launch (or terminate) the standalone 1H historical.py refresh process."""
+        if getattr(self, "_database_reconciliation_in_progress", False):
+            QMessageBox.information(
+                self,
+                "Database synchronization in progress",
+                "PC/local data is being synchronized. The 1H refresh can start "
+                "after the database switch finishes or retries.",
+            )
+            return False
         if not self.db_enabled:
             QMessageBox.warning(
                 self,
@@ -1236,6 +1252,12 @@ class ScannerMixin:
         if outcome == "completed":
             self.show_refresh_complete(result.get("updated_count", 0))
             self.update_dashboard_summary(force=True)
+            if getattr(self, "db_engine_source", "none") == "pc":
+                mirror_sync = getattr(
+                    self, "_sync_active_pc_to_local_mirror", None
+                )
+                if callable(mirror_sync):
+                    mirror_sync()
         elif outcome == "error":
             message = result.get("error_message") or "Unknown error"
             self.show_refresh_error(message)

@@ -28,6 +28,7 @@ from sqlalchemy import (
     delete,
     insert,
     inspect,
+    tuple_,
 )
 from sqlalchemy.engine import Engine, URL
 from sqlalchemy.exc import SQLAlchemyError
@@ -193,10 +194,12 @@ def init_mysql_engine(
 
 # --- Local mirror (offline fallback when the PC's MySQL is unreachable) -----
 #
-# The PC's MySQL database is the single source of truth for the market-data
-# cache (see docs/pc_sync_data_pipeline.md). This SQLite file is a laptop-only,
-# one-directional (PC -> laptop) mirror of a subset of that data, used only
-# when the PC cannot be reached at all. It is never written back to the PC.
+# The PC's MySQL database remains the canonical market-data cache (see
+# docs/pc_sync_data_pipeline.md).  The SQLite file is the laptop's offline
+# mirror.  Normal mirroring is PC -> laptop.  On a local -> PC runtime
+# transition, a deliberately narrow reconciliation may promote *missing,
+# completed raw bars* from the mirror without ever overwriting an existing PC
+# bar; derived caches are rebuilt on the PC and then mirrored back down.
 
 LOCAL_MIRROR_DB_PATH = DATA_DIR / "local_mirror.db"
 LOCAL_MIRROR_ENABLED_ENV = "QUANT_LOCAL_MIRROR_ENABLED"
@@ -217,6 +220,237 @@ MIRRORED_TABLES: Tuple[Tuple[str, str], ...] = (
     ("scanner_metric_snapshots", "snapshot_date"),
     ("symbol_refresh_failures", "last_attempt_at"),
 )
+
+
+@dataclass(frozen=True)
+class LocalMirrorReconciliationResult:
+    """Outcome of the guarded local-mirror -> PC transition reconciliation."""
+
+    success: bool
+    local_to_pc_rows: Dict[str, int]
+    pc_to_local_rows: Dict[str, int]
+    affected_daily_symbols: Tuple[str, ...] = ()
+    affected_hourly_symbols: Tuple[str, ...] = ()
+    errors: Tuple[str, ...] = ()
+    local_handoff_ready: bool = False
+
+    @property
+    def total_local_to_pc_rows(self) -> int:
+        return sum(self.local_to_pc_rows.values())
+
+    @property
+    def total_pc_to_local_rows(self) -> int:
+        return sum(self.pc_to_local_rows.values())
+
+
+class LocalMirrorNeedsReconciliationError(RuntimeError):
+    """The active-PC mirror found local writes that require a guarded merge."""
+
+
+@dataclass(frozen=True)
+class _RawMirrorSpec:
+    table_name: str
+    watermark_column: str
+    group_columns: Tuple[str, ...]
+    required_value: Optional[Tuple[str, str]] = None
+
+
+_RAW_MIRROR_SPECS: Tuple[_RawMirrorSpec, ...] = (
+    _RawMirrorSpec(
+        "price_history",
+        "date",
+        ("symbol", "interval"),
+        required_value=("interval", "1d"),
+    ),
+    _RawMirrorSpec(
+        "hourly_price_history",
+        "timestamp",
+        ("symbol", "source"),
+    ),
+)
+
+
+@dataclass(frozen=True)
+class _ReconcileTableSpec:
+    table_name: str
+    primary_key: Tuple[str, ...]
+    partition_columns: Tuple[str, ...]
+    watermark_column: str
+    revision_column: str
+    reverse_raw: bool = False
+
+
+_RECONCILE_TABLE_SPECS: Tuple[_ReconcileTableSpec, ...] = (
+    _ReconcileTableSpec(
+        "price_history",
+        ("symbol", "date", "interval"),
+        ("symbol", "interval"),
+        "date",
+        "updated_at",
+        reverse_raw=True,
+    ),
+    _ReconcileTableSpec(
+        "hourly_price_history",
+        ("symbol", "timestamp", "source"),
+        ("symbol", "source"),
+        "timestamp",
+        "updated_at",
+        reverse_raw=True,
+    ),
+    _ReconcileTableSpec(
+        "chart_indicators",
+        ("symbol", "date"),
+        ("symbol",),
+        "date",
+        "updated_at",
+    ),
+    _ReconcileTableSpec(
+        "chart_indicator_manifests",
+        ("symbol",),
+        ("symbol",),
+        "completed_at",
+        "completed_at",
+    ),
+    _ReconcileTableSpec(
+        "scanner_metrics",
+        ("symbol", "date"),
+        ("date",),
+        "date",
+        "updated_at",
+    ),
+    _ReconcileTableSpec(
+        "scanner_metric_snapshots",
+        ("snapshot_date",),
+        ("snapshot_date",),
+        "snapshot_date",
+        "completed_at",
+    ),
+    _ReconcileTableSpec(
+        "symbol_refresh_failures",
+        ("symbol", "interval"),
+        ("interval",),
+        "last_attempt_at",
+        "last_attempt_at",
+    ),
+)
+
+
+@dataclass(frozen=True)
+class _PartitionFingerprint:
+    raw_key: Tuple[object, ...]
+    row_count: int
+    digest: str
+
+
+_BOOLEAN_RECONCILE_COLUMNS = frozenset(
+    {
+        "is_ti65_bullish",
+        "is_ti65_bearish",
+        "is_9m_volume",
+        "is_plus_4pct_change",
+        "is_minus_4pct_change",
+        "is_rs_cross_up",
+        "above_sma_20",
+        "above_ema_50",
+        "ma_alignment",
+        "breakout_20d",
+        "breakout_50d",
+        "parabolic_flag",
+        "rs_above_sma_50",
+    }
+)
+
+_LOCAL_MIRROR_HANDOFF_TABLE = "local_mirror_handoff_state"
+
+
+def _local_mirror_handoff_table(metadata: MetaData) -> Table:
+    return Table(
+        _LOCAL_MIRROR_HANDOFF_TABLE,
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("dirty", Boolean, nullable=False, default=True),
+    )
+
+
+def _ensure_local_mirror_handoff_tracking(engine: Engine) -> None:
+    """Install SQLite triggers that mark any mirrored-table write as dirty."""
+    if engine.dialect.name != "sqlite":
+        return
+    metadata = MetaData()
+    handoff = _local_mirror_handoff_table(metadata)
+    metadata.create_all(engine)
+    existing_tables = set(inspect(engine).get_table_names())
+    with engine.begin() as conn:
+        conn.execute(
+            sqlite_insert(handoff)
+            .values(id=1, dirty=True)
+            .on_conflict_do_nothing(index_elements=["id"])
+        )
+        for table_name, _watermark in MIRRORED_TABLES:
+            if table_name not in existing_tables:
+                continue
+            for operation in ("INSERT", "UPDATE", "DELETE"):
+                trigger_name = (
+                    f"local_mirror_dirty_{table_name}_{operation.lower()}"
+                )
+                conn.exec_driver_sql(
+                    f'CREATE TRIGGER IF NOT EXISTS "{trigger_name}" '
+                    f'AFTER {operation} ON "{table_name}" '
+                    "BEGIN "
+                    f'UPDATE "{_LOCAL_MIRROR_HANDOFF_TABLE}" '
+                    'SET "dirty" = 1 WHERE "id" = 1 AND "dirty" = 0; '
+                    "END"
+                )
+
+
+def _mark_local_mirror_handoff_clean(conn) -> None:
+    handoff = _local_mirror_handoff_table(MetaData())
+    conn.execute(
+        handoff.update().where(handoff.c.id == 1).values(dirty=False)
+    )
+
+
+def acquire_local_mirror_handoff_guard(local_engine: Engine):
+    """Lock SQLite and prove no mirrored write occurred after reconciliation."""
+    if local_engine is None or local_engine.dialect.name != "sqlite":
+        raise RuntimeError("A SQLite local mirror is required for database handoff.")
+    conn = local_engine.connect()
+    try:
+        # The GUI must retry rather than freeze if an external writer currently
+        # owns SQLite.  The normal mirror connection default is intentionally
+        # longer for background work.
+        conn.exec_driver_sql("PRAGMA busy_timeout=1000")
+        conn.exec_driver_sql("BEGIN IMMEDIATE")
+        handoff = _local_mirror_handoff_table(MetaData())
+        dirty = conn.execute(
+            select(handoff.c.dirty).where(handoff.c.id == 1)
+        ).scalar_one()
+        if bool(dirty):
+            raise RuntimeError("Local mirror changed after reconciliation.")
+        return conn
+    except Exception:
+        try:
+            conn.rollback()
+        finally:
+            try:
+                conn.exec_driver_sql("PRAGMA busy_timeout=30000")
+            except Exception:
+                pass
+            conn.close()
+        raise
+
+
+def release_local_mirror_handoff_guard(conn) -> None:
+    if conn is None:
+        return
+    try:
+        conn.rollback()
+    finally:
+        try:
+            conn.exec_driver_sql("PRAGMA busy_timeout=30000")
+        except Exception:
+            pass
+        conn.close()
 
 
 def init_local_mirror_engine(db_path=None) -> Optional[Engine]:
@@ -250,6 +484,7 @@ def init_local_mirror_engine(db_path=None) -> Optional[Engine]:
         _ensure_scanner_metrics_table(engine)
         _ensure_scanner_metric_snapshots_table(engine)
         _ensure_symbol_refresh_failures_table(engine)
+        _ensure_local_mirror_handoff_tracking(engine)
         return engine
     except (ImportError, OSError, SQLAlchemyError, ValueError, TypeError) as exc:
         if engine is not None:
@@ -307,6 +542,523 @@ def mirror_table_stats(engine: Engine, table_name: str, watermark_column: str) -
         return {"row_count": int(count or 0), "latest": latest}
     except SQLAlchemyError as exc:
         return {"row_count": 0, "latest": None, "error": str(exc)}
+
+
+def _normalized_watermark(value: object) -> Optional[dt.datetime]:
+    if value is None or pd.isna(value):
+        return None
+    timestamp = pd.Timestamp(value)
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.tz_convert("UTC").tz_localize(None)
+    return timestamp.to_pydatetime()
+
+
+def _raw_mirror_cutoff(spec: _RawMirrorSpec) -> dt.datetime:
+    """Latest completed bar that is eligible for a local -> PC promotion."""
+    if spec.table_name == "price_history":
+        return dt.datetime.combine(expected_latest_market_data_date(), dt.time.max)
+    # Do not promote the currently forming hourly candle.  Cached timestamps
+    # are stored as naive UTC, so the start of the current UTC hour is the
+    # first timestamp that is not yet safe to publish to the PC.
+    current_hour = _utcnow_naive().replace(minute=0, second=0, microsecond=0)
+    return current_hour - dt.timedelta(microseconds=1)
+
+
+def _raw_group_watermarks(
+    engine: Engine,
+    spec: _RawMirrorSpec,
+    *,
+    cutoff: Optional[dt.datetime] = None,
+) -> Dict[Tuple[object, ...], dt.datetime]:
+    if not inspect(engine).has_table(spec.table_name):
+        return {}
+    table = Table(spec.table_name, MetaData(), autoload_with=engine)
+    required_columns = {
+        spec.watermark_column,
+        *spec.group_columns,
+    }
+    missing = required_columns.difference(table.columns.keys())
+    if missing:
+        raise ValueError(
+            f"{spec.table_name} is missing reconciliation column(s): "
+            f"{', '.join(sorted(missing))}"
+        )
+
+    watermark = table.c[spec.watermark_column]
+    group_columns = [table.c[name] for name in spec.group_columns]
+    stmt = select(*group_columns, func.max(watermark).label("latest"))
+    conditions = []
+    if spec.required_value is not None:
+        column_name, required_value = spec.required_value
+        conditions.append(table.c[column_name] == required_value)
+    if cutoff is not None:
+        conditions.append(watermark <= cutoff)
+    if conditions:
+        stmt = stmt.where(*conditions)
+    stmt = stmt.group_by(*group_columns)
+
+    with engine.connect() as conn:
+        rows = conn.execute(stmt).all()
+    watermarks: Dict[Tuple[object, ...], dt.datetime] = {}
+    for row in rows:
+        latest = _normalized_watermark(row.latest)
+        if latest is None:
+            continue
+        key = tuple(row[index] for index in range(len(group_columns)))
+        watermarks[key] = latest
+    return watermarks
+
+
+def _validate_promoted_market_bar(
+    spec: _RawMirrorSpec,
+    record: Dict[str, object],
+    cutoff: dt.datetime,
+) -> None:
+    """Reject malformed or incomplete local rows before they can reach MySQL."""
+    symbol = str(record.get("symbol") or "").strip()
+    if not symbol or len(symbol) > 20 or symbol != symbol.upper():
+        raise ValueError(f"Invalid symbol in local {spec.table_name}: {symbol!r}")
+
+    if spec.required_value is not None:
+        column_name, required_value = spec.required_value
+        if str(record.get(column_name) or "").strip().lower() != required_value:
+            raise ValueError(
+                f"Unsupported {column_name} in local {spec.table_name}: "
+                f"{record.get(column_name)!r}"
+            )
+    if spec.table_name == "hourly_price_history":
+        source = str(record.get("source") or "").strip()
+        if not source or len(source) > 20:
+            raise ValueError(
+                f"Invalid source in local hourly_price_history: {source!r}"
+            )
+
+    watermark = _normalized_watermark(record.get(spec.watermark_column))
+    if watermark is None or watermark > cutoff:
+        raise ValueError(
+            f"Incomplete/future local bar in {spec.table_name}: {watermark!r}"
+        )
+
+    prices: Dict[str, float] = {}
+    for column_name in ("open", "high", "low", "close"):
+        raw_value = record.get(column_name)
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid {column_name} in local {spec.table_name} for {symbol}"
+            ) from exc
+        if not np.isfinite(value) or value <= 0:
+            raise ValueError(
+                f"Invalid {column_name} in local {spec.table_name} for {symbol}"
+            )
+        prices[column_name] = value
+
+    tolerance = max(1e-9, abs(prices["high"]) * 1e-9)
+    if (
+        prices["high"] + tolerance
+        < max(prices["open"], prices["low"], prices["close"])
+        or prices["low"] - tolerance
+        > min(prices["open"], prices["high"], prices["close"])
+    ):
+        raise ValueError(f"Invalid OHLC range in local {spec.table_name} for {symbol}")
+
+    volume = record.get("volume")
+    if volume is not None:
+        try:
+            volume_value = float(volume)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid volume in local {spec.table_name} for {symbol}"
+            ) from exc
+        if not np.isfinite(volume_value) or volume_value < 0:
+            raise ValueError(
+                f"Invalid volume in local {spec.table_name} for {symbol}"
+            )
+
+
+def _normalize_reconcile_value(column, value: object) -> object:
+    if value is None or pd.isna(value):
+        return None
+    if column.name in _BOOLEAN_RECONCILE_COLUMNS:
+        return bool(value)
+    if isinstance(column.type, DateTime):
+        normalized = _normalized_watermark(value)
+        return normalized.isoformat(timespec="microseconds") if normalized else None
+    if isinstance(column.type, Boolean):
+        return bool(value)
+    if isinstance(column.type, Integer):
+        return int(value)
+    if isinstance(column.type, Float):
+        numeric = float(value)
+        if not np.isfinite(numeric):
+            return str(numeric)
+        return format(numeric, ".17g")
+    if isinstance(value, bytes):
+        return value.hex()
+    return str(value)
+
+
+def _normalized_reconcile_key(
+    table: Table, column_names: Tuple[str, ...], record: Dict[str, object]
+) -> Tuple[object, ...]:
+    return tuple(
+        _normalize_reconcile_value(table.c[name], record.get(name))
+        for name in column_names
+    )
+
+
+def _validate_reconcile_table_schema(
+    pc_table: Table,
+    local_table: Table,
+    spec: _ReconcileTableSpec,
+) -> None:
+    required_columns = set(spec.primary_key).union(
+        spec.partition_columns,
+        {spec.watermark_column, spec.revision_column},
+    )
+    missing_pc_required = required_columns.difference(pc_table.columns.keys())
+    missing_local_required = required_columns.difference(
+        local_table.columns.keys()
+    )
+    if missing_pc_required or missing_local_required:
+        raise ValueError(
+            f"Unsafe {spec.table_name} schema: missing required column(s); "
+            f"PC {', '.join(sorted(missing_pc_required)) or 'none'}, local "
+            f"{', '.join(sorted(missing_local_required)) or 'none'}."
+        )
+    pc_primary_key = tuple(column.name for column in pc_table.primary_key.columns)
+    local_primary_key = tuple(
+        column.name for column in local_table.primary_key.columns
+    )
+    if pc_primary_key != spec.primary_key or local_primary_key != spec.primary_key:
+        raise ValueError(
+            f"Unsafe {spec.table_name} schema: expected primary key "
+            f"{spec.primary_key}, found PC {pc_primary_key} and local "
+            f"{local_primary_key}."
+        )
+    missing_local_columns = set(pc_table.columns.keys()).difference(
+        local_table.columns.keys()
+    )
+    if missing_local_columns:
+        raise ValueError(
+            f"Local {spec.table_name} is missing PC column(s): "
+            f"{', '.join(sorted(missing_local_columns))}"
+        )
+
+
+def _partition_filter(table: Table, columns: Tuple[str, ...], keys: List[Tuple[object, ...]]):
+    if len(columns) == 1:
+        return table.c[columns[0]].in_([key[0] for key in keys])
+    return tuple_(*(table.c[name] for name in columns)).in_(keys)
+
+
+def _partition_fingerprints(
+    engine: Engine,
+    spec: _ReconcileTableSpec,
+    *,
+    raw_partition_keys: Optional[List[Tuple[object, ...]]] = None,
+    connection=None,
+) -> Dict[Tuple[object, ...], _PartitionFingerprint]:
+    """Hash every ordered primary key and value per logical partition.
+
+    Watermark/count checks alone cannot detect an interior gap or an older
+    corrected row.  This digest is intentionally complete so ``success``
+    means the compared PC/local partitions really contain the same rows.
+    """
+    bind = connection if connection is not None else engine
+    if not inspect(bind).has_table(spec.table_name):
+        return {}
+    table = Table(spec.table_name, MetaData(), autoload_with=bind)
+    required = set(spec.primary_key).union(spec.partition_columns)
+    missing = required.difference(table.columns.keys())
+    if missing:
+        raise ValueError(
+            f"{spec.table_name} is missing reconciliation column(s): "
+            f"{', '.join(sorted(missing))}"
+        )
+
+    ordered_names = tuple(sorted(table.columns.keys()))
+    selected_columns = [table.c[name] for name in ordered_names]
+    value_indexes = {name: index for index, name in enumerate(ordered_names)}
+    order_names = list(spec.partition_columns)
+    order_names.extend(name for name in spec.primary_key if name not in order_names)
+    stmt = select(*selected_columns)
+    if raw_partition_keys is not None:
+        if not raw_partition_keys:
+            return {}
+        stmt = stmt.where(
+            _partition_filter(
+                table, spec.partition_columns, raw_partition_keys
+            )
+        )
+    stmt = stmt.order_by(*(table.c[name] for name in order_names))
+
+    states: Dict[
+        Tuple[object, ...], Tuple[Tuple[object, ...], int, object]
+    ] = {}
+    boolean_indexes = [
+        value_indexes[name]
+        for name in ordered_names
+        if name in _BOOLEAN_RECONCILE_COLUMNS
+    ]
+    def consume(conn) -> None:
+        result = conn.execution_options(stream_results=True).execute(stmt)
+        for row in result:
+            values = list(row)
+            raw_partition = tuple(
+                values[value_indexes[name]] for name in spec.partition_columns
+            )
+            normalized_partition = tuple(
+                (
+                    _normalized_watermark(value).isoformat(timespec="microseconds")
+                    if isinstance(value, (dt.datetime, pd.Timestamp))
+                    else value
+                )
+                for value in raw_partition
+            )
+            state = states.get(normalized_partition)
+            if state is None:
+                state = (raw_partition, 0, hashlib.sha256())
+            raw_key, row_count, digest = state
+            # MySQL reflects BOOLEAN as TINYINT(1), whereas SQLite reflects
+            # it as Boolean.  Normalize known semantic boolean columns so the
+            # same row hashes identically across both dialects.
+            for index in boolean_indexes:
+                if values[index] is not None:
+                    values[index] = bool(values[index])
+            payload = repr(tuple(values)).encode("utf-8")
+            digest.update(len(payload).to_bytes(4, "big"))
+            digest.update(payload)
+            states[normalized_partition] = (raw_key, row_count + 1, digest)
+
+    if connection is not None:
+        consume(connection)
+    else:
+        with engine.connect() as conn:
+            consume(conn)
+
+    return {
+        key: _PartitionFingerprint(raw_key, row_count, digest.hexdigest())
+        for key, (raw_key, row_count, digest) in states.items()
+    }
+
+
+def _mismatched_partitions(
+    pc_fingerprints: Dict[Tuple[object, ...], _PartitionFingerprint],
+    local_fingerprints: Dict[Tuple[object, ...], _PartitionFingerprint],
+) -> List[Tuple[object, ...]]:
+    mismatched = []
+    for key in sorted(
+        set(pc_fingerprints).union(local_fingerprints),
+        key=lambda value: repr(value),
+    ):
+        pc_value = pc_fingerprints.get(key)
+        local_value = local_fingerprints.get(key)
+        if (
+            pc_value is None
+            or local_value is None
+            or pc_value.row_count != local_value.row_count
+            or pc_value.digest != local_value.digest
+        ):
+            mismatched.append(key)
+    return mismatched
+
+
+def _fetch_partition_rows(
+    engine: Engine,
+    table: Table,
+    spec: _ReconcileTableSpec,
+    raw_partition_keys: List[Tuple[object, ...]],
+    *,
+    connection=None,
+) -> Dict[Tuple[object, ...], Tuple[Dict[str, object], Tuple[object, ...]]]:
+    if not raw_partition_keys:
+        return {}
+    stmt = select(table).where(
+        _partition_filter(table, spec.partition_columns, raw_partition_keys)
+    )
+    rows: Dict[
+        Tuple[object, ...], Tuple[Dict[str, object], Tuple[object, ...]]
+    ] = {}
+    ordered_names = tuple(sorted(table.columns.keys()))
+    def consume(conn) -> None:
+        for row in conn.execution_options(stream_results=True).execute(stmt):
+            record = dict(row._mapping)
+            primary_key = _normalized_reconcile_key(
+                table, spec.primary_key, record
+            )
+            normalized_row = tuple(
+                _normalize_reconcile_value(table.c[name], record.get(name))
+                for name in ordered_names
+            )
+            rows[primary_key] = (record, normalized_row)
+
+    if connection is not None:
+        consume(connection)
+    else:
+        with engine.connect() as conn:
+            consume(conn)
+    return rows
+
+
+def _raw_validation_spec(table_name: str) -> _RawMirrorSpec:
+    for spec in _RAW_MIRROR_SPECS:
+        if spec.table_name == table_name:
+            return spec
+    raise ValueError(f"No raw validation policy exists for {table_name!r}.")
+
+
+def _insert_missing_local_raw_partitions(
+    pc_engine: Engine,
+    local_engine: Engine,
+    spec: _ReconcileTableSpec,
+    partition_keys: List[Tuple[object, ...]],
+    pc_fingerprints: Dict[Tuple[object, ...], _PartitionFingerprint],
+    local_fingerprints: Dict[Tuple[object, ...], _PartitionFingerprint],
+    *,
+    partition_chunk_size: int = 100,
+) -> Tuple[int, Set[str]]:
+    if not partition_keys:
+        return 0, set()
+    pc_table = Table(spec.table_name, MetaData(), autoload_with=pc_engine)
+    local_table = Table(spec.table_name, MetaData(), autoload_with=local_engine)
+    _validate_reconcile_table_schema(pc_table, local_table, spec)
+    validation_spec = _raw_validation_spec(spec.table_name)
+    cutoff = _raw_mirror_cutoff(validation_spec)
+    inserted = 0
+    affected_symbols: Set[str] = set()
+
+    for key_chunk in _record_chunks(partition_keys, partition_chunk_size):
+        raw_keys = [
+            (
+                local_fingerprints.get(key)
+                or pc_fingerprints.get(key)
+            ).raw_key
+            for key in key_chunk
+        ]
+        local_rows = _fetch_partition_rows(
+            local_engine, local_table, spec, raw_keys
+        )
+        pc_rows = _fetch_partition_rows(pc_engine, pc_table, spec, raw_keys)
+        missing_records = []
+        for primary_key, (record, _normalized_row) in local_rows.items():
+            if primary_key in pc_rows:
+                continue
+            _validate_promoted_market_bar(validation_spec, record, cutoff)
+            missing_records.append(
+                {
+                    name: value
+                    for name, value in record.items()
+                    if name in pc_table.columns
+                }
+            )
+            affected_symbols.add(str(record.get("symbol") or "").upper())
+        for records in _record_chunks(missing_records, 1000):
+            with pc_engine.begin() as conn:
+                # Existing PC keys were removed above.  A duplicate caused by
+                # a concurrent PC refresh intentionally fails this pass so no
+                # PC value can be overwritten or an INSERT warning concealed.
+                conn.execute(insert(pc_table), records)
+            inserted += len(records)
+    return inserted, affected_symbols
+
+
+def _delete_primary_keys(
+    conn,
+    table: Table,
+    primary_key: Tuple[str, ...],
+    raw_keys: List[Tuple[object, ...]],
+) -> None:
+    if not raw_keys:
+        return
+    max_keys = max(1, 800 // max(1, len(primary_key)))
+    for key_chunk in _record_chunks(raw_keys, max_keys):
+        if len(primary_key) == 1:
+            condition = table.c[primary_key[0]].in_(
+                [key[0] for key in key_chunk]
+            )
+        else:
+            condition = tuple_(
+                *(table.c[name] for name in primary_key)
+            ).in_(key_chunk)
+        conn.execute(delete(table).where(condition))
+
+
+def _copy_pc_partitions_to_local_exactly(
+    pc_engine: Engine,
+    local_engine: Engine,
+    spec: _ReconcileTableSpec,
+    partition_keys: List[Tuple[object, ...]],
+    pc_fingerprints: Dict[Tuple[object, ...], _PartitionFingerprint],
+    local_fingerprints: Dict[Tuple[object, ...], _PartitionFingerprint],
+    *,
+    partition_chunk_size: int = 100,
+    local_connection=None,
+    preserve_local_raw: bool = True,
+) -> int:
+    """Apply PC-wins rows and remove local-only keys for changed partitions."""
+    if not partition_keys:
+        return 0
+    pc_table = Table(spec.table_name, MetaData(), autoload_with=pc_engine)
+    local_bind = local_connection if local_connection is not None else local_engine
+    local_table = Table(spec.table_name, MetaData(), autoload_with=local_bind)
+    _validate_reconcile_table_schema(pc_table, local_table, spec)
+    changed = 0
+
+    for key_chunk in _record_chunks(partition_keys, partition_chunk_size):
+        raw_keys = [
+            (
+                pc_fingerprints.get(key)
+                or local_fingerprints.get(key)
+            ).raw_key
+            for key in key_chunk
+        ]
+        pc_rows = _fetch_partition_rows(pc_engine, pc_table, spec, raw_keys)
+        local_rows = _fetch_partition_rows(
+            local_engine,
+            local_table,
+            spec,
+            raw_keys,
+            connection=local_connection,
+        )
+        upsert_records = []
+        for primary_key, (pc_record, pc_normalized) in pc_rows.items():
+            local_value = local_rows.get(primary_key)
+            if local_value is None or local_value[1] != pc_normalized:
+                upsert_records.append(
+                    {
+                        name: value
+                        for name, value in pc_record.items()
+                        if name in local_table.columns
+                    }
+                )
+        # Raw local-only keys are the only data eligible for promotion on the
+        # next pass.  If one arrives after the promotion snapshot, preserving
+        # it makes the final equality fence fail and retry; deleting it here
+        # could silently erase a just-completed offline refresh.  Derived and
+        # operational rows remain PC-canonical and may be removed locally.
+        delete_keys = [] if spec.reverse_raw and preserve_local_raw else [
+            tuple(local_rows[key][0].get(name) for name in spec.primary_key)
+            for key in local_rows.keys() - pc_rows.keys()
+        ]
+        def apply_changes(conn) -> None:
+            _delete_primary_keys(conn, local_table, spec.primary_key, delete_keys)
+            if upsert_records:
+                _execute_bulk_upsert(
+                    conn,
+                    local_table,
+                    upsert_records,
+                    spec.primary_key,
+                    local_engine.dialect.name,
+                )
+        if local_connection is not None:
+            apply_changes(local_connection)
+        else:
+            with local_engine.begin() as conn:
+                apply_changes(conn)
+        changed += len(delete_keys) + len(upsert_records)
+    return changed
 
 
 def sync_mirror_table(
@@ -400,6 +1152,710 @@ def sync_local_mirror_from_pc(
             if error_callback:
                 error_callback(message)
     return written
+
+
+def _pc_daily_watermarks_read_only(
+    pc_engine: Engine, symbols: List[str]
+) -> Dict[str, Tuple[Optional[dt.datetime], int]]:
+    """Read daily input watermarks without running a PC schema initializer."""
+    cleaned_symbols = _clean_symbols(symbols)
+    if not cleaned_symbols:
+        return {}
+    table = Table("price_history", MetaData(), autoload_with=pc_engine)
+    rows = []
+    with pc_engine.connect() as conn:
+        for chunk in _record_chunks(
+            cleaned_symbols, CACHE_QUERY_SYMBOL_CHUNK_SIZE
+        ):
+            rows.extend(
+                conn.execute(
+                    select(
+                        table.c.symbol,
+                        func.max(table.c.date).label("latest_date"),
+                        func.count().label("row_count"),
+                    )
+                    .where(
+                        table.c.symbol.in_(chunk),
+                        table.c.interval == "1d",
+                    )
+                    .group_by(table.c.symbol)
+                ).all()
+            )
+    return {
+        str(row.symbol).upper(): (row.latest_date, int(row.row_count or 0))
+        for row in rows
+    }
+
+
+def _pc_reconciliation_universe_read_only(
+    pc_engine: Engine, tickers: Optional[List[str]]
+) -> List[str]:
+    """Resolve the active universe using SELECTs only on the PC database."""
+    symbols = _clean_symbols(tickers or [])
+    if not symbols:
+        try:
+            from src.utils.data_loader import get_default_universe
+
+            symbols = _clean_symbols(
+                get_default_universe(max_symbols=None, refresh=False)
+            )
+        except Exception:
+            symbols = []
+    if not symbols:
+        table = Table("price_history", MetaData(), autoload_with=pc_engine)
+        with pc_engine.connect() as conn:
+            symbols = _clean_symbols(
+                list(
+                    conn.execute(
+                        select(table.c.symbol)
+                        .where(table.c.interval == "1d")
+                        .distinct()
+                    ).scalars()
+                )
+            )
+    return list(dict.fromkeys([REFERENCE_SYMBOL, *symbols]))
+
+
+def _verify_pc_derived_data_current_read_only(
+    pc_engine: Engine, tickers: Optional[List[str]]
+) -> None:
+    """Prove PC derived caches match raw inputs without changing the PC.
+
+    The periodic mirror runs while the dashboard is already routed to the PC.
+    It must therefore never rebuild, invalidate, or backfill PC cache rows. A
+    stale manifest/snapshot means a refresh is still in progress (or needed),
+    so this mirror attempt is retried later.
+    """
+    input_symbols = _pc_reconciliation_universe_read_only(pc_engine, tickers)
+    history_watermarks = _pc_daily_watermarks_read_only(
+        pc_engine, input_symbols
+    )
+    reference_values = _history_watermark_values(
+        history_watermarks.get(REFERENCE_SYMBOL)
+    )
+
+    chart_symbols = [
+        symbol
+        for symbol in input_symbols
+        if symbol != REFERENCE_SYMBOL
+        and _history_watermark_values(history_watermarks.get(symbol)) is not None
+    ]
+    if chart_symbols:
+        if reference_values is None:
+            raise RuntimeError(
+                f"PC {REFERENCE_SYMBOL} history is unavailable for derived-data verification."
+            )
+        manifests_table = Table(
+            "chart_indicator_manifests", MetaData(), autoload_with=pc_engine
+        )
+        manifests: Dict[str, Dict[str, object]] = {}
+        with pc_engine.connect() as conn:
+            for chunk in _record_chunks(
+                chart_symbols, CACHE_QUERY_SYMBOL_CHUNK_SIZE
+            ):
+                for row in conn.execute(
+                    select(manifests_table).where(
+                        manifests_table.c.symbol.in_(chunk)
+                    )
+                ):
+                    manifests[str(row.symbol).upper()] = {
+                        "reference_symbol": str(row.reference_symbol).upper(),
+                        "source_latest_date": row.source_latest_date,
+                        "source_row_count": int(row.source_row_count or 0),
+                        "reference_latest_date": row.reference_latest_date,
+                        "reference_row_count": int(row.reference_row_count or 0),
+                        "cache_version": int(row.cache_version or 0),
+                    }
+        stale_chart_symbols = [
+            symbol
+            for symbol in chart_symbols
+            if not _chart_indicator_manifest_matches(
+                manifests.get(symbol),
+                _history_watermark_values(history_watermarks.get(symbol)),
+                reference_values,
+                REFERENCE_SYMBOL,
+            )
+        ]
+        if stale_chart_symbols:
+            raise RuntimeError(
+                "PC chart indicators are not current for "
+                f"{len(stale_chart_symbols)} symbol(s)."
+            )
+
+    metric_symbols = [
+        symbol for symbol in input_symbols if symbol != REFERENCE_SYMBOL
+    ]
+    if not metric_symbols:
+        return
+    snapshots_table = Table(
+        "scanner_metric_snapshots", MetaData(), autoload_with=pc_engine
+    )
+    metrics_table = Table("scanner_metrics", MetaData(), autoload_with=pc_engine)
+    snapshot_date = scanner_metrics_snapshot_date()
+    expected_fingerprint = scanner_metrics_input_fingerprint(
+        input_symbols, history_watermarks
+    )
+    with pc_engine.connect() as conn:
+        snapshot = conn.execute(
+            select(
+                snapshots_table.c.input_fingerprint,
+                snapshots_table.c.metric_count,
+            ).where(snapshots_table.c.snapshot_date == snapshot_date)
+        ).one_or_none()
+        actual_count = 0
+        if snapshot is not None:
+            for chunk in _record_chunks(
+                metric_symbols, SCANNER_QUERY_SYMBOL_CHUNK_SIZE
+            ):
+                actual_count += int(
+                    conn.execute(
+                        select(func.count())
+                        .select_from(metrics_table)
+                        .where(
+                            metrics_table.c.symbol.in_(chunk),
+                            metrics_table.c.date == snapshot_date,
+                        )
+                    ).scalar_one()
+                )
+    if (
+        snapshot is None
+        or snapshot.input_fingerprint != expected_fingerprint
+        or int(snapshot.metric_count or 0) <= 0
+        or actual_count != int(snapshot.metric_count or 0)
+    ):
+        raise RuntimeError("PC scanner metrics are not current.")
+
+
+def _sync_clean_local_mirror_from_pc_exactly(
+    pc_engine: Engine,
+    local_engine: Engine,
+    tables: Tuple[Tuple[str, str], ...],
+    *,
+    tickers: Optional[List[str]],
+    verify_derived: bool,
+) -> Dict[str, int]:
+    """Implement the PC-read-only active mirror under one SQLite write lock."""
+    if local_engine is None or local_engine.dialect.name != "sqlite":
+        raise RuntimeError("An SQLite local mirror is required for atomic sync.")
+
+    requested_names = {table_name for table_name, _watermark in tables}
+    reconcile_specs = [
+        spec
+        for spec in _RECONCILE_TABLE_SPECS
+        if spec.table_name in requested_names
+    ]
+    unsupported = requested_names.difference(
+        spec.table_name for spec in reconcile_specs
+    )
+    if unsupported:
+        raise RuntimeError(
+            "No exact reconciliation policy for: "
+            + ", ".join(sorted(unsupported))
+        )
+
+    local_conn = None
+    try:
+        with pc_engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        _ensure_local_mirror_handoff_tracking(local_engine)
+        local_conn = local_engine.connect()
+        local_conn.exec_driver_sql("BEGIN IMMEDIATE")
+        handoff = _local_mirror_handoff_table(MetaData())
+        dirty = local_conn.execute(
+            select(handoff.c.dirty).where(handoff.c.id == 1)
+        ).scalar_one()
+        if bool(dirty):
+            raise LocalMirrorNeedsReconciliationError(
+                "Local mirror contains changes that require staged reconciliation."
+            )
+
+        # Equal or empty legacy tables must not bypass schema validation.
+        for spec in reconcile_specs:
+            pc_table = Table(
+                spec.table_name, MetaData(), autoload_with=pc_engine
+            )
+            local_table = Table(
+                spec.table_name, MetaData(), autoload_with=local_conn
+            )
+            _validate_reconcile_table_schema(pc_table, local_table, spec)
+
+        pc_before = {
+            spec.table_name: _partition_fingerprints(pc_engine, spec)
+            for spec in reconcile_specs
+        }
+        if verify_derived:
+            _verify_pc_derived_data_current_read_only(pc_engine, tickers)
+            pc_after_derived_check = {
+                spec.table_name: _partition_fingerprints(pc_engine, spec)
+                for spec in reconcile_specs
+            }
+            changed_during_verification = [
+                spec.table_name
+                for spec in reconcile_specs
+                if _mismatched_partitions(
+                    pc_before[spec.table_name],
+                    pc_after_derived_check[spec.table_name],
+                )
+            ]
+            if changed_during_verification:
+                raise RuntimeError(
+                    "PC database changed during derived-data verification: "
+                    + ", ".join(changed_during_verification)
+                )
+
+        local_before = {
+            spec.table_name: _partition_fingerprints(
+                local_engine, spec, connection=local_conn
+            )
+            for spec in reconcile_specs
+        }
+        pending_written: Dict[str, int] = {}
+        for spec in reconcile_specs:
+            mismatched = _mismatched_partitions(
+                pc_before[spec.table_name], local_before[spec.table_name]
+            )
+            pending_written[spec.table_name] = (
+                _copy_pc_partitions_to_local_exactly(
+                    pc_engine,
+                    local_engine,
+                    spec,
+                    mismatched,
+                    pc_before[spec.table_name],
+                    local_before[spec.table_name],
+                    local_connection=local_conn,
+                    preserve_local_raw=False,
+                )
+            )
+
+        local_after = {
+            spec.table_name: _partition_fingerprints(
+                local_engine, spec, connection=local_conn
+            )
+            for spec in reconcile_specs
+        }
+        pc_after = {
+            spec.table_name: _partition_fingerprints(pc_engine, spec)
+            for spec in reconcile_specs
+        }
+        unstable = [
+            spec.table_name
+            for spec in reconcile_specs
+            if _mismatched_partitions(
+                pc_before[spec.table_name], local_after[spec.table_name]
+            )
+            or _mismatched_partitions(
+                pc_before[spec.table_name], pc_after[spec.table_name]
+            )
+        ]
+        if unstable:
+            raise RuntimeError(
+                "database changed during atomic mirror sync: "
+                + ", ".join(unstable)
+            )
+
+        _mark_local_mirror_handoff_clean(local_conn)
+        local_conn.commit()
+        return pending_written
+    except LocalMirrorNeedsReconciliationError:
+        if local_conn is not None:
+            local_conn.rollback()
+        raise
+    except Exception as exc:
+        if local_conn is not None:
+            try:
+                local_conn.rollback()
+            except Exception:
+                pass
+        raise RuntimeError(f"Exact PC -> local mirror sync failed: {exc}") from exc
+    finally:
+        if local_conn is not None:
+            local_conn.close()
+
+
+def sync_local_mirror_from_pc_atomic(
+    pc_engine: Engine,
+    local_engine: Engine,
+    tables: Tuple[Tuple[str, str], ...] = MIRRORED_TABLES,
+    *,
+    tickers: Optional[List[str]] = None,
+    verify_derived: bool = True,
+) -> Dict[str, int]:
+    """Publish an exact PC generation only when the local mirror is clean.
+
+    All keys and values are compared, causal derived caches are verified, and
+    every local change shares one SQLite transaction. The PC is read-only in
+    this active-dashboard path; tracked local writes raise a typed exception
+    so the UI can stage the normal guarded reconciliation. Readers see the old
+    generation or the new one—never a partially copied collection of tables.
+
+    Full content comparison is deletion-aware and deliberately avoids a
+    timestamp cursor, so out-of-order commits and old corrections cannot fall
+    through a replication hole.
+    """
+    return _sync_clean_local_mirror_from_pc_exactly(
+        pc_engine,
+        local_engine,
+        tables,
+        tickers=tickers,
+        verify_derived=verify_derived,
+    )
+
+def _reconciliation_universe(
+    pc_engine: Engine,
+    tickers: Optional[List[str]],
+    affected_daily_symbols: Set[str],
+) -> Tuple[List[str], List[str]]:
+    """Return scanner and chart symbol sets without doing a network refresh."""
+    scanner_symbols = _clean_symbols(tickers or [])
+    if not scanner_symbols:
+        try:
+            from src.utils.data_loader import get_default_universe
+
+            scanner_symbols = _clean_symbols(
+                get_default_universe(max_symbols=None, refresh=False)
+            )
+        except Exception:
+            scanner_symbols = []
+    if not scanner_symbols:
+        price_history = _ensure_price_history_table(pc_engine)
+        with pc_engine.connect() as conn:
+            scanner_symbols = _clean_symbols(
+                list(
+                    conn.execute(
+                        select(price_history.c.symbol)
+                        .where(price_history.c.interval == "1d")
+                        .distinct()
+                    ).scalars()
+                )
+            )
+
+    scanner_symbols = list(
+        dict.fromkeys([REFERENCE_SYMBOL, *scanner_symbols])
+    )
+    chart_symbols = list(
+        dict.fromkeys(
+            [REFERENCE_SYMBOL, *scanner_symbols, *sorted(affected_daily_symbols)]
+        )
+    )
+    return scanner_symbols, chart_symbols
+
+
+def _rebuild_and_verify_pc_derived_data(
+    pc_engine: Engine,
+    tickers: Optional[List[str]],
+    affected_daily_symbols: Set[str],
+) -> None:
+    """Make PC chart/scanner caches causal to the reconciled daily history."""
+    scanner_symbols, chart_symbols = _reconciliation_universe(
+        pc_engine, tickers, affected_daily_symbols
+    )
+    chart_inputs = _clean_symbols(chart_symbols)
+    history_watermarks = get_price_history_watermarks(
+        pc_engine, chart_inputs, interval="1d", strict=True
+    )
+
+    chart_plan = get_chart_indicator_refresh_plan(
+        pc_engine,
+        chart_inputs,
+        reference_symbol=REFERENCE_SYMBOL,
+        history_watermarks=history_watermarks,
+    )
+    if chart_plan:
+        refresh_chart_indicators_to_db(
+            chart_inputs,
+            pc_engine,
+            reference_symbol=REFERENCE_SYMBOL,
+            history_watermarks=history_watermarks,
+            refresh_plan=chart_plan,
+        )
+        remaining = get_chart_indicator_refresh_plan(
+            pc_engine,
+            list(chart_plan),
+            reference_symbol=REFERENCE_SYMBOL,
+            history_watermarks=history_watermarks,
+        )
+        if remaining:
+            raise RuntimeError(
+                f"PC chart indicators remain incomplete for {len(remaining)} symbol(s)."
+            )
+
+    metric_symbols = [
+        symbol for symbol in scanner_symbols if symbol != REFERENCE_SYMBOL
+    ]
+    if not metric_symbols:
+        return
+    metric_inputs = list(dict.fromkeys([REFERENCE_SYMBOL, *metric_symbols]))
+    metric_watermarks = {
+        symbol: history_watermarks.get(symbol)
+        for symbol in metric_inputs
+    }
+    if any(value is None for value in metric_watermarks.values()):
+        metric_watermarks = get_price_history_watermarks(
+            pc_engine, metric_inputs, interval="1d", strict=True
+        )
+    if not is_scanner_metrics_snapshot_current(
+        pc_engine,
+        metric_symbols,
+        history_watermarks=metric_watermarks,
+        strict=True,
+    ):
+        refresh_scanner_metrics_to_db(
+            metric_symbols,
+            pc_engine,
+            history_watermarks=metric_watermarks,
+        )
+    if not is_scanner_metrics_snapshot_current(
+        pc_engine,
+        metric_symbols,
+        history_watermarks=metric_watermarks,
+        strict=True,
+    ):
+        raise RuntimeError("PC scanner metrics remain incomplete after reconciliation.")
+
+
+def reconcile_local_mirror_with_pc(
+    pc_engine: Engine,
+    local_engine: Engine,
+    *,
+    tickers: Optional[List[str]] = None,
+    verify_derived: bool = True,
+    tables: Tuple[Tuple[str, str], ...] = MIRRORED_TABLES,
+) -> LocalMirrorReconciliationResult:
+    """Converge market data before routing the dashboard from local to PC.
+
+    The merge is intentionally asymmetric:
+
+    * only missing, completed, validated raw daily/hourly bars may travel from
+      local SQLite to PC MySQL;
+    * those writes are insert-only, so an existing PC primary key always wins;
+    * derived/operational tables never travel local -> PC;
+    * PC-derived caches are rebuilt/verified, then the PC is mirrored back to
+      the laptop and the raw per-symbol watermarks are verified both ways.
+
+    Any error returns ``success=False``.  Callers must keep using the local
+    engine and retry later rather than switching on a partial result.
+    """
+    requested_names = {table_name for table_name, _watermark in tables}
+    reconcile_specs = [
+        spec
+        for spec in _RECONCILE_TABLE_SPECS
+        if spec.table_name in requested_names
+    ]
+    unsupported = requested_names.difference(
+        spec.table_name for spec in reconcile_specs
+    )
+    if unsupported:
+        return LocalMirrorReconciliationResult(
+            False,
+            {},
+            {},
+            errors=(
+                "No exact reconciliation policy for: "
+                + ", ".join(sorted(unsupported)),
+            ),
+        )
+
+    local_to_pc: Dict[str, int] = {}
+    pc_to_local: Dict[str, int] = {}
+    errors: List[str] = []
+    affected_daily: Set[str] = set()
+    affected_hourly: Set[str] = set()
+    local_handoff_ready = False
+
+    try:
+        with pc_engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        with local_engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        _ensure_symbol_refresh_failures_table(pc_engine)
+        _ensure_symbol_refresh_failures_table(local_engine)
+        _ensure_local_mirror_handoff_tracking(local_engine)
+        # Never let two empty/equal legacy tables bypass safety checks merely
+        # because there are no mismatched partitions for a copy helper to
+        # inspect.  Every requested table must have the exact key shape before
+        # any local row is eligible to reach the PC or the UI can switch green.
+        for spec in reconcile_specs:
+            pc_table = Table(
+                spec.table_name, MetaData(), autoload_with=pc_engine
+            )
+            local_table = Table(
+                spec.table_name, MetaData(), autoload_with=local_engine
+            )
+            _validate_reconcile_table_schema(pc_table, local_table, spec)
+    except Exception as exc:
+        return LocalMirrorReconciliationResult(
+            False, {}, {}, errors=(f"Database readiness check failed: {exc}",)
+        )
+
+    # First find exact raw-partition differences and promote only composite
+    # primary keys that do not exist on the PC.  Existing PC rows are never
+    # updated, regardless of local timestamps or values.
+    for spec in (item for item in reconcile_specs if item.reverse_raw):
+        try:
+            pc_fingerprints = _partition_fingerprints(pc_engine, spec)
+            local_fingerprints = _partition_fingerprints(local_engine, spec)
+            mismatched = _mismatched_partitions(
+                pc_fingerprints, local_fingerprints
+            )
+            count, symbols = _insert_missing_local_raw_partitions(
+                pc_engine,
+                local_engine,
+                spec,
+                mismatched,
+                pc_fingerprints,
+                local_fingerprints,
+            )
+            local_to_pc[spec.table_name] = count
+            if spec.table_name == "price_history":
+                affected_daily.update(symbols)
+            else:
+                affected_hourly.update(symbols)
+        except Exception as exc:
+            errors.append(f"{spec.table_name} local -> PC failed: {exc}")
+
+    # Always verify causal derived caches before a successful adoption.  Raw
+    # inserts commit in retry-safe chunks; if a later table failed during a
+    # previous pass, the next pass may see zero newly affected symbols even
+    # though the PC's chart/scanner artifacts still need rebuilding.
+    raw_pc_before_derived: Dict[
+        str, Dict[Tuple[object, ...], _PartitionFingerprint]
+    ] = {}
+    if not errors and verify_derived:
+        try:
+            # This is the first side of a write fence.  If the PC refresh
+            # changes raw history while derived caches are being rebuilt, the
+            # canonical snapshot below will differ and this attempt must not
+            # activate PC routing.
+            for spec in (item for item in reconcile_specs if item.reverse_raw):
+                raw_pc_before_derived[spec.table_name] = _partition_fingerprints(
+                    pc_engine, spec
+                )
+            _rebuild_and_verify_pc_derived_data(
+                pc_engine, tickers, affected_daily
+            )
+        except Exception as exc:
+            errors.append(f"PC derived-data verification failed: {exc}")
+
+    # Canonicalize every changed partition from PC -> local.  This applies PC
+    # values to conflicts, fills interior gaps, and removes local-only derived
+    # or operational rows.  It is deliberately deferred until reverse raw
+    # writes and any necessary derived rebuild have succeeded.  One SQLite
+    # transaction publishes all tables together and reserves the local writer
+    # lock through the final equality barrier.
+    canonical_pc_before: Dict[
+        str, Dict[Tuple[object, ...], _PartitionFingerprint]
+    ] = {}
+    if not errors:
+        local_conn = None
+        try:
+            local_conn = local_engine.connect()
+            if local_engine.dialect.name == "sqlite":
+                local_conn.exec_driver_sql("BEGIN IMMEDIATE")
+            else:
+                local_conn.begin()
+
+            # Capture every PC table before any canonical copy starts.  A
+            # second full snapshot after the copy is the other side of the
+            # fence; any concurrent PC writer makes this pass fail safely.
+            for spec in reconcile_specs:
+                canonical_pc_before[spec.table_name] = _partition_fingerprints(
+                    pc_engine, spec
+                )
+            if verify_derived:
+                for spec in (item for item in reconcile_specs if item.reverse_raw):
+                    if _mismatched_partitions(
+                        raw_pc_before_derived.get(spec.table_name, {}),
+                        canonical_pc_before[spec.table_name],
+                    ):
+                        raise RuntimeError(
+                            f"PC {spec.table_name} changed while derived data "
+                            "was being verified"
+                        )
+
+            canonical_local_before = {
+                spec.table_name: _partition_fingerprints(
+                    local_engine, spec, connection=local_conn
+                )
+                for spec in reconcile_specs
+            }
+            pending_pc_to_local: Dict[str, int] = {}
+            for spec in reconcile_specs:
+                pc_fingerprints = canonical_pc_before[spec.table_name]
+                local_fingerprints = canonical_local_before[spec.table_name]
+                mismatched = _mismatched_partitions(
+                    pc_fingerprints, local_fingerprints
+                )
+                try:
+                    pending_pc_to_local[spec.table_name] = (
+                        _copy_pc_partitions_to_local_exactly(
+                            pc_engine,
+                            local_engine,
+                            spec,
+                            mismatched,
+                            pc_fingerprints,
+                            local_fingerprints,
+                            local_connection=local_conn,
+                        )
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"{spec.table_name} PC -> local failed: {exc}"
+                    ) from exc
+
+            # Full all-table barrier: PC-before == local-after == PC-after.
+            # This catches new partitions, edits to a formerly equal
+            # partition, and a local refresh that started after the initial
+            # guard.  A moving database is retried while the UI stays local.
+            canonical_local_after = {
+                spec.table_name: _partition_fingerprints(
+                    local_engine, spec, connection=local_conn
+                )
+                for spec in reconcile_specs
+            }
+            canonical_pc_after = {
+                spec.table_name: _partition_fingerprints(pc_engine, spec)
+                for spec in reconcile_specs
+            }
+            unstable = []
+            for spec in reconcile_specs:
+                before = canonical_pc_before[spec.table_name]
+                if _mismatched_partitions(
+                    before, canonical_local_after[spec.table_name]
+                ) or _mismatched_partitions(
+                    before, canonical_pc_after[spec.table_name]
+                ):
+                    unstable.append(spec.table_name)
+            if unstable:
+                raise RuntimeError(
+                    "database changed during reconciliation: "
+                    + ", ".join(unstable)
+                )
+
+            if local_engine.dialect.name == "sqlite":
+                _mark_local_mirror_handoff_clean(local_conn)
+            local_conn.commit()
+            pc_to_local = pending_pc_to_local
+            local_handoff_ready = local_engine.dialect.name == "sqlite"
+        except Exception as exc:
+            if local_conn is not None:
+                try:
+                    local_conn.rollback()
+                except Exception:
+                    pass
+            errors.append(f"Atomic PC/local equality barrier failed: {exc}")
+        finally:
+            if local_conn is not None:
+                local_conn.close()
+
+    return LocalMirrorReconciliationResult(
+        success=not errors,
+        local_to_pc_rows=local_to_pc,
+        pc_to_local_rows=pc_to_local,
+        affected_daily_symbols=tuple(sorted(affected_daily)),
+        affected_hourly_symbols=tuple(sorted(affected_hourly)),
+        errors=tuple(errors),
+        local_handoff_ready=local_handoff_ready,
+    )
 
 
 def local_mirror_is_stale(
