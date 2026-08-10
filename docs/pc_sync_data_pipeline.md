@@ -113,6 +113,10 @@ completed session's data, never watch positions in real time.
 - `scripts/setup_mysql_tailscale_access.ps1` — firewall rule scoped to the
   Tailscale network adapter specifically (not a broad IP range) + prints the
   `GRANT` step for a second, Tailscale-IP-scoped account.
+- `scripts/setup_pc_winrm_tailscale_access.ps1` (PC) /
+  `scripts/setup_laptop_winrm_trust.ps1` (laptop) — one-time WinRM setup so
+  the laptop can remotely tail logs (`scripts/tail_pc_log.ps1`) and, later,
+  launch scripts on the PC. See "Remote log access" below.
 - `scripts/Configure-AutomaticShutdown.ps1` — the 10:00 shutdown. Lives here
   (not only in the standalone `PC-Automation` folder) specifically so the
   PC's `git fetch`/`reset --hard` step can actually reach it.
@@ -149,6 +153,51 @@ usable; `Listener` reports remote-shutdown availability. Each running
 database PC's `main.py` state even when the listener is stopped. A missing
 heartbeat is `Unknown`; an explicit stop or a heartbeat older than 60 seconds
 is `Off`.
+
+## Remote log access from the laptop (WinRM over Tailscale)
+
+Status: **scripted, not yet run** — `setup_pc_winrm_tailscale_access.ps1`
+must be run once on the PC and `setup_laptop_winrm_trust.ps1` once on the
+laptop before this works.
+
+The PC's own logs (`quant_app.log`, `pc_morning_routine.log`,
+`main_py_stdout.log`/`main_py_stderr.log`,
+`pc_remote_control_listener.log`, all under `data/logs/`) only ever existed
+on the PC's disk — nothing shipped them to the laptop. PowerShell Remoting
+(WinRM) closes that gap using the same Tailscale trust already relied on
+for MySQL and the remote-shutdown listener, scoped to the Tailscale adapter
+the same way.
+
+Setup (once):
+1. On the PC (as Administrator): `.\scripts\setup_pc_winrm_tailscale_access.ps1`
+   — enables WinRM, adds a firewall rule for TCP 5985 scoped to the
+   Tailscale adapter only (mirrors the MySQL/remote-control Tailscale
+   rules).
+2. On the laptop (as Administrator): `.\scripts\setup_laptop_winrm_trust.ps1`
+   — adds the PC's Tailscale IP to the laptop's WinRM `TrustedHosts` (NTLM
+   auth, since the two machines aren't in a shared Windows domain).
+
+Usage from the laptop:
+```powershell
+.\scripts\tail_pc_log.ps1                              # tails data\logs\quant_app.log
+.\scripts\tail_pc_log.ps1 -LogName pc_morning_routine.log
+```
+Or directly, for anything beyond log tailing:
+```powershell
+$cred = Get-Credential DESKTOP-E42GSKJ\<pc-username>
+Invoke-Command -ComputerName 100.121.30.45 -Credential $cred -ScriptBlock { ... }
+```
+
+WinRM traffic is plain HTTP (port 5985); that's acceptable here because
+Tailscale already encrypts everything on that adapter (WireGuard) — same
+trust model already used for MySQL over Tailscale in this project. Unlike
+`pc_remote_control_listener.py`'s single-purpose token check, WinRM
+authenticates with a real Windows account and then allows arbitrary
+PowerShell execution as that user — a broader capability than the listener,
+so treat that account's password with the same care as any other admin
+credential. This same WinRM setup is also the intended path for launching
+scripts on the PC from the laptop (a later step); nothing further needs to
+be configured for that once these two setup scripts have been run.
 
 ## Known gotchas hit during setup (fixed, documented so they don't recur)
 
