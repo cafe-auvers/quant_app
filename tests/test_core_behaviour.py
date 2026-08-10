@@ -924,6 +924,81 @@ def test_tradingview_indicator_reference_history_is_normalized_from_multiindex()
     assert "relative_strength" in indicators.columns
 
 
+def test_tradingview_1h_indicators_cover_the_rendered_chart_horizon():
+    rendered_bar_count = MainWindow._tradingview_max_history_bars("1H")
+    assert rendered_bar_count is not None
+    index = pd.date_range(
+        "2026-01-01", periods=rendered_bar_count, freq="h", tz="UTC"
+    )
+    chart_history = pd.DataFrame(
+        {
+            "Open": [100.0 + offset for offset in range(len(index))],
+            "High": [101.0 + offset for offset in range(len(index))],
+            "Low": [99.0 + offset for offset in range(len(index))],
+            "Close": [100.5 + offset for offset in range(len(index))],
+            "Volume": [1_000.0] * len(index),
+        },
+        index=index,
+    )
+    reference_history = pd.DataFrame(
+        {
+            "Open": [500.0] * len(index),
+            "High": [501.0] * len(index),
+            "Low": [499.0] * len(index),
+            "Close": [500.0] * len(index),
+            "Volume": [10_000.0] * len(index),
+        },
+        index=index,
+    )
+    window = MainWindow.__new__(MainWindow)
+    window.db_enabled = False
+    window.db_engine = None
+    window._load_chart_history_for_timeframe = (
+        lambda symbol, timeframe, use_live_fallback=True: reference_history
+    )
+
+    indicators = window._load_tradingview_indicator_history(
+        "AAPL", "1H", chart_history
+    )
+
+    assert len(indicators) == len(chart_history)
+    assert indicators.index.equals(index.tz_convert(None))
+
+
+def test_tradingview_rs_series_keeps_the_candle_time_domain():
+    index = pd.date_range("2026-01-01 14:30", periods=4, freq="h", tz="UTC")
+    history = pd.DataFrame(
+        {
+            "Open": [10.0, 11.0, 12.0, 13.0],
+            "High": [11.0, 12.0, 13.0, 14.0],
+            "Low": [9.0, 10.0, 11.0, 12.0],
+            "Close": [10.5, 11.5, 12.5, 13.5],
+            "Volume": [1_000.0] * len(index),
+        },
+        index=index,
+    )
+    indicators = pd.DataFrame(
+        {
+            "relative_strength": [1.1, 1.2],
+            "rs_sma_50": [1.05, 1.1],
+            "is_ti65_bullish": [True, True],
+            "is_ti65_bearish": [False, False],
+        },
+        index=index[-2:],
+    )
+
+    chart_html = MainWindow._generate_tradingview_lightweight_chart_html(
+        "AAPL",
+        history,
+        options={"timeframe": "1H", "show_rs": True},
+        indicators=indicators,
+    )
+
+    assert "const alignedRsPoints = alignIndicatorSeries(rsPoints);" in chart_html
+    assert "rsSeries.setData(alignedRsPoints.concat(futureWhitespace));" in chart_html
+    assert "rsBackground.setData(alignedTi65Background.concat(futureWhitespace));" in chart_html
+
+
 def test_tradingview_passive_refresh_is_due_every_five_minutes():
     now = dt.datetime(2026, 1, 1, 12, 0, tzinfo=dt.timezone.utc)
 

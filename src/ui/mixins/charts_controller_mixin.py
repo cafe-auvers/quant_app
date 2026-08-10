@@ -1791,8 +1791,10 @@ class ChartsControllerMixin:
         reference_history = self._load_chart_history_for_timeframe(
             REFERENCE_SYMBOL, timeframe, use_live_fallback=False
         )
+        # The displayed symbol history already bounds the output.  Keeping the
+        # full reference avoids shortening RS/TI65 independently of the chart.
         reference_history = self._normalize_chart_history(
-            reference_history, REFERENCE_SYMBOL, max_rows=260
+            reference_history, REFERENCE_SYMBOL, max_rows=None
         )
         if reference_history.empty or "Close" not in reference_history.columns:
             return pd.DataFrame()

@@ -686,6 +686,17 @@ class ChartsRenderMixin:
                 const rsSmaPoints = {rs_sma_points_json};
                 const rsMarkers = {rs_markers_json};
                 const ti65Background = {ti65_background_json};
+                function alignIndicatorSeries(points) {{
+                    const pointsByTime = new Map(
+                        points.map(point => [String(point.time), point])
+                    );
+                    return candles.map(candle =>
+                        pointsByTime.get(String(candle.time)) || {{ time: candle.time }}
+                    );
+                }}
+                const alignedRsPoints = alignIndicatorSeries(rsPoints);
+                const alignedRsSmaPoints = alignIndicatorSeries(rsSmaPoints);
+                const alignedTi65Background = alignIndicatorSeries(ti65Background);
                 const savedDrawings = {drawings_json};
                 const symbolName = {symbol_json};
                 const container = document.getElementById('chart');
@@ -894,14 +905,14 @@ class ChartsRenderMixin:
                     rsBackground.priceScale().applyOptions({{
                         scaleMargins: {{ top: 0, bottom: 0 }}
                     }});
-                    rsBackground.setData(ti65Background.concat(futureWhitespace));
+                    rsBackground.setData(alignedTi65Background.concat(futureWhitespace));
                     const rsSeries = rsChart.addLineSeries({{
                         title: 'RS vs SPY',
                         color: '#22c55e',
                         lineWidth: 2,
                         priceLineVisible: false
                     }});
-                    rsSeries.setData(rsPoints.concat(futureWhitespace));
+                    rsSeries.setData(alignedRsPoints.concat(futureWhitespace));
 
                     // Custom fixed-size spike marker primitive (dots on the RS line, zoom-invariant)
                     class RsSpikePrimitive {{
@@ -975,7 +986,7 @@ class ChartsRenderMixin:
                         lineWidth: 1,
                         priceLineVisible: false
                     }});
-                    rsSmaSeries.setData(rsSmaPoints.concat(futureWhitespace));
+                    rsSmaSeries.setData(alignedRsSmaPoints.concat(futureWhitespace));
                     let syncingRange = false;
                     chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {{
                         if (syncingRange || !range) return;
