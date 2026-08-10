@@ -155,6 +155,7 @@ class StateSaveManager:
         self.last_save_started_at: datetime | None = None
         self.last_save_finished_at: datetime | None = None
         self.last_result: SaveResult | None = None
+        self._binding_lock = threading.Lock()
         self._engine = None
         self._device_id = ""
         self._is_main_device = False
@@ -175,13 +176,15 @@ class StateSaveManager:
         or if the DB is unreachable, `engine` stays None and pushes are
         skipped -- saves still work locally exactly as before.
         """
-        self._engine = engine
-        self._device_id = str(device_id or "")
-        self._is_main_device = bool(is_main_device)
+        with self._binding_lock:
+            self._engine = engine
+            self._device_id = str(device_id or "")
+            self._is_main_device = bool(is_main_device)
 
     def set_main_device(self, is_main_device: bool) -> None:
         """Update whether this process may attempt remote state writes."""
-        self._is_main_device = bool(is_main_device)
+        with self._binding_lock:
+            self._is_main_device = bool(is_main_device)
 
     def schedule_save(
         self,
@@ -337,8 +340,11 @@ class StateSaveManager:
         Silently does nothing if no engine is attached yet or the DB is
         unreachable -- local save has already succeeded regardless.
         """
-        engine = self._engine
-        if engine is None or not self._is_main_device or not self._device_id:
+        with self._binding_lock:
+            engine = self._engine
+            is_main_device = self._is_main_device
+            device_id = self._device_id
+        if engine is None or not is_main_device or not device_id:
             return
         payloads = {
             WATCHLIST_KEY: watchlist_dict,
@@ -362,7 +368,7 @@ class StateSaveManager:
                 engine,
                 state_key,
                 payload,
-                device_id=self._device_id,
+                device_id=device_id,
                 expected_revision=base_revision,
             )
             if result.status == PUSH_WRITTEN:
@@ -373,7 +379,9 @@ class StateSaveManager:
                 )
                 continue
             if result.status == PUSH_NOT_MAIN:
-                self._is_main_device = False
+                with self._binding_lock:
+                    if self._engine is engine and self._device_id == device_id:
+                        self._is_main_device = False
                 _append_sync_message(
                     append_log,
                     "Remote state save stopped because another device is now main.",

@@ -1,4 +1,5 @@
 import datetime as dt
+from types import SimpleNamespace
 
 from sqlalchemy import create_engine, text
 
@@ -171,6 +172,7 @@ def test_pc_status_poll_retains_worker_until_finished(monkeypatch):
     window = MainWindow.__new__(MainWindow)
     window.db_initializing = False
     window.pc_db_engine = object()
+    window._pc_probe_engine = window.pc_db_engine
     window._pc_status_worker = None
 
     window._poll_pc_status()
@@ -206,8 +208,258 @@ class _WidgetStub:
         self.tooltip = value
 
 
+class _StateSaveManagerStub:
+    def __init__(self):
+        self.engine_bindings = []
+
+    def set_engine(self, engine, *, device_id="", is_main_device=False):
+        self.engine_bindings.append((engine, device_id, is_main_device))
+
+
+class _RecoveryWorkerStub:
+    instances = []
+
+    def __init__(self, generation):
+        self.generation = generation
+        self.recovered = _SignalStub()
+        self.finished = _SignalStub()
+        self.started = False
+        self.__class__.instances.append(self)
+
+    def start(self):
+        self.started = True
+
+
+def _runtime_transition_window(pc_engine, *, local_engine=None):
+    window = MainWindow.__new__(MainWindow)
+    window.pc_status_dot = _WidgetStub()
+    window.pc_status_label = _WidgetStub()
+    window.pc_services_label = _WidgetStub()
+    window.pc_status_button = _WidgetStub()
+    window.main_device_button = _WidgetStub()
+    window.db_engine = pc_engine
+    window.pc_db_engine = pc_engine
+    window._pc_probe_engine = pc_engine
+    window._local_mirror_engine = local_engine
+    window.db_engine_source = "pc"
+    window.db_enabled = True
+    window.db_initializing = False
+    window.database_recovery_worker = None
+    window._pc_database_ready = True
+    window._last_pc_database_probe_ready = True
+    window._database_transition_generation = 0
+    window._initial_state_sync_complete = True
+    window._cached_market_data_status = object()
+    window.state_sync_role = SimpleNamespace(
+        device_id="laptop-id",
+        is_main=True,
+    )
+    window.state_sync_worker = None
+    manager = _StateSaveManagerStub()
+    window.state_save_manager = manager
+    logs = []
+    summary_updates = []
+    window.append_log = logs.append
+    window.update_dashboard_summary = lambda: summary_updates.append(True)
+    return window, manager, logs, summary_updates
+
+
+def _offline_pc_status():
+    return PcServiceStatus(
+        listener_status=PcStatus.OFF,
+        database_ready=False,
+    )
+
+
+def _online_pc_status():
+    return PcServiceStatus(
+        listener_status=PcStatus.OFF,
+        database_ready=True,
+        database_hostname="data-pc",
+    )
+
+
+def test_runtime_pc_database_loss_switches_to_local_mirror_and_detaches_state_sync(
+    monkeypatch,
+):
+    import src.utils.db_loader as db_loader
+
+    pc_engine = object()
+    local_engine = object()
+    window, manager, logs, summary_updates = _runtime_transition_window(pc_engine)
+    mirror_opens = []
+    monkeypatch.setattr(
+        db_loader,
+        "init_local_mirror_engine",
+        lambda: mirror_opens.append(True) or local_engine,
+    )
+
+    window._on_pc_status_result(_offline_pc_status())
+
+    assert mirror_opens == [True]
+    assert window.db_engine is local_engine
+    assert window.db_engine_source == "local_mirror"
+    assert window.db_enabled is True
+    assert window.pc_db_engine is None
+    assert window._pc_probe_engine is pc_engine
+    assert window._pc_database_ready is False
+    assert window._initial_state_sync_complete is False
+    assert manager.engine_bindings == [(None, "laptop-id", False)]
+    assert summary_updates == [True]
+    assert any("switched automatically to the local data mirror" in line for line in logs)
+
+
+def test_repeated_runtime_offline_status_does_not_repeat_failover(monkeypatch):
+    import src.utils.db_loader as db_loader
+
+    pc_engine = object()
+    local_engine = object()
+    window, manager, logs, summary_updates = _runtime_transition_window(pc_engine)
+    mirror_opens = []
+    monkeypatch.setattr(
+        db_loader,
+        "init_local_mirror_engine",
+        lambda: mirror_opens.append(True) or local_engine,
+    )
+    status = _offline_pc_status()
+
+    window._on_pc_status_result(status)
+    window._on_pc_status_result(status)
+
+    assert mirror_opens == [True]
+    assert manager.engine_bindings == [(None, "laptop-id", False)]
+    assert window._database_transition_generation == 1
+    assert summary_updates == [True]
+    assert sum("switched automatically" in line for line in logs) == 1
+
+
+def test_periodic_state_sync_is_gated_after_runtime_failover(monkeypatch):
+    import src.ui.main_window as main_window
+
+    pc_engine = object()
+    local_engine = object()
+    window, _manager, _logs, _summary_updates = _runtime_transition_window(
+        pc_engine,
+        local_engine=local_engine,
+    )
+    worker_creations = []
+    monkeypatch.setattr(
+        main_window,
+        "StateSyncWorker",
+        lambda *args, **kwargs: worker_creations.append((args, kwargs)),
+    )
+
+    window._on_pc_status_result(_offline_pc_status())
+    window._start_state_sync()
+
+    assert window.pc_db_engine is None
+    assert window._pc_database_ready is False
+    assert worker_creations == []
+
+
+def test_repeated_online_probe_starts_only_one_database_recovery(monkeypatch):
+    import src.ui.main_window as main_window
+
+    pc_engine = object()
+    local_engine = object()
+    window, _manager, _logs, _summary_updates = _runtime_transition_window(
+        pc_engine,
+        local_engine=local_engine,
+    )
+    window._on_pc_status_result(_offline_pc_status())
+    window._pc_probe_engine = None
+    _RecoveryWorkerStub.instances = []
+    monkeypatch.setattr(main_window, "DatabaseRecoveryWorker", _RecoveryWorkerStub)
+
+    status = _online_pc_status()
+    window._on_pc_status_result(status)
+    window._on_pc_status_result(status)
+
+    assert len(_RecoveryWorkerStub.instances) == 1
+    worker = _RecoveryWorkerStub.instances[0]
+    assert worker.generation == 1
+    assert worker.started is True
+    assert window.database_recovery_worker is worker
+    assert window.db_engine is local_engine
+    assert window.db_engine_source == "local_mirror"
+
+
+def test_local_mirror_to_pc_recovery_is_idempotent():
+    pc_engine = object()
+    local_engine = object()
+    window, manager, logs, summary_updates = _runtime_transition_window(
+        pc_engine,
+        local_engine=local_engine,
+    )
+    state_sync_starts = []
+    mirror_sync_starts = []
+    window._start_state_sync = lambda: state_sync_starts.append(True)
+    window._start_background_local_mirror_sync = mirror_sync_starts.append
+
+    window._on_pc_status_result(_offline_pc_status())
+    status = _online_pc_status()
+    window._on_pc_status_result(status)
+    window._on_pc_status_result(status)
+
+    assert window.db_engine is pc_engine
+    assert window.pc_db_engine is pc_engine
+    assert window.db_engine_source == "pc"
+    assert window.db_enabled is True
+    assert window._pc_database_ready is True
+    assert window._database_transition_generation == 2
+    assert manager.engine_bindings == [
+        (None, "laptop-id", False),
+        (pc_engine, "laptop-id", False),
+    ]
+    assert state_sync_starts == [True]
+    assert mirror_sync_starts == [pc_engine]
+    assert summary_updates == [True, True]
+    assert sum("back online" in line for line in logs) == 1
+
+
+def test_database_recovery_result_is_disposed_while_window_is_closing():
+    class CandidateEngine:
+        def __init__(self):
+            self.dispose_calls = 0
+
+        def dispose(self):
+            self.dispose_calls += 1
+
+    pc_engine = object()
+    window, _manager, _logs, _summary_updates = _runtime_transition_window(
+        pc_engine
+    )
+    window._database_shutting_down = True
+    candidate = CandidateEngine()
+
+    window._on_database_recovery_finished(candidate, generation=0)
+
+    assert candidate.dispose_calls == 1
+    assert window.pc_db_engine is pc_engine
+
+
+def test_transition_error_is_contained_inside_pc_status_slot():
+    pc_engine = object()
+    window, _manager, logs, _summary_updates = _runtime_transition_window(pc_engine)
+
+    def fail_transition():
+        raise RuntimeError("transition failed")
+
+    window._switch_to_runtime_local_mirror = fail_transition
+
+    window._on_pc_status_result(_offline_pc_status())
+
+    assert window.pc_status_label.text == "PC: Unreachable"
+    assert any("keep retrying" in line for line in logs)
+
+
 def test_ui_keeps_pc_on_when_database_works_but_listener_is_off():
     window = MainWindow.__new__(MainWindow)
+    engine = object()
+    window.db_engine_source = "pc"
+    window.pc_db_engine = engine
+    window._pc_probe_engine = engine
+    window._pc_database_ready = True
     window.pc_status_dot = _WidgetStub()
     window.pc_status_label = _WidgetStub()
     window.pc_services_label = _WidgetStub()

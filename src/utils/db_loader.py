@@ -1100,7 +1100,6 @@ def load_hourly_history_from_db(
 ) -> pd.DataFrame:
     metadata = MetaData()
     hourly_history = _get_hourly_price_history_table(metadata)
-    _ensure_hourly_price_history_table(engine)
     stmt = select(hourly_history).where(hourly_history.c.symbol == symbol.strip().upper())
     if source:
         stmt = stmt.where(hourly_history.c.source == source)
@@ -1111,6 +1110,7 @@ def load_hourly_history_from_db(
     stmt = stmt.order_by(hourly_history.c.timestamp)
 
     try:
+        _ensure_hourly_price_history_table(engine)
         with engine.connect() as conn:
             rows = conn.execute(stmt).all()
     except SQLAlchemyError:
@@ -1134,7 +1134,6 @@ def get_latest_hourly_price_history_timestamp(
 ) -> Optional[dt.datetime]:
     metadata = MetaData()
     hourly_history = _get_hourly_price_history_table(metadata)
-    _ensure_hourly_price_history_table(engine)
     stmt = select(func.max(hourly_history.c.timestamp))
     if symbol:
         stmt = stmt.where(hourly_history.c.symbol == symbol.strip().upper())
@@ -1142,6 +1141,7 @@ def get_latest_hourly_price_history_timestamp(
         stmt = stmt.where(hourly_history.c.source == source)
 
     try:
+        _ensure_hourly_price_history_table(engine)
         with engine.connect() as conn:
             latest_timestamp = conn.execute(stmt).scalar_one_or_none()
     except SQLAlchemyError:
@@ -1215,7 +1215,6 @@ def load_intraday_history_from_db(
 ) -> pd.DataFrame:
     metadata = MetaData()
     intraday_history = _get_intraday_price_history_table(metadata)
-    _ensure_intraday_price_history_table(engine)
 
     stmt = select(intraday_history).where(
         intraday_history.c.symbol == symbol.upper(),
@@ -1227,8 +1226,12 @@ def load_intraday_history_from_db(
         stmt = stmt.where(intraday_history.c.timestamp >= since)
     stmt = stmt.order_by(intraday_history.c.timestamp)
 
-    with engine.connect() as conn:
-        df = pd.read_sql(stmt, conn)
+    try:
+        _ensure_intraday_price_history_table(engine)
+        with engine.connect() as conn:
+            df = pd.read_sql(stmt, conn)
+    except SQLAlchemyError:
+        return pd.DataFrame()
 
     if df.empty:
         return pd.DataFrame()
@@ -1276,7 +1279,6 @@ def load_symbol_history_from_db(
 ) -> pd.DataFrame:
     metadata = MetaData()
     price_history = _get_price_history_table(metadata)
-    _ensure_price_history_table(engine)
     stmt = select(price_history).where(
         price_history.c.symbol == symbol.strip().upper(),
         price_history.c.interval == interval.strip().lower(),
@@ -1288,6 +1290,7 @@ def load_symbol_history_from_db(
     stmt = stmt.order_by(price_history.c.date)
 
     try:
+        _ensure_price_history_table(engine)
         with engine.connect() as conn:
             rows = conn.execute(stmt).all()
     except SQLAlchemyError:
@@ -1313,13 +1316,13 @@ def load_universe_history_from_db(
 ) -> dict[str, pd.DataFrame]:
     metadata = MetaData()
     price_history = _get_price_history_table(metadata)
-    _ensure_price_history_table(engine)
     symbols = _clean_symbols(tickers)
     if not symbols:
         return {}
 
     rows = []
     try:
+        _ensure_price_history_table(engine)
         with engine.connect() as conn:
             for chunk in _record_chunks(symbols, CACHE_QUERY_SYMBOL_CHUNK_SIZE):
                 stmt = select(price_history).where(
@@ -1626,9 +1629,9 @@ def get_latest_chart_indicator_dates(
     cleaned_symbols = _clean_symbols(symbols)
     if not cleaned_symbols:
         return {}
-    table = _ensure_chart_indicators_table(engine)
     rows = []
     try:
+        table = _ensure_chart_indicators_table(engine)
         with engine.connect() as conn:
             for chunk in _record_chunks(
                 cleaned_symbols, CACHE_QUERY_SYMBOL_CHUNK_SIZE
@@ -1670,9 +1673,9 @@ def _get_chart_indicator_manifests(
     cleaned_symbols = _clean_symbols(symbols)
     if not cleaned_symbols:
         return {}
-    table = _ensure_chart_indicator_manifests_table(engine)
     rows = []
     try:
+        table = _ensure_chart_indicator_manifests_table(engine)
         with engine.connect() as conn:
             for chunk in _record_chunks(
                 cleaned_symbols, CACHE_QUERY_SYMBOL_CHUNK_SIZE
@@ -2186,10 +2189,10 @@ def get_latest_price_history_date(engine: Engine, interval: str = "1d") -> Optio
     """Return the most recent market data date stored in price_history."""
     metadata = MetaData()
     price_history = _get_price_history_table(metadata)
-    _ensure_price_history_table(engine)
     stmt = select(func.max(price_history.c.date)).where(price_history.c.interval == interval.strip().lower())
 
     try:
+        _ensure_price_history_table(engine)
         with engine.connect() as conn:
             latest_date = conn.execute(stmt).scalar_one_or_none()
     except SQLAlchemyError:
@@ -2211,9 +2214,9 @@ def get_latest_price_history_dates(
 
     metadata = MetaData()
     price_history = _get_price_history_table(metadata)
-    _ensure_price_history_table(engine)
     rows = []
     try:
+        _ensure_price_history_table(engine)
         with engine.connect() as conn:
             for chunk in _record_chunks(cleaned_symbols, CACHE_QUERY_SYMBOL_CHUNK_SIZE):
                 stmt = (
@@ -2249,9 +2252,9 @@ def get_price_history_watermarks(
 
     metadata = MetaData()
     price_history = _get_price_history_table(metadata)
-    _ensure_price_history_table(engine)
     rows = []
     try:
+        _ensure_price_history_table(engine)
         with engine.connect() as conn:
             for chunk in _record_chunks(cleaned_symbols, CACHE_QUERY_SYMBOL_CHUNK_SIZE):
                 stmt = (
@@ -2290,9 +2293,9 @@ def get_latest_hourly_price_history_timestamps(
 
     metadata = MetaData()
     hourly_history = _get_hourly_price_history_table(metadata)
-    _ensure_hourly_price_history_table(engine)
     rows = []
     try:
+        _ensure_hourly_price_history_table(engine)
         with engine.connect() as conn:
             for chunk in _record_chunks(
                 cleaned_symbols, HOURLY_CACHE_QUERY_SYMBOL_CHUNK_SIZE

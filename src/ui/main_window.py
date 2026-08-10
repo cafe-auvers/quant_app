@@ -155,6 +155,26 @@ class DatabaseInitWorker(QThread):
             self.initialized.emit(None, "none", None, str(exc))
 
 
+class DatabaseRecoveryWorker(QThread):
+    """Recreate the PC MySQL engine after recovery from an offline startup."""
+
+    recovered = pyqtSignal(object, int)
+
+    def __init__(self, generation: int) -> None:
+        super().__init__()
+        self.generation = int(generation)
+
+    def run(self) -> None:
+        from src.utils.db_loader import init_mysql_engine
+
+        try:
+            engine = init_mysql_engine(log_unavailable=False)
+        except Exception:
+            logger.exception("Runtime MySQL recovery failed unexpectedly")
+            engine = None
+        self.recovered.emit(engine, self.generation)
+
+
 class LocalMirrorSyncWorker(QThread):
     """Best-effort, silent PC -> laptop local-mirror top-up in the background."""
 
@@ -178,17 +198,12 @@ class LocalMirrorSyncWorker(QThread):
             self.completed.emit(written, "; ".join(errors))
         except Exception as exc:
             self.completed.emit({}, str(exc))
-        finally:
-            try:
-                self.local_engine.dispose()
-            except Exception:
-                pass
 
 
 class StateSyncWorker(QThread):
     """Reconcile shared state without blocking the Qt event loop."""
 
-    completed = pyqtSignal(object)
+    completed = pyqtSignal(object, int)
 
     def __init__(
         self,
@@ -198,6 +213,7 @@ class StateSyncWorker(QThread):
         *,
         activate: bool = False,
         ownership_only_when_main: bool = False,
+        generation: int = 0,
     ) -> None:
         super().__init__()
         self.engine = engine
@@ -205,6 +221,7 @@ class StateSyncWorker(QThread):
         self.save_lock = save_lock
         self.activate = activate
         self.ownership_only_when_main = ownership_only_when_main
+        self.generation = int(generation)
 
     def run(self) -> None:
         try:
@@ -227,7 +244,7 @@ class StateSyncWorker(QThread):
                 errors=[f"State sync failed: {exc}"],
                 local_role=self.role,
             )
-        self.completed.emit(result)
+        self.completed.emit(result, self.generation)
 
 
 class MainWindow(
@@ -284,10 +301,18 @@ class MainWindow(
         # after the event loop begins.
         self.db_engine = None
         self.pc_db_engine = None
+        self._pc_probe_engine = None
+        self._local_mirror_engine = None
         self.db_engine_source = "none"
         self.db_enabled = False
         self.db_initializing = True
         self.database_init_worker = None
+        self.database_recovery_worker = None
+        self._pc_database_ready = False
+        self._pc_database_coordination_ready = False
+        self._last_pc_database_probe_ready = False
+        self._database_transition_generation = 0
+        self._database_shutting_down = False
         self._local_mirror_sync_worker = None
         self.state_sync_role = load_local_device_role()
         self.state_sync_worker = None
@@ -402,6 +427,8 @@ class MainWindow(
 
     def _start_optional_database_initialization(self) -> None:
         """Begin optional database setup after widgets have been rendered."""
+        if self.__dict__.get("_database_shutting_down", False):
+            return
         if self.database_init_worker is not None and self.database_init_worker.isRunning():
             return
         worker = DatabaseInitWorker()
@@ -413,16 +440,28 @@ class MainWindow(
     def _on_optional_database_initialized(
         self, engine, source: str = "none", pc_engine=None, error: str = ""
     ) -> None:
+        if self.__dict__.get("_database_shutting_down", False):
+            disposed = set()
+            for candidate in (engine, pc_engine):
+                if candidate is None or id(candidate) in disposed:
+                    continue
+                disposed.add(id(candidate))
+                try:
+                    candidate.dispose()
+                except Exception:
+                    pass
+            return
         self.db_engine = engine
         self.pc_db_engine = pc_engine
+        self._pc_probe_engine = pc_engine
+        self._local_mirror_engine = engine if source == "local_mirror" else None
         self.db_engine_source = source
         self.db_enabled = engine is not None
         self.db_initializing = False
-        self._state_save_manager().set_engine(
-            pc_engine,
-            device_id=self.state_sync_role.device_id,
-            is_main_device=self.state_sync_role.is_main,
-        )
+        self._pc_database_ready = bool(source == "pc" and pc_engine is not None)
+        self._pc_database_coordination_ready = False
+        self._last_pc_database_probe_ready = self._pc_database_ready
+        self._bind_remote_state_engine(pc_engine, is_main_device=False)
 
         if source == "pc":
             self.append_log("MySQL cache connected; starting initial scanner refresh.")
@@ -447,9 +486,19 @@ class MainWindow(
         """Best-effort, silent PC -> laptop mirror top-up once connected to the PC."""
         from src.utils.db_loader import init_local_mirror_engine
 
-        local_engine = init_local_mirror_engine()
+        if self.__dict__.get("_database_shutting_down", False):
+            return
+        if (
+            pc_engine is None
+            or self.__dict__.get("_local_mirror_sync_worker") is not None
+        ):
+            return
+        local_engine = self.__dict__.get("_local_mirror_engine")
+        if local_engine is None:
+            local_engine = init_local_mirror_engine()
         if local_engine is None:
             return
+        self._local_mirror_engine = local_engine
         worker = LocalMirrorSyncWorker(pc_engine, local_engine)
         self._local_mirror_sync_worker = worker
         worker.completed.connect(self._on_local_mirror_sync_completed)
@@ -457,6 +506,8 @@ class MainWindow(
         worker.start()
 
     def _on_local_mirror_sync_completed(self, written: dict, error: str) -> None:
+        if self.__dict__.get("_database_shutting_down", False):
+            return
         total = sum(written.values())
         if error:
             self.append_log(
@@ -535,7 +586,12 @@ class MainWindow(
 
     def _start_state_sync(self, *, activate: bool = False) -> None:
         """Start one ownership/state reconciliation in a background worker."""
-        if self.pc_db_engine is None:
+        if self.__dict__.get("_database_shutting_down", False):
+            return
+        pc_engine = self.__dict__.get("pc_db_engine")
+        if pc_engine is None or not self.__dict__.get(
+            "_pc_database_ready", pc_engine is not None
+        ):
             return
         worker = self.state_sync_worker
         if worker is not None and worker.isRunning():
@@ -556,6 +612,7 @@ class MainWindow(
                 and self.state_sync_role.is_main
                 and self._initial_state_sync_complete
             ),
+            generation=self.__dict__.get("_database_transition_generation", 0),
         )
         self.state_sync_worker = worker
         self._state_sync_action = "activate" if activate else "reconcile"
@@ -570,7 +627,15 @@ class MainWindow(
         """Compatibility wrapper for callers requesting an immediate sync."""
         self._start_state_sync()
 
-    def _on_state_sync_completed(self, result: StateReconcileResult) -> None:
+    def _on_state_sync_completed(
+        self, result: StateReconcileResult, generation: int
+    ) -> None:
+        if self.__dict__.get("_database_shutting_down", False):
+            return
+        if generation != self.__dict__.get("_database_transition_generation", 0):
+            return
+        if not self.__dict__.get("_pc_database_ready", False):
+            return
         previous_main = bool(self.state_sync_role.is_main)
         if result.local_role is not None:
             self.state_sync_role = result.local_role
@@ -580,9 +645,19 @@ class MainWindow(
                 self.state_sync_role.hostname,
                 result.is_main_device,
             )
-        self._state_save_manager().set_main_device(result.is_main_device)
         if not result.errors:
             self._initial_state_sync_complete = True
+            self._pc_database_coordination_ready = True
+            self._bind_remote_state_engine(
+                self.pc_db_engine,
+                is_main_device=result.is_main_device,
+            )
+        else:
+            self._pc_database_coordination_ready = False
+            self._bind_remote_state_engine(
+                self.pc_db_engine,
+                is_main_device=False,
+            )
         self._update_main_device_button(
             main_hostname=result.main_device_hostname,
         )
@@ -632,7 +707,15 @@ class MainWindow(
         if button is None:
             return
         is_main = bool(self.state_sync_role.is_main)
-        button.setEnabled(self.pc_db_engine is not None or self.db_initializing)
+        button.setEnabled(
+            bool(
+                self.__dict__.get(
+                    "_pc_database_ready",
+                    self.__dict__.get("pc_db_engine") is not None,
+                )
+            )
+            or bool(self.__dict__.get("db_initializing", False))
+        )
         if is_main:
             button.setText("Main Device: ON")
             button.setStyleSheet(
@@ -1045,6 +1128,22 @@ class MainWindow(
             self.state_save_manager = manager
         return manager
 
+    def _bind_remote_state_engine(
+        self,
+        engine,
+        *,
+        is_main_device: Optional[bool] = None,
+    ) -> None:
+        """Attach or detach remote state persistence as one routing change."""
+        role = self.state_sync_role
+        if is_main_device is None:
+            is_main_device = bool(role.is_main)
+        self._state_save_manager().set_engine(
+            engine,
+            device_id=role.device_id,
+            is_main_device=is_main_device,
+        )
+
     def _state_save_payload(
         self,
     ) -> tuple[
@@ -1245,24 +1344,30 @@ class MainWindow(
         return True
 
     def closeEvent(self, event) -> None:
-        if self.live_data_timer is not None:
-            self.live_data_timer.stop()
-        if getattr(self, "state_sync_timer", None) is not None:
-            self.state_sync_timer.stop()
-        if getattr(self, "pc_status_timer", None) is not None:
-            self.pc_status_timer.stop()
-        if (
-            hasattr(self, "market_status_timer")
-            and self.market_status_timer is not None
-        ):
-            self.market_status_timer.stop()
-        if (
-            hasattr(self, "_refresh_poll_timer")
-            and self._refresh_poll_timer is not None
-        ):
-            self._refresh_poll_timer.stop()
+        self._database_shutting_down = True
+        self._database_transition_generation = (
+            self.__dict__.get("_database_transition_generation", 0) + 1
+        )
+        timers = [
+            self.__dict__.get("live_data_timer"),
+            self.__dict__.get("state_sync_timer"),
+            self.__dict__.get("pc_status_timer"),
+            self.__dict__.get("market_status_timer"),
+            self.__dict__.get("_refresh_poll_timer"),
+        ]
+        timer_states = []
+        for timer in timers:
+            if timer is None:
+                continue
+            try:
+                was_active = bool(timer.isActive())
+            except Exception:
+                was_active = True
+            timer_states.append((timer, was_active))
+            timer.stop()
         candidate_workers = [
             getattr(self, "database_init_worker", None),
+            getattr(self, "database_recovery_worker", None),
             getattr(self, "_local_mirror_sync_worker", None),
             getattr(self, "state_sync_worker", None),
             getattr(self, "_pc_status_worker", None),
@@ -1293,6 +1398,10 @@ class MainWindow(
         if not self._stop_workers_for_shutdown(
             running_workers, timeout_ms=WORKER_SHUTDOWN_TIMEOUT_MS
         ):
+            self._database_shutting_down = False
+            for timer, was_active in timer_states:
+                if was_active:
+                    timer.start()
             QMessageBox.warning(
                 self,
                 "Background task running",
@@ -1302,7 +1411,11 @@ class MainWindow(
             return
         from src.services.runtime_status import safe_mark_runtime_process_stopped
 
-        safe_mark_runtime_process_stopped(self.pc_db_engine)
+        safe_mark_runtime_process_stopped(
+            self.pc_db_engine
+            if getattr(self, "_pc_database_ready", False)
+            else None
+        )
         save_result = self._flush_state_saves_for_shutdown(timeout=5.0)
         if not save_result.success:
             message = save_result.error or "Unknown local state save error."
@@ -1759,6 +1872,149 @@ class MainWindow(
                     "<b>Market Status:</b> Closed (After Hours)"
                 )
 
+    def _switch_to_runtime_local_mirror(self) -> None:
+        """Route market-data reads locally after the connected PC disappears."""
+        if self.__dict__.get("_database_shutting_down", False):
+            return
+        was_pc_active = bool(
+            self.__dict__.get("_pc_database_ready", False)
+            or self.__dict__.get("pc_db_engine") is not None
+            or self.__dict__.get("db_engine_source", "none") == "pc"
+        )
+        if not was_pc_active:
+            return
+
+        current_pc_engine = self.__dict__.get("pc_db_engine")
+        if self.__dict__.get("_pc_probe_engine") is None:
+            self._pc_probe_engine = current_pc_engine
+        self._pc_database_ready = False
+        self._pc_database_coordination_ready = False
+        self.pc_db_engine = None
+        self.db_engine = None
+        self.db_engine_source = "none"
+        self.db_enabled = False
+        self._database_transition_generation = (
+            self.__dict__.get("_database_transition_generation", 0) + 1
+        )
+        self._initial_state_sync_complete = False
+        try:
+            self._bind_remote_state_engine(None, is_main_device=False)
+        except Exception:
+            logger.exception("Could not detach remote state persistence during failover")
+
+        local_engine = self.__dict__.get("_local_mirror_engine")
+        if local_engine is None:
+            from src.utils.db_loader import init_local_mirror_engine
+
+            local_engine = init_local_mirror_engine()
+            self._local_mirror_engine = local_engine
+
+        if local_engine is not None:
+            self.db_engine = local_engine
+            self.db_engine_source = "local_mirror"
+            self.db_enabled = True
+            self.append_log(
+                "PC database went offline; switched automatically to the local data mirror."
+            )
+        else:
+            self.db_engine = None
+            self.db_engine_source = "none"
+            self.db_enabled = False
+            self.append_log(
+                "PC database went offline and no local data mirror is available; "
+                "cached market-data features are temporarily disabled."
+            )
+
+        self._cached_market_data_status = None
+        self._update_main_device_button()
+        self.update_dashboard_summary()
+
+    def _activate_recovered_pc_database(self, engine) -> None:
+        """Restore PC-backed routing after a successful background probe."""
+        if engine is None or self.__dict__.get("_database_shutting_down", False):
+            return
+        if (
+            self.__dict__.get("_pc_database_ready", False)
+            and self.__dict__.get("pc_db_engine") is engine
+            and self.__dict__.get("db_engine_source", "none") == "pc"
+        ):
+            return
+
+        previous_source = self.__dict__.get("db_engine_source", "none")
+        self._database_transition_generation = (
+            self.__dict__.get("_database_transition_generation", 0) + 1
+        )
+        self._pc_probe_engine = engine
+        self.pc_db_engine = engine
+        self.db_engine = engine
+        self.db_engine_source = "pc"
+        self.db_enabled = True
+        self._pc_database_ready = True
+        self._pc_database_coordination_ready = False
+        self._last_pc_database_probe_ready = True
+        self._initial_state_sync_complete = False
+        self._cached_market_data_status = None
+        try:
+            # Remote writes and order submission remain disabled until the
+            # current-generation reconciliation confirms device ownership.
+            self._bind_remote_state_engine(engine, is_main_device=False)
+        except Exception:
+            logger.exception("Could not attach recovered remote state persistence")
+
+        if previous_source != "pc":
+            self.append_log(
+                "PC database is back online; switched automatically from the local mirror."
+            )
+        try:
+            self._update_main_device_button()
+            self.update_dashboard_summary()
+            self._start_state_sync()
+            self._start_background_local_mirror_sync(engine)
+        except Exception:
+            # This method runs from Qt signal handlers.  A secondary UI or
+            # worker-start failure must not unwind through Qt and close the app.
+            logger.exception("PC database recovery follow-up failed")
+
+    def _start_database_recovery(self) -> None:
+        """Resolve a new PC engine without blocking the GUI after offline startup."""
+        if self.__dict__.get("_database_shutting_down", False):
+            return
+        worker = self.__dict__.get("database_recovery_worker")
+        if worker is not None:
+            return
+        generation = self.__dict__.get("_database_transition_generation", 0)
+        worker = DatabaseRecoveryWorker(generation)
+        self.database_recovery_worker = worker
+        worker.recovered.connect(self._on_database_recovery_finished)
+        self._track_worker("database_recovery_worker", worker)
+        worker.start()
+
+    def _on_database_recovery_finished(self, engine, generation: int) -> None:
+        if engine is None:
+            return
+        current_generation = self.__dict__.get(
+            "_database_transition_generation", 0
+        )
+        if (
+            self.__dict__.get("_database_shutting_down", False)
+            or generation != current_generation
+            or not self.__dict__.get("_last_pc_database_probe_ready", False)
+        ):
+            try:
+                engine.dispose()
+            except Exception:
+                pass
+            return
+        try:
+            self._activate_recovered_pc_database(engine)
+        except Exception:
+            logger.exception("Could not adopt recovered PC database engine")
+            if self.__dict__.get("pc_db_engine") is not engine:
+                try:
+                    engine.dispose()
+                except Exception:
+                    pass
+
     def _poll_pc_status(self) -> None:
         """Kick off a background check of the always-on PC's status.
 
@@ -1766,11 +2022,18 @@ class MainWindow(
         Replacing a QThread merely because ``isRunning()`` became false can
         destroy its wrapper while queued signals are still being dispatched.
         """
+        if self.__dict__.get("_database_shutting_down", False):
+            return
         if getattr(self, "db_initializing", False):
+            return
+        if self.__dict__.get("database_recovery_worker") is not None:
             return
         if self._pc_status_worker is not None:
             return
-        worker = PcRemoteStatusWorker(self.pc_db_engine, parent=self)
+        probe_engine = self.__dict__.get("_pc_probe_engine")
+        if probe_engine is None:
+            probe_engine = self.pc_db_engine
+        worker = PcRemoteStatusWorker(probe_engine, parent=self)
         self._pc_status_worker = worker
         worker.finished_status.connect(self._on_pc_status_result)
         self._track_worker("_pc_status_worker", worker)
@@ -1783,6 +2046,8 @@ class MainWindow(
     def _on_pc_status_result(self, status) -> None:
         from src.services.pc_remote_control import PcStatus
 
+        if self.__dict__.get("_database_shutting_down", False):
+            return
         dot = getattr(self, "pc_status_dot", None)
         label = getattr(self, "pc_status_label", None)
         services_label = getattr(self, "pc_services_label", None)
@@ -1792,6 +2057,28 @@ class MainWindow(
 
         listener_on = status.listener_status == PcStatus.ON
         db_ready = bool(status.database_ready)
+        self._last_pc_database_probe_ready = db_ready
+        if "db_engine_source" in self.__dict__:
+            try:
+                if db_ready:
+                    probe_engine = self.__dict__.get("_pc_probe_engine")
+                    if probe_engine is None:
+                        probe_engine = self.__dict__.get("pc_db_engine")
+                    if probe_engine is not None:
+                        self._activate_recovered_pc_database(probe_engine)
+                    elif not self.__dict__.get("_pc_database_ready", False):
+                        self._start_database_recovery()
+                else:
+                    self._switch_to_runtime_local_mirror()
+            except Exception:
+                logger.exception("Runtime database transition failed")
+                try:
+                    self.append_log(
+                        "Automatic database transition encountered an error; "
+                        "the dashboard will keep retrying in the background."
+                    )
+                except Exception:
+                    pass
         self._pc_is_on = db_ready or listener_on
         self._pc_remote_control_available = listener_on
 

@@ -230,3 +230,39 @@ def test_refresh_failure_bookkeeping_ignores_table_creation_errors(monkeypatch, 
     db_loader.record_symbol_refresh_outcomes(engine, "1d", [], ["AAPL"])
 
     assert db_loader.get_chronically_failing_symbols(engine, "1d") == set()
+
+
+@pytest.mark.parametrize(
+    ("ensure_name", "load_history"),
+    [
+        (
+            "_ensure_price_history_table",
+            lambda engine: db_loader.load_symbol_history_from_db("AAPL", engine),
+        ),
+        (
+            "_ensure_hourly_price_history_table",
+            lambda engine: db_loader.load_hourly_history_from_db("AAPL", engine),
+        ),
+        (
+            "_ensure_intraday_price_history_table",
+            lambda engine: db_loader.load_intraday_history_from_db(
+                "AAPL", engine, interval="5m"
+            ),
+        ),
+    ],
+    ids=["daily", "hourly", "intraday"],
+)
+def test_history_loaders_return_empty_when_table_creation_fails(
+    monkeypatch, sqlite_engine, ensure_name, load_history
+):
+    def fail_table_creation(_engine):
+        raise OperationalError(
+            "CREATE TABLE", {}, RuntimeError("database went offline")
+        )
+
+    monkeypatch.setattr(db_loader, ensure_name, fail_table_creation)
+
+    history = load_history(sqlite_engine)
+
+    assert isinstance(history, pd.DataFrame)
+    assert history.empty
