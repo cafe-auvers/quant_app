@@ -108,6 +108,48 @@ def _raw_engines():
     )
 
 
+@pytest.mark.parametrize(
+    ("table_name", "expected_order"),
+    [
+        (
+            "price_history",
+            "order by price_history.symbol, price_history.date, price_history.interval",
+        ),
+        (
+            "hourly_price_history",
+            "order by hourly_price_history.symbol, hourly_price_history.timestamp, hourly_price_history.source",
+        ),
+    ],
+)
+def test_full_fingerprint_scan_uses_primary_key_order(table_name, expected_order):
+    engine = create_engine("sqlite:///:memory:", future=True)
+    if table_name == "price_history":
+        db_loader._ensure_price_history_table(engine)
+    else:
+        db_loader._ensure_hourly_price_history_table(engine)
+    spec = next(
+        item
+        for item in db_loader._RECONCILE_TABLE_SPECS
+        if item.table_name == table_name
+    )
+    statements = []
+
+    def capture_statement(_conn, _cursor, statement, _parameters, _context, _many):
+        normalized = statement.lower().replace('"', "").replace("`", "")
+        if f"from {table_name}" in normalized and "order by" in normalized:
+            statements.append(normalized)
+
+    event.listen(engine, "before_cursor_execute", capture_statement)
+    try:
+        db_loader._partition_fingerprints(engine, spec)
+    finally:
+        event.remove(engine, "before_cursor_execute", capture_statement)
+        engine.dispose()
+
+    assert len(statements) == 1
+    assert expected_order in statements[0]
+
+
 def test_resolve_data_engine_prefers_pc_and_falls_back_to_local(monkeypatch):
     pc_engine = object()
     local_engine = object()

@@ -781,8 +781,14 @@ def _partition_fingerprints(
     ordered_names = tuple(sorted(table.columns.keys()))
     selected_columns = [table.c[name] for name in ordered_names]
     value_indexes = {name: index for index, name in enumerate(ordered_names)}
-    order_names = list(spec.partition_columns)
-    order_names.extend(name for name in spec.primary_key if name not in order_names)
+    # Scan in the table's exact primary-key order.  Each logical partition's
+    # rows still have a deterministic relative order even when multiple
+    # partitions are interleaved, and ``states`` below already tracks them
+    # independently.  Putting partition columns first forced MySQL to filesort
+    # the complete daily/hourly tables because their PKs are respectively
+    # (symbol, date, interval) and (symbol, timestamp, source).  On a remote PC
+    # that sort could produce no socket data before PyMySQL's read timeout.
+    order_names = list(spec.primary_key)
     stmt = select(*selected_columns)
     if raw_partition_keys is not None:
         if not raw_partition_keys:
