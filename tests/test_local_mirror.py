@@ -750,6 +750,45 @@ def test_reconciliation_canonicalizes_older_conflict_below_latest_date():
     ]
 
 
+def test_hourly_reconciliation_ignores_symbols_outside_relevant_scope():
+    pc, local, _pc_daily, _local_daily, pc_hourly, local_hourly = _raw_engines()
+    with pc.begin() as conn:
+        conn.execute(
+            insert(pc_hourly),
+            [_hourly_bar("A", 10, 100), _hourly_bar("B", 10, 200)],
+        )
+    with local.begin() as conn:
+        conn.execute(
+            insert(local_hourly),
+            [_hourly_bar("A", 11, 101), _hourly_bar("B", 10, 999)],
+        )
+
+    result = db_loader.reconcile_local_mirror_with_pc(
+        pc,
+        local,
+        hourly_symbols=["A"],
+        verify_derived=False,
+        tables=db_loader.HOURLY_MIRROR_TABLES,
+    )
+
+    assert result.success is True
+    assert result.local_to_pc_rows["hourly_price_history"] == 1
+    with pc.connect() as conn:
+        pc_values = conn.execute(
+            select(pc_hourly.c.symbol, pc_hourly.c.close).order_by(
+                pc_hourly.c.symbol, pc_hourly.c.timestamp
+            )
+        ).all()
+    with local.connect() as conn:
+        local_values = conn.execute(
+            select(local_hourly.c.symbol, local_hourly.c.close).order_by(
+                local_hourly.c.symbol, local_hourly.c.timestamp
+            )
+        ).all()
+    assert pc_values == [("A", 100.0), ("A", 101.0), ("B", 200.0)]
+    assert local_values == [("A", 100.0), ("A", 101.0), ("B", 999.0)]
+
+
 def test_reconciliation_removes_local_only_derived_rows():
     pc = create_engine("sqlite:///:memory:", future=True)
     local = create_engine("sqlite:///:memory:", future=True)

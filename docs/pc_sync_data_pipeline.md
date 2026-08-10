@@ -25,8 +25,9 @@ laptop, and the active-PC background copy never promotes laptop data. If a
 completed daily/hourly refresh was written locally while the PC was
 unavailable, normal recovery performs a guarded exception: valid completed
 raw bars that are missing on the PC are inserted without overwriting an
-existing PC key. Derived chart/scanner caches are rebuilt and verified on the
-PC before the dashboard switches back.
+existing PC key. Daily history and derived chart/scanner caches are reconciled
+before the dashboard switches back. Hourly history is not routing-critical; it
+continues in the background after the dashboard is usable on PC MySQL.
 
 ## Architecture
 
@@ -258,17 +259,17 @@ morning) for dependencies:
 - **Switching is transactional from the dashboard's point of view.** While
   reconnect reconciliation runs, the status remains yellow as
   `DB: Local (Syncing...)` and all market-data reads continue using SQLite.
-  The status becomes green `DB: PC` only after raw histories converge,
-  PC-derived caches verify, and the canonical PC copy has been mirrored back.
-  A failure leaves the app on local data and is retried automatically.
+  The status becomes green `DB: PC` after daily history and PC-derived caches
+  converge. Hourly synchronization then runs in the background only for SPY
+  and symbols in scanner results, watchlist, or buylist. A routing-critical
+  failure leaves the app on local data and is retried automatically; an hourly
+  failure does not block startup and retries in the background.
 - **The active-PC safety copy is exact and atomic.** Full keys and values are
-  compared, including old backfills, corrections, and PC-side removal of
-  derived/operational rows. It is strictly PC-to-local and runs only while the
-  mirror is clean. A dirty flag or any local-only change cancels that copy and
-  forces yellow staged reconciliation; only normal recovery may promote
-  validated missing raw bars. Derived caches must be current, and all mirrored
-  tables commit as one SQLite generation, so sudden PC loss cannot expose
-  half-new raw data with half-old indicators.
+  compared for daily/derived data, including old corrections and PC-side
+  removal of derived/operational rows. Hourly comparison is deliberately
+  limited to relevant scanner/watchlist/buylist symbols. It is strictly
+  PC-to-local and runs only while the mirror is clean. A dirty flag or any
+  local-only change cancels that copy and forces staged reconciliation.
 - **Root causes worth checking**: BIOS RTC alarm didn't fire (power/PSU
   prerequisites), Windows didn't auto-login, or a step in
   `pc_morning_routine.ps1` failed -- check `data/logs/pc_morning_routine.log`
@@ -279,10 +280,11 @@ morning) for dependencies:
 Yes. When PC MySQL is reachable, a manual run writes to the authoritative
 tables there. When it is unreachable, `historical.py` and
 `scripts/run_daily_refresh.py` resolve the local SQLite mirror instead and
-refresh that copy. On the next local-to-PC transition, completed missing raw
-daily/hourly bars are inserted into missing PC keys, existing PC values win
-all conflicts, PC-derived caches are rebuilt, and the result is mirrored back
-before routing changes. Prefer `python scripts\run_daily_refresh.py` over
+refresh that copy. On the next local-to-PC transition, completed missing daily
+bars are inserted into missing PC keys, existing PC values win all conflicts,
+and PC-derived caches are rebuilt before routing changes. Relevant hourly bars
+are reconciled immediately afterward in the background. Prefer
+`python scripts\run_daily_refresh.py` over
 calling `historical.py` directly because it checks per-symbol freshness and
 runs only the necessary modes.
 

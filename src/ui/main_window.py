@@ -47,6 +47,8 @@ from src.core.trade_reviewer import TradeReviewer
 from src.utils.config import DATA_DIR, ROOT_DIR, RULEBOOK_DIR
 from src.utils.data_loader import get_default_universe
 from src.utils.db_loader import (
+    HOURLY_MIRROR_TABLES,
+    ROUTING_CRITICAL_MIRROR_TABLES,
     local_mirror_hourly_is_stale,
     local_mirror_is_stale,
     resolve_data_engine,
@@ -174,6 +176,7 @@ class DatabaseInitWorker(QThread):
                         self.reconciliation_result = reconcile_local_mirror_with_pc(
                             resolution.pc_engine,
                             self.local_engine,
+                            tables=ROUTING_CRITICAL_MIRROR_TABLES,
                         )
                     except Exception as exc:
                         self.pc_candidate_engine = resolution.pc_engine
@@ -256,6 +259,7 @@ class DatabaseRecoveryWorker(QThread):
                     engine,
                     self.local_engine,
                     tickers=self.tickers or None,
+                    tables=ROUTING_CRITICAL_MIRROR_TABLES,
                 )
                 error = "; ".join(result.errors)
                 outcome = DatabaseRecoveryOutcome(
@@ -287,6 +291,7 @@ class LocalMirrorSyncWorker(QThread):
         pc_engine,
         local_engine,
         tickers: Optional[List[str]] = None,
+        hourly_symbols: Optional[List[str]] = None,
         *,
         generation: int = 0,
     ) -> None:
@@ -294,6 +299,9 @@ class LocalMirrorSyncWorker(QThread):
         self.pc_engine = pc_engine
         self.local_engine = local_engine
         self.tickers = list(tickers or [])
+        self.hourly_symbols = (
+            None if hourly_symbols is None else list(hourly_symbols)
+        )
         self.generation = int(generation)
 
     def run(self) -> None:
@@ -307,6 +315,7 @@ class LocalMirrorSyncWorker(QThread):
                 self.pc_engine,
                 self.local_engine,
                 tickers=self.tickers or None,
+                hourly_symbols=self.hourly_symbols,
             )
             self.completed.emit(written, "", False, self.generation)
         except LocalMirrorNeedsReconciliationError as exc:
@@ -316,6 +325,42 @@ class LocalMirrorSyncWorker(QThread):
             self.completed.emit({}, str(exc), True, self.generation)
         except Exception as exc:
             self.completed.emit({}, str(exc), False, self.generation)
+
+
+class HourlyMirrorReconciliationWorker(QThread):
+    """Reconcile relevant 1-hour rows after the dashboard has opened on PC."""
+
+    completed = pyqtSignal(object, str, int)
+
+    def __init__(
+        self,
+        pc_engine,
+        local_engine,
+        hourly_symbols: List[str],
+        *,
+        generation: int = 0,
+    ) -> None:
+        super().__init__()
+        self.pc_engine = pc_engine
+        self.local_engine = local_engine
+        self.hourly_symbols = list(hourly_symbols)
+        self.generation = int(generation)
+
+    def run(self) -> None:
+        from src.utils.db_loader import reconcile_local_mirror_with_pc
+
+        try:
+            result = reconcile_local_mirror_with_pc(
+                self.pc_engine,
+                self.local_engine,
+                hourly_symbols=self.hourly_symbols,
+                verify_derived=False,
+                tables=HOURLY_MIRROR_TABLES,
+            )
+            error = "" if result.success else "; ".join(result.errors)
+            self.completed.emit(result, error, self.generation)
+        except Exception as exc:
+            self.completed.emit(None, str(exc), self.generation)
 
 
 class StateSyncWorker(QThread):
@@ -435,6 +480,8 @@ class MainWindow(
         self._last_database_reconciliation_notice = ""
         self._local_mirror_sync_worker = None
         self._local_mirror_sync_log_completion = True
+        self._hourly_mirror_reconciliation_worker = None
+        self._hourly_mirror_reconciliation_pending = False
         self._pending_local_mirror_reconciliation_engine = None
         self._last_pc_main_app_active = None
         self.state_sync_role = load_local_device_role()
@@ -644,6 +691,7 @@ class MainWindow(
             self.append_log("MySQL cache connected; starting initial scanner refresh.")
             self._start_state_sync()
             self.run_all_scanners(show_warnings=False)
+            self._start_background_hourly_reconciliation(pc_engine)
             if startup_reconciliation is None:
                 self._start_background_local_mirror_sync(pc_engine)
         elif source == "local_mirror":
@@ -681,8 +729,99 @@ class MainWindow(
             # Exact content/causality fences in the worker remain authoritative
             # if the optional refresh-status file cannot be read.
             pass
+        if self.__dict__.get("_hourly_mirror_reconciliation_pending", False):
+            self._start_background_hourly_reconciliation(
+                self.__dict__.get("pc_db_engine")
+            )
+            return
         self._start_background_local_mirror_sync(
             self.__dict__.get("pc_db_engine"), log_completion=False
+        )
+
+    def _relevant_hourly_symbols(self) -> List[str]:
+        """Return symbols whose full 1-hour history is useful on the laptop."""
+        symbols = {REFERENCE_SYMBOL}
+
+        def add_symbol(value) -> None:
+            if isinstance(value, dict):
+                value = value.get("symbol")
+            else:
+                value = getattr(value, "symbol", value)
+            symbol = str(value or "").strip().upper()
+            if symbol:
+                symbols.add(symbol)
+
+        watchlist = self.__dict__.get("watchlist")
+        for item in getattr(watchlist, "items", []) or []:
+            add_symbol(item)
+        buylist = self.__dict__.get("buylist_manager")
+        for item in getattr(buylist, "items", []) or []:
+            add_symbol(item)
+        for result in self.__dict__.get("scanner_results", []) or []:
+            add_symbol(result)
+        for results in (
+            self.__dict__.get("scanner_results_by_setup", {}) or {}
+        ).values():
+            for result in results or []:
+                add_symbol(result)
+
+        return [REFERENCE_SYMBOL, *sorted(symbols - {REFERENCE_SYMBOL})]
+
+    def _start_background_hourly_reconciliation(self, pc_engine) -> None:
+        """Start non-blocking two-way 1H sync after PC routing is available."""
+        if self.__dict__.get("_database_shutting_down", False):
+            return
+        if self.__dict__.get("db_engine_source", "none") != "pc":
+            return
+        if pc_engine is None:
+            return
+        if self.__dict__.get("_hourly_mirror_reconciliation_worker") is not None:
+            return
+        if self.__dict__.get("_local_mirror_sync_worker") is not None:
+            return
+        local_engine = self.__dict__.get("_local_mirror_engine")
+        if local_engine is None:
+            self._hourly_mirror_reconciliation_pending = False
+            return
+
+        symbols = self._relevant_hourly_symbols()
+        self._hourly_mirror_reconciliation_pending = True
+        worker = HourlyMirrorReconciliationWorker(
+            pc_engine,
+            local_engine,
+            symbols,
+            generation=self.__dict__.get("_database_transition_generation", 0),
+        )
+        self._hourly_mirror_reconciliation_worker = worker
+        worker.completed.connect(self._on_background_hourly_reconciliation_completed)
+        self._track_worker("_hourly_mirror_reconciliation_worker", worker)
+        self.append_log(
+            f"Dashboard is ready; synchronizing 1H history for "
+            f"{len(symbols)} relevant symbol(s) in the background."
+        )
+        worker.start()
+
+    def _on_background_hourly_reconciliation_completed(
+        self, result, error: str, generation: int
+    ) -> None:
+        if (
+            generation
+            != self.__dict__.get("_database_transition_generation", 0)
+            or self.__dict__.get("db_engine_source", "none") != "pc"
+        ):
+            return
+        if error or result is None or not getattr(result, "success", False):
+            self._hourly_mirror_reconciliation_pending = True
+            self.append_log(
+                "Background relevant-symbol 1H synchronization is incomplete; "
+                f"it will retry automatically. {error or 'Unknown error'}"
+            )
+            return
+        self._hourly_mirror_reconciliation_pending = False
+        self.append_log(
+            "Background relevant-symbol 1H synchronization completed "
+            f"(local -> PC: {result.total_local_to_pc_rows} row(s), "
+            f"PC -> local: {result.total_pc_to_local_rows} row(s))."
         )
 
     def _start_background_local_mirror_sync(
@@ -701,6 +840,7 @@ class MainWindow(
         if (
             pc_engine is None
             or self.__dict__.get("_local_mirror_sync_worker") is not None
+            or self.__dict__.get("_hourly_mirror_reconciliation_worker") is not None
         ):
             return
         local_engine = self.__dict__.get("_local_mirror_engine")
@@ -713,6 +853,7 @@ class MainWindow(
             pc_engine,
             local_engine,
             tickers=list(self.__dict__.get("universe_tickers", []) or []),
+            hourly_symbols=self._relevant_hourly_symbols(),
             generation=self.__dict__.get("_database_transition_generation", 0),
         )
         self._local_mirror_sync_worker = worker
@@ -2408,6 +2549,7 @@ class MainWindow(
             self._update_main_device_button()
             self.update_dashboard_summary()
             self._start_state_sync()
+            self._start_background_hourly_reconciliation(engine)
             if not local_mirror_reconciled:
                 self._start_background_local_mirror_sync(engine)
         except Exception:

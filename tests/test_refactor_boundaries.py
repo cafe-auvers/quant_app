@@ -158,7 +158,7 @@ def test_database_init_worker_reconciles_existing_local_mirror_before_pc(monkeyp
     monkeypatch.setattr(
         db_loader,
         "reconcile_local_mirror_with_pc",
-        lambda pc, local: calls.append((pc, local)) or report,
+        lambda pc, local, **kwargs: calls.append((pc, local, kwargs)) or report,
     )
     results = []
     worker = main_window.DatabaseInitWorker()
@@ -170,7 +170,16 @@ def test_database_init_worker_reconciles_existing_local_mirror_before_pc(monkeyp
 
     worker.run()
 
-    assert calls == [(pc_engine, local_engine)]
+    assert calls == [
+        (
+            pc_engine,
+            local_engine,
+            {"tables": db_loader.ROUTING_CRITICAL_MIRROR_TABLES},
+        )
+    ]
+    assert "hourly_price_history" not in {
+        table_name for table_name, _watermark in calls[0][2]["tables"]
+    }
     assert results == [(pc_engine, "pc", pc_engine, "")]
     assert worker.local_engine is local_engine
     assert worker.reconciliation_result is report
@@ -244,7 +253,7 @@ def test_database_init_worker_stays_local_when_startup_reconciliation_fails(
     monkeypatch.setattr(
         db_loader,
         "reconcile_local_mirror_with_pc",
-        lambda *_args: report,
+        lambda *_args, **_kwargs: report,
     )
     results = []
     worker = main_window.DatabaseInitWorker()
@@ -281,7 +290,9 @@ def test_database_init_worker_contains_unexpected_reconciliation_error(monkeypat
     monkeypatch.setattr(
         db_loader,
         "reconcile_local_mirror_with_pc",
-        lambda *_args: (_ for _ in ()).throw(RuntimeError("sync exploded")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("sync exploded")
+        ),
     )
     results = []
     worker = main_window.DatabaseInitWorker()

@@ -220,6 +220,12 @@ MIRRORED_TABLES: Tuple[Tuple[str, str], ...] = (
     ("scanner_metric_snapshots", "snapshot_date"),
     ("symbol_refresh_failures", "last_attempt_at"),
 )
+ROUTING_CRITICAL_MIRROR_TABLES: Tuple[Tuple[str, str], ...] = tuple(
+    item for item in MIRRORED_TABLES if item[0] != "hourly_price_history"
+)
+HOURLY_MIRROR_TABLES: Tuple[Tuple[str, str], ...] = (
+    ("hourly_price_history", "timestamp"),
+)
 
 
 @dataclass(frozen=True)
@@ -758,6 +764,7 @@ def _partition_fingerprints(
     spec: _ReconcileTableSpec,
     *,
     raw_partition_keys: Optional[List[Tuple[object, ...]]] = None,
+    symbol_filter: Optional[List[str]] = None,
     connection=None,
 ) -> Dict[Tuple[object, ...], _PartitionFingerprint]:
     """Hash every ordered primary key and value per logical partition.
@@ -789,16 +796,41 @@ def _partition_fingerprints(
     # (symbol, date, interval) and (symbol, timestamp, source).  On a remote PC
     # that sort could produce no socket data before PyMySQL's read timeout.
     order_names = list(spec.primary_key)
-    stmt = select(*selected_columns)
+    base_stmt = select(*selected_columns)
     if raw_partition_keys is not None:
         if not raw_partition_keys:
             return {}
-        stmt = stmt.where(
+        base_stmt = base_stmt.where(
             _partition_filter(
                 table, spec.partition_columns, raw_partition_keys
             )
         )
-    stmt = stmt.order_by(*(table.c[name] for name in order_names))
+    symbol_chunks: List[Optional[List[str]]] = [None]
+    if symbol_filter is not None:
+        if "symbol" not in table.columns:
+            raise ValueError(
+                f"{spec.table_name} cannot be reconciled by symbol."
+            )
+        cleaned_symbols = list(
+            dict.fromkeys(
+                str(symbol).strip().upper()
+                for symbol in symbol_filter
+                if symbol is not None and str(symbol).strip()
+            )
+        )
+        if not cleaned_symbols:
+            return {}
+        symbol_chunks = list(
+            _record_chunks(cleaned_symbols, HOURLY_CACHE_QUERY_SYMBOL_CHUNK_SIZE)
+        )
+    statements = []
+    for symbol_chunk in symbol_chunks:
+        stmt = base_stmt
+        if symbol_chunk is not None:
+            stmt = stmt.where(table.c.symbol.in_(symbol_chunk))
+        statements.append(
+            stmt.order_by(*(table.c[name] for name in order_names))
+        )
 
     states: Dict[
         Tuple[object, ...], Tuple[Tuple[object, ...], int, object]
@@ -809,34 +841,36 @@ def _partition_fingerprints(
         if name in _BOOLEAN_RECONCILE_COLUMNS
     ]
     def consume(conn) -> None:
-        result = conn.execution_options(stream_results=True).execute(stmt)
-        for row in result:
-            values = list(row)
-            raw_partition = tuple(
-                values[value_indexes[name]] for name in spec.partition_columns
-            )
-            normalized_partition = tuple(
-                (
-                    _normalized_watermark(value).isoformat(timespec="microseconds")
-                    if isinstance(value, (dt.datetime, pd.Timestamp))
-                    else value
+        streaming_conn = conn.execution_options(stream_results=True)
+        for stmt in statements:
+            result = streaming_conn.execute(stmt)
+            for row in result:
+                values = list(row)
+                raw_partition = tuple(
+                    values[value_indexes[name]] for name in spec.partition_columns
                 )
-                for value in raw_partition
-            )
-            state = states.get(normalized_partition)
-            if state is None:
-                state = (raw_partition, 0, hashlib.sha256())
-            raw_key, row_count, digest = state
-            # MySQL reflects BOOLEAN as TINYINT(1), whereas SQLite reflects
-            # it as Boolean.  Normalize known semantic boolean columns so the
-            # same row hashes identically across both dialects.
-            for index in boolean_indexes:
-                if values[index] is not None:
-                    values[index] = bool(values[index])
-            payload = repr(tuple(values)).encode("utf-8")
-            digest.update(len(payload).to_bytes(4, "big"))
-            digest.update(payload)
-            states[normalized_partition] = (raw_key, row_count + 1, digest)
+                normalized_partition = tuple(
+                    (
+                        _normalized_watermark(value).isoformat(timespec="microseconds")
+                        if isinstance(value, (dt.datetime, pd.Timestamp))
+                        else value
+                    )
+                    for value in raw_partition
+                )
+                state = states.get(normalized_partition)
+                if state is None:
+                    state = (raw_partition, 0, hashlib.sha256())
+                raw_key, row_count, digest = state
+                # MySQL reflects BOOLEAN as TINYINT(1), whereas SQLite reflects
+                # it as Boolean.  Normalize known semantic boolean columns so the
+                # same row hashes identically across both dialects.
+                for index in boolean_indexes:
+                    if values[index] is not None:
+                        values[index] = bool(values[index])
+                payload = repr(tuple(values)).encode("utf-8")
+                digest.update(len(payload).to_bytes(4, "big"))
+                digest.update(payload)
+                states[normalized_partition] = (raw_key, row_count + 1, digest)
 
     if connection is not None:
         consume(connection)
@@ -869,6 +903,26 @@ def _mismatched_partitions(
         ):
             mismatched.append(key)
     return mismatched
+
+
+def _scoped_partition_fingerprints(
+    engine: Engine,
+    spec: _ReconcileTableSpec,
+    *,
+    hourly_symbols: Optional[List[str]] = None,
+    connection=None,
+) -> Dict[Tuple[object, ...], _PartitionFingerprint]:
+    """Limit expensive hourly comparisons while leaving every other table exact."""
+    return _partition_fingerprints(
+        engine,
+        spec,
+        symbol_filter=(
+            hourly_symbols
+            if spec.table_name == "hourly_price_history"
+            else None
+        ),
+        connection=connection,
+    )
 
 
 def _fetch_partition_rows(
@@ -1338,6 +1392,7 @@ def _sync_clean_local_mirror_from_pc_exactly(
     tables: Tuple[Tuple[str, str], ...],
     *,
     tickers: Optional[List[str]],
+    hourly_symbols: Optional[List[str]],
     verify_derived: bool,
 ) -> Dict[str, int]:
     """Implement the PC-read-only active mirror under one SQLite write lock."""
@@ -1386,13 +1441,17 @@ def _sync_clean_local_mirror_from_pc_exactly(
             _validate_reconcile_table_schema(pc_table, local_table, spec)
 
         pc_before = {
-            spec.table_name: _partition_fingerprints(pc_engine, spec)
+            spec.table_name: _scoped_partition_fingerprints(
+                pc_engine, spec, hourly_symbols=hourly_symbols
+            )
             for spec in reconcile_specs
         }
         if verify_derived:
             _verify_pc_derived_data_current_read_only(pc_engine, tickers)
             pc_after_derived_check = {
-                spec.table_name: _partition_fingerprints(pc_engine, spec)
+                spec.table_name: _scoped_partition_fingerprints(
+                    pc_engine, spec, hourly_symbols=hourly_symbols
+                )
                 for spec in reconcile_specs
             }
             changed_during_verification = [
@@ -1410,8 +1469,11 @@ def _sync_clean_local_mirror_from_pc_exactly(
                 )
 
         local_before = {
-            spec.table_name: _partition_fingerprints(
-                local_engine, spec, connection=local_conn
+            spec.table_name: _scoped_partition_fingerprints(
+                local_engine,
+                spec,
+                hourly_symbols=hourly_symbols,
+                connection=local_conn,
             )
             for spec in reconcile_specs
         }
@@ -1434,13 +1496,18 @@ def _sync_clean_local_mirror_from_pc_exactly(
             )
 
         local_after = {
-            spec.table_name: _partition_fingerprints(
-                local_engine, spec, connection=local_conn
+            spec.table_name: _scoped_partition_fingerprints(
+                local_engine,
+                spec,
+                hourly_symbols=hourly_symbols,
+                connection=local_conn,
             )
             for spec in reconcile_specs
         }
         pc_after = {
-            spec.table_name: _partition_fingerprints(pc_engine, spec)
+            spec.table_name: _scoped_partition_fingerprints(
+                pc_engine, spec, hourly_symbols=hourly_symbols
+            )
             for spec in reconcile_specs
         }
         unstable = [
@@ -1484,6 +1551,7 @@ def sync_local_mirror_from_pc_atomic(
     tables: Tuple[Tuple[str, str], ...] = MIRRORED_TABLES,
     *,
     tickers: Optional[List[str]] = None,
+    hourly_symbols: Optional[List[str]] = None,
     verify_derived: bool = True,
 ) -> Dict[str, int]:
     """Publish an exact PC generation only when the local mirror is clean.
@@ -1503,6 +1571,7 @@ def sync_local_mirror_from_pc_atomic(
         local_engine,
         tables,
         tickers=tickers,
+        hourly_symbols=hourly_symbols,
         verify_derived=verify_derived,
     )
 
@@ -1624,6 +1693,7 @@ def reconcile_local_mirror_with_pc(
     local_engine: Engine,
     *,
     tickers: Optional[List[str]] = None,
+    hourly_symbols: Optional[List[str]] = None,
     verify_derived: bool = True,
     tables: Tuple[Tuple[str, str], ...] = MIRRORED_TABLES,
 ) -> LocalMirrorReconciliationResult:
@@ -1698,8 +1768,12 @@ def reconcile_local_mirror_with_pc(
     # updated, regardless of local timestamps or values.
     for spec in (item for item in reconcile_specs if item.reverse_raw):
         try:
-            pc_fingerprints = _partition_fingerprints(pc_engine, spec)
-            local_fingerprints = _partition_fingerprints(local_engine, spec)
+            pc_fingerprints = _scoped_partition_fingerprints(
+                pc_engine, spec, hourly_symbols=hourly_symbols
+            )
+            local_fingerprints = _scoped_partition_fingerprints(
+                local_engine, spec, hourly_symbols=hourly_symbols
+            )
             mismatched = _mismatched_partitions(
                 pc_fingerprints, local_fingerprints
             )
@@ -1733,8 +1807,10 @@ def reconcile_local_mirror_with_pc(
             # canonical snapshot below will differ and this attempt must not
             # activate PC routing.
             for spec in (item for item in reconcile_specs if item.reverse_raw):
-                raw_pc_before_derived[spec.table_name] = _partition_fingerprints(
-                    pc_engine, spec
+                raw_pc_before_derived[spec.table_name] = (
+                    _scoped_partition_fingerprints(
+                        pc_engine, spec, hourly_symbols=hourly_symbols
+                    )
                 )
             _rebuild_and_verify_pc_derived_data(
                 pc_engine, tickers, affected_daily
@@ -1764,8 +1840,10 @@ def reconcile_local_mirror_with_pc(
             # second full snapshot after the copy is the other side of the
             # fence; any concurrent PC writer makes this pass fail safely.
             for spec in reconcile_specs:
-                canonical_pc_before[spec.table_name] = _partition_fingerprints(
-                    pc_engine, spec
+                canonical_pc_before[spec.table_name] = (
+                    _scoped_partition_fingerprints(
+                        pc_engine, spec, hourly_symbols=hourly_symbols
+                    )
                 )
             if verify_derived:
                 for spec in (item for item in reconcile_specs if item.reverse_raw):
@@ -1779,8 +1857,11 @@ def reconcile_local_mirror_with_pc(
                         )
 
             canonical_local_before = {
-                spec.table_name: _partition_fingerprints(
-                    local_engine, spec, connection=local_conn
+                spec.table_name: _scoped_partition_fingerprints(
+                    local_engine,
+                    spec,
+                    hourly_symbols=hourly_symbols,
+                    connection=local_conn,
                 )
                 for spec in reconcile_specs
             }
@@ -1813,13 +1894,18 @@ def reconcile_local_mirror_with_pc(
             # partition, and a local refresh that started after the initial
             # guard.  A moving database is retried while the UI stays local.
             canonical_local_after = {
-                spec.table_name: _partition_fingerprints(
-                    local_engine, spec, connection=local_conn
+                spec.table_name: _scoped_partition_fingerprints(
+                    local_engine,
+                    spec,
+                    hourly_symbols=hourly_symbols,
+                    connection=local_conn,
                 )
                 for spec in reconcile_specs
             }
             canonical_pc_after = {
-                spec.table_name: _partition_fingerprints(pc_engine, spec)
+                spec.table_name: _scoped_partition_fingerprints(
+                    pc_engine, spec, hourly_symbols=hourly_symbols
+                )
                 for spec in reconcile_specs
             }
             unstable = []

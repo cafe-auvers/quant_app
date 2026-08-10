@@ -754,7 +754,7 @@ def test_database_recovery_worker_emits_verified_reconciliation(monkeypatch):
     monkeypatch.setattr(
         db_loader,
         "reconcile_local_mirror_with_pc",
-        lambda pc, local, *, tickers=None: calls.append((pc, local, tickers))
+        lambda pc, local, **kwargs: calls.append((pc, local, kwargs))
         or reconciliation,
     )
     emitted = []
@@ -768,12 +768,87 @@ def test_database_recovery_worker_emits_verified_reconciliation(monkeypatch):
 
     worker.run()
 
-    assert calls == [(pc_engine, local_engine, ["AAPL"])]
+    assert calls == [
+        (
+            pc_engine,
+            local_engine,
+            {
+                "tickers": ["AAPL"],
+                "tables": db_loader.ROUTING_CRITICAL_MIRROR_TABLES,
+            },
+        )
+    ]
     outcome, generation = emitted[0]
     assert generation == 9
     assert outcome.success is True
     assert outcome.reconciled_local_mirror is True
     assert outcome.reconciliation_result is reconciliation
+
+
+def test_relevant_hourly_symbols_include_scan_watchlist_and_buylist():
+    window = SimpleNamespace(
+        watchlist=SimpleNamespace(
+            items=[SimpleNamespace(symbol="msft"), SimpleNamespace(symbol="AAPL")]
+        ),
+        buylist_manager=SimpleNamespace(
+            items=[SimpleNamespace(symbol="NVDA"), SimpleNamespace(symbol="MSFT")]
+        ),
+        scanner_results=[{"symbol": "tsla"}],
+        scanner_results_by_setup={
+            "Setup 1": [{"symbol": "AMZN"}, {"symbol": "aapl"}]
+        },
+    )
+
+    assert MainWindow._relevant_hourly_symbols(window) == [
+        "SPY",
+        "AAPL",
+        "AMZN",
+        "MSFT",
+        "NVDA",
+        "TSLA",
+    ]
+
+
+def test_hourly_reconciliation_worker_is_scoped_and_non_derived(monkeypatch):
+    import src.ui.main_window as main_window
+    import src.utils.db_loader as db_loader
+
+    report = SimpleNamespace(success=True, errors=())
+    calls = []
+    monkeypatch.setattr(
+        db_loader,
+        "reconcile_local_mirror_with_pc",
+        lambda pc, local, **kwargs: calls.append((pc, local, kwargs)) or report,
+    )
+    emitted = []
+    pc_engine = object()
+    local_engine = object()
+    worker = main_window.HourlyMirrorReconciliationWorker(
+        pc_engine,
+        local_engine,
+        ["SPY", "AAPL"],
+        generation=12,
+    )
+    worker.completed.connect(
+        lambda result, error, generation: emitted.append(
+            (result, error, generation)
+        )
+    )
+
+    worker.run()
+
+    assert calls == [
+        (
+            pc_engine,
+            local_engine,
+            {
+                "hourly_symbols": ["SPY", "AAPL"],
+                "verify_derived": False,
+                "tables": db_loader.HOURLY_MIRROR_TABLES,
+            },
+        )
+    ]
+    assert emitted == [(report, "", 12)]
 
 
 def test_database_recovery_worker_contains_reconciliation_failure(monkeypatch):
@@ -836,6 +911,47 @@ def test_active_mirror_worker_emits_typed_staged_reconciliation(monkeypatch):
     assert emitted == [
         ({}, "Local mirror contains laptop-side writes.", True, 7)
     ]
+
+
+def test_active_mirror_worker_forwards_relevant_hourly_symbols(monkeypatch):
+    import src.ui.main_window as main_window
+    import src.utils.db_loader as db_loader
+
+    calls = []
+    monkeypatch.setattr(
+        db_loader,
+        "sync_local_mirror_from_pc_atomic",
+        lambda pc, local, **kwargs: calls.append((pc, local, kwargs)) or {},
+    )
+    emitted = []
+    pc_engine = object()
+    local_engine = object()
+    worker = main_window.LocalMirrorSyncWorker(
+        pc_engine,
+        local_engine,
+        tickers=["AAPL", "MSFT"],
+        hourly_symbols=["SPY", "AAPL"],
+        generation=8,
+    )
+    worker.completed.connect(
+        lambda written, error, needs_reconciliation, generation: emitted.append(
+            (written, error, needs_reconciliation, generation)
+        )
+    )
+
+    worker.run()
+
+    assert calls == [
+        (
+            pc_engine,
+            local_engine,
+            {
+                "tickers": ["AAPL", "MSFT"],
+                "hourly_symbols": ["SPY", "AAPL"],
+            },
+        )
+    ]
+    assert emitted == [({}, "", False, 8)]
 
 
 def test_database_recovery_result_is_disposed_while_window_is_closing():
