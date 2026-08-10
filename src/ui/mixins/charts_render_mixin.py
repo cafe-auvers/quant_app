@@ -517,11 +517,19 @@ class ChartsRenderMixin:
                 latest_score = latest_scores.iloc[-1]
                 def score_text(value) -> str:
                     return "N/A" if pd.isna(value) else str(int(round(float(value))))
+                def score_span(label, value) -> str:
+                    txt = score_text(value)
+                    try:
+                        is_high = not pd.isna(value) and float(value) > 85
+                    except (TypeError, ValueError):
+                        is_high = False
+                    color = ' style="color:#22c55e"' if is_high else ''
+                    return f'{label} <span{color}>{txt}</span>'
                 score_summary = (
-                    f"RS Score C {score_text(latest_score.get('rs_score_current'))} | "
-                    f"W {score_text(latest_score.get('rs_score_week'))} | "
-                    f"M {score_text(latest_score.get('rs_score_month'))} | "
-                    f"Y {score_text(latest_score.get('rs_score_yesterday'))}"
+                    f"RS Score {score_span('C', latest_score.get('rs_score_current'))} | "
+                    f"{score_span('W', latest_score.get('rs_score_week'))} | "
+                    f"{score_span('M', latest_score.get('rs_score_month'))} | "
+                    f"{score_span('Y', latest_score.get('rs_score_yesterday'))}"
                 )
         rs_points_json = json.dumps(rs_points)
         rs_sma_points_json = json.dumps(rs_sma_points)
@@ -600,9 +608,9 @@ class ChartsRenderMixin:
                     letter-spacing: 0.01em;
                 }}
                 .adr-chip span.label {{
-                    color: #6b7280;
-                    font-weight: 400;
-                    font-size: 11px;
+                    color: #94a3b8;
+                    font-weight: 500;
+                    font-size: 12px;
                     margin-right: 3px;
                 }}
                 #chart-area {{
@@ -649,7 +657,7 @@ class ChartsRenderMixin:
             <div id="header">
                 <div id="header-row1">
                     <div id="symbol">{safe_symbol}</div>
-                    <div id="metrics">{html.escape(header_metrics)} | {html.escape(str(options.get("timeframe", "1D")))} | {html.escape(score_summary)}</div>
+                    <div id="metrics">{html.escape(header_metrics)} | {html.escape(str(options.get("timeframe", "1D")))} | {score_summary}</div>
                 </div>
                 <div id="header-row2">
                     <div id="adr-metrics">{adr_chips}</div>
