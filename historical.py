@@ -168,7 +168,16 @@ class _ModeLock:
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Standalone 1D/1H historical data refresh.")
     parser.add_argument("--mode", required=True, choices=[MODE_1D, MODE_1H])
-    parser.add_argument("--backfill", action="store_true", help="Full 730d backfill (1H mode only).")
+    parser.add_argument(
+        "--backfill",
+        action="store_true",
+        help=(
+            "1H mode only. Force a full 730d re-pull for every symbol. Not "
+            "required for normal use: symbols missing data, with a stale "
+            "latest bar, or with shallow history now backfill automatically "
+            "per-symbol without this flag."
+        ),
+    )
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--universe-limit", type=int, default=None)
     selection.add_argument(
