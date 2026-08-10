@@ -194,6 +194,7 @@ class _WidgetStub:
         self.text = ""
         self.enabled = None
         self.tooltip = ""
+        self.stylesheet = ""
 
     def setText(self, value):
         self.text = value
@@ -202,7 +203,7 @@ class _WidgetStub:
         self.enabled = value
 
     def setStyleSheet(self, value):
-        pass
+        self.stylesheet = value
 
     def setToolTip(self, value):
         self.tooltip = value
@@ -236,6 +237,8 @@ def _runtime_transition_window(pc_engine, *, local_engine=None):
     window.pc_status_label = _WidgetStub()
     window.pc_services_label = _WidgetStub()
     window.pc_status_button = _WidgetStub()
+    window.database_source_dot = _WidgetStub()
+    window.database_source_label = _WidgetStub()
     window.main_device_button = _WidgetStub()
     window.db_engine = pc_engine
     window.pc_db_engine = pc_engine
@@ -300,6 +303,8 @@ def test_runtime_pc_database_loss_switches_to_local_mirror_and_detaches_state_sy
     assert window.db_engine is local_engine
     assert window.db_engine_source == "local_mirror"
     assert window.db_enabled is True
+    assert window.database_source_label.text == "DB: Local"
+    assert "#ffb300" in window.database_source_dot.stylesheet
     assert window.pc_db_engine is None
     assert window._pc_probe_engine is pc_engine
     assert window._pc_database_ready is False
@@ -331,6 +336,23 @@ def test_repeated_runtime_offline_status_does_not_repeat_failover(monkeypatch):
     assert window._database_transition_generation == 1
     assert summary_updates == [True]
     assert sum("switched automatically" in line for line in logs) == 1
+
+
+def test_runtime_database_loss_without_local_mirror_shows_offline_red(monkeypatch):
+    import src.utils.db_loader as db_loader
+
+    window, _manager, _logs, _summary_updates = _runtime_transition_window(
+        object()
+    )
+    monkeypatch.setattr(db_loader, "init_local_mirror_engine", lambda: None)
+
+    window._on_pc_status_result(_offline_pc_status())
+
+    assert window.db_engine is None
+    assert window.db_engine_source == "none"
+    assert window.db_enabled is False
+    assert window.database_source_label.text == "DB: Offline"
+    assert "#f23645" in window.database_source_dot.stylesheet
 
 
 def test_periodic_state_sync_is_gated_after_runtime_failover(monkeypatch):
@@ -405,6 +427,8 @@ def test_local_mirror_to_pc_recovery_is_idempotent():
     assert window.pc_db_engine is pc_engine
     assert window.db_engine_source == "pc"
     assert window.db_enabled is True
+    assert window.database_source_label.text == "DB: PC"
+    assert "#26a69a" in window.database_source_dot.stylesheet
     assert window._pc_database_ready is True
     assert window._database_transition_generation == 2
     assert manager.engine_bindings == [
@@ -453,6 +477,28 @@ def test_transition_error_is_contained_inside_pc_status_slot():
     assert any("keep retrying" in line for line in logs)
 
 
+def test_database_source_indicator_maps_pc_local_and_offline_colors():
+    window = MainWindow.__new__(MainWindow)
+    window.database_source_dot = _WidgetStub()
+    window.database_source_label = _WidgetStub()
+    window.db_initializing = False
+
+    cases = [
+        ("pc", object(), True, "DB: PC", "#26a69a"),
+        ("local_mirror", object(), True, "DB: Local", "#ffb300"),
+        ("none", None, False, "DB: Offline", "#f23645"),
+    ]
+    for source, engine, enabled, expected_text, expected_color in cases:
+        window.db_engine_source = source
+        window.db_engine = engine
+        window.db_enabled = enabled
+
+        window._update_database_source_indicator()
+
+        assert window.database_source_label.text == expected_text
+        assert expected_color in window.database_source_dot.stylesheet
+
+
 def test_ui_keeps_pc_on_when_database_works_but_listener_is_off():
     window = MainWindow.__new__(MainWindow)
     engine = object()
@@ -474,7 +520,7 @@ def test_ui_keeps_pc_on_when_database_works_but_listener_is_off():
     window._on_pc_status_result(status)
 
     assert window.pc_status_label.text == "PC: On"
-    assert window.pc_services_label.text == "DB: On | Listener: Off | main.py: On"
+    assert window.pc_services_label.text == "PC DB: On | Listener: Off | main.py: On"
     assert window.pc_status_button.text == "Remote Control Offline"
     assert window.pc_status_button.enabled is False
     assert window._pc_is_on is True

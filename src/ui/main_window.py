@@ -462,6 +462,7 @@ class MainWindow(
         self._pc_database_coordination_ready = False
         self._last_pc_database_probe_ready = self._pc_database_ready
         self._bind_remote_state_engine(pc_engine, is_main_device=False)
+        self._update_database_source_indicator()
 
         if source == "pc":
             self.append_log("MySQL cache connected; starting initial scanner refresh.")
@@ -1572,6 +1573,23 @@ class MainWindow(
         outer_corner_layout.setContentsMargins(0, 0, 10, 0)
         outer_corner_layout.setSpacing(16)
 
+        # -- Active market-data database --
+        # This is deliberately separate from the PC health indicator: the PC
+        # can be offline while the dashboard continues from its local mirror.
+        self.database_source_status_widget = QWidget()
+        database_source_layout = QHBoxLayout()
+        database_source_layout.setContentsMargins(0, 0, 0, 0)
+        database_source_layout.setSpacing(6)
+
+        self.database_source_dot = QLabel()
+        self.database_source_dot.setFixedSize(10, 10)
+        self.database_source_label = QLabel("DB: Checking...")
+        database_source_layout.addWidget(self.database_source_dot)
+        database_source_layout.addWidget(self.database_source_label)
+        self.database_source_status_widget.setLayout(database_source_layout)
+        self._update_database_source_indicator()
+        outer_corner_layout.addWidget(self.database_source_status_widget)
+
         # -- Shared-data PC and service status --
         self.pc_status_widget = QWidget()
         pc_status_layout = QHBoxLayout()
@@ -1589,7 +1607,7 @@ class MainWindow(
             "font-size: 13px; font-weight: bold; color: #131722;"
         )
         self.pc_services_label = QLabel(
-            "DB: Checking | Listener: Checking | main.py: Checking"
+            "PC DB: Checking | Listener: Checking | main.py: Checking"
         )
         self.pc_services_label.setStyleSheet("font-size: 10px; color: #555555;")
 
@@ -1872,6 +1890,49 @@ class MainWindow(
                     "<b>Market Status:</b> Closed (After Hours)"
                 )
 
+    def _update_database_source_indicator(self) -> None:
+        """Show which database currently serves dashboard market-data reads."""
+        dot = self.__dict__.get("database_source_dot")
+        label = self.__dict__.get("database_source_label")
+        if dot is None or label is None:
+            return
+
+        source = self.__dict__.get("db_engine_source", "none")
+        enabled = bool(
+            self.__dict__.get("db_enabled", False)
+            and self.__dict__.get("db_engine") is not None
+        )
+        if self.__dict__.get("db_initializing", False):
+            text_value = "DB: Checking..."
+            dot_color = "#787b86"
+            text_color = "#555555"
+            tooltip = "Checking which market-data database is available."
+        elif enabled and source == "pc":
+            text_value = "DB: PC"
+            dot_color = "#26a69a"
+            text_color = "#137333"
+            tooltip = "Market-data reads are using the PC MySQL database."
+        elif enabled and source == "local_mirror":
+            text_value = "DB: Local"
+            dot_color = "#ffb300"
+            text_color = "#9a6700"
+            tooltip = "Market-data reads are using the laptop's local SQLite mirror."
+        else:
+            text_value = "DB: Offline"
+            dot_color = "#f23645"
+            text_color = "#b42318"
+            tooltip = "No usable market-data database is currently connected."
+
+        dot.setStyleSheet(
+            f"border-radius: 5px; background-color: {dot_color};"
+        )
+        label.setText(text_value)
+        label.setStyleSheet(
+            f"font-size: 13px; font-weight: bold; color: {text_color};"
+        )
+        dot.setToolTip(tooltip)
+        label.setToolTip(tooltip)
+
     def _switch_to_runtime_local_mirror(self) -> None:
         """Route market-data reads locally after the connected PC disappears."""
         if self.__dict__.get("_database_shutting_down", False):
@@ -1893,6 +1954,7 @@ class MainWindow(
         self.db_engine = None
         self.db_engine_source = "none"
         self.db_enabled = False
+        self._update_database_source_indicator()
         self._database_transition_generation = (
             self.__dict__.get("_database_transition_generation", 0) + 1
         )
@@ -1925,6 +1987,7 @@ class MainWindow(
                 "cached market-data features are temporarily disabled."
             )
 
+        self._update_database_source_indicator()
         self._cached_market_data_status = None
         self._update_main_device_button()
         self.update_dashboard_summary()
@@ -1954,6 +2017,7 @@ class MainWindow(
         self._last_pc_database_probe_ready = True
         self._initial_state_sync_complete = False
         self._cached_market_data_status = None
+        self._update_database_source_indicator()
         try:
             # Remote writes and order submission remain disabled until the
             # current-generation reconciliation confirms device ownership.
@@ -2104,7 +2168,7 @@ class MainWindow(
         else:
             main_app_text = "Unknown"
         services_text = (
-            f"DB: {'On' if db_ready else 'Off'} | "
+            f"PC DB: {'On' if db_ready else 'Off'} | "
             f"Listener: {listener_text} | main.py: {main_app_text}"
         )
         services_label.setText(services_text)
@@ -2115,6 +2179,7 @@ class MainWindow(
         )
         label.setToolTip(tooltip)
         services_label.setToolTip(tooltip)
+        self._update_database_source_indicator()
 
         if button is not None:
             if listener_on:
