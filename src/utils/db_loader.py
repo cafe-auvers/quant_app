@@ -1934,6 +1934,51 @@ def local_mirror_is_stale(
     )
 
 
+def local_mirror_hourly_is_stale(
+    engine: Engine,
+    expected_date: dt.date,
+    tickers: Optional[List[str]],
+) -> bool:
+    """True when actionable 1-hour history is missing or behind.
+
+    The laptop startup prompt uses this alongside ``local_mirror_is_stale`` so
+    current daily rows cannot hide a failed hourly refresh. As in the PC's
+    scheduled gate, chronically unavailable symbols are ignored while SPY
+    remains the provider canary.
+    """
+    if isinstance(expected_date, dt.datetime):
+        expected_date = expected_date.date()
+    if tickers is None:
+        return True
+
+    symbols = _clean_symbols([REFERENCE_SYMBOL, *tickers])
+    try:
+        latest_by_symbol = get_latest_hourly_price_history_timestamps(
+            engine, symbols, strict=True
+        )
+        chronic = get_chronically_failing_symbols(engine, interval="1h")
+    except (RuntimeError, SQLAlchemyError, ValueError, TypeError):
+        return True
+
+    reference_latest = latest_by_symbol.get(REFERENCE_SYMBOL)
+    reference_date = (
+        reference_latest.date()
+        if hasattr(reference_latest, "date")
+        else reference_latest
+    )
+    if reference_date is None or reference_date < expected_date:
+        return True
+
+    for symbol in symbols:
+        if symbol == REFERENCE_SYMBOL or symbol in chronic:
+            continue
+        latest = latest_by_symbol.get(symbol)
+        latest_date = latest.date() if hasattr(latest, "date") else latest
+        if latest_date is None or latest_date < expected_date:
+            return True
+    return False
+
+
 def _get_price_history_table(metadata: MetaData) -> Table:
     return Table(
         "price_history",
@@ -3772,48 +3817,6 @@ def get_latest_hourly_price_history_timestamps(
     return {str(row.symbol).upper(): row.latest_timestamp for row in rows if row.latest_timestamp is not None}
 
 
-def get_earliest_hourly_price_history_timestamps(
-    engine: Engine,
-    symbols: List[str],
-    source: Optional[str] = None,
-    strict: bool = False,
-) -> Dict[str, dt.datetime]:
-    """Return earliest cached 1-hour timestamp per symbol.
-
-    Used alongside the latest timestamp to detect "shallow" hourly history --
-    a symbol that refreshes daily can look perfectly current by recency alone
-    while still only holding a couple of weeks of depth (see
-    ``_period_for_hourly_refresh``).
-    """
-    cleaned_symbols = _clean_symbols(symbols)
-    if not cleaned_symbols:
-        return {}
-
-    metadata = MetaData()
-    hourly_history = _get_hourly_price_history_table(metadata)
-    rows = []
-    try:
-        _ensure_hourly_price_history_table(engine)
-        with engine.connect() as conn:
-            for chunk in _record_chunks(
-                cleaned_symbols, HOURLY_CACHE_QUERY_SYMBOL_CHUNK_SIZE
-            ):
-                stmt = select(
-                    hourly_history.c.symbol,
-                    func.min(hourly_history.c.timestamp).label("earliest_timestamp"),
-                ).where(hourly_history.c.symbol.in_(chunk))
-                if source:
-                    stmt = stmt.where(hourly_history.c.source == source)
-                stmt = stmt.group_by(hourly_history.c.symbol)
-                rows.extend(conn.execute(stmt).all())
-    except SQLAlchemyError as exc:
-        if strict:
-            raise RuntimeError("Unable to verify earliest hourly-history timestamps") from exc
-        return {}
-
-    return {str(row.symbol).upper(): row.earliest_timestamp for row in rows if row.earliest_timestamp is not None}
-
-
 def _format_eta(seconds: int) -> str:
     if seconds < 0:
         return "00:00"
@@ -4124,71 +4127,33 @@ def refresh_universe_history_to_db(
     return deduped_updated
 
 
-# Depth a symbol's hourly history must reach back to before it's treated as
-# "complete" rather than a thin, recency-only cache. 200 calendar days covers
-# the TradingView 1H chart's ~120-trading-day default view (~840 hourly bars)
-# with headroom for panning back further. This also sizes the "full re-pull"
-# period itself: yfinance allows up to 730d for 1h bars, but pulling that much
-# every time a symbol needs catching up is wasted bandwidth/time when 200d is
-# all the app ever displays -- earliest stays fixed once pulled and "now"
-# only advances, so depth only grows afterward and this can't flap.
-MIN_HOURLY_HISTORY_DAYS = 200
-HOURLY_FULL_REFRESH_PERIOD = f"{MIN_HOURLY_HISTORY_DAYS}d"
+HOURLY_INCREMENTAL_REFRESH_DAYS = 10
+HOURLY_INCREMENTAL_REFRESH_PERIOD = f"{HOURLY_INCREMENTAL_REFRESH_DAYS}d"
+HOURLY_BACKFILL_DAYS = 200
+HOURLY_BACKFILL_PERIOD = f"{HOURLY_BACKFILL_DAYS}d"
 
 
 def _period_for_hourly_refresh(
-    latest_timestamp: Optional[dt.datetime],
-    earliest_timestamp: Optional[dt.datetime] = None,
-    full_period: str = HOURLY_FULL_REFRESH_PERIOD,
-    incremental_period: str = "10d",
-    recent_days: int = 10,
-    min_history_days: int = MIN_HOURLY_HISTORY_DAYS,
+    *,
+    full_period: str = HOURLY_BACKFILL_PERIOD,
+    incremental_period: str = HOURLY_INCREMENTAL_REFRESH_PERIOD,
     backfill: bool = False,
 ) -> str:
-    """Mirror ``_period_for_daily_refresh``, plus a depth check daily doesn't
-    need (daily's very first fetch always used the full period, so recency
-    alone implies depth; hourly's did not until this fixed, so existing
-    "recent but shallow" caches must self-heal too).
-
-    A symbol gets a full re-pull, with no manual ``--backfill`` flag
-    required, when any of:
-    - it has no cached hourly history at all,
-    - its latest cached bar is older than ``recent_days`` (an incremental
-      pull would leave a permanent gap behind it), or
-    - its earliest cached bar doesn't reach back ``min_history_days`` (the
-      cache is recent but shallow).
-    ``backfill`` remains as an explicit override to force a full re-pull for
-    every symbol regardless of freshness or depth.
-    """
-    if backfill:
-        return full_period
-    if latest_timestamp is None:
-        return full_period
-    latest = pd.Timestamp(latest_timestamp).tz_localize(None).to_pydatetime()
-    age_days = max(0, (_utcnow_naive() - latest).days)
-    if age_days > max(1, int(recent_days)):
-        return full_period
-    if earliest_timestamp is not None:
-        earliest = pd.Timestamp(earliest_timestamp).tz_localize(None).to_pydatetime()
-        depth_days = max(0, (_utcnow_naive() - earliest).days)
-        if depth_days < max(1, int(min_history_days)):
-            return full_period
-    return incremental_period
+    """Keep routine D-10 refreshes separate from explicit D-200 repair runs."""
+    return full_period if backfill else incremental_period
 
 
 def refresh_universe_hourly_history_to_db(
     tickers: List[str],
     engine: Engine,
-    full_period: str = HOURLY_FULL_REFRESH_PERIOD,
+    full_period: str = HOURLY_BACKFILL_PERIOD,
     source: str = "yfinance",
     chunk_size: int = 100,
     threads: int = 8,
     batch_sleep: float = 1.5,
     retry_attempts: int = 0,
     backfill: bool = False,
-    incremental_period: str = "10d",
-    recent_days: int = 10,
-    min_history_days: int = MIN_HOURLY_HISTORY_DAYS,
+    incremental_period: str = HOURLY_INCREMENTAL_REFRESH_PERIOD,
     progress_callback: Optional[Callable[[str, int, int, int, str], None]] = None,
     log_callback: Optional[Callable[[str], None]] = None,
 ) -> List[str]:
@@ -4203,36 +4168,16 @@ def refresh_universe_hourly_history_to_db(
     current_from_download: Set[str] = set()
     expected_date = expected_latest_market_data_date()
 
-    latest_by_symbol = get_latest_hourly_price_history_timestamps(engine, symbols, source=source)
-    earliest_by_symbol = (
-        {}
-        if backfill
-        else get_earliest_hourly_price_history_timestamps(engine, symbols, source=source)
+    fetch_period = _period_for_hourly_refresh(
+        full_period=full_period,
+        incremental_period=incremental_period,
+        backfill=backfill,
     )
-    period_by_symbol = {
-        symbol: _period_for_hourly_refresh(
-            latest_by_symbol.get(symbol),
-            earliest_timestamp=earliest_by_symbol.get(symbol),
-            full_period=full_period,
-            incremental_period=incremental_period,
-            recent_days=recent_days,
-            min_history_days=min_history_days,
-            backfill=backfill,
-        )
-        for symbol in symbols
-    }
+    period_by_symbol = {symbol: fetch_period for symbol in symbols}
     period_groups = _period_groups_for_symbols(period_by_symbol, symbols)
 
     if log_callback:
-        if backfill:
-            mode = "forced full backfill"
-        else:
-            full_count = sum(1 for period in period_by_symbol.values() if period == full_period)
-            mode = (
-                f"auto (self-healing: {full_count} full / {total - full_count} incremental)"
-                if full_count
-                else "incremental"
-            )
+        mode = "forced D-200 backfill" if backfill else "routine D-10"
         log_callback(
             f"Starting 1h yfinance {mode} refresh: {total} symbols, "
             f"chunk_size={chunk_size}, threads={threads}, sleep={batch_sleep:.1f}s"

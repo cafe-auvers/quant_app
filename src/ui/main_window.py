@@ -46,7 +46,11 @@ from src.core.watchlist import Watchlist, TradePlanManager, BuylistManager
 from src.core.trade_reviewer import TradeReviewer
 from src.utils.config import DATA_DIR, ROOT_DIR, RULEBOOK_DIR
 from src.utils.data_loader import get_default_universe
-from src.utils.db_loader import local_mirror_is_stale, resolve_data_engine
+from src.utils.db_loader import (
+    local_mirror_hourly_is_stale,
+    local_mirror_is_stale,
+    resolve_data_engine,
+)
 from src.utils.market_calendar import expected_latest_market_data_date
 from src.utils.storage import load_json
 from src.services.historical_refresh_control import (
@@ -859,7 +863,13 @@ class MainWindow(
         except Exception:
             logger.exception("Could not load default universe for staleness check")
             tickers = None
-        if not local_mirror_is_stale(engine, expected_date, tickers=tickers):
+        daily_is_stale = local_mirror_is_stale(
+            engine, expected_date, tickers=tickers
+        )
+        hourly_is_stale = local_mirror_hourly_is_stale(
+            engine, expected_date, tickers=tickers
+        )
+        if not daily_is_stale and not hourly_is_stale:
             self.append_log("PC unreachable; using local data mirror (up to date).")
             self.run_all_scanners(show_warnings=False)
             return
@@ -874,26 +884,38 @@ class MainWindow(
             "The PC is unreachable and this laptop's local data mirror is stale "
             f"(market data expected through {expected_date}).\n\n"
             "Fetch fresh data now directly from Yahoo Finance? This only updates "
-            "this laptop's local copy. It usually takes a few minutes, but can "
-            "take much longer if hourly history also needs to be backfilled "
-            "(e.g. after this laptop has been offline or away from the PC for a while).\n\n"
+            "this laptop's local copy. The routine 1-hour refresh downloads the "
+            "rolling D-10 window and usually takes a few minutes.\n\n"
             "Choose No to keep working with the existing (slightly stale) local data.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
         if reply == QMessageBox.Yes:
             self.append_log("Fetching fresh data into the local mirror ...")
-            self._pending_local_mirror_hourly_refresh = True
             self._run_scanners_after_local_mirror_refresh = True
-            daily_running, _ = is_refresh_running(MODE_1D)
-            if daily_running:
-                self.append_log(
-                    "A 1D refresh is already running; the 1H refresh will start after it completes."
-                )
-            elif not self.refresh_data_to_db():
-                self._pending_local_mirror_hourly_refresh = False
-                self._run_scanners_after_local_mirror_refresh = False
-                self.run_all_scanners(show_warnings=False)
+            if daily_is_stale:
+                # Keep the existing daily-then-hourly sequencing when daily
+                # data needs work. The rolling D-10 hourly top-up is cheap and
+                # guarantees the laptop refresh completes both histories.
+                self._pending_local_mirror_hourly_refresh = True
+                daily_running, _ = is_refresh_running(MODE_1D)
+                if daily_running:
+                    self.append_log(
+                        "A 1D refresh is already running; the 1H refresh will start after it completes."
+                    )
+                elif not self.refresh_data_to_db():
+                    self._pending_local_mirror_hourly_refresh = False
+                    self._run_scanners_after_local_mirror_refresh = False
+                    self.run_all_scanners(show_warnings=False)
+            elif hourly_is_stale:
+                hourly_running, _ = is_refresh_running(MODE_1H)
+                if hourly_running:
+                    self.append_log(
+                        "A 1H local-mirror refresh is already running; waiting for it to complete."
+                    )
+                elif not self.refresh_hourly_data_to_db():
+                    self._run_scanners_after_local_mirror_refresh = False
+                    self.run_all_scanners(show_warnings=False)
         else:
             self.append_log(
                 "Continuing with stale local data. Use 'Update 1D/1H Data' to refresh manually."

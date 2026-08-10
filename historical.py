@@ -172,10 +172,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--backfill",
         action="store_true",
         help=(
-            "1H mode only. Force a full 730d re-pull for every symbol. Not "
-            "required for normal use: symbols missing data, with a stale "
-            "latest bar, or with shallow history now backfill automatically "
-            "per-symbol without this flag."
+            "1H mode only. Force a 200d re-pull for every symbol. Routine "
+            "refreshes intentionally fetch only the rolling D-10 window."
         ),
     )
     selection = parser.add_mutually_exclusive_group()

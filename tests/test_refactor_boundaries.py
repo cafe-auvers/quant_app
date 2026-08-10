@@ -355,6 +355,58 @@ def test_completed_daily_fallback_refresh_starts_queued_hourly_refresh(monkeypat
     assert window.scanner_starts == 1
 
 
+def test_laptop_prompts_and_starts_d10_hourly_refresh_when_only_hourly_is_stale(
+    monkeypatch,
+):
+    import src.ui.main_window as main_window
+
+    class Window:
+        def __init__(self):
+            self.logs = []
+            self.daily_starts = 0
+            self.hourly_starts = 0
+            self.scanner_starts = 0
+
+        def append_log(self, message):
+            self.logs.append(message)
+
+        def refresh_data_to_db(self):
+            self.daily_starts += 1
+            return True
+
+        def refresh_hourly_data_to_db(self):
+            self.hourly_starts += 1
+            return True
+
+        def run_all_scanners(self, **_kwargs):
+            self.scanner_starts += 1
+
+    questions = []
+    monkeypatch.setattr(main_window, "get_default_universe", lambda: ["AAPL"])
+    monkeypatch.setattr(
+        main_window, "expected_latest_market_data_date", lambda: "2026-08-07"
+    )
+    monkeypatch.setattr(main_window, "local_mirror_is_stale", lambda *a, **k: False)
+    monkeypatch.setattr(
+        main_window, "local_mirror_hourly_is_stale", lambda *a, **k: True
+    )
+    monkeypatch.setattr(main_window, "is_refresh_running", lambda _mode: (False, {}))
+    monkeypatch.setattr(
+        main_window.QMessageBox,
+        "question",
+        lambda *args: questions.append(args) or main_window.QMessageBox.Yes,
+    )
+
+    window = Window()
+    main_window.MainWindow._handle_local_mirror_startup_inner(window, object())
+
+    assert len(questions) == 1
+    assert "D-10" in questions[0][2]
+    assert window.daily_starts == 0
+    assert window.hourly_starts == 1
+    assert window._run_scanners_after_local_mirror_refresh is True
+
+
 def test_manual_refresh_cannot_start_during_database_reconciliation(monkeypatch):
     import src.ui.mixins.scanner_mixin as scanner_mixin
 

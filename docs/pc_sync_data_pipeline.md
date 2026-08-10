@@ -200,11 +200,12 @@ morning) for dependencies:
   completed market session, the dashboard uses it silently. If it is stale,
   the dashboard asks whether to refresh the laptop copy directly from Yahoo
   Finance; declining continues with the stale mirror.
-- **Recovery is automatic once the PC is back**, no manual backfill needed
-  -- `historical.py` pulls a wide window each run (`1y` daily, `730d`
-  hourly), and `run_daily_refresh.py` checks every scheduled symbol in both
-  tables rather than trusting one global latest date. Any gap (a missed wake,
-  a failed mode, several days off) self-heals on the next successful run.
+- **Recovery is automatic once the PC is back.** `historical.py` pulls `1y`
+  for daily data and the rolling D-10 window for hourly data, while
+  `run_daily_refresh.py` checks every scheduled symbol in both tables rather
+  than trusting one global latest date. Routine hourly gaps inside D-10
+  self-heal on the next successful run; older hourly repairs use the explicit
+  one-time D-200 script below.
 - **Switching is transactional from the dashboard's point of view.** While
   reconnect reconciliation runs, the status remains yellow as
   `DB: Local (Syncing...)` and all market-data reads continue using SQLite.
@@ -235,6 +236,21 @@ all conflicts, PC-derived caches are rebuilt, and the result is mirrored back
 before routing changes. Prefer `python scripts\run_daily_refresh.py` over
 calling `historical.py` directly because it checks per-symbol freshness and
 runs only the necessary modes.
+
+## How do I run the one-time D-200 hourly repair?
+
+Run this manually and directly on the PC that hosts MySQL:
+
+```powershell
+.\venv\Scripts\python.exe scripts\backfill_hourly_history_200d_once.py
+```
+
+The script verifies that the local Windows hostname matches the MySQL server
+hostname, so a laptop connected to PC MySQL is rejected. It re-pulls 200 days
+for the complete refresh universe and upserts the returned 1-hour bars. A
+successful-completion marker under `data/` prevents accidental repeat runs;
+`--force` is available only for a deliberate repair rerun. This script is not
+called by `pc_morning_routine.ps1`.
 
 Run `python scripts\sync_local_mirror_from_pc.py` while the PC is reachable
 to force an immediate mirror top-up and print per-table row counts and
