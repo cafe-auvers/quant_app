@@ -4127,14 +4127,19 @@ def refresh_universe_history_to_db(
 # Depth a symbol's hourly history must reach back to before it's treated as
 # "complete" rather than a thin, recency-only cache. 200 calendar days covers
 # the TradingView 1H chart's ~120-trading-day default view (~840 hourly bars)
-# with headroom for panning back further.
+# with headroom for panning back further. This also sizes the "full re-pull"
+# period itself: yfinance allows up to 730d for 1h bars, but pulling that much
+# every time a symbol needs catching up is wasted bandwidth/time when 200d is
+# all the app ever displays -- earliest stays fixed once pulled and "now"
+# only advances, so depth only grows afterward and this can't flap.
 MIN_HOURLY_HISTORY_DAYS = 200
+HOURLY_FULL_REFRESH_PERIOD = f"{MIN_HOURLY_HISTORY_DAYS}d"
 
 
 def _period_for_hourly_refresh(
     latest_timestamp: Optional[dt.datetime],
     earliest_timestamp: Optional[dt.datetime] = None,
-    full_period: str = "730d",
+    full_period: str = HOURLY_FULL_REFRESH_PERIOD,
     incremental_period: str = "10d",
     recent_days: int = 10,
     min_history_days: int = MIN_HOURLY_HISTORY_DAYS,
@@ -4174,7 +4179,7 @@ def _period_for_hourly_refresh(
 def refresh_universe_hourly_history_to_db(
     tickers: List[str],
     engine: Engine,
-    full_period: str = "730d",
+    full_period: str = HOURLY_FULL_REFRESH_PERIOD,
     source: str = "yfinance",
     chunk_size: int = 100,
     threads: int = 8,

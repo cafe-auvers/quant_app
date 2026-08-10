@@ -326,7 +326,6 @@ def run_1h(engine, tickers: List[str], backfill: bool, state: RunState) -> None:
     updated = refresh_universe_hourly_history_to_db(
         tickers,
         engine,
-        full_period="730d",
         backfill=backfill,
         progress_callback=state.update_progress,
         log_callback=state.log,
