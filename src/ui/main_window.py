@@ -874,7 +874,9 @@ class MainWindow(
             "The PC is unreachable and this laptop's local data mirror is stale "
             f"(market data expected through {expected_date}).\n\n"
             "Fetch fresh data now directly from Yahoo Finance? This only updates "
-            "this laptop's local copy and may take several minutes.\n\n"
+            "this laptop's local copy. It usually takes a few minutes, but can "
+            "take much longer if hourly history also needs to be backfilled "
+            "(e.g. after this laptop has been offline or away from the PC for a while).\n\n"
             "Choose No to keep working with the existing (slightly stale) local data.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
