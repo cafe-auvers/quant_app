@@ -1650,6 +1650,9 @@ class ChartsControllerMixin:
             "window_days": int(base_options.get("window_days", 7) or 7),
             "timeframe": timeframe,
         }
+        options["max_history_bars"] = self._tradingview_max_history_bars(
+            timeframe, options["window_days"]
+        )
         if timeframe.strip().upper() != "1D":
             options.update(
                 {
@@ -1692,9 +1695,7 @@ class ChartsControllerMixin:
         chart_history = self._normalize_chart_history(
             history,
             symbol,
-            max_rows=self._tradingview_max_history_bars(
-                timeframe, int(options.get("window_days", 7) or 7)
-            ),
+            max_rows=options["max_history_bars"],
         )
         if chart_history.empty:
             message = f"No {timeframe} chart data found for {symbol}."

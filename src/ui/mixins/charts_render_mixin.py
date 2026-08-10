@@ -325,7 +325,9 @@ class ChartsRenderMixin:
         except (TypeError, ValueError):
             pan_step_bars = 1
 
-        chart_history = ChartsRenderMixin._normalize_chart_history(history, symbol, max_rows=260)
+        chart_history = ChartsRenderMixin._normalize_chart_history(
+            history, symbol, max_rows=options.get("max_history_bars", 260)
+        )
         if chart_history.empty:
             return ChartsRenderMixin._generate_message_html(symbol, "No chart data available.")
 
@@ -550,6 +552,10 @@ class ChartsRenderMixin:
                 });
                 volumeSeries.setData(volumes);
             """
+        # Default zoom on load, expressed in bar counts. Hourly bars run ~7/trading-day
+        # (regular session), so 840 hourly bars covers roughly the same 120-trading-day
+        # span that the flat 120-bar default covers for daily candles.
+        default_visible_bars = 840 if str(options.get("timeframe", "1D")).strip().upper() == "1H" else 120
         bridge_enabled = QWebEngineView is not None and QWebChannel is not None
         bridge_script = '<script src="qrc:///qtwebchannel/qwebchannel.js"></script>' if bridge_enabled else ""
         symbol_json = json.dumps((storage_symbol or symbol).strip().upper())
@@ -1253,7 +1259,7 @@ class ChartsRenderMixin:
                 }};
                 window.resetFullView = function() {{
                     const futureBars = Math.min(40, futureWhitespace.length);
-                    const visibleBars = Math.min(120, candles.length + futureBars);
+                    const visibleBars = Math.min({default_visible_bars}, candles.length + futureBars);
                     const visibleTo = Math.max(0, candles.length - 1 + futureBars);
                     const range = {{
                         from: Math.max(0, visibleTo - visibleBars),
