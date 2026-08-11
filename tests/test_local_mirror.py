@@ -553,6 +553,11 @@ def test_pc_authoritative_mirror_reports_named_progress_phases():
     )
     assert progress[-1][0] == "Laptop safety backup complete"
     assert progress[-1][1] == progress[-1][2]
+    positive_totals = {total for _phase, _current, total in progress if total > 0}
+    assert positive_totals == {4}
+    row_progress = [current for _phase, current, total in progress if total == 4]
+    assert row_progress == sorted(row_progress)
+    assert row_progress[-1] == 4
 
 
 def test_pc_authoritative_mirror_honors_cancellation_callback():

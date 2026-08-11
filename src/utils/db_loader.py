@@ -769,6 +769,7 @@ def _partition_fingerprints(
     raw_partition_keys: Optional[List[Tuple[object, ...]]] = None,
     symbol_filter: Optional[List[str]] = None,
     cancellation_callback: Optional[Callable[[], bool]] = None,
+    row_progress_callback: Optional[Callable[[int], None]] = None,
     connection=None,
 ) -> Dict[Tuple[object, ...], _PartitionFingerprint]:
     """Hash every ordered primary key and value per logical partition.
@@ -844,7 +845,10 @@ def _partition_fingerprints(
         for name in ordered_names
         if name in _BOOLEAN_RECONCILE_COLUMNS
     ]
+    rows_processed = 0
+
     def consume(conn) -> None:
+        nonlocal rows_processed
         streaming_conn = conn.execution_options(stream_results=True)
         for stmt in statements:
             if cancellation_callback is not None and cancellation_callback():
@@ -886,12 +890,18 @@ def _partition_fingerprints(
                 digest.update(len(payload).to_bytes(4, "big"))
                 digest.update(payload)
                 states[normalized_partition] = (raw_key, row_count + 1, digest)
+                rows_processed += 1
+                if row_progress_callback is not None and rows_processed % 5000 == 0:
+                    row_progress_callback(rows_processed)
 
     if connection is not None:
         consume(connection)
     else:
         with engine.connect() as conn:
             consume(conn)
+
+    if row_progress_callback is not None:
+        row_progress_callback(rows_processed)
 
     return {
         key: _PartitionFingerprint(raw_key, row_count, digest.hexdigest())
@@ -926,6 +936,7 @@ def _scoped_partition_fingerprints(
     *,
     hourly_symbols: Optional[List[str]] = None,
     cancellation_callback: Optional[Callable[[], bool]] = None,
+    row_progress_callback: Optional[Callable[[int], None]] = None,
     connection=None,
 ) -> Dict[Tuple[object, ...], _PartitionFingerprint]:
     """Limit expensive hourly comparisons while leaving every other table exact."""
@@ -938,8 +949,54 @@ def _scoped_partition_fingerprints(
             else None
         ),
         cancellation_callback=cancellation_callback,
+        row_progress_callback=row_progress_callback,
         connection=connection,
     )
+
+
+def _scoped_reconcile_row_count(
+    engine: Engine,
+    spec: _ReconcileTableSpec,
+    *,
+    hourly_symbols: Optional[List[str]] = None,
+    cancellation_callback: Optional[Callable[[], bool]] = None,
+    connection=None,
+) -> int:
+    """Count the rows that an exact mirror pass will inspect."""
+    bind = connection if connection is not None else engine
+    if not inspect(bind).has_table(spec.table_name):
+        return 0
+    table = Table(spec.table_name, MetaData(), autoload_with=bind)
+    symbol_chunks: List[Optional[List[str]]] = [None]
+    if spec.table_name == "hourly_price_history" and hourly_symbols is not None:
+        cleaned_symbols = list(
+            dict.fromkeys(
+                str(symbol).strip().upper()
+                for symbol in hourly_symbols
+                if symbol is not None and str(symbol).strip()
+            )
+        )
+        if not cleaned_symbols:
+            return 0
+        symbol_chunks = list(
+            _record_chunks(cleaned_symbols, HOURLY_CACHE_QUERY_SYMBOL_CHUNK_SIZE)
+        )
+
+    def count_rows(conn) -> int:
+        total = 0
+        for symbol_chunk in symbol_chunks:
+            if cancellation_callback is not None and cancellation_callback():
+                raise InterruptedError("Local mirror synchronization was cancelled.")
+            stmt = select(func.count()).select_from(table)
+            if symbol_chunk is not None:
+                stmt = stmt.where(table.c.symbol.in_(symbol_chunk))
+            total += int(conn.execute(stmt).scalar_one() or 0)
+        return total
+
+    if connection is not None:
+        return count_rows(connection)
+    with engine.connect() as conn:
+        return count_rows(conn)
 
 
 def _fetch_partition_rows(
@@ -1074,6 +1131,7 @@ def _copy_pc_partitions_to_local_exactly(
     local_connection=None,
     preserve_local_raw: bool = True,
     cancellation_callback: Optional[Callable[[], bool]] = None,
+    row_progress_callback: Optional[Callable[[int], None]] = None,
 ) -> int:
     """Apply PC-wins rows and remove local-only keys for changed partitions."""
     if not partition_keys:
@@ -1083,6 +1141,7 @@ def _copy_pc_partitions_to_local_exactly(
     local_table = Table(spec.table_name, MetaData(), autoload_with=local_bind)
     _validate_reconcile_table_schema(pc_table, local_table, spec)
     changed = 0
+    rows_processed = 0
 
     for key_chunk in _record_chunks(partition_keys, partition_chunk_size):
         if cancellation_callback is not None and cancellation_callback():
@@ -1102,6 +1161,9 @@ def _copy_pc_partitions_to_local_exactly(
             raw_keys,
             connection=local_connection,
         )
+        rows_processed += len(pc_rows) + len(local_rows)
+        if row_progress_callback is not None:
+            row_progress_callback(rows_processed)
         upsert_records = []
         for primary_key, (pc_record, pc_normalized) in pc_rows.items():
             local_value = local_rows.get(primary_key)
@@ -1138,6 +1200,8 @@ def _copy_pc_partitions_to_local_exactly(
             with local_engine.begin() as conn:
                 apply_changes(conn)
         changed += len(delete_keys) + len(upsert_records)
+    if row_progress_callback is not None:
+        row_progress_callback(rows_processed)
     return changed
 
 
@@ -1437,10 +1501,8 @@ def _sync_clean_local_mirror_from_pc_exactly(
             + ", ".join(sorted(unsupported))
         )
 
-    total_steps = 2 + (6 * len(reconcile_specs))
-    if verify_derived:
-        total_steps += 1 + len(reconcile_specs)
-    completed_steps = 0
+    total_work = 0
+    completed_work = 0
 
     def check_cancelled() -> None:
         if cancellation_callback is not None and cancellation_callback():
@@ -1449,11 +1511,37 @@ def _sync_clean_local_mirror_from_pc_exactly(
     def start_phase(label: str) -> None:
         check_cancelled()
         if progress_callback is not None:
-            progress_callback(label, completed_steps, total_steps)
+            progress_callback(label, completed_work, total_work)
 
-    def finish_phase() -> None:
-        nonlocal completed_steps
-        completed_steps += 1
+    def report_phase_progress(label: str, current: int) -> None:
+        check_cancelled()
+        if progress_callback is not None:
+            progress_callback(label, min(max(0, current), total_work), total_work)
+
+    def scan_fingerprints(
+        engine: Engine,
+        spec: _ReconcileTableSpec,
+        label: str,
+        units: int,
+        *,
+        connection=None,
+    ) -> Dict[Tuple[object, ...], _PartitionFingerprint]:
+        nonlocal completed_work
+        start = completed_work
+        start_phase(label)
+        result = _scoped_partition_fingerprints(
+            engine,
+            spec,
+            hourly_symbols=hourly_symbols,
+            cancellation_callback=cancellation_callback,
+            row_progress_callback=lambda rows: report_phase_progress(
+                label, start + min(max(0, int(rows)), units)
+            ),
+            connection=connection,
+        )
+        completed_work = start + units
+        report_phase_progress(label, completed_work)
+        return result
 
     local_conn = None
     try:
@@ -1471,7 +1559,6 @@ def _sync_clean_local_mirror_from_pc_exactly(
             raise LocalMirrorNeedsReconciliationError(
                 "Local mirror contains changes that require staged reconciliation."
             )
-        finish_phase()
 
         # Equal or empty legacy tables must not bypass schema validation.
         for spec in reconcile_specs:
@@ -1483,34 +1570,57 @@ def _sync_clean_local_mirror_from_pc_exactly(
                 spec.table_name, MetaData(), autoload_with=local_conn
             )
             _validate_reconcile_table_schema(pc_table, local_table, spec)
-            finish_phase()
 
-        pc_before = {}
+        pc_row_counts: Dict[str, int] = {}
+        local_row_counts: Dict[str, int] = {}
         for spec in reconcile_specs:
-            start_phase(f"Reading PC data: {spec.table_name}")
-            pc_before[spec.table_name] = _scoped_partition_fingerprints(
+            start_phase(f"Counting backup records: {spec.table_name}")
+            pc_row_counts[spec.table_name] = _scoped_reconcile_row_count(
                 pc_engine,
                 spec,
                 hourly_symbols=hourly_symbols,
                 cancellation_callback=cancellation_callback,
             )
-            finish_phase()
+            local_row_counts[spec.table_name] = _scoped_reconcile_row_count(
+                local_engine,
+                spec,
+                hourly_symbols=hourly_symbols,
+                cancellation_callback=cancellation_callback,
+                connection=local_conn,
+            )
+
+        # Each PC row is read initially, during the update/copy decision,
+        # when verifying the laptop copy, and once more to prove the PC did
+        # not change. Each existing laptop row is read initially and during
+        # the update/copy decision. Derived verification adds one PC reread.
+        pc_passes = 5 if verify_derived else 4
+        total_work = (
+            pc_passes * sum(pc_row_counts.values())
+            + 2 * sum(local_row_counts.values())
+        )
+        start_phase("Starting record comparison")
+
+        pc_before = {}
+        for spec in reconcile_specs:
+            pc_before[spec.table_name] = scan_fingerprints(
+                pc_engine,
+                spec,
+                f"Reading PC data: {spec.table_name}",
+                pc_row_counts[spec.table_name],
+            )
         if verify_derived:
             start_phase("Checking PC derived-data freshness")
             _verify_pc_derived_data_current_read_only(pc_engine, tickers)
-            finish_phase()
             pc_after_derived_check = {}
             for spec in reconcile_specs:
-                start_phase(f"Rechecking PC data: {spec.table_name}")
                 pc_after_derived_check[spec.table_name] = (
-                    _scoped_partition_fingerprints(
+                    scan_fingerprints(
                         pc_engine,
                         spec,
-                        hourly_symbols=hourly_symbols,
-                        cancellation_callback=cancellation_callback,
+                        f"Rechecking PC data: {spec.table_name}",
+                        pc_row_counts[spec.table_name],
                     )
                 )
-                finish_phase()
             changed_during_verification = [
                 spec.table_name
                 for spec in reconcile_specs
@@ -1527,21 +1637,41 @@ def _sync_clean_local_mirror_from_pc_exactly(
 
         local_before = {}
         for spec in reconcile_specs:
-            start_phase(f"Reading laptop backup: {spec.table_name}")
-            local_before[spec.table_name] = _scoped_partition_fingerprints(
+            local_before[spec.table_name] = scan_fingerprints(
                 local_engine,
                 spec,
-                hourly_symbols=hourly_symbols,
-                cancellation_callback=cancellation_callback,
+                f"Reading laptop backup: {spec.table_name}",
+                local_row_counts[spec.table_name],
                 connection=local_conn,
             )
-            finish_phase()
         pending_written: Dict[str, int] = {}
         for spec in reconcile_specs:
-            start_phase(f"Updating laptop backup: {spec.table_name}")
+            label = f"Updating laptop backup: {spec.table_name}"
+            start = completed_work
+            phase_units = (
+                pc_row_counts[spec.table_name]
+                + local_row_counts[spec.table_name]
+            )
+            start_phase(label)
             mismatched = _mismatched_partitions(
                 pc_before[spec.table_name], local_before[spec.table_name]
             )
+            mismatched_units = sum(
+                (
+                    pc_before[spec.table_name].get(key).row_count
+                    if pc_before[spec.table_name].get(key) is not None
+                    else 0
+                )
+                + (
+                    local_before[spec.table_name].get(key).row_count
+                    if local_before[spec.table_name].get(key) is not None
+                    else 0
+                )
+                for key in mismatched
+            )
+            mismatch_work = min(phase_units, mismatched_units)
+            already_matched = phase_units - mismatch_work
+            report_phase_progress(label, start + already_matched)
             pending_written[spec.table_name] = (
                 _copy_pc_partitions_to_local_exactly(
                     pc_engine,
@@ -1553,31 +1683,34 @@ def _sync_clean_local_mirror_from_pc_exactly(
                     local_connection=local_conn,
                     preserve_local_raw=False,
                     cancellation_callback=cancellation_callback,
+                    row_progress_callback=lambda rows: report_phase_progress(
+                        label,
+                        start
+                        + already_matched
+                        + min(max(0, int(rows)), mismatch_work),
+                    ),
                 )
             )
-            finish_phase()
+            completed_work = start + phase_units
+            report_phase_progress(label, completed_work)
 
         local_after = {}
         for spec in reconcile_specs:
-            start_phase(f"Verifying laptop backup: {spec.table_name}")
-            local_after[spec.table_name] = _scoped_partition_fingerprints(
+            local_after[spec.table_name] = scan_fingerprints(
                 local_engine,
                 spec,
-                hourly_symbols=hourly_symbols,
-                cancellation_callback=cancellation_callback,
+                f"Verifying laptop backup: {spec.table_name}",
+                pc_row_counts[spec.table_name],
                 connection=local_conn,
             )
-            finish_phase()
         pc_after = {}
         for spec in reconcile_specs:
-            start_phase(f"Confirming PC unchanged: {spec.table_name}")
-            pc_after[spec.table_name] = _scoped_partition_fingerprints(
+            pc_after[spec.table_name] = scan_fingerprints(
                 pc_engine,
                 spec,
-                hourly_symbols=hourly_symbols,
-                cancellation_callback=cancellation_callback,
+                f"Confirming PC unchanged: {spec.table_name}",
+                pc_row_counts[spec.table_name],
             )
-            finish_phase()
         unstable = [
             spec.table_name
             for spec in reconcile_specs
@@ -1597,9 +1730,8 @@ def _sync_clean_local_mirror_from_pc_exactly(
         start_phase("Finalizing laptop safety backup")
         _mark_local_mirror_handoff_clean(local_conn)
         local_conn.commit()
-        finish_phase()
         if progress_callback is not None:
-            progress_callback("Laptop safety backup complete", total_steps, total_steps)
+            progress_callback("Laptop safety backup complete", total_work, total_work)
         return pending_written
     except LocalMirrorNeedsReconciliationError:
         if local_conn is not None:

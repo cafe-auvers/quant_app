@@ -807,9 +807,38 @@ def test_laptop_backup_progress_is_shown_in_dashboard_progress_widgets():
     assert window.progress_bar.maximum == 20
     assert window.progress_bar.value == 8
     assert window.progress_label.value == (
-        "Laptop backup: Reading PC data: hourly_price_history (40%)"
+        "Laptop backup — Checking PC 1-hour prices | "
+        "8 / 20 records (40%) | ETA calculating"
     )
     assert "already using PC MySQL" in window.progress_label.tooltip
+
+
+def test_laptop_backup_progress_estimates_eta_from_record_rate(monkeypatch):
+    import src.ui.main_window as main_window
+
+    window = MainWindow.__new__(MainWindow)
+    window._database_shutting_down = False
+    window._database_transition_generation = 4
+    window.progress_bar = _ProgressBarStub()
+    window.progress_label = _ProgressLabelStub()
+    clock = iter((100.0, 110.0))
+    monkeypatch.setattr(main_window.time, "monotonic", lambda: next(clock))
+
+    window._on_local_mirror_sync_progress(
+        "Reading PC data: price_history",
+        100,
+        1000,
+        4,
+    )
+    window._on_local_mirror_sync_progress(
+        "Reading PC data: price_history",
+        300,
+        1000,
+        4,
+    )
+
+    assert "300 / 1,000 records (30%)" in window.progress_label.value
+    assert "ETA less than 1 min" in window.progress_label.value
 
 
 def test_shutdown_message_identifies_laptop_backup_and_current_phase():

@@ -386,6 +386,7 @@ class MainWindow(
         self._local_mirror_sync_worker = None
         self._local_mirror_sync_log_completion = True
         self._local_mirror_progress_phase = ""
+        self._local_mirror_progress_samples = []
         self._last_pc_main_app_active = None
         self.state_sync_role = load_local_device_role()
         self.state_sync_worker = None
@@ -639,13 +640,17 @@ class MainWindow(
         worker.completed.connect(self._on_local_mirror_sync_completed)
         self._track_worker("_local_mirror_sync_worker", worker)
         self._local_mirror_progress_phase = "Preparing laptop safety backup"
+        self._local_mirror_progress_samples = []
         progress_bar = self.__dict__.get("progress_bar")
         progress_label = self.__dict__.get("progress_label")
         if progress_bar is not None and progress_label is not None:
             progress_bar.setRange(0, 0)
-            progress_label.setText("Laptop backup: preparing...")
+            progress_label.setText(
+                "Laptop backup — preparing the laptop safety copy..."
+            )
             progress_label.setToolTip(
-                "PC to laptop safety backup. It does not block database use."
+                "This copies PC market data to the laptop for offline use. "
+                "The dashboard continues using the PC database while it runs."
             )
         if log_completion:
             self.append_log(
@@ -653,6 +658,88 @@ class MainWindow(
                 "(PC data remains active)."
             )
         worker.start()
+
+    @staticmethod
+    def _friendly_local_mirror_phase(phase: str) -> str:
+        table_labels = {
+            "price_history": "daily prices",
+            "hourly_price_history": "1-hour prices",
+            "chart_indicators": "chart indicators",
+            "chart_indicator_manifests": "chart status",
+            "scanner_metrics": "scanner data",
+            "scanner_metric_snapshots": "scanner status",
+            "symbol_refresh_failures": "refresh status",
+        }
+        exact_labels = {
+            "Preparing laptop safety backup": "Preparing the laptop safety copy",
+            "Checking PC derived-data freshness": "Checking PC scanner data",
+            "Starting record comparison": "Starting the record check",
+            "Finalizing laptop safety backup": "Saving the laptop safety copy",
+            "Laptop safety backup complete": "Laptop safety copy complete",
+        }
+        if phase in exact_labels:
+            return exact_labels[phase]
+        phase_prefixes = {
+            "Checking table layout": "Checking backup setup for {table}",
+            "Counting backup records": "Counting {table}",
+            "Reading PC data": "Checking PC {table}",
+            "Rechecking PC data": "Rechecking PC {table}",
+            "Reading laptop backup": "Checking laptop {table}",
+            "Updating laptop backup": "Copying changed {table} to laptop",
+            "Verifying laptop backup": "Verifying laptop {table}",
+            "Confirming PC unchanged": "Final PC check for {table}",
+        }
+        for prefix, template in phase_prefixes.items():
+            marker = f"{prefix}: "
+            if phase.startswith(marker):
+                table_name = phase[len(marker):]
+                return template.format(
+                    table=table_labels.get(table_name, table_name.replace("_", " "))
+                )
+        return str(phase or "Working")
+
+    @staticmethod
+    def _format_local_mirror_eta(seconds: float) -> str:
+        safe_seconds = max(0.0, float(seconds))
+        if safe_seconds < 45:
+            return "less than 1 min"
+        if safe_seconds < 90:
+            return "about 1 min"
+        if safe_seconds < 3600:
+            return f"about {math.ceil(safe_seconds / 60):d} min"
+        hours = int(safe_seconds // 3600)
+        minutes = int(math.ceil((safe_seconds % 3600) / 60))
+        if minutes >= 60:
+            hours += 1
+            minutes = 0
+        if minutes == 0:
+            return f"about {hours:d} hr"
+        return f"about {hours:d} hr {minutes:d} min"
+
+    def _local_mirror_eta(self, current: int, total: int) -> str:
+        now = time.monotonic()
+        samples = list(self.__dict__.get("_local_mirror_progress_samples", []))
+        if samples and (samples[-1][2] != total or current < samples[-1][1]):
+            samples = []
+        if not samples or current != samples[-1][1]:
+            samples.append((now, current, total))
+        cutoff = now - 120.0
+        while len(samples) > 2 and samples[1][0] < cutoff:
+            samples.pop(0)
+        if len(samples) > 120:
+            samples = samples[-120:]
+        self._local_mirror_progress_samples = samples
+        if current >= total:
+            return "finishing"
+        if len(samples) < 2:
+            return "calculating"
+        elapsed = samples[-1][0] - samples[0][0]
+        completed = samples[-1][1] - samples[0][1]
+        if elapsed < 2.0 or completed <= 0:
+            return "calculating"
+        rows_per_second = completed / elapsed
+        remaining_seconds = (total - current) / rows_per_second
+        return self._format_local_mirror_eta(remaining_seconds)
 
     def _on_local_mirror_sync_progress(
         self,
@@ -667,19 +754,37 @@ class MainWindow(
             != self.__dict__.get("_database_transition_generation", 0)
         ):
             return
-        self._local_mirror_progress_phase = str(phase or "Working")
+        friendly_phase = self._friendly_local_mirror_phase(str(phase or "Working"))
+        self._local_mirror_progress_phase = friendly_phase
         progress_bar = self.__dict__.get("progress_bar")
         progress_label = self.__dict__.get("progress_label")
         if progress_bar is None or progress_label is None:
             return
-        safe_total = max(1, int(total or 0))
+        if int(total or 0) <= 0:
+            progress_bar.setRange(0, 0)
+            progress_label.setText(
+                f"Laptop backup — {friendly_phase} | counting records..."
+            )
+            progress_label.setToolTip(
+                "This is a PC-to-laptop safety copy for offline use. "
+                "The dashboard is already using PC MySQL. "
+                "An ETA appears as soon as the record count is known."
+            )
+            return
+        safe_total = max(1, int(total))
         safe_current = max(0, min(int(current or 0), safe_total))
         percent = int((safe_current * 100) / safe_total)
         progress_bar.setRange(0, safe_total)
         progress_bar.setValue(safe_current)
-        progress_label.setText(f"Laptop backup: {phase} ({percent}%)")
+        eta = self._local_mirror_eta(safe_current, safe_total)
+        progress_label.setText(
+            f"Laptop backup — {friendly_phase} | "
+            f"{safe_current:,} / {safe_total:,} records ({percent}%) | ETA {eta}"
+        )
         progress_label.setToolTip(
-            "PC to laptop safety backup. The dashboard is already using PC MySQL."
+            "This checks and copies PC market data to the laptop for offline use. "
+            "The count includes the comparison and verification passes. "
+            "The dashboard is already using PC MySQL."
         )
 
     def _on_local_mirror_sync_completed(
@@ -706,6 +811,7 @@ class MainWindow(
         progress_label = self.__dict__.get("progress_label")
         if error:
             self._local_mirror_progress_phase = "incomplete"
+            self._local_mirror_progress_samples = []
             if progress_bar is not None and progress_label is not None:
                 progress_bar.setRange(0, 100)
                 progress_bar.setValue(0)
@@ -716,6 +822,7 @@ class MainWindow(
             )
             return
         self._local_mirror_progress_phase = "complete"
+        self._local_mirror_progress_samples = []
         if progress_bar is not None and progress_label is not None:
             progress_bar.setRange(0, 100)
             progress_bar.setValue(100)
@@ -1978,8 +2085,8 @@ class MainWindow(
         self.main_device_button.clicked.connect(
             self._on_main_device_button_clicked
         )
-        progress_layout.addWidget(self.progress_bar, 3)
-        progress_layout.addWidget(self.progress_label, 1)
+        progress_layout.addWidget(self.progress_bar, 2)
+        progress_layout.addWidget(self.progress_label, 3)
         progress_layout.addWidget(self.main_device_button)
 
         self.log_output = QTextEdit()
