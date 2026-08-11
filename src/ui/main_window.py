@@ -223,7 +223,6 @@ class LocalMirrorSyncWorker(QThread):
         self,
         pc_engine,
         local_engine,
-        tickers: Optional[List[str]] = None,
         hourly_symbols: Optional[List[str]] = None,
         *,
         generation: int = 0,
@@ -231,7 +230,6 @@ class LocalMirrorSyncWorker(QThread):
         super().__init__()
         self.pc_engine = pc_engine
         self.local_engine = local_engine
-        self.tickers = list(tickers or [])
         self.hourly_symbols = (
             None if hourly_symbols is None else list(hourly_symbols)
         )
@@ -240,7 +238,7 @@ class LocalMirrorSyncWorker(QThread):
     def run(self) -> None:
         from src.utils.db_loader import (
             init_local_mirror_engine,
-            sync_local_mirror_from_pc_atomic,
+            sync_local_mirror_from_pc_checkpointed,
         )
 
         try:
@@ -248,13 +246,10 @@ class LocalMirrorSyncWorker(QThread):
                 self.local_engine = init_local_mirror_engine()
             if self.local_engine is None:
                 raise RuntimeError("The local data mirror is unavailable.")
-            written = sync_local_mirror_from_pc_atomic(
+            written = sync_local_mirror_from_pc_checkpointed(
                 self.pc_engine,
                 self.local_engine,
-                tickers=self.tickers or None,
                 hourly_symbols=self.hourly_symbols,
-                verify_derived=False,
-                pc_authoritative=True,
                 progress_callback=lambda phase, current, total: self.progress.emit(
                     phase,
                     current,
@@ -630,7 +625,6 @@ class MainWindow(
         worker = LocalMirrorSyncWorker(
             pc_engine,
             local_engine,
-            tickers=list(self.__dict__.get("universe_tickers", []) or []),
             hourly_symbols=self._relevant_hourly_symbols(),
             generation=self.__dict__.get("_database_transition_generation", 0),
         )
@@ -672,9 +666,11 @@ class MainWindow(
         }
         exact_labels = {
             "Preparing laptop safety backup": "Preparing the laptop safety copy",
+            "Checking laptop backup checkpoint": "Checking whether the laptop copy is current",
             "Checking PC derived-data freshness": "Checking PC scanner data",
             "Starting record comparison": "Starting the record check",
             "Finalizing laptop safety backup": "Saving the laptop safety copy",
+            "Laptop safety backup already up to date": "Laptop safety copy is already up to date",
             "Laptop safety backup complete": "Laptop safety copy complete",
         }
         if phase in exact_labels:
@@ -682,6 +678,14 @@ class MainWindow(
         phase_prefixes = {
             "Checking table layout": "Checking backup setup for {table}",
             "Counting backup records": "Counting {table}",
+            "Checking PC changes": "Checking PC {table} for changes",
+            "Checking laptop changes": "Checking laptop {table}",
+            "Counting changed PC rows": "Counting changed PC {table}",
+            "Copying changed PC data": "Copying changed {table} to laptop",
+            "Verifying incremental backup": "Verifying changed {table}",
+            "Finding changed partitions": "Locating changed {table}",
+            "Reconciling changed partitions": "Repairing changed {table}",
+            "Confirming PC checkpoint": "Final PC check for {table}",
             "Reading PC data": "Checking PC {table}",
             "Rechecking PC data": "Rechecking PC {table}",
             "Reading laptop backup": "Checking laptop {table}",
@@ -826,9 +830,12 @@ class MainWindow(
         if progress_bar is not None and progress_label is not None:
             progress_bar.setRange(0, 100)
             progress_bar.setValue(100)
-            progress_label.setText(
-                f"Laptop backup complete ({total} row change(s))."
-            )
+            if total:
+                progress_label.setText(
+                    f"Laptop backup complete ({total} row update(s) applied)."
+                )
+            else:
+                progress_label.setText("Laptop backup already up to date.")
             progress_label.setToolTip(
                 "PC to laptop safety backup completed successfully."
             )

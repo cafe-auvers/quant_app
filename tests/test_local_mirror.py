@@ -581,6 +581,303 @@ def test_pc_authoritative_mirror_honors_cancellation_callback():
         )
 
 
+def test_checkpointed_mirror_skips_unchanged_restart_without_row_scan(monkeypatch):
+    pc, local, pc_daily, local_daily, _pc_hourly, _local_hourly = _raw_engines()
+    row = _daily_bar("A", 1, 100)
+    for engine, table in ((pc, pc_daily), (local, local_daily)):
+        with engine.begin() as conn:
+            conn.execute(insert(table), row)
+
+    first_progress = []
+    first = db_loader.sync_local_mirror_from_pc_checkpointed(
+        pc,
+        local,
+        tables=(("price_history", "date"),),
+        progress_callback=lambda phase, current, total: first_progress.append(
+            (phase, current, total)
+        ),
+    )
+    assert first == {"price_history": 0}
+    assert first_progress[-1] == (
+        "Laptop safety backup already up to date",
+        1,
+        1,
+    )
+
+    monkeypatch.setattr(
+        db_loader,
+        "_copy_scoped_changed_rows_to_local",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unchanged restart must not read table rows")
+        ),
+    )
+    monkeypatch.setattr(
+        db_loader,
+        "_scoped_partition_revision_summaries",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unchanged restart must not scan partitions")
+        ),
+    )
+
+    second = db_loader.sync_local_mirror_from_pc_checkpointed(
+        pc,
+        local,
+        tables=(("price_history", "date"),),
+    )
+
+    assert second == {"price_history": 0}
+
+
+def test_checkpointed_mirror_copies_only_new_revision_rows(monkeypatch):
+    pc, local, pc_daily, local_daily, _pc_hourly, _local_hourly = _raw_engines()
+    shared = _daily_bar("A", 1, 100)
+    for engine, table in ((pc, pc_daily), (local, local_daily)):
+        with engine.begin() as conn:
+            conn.execute(insert(table), shared)
+    db_loader.sync_local_mirror_from_pc_checkpointed(
+        pc,
+        local,
+        tables=(("price_history", "date"),),
+    )
+    new_row = _daily_bar("B", 2, 200)
+    new_row["updated_at"] = dt.datetime(2026, 1, 3, 1)
+    with pc.begin() as conn:
+        conn.execute(insert(pc_daily), new_row)
+    monkeypatch.setattr(
+        db_loader,
+        "_partition_fingerprints",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("incremental path must not fingerprint full tables")
+        ),
+    )
+    progress = []
+
+    written = db_loader.sync_local_mirror_from_pc_checkpointed(
+        pc,
+        local,
+        tables=(("price_history", "date"),),
+        progress_callback=lambda phase, current, total: progress.append(
+            (phase, current, total)
+        ),
+    )
+
+    assert written["price_history"] == 2  # boundary replay plus the new row
+    with local.connect() as conn:
+        assert conn.execute(
+            select(local_daily.c.symbol).order_by(local_daily.c.symbol)
+        ).scalars().all() == ["A", "B"]
+    copy_totals = [
+        total
+        for phase, _current, total in progress
+        if phase == "Copying changed PC data: price_history"
+    ]
+    assert copy_totals and max(copy_totals) == 2
+
+
+def test_checkpointed_mirror_applies_old_row_correction_by_revision():
+    pc, local, pc_daily, local_daily, _pc_hourly, _local_hourly = _raw_engines()
+    shared = _daily_bar("A", 1, 100)
+    for engine, table in ((pc, pc_daily), (local, local_daily)):
+        with engine.begin() as conn:
+            conn.execute(insert(table), shared)
+    db_loader.sync_local_mirror_from_pc_checkpointed(
+        pc,
+        local,
+        tables=(("price_history", "date"),),
+    )
+    with pc.begin() as conn:
+        conn.execute(
+            update(pc_daily)
+            .where(pc_daily.c.symbol == "A")
+            .values(close=125.0, updated_at=dt.datetime(2026, 1, 5, 1))
+        )
+
+    db_loader.sync_local_mirror_from_pc_checkpointed(
+        pc,
+        local,
+        tables=(("price_history", "date"),),
+    )
+
+    with local.connect() as conn:
+        assert conn.execute(select(local_daily.c.close)).scalar_one() == 125.0
+
+
+def test_checkpointed_mirror_targets_partition_for_pc_deletion():
+    pc, local, pc_daily, local_daily, _pc_hourly, _local_hourly = _raw_engines()
+    rows = [_daily_bar("A", 1, 100), _daily_bar("B", 2, 200)]
+    for engine, table in ((pc, pc_daily), (local, local_daily)):
+        with engine.begin() as conn:
+            conn.execute(insert(table), rows)
+    db_loader.sync_local_mirror_from_pc_checkpointed(
+        pc,
+        local,
+        tables=(("price_history", "date"),),
+    )
+    with pc.begin() as conn:
+        conn.execute(delete(pc_daily).where(pc_daily.c.symbol == "B"))
+    progress = []
+
+    written = db_loader.sync_local_mirror_from_pc_checkpointed(
+        pc,
+        local,
+        tables=(("price_history", "date"),),
+        progress_callback=lambda phase, current, total: progress.append(
+            (phase, current, total)
+        ),
+    )
+
+    assert written["price_history"] == 1
+    assert any(
+        phase == "Reconciling changed partitions: price_history"
+        for phase, _current, _total in progress
+    )
+    with local.connect() as conn:
+        assert conn.execute(select(local_daily.c.symbol)).scalars().all() == ["A"]
+
+
+def test_checkpointed_hourly_scope_copies_newly_relevant_symbol_only():
+    pc, local, _pc_daily, _local_daily, pc_hourly, local_hourly = _raw_engines()
+    with pc.begin() as conn:
+        conn.execute(
+            insert(pc_hourly),
+            [_hourly_bar("A", 10, 100), _hourly_bar("B", 10, 200)],
+        )
+
+    db_loader.sync_local_mirror_from_pc_checkpointed(
+        pc,
+        local,
+        tables=(("hourly_price_history", "timestamp"),),
+        hourly_symbols=["A"],
+    )
+    with local.connect() as conn:
+        assert conn.execute(select(local_hourly.c.symbol)).scalars().all() == ["A"]
+
+    db_loader.sync_local_mirror_from_pc_checkpointed(
+        pc,
+        local,
+        tables=(("hourly_price_history", "timestamp"),),
+        hourly_symbols=["A", "B"],
+    )
+    with local.connect() as conn:
+        assert conn.execute(
+            select(local_hourly.c.symbol).order_by(local_hourly.c.symbol)
+        ).scalars().all() == ["A", "B"]
+
+
+def test_checkpoint_and_rows_roll_back_together_on_commit_failure(monkeypatch):
+    pc, local, pc_daily, local_daily, _pc_hourly, _local_hourly = _raw_engines()
+    shared = _daily_bar("A", 1, 100)
+    for engine, table in ((pc, pc_daily), (local, local_daily)):
+        with engine.begin() as conn:
+            conn.execute(insert(table), shared)
+    db_loader.sync_local_mirror_from_pc_checkpointed(
+        pc,
+        local,
+        tables=(("price_history", "date"),),
+    )
+    new_row = _daily_bar("B", 2, 200)
+    new_row["updated_at"] = dt.datetime(2026, 1, 3, 1)
+    with pc.begin() as conn:
+        conn.execute(insert(pc_daily), new_row)
+
+    original_save = db_loader._save_mirror_sync_checkpoint
+    monkeypatch.setattr(
+        db_loader,
+        "_save_mirror_sync_checkpoint",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("checkpoint write failed")
+        ),
+    )
+    with pytest.raises(RuntimeError, match="checkpoint write failed"):
+        db_loader.sync_local_mirror_from_pc_checkpointed(
+            pc,
+            local,
+            tables=(("price_history", "date"),),
+        )
+    with local.connect() as conn:
+        assert conn.execute(select(local_daily.c.symbol)).scalars().all() == ["A"]
+
+    monkeypatch.setattr(db_loader, "_save_mirror_sync_checkpoint", original_save)
+    db_loader.sync_local_mirror_from_pc_checkpointed(
+        pc,
+        local,
+        tables=(("price_history", "date"),),
+    )
+    with local.connect() as conn:
+        assert conn.execute(
+            select(local_daily.c.symbol).order_by(local_daily.c.symbol)
+        ).scalars().all() == ["A", "B"]
+
+
+def test_checkpointed_mirror_rolls_back_if_pc_changes_during_copy(monkeypatch):
+    pc, local, pc_daily, local_daily, _pc_hourly, _local_hourly = _raw_engines()
+    shared = _daily_bar("A", 1, 100)
+    for engine, table in ((pc, pc_daily), (local, local_daily)):
+        with engine.begin() as conn:
+            conn.execute(insert(table), shared)
+    db_loader.sync_local_mirror_from_pc_checkpointed(
+        pc,
+        local,
+        tables=(("price_history", "date"),),
+    )
+    added = _daily_bar("B", 2, 200)
+    added["updated_at"] = dt.datetime(2026, 1, 3, 1)
+    with pc.begin() as conn:
+        conn.execute(insert(pc_daily), added)
+
+    original_copy = db_loader._copy_scoped_changed_rows_to_local
+
+    def copy_then_change_pc(*args, **kwargs):
+        copied = original_copy(*args, **kwargs)
+        concurrent = _daily_bar("C", 3, 300)
+        concurrent["updated_at"] = dt.datetime(2026, 1, 4, 1)
+        with pc.begin() as conn:
+            conn.execute(insert(pc_daily), concurrent)
+        return copied
+
+    monkeypatch.setattr(
+        db_loader,
+        "_copy_scoped_changed_rows_to_local",
+        copy_then_change_pc,
+    )
+
+    with pytest.raises(RuntimeError, match="changed during incremental backup"):
+        db_loader.sync_local_mirror_from_pc_checkpointed(
+            pc,
+            local,
+            tables=(("price_history", "date"),),
+        )
+
+    with local.connect() as conn:
+        assert conn.execute(select(local_daily.c.symbol)).scalars().all() == ["A"]
+
+
+def test_checkpointed_mirror_never_writes_to_pc():
+    pc, local, pc_daily, _local_daily, _pc_hourly, _local_hourly = _raw_engines()
+    with pc.begin() as conn:
+        conn.execute(insert(pc_daily), _daily_bar("A", 1, 100))
+    pc_mutations = []
+
+    def capture_pc_mutations(
+        _conn, _cursor, statement, _parameters, _context, _executemany
+    ):
+        verb = statement.lstrip().split(None, 1)[0].upper()
+        if verb in {"INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER"}:
+            pc_mutations.append(statement)
+
+    event.listen(pc, "before_cursor_execute", capture_pc_mutations)
+    try:
+        db_loader.sync_local_mirror_from_pc_checkpointed(
+            pc,
+            local,
+            tables=(("price_history", "date"),),
+        )
+    finally:
+        event.remove(pc, "before_cursor_execute", capture_pc_mutations)
+
+    assert pc_mutations == []
+
+
 def test_atomic_mirror_sync_rolls_back_all_tables_on_later_failure(monkeypatch):
     pc, local, pc_daily, local_daily, pc_hourly, local_hourly = _raw_engines()
     with pc.begin() as conn:

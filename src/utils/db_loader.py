@@ -370,6 +370,21 @@ _BOOLEAN_RECONCILE_COLUMNS = frozenset(
 )
 
 _LOCAL_MIRROR_HANDOFF_TABLE = "local_mirror_handoff_state"
+_LOCAL_MIRROR_SYNC_STATE_TABLE = "local_mirror_sync_state"
+
+
+@dataclass(frozen=True)
+class _MirrorTableSignature:
+    row_count: int
+    max_revision: Optional[dt.datetime]
+
+
+@dataclass(frozen=True)
+class _MirrorSyncCheckpoint:
+    table_name: str
+    scope_hash: str
+    signature: _MirrorTableSignature
+    synced_at: dt.datetime
 
 
 def _local_mirror_handoff_table(metadata: MetaData) -> Table:
@@ -379,6 +394,26 @@ def _local_mirror_handoff_table(metadata: MetaData) -> Table:
         Column("id", Integer, primary_key=True),
         Column("dirty", Boolean, nullable=False, default=True),
     )
+
+
+def _local_mirror_sync_state_table(metadata: MetaData) -> Table:
+    return Table(
+        _LOCAL_MIRROR_SYNC_STATE_TABLE,
+        metadata,
+        Column("table_name", String(64), primary_key=True),
+        Column("scope_hash", String(64), primary_key=True),
+        Column("pc_row_count", Integer, nullable=False),
+        Column("pc_max_revision", DateTime, nullable=True),
+        Column("synced_at", DateTime, nullable=False),
+    )
+
+
+def _ensure_local_mirror_sync_state(engine: Engine) -> None:
+    if engine.dialect.name != "sqlite":
+        return
+    metadata = MetaData()
+    _local_mirror_sync_state_table(metadata)
+    metadata.create_all(engine)
 
 
 def _ensure_local_mirror_handoff_tracking(engine: Engine) -> None:
@@ -494,6 +529,7 @@ def init_local_mirror_engine(db_path=None) -> Optional[Engine]:
         _ensure_scanner_metric_snapshots_table(engine)
         _ensure_symbol_refresh_failures_table(engine)
         _ensure_local_mirror_handoff_tracking(engine)
+        _ensure_local_mirror_sync_state(engine)
         return engine
     except (ImportError, OSError, SQLAlchemyError, ValueError, TypeError) as exc:
         if engine is not None:
@@ -997,6 +1033,274 @@ def _scoped_reconcile_row_count(
         return count_rows(connection)
     with engine.connect() as conn:
         return count_rows(conn)
+
+
+def _mirror_scope_hash(
+    spec: _ReconcileTableSpec,
+    hourly_symbols: Optional[List[str]],
+) -> str:
+    if spec.table_name != "hourly_price_history" or hourly_symbols is None:
+        return "all"
+    symbols = sorted(
+        {
+            str(symbol).strip().upper()
+            for symbol in hourly_symbols
+            if symbol is not None and str(symbol).strip()
+        }
+    )
+    return hashlib.sha256("\n".join(symbols).encode("utf-8")).hexdigest()
+
+
+def _scoped_symbol_chunks(
+    spec: _ReconcileTableSpec,
+    hourly_symbols: Optional[List[str]],
+) -> List[Optional[List[str]]]:
+    if spec.table_name != "hourly_price_history" or hourly_symbols is None:
+        return [None]
+    symbols = list(
+        dict.fromkeys(
+            str(symbol).strip().upper()
+            for symbol in hourly_symbols
+            if symbol is not None and str(symbol).strip()
+        )
+    )
+    if not symbols:
+        return []
+    return list(_record_chunks(symbols, HOURLY_CACHE_QUERY_SYMBOL_CHUNK_SIZE))
+
+
+def _scoped_table_signature(
+    engine: Engine,
+    spec: _ReconcileTableSpec,
+    *,
+    hourly_symbols: Optional[List[str]] = None,
+    cancellation_callback: Optional[Callable[[], bool]] = None,
+    connection=None,
+) -> _MirrorTableSignature:
+    """Return a cheap revision/count signature for one mirrored scope."""
+    bind = connection if connection is not None else engine
+    if not inspect(bind).has_table(spec.table_name):
+        return _MirrorTableSignature(0, None)
+    table = Table(spec.table_name, MetaData(), autoload_with=bind)
+    symbol_chunks = _scoped_symbol_chunks(spec, hourly_symbols)
+    if not symbol_chunks:
+        return _MirrorTableSignature(0, None)
+
+    def read_signature(conn) -> _MirrorTableSignature:
+        row_count = 0
+        max_revision: Optional[dt.datetime] = None
+        for symbol_chunk in symbol_chunks:
+            if cancellation_callback is not None and cancellation_callback():
+                raise InterruptedError("Local mirror synchronization was cancelled.")
+            stmt = select(
+                func.count().label("row_count"),
+                func.max(table.c[spec.revision_column]).label("max_revision"),
+            ).select_from(table)
+            if symbol_chunk is not None:
+                stmt = stmt.where(table.c.symbol.in_(symbol_chunk))
+            row = conn.execute(stmt).one()
+            row_count += int(row.row_count or 0)
+            revision = _normalized_watermark(row.max_revision)
+            if revision is not None and (
+                max_revision is None or revision > max_revision
+            ):
+                max_revision = revision
+        return _MirrorTableSignature(row_count, max_revision)
+
+    if connection is not None:
+        return read_signature(connection)
+    with engine.connect() as conn:
+        return read_signature(conn)
+
+
+def _load_mirror_sync_checkpoint(
+    conn,
+    spec: _ReconcileTableSpec,
+    scope_hash: str,
+) -> Optional[_MirrorSyncCheckpoint]:
+    table = _local_mirror_sync_state_table(MetaData())
+    row = conn.execute(
+        select(table).where(
+            table.c.table_name == spec.table_name,
+            table.c.scope_hash == scope_hash,
+        )
+    ).first()
+    if row is None:
+        return None
+    return _MirrorSyncCheckpoint(
+        table_name=spec.table_name,
+        scope_hash=scope_hash,
+        signature=_MirrorTableSignature(
+            int(row.pc_row_count or 0),
+            _normalized_watermark(row.pc_max_revision),
+        ),
+        synced_at=_normalized_watermark(row.synced_at) or _utcnow_naive(),
+    )
+
+
+def _save_mirror_sync_checkpoint(
+    conn,
+    spec: _ReconcileTableSpec,
+    scope_hash: str,
+    signature: _MirrorTableSignature,
+) -> None:
+    table = _local_mirror_sync_state_table(MetaData())
+    stmt = sqlite_insert(table).values(
+        table_name=spec.table_name,
+        scope_hash=scope_hash,
+        pc_row_count=signature.row_count,
+        pc_max_revision=signature.max_revision,
+        synced_at=_utcnow_naive(),
+    )
+    conn.execute(
+        stmt.on_conflict_do_update(
+            index_elements=["table_name", "scope_hash"],
+            set_={
+                "pc_row_count": stmt.excluded.pc_row_count,
+                "pc_max_revision": stmt.excluded.pc_max_revision,
+                "synced_at": stmt.excluded.synced_at,
+            },
+        )
+    )
+
+
+def _scoped_changed_row_count(
+    engine: Engine,
+    spec: _ReconcileTableSpec,
+    *,
+    since_revision: Optional[dt.datetime],
+    hourly_symbols: Optional[List[str]],
+    cancellation_callback: Optional[Callable[[], bool]],
+) -> int:
+    table = Table(spec.table_name, MetaData(), autoload_with=engine)
+    symbol_chunks = _scoped_symbol_chunks(spec, hourly_symbols)
+    total = 0
+    with engine.connect() as conn:
+        for symbol_chunk in symbol_chunks:
+            if cancellation_callback is not None and cancellation_callback():
+                raise InterruptedError("Local mirror synchronization was cancelled.")
+            stmt = select(func.count()).select_from(table)
+            if since_revision is not None:
+                stmt = stmt.where(
+                    table.c[spec.revision_column] >= since_revision
+                )
+            if symbol_chunk is not None:
+                stmt = stmt.where(table.c.symbol.in_(symbol_chunk))
+            total += int(conn.execute(stmt).scalar_one() or 0)
+    return total
+
+
+def _copy_scoped_changed_rows_to_local(
+    pc_engine: Engine,
+    local_engine: Engine,
+    local_conn,
+    spec: _ReconcileTableSpec,
+    *,
+    since_revision: Optional[dt.datetime],
+    hourly_symbols: Optional[List[str]],
+    cancellation_callback: Optional[Callable[[], bool]],
+    row_progress_callback: Optional[Callable[[int], None]],
+) -> int:
+    pc_table = Table(spec.table_name, MetaData(), autoload_with=pc_engine)
+    local_table = Table(spec.table_name, MetaData(), autoload_with=local_conn)
+    _validate_reconcile_table_schema(pc_table, local_table, spec)
+    symbol_chunks = _scoped_symbol_chunks(spec, hourly_symbols)
+    rows_written = 0
+    with pc_engine.connect() as pc_conn:
+        streaming_conn = pc_conn.execution_options(stream_results=True)
+        for symbol_chunk in symbol_chunks:
+            if cancellation_callback is not None and cancellation_callback():
+                raise InterruptedError("Local mirror synchronization was cancelled.")
+            stmt = select(pc_table)
+            if since_revision is not None:
+                stmt = stmt.where(
+                    pc_table.c[spec.revision_column] >= since_revision
+                )
+            if symbol_chunk is not None:
+                stmt = stmt.where(pc_table.c.symbol.in_(symbol_chunk))
+            result = streaming_conn.execute(stmt)
+            while True:
+                if cancellation_callback is not None and cancellation_callback():
+                    result.close()
+                    raise InterruptedError(
+                        "Local mirror synchronization was cancelled."
+                    )
+                batch = result.fetchmany(1000)
+                if not batch:
+                    break
+                records = [
+                    {
+                        name: value
+                        for name, value in dict(row._mapping).items()
+                        if name in local_table.columns
+                    }
+                    for row in batch
+                ]
+                _execute_bulk_upsert(
+                    local_conn,
+                    local_table,
+                    records,
+                    spec.primary_key,
+                    local_engine.dialect.name,
+                )
+                rows_written += len(records)
+                if row_progress_callback is not None:
+                    row_progress_callback(rows_written)
+            result.close()
+    if row_progress_callback is not None:
+        row_progress_callback(rows_written)
+    return rows_written
+
+
+def _scoped_partition_revision_summaries(
+    engine: Engine,
+    spec: _ReconcileTableSpec,
+    *,
+    hourly_symbols: Optional[List[str]],
+    cancellation_callback: Optional[Callable[[], bool]],
+    connection=None,
+) -> Dict[Tuple[object, ...], _PartitionFingerprint]:
+    """Summarize partitions in SQL so only changed partitions need row reads."""
+    bind = connection if connection is not None else engine
+    table = Table(spec.table_name, MetaData(), autoload_with=bind)
+    partition_columns = [table.c[name] for name in spec.partition_columns]
+    symbol_chunks = _scoped_symbol_chunks(spec, hourly_symbols)
+
+    def read_summaries(conn) -> Dict[Tuple[object, ...], _PartitionFingerprint]:
+        summaries: Dict[Tuple[object, ...], _PartitionFingerprint] = {}
+        for symbol_chunk in symbol_chunks:
+            if cancellation_callback is not None and cancellation_callback():
+                raise InterruptedError("Local mirror synchronization was cancelled.")
+            stmt = select(
+                *partition_columns,
+                func.count().label("row_count"),
+                func.max(table.c[spec.revision_column]).label("max_revision"),
+            ).group_by(*partition_columns)
+            if symbol_chunk is not None:
+                stmt = stmt.where(table.c.symbol.in_(symbol_chunk))
+            for row in conn.execute(stmt):
+                raw_key = tuple(row[index] for index in range(len(partition_columns)))
+                normalized_key = tuple(
+                    (
+                        _normalized_watermark(value).isoformat(timespec="microseconds")
+                        if isinstance(value, (dt.datetime, pd.Timestamp))
+                        else value
+                    )
+                    for value in raw_key
+                )
+                revision = _normalized_watermark(row.max_revision)
+                digest = revision.isoformat(timespec="microseconds") if revision else ""
+                summaries[normalized_key] = _PartitionFingerprint(
+                    raw_key,
+                    int(row.row_count or 0),
+                    digest,
+                )
+        return summaries
+
+    if connection is not None:
+        return read_summaries(connection)
+    with engine.connect() as conn:
+        return read_summaries(conn)
 
 
 def _fetch_partition_rows(
@@ -1784,6 +2088,311 @@ def sync_local_mirror_from_pc_atomic(
         progress_callback=progress_callback,
         cancellation_callback=cancellation_callback,
     )
+
+
+def sync_local_mirror_from_pc_checkpointed(
+    pc_engine: Engine,
+    local_engine: Engine,
+    tables: Tuple[Tuple[str, str], ...] = MIRRORED_TABLES,
+    *,
+    hourly_symbols: Optional[List[str]] = None,
+    progress_callback: Optional[Callable[[str, int, int], None]] = None,
+    cancellation_callback: Optional[Callable[[], bool]] = None,
+) -> Dict[str, int]:
+    """Incrementally maintain the disposable laptop safety copy.
+
+    A successful run stores a per-table PC revision/count checkpoint in the
+    same SQLite transaction as the copied rows. Unchanged restarts therefore
+    need only small aggregate queries. Changed rows are replayed by revision;
+    count/revision mismatches use SQL partition summaries and exact-copy only
+    the affected partitions, which also propagates deletions.
+    """
+    if local_engine is None or local_engine.dialect.name != "sqlite":
+        raise RuntimeError("An SQLite local mirror is required for checkpointed sync.")
+
+    requested_names = {table_name for table_name, _watermark in tables}
+    reconcile_specs = [
+        spec
+        for spec in _RECONCILE_TABLE_SPECS
+        if spec.table_name in requested_names
+    ]
+    unsupported = requested_names.difference(
+        spec.table_name for spec in reconcile_specs
+    )
+    if unsupported:
+        raise RuntimeError(
+            "No incremental reconciliation policy for: "
+            + ", ".join(sorted(unsupported))
+        )
+
+    def check_cancelled() -> None:
+        if cancellation_callback is not None and cancellation_callback():
+            raise InterruptedError("Local mirror synchronization was cancelled.")
+
+    def report(label: str, current: int = 0, total: int = 0) -> None:
+        check_cancelled()
+        if progress_callback is not None:
+            progress_callback(label, max(0, int(current)), max(0, int(total)))
+
+    _ensure_local_mirror_handoff_tracking(local_engine)
+    _ensure_local_mirror_sync_state(local_engine)
+    local_conn = None
+    try:
+        report("Checking laptop backup checkpoint")
+        with pc_engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        local_conn = local_engine.connect()
+        local_conn.exec_driver_sql("BEGIN IMMEDIATE")
+        handoff = _local_mirror_handoff_table(MetaData())
+        local_dirty = bool(
+            local_conn.execute(
+                select(handoff.c.dirty).where(handoff.c.id == 1)
+            ).scalar_one()
+        )
+
+        for spec in reconcile_specs:
+            report(f"Checking table layout: {spec.table_name}")
+            pc_table = Table(spec.table_name, MetaData(), autoload_with=pc_engine)
+            local_table = Table(
+                spec.table_name, MetaData(), autoload_with=local_conn
+            )
+            _validate_reconcile_table_schema(pc_table, local_table, spec)
+
+        pc_before: Dict[str, _MirrorTableSignature] = {}
+        checkpoints: Dict[str, Optional[_MirrorSyncCheckpoint]] = {}
+        scope_hashes: Dict[str, str] = {}
+        changed_specs: List[_ReconcileTableSpec] = []
+        for spec in reconcile_specs:
+            report(f"Checking PC changes: {spec.table_name}")
+            scope_hash = _mirror_scope_hash(spec, hourly_symbols)
+            scope_hashes[spec.table_name] = scope_hash
+            signature = _scoped_table_signature(
+                pc_engine,
+                spec,
+                hourly_symbols=hourly_symbols,
+                cancellation_callback=cancellation_callback,
+            )
+            pc_before[spec.table_name] = signature
+            checkpoint = _load_mirror_sync_checkpoint(
+                local_conn, spec, scope_hash
+            )
+            checkpoints[spec.table_name] = checkpoint
+            if (
+                not local_dirty
+                and checkpoint is not None
+                and checkpoint.signature == signature
+            ):
+                continue
+
+            # This also seeds a checkpoint after an older exact-sync version:
+            # a clean handoff plus matching local/PC revision and count means
+            # the existing safety copy can be adopted without another audit.
+            report(f"Checking laptop changes: {spec.table_name}")
+            local_signature = _scoped_table_signature(
+                local_engine,
+                spec,
+                hourly_symbols=hourly_symbols,
+                cancellation_callback=cancellation_callback,
+                connection=local_conn,
+            )
+            if local_signature != signature:
+                changed_specs.append(spec)
+
+        written = {spec.table_name: 0 for spec in reconcile_specs}
+        if not changed_specs:
+            for spec in reconcile_specs:
+                _save_mirror_sync_checkpoint(
+                    local_conn,
+                    spec,
+                    scope_hashes[spec.table_name],
+                    pc_before[spec.table_name],
+                )
+            _mark_local_mirror_handoff_clean(local_conn)
+            local_conn.commit()
+            if progress_callback is not None:
+                progress_callback("Laptop safety backup already up to date", 1, 1)
+            return written
+
+        changed_row_counts: Dict[str, int] = {}
+        since_revisions: Dict[str, Optional[dt.datetime]] = {}
+        for spec in changed_specs:
+            checkpoint = checkpoints[spec.table_name]
+            since_revision = (
+                checkpoint.signature.max_revision
+                if checkpoint is not None
+                else None
+            )
+            since_revisions[spec.table_name] = since_revision
+            report(f"Counting changed PC rows: {spec.table_name}")
+            changed_row_counts[spec.table_name] = _scoped_changed_row_count(
+                pc_engine,
+                spec,
+                since_revision=since_revision,
+                hourly_symbols=hourly_symbols,
+                cancellation_callback=cancellation_callback,
+            )
+
+        total_work = sum(changed_row_counts.values())
+        completed_work = 0
+        for spec in changed_specs:
+            label = f"Copying changed PC data: {spec.table_name}"
+            phase_start = completed_work
+            phase_total = changed_row_counts[spec.table_name]
+            report(label, completed_work, total_work)
+            copied = _copy_scoped_changed_rows_to_local(
+                pc_engine,
+                local_engine,
+                local_conn,
+                spec,
+                since_revision=since_revisions[spec.table_name],
+                hourly_symbols=hourly_symbols,
+                cancellation_callback=cancellation_callback,
+                row_progress_callback=lambda rows: report(
+                    label,
+                    phase_start + min(max(0, int(rows)), phase_total),
+                    total_work,
+                ),
+            )
+            written[spec.table_name] += copied
+            completed_work = phase_start + phase_total
+            report(label, completed_work, total_work)
+
+            report(
+                f"Verifying incremental backup: {spec.table_name}",
+                completed_work,
+                total_work,
+            )
+            pc_after_copy = _scoped_table_signature(
+                pc_engine,
+                spec,
+                hourly_symbols=hourly_symbols,
+                cancellation_callback=cancellation_callback,
+            )
+            if pc_after_copy != pc_before[spec.table_name]:
+                raise RuntimeError(
+                    f"PC {spec.table_name} changed during incremental backup."
+                )
+            local_after_copy = _scoped_table_signature(
+                local_engine,
+                spec,
+                hourly_symbols=hourly_symbols,
+                cancellation_callback=cancellation_callback,
+                connection=local_conn,
+            )
+            if local_after_copy == pc_after_copy:
+                continue
+
+            report(
+                f"Finding changed partitions: {spec.table_name}",
+                completed_work,
+                total_work,
+            )
+            pc_partitions = _scoped_partition_revision_summaries(
+                pc_engine,
+                spec,
+                hourly_symbols=hourly_symbols,
+                cancellation_callback=cancellation_callback,
+            )
+            local_partitions = _scoped_partition_revision_summaries(
+                local_engine,
+                spec,
+                hourly_symbols=hourly_symbols,
+                cancellation_callback=cancellation_callback,
+                connection=local_conn,
+            )
+            mismatched = _mismatched_partitions(pc_partitions, local_partitions)
+            partition_work = sum(
+                (
+                    pc_partitions.get(key).row_count
+                    if pc_partitions.get(key) is not None
+                    else 0
+                )
+                + (
+                    local_partitions.get(key).row_count
+                    if local_partitions.get(key) is not None
+                    else 0
+                )
+                for key in mismatched
+            )
+            total_work += partition_work
+            label = f"Reconciling changed partitions: {spec.table_name}"
+            phase_start = completed_work
+            report(label, completed_work, total_work)
+            changed = _copy_pc_partitions_to_local_exactly(
+                pc_engine,
+                local_engine,
+                spec,
+                mismatched,
+                pc_partitions,
+                local_partitions,
+                local_connection=local_conn,
+                preserve_local_raw=False,
+                cancellation_callback=cancellation_callback,
+                row_progress_callback=lambda rows: report(
+                    label,
+                    phase_start + min(max(0, int(rows)), partition_work),
+                    total_work,
+                ),
+            )
+            written[spec.table_name] += changed
+            completed_work += partition_work
+            local_after_copy = _scoped_table_signature(
+                local_engine,
+                spec,
+                hourly_symbols=hourly_symbols,
+                cancellation_callback=cancellation_callback,
+                connection=local_conn,
+            )
+            if local_after_copy != pc_after_copy:
+                raise RuntimeError(
+                    f"Laptop {spec.table_name} did not match the PC after "
+                    "targeted reconciliation."
+                )
+
+        final_signatures: Dict[str, _MirrorTableSignature] = {}
+        for spec in reconcile_specs:
+            report(
+                f"Confirming PC checkpoint: {spec.table_name}",
+                completed_work,
+                total_work,
+            )
+            final_signature = _scoped_table_signature(
+                pc_engine,
+                spec,
+                hourly_symbols=hourly_symbols,
+                cancellation_callback=cancellation_callback,
+            )
+            if final_signature != pc_before[spec.table_name]:
+                raise RuntimeError(
+                    f"PC {spec.table_name} changed before checkpoint commit."
+                )
+            final_signatures[spec.table_name] = final_signature
+
+        for spec in reconcile_specs:
+            _save_mirror_sync_checkpoint(
+                local_conn,
+                spec,
+                scope_hashes[spec.table_name],
+                final_signatures[spec.table_name],
+            )
+        _mark_local_mirror_handoff_clean(local_conn)
+        local_conn.commit()
+        final_total = max(total_work, completed_work, 1)
+        if progress_callback is not None:
+            progress_callback("Laptop safety backup complete", final_total, final_total)
+        return written
+    except Exception as exc:
+        if local_conn is not None:
+            try:
+                local_conn.rollback()
+            except Exception:
+                pass
+        raise RuntimeError(
+            f"Checkpointed PC -> local mirror sync failed: {exc}"
+        ) from exc
+    finally:
+        if local_conn is not None:
+            local_conn.close()
 
 def _reconciliation_universe(
     pc_engine: Engine,

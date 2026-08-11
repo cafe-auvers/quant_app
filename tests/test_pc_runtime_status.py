@@ -841,6 +841,25 @@ def test_laptop_backup_progress_estimates_eta_from_record_rate(monkeypatch):
     assert "ETA less than 1 min" in window.progress_label.value
 
 
+def test_completed_checkpoint_check_reports_already_up_to_date(monkeypatch):
+    import src.ui.main_window as main_window
+
+    window = MainWindow.__new__(MainWindow)
+    window._database_shutting_down = False
+    window._database_transition_generation = 4
+    window._local_mirror_sync_worker = SimpleNamespace(local_engine=None)
+    window._local_mirror_sync_log_completion = True
+    window.progress_bar = _ProgressBarStub()
+    window.progress_label = _ProgressLabelStub()
+    window.append_log = lambda _message: None
+    monkeypatch.setattr(main_window.QTimer, "singleShot", lambda *_args: None)
+
+    window._on_local_mirror_sync_completed({}, "", False, 4)
+
+    assert window.progress_bar.value == 100
+    assert window.progress_label.value == "Laptop backup already up to date."
+
+
 def test_shutdown_message_identifies_laptop_backup_and_current_phase():
     mirror_worker = object()
     window = SimpleNamespace(
@@ -872,7 +891,7 @@ def test_backup_worker_initializes_local_mirror_and_uses_pc_as_authority(monkeyp
     )
     monkeypatch.setattr(
         db_loader,
-        "sync_local_mirror_from_pc_atomic",
+        "sync_local_mirror_from_pc_checkpointed",
         lambda pc, local, **kwargs: calls.append((pc, local, kwargs)) or {},
     )
     emitted = []
@@ -905,9 +924,6 @@ def test_backup_worker_initializes_local_mirror_and_uses_pc_as_authority(monkeyp
     cancellation_callback = kwargs.pop("cancellation_callback")
     assert kwargs == {
         "hourly_symbols": ["SPY", "AAPL"],
-        "tickers": None,
-        "verify_derived": False,
-        "pc_authoritative": True,
     }
     assert cancellation_callback() is False
     progress_callback("Reading PC data: hourly_price_history", 2, 10)
@@ -952,7 +968,7 @@ def test_backup_worker_reports_error_without_requesting_reroute(monkeypatch):
 
     monkeypatch.setattr(
         db_loader,
-        "sync_local_mirror_from_pc_atomic",
+        "sync_local_mirror_from_pc_checkpointed",
         require_staged_reconciliation,
     )
     emitted = []
@@ -981,7 +997,7 @@ def test_active_mirror_worker_forwards_relevant_hourly_symbols(monkeypatch):
     calls = []
     monkeypatch.setattr(
         db_loader,
-        "sync_local_mirror_from_pc_atomic",
+        "sync_local_mirror_from_pc_checkpointed",
         lambda pc, local, **kwargs: calls.append((pc, local, kwargs)) or {},
     )
     emitted = []
@@ -990,7 +1006,6 @@ def test_active_mirror_worker_forwards_relevant_hourly_symbols(monkeypatch):
     worker = main_window.LocalMirrorSyncWorker(
         pc_engine,
         local_engine,
-        tickers=["AAPL", "MSFT"],
         hourly_symbols=["SPY", "AAPL"],
         generation=8,
     )
@@ -1009,10 +1024,7 @@ def test_active_mirror_worker_forwards_relevant_hourly_symbols(monkeypatch):
     assert callable(kwargs.pop("progress_callback"))
     assert callable(kwargs.pop("cancellation_callback"))
     assert kwargs == {
-        "tickers": ["AAPL", "MSFT"],
         "hourly_symbols": ["SPY", "AAPL"],
-        "verify_derived": False,
-        "pc_authoritative": True,
     }
     assert emitted == [({}, "", False, 8)]
 

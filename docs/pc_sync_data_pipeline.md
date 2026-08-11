@@ -27,6 +27,17 @@ database immediately. The SQLite safety backup is disposable and updates in
 the background; it never blocks PC routing. Full hourly backup is limited to
 SPY and symbols in scanner results, watchlist, or buylist.
 
+The normal dashboard backup is checkpointed and incremental. A successful
+SQLite transaction records each table's PC row count, latest revision, and
+hourly-symbol scope. Startup and the 15-minute timer first compare those small
+signatures. An unchanged mirror is reported as already up to date without a
+row scan. When data changed, only rows at or after the saved revision boundary
+are replayed. A remaining count/revision mismatch (including a deletion or a
+laptop-only row) uses SQL partition summaries and exact-copies only the
+affected symbols/partitions. The older full-content verifier remains the
+fallback for explicit integrity and handoff workflows; it is not the normal
+dashboard restart path.
+
 ## Architecture
 
 ```mermaid
@@ -265,10 +276,11 @@ morning) for dependencies:
   is logged and retried without changing active database routing.
 - **Backup progress is visible.** The dashboard progress line identifies the
   current PC-read, laptop-update, or verification phase in plain language. It
-  first counts the scoped records, then shows records processed out of total,
-  percentage, and a rolling ETA while each table is scanned. Closing requests
-  a cooperative cancellation; if the atomic transaction is still rolling
-  back, the close warning names the laptop safety backup and its current phase.
+  first checks the saved checkpoint. Unchanged data reports already up to date;
+  changed data shows changed records processed out of total, percentage, and a
+  rolling ETA. Closing requests a cooperative cancellation; if the atomic
+  transaction is still rolling back, the close warning names the laptop safety
+  backup and its current phase.
 - **Root causes worth checking**: BIOS RTC alarm didn't fire (power/PSU
   prerequisites), Windows didn't auto-login, or a step in
   `pc_morning_routine.ps1` failed -- check `data/logs/pc_morning_routine.log`
