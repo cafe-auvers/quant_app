@@ -168,6 +168,16 @@ class SidebarMixin:
                 if self.sidebar_source_combo.currentIndex() != index:
                     self.sidebar_source_combo.setCurrentIndex(index)
                 return
+    @staticmethod
+    def _format_sidebar_added_date(added_date) -> str:
+        """Format an item's added_date for the sidebar label, e.g. 2026/08/11."""
+        if not added_date:
+            return "?"
+        try:
+            return added_date.astimezone(KST_ZONE).strftime("%Y/%m/%d")
+        except (TypeError, ValueError):
+            return "?"
+
     def refresh_stock_sidebar(self, *args) -> None:
         """Refresh sidebar stock list from scanner results or watchlist."""
         if not hasattr(self, "sidebar_stock_list"):
@@ -201,7 +211,7 @@ class SidebarMixin:
                 self.sidebar_stock_list.addItem(item)
         elif source.get("type") == "buylist":
             for buy_item in self.buylist_manager.items:
-                label = f"{buy_item.symbol}  {buy_item.entry_price:.2f}  Score {buy_item.total_score:.0f}"
+                label = f"{buy_item.symbol} ({self._format_sidebar_added_date(buy_item.added_date)})"
                 item = QListWidgetItem(label)
                 item.setData(Qt.UserRole, {
                     "symbol": buy_item.symbol,
@@ -216,9 +226,7 @@ class SidebarMixin:
                 self.sidebar_stock_list.addItem(item)
         else:
             for watch_item in self.watchlist.items:
-                label = watch_item.symbol
-                if watch_item.entry_price is not None:
-                    label += f"  {watch_item.entry_price:.2f}"
+                label = f"{watch_item.symbol} ({self._format_sidebar_added_date(watch_item.added_date)})"
                 item = QListWidgetItem(label)
                 item.setData(Qt.UserRole, {
                     "symbol": watch_item.symbol,

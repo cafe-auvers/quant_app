@@ -227,7 +227,7 @@ class WatchlistMixin:
         self.watchlist_entry_input.setVisible(False)
 
         # Watchlist Table
-        self.watchlist_table = QTableWidget(0, 14)
+        self.watchlist_table = QTableWidget(0, 15)
         self.watchlist_table.setHorizontalHeaderLabels(
             [
                 "Symbol",
@@ -244,6 +244,7 @@ class WatchlistMixin:
                 "Breakout Price",
                 "Stop Loss",
                 "Notes",
+                "Added",
             ]
         )
         header = self.watchlist_table.horizontalHeader()
@@ -936,6 +937,14 @@ class WatchlistMixin:
                 row, 12, qitem(self._format_optional_price(item.stop_loss))
             )
             self.watchlist_table.setItem(row, 13, qitem(item.notes))
+
+            added_date = getattr(item, "added_date", None)
+            added_str = (
+                added_date.astimezone(KST_ZONE).strftime("%Y/%m/%d")
+                if added_date
+                else ""
+            )
+            self.watchlist_table.setItem(row, 14, qitem(added_str))
 
             # â”€â”€ ORB status takes precedence over scoring status â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             # NO_ENTRY  â†’ all valid ORB plans have no entry zone â†’ overrides BUY_READY
