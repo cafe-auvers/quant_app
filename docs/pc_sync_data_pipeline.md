@@ -263,6 +263,10 @@ morning) for dependencies:
   after the dashboard is usable, is strictly PC-to-local, and treats MySQL as
   authoritative even when the laptop cache has local changes. Backup failure
   is logged and retried without changing active database routing.
+- **Backup progress is visible.** The dashboard progress line identifies the
+  current PC-read, laptop-update, or verification phase. Closing requests a
+  cooperative cancellation; if the atomic transaction is still rolling back,
+  the close warning names the laptop safety backup and its current phase.
 - **Root causes worth checking**: BIOS RTC alarm didn't fire (power/PSU
   prerequisites), Windows didn't auto-login, or a step in
   `pc_morning_routine.ps1` failed -- check `data/logs/pc_morning_routine.log`

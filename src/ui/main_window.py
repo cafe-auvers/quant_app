@@ -217,6 +217,7 @@ class LocalMirrorSyncWorker(QThread):
     """Best-effort, silent PC -> laptop local-mirror top-up in the background."""
 
     completed = pyqtSignal(dict, str, bool, int)
+    progress = pyqtSignal(str, int, int, int)
 
     def __init__(
         self,
@@ -254,6 +255,13 @@ class LocalMirrorSyncWorker(QThread):
                 hourly_symbols=self.hourly_symbols,
                 verify_derived=False,
                 pc_authoritative=True,
+                progress_callback=lambda phase, current, total: self.progress.emit(
+                    phase,
+                    current,
+                    total,
+                    self.generation,
+                ),
+                cancellation_callback=self.isInterruptionRequested,
             )
             self.completed.emit(written, "", False, self.generation)
         except Exception as exc:
@@ -377,6 +385,7 @@ class MainWindow(
         self._last_database_reconciliation_notice = ""
         self._local_mirror_sync_worker = None
         self._local_mirror_sync_log_completion = True
+        self._local_mirror_progress_phase = ""
         self._last_pc_main_app_active = None
         self.state_sync_role = load_local_device_role()
         self.state_sync_worker = None
@@ -626,9 +635,52 @@ class MainWindow(
         )
         self._local_mirror_sync_worker = worker
         self._local_mirror_sync_log_completion = bool(log_completion)
+        worker.progress.connect(self._on_local_mirror_sync_progress)
         worker.completed.connect(self._on_local_mirror_sync_completed)
         self._track_worker("_local_mirror_sync_worker", worker)
+        self._local_mirror_progress_phase = "Preparing laptop safety backup"
+        progress_bar = self.__dict__.get("progress_bar")
+        progress_label = self.__dict__.get("progress_label")
+        if progress_bar is not None and progress_label is not None:
+            progress_bar.setRange(0, 0)
+            progress_label.setText("Laptop backup: preparing...")
+            progress_label.setToolTip(
+                "PC to laptop safety backup. It does not block database use."
+            )
+        if log_completion:
+            self.append_log(
+                "Laptop safety backup started in the background "
+                "(PC data remains active)."
+            )
         worker.start()
+
+    def _on_local_mirror_sync_progress(
+        self,
+        phase: str,
+        current: int,
+        total: int,
+        generation: int,
+    ) -> None:
+        if (
+            self.__dict__.get("_database_shutting_down", False)
+            or generation
+            != self.__dict__.get("_database_transition_generation", 0)
+        ):
+            return
+        self._local_mirror_progress_phase = str(phase or "Working")
+        progress_bar = self.__dict__.get("progress_bar")
+        progress_label = self.__dict__.get("progress_label")
+        if progress_bar is None or progress_label is None:
+            return
+        safe_total = max(1, int(total or 0))
+        safe_current = max(0, min(int(current or 0), safe_total))
+        percent = int((safe_current * 100) / safe_total)
+        progress_bar.setRange(0, safe_total)
+        progress_bar.setValue(safe_current)
+        progress_label.setText(f"Laptop backup: {phase} ({percent}%)")
+        progress_label.setToolTip(
+            "PC to laptop safety backup. The dashboard is already using PC MySQL."
+        )
 
     def _on_local_mirror_sync_completed(
         self,
@@ -650,13 +702,49 @@ class MainWindow(
         ):
             return
         total = sum(written.values())
+        progress_bar = self.__dict__.get("progress_bar")
+        progress_label = self.__dict__.get("progress_label")
         if error:
+            self._local_mirror_progress_phase = "incomplete"
+            if progress_bar is not None and progress_label is not None:
+                progress_bar.setRange(0, 100)
+                progress_bar.setValue(0)
+                progress_label.setText("Laptop backup incomplete; will retry.")
+                progress_label.setToolTip(str(error))
             self.append_log(
                 f"Local data mirror sync incomplete ({total} row(s) written): {error}"
             )
             return
+        self._local_mirror_progress_phase = "complete"
+        if progress_bar is not None and progress_label is not None:
+            progress_bar.setRange(0, 100)
+            progress_bar.setValue(100)
+            progress_label.setText(
+                f"Laptop backup complete ({total} row change(s))."
+            )
+            progress_label.setToolTip(
+                "PC to laptop safety backup completed successfully."
+            )
+            QTimer.singleShot(5000, self._clear_local_mirror_progress_if_finished)
         if total and self.__dict__.get("_local_mirror_sync_log_completion", True):
             self.append_log(f"Local data mirror updated ({total} row(s)) for offline fallback.")
+
+    def _clear_local_mirror_progress_if_finished(self) -> None:
+        if self.__dict__.get("_local_mirror_progress_phase") != "complete":
+            return
+        progress_label = self.__dict__.get("progress_label")
+        progress_bar = self.__dict__.get("progress_bar")
+        if (
+            progress_label is None
+            or progress_bar is None
+            or not progress_label.text().startswith("Laptop backup complete")
+        ):
+            return
+        self._local_mirror_progress_phase = ""
+        progress_bar.setRange(0, 100)
+        progress_bar.setValue(0)
+        progress_label.setText("Ready.")
+        progress_label.setToolTip("")
 
     def _handle_local_mirror_startup(self, engine) -> None:
         """PC unreachable; decide whether to use the local mirror silently or ask first."""
@@ -1504,6 +1592,33 @@ class MainWindow(
                 return False
         return True
 
+    def _shutdown_wait_message(
+        self, unfinished_workers: List[QThread]
+    ) -> Tuple[str, str]:
+        """Describe the task that prevented a safe close."""
+        mirror_worker = self.__dict__.get("_local_mirror_sync_worker")
+        if mirror_worker in unfinished_workers:
+            phase = self.__dict__.get(
+                "_local_mirror_progress_phase",
+                "closing its database transaction",
+            )
+            return (
+                "Laptop backup finishing",
+                "The PC-to-laptop safety backup is still stopping safely.\n\n"
+                f"Current phase: {phase}\n\n"
+                "The dashboard is not downloading market data for trading. "
+                "Wait for the Laptop backup progress line to finish, then close again.",
+            )
+        task_names = ", ".join(
+            type(worker).__name__ for worker in unfinished_workers
+        ) or "unknown task"
+        return (
+            "Background task running",
+            "A background task is still stopping safely.\n\n"
+            f"Running: {task_names}\n\n"
+            "Wait for it to finish before closing.",
+        )
+
     def closeEvent(self, event) -> None:
         self._database_shutting_down = True
         self._database_transition_generation = (
@@ -1564,10 +1679,14 @@ class MainWindow(
             for timer, was_active in timer_states:
                 if was_active:
                     timer.start()
+            unfinished_workers = [
+                worker for worker in running_workers if worker.isRunning()
+            ]
+            title, message = self._shutdown_wait_message(unfinished_workers)
             QMessageBox.warning(
                 self,
-                "Background task running",
-                "A background data fetch is still running. Wait for it to finish before closing.",
+                title,
+                message,
             )
             event.ignore()
             return

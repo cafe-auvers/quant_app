@@ -209,6 +209,35 @@ class _WidgetStub:
         self.tooltip = value
 
 
+class _ProgressBarStub:
+    def __init__(self):
+        self.minimum = 0
+        self.maximum = 100
+        self.value = 0
+
+    def setRange(self, minimum, maximum):
+        self.minimum = minimum
+        self.maximum = maximum
+
+    def setValue(self, value):
+        self.value = value
+
+
+class _ProgressLabelStub:
+    def __init__(self):
+        self.value = ""
+        self.tooltip = ""
+
+    def setText(self, value):
+        self.value = value
+
+    def text(self):
+        return self.value
+
+    def setToolTip(self, value):
+        self.tooltip = value
+
+
 class _StateSaveManagerStub:
     def __init__(self):
         self.engine_bindings = []
@@ -760,6 +789,47 @@ def test_relevant_hourly_symbols_include_scan_watchlist_and_buylist():
     ]
 
 
+def test_laptop_backup_progress_is_shown_in_dashboard_progress_widgets():
+    window = MainWindow.__new__(MainWindow)
+    window._database_shutting_down = False
+    window._database_transition_generation = 4
+    window.progress_bar = _ProgressBarStub()
+    window.progress_label = _ProgressLabelStub()
+
+    window._on_local_mirror_sync_progress(
+        "Reading PC data: hourly_price_history",
+        8,
+        20,
+        4,
+    )
+
+    assert window.progress_bar.minimum == 0
+    assert window.progress_bar.maximum == 20
+    assert window.progress_bar.value == 8
+    assert window.progress_label.value == (
+        "Laptop backup: Reading PC data: hourly_price_history (40%)"
+    )
+    assert "already using PC MySQL" in window.progress_label.tooltip
+
+
+def test_shutdown_message_identifies_laptop_backup_and_current_phase():
+    mirror_worker = object()
+    window = SimpleNamespace(
+        _local_mirror_sync_worker=mirror_worker,
+        _local_mirror_progress_phase="Verifying laptop backup: price_history",
+    )
+
+    title, message = MainWindow._shutdown_wait_message(
+        window,
+        [mirror_worker],
+    )
+
+    assert title == "Laptop backup finishing"
+    assert "PC-to-laptop safety backup" in message
+    assert "Verifying laptop backup: price_history" in message
+    assert "not downloading market data for trading" in message
+
+
 def test_backup_worker_initializes_local_mirror_and_uses_pc_as_authority(monkeypatch):
     import src.ui.main_window as main_window
     import src.utils.db_loader as db_loader
@@ -777,6 +847,7 @@ def test_backup_worker_initializes_local_mirror_and_uses_pc_as_authority(monkeyp
         lambda pc, local, **kwargs: calls.append((pc, local, kwargs)) or {},
     )
     emitted = []
+    progress_events = []
     pc_engine = object()
     worker = main_window.LocalMirrorSyncWorker(
         pc_engine,
@@ -789,20 +860,30 @@ def test_backup_worker_initializes_local_mirror_and_uses_pc_as_authority(monkeyp
             (written, error, needs_reconciliation, generation)
         )
     )
+    worker.progress.connect(
+        lambda phase, current, total, generation: progress_events.append(
+            (phase, current, total, generation)
+        )
+    )
 
     worker.run()
 
-    assert calls == [
-        (
-            pc_engine,
-            local_engine,
-            {
-                "hourly_symbols": ["SPY", "AAPL"],
-                "tickers": None,
-                "verify_derived": False,
-                "pc_authoritative": True,
-            },
-        )
+    assert len(calls) == 1
+    called_pc, called_local, kwargs = calls[0]
+    assert called_pc is pc_engine
+    assert called_local is local_engine
+    progress_callback = kwargs.pop("progress_callback")
+    cancellation_callback = kwargs.pop("cancellation_callback")
+    assert kwargs == {
+        "hourly_symbols": ["SPY", "AAPL"],
+        "tickers": None,
+        "verify_derived": False,
+        "pc_authoritative": True,
+    }
+    assert cancellation_callback() is False
+    progress_callback("Reading PC data: hourly_price_history", 2, 10)
+    assert progress_events == [
+        ("Reading PC data: hourly_price_history", 2, 10, 12)
     ]
     assert worker.local_engine is local_engine
     assert emitted == [({}, "", False, 12)]
@@ -892,18 +973,18 @@ def test_active_mirror_worker_forwards_relevant_hourly_symbols(monkeypatch):
 
     worker.run()
 
-    assert calls == [
-        (
-            pc_engine,
-            local_engine,
-                {
-                    "tickers": ["AAPL", "MSFT"],
-                    "hourly_symbols": ["SPY", "AAPL"],
-                    "verify_derived": False,
-                    "pc_authoritative": True,
-                },
-        )
-    ]
+    assert len(calls) == 1
+    called_pc, called_local, kwargs = calls[0]
+    assert called_pc is pc_engine
+    assert called_local is local_engine
+    assert callable(kwargs.pop("progress_callback"))
+    assert callable(kwargs.pop("cancellation_callback"))
+    assert kwargs == {
+        "tickers": ["AAPL", "MSFT"],
+        "hourly_symbols": ["SPY", "AAPL"],
+        "verify_derived": False,
+        "pc_authoritative": True,
+    }
     assert emitted == [({}, "", False, 8)]
 
 

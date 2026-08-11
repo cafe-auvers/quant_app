@@ -768,6 +768,7 @@ def _partition_fingerprints(
     *,
     raw_partition_keys: Optional[List[Tuple[object, ...]]] = None,
     symbol_filter: Optional[List[str]] = None,
+    cancellation_callback: Optional[Callable[[], bool]] = None,
     connection=None,
 ) -> Dict[Tuple[object, ...], _PartitionFingerprint]:
     """Hash every ordered primary key and value per logical partition.
@@ -846,8 +847,19 @@ def _partition_fingerprints(
     def consume(conn) -> None:
         streaming_conn = conn.execution_options(stream_results=True)
         for stmt in statements:
+            if cancellation_callback is not None and cancellation_callback():
+                raise InterruptedError("Local mirror synchronization was cancelled.")
             result = streaming_conn.execute(stmt)
-            for row in result:
+            for row_index, row in enumerate(result):
+                if (
+                    row_index % 1000 == 0
+                    and cancellation_callback is not None
+                    and cancellation_callback()
+                ):
+                    result.close()
+                    raise InterruptedError(
+                        "Local mirror synchronization was cancelled."
+                    )
                 values = list(row)
                 raw_partition = tuple(
                     values[value_indexes[name]] for name in spec.partition_columns
@@ -913,6 +925,7 @@ def _scoped_partition_fingerprints(
     spec: _ReconcileTableSpec,
     *,
     hourly_symbols: Optional[List[str]] = None,
+    cancellation_callback: Optional[Callable[[], bool]] = None,
     connection=None,
 ) -> Dict[Tuple[object, ...], _PartitionFingerprint]:
     """Limit expensive hourly comparisons while leaving every other table exact."""
@@ -924,6 +937,7 @@ def _scoped_partition_fingerprints(
             if spec.table_name == "hourly_price_history"
             else None
         ),
+        cancellation_callback=cancellation_callback,
         connection=connection,
     )
 
@@ -1059,6 +1073,7 @@ def _copy_pc_partitions_to_local_exactly(
     partition_chunk_size: int = 100,
     local_connection=None,
     preserve_local_raw: bool = True,
+    cancellation_callback: Optional[Callable[[], bool]] = None,
 ) -> int:
     """Apply PC-wins rows and remove local-only keys for changed partitions."""
     if not partition_keys:
@@ -1070,6 +1085,8 @@ def _copy_pc_partitions_to_local_exactly(
     changed = 0
 
     for key_chunk in _record_chunks(partition_keys, partition_chunk_size):
+        if cancellation_callback is not None and cancellation_callback():
+            raise InterruptedError("Local mirror synchronization was cancelled.")
         raw_keys = [
             (
                 pc_fingerprints.get(key)
@@ -1398,6 +1415,8 @@ def _sync_clean_local_mirror_from_pc_exactly(
     hourly_symbols: Optional[List[str]],
     verify_derived: bool,
     pc_authoritative: bool,
+    progress_callback: Optional[Callable[[str, int, int], None]],
+    cancellation_callback: Optional[Callable[[], bool]],
 ) -> Dict[str, int]:
     """Implement the PC-read-only active mirror under one SQLite write lock."""
     if local_engine is None or local_engine.dialect.name != "sqlite":
@@ -1418,8 +1437,27 @@ def _sync_clean_local_mirror_from_pc_exactly(
             + ", ".join(sorted(unsupported))
         )
 
+    total_steps = 2 + (6 * len(reconcile_specs))
+    if verify_derived:
+        total_steps += 1 + len(reconcile_specs)
+    completed_steps = 0
+
+    def check_cancelled() -> None:
+        if cancellation_callback is not None and cancellation_callback():
+            raise InterruptedError("Local mirror synchronization was cancelled.")
+
+    def start_phase(label: str) -> None:
+        check_cancelled()
+        if progress_callback is not None:
+            progress_callback(label, completed_steps, total_steps)
+
+    def finish_phase() -> None:
+        nonlocal completed_steps
+        completed_steps += 1
+
     local_conn = None
     try:
+        start_phase("Preparing laptop safety backup")
         with pc_engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         _ensure_local_mirror_handoff_tracking(local_engine)
@@ -1433,9 +1471,11 @@ def _sync_clean_local_mirror_from_pc_exactly(
             raise LocalMirrorNeedsReconciliationError(
                 "Local mirror contains changes that require staged reconciliation."
             )
+        finish_phase()
 
         # Equal or empty legacy tables must not bypass schema validation.
         for spec in reconcile_specs:
+            start_phase(f"Checking table layout: {spec.table_name}")
             pc_table = Table(
                 spec.table_name, MetaData(), autoload_with=pc_engine
             )
@@ -1443,21 +1483,34 @@ def _sync_clean_local_mirror_from_pc_exactly(
                 spec.table_name, MetaData(), autoload_with=local_conn
             )
             _validate_reconcile_table_schema(pc_table, local_table, spec)
+            finish_phase()
 
-        pc_before = {
-            spec.table_name: _scoped_partition_fingerprints(
-                pc_engine, spec, hourly_symbols=hourly_symbols
+        pc_before = {}
+        for spec in reconcile_specs:
+            start_phase(f"Reading PC data: {spec.table_name}")
+            pc_before[spec.table_name] = _scoped_partition_fingerprints(
+                pc_engine,
+                spec,
+                hourly_symbols=hourly_symbols,
+                cancellation_callback=cancellation_callback,
             )
-            for spec in reconcile_specs
-        }
+            finish_phase()
         if verify_derived:
+            start_phase("Checking PC derived-data freshness")
             _verify_pc_derived_data_current_read_only(pc_engine, tickers)
-            pc_after_derived_check = {
-                spec.table_name: _scoped_partition_fingerprints(
-                    pc_engine, spec, hourly_symbols=hourly_symbols
+            finish_phase()
+            pc_after_derived_check = {}
+            for spec in reconcile_specs:
+                start_phase(f"Rechecking PC data: {spec.table_name}")
+                pc_after_derived_check[spec.table_name] = (
+                    _scoped_partition_fingerprints(
+                        pc_engine,
+                        spec,
+                        hourly_symbols=hourly_symbols,
+                        cancellation_callback=cancellation_callback,
+                    )
                 )
-                for spec in reconcile_specs
-            }
+                finish_phase()
             changed_during_verification = [
                 spec.table_name
                 for spec in reconcile_specs
@@ -1472,17 +1525,20 @@ def _sync_clean_local_mirror_from_pc_exactly(
                     + ", ".join(changed_during_verification)
                 )
 
-        local_before = {
-            spec.table_name: _scoped_partition_fingerprints(
+        local_before = {}
+        for spec in reconcile_specs:
+            start_phase(f"Reading laptop backup: {spec.table_name}")
+            local_before[spec.table_name] = _scoped_partition_fingerprints(
                 local_engine,
                 spec,
                 hourly_symbols=hourly_symbols,
+                cancellation_callback=cancellation_callback,
                 connection=local_conn,
             )
-            for spec in reconcile_specs
-        }
+            finish_phase()
         pending_written: Dict[str, int] = {}
         for spec in reconcile_specs:
+            start_phase(f"Updating laptop backup: {spec.table_name}")
             mismatched = _mismatched_partitions(
                 pc_before[spec.table_name], local_before[spec.table_name]
             )
@@ -1496,24 +1552,32 @@ def _sync_clean_local_mirror_from_pc_exactly(
                     local_before[spec.table_name],
                     local_connection=local_conn,
                     preserve_local_raw=False,
+                    cancellation_callback=cancellation_callback,
                 )
             )
+            finish_phase()
 
-        local_after = {
-            spec.table_name: _scoped_partition_fingerprints(
+        local_after = {}
+        for spec in reconcile_specs:
+            start_phase(f"Verifying laptop backup: {spec.table_name}")
+            local_after[spec.table_name] = _scoped_partition_fingerprints(
                 local_engine,
                 spec,
                 hourly_symbols=hourly_symbols,
+                cancellation_callback=cancellation_callback,
                 connection=local_conn,
             )
-            for spec in reconcile_specs
-        }
-        pc_after = {
-            spec.table_name: _scoped_partition_fingerprints(
-                pc_engine, spec, hourly_symbols=hourly_symbols
+            finish_phase()
+        pc_after = {}
+        for spec in reconcile_specs:
+            start_phase(f"Confirming PC unchanged: {spec.table_name}")
+            pc_after[spec.table_name] = _scoped_partition_fingerprints(
+                pc_engine,
+                spec,
+                hourly_symbols=hourly_symbols,
+                cancellation_callback=cancellation_callback,
             )
-            for spec in reconcile_specs
-        }
+            finish_phase()
         unstable = [
             spec.table_name
             for spec in reconcile_specs
@@ -1530,8 +1594,12 @@ def _sync_clean_local_mirror_from_pc_exactly(
                 + ", ".join(unstable)
             )
 
+        start_phase("Finalizing laptop safety backup")
         _mark_local_mirror_handoff_clean(local_conn)
         local_conn.commit()
+        finish_phase()
+        if progress_callback is not None:
+            progress_callback("Laptop safety backup complete", total_steps, total_steps)
         return pending_written
     except LocalMirrorNeedsReconciliationError:
         if local_conn is not None:
@@ -1558,6 +1626,8 @@ def sync_local_mirror_from_pc_atomic(
     hourly_symbols: Optional[List[str]] = None,
     verify_derived: bool = True,
     pc_authoritative: bool = False,
+    progress_callback: Optional[Callable[[str, int, int], None]] = None,
+    cancellation_callback: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, int]:
     """Publish an exact PC generation to the local mirror atomically.
 
@@ -1579,6 +1649,8 @@ def sync_local_mirror_from_pc_atomic(
         hourly_symbols=hourly_symbols,
         verify_derived=verify_derived,
         pc_authoritative=pc_authoritative,
+        progress_callback=progress_callback,
+        cancellation_callback=cancellation_callback,
     )
 
 def _reconciliation_universe(

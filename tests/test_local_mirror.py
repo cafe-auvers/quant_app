@@ -525,6 +525,57 @@ def test_pc_authoritative_mirror_replaces_dirty_local_rows_without_pc_write():
         ).scalars().all() == ["A"]
 
 
+def test_pc_authoritative_mirror_reports_named_progress_phases():
+    pc, local, pc_daily, _local_daily, _pc_hourly, _local_hourly = _raw_engines()
+    with pc.begin() as conn:
+        conn.execute(insert(pc_daily), _daily_bar("A", 1, 100))
+    progress = []
+
+    db_loader.sync_local_mirror_from_pc_atomic(
+        pc,
+        local,
+        tables=(("price_history", "date"),),
+        verify_derived=False,
+        pc_authoritative=True,
+        progress_callback=lambda phase, current, total: progress.append(
+            (phase, current, total)
+        ),
+    )
+
+    assert progress[0][0] == "Preparing laptop safety backup"
+    assert any(
+        phase == "Reading PC data: price_history"
+        for phase, _current, _total in progress
+    )
+    assert any(
+        phase == "Updating laptop backup: price_history"
+        for phase, _current, _total in progress
+    )
+    assert progress[-1][0] == "Laptop safety backup complete"
+    assert progress[-1][1] == progress[-1][2]
+
+
+def test_pc_authoritative_mirror_honors_cancellation_callback():
+    pc, local, pc_daily, _local_daily, _pc_hourly, _local_hourly = _raw_engines()
+    with pc.begin() as conn:
+        conn.execute(insert(pc_daily), _daily_bar("A", 1, 100))
+    checks = {"count": 0}
+
+    def cancel_after_preparation():
+        checks["count"] += 1
+        return checks["count"] >= 3
+
+    with pytest.raises(RuntimeError, match="synchronization was cancelled"):
+        db_loader.sync_local_mirror_from_pc_atomic(
+            pc,
+            local,
+            tables=(("price_history", "date"),),
+            verify_derived=False,
+            pc_authoritative=True,
+            cancellation_callback=cancel_after_preparation,
+        )
+
+
 def test_atomic_mirror_sync_rolls_back_all_tables_on_later_failure(monkeypatch):
     pc, local, pc_daily, local_daily, pc_hourly, local_hourly = _raw_engines()
     with pc.begin() as conn:
