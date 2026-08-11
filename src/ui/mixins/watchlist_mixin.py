@@ -837,6 +837,54 @@ class WatchlistMixin:
             return QColor(192, 57, 43)
         return None
 
+    def mark_watchlist_and_dashboard_dirty(self) -> None:
+        """Defer populate_watchlist_table()/update_dashboard_summary() until
+        the Watchlist/Dashboard tab is actually visible.
+
+        populate_watchlist_table() recalculates ORB scores for every
+        watchlist item, and update_dashboard_summary() does its own full
+        pass -- both are expensive and pointless to run every time a chart
+        interaction (breakout price, drawing) happens on an unrelated tab.
+        If either tab IS currently active, refresh immediately as before so
+        on-screen data never goes stale while being looked at.
+        """
+        active_widget = (
+            self.__dict__.get("tabs").currentWidget()
+            if self.__dict__.get("tabs") is not None
+            else None
+        )
+        if active_widget is self.__dict__.get("watchlist_widget"):
+            self.populate_watchlist_table()
+        else:
+            self._watchlist_table_dirty = True
+        if active_widget is self.__dict__.get("dashboard_widget"):
+            self.update_dashboard_summary()
+        else:
+            self._dashboard_summary_dirty = True
+
+    def _flush_dirty_watchlist_and_dashboard(self) -> None:
+        """Called from on_tab_changed: catch up any refresh that was
+        deferred by mark_watchlist_and_dashboard_dirty()."""
+        active_widget = (
+            self.__dict__.get("tabs").currentWidget()
+            if self.__dict__.get("tabs") is not None
+            else None
+        )
+        if active_widget is None:
+            return
+        if (
+            self.__dict__.get("_watchlist_table_dirty")
+            and active_widget is self.__dict__.get("watchlist_widget")
+        ):
+            self._watchlist_table_dirty = False
+            self.populate_watchlist_table()
+        if (
+            self.__dict__.get("_dashboard_summary_dirty")
+            and active_widget is self.__dict__.get("dashboard_widget")
+        ):
+            self._dashboard_summary_dirty = False
+            self.update_dashboard_summary()
+
     def populate_watchlist_table(self) -> None:
         """Populate the watchlist scoreboard table."""
         self.watchlist_table.setRowCount(0)

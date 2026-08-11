@@ -668,7 +668,10 @@ def test_tradingview_lightweight_chart_html_uses_local_ohlcv_data():
         target_price=12.0,
     )
 
-    assert "lightweight-charts@4.2.3" in chart_html
+    # The library is vendored/inlined (see _lightweight_charts_script_tag) so
+    # chart reloads don't depend on a network fetch to a CDN; just confirm
+    # the expected pinned version made it into the page either way.
+    assert "4.2.3" in chart_html
     assert "createChart" in chart_html
     assert '"time": "2026-01-01"' in chart_html
     assert '"close": 11.5' in chart_html
@@ -696,6 +699,10 @@ def test_tradingview_lightweight_chart_html_uses_local_ohlcv_data():
     assert "pointer-events: none" in chart_html
     assert "enableLineToolMode" in chart_html
     assert "embed-widget-advanced-chart.js" not in chart_html
+    # Library should be inlined from the vendored asset, not fetched from a
+    # CDN on every reload (this is what previously caused a network round
+    # trip on every chart re-render / redraw).
+    assert "unpkg.com" not in chart_html
 
 
 def test_tradingview_lightweight_chart_html_includes_rs_ti65_indicator():
