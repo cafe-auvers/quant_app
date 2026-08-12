@@ -2110,7 +2110,15 @@ class ChartsControllerMixin:
                 if hasattr(self, "watchlist_env_combo")
                 else "PROD"
             )
-            self.refresh_execution_queue(env, show_log=False)
+            # Only this symbol's cached intraday data actually changed, so only
+            # recheck this one execution-queue row (if it's even queued) instead
+            # of every queued symbol. refresh_execution_queue(env, symbols=None)
+            # walks the WHOLE queue -- per item that's two DB reads plus a full
+            # order-ledger reload from disk -- and this handler fires on every
+            # single-symbol intraday fetch (watchlist add, Activate, chart
+            # refresh), so that used to run synchronously on the UI thread far
+            # more often than the data actually warranted.
+            self.refresh_execution_queue(env, show_log=False, symbols=[symbol])
         if (
             hasattr(self, "tradingview_timeframe_combo")
             and hasattr(self, "tradingview_widget")

@@ -166,3 +166,37 @@ def test_flush_stale_chart_views_noop_when_nothing_stale():
     window.flush_stale_chart_views()
 
     assert calls == []
+
+
+# --- _on_intraday_fetch_finished only rechecks the symbol that changed ---
+
+def test_intraday_fetch_finished_scopes_execution_queue_refresh_to_symbol():
+    """A single symbol's intraday fetch completing used to trigger a refresh
+    of the ENTIRE execution queue (two DB reads + a disk order-ledger reload
+    per queued item), synchronously on the UI thread, every time. It should
+    only recheck the symbol that actually got new data.
+    """
+    window = MainWindow.__new__(MainWindow)
+    window.latest_intraday_sources = {}
+    window.append_log = lambda *a, **kw: None
+    window.intraday_symbol_combo = SimpleNamespace(currentText=lambda: "")
+    # A QMainWindow subclass built via __new__ (no __init__) raises instead
+    # of returning False from hasattr() on a genuinely-unset attribute, so
+    # every attribute this method's hasattr-guarded branches touch has to be
+    # given a harmless value up front.
+    window.live_data_source_label = SimpleNamespace(setText=lambda *_a: None)
+    window.symbol_input = SimpleNamespace(text=lambda: "")
+    window.watchlist_env_combo = SimpleNamespace(currentText=lambda: "PROD")
+    window.tradingview_timeframe_combo = SimpleNamespace(currentText=lambda: "1D")
+    window.tradingview_widget = object()
+    window.tabs = _FakeTabs(object())  # active tab is neither tradingview_widget
+
+    calls = []
+    window.refresh_execution_queue = lambda *a, **kw: calls.append((a, kw))
+
+    window._on_intraday_fetch_finished("LIFE", None, 7, "kis")
+
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args == ("PROD",)
+    assert kwargs.get("symbols") == ["LIFE"]
