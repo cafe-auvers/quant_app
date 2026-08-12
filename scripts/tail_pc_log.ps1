@@ -11,7 +11,7 @@ Usage:
     .\scripts\tail_pc_log.ps1
     .\scripts\tail_pc_log.ps1 -LogName pc_morning_routine.log
     .\scripts\tail_pc_log.ps1 -LogName quant_app.log -Lines 200
-    $cred = Get-Credential DESKTOP-E42GSKJ\<pc-username>
+    $cred = Get-Credential <PC-HOSTNAME>\<pc-username>
     .\scripts\tail_pc_log.ps1 -Credential $cred   # skips the prompt
 #>
 
@@ -38,7 +38,7 @@ if (-not $PcTailscaleIp) {
 }
 
 if (-not $Credential) {
-    $Credential = Get-Credential -Message "PC Windows account (e.g. DESKTOP-E42GSKJ\<username>) for $PcTailscaleIp"
+    $Credential = Get-Credential -Message "PC Windows account (e.g. <PC-HOSTNAME>\<username>) for $PcTailscaleIp"
 }
 
 Write-Host "Tailing $LogName on $PcTailscaleIp -- Ctrl+C to stop."

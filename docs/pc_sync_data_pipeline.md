@@ -4,13 +4,21 @@ Status: **built and verified working end-to-end**, including a real
 BIOS-wake → auto-login → morning-routine → auto-shutdown cycle, and remote
 access confirmed from a mobile hotspot (genuinely off the home network).
 
+> **Placeholders used in this doc** (real values live only in each machine's
+> local `.env`/OS config, never in git): `<LAPTOP-HOSTNAME>`, `<PC-HOSTNAME>`
+> for the two Windows machine names; `192.168.x.x` / `192.168.x.%` for the
+> home LAN address/subnet; `100.x.x.x` for Tailscale addresses (always in
+> that CGNAT range, so the shape alone isn't identifying); `<tailscale-account-email>`
+> for the Tailscale admin login. Swap in your own machines' real values when
+> following these steps.
+
 ## Roles
 
-- **Laptop** (`DESKTOP-T5V57VV`) — where development happens (edits,
+- **Laptop** (`<LAPTOP-HOSTNAME>`) — where development happens (edits,
   commits, `git push`). `main.py` normally reads from the shared database and
   keeps an offline SQLite market-data mirror in `data/local_mirror.db` for the
   periods when the PC cannot be reached.
-- **Always-on PC** (`DESKTOP-E42GSKJ`) — never used for development. Two
+- **Always-on PC** (`<PC-HOSTNAME>`) — never used for development. Two
   jobs only:
   1. Host the single shared MySQL database (`quant_app`) that both machines
      read from.
@@ -42,16 +50,16 @@ dashboard restart path.
 
 ```mermaid
 flowchart LR
-  repo(["GitHub: cafe-auvers/quant_app"])
+  repo(["GitHub: <org>/quant_app"])
 
-  subgraph LAP["Laptop - DESKTOP-T5V57VV"]
+  subgraph LAP["Laptop - LAPTOP-HOSTNAME"]
     direction TB
     mainL["main.py (dev + client)"]
     mirror[("SQLite offline mirror")]
     mainL --> mirror
   end
 
-  subgraph PCBOX["Always-on PC - DESKTOP-E42GSKJ"]
+  subgraph PCBOX["Always-on PC - PC-HOSTNAME"]
     direction TB
     bios["BIOS RTC alarm, wakes 08:00 daily"]
     sched["Task Scheduler: auto-logon then morning routine, shutdown 10:00 daily"]
@@ -62,8 +70,8 @@ flowchart LR
 
   mainL -- "git push" --> repo
   repo -- "git fetch + reset --hard, each morning routine run" --> sched
-  mainL -- "LAN: 192.168.219.111:3306, home Wi-Fi only" --> db
-  mainL -- "Tailscale: 100.121.30.45:3306, works anywhere" --> db
+  mainL -- "LAN: 192.168.x.x:3306, home Wi-Fi only" --> db
+  mainL -- "Tailscale: 100.x.x.x:3306, works anywhere" --> db
   db -- "canonical market-data mirror" --> mirror
 ```
 
@@ -118,7 +126,7 @@ completed session's data, never watch positions in real time.
   Scheduler task.
 - `scripts/setup_mysql_lan_access.ps1` — LAN firewall rule (scoped to
   `LocalSubnet`) + prints the `my.ini`/`GRANT` steps for the
-  `quant_remote@192.168.219.%` account.
+  `quant_remote@192.168.x.%` account.
 - `scripts/setup_mysql_tailscale_access.ps1` — firewall rule scoped to the
   Tailscale network adapter specifically (not a broad IP range) + prints the
   `GRANT` step for a second, Tailscale-IP-scoped account.
@@ -138,12 +146,12 @@ rule and MySQL grant, so either works whenever it's relevant:
 
 | Path | Address | Works when | Firewall scope |
 |---|---|---|---|
-| LAN | `192.168.219.111:3306` | Laptop on the same home Wi-Fi | `LocalSubnet` only |
-| Tailscale | `100.121.30.45:3306` | Anywhere with internet | Tailscale adapter only |
+| LAN | `192.168.x.x:3306` | Laptop on the same home Wi-Fi | `LocalSubnet` only |
+| Tailscale | `100.x.x.x:3306` | Anywhere with internet | Tailscale adapter only |
 
 [Tailscale](https://tailscale.com) creates a private encrypted network
 ("tailnet") between only the devices signed into the account
-(`tonyhdkim@gmail.com`), giving each a stable `100.x.x.x` address regardless
+(`<tailscale-account-email>`), giving each a stable `100.x.x.x` address regardless
 of physical network. On the same LAN it typically routes directly (same
 speed as the plain LAN path); off it, it tunnels through NAT/firewalls
 automatically, without opening any port on the router or exposing MySQL to
@@ -193,8 +201,8 @@ Usage from the laptop:
 ```
 Or directly, for anything beyond log tailing:
 ```powershell
-$cred = Get-Credential DESKTOP-E42GSKJ\<pc-username>
-Invoke-Command -ComputerName 100.121.30.45 -Credential $cred -ScriptBlock { ... }
+$cred = Get-Credential <PC-HOSTNAME>\<pc-username>
+Invoke-Command -ComputerName 100.x.x.x -Credential $cred -ScriptBlock { ... }
 ```
 
 WinRM traffic is plain HTTP (port 5985); that's acceptable here because
@@ -231,7 +239,7 @@ be configured for that once these two setup scripts have been run.
 
 ## How do I make sure the PC is running the latest code and dependencies?
 
-**Via git** (`origin` -> `https://github.com/cafe-auvers/quant_app.git`) for
+**Via git** (`origin` -> the repo's GitHub URL) for
 code, and `pip install -r requirements.txt` (also run automatically each
 morning) for dependencies:
 

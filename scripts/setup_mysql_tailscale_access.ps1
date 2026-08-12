@@ -41,5 +41,5 @@ Write-Host "  3. Run (replace <laptop-tailscale-ip> and choose your own password
 Write-Host "       CREATE USER 'quant_remote'@'<laptop-tailscale-ip>' IDENTIFIED BY 'choose-a-strong-password';"
 Write-Host "       GRANT ALL PRIVILEGES ON quant_app.* TO 'quant_remote'@'<laptop-tailscale-ip>';"
 Write-Host "       FLUSH PRIVILEGES;"
-Write-Host "     (This is a SEPARATE grant from the existing 192.168.219.% one -- both coexist,"
+Write-Host "     (This is a SEPARATE grant from the existing 192.168.x.% one -- both coexist,"
 Write-Host "      so LAN access at home and Tailscale access away both keep working.)"

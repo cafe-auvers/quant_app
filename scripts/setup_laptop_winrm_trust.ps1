@@ -15,7 +15,7 @@ them.
 
 Usage:
     .\scripts\setup_laptop_winrm_trust.ps1
-    .\scripts\setup_laptop_winrm_trust.ps1 -PcTailscaleIp 100.121.30.45   # override .env's PC_REMOTE_CONTROL_HOST
+    .\scripts\setup_laptop_winrm_trust.ps1 -PcTailscaleIp 100.x.x.x   # override .env's PC_REMOTE_CONTROL_HOST
 #>
 
 param(
@@ -62,7 +62,7 @@ if ($hosts -contains $PcTailscaleIp -or $hosts -contains "*") {
 
 Write-Host ""
 Write-Host "Test the connection (replace the account with the one printed by setup_pc_winrm_tailscale_access.ps1):"
-Write-Host "    `$cred = Get-Credential DESKTOP-E42GSKJ\<pc-username>"
+Write-Host "    `$cred = Get-Credential <PC-HOSTNAME>\<pc-username>"
 Write-Host "    Invoke-Command -ComputerName $PcTailscaleIp -Credential `$cred -ScriptBlock { `$env:COMPUTERNAME }"
 Write-Host ""
 Write-Host "Once that works, tail a PC log live with:"

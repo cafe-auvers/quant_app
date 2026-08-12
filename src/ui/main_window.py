@@ -2698,7 +2698,7 @@ class MainWindow(
         if not url:
             QMessageBox.warning(
                 self, "Not configured",
-                "PC_WAKE_URL is not set in .env (e.g. http://tonyhdkim.ddns.net:88/).",
+                "PC_WAKE_URL is not set in .env (e.g. http://your-router-ddns-host:PORT/).",
             )
             return
         webbrowser.open(url)
