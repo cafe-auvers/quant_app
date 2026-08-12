@@ -63,24 +63,7 @@ architecture and automation.
 
 ## Configuration
 
-Database and API credentials are local-only and belong in `.env`.
-
-```text
-MYSQL_HOST=127.0.0.1
-MYSQL_PORT=3306
-MYSQL_USER=root
-MYSQL_PASSWORD=your_password_here
-MYSQL_DB=quant_app
-
-KIS_PROD_APP_KEY=your_prod_key
-KIS_PROD_APP_SECRET=your_prod_secret
-KIS_PROD_ACCOUNT_NO=87654321-01
-
-KIS_INTRADAY_ENABLED=false
-OPENAI_API_KEY=
-
-QUANT_BACKUP_DIR=G:\My Drive
-```
+Database and API credentials are local-only and belong in `.env` (gitignored, never commit it). See `.env.example` for the full list of variables to fill in, covering MySQL connection settings, KIS broker API credentials, and optional integration keys.
 
 Only enable KIS intraday after the endpoint, TR ID, request parameters, output field, and raw OHLCV field mappings have been verified.
 
