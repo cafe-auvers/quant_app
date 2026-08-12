@@ -1969,7 +1969,7 @@ class MainWindow(
 
         tools_menu = menubar.addMenu("Tools")
         refresh_action = tools_menu.addAction("Refresh Dashboard")
-        refresh_action.triggered.connect(self.update_dashboard_summary)
+        refresh_action.triggered.connect(self._refresh_dashboard_summary_manually)
         refresh_db_action = tools_menu.addAction("Update 1D Data")
         refresh_db_action.triggered.connect(self.refresh_data_to_db)
         scan_action = tools_menu.addAction("Run All Scanners")

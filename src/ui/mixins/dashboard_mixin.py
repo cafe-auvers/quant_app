@@ -311,7 +311,7 @@ class DashboardMixin:
 
         refresh_button = QPushButton("Refresh Summary")
         refresh_button.setObjectName("refreshSummaryButton")
-        refresh_button.clicked.connect(self.update_dashboard_summary)
+        refresh_button.clicked.connect(self._refresh_dashboard_summary_manually)
         button_layout.addWidget(refresh_button)
 
         self.refresh_db_button = QPushButton("Update 1D Data")
@@ -1276,17 +1276,13 @@ class DashboardMixin:
             }
         return total_krw
 
-    def update_dashboard_summary(self, *args, force: bool = False) -> None:
+    def _refresh_dashboard_summary_manually(self, *_signal_args) -> None:
+        """Refresh user-requested data without consulting QObject.sender()."""
+        self.update_dashboard_summary(force=True)
+
+    def update_dashboard_summary(self, *_signal_args, force: bool = False) -> None:
         """Update the dashboard summary section."""
         is_manual = force
-        if hasattr(self, "sender") and self.sender() is not None:
-            sender = self.sender()
-            try:
-                txt = getattr(sender, "text", lambda: "")().lower()
-                if "refresh" in txt or "run" in txt:
-                    is_manual = True
-            except Exception:
-                pass
 
         if is_manual:
             self._cached_market_data_status = None

@@ -272,7 +272,11 @@ class BuylistMixin:
         ):
             table.setColumnWidth(col, width)
         layout.addWidget(table, 1)
-        table.cellDoubleClicked.connect(self._buylist_show_tradingview_chart)
+        table.cellDoubleClicked.connect(
+            lambda row, column, source=table: self._buylist_show_tradingview_chart(
+                source, row, column
+            )
+        )
 
         self.buylist_prod_table = table
 
@@ -366,10 +370,11 @@ class BuylistMixin:
         panel.setLayout(layout)
         return panel
 
-    def _buylist_show_tradingview_chart(self, row: int, column: int) -> None:
+    def _buylist_show_tradingview_chart(
+        self, table: QTableWidget, row: int, column: int
+    ) -> None:
         """Buy Dashboard double-click: jump to the TradingView tab for the selected symbol."""
-        table = self.sender()
-        symbol_item = table.item(row, 0) if table is not None else None
+        symbol_item = table.item(row, 0)
         if symbol_item is None:
             return
         symbol = symbol_item.text().strip().upper()
