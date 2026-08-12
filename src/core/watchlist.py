@@ -436,6 +436,14 @@ class BuylistItem:
         if self.environment != "PROD":
             raise ValueError("Buylist items must use the PROD environment")
         self.kis_account_no = str(self.kis_account_no or "").strip()
+        # ``FILLED`` belongs to the execution-queue/order lifecycle, while the
+        # Buy Dashboard uses ``BOUGHT`` for an owned position. Repair older
+        # persisted rows where the queue status leaked into the dashboard field.
+        if (
+            str(self.monitoring_status or "").strip().upper() == "FILLED"
+            and int(self.shares_held or 0) > 0
+        ):
+            self.monitoring_status = "BOUGHT"
         self.added_date = _parse_timestamp(self.added_date)
         if self.buy_date is not None:
             self.buy_date = _parse_timestamp(

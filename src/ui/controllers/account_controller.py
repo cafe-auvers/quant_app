@@ -221,8 +221,11 @@ class AccountController(WindowController):
             if item.monitoring_status in {
                 "WATCHING",
                 "ACTIVE",
+                "ORDER_PENDING",
+                "ORDER_SUBMITTED",
                 "BUY_SUBMITTED",
                 "BUY_PARTIAL",
+                "FILLED",
                 "ERROR",
                 "UNKNOWN_SUBMISSION_STATE",
                 "BOUGHT",

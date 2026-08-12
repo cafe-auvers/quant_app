@@ -69,6 +69,37 @@ def test_buylist_item_serialization():
     assert deserialized.kis_account_no == "12345678-01"
 
 
+def test_buylist_item_restores_filled_holding_as_bought_position():
+    item = BuylistItem(
+        symbol="STIM",
+        name="STIM",
+        entry_price=2.8899,
+        target_price=0.0,
+        stop_loss=2.73,
+        total_score=65.6,
+        status="FILLED",
+        technical_score=0.0,
+        setup_score=0.0,
+        risk_score=0.0,
+        news_score=0.0,
+        timing_score=0.0,
+        rr=0.0,
+        stop_adr=43.0,
+        position_percent=18.1,
+        ai_summary="Execution queue FILLED",
+        warnings=[],
+        monitoring_status="FILLED",
+        shares_held=791,
+        avg_cost=2.88,
+        breakout_method="execution_queue:1m",
+    )
+
+    assert item.status == "FILLED"
+    assert item.monitoring_status == "BOUGHT"
+    assert item.shares_held == 791
+    assert item.avg_cost == 2.88
+
+
 def test_legacy_sim_buylist_state_is_ignored():
     serialized = BuylistItem(
         symbol="AAPL",

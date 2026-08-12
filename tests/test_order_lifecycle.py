@@ -2308,6 +2308,55 @@ def test_buylist_position_sync_uses_total_kis_holding_quantity():
     assert any("shares 23 -> 41" in message for message in logs)
 
 
+def test_buylist_position_sync_converts_filled_queue_status_to_bought():
+    save_calls = []
+    queue_item = SimpleNamespace(status="FILLED")
+
+    class QueueManager:
+        def get_item(self, symbol, environment):
+            assert (symbol, environment) == ("STIM", "PROD")
+            return queue_item
+
+        def mark_order_filled(self, symbol, order_status, environment):
+            assert (symbol, order_status, environment) == (
+                "STIM",
+                "FILLED",
+                "PROD",
+            )
+
+    item = SimpleNamespace(
+        symbol="STIM",
+        environment="PROD",
+        kis_account_no="63187258-01",
+        monitoring_status="FILLED",
+        status="FILLED",
+        breakout_method="execution_queue:1m",
+        shares_held=791,
+        avg_cost=2.88,
+        buy_date=None,
+        _buy_order_pending=True,
+    )
+    window = MainWindow.__new__(MainWindow)
+    window.buylist_manager = SimpleNamespace(items=[item])
+    window.execution_queue_manager = QueueManager()
+    window.order_ledger = []
+    window.append_log = lambda _message: None
+    window._save_state = lambda: save_calls.append(True)
+    window.populate_buylist_dashboard = lambda: None
+
+    changed = MainWindow.sync_buylist_positions_from_kis_snapshots(
+        window,
+        {("PROD", "63187258-01"): _snapshot("STIM", 791, 2.88)},
+    )
+
+    assert changed == 1
+    assert item.monitoring_status == "BOUGHT"
+    assert item.status == "FILLED"
+    assert item.shares_held == 791
+    assert item.avg_cost == 2.88
+    assert save_calls == [True]
+
+
 def test_buylist_position_sync_uses_item_account_not_largest_same_symbol_holding():
     item = SimpleNamespace(
         symbol="MRVL",
@@ -2450,3 +2499,37 @@ def test_startup_unresolved_order_state_uses_app_state_save():
     assert item.kis_order_id == "KIS-STOP"
     assert save_calls == [True]
     assert populate_calls == [True]
+
+
+def test_startup_unresolved_buy_does_not_demote_confirmed_position():
+    save_calls = []
+    item = SimpleNamespace(
+        symbol="STIM",
+        environment="PROD",
+        monitoring_status="BOUGHT",
+        shares_held=791,
+        kis_order_id="",
+    )
+
+    class Manager:
+        def get(self, symbol, environment=None):
+            assert (symbol, environment) == ("STIM", "PROD")
+            return item
+
+    order = _order(side=OrderSide.BUY, quantity=791, status=OrderStatus.WORKING)
+    order.environment = "PROD"
+    order.symbol = "STIM"
+    order.broker_order_id = "KIS-STIM"
+
+    window = MainWindow.__new__(MainWindow)
+    window.order_ledger = [order]
+    window.buylist_manager = Manager()
+    window.append_log = lambda _message: None
+    window._save_state = lambda: save_calls.append(True)
+    window.populate_buylist_dashboard = lambda: None
+
+    MainWindow._apply_unresolved_order_startup_state(window)
+
+    assert item.monitoring_status == "BOUGHT"
+    assert item.kis_order_id == "KIS-STIM"
+    assert save_calls == [True]

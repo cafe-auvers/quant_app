@@ -1183,7 +1183,16 @@ class MainWindow(
             if order.status == OrderStatus.UNKNOWN_SUBMISSION_STATE:
                 new_status = "UNKNOWN_SUBMISSION_STATE"
             elif order.side == OrderSide.BUY:
-                new_status = "BUY_SUBMITTED"
+                # Keep a holdings-confirmed position visible even when its
+                # durable broker ledger entry has not reached a terminal state.
+                # The ledger still blocks duplicate order submission.
+                new_status = (
+                    "BOUGHT"
+                    if str(getattr(item, "monitoring_status", "") or "").upper()
+                    == "BOUGHT"
+                    and int(getattr(item, "shares_held", 0) or 0) > 0
+                    else "BUY_SUBMITTED"
+                )
             elif order.intent in {
                 OrderIntent.PARTIAL_EXIT,
                 OrderIntent.PARTIAL_TAKE_PROFIT,

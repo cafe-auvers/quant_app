@@ -273,6 +273,31 @@ def test_apply_queue_item_does_not_overwrite_bought_position_fields():
     assert not hasattr(existing, "_planned_shares")
 
 
+def test_apply_queue_item_repairs_filled_monitoring_status_for_held_position():
+    controller = BuylistExecutionController(SimpleNamespace())
+    manager = FakeBuylistManager()
+    existing = _existing_buylist_item(
+        monitoring_status="FILLED",
+        status="FILLED",
+        shares_held=791,
+        avg_cost=2.88,
+    )
+    manager.items[(existing.symbol, existing.environment)] = existing
+
+    controller.apply_execution_queue_item_to_buylist(
+        _queue_item(status="FILLED"),
+        _target(),
+        "PROD",
+        0.001,
+        buylist_manager=manager,
+    )
+
+    assert existing.monitoring_status == "BOUGHT"
+    assert existing.status == "FILLED"
+    assert existing.shares_held == 791
+    assert existing.avg_cost == 2.88
+
+
 def test_submit_selected_queue_order_uses_queue_candidate_not_buylist_mirrors(
     monkeypatch,
 ):

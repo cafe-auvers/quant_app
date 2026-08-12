@@ -156,8 +156,18 @@ class BuylistExecutionController(WindowController):
         }
         manager = buylist_manager if buylist_manager is not None else self.buylist_manager
         existing = manager.get(symbol, env)
-        if existing is not None and str(getattr(existing, "monitoring_status", "")).upper() in protected_statuses:
-            return
+        if existing is not None:
+            existing_status = str(
+                getattr(existing, "monitoring_status", "") or ""
+            ).upper()
+            if (
+                existing_status == "FILLED"
+                and int(getattr(existing, "shares_held", 0) or 0) > 0
+            ):
+                existing.monitoring_status = "BOUGHT"
+                existing_status = "BOUGHT"
+            if existing_status in protected_statuses:
+                return
 
         status_text = self._status_text(queue_item.status)
         candidate = queue_item.selected_candidate
