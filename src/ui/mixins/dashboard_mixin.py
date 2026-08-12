@@ -1215,16 +1215,26 @@ class DashboardMixin:
         # a single global deposit figure, not a per-exchange split.
         ovrs_stock_usd = 0.0
         ovrs_cash_usd = 0.0
-        frcr_evlu_tota_krw = 0.0  # from CTRP6548R; used when holdings not yet settled
+        summary_stock_usd = 0.0
+        # CTRP6548R reports the broker's KRW-valued foreign-assets subtotal
+        # and whole-account total.  Unlike TTTS3012R output2, these include
+        # both overseas holdings and foreign-currency cash.
+        frcr_evlu_tota_krw = 0.0
+        broker_total_assets_krw = 0.0
         if fx_rate > 0:
             overseas = snapshot.get("overseas")
             if isinstance(overseas, dict):
                 frcr_evlu_tota_krw = _number(overseas.get("frcr_evlu_tota_krw"))
+                broker_total_assets_krw = _number(overseas.get("tot_asst_krw"))
 
                 for holding in overseas.get("holdings", []):
                     if not isinstance(holding, dict):
                         continue
                     holding_value = _number(holding.get("evaluation_amount"))
+                    if holding_value <= 0:
+                        quantity = _number(holding.get("quantity"))
+                        current_price = _number(holding.get("current_price"))
+                        holding_value = quantity * current_price
                     if holding_value > 0:
                         ovrs_stock_usd += holding_value
 
@@ -1234,8 +1244,23 @@ class DashboardMixin:
                     value = _number(exch_summary.get("cash_balance_usd"))
                     if value > ovrs_cash_usd:
                         ovrs_cash_usd = value
+                    # Summary totals may be repeated by several exchange
+                    # queries, so MAX is safe while SUM can triple-count.
+                    stock_value = _number(
+                        exch_summary.get("foreign_stock_evaluation")
+                    )
+                    if stock_value > summary_stock_usd:
+                        summary_stock_usd = stock_value
 
-                if ovrs_cash_usd == 0.0 and ovrs_stock_usd == 0.0 and frcr_evlu_tota_krw == 0.0:
+                if ovrs_stock_usd <= 0:
+                    ovrs_stock_usd = summary_stock_usd
+
+                if (
+                    ovrs_cash_usd == 0.0
+                    and ovrs_stock_usd == 0.0
+                    and frcr_evlu_tota_krw == 0.0
+                    and broker_total_assets_krw == 0.0
+                ):
                     # Log raw summary fields to identify which field carries USD cash
                     raw_summaries = {
                         exch: s.get("raw_summary", {})
@@ -1252,13 +1277,32 @@ class DashboardMixin:
         domestic_total_krw = (
             gross_domestic_krw if gross_domestic_krw > 0 else cash_krw + kr_stock_krw
         )
-        # Use per-exchange USD values if available; fall back to frcr_evlu_tota_krw
-        # (CTRP6548R, already in KRW) when holdings are unsettled.
-        if ovrs_stock_usd > 0 or ovrs_cash_usd > 0:
-            ovrs_krw = (ovrs_stock_usd + ovrs_cash_usd) * fx_rate
+
+        component_overseas_krw = (ovrs_stock_usd + ovrs_cash_usd) * fx_rate
+        # Prefer the broker's foreign-assets subtotal.  It captures US stocks
+        # plus USD cash even though TTTS3012R commonly omits a cash field.  A
+        # whole-account total is the final authority when present; otherwise
+        # retain the component calculation for older/cached snapshots.
+        overseas_total_krw = (
+            frcr_evlu_tota_krw
+            if frcr_evlu_tota_krw > 0
+            else component_overseas_krw
+        )
+        if broker_total_assets_krw >= domestic_total_krw and broker_total_assets_krw > 0:
+            total_krw = broker_total_assets_krw
+            overseas_total_krw = max(0.0, total_krw - domestic_total_krw)
         else:
-            ovrs_krw = frcr_evlu_tota_krw
-        total_krw = domestic_total_krw + ovrs_krw
+            total_krw = domestic_total_krw + overseas_total_krw
+
+        # When TTTS3012R has no explicit cash field, derive the foreign cash
+        # residual from CTRP6548R so the displayed breakdown reconciles to the
+        # same entire-capital figure used by position sizing.
+        if overseas_total_krw > 0:
+            overseas_total_usd = overseas_total_krw / fx_rate
+            derived_cash_usd = max(0.0, overseas_total_usd - ovrs_stock_usd)
+            if ovrs_cash_usd <= 0 and derived_cash_usd > 0:
+                ovrs_cash_usd = derived_cash_usd
+
         if not math.isfinite(total_krw) or total_krw <= 0:
             return None
 
@@ -1270,9 +1314,13 @@ class DashboardMixin:
                 "cash_krw": cash_krw,
                 "kr_stock_krw": kr_stock_krw,
                 "ovrs_stock_usd": ovrs_stock_usd,
-                # When holdings not settled, expose frcr_evlu as ovrs_cash_usd
+                # When no holding rows are available, the foreign subtotal is
+                # necessarily unresolved between stock and cash.  Preserve the
+                # legacy cash-like display rather than dropping it entirely.
                 "ovrs_cash_usd": ovrs_cash_usd if ovrs_cash_usd > 0 else frcr_usd,
                 "frcr_evlu_tota_krw": frcr_evlu_tota_krw,
+                "broker_total_assets_krw": broker_total_assets_krw,
+                "overseas_total_krw": overseas_total_krw,
             }
         return total_krw
 

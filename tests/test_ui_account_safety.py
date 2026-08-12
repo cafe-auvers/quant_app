@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from src.core.position_sizer import PositionSizer
 from src.ui.main_window import MainWindow
 from src.ui.mixins.dashboard_mixin import DashboardMixin
 
@@ -202,6 +203,93 @@ def test_kis_account_value_rejects_nonfinite_broker_totals():
     }
 
     assert MainWindow._extract_kis_account_value_krw(snapshot, fx_rate=1450.0) is None
+
+
+def test_kis_account_value_includes_us_stocks_in_entire_capital_sizing():
+    fx_rate = 1450.0
+    snapshot = {
+        "domestic": {
+            "summary": {
+                # $2,000 cash converted to KRW.
+                "cash_total_krw": 2_900_000,
+                "total_evaluation_krw": 2_900_000,
+            }
+        },
+        "overseas": {
+            "holdings": [
+                {
+                    "symbol": "AAPL",
+                    "quantity": 80,
+                    "current_price": 100,
+                    # Some KIS responses omit the explicit evaluation field;
+                    # quantity * current price must still value the holding.
+                    "evaluation_amount": 0,
+                }
+            ],
+        },
+    }
+
+    breakdown = MainWindow._extract_kis_account_value_krw(
+        snapshot, fx_rate=fx_rate, return_breakdown=True
+    )
+
+    assert breakdown["total_krw"] == pytest.approx(14_500_000)
+    assert breakdown["ovrs_stock_usd"] == pytest.approx(8_000)
+    account_value_usd = breakdown["total_krw"] / fx_rate
+    assert account_value_usd == pytest.approx(10_000)
+    summary = MainWindow._format_kis_snapshot_summary(snapshot, fx_rate=fx_rate)
+    assert "US stocks: $8,000.00" in summary
+    assert "Total (est.): 14,500,000 KRW = $10,000.00 USD" in summary
+
+    sizing = PositionSizer(account_value_usd).size_fixed_percent(
+        entry_price=100, percent=0.20
+    )
+    assert sizing.dollar_amount == pytest.approx(2_000)
+
+
+def test_kis_foreign_total_adds_usd_cash_to_us_stock_value():
+    snapshot = {
+        "overseas": {
+            # $8,000 stock plus $2,000 USD cash, converted by KIS to KRW.
+            "frcr_evlu_tota_krw": 14_500_000,
+            "tot_asst_krw": 14_500_000,
+            "holdings": [
+                {
+                    "symbol": "AAPL",
+                    "evaluation_amount": 8_000,
+                }
+            ],
+        }
+    }
+
+    breakdown = MainWindow._extract_kis_account_value_krw(
+        snapshot, fx_rate=1450.0, return_breakdown=True
+    )
+
+    assert breakdown["total_krw"] == pytest.approx(14_500_000)
+    assert breakdown["ovrs_stock_usd"] == pytest.approx(8_000)
+    assert breakdown["ovrs_cash_usd"] == pytest.approx(2_000)
+
+
+def test_kis_account_value_uses_overseas_summary_when_holding_value_is_missing():
+    snapshot = {
+        "domestic": {"summary": {"cash_total_krw": 2_900_000}},
+        "overseas": {
+            "holdings": [{"symbol": "AAPL", "quantity": 80}],
+            "summary_by_exchange": {
+                "NASD": {"foreign_stock_evaluation": 8_000},
+                # Repeated global totals must not be double-counted.
+                "NYSE": {"foreign_stock_evaluation": 8_000},
+            },
+        },
+    }
+
+    breakdown = MainWindow._extract_kis_account_value_krw(
+        snapshot, fx_rate=1450.0, return_breakdown=True
+    )
+
+    assert breakdown["ovrs_stock_usd"] == pytest.approx(8_000)
+    assert breakdown["total_krw"] == pytest.approx(14_500_000)
 
 
 @pytest.mark.parametrize("fx_rate", [0.0, float("inf")])
