@@ -15,12 +15,16 @@ main.py
   -> QApplication
   -> src.ui.main_window.MainWindow
       -> load local JSON state
-      -> initialize optional MySQL engine
+      -> load local device role (data/device_role.json) and connect MySQL,
+         falling back to the offline SQLite mirror (data/local_mirror.db)
+         when MySQL is unreachable
       -> initialize UI workflow controllers
       -> build tabs, sidebar, status log, and menus
       -> preload KIS profiles and account data
       -> run scanner/watchlist/chart workers through QThread
       -> reconcile any open broker orders from the local order ledger
+      -> start cross-machine state sync and background PC-to-laptop
+         mirror top-up when MySQL is reachable
 ```
 
 Long-running work runs in `QThread` workers so the PyQt UI remains responsive.
@@ -41,7 +45,7 @@ flowchart TB
         direction LR
         Window --> State[Load local JSON state\nwatchlist, buylist, queue, orders, drawings, settings]
         Window --> UI[Build tabs, menus, sidebar, and status log]
-        Window --> DBInit[Start optional MySQL initialization in a worker]
+        Window --> DBInit[Connect canonical MySQL, or fall back to\nthe offline SQLite mirror when unreachable]
         Window --> AccountPreload[Preload KIS account profiles and snapshots]
         Window --> StartupReconcile[Restore unresolved local order state\nand schedule reconciliation]
     end
@@ -54,9 +58,10 @@ flowchart TB
         KISIntraday --> IntradayCache[Source-aware intraday cache]
         KISIntraday -. unavailable or no usable bars .-> YF[yfinance fallback]
         YF --> IntradayCache
-        Daily --> MySQL[(Optional MySQL cache)]
+        Daily --> MySQL[(MySQL cache:\ncanonical on the always-on PC,\noptional/local-only otherwise)]
         Metrics --> MySQL
         IntradayCache --> MySQL
+        MySQL -. background top-up when reachable .-> Mirror[(SQLite offline mirror\ndata/local_mirror.db)]
     end
 
     subgraph Review[Research, planning, and monitoring]
@@ -123,8 +128,8 @@ flowchart TB
 
 Reading guide:
 
-- Solid arrows are the normal flow; the dashed arrow is the explicit KIS-to-yfinance intraday fallback.
-- MySQL improves freshness and speed but is optional: Yahoo/KIS sources and local state keep the desktop application usable without it.
+- Solid arrows are the normal flow; dashed arrows are explicit fallbacks (KIS-to-yfinance intraday, and MySQL-to-local-mirror data).
+- MySQL improves freshness and speed and is optional for a single-machine setup: Yahoo/KIS sources and local state keep the desktop application usable without it. In the two-machine setup (see [Two-Machine Data Pipeline](#two-machine-data-pipeline-pc-sync) below) it is the one canonical database, and the local SQLite mirror is a disposable safety copy, not a peer.
 - The persistence area is shared by user edits, the execution queue, chart drawings, and every meaningful order-status transition.
 
 ## System Architecture
@@ -141,10 +146,10 @@ flowchart LR
         direction TB
         UI[MainWindow and tab mixins\nwidgets, tables, dialogs, charts]
         Controllers[UI controllers\naccount, scanner, watchlist, chart, execution]
-        Workers[QThread workers\nnetwork, refresh, scanner, review, reconciliation]
+        Workers[QThread workers\nnetwork, refresh, scanner, review,\norder submission/query/cancel, reconciliation,\nPC status polling]
         Core[Core domain\nscanner, watchlist, ORB, sizing, scoring,\nexecution queue, order state]
-        Services[Services\napp state, intraday orchestration,\norder ledger, guarded execution, reconciliation]
-        Utils[Utilities\nconfig, storage, calendar, loaders, DB helpers]
+        Services[Services\napp state, intraday orchestration,\norder ledger, guarded execution, reconciliation,\ncross-machine state sync, PC remote control,\nruntime heartbeats, historical refresh control,\ncloud/env backup]
+        Utils[Utilities\nconfig, storage, market calendar, logging,\nloaders, DB and local-mirror helpers]
 
         UI <--> Controllers
         Controllers --> Workers
@@ -156,12 +161,20 @@ flowchart LR
         Services --> Utils
     end
 
-    subgraph Local[Local machine]
+    subgraph Local[This machine]
         direction TB
         Json[(data/*.json\nstate, queue, order ledger, drawings)]
         Rulebooks[rulebooks/*.md]
         Env[.env\nlocal secrets and settings]
-        MySQL[(Optional MySQL\nprices, indicators, scanner metrics)]
+        Mirror[(data/local_mirror.db\noffline SQLite mirror)]
+        DeviceRole[data/device_role.json\ndevice id and main/pull-only role]
+        Historical[historical.py\nstandalone 1D/1H refresh process]
+    end
+
+    subgraph PC[Always-on PC, reached over LAN/Tailscale\noptional second machine]
+        direction TB
+        MySQL[(MySQL: quant_app\ncanonical prices, indicators,\nscanner metrics, app-state sync,\nruntime heartbeats)]
+        Listener[pc_remote_control_listener.py\nremote status/shutdown]
     end
 
     subgraph External[External providers]
@@ -169,35 +182,48 @@ flowchart LR
         KIS[KIS APIs\naccounts, orders, market data]
         Yahoo[Yahoo Finance\nmarket and intraday data]
         OpenAI[OpenAI API\noptional trade review]
+        Drive[Google Drive for Desktop\noffsite JSON/.env backup]
     end
 
     UI <--> Json
     Services <--> Json
     Core --> Rulebooks
     Utils --> Env
+    Utils <--> Mirror
+    Services --> DeviceRole
+    Services -. launches/monitors .-> Historical
+    Historical <--> MySQL
+    Historical -. falls back when PC unreachable .-> Mirror
     Utils <--> MySQL
+    Services <--> Listener
     Workers <--> KIS
     Workers <--> Yahoo
     Core -. optional review .-> OpenAI
+    Services -. best-effort backup .-> Drive
 
     classDef boundary fill:#eaf2ff,stroke:#2b6cb0,color:#102a43;
     classDef store fill:#f0fff4,stroke:#2f855a,color:#1c4532;
     class UI,Controllers,Workers,Core,Services,Utils boundary;
-    class Json,Rulebooks,Env,MySQL,KIS,Yahoo,OpenAI store;
+    class Json,Rulebooks,Env,Mirror,DeviceRole,Historical,MySQL,Listener,KIS,Yahoo,OpenAI,Drive store;
 ```
+
+Peer-machine roles, the SQLite fallback/backup mechanics, and the always-on-PC automation scripts are described in full in [docs/pc_sync_data_pipeline.md](docs/pc_sync_data_pipeline.md); this diagram only shows how they attach to the desktop app's own layers. A single machine works the same way with the `PC` subgraph absent and MySQL either unset (Yahoo/KIS-only) or pointed at a local instance.
 
 ## Directory Layout
 
 ```text
 quant_app/
   main.py                         Application entry point
+  historical.py                   Standalone 1D/1H historical-data refresh process (not Qt)
   src/
     ui/                           PyQt windows, UI controllers, workers, chart bridge, UI constants
     core/                         Trading domain models and pure business logic
-    services/                     App-state persistence and order lifecycle services
-    utils/                        Storage, configuration, market-data, and MySQL helpers
+    services/                     App-state persistence, order lifecycle, PC sync, and backup services
+    utils/                        Storage, configuration, market-data, market-calendar, logging, and DB/local-mirror helpers
     api/                          KIS API adapters and order/account helpers
-  data/                           Local JSON state and ticker universe files
+  scripts/                        PC automation, setup, and one-off maintenance scripts (see docs/pc_sync_data_pipeline.md)
+  data/                           Local JSON state, ticker universe files, SQLite mirror, and refresh status/logs
+  docs/                           Architecture-adjacent design docs (PC sync, cloud backup, historical refactor plan)
   rulebooks/                      Markdown trading rules used by review workflows
   tests/                          Pytest regression suite
   config/                         Non-secret configuration template
@@ -241,13 +267,14 @@ Supporting UI modules:
 | `src/ui/mixins/buylist_mixin.py` | Buy dashboard widgets, monitoring controls, execution queue request parsing/result application, order submission UI, order reconciliation callbacks |
 | `src/ui/mixins/charts_render_mixin.py` | Chart HTML/SVG generation, TradingView symbol formatting, indicator panel rendering, chart data normalization helpers |
 | `src/ui/mixins/charts_controller_mixin.py` | Chart tabs, symbol controls, drawing callbacks, chart bridge actions, chart refresh UI |
-| `src/ui/workers.py` | `QThread` workers for refreshes, KIS snapshots, KIS order submission, order reconciliation, intraday fetches, scanner runs, and review jobs |
+| `src/ui/workers.py` | `QThread` workers for KIS snapshots, intraday fetches, scanner runs, review jobs, and PC status polling |
+| `src/ui/order_workers.py` | `QThread` workers for KIS order submission, query, cancel, and reconciliation |
 | `src/ui/chart_bridge.py` | `QWebChannel` bridge used by chart JavaScript to persist drawings and breakout-price markers |
 | `src/ui/filter_catalog.py` | Default scanner setups, scanner metric labels, tab defaults, and settings defaults |
 
 ### UI Workflow Controllers
 
-Controllers are ordinary Python objects that receive the `MainWindow` only as a dependency boundary. They keep workflow code out of tab rendering methods while preserving the existing UI side effects in the mixins.
+Controllers are ordinary Python objects that receive the `MainWindow` only as a dependency boundary. They keep workflow code out of tab rendering methods while preserving the existing UI side effects in the mixins. `src/ui/controllers/base.py` provides `WindowController`, a thin base that forwards otherwise-unhandled attribute access back to the owning `MainWindow`, plus a `get_controller()` helper that lazily constructs and caches a controller instance on the window.
 
 | Controller | Responsibility |
 |---|---|
@@ -273,22 +300,23 @@ Current tab construction in `_setup_tabs()`:
 
 ## Worker Layer
 
-Workers live in `src/ui/workers.py`.
+Most workers live in `src/ui/workers.py`; KIS order submission/query/cancel and reconciliation workers live in `src/ui/order_workers.py`. Daily/hourly history refresh is no longer an in-process worker -- see [Historical Data Refresh](#historical-data-refresh).
 
-| Worker | Purpose |
-|---|---|
-| `RefreshWorker` | Refresh daily price history and indicators into MySQL |
-| `HourlyRefreshWorker` | Refresh hourly price history into MySQL |
-| `KisAccountWorker` | Fetch one KIS account snapshot |
-| `KisStartupAccountsWorker` | Preload configured KIS production account profiles |
-| `FxRateWorker` | Resolve USD/KRW from KIS snapshot data or fallback sources |
-| `KisOrderWorker` | Submit KIS overseas orders and emit broker acceptance/rejection state |
-| `OrderReconciliationWorker` | Fetch account snapshots and reconcile open broker orders against holdings deltas |
-| `IntradayFetchWorker` | Fetch one symbol's intraday bars |
-| `IntradayBulkFetchWorker` | Fetch intraday bars for multiple symbols |
-| `ScannerWorker` | Run scanner rules over loaded metrics |
-| `WatchlistAiWorker` | Review watchlist items in batch |
-| `SingleStockAiWorker` | Review one stock/setup |
+| Worker | Module | Purpose |
+|---|---|---|
+| `KisAccountWorker` | `workers.py` | Fetch one KIS account snapshot |
+| `KisStartupAccountsWorker` | `workers.py` | Preload configured KIS production account profiles |
+| `FxRateWorker` | `workers.py` | Resolve USD/KRW from KIS snapshot data or fallback sources |
+| `IntradayFetchWorker` | `workers.py` | Fetch one symbol's intraday bars |
+| `IntradayBulkFetchWorker` | `workers.py` | Fetch intraday bars for multiple symbols |
+| `ScannerWorker` | `workers.py` | Run scanner rules over loaded metrics |
+| `WatchlistAiWorker` | `workers.py` | Review watchlist items in batch |
+| `SingleStockAiWorker` | `workers.py` | Review one stock/setup |
+| `PcRemoteStatusWorker` | `workers.py` | Check database, remote-control listener, and remote `main.py` health independently |
+| `KisOrderWorker` | `order_workers.py` | Submit KIS overseas orders and emit broker acceptance/rejection state |
+| `OrderReconciliationWorker` | `order_workers.py` | Fetch account snapshots and reconcile open broker orders against holdings deltas |
+| `KisOrderQueryWorker` | `order_workers.py` | Query and reconcile unresolved orders via snapshot-based lookup |
+| `KisOrderCancelWorker` | `order_workers.py` | Cancel a locally tracked order and reconcile the result |
 
 ## Service Layer
 
@@ -302,6 +330,12 @@ Workers live in `src/ui/workers.py`.
 | `src/services/order_ledger.py` | Persistent local order ledger stored at `data/orders.json` |
 | `src/services/order_execution_service.py` | Guarded KIS order submission with durable idempotency before and after API calls |
 | `src/services/order_reconciliation.py` | Conservative account-snapshot reconciliation for accepted/working broker orders |
+| `src/services/historical_refresh_control.py` | Launches, polls, and terminates the standalone `historical.py` subprocess; owns its status-file schema and PID liveness checks |
+| `src/services/state_sync.py` | Conflict-safe cross-machine sync of user-managed state (watchlist/buylist/trade plans) through a revision-tracked MySQL table; only the `main` device pushes, others pull-only |
+| `src/services/runtime_status.py` | Database-backed runtime heartbeats so any device can see whether `main.py` is currently running elsewhere |
+| `src/services/pc_remote_control.py` | Tailscale-reached client for the always-on PC's remote-control listener: status ping and shared-secret-authenticated shutdown request |
+| `src/services/cloud_backup.py` | Best-effort offsite backup of gitignored `data/*.json` state files to a local Google Drive for Desktop folder (current + rolling daily snapshots) |
+| `src/services/env_backup.py` | Passphrase-encrypted (PBKDF2 + Fernet) offsite backup/restore of `.env` secrets, kept separate from the automatic JSON backup cycle |
 
 The service layer contains persistence and lifecycle logic that is not specific to one widget.
 
@@ -339,6 +373,10 @@ Local JSON state is read/written through `src/utils/storage.py` and service help
 | `data/state_metadata.json` | Optional sidecar with last successful/failed app-state save time, last error, and files written |
 | `data/us_kis_tickers.csv` | Cached KIS-registered US stock universe used by scanner refreshes |
 | `data/sp500_tickers.csv` | Cached S&P 500 fallback universe |
+| `data/device_role.json` | This device's id, hostname, and `is_main` cross-machine state-sync role (see [Two-Machine Data Pipeline](#two-machine-data-pipeline-pc-sync)) |
+| `data/local_mirror.db` (+ `-shm`/`-wal`) | Offline SQLite mirror of MySQL market data, runtime-only, never committed |
+| `data/refresh_status_1d.json`, `data/refresh_status_1h.json` | Live status of the standalone `historical.py` refresh subprocess (see [Historical Data Refresh](#historical-data-refresh)) |
+| `data/refresh_lock_1d.lock`, `data/refresh_lock_1h.lock` | Lock files preventing overlapping `historical.py` runs per mode |
 
 `data/settings.json` may be created when settings or shortcuts are saved.
 
@@ -357,15 +395,58 @@ The production-only migration archives legacy non-production buylist and executi
 - Multi-symbol history normalization.
 - Technical metric calculation used by scanning and charts.
 
-`src/utils/db_loader.py` provides optional MySQL-backed caching:
+`src/utils/db_loader.py` provides MySQL-backed caching, plus the parallel offline SQLite mirror engine used when MySQL is unreachable:
 
 - `price_history` for daily and interval-aware historical data.
 - `hourly_price_history` for hourly chart data.
 - `intraday_price_history` for 1m/5m intraday bars, keyed by `source`.
 - `chart_indicators` for RS/TI65-style chart overlays.
 - `scanner_metrics` for scanner-ready metrics.
+- `init_local_mirror_engine()` / `sync_local_mirror_from_pc_checkpointed()` and related helpers manage `data/local_mirror.db`, its checkpointed top-up from PC MySQL, and staleness checks (`local_mirror_is_stale`, `local_mirror_hourly_is_stale`).
 
-The app can run without MySQL. When MySQL is configured, refresh and scanner workflows use cached tables for speed and freshness checks.
+The app can run without MySQL. When MySQL is configured (whether local or the always-on PC's canonical instance), refresh and scanner workflows use cached tables for speed and freshness checks; see [Two-Machine Data Pipeline](#two-machine-data-pipeline-pc-sync) for the multi-device case.
+
+Supporting utility modules:
+
+- `src/utils/market_calendar.py` -- NYSE holiday/session calendar helpers shared by refresh automation and the UI's market-status widget.
+- `src/utils/logging_config.py` -- configures console + rotating-file logging (`data/logs/quant_app.log`) once at each entry point (`main.py`, `historical.py`, scripts).
+- `src/utils/intraday_helpers.py` -- small intraday DataFrame helpers shared by UI code and workers.
+
+## Historical Data Refresh
+
+1D and 1H history refresh runs as a standalone OS subprocess, not an in-process `QThread` (the earlier `RefreshWorker`/`HourlyRefreshWorker` workers were removed), so closing/reopening the dashboard has no effect on an in-flight refresh:
+
+```text
+main.py "Update 1D/1H Data" action or scripts/run_daily_refresh.py
+  -> src.services.historical_refresh_control.launch_refresh()
+  -> detached `python historical.py --mode 1d|1h [...]` subprocess
+  -> historical.py writes progress to data/refresh_status_{mode}.json
+     (idle -> starting -> running -> completed | error | terminated)
+  -> historical_refresh_control polls the status file and PID liveness
+  -> UI can request termination independent of subprocess ownership
+```
+
+`historical.py` and `scripts/run_daily_refresh.py` write to canonical MySQL when reachable and to the local SQLite mirror otherwise; laptop-only bars written while the PC is unreachable are never uploaded back to MySQL once it returns. `scripts/run_daily_refresh.py` is the freshness-gated entry point (checks every symbol/table against the expected latest NYSE session before refreshing) used by the PC's morning routine; calling `historical.py` directly re-fetches unconditionally. See `docs/historical_refactor_plan.md` for the original design rationale.
+
+## Two-Machine Data Pipeline (PC Sync)
+
+An optional second machine -- an always-on PC reachable over LAN or Tailscale -- can host the single canonical MySQL database while a laptop does development and live trading. This is fully documented in [docs/pc_sync_data_pipeline.md](docs/pc_sync_data_pipeline.md); summary:
+
+- **Roles**: the always-on PC only hosts MySQL and runs `historical.py` on a schedule (BIOS wake -> auto-login -> `scripts/pc_morning_routine.ps1` -> freshness-gated refresh -> auto-shutdown). The laptop is where development and trading happen; `data/local_mirror.db` is its offline safety copy, not a peer database.
+- **Device identity**: `data/device_role.json` (device id, hostname, `is_main`) determines which device is allowed to push cross-machine app state; other devices are pull-only. `src/services/state_sync.py` syncs watchlist/buylist/trade-plan state through a revision-tracked MySQL table so a stale device can't clobber a newer remote copy.
+- **Runtime visibility**: `src/services/runtime_status.py` writes a heartbeat to MySQL from every running `main.py`; combined with `src/services/pc_remote_control.py` (status ping / shared-secret shutdown over Tailscale to `scripts/pc_remote_control_listener.py`), the dashboard shows independent `PC` / `DB` / `Listener` signals.
+- **Fallback behavior**: connection to MySQL is checked once at startup/reconnect; a success routes reads/writes to MySQL immediately, a failure routes to the local SQLite mirror with cross-machine sync and heartbeats disabled. The mirror top-up afterward is incremental and checkpointed (row-count/revision signatures first, full comparison only on mismatch).
+- **Automation scripts** live in `scripts/` (`pc_morning_routine.ps1`, `run_daily_refresh.py`, `sync_local_mirror_from_pc.py`, `setup_pc_autologin.ps1`, `setup_pc_morning_task.ps1`, `setup_mysql_lan_access.ps1`, `setup_mysql_tailscale_access.ps1`, `pc_remote_control_listener.py`, `Configure-AutomaticShutdown.ps1`, WinRM setup/log-tailing scripts, and the one-time `backfill_hourly_history_200d_once.py` repair).
+
+A single-machine setup is unaffected: `data/device_role.json` still exists but `is_main` is irrelevant with no peer, and MySQL is simply the optional local cache described in [Market Data Layer](#market-data-layer).
+
+## Cloud Backup
+
+Best-effort offsite backup of local state, separate from the MySQL sync above and from git. Documented in full in [docs/cloud_backup.md](docs/cloud_backup.md); summary:
+
+- `src/services/cloud_backup.py` copies the gitignored `data/*.json` state files (11 files, listed in `STATE_BACKUP_FILENAMES`) into a local folder synced by Google Drive for Desktop (or any similar sync client), keeping a `current/` copy plus rolling `daily/<date>/` snapshots. It never calls a cloud API directly.
+- `src/services/env_backup.py` separately backs up `.env` secrets, encrypted with a user-chosen passphrase (PBKDF2-HMAC-SHA256 + Fernet) that is never stored anywhere; this is a manual, explicit action, not part of the automatic cycle.
+- `QUANT_BACKUP_DIR` (see [Configuration](#configuration)) points at the synced folder; auto-detected if unset and a Google Drive for Desktop folder is present.
 
 ## Intraday Source Architecture
 
@@ -530,11 +611,14 @@ Runtime configuration is environment-driven:
 
 | Key family | Used by | Purpose |
 |---|---|---|
-| `MYSQL_*` | `src/utils/config.py`, `src/utils/db_loader.py` | Optional MySQL cache connection |
-| `KIS_PROD_*` | KIS account/order modules | KIS production account snapshots and order workflows |
+| `MYSQL_*` | `src/utils/config.py`, `src/utils/db_loader.py` | MySQL connection; optional for a single machine, canonical for the two-machine setup |
+| `KIS_PROD_*` / `KIS_SIM_*` | KIS account/order modules | KIS production/simulation account snapshots and order workflows |
+| `KIS_INTRADAY_ENABLED`, `KIS_OVERSEAS_INTRADAY_*` | `src/api/kis_intraday.py` | Configuration-gated KIS intraday endpoint/field mapping |
+| `PC_REMOTE_CONTROL_HOST`, `PC_WAKE_URL`, `REMOTE_CONTROL_TOKEN` | `src/services/pc_remote_control.py` | Always-on PC remote status/shutdown over Tailscale (see [Two-Machine Data Pipeline](#two-machine-data-pipeline-pc-sync)) |
+| `QUANT_BACKUP_DIR` | `src/services/cloud_backup.py`, `src/services/env_backup.py` | Optional offsite backup target folder (see [Cloud Backup](#cloud-backup)) |
 | `OPENAI_API_KEY` | `src/core/scoring.py` | Optional AI review |
 
-The `.env` file is local-only and ignored by git. `config/template_config.py` remains a non-secret example configuration file.
+The `.env` file is local-only and ignored by git. See `.env.example` for the full list of variables with placeholder values. `config/template_config.py` remains a non-secret example configuration file for the legacy `kis_config.py` loader.
 
 ## Tests
 
@@ -548,6 +632,7 @@ pytest -q
 Coverage includes scanner rules, scoring, position sizing, ORB logic, execution queue strategy, watchlist and buylist persistence, local JSON backup/recovery and shutdown flushing, MySQL helper behavior, KIS account config/profile parsing, selected `MainWindow` formatting/helpers, refactor boundaries, buylist execution queue refresh request/result behavior, and KIS order lifecycle safety.
 Buylist execution controller coverage includes selected-symbol queueing, missing symbols, unavailable queue manager failures, duplicate pending/open-order propagation, callback failures, refreshed counts, and result status counts.
 Intraday provider coverage includes KIS disabled/configuration errors, yfinance fallback behavior, source-priority cache loading, ORB invariance across normalized provider data, 1m-to-5m resampling, and worker signal payload shape.
+Two-machine/backup coverage includes the local SQLite mirror (`test_local_mirror.py`), cross-machine state sync (`test_state_sync.py`), runtime heartbeats (`test_pc_runtime_status.py`), the standalone refresh subprocess (`test_historical_refresh_control.py`, `test_run_daily_refresh.py`), selective/derived refresh caching (`test_historical_selective_refresh.py`, `test_derived_refresh_cache.py`), hourly backfill policy (`test_hourly_backfill_policy.py`), broker order query/cancel (`test_broker_order_query_cancel.py`), and cloud/env backup (`test_cloud_backup.py`, `test_env_backup.py`).
 
 ## Production Safety Notes
 
@@ -556,6 +641,8 @@ Intraday provider coverage includes KIS disabled/configuration errors, yfinance 
 - KIS intraday remains configuration-gated. Do not enable it until endpoint/TR ID/request params/raw field mappings are verified.
 - yfinance fallback remains available for intraday/ORB workflows when KIS intraday is disabled or unavailable.
 - Do not treat KIS order acceptance as a fill. Confirm fills through verified order status endpoints or conservative account snapshot reconciliation.
-- MySQL is optional, but production workflows that depend on scanner/cache freshness should configure `MYSQL_*` and validate refresh jobs.
+- MySQL is optional for a single machine, but production workflows that depend on scanner/cache freshness should configure `MYSQL_*` and validate refresh jobs. In the two-machine setup, MySQL is canonical and only the always-on PC should run with `QUANT_LOCAL_MIRROR_ENABLED=0` so an outage fails visibly there instead of silently falling back.
+- Treat MySQL as authoritative over the local SQLite mirror: the background PC-to-laptop sync is strictly one-directional, and laptop-only data written while the PC was unreachable is never uploaded back.
+- `REMOTE_CONTROL_TOKEN` and the WinRM trust set up for remote log access grant real remote-execution capability on the always-on PC; treat them with the same care as any other admin credential.
 - `data/` files are local state unless intentionally replaced with sanitized sample data.
-- Keep generated `.bak` files and `data/state_metadata.json` out of source control with the rest of local runtime state.
+- Keep generated `.bak` files, `data/state_metadata.json`, `data/local_mirror.db*`, and `data/device_role.json` out of source control with the rest of local runtime state.
