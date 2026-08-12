@@ -153,6 +153,10 @@ class SidebarMixin:
         self.refresh_stock_sidebar()
     def on_tab_changed(self, *args) -> None:
         """Apply sidebar selection to the newly active tab."""
+        if hasattr(self, "flush_stale_chart_views"):
+            self.flush_stale_chart_views()
+        if hasattr(self, "_flush_dirty_watchlist_and_dashboard"):
+            self._flush_dirty_watchlist_and_dashboard()
         if not hasattr(self, "stock_sidebar"):
             return
         self.stock_sidebar.setVisible(True)

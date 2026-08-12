@@ -401,6 +401,17 @@ class MainWindow(
         self.scanner_dataframe = pd.DataFrame()
         self.selected_scan_symbol: Optional[str] = None
         self.chart_view_windows: dict[str, dict] = {}
+        # Deferred-refresh flags: chart edits (breakout price, drawings) used to
+        # eagerly rebuild the watchlist table / dashboard summary / other chart
+        # tabs even while those tabs weren't visible. These flags let that work
+        # be skipped and picked up once the user actually switches to the tab
+        # (see on_tab_changed / flush_stale_chart_views), instead of paying the
+        # cost synchronously in the middle of an unrelated chart interaction.
+        self._watchlist_table_dirty = False
+        self._dashboard_summary_dirty = False
+        self._charts_tab_chart_stale = False
+        self._intraday_tab_chart_stale = False
+        self._tradingview_tab_chart_stale = False
         self.running_scanner_setup_name: Optional[str] = None
         self.running_scanner_show_warnings = True
         self.scanner_worker = None

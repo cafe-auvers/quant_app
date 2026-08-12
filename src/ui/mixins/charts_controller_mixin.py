@@ -1134,6 +1134,16 @@ class ChartsControllerMixin:
         self.refresh_intraday_chart_if_symbol(symbol, allow_fetch=allow_fetch)
 
     def refresh_other_chart_views_for_symbol(self, symbol: str) -> None:
+        """Keep other (currently hidden) chart tabs in sync with an edit made
+        on the active tab (breakout price set, drawing added/changed).
+
+        These tabs aren't visible right now, so rebuilding their chart HTML
+        and calling setHtml() immediately is pure wasted work in the middle
+        of an interaction the user IS looking at. Instead, mark them stale;
+        flush_stale_chart_views() (called from on_tab_changed) does the
+        actual refresh the moment the user switches into that tab -- same
+        end result, no work paid for tabs nobody is looking at.
+        """
         symbol = symbol.strip().upper()
         if not symbol:
             return
@@ -1152,20 +1162,49 @@ class ChartsControllerMixin:
             and chart_symbol
             and chart_symbol.strip().upper() == symbol
         ):
-            self.plot_selected_symbol(show_warnings=False)
+            self._charts_tab_chart_stale = True
         intraday_symbol_combo = self.__dict__.get("intraday_symbol_combo")
         if (
             active_widget is not self.__dict__.get("intraday_charts_widget")
             and intraday_symbol_combo is not None
             and intraday_symbol_combo.currentText().strip().upper() == symbol
         ):
-            self.plot_intraday_watchlist_symbol(allow_fetch=False)
+            self._intraday_tab_chart_stale = True
         tradingview_symbol_combo = self.__dict__.get("tradingview_symbol_combo")
         if (
             active_widget is not self.__dict__.get("tradingview_widget")
             and tradingview_symbol_combo is not None
             and tradingview_symbol_combo.currentText().strip().upper() == symbol
         ):
+            self._tradingview_tab_chart_stale = True
+
+    def flush_stale_chart_views(self) -> None:
+        """Refresh whichever chart tab just became active, if a prior edit on
+        another tab marked it stale. Called from on_tab_changed."""
+        active_widget = (
+            self.__dict__.get("tabs").currentWidget()
+            if self.__dict__.get("tabs") is not None
+            else None
+        )
+        if active_widget is None:
+            return
+        if (
+            self.__dict__.get("_charts_tab_chart_stale")
+            and active_widget is self.__dict__.get("charts_widget")
+        ):
+            self._charts_tab_chart_stale = False
+            self.plot_selected_symbol(show_warnings=False)
+        if (
+            self.__dict__.get("_intraday_tab_chart_stale")
+            and active_widget is self.__dict__.get("intraday_charts_widget")
+        ):
+            self._intraday_tab_chart_stale = False
+            self.plot_intraday_watchlist_symbol(allow_fetch=False)
+        if (
+            self.__dict__.get("_tradingview_tab_chart_stale")
+            and active_widget is self.__dict__.get("tradingview_widget")
+        ):
+            self._tradingview_tab_chart_stale = False
             self.load_tradingview_chart(force=True)
 
     def step_tradingview_watchlist_symbol(self, direction: int) -> None:
@@ -1223,8 +1262,7 @@ class ChartsControllerMixin:
         existing = self.watchlist.get(symbol)
         if existing is not None:
             self.watchlist.remove(symbol)
-            self.populate_watchlist_table()
-            self.update_dashboard_summary()
+            self.mark_watchlist_and_dashboard_dirty()
             self._save_state()
             self.append_log(f"Removed {symbol} from watchlist from TradingView.")
             self._update_tradingview_watchlist_btn()
@@ -1234,8 +1272,7 @@ class ChartsControllerMixin:
         if selected and str(selected.get("symbol", "")).strip().upper() == symbol:
             name = selected.get("name", symbol) or symbol
         self.watchlist.add(symbol=symbol, name=name)
-        self.populate_watchlist_table()
-        self.update_dashboard_summary()
+        self.mark_watchlist_and_dashboard_dirty()
         self._save_state()
         self.prefetch_intraday_cache_for_symbol(symbol)
         self.append_log(f"Added/updated {symbol} in watchlist from TradingView.")
@@ -2670,8 +2707,7 @@ class ChartsControllerMixin:
         if item is None:
             item = self.watchlist.add(symbol=symbol, name=symbol)
         item.breakout_price = round(float(breakout_price), 2)
-        self.populate_watchlist_table()
-        self.update_dashboard_summary()
+        self.mark_watchlist_and_dashboard_dirty()
         self._save_state()
         self._reset_chart_mode_buttons()
         self.refresh_other_chart_views_for_symbol(symbol)
@@ -2716,8 +2752,7 @@ class ChartsControllerMixin:
             )
 
         item.breakout_price = None
-        self.populate_watchlist_table()
-        self.update_dashboard_summary()
+        self.mark_watchlist_and_dashboard_dirty()
         self._save_state()
         self._reset_chart_mode_buttons()
         self.refresh_other_chart_views_for_symbol(symbol)
