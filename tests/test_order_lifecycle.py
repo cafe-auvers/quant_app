@@ -2054,6 +2054,36 @@ def test_buylist_sell_half_selected_requires_bought_position(monkeypatch):
     assert warnings
 
 
+def test_buylist_activate_explicitly_retires_legacy_entry(monkeypatch):
+    warnings = []
+    logs = []
+    item = SimpleNamespace(
+        symbol="AAPL",
+        monitoring_status="WATCHING",
+        breakout_method="manual_pivot_high",
+    )
+    window = MainWindow.__new__(MainWindow)
+    window._buylist_selected_item = lambda _env: item
+    window.append_log = logs.append
+    window._save_state = lambda: pytest.fail("legacy activation must not save")
+    window._toggle_buylist_monitor = lambda _env: pytest.fail(
+        "legacy activation must not start monitoring"
+    )
+
+    monkeypatch.setattr(
+        buylist_actions_module.QMessageBox,
+        "warning",
+        lambda *args, **kwargs: warnings.append(args),
+    )
+
+    MainWindow._buylist_activate_selected(window, "PROD")
+
+    assert item.monitoring_status == "WATCHING"
+    assert warnings
+    assert "Legacy entry retired" in warnings[0]
+    assert "No BUY order was submitted" in logs[0]
+
+
 def test_buylist_move_to_breakeven_requires_bought_position(monkeypatch):
     warnings = []
     item = SimpleNamespace(
@@ -2491,8 +2521,8 @@ def test_submit_kis_buy_order_uses_the_account_selected_in_the_ui(monkeypatch):
         environment="PROD",
         kis_account_no="",
         _buy_order_pending=True,
-        monitoring_status="WATCHING",
-        breakout_method="",
+        monitoring_status="ORDER_PENDING",
+        breakout_method="execution_queue:1m",
         shares_held=0,
         avg_cost=0.0,
         stop_loss=90.0,
@@ -2504,6 +2534,7 @@ def test_submit_kis_buy_order_uses_the_account_selected_in_the_ui(monkeypatch):
     window.latest_intraday_prices = {"AAPL": 101.0}
     window.append_log = lambda _message: None
     window._has_duplicate_open_order = lambda *args: False
+    window._ensure_execution_queue_manager = lambda: SimpleNamespace(items={})
 
     monkeypatch.setattr(buylist_orders_module, "KisOrderWorker", FakeKisOrderWorker)
 
@@ -2523,6 +2554,33 @@ def test_submit_kis_buy_order_uses_the_account_selected_in_the_ui(monkeypatch):
 
     assert len(created_workers) == 1
     assert created_workers[0].account_no == "22222222-01"
+
+
+def test_low_level_buy_submission_retires_non_queue_entry_before_worker(monkeypatch):
+    created_workers = []
+    monkeypatch.setattr(
+        buylist_orders_module,
+        "KisOrderWorker",
+        lambda *_args, **_kwargs: created_workers.append(True),
+    )
+    logs = []
+    item = SimpleNamespace(
+        symbol="AAPL",
+        environment="PROD",
+        monitoring_status="ACTIVE",
+        breakout_method="",
+        _buy_order_pending=True,
+    )
+    window = MainWindow.__new__(MainWindow)
+    window.append_log = logs.append
+
+    MainWindow._submit_kis_buy_order(window, item, quantity=3, order_price=100.0)
+    MainWindow._submit_kis_buy_order(window, item, quantity=3, order_price=100.0)
+
+    assert item._buy_order_pending is False
+    assert created_workers == []
+    assert len(logs) == 1
+    assert "only execution-queue strategies" in logs[0]
 
 
 def test_apply_partial_sell_fill_is_idempotent(monkeypatch):

@@ -283,8 +283,6 @@ class BuylistMonitoringMixin:
         if not active_items and not queue_watching_items and not stop_reprice_items:
             return
 
-        bought_count = sum(1 for it in items if it.monitoring_status == "BOUGHT")
-
         # Trigger an async KIS-first intraday refresh for execution-queue items.
         # When the worker finishes, _on_intraday_bulk_finished calls refresh_execution_queue
         # and then _auto_submit_execute_ready_queue_items, which fires any EXECUTE_READY orders.
@@ -313,96 +311,18 @@ class BuylistMonitoringMixin:
                 continue
 
             if item.monitoring_status == "ACTIVE":
-                if self._is_orb_buylist_item(item):
-                    if not getattr(item, "_orb_queue_required_notice_logged", False):
-                        item._orb_queue_required_notice_logged = True
-                        self.append_log(
-                            f"[Buylist/{env}] {item.symbol} is an ORB entry; skipping legacy ACTIVE auto-buy. "
-                            "Use the execution queue Review Order and Submit Buy flow."
-                        )
-                    continue
-
-                # Compute entry_trigger: max(ORB high, breakout_price * (1+buffer))
-                try:
-                    bp = float(getattr(item, "breakout_price", None) or 0.0)
-                    buf = float(getattr(item, "buffer_pct", 0.001) or 0.0)
-                    item_entry_price = float(getattr(item, "entry_price", 0.0) or 0.0)
-                except (TypeError, ValueError):
-                    bp = buf = item_entry_price = 0.0
-                if not math.isfinite(bp) or bp < 0:
-                    bp = 0.0
-                if not math.isfinite(buf) or buf < 0:
-                    buf = 0.0
-                if not math.isfinite(item_entry_price) or item_entry_price <= 0:
-                    if not getattr(item, "_invalid_entry_notice_logged", False):
-                        item._invalid_entry_notice_logged = True
-                        self.append_log(
-                            f"[Buylist/{env}] {item.symbol} has an invalid entry trigger; "
-                            "monitoring will not submit an order until the plan is corrected."
-                        )
-                    continue
-                breakout_trigger = bp * (1 + buf) if bp > 0 else 0.0
-                entry_trigger = (
-                    max(item_entry_price, breakout_trigger)
-                    if breakout_trigger > 0
-                    else item_entry_price
-                )
-                auto_order_blocked = self._buylist_auto_order_blocked(item)
-
-                # Chase guard: if price has already run â‰¥2% above the trigger the setup is
-                # stale (entered from a previous session or the breakout already happened).
-                # Do not auto-buy; log once per cycle.
-                MAX_CHASE_PCT = 0.02
-                if current_price > entry_trigger * (1 + MAX_CHASE_PCT):
-                    overshoot_pct = (current_price / entry_trigger - 1) * 100
-                    self.append_log(
-                        f"[Buylist/{env}] {item.symbol} price ${current_price:.2f} is "
-                        f"+{overshoot_pct:.1f}% above trigger ${entry_trigger:.2f} — "
-                        f"setup stale, skipping auto-buy."
-                    )
-                elif (
-                    bought_count < 30
-                    and current_price >= entry_trigger
-                    and not auto_order_blocked
-                    and not getattr(item, "_buy_order_pending", False)
+                if not getattr(
+                    item, "_legacy_active_entry_block_notice_logged", False
                 ):
-                    item._buy_order_pending = True
-                    if bp > 0:
-                        self.append_log(
-                            f"[Buylist/{env}] {item.symbol} confirmed breakout — "
-                            f"trigger ${entry_trigger:.2f} (ORB ${item.entry_price:.2f}, "
-                            f"daily breakout ${bp:.2f}, current ${current_price:.2f}) — submitting BUY."
-                        )
-                    else:
-                        self.append_log(
-                            f"[Buylist/{env}] {item.symbol} hit ORB entry ${entry_trigger:.2f} "
-                            f"(current ${current_price:.2f}) — submitting BUY order."
-                        )
-                    # Order at current_price so avg_cost reflects what we'd actually pay;
-                    # entry_trigger is the condition, not necessarily the fill price.
-                    self._submit_kis_buy_order(item, order_price=current_price)
-                    bought_count += 1
-                elif (
-                    current_price >= entry_trigger
-                    and auto_order_blocked
-                    and not getattr(item, "_auto_order_block_notice_logged", False)
-                ):
-                    item._auto_order_block_notice_logged = True
+                    item._legacy_active_entry_block_notice_logged = True
                     self.append_log(
-                        f"[Buylist/{env}] Trigger met for {item.symbol}, but auto KIS order is blocked: "
-                        f"{getattr(item, 'auto_order_block_reason', '')}"
+                        f"[Buylist/{env}] {item.symbol} skipping legacy ACTIVE auto-buy; "
+                        "entry blocked because only EXECUTE_READY execution-queue "
+                        "strategies may submit entry orders."
                     )
-                elif (
-                    bp > 0
-                    and current_price > item.entry_price
-                    and current_price < breakout_trigger
-                ):
-                    self.append_log(
-                        f"[Buylist/{env}] {item.symbol} above ORB ${item.entry_price:.2f} "
-                        f"but below breakout trigger ${breakout_trigger:.2f} (${current_price:.2f}) — waiting."
-                    )
+                continue
 
-            elif item.monitoring_status == "BOUGHT":
+            if item.monitoring_status == "BOUGHT":
                 auto_order_blocked = self._buylist_auto_order_blocked(item)
                 exit_order_pending = getattr(item, "_exit_order_pending", False)
                 if (

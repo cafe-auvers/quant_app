@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import html
 import json
-from typing import List, Optional
+from typing import Any, List, Mapping, Optional
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -19,9 +19,6 @@ try:
 except ImportError:
     QWebChannel = None
 
-from src.services.app_state import SETTINGS_FILE
-from src.utils.storage import load_json
-
 REFERENCE_SYMBOL = "SPY"
 KST_ZONE = ZoneInfo("Asia/Seoul")
 US_MARKET_ZONE = ZoneInfo("America/New_York")
@@ -32,6 +29,7 @@ KIS_DAILY_CHART_FAILURE_COOLDOWN_SECONDS = 30 * 60
 US_MARKET_OPEN_TIME = dt.time(9, 30)
 US_MARKET_CLOSE_TIME = dt.time(16, 0)
 
+from .models import normalize_chart_interaction_settings
 from .render_metrics import ChartRenderMetricsMixin
 from .render_primitives import ChartRenderPrimitivesMixin
 
@@ -46,20 +44,14 @@ class ChartLocalRenderMixin:
         options: Optional[dict] = None,
         target_price: Optional[float] = None,
         drawings: Optional[List[dict]] = None,
+        interaction_settings: Optional[Mapping[str, Any]] = None,
     ) -> str:
         """Generate a local SVG chart from OHLCV data."""
         options = ChartRenderMetricsMixin._normalize_chart_options(options)
-        settings = load_json(SETTINGS_FILE, {})
-        shortcuts = settings.get("shortcuts", {
-            "set_target": "T",
-            "draw_line": "D",
-            "erase_drawing": "E",
-            "full_view": "F",
-            "prev_symbol": "Up",
-            "next_symbol": "Down",
-            "pan_left": "Left",
-            "pan_right": "Right"
-        })
+        shortcuts, pan_step_bars = normalize_chart_interaction_settings(
+            interaction_settings,
+            renderer="local",
+        )
         target_cond_js = ChartRenderPrimitivesMixin._get_js_key_condition(shortcuts.get("set_target", "T"))
         draw_cond_js = ChartRenderPrimitivesMixin._get_js_key_condition(shortcuts.get("draw_line", "D"))
         erase_cond_js = ChartRenderPrimitivesMixin._get_js_key_condition(shortcuts.get("erase_drawing", "E"))
@@ -68,10 +60,6 @@ class ChartLocalRenderMixin:
         next_symbol_cond_js = ChartRenderPrimitivesMixin._get_js_key_condition(shortcuts.get("next_symbol", "Down"))
         pan_left_cond_js = ChartRenderPrimitivesMixin._get_js_key_condition(shortcuts.get("pan_left", "Left"))
         pan_right_cond_js = ChartRenderPrimitivesMixin._get_js_key_condition(shortcuts.get("pan_right", "Right"))
-        try:
-            pan_step_bars = max(1, int(settings.get("chart_pan_step_bars", 1)))
-        except (TypeError, ValueError):
-            pan_step_bars = 1
         chart_history = ChartRenderPrimitivesMixin._normalize_chart_history(
             history,
             symbol,

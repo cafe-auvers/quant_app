@@ -1,6 +1,5 @@
 """Buylist widgets, table rendering, and execution-queue persistence."""
 
-import math
 from typing import Any, List, Optional, Tuple
 
 from PyQt5.QtCore import Qt, QThread, QTimer
@@ -501,41 +500,7 @@ class BuylistViewMixin:
                     )
                 )
         elif item.monitoring_status == "ACTIVE":
-            if self._is_orb_buylist_item(item):
-                alerts.append("QUEUE REQUIRED")
-                return " | ".join(dict.fromkeys(alerts))
-            bought_count = sum(
-                1
-                for it in self.buylist_manager.items
-                if it.monitoring_status == "BOUGHT"
-                and it.environment == item.environment
-            )
-            if bought_count >= 30:
-                alerts.append("MAX POSITIONS")
-            # Show where price stands relative to ORB high and daily breakout trigger
-            try:
-                bp = float(getattr(item, "breakout_price", None) or 0.0)
-                entry_price = float(getattr(item, "entry_price", None) or 0.0)
-                buf = float(getattr(item, "buffer_pct", 0.001) or 0.0)
-            except (TypeError, ValueError):
-                bp = entry_price = 0.0
-                buf = 0.0
-            if not math.isfinite(bp) or bp < 0:
-                bp = 0.0
-            if not math.isfinite(entry_price) or entry_price <= 0:
-                alerts.append("INVALID ENTRY - REVIEW PLAN")
-                return " | ".join(dict.fromkeys(alerts))
-            if not math.isfinite(buf) or buf < 0:
-                buf = 0.0
-            if bp > 0 and current_price > 0:
-                breakout_trigger = bp * (1 + buf)
-                entry_trigger = max(entry_price, breakout_trigger)
-                if current_price >= entry_trigger:
-                    alerts.append(f"TRIGGER MET ${entry_trigger:.2f}")
-                elif current_price > entry_price:
-                    alerts.append(f"ORB OK / below BKT ${breakout_trigger:.2f}")
-                else:
-                    alerts.append(f"below ORB ${entry_price:.2f}")
+            alerts.append("LEGACY ENTRY RETIRED - QUEUE REQUIRED")
         else:
             queue_statuses = self._execution_queue_status_values()
             status_text = str(getattr(item, "monitoring_status", "") or "").upper()
@@ -675,12 +640,8 @@ class BuylistViewMixin:
 
     @staticmethod
     def _is_execution_queue_buylist_item(item) -> bool:
-        from src.core.execution_queue import ExecutionQueueStatus
-
-        queue_statuses = {status.value for status in ExecutionQueueStatus}
-        method = str(getattr(item, "breakout_method", "") or "")
-        status = str(getattr(item, "monitoring_status", "") or "").upper()
-        return method.startswith("execution_queue") or status in queue_statuses
+        method = str(getattr(item, "breakout_method", "") or "").lower()
+        return method.startswith("execution_queue")
 
     @staticmethod
     def _is_pre_entry_execution_queue_buylist_item(item) -> bool:

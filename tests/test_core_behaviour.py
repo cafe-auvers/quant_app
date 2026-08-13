@@ -1828,7 +1828,9 @@ def test_tradingview_add_current_symbol_removes_regardless_of_sidebar_source():
     assert window.watchlist.get("MSFT") is None
 
 
-def test_tradingview_activate_starts_buy_dashboard_monitor():
+def test_tradingview_activate_retires_legacy_entry(monkeypatch):
+    import src.ui.charts.controller_navigation as chart_navigation_module
+
     class Combo:
         def __init__(self, text):
             self.text = text
@@ -1859,9 +1861,11 @@ def test_tradingview_activate_starts_buy_dashboard_monitor():
     window.buylist_manager = Manager(item)
     window._buylist_prod_monitor_active = False
     window._clear_buylist_auto_order_block = lambda _item: None
-    window._save_state = lambda: None
+    saves = []
+    window._save_state = lambda: saves.append(True)
     window.populate_buylist_dashboard = lambda: None
-    window.append_log = lambda _message: None
+    logs = []
+    window.append_log = logs.append
     window._set_intraday_symbol = lambda _symbol: None
     window.prefetch_intraday_cache_for_symbol = lambda _symbol: None
     window._update_tradingview_activate_btn = lambda: None
@@ -1872,13 +1876,22 @@ def test_tradingview_activate_starts_buy_dashboard_monitor():
         window._buylist_prod_monitor_active = True
 
     window._toggle_buylist_monitor = toggle_monitor
+    warnings = []
+    monkeypatch.setattr(
+        chart_navigation_module.QMessageBox,
+        "warning",
+        lambda *args, **kwargs: warnings.append(args),
+    )
 
     window._tradingview_activate_toggle()
 
     assert item.monitoring_status == "WATCHING"
-    assert item.orb_monitor_enabled is True
-    assert window._buylist_prod_monitor_active is True
-    assert toggled == ["PROD"]
+    assert not hasattr(item, "orb_monitor_enabled")
+    assert window._buylist_prod_monitor_active is False
+    assert toggled == []
+    assert saves == []
+    assert warnings
+    assert "No BUY order was submitted" in logs[0]
 
 
 def test_chart_html_includes_bounded_pan_zoom_state():

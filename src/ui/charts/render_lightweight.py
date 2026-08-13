@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import html
 import json
-from typing import List, Optional
+from typing import Any, List, Mapping, Optional
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -19,9 +19,6 @@ try:
 except ImportError:
     QWebChannel = None
 
-from src.services.app_state import SETTINGS_FILE
-from src.utils.storage import load_json
-
 REFERENCE_SYMBOL = "SPY"
 KST_ZONE = ZoneInfo("Asia/Seoul")
 US_MARKET_ZONE = ZoneInfo("America/New_York")
@@ -33,6 +30,7 @@ US_MARKET_OPEN_TIME = dt.time(9, 30)
 US_MARKET_CLOSE_TIME = dt.time(16, 0)
 from .render_assets import _lightweight_charts_script_tag
 from .render_metrics import ChartRenderMetricsMixin
+from .models import normalize_chart_interaction_settings
 from .render_primitives import ChartRenderPrimitivesMixin
 
 
@@ -48,29 +46,20 @@ class ChartLightweightRenderMixin:
         target_price: Optional[float] = None,
         buy_price: Optional[float] = None,
         stop_loss: Optional[float] = None,
+        interaction_settings: Optional[Mapping[str, Any]] = None,
     ) -> str:
         """Generate a stable TradingView Lightweight Charts page from local OHLCV data."""
         options = options or {}
-        settings = load_json(SETTINGS_FILE, {})
-        shortcuts = settings.get("shortcuts", {
-            "set_target": "T",
-            "draw_line": "D",
-            "erase_drawing": "E",
-            "full_view": "F",
-            "pan_left": "Left",
-            "pan_right": "Right"
-        })
+        shortcuts, pan_step_bars = normalize_chart_interaction_settings(
+            interaction_settings,
+            renderer="lightweight",
+        )
         target_cond_js = ChartRenderPrimitivesMixin._get_js_key_condition(shortcuts.get("set_target", "T"))
         draw_cond_js = ChartRenderPrimitivesMixin._get_js_key_condition(shortcuts.get("draw_line", "D"))
         erase_cond_js = ChartRenderPrimitivesMixin._get_js_key_condition(shortcuts.get("erase_drawing", "E"))
         full_view_cond_js = ChartRenderPrimitivesMixin._get_js_key_condition(shortcuts.get("full_view", "F"))
         pan_left_cond_js = ChartRenderPrimitivesMixin._get_js_key_condition(shortcuts.get("pan_left", "Left"))
         pan_right_cond_js = ChartRenderPrimitivesMixin._get_js_key_condition(shortcuts.get("pan_right", "Right"))
-        try:
-            pan_step_bars = max(1, int(settings.get("chart_pan_step_bars", 1)))
-        except (TypeError, ValueError):
-            pan_step_bars = 1
-
         chart_history = ChartRenderPrimitivesMixin._normalize_chart_history(
             history, symbol, max_rows=options.get("max_history_bars", 260)
         )

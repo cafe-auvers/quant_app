@@ -96,6 +96,32 @@ def test_chart_compatibility_modules_export_static_composites_and_models():
     }
 
 
+def test_chart_interaction_settings_are_explicit_and_deterministic():
+    from src.ui.charts.models import normalize_chart_interaction_settings
+
+    shortcuts, pan_step_bars = normalize_chart_interaction_settings(
+        {
+            "shortcuts": {
+                "set_target": "Ctrl+T",
+                "pan_left": "A",
+                "unknown_action": "X",
+            },
+            "chart_pan_step_bars": "7",
+        },
+        renderer="local",
+    )
+
+    assert shortcuts["set_target"] == "Ctrl+T"
+    assert shortcuts["pan_left"] == "A"
+    assert shortcuts["draw_line"] == "D"
+    assert "unknown_action" not in shortcuts
+    assert pan_step_bars == 7
+    assert normalize_chart_interaction_settings(
+        {"shortcuts": "invalid", "chart_pan_step_bars": 0},
+        renderer="lightweight",
+    )[1] == 1
+
+
 def test_p2_modules_use_no_wildcard_or_runtime_module_mutation():
     violations = []
     for path in _p2_source_files():
@@ -157,8 +183,10 @@ def test_layer_dependencies_remain_one_way():
 
     forbidden_render_prefixes = (
         "src.api",
+        "src.services.app_state",
         "src.services.order_ledger",
         "src.ui.workers",
+        "src.utils.storage",
     )
     for path in rendering_files:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))

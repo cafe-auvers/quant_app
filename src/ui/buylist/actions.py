@@ -808,6 +808,15 @@ class BuylistActionsMixin:
                 f"{item.symbol} is already in a BOUGHT position.",
             )
             return
+        if not self._is_execution_queue_buylist_item(item):
+            message = (
+                f"{item.symbol} uses the retired legacy entry workflow. "
+                "No BUY order was submitted. Add or refresh this symbol as an "
+                "execution-queue strategy before activating entry monitoring."
+            )
+            self.append_log(f"[Buylist/{env}] {message}")
+            QMessageBox.warning(self, "Legacy entry retired", message)
+            return
         if self._is_execution_queue_buylist_item(item):
             item.orb_monitor_enabled = True
             self._save_state()
@@ -835,30 +844,6 @@ class BuylistActionsMixin:
                 )
             QMessageBox.information(self, "Activated", msg)
             return
-        bought_count = sum(
-            1
-            for it in self.buylist_manager.items
-            if it.monitoring_status == "BOUGHT" and it.environment == env
-        )
-        if bought_count >= 30:
-            QMessageBox.warning(
-                self,
-                "Max positions",
-                "Already holding 30 positions. Sell one before activating another.",
-            )
-            return
-        item.monitoring_status = "ACTIVE"
-        self._clear_buylist_auto_order_block(item)
-        self._save_state()
-        monitor_started = self._ensure_buylist_monitor_running(env)
-        self.populate_buylist_dashboard()
-        self.append_log(
-            f"[Buylist/{env}] {item.symbol} set to ACTIVE — monitoring for entry at ${item.entry_price:.2f}."
-        )
-        if monitor_started:
-            self.append_log(
-                f"[Buylist/{env}] Monitor auto-started for active entry monitoring."
-            )
 
     def _buylist_deactivate_selected(self, env: str) -> None:
         item = self._buylist_selected_item(env)

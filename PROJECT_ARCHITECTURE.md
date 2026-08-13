@@ -265,8 +265,8 @@ Supporting UI modules:
 | `src/ui/main_window.py` | Main shell, startup ordering, local state loading/saving, tab registration, menus, status log, shared helpers |
 | `src/ui/dialogs.py` | Settings dialog and scanner filter dialog |
 | `src/ui/controllers/` | Workflow controllers for account sync, scanner runs, watchlist ORB refreshes, chart data loading, and buylist execution queue actions |
-| `src/ui/buylist/` | Buy-dashboard view, action, monitoring, and order mixins plus pure policy and execution-queue controllers |
-| `src/ui/charts/` | Chart UI controller, renderer, render-option models, and chart-data service |
+| `src/ui/buylist/` | Static buy-dashboard view, action, monitoring, and order mixins plus thin policy and execution-queue adapters |
+| `src/ui/charts/` | Static chart controller/render composites, focused controller and renderer modules, deterministic render-option/interaction models, and chart-data service |
 | `src/ui/mixins/sidebar_mixin.py` | Left sidebar source switching, selected-symbol routing, and sidebar actions |
 | `src/ui/mixins/dashboard_mixin.py` | Dashboard tab, KIS account snapshot UI, profile selection widgets, FX/account-size display, summary widgets |
 | `src/ui/mixins/scanner_mixin.py` | Scanner tab, scanner setup/rule UI, worker signal wiring, scanner result table actions |
@@ -289,7 +289,7 @@ Controllers are ordinary Python objects that receive the `MainWindow` only as a 
 | `ScannerController` | Scanner setup persistence, scanner worker orchestration, and result action coordination |
 | `WatchlistController` | Watchlist ORB status refreshes and watchlist-to-buylist workflow helpers |
 | `ChartDataController` | `src/ui/charts/data_service.py`; chart data loading and refresh coordination for daily, hourly, TradingView, and intraday views |
-| `BuylistController` | `src/ui/buylist/controller.py`; pure buylist date, exit-signal, quantity, EMA, and safety-gate policies |
+| `BuylistController` | `src/ui/buylist/controller.py`; thin UI adapter that exposes the framework-neutral exit rules owned by `src/core/exit_policy.py` |
 | `BuylistExecutionController` | `src/ui/buylist/execution_controller.py`; execution queue refresh and guarded order-command coordination. `ExecutionQueueRefreshRequest` carries parsed UI inputs and callbacks, and `ExecutionQueueRefreshResult` returns missing symbols, failures, refreshed count, and status counts |
 
 Current tab construction in `_setup_tabs()`:
@@ -369,9 +369,9 @@ The buylist is the local monitoring model. Broker orders are now tracked separat
 |---|---|
 | `src/risk/position_sizer.py` | `PositionSizer` -- fixed-risk, fixed-percent, volatility-based, and Kelly position sizing calculations |
 | `src/risk/orb_position.py` | Shared ORB sizing metrics, 10%/30% capital-allocation limits, 15%/66% stop-to-ADR limits, validation warnings, and recommendation score used by the queue, worker, and watchlist UI |
-| `src/risk/pre_trade.py` | Immutable, quantity-bound `PreTradeRiskDecision`, final entry-order approval enforcement, and immediate ORB-candidate revalidation |
+| `src/risk/pre_trade.py` | Immutable, short-lived `PreTradeRiskDecision` bound to the complete entry-order fingerprint, final approval enforcement, and immediate ORB-candidate/plan revalidation |
 
-`PositionSizer` and the duplicated ORB position-plan checks now live under `src/risk/` with their existing formulas and thresholds. `src/core/position_sizer.py` is a compatibility import for older scripts; new code imports from `src.risk`. Immediately before an entry is submitted, the selected ORB candidate is revalidated into a `PreTradeRiskDecision`; `submit_guarded_overseas_order()` rejects missing, rejected, or quantity-mismatched decisions before creating a ledger row. Exit intents deliberately do not require entry-risk approval, so protective liquidation remains available. The duplicate-open-order guard remains in `src/services/order_ledger.py` (`reserve_order_if_no_matching_open`) rather than moving here, since it is inherently coupled to the order ledger's file I/O rather than being a standalone calculation.
+`PositionSizer` and the duplicated ORB position-plan checks now live under `src/risk/` with their existing formulas and thresholds. `src/core/position_sizer.py` is a compatibility import for older scripts; new code imports from `src.risk`. Immediately before an entry is submitted, the selected ORB candidate is revalidated into a `PreTradeRiskDecision`. Candidate symbol and plan fingerprint must match the requested order. The decision binds environment, account, symbol, side, intent, quantity, reference price, exchange, execution policy, strategy ID, and plan ID, and expires within 30 seconds. `submit_guarded_overseas_order()` verifies it before ledger reservation and again after reservation. Exit intents deliberately do not require entry-risk approval, so protective liquidation remains available. The duplicate-open-order guard remains in `src/services/order_ledger.py` (`reserve_order_if_no_matching_open`) rather than moving here, since it is inherently coupled to the order ledger's file I/O rather than being a standalone calculation.
 
 ## Data and Persistence
 
@@ -416,13 +416,13 @@ The production-only migration archives legacy non-production buylist and executi
 
 Database behavior is split by responsibility under `src/infrastructure/database/`:
 
-- `engine.py` owns MySQL configuration and engine construction.
+- `settings.py` owns stable constants and validation patterns; `engine.py` owns validated MySQL configuration and engine construction.
 - `schema.py` owns SQLAlchemy table definitions and schema setup.
 - `refresh.py` owns history refresh orchestration.
-- `mirror.py` owns the offline SQLite mirror, checkpointing, staleness checks, and reconciliation.
-- `repositories/market_data.py` and `repositories/scanner.py` own focused persistence queries.
+- `mirror.py` is a static compatibility facade. `mirror_engine.py`, `mirror_freshness.py`, `mirror_copy.py`, and `mirror_reconciliation.py` separately own local SQLite construction/handoff, freshness, checkpointed copying, and reconciliation.
+- `repositories/market_data.py` is a static compatibility facade. `market_bars.py`, `chart_indicators.py`, and `market_watermarks.py` own the focused market-data operations; `repositories/scanner.py` owns scanner persistence queries.
 
-`src/utils/db_loader.py` is a synchronized compatibility facade for the package, so existing callers and monkeypatch-based tests retain the former module API while new code can import the focused modules. Together these modules provide:
+`src/utils/db_loader.py` is a static legacy compatibility module built from explicit imports. It performs no runtime namespace synchronization, and production code imports the focused owners instead. Together these modules provide:
 
 - `price_history` for daily and interval-aware historical data.
 - `hourly_price_history` for hourly chart data.
@@ -552,7 +552,7 @@ Buy/Sell UI action or EXECUTE_READY execution queue submit action
   -> BuylistExecutionController submit command validation
   -> KisOrderWorker
   -> submit_guarded_overseas_order()
-  -> ENTRY only: require quantity-bound PreTradeRiskDecision before ledger creation
+  -> ENTRY only: require a fresh complete-fingerprint PreTradeRiskDecision before ledger creation
   -> duplicate-open-order check in data/orders.json by environment, account, symbol, side, and intent
   -> BrokerOrder(status=CREATED) written to data/orders.json before KIS API call
   -> BrokerOrder(status=UNKNOWN_SUBMISSION_STATE) written before request is sent
@@ -566,7 +566,8 @@ Buy/Sell UI action or EXECUTE_READY execution queue submit action
 Important safety rules:
 
 - Execution queue submit actions are gated to `EXECUTE_READY` queue rows before KIS order submission starts.
-- Entry orders require an approved `PreTradeRiskDecision` for the exact submitted quantity. Missing/rejected/mismatched approvals fail before ledger reservation or a broker call; exits are exempt so risk controls cannot block liquidation.
+- Queue-backed entries are identified by their persisted `execution_queue...` strategy marker, not by an ambiguous display status such as `WATCHING`. Legacy non-queue `ACTIVE` entry automation is retired and blocked before worker creation; existing position exits remain available.
+- Entry orders require an approved `PreTradeRiskDecision` matching the full submitted command and ORB plan. Missing, rejected, stale, or mismatched approvals fail before ledger reservation or a broker call; exits are exempt so risk controls cannot block liquidation.
 - Manual PROD partial/full exits outside the U.S. regular session use KIS's
   reserved U.S. sell endpoint with market-on-open execution. The selected
   quantity and `RESERVED_MOO` policy are persisted before the broker call, so
@@ -578,13 +579,14 @@ Important safety rules:
 - Only `PROD` records are actionable; legacy non-production records are ignored rather than migrated into live state. Multiple accounts remain isolated by `account_no`.
 - Account snapshot deltas are used as fill evidence. Ambiguous cases remain `WORKING` rather than being treated as filled.
 - Partial fills are idempotent through `BrokerOrder.applied_filled_quantity`, so repeated reconciliation cannot double-apply the same fill.
-- Cancel requests can be represented locally as `CANCEL_REQUESTED`; direct KIS cancel/status endpoint wrappers intentionally raise until the exact endpoints/TR IDs are verified.
+- Order query and cancellation run through the injected `Broker`; `KisBroker` owns the KIS request/response mapping, while local status remains conservative when the broker result is ambiguous. A credentialed KIS SIM submit/query/cancel remains a separate operational contract check.
 
 ## Charting
 
 The chart experience is generated by `MainWindow` and coordinated with `ChartBridge`:
 
 - TradingView Lightweight Charts HTML/JavaScript is generated locally.
+- Controllers inject normalized shortcut and pan settings into both renderers; renderer functions do not read settings persistence and are deterministic for their arguments.
 - `QWebEngineView` is used when PyQtWebEngine is installed.
 - Fallback text is shown when WebEngine is unavailable.
 - Chart drawings are saved through `QWebChannel` into `data/chart_drawings.json`.

@@ -403,6 +403,7 @@ class ChartsPlottingMixin:
                 options=primary_options,
                 target_price=target_price,
                 drawings=drawings,
+                interaction_settings=self.__dict__.get("settings", {}),
             )
         self._set_html_or_text(
             self.chart_view,
@@ -437,6 +438,7 @@ class ChartsPlottingMixin:
                     options=split_options,
                     target_price=target_price,
                     drawings=split_drawings,
+                    interaction_settings=self.__dict__.get("settings", {}),
                 )
             )
             self._set_html_or_text(

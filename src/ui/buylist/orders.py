@@ -289,6 +289,16 @@ class BuylistOrdersMixin:
         if callable(submission_guard) and not submission_guard():
             item._buy_order_pending = False
             return
+        if not self._is_pre_entry_execution_queue_buylist_item(item):
+            item._buy_order_pending = False
+            if not getattr(item, "_legacy_entry_block_notice_logged", False):
+                item._legacy_entry_block_notice_logged = True
+                self.append_log(
+                    f"[Buylist/{getattr(item, 'environment', 'PROD')}] "
+                    f"{item.symbol} entry blocked: only execution-queue strategies "
+                    "may submit BUY entry orders."
+                )
+            return
         env = self._buylist_order_environment(item)
         account_no = self._selected_order_account_for_item(item, env)
         if not account_no:

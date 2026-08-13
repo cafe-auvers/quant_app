@@ -328,6 +328,36 @@ def test_orb_candidate_is_revalidated_into_full_order_decision():
     assert any("plan identifier" in reason.lower() for reason in wrong_plan.reasons)
 
 
+def test_orb_candidate_cannot_authorize_another_symbol():
+    candidate = SimpleNamespace(
+        symbol="MSFT",
+        window="1m",
+        status="EXECUTE_READY",
+        valid=True,
+        shares=10,
+        entry_trigger=100.0,
+        stop_loss=98.0,
+        capital_percent=20.0,
+        stop_loss_percent=2.0,
+        stop_adr=50.0,
+        risk_percent=0.4,
+        warnings=[],
+    )
+
+    decision = assess_orb_entry_candidate(
+        candidate,
+        environment="SIM",
+        account_no="12345678",
+        symbol="AAPL",
+        quantity=candidate.shares,
+        reference_price=candidate.entry_trigger,
+        plan_id=orb_candidate_plan_id(candidate),
+    )
+
+    assert decision.approved is False
+    assert any("symbol" in reason.lower() for reason in decision.reasons)
+
+
 def test_order_execution_service_has_no_kis_response_dependency():
     import src.services.order_execution_service as service
 

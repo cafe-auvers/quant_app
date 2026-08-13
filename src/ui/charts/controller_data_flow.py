@@ -297,6 +297,7 @@ class ChartsDataFlowMixin:
             target_price=target_price,
             buy_price=buy_price,
             stop_loss=buy_stop_loss,
+            interaction_settings=self.__dict__.get("settings", {}),
         )
         if QWebEngineView is not None and isinstance(target_view, QWebEngineView):
             target_view.setHtml(html_content, QUrl("https://www.tradingview.com/"))
@@ -450,6 +451,7 @@ class ChartsDataFlowMixin:
                 options=self._get_intraday_chart_options(),
                 target_price=target_price,
                 drawings=drawings,
+                interaction_settings=self.__dict__.get("settings", {}),
             ),
             f"{symbol} intraday {interval} chart loaded. Latest price: {latest_price:.2f}",
         )

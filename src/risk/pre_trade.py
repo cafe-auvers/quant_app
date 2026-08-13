@@ -262,6 +262,15 @@ def assess_orb_entry_candidate(
     if candidate is None:
         reasons.append("No selected ORB candidate")
     else:
+        requested_symbol = str(symbol or "").strip().upper()
+        candidate_symbol = str(
+            getattr(candidate, "symbol", "") or ""
+        ).strip().upper()
+        if candidate_symbol != requested_symbol:
+            reasons.append(
+                f"ORB candidate symbol {candidate_symbol or '<missing>'} "
+                f"does not match requested order symbol {requested_symbol or '<missing>'}"
+            )
         if plan_id != orb_candidate_plan_id(candidate):
             reasons.append("ORB plan identifier does not match the selected candidate")
         raw_status = getattr(candidate, "status", "")

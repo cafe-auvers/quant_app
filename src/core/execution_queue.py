@@ -77,17 +77,6 @@ class ExecutionQueueStatus(str, Enum):
     REJECTED = "REJECTED"
 
 
-PRE_ENTRY_EXECUTION_QUEUE_STATUS_VALUES = {
-    ExecutionQueueStatus.WATCHING.value,
-    ExecutionQueueStatus.ORB_FORMING.value,
-    ExecutionQueueStatus.WAITING_BREAKOUT.value,
-    ExecutionQueueStatus.ARMED.value,
-    ExecutionQueueStatus.EXECUTE_READY.value,
-    ExecutionQueueStatus.ORDER_PENDING.value,
-    ExecutionQueueStatus.ORDER_SUBMITTED.value,
-    ExecutionQueueStatus.UNKNOWN_SUBMISSION_STATE.value,
-}
-
 UNKNOWN_SUBMISSION_ORDER_STATUS_VALUES = {
     "UNKNOWN",
     "UNKNOWN_SUBMISSION_STATE",
@@ -106,7 +95,6 @@ NON_PRE_ENTRY_BUYLIST_STATUSES = {
     "PARTIAL_EXIT_RESERVED",
     "SELL_RESERVED",
 }
-
 
 class OrbCandidateStatus(str, Enum):
     NOT_AVAILABLE = "NOT_AVAILABLE"
@@ -325,18 +313,13 @@ def is_pre_entry_execution_queue_item(item: Any) -> bool:
     """Return True for buylist rows whose pre-entry state is queue-backed."""
     if item is None:
         return False
-
     status = _status_text(
         getattr(item, "monitoring_status", None) or getattr(item, "status", "")
     )
     if status in NON_PRE_ENTRY_BUYLIST_STATUSES:
         return False
-
     method = str(getattr(item, "breakout_method", "") or "").lower()
-    if method.startswith("execution_queue"):
-        return True
-
-    return status in PRE_ENTRY_EXECUTION_QUEUE_STATUS_VALUES
+    return method.startswith("execution_queue")
 
 
 def build_queue_display_state(

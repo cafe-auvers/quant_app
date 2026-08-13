@@ -5,6 +5,7 @@ import pytest
 
 import src.ui.buylist.view as buylist_view_module
 from src.core.execution_queue import (ExecutionQueueStatus, OrbCandidateStatus,
+                                      is_pre_entry_execution_queue_item,
                                       queue_key)
 from src.core.watchlist import BuylistManager, Watchlist, WatchlistItem
 from src.ui.main_window import MainWindow
@@ -28,6 +29,19 @@ def _intraday(minutes=31, high=101.0, low=99.0, close=102.0):
 
 def _line_edit(text: str):
     return SimpleNamespace(text=lambda: text)
+
+
+def test_queue_identity_requires_the_durable_strategy_marker():
+    legacy = SimpleNamespace(monitoring_status="WATCHING", breakout_method="")
+    queued = SimpleNamespace(
+        monitoring_status="WATCHING",
+        breakout_method="execution_queue:1m",
+    )
+
+    assert is_pre_entry_execution_queue_item(legacy) is False
+    assert is_pre_entry_execution_queue_item(queued) is True
+    assert MainWindow._is_execution_queue_buylist_item(legacy) is False
+    assert MainWindow._is_execution_queue_buylist_item(queued) is True
 
 
 class FakeTable:
@@ -531,7 +545,7 @@ def test_queue_order_review_uses_selected_candidate_values(monkeypatch, tmp_path
     assert "Limit price: $1.23" not in review
 
 
-def test_legacy_orb_active_row_does_not_auto_buy(monkeypatch, tmp_path):
+def test_legacy_active_row_is_blocked_once_before_auto_buy(monkeypatch, tmp_path):
     window = _build_queue_window(monkeypatch, tmp_path)
     logs = []
     submissions = []
@@ -540,10 +554,11 @@ def test_legacy_orb_active_row_does_not_auto_buy(monkeypatch, tmp_path):
         environment="PROD",
         monitoring_status="ACTIVE",
         breakout_method="manual_trendline",
-        breakout_price=100.0,
+        breakout_price=0.0,
         buffer_pct=0.001,
         entry_price=100.1,
         stop_loss=98.0,
+        _buy_order_pending=False,
     )
     window.buylist_manager = SimpleNamespace(items=[item])
     window.latest_intraday_prices = {"AAPL": 101.0}
@@ -553,6 +568,12 @@ def test_legacy_orb_active_row_does_not_auto_buy(monkeypatch, tmp_path):
     window._submit_kis_buy_order = lambda *_args, **_kwargs: submissions.append(True)
 
     MainWindow._run_buylist_monitor_cycle(window, "PROD")
+    MainWindow._run_buylist_monitor_cycle(window, "PROD")
 
     assert submissions == []
-    assert any("skipping legacy ACTIVE auto-buy" in message for message in logs)
+    assert item._buy_order_pending is False
+    matching_logs = [
+        message for message in logs if "skipping legacy ACTIVE auto-buy" in message
+    ]
+    assert len(matching_logs) == 1
+    assert "only EXECUTE_READY execution-queue" in matching_logs[0]

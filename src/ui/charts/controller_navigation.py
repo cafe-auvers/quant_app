@@ -479,8 +479,6 @@ class ChartsNavigationMixin:
             return
         item = buylist_manager.get(symbol, env)
         if item is None:
-            from PyQt5.QtWidgets import QMessageBox
-
             QMessageBox.information(
                 self,
                 "Not in queue",
@@ -500,8 +498,6 @@ class ChartsNavigationMixin:
             self.append_log(f"[Chart] {symbol} monitoring deactivated.")
         else:
             if str(getattr(item, "monitoring_status", "")).upper() == "BOUGHT":
-                from PyQt5.QtWidgets import QMessageBox
-
                 QMessageBox.information(
                     self, "Already bought", f"{symbol} is already in a BOUGHT position."
                 )
@@ -510,23 +506,14 @@ class ChartsNavigationMixin:
                 item.orb_monitor_enabled = True
                 self._ensure_buylist_monitor_running(env)
             else:
-                bought_count = sum(
-                    1
-                    for it in buylist_manager.items
-                    if str(getattr(it, "monitoring_status", "")).upper() == "BOUGHT"
-                    and it.environment == env
+                message = (
+                    f"{symbol} uses the retired legacy entry workflow. "
+                    "No BUY order was submitted. Add or refresh it as an "
+                    "execution-queue strategy before activating entry monitoring."
                 )
-                if bought_count >= 30:
-                    from PyQt5.QtWidgets import QMessageBox
-
-                    QMessageBox.warning(
-                        self, "Max positions", "Already holding 30 positions."
-                    )
-                    return
-                item.monitoring_status = "ACTIVE"
-                self._clear_buylist_auto_order_block(item)
-                if start_monitor:
-                    self._ensure_buylist_monitor_running(env)
+                self.append_log(f"[Chart] {message}")
+                QMessageBox.warning(self, "Legacy entry retired", message)
+                return
             self._save_state()
             self.populate_buylist_dashboard()
             self.append_log(f"[Chart] {symbol} monitoring activated.")
