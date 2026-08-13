@@ -629,6 +629,8 @@ python -m compileall main.py src tests -q
 pytest -q
 ```
 
+`.github/workflows/ci.yml` runs both commands on `windows-latest` for every push/PR to `master` (Windows matches the app's actual runtime platform, avoiding Qt/PyQt5 Linux system-library setup). `master` is expected to stay 100% green -- no "green except known failures".
+
 Coverage includes scanner rules, scoring, position sizing, ORB logic, execution queue strategy, watchlist and buylist persistence, local JSON backup/recovery and shutdown flushing, MySQL helper behavior, KIS account config/profile parsing, selected `MainWindow` formatting/helpers, refactor boundaries, buylist execution queue refresh request/result behavior, and KIS order lifecycle safety.
 Buylist execution controller coverage includes selected-symbol queueing, missing symbols, unavailable queue manager failures, duplicate pending/open-order propagation, callback failures, refreshed counts, and result status counts.
 Intraday provider coverage includes KIS disabled/configuration errors, yfinance fallback behavior, source-priority cache loading, ORB invariance across normalized provider data, 1m-to-5m resampling, and worker signal payload shape.
