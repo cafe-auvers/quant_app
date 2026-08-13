@@ -98,6 +98,7 @@ from src.ui.filter_catalog import (
     DEFAULT_TAB_OPTIONS,
 )
 from src.ui.workers import PcRemoteStatusWorker, WatchlistAiWorker
+from src.services import trading_state
 from src.services.order_ledger import (
     append_order,
     find_open_orders,
@@ -1988,6 +1989,17 @@ class MainWindow(
         outer_corner_layout.setContentsMargins(0, 0, 10, 0)
         outer_corner_layout.setSpacing(16)
 
+        # -- Live-trading kill switch --
+        # Placed first (leftmost / most prominent). Starts DISABLED every
+        # launch by design (src/services/trading_state.py has no persistence);
+        # enabling requires an explicit click-through confirmation, disabling
+        # is instant. See docs/next_steps_plan.md P1.
+        self.trading_enabled_button = QPushButton()
+        self.trading_enabled_button.setCheckable(True)
+        self.trading_enabled_button.clicked.connect(self._on_trading_enabled_toggled)
+        outer_corner_layout.addWidget(self.trading_enabled_button)
+        self._refresh_trading_enabled_widget()
+
         # -- Active market-data database --
         # This is deliberately separate from the PC health indicator: the PC
         # can be offline while the dashboard continues from its local mirror.
@@ -2089,6 +2101,79 @@ class MainWindow(
         self.market_status_timer.timeout.connect(self.update_market_countdown_status)
         self.market_status_timer.start()
         self.update_market_countdown_status()
+
+    def _refresh_trading_enabled_widget(self) -> None:
+        """Sync the toolbar kill-switch button to the real trading_state."""
+        button = getattr(self, "trading_enabled_button", None)
+        if button is None:
+            return
+        locked = trading_state.is_trading_locked_disabled()
+        enabled = trading_state.is_trading_enabled()
+        button.blockSignals(True)
+        try:
+            button.setChecked(enabled)
+            if locked:
+                button.setText("LIVE TRADING ● LOCKED OFF")
+                button.setToolTip(
+                    "TRADING_ENABLED is set to a falsy value in .env/environment; "
+                    "this forces live trading off for this process and cannot be "
+                    "overridden from the UI."
+                )
+                button.setEnabled(False)
+                button.setStyleSheet(
+                    "QPushButton { background-color: #363a45; color: #787b86; "
+                    "font-weight: bold; padding: 4px 10px; border-radius: 4px; }"
+                )
+            elif enabled:
+                button.setText("LIVE TRADING ● ON")
+                button.setToolTip("Guarded order submission is armed. Click to disable.")
+                button.setEnabled(True)
+                button.setStyleSheet(
+                    "QPushButton { background-color: #f23645; color: white; "
+                    "font-weight: bold; padding: 4px 10px; border-radius: 4px; }"
+                )
+            else:
+                button.setText("LIVE TRADING ● DISABLED")
+                button.setToolTip(
+                    "Guarded order submission is blocked. Click to enable (confirmation required)."
+                )
+                button.setEnabled(True)
+                button.setStyleSheet(
+                    "QPushButton { background-color: #363a45; color: #d1d4dc; "
+                    "font-weight: bold; padding: 4px 10px; border-radius: 4px; }"
+                )
+        finally:
+            button.blockSignals(False)
+
+    def _on_trading_enabled_toggled(self, checked: bool) -> None:
+        """Handle a click on the toolbar live-trading kill switch.
+
+        Disabling is always immediate. Enabling requires an explicit
+        confirmation click-through -- per docs/next_steps_plan.md P1,
+        "activating live trading should be deliberate".
+        """
+        if checked:
+            reply = QMessageBox.question(
+                self,
+                "Enable Live Trading",
+                "This allows guarded KIS order submission (PROD and SIM) for the "
+                "rest of this session. Enable live trading?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                self._refresh_trading_enabled_widget()
+                return
+            trading_state.set_trading_enabled(True)
+        else:
+            trading_state.set_trading_enabled(False)
+
+        self._refresh_trading_enabled_widget()
+        effective = trading_state.is_trading_enabled()
+        self.append_log(
+            f"Live trading {'ENABLED' if effective else 'DISABLED'} "
+            f"(guarded KIS order submission gate)."
+        )
 
     def _build_status_log(self, parent_layout: QVBoxLayout) -> None:
         """Build the shared dashboard log and progress widgets."""

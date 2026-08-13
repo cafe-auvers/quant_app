@@ -29,7 +29,7 @@ try:
 except ImportError:
     QWebChannel = None
 
-from src.core.position_sizer import PositionSizer
+from src.risk.position_sizer import PositionSizer
 from src.core.order_state import BrokerOrder, OrderIntent, OrderSide, OrderStatus, OPEN_ORDER_STATUSES
 from src.core.orb import calculate_orb_range, evaluate_orb_entry_signal, resample_intraday_bars
 from src.core.scanner import StockScanner, ComparisonOperator, ScanRule

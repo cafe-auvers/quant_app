@@ -17,7 +17,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 import pandas as pd
 
 from src.core.orb import calculate_orb_range, evaluate_orb_entry_signal
-from src.core.position_sizer import PositionSizer
+from src.risk.position_sizer import PositionSizer
 
 logger = logging.getLogger(__name__)
 

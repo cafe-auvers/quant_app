@@ -147,7 +147,8 @@ flowchart LR
         UI[MainWindow and tab mixins\nwidgets, tables, dialogs, charts]
         Controllers[UI controllers\naccount, scanner, watchlist, chart, execution]
         Workers[QThread workers\nnetwork, refresh, scanner, review,\norder submission/query/cancel, reconciliation,\nPC status polling]
-        Core[Core domain\nscanner, watchlist, ORB, sizing, scoring,\nexecution queue, order state]
+        Core[Core domain\nscanner, watchlist, ORB, scoring,\nexecution queue, order state]
+        Risk[Risk\nposition sizing]
         Services[Services\napp state, intraday orchestration,\norder ledger, guarded execution, reconciliation,\ncross-machine state sync, PC remote control,\nruntime heartbeats, historical refresh control,\ncloud/env backup]
         Utils[Utilities\nconfig, storage, market calendar, logging,\nloaders, DB and local-mirror helpers]
 
@@ -157,6 +158,8 @@ flowchart LR
         Workers <--> Core
         Controllers <--> Services
         Workers <--> Services
+        Core <--> Risk
+        Services <--> Risk
         Core --> Utils
         Services --> Utils
     end
@@ -203,7 +206,7 @@ flowchart LR
 
     classDef boundary fill:#eaf2ff,stroke:#2b6cb0,color:#102a43;
     classDef store fill:#f0fff4,stroke:#2f855a,color:#1c4532;
-    class UI,Controllers,Workers,Core,Services,Utils boundary;
+    class UI,Controllers,Workers,Core,Risk,Services,Utils boundary;
     class Json,Rulebooks,Env,Mirror,DeviceRole,Historical,MySQL,Listener,KIS,Yahoo,OpenAI,Drive store;
 ```
 
@@ -218,6 +221,7 @@ quant_app/
   src/
     ui/                           PyQt windows, UI controllers, workers, chart bridge, UI constants
     core/                         Trading domain models and pure business logic
+    risk/                         Pre-trade risk/sizing checks (position sizing today)
     services/                     App-state persistence, order lifecycle, PC sync, and backup services
     utils/                        Storage, configuration, market-data, market-calendar, logging, and DB/local-mirror helpers
     api/                          KIS API adapters and order/account helpers
@@ -328,7 +332,9 @@ Most workers live in `src/ui/workers.py`; KIS order submission/query/cancel and 
 | `src/services/kis_intraday_provider.py` | KIS intraday provider wrapper using production account config |
 | `src/services/yfinance_intraday_provider.py` | yfinance intraday fallback provider preserving existing retry behavior |
 | `src/services/order_ledger.py` | Persistent local order ledger stored at `data/orders.json` |
-| `src/services/order_execution_service.py` | Guarded KIS order submission with durable idempotency before and after API calls |
+| `src/services/trading_state.py` | In-memory `TRADING_ENABLED` kill switch -- disabled by default on every launch, no persistence; an explicit falsy `TRADING_ENABLED` in `.env`/environment can force it permanently off but never on |
+| `src/services/broker.py` | `Broker` protocol (`submit_order`/`cancel_order`/`get_order`/`get_positions`) and `KisBroker`, a thin passthrough to `src.api.kis_order`/`kis_account_snapshot_dual` -- lets `OrderExecutionService` depend on an abstraction instead of the KIS API directly |
+| `src/services/order_execution_service.py` | Guarded KIS order submission with durable idempotency before and after API calls; gated by `trading_state` and routed through an injectable `Broker` (defaults to `KisBroker`) |
 | `src/services/order_reconciliation.py` | Conservative account-snapshot reconciliation for accepted/working broker orders |
 | `src/services/historical_refresh_control.py` | Launches, polls, and terminates the standalone `historical.py` subprocess; owns its status-file schema and PID liveness checks |
 | `src/services/state_sync.py` | Conflict-safe cross-machine sync of user-managed state (watchlist/buylist/trade plans) through a revision-tracked MySQL table; only the `main` device pushes, others pull-only |
@@ -345,7 +351,6 @@ The service layer contains persistence and lifecycle logic that is not specific 
 |---|---|
 | `src/core/scanner.py` | `StockScanner`, `ScanRule`, and comparison operators for rule-based filtering |
 | `src/core/watchlist.py` | `Watchlist`, `TradePlanManager`, `BuylistManager`, and persistence-ready dataclasses |
-| `src/core/position_sizer.py` | Fixed-risk and fixed-dollar position sizing calculations |
 | `src/core/orb.py` | Opening range breakout range calculation, signal evaluation, and intraday resampling |
 | `src/core/execution_queue.py` | Dynamic ORB execution queue strategy, queue item/candidate state, environment-symbol queue keys, duplicate-pending candidate rejection, and display-state helpers |
 | `src/core/trade_reviewer.py` | Rulebook-backed trade setup review model |
@@ -353,6 +358,14 @@ The service layer contains persistence and lifecycle logic that is not specific 
 | `src/core/order_state.py` | Broker order lifecycle enums and `BrokerOrder` persistence model |
 
 The buylist is the local monitoring model. Broker orders are now tracked separately in the order ledger and only applied back to buylist positions after fill evidence is confirmed.
+
+## Risk
+
+| Module | Responsibility |
+|---|---|
+| `src/risk/position_sizer.py` | `PositionSizer` -- fixed-risk, fixed-percent, volatility-based, and Kelly position sizing calculations |
+
+Moved here from `src/core/position_sizer.py` as the first step of consolidating pre-trade risk checks into one authoritative location (docs/next_steps_plan.md P1); UI/core call sites import `PositionSizer` from `src.risk.position_sizer` (or `src.risk`) with no change to its thresholds or math. The duplicate-open-order guard remains in `src/services/order_ledger.py` (`reserve_order_if_no_matching_open`) rather than moving here, since it is inherently coupled to the order ledger's file I/O rather than being a standalone calculation.
 
 ## Data and Persistence
 
@@ -639,6 +652,7 @@ Two-machine/backup coverage includes the local SQLite mirror (`test_local_mirror
 ## Production Safety Notes
 
 - Keep secrets out of source. `.env` and `.kis_token_cache*.json` are local runtime files.
+- Guarded order submission is gated behind the `TRADING_ENABLED` kill switch (`src/services/trading_state.py`, toolbar toggle top-right of the main window). It starts disabled on every launch with no persistence; enabling requires an explicit click-through confirmation in the UI. An explicit falsy `TRADING_ENABLED` in `.env`/environment forces it off for that machine/process and cannot be overridden from the UI.
 - KIS PROD order paths require valid credentials. Keep monitoring off until account snapshots, order review, and reconciliation have been verified.
 - KIS intraday remains configuration-gated. Do not enable it until endpoint/TR ID/request params/raw field mappings are verified.
 - yfinance fallback remains available for intraday/ORB workflows when KIS intraday is disabled or unavailable.

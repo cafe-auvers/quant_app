@@ -56,7 +56,7 @@ try:
 except ImportError:
     QWebChannel = None
 
-from src.core.position_sizer import PositionSizer
+from src.risk.position_sizer import PositionSizer
 from src.core.order_state import (
     BrokerOrder,
     OrderIntent,

@@ -1,4 +1,10 @@
-"""Position sizing calculations."""
+"""Position sizing calculations.
+
+Moved here from src/core/position_sizer.py as part of the P1 risk-check
+consolidation (docs/next_steps_plan.md) -- this is the same class, thresholds,
+and math unchanged, just relocated to the module that owns pre-trade risk
+checks.
+"""
 from dataclasses import dataclass
 from enum import Enum
 import math
@@ -43,11 +49,11 @@ def _zero_position() -> PositionSize:
 
 class PositionSizer:
     """Position sizing calculator."""
-    
+
     def __init__(self, account_size: float, max_risk_per_trade: float = 0.02):
         """
         Initialize position sizer.
-        
+
         Args:
             account_size: Total account size in currency units
             max_risk_per_trade: Maximum risk per trade as % of account (e.g., 0.02 = 2%)
@@ -65,16 +71,16 @@ class PositionSizer:
             if normalized_max_risk is not None and 0.0 <= normalized_max_risk <= 1.0
             else 0.0
         )
-    
-    def size_fixed_percent(self, entry_price: float, 
+
+    def size_fixed_percent(self, entry_price: float,
                           percent: float = 0.01) -> PositionSize:
         """
         Calculate position size as fixed % of account.
-        
+
         Args:
             entry_price: Entry price per share
             percent: Position size as % of account (e.g., 0.01 = 1%)
-        
+
         Returns:
             PositionSize object
         """
@@ -97,24 +103,24 @@ class PositionSizer:
         if not math.isfinite(raw_shares) or raw_shares < 0:
             return _zero_position()
         shares = int(raw_shares)
-        
+
         return PositionSize(
             shares=shares,
             dollar_amount=shares * entry,
             percent_of_account=position_percent,
             risk_amount=dollar_amount * self.max_risk_per_trade
         )
-    
+
     def size_risk_based(self, entry_price: float, stop_loss_price: float,
                        risk_percent: Optional[float] = None) -> PositionSize:
         """
         Calculate position size based on risk.
-        
+
         Args:
             entry_price: Entry price per share
             stop_loss_price: Stop loss price per share
             risk_percent: % of account to risk (defaults to max_risk_per_trade)
-        
+
         Returns:
             PositionSize object
         """
@@ -166,24 +172,24 @@ class PositionSizer:
             or not math.isfinite(position_percent)
         ):
             return _zero_position()
-        
+
         return PositionSize(
             shares=shares,
             dollar_amount=dollar_amount,
             percent_of_account=position_percent,
             risk_amount=risk_amount
         )
-    
+
     def size_volatility_based(self, entry_price: float, atr: float,
                              atr_multiplier: float = 2.0) -> PositionSize:
         """
         Calculate position size based on volatility (ATR).
-        
+
         Args:
             entry_price: Entry price per share
             atr: Average True Range value
             atr_multiplier: Stop loss distance as multiple of ATR
-        
+
         Returns:
             PositionSize object
         """
@@ -201,17 +207,17 @@ class PositionSizer:
             return _zero_position()
         stop_loss_price = entry - (atr_value * multiplier)
         return self.size_risk_based(entry, stop_loss_price)
-    
-    def size_kelly(self, win_rate: float, avg_win: float, 
+
+    def size_kelly(self, win_rate: float, avg_win: float,
                   avg_loss: float) -> PositionSize:
         """
         Calculate position size using Kelly criterion.
-        
+
         Args:
             win_rate: Win rate as decimal (e.g., 0.55 = 55%)
             avg_win: Average win amount per trade
             avg_loss: Average loss amount per trade
-        
+
         Returns:
             PositionSize object
         """
@@ -232,7 +238,7 @@ class PositionSizer:
             # Preserve the documented neutral 1:1 fallback for missing loss
             # history while malformed/negative/non-finite values fail closed.
             avg_loss_value = avg_win_value
-        
+
         # Kelly % = (win_rate * avg_win - (1 - win_rate) * avg_loss) / avg_win
         kelly_percent = (
             win_rate_value * avg_win_value
@@ -240,12 +246,12 @@ class PositionSizer:
         ) / avg_win_value
         if not math.isfinite(kelly_percent):
             return _zero_position()
-        
+
         # Apply fractional Kelly for safety (e.g., 25% of Kelly)
         kelly_percent = kelly_percent * 0.25
-        
+
         # Cap at max risk per trade
         kelly_percent = min(kelly_percent, self.max_risk_per_trade)
         kelly_percent = max(kelly_percent, 0)
-        
+
         return self.size_fixed_percent(entry_price=1.0, percent=kelly_percent)

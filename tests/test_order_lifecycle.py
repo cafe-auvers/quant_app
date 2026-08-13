@@ -258,6 +258,83 @@ def test_has_open_order_respects_open_closed_account_and_environment(tmp_path):
     assert not has_open_order("SIM", "12345678", "AAPL", side=OrderSide.BUY, intent=OrderIntent.ENTRY, path=path)
 
 
+def test_submit_guarded_order_refuses_when_trading_disabled(monkeypatch, tmp_path):
+    from src.services import trading_state
+    from src.services.order_execution_service import TradingDisabledError
+
+    path = tmp_path / "orders.json"
+    trading_state.set_trading_enabled(False)
+    monkeypatch.setattr(
+        kis_order,
+        "place_overseas_order",
+        lambda **kwargs: pytest.fail("broker must not be called while trading is disabled"),
+    )
+
+    with pytest.raises(TradingDisabledError):
+        submit_guarded_overseas_order(
+            environment="SIM",
+            account_no="12345678",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            intent=OrderIntent.ENTRY,
+            quantity=1,
+            limit_price=100.0,
+            path=path,
+        )
+
+    # No ledger entry at all -- not even a CREATED/UNKNOWN_SUBMISSION_STATE row.
+    assert load_orders(path=path) == []
+
+
+def test_submit_guarded_order_refuses_prod_and_sim_alike_when_disabled(monkeypatch, tmp_path):
+    from src.services import trading_state
+    from src.services.order_execution_service import TradingDisabledError
+
+    path = tmp_path / "orders.json"
+    trading_state.set_trading_enabled(False)
+    monkeypatch.setattr(
+        kis_order,
+        "place_overseas_order",
+        lambda **kwargs: pytest.fail("broker must not be called while trading is disabled"),
+    )
+
+    for environment in ("PROD", "SIM"):
+        with pytest.raises(TradingDisabledError):
+            submit_guarded_overseas_order(
+                environment=environment,
+                account_no="12345678",
+                symbol="AAPL",
+                side=OrderSide.BUY,
+                intent=OrderIntent.ENTRY,
+                quantity=1,
+                limit_price=100.0,
+                path=path,
+            )
+
+
+def test_submit_guarded_order_proceeds_normally_once_trading_enabled(monkeypatch, tmp_path):
+    from src.services import trading_state
+
+    path = tmp_path / "orders.json"
+    trading_state.set_trading_enabled(True)
+    monkeypatch.setattr(
+        kis_order, "place_overseas_order", lambda **kwargs: {"rt_cd": "0", "output": {"ODNO": "OK"}}
+    )
+
+    order = submit_guarded_overseas_order(
+        environment="SIM",
+        account_no="12345678",
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        intent=OrderIntent.ENTRY,
+        quantity=1,
+        limit_price=100.0,
+        path=path,
+    )
+
+    assert order.status == OrderStatus.ACCEPTED
+
+
 def test_submit_guarded_order_persists_created_before_api_and_accepted_after(monkeypatch, tmp_path):
     path = tmp_path / "orders.json"
     captured_statuses = []

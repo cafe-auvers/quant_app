@@ -14,7 +14,9 @@ from src.core.order_state import (
     OrderSide,
     OrderStatus,
 )
+from src.services.broker import Broker, KisBroker
 from src.services.order_ledger import ORDERS_FILE, reserve_order_if_no_matching_open, upsert_order
+from src.services import trading_state
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +30,21 @@ class DuplicateOpenOrderError(RuntimeError):
             f"Open {order.side.value} {order.intent.value} order already exists for "
             f"{order.symbol} in {order.environment} account {order.account_no}. "
             "Reconcile or cancel it before submitting another order."
+        )
+
+
+class TradingDisabledError(RuntimeError):
+    """Raised when a guarded order submission is attempted while the live-trading
+    kill switch is off. Independent of PROD/SIM environment selection -- this
+    gate applies to every guarded submission, not just live PROD orders."""
+
+    def __init__(self, environment: str, symbol: str) -> None:
+        self.environment = environment
+        self.symbol = symbol
+        super().__init__(
+            f"Live trading is disabled (kill switch off); refused to submit "
+            f"{environment} order for {symbol}. Enable trading from the toolbar "
+            "before submitting orders."
         )
 
 
@@ -73,13 +90,24 @@ def submit_guarded_overseas_order(
     execution_policy: str = REGULAR_LIMIT_EXECUTION,
     allow_duplicate: bool = False,
     path: Path = ORDERS_FILE,
+    broker: Optional[Broker] = None,
 ) -> BrokerOrder:
     """Submit a KIS order with a durable local idempotency guard.
 
     This function records local intent before touching the KIS API. A returned
     ACCEPTED order means only that KIS received the order request; it never
     implies a broker fill or local position change.
+
+    ``broker`` defaults to ``KisBroker()`` (the real KIS API) -- this state
+    machine itself has no broker-specific knowledge and doesn't change based
+    on which ``Broker`` implementation runs underneath it.
     """
+    broker = broker or KisBroker()
+    if not trading_state.is_trading_enabled():
+        raise TradingDisabledError(
+            environment=str(environment or "").upper(),
+            symbol=str(symbol or "").upper(),
+        )
     if quantity <= 0:
         raise ValueError(f"quantity must be positive, got {quantity}")
 
@@ -132,25 +160,16 @@ def submit_guarded_overseas_order(
     upsert_order(order, path=path)
 
     try:
-        if execution_policy == RESERVED_MOO_EXECUTION:
-            response = kis_order.place_overseas_reserved_market_on_open_sell(
-                environment=environment,
-                account_no=account_no,
-                symbol=symbol,
-                quantity=quantity,
-                exchange=exchange,
-            )
-        else:
-            response = kis_order.place_overseas_order(
-                environment=environment,
-                account_no=account_no,
-                symbol=symbol,
-                quantity=quantity,
-                price=limit_price,
-                side=side.value.lower(),
-                exchange=exchange,
-                order_type="limit",
-            )
+        response = broker.submit_order(
+            environment=environment,
+            account_no=account_no,
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            limit_price=limit_price,
+            exchange=exchange,
+            execution_policy=execution_policy,
+        )
     except Exception as exc:
         if kis_order.is_ambiguous_order_submission_error(exc):
             order.status = OrderStatus.UNKNOWN_SUBMISSION_STATE

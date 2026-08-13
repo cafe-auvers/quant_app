@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.core.position_sizer import PositionSizer
+from src.risk.position_sizer import PositionSizer
 from src.ui.main_window import MainWindow
 from src.ui.mixins.dashboard_mixin import DashboardMixin
 

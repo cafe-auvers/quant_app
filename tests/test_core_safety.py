@@ -16,7 +16,7 @@ from src.core.order_state import (
     OrderStatus,
     generate_client_order_id,
 )
-from src.core.position_sizer import PositionSizer
+from src.risk.position_sizer import PositionSizer
 from src.core.scoring import calculate_deterministic_scores
 from src.core.trade_reviewer import TradeReviewer, TradeSetup
 from src.services.order_reconciliation import (

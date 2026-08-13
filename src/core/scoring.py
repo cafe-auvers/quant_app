@@ -8,7 +8,7 @@ import pandas as pd
 import requests
 
 from src.utils.config import get_env_value
-from src.core.position_sizer import PositionSizer
+from src.risk.position_sizer import PositionSizer
 
 
 def _finite_float(value: Any) -> Optional[float]:
