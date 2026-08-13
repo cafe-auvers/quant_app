@@ -79,6 +79,7 @@ from src.services.state_sync import LocalDeviceRole, load_local_device_role
 from src.services.cloud_backup import restore_state_directory, restore_state_files
 from src.ui.controllers import (
     AccountController,
+    BuylistController,
     BuylistExecutionController,
     ChartDataController,
     ScannerController,
@@ -89,9 +90,9 @@ from src.ui.mixins.sidebar_mixin import SidebarMixin
 from src.ui.mixins.dashboard_mixin import DashboardMixin
 from src.ui.mixins.scanner_mixin import ScannerMixin
 from src.ui.mixins.watchlist_mixin import WatchlistMixin
-from src.ui.mixins.buylist_mixin import BuylistMixin
-from src.ui.mixins.charts_controller_mixin import ChartsControllerMixin
-from src.ui.mixins.charts_render_mixin import ChartsRenderMixin
+from src.ui.buylist import BuylistMixin
+from src.ui.charts.controller import ChartsControllerMixin
+from src.ui.charts.renderer import ChartsRenderMixin
 from src.ui.filter_catalog import (
     DEFAULT_SCANNER_SETUPS,
     DEFAULT_SETTINGS,
@@ -502,6 +503,7 @@ class MainWindow(
         """Initialize non-rendering workflow controllers."""
         self.watchlist_controller = WatchlistController(self)
         self.buylist_execution_controller = BuylistExecutionController(self)
+        self.buylist_controller = BuylistController(self)
         self.scanner_controller = ScannerController(self)
         self.chart_data_controller = ChartDataController(self)
         self.account_controller = AccountController(self)

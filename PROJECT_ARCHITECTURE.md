@@ -221,6 +221,7 @@ quant_app/
   src/
     ui/                           PyQt windows, UI controllers, workers, chart bridge, UI constants
     core/                         Trading domain models and pure business logic
+    infrastructure/              Database engines, schemas, refresh orchestration, mirrors, and repositories
     risk/                         Pre-trade risk/sizing checks (position sizing today)
     services/                     App-state persistence, order lifecycle, PC sync, and backup services
     utils/                        Storage, configuration, market-data, market-calendar, logging, and DB/local-mirror helpers
@@ -240,7 +241,7 @@ Generated files such as `__pycache__/` and `.pytest_cache/` are not part of the 
 
 `src/ui/main_window.py` owns the `MainWindow` shell: application state, startup ordering, tab registration, menus, status/progress helpers, persistence entry points, and shared parsing/formatting helpers. Domain-heavy UI behavior is split into plain Python mixins inherited by `MainWindow`; the mixins do not inherit Qt classes and do not import `MainWindow`.
 
-Workflow orchestration that can be tested outside the full PyQt window lives in `src/ui/controllers/`. Mixins keep widget construction, event parsing, table refreshes, logging, and state-save side effects close to the UI while delegating account, scanner, watchlist, chart-data, and buylist execution workflows to controllers.
+Workflow orchestration that can be tested outside the full PyQt window lives in focused UI packages and `src/ui/controllers/`. Mixins keep widget construction, event parsing, table refreshes, logging, and state-save side effects close to the UI while delegating account, scanner, watchlist, chart-data, and buylist execution workflows to controllers.
 
 Current inheritance shape:
 
@@ -264,13 +265,15 @@ Supporting UI modules:
 | `src/ui/main_window.py` | Main shell, startup ordering, local state loading/saving, tab registration, menus, status log, shared helpers |
 | `src/ui/dialogs.py` | Settings dialog and scanner filter dialog |
 | `src/ui/controllers/` | Workflow controllers for account sync, scanner runs, watchlist ORB refreshes, chart data loading, and buylist execution queue actions |
+| `src/ui/buylist/` | Buy-dashboard view, action, monitoring, and order mixins plus pure policy and execution-queue controllers |
+| `src/ui/charts/` | Chart UI controller, renderer, render-option models, and chart-data service |
 | `src/ui/mixins/sidebar_mixin.py` | Left sidebar source switching, selected-symbol routing, and sidebar actions |
 | `src/ui/mixins/dashboard_mixin.py` | Dashboard tab, KIS account snapshot UI, profile selection widgets, FX/account-size display, summary widgets |
 | `src/ui/mixins/scanner_mixin.py` | Scanner tab, scanner setup/rule UI, worker signal wiring, scanner result table actions |
 | `src/ui/mixins/watchlist_mixin.py` | Watchlist tab, breakout-price persistence, ORB planning UI, AI review UI, move-to-buylist flow |
-| `src/ui/mixins/buylist_mixin.py` | Buy dashboard widgets, monitoring controls, execution queue request parsing/result application, order submission UI, order reconciliation callbacks |
-| `src/ui/mixins/charts_render_mixin.py` | Chart HTML/SVG generation, TradingView symbol formatting, indicator panel rendering, chart data normalization helpers |
-| `src/ui/mixins/charts_controller_mixin.py` | Chart tabs, symbol controls, drawing callbacks, chart bridge actions, chart refresh UI |
+| `src/ui/mixins/buylist_mixin.py` | Compatibility import for `src/ui/buylist/`; existing imports and monkeypatch-based tests continue to work |
+| `src/ui/mixins/charts_render_mixin.py` | Compatibility import for `src/ui/charts/renderer.py` |
+| `src/ui/mixins/charts_controller_mixin.py` | Compatibility import for `src/ui/charts/controller.py` |
 | `src/ui/workers.py` | `QThread` workers for KIS snapshots, intraday fetches, scanner runs, review jobs, and PC status polling |
 | `src/ui/order_workers.py` | `QThread` workers for KIS order submission, query, cancel, and reconciliation |
 | `src/ui/chart_bridge.py` | `QWebChannel` bridge used by chart JavaScript to persist drawings and breakout-price markers |
@@ -285,8 +288,9 @@ Controllers are ordinary Python objects that receive the `MainWindow` only as a 
 | `AccountController` | KIS account snapshot/profile sync, FX/account-size application, and account refresh commands |
 | `ScannerController` | Scanner setup persistence, scanner worker orchestration, and result action coordination |
 | `WatchlistController` | Watchlist ORB status refreshes and watchlist-to-buylist workflow helpers |
-| `ChartDataController` | Chart data loading and refresh coordination for daily, hourly, TradingView, and intraday views |
-| `BuylistExecutionController` | Execution queue refresh and guarded order-command coordination; `ExecutionQueueRefreshRequest` carries parsed UI inputs and callbacks, and `ExecutionQueueRefreshResult` returns missing symbols, failures, refreshed count, and status counts |
+| `ChartDataController` | `src/ui/charts/data_service.py`; chart data loading and refresh coordination for daily, hourly, TradingView, and intraday views |
+| `BuylistController` | `src/ui/buylist/controller.py`; pure buylist date, exit-signal, quantity, EMA, and safety-gate policies |
+| `BuylistExecutionController` | `src/ui/buylist/execution_controller.py`; execution queue refresh and guarded order-command coordination. `ExecutionQueueRefreshRequest` carries parsed UI inputs and callbacks, and `ExecutionQueueRefreshResult` returns missing symbols, failures, refreshed count, and status counts |
 
 Current tab construction in `_setup_tabs()`:
 
@@ -409,7 +413,15 @@ The production-only migration archives legacy non-production buylist and executi
 - Multi-symbol history normalization.
 - Technical metric calculation used by scanning and charts.
 
-`src/utils/db_loader.py` provides MySQL-backed caching, plus the parallel offline SQLite mirror engine used when MySQL is unreachable:
+Database behavior is split by responsibility under `src/infrastructure/database/`:
+
+- `engine.py` owns MySQL configuration and engine construction.
+- `schema.py` owns SQLAlchemy table definitions and schema setup.
+- `refresh.py` owns history refresh orchestration.
+- `mirror.py` owns the offline SQLite mirror, checkpointing, staleness checks, and reconciliation.
+- `repositories/market_data.py` and `repositories/scanner.py` own focused persistence queries.
+
+`src/utils/db_loader.py` is a synchronized compatibility facade for the package, so existing callers and monkeypatch-based tests retain the former module API while new code can import the focused modules. Together these modules provide:
 
 - `price_history` for daily and interval-aware historical data.
 - `hourly_price_history` for hourly chart data.
@@ -625,7 +637,7 @@ Runtime configuration is environment-driven:
 
 | Key family | Used by | Purpose |
 |---|---|---|
-| `MYSQL_*` | `src/utils/config.py`, `src/utils/db_loader.py` | MySQL connection; optional for a single machine, canonical for the two-machine setup |
+| `MYSQL_*` | `src/utils/config.py`, `src/infrastructure/database/` | MySQL connection; optional for a single machine, canonical for the two-machine setup |
 | `TRADING_ENABLED` | `src/services/trading_state.py` | Administrative order-submission lock; false/blank/invalid locks off, true only permits the separately confirmed in-app session toggle |
 | `KIS_PROD_*` / `KIS_SIM_*` | KIS account/order modules | KIS production/simulation account snapshots and order workflows |
 | `KIS_INTRADAY_ENABLED`, `KIS_OVERSEAS_INTRADAY_*` | `src/api/kis_intraday.py` | Configuration-gated KIS intraday endpoint/field mapping |
