@@ -1,5 +1,21 @@
-"""P2 buylist view submixin."""
-from src.ui.buylist._shared import *  # noqa: F401,F403
+"""Buylist widgets, table rendering, and execution-queue persistence."""
+
+import math
+from typing import Any, List, Optional, Tuple
+
+from PyQt5.QtCore import Qt, QThread, QTimer
+from PyQt5.QtGui import QColor
+from PyQt5.QtWidgets import (QAbstractItemView, QDialog, QHBoxLayout,
+                             QHeaderView, QLabel, QMessageBox, QPushButton,
+                             QSplitter, QTableWidget, QTableWidgetItem,
+                             QVBoxLayout, QWidget)
+
+from src.services.app_state import (
+    archive_non_production_execution_queue_state, quarantine_rejected_records)
+from src.utils.storage import load_json, save_json
+
+from .constants import EXECUTION_QUEUE_FILE
+
 
 class BuylistViewMixin:
     def _build_buylist_env_panel(self, env: str) -> QWidget:
@@ -735,9 +751,8 @@ class BuylistViewMixin:
         *,
         create_missing: bool = False,
     ):
-        from src.ui.buylist.execution_controller import (
-            ExecutionQueueRefreshRequest,
-        )
+        from src.ui.buylist.execution_controller import \
+            ExecutionQueueRefreshRequest
 
         env = (
             env
@@ -873,10 +888,9 @@ class BuylistViewMixin:
         create_missing: bool = False,
     ) -> int:
         """Refresh existing queue rows, or intentionally queue selected symbols."""
+        from src.ui.buylist.execution_controller import \
+            BuylistExecutionController
         from src.ui.controllers.base import get_controller
-        from src.ui.buylist.execution_controller import (
-            BuylistExecutionController,
-        )
 
         controller = get_controller(
             self, "buylist_execution_controller", BuylistExecutionController
@@ -894,10 +908,9 @@ class BuylistViewMixin:
     def _apply_execution_queue_item_to_buylist(
         self, queue_item, watch_item, env: str, buffer_pct: float
     ) -> None:
+        from src.ui.buylist.execution_controller import \
+            BuylistExecutionController
         from src.ui.controllers.base import get_controller
-        from src.ui.buylist.execution_controller import (
-            BuylistExecutionController,
-        )
 
         controller = get_controller(
             self, "buylist_execution_controller", BuylistExecutionController
@@ -1023,11 +1036,8 @@ class BuylistViewMixin:
         )
 
     def _buylist_review_selected_queue_order(self, env: str) -> None:
-        from src.core.execution_queue import (
-            OrbCandidateStatus,
-            select_best_orb_candidate,
-            SUPPORTED_ORB_WINDOWS,
-        )
+        from src.core.execution_queue import (SUPPORTED_ORB_WINDOWS,
+                                              OrbCandidateStatus)
 
         item = self._buylist_selected_item(env)
         if not item:
@@ -1298,10 +1308,9 @@ class BuylistViewMixin:
         dlg.exec_()
 
     def _buylist_submit_selected_queue_order(self, env: str) -> None:
+        from src.ui.buylist.execution_controller import \
+            BuylistExecutionController
         from src.ui.controllers.base import get_controller
-        from src.ui.buylist.execution_controller import (
-            BuylistExecutionController,
-        )
 
         controller = get_controller(
             self, "buylist_execution_controller", BuylistExecutionController

@@ -12,107 +12,75 @@ import time
 import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-from PyQt5.QtWidgets import (
-    QApplication,
-    QMainWindow,
-    QWidget,
-    QVBoxLayout,
-    QHBoxLayout,
-    QTabWidget,
-    QLabel,
-    QLineEdit,
-    QTextEdit,
-    QProgressBar,
-    QMessageBox,
-    QSizePolicy,
-    QDialog,
-    QPushButton,
-)
 from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QKeySequence
+from PyQt5.QtWidgets import (QApplication, QDialog, QHBoxLayout, QLabel,
+                             QLineEdit, QMainWindow, QMessageBox, QProgressBar,
+                             QPushButton, QSizePolicy, QTabWidget, QTextEdit,
+                             QVBoxLayout, QWidget)
 
 try:
     from PyQt5.QtWebEngineWidgets import QWebEngineView
 except ImportError:
     QWebEngineView = None
 
-from src.core.order_state import BrokerOrder, OrderIntent, OrderSide, OrderStatus
+from src.core.order_state import (BrokerOrder, OrderIntent, OrderSide,
+                                  OrderStatus)
 from src.core.scanner import StockScanner
-from src.core.watchlist import Watchlist, TradePlanManager, BuylistManager
 from src.core.trade_reviewer import TradeReviewer
-from src.utils.config import DATA_DIR, ROOT_DIR, RULEBOOK_DIR
-from src.utils.data_loader import get_default_universe
-from src.utils.db_loader import (
-    local_mirror_hourly_is_stale,
-    local_mirror_is_stale,
-    resolve_data_engine,
-)
-from src.utils.market_calendar import expected_latest_market_data_date
-from src.utils.storage import load_json
-from src.services.historical_refresh_control import (
-    MODE_1D,
-    MODE_1H,
-    is_refresh_running,
-    read_status,
-    reconcile_stale_status,
-)
-from src.services.app_state import (
-    SETTINGS_FILE,
-    SaveResult,
-    StateReconcileResult,
-    activate_device_as_main,
-    get_state_save_manager,
-    load_buylist_state,
-    load_chart_drawings_state,
-    load_scanner_setups_state,
-    load_tab_options_state,
-    load_trade_plans_state,
-    load_watchlist_state,
-    reconcile_state_with_remote,
-    save_app_state,
-)
+from src.core.watchlist import BuylistManager, TradePlanManager, Watchlist
+from src.infrastructure.database.mirror_engine import resolve_data_engine
+from src.infrastructure.database.mirror_freshness import (
+    local_mirror_hourly_is_stale, local_mirror_is_stale)
+from src.services import trading_state
+from src.services.app_state import (SETTINGS_FILE, SaveResult,
+                                    StateReconcileResult,
+                                    activate_device_as_main,
+                                    get_state_save_manager, load_buylist_state,
+                                    load_chart_drawings_state,
+                                    load_scanner_setups_state,
+                                    load_tab_options_state,
+                                    load_trade_plans_state,
+                                    load_watchlist_state,
+                                    reconcile_state_with_remote,
+                                    save_app_state)
+from src.services.cloud_backup import (restore_state_directory,
+                                       restore_state_files)
+from src.services.historical_refresh_control import (MODE_1D, MODE_1H,
+                                                     is_refresh_running,
+                                                     read_status,
+                                                     reconcile_stale_status)
+from src.services.order_ledger import (append_order, find_open_orders,
+                                       has_open_order, load_order_ledger,
+                                       merge_orders, save_order_ledger,
+                                       update_order)
 from src.services.state_sync import LocalDeviceRole, load_local_device_role
-from src.services.cloud_backup import restore_state_directory, restore_state_files
-from src.ui.controllers import (
-    AccountController,
-    BuylistController,
-    BuylistExecutionController,
-    ChartDataController,
-    ScannerController,
-    WatchlistController,
-)
-from src.ui.dialogs import BackupEnvDialog, RestoreBackupDialog, RestoreEnvDialog, SettingsDialog
-from src.ui.mixins.sidebar_mixin import SidebarMixin
-from src.ui.mixins.dashboard_mixin import DashboardMixin
-from src.ui.mixins.scanner_mixin import ScannerMixin
-from src.ui.mixins.watchlist_mixin import WatchlistMixin
 from src.ui.buylist import BuylistMixin
 from src.ui.charts.controller import ChartsControllerMixin
 from src.ui.charts.renderer import ChartsRenderMixin
-from src.ui.filter_catalog import (
-    DEFAULT_SCANNER_SETUPS,
-    DEFAULT_SETTINGS,
-    DEFAULT_TAB_OPTIONS,
-)
+from src.ui.controllers import (AccountController, BuylistController,
+                                BuylistExecutionController,
+                                ChartDataController, ScannerController,
+                                WatchlistController)
+from src.ui.dialogs import (BackupEnvDialog, RestoreBackupDialog,
+                            RestoreEnvDialog, SettingsDialog)
+from src.ui.filter_catalog import (DEFAULT_SCANNER_SETUPS, DEFAULT_SETTINGS,
+                                   DEFAULT_TAB_OPTIONS)
+from src.ui.mixins.dashboard_mixin import DashboardMixin
+from src.ui.mixins.scanner_mixin import ScannerMixin
+from src.ui.mixins.sidebar_mixin import SidebarMixin
+from src.ui.mixins.watchlist_mixin import WatchlistMixin
 from src.ui.workers import PcRemoteStatusWorker, WatchlistAiWorker
-from src.services import trading_state
-from src.services.order_ledger import (
-    append_order,
-    find_open_orders,
-    has_open_order,
-    load_order_ledger,
-    merge_orders,
-    save_order_ledger,
-    update_order,
-)
-from src.utils.intraday_helpers import (
-    extract_latest_opening_bar as _extract_latest_opening_bar,
-)
-
+from src.utils.config import DATA_DIR, ROOT_DIR, RULEBOOK_DIR
+from src.utils.data_loader import get_default_universe
+from src.utils.intraday_helpers import \
+    extract_latest_opening_bar as _extract_latest_opening_bar
+from src.utils.market_calendar import expected_latest_market_data_date
+from src.utils.storage import load_json
 
 __all__ = [
     "MainWindow",
@@ -188,7 +156,7 @@ class DatabaseRecoveryWorker(QThread):
     def run(self) -> None:
         from sqlalchemy import text
 
-        from src.utils.db_loader import init_mysql_engine
+        from src.infrastructure.database.engine import init_mysql_engine
 
         engine = self.pc_engine
         try:
@@ -238,10 +206,10 @@ class LocalMirrorSyncWorker(QThread):
         self.generation = int(generation)
 
     def run(self) -> None:
-        from src.utils.db_loader import (
-            init_local_mirror_engine,
-            sync_local_mirror_from_pc_checkpointed,
-        )
+        from src.infrastructure.database.mirror_copy import \
+            sync_local_mirror_from_pc_checkpointed
+        from src.infrastructure.database.mirror_engine import \
+            init_local_mirror_engine
 
         try:
             if self.local_engine is None:
@@ -624,7 +592,8 @@ class MainWindow(
         self, pc_engine, *, log_completion: bool = True
     ) -> None:
         """Start a disposable PC-authoritative laptop backup off the UI thread."""
-        from src.utils.db_loader import _local_mirror_enabled
+        from src.infrastructure.database.mirror_engine import \
+            _local_mirror_enabled
 
         if self.__dict__.get("_database_shutting_down", False):
             return
@@ -1827,7 +1796,8 @@ class MainWindow(
             )
             event.ignore()
             return
-        from src.services.runtime_status import safe_mark_runtime_process_stopped
+        from src.services.runtime_status import \
+            safe_mark_runtime_process_stopped
 
         safe_mark_runtime_process_stopped(
             self.pc_db_engine
@@ -2485,10 +2455,8 @@ class MainWindow(
 
         local_engine = self.__dict__.get("_local_mirror_engine")
         if local_engine is None:
-            from src.utils.db_loader import (
-                _local_mirror_enabled,
-                init_local_mirror_engine,
-            )
+            from src.infrastructure.database.mirror_engine import (
+                _local_mirror_enabled, init_local_mirror_engine)
 
             if _local_mirror_enabled():
                 local_engine = init_local_mirror_engine()

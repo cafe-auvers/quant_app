@@ -8,15 +8,13 @@ import pandas as pd
 from sqlalchemy.engine import Engine
 
 from src.api.kis_intraday import is_kis_intraday_enabled
-from src.services.intraday_provider import (
-    IntradayProviderName,
-    IntradayRequest,
-    IntradayResult,
-    empty_intraday_result,
-)
+from src.infrastructure.database.repositories.market_bars import \
+    load_intraday_history_from_db
+from src.services.intraday_provider import (IntradayProviderName,
+                                            IntradayRequest, IntradayResult,
+                                            empty_intraday_result)
 from src.services.kis_intraday_provider import fetch_kis_intraday
 from src.services.yfinance_intraday_provider import fetch_yfinance_intraday
-from src.utils.db_loader import load_intraday_history_from_db
 
 
 def fetch_intraday_with_fallback(request: IntradayRequest) -> IntradayResult:

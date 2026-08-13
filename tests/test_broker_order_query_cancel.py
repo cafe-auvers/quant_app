@@ -2,23 +2,16 @@ from types import SimpleNamespace
 
 import pytest
 
+import src.ui.buylist.actions as buylist_actions_module
 from src.api import kis_order
-from src.core.order_state import (
-    RESERVED_MOO_EXECUTION,
-    BrokerOrder,
-    BrokerOrderStatusSnapshot,
-    OrderIntent,
-    OrderSide,
-    OrderStatus,
-)
+from src.core.order_state import (RESERVED_MOO_EXECUTION, BrokerOrder,
+                                  BrokerOrderStatusSnapshot, OrderIntent,
+                                  OrderSide, OrderStatus)
 from src.services.order_ledger import append_order, load_orders
 from src.services.order_reconciliation import (
-    _select_snapshot_for_order,
-    cancel_and_reconcile_order,
+    _select_snapshot_for_order, cancel_and_reconcile_order,
     query_and_reconcile_unresolved_orders,
-    reconcile_order_with_broker_snapshot,
-)
-import src.ui.mixins.buylist_mixin as buylist_mixin_module
+    reconcile_order_with_broker_snapshot)
 from src.ui.main_window import MainWindow
 
 
@@ -466,7 +459,7 @@ def test_cancel_order_ui_is_blocked_without_broker_order_id(monkeypatch):
     window._selected_open_broker_order = lambda env: (item, order)
     window.append_log = lambda message: None
     monkeypatch.setattr(
-        buylist_mixin_module.QMessageBox,
+        buylist_actions_module.QMessageBox,
         "warning",
         lambda parent, title, message: warnings.append((title, message)),
     )
@@ -505,11 +498,11 @@ def test_cancel_order_ui_confirms_and_starts_worker(monkeypatch):
     window.broker_order_cancel_worker = None
     window._selected_open_broker_order = lambda env: (item, order)
     window.append_log = lambda message: None
-    monkeypatch.setattr(buylist_mixin_module, "KisOrderCancelWorker", FakeCancelWorker)
+    monkeypatch.setattr(buylist_actions_module, "KisOrderCancelWorker", FakeCancelWorker)
     monkeypatch.setattr(
-        buylist_mixin_module.QMessageBox,
+        buylist_actions_module.QMessageBox,
         "question",
-        lambda *args, **kwargs: questions.append(args) or buylist_mixin_module.QMessageBox.Yes,
+        lambda *args, **kwargs: questions.append(args) or buylist_actions_module.QMessageBox.Yes,
     )
 
     MainWindow._buylist_cancel_selected_order(window, "SIM")
@@ -541,12 +534,12 @@ def test_cancel_error_warns_order_is_still_active_and_checks_status(monkeypatch)
     window.append_log = logs.append
     window._buylist_check_order_status = lambda env: checked.append(env)
     monkeypatch.setattr(
-        buylist_mixin_module.QMessageBox,
+        buylist_actions_module.QMessageBox,
         "warning",
         lambda _parent, title, message: warnings.append((title, message)),
     )
     monkeypatch.setattr(
-        buylist_mixin_module.QTimer,
+        buylist_actions_module.QTimer,
         "singleShot",
         lambda _delay, callback: callback(),
     )

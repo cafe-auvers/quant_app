@@ -3,8 +3,9 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
-import src.ui.mixins.buylist_mixin as buylist_mixin_module
-from src.core.execution_queue import ExecutionQueueStatus, OrbCandidateStatus, queue_key
+import src.ui.buylist.view as buylist_view_module
+from src.core.execution_queue import (ExecutionQueueStatus, OrbCandidateStatus,
+                                      queue_key)
 from src.core.watchlist import BuylistManager, Watchlist, WatchlistItem
 from src.ui.main_window import MainWindow
 
@@ -54,7 +55,7 @@ class FakeTable:
 
 def _build_queue_window(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        buylist_mixin_module,
+        buylist_view_module,
         "EXECUTION_QUEUE_FILE",
         tmp_path / "execution_queue.json",
     )

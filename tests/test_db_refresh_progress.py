@@ -1,9 +1,10 @@
-import pandas as pd
 import numpy as np
+import pandas as pd
 from sqlalchemy import create_engine
 
 import src.utils.data_loader as data_loader
 import src.utils.db_loader as db_loader
+from src.infrastructure.database.repositories import chart_indicators, scanner
 
 
 def test_chart_indicator_refresh_logs_progress(monkeypatch):
@@ -19,19 +20,19 @@ def test_chart_indicator_refresh_logs_progress(monkeypatch):
         index=[pd.Timestamp("2026-01-05"), pd.Timestamp("2026-01-06")],
     )
     monkeypatch.setattr(
-        db_loader,
+        chart_indicators,
         "load_universe_history_from_db",
         lambda tickers, engine, start=None, end=None, interval="1d": {"SPY": history, "AAPL": history},
     )
     monkeypatch.setattr(
-        db_loader,
+        chart_indicators,
         "get_chart_indicator_refresh_plan",
         lambda *args, **kwargs: {
             "AAPL": pd.Timestamp("2026-01-05").to_pydatetime(),
             "BAD": pd.Timestamp("2026-01-05").to_pydatetime(),
         },
     )
-    monkeypatch.setattr(db_loader, "save_chart_indicators_batch_to_db", lambda records, engine: len(records))
+    monkeypatch.setattr(chart_indicators, "save_chart_indicators_batch_to_db", lambda records, engine: len(records))
 
     engine = create_engine("sqlite:///:memory:", future=True)
     updated = db_loader.refresh_chart_indicators_to_db(
@@ -60,7 +61,7 @@ def test_scanner_metrics_refresh_logs_calculate_and_save_progress(monkeypatch):
     )
 
     monkeypatch.setattr(
-        db_loader,
+        scanner,
         "load_universe_history_from_db",
         lambda tickers, engine, start=None: {"SPY": history, "AAPL": history, "MSFT": history},
     )
@@ -70,9 +71,9 @@ def test_scanner_metrics_refresh_logs_calculate_and_save_progress(monkeypatch):
         lambda symbol, symbol_history, spy_history=None: {"symbol": symbol, "return_1m": 1.0, "return_3m": 1.0},
     )
     snapshot_date = pd.Timestamp("2026-01-05").to_pydatetime()
-    monkeypatch.setattr(db_loader, "scanner_metrics_snapshot_date", lambda: snapshot_date)
+    monkeypatch.setattr(scanner, "scanner_metrics_snapshot_date", lambda: snapshot_date)
     monkeypatch.setattr(
-        db_loader,
+        scanner,
         "get_price_history_watermarks",
         lambda *args, **kwargs: {
             "SPY": (snapshot_date, 1),
@@ -82,12 +83,12 @@ def test_scanner_metrics_refresh_logs_calculate_and_save_progress(monkeypatch):
     )
     cache_checks = iter([False, True])
     monkeypatch.setattr(
-        db_loader,
+        scanner,
         "is_scanner_metrics_snapshot_current",
         lambda *args, **kwargs: next(cache_checks),
     )
     monkeypatch.setattr(
-        db_loader,
+        scanner,
         "save_scanner_metrics_snapshot_to_db",
         lambda metrics_list, date, fingerprint, engine, **kwargs: [
             item["symbol"] for item in metrics_list

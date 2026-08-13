@@ -109,7 +109,7 @@ def test_pc_status_worker_silences_expected_mysql_probe_failures(monkeypatch):
         return None
 
     monkeypatch.setattr(
-        "src.utils.db_loader.init_mysql_engine",
+        "src.infrastructure.database.engine.init_mysql_engine",
         unavailable_engine,
     )
     results = []
@@ -329,14 +329,14 @@ def _online_pc_status():
 def test_runtime_pc_database_loss_switches_to_local_mirror_and_detaches_state_sync(
     monkeypatch,
 ):
-    import src.utils.db_loader as db_loader
+    import src.infrastructure.database.mirror_engine as mirror_engine
 
     pc_engine = object()
     local_engine = object()
     window, manager, logs, summary_updates = _runtime_transition_window(pc_engine)
     mirror_opens = []
     monkeypatch.setattr(
-        db_loader,
+        mirror_engine,
         "init_local_mirror_engine",
         lambda: mirror_opens.append(True) or local_engine,
     )
@@ -359,14 +359,14 @@ def test_runtime_pc_database_loss_switches_to_local_mirror_and_detaches_state_sy
 
 
 def test_repeated_runtime_offline_status_does_not_repeat_failover(monkeypatch):
-    import src.utils.db_loader as db_loader
+    import src.infrastructure.database.mirror_engine as mirror_engine
 
     pc_engine = object()
     local_engine = object()
     window, manager, logs, summary_updates = _runtime_transition_window(pc_engine)
     mirror_opens = []
     monkeypatch.setattr(
-        db_loader,
+        mirror_engine,
         "init_local_mirror_engine",
         lambda: mirror_opens.append(True) or local_engine,
     )
@@ -383,12 +383,12 @@ def test_repeated_runtime_offline_status_does_not_repeat_failover(monkeypatch):
 
 
 def test_runtime_database_loss_without_local_mirror_shows_offline_red(monkeypatch):
-    import src.utils.db_loader as db_loader
+    import src.infrastructure.database.mirror_engine as mirror_engine
 
     window, _manager, _logs, _summary_updates = _runtime_transition_window(
         object()
     )
-    monkeypatch.setattr(db_loader, "init_local_mirror_engine", lambda: None)
+    monkeypatch.setattr(mirror_engine, "init_local_mirror_engine", lambda: None)
 
     window._on_pc_status_result(_offline_pc_status())
 
@@ -563,7 +563,7 @@ def test_stale_active_mirror_result_cannot_change_current_database_routing():
 
 def test_local_backup_changes_cannot_block_pc_recovery(monkeypatch):
     import src.ui.main_window as main_window
-    import src.utils.db_loader as db_loader
+    import src.infrastructure.database.mirror_engine as mirror_engine
 
     pc_engine = object()
     local_engine = object()
@@ -578,7 +578,7 @@ def test_local_backup_changes_cannot_block_pc_recovery(monkeypatch):
     window._start_state_sync = lambda: state_sync_starts.append(True)
     window._start_background_local_mirror_sync = backup_starts.append
     monkeypatch.setattr(
-        db_loader,
+        mirror_engine,
         "acquire_local_mirror_handoff_guard",
         lambda _engine: (_ for _ in ()).throw(
             RuntimeError("Local mirror changed after reconciliation.")
@@ -740,12 +740,12 @@ def test_pc_startup_routes_immediately_then_starts_backup_in_background():
 
 def test_database_recovery_worker_only_checks_pc_connectivity(monkeypatch):
     import src.ui.main_window as main_window
-    import src.utils.db_loader as db_loader
+    import src.infrastructure.database.mirror_reconciliation as mirror_reconciliation
 
     pc_engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     calls = []
     monkeypatch.setattr(
-        db_loader,
+        mirror_reconciliation,
         "reconcile_local_mirror_with_pc",
         lambda pc, local, **kwargs: calls.append((pc, local, kwargs)),
     )
@@ -880,17 +880,18 @@ def test_shutdown_message_identifies_laptop_backup_and_current_phase():
 
 def test_backup_worker_initializes_local_mirror_and_uses_pc_as_authority(monkeypatch):
     import src.ui.main_window as main_window
-    import src.utils.db_loader as db_loader
+    import src.infrastructure.database.mirror_copy as mirror_copy
+    import src.infrastructure.database.mirror_engine as mirror_engine
 
     local_engine = object()
     calls = []
     monkeypatch.setattr(
-        db_loader,
+        mirror_engine,
         "init_local_mirror_engine",
         lambda: local_engine,
     )
     monkeypatch.setattr(
-        db_loader,
+        mirror_copy,
         "sync_local_mirror_from_pc_checkpointed",
         lambda pc, local, **kwargs: calls.append((pc, local, kwargs)) or {},
     )
@@ -936,10 +937,10 @@ def test_backup_worker_initializes_local_mirror_and_uses_pc_as_authority(monkeyp
 
 def test_database_recovery_worker_contains_connection_failure(monkeypatch):
     import src.ui.main_window as main_window
-    import src.utils.db_loader as db_loader
+    import src.infrastructure.database.engine as database_engine
 
     monkeypatch.setattr(
-        db_loader,
+        database_engine,
         "init_mysql_engine",
         lambda **_kwargs: None,
     )
@@ -959,15 +960,18 @@ def test_database_recovery_worker_contains_connection_failure(monkeypatch):
 
 def test_backup_worker_reports_error_without_requesting_reroute(monkeypatch):
     import src.ui.main_window as main_window
-    import src.utils.db_loader as db_loader
+    import src.infrastructure.database.mirror_copy as mirror_copy
+    from src.infrastructure.database.mirror_engine import (
+        LocalMirrorNeedsReconciliationError,
+    )
 
     def require_staged_reconciliation(*_args, **_kwargs):
-        raise db_loader.LocalMirrorNeedsReconciliationError(
+        raise LocalMirrorNeedsReconciliationError(
             "Local mirror contains laptop-side writes."
         )
 
     monkeypatch.setattr(
-        db_loader,
+        mirror_copy,
         "sync_local_mirror_from_pc_checkpointed",
         require_staged_reconciliation,
     )
@@ -992,11 +996,11 @@ def test_backup_worker_reports_error_without_requesting_reroute(monkeypatch):
 
 def test_active_mirror_worker_forwards_relevant_hourly_symbols(monkeypatch):
     import src.ui.main_window as main_window
-    import src.utils.db_loader as db_loader
+    import src.infrastructure.database.mirror_copy as mirror_copy
 
     calls = []
     monkeypatch.setattr(
-        db_loader,
+        mirror_copy,
         "sync_local_mirror_from_pc_checkpointed",
         lambda pc, local, **kwargs: calls.append((pc, local, kwargs)) or {},
     )

@@ -1,5 +1,31 @@
-"""P2 scanner repository extraction from the legacy database loader."""
-from .._shared import *  # noqa: F401,F403
+"""Scanner-metric persistence and derived-cache refresh."""
+
+import datetime as dt
+import hashlib
+import time
+from typing import Callable, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+from sqlalchemy import Boolean, MetaData, Table, delete, func, select
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
+
+from src.utils.market_calendar import expected_latest_market_data_date
+
+from ..formatting import _format_elapsed, _format_eta
+from ..schema import (_ensure_scanner_metric_snapshots_table,
+                      _ensure_scanner_metrics_table,
+                      _get_scanner_metrics_table)
+from ..settings import (REFERENCE_SYMBOL, SCANNER_METRIC_WRITE_CHUNK_SIZE,
+                        SCANNER_METRICS_CACHE_VERSION,
+                        SCANNER_QUERY_SYMBOL_CHUNK_SIZE)
+from ..sql_helpers import _clean_symbols, _execute_bulk_upsert, _record_chunks
+from ..time_utils import _utcnow_naive
+from .market_bars import (load_symbol_history_from_db,
+                          load_universe_history_from_db)
+from .market_watermarks import get_price_history_watermarks
+
 
 def scanner_metrics_snapshot_date(expected_date: Optional[dt.date] = None) -> dt.datetime:
     """Database key for metrics derived from the latest completed market session."""

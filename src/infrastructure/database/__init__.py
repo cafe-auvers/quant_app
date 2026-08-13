@@ -1,50 +1,82 @@
-"""Database infrastructure facade preserving the legacy db_loader API.
+"""Explicit database infrastructure facade.
 
-P2 divides connection, mirror, schema, refresh, and repository concerns into
-focused modules. The synchronized namespace is temporary compatibility glue:
-existing callers and tests can keep importing/monkeypatching
-``src.utils.db_loader`` while consumers migrate to the focused modules.
+New code should import the focused owner module. This facade preserves the
+public API while avoiding shared globals, module replacement, and monkeypatch
+synchronization.
 """
-from __future__ import annotations
 
-import sys
-import types
+from .engine import (get_mysql_connection_url, init_mysql_engine,
+                     validate_mysql_config, validate_mysql_identifier,
+                     validate_mysql_port)
+from .mirror import (_RAW_MIRROR_SPECS, _RECONCILE_TABLE_SPECS,
+                     HOURLY_MIRROR_TABLES, LOCAL_MIRROR_DB_PATH,
+                     LOCAL_MIRROR_ENABLED_ENV, MIRRORED_TABLES,
+                     DataEngineResolution, LocalMirrorNeedsReconciliationError,
+                     LocalMirrorReconciliationResult,
+                     _copy_scoped_changed_rows_to_local, _local_mirror_enabled,
+                     _partition_fingerprints, _raw_group_watermarks,
+                     _save_mirror_sync_checkpoint,
+                     acquire_local_mirror_handoff_guard,
+                     init_local_mirror_engine, local_mirror_hourly_is_stale,
+                     local_mirror_is_stale, mirror_table_stats,
+                     reconcile_local_mirror_with_pc,
+                     release_local_mirror_handoff_guard, resolve_data_engine,
+                     sync_local_mirror_from_pc,
+                     sync_local_mirror_from_pc_atomic,
+                     sync_local_mirror_from_pc_checkpointed, sync_mirror_table)
+from .refresh import (HOURLY_BACKFILL_PERIOD, _period_for_daily_refresh,
+                      _period_for_hourly_refresh,
+                      refresh_universe_history_to_db,
+                      refresh_universe_hourly_history_to_db)
+from .repositories.market_data import (
+    _get_chart_indicator_manifests, calculate_chart_indicators,
+    calculate_chart_indicators_since, delete_intraday_history_for_symbol,
+    get_chart_indicator_refresh_plan, get_latest_chart_indicator_dates,
+    get_latest_chart_indicator_source_dates,
+    get_latest_hourly_price_history_timestamp,
+    get_latest_hourly_price_history_timestamps, get_latest_price_history_date,
+    get_latest_price_history_dates, get_price_history_watermarks,
+    load_chart_indicators_from_db, load_hourly_history_from_db,
+    load_intraday_history_from_db, load_symbol_history_from_db,
+    load_universe_history_from_db, prune_intraday_history,
+    refresh_chart_indicators_for_symbol, refresh_chart_indicators_to_db,
+    save_chart_indicators_batch_to_db, save_chart_indicators_to_db,
+    save_hourly_history_to_db, save_intraday_history_to_db,
+    save_symbol_history_to_db, save_universe_history_batch_to_db,
+    save_universe_hourly_history_batch_to_db)
+from .repositories.scanner import (get_universe_stock_metrics_from_db,
+                                   is_scanner_metrics_snapshot_current,
+                                   load_scanner_metrics_from_db,
+                                   refresh_scanner_metrics_to_db,
+                                   save_scanner_metrics_batch_to_db,
+                                   save_scanner_metrics_snapshot_to_db,
+                                   save_scanner_metrics_to_db,
+                                   scanner_metrics_input_fingerprint,
+                                   scanner_metrics_snapshot_date)
+from .schema import (CHRONIC_FAILURE_THRESHOLD,
+                     _ensure_chart_indicator_manifests_table,
+                     _ensure_chart_indicators_table,
+                     _ensure_hourly_price_history_table,
+                     _ensure_intraday_price_history_table,
+                     _ensure_price_history_table,
+                     _ensure_scanner_metric_snapshots_table,
+                     _ensure_scanner_metrics_table, _ensured_engines,
+                     _get_intraday_price_history_table,
+                     _get_price_history_table, get_chronically_failing_symbols,
+                     record_symbol_refresh_outcomes)
+from .settings import (CACHE_QUERY_SYMBOL_CHUNK_SIZE,
+                       CHART_INDICATOR_CACHE_VERSION,
+                       HOURLY_CACHE_QUERY_SYMBOL_CHUNK_SIZE,
+                       MYSQL_CONNECT_TIMEOUT_SECONDS,
+                       MYSQL_POOL_RECYCLE_SECONDS,
+                       MYSQL_READ_WRITE_TIMEOUT_SECONDS, REFERENCE_SYMBOL,
+                       SCANNER_METRIC_WRITE_CHUNK_SIZE,
+                       SCANNER_METRICS_CACHE_VERSION,
+                       SCANNER_QUERY_SYMBOL_CHUNK_SIZE)
+from .sql_helpers import _execute_bulk_upsert
 
-from src.infrastructure.database import _shared, engine, mirror, refresh, schema
-from src.infrastructure.database.repositories import market_data, scanner
-
-_P2_MODULES = (_shared, engine, mirror, schema, market_data, refresh, scanner)
-
-
-def _p2_exports(module):
-    return {
-        name: value
-        for name, value in vars(module).items()
-        if not name.startswith("__")
-    }
-
-
-_P2_EXPORTS = {}
-for _module in _P2_MODULES:
-    _P2_EXPORTS.update(_p2_exports(_module))
-globals().update(_P2_EXPORTS)
-
-# Existing functions historically shared one module-global namespace. Populate
-# missing cross-module names so their runtime lookup behavior stays unchanged.
-for _module in _P2_MODULES:
-    for _name, _value in _P2_EXPORTS.items():
-        _module.__dict__.setdefault(_name, _value)
-
-
-class _DatabaseFacadeModule(types.ModuleType):
-    def __setattr__(self, name, value):
-        super().__setattr__(name, value)
-        if name.startswith("_P2_"):
-            return
-        for module in _P2_MODULES:
-            if name in module.__dict__:
-                module.__dict__[name] = value
-
-
-sys.modules[__name__].__class__ = _DatabaseFacadeModule
-__all__ = sorted(name for name in _P2_EXPORTS if not name.startswith("_"))
+__all__ = [
+    name
+    for name in globals()
+    if not name.startswith("_")
+]

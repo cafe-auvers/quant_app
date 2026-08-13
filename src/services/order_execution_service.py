@@ -2,24 +2,22 @@
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 from typing import Optional
 
-from src.core.order_state import (
-    REGULAR_LIMIT_EXECUTION,
-    RESERVED_MOO_EXECUTION,
-    BrokerOrder,
-    OrderIntent,
-    OrderSide,
-    OrderStatus,
-)
-from src.risk.pre_trade import (
-    PreTradeRiskDecision,
-    require_pre_trade_risk_approval,
-)
-from src.services.broker import Broker, BrokerSubmissionResult, KisBroker
-from src.services.order_ledger import ORDERS_FILE, reserve_order_if_no_matching_open, upsert_order
+from src.core.order_state import (REGULAR_LIMIT_EXECUTION,
+                                  RESERVED_MOO_EXECUTION, BrokerOrder,
+                                  OrderIntent, OrderSide, OrderStatus)
+from src.risk.pre_trade import (PreTradeRiskDecision,
+                                PreTradeRiskRejectedError,
+                                normalize_share_quantity,
+                                require_pre_trade_risk_approval)
 from src.services import trading_state
+from src.services.broker import Broker, BrokerSubmissionResult, KisBroker
+from src.services.order_ledger import (ORDERS_FILE,
+                                       reserve_order_if_no_matching_open,
+                                       upsert_order)
 from src.services.trading_state import TradingDisabledError
 
 logger = logging.getLogger(__name__)
@@ -52,6 +50,8 @@ def submit_guarded_overseas_order(
     path: Path = ORDERS_FILE,
     broker: Optional[Broker] = None,
     pre_trade_risk_decision: Optional[PreTradeRiskDecision] = None,
+    strategy_id: str = "",
+    plan_id: str = "",
 ) -> BrokerOrder:
     """Submit an overseas order with a durable local idempotency guard.
 
@@ -62,18 +62,17 @@ def submit_guarded_overseas_order(
     ``broker`` defaults to ``KisBroker()`` (the real KIS API) -- this state
     machine itself has no KIS-specific knowledge and doesn't change based on
     which ``Broker`` implementation runs underneath it. ENTRY orders must
-    carry an explicit risk approval bound to the requested quantity; exit
+    carry a fresh risk approval bound to the complete order fingerprint; exit
     orders deliberately remain available without entry-risk approval.
     """
     trading_state.require_trading_enabled(environment, symbol)
-    if quantity <= 0:
-        raise ValueError(f"quantity must be positive, got {quantity}")
-
     environment = str(environment or "").upper()
     account_no = str(account_no or "")
     symbol = str(symbol or "").upper()
     side = side if isinstance(side, OrderSide) else OrderSide(str(side).upper())
     intent = intent if isinstance(intent, OrderIntent) else OrderIntent(str(intent).upper())
+    quantity = normalize_share_quantity(quantity)
+    exchange = str(exchange or "").strip().upper()
     execution_policy = str(
         execution_policy or REGULAR_LIMIT_EXECUTION
     ).strip().upper()
@@ -82,15 +81,40 @@ def submit_guarded_overseas_order(
         RESERVED_MOO_EXECUTION,
     }:
         raise ValueError(f"Unsupported execution_policy={execution_policy!r}")
+    if side == OrderSide.BUY and intent != OrderIntent.ENTRY:
+        raise ValueError("BUY orders require explicit ENTRY intent")
+    if intent == OrderIntent.ENTRY and side != OrderSide.BUY:
+        raise ValueError("ENTRY intent requires a BUY order")
     if execution_policy == RESERVED_MOO_EXECUTION:
         if environment != "PROD" or side != OrderSide.SELL:
             raise ValueError("Reserved MOO execution requires a PROD sell order")
         limit_price = 0.0
-    elif limit_price <= 0:
-        raise ValueError(f"limit_price must be positive, got {limit_price}")
+    else:
+        try:
+            limit_price = float(limit_price)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("limit_price must be positive and finite") from exc
+        if not math.isfinite(limit_price) or limit_price <= 0:
+            raise ValueError(f"limit_price must be positive, got {limit_price}")
 
-    if intent == OrderIntent.ENTRY:
-        require_pre_trade_risk_approval(pre_trade_risk_decision, quantity)
+    def require_current_entry_approval() -> None:
+        if intent == OrderIntent.ENTRY:
+            require_pre_trade_risk_approval(
+                pre_trade_risk_decision,
+                environment=environment,
+                account_no=account_no,
+                symbol=symbol,
+                side=side,
+                intent=intent,
+                quantity=quantity,
+                reference_price=limit_price,
+                exchange=exchange,
+                execution_policy=execution_policy,
+                strategy_id=strategy_id,
+                plan_id=plan_id,
+            )
+
+    require_current_entry_approval()
 
     broker = KisBroker() if broker is None else broker
 
@@ -115,13 +139,14 @@ def submit_guarded_overseas_order(
     if match is not None:
         raise DuplicateOpenOrderError(match)
 
-    # Re-check after the durable duplicate-order reservation. The user may
-    # disable trading while validation or local file I/O is in progress. In
-    # that case no broker request was attempted, so close the reserved row as
-    # REJECTED instead of leaving an ambiguous/open order behind.
+    # Re-check both the kill switch and short-lived entry approval after the
+    # durable duplicate-order reservation. Either can change/expire while
+    # waiting for the ledger lock. No broker request was attempted, so close
+    # the reserved row as REJECTED instead of leaving an open order behind.
     try:
         trading_state.require_trading_enabled(environment, symbol)
-    except TradingDisabledError as exc:
+        require_current_entry_approval()
+    except (TradingDisabledError, PreTradeRiskRejectedError) as exc:
         order.status = OrderStatus.REJECTED
         order.error_message = str(exc)
         order.touch()

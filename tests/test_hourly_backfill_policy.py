@@ -8,6 +8,8 @@ import pandas as pd
 from sqlalchemy import create_engine
 
 import src.utils.db_loader as db_loader
+from src.infrastructure.database import mirror_freshness
+from src.infrastructure.database import refresh as refresh_module
 
 
 def _load_once_script():
@@ -34,7 +36,7 @@ def test_hourly_refresh_uses_d10_normally_and_d200_only_when_forced(monkeypatch)
     engine = create_engine("sqlite:///:memory:", future=True)
     calls = []
     monkeypatch.setattr(
-        db_loader,
+        refresh_module,
         "download_price_history",
         lambda *args, **kwargs: calls.append(kwargs["period"]) or pd.DataFrame(),
     )
@@ -58,12 +60,12 @@ def test_laptop_hourly_staleness_checks_each_actionable_symbol(monkeypatch):
         "AAPL": dt.datetime(2026, 8, 6, 20),
     }
     monkeypatch.setattr(
-        db_loader,
+        mirror_freshness,
         "get_latest_hourly_price_history_timestamps",
         lambda *args, **kwargs: latest,
     )
     monkeypatch.setattr(
-        db_loader, "get_chronically_failing_symbols", lambda *args, **kwargs: set()
+        mirror_freshness, "get_chronically_failing_symbols", lambda *args, **kwargs: set()
     )
 
     assert db_loader.local_mirror_hourly_is_stale(object(), expected, ["AAPL"])

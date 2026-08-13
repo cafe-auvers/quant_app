@@ -2,11 +2,11 @@ import pytest
 from sqlalchemy.engine import URL
 
 import src.utils.db_loader as db_loader
-from src.utils.db_loader import (
-    get_mysql_connection_url,
-    validate_mysql_config,
-    validate_mysql_identifier,
-)
+from src.infrastructure.database import engine as engine_module
+from src.infrastructure.database import schema as schema_module
+from src.utils.db_loader import (get_mysql_connection_url,
+                                 validate_mysql_config,
+                                 validate_mysql_identifier)
 
 
 @pytest.mark.parametrize(
@@ -33,7 +33,7 @@ def test_connection_url_rejects_unsafe_database_before_engine_creation():
 
 def test_mysql_config_requires_explicit_host_and_user(monkeypatch):
     monkeypatch.setattr(
-        db_loader,
+        engine_module,
         "get_mysql_config",
         lambda: {"host": "", "port": "3306", "user": "", "password": "", "database": "quant_app"},
     )
@@ -67,7 +67,7 @@ def test_init_mysql_uses_preprovisioned_database_with_bounded_timeouts(monkeypat
 
     engine = _Engine()
     monkeypatch.setattr(
-        db_loader,
+        engine_module,
         "get_mysql_config",
         lambda: {
             "host": "127.0.0.1",
@@ -78,7 +78,7 @@ def test_init_mysql_uses_preprovisioned_database_with_bounded_timeouts(monkeypat
         },
     )
     monkeypatch.setattr(
-        db_loader,
+        engine_module,
         "create_engine",
         lambda url, **kwargs: calls.append((url, kwargs)) or engine,
     )
@@ -91,7 +91,7 @@ def test_init_mysql_uses_preprovisioned_database_with_bounded_timeouts(monkeypat
         "_ensure_scanner_metrics_table",
         "_ensure_scanner_metric_snapshots_table",
     ):
-        monkeypatch.setattr(db_loader, name, lambda _engine: None)
+        monkeypatch.setattr(schema_module, name, lambda _engine: None)
 
     result = db_loader.init_mysql_engine()
 

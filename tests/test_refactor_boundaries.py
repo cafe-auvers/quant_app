@@ -93,13 +93,13 @@ def test_account_and_order_reconciliation_workers_keep_separate_state(
 def test_scanner_worker_loads_cold_universe_off_the_calling_ui_path(monkeypatch):
     import src.ui.workers as workers
     import src.utils.data_loader as data_loader
-    import src.utils.db_loader as db_loader
+    import src.infrastructure.database.repositories.scanner as scanner_repository
 
     monkeypatch.setattr(
         data_loader, "get_default_universe", lambda max_symbols=None: ["AAPL", "MSFT"]
     )
     monkeypatch.setattr(
-        db_loader,
+        scanner_repository,
         "get_universe_stock_metrics_from_db",
         lambda tickers, engine: [{"symbol": ticker} for ticker in tickers],
     )
@@ -147,7 +147,8 @@ def test_database_init_worker_never_raises_connection_errors_into_the_ui(monkeyp
 
 def test_database_init_worker_routes_to_pc_without_opening_local_mirror(monkeypatch):
     import src.ui.main_window as main_window
-    import src.utils.db_loader as db_loader
+    import src.infrastructure.database.mirror_engine as mirror_engine
+    import src.infrastructure.database.mirror_reconciliation as mirror_reconciliation
 
     pc_engine = object()
     local_engine = object()
@@ -162,10 +163,10 @@ def test_database_init_worker_routes_to_pc_without_opening_local_mirror(monkeypa
             pc_engine=pc_engine,
         ),
     )
-    monkeypatch.setattr(db_loader, "init_local_mirror_engine", lambda: local_engine)
+    monkeypatch.setattr(mirror_engine, "init_local_mirror_engine", lambda: local_engine)
     calls = []
     monkeypatch.setattr(
-        db_loader,
+        mirror_reconciliation,
         "reconcile_local_mirror_with_pc",
         lambda pc, local, **kwargs: calls.append((pc, local, kwargs)) or report,
     )
@@ -187,7 +188,8 @@ def test_database_init_worker_routes_to_pc_without_opening_local_mirror(monkeypa
 
 def test_database_init_worker_respects_disabled_local_mirror_on_pc(monkeypatch):
     import src.ui.main_window as main_window
-    import src.utils.db_loader as db_loader
+    import src.infrastructure.database.mirror_engine as mirror_engine
+    import src.infrastructure.database.mirror_reconciliation as mirror_reconciliation
 
     pc_engine = object()
     monkeypatch.setattr(
@@ -199,16 +201,16 @@ def test_database_init_worker_respects_disabled_local_mirror_on_pc(monkeypatch):
             pc_engine=pc_engine,
         ),
     )
-    monkeypatch.setattr(db_loader, "_local_mirror_enabled", lambda: False)
+    monkeypatch.setattr(mirror_engine, "_local_mirror_enabled", lambda: False)
     monkeypatch.setattr(
-        db_loader,
+        mirror_engine,
         "init_local_mirror_engine",
         lambda: (_ for _ in ()).throw(
             AssertionError("disabled mirror must not be opened")
         ),
     )
     monkeypatch.setattr(
-        db_loader,
+        mirror_reconciliation,
         "reconcile_local_mirror_with_pc",
         lambda *_args: (_ for _ in ()).throw(
             AssertionError("disabled mirror must not be reconciled")
@@ -232,7 +234,8 @@ def test_database_init_worker_does_not_wait_for_backup_reconciliation(
     monkeypatch,
 ):
     import src.ui.main_window as main_window
-    import src.utils.db_loader as db_loader
+    import src.infrastructure.database.mirror_engine as mirror_engine
+    import src.infrastructure.database.mirror_reconciliation as mirror_reconciliation
 
     pc_engine = object()
     local_engine = object()
@@ -249,9 +252,9 @@ def test_database_init_worker_does_not_wait_for_backup_reconciliation(
             pc_engine=pc_engine,
         ),
     )
-    monkeypatch.setattr(db_loader, "init_local_mirror_engine", lambda: local_engine)
+    monkeypatch.setattr(mirror_engine, "init_local_mirror_engine", lambda: local_engine)
     monkeypatch.setattr(
-        db_loader,
+        mirror_reconciliation,
         "reconcile_local_mirror_with_pc",
         lambda *_args, **_kwargs: report,
     )
@@ -271,7 +274,8 @@ def test_database_init_worker_does_not_wait_for_backup_reconciliation(
 
 def test_database_init_worker_never_starts_backup_reconciliation(monkeypatch):
     import src.ui.main_window as main_window
-    import src.utils.db_loader as db_loader
+    import src.infrastructure.database.mirror_engine as mirror_engine
+    import src.infrastructure.database.mirror_reconciliation as mirror_reconciliation
 
     pc_engine = object()
     local_engine = object()
@@ -284,9 +288,9 @@ def test_database_init_worker_never_starts_backup_reconciliation(monkeypatch):
             pc_engine=pc_engine,
         ),
     )
-    monkeypatch.setattr(db_loader, "init_local_mirror_engine", lambda: local_engine)
+    monkeypatch.setattr(mirror_engine, "init_local_mirror_engine", lambda: local_engine)
     monkeypatch.setattr(
-        db_loader,
+        mirror_reconciliation,
         "reconcile_local_mirror_with_pc",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             RuntimeError("sync exploded")

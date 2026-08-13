@@ -7,16 +7,20 @@ from sqlalchemy import create_engine, delete, event, select
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 import src.utils.db_loader as db_loader
+from src.infrastructure.database import schema as schema_module
+from src.infrastructure.database.repositories import (chart_indicators,
+                                                      market_watermarks,
+                                                      scanner)
 
 
 @pytest.fixture
 def engine():
     value = create_engine("sqlite:///:memory:", future=True)
-    db_loader._ensured_engines.discard(value)
+    schema_module._ensured_engines.discard(value)
     try:
         yield value
     finally:
-        db_loader._ensured_engines.discard(value)
+        schema_module._ensured_engines.discard(value)
         value.dispose()
 
 
@@ -61,7 +65,7 @@ def test_price_history_watermarks_use_bounded_symbol_batches(engine, monkeypatch
             symbol, _history(dates, 100 + offset), engine
         )
 
-    monkeypatch.setattr(db_loader, "CACHE_QUERY_SYMBOL_CHUNK_SIZE", 2)
+    monkeypatch.setattr(market_watermarks, "CACHE_QUERY_SYMBOL_CHUNK_SIZE", 2)
     captured, listener = _capture_selects(engine)
     try:
         watermarks = db_loader.get_price_history_watermarks(
@@ -94,7 +98,7 @@ def test_complete_chart_cache_uses_manifest_without_indicator_scan(
         assert db_loader.save_chart_indicators_to_db(symbol, indicators, engine)
     watermarks = db_loader.get_price_history_watermarks(engine, ["SPY", *symbols])
 
-    monkeypatch.setattr(db_loader, "CACHE_QUERY_SYMBOL_CHUNK_SIZE", 2)
+    monkeypatch.setattr(chart_indicators, "CACHE_QUERY_SYMBOL_CHUNK_SIZE", 2)
     assert db_loader.get_chart_indicator_refresh_plan(
         engine,
         ["SPY", *symbols],
@@ -137,7 +141,7 @@ def test_ambiguous_chart_gap_checks_use_bounded_symbol_batches(engine, monkeypat
         )
     watermarks = db_loader.get_price_history_watermarks(engine, ["SPY", *symbols])
 
-    monkeypatch.setattr(db_loader, "CACHE_QUERY_SYMBOL_CHUNK_SIZE", 2)
+    monkeypatch.setattr(chart_indicators, "CACHE_QUERY_SYMBOL_CHUNK_SIZE", 2)
     captured, listener = _capture_selects(engine)
     try:
         plan = db_loader.get_chart_indicator_refresh_plan(
@@ -173,7 +177,7 @@ def test_chart_plan_finds_middle_gap_and_refresh_repairs_it(engine, monkeypatch)
     assert db_loader.get_chart_indicator_refresh_plan(engine, ["SPY", "AAPL"]) == {}
 
     monkeypatch.setattr(
-        db_loader,
+        chart_indicators,
         "load_universe_history_from_db",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("current indicators must not load or calculate history")
@@ -237,7 +241,7 @@ def test_chart_manifest_version_change_forces_recalculation(engine, monkeypatch)
     ) == {}
 
     monkeypatch.setattr(
-        db_loader,
+        chart_indicators,
         "CHART_INDICATOR_CACHE_VERSION",
         db_loader.CHART_INDICATOR_CACHE_VERSION + 1,
     )
@@ -432,9 +436,9 @@ def test_scanner_snapshot_uses_bounded_atomic_statements(engine, monkeypatch):
         {"symbol": symbol, "return_1m": float(index)}
         for index, symbol in enumerate(symbols)
     ]
-    monkeypatch.setattr(db_loader, "SCANNER_QUERY_SYMBOL_CHUNK_SIZE", 2)
-    monkeypatch.setattr(db_loader, "SCANNER_METRIC_WRITE_CHUNK_SIZE", 2)
-    original_upsert = db_loader._execute_bulk_upsert
+    monkeypatch.setattr(scanner, "SCANNER_QUERY_SYMBOL_CHUNK_SIZE", 2)
+    monkeypatch.setattr(scanner, "SCANNER_METRIC_WRITE_CHUNK_SIZE", 2)
+    original_upsert = scanner._execute_bulk_upsert
     metric_write_sizes = []
 
     def recording_upsert(conn, table, records, key_columns, dialect_name):
@@ -447,7 +451,7 @@ def test_scanner_snapshot_uses_bounded_atomic_statements(engine, monkeypatch):
     def record_statement(_conn, _cursor, statement, parameters, _context, _many):
         statements.append((" ".join(statement.lower().split()), parameters))
 
-    monkeypatch.setattr(db_loader, "_execute_bulk_upsert", recording_upsert)
+    monkeypatch.setattr(scanner, "_execute_bulk_upsert", recording_upsert)
     event.listen(engine, "before_cursor_execute", record_statement)
     try:
         saved = db_loader.save_scanner_metrics_snapshot_to_db(
@@ -485,8 +489,8 @@ def test_scanner_snapshot_chunk_failure_rolls_back_replacement(engine, monkeypat
         engine,
     ) == ["AAPL", "MSFT"]
 
-    monkeypatch.setattr(db_loader, "SCANNER_METRIC_WRITE_CHUNK_SIZE", 1)
-    original_upsert = db_loader._execute_bulk_upsert
+    monkeypatch.setattr(scanner, "SCANNER_METRIC_WRITE_CHUNK_SIZE", 1)
+    original_upsert = scanner._execute_bulk_upsert
     metric_writes = 0
 
     def fail_second_metric_chunk(conn, table, records, key_columns, dialect_name):
@@ -498,7 +502,7 @@ def test_scanner_snapshot_chunk_failure_rolls_back_replacement(engine, monkeypat
         return original_upsert(conn, table, records, key_columns, dialect_name)
 
     monkeypatch.setattr(
-        db_loader, "_execute_bulk_upsert", fail_second_metric_chunk
+        scanner, "_execute_bulk_upsert", fail_second_metric_chunk
     )
     saved = db_loader.save_scanner_metrics_snapshot_to_db(
         [
@@ -531,7 +535,7 @@ def test_scanner_snapshot_chunk_failure_rolls_back_replacement(engine, monkeypat
 
 def test_scanner_snapshot_strict_error_keeps_driver_message(engine, monkeypatch):
     monkeypatch.setattr(
-        db_loader,
+        scanner,
         "_execute_bulk_upsert",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             OperationalError(
@@ -569,7 +573,7 @@ def test_scanner_cache_hit_skips_history_loading_and_calculation(engine, monkeyp
     ) == ["AAPL"]
 
     monkeypatch.setattr(
-        db_loader,
+        scanner,
         "load_universe_history_from_db",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("current scanner metrics must not load history")
@@ -599,7 +603,7 @@ def test_scanner_reader_rejects_old_80_percent_style_partial_cache(engine, monke
     ) == ["AAPL"]
     history_loads = []
     monkeypatch.setattr(
-        db_loader,
+        scanner,
         "load_universe_history_from_db",
         lambda symbols, *args, **kwargs: history_loads.append(list(symbols)) or {},
     )
@@ -620,7 +624,7 @@ def test_scanner_fingerprint_tracks_spy_and_cache_version(engine, monkeypatch):
     changed = db_loader.get_price_history_watermarks(engine, symbols)
     second = db_loader.scanner_metrics_input_fingerprint(symbols, changed)
     monkeypatch.setattr(
-        db_loader,
+        scanner,
         "SCANNER_METRICS_CACHE_VERSION",
         db_loader.SCANNER_METRICS_CACHE_VERSION + 1,
     )

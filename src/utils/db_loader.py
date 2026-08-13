@@ -1,5 +1,55 @@
-"""Compatibility alias for :mod:`src.infrastructure.database`."""
-import sys
-from src.infrastructure import database as _database
+"""Compatibility imports for the explicit database infrastructure facade.
 
-sys.modules[__name__] = _database
+Prefer importing from ``src.infrastructure.database`` or its focused owner
+modules in new code.
+"""
+
+from src.infrastructure.database import (
+    _RAW_MIRROR_SPECS, _RECONCILE_TABLE_SPECS, CACHE_QUERY_SYMBOL_CHUNK_SIZE,
+    CHART_INDICATOR_CACHE_VERSION, CHRONIC_FAILURE_THRESHOLD,
+    HOURLY_BACKFILL_PERIOD, HOURLY_CACHE_QUERY_SYMBOL_CHUNK_SIZE,
+    HOURLY_MIRROR_TABLES, LOCAL_MIRROR_DB_PATH, LOCAL_MIRROR_ENABLED_ENV,
+    MIRRORED_TABLES, MYSQL_CONNECT_TIMEOUT_SECONDS, MYSQL_POOL_RECYCLE_SECONDS,
+    MYSQL_READ_WRITE_TIMEOUT_SECONDS, REFERENCE_SYMBOL,
+    SCANNER_METRIC_WRITE_CHUNK_SIZE, SCANNER_METRICS_CACHE_VERSION,
+    SCANNER_QUERY_SYMBOL_CHUNK_SIZE, DataEngineResolution,
+    LocalMirrorNeedsReconciliationError, LocalMirrorReconciliationResult,
+    _copy_scoped_changed_rows_to_local,
+    _ensure_chart_indicator_manifests_table, _ensure_chart_indicators_table,
+    _ensure_hourly_price_history_table, _ensure_intraday_price_history_table,
+    _ensure_price_history_table, _ensure_scanner_metric_snapshots_table,
+    _ensure_scanner_metrics_table, _ensured_engines, _execute_bulk_upsert,
+    _get_chart_indicator_manifests, _get_intraday_price_history_table,
+    _get_price_history_table, _local_mirror_enabled, _partition_fingerprints,
+    _period_for_daily_refresh, _period_for_hourly_refresh, _raw_group_watermarks,
+    _save_mirror_sync_checkpoint, acquire_local_mirror_handoff_guard,
+    calculate_chart_indicators, calculate_chart_indicators_since,
+    delete_intraday_history_for_symbol, get_chart_indicator_refresh_plan,
+    get_chronically_failing_symbols, get_latest_chart_indicator_dates,
+    get_latest_chart_indicator_source_dates,
+    get_latest_hourly_price_history_timestamp,
+    get_latest_hourly_price_history_timestamps, get_latest_price_history_date,
+    get_latest_price_history_dates, get_mysql_connection_url,
+    get_price_history_watermarks, get_universe_stock_metrics_from_db,
+    init_local_mirror_engine, init_mysql_engine,
+    is_scanner_metrics_snapshot_current, load_chart_indicators_from_db,
+    load_hourly_history_from_db, load_intraday_history_from_db,
+    load_scanner_metrics_from_db, load_symbol_history_from_db,
+    load_universe_history_from_db, local_mirror_hourly_is_stale,
+    local_mirror_is_stale, mirror_table_stats, prune_intraday_history,
+    reconcile_local_mirror_with_pc, record_symbol_refresh_outcomes,
+    refresh_chart_indicators_for_symbol, refresh_chart_indicators_to_db,
+    refresh_scanner_metrics_to_db, refresh_universe_history_to_db,
+    refresh_universe_hourly_history_to_db, release_local_mirror_handoff_guard,
+    resolve_data_engine, save_chart_indicators_batch_to_db,
+    save_chart_indicators_to_db, save_hourly_history_to_db,
+    save_intraday_history_to_db, save_scanner_metrics_batch_to_db,
+    save_scanner_metrics_snapshot_to_db, save_scanner_metrics_to_db,
+    save_symbol_history_to_db, save_universe_history_batch_to_db,
+    save_universe_hourly_history_batch_to_db,
+    scanner_metrics_input_fingerprint, scanner_metrics_snapshot_date,
+    sync_local_mirror_from_pc, sync_local_mirror_from_pc_atomic,
+    sync_local_mirror_from_pc_checkpointed, sync_mirror_table,
+    validate_mysql_config, validate_mysql_identifier, validate_mysql_port)
+
+__all__ = [name for name in globals() if not name.startswith("_")]

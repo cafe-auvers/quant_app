@@ -1,5 +1,19 @@
-"""P2 schema extraction from the legacy database loader."""
-from ._shared import *  # noqa: F401,F403
+"""Database table definitions and schema guards."""
+
+import weakref
+from typing import List, Set
+
+from sqlalchemy import (Boolean, Column, DateTime, Float, Integer, MetaData,
+                        String, Table, insert, inspect, select, text)
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
+
+from .sql_helpers import _clean_symbols, _execute_bulk_upsert
+from .time_utils import _utcnow_naive
+
+_ensured_engines: weakref.WeakSet[Engine] = weakref.WeakSet()
 
 def _get_price_history_table(metadata: MetaData) -> Table:
     return Table(

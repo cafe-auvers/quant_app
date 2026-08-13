@@ -9,14 +9,11 @@ REJECTED) is covered separately in test_order_lifecycle.py.
 import pytest
 
 from src.api import kis_account_snapshot_dual, kis_order
-from src.core.order_state import (
-    REGULAR_LIMIT_EXECUTION,
-    RESERVED_MOO_EXECUTION,
-    OrderSide,
-)
+from src.core.order_state import (REGULAR_LIMIT_EXECUTION,
+                                  RESERVED_MOO_EXECUTION, OrderSide)
 from src.risk.pre_trade import PreTradeRiskDecision
-from src.services.broker import BrokerSubmissionResult, KisBroker
 from src.services import trading_state
+from src.services.broker import BrokerSubmissionResult, KisBroker
 from src.services.trading_state import TradingDisabledError
 
 
@@ -240,7 +237,8 @@ def test_submit_guarded_overseas_order_accepts_injected_broker(monkeypatch, tmp_
     is passed in -- KisBroker is only the default, not a hardcoded dependency."""
     from src.core.order_state import OrderIntent
     from src.services import trading_state
-    from src.services.order_execution_service import submit_guarded_overseas_order
+    from src.services.order_execution_service import \
+        submit_guarded_overseas_order
 
     trading_state.set_trading_enabled(True)
     path = tmp_path / "orders.json"
@@ -276,7 +274,21 @@ def test_submit_guarded_overseas_order_accepts_injected_broker(monkeypatch, tmp_
         limit_price=100.0,
         path=path,
         broker=fake_broker,
-        pre_trade_risk_decision=PreTradeRiskDecision.approve(1),
+        pre_trade_risk_decision=PreTradeRiskDecision.approve(
+            environment="SIM",
+            account_no="12345678",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            intent=OrderIntent.ENTRY,
+            quantity=1,
+            reference_price=100.0,
+            exchange="NASD",
+            execution_policy=REGULAR_LIMIT_EXECUTION,
+            strategy_id="TEST",
+            plan_id="TEST:AAPL",
+        ),
+        strategy_id="TEST",
+        plan_id="TEST:AAPL",
     )
 
     assert order.broker_order_id == "FAKE-1"

@@ -1,5 +1,5 @@
-"""Compatibility alias for the P2 chart controller."""
-import sys
-from src.ui.charts import controller as _controller
+"""Compatibility import for the decomposed chart controller."""
 
-sys.modules[__name__] = _controller
+from src.ui.charts.controller import ChartsControllerMixin
+
+__all__ = ["ChartsControllerMixin"]

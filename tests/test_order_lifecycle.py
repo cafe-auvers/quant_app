@@ -1,45 +1,67 @@
-import json
 import datetime as dt
+import json
 import threading
 from types import SimpleNamespace
 
 import pytest
 import requests
 
-from src.api import kis_order
-from src.api.kis_account_snapshot_dual import (
-    KisAccountClient,
-    KisEnvironment,
-    KisRateLimitError,
-    KisTokenError,
-)
-from src.core.order_state import (
-    REGULAR_LIMIT_EXECUTION,
-    RESERVED_MOO_EXECUTION,
-    BrokerOrder,
-    OrderIntent,
-    OrderSide,
-    OrderStatus,
-    generate_client_order_id,
-)
-from src.services.order_ledger import (
-    OrderLedgerCorruptionError,
-    append_order,
-    clear_unknown_submission_order,
-    find_open_orders,
-    has_open_order,
-    has_open_order_for_buylist_item,
-    load_orders,
-    load_order_ledger,
-    update_order,
-)
-from src.services import order_execution_service
-from src.services.order_execution_service import DuplicateOpenOrderError, submit_guarded_overseas_order
-from src.risk.pre_trade import PreTradeRiskDecision
-from src.services.order_reconciliation import reconcile_orders_with_snapshot
-import src.ui.mixins.buylist_mixin as buylist_mixin_module
+import src.ui.buylist.actions as buylist_actions_module
+import src.ui.buylist.constants as buylist_constants
+import src.ui.buylist.orders as buylist_orders_module
 import src.ui.main_window as main_window_module
+from src.api import kis_order
+from src.api.kis_account_snapshot_dual import (KisAccountClient,
+                                               KisEnvironment,
+                                               KisRateLimitError,
+                                               KisTokenError)
+from src.core.order_state import (REGULAR_LIMIT_EXECUTION,
+                                  RESERVED_MOO_EXECUTION, BrokerOrder,
+                                  OrderIntent, OrderSide, OrderStatus,
+                                  generate_client_order_id)
+from src.risk.pre_trade import PreTradeRiskDecision
+from src.services import order_execution_service
+from src.services.order_execution_service import (
+    DuplicateOpenOrderError, submit_guarded_overseas_order)
+from src.services.order_ledger import (OrderLedgerCorruptionError,
+                                       append_order,
+                                       clear_unknown_submission_order,
+                                       find_open_orders, has_open_order,
+                                       has_open_order_for_buylist_item,
+                                       load_order_ledger, load_orders,
+                                       update_order)
+from src.services.order_reconciliation import reconcile_orders_with_snapshot
 from src.ui.main_window import MainWindow
+
+RISK_STRATEGY_ID = "TEST"
+RISK_PLAN_ID = "TEST:AAPL"
+
+
+def _risk_approval(
+    quantity,
+    *,
+    environment="SIM",
+    account_no="12345678",
+    symbol="AAPL",
+    reference_price=100.0,
+):
+    return PreTradeRiskDecision.approve(
+        environment=environment,
+        account_no=account_no,
+        symbol=symbol,
+        side=OrderSide.BUY,
+        intent=OrderIntent.ENTRY,
+        quantity=quantity,
+        reference_price=reference_price,
+        exchange="NASD",
+        execution_policy=REGULAR_LIMIT_EXECUTION,
+        strategy_id=RISK_STRATEGY_ID,
+        plan_id=RISK_PLAN_ID,
+    )
+
+
+def _risk_metadata():
+    return {"strategy_id": RISK_STRATEGY_ID, "plan_id": RISK_PLAN_ID}
 
 
 def _snapshot(symbol: str, quantity: int, average_price: float = 0.0) -> dict:
@@ -237,7 +259,12 @@ def test_guarded_submission_does_not_call_broker_with_corrupt_ledger(
             quantity=1,
             limit_price=100.0,
             path=path,
-            pre_trade_risk_decision=PreTradeRiskDecision.approve(1),
+            pre_trade_risk_decision=_risk_approval(
+                1,
+                environment="PROD",
+                account_no="12345678-01",
+            ),
+            **_risk_metadata(),
         )
 
 
@@ -332,7 +359,8 @@ def test_submit_guarded_order_proceeds_normally_once_trading_enabled(monkeypatch
         quantity=1,
         limit_price=100.0,
         path=path,
-        pre_trade_risk_decision=PreTradeRiskDecision.approve(1),
+        pre_trade_risk_decision=_risk_approval(1),
+        **_risk_metadata(),
     )
 
     assert order.status == OrderStatus.ACCEPTED
@@ -366,7 +394,8 @@ def test_submit_guarded_order_persists_created_before_api_and_accepted_after(
         quantity=3,
         limit_price=191.23,
         path=path,
-        pre_trade_risk_decision=PreTradeRiskDecision.approve(3),
+        pre_trade_risk_decision=_risk_approval(3, reference_price=191.23),
+        **_risk_metadata(),
     )
 
     assert captured_statuses == [OrderStatus.CREATED]
@@ -412,7 +441,8 @@ def test_disabling_during_local_reservation_prevents_broker_call(
             quantity=1,
             limit_price=100.0,
             path=path,
-            pre_trade_risk_decision=PreTradeRiskDecision.approve(1),
+            pre_trade_risk_decision=_risk_approval(1),
+            **_risk_metadata(),
         )
 
     [persisted] = load_orders(path=path)
@@ -476,7 +506,8 @@ def test_submit_guarded_order_blocks_duplicate_but_isolates_account_env_and_clos
             quantity=1,
             limit_price=100.0,
             path=path,
-            pre_trade_risk_decision=PreTradeRiskDecision.approve(1),
+            pre_trade_risk_decision=_risk_approval(1),
+            **_risk_metadata(),
         )
 
     other_account = submit_guarded_overseas_order(
@@ -488,7 +519,8 @@ def test_submit_guarded_order_blocks_duplicate_but_isolates_account_env_and_clos
         quantity=1,
         limit_price=100.0,
         path=path,
-        pre_trade_risk_decision=PreTradeRiskDecision.approve(1),
+        pre_trade_risk_decision=_risk_approval(1, account_no="99999999"),
+        **_risk_metadata(),
     )
     other_env = submit_guarded_overseas_order(
         environment="PROD",
@@ -499,7 +531,8 @@ def test_submit_guarded_order_blocks_duplicate_but_isolates_account_env_and_clos
         quantity=1,
         limit_price=100.0,
         path=path,
-        pre_trade_risk_decision=PreTradeRiskDecision.approve(1),
+        pre_trade_risk_decision=_risk_approval(1, environment="PROD"),
+        **_risk_metadata(),
     )
 
     assert other_account.status == OrderStatus.ACCEPTED
@@ -527,7 +560,8 @@ def test_same_symbol_account_with_closed_previous_order_does_not_block(
         quantity=1,
         limit_price=100.0,
         path=path,
-        pre_trade_risk_decision=PreTradeRiskDecision.approve(1),
+        pre_trade_risk_decision=_risk_approval(1),
+        **_risk_metadata(),
     )
 
     assert order.status == OrderStatus.ACCEPTED
@@ -561,7 +595,12 @@ def test_concurrent_guarded_submissions_reserve_only_one_order(
                     quantity=1,
                     limit_price=100.0,
                     path=path,
-                    pre_trade_risk_decision=PreTradeRiskDecision.approve(1),
+                    pre_trade_risk_decision=_risk_approval(
+                        1,
+                        environment="PROD",
+                        account_no="12345678-01",
+                    ),
+                    **_risk_metadata(),
                 )
             )
         except DuplicateOpenOrderError as exc:
@@ -577,6 +616,34 @@ def test_concurrent_guarded_submissions_reserve_only_one_order(
     assert len(submitted) == 1
     assert len(load_orders(path)) == 1
     assert sum(isinstance(result, DuplicateOpenOrderError) for result in results) == 1
+
+
+def test_order_ledger_lock_retries_windows_permission_collision(monkeypatch, tmp_path):
+    from src.services import order_ledger
+
+    path = tmp_path / "orders.json"
+    lock_path = path.with_suffix(".json.lock")
+    original_open = order_ledger.os.open
+    calls = {"count": 0}
+
+    def windows_open(candidate, flags, mode=0o777):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            lock_path.write_text("other owner", encoding="utf-8")
+            raise PermissionError(13, "permission denied", str(candidate))
+        return original_open(candidate, flags, mode)
+
+    def release_other_owner(_seconds):
+        lock_path.unlink()
+
+    monkeypatch.setattr(order_ledger.os, "open", windows_open)
+    monkeypatch.setattr(order_ledger.time, "sleep", release_other_owner)
+
+    with order_ledger._exclusive_ledger_lock(path):
+        assert lock_path.exists()
+
+    assert calls["count"] == 2
+    assert not lock_path.exists()
 
 
 def test_concurrent_independent_ledger_appends_preserve_both_orders(tmp_path):
@@ -666,7 +733,8 @@ def test_unknown_submission_order_is_open_persistent_and_blocks_duplicate(
             quantity=1,
             limit_price=100.0,
             path=path,
-            pre_trade_risk_decision=PreTradeRiskDecision.approve(1),
+            pre_trade_risk_decision=_risk_approval(1),
+            **_risk_metadata(),
         )
 
 
@@ -704,7 +772,8 @@ def test_submit_guarded_order_persists_unknown_state_on_ambiguous_error(
         quantity=3,
         limit_price=191.23,
         path=path,
-        pre_trade_risk_decision=PreTradeRiskDecision.approve(3),
+        pre_trade_risk_decision=_risk_approval(3, reference_price=191.23),
+        **_risk_metadata(),
     )
 
     loaded = load_orders(path=path)
@@ -941,10 +1010,10 @@ def test_guarded_reserved_moo_sell_is_durable_and_does_not_call_regular_order(
 def test_manual_prod_sell_uses_reserved_moo_before_open_and_limit_during_session():
     window = MainWindow.__new__(MainWindow)
     before_open_kst = dt.datetime(
-        2026, 7, 27, 17, 0, tzinfo=buylist_mixin_module.KST_ZONE
+        2026, 7, 27, 17, 0, tzinfo=buylist_constants.KST_ZONE
     )
     during_session_kst = dt.datetime(
-        2026, 7, 27, 23, 0, tzinfo=buylist_mixin_module.KST_ZONE
+        2026, 7, 27, 23, 0, tzinfo=buylist_constants.KST_ZONE
     )
 
     assert (
@@ -1135,9 +1204,9 @@ def test_buy_acceptance_does_not_mark_position_filled(monkeypatch):
     window.populate_buylist_dashboard = lambda: None
     window.append_log = logs.append
 
-    monkeypatch.setattr(main_window_module, "append_order", lambda order: recorded.append(order))
-    monkeypatch.setattr(main_window_module, "load_order_ledger", lambda: list(recorded))
-    monkeypatch.setattr(main_window_module.QTimer, "singleShot", lambda *_args: None)
+    monkeypatch.setattr(buylist_orders_module, "append_order", lambda order: recorded.append(order))
+    monkeypatch.setattr(buylist_orders_module, "load_order_ledger", lambda: list(recorded))
+    monkeypatch.setattr(buylist_orders_module.QTimer, "singleShot", lambda *_args: None)
 
     order = _order(side=OrderSide.BUY, quantity=5)
     order.broker_order_id = "KIS-1"
@@ -1197,10 +1266,10 @@ def test_ambiguous_buy_submission_keeps_queue_and_buylist_blocked(monkeypatch):
     window.append_log = logs.append
     window.reconcile_open_orders = lambda: None
 
-    monkeypatch.setattr(main_window_module, "append_order", lambda order: recorded.append(order))
-    monkeypatch.setattr(main_window_module, "load_order_ledger", lambda: list(recorded))
-    monkeypatch.setattr(main_window_module.QTimer, "singleShot", lambda *_args: None)
-    monkeypatch.setattr(buylist_mixin_module.QMessageBox, "warning", lambda *args, **kwargs: None)
+    monkeypatch.setattr(buylist_orders_module, "append_order", lambda order: recorded.append(order))
+    monkeypatch.setattr(buylist_orders_module, "load_order_ledger", lambda: list(recorded))
+    monkeypatch.setattr(buylist_orders_module.QTimer, "singleShot", lambda *_args: None)
+    monkeypatch.setattr(buylist_orders_module.QMessageBox, "warning", lambda *args, **kwargs: None)
 
     order = _order(side=OrderSide.BUY, quantity=5, status=OrderStatus.UNKNOWN_SUBMISSION_STATE)
     order.error_message = "read timed out"
@@ -1251,7 +1320,7 @@ def test_ambiguous_buy_order_error_keeps_duplicate_protection_active(monkeypatch
     window.populate_buylist_dashboard = lambda: None
     window.append_log = logs.append
 
-    monkeypatch.setattr(buylist_mixin_module.QMessageBox, "warning", lambda *args, **kwargs: None)
+    monkeypatch.setattr(buylist_orders_module.QMessageBox, "warning", lambda *args, **kwargs: None)
 
     MainWindow._on_order_error(window, "AAPL", "buy", "read timed out", item)
 
@@ -1286,9 +1355,9 @@ def test_sell_acceptance_does_not_reduce_position_or_move_stop(monkeypatch):
     window.populate_buylist_dashboard = lambda: None
     window.append_log = lambda _message: None
 
-    monkeypatch.setattr(main_window_module, "append_order", lambda order: recorded.append(order))
-    monkeypatch.setattr(main_window_module, "load_order_ledger", lambda: list(recorded))
-    monkeypatch.setattr(main_window_module.QTimer, "singleShot", lambda *_args: None)
+    monkeypatch.setattr(buylist_orders_module, "append_order", lambda order: recorded.append(order))
+    monkeypatch.setattr(buylist_orders_module, "load_order_ledger", lambda: list(recorded))
+    monkeypatch.setattr(buylist_orders_module.QTimer, "singleShot", lambda *_args: None)
 
     order = _order(
         side=OrderSide.SELL,
@@ -1327,9 +1396,9 @@ def test_reserved_partial_sell_acceptance_shows_reserved_until_fill(monkeypatch)
     window.populate_buylist_dashboard = lambda: None
     window.append_log = logs.append
     window._clear_buylist_auto_order_block = lambda _item: None
-    monkeypatch.setattr(main_window_module, "append_order", lambda _order: None)
-    monkeypatch.setattr(main_window_module, "load_order_ledger", lambda: [])
-    monkeypatch.setattr(main_window_module.QTimer, "singleShot", lambda *_args: None)
+    monkeypatch.setattr(buylist_orders_module, "append_order", lambda _order: None)
+    monkeypatch.setattr(buylist_orders_module, "load_order_ledger", lambda: [])
+    monkeypatch.setattr(buylist_orders_module.QTimer, "singleShot", lambda *_args: None)
 
     order = BrokerOrder.create(
         environment="PROD",
@@ -1375,9 +1444,9 @@ def test_sell_rejection_keeps_held_position_as_bought(monkeypatch):
     window.populate_buylist_dashboard = lambda: None
     window.append_log = logs.append
 
-    monkeypatch.setattr(main_window_module, "append_order", lambda order: None)
-    monkeypatch.setattr(main_window_module, "load_order_ledger", lambda: [])
-    monkeypatch.setattr(buylist_mixin_module.QMessageBox, "warning", lambda *args, **kwargs: None)
+    monkeypatch.setattr(buylist_orders_module, "append_order", lambda order: None)
+    monkeypatch.setattr(buylist_orders_module, "load_order_ledger", lambda: [])
+    monkeypatch.setattr(buylist_orders_module.QMessageBox, "warning", lambda *args, **kwargs: None)
 
     order = _order(
         side=OrderSide.SELL,
@@ -1419,9 +1488,9 @@ def test_production_sell_rejection_does_not_create_sim_retry_block(monkeypatch):
     window.populate_buylist_dashboard = lambda: None
     window.append_log = logs.append
 
-    monkeypatch.setattr(main_window_module, "append_order", lambda order: None)
-    monkeypatch.setattr(main_window_module, "load_order_ledger", lambda: [])
-    monkeypatch.setattr(buylist_mixin_module.QMessageBox, "warning", lambda *args, **kwargs: None)
+    monkeypatch.setattr(buylist_orders_module, "append_order", lambda order: None)
+    monkeypatch.setattr(buylist_orders_module, "load_order_ledger", lambda: [])
+    monkeypatch.setattr(buylist_orders_module.QMessageBox, "warning", lambda *args, **kwargs: None)
 
     order = _order(
         side=OrderSide.SELL,
@@ -1681,8 +1750,8 @@ def test_completed_daily_close_rows_excludes_current_session_before_close():
         (dt.date(2026, 7, 8), 100.0),
         (dt.date(2026, 7, 9), 102.0),
     ]
-    before_close = dt.datetime(2026, 7, 9, 15, 59, tzinfo=buylist_mixin_module.US_MARKET_ZONE)
-    after_close = dt.datetime(2026, 7, 9, 16, 1, tzinfo=buylist_mixin_module.US_MARKET_ZONE)
+    before_close = dt.datetime(2026, 7, 9, 15, 59, tzinfo=buylist_constants.US_MARKET_ZONE)
+    after_close = dt.datetime(2026, 7, 9, 16, 1, tzinfo=buylist_constants.US_MARKET_ZONE)
 
     assert MainWindow._completed_daily_close_rows(rows, before_close) == [(dt.date(2026, 7, 8), 100.0)]
     assert MainWindow._completed_daily_close_rows(rows, after_close) == rows
@@ -1724,7 +1793,7 @@ def test_stop_loss_sell_reprice_starts_cancel_when_price_moves_lower(monkeypatch
     window._open_broker_orders_for_buylist_item = lambda *args, **kwargs: [order]
     window.append_log = lambda _message: None
 
-    monkeypatch.setattr(buylist_mixin_module, "KisOrderCancelWorker", FakeCancelWorker)
+    monkeypatch.setattr(buylist_actions_module, "KisOrderCancelWorker", FakeCancelWorker)
 
     MainWindow._maybe_reprice_stop_loss_sell(window, item, "SIM", 45.0)
 
@@ -1948,12 +2017,12 @@ def test_buylist_sell_half_selected_submits_manual_partial_with_allowed_range(mo
     window._warn_if_open_sell_order = lambda _item, _env: False
     window._submit_kis_sell_order = lambda it, qty, reason: submitted.append((it, qty, reason))
 
-    monkeypatch.setattr(buylist_mixin_module, "QDialog", FakeDialog)
-    monkeypatch.setattr(buylist_mixin_module, "QVBoxLayout", FakeLayout)
-    monkeypatch.setattr(buylist_mixin_module, "QLabel", FakeLabel)
-    monkeypatch.setattr(buylist_mixin_module, "QSlider", FakeSlider)
-    monkeypatch.setattr(buylist_mixin_module, "QSpinBox", FakeSpin)
-    monkeypatch.setattr(buylist_mixin_module, "QDialogButtonBox", FakeButtonBox)
+    monkeypatch.setattr(buylist_actions_module, "QDialog", FakeDialog)
+    monkeypatch.setattr(buylist_actions_module, "QVBoxLayout", FakeLayout)
+    monkeypatch.setattr(buylist_actions_module, "QLabel", FakeLabel)
+    monkeypatch.setattr(buylist_actions_module, "QSlider", FakeSlider)
+    monkeypatch.setattr(buylist_actions_module, "QSpinBox", FakeSpin)
+    monkeypatch.setattr(buylist_actions_module, "QDialogButtonBox", FakeButtonBox)
 
     MainWindow._buylist_sell_half_selected(window, "SIM")
 
@@ -1977,7 +2046,7 @@ def test_buylist_sell_half_selected_requires_bought_position(monkeypatch):
     window._warn_if_open_sell_order = lambda _item, _env: pytest.fail("duplicate check should not run")
     window._submit_kis_sell_order = lambda *args, **kwargs: submitted.append((args, kwargs))
 
-    monkeypatch.setattr(buylist_mixin_module.QMessageBox, "warning", lambda *args, **kwargs: warnings.append(args))
+    monkeypatch.setattr(buylist_actions_module.QMessageBox, "warning", lambda *args, **kwargs: warnings.append(args))
 
     MainWindow._buylist_sell_half_selected(window, "SIM")
 
@@ -1998,7 +2067,7 @@ def test_buylist_move_to_breakeven_requires_bought_position(monkeypatch):
     window = MainWindow.__new__(MainWindow)
     window._buylist_selected_item = lambda _env: item
 
-    monkeypatch.setattr(buylist_mixin_module.QMessageBox, "warning", lambda *args, **kwargs: warnings.append(args))
+    monkeypatch.setattr(buylist_actions_module.QMessageBox, "warning", lambda *args, **kwargs: warnings.append(args))
 
     MainWindow._buylist_move_to_breakeven_selected(window, "SIM")
 
@@ -2025,11 +2094,11 @@ def test_buylist_move_to_breakeven_uses_avg_cost_and_never_lowers_stop(monkeypat
     window.append_log = lambda _message: None
 
     monkeypatch.setattr(
-        buylist_mixin_module.QMessageBox,
+        buylist_actions_module.QMessageBox,
         "question",
-        lambda *args, **kwargs: questions.append(args) or buylist_mixin_module.QMessageBox.Yes,
+        lambda *args, **kwargs: questions.append(args) or buylist_actions_module.QMessageBox.Yes,
     )
-    monkeypatch.setattr(buylist_mixin_module.QMessageBox, "information", lambda *args, **kwargs: infos.append(args))
+    monkeypatch.setattr(buylist_actions_module.QMessageBox, "information", lambda *args, **kwargs: infos.append(args))
 
     MainWindow._buylist_move_to_breakeven_selected(window, "SIM")
 
@@ -2059,9 +2128,9 @@ def test_buylist_move_to_breakeven_falls_back_to_entry_price(monkeypatch):
     window.append_log = lambda _message: None
 
     monkeypatch.setattr(
-        buylist_mixin_module.QMessageBox,
+        buylist_actions_module.QMessageBox,
         "question",
-        lambda *args, **kwargs: buylist_mixin_module.QMessageBox.Yes,
+        lambda *args, **kwargs: buylist_actions_module.QMessageBox.Yes,
     )
 
     MainWindow._buylist_move_to_breakeven_selected(window, "SIM")
@@ -2083,9 +2152,9 @@ def test_buylist_sell_all_selected_confirms_limit_order_and_submits_full_quantit
     window._submit_kis_sell_order = lambda it, qty, reason: submitted.append((it, qty, reason))
 
     monkeypatch.setattr(
-        buylist_mixin_module.QMessageBox,
+        buylist_actions_module.QMessageBox,
         "question",
-        lambda *args, **kwargs: questions.append(args) or buylist_mixin_module.QMessageBox.Yes,
+        lambda *args, **kwargs: questions.append(args) or buylist_actions_module.QMessageBox.Yes,
     )
 
     MainWindow._buylist_sell_all_selected(window, "SIM")
@@ -2107,7 +2176,7 @@ def test_buylist_sell_all_selected_blocks_when_open_sell_exists(monkeypatch):
     window._warn_if_open_sell_order = lambda _item, _env: True
     window._submit_kis_sell_order = lambda *args, **kwargs: submitted.append((args, kwargs))
 
-    monkeypatch.setattr(buylist_mixin_module.QMessageBox, "question", lambda *args, **kwargs: questions.append(args))
+    monkeypatch.setattr(buylist_actions_module.QMessageBox, "question", lambda *args, **kwargs: questions.append(args))
 
     MainWindow._buylist_sell_all_selected(window, "SIM")
 
@@ -2140,6 +2209,8 @@ def test_submit_kis_sell_order_uses_environment_and_live_price_without_current_p
             intent=OrderIntent.UNKNOWN,
             buylist_symbol_key="",
             pre_trade_risk_decision=None,
+            strategy_id="",
+            plan_id="",
         ):
             self.environment = environment
             self.symbol = symbol
@@ -2152,6 +2223,8 @@ def test_submit_kis_sell_order_uses_environment_and_live_price_without_current_p
             self.intent = intent
             self.buylist_symbol_key = buylist_symbol_key
             self.pre_trade_risk_decision = pre_trade_risk_decision
+            self.strategy_id = strategy_id
+            self.plan_id = plan_id
             self.finished_order = FakeSignal()
             self.error_occurred = FakeSignal()
             self.started = False
@@ -2179,7 +2252,7 @@ def test_submit_kis_sell_order_uses_environment_and_live_price_without_current_p
     window.buylist_manager = SimpleNamespace()
     window.populate_buylist_dashboard = lambda: None
 
-    monkeypatch.setattr(buylist_mixin_module, "KisOrderWorker", FakeKisOrderWorker)
+    monkeypatch.setattr(buylist_orders_module, "KisOrderWorker", FakeKisOrderWorker)
 
     MainWindow._submit_kis_sell_order(window, item, 10, "stop-loss")
 
@@ -2238,7 +2311,7 @@ def test_submit_manual_prod_sell_before_open_passes_selected_quantity_to_reserve
     window._has_open_sell_order = lambda *args: False
     window._manual_sell_execution_policy = lambda _env: RESERVED_MOO_EXECUTION
 
-    monkeypatch.setattr(buylist_mixin_module, "KisOrderWorker", FakeKisOrderWorker)
+    monkeypatch.setattr(buylist_orders_module, "KisOrderWorker", FakeKisOrderWorker)
 
     MainWindow._submit_kis_sell_order(window, item, 4, "partial sell")
 
@@ -2277,7 +2350,7 @@ def test_submit_kis_sell_order_blocks_any_existing_open_sell(monkeypatch):
     window._first_account_no_for_environment = lambda environment: "12345678"
     window._has_open_sell_order = lambda environment, account_no, symbol: True
 
-    monkeypatch.setattr(buylist_mixin_module, "KisOrderWorker", FakeKisOrderWorker)
+    monkeypatch.setattr(buylist_orders_module, "KisOrderWorker", FakeKisOrderWorker)
 
     MainWindow._submit_kis_sell_order(window, item, 10, "manual sell all")
 
@@ -2312,6 +2385,8 @@ def test_submit_kis_buy_order_honors_explicit_order_price_over_live_price(monkey
             intent=OrderIntent.UNKNOWN,
             buylist_symbol_key="",
             pre_trade_risk_decision=None,
+            strategy_id="",
+            plan_id="",
         ):
             self.environment = environment
             self.symbol = symbol
@@ -2322,6 +2397,8 @@ def test_submit_kis_buy_order_honors_explicit_order_price_over_live_price(monkey
             self.intent = intent
             self.buylist_symbol_key = buylist_symbol_key
             self.pre_trade_risk_decision = pre_trade_risk_decision
+            self.strategy_id = strategy_id
+            self.plan_id = plan_id
             self.finished_order = FakeSignal()
             self.error_occurred = FakeSignal()
             self.started = False
@@ -2351,14 +2428,19 @@ def test_submit_kis_buy_order_honors_explicit_order_price_over_live_price(monkey
     window.buylist_manager = SimpleNamespace()
     window.populate_buylist_dashboard = lambda: None
 
-    monkeypatch.setattr(buylist_mixin_module, "KisOrderWorker", FakeKisOrderWorker)
+    monkeypatch.setattr(buylist_orders_module, "KisOrderWorker", FakeKisOrderWorker)
 
+    decision = _risk_approval(
+        7,
+        environment="PROD",
+        reference_price=123.45,
+    )
     MainWindow._submit_kis_buy_order(
         window,
         item,
         quantity=7,
         order_price=123.45,
-        pre_trade_risk_decision=PreTradeRiskDecision.approve(7),
+        pre_trade_risk_decision=decision,
     )
 
     assert len(created_workers) == 1
@@ -2367,7 +2449,9 @@ def test_submit_kis_buy_order_honors_explicit_order_price_over_live_price(monkey
     assert worker.quantity == 7
     assert worker.side == "buy"
     assert worker.intent == OrderIntent.ENTRY
-    assert worker.pre_trade_risk_decision == PreTradeRiskDecision.approve(7)
+    assert worker.pre_trade_risk_decision is decision
+    assert worker.strategy_id == RISK_STRATEGY_ID
+    assert worker.plan_id == RISK_PLAN_ID
     assert worker.started is True
     assert any("BUY submitted for AAPL: 7 shares @ limit $123.45" in message for message in logs)
 
@@ -2421,14 +2505,20 @@ def test_submit_kis_buy_order_uses_the_account_selected_in_the_ui(monkeypatch):
     window.append_log = lambda _message: None
     window._has_duplicate_open_order = lambda *args: False
 
-    monkeypatch.setattr(buylist_mixin_module, "KisOrderWorker", FakeKisOrderWorker)
+    monkeypatch.setattr(buylist_orders_module, "KisOrderWorker", FakeKisOrderWorker)
 
+    decision = _risk_approval(
+        3,
+        environment="PROD",
+        account_no="22222222-01",
+        reference_price=101.0,
+    )
     MainWindow._submit_kis_buy_order(
         window,
         item,
         quantity=3,
         order_price=101.0,
-        pre_trade_risk_decision=PreTradeRiskDecision.approve(3),
+        pre_trade_risk_decision=decision,
     )
 
     assert len(created_workers) == 1
@@ -2460,8 +2550,8 @@ def test_apply_partial_sell_fill_is_idempotent(monkeypatch):
     window.populate_buylist_dashboard = lambda: None
     window.append_log = lambda _message: None
 
-    monkeypatch.setattr(main_window_module, "update_order", lambda order: order)
-    monkeypatch.setattr(main_window_module, "load_order_ledger", lambda: [])
+    monkeypatch.setattr(buylist_orders_module, "update_order", lambda order: order)
+    monkeypatch.setattr(buylist_orders_module, "load_order_ledger", lambda: [])
 
     order = _order(
         side=OrderSide.SELL,
@@ -2633,8 +2723,8 @@ def test_cancelled_order_with_confirmed_partial_fill_updates_buylist(monkeypatch
     window.populate_buylist_dashboard = lambda: None
     window.append_log = lambda _message: None
 
-    monkeypatch.setattr(main_window_module, "update_order", lambda value: value)
-    monkeypatch.setattr(main_window_module, "load_order_ledger", lambda: [])
+    monkeypatch.setattr(buylist_orders_module, "update_order", lambda value: value)
+    monkeypatch.setattr(buylist_orders_module, "load_order_ledger", lambda: [])
 
     MainWindow.apply_confirmed_order_fills_to_buylist(window, [order])
 

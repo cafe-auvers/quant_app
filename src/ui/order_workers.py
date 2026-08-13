@@ -5,13 +5,9 @@ from typing import List, Optional
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
-from src.core.order_state import (
-    REGULAR_LIMIT_EXECUTION,
-    RESERVED_MOO_EXECUTION,
-    BrokerOrder,
-    OrderIntent,
-    OrderSide,
-)
+from src.core.order_state import (REGULAR_LIMIT_EXECUTION,
+                                  RESERVED_MOO_EXECUTION, BrokerOrder,
+                                  OrderIntent, OrderSide)
 from src.risk.pre_trade import PreTradeRiskDecision
 from src.services.broker import Broker, KisBroker
 from src.services.order_reconciliation import reconcile_orders_with_snapshot
@@ -38,6 +34,8 @@ class KisOrderWorker(QThread):
         execution_policy: str = REGULAR_LIMIT_EXECUTION,
         broker: Optional[Broker] = None,
         pre_trade_risk_decision: Optional[PreTradeRiskDecision] = None,
+        strategy_id: str = "",
+        plan_id: str = "",
     ) -> None:
         super().__init__()
         self.environment = environment
@@ -53,12 +51,13 @@ class KisOrderWorker(QThread):
         self.execution_policy = execution_policy
         self.broker = broker
         self.pre_trade_risk_decision = pre_trade_risk_decision
+        self.strategy_id = strategy_id
+        self.plan_id = plan_id
 
     def run(self) -> None:
         try:
-            from src.services.order_execution_service import (
-                submit_guarded_overseas_order,
-            )
+            from src.services.order_execution_service import \
+                submit_guarded_overseas_order
 
             order = submit_guarded_overseas_order(
                 environment=self.environment,
@@ -76,6 +75,8 @@ class KisOrderWorker(QThread):
                 execution_policy=self.execution_policy,
                 broker=self.broker,
                 pre_trade_risk_decision=self.pre_trade_risk_decision,
+                strategy_id=self.strategy_id,
+                plan_id=self.plan_id,
             )
             self.finished_order.emit(order)
         except Exception as exc:
@@ -108,9 +109,8 @@ class OrderReconciliationWorker(QThread):
                 order.execution_policy == RESERVED_MOO_EXECUTION
                 for order in self.open_orders
             ):
-                from src.services.order_reconciliation import (
-                    query_and_reconcile_unresolved_orders,
-                )
+                from src.services.order_reconciliation import \
+                    query_and_reconcile_unresolved_orders
 
                 direct_updates = query_and_reconcile_unresolved_orders(
                     environment=self.environment,
@@ -163,9 +163,8 @@ class KisOrderQueryWorker(QThread):
 
     def run(self) -> None:
         try:
-            from src.services.order_reconciliation import (
-                query_and_reconcile_unresolved_orders,
-            )
+            from src.services.order_reconciliation import \
+                query_and_reconcile_unresolved_orders
 
             updated = query_and_reconcile_unresolved_orders(
                 environment=self.environment,
@@ -201,7 +200,8 @@ class KisOrderCancelWorker(QThread):
 
     def run(self) -> None:
         try:
-            from src.services.order_reconciliation import cancel_and_reconcile_order
+            from src.services.order_reconciliation import \
+                cancel_and_reconcile_order
 
             order = cancel_and_reconcile_order(
                 self.client_order_id, broker=self.broker

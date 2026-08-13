@@ -1,17 +1,31 @@
-"""P2 buylist actions submixin."""
-from src.ui.buylist._shared import *  # noqa: F401,F403
+"""Buylist query, cancellation, and manual-action workflows."""
+
+from typing import Any, Dict, List, Optional, Tuple
+
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtWidgets import (QDialog, QDialogButtonBox, QLabel, QMessageBox,
+                             QSlider, QSpinBox, QTableWidget, QVBoxLayout)
+
+from src.api.kis_order import format_overseas_order_price
+from src.core.order_state import (REGULAR_LIMIT_EXECUTION,
+                                  RESERVED_MOO_EXECUTION, BrokerOrder,
+                                  OrderIntent, OrderSide, OrderStatus)
+from src.services.order_ledger import find_open_orders, load_order_ledger
+from src.ui.workers import KisOrderCancelWorker, KisOrderQueryWorker
+
+from .constants import (STOP_LOSS_REPRICE_MIN_DROP_PCT,
+                        STOP_LOSS_SELL_LIMIT_DISCOUNT_PCT)
+
 
 class BuylistActionsMixin:
     def _open_orders_for_buylist_item(self, item, env: str) -> List[BrokerOrder]:
         if item is None:
             return []
-        load_fn = _main_window_global("load_order_ledger", load_order_ledger)
-        find_fn = _main_window_global("find_open_orders", find_open_orders)
-        self.order_ledger = load_fn()
+        self.order_ledger = load_order_ledger()
         account_no = self._order_lookup_account_no_for_item(item, env)
         if not account_no:
             return []
-        matches = find_fn(
+        matches = find_open_orders(
             self.order_ledger,
             environment=env,
             account_no=account_no,
@@ -39,14 +53,12 @@ class BuylistActionsMixin:
     ) -> List[BrokerOrder]:
         if item is None:
             return []
-        load_fn = _main_window_global("load_order_ledger", load_order_ledger)
-        find_fn = _main_window_global("find_open_orders", find_open_orders)
-        self.order_ledger = load_fn()
+        self.order_ledger = load_order_ledger()
         account_no = self._order_lookup_account_no_for_item(item, env)
         if not account_no:
             return []
         symbol = getattr(item, "symbol", "")
-        matches = find_fn(
+        matches = find_open_orders(
             self.order_ledger,
             environment=env,
             account_no=account_no,
@@ -208,8 +220,7 @@ class BuylistActionsMixin:
     def _on_broker_order_query_finished(
         self, updated_orders: List[BrokerOrder]
     ) -> None:
-        load_fn = _main_window_global("load_order_ledger", load_order_ledger)
-        self.order_ledger = load_fn()
+        self.order_ledger = load_order_ledger()
         self.apply_confirmed_order_fills_to_buylist(updated_orders)
         self._apply_broker_order_status_updates_to_buylist(updated_orders)
         self.populate_buylist_dashboard()
@@ -415,8 +426,7 @@ class BuylistActionsMixin:
         )
 
     def _on_broker_order_cancel_finished(self, order: BrokerOrder) -> None:
-        load_fn = _main_window_global("load_order_ledger", load_order_ledger)
-        self.order_ledger = load_fn()
+        self.order_ledger = load_order_ledger()
         self.apply_confirmed_order_fills_to_buylist([order])
         self._apply_broker_order_status_updates_to_buylist([order])
         self.populate_buylist_dashboard()
@@ -445,8 +455,7 @@ class BuylistActionsMixin:
             "Treat the order as still active until its broker status is checked. "
             f"Details: {message}",
         )
-        timer = _main_window_global("QTimer", QTimer)
-        timer.singleShot(
+        QTimer.singleShot(
             1000,
             lambda e=env: self._buylist_check_order_status(e),
         )
@@ -574,9 +583,7 @@ class BuylistActionsMixin:
         self, item, replacement, order: BrokerOrder
     ) -> None:
         item._buy_replace_pending = False
-        self.order_ledger = _main_window_global(
-            "load_order_ledger", load_order_ledger
-        )()
+        self.order_ledger = load_order_ledger()
         self.apply_confirmed_order_fills_to_buylist([order])
         self._apply_broker_order_status_updates_to_buylist([order])
 
@@ -710,9 +717,7 @@ class BuylistActionsMixin:
         self, item, new_limit: float, order: BrokerOrder
     ) -> None:
         item._stop_reprice_pending = False
-        self.order_ledger = _main_window_global(
-            "load_order_ledger", load_order_ledger
-        )()
+        self.order_ledger = load_order_ledger()
         self.apply_confirmed_order_fills_to_buylist([order])
         self._apply_broker_order_status_updates_to_buylist([order])
 

@@ -1,5 +1,13 @@
-"""Compatibility alias for :mod:`src.ui.buylist`."""
-import sys
-from src.ui import buylist as _buylist
+"""Compatibility imports for the decomposed buylist mixins."""
 
-sys.modules[__name__] = _buylist
+from src.ui.buylist import (BuylistController, BuylistExecutionController,
+                            BuylistMixin, ExecutionQueueRefreshRequest,
+                            ExecutionQueueRefreshResult)
+
+__all__ = [
+    "BuylistController",
+    "BuylistExecutionController",
+    "BuylistMixin",
+    "ExecutionQueueRefreshRequest",
+    "ExecutionQueueRefreshResult",
+]

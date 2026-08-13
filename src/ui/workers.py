@@ -13,36 +13,22 @@ from PyQt5.QtCore import QThread, pyqtSignal
 from src.api.kis_account_snapshot_dual import fetch_account_snapshot
 from src.core.orb import calculate_orb_range
 from src.core.scoring import calculate_deterministic_scores, run_ai_review
-from src.risk.orb_position import (
-    calculate_orb_position_values,
-    is_orb_position_plan_valid,
-    score_orb_position_recommendation,
-)
-from src.services.intraday_data_service import (
-    fetch_intraday_with_fallback,
-    load_best_intraday_history,
-)
+from src.infrastructure.database.repositories.market_bars import (
+    load_symbol_history_from_db, prune_intraday_history,
+    save_intraday_history_to_db)
+from src.risk.orb_position import (calculate_orb_position_values,
+                                   is_orb_position_plan_valid,
+                                   score_orb_position_recommendation)
+from src.services.intraday_data_service import (fetch_intraday_with_fallback,
+                                                load_best_intraday_history)
 from src.services.intraday_provider import IntradayInterval, IntradayRequest
-from src.ui.order_workers import (
-    KisOrderCancelWorker,
-    KisOrderQueryWorker,
-    KisOrderWorker,
-    OrderReconciliationWorker,
-)
-from src.utils.data_loader import (
-    download_price_history,
-    download_single_symbol_history,
-    _extract_symbol_history,
-)
-from src.utils.db_loader import (
-    load_symbol_history_from_db,
-    prune_intraday_history,
-    save_intraday_history_to_db,
-)
-from src.utils.intraday_helpers import (
-    intraday_cache_needs_backfill,
-    utcnow_naive as _utcnow_naive,
-)
+from src.ui.order_workers import (KisOrderCancelWorker, KisOrderQueryWorker,
+                                  KisOrderWorker, OrderReconciliationWorker)
+from src.utils.data_loader import (_extract_symbol_history,
+                                   download_price_history,
+                                   download_single_symbol_history)
+from src.utils.intraday_helpers import intraday_cache_needs_backfill
+from src.utils.intraday_helpers import utcnow_naive as _utcnow_naive
 
 
 class KisAccountWorker(QThread):
@@ -283,13 +269,15 @@ class IntradayFetchWorker(QThread):
     def _download_with_retries(
         symbol: str, days: int, attempts: int = 3
     ) -> pd.DataFrame:
-        from src.services.yfinance_intraday_provider import _download_5m_with_retries
+        from src.services.yfinance_intraday_provider import \
+            _download_5m_with_retries
 
         return _download_5m_with_retries(symbol, days, attempts=attempts)
 
     @staticmethod
     def _download_opening_1m_bar(symbol: str) -> pd.DataFrame:
-        from src.services.yfinance_intraday_provider import _download_opening_1m_bar
+        from src.services.yfinance_intraday_provider import \
+            _download_opening_1m_bar
 
         return _download_opening_1m_bar(symbol)
 
@@ -430,7 +418,8 @@ class ScannerWorker(QThread):
 
     def run(self) -> None:
         try:
-            from src.utils.db_loader import get_universe_stock_metrics_from_db
+            from src.infrastructure.database.repositories.scanner import \
+                get_universe_stock_metrics_from_db
 
             if self.engine is None:
                 raise RuntimeError(
@@ -558,12 +547,14 @@ class WatchlistAiWorker(QThread):
         return symbol_df.iloc[0]
 
     def run(self) -> None:
-        import pandas as pd
-        import math
         import datetime as dt
-        from src.core.scoring import calculate_deterministic_scores, run_ai_review
-        from src.utils.db_loader import load_symbol_history_from_db
+        import math
+
+        import pandas as pd
+
         from src.core.orb import calculate_orb_range
+        from src.core.scoring import (calculate_deterministic_scores,
+                                      run_ai_review)
 
         total_items = len(self.watchlist_items)
         self.log_message.emit(
@@ -992,16 +983,14 @@ class SingleStockAiWorker(QThread):
         )
 
     def run(self) -> None:
-        import pandas as pd
-        import json
         import datetime as dt
-        from src.core.scoring import (
-            run_ai_review,
-            calculate_deterministic_scores,
-            fetch_recent_news_headlines,
-        )
-        from src.utils.db_loader import load_symbol_history_from_db
+        import json
 
+        import pandas as pd
+
+        from src.core.scoring import (calculate_deterministic_scores,
+                                      fetch_recent_news_headlines,
+                                      run_ai_review)
         symbol = self.symbol
         item = self.item
 
@@ -1167,17 +1156,12 @@ class PcRemoteStatusWorker(QThread):
     def run(self) -> None:
         from sqlalchemy import text
 
-        from src.services.pc_remote_control import (
-            PcServiceStatus,
-            PcStatus,
-            check_pc_status,
-        )
-        from src.services.runtime_status import (
-            database_server_hostname,
-            get_runtime_process_status,
-            record_runtime_heartbeat,
-        )
-        from src.utils.db_loader import init_mysql_engine
+        from src.infrastructure.database.engine import init_mysql_engine
+        from src.services.pc_remote_control import (PcServiceStatus, PcStatus,
+                                                    check_pc_status)
+        from src.services.runtime_status import (database_server_hostname,
+                                                 get_runtime_process_status,
+                                                 record_runtime_heartbeat)
 
         try:
             listener_status = check_pc_status()

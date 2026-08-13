@@ -20,6 +20,8 @@ from src.risk.pre_trade import (
     PreTradeRiskDecision,
     PreTradeRiskRejectedError,
     assess_orb_entry_candidate,
+    normalize_share_quantity,
+    orb_candidate_plan_id,
     require_pre_trade_risk_approval,
 )
 
@@ -34,6 +36,8 @@ __all__ = [
     "PreTradeRiskDecision",
     "PreTradeRiskRejectedError",
     "assess_orb_entry_candidate",
+    "normalize_share_quantity",
+    "orb_candidate_plan_id",
     "calculate_orb_position_values",
     "is_orb_position_plan_valid",
     "score_orb_position_recommendation",

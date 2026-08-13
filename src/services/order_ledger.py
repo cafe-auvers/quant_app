@@ -1,8 +1,8 @@
 """Persistent local order ledger for submitted broker orders."""
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import logging
 import os
 import time
@@ -10,10 +10,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, List, Optional, TypeVar
 
-from src.core.order_state import BrokerOrder, OrderIntent, OrderSide, OrderStatus, is_open_status
+from src.core.order_state import (BrokerOrder, OrderIntent, OrderSide,
+                                  OrderStatus, is_open_status)
 from src.utils.config import DATA_DIR
 from src.utils.storage import save_json
-
 
 ORDERS_FILE = DATA_DIR / "orders.json"
 _LOCK_TIMEOUT_SECONDS = 5.0
@@ -37,7 +37,13 @@ def _exclusive_ledger_lock(path: Path) -> Iterator[None]:
         try:
             descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             os.write(descriptor, f"{os.getpid()} {time.time()}".encode("ascii"))
-        except FileExistsError:
+        except (FileExistsError, PermissionError) as exc:
+            # Windows can surface an exclusive-create collision as
+            # PermissionError while another process still owns the file.
+            # Only treat it as contention when the lock actually exists;
+            # genuine directory/ACL failures must remain visible.
+            if isinstance(exc, PermissionError) and not lock_path.exists():
+                raise
             try:
                 stale = time.time() - lock_path.stat().st_mtime > _STALE_LOCK_SECONDS
             except OSError:

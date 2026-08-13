@@ -3,9 +3,10 @@ from __future__ import annotations
 import pandas as pd
 
 from src.core.orb import resample_intraday_bars
+from src.infrastructure.database.repositories.market_bars import (
+    load_hourly_history_from_db, load_symbol_history_from_db)
 from src.ui.controllers.base import WindowController
 from src.utils.data_loader import download_price_history
-from src.utils.db_loader import load_hourly_history_from_db, load_symbol_history_from_db
 
 
 class ChartDataController(WindowController):

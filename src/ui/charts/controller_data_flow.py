@@ -1,0 +1,825 @@
+"""TradingView and intraday data-flow orchestration."""
+
+from __future__ import annotations
+
+import datetime as dt
+from typing import List, Optional
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+from PyQt5.QtCore import Qt, QUrl
+from PyQt5.QtWidgets import QMessageBox
+
+try:
+    from PyQt5.QtWebEngineWidgets import QWebEngineView
+except ImportError:
+    QWebEngineView = None
+try:
+    from PyQt5.QtWebChannel import QWebChannel
+except ImportError:
+    QWebChannel = None
+
+from src.core.orb import resample_intraday_bars
+from src.infrastructure.database.repositories.chart_indicators import (
+    calculate_chart_indicators, load_chart_indicators_from_db,
+    refresh_chart_indicators_for_symbol)
+from src.infrastructure.database.repositories.market_bars import \
+    delete_intraday_history_for_symbol
+from src.services.intraday_data_service import (format_intraday_source_label,
+                                                load_best_intraday_history)
+from src.ui.workers import IntradayBulkFetchWorker, IntradayFetchWorker
+from src.utils.intraday_helpers import intraday_cache_needs_backfill
+from src.utils.intraday_helpers import utcnow_naive as _utcnow_naive
+
+REFERENCE_SYMBOL = "SPY"
+KST_ZONE = ZoneInfo("Asia/Seoul")
+US_MARKET_ZONE = ZoneInfo("America/New_York")
+MARKET_DATA_READY_TIME_KST = dt.time(7, 0)
+LIVE_INTRADAY_REFRESH_INTERVAL_MS = 5 * 60 * 1000
+TRADINGVIEW_REFRESH_INTERVAL_SECONDS = 5 * 60
+KIS_DAILY_CHART_FAILURE_COOLDOWN_SECONDS = 30 * 60
+US_MARKET_OPEN_TIME = dt.time(9, 30)
+US_MARKET_CLOSE_TIME = dt.time(16, 0)
+
+
+class ChartsDataFlowMixin:
+    def load_tradingview_chart(
+        self,
+        show_empty_message: bool = True,
+        force: bool = False,
+        fetch_live: bool = False,
+        skip_split_view: bool = False,
+    ) -> None:
+        if not hasattr(self, "tradingview_symbol_combo"):
+            return
+        symbol = self.tradingview_symbol_combo.currentText().strip().upper()
+        if not symbol:
+            message = "Enter or select a symbol first."
+            self.current_tradingview_symbol = ""
+            if hasattr(self, "tradingview_status_label"):
+                self.tradingview_status_label.setText(message)
+            if show_empty_message:
+                self._set_html_or_text(
+                    self.tradingview_chart_view,
+                    self._generate_message_html("No watchlist symbols", message),
+                    message,
+                )
+                if hasattr(self, "tradingview_split_chart_view"):
+                    self._set_html_or_text(
+                        self.tradingview_split_chart_view,
+                        self._generate_message_html("No watchlist symbols", message),
+                        message,
+                    )
+            return
+
+        tradingview_symbol = self._to_tradingview_symbol(symbol)
+        base_options = {
+            "show_volume": (
+                self.tradingview_show_volume_checkbox.isChecked()
+                if hasattr(self, "tradingview_show_volume_checkbox")
+                else True
+            ),
+            "show_ema": (
+                self.tradingview_show_ema_checkbox.isChecked()
+                if hasattr(self, "tradingview_show_ema_checkbox")
+                else True
+            ),
+            "show_rs": (
+                self.tradingview_show_rs_checkbox.isChecked()
+                if hasattr(self, "tradingview_show_rs_checkbox")
+                else True
+            ),
+            "show_adr": (
+                self.tradingview_show_adr_checkbox.isChecked()
+                if hasattr(self, "tradingview_show_adr_checkbox")
+                else True
+            ),
+            "show_growth_1m": (
+                self.tradingview_show_growth_1m_checkbox.isChecked()
+                if hasattr(self, "tradingview_show_growth_1m_checkbox")
+                else True
+            ),
+            "show_growth_3m": (
+                self.tradingview_show_growth_3m_checkbox.isChecked()
+                if hasattr(self, "tradingview_show_growth_3m_checkbox")
+                else True
+            ),
+            "show_growth_6m": (
+                self.tradingview_show_growth_6m_checkbox.isChecked()
+                if hasattr(self, "tradingview_show_growth_6m_checkbox")
+                else False
+            ),
+            "window_days": self._get_tradingview_window_days(),
+        }
+        now = dt.datetime.now(dt.timezone.utc)
+
+        split_enabled = (
+            hasattr(self, "tradingview_split_screen_checkbox")
+            and self.tradingview_split_screen_checkbox.isChecked()
+        )
+        if split_enabled:
+            self.tradingview_split_chart_view.setVisible(True)
+            primary_status = self._render_tradingview_chart_view(
+                self.tradingview_chart_view,
+                symbol=symbol,
+                tradingview_symbol=tradingview_symbol,
+                timeframe="1D",
+                base_options=base_options,
+                now=now,
+                force=force,
+                fetch_live=fetch_live,
+                view_key="left",
+            )
+            if not skip_split_view:
+                split_status = self._render_tradingview_chart_view(
+                    self.tradingview_split_chart_view,
+                    symbol=symbol,
+                    tradingview_symbol=tradingview_symbol,
+                    timeframe="1H",
+                    base_options=base_options,
+                    now=now,
+                    force=force,
+                    fetch_live=fetch_live,
+                    view_key="right",
+                )
+            else:
+                split_status = "1H skipped (drawing sync)"
+            self.current_tradingview_symbol = (
+                f"{tradingview_symbol}|split|volume={int(base_options['show_volume'])}|"
+                f"ema={int(base_options['show_ema'])}|rs={int(base_options.get('show_rs', True))}"
+            )
+            self.tradingview_status_label.setText(f"{primary_status} | {split_status}")
+            return
+
+        if hasattr(self, "tradingview_split_chart_view"):
+            self.tradingview_split_chart_view.setVisible(False)
+        timeframe = (
+            self.tradingview_timeframe_combo.currentText().strip().upper()
+            if hasattr(self, "tradingview_timeframe_combo")
+            else "1D"
+        )
+        status = self._render_tradingview_chart_view(
+            self.tradingview_chart_view,
+            symbol=symbol,
+            tradingview_symbol=tradingview_symbol,
+            timeframe=timeframe,
+            base_options=base_options,
+            now=now,
+            force=force,
+            fetch_live=fetch_live,
+            view_key="single",
+        )
+        self.current_tradingview_symbol = (
+            f"{tradingview_symbol}|{timeframe}|volume={int(base_options['show_volume'])}|"
+            f"ema={int(base_options['show_ema'])}|rs={int(base_options.get('show_rs', True))}"
+        )
+        self.tradingview_status_label.setText(status)
+
+    def _render_tradingview_chart_view(
+        self,
+        target_view,
+        symbol: str,
+        tradingview_symbol: str,
+        timeframe: str,
+        base_options: dict,
+        now: dt.datetime,
+        force: bool,
+        view_key: str,
+        fetch_live: bool = False,
+    ) -> str:
+        options = {
+            "show_volume": bool(base_options.get("show_volume", True)),
+            "show_ema": bool(base_options.get("show_ema", True)),
+            "show_rs": bool(base_options.get("show_rs", True)),
+            "show_adr": bool(base_options.get("show_adr", True)),
+            "show_growth_1m": bool(base_options.get("show_growth_1m", True)),
+            "show_growth_3m": bool(base_options.get("show_growth_3m", True)),
+            "show_growth_6m": bool(base_options.get("show_growth_6m", False)),
+            "window_days": int(base_options.get("window_days", 7) or 7),
+            "timeframe": timeframe,
+        }
+        options["max_history_bars"] = self._tradingview_max_history_bars(
+            timeframe, options["window_days"]
+        )
+        if timeframe.strip().upper() != "1D":
+            options.update(
+                {
+                    "show_adr": False,
+                    "show_growth_1m": False,
+                    "show_growth_3m": False,
+                    "show_growth_6m": False,
+                }
+            )
+        refresh_key = (
+            f"{view_key}|{tradingview_symbol}|{timeframe}|"
+            f"volume={int(options['show_volume'])}|ema={int(options['show_ema'])}|"
+            f"rs={int(options.get('show_rs', True))}|adr={int(options.get('show_adr', False))}|"
+            f"g1={int(options.get('show_growth_1m', False))}|g3={int(options.get('show_growth_3m', False))}|"
+            f"g6={int(options.get('show_growth_6m', False))}|window={options.get('window_days', 7)}"
+        )
+        last_refresh = self.tradingview_refresh_timestamps.get(refresh_key)
+        if not force and not self._tradingview_refresh_due(last_refresh, now=now):
+            next_refresh = last_refresh + dt.timedelta(
+                seconds=TRADINGVIEW_REFRESH_INTERVAL_SECONDS
+            )
+            seconds_left = max(1, int((next_refresh - now).total_seconds()))
+            return f"{timeframe} skipped; next auto refresh in {seconds_left // 60}m {seconds_left % 60}s"
+
+        try:
+            history = self._load_chart_history_for_timeframe(
+                symbol,
+                timeframe,
+                use_live_fallback=fetch_live,
+                window_days=int(options.get("window_days", 7) or 7),
+                force_refresh=fetch_live,
+            )
+        except TypeError:
+            history = self._load_chart_history_for_timeframe(
+                symbol,
+                timeframe,
+                use_live_fallback=fetch_live,
+                window_days=int(options.get("window_days", 7) or 7),
+            )
+        chart_history = self._normalize_chart_history(
+            history,
+            symbol,
+            max_rows=options["max_history_bars"],
+        )
+        if chart_history.empty:
+            message = f"No {timeframe} chart data found for {symbol}."
+            self._set_html_or_text(
+                target_view,
+                self._generate_message_html(symbol, message),
+                message,
+            )
+            self.tradingview_refresh_timestamps[refresh_key] = now
+            return message
+
+        latest_text = self._format_chart_latest_text(chart_history, timeframe)
+        options["data_latest_text"] = latest_text
+
+        drawings = self._build_combined_drawings(symbol, timeframe)
+        watchlist = self.__dict__.get("watchlist")
+        watchlist_item = watchlist.get(symbol) if watchlist is not None else None
+        target_price = (
+            watchlist_item.breakout_price if watchlist_item is not None else None
+        )
+        buylist_manager = self.__dict__.get("buylist_manager")
+        buylist_item = (
+            buylist_manager.get(symbol) if buylist_manager is not None else None
+        )
+        buy_price: Optional[float] = None
+        buy_stop_loss: Optional[float] = None
+        if buylist_item is not None:
+            raw_buy = (
+                buylist_item.avg_cost
+                if buylist_item.monitoring_status == "BOUGHT"
+                and buylist_item.avg_cost > 0
+                else buylist_item.entry_price
+            )
+            buy_price = float(raw_buy) if raw_buy and float(raw_buy) > 0 else None
+            raw_stop = buylist_item.stop_loss
+            buy_stop_loss = (
+                float(raw_stop) if raw_stop and float(raw_stop) > 0 else None
+            )
+        indicators = (
+            self._load_tradingview_indicator_history(symbol, timeframe, chart_history)
+            if options.get("show_rs", True)
+            else pd.DataFrame()
+        )
+        html_content = self._generate_tradingview_lightweight_chart_html(
+            tradingview_symbol,
+            chart_history,
+            options=options,
+            drawings=drawings,
+            storage_symbol=symbol,
+            indicators=indicators,
+            target_price=target_price,
+            buy_price=buy_price,
+            stop_loss=buy_stop_loss,
+        )
+        if QWebEngineView is not None and isinstance(target_view, QWebEngineView):
+            target_view.setHtml(html_content, QUrl("https://www.tradingview.com/"))
+        else:
+            target_view.setPlainText(
+                f"TradingView Lightweight Chart for {tradingview_symbol} requires PyQtWebEngine."
+            )
+        self.tradingview_refresh_timestamps[refresh_key] = now
+        return f"Loaded {timeframe} chart for {tradingview_symbol}"
+
+    @staticmethod
+    def _format_chart_latest_text(history: pd.DataFrame, timeframe: str) -> str:
+        if history.empty:
+            return "latest: unavailable"
+        latest = pd.Timestamp(history.index[-1])
+        timeframe = timeframe.strip().upper()
+        if timeframe in {"1H", "5M"}:
+            kst = (
+                latest.tz_localize("UTC") if latest.tzinfo is None else latest
+            ).tz_convert(KST_ZONE)
+            return f"latest: {kst.strftime('%Y-%m-%d %H:%M')} KST"
+        return f"latest: {latest.strftime('%Y-%m-%d')}"
+
+    def _load_tradingview_indicator_history(
+        self, symbol: str, timeframe: str, chart_history: pd.DataFrame
+    ) -> pd.DataFrame:
+        if chart_history.empty:
+            return pd.DataFrame()
+        symbol = symbol.strip().upper()
+        timeframe = timeframe.strip().upper()
+        if timeframe == "1D" and self.db_enabled and self.db_engine is not None:
+            indicators = load_chart_indicators_from_db(symbol, self.db_engine)
+            if indicators.empty and refresh_chart_indicators_for_symbol(
+                symbol, self.db_engine, reference_symbol=REFERENCE_SYMBOL
+            ):
+                indicators = load_chart_indicators_from_db(symbol, self.db_engine)
+            if not indicators.empty:
+                return self._align_chart_indicators(chart_history, indicators)
+
+        reference_history = self._load_chart_history_for_timeframe(
+            REFERENCE_SYMBOL, timeframe, use_live_fallback=False
+        )
+        # The displayed symbol history already bounds the output.  Keeping the
+        # full reference avoids shortening RS/TI65 independently of the chart.
+        reference_history = self._normalize_chart_history(
+            reference_history, REFERENCE_SYMBOL, max_rows=None
+        )
+        if reference_history.empty or "Close" not in reference_history.columns:
+            return pd.DataFrame()
+        indicators = calculate_chart_indicators(
+            symbol, chart_history, reference_history
+        )
+        return self._align_chart_indicators(chart_history, indicators)
+
+    def step_intraday_watchlist_symbol(self, direction: int) -> None:
+        if not hasattr(self, "intraday_symbol_combo"):
+            return
+        count = self.intraday_symbol_combo.count()
+        if count <= 0:
+            self.intraday_status_label.setText("Add symbols to the watchlist first.")
+            return
+
+        current_index = self.intraday_symbol_combo.currentIndex()
+        if current_index < 0:
+            current_index = 0
+        next_index = (current_index + direction) % count
+        self.intraday_symbol_combo.setCurrentIndex(next_index)
+        symbol = self.intraday_symbol_combo.currentText().strip().upper()
+
+        sidebar_stock_list = self.__dict__.get("sidebar_stock_list")
+        if sidebar_stock_list is not None:
+            for row in range(sidebar_stock_list.count()):
+                item = sidebar_stock_list.item(row)
+                data = item.data(Qt.UserRole) or {}
+                if data.get("symbol") == symbol:
+                    sidebar_stock_list.setCurrentRow(row)
+                    break
+
+        self.plot_intraday_watchlist_symbol()
+
+    def plot_intraday_watchlist_symbol(self, allow_fetch: bool = True) -> None:
+        if not hasattr(self, "intraday_symbol_combo"):
+            return
+        symbol = self.intraday_symbol_combo.currentText().strip().upper()
+        if not symbol:
+            self.intraday_status_label.setText("Add symbols to the watchlist first.")
+            return
+
+        if not self.db_enabled or self.db_engine is None:
+            message = (
+                "Intraday charts and ORB monitoring require the MySQL cache. "
+                "Configure MySQL, then refresh intraday data."
+            )
+            self._set_html_or_text(
+                self.intraday_chart_view,
+                self._generate_message_html("Intraday cache unavailable", message),
+                message,
+            )
+            self.intraday_status_label.setText(message)
+            return
+
+        interval = self.intraday_interval_combo.currentText()
+        window_days = self._get_intraday_window_days()
+        symbol_history, cache_source = self._load_cached_intraday_5m_with_source(
+            symbol, window_days=window_days
+        )
+        needs_backfill = self._intraday_cache_needs_backfill(
+            symbol_history if symbol_history is not None else pd.DataFrame(),
+            _utcnow_naive() - dt.timedelta(days=window_days),
+        )
+        if (
+            allow_fetch
+            and needs_backfill
+            and self._can_start_intraday_fetch(symbol, window_days)
+        ):
+            self.start_intraday_fetch(symbol, window_days=window_days)
+        if symbol_history is None or symbol_history.empty:
+            self._set_html_or_text(
+                self.intraday_chart_view,
+                self._generate_message_html(
+                    "Loading intraday data",
+                    f"Fetching {window_days} days of 5-minute data for {symbol} in the background.",
+                ),
+                f"Fetching {window_days} days of 5-minute data for {symbol} in the background.",
+            )
+            self.intraday_status_label.setText(
+                f"Fetching {symbol} intraday data in the background..."
+            )
+            return
+
+        chart_history = resample_intraday_bars(symbol_history, interval)
+        if chart_history.empty:
+            self.intraday_status_label.setText(
+                f"No {interval} intraday bars available for {symbol}."
+            )
+            return
+
+        latest_price = float(chart_history["Close"].iloc[-1])
+        self.update_trade_prices_from_latest(symbol, latest_price)
+        watchlist_item = self.watchlist.get(symbol)
+        target_price = (
+            watchlist_item.breakout_price if watchlist_item is not None else None
+        )
+        drawings = self.chart_drawings.get(symbol, [])
+        self._set_html_or_text(
+            self.intraday_chart_view,
+            self._generate_local_chart_html(
+                symbol,
+                chart_history,
+                compact=False,
+                options=self._get_intraday_chart_options(),
+                target_price=target_price,
+                drawings=drawings,
+            ),
+            f"{symbol} intraday {interval} chart loaded. Latest price: {latest_price:.2f}",
+        )
+        latest_time = pd.Timestamp(chart_history.index[-1]).strftime("%Y-%m-%d %H:%M")
+        source_note = f"{cache_source or 'legacy'} cache"
+        if needs_backfill:
+            source_note += "; background refresh running"
+        if hasattr(self, "live_data_source_label") and cache_source:
+            self.live_data_source_label.setText(
+                format_intraday_source_label(cache_source)
+            )
+        self.intraday_status_label.setText(
+            f"{symbol} {interval} {window_days}D intraday chart loaded from {source_note}. "
+            f"Latest {latest_price:.2f} at {latest_time}."
+        )
+
+    def _get_intraday_window_days(self) -> int:
+        if not hasattr(self, "intraday_window_combo"):
+            return 7
+        text = self.intraday_window_combo.currentText().strip().upper().replace("D", "")
+        try:
+            return max(1, min(7, int(text)))
+        except ValueError:
+            return 7
+
+    def _get_tradingview_window_days(self) -> int:
+        if not hasattr(self, "tradingview_window_combo"):
+            return 7
+        text = (
+            self.tradingview_window_combo.currentText().strip().upper().replace("D", "")
+        )
+        try:
+            return max(1, min(7, int(text)))
+        except ValueError:
+            return 7
+
+    @staticmethod
+    def _tradingview_max_history_bars(
+        timeframe: str, window_days: int = 7
+    ) -> Optional[int]:
+        timeframe = timeframe.strip().upper()
+        if timeframe == "5M":
+            return max(100, min(2000, max(1, int(window_days or 7)) * 120))
+        if timeframe == "1H":
+            return 1000
+        return 260
+
+    def _get_intraday_chart_options(self) -> dict:
+        return {
+            "show_volume": self.intraday_show_volume_checkbox.isChecked(),
+            "show_rs": False,
+            "show_ema": self.intraday_show_ema_checkbox.isChecked(),
+            "show_adr": False,
+            "show_growth_1m": False,
+            "show_growth_3m": False,
+            "show_growth_6m": False,
+            "max_history_bars": 2000,
+            "visible_bars": 2000,
+            "intraday_chart": True,
+        }
+
+    def _intraday_fetch_key(self, symbol: str, window_days: int) -> str:
+        return f"{symbol.strip().upper()}:{max(1, min(7, int(window_days or 7)))}"
+
+    def _can_start_intraday_fetch(
+        self, symbol: str, window_days: int, cooldown_seconds: int = 300
+    ) -> bool:
+        key = self._intraday_fetch_key(symbol, window_days)
+        last_attempt = self.intraday_fetch_attempts.get(key)
+        if last_attempt is None:
+            return True
+        return (_utcnow_naive() - last_attempt).total_seconds() >= cooldown_seconds
+
+    def _load_cached_intraday_5m(
+        self, symbol: str, window_days: int = 7
+    ) -> Optional[pd.DataFrame]:
+        bars, _source = self._load_cached_intraday_5m_with_source(
+            symbol, window_days=window_days
+        )
+        return bars
+
+    def _load_cached_intraday_5m_with_source(
+        self, symbol: str, window_days: int = 7
+    ) -> tuple[pd.DataFrame, str]:
+        window_days = max(1, min(7, int(window_days or 7)))
+        since = _utcnow_naive() - dt.timedelta(days=window_days)
+        if self.db_enabled and self.db_engine is not None:
+            try:
+                bars, source = load_best_intraday_history(
+                    symbol, self.db_engine, interval="5m", since=since
+                )
+                self.latest_intraday_sources[(symbol.strip().upper(), "5m")] = source
+                return bars, source
+            except Exception:
+                return pd.DataFrame(), "none"
+        return pd.DataFrame(), "none"
+
+    def start_intraday_fetch(self, symbol: str, window_days: int = 7) -> bool:
+        symbol = symbol.strip().upper()
+        if not symbol:
+            return False
+        if not self.db_enabled or self.db_engine is None:
+            if hasattr(self, "intraday_status_label"):
+                self.intraday_status_label.setText(
+                    "Intraday cache requires MySQL; no background fetch was started."
+                )
+            return False
+        if (
+            self.intraday_fetch_worker is not None
+            and self.intraday_fetch_worker.isRunning()
+        ):
+            self.append_log(f"Intraday fetch for {symbol} already running, skipping.")
+            return False
+        engine = self.db_engine
+        profile = self._selected_dashboard_kis_profile() or {}
+        self.intraday_fetch_attempts[self._intraday_fetch_key(symbol, window_days)] = (
+            _utcnow_naive()
+        )
+        self.append_log(
+            f"Starting intraday fetch for {symbol} ({window_days}d window)..."
+        )
+        self.intraday_fetch_worker = IntradayFetchWorker(
+            symbol,
+            engine,
+            window_days=window_days,
+            fetch_days=None,
+            environment=profile.get("environment", "PROD"),
+            account_no=profile.get("account_no", ""),
+            exchange="NASD",
+            allow_fallback=True,
+        )
+        self.intraday_fetch_worker.finished_fetch.connect(
+            self._on_intraday_fetch_finished
+        )
+        self.intraday_fetch_worker.provider_warning.connect(
+            self._log_intraday_provider_warning
+        )
+        self.intraday_fetch_worker.error_occurred.connect(self._on_intraday_fetch_error)
+        self._track_worker("intraday_fetch_worker", self.intraday_fetch_worker)
+        self.intraday_fetch_worker.start()
+        return True
+
+    def _on_intraday_fetch_finished(
+        self, symbol: str, fetched, window_days: int, source: str
+    ) -> None:
+        source_text = "yfinance fallback" if source == "yfinance" else source
+        self.latest_intraday_sources[(symbol.strip().upper(), "5m")] = source
+        latest_ts = ""
+        try:
+            if hasattr(fetched, "index") and not fetched.empty:
+                latest_ts = f" | latest bar: {pd.Timestamp(fetched.index.max())}"
+        except Exception:
+            pass
+        self.append_log(
+            f"Updated intraday cache for {symbol} from {source_text}.{latest_ts}"
+        )
+        if hasattr(self, "live_data_source_label"):
+            self.live_data_source_label.setText(format_intraday_source_label(source))
+        if self.intraday_symbol_combo.currentText().strip().upper() == symbol:
+            self.plot_intraday_watchlist_symbol(allow_fetch=False)
+        if (
+            hasattr(self, "symbol_input")
+            and self.symbol_input.text().strip().upper() == symbol
+        ):
+            self.refresh_orb_trade_plan_table()
+        if hasattr(self, "refresh_execution_queue"):
+            env = (
+                self.watchlist_env_combo.currentText()
+                if hasattr(self, "watchlist_env_combo")
+                else "PROD"
+            )
+            # Only this symbol's cached intraday data actually changed, so only
+            # recheck this one execution-queue row (if it's even queued) instead
+            # of every queued symbol. refresh_execution_queue(env, symbols=None)
+            # walks the WHOLE queue -- per item that's two DB reads plus a full
+            # order-ledger reload from disk -- and this handler fires on every
+            # single-symbol intraday fetch (watchlist add, Activate, chart
+            # refresh), so that used to run synchronously on the UI thread far
+            # more often than the data actually warranted.
+            self.refresh_execution_queue(env, show_log=False, symbols=[symbol])
+        if (
+            hasattr(self, "tradingview_timeframe_combo")
+            and hasattr(self, "tradingview_widget")
+            and hasattr(self, "tabs")
+            and self.tabs.currentWidget() is self.tradingview_widget
+        ):
+            timeframe = self.tradingview_timeframe_combo.currentText().strip().upper()
+            if timeframe in ("5M", "1H"):
+                active = (
+                    self.tradingview_symbol_combo.currentText().strip().upper()
+                    if hasattr(self, "tradingview_symbol_combo")
+                    else ""
+                )
+                if active == symbol.strip().upper():
+                    self.load_tradingview_chart(force=True)
+
+    def _on_intraday_fetch_error(self, symbol: str, message: str) -> None:
+        self.append_log(f"Intraday fetch failed for {symbol}: {message}")
+        if hasattr(self, "intraday_status_label"):
+            self.intraday_status_label.setText(
+                f"Intraday fetch failed for {symbol}: {message}"
+            )
+
+    def refresh_watchlist_intraday_cache(
+        self,
+        checked: bool = False,
+        show_messages: bool = True,
+        triggered_by_live: bool = False,
+        source: str = "",
+    ) -> None:
+        symbols = [item.symbol for item in self.watchlist.items]
+        if not symbols:
+            if show_messages:
+                QMessageBox.information(
+                    self, "No watchlist", "Add symbols to the watchlist first."
+                )
+            if triggered_by_live and hasattr(self, "live_data_status_label"):
+                self.live_data_status_label.setText("Live data: no watchlist symbols")
+            return
+        if not self.db_enabled or self.db_engine is None:
+            message = (
+                "Intraday watchlist refresh requires the MySQL cache; no data was fetched."
+            )
+            if not triggered_by_live or not getattr(
+                self, "_intraday_cache_unavailable_notice_logged", False
+            ):
+                self.append_log(message)
+                self._intraday_cache_unavailable_notice_logged = True
+            if show_messages:
+                QMessageBox.warning(self, "Intraday cache unavailable", message)
+            if triggered_by_live and hasattr(self, "live_data_status_label"):
+                self.live_data_status_label.setText("Live data: MySQL cache unavailable")
+            return
+        if (
+            self.intraday_bulk_worker is not None
+            and self.intraday_bulk_worker.isRunning()
+        ):
+            if show_messages:
+                QMessageBox.information(
+                    self,
+                    "Intraday refresh running",
+                    "Watchlist intraday refresh is already running.",
+                )
+            if triggered_by_live and hasattr(self, "live_data_status_label"):
+                self.live_data_status_label.setText(
+                    "Live data: refresh already running"
+                )
+            return
+
+        engine = self.db_engine
+        self.intraday_bulk_purpose = "watchlist"
+        if hasattr(self, "refresh_watchlist_orb_button"):
+            self.refresh_watchlist_orb_button.setEnabled(False)
+        self.refresh_intraday_button.setEnabled(False)
+        log_source = source or (
+            "live auto refresh" if triggered_by_live else "manual refresh"
+        )
+        self.append_log(
+            f"Starting 5-minute intraday {log_source} for {len(symbols)} watchlist symbols."
+        )
+        profile = self._selected_dashboard_kis_profile() or {}
+        self.intraday_bulk_worker = IntradayBulkFetchWorker(
+            symbols,
+            engine,
+            window_days=7,
+            environment=profile.get("environment", "PROD"),
+            account_no=profile.get("account_no", ""),
+            exchange="NASD",
+            allow_fallback=True,
+        )
+        self.intraday_bulk_worker.progress.connect(self._on_intraday_bulk_progress)
+        self.intraday_bulk_worker.provider_warning.connect(
+            self._log_intraday_provider_warning
+        )
+        self.intraday_bulk_worker.finished_bulk.connect(self._on_intraday_bulk_finished)
+        self._track_worker("intraday_bulk_worker", self.intraday_bulk_worker)
+        self.intraday_bulk_worker.start()
+
+    def _on_intraday_bulk_progress(self, symbol: str, index: int, total: int) -> None:
+        self.progress_label.setText(f"Intraday {index}/{total}: {symbol}")
+
+    def _on_intraday_bulk_finished(self, updated: list, failed: list) -> None:
+        if self.intraday_bulk_purpose == "scanner_orb":
+            self.intraday_bulk_purpose = "watchlist"
+            self.append_log(
+                f"Scanner ORB phase intraday fetch complete: {len(updated)} updated, {len(failed)} failed."
+            )
+            if failed:
+                self.append_log("Scanner ORB fetch failures: " + "; ".join(failed[:5]))
+            self._score_scanner_results_by_orb()
+            selected_source = self.pending_scanner_orb_source
+            self.pending_scanner_orb_source = None
+            self._finish_scanner_after_orb_phase(selected_source)
+            return
+
+        self.refresh_intraday_button.setEnabled(True)
+        if hasattr(self, "refresh_watchlist_orb_button"):
+            self.refresh_watchlist_orb_button.setEnabled(True)
+        self.progress_label.setText("Intraday refresh complete.")
+        self.append_log(
+            f"Intraday refresh complete: {len(updated)} updated, {len(failed)} failed."
+        )
+        if failed:
+            self.append_log("Intraday failures: " + "; ".join(failed[:5]))
+        if getattr(self, "_refresh_orb_after_intraday_bulk", False):
+            self._refresh_orb_after_intraday_bulk = False
+            self.refresh_all_watchlist_orb_statuses()
+        if hasattr(self, "refresh_execution_queue"):
+            env = (
+                self.watchlist_env_combo.currentText()
+                if hasattr(self, "watchlist_env_combo")
+                else "PROD"
+            )
+            self.refresh_execution_queue(env, show_log=False)
+            if hasattr(self, "_auto_replace_working_entry_queue_items"):
+                self._auto_replace_working_entry_queue_items(env)
+            if hasattr(self, "_auto_submit_execute_ready_queue_items"):
+                self._auto_submit_execute_ready_queue_items(env)
+        if hasattr(self, "live_data_checkbox") and self.live_data_checkbox.isChecked():
+            status = f"Live data: updated {len(updated)}, failed {len(failed)}"
+            if not self._is_us_regular_market_open():
+                status += "; waiting for U.S. market hours"
+            self.live_data_status_label.setText(status)
+        if (
+            hasattr(self, "intraday_symbol_combo")
+            and self.tabs.currentWidget() is self.intraday_charts_widget
+        ):
+            self.plot_intraday_watchlist_symbol()
+        if (
+            hasattr(self, "tradingview_timeframe_combo")
+            and hasattr(self, "tradingview_widget")
+            and self.tabs.currentWidget() is self.tradingview_widget
+        ):
+            timeframe = self.tradingview_timeframe_combo.currentText().strip().upper()
+            if timeframe in ("5M", "1H"):
+                self.load_tradingview_chart(force=True)
+
+    @staticmethod
+    def _intraday_cache_needs_backfill(
+        cached: pd.DataFrame, since: dt.datetime
+    ) -> bool:
+        return intraday_cache_needs_backfill(cached, since)
+
+    def prefetch_intraday_cache_for_symbol(self, symbol: str) -> None:
+        symbol = symbol.strip().upper()
+        if not symbol:
+            return
+        try:
+            if self.start_intraday_fetch(symbol, window_days=7):
+                self.append_log(f"Queued 7-day intraday cache refresh for {symbol}.")
+        except Exception as exc:
+            self.append_log(f"Intraday prefetch failed for {symbol}: {exc}")
+
+    def delete_intraday_cache_for_symbol(self, symbol: str) -> None:
+        if not self.db_enabled or self.db_engine is None:
+            return
+        try:
+            deleted = delete_intraday_history_for_symbol(self.db_engine, symbol)
+            if deleted:
+                self.append_log(f"Removed {deleted} intraday cache rows for {symbol}.")
+        except Exception as exc:
+            self.append_log(f"Intraday cache delete failed for {symbol}: {exc}")
+
+    @staticmethod
+    def _filter_symbols_by_prefix(symbols, prefix: str) -> List[str]:
+        prefix = prefix.strip().upper()
+        return [
+            symbol
+            for symbol in sorted(
+                {str(item).strip().upper() for item in symbols if str(item).strip()}
+            )
+            if symbol.startswith(prefix)
+        ]

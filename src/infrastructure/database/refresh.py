@@ -1,16 +1,27 @@
-"""P2 refresh orchestration extraction from the legacy database loader."""
-from ._shared import *  # noqa: F401,F403
+"""History refresh orchestration."""
 
-def _format_eta(seconds: int) -> str:
-    if seconds < 0:
-        return "00:00"
-    minutes = seconds // 60
-    secs = seconds % 60
-    return f"{int(minutes):02d}:{int(secs):02d}"
+import datetime as dt
+import random
+import time
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
+import pandas as pd
+from sqlalchemy.engine import Engine
 
-def _format_elapsed(seconds: float) -> str:
-    return _format_eta(int(max(0, seconds)))
+from src.utils.data_loader import (_extract_symbol_history,
+                                   download_price_history)
+from src.utils.market_calendar import expected_latest_market_data_date
+
+from .formatting import _format_elapsed, _format_eta
+from .repositories.market_bars import (
+    save_universe_history_batch_to_db,
+    save_universe_hourly_history_batch_to_db)
+from .repositories.market_watermarks import (
+    get_latest_hourly_price_history_timestamps, get_latest_price_history_dates)
+from .schema import record_symbol_refresh_outcomes
+from .settings import REFERENCE_SYMBOL
+from .sql_helpers import _clean_symbols
+from .time_utils import _utcnow_naive
 
 
 def _chunk_symbols(symbols: List[str], chunk_size: int) -> List[List[str]]:

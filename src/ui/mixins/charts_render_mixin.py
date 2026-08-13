@@ -1,5 +1,5 @@
-"""Compatibility alias for the P2 chart renderer."""
-import sys
-from src.ui.charts import renderer as _renderer
+"""Compatibility import for the decomposed chart renderer."""
 
-sys.modules[__name__] = _renderer
+from src.ui.charts.renderer import ChartsRenderMixin
+
+__all__ = ["ChartsRenderMixin"]

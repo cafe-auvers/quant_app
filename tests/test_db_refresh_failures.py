@@ -6,16 +6,19 @@ from sqlalchemy import create_engine
 from sqlalchemy.exc import OperationalError
 
 import src.utils.db_loader as db_loader
+from src.infrastructure.database import refresh as refresh_module
+from src.infrastructure.database import schema as schema_module
+from src.infrastructure.database.repositories import market_bars
 
 
 @pytest.fixture
 def sqlite_engine():
     engine = create_engine("sqlite:///:memory:", future=True)
-    db_loader._ensured_engines.discard(engine)
+    schema_module._ensured_engines.discard(engine)
     try:
         yield engine
     finally:
-        db_loader._ensured_engines.discard(engine)
+        schema_module._ensured_engines.discard(engine)
         engine.dispose()
 
 
@@ -37,8 +40,8 @@ def test_daily_refresh_counts_old_nonempty_history_as_failure(monkeypatch, sqlit
     expected_date = dt.date(2026, 6, 23)
     old_history = _single_symbol_history("2026-06-20")
 
-    monkeypatch.setattr(db_loader, "expected_latest_market_data_date", lambda: expected_date)
-    monkeypatch.setattr(db_loader, "download_price_history", lambda *args, **kwargs: old_history)
+    monkeypatch.setattr(refresh_module, "expected_latest_market_data_date", lambda: expected_date)
+    monkeypatch.setattr(refresh_module, "download_price_history", lambda *args, **kwargs: old_history)
 
     for _ in range(db_loader.CHRONIC_FAILURE_THRESHOLD):
         updated = db_loader.refresh_universe_history_to_db(
@@ -50,7 +53,7 @@ def test_daily_refresh_counts_old_nonempty_history_as_failure(monkeypatch, sqlit
     assert db_loader.get_chronically_failing_symbols(engine, "1h") == set()
 
     fresh_history = _single_symbol_history("2026-06-23")
-    monkeypatch.setattr(db_loader, "download_price_history", lambda *args, **kwargs: fresh_history)
+    monkeypatch.setattr(refresh_module, "download_price_history", lambda *args, **kwargs: fresh_history)
     db_loader.refresh_universe_history_to_db(
         ["OLD"], engine, chunk_size=1, batch_sleep=0, retry_attempts=0
     )
@@ -76,9 +79,9 @@ def test_daily_refresh_retries_nonempty_stale_history_and_accepts_fresh_retry(
         calls.append((args, kwargs))
         return next(responses)
 
-    monkeypatch.setattr(db_loader, "expected_latest_market_data_date", lambda: expected_date)
-    monkeypatch.setattr(db_loader, "download_price_history", download)
-    monkeypatch.setattr(db_loader.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(refresh_module, "expected_latest_market_data_date", lambda: expected_date)
+    monkeypatch.setattr(refresh_module, "download_price_history", download)
+    monkeypatch.setattr(refresh_module.time, "sleep", lambda _seconds: None)
 
     for _ in range(db_loader.CHRONIC_FAILURE_THRESHOLD):
         db_loader.record_symbol_refresh_outcomes(engine, "1d", [], ["STALE"])
@@ -107,8 +110,8 @@ def test_hourly_refresh_counts_old_nonempty_history_as_failure(monkeypatch, sqli
     expected_date = dt.date(2026, 6, 23)
     old_history = _single_symbol_history("2026-06-20 15:30:00")
 
-    monkeypatch.setattr(db_loader, "expected_latest_market_data_date", lambda: expected_date)
-    monkeypatch.setattr(db_loader, "download_price_history", lambda *args, **kwargs: old_history)
+    monkeypatch.setattr(refresh_module, "expected_latest_market_data_date", lambda: expected_date)
+    monkeypatch.setattr(refresh_module, "download_price_history", lambda *args, **kwargs: old_history)
 
     for _ in range(db_loader.CHRONIC_FAILURE_THRESHOLD):
         updated = db_loader.refresh_universe_hourly_history_to_db(
@@ -119,7 +122,7 @@ def test_hourly_refresh_counts_old_nonempty_history_as_failure(monkeypatch, sqli
     assert db_loader.get_chronically_failing_symbols(engine, "1h") == {"OLD"}
 
     fresh_history = _single_symbol_history("2026-06-23 15:30:00")
-    monkeypatch.setattr(db_loader, "download_price_history", lambda *args, **kwargs: fresh_history)
+    monkeypatch.setattr(refresh_module, "download_price_history", lambda *args, **kwargs: fresh_history)
     db_loader.refresh_universe_hourly_history_to_db(
         ["OLD"], engine, chunk_size=1, batch_sleep=0, retry_attempts=0
     )
@@ -132,10 +135,10 @@ def test_provider_outage_only_advances_reference_symbol_failure_streak(
 ):
     expected_date = dt.date(2026, 6, 23)
     monkeypatch.setattr(
-        db_loader, "expected_latest_market_data_date", lambda: expected_date
+        refresh_module, "expected_latest_market_data_date", lambda: expected_date
     )
     monkeypatch.setattr(
-        db_loader, "download_price_history", lambda *args, **kwargs: pd.DataFrame()
+        refresh_module, "download_price_history", lambda *args, **kwargs: pd.DataFrame()
     )
 
     for _ in range(db_loader.CHRONIC_FAILURE_THRESHOLD):
@@ -177,7 +180,7 @@ def test_refresh_does_not_immediately_repeat_failed_batch(
     calls = []
     logs = []
     monkeypatch.setattr(
-        db_loader,
+        refresh_module,
         "download_price_history",
         lambda *args, **kwargs: calls.append((args, kwargs)) or pd.DataFrame(),
     )
@@ -206,9 +209,9 @@ def test_daily_refresh_resets_streak_when_existing_cache_is_current(monkeypatch,
         db_loader.record_symbol_refresh_outcomes(engine, "1d", [], ["CACHED"])
     assert db_loader.get_chronically_failing_symbols(engine, "1d") == {"CACHED"}
 
-    monkeypatch.setattr(db_loader, "expected_latest_market_data_date", lambda: expected_date)
+    monkeypatch.setattr(refresh_module, "expected_latest_market_data_date", lambda: expected_date)
     monkeypatch.setattr(
-        db_loader, "download_price_history", lambda *args, **kwargs: pd.DataFrame()
+        refresh_module, "download_price_history", lambda *args, **kwargs: pd.DataFrame()
     )
 
     updated = db_loader.refresh_universe_history_to_db(
@@ -225,7 +228,7 @@ def test_refresh_failure_bookkeeping_ignores_table_creation_errors(monkeypatch, 
     def fail_table_creation(_engine):
         raise OperationalError("CREATE TABLE", {}, RuntimeError("permission denied"))
 
-    monkeypatch.setattr(db_loader, "_ensure_symbol_refresh_failures_table", fail_table_creation)
+    monkeypatch.setattr(schema_module, "_ensure_symbol_refresh_failures_table", fail_table_creation)
 
     db_loader.record_symbol_refresh_outcomes(engine, "1d", [], ["AAPL"])
 
@@ -260,7 +263,7 @@ def test_history_loaders_return_empty_when_table_creation_fails(
             "CREATE TABLE", {}, RuntimeError("database went offline")
         )
 
-    monkeypatch.setattr(db_loader, ensure_name, fail_table_creation)
+    monkeypatch.setattr(market_bars, ensure_name, fail_table_creation)
 
     history = load_history(sqlite_engine)
 

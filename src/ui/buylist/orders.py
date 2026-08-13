@@ -1,5 +1,27 @@
-"""P2 buylist orders submixin."""
-from src.ui.buylist._shared import *  # noqa: F401,F403
+"""Buylist order submission and fill application."""
+
+import datetime as dt
+import math
+from typing import Any, Dict, List, Optional, Tuple
+
+from PyQt5.QtCore import QThread, QTimer
+from PyQt5.QtWidgets import QMessageBox
+
+from src.api.kis_order import is_ambiguous_order_submission_error
+from src.core.order_state import (OPEN_ORDER_STATUSES, REGULAR_LIMIT_EXECUTION,
+                                  RESERVED_MOO_EXECUTION, BrokerOrder,
+                                  OrderIntent, OrderSide, OrderStatus)
+from src.risk.pre_trade import (PreTradeRiskDecision,
+                                assess_orb_entry_candidate,
+                                orb_candidate_plan_id)
+from src.services.order_ledger import (append_order, find_open_orders,
+                                       has_open_order, load_order_ledger,
+                                       merge_orders, update_order)
+from src.ui.workers import KisOrderWorker, OrderReconciliationWorker
+
+from .constants import (KST_ZONE, US_MARKET_CLOSE_TIME, US_MARKET_OPEN_TIME,
+                        US_MARKET_ZONE)
+
 
 class BuylistOrdersMixin:
     def _selected_trade_account_no_for_environment(
@@ -34,7 +56,8 @@ class BuylistOrdersMixin:
         if combo is not None:
             return self._selected_trade_account_no_for_environment(environment)
         try:
-            from src.api.kis_account_snapshot_dual import discover_account_profiles
+            from src.api.kis_account_snapshot_dual import \
+                discover_account_profiles
 
             profiles = [
                 p
@@ -109,10 +132,8 @@ class BuylistOrdersMixin:
         side: OrderSide,
         intent: OrderIntent,
     ) -> bool:
-        load_fn = _main_window_global("load_order_ledger", load_order_ledger)
-        has_open_fn = _main_window_global("has_open_order", has_open_order)
-        self.order_ledger = load_fn()
-        return has_open_fn(
+        self.order_ledger = load_order_ledger()
+        return has_open_order(
             environment=environment,
             account_no=account_no or "",
             symbol=symbol,
@@ -123,10 +144,8 @@ class BuylistOrdersMixin:
     def _has_open_sell_order(
         self, environment: str, account_no: str, symbol: str
     ) -> bool:
-        load_fn = _main_window_global("load_order_ledger", load_order_ledger)
-        has_open_fn = _main_window_global("has_open_order", has_open_order)
-        self.order_ledger = load_fn()
-        return has_open_fn(
+        self.order_ledger = load_order_ledger()
+        return has_open_order(
             environment=environment,
             account_no=account_no or "",
             symbol=symbol,
@@ -379,9 +398,19 @@ class BuylistOrdersMixin:
             )
             return
         if pre_trade_risk_decision is None:
+            plan_id = orb_candidate_plan_id(risk_candidate)
             pre_trade_risk_decision = assess_orb_entry_candidate(
-                risk_candidate, quantity
+                risk_candidate,
+                environment=env,
+                account_no=account_no,
+                symbol=item.symbol,
+                quantity=quantity,
+                reference_price=order_price,
+                plan_id=plan_id,
             )
+        else:
+            plan_id = pre_trade_risk_decision.plan_id
+        strategy_id = pre_trade_risk_decision.strategy_id
         try:
             worker = KisOrderWorker(
                 env,
@@ -393,6 +422,8 @@ class BuylistOrdersMixin:
                 intent=intent,
                 buylist_symbol_key=f"{env}:{item.symbol}",
                 pre_trade_risk_decision=pre_trade_risk_decision,
+                strategy_id=strategy_id,
+                plan_id=plan_id,
             )
             self.kis_order_worker = worker
             self._track_buylist_order_worker(worker)
@@ -562,10 +593,8 @@ class BuylistOrdersMixin:
             QMessageBox.warning(self, "KIS order failed", str(exc))
 
     def _record_broker_order(self, order: BrokerOrder) -> None:
-        append_fn = _main_window_global("append_order", append_order)
-        load_fn = _main_window_global("load_order_ledger", load_order_ledger)
-        append_fn(order)
-        self.order_ledger = load_fn()
+        append_order(order)
+        self.order_ledger = load_order_ledger()
 
     def _on_buy_order_accepted(self, item, order: BrokerOrder) -> None:
         self._record_broker_order(order)
@@ -611,8 +640,7 @@ class BuylistOrdersMixin:
                 f"{item.symbol} buy order submission result is unknown.\n\n"
                 "Verify KIS account/order status before clearing this state or submitting again.",
             )
-            timer = _main_window_global("QTimer", QTimer)
-            timer.singleShot(5000, self.reconcile_open_orders)
+            QTimer.singleShot(5000, self.reconcile_open_orders)
             return
 
         if order.status == OrderStatus.REJECTED:
@@ -660,8 +688,7 @@ class BuylistOrdersMixin:
         self.append_log(
             f"BUY order accepted by broker for {item.symbol}: {order.quantity} shares; waiting for fill confirmation"
         )
-        timer = _main_window_global("QTimer", QTimer)
-        timer.singleShot(5000, self.reconcile_open_orders)
+        QTimer.singleShot(5000, self.reconcile_open_orders)
 
     def _on_sell_order_accepted(
         self, item, quantity: int, reason: str, order: BrokerOrder
@@ -690,8 +717,7 @@ class BuylistOrdersMixin:
                 f"{item.symbol} sell order submission result is unknown.\n\n"
                 "Verify KIS account/order status before clearing this state or submitting again.",
             )
-            timer = _main_window_global("QTimer", QTimer)
-            timer.singleShot(5000, self.reconcile_open_orders)
+            QTimer.singleShot(5000, self.reconcile_open_orders)
             return
 
         if order.status == OrderStatus.REJECTED:
@@ -742,8 +768,7 @@ class BuylistOrdersMixin:
                 f"SELL order accepted by broker for {item.symbol}: {quantity} shares "
                 f"({reason}); waiting for fill confirmation"
             )
-        timer = _main_window_global("QTimer", QTimer)
-        timer.singleShot(5000, self.reconcile_open_orders)
+        QTimer.singleShot(5000, self.reconcile_open_orders)
 
     def _on_buy_order_filled(
         self, item, quantity: int, order_price: float, result: dict
@@ -799,11 +824,11 @@ class BuylistOrdersMixin:
         ):
             return
 
-        load_fn = _main_window_global("load_order_ledger", load_order_ledger)
-        find_fn = _main_window_global("find_open_orders", find_open_orders)
-        self.order_ledger = load_fn()
+        self.order_ledger = load_order_ledger()
         open_orders = [
-            order for order in find_fn(self.order_ledger) if order.environment == "PROD"
+            order
+            for order in find_open_orders(self.order_ledger)
+            if order.environment == "PROD"
         ]
         if not open_orders:
             self._pending_reconciliation_groups = []
@@ -858,18 +883,15 @@ class BuylistOrdersMixin:
         snapshot: dict,
     ) -> None:
         self.kis_account_snapshots[(environment, account_no)] = snapshot or {}
-        load_fn = _main_window_global("load_order_ledger", load_order_ledger)
-        merge_fn = _main_window_global("merge_orders", merge_orders)
-        merge_fn(updated_orders)
-        self.order_ledger = load_fn()
+        merge_orders(updated_orders)
+        self.order_ledger = load_order_ledger()
         self.apply_confirmed_order_fills_to_buylist(updated_orders)
         self.sync_buylist_positions_from_kis_snapshots(
             {(environment, account_no): snapshot}
         )
 
         if self._pending_reconciliation_groups:
-            timer = _main_window_global("QTimer", QTimer)
-            timer.singleShot(1000, self.reconcile_open_orders)
+            QTimer.singleShot(1000, self.reconcile_open_orders)
 
     @staticmethod
     def _buylist_to_float(value: Any) -> float:
@@ -975,8 +997,7 @@ class BuylistOrdersMixin:
                     f"BUY fill confirmed for {order.symbol}: {filled_qty}/{order.quantity} shares"
                 )
                 order.applied_filled_quantity = filled_qty
-                update_fn = _main_window_global("update_order", update_order)
-                update_fn(order)
+                update_order(order)
                 changed = True
                 continue
 
@@ -1003,19 +1024,16 @@ class BuylistOrdersMixin:
                 f"SELL fill confirmed for {order.symbol}: {filled_qty}/{order.quantity} shares; {remaining_shares} remaining"
             )
             order.applied_filled_quantity = filled_qty
-            update_fn = _main_window_global("update_order", update_order)
-            update_fn(order)
+            update_order(order)
             changed = True
 
         if changed:
             self._save_buylist_state()
             self.populate_buylist_dashboard()
-            load_fn = _main_window_global("load_order_ledger", load_order_ledger)
-            self.order_ledger = load_fn()
+            self.order_ledger = load_order_ledger()
 
     def request_cancel_order(self, client_order_id: str) -> bool:
-        load_fn = _main_window_global("load_order_ledger", load_order_ledger)
-        self.order_ledger = load_fn()
+        self.order_ledger = load_order_ledger()
         target = next(
             (
                 order
@@ -1040,7 +1058,8 @@ class BuylistOrdersMixin:
             )
             return False
         try:
-            from src.services.order_reconciliation import cancel_and_reconcile_order
+            from src.services.order_reconciliation import \
+                cancel_and_reconcile_order
 
             updated = cancel_and_reconcile_order(client_order_id)
         except Exception as exc:
@@ -1048,7 +1067,7 @@ class BuylistOrdersMixin:
                 f"Cancel request failed for {target.symbol} order {client_order_id}: {exc}"
             )
             return False
-        self.order_ledger = load_fn()
+        self.order_ledger = load_order_ledger()
         self.apply_confirmed_order_fills_to_buylist([updated])
         self._apply_broker_order_status_updates_to_buylist([updated])
         self.populate_buylist_dashboard()

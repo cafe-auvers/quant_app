@@ -1,6 +1,18 @@
-"""P2 engine extraction from the legacy database loader."""
-from ._shared import *  # noqa: F401,F403
+"""MySQL engine construction and validated connection settings."""
 
+from typing import Dict, Optional
+
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import URL, Engine
+from sqlalchemy.exc import SQLAlchemyError
+
+from src.utils.config import get_mysql_config
+
+from .settings import (_MYSQL_HOST_FORBIDDEN_CHARACTERS,
+                       _MYSQL_IDENTIFIER_PATTERN,
+                       MYSQL_CONNECT_TIMEOUT_SECONDS,
+                       MYSQL_POOL_RECYCLE_SECONDS,
+                       MYSQL_READ_WRITE_TIMEOUT_SECONDS, logger)
 def validate_mysql_identifier(value: str, *, label: str = "database name") -> str:
     """Accept a deliberately narrow set of safe MySQL identifier characters."""
     identifier = str(value or "").strip()
@@ -59,11 +71,6 @@ def validate_mysql_config(config: Optional[Dict[str, str]] = None) -> Dict[str, 
         "password": str(raw.get("password") or ""),
         "database": validate_mysql_identifier(raw.get("database"), label="database name"),
     }
-
-def _utcnow_naive() -> dt.datetime:
-    """Return a naive UTC timestamp for existing DB columns and comparisons."""
-    return dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
-
 
 def get_mysql_connection_url(db_name: Optional[str] = None) -> URL:
     # Validate an explicit identifier before inspecting environment settings so
@@ -127,6 +134,14 @@ def init_mysql_engine(
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         if ensure_schema:
+            from .schema import (_ensure_chart_indicator_manifests_table,
+                                 _ensure_chart_indicators_table,
+                                 _ensure_hourly_price_history_table,
+                                 _ensure_intraday_price_history_table,
+                                 _ensure_price_history_table,
+                                 _ensure_scanner_metric_snapshots_table,
+                                 _ensure_scanner_metrics_table)
+
             _ensure_price_history_table(engine)
             _ensure_hourly_price_history_table(engine)
             _ensure_chart_indicators_table(engine)

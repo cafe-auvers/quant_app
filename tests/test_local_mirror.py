@@ -2,22 +2,13 @@ import datetime as dt
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import (
-    Column,
-    DateTime,
-    Float,
-    MetaData,
-    String,
-    Table,
-    create_engine,
-    delete,
-    event,
-    insert,
-    select,
-    update,
-)
+from sqlalchemy import (Column, DateTime, Float, MetaData, String, Table,
+                        create_engine, delete, event, insert, inspect, select,
+                        update)
 
 import src.utils.db_loader as db_loader
+from src.infrastructure.database import (mirror_copy, mirror_engine,
+                                         mirror_reconciliation)
 
 
 def _source_table(engine, table_name="bars"):
@@ -169,12 +160,12 @@ def test_resolve_data_engine_prefers_pc_and_falls_back_to_local(monkeypatch):
 
     mysql_calls = []
     monkeypatch.setattr(
-        db_loader,
+        mirror_engine,
         "init_mysql_engine",
         lambda **kwargs: mysql_calls.append(kwargs) or pc_engine,
     )
     monkeypatch.setattr(
-        db_loader,
+        mirror_engine,
         "init_local_mirror_engine",
         lambda: (_ for _ in ()).throw(AssertionError("local should not open")),
     )
@@ -184,8 +175,8 @@ def test_resolve_data_engine_prefers_pc_and_falls_back_to_local(monkeypatch):
     assert resolution.source == "pc"
     assert mysql_calls == [{"ensure_schema": True}]
 
-    monkeypatch.setattr(db_loader, "init_mysql_engine", lambda **_kwargs: None)
-    monkeypatch.setattr(db_loader, "init_local_mirror_engine", lambda: local_engine)
+    monkeypatch.setattr(mirror_engine, "init_mysql_engine", lambda **_kwargs: None)
+    monkeypatch.setattr(mirror_engine, "init_local_mirror_engine", lambda: local_engine)
     resolution = db_loader.resolve_data_engine()
     assert resolution.engine is local_engine
     assert resolution.pc_engine is None
@@ -194,9 +185,9 @@ def test_resolve_data_engine_prefers_pc_and_falls_back_to_local(monkeypatch):
 
 def test_resolve_data_engine_can_disable_laptop_only_fallback(monkeypatch):
     monkeypatch.setenv(db_loader.LOCAL_MIRROR_ENABLED_ENV, "0")
-    monkeypatch.setattr(db_loader, "init_mysql_engine", lambda **_kwargs: None)
+    monkeypatch.setattr(mirror_engine, "init_mysql_engine", lambda **_kwargs: None)
     monkeypatch.setattr(
-        db_loader,
+        mirror_engine,
         "init_local_mirror_engine",
         lambda: (_ for _ in ()).throw(AssertionError("local should not open")),
     )
@@ -217,7 +208,7 @@ def test_init_local_mirror_engine_accepts_string_path_and_configures_sqlite(tmp_
             busy_timeout = conn.exec_driver_sql("PRAGMA busy_timeout").scalar_one()
         assert journal_mode.lower() == "wal"
         assert busy_timeout == 30_000
-        assert "price_history" in set(db_loader.inspect(engine).get_table_names())
+        assert "price_history" in set(inspect(engine).get_table_names())
     finally:
         engine.dispose()
 
@@ -267,13 +258,13 @@ def test_mirror_sync_resume_does_not_skip_rows_after_interruption(monkeypatch):
             raise RuntimeError("interrupted")
         return original_upsert(*args, **kwargs)
 
-    monkeypatch.setattr(db_loader, "_execute_bulk_upsert", interrupt_second_batch)
+    monkeypatch.setattr(mirror_copy, "_execute_bulk_upsert", interrupt_second_batch)
     with pytest.raises(RuntimeError, match="interrupted"):
         db_loader.sync_mirror_table(
             source, local, "bars", "stamp", chunk_size=2
         )
 
-    monkeypatch.setattr(db_loader, "_execute_bulk_upsert", original_upsert)
+    monkeypatch.setattr(mirror_copy, "_execute_bulk_upsert", original_upsert)
     db_loader.sync_mirror_table(source, local, "bars", "stamp", chunk_size=2)
 
     assert len(_read_rows(local)) == len(rows)
@@ -618,14 +609,14 @@ def test_checkpointed_mirror_skips_unchanged_restart_without_row_scan(monkeypatc
     )
 
     monkeypatch.setattr(
-        db_loader,
+        mirror_copy,
         "_copy_scoped_changed_rows_to_local",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("unchanged restart must not read table rows")
         ),
     )
     monkeypatch.setattr(
-        db_loader,
+        mirror_copy,
         "_scoped_partition_revision_summaries",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("unchanged restart must not scan partitions")
@@ -657,7 +648,7 @@ def test_checkpointed_mirror_copies_only_new_revision_rows(monkeypatch):
     with pc.begin() as conn:
         conn.execute(insert(pc_daily), new_row)
     monkeypatch.setattr(
-        db_loader,
+        mirror_copy,
         "_partition_fingerprints",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("incremental path must not fingerprint full tables")
@@ -795,7 +786,7 @@ def test_checkpoint_and_rows_roll_back_together_on_commit_failure(monkeypatch):
 
     original_save = db_loader._save_mirror_sync_checkpoint
     monkeypatch.setattr(
-        db_loader,
+        mirror_copy,
         "_save_mirror_sync_checkpoint",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             RuntimeError("checkpoint write failed")
@@ -810,7 +801,7 @@ def test_checkpoint_and_rows_roll_back_together_on_commit_failure(monkeypatch):
     with local.connect() as conn:
         assert conn.execute(select(local_daily.c.symbol)).scalars().all() == ["A"]
 
-    monkeypatch.setattr(db_loader, "_save_mirror_sync_checkpoint", original_save)
+    monkeypatch.setattr(mirror_copy, "_save_mirror_sync_checkpoint", original_save)
     db_loader.sync_local_mirror_from_pc_checkpointed(
         pc,
         local,
@@ -849,7 +840,7 @@ def test_checkpointed_mirror_rolls_back_if_pc_changes_during_copy(monkeypatch):
         return copied
 
     monkeypatch.setattr(
-        db_loader,
+        mirror_copy,
         "_copy_scoped_changed_rows_to_local",
         copy_then_change_pc,
     )
@@ -924,7 +915,7 @@ def test_atomic_mirror_sync_rolls_back_all_tables_on_later_failure(monkeypatch):
             raise RuntimeError("simulated later-table failure")
         return original_upsert(conn, table, records, key_columns, dialect_name)
 
-    monkeypatch.setattr(db_loader, "_execute_bulk_upsert", fail_hourly)
+    monkeypatch.setattr(mirror_copy, "_execute_bulk_upsert", fail_hourly)
 
     with pytest.raises(RuntimeError, match="later-table failure"):
         db_loader.sync_local_mirror_from_pc_atomic(
@@ -1379,7 +1370,7 @@ def test_reconciliation_rebuilds_pc_derived_data_after_daily_promotion(monkeypat
         conn.execute(insert(local_daily), _daily_bar("A", 2, 100))
     calls = []
     monkeypatch.setattr(
-        db_loader,
+        mirror_reconciliation,
         "_rebuild_and_verify_pc_derived_data",
         lambda engine, tickers, affected: calls.append(
             (engine, tickers, set(affected))
@@ -1413,10 +1404,10 @@ def test_reconciliation_retry_still_verifies_derived_after_committed_raw_insert(
             raise RuntimeError("transient hourly failure")
         return original_fingerprints(engine, spec, **kwargs)
 
-    monkeypatch.setattr(db_loader, "_partition_fingerprints", flaky_fingerprints)
+    monkeypatch.setattr(mirror_copy, "_partition_fingerprints", flaky_fingerprints)
     derived_calls = []
     monkeypatch.setattr(
-        db_loader,
+        mirror_reconciliation,
         "_rebuild_and_verify_pc_derived_data",
         lambda engine, tickers, affected: derived_calls.append(set(affected)),
     )
@@ -1465,7 +1456,7 @@ def test_reconciliation_write_fence_rejects_concurrent_pc_change(monkeypatch):
         return snapshot
 
     monkeypatch.setattr(
-        db_loader, "_partition_fingerprints", fingerprints_with_concurrent_pc_write
+        mirror_copy, "_partition_fingerprints", fingerprints_with_concurrent_pc_write
     )
 
     first = db_loader.reconcile_local_mirror_with_pc(
@@ -1511,7 +1502,7 @@ def test_reconciliation_preserves_concurrent_local_raw_insert_for_retry(monkeypa
         return snapshot
 
     monkeypatch.setattr(
-        db_loader, "_partition_fingerprints", fingerprints_with_concurrent_local_write
+        mirror_copy, "_partition_fingerprints", fingerprints_with_concurrent_local_write
     )
 
     first = db_loader.reconcile_local_mirror_with_pc(

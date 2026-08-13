@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import math
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from PyQt5.QtWidgets import QMessageBox
 
-from src.core.order_state import OrderIntent, OrderSide
 from src.core.execution_queue import build_queue_display_state
+from src.core.order_state import OrderIntent, OrderSide
 from src.core.watchlist import BuylistItem
 from src.ui.controllers.base import WindowController
 
