@@ -9,6 +9,7 @@ import requests
 
 from src.utils.config import get_env_value
 from src.risk.position_sizer import PositionSizer
+from src.risk.orb_position import MAX_CAPITAL_PERCENT
 
 
 def _finite_float(value: Any) -> Optional[float]:
@@ -270,8 +271,11 @@ def calculate_deterministic_scores(
         warnings.append(f"Daily dollar volume (${dollar_volume:,.2f}) is below $35,000")
     if stop_loss_percent >= adr_percent:
         warnings.append(f"Stop loss % ({stop_loss_percent:.2f}%) is wider than ADR 20-day ({adr_percent:.2f}%)")
-    if capital_percent >= 30.0:
-        warnings.append(f"Capital allocation ({capital_percent:.2f}%) exceeds hard limit of 30%")
+    if capital_percent >= MAX_CAPITAL_PERCENT:
+        warnings.append(
+            f"Capital allocation ({capital_percent:.2f}%) exceeds hard limit of "
+            f"{MAX_CAPITAL_PERCENT:.0f}%"
+        )
     if shares < 1:
         warnings.append("Position size calculation resulted in 0 shares")
         

@@ -17,7 +17,13 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 import pandas as pd
 
 from src.core.orb import calculate_orb_range, evaluate_orb_entry_signal
-from src.risk.position_sizer import PositionSizer
+from src.risk.orb_position import (
+    MAX_CAPITAL_PERCENT,
+    MIN_CAPITAL_PERCENT,
+    calculate_orb_position_values,
+    score_orb_position_recommendation,
+    validate_orb_position_values,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,10 +41,6 @@ def _parse_utc_timestamp(value: Any) -> datetime:
 SUPPORTED_ORB_WINDOWS = ("1m", "5m", "30m")
 DEFAULT_ORB_BUFFER_PCT = 0.001
 DEFAULT_UPGRADE_MARGIN = 0.0
-MIN_CAPITAL_PERCENT = 10.0
-MAX_CAPITAL_PERCENT = 30.0
-MIN_STOP_ADR = 15.0
-MAX_STOP_ADR = 66.0
 PRODUCTION_ENVIRONMENT = "PROD"
 
 
@@ -471,94 +473,31 @@ def calculate_position_values(
     stop_price: float,
     adr_percent: Optional[float] = None,
 ) -> Dict[str, Any]:
-    if account_size <= 0 or risk_percent <= 0 or entry_price <= 0 or stop_price <= 0:
-        return {
-            "shares": 0,
-            "investment": 0.0,
-            "capital_percent": 0.0,
-            "stop_loss_percent": 0.0,
-            "sl_adr": None,
-            "risk_per_share": 0.0,
-        }
-
-    risk_per_share = max(0.0, entry_price - stop_price)
-    if risk_per_share <= 0:
-        return {
-            "shares": 0,
-            "investment": 0.0,
-            "capital_percent": 0.0,
-            "stop_loss_percent": 0.0,
-            "sl_adr": None,
-            "risk_per_share": 0.0,
-        }
-
-    sizer = PositionSizer(account_size=account_size, max_risk_per_trade=risk_percent)
-    sizing = sizer.size_risk_based(
-        entry_price=entry_price, stop_loss_price=stop_price, risk_percent=risk_percent
-    )
-    stop_loss_percent = risk_per_share / entry_price * 100.0
-    sl_adr = (
-        stop_loss_percent / adr_percent * 100.0
-        if adr_percent and adr_percent > 0
-        else None
+    sizing = calculate_orb_position_values(
+        account_size=account_size,
+        risk_percent=risk_percent,
+        entry_price=entry_price,
+        stop_price=stop_price,
+        adr_percent=adr_percent,
     )
     return {
-        "shares": int(sizing.shares),
-        "investment": float(sizing.dollar_amount),
-        "capital_percent": float(sizing.percent_of_account * 100.0),
-        "stop_loss_percent": float(stop_loss_percent),
-        "sl_adr": sl_adr,
-        "risk_per_share": float(risk_per_share),
+        "shares": int(sizing["shares"]),
+        "investment": float(sizing["investment"]),
+        "capital_percent": float(sizing["capital_percent"]),
+        "stop_loss_percent": float(sizing["stop_loss_percent"]),
+        "sl_adr": sizing["sl_adr"],
+        "risk_per_share": float(sizing["risk_per_share"]),
     }
 
 
 def validate_position_values(
     sizing: Dict[str, Any], adr_percent: Optional[float]
 ) -> List[str]:
-    warnings: List[str] = []
-    shares = int(sizing.get("shares", 0) or 0)
-    capital_percent = float(sizing.get("capital_percent", 0.0) or 0.0)
-    stop_loss_percent = float(sizing.get("stop_loss_percent", 0.0) or 0.0)
-    stop_adr = sizing.get("sl_adr")
-
-    if shares < 1:
-        warnings.append("Position size calculation resulted in 0 shares")
-    if capital_percent < MIN_CAPITAL_PERCENT:
-        warnings.append(
-            f"Capital allocation ({capital_percent:.2f}%) is below {MIN_CAPITAL_PERCENT:.0f}%"
-        )
-    if capital_percent >= MAX_CAPITAL_PERCENT:
-        warnings.append(
-            f"Capital allocation ({capital_percent:.2f}%) exceeds {MAX_CAPITAL_PERCENT:.0f}%"
-        )
-    if adr_percent is not None and adr_percent > 0 and stop_loss_percent >= adr_percent:
-        warnings.append(
-            f"Stop loss % ({stop_loss_percent:.2f}%) is wider than ADR ({adr_percent:.2f}%)"
-        )
-    if stop_adr is not None:
-        stop_adr_value = float(stop_adr)
-        if stop_adr_value < MIN_STOP_ADR:
-            warnings.append(
-                f"Stop/ADR ({stop_adr_value:.2f}%) is below {MIN_STOP_ADR:.0f}%"
-            )
-        elif stop_adr_value > MAX_STOP_ADR:
-            warnings.append(
-                f"Stop/ADR ({stop_adr_value:.2f}%) exceeds {MAX_STOP_ADR:.0f}%"
-            )
-    return warnings
+    return validate_orb_position_values(sizing, adr_percent)
 
 
 def score_orb_candidate(sizing: Dict[str, Any], risk_percent: float) -> float:
-    stop_adr = sizing.get("sl_adr")
-    if stop_adr is None:
-        return 0.0
-    capital_percent = float(sizing.get("capital_percent", 0.0) or 0.0)
-    stop_adr_score = max(0.0, 100.0 - abs(float(stop_adr) - 65.0) * 3.0)
-    capital_score = max(0.0, 100.0 - abs(capital_percent - 17.5) * 4.0)
-    risk_score = max(0.0, 100.0 - float(risk_percent) * 100.0 * 25.0)
-    return round(
-        (stop_adr_score * 0.45) + (capital_score * 0.40) + (risk_score * 0.15), 1
-    )
+    return score_orb_position_recommendation(sizing, risk_percent)
 
 
 def build_orb_candidate(

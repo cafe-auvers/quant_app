@@ -1993,7 +1993,7 @@ class MainWindow(
         # Placed first (leftmost / most prominent). Starts DISABLED every
         # launch by design (src/services/trading_state.py has no persistence);
         # enabling requires an explicit click-through confirmation, disabling
-        # is instant. See docs/next_steps_plan.md P1.
+        # is instant. See PROJECT_ARCHITECTURE.md Production Safety Notes.
         self.trading_enabled_button = QPushButton()
         self.trading_enabled_button.setCheckable(True)
         self.trading_enabled_button.clicked.connect(self._on_trading_enabled_toggled)
@@ -2115,9 +2115,9 @@ class MainWindow(
             if locked:
                 button.setText("LIVE TRADING ● LOCKED OFF")
                 button.setToolTip(
-                    "TRADING_ENABLED is set to a falsy value in .env/environment; "
-                    "this forces live trading off for this process and cannot be "
-                    "overridden from the UI."
+                    "TRADING_ENABLED is blank, false, or invalid in "
+                    ".env/environment; this forces live trading off and cannot "
+                    "be overridden from the UI."
                 )
                 button.setEnabled(False)
                 button.setStyleSheet(
@@ -2149,8 +2149,7 @@ class MainWindow(
         """Handle a click on the toolbar live-trading kill switch.
 
         Disabling is always immediate. Enabling requires an explicit
-        confirmation click-through -- per docs/next_steps_plan.md P1,
-        "activating live trading should be deliberate".
+        confirmation click-through so activating order submission is deliberate.
         """
         if checked:
             reply = QMessageBox.question(

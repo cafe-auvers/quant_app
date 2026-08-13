@@ -57,6 +57,15 @@ except ImportError:
     QWebChannel = None
 
 from src.risk.position_sizer import PositionSizer
+from src.risk.orb_position import (
+    MAX_CAPITAL_PERCENT,
+    MAX_STOP_ADR,
+    MIN_CAPITAL_PERCENT,
+    MIN_STOP_ADR,
+    calculate_orb_position_values,
+    is_orb_position_plan_valid,
+    score_orb_position_recommendation,
+)
 from src.core.order_state import (
     BrokerOrder,
     OrderIntent,
@@ -738,7 +747,7 @@ class WatchlistMixin:
         # very high-priced stocks, floating-point rounding).  Ensure warnings are
         # always consistent with the values actually displayed in the table.
         plan_warnings = scores.setdefault("warnings", [])
-        if cap_pct_val >= 30.0 and not any(
+        if cap_pct_val >= MAX_CAPITAL_PERCENT and not any(
             "Capital allocation" in w for w in plan_warnings
         ):
             plan_warnings.append(
@@ -1625,35 +1634,11 @@ class WatchlistMixin:
 
     @staticmethod
     def _orb_position_plan_is_valid(sizing: dict, adr_percent: Optional[float]) -> bool:
-        if sizing.get("shares", 0.0) < 1.0:
-            return False
-        capital_percent = sizing.get("capital_percent", 0.0)
-        if capital_percent < 10.0 or capital_percent >= 30.0:
-            return False
-        stop_loss_percent = sizing.get("stop_loss_percent", 0.0)
-        if (
-            adr_percent is not None
-            and adr_percent > 0
-            and stop_loss_percent >= adr_percent
-        ):
-            return False
-        sl_adr = sizing.get("sl_adr")
-        if sl_adr is not None and (sl_adr < 15.0 or sl_adr > 66.0):
-            return False
-        return True
+        return is_orb_position_plan_valid(sizing, adr_percent)
 
     @staticmethod
     def _score_orb_position_recommendation(sizing: dict, risk_percent: float) -> float:
-        sl_adr = sizing.get("sl_adr")
-        capital_percent = sizing.get("capital_percent", 0.0)
-        if sl_adr is None:
-            return 0.0
-        sl_adr_score = max(0.0, 100.0 - abs(float(sl_adr) - 65.0) * 3.0)
-        capital_score = max(0.0, 100.0 - abs(float(capital_percent) - 17.5) * 4.0)
-        risk_score = max(0.0, 100.0 - float(risk_percent) * 100.0 * 25.0)
-        return round(
-            (sl_adr_score * 0.45) + (capital_score * 0.40) + (risk_score * 0.15), 1
-        )
+        return score_orb_position_recommendation(sizing, risk_percent)
 
     @staticmethod
     def _format_orb_recommendation(score: float, valid: bool) -> str:
@@ -1685,39 +1670,13 @@ class WatchlistMixin:
         stop_price: float,
         adr_percent: Optional[float] = None,
     ) -> dict:
-        total_risk = (
-            account_size * risk_percent
-            if account_size > 0 and risk_percent > 0
-            else 0.0
+        return calculate_orb_position_values(
+            account_size,
+            risk_percent,
+            entry_price,
+            stop_price,
+            adr_percent,
         )
-        risk_per_share = max(0.0, entry_price - stop_price)
-        raw_shares = (
-            total_risk / risk_per_share
-            if total_risk > 0 and risk_per_share > 0
-            else 0.0
-        )
-        shares = float(math.ceil(raw_shares)) if raw_shares > 0 else 0.0
-        investment = shares * entry_price
-        capital_percent = (
-            (investment / account_size * 100.0) if account_size > 0 else 0.0
-        )
-        stop_loss_percent = (
-            (risk_per_share / entry_price * 100.0) if entry_price > 0 else 0.0
-        )
-        sl_adr = (
-            (stop_loss_percent / adr_percent * 100.0)
-            if adr_percent and adr_percent > 0
-            else None
-        )
-        return {
-            "total_risk": total_risk,
-            "risk_per_share": risk_per_share,
-            "shares": shares,
-            "investment": investment,
-            "capital_percent": capital_percent,
-            "stop_loss_percent": stop_loss_percent,
-            "sl_adr": sl_adr,
-        }
 
     def _apply_orb_trade_plan_selection(self, column: int, checked: bool) -> None:
         pass
@@ -2506,8 +2465,8 @@ class WatchlistMixin:
                         metric_name == "Capital %"
                         and sizing
                         and (
-                            sizing.get("capital_percent", 0) < 10.0
-                            or sizing.get("capital_percent", 0) >= 30.0
+                            sizing.get("capital_percent", 0) < MIN_CAPITAL_PERCENT
+                            or sizing.get("capital_percent", 0) >= MAX_CAPITAL_PERCENT
                         )
                     )
                     or (
@@ -2521,7 +2480,10 @@ class WatchlistMixin:
                         metric_name == "SL / ADR"
                         and sizing
                         and sizing.get("sl_adr") is not None
-                        and (sizing["sl_adr"] < 15.0 or sizing["sl_adr"] > 66.0)
+                        and (
+                            sizing["sl_adr"] < MIN_STOP_ADR
+                            or sizing["sl_adr"] > MAX_STOP_ADR
+                        )
                     )
                 ):
                     cell.setBackground(QColor(210, 70, 60))  # coral red — readable

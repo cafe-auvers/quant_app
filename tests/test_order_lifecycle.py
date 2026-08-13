@@ -216,7 +216,7 @@ def test_load_orders_rejects_one_malformed_record_instead_of_skipping_it(tmp_pat
 
 
 def test_guarded_submission_does_not_call_broker_with_corrupt_ledger(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, trading_enabled
 ):
     path = tmp_path / "orders.json"
     path.write_text("{bad json", encoding="utf-8")
@@ -335,7 +335,9 @@ def test_submit_guarded_order_proceeds_normally_once_trading_enabled(monkeypatch
     assert order.status == OrderStatus.ACCEPTED
 
 
-def test_submit_guarded_order_persists_created_before_api_and_accepted_after(monkeypatch, tmp_path):
+def test_submit_guarded_order_persists_created_before_api_and_accepted_after(
+    monkeypatch, tmp_path, trading_enabled
+):
     path = tmp_path / "orders.json"
     captured_statuses = []
     real_reserve = order_execution_service.reserve_order_if_no_matching_open
@@ -371,7 +373,90 @@ def test_submit_guarded_order_persists_created_before_api_and_accepted_after(mon
     assert load_orders(path=path)[0].status == OrderStatus.ACCEPTED
 
 
-def test_submit_guarded_order_blocks_duplicate_but_isolates_account_env_and_closed(monkeypatch, tmp_path):
+def test_disabling_during_local_reservation_prevents_broker_call(
+    monkeypatch, tmp_path, trading_enabled
+):
+    from src.services import trading_state
+    from src.services.order_execution_service import TradingDisabledError
+
+    path = tmp_path / "orders.json"
+    real_reserve = order_execution_service.reserve_order_if_no_matching_open
+
+    def reserve_then_disable(order, *, allow_duplicate=False, path=path):
+        match = real_reserve(order, allow_duplicate=allow_duplicate, path=path)
+        trading_state.set_trading_enabled(False)
+        return match
+
+    monkeypatch.setattr(
+        order_execution_service,
+        "reserve_order_if_no_matching_open",
+        reserve_then_disable,
+    )
+    monkeypatch.setattr(
+        kis_order,
+        "place_overseas_order",
+        lambda **kwargs: pytest.fail("broker must not be called after disarming"),
+    )
+
+    with pytest.raises(TradingDisabledError):
+        submit_guarded_overseas_order(
+            environment="SIM",
+            account_no="12345678",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            intent=OrderIntent.ENTRY,
+            quantity=1,
+            limit_price=100.0,
+            path=path,
+        )
+
+    [persisted] = load_orders(path=path)
+    assert persisted.status == OrderStatus.REJECTED
+    assert "kill switch off" in persisted.error_message
+
+
+def test_low_level_kis_boundary_rechecks_after_authentication(
+    monkeypatch, trading_enabled
+):
+    from src.services import trading_state
+    from src.services.trading_state import TradingDisabledError
+
+    class FakeSession:
+        def post(self, *args, **kwargs):
+            pytest.fail("disarming during authentication must prevent the HTTP POST")
+
+    class FakeClient:
+        session = FakeSession()
+
+        def authenticate(self, force_refresh=False):
+            trading_state.set_trading_enabled(False)
+            return "token"
+
+        def _headers(self, tr_id, tr_cont=""):
+            return {"tr_id": tr_id}
+
+    fake_config = SimpleNamespace(
+        base_url="https://kis.example",
+        cano="12345678",
+        account_product_code="01",
+    )
+    monkeypatch.setattr(kis_order, "load_config", lambda *args, **kwargs: fake_config)
+    monkeypatch.setattr(kis_order, "KisAccountClient", lambda _config: FakeClient())
+
+    with pytest.raises(TradingDisabledError):
+        kis_order.place_overseas_order(
+            environment="PROD",
+            account_no="12345678-01",
+            symbol="AAPL",
+            quantity=1,
+            price=100.0,
+            side="buy",
+        )
+
+
+def test_submit_guarded_order_blocks_duplicate_but_isolates_account_env_and_closed(
+    monkeypatch, tmp_path, trading_enabled
+):
     path = tmp_path / "orders.json"
     append_order(_order(status=OrderStatus.ACCEPTED), path=path)
     monkeypatch.setattr(kis_order, "place_overseas_order", lambda **kwargs: {"rt_cd": "0", "output": {"ODNO": "OK"}})
@@ -418,7 +503,9 @@ def test_submit_guarded_order_blocks_duplicate_but_isolates_account_env_and_clos
     assert has_open_order("SIM", "12345678", "AAPL", side=OrderSide.BUY, intent=OrderIntent.ENTRY, path=path)
 
 
-def test_same_symbol_account_with_closed_previous_order_does_not_block(monkeypatch, tmp_path):
+def test_same_symbol_account_with_closed_previous_order_does_not_block(
+    monkeypatch, tmp_path, trading_enabled
+):
     path = tmp_path / "orders.json"
     append_order(_order(status=OrderStatus.FILLED), path=path)
     monkeypatch.setattr(kis_order, "place_overseas_order", lambda **kwargs: {"rt_cd": "0", "output": {"ODNO": "OK"}})
@@ -438,7 +525,9 @@ def test_same_symbol_account_with_closed_previous_order_does_not_block(monkeypat
     assert order.status != OrderStatus.FILLED
 
 
-def test_concurrent_guarded_submissions_reserve_only_one_order(monkeypatch, tmp_path):
+def test_concurrent_guarded_submissions_reserve_only_one_order(
+    monkeypatch, tmp_path, trading_enabled
+):
     path = tmp_path / "orders.json"
     start = threading.Barrier(2)
     submitted = []
@@ -536,7 +625,16 @@ def test_order_submission_classifier_treats_clear_rejections_as_not_ambiguous(er
     assert kis_order.is_ambiguous_order_submission_error(error) is False
 
 
-def test_unknown_submission_order_is_open_persistent_and_blocks_duplicate(monkeypatch, tmp_path):
+def test_order_submission_classifier_treats_kill_switch_as_not_submitted():
+    from src.services.trading_state import TradingDisabledError
+
+    error = TradingDisabledError(environment="PROD", symbol="AAPL")
+    assert kis_order.is_ambiguous_order_submission_error(error) is False
+
+
+def test_unknown_submission_order_is_open_persistent_and_blocks_duplicate(
+    monkeypatch, tmp_path, trading_enabled
+):
     path = tmp_path / "orders.json"
     order = _order(status=OrderStatus.UNKNOWN_SUBMISSION_STATE)
     order.error_message = "read timed out"
@@ -576,7 +674,9 @@ def test_clear_unknown_submission_order_requires_verification_and_unblocks(tmp_p
     assert not has_open_order("SIM", "12345678", "AAPL", side=OrderSide.BUY, intent=OrderIntent.ENTRY, path=path)
 
 
-def test_submit_guarded_order_persists_unknown_state_on_ambiguous_error(monkeypatch, tmp_path):
+def test_submit_guarded_order_persists_unknown_state_on_ambiguous_error(
+    monkeypatch, tmp_path, trading_enabled
+):
     path = tmp_path / "orders.json"
 
     def fake_place_overseas_order(**kwargs):
@@ -637,7 +737,9 @@ def test_kis_parse_response_classifies_token_issuance_throttle():
         KisAccountClient._parse_response(response, endpoint="/oauth2/tokenP", check_rt_cd=False)
 
 
-def test_place_overseas_order_refreshes_expired_token_once(monkeypatch):
+def test_place_overseas_order_refreshes_expired_token_once(
+    monkeypatch, trading_enabled
+):
     auth_calls = []
     posts = []
 
@@ -717,7 +819,9 @@ def test_place_overseas_order_refreshes_expired_token_once(monkeypatch):
     assert posts[0]["headers"]["tr_id"] == "TTTT1006U"
 
 
-def test_reserved_moo_sell_uses_kis_broker_reservation_contract(monkeypatch):
+def test_reserved_moo_sell_uses_kis_broker_reservation_contract(
+    monkeypatch, trading_enabled
+):
     posts = []
 
     class FakeSession:
@@ -784,7 +888,7 @@ def test_reserved_moo_sell_uses_kis_broker_reservation_contract(monkeypatch):
 
 
 def test_guarded_reserved_moo_sell_is_durable_and_does_not_call_regular_order(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, trading_enabled
 ):
     path = tmp_path / "orders.json"
     submitted = []

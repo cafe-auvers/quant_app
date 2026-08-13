@@ -12,15 +12,21 @@ from src.services import trading_state  # noqa: E402  (needs sys.path set up abo
 
 
 @pytest.fixture(autouse=True)
-def _default_trading_enabled_for_tests(monkeypatch):
-    """Guarded order submission is gated behind a kill switch that starts
-    disabled on every real process launch (src/services/trading_state.py).
-    Most tests exercise submission behavior unrelated to the switch itself and
-    were written before it existed, so default it to enabled here and restore
-    the real disabled-by-default state afterward. Tests targeting the switch
-    itself can still call trading_state.set_trading_enabled(False) (or
-    monkeypatch the env lock) within the test body to override this.
-    """
-    monkeypatch.setattr(trading_state, "_trading_enabled", True)
+def _reset_trading_state(monkeypatch):
+    """Keep every test disarmed unless it explicitly opts into submission."""
+    # Do not let a developer's real .env decide unit-test behavior.
+    monkeypatch.setattr(
+        trading_state,
+        "get_env_value",
+        lambda key, default=None: None,
+    )
+    trading_state.reset_trading_state_for_tests()
     yield
     trading_state.reset_trading_state_for_tests()
+
+
+@pytest.fixture
+def trading_enabled():
+    """Explicit opt-in for tests that must cross a submission boundary."""
+    assert trading_state.set_trading_enabled(True) is True
+    yield

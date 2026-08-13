@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-import math
 import time
 from typing import List, Optional
 
@@ -14,6 +13,11 @@ from PyQt5.QtCore import QThread, pyqtSignal
 from src.api.kis_account_snapshot_dual import fetch_account_snapshot
 from src.core.orb import calculate_orb_range
 from src.core.scoring import calculate_deterministic_scores, run_ai_review
+from src.risk.orb_position import (
+    calculate_orb_position_values,
+    is_orb_position_plan_valid,
+    score_orb_position_recommendation,
+)
 from src.services.intraday_data_service import (
     fetch_intraday_with_fallback,
     load_best_intraday_history,
@@ -486,71 +490,21 @@ class WatchlistAiWorker(QThread):
         stop_price: float,
         adr_percent: Optional[float] = None,
     ) -> dict:
-        total_risk = (
-            account_size * risk_percent
-            if account_size > 0 and risk_percent > 0
-            else 0.0
+        return calculate_orb_position_values(
+            account_size,
+            risk_percent,
+            entry_price,
+            stop_price,
+            adr_percent,
         )
-        risk_per_share = max(0.0, entry_price - stop_price)
-        raw_shares = (
-            total_risk / risk_per_share
-            if total_risk > 0 and risk_per_share > 0
-            else 0.0
-        )
-        shares = float(math.ceil(raw_shares)) if raw_shares > 0 else 0.0
-        investment = shares * entry_price
-        capital_percent = (
-            (investment / account_size * 100.0) if account_size > 0 else 0.0
-        )
-        stop_loss_percent = (
-            (risk_per_share / entry_price * 100.0) if entry_price > 0 else 0.0
-        )
-        sl_adr = (
-            (stop_loss_percent / adr_percent * 100.0)
-            if adr_percent and adr_percent > 0
-            else None
-        )
-        return {
-            "total_risk": total_risk,
-            "risk_per_share": risk_per_share,
-            "shares": shares,
-            "investment": investment,
-            "capital_percent": capital_percent,
-            "stop_loss_percent": stop_loss_percent,
-            "sl_adr": sl_adr,
-        }
 
     @staticmethod
     def _is_plan_valid(sizing: dict, adr_percent: Optional[float]) -> bool:
-        if sizing.get("shares", 0.0) < 1.0:
-            return False
-        capital_percent = sizing.get("capital_percent", 0.0)
-        if capital_percent < 10.0 or capital_percent >= 30.0:
-            return False
-        stop_loss_percent = sizing.get("stop_loss_percent", 0.0)
-        if (
-            adr_percent is not None
-            and adr_percent > 0
-            and stop_loss_percent >= adr_percent
-        ):
-            return False
-        sl_adr = sizing.get("sl_adr")
-        if sl_adr is not None and (sl_adr < 15.0 or sl_adr > 66.0):
-            return False
-        return True
+        return is_orb_position_plan_valid(sizing, adr_percent)
 
     @staticmethod
     def _score_recommendation(sizing: dict, risk_percent: float) -> float:
-        sl_adr = sizing.get("sl_adr")
-        capital_percent = sizing.get("capital_percent", 0.0)
-        if sl_adr is None:
-            return 0.0
-        sl_adr_score = max(0.0, 100.0 - abs(float(sl_adr) - 65.0) * 3.0)
-        capital_score = max(0.0, 100.0 - abs(float(capital_percent) - 17.5) * 4.0)
-        risk_score = max(0.0, 100.0 - float(risk_percent) * 100.0 * 25.0)
-        return round(
-            (sl_adr_score * 0.45) + (capital_score * 0.40) + (risk_score * 0.15), 1
-        )
+        return score_orb_position_recommendation(sizing, risk_percent)
 
     @staticmethod
     def _select_recommended_plan(df: pd.DataFrame, symbol: str) -> Optional[pd.Series]:

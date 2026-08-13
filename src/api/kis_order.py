@@ -70,6 +70,7 @@ _AMBIGUOUS_ORDER_ERROR_FRAGMENTS = (
 )
 
 _CLEAR_ORDER_ERROR_FRAGMENTS = (
+    "kill switch off",
     "quantity must be positive",
     "limit_price must be positive",
     "price must be positive",
@@ -842,6 +843,14 @@ def place_overseas_order(
     if not tr_id:
         raise ValueError(f"No tr_id for environment={environment!r} side={side!r}")
 
+    # This is the final real-network boundary. Keep it guarded even when a
+    # caller bypasses OrderExecutionService/KisBroker (for example, an old
+    # maintenance script). The check is repeated immediately before each POST
+    # below because authentication can take time.
+    from src.services import trading_state
+
+    trading_state.require_trading_enabled(environment, symbol)
+
     env = KisEnvironment(environment.upper())
     config = load_config(env, account_no_override=account_no)
     client = KisAccountClient(config)
@@ -880,6 +889,7 @@ def place_overseas_order(
     url = f"{config.base_url}{OVERSEAS_ORDER_ENDPOINT}"
 
     def _post_order() -> Dict[str, Any]:
+        trading_state.require_trading_enabled(environment, symbol)
         response = client.session.post(
             url,
             headers=client._headers(tr_id=tr_id),
@@ -928,6 +938,10 @@ def place_overseas_reserved_market_on_open_sell(
             "Reserved U.S. market-on-open sells are supported for PROD only"
         )
 
+    from src.services import trading_state
+
+    trading_state.require_trading_enabled(environment, symbol)
+
     env = KisEnvironment(env_key)
     config = load_config(env, account_no_override=account_no)
     client = KisAccountClient(config)
@@ -946,6 +960,7 @@ def place_overseas_reserved_market_on_open_sell(
     url = f"{config.base_url}{OVERSEAS_RESERVED_ORDER_ENDPOINT}"
 
     def _post_reserved_order() -> Dict[str, Any]:
+        trading_state.require_trading_enabled(environment, symbol)
         response = client.session.post(
             url,
             headers=client._headers(tr_id=tr_id),

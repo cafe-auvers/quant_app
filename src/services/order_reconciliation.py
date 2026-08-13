@@ -17,6 +17,7 @@ from src.core.order_state import (
     is_open_status,
 )
 from src.services.order_ledger import ORDERS_FILE, load_orders, mutate_order
+from src.services.broker import Broker, KisBroker
 
 
 def _to_float(value: Any) -> float:
@@ -332,9 +333,10 @@ def query_and_reconcile_unresolved_orders(
     symbol: Optional[str] = None,
     execution_policy: Optional[str] = None,
     path: Path = ORDERS_FILE,
+    broker: Optional[Broker] = None,
 ) -> List[BrokerOrder]:
-    """Query KIS for unresolved local orders and persist broker-backed updates."""
-    from src.api import kis_order
+    """Query the broker for unresolved local orders and persist updates."""
+    broker = KisBroker() if broker is None else broker
 
     environment_key = str(environment or "").upper()
     account_key = str(account_no or "")
@@ -357,14 +359,10 @@ def query_and_reconcile_unresolved_orders(
 
         start, end = _date_window_for_order(order)
         try:
-            query_fn = (
-                kis_order.query_overseas_reserved_order
-                if order.execution_policy == RESERVED_MOO_EXECUTION
-                else kis_order.query_overseas_order
-            )
-            snapshots = query_fn(
+            snapshots = broker.get_order(
                 environment=order.environment,
                 account_no=order.account_no,
+                is_reserved=order.execution_policy == RESERVED_MOO_EXECUTION,
                 symbol=order.symbol,
                 broker_order_id=order.broker_order_id,
                 client_order_id=order.client_order_id,
@@ -407,9 +405,10 @@ def cancel_and_reconcile_order(
     client_order_id: str,
     *,
     path: Path = ORDERS_FILE,
+    broker: Optional[Broker] = None,
 ) -> BrokerOrder:
     """Cancel one known broker-side open order and persist the local status."""
-    from src.api import kis_order
+    broker = KisBroker() if broker is None else broker
 
     orders = load_orders(path)
     target: Optional[BrokerOrder] = None
@@ -441,17 +440,19 @@ def cancel_and_reconcile_order(
             reservation_date = datetime.now(ZoneInfo("Asia/Seoul")).strftime(
                 "%Y%m%d"
             )
-        snapshot = kis_order.cancel_overseas_reserved_order(
+        snapshot = broker.cancel_order(
             environment=target.environment,
             account_no=target.account_no,
+            is_reserved=True,
             broker_order_id=target.broker_order_id,
             reservation_date=reservation_date,
         )
         snapshot.symbol = target.symbol
     else:
-        snapshot = kis_order.cancel_overseas_order(
+        snapshot = broker.cancel_order(
             environment=target.environment,
             account_no=target.account_no,
+            is_reserved=False,
             symbol=target.symbol,
             broker_order_id=target.broker_order_id,
             quantity=quantity,

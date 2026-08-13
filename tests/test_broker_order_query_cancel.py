@@ -387,6 +387,41 @@ def test_cancel_and_reconcile_routes_reserved_moo_to_reservation_cancel(
     assert captured[0]["reservation_date"] == "20260727"
 
 
+def test_reconciliation_query_and_cancel_use_injected_broker(tmp_path):
+    path = tmp_path / "orders.json"
+    order = _order(broker_order_id="KIS-1")
+    append_order(order, path=path)
+
+    class FakeBroker:
+        def __init__(self):
+            self.query_calls = []
+            self.cancel_calls = []
+
+        def get_order(self, **kwargs):
+            self.query_calls.append(kwargs)
+            return [_snapshot(OrderStatus.WORKING, remaining=10)]
+
+        def cancel_order(self, **kwargs):
+            self.cancel_calls.append(kwargs)
+            return _snapshot(
+                OrderStatus.CANCEL_REQUESTED,
+                remaining=kwargs["quantity"],
+            )
+
+    broker = FakeBroker()
+    [queried] = query_and_reconcile_unresolved_orders(path=path, broker=broker)
+    cancelled = cancel_and_reconcile_order(
+        order.client_order_id,
+        path=path,
+        broker=broker,
+    )
+
+    assert queried.status == OrderStatus.WORKING
+    assert cancelled.status == OrderStatus.CANCEL_REQUESTED
+    assert broker.query_calls[0]["is_reserved"] is False
+    assert broker.cancel_calls[0]["is_reserved"] is False
+
+
 def test_check_order_status_unknown_not_found_keeps_manual_verification_message():
     logs = []
     item = SimpleNamespace(

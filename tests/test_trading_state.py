@@ -54,6 +54,38 @@ def test_env_lock_recognizes_common_falsy_spellings(monkeypatch):
         assert trading_state.is_trading_locked_disabled() is True
 
 
+@pytest.mark.parametrize("value", ["", " ", "flase", "enabled", "2"])
+def test_env_lock_fails_closed_for_blank_or_unrecognized_values(
+    monkeypatch, value
+):
+    monkeypatch.setattr(
+        trading_state,
+        "get_env_value",
+        lambda key, default=None: value,
+    )
+
+    assert trading_state.is_trading_locked_disabled() is True
+    assert trading_state.set_trading_enabled(True) is False
+
+
+def test_env_lock_clears_hidden_armed_state(monkeypatch):
+    configured_value = ["true"]
+    monkeypatch.setattr(
+        trading_state,
+        "get_env_value",
+        lambda key, default=None: configured_value[0],
+    )
+    assert trading_state.set_trading_enabled(True) is True
+
+    configured_value[0] = "false"
+    assert trading_state.is_trading_enabled() is False
+
+    # Removing the lock must not resurrect the old armed state. A fresh user
+    # confirmation is required after every administrative lock.
+    configured_value[0] = "true"
+    assert trading_state.is_trading_enabled() is False
+
+
 def test_env_value_unset_or_truthy_does_not_lock_or_auto_enable(monkeypatch):
     monkeypatch.setattr(trading_state, "get_env_value", lambda key, default=None: None)
     assert trading_state.is_trading_locked_disabled() is False

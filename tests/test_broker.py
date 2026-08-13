@@ -6,6 +6,8 @@ retry/validation/state logic should exist here. OrderExecutionService's own
 state-machine behavior (CREATED -> UNKNOWN_SUBMISSION_STATE -> ACCEPTED/
 REJECTED) is covered separately in test_order_lifecycle.py.
 """
+import pytest
+
 from src.api import kis_account_snapshot_dual, kis_order
 from src.core.order_state import (
     REGULAR_LIMIT_EXECUTION,
@@ -13,9 +15,53 @@ from src.core.order_state import (
     OrderSide,
 )
 from src.services.broker import KisBroker
+from src.services import trading_state
+from src.services.trading_state import TradingDisabledError
 
 
-def test_submit_order_regular_limit_calls_place_overseas_order(monkeypatch):
+def test_real_broker_submission_is_disarmed_by_default(monkeypatch):
+    monkeypatch.setattr(
+        kis_order,
+        "place_overseas_order",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("disabled broker must not reach the KIS adapter")
+        ),
+    )
+
+    with pytest.raises(TradingDisabledError):
+        KisBroker().submit_order(
+            environment="SIM",
+            account_no="12345678",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            quantity=1,
+            limit_price=100.0,
+        )
+
+
+def test_low_level_kis_submission_is_disarmed_before_authentication(monkeypatch):
+    monkeypatch.setattr(
+        kis_order,
+        "load_config",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("disabled submission must not authenticate")
+        ),
+    )
+
+    with pytest.raises(TradingDisabledError):
+        kis_order.place_overseas_order(
+            environment="PROD",
+            account_no="12345678-01",
+            symbol="AAPL",
+            quantity=1,
+            price=100.0,
+            side="buy",
+        )
+
+
+def test_submit_order_regular_limit_calls_place_overseas_order(
+    monkeypatch, trading_enabled
+):
     captured = {}
 
     def fake_place_overseas_order(**kwargs):
@@ -30,8 +76,8 @@ def test_submit_order_regular_limit_calls_place_overseas_order(monkeypatch):
     )
 
     result = KisBroker().submit_order(
-        environment="SIM",
-        account_no="12345678",
+        environment="PROD",
+        account_no="12345678-01",
         symbol="aapl",
         side=OrderSide.BUY,
         quantity=3,
@@ -42,8 +88,8 @@ def test_submit_order_regular_limit_calls_place_overseas_order(monkeypatch):
 
     assert result["output"]["ODNO"] == "OK"
     assert captured == {
-        "environment": "SIM",
-        "account_no": "12345678",
+        "environment": "PROD",
+        "account_no": "12345678-01",
         "symbol": "aapl",
         "quantity": 3,
         "price": 191.23,
@@ -53,7 +99,9 @@ def test_submit_order_regular_limit_calls_place_overseas_order(monkeypatch):
     }
 
 
-def test_submit_order_reserved_moo_calls_reserved_endpoint(monkeypatch):
+def test_submit_order_reserved_moo_calls_reserved_endpoint(
+    monkeypatch, trading_enabled
+):
     captured = {}
 
     def fake_reserved(**kwargs):
@@ -104,8 +152,8 @@ def test_cancel_order_regular_vs_reserved_routes_to_different_endpoints(monkeypa
 
     broker = KisBroker()
     regular_result = broker.cancel_order(
-        environment="SIM",
-        account_no="12345678",
+        environment="PROD",
+        account_no="12345678-01",
         symbol="AAPL",
         broker_order_id="KIS-1",
         quantity=1,
@@ -123,8 +171,8 @@ def test_cancel_order_regular_vs_reserved_routes_to_different_endpoints(monkeypa
     assert reserved_result == "reserved-result"
     assert regular_calls == [
         {
-            "environment": "SIM",
-            "account_no": "12345678",
+            "environment": "PROD",
+            "account_no": "12345678-01",
             "symbol": "AAPL",
             "broker_order_id": "KIS-1",
             "quantity": 1,
@@ -146,7 +194,9 @@ def test_get_order_regular_vs_reserved_routes_to_different_endpoints(monkeypatch
     monkeypatch.setattr(kis_order, "query_overseas_reserved_order", lambda **kwargs: ["reserved"])
 
     broker = KisBroker()
-    assert broker.get_order(environment="SIM", account_no="12345678", symbol="AAPL") == ["regular"]
+    assert broker.get_order(
+        environment="PROD", account_no="12345678-01", symbol="AAPL"
+    ) == ["regular"]
     assert broker.get_order(
         environment="PROD", account_no="12345678-01", is_reserved=True
     ) == ["reserved"]

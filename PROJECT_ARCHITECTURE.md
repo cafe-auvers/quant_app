@@ -332,10 +332,10 @@ Most workers live in `src/ui/workers.py`; KIS order submission/query/cancel and 
 | `src/services/kis_intraday_provider.py` | KIS intraday provider wrapper using production account config |
 | `src/services/yfinance_intraday_provider.py` | yfinance intraday fallback provider preserving existing retry behavior |
 | `src/services/order_ledger.py` | Persistent local order ledger stored at `data/orders.json` |
-| `src/services/trading_state.py` | In-memory `TRADING_ENABLED` kill switch -- disabled by default on every launch, no persistence; an explicit falsy `TRADING_ENABLED` in `.env`/environment can force it permanently off but never on |
-| `src/services/broker.py` | `Broker` protocol (`submit_order`/`cancel_order`/`get_order`/`get_positions`) and `KisBroker`, a thin passthrough to `src.api.kis_order`/`kis_account_snapshot_dual` -- lets `OrderExecutionService` depend on an abstraction instead of the KIS API directly |
+| `src/services/trading_state.py` | In-memory `TRADING_ENABLED` kill switch -- disabled by default on every launch, no persistence; blank, falsy, or malformed configured values lock it off, while a truthy value only permits the per-session UI toggle |
+| `src/services/broker.py` | `Broker` protocol (`submit_order`/`cancel_order`/`get_order`/`get_positions`) and `KisBroker`, a thin passthrough to `src.api.kis_order`/`kis_account_snapshot_dual` -- guarded submission and direct query/cancel reconciliation depend on this abstraction instead of the KIS API directly |
 | `src/services/order_execution_service.py` | Guarded KIS order submission with durable idempotency before and after API calls; gated by `trading_state` and routed through an injectable `Broker` (defaults to `KisBroker`) |
-| `src/services/order_reconciliation.py` | Conservative account-snapshot reconciliation for accepted/working broker orders |
+| `src/services/order_reconciliation.py` | Conservative account-snapshot reconciliation plus injectable broker order query/cancel for accepted/working orders |
 | `src/services/historical_refresh_control.py` | Launches, polls, and terminates the standalone `historical.py` subprocess; owns its status-file schema and PID liveness checks |
 | `src/services/state_sync.py` | Conflict-safe cross-machine sync of user-managed state (watchlist/buylist/trade plans) through a revision-tracked MySQL table; only the `main` device pushes, others pull-only |
 | `src/services/runtime_status.py` | Database-backed runtime heartbeats so any device can see whether `main.py` is currently running elsewhere |
@@ -364,8 +364,9 @@ The buylist is the local monitoring model. Broker orders are now tracked separat
 | Module | Responsibility |
 |---|---|
 | `src/risk/position_sizer.py` | `PositionSizer` -- fixed-risk, fixed-percent, volatility-based, and Kelly position sizing calculations |
+| `src/risk/orb_position.py` | Shared ORB sizing metrics, 10%/30% capital-allocation limits, 15%/66% stop-to-ADR limits, validation warnings, and recommendation score used by the queue, worker, and watchlist UI |
 
-Moved here from `src/core/position_sizer.py` as the first step of consolidating pre-trade risk checks into one authoritative location (docs/next_steps_plan.md P1); UI/core call sites import `PositionSizer` from `src.risk.position_sizer` (or `src.risk`) with no change to its thresholds or math. The duplicate-open-order guard remains in `src/services/order_ledger.py` (`reserve_order_if_no_matching_open`) rather than moving here, since it is inherently coupled to the order ledger's file I/O rather than being a standalone calculation.
+`PositionSizer` and the duplicated ORB position-plan checks now live under `src/risk/` with their existing formulas and thresholds. `src/core/position_sizer.py` is a compatibility import for older scripts; new code imports from `src.risk`. The duplicate-open-order guard remains in `src/services/order_ledger.py` (`reserve_order_if_no_matching_open`) rather than moving here, since it is inherently coupled to the order ledger's file I/O rather than being a standalone calculation.
 
 ## Data and Persistence
 
@@ -540,8 +541,8 @@ Buy/Sell UI action or EXECUTE_READY execution queue submit action
   -> submit_guarded_overseas_order()
   -> duplicate-open-order check in data/orders.json by environment, account, symbol, side, and intent
   -> BrokerOrder(status=CREATED) written to data/orders.json before KIS API call
-  -> BrokerOrder(status=SUBMITTING) written before request is sent
-  -> src.api.kis_order.place_overseas_order()
+  -> BrokerOrder(status=UNKNOWN_SUBMISSION_STATE) written before request is sent
+  -> KisBroker.submit_order() -> src.api.kis_order placement endpoint
   -> BrokerOrder(status=ACCEPTED or REJECTED) written with raw submit response/error
   -> UI status becomes BUY_SUBMITTED / SELL_SUBMITTED / PARTIAL_EXIT_SUBMITTED
   -> OrderReconciliationWorker compares KIS holdings snapshots
@@ -625,6 +626,7 @@ Runtime configuration is environment-driven:
 | Key family | Used by | Purpose |
 |---|---|---|
 | `MYSQL_*` | `src/utils/config.py`, `src/utils/db_loader.py` | MySQL connection; optional for a single machine, canonical for the two-machine setup |
+| `TRADING_ENABLED` | `src/services/trading_state.py` | Administrative order-submission lock; false/blank/invalid locks off, true only permits the separately confirmed in-app session toggle |
 | `KIS_PROD_*` / `KIS_SIM_*` | KIS account/order modules | KIS production/simulation account snapshots and order workflows |
 | `KIS_INTRADAY_ENABLED`, `KIS_OVERSEAS_INTRADAY_*` | `src/api/kis_intraday.py` | Configuration-gated KIS intraday endpoint/field mapping |
 | `PC_REMOTE_CONTROL_HOST`, `PC_WAKE_URL`, `REMOTE_CONTROL_TOKEN` | `src/services/pc_remote_control.py` | Always-on PC remote status/shutdown over Tailscale (see [Two-Machine Data Pipeline](#two-machine-data-pipeline-pc-sync)) |
@@ -652,7 +654,7 @@ Two-machine/backup coverage includes the local SQLite mirror (`test_local_mirror
 ## Production Safety Notes
 
 - Keep secrets out of source. `.env` and `.kis_token_cache*.json` are local runtime files.
-- Guarded order submission is gated behind the `TRADING_ENABLED` kill switch (`src/services/trading_state.py`, toolbar toggle top-right of the main window). It starts disabled on every launch with no persistence; enabling requires an explicit click-through confirmation in the UI. An explicit falsy `TRADING_ENABLED` in `.env`/environment forces it off for that machine/process and cannot be overridden from the UI.
+- Guarded order submission is gated behind the `TRADING_ENABLED` kill switch (`src/services/trading_state.py`, toolbar toggle top-right of the main window). It starts disabled on every launch with no persistence; enabling requires an explicit click-through confirmation in the UI. Blank, falsy, or malformed configured values lock it off, and truthy configuration only permits the UI toggle. The service checks before ledger creation and again after reservation; `KisBroker` and the low-level KIS POST boundary also re-check defensively.
 - KIS PROD order paths require valid credentials. Keep monitoring off until account snapshots, order review, and reconciliation have been verified.
 - KIS intraday remains configuration-gated. Do not enable it until endpoint/TR ID/request params/raw field mappings are verified.
 - yfinance fallback remains available for intraday/ORB workflows when KIS intraday is disabled or unavailable.

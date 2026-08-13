@@ -1,9 +1,8 @@
 """Position sizing calculations.
 
-Moved here from src/core/position_sizer.py as part of the P1 risk-check
-consolidation (docs/next_steps_plan.md) -- this is the same class, thresholds,
-and math unchanged, just relocated to the module that owns pre-trade risk
-checks.
+Moved here from src/core/position_sizer.py as part of risk-check consolidation.
+This is the same class, thresholds, and math unchanged, just relocated to the
+module that owns pre-trade risk checks.
 """
 from dataclasses import dataclass
 from enum import Enum

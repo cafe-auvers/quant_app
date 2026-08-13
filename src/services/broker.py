@@ -26,6 +26,7 @@ from src.core.order_state import (
     BrokerOrderStatusSnapshot,
     OrderSide,
 )
+from src.services import trading_state
 
 
 class Broker(Protocol):
@@ -46,8 +47,7 @@ class Broker(Protocol):
         """Submit an order. Returns the raw broker response.
 
         Acceptance only -- callers must never treat a returned response as a
-        fill; see docs/next_steps_plan.md and PROJECT_ARCHITECTURE.md's KIS
-        Order Lifecycle section.
+        fill; see PROJECT_ARCHITECTURE.md's KIS Order Lifecycle section.
         """
         ...
 
@@ -102,6 +102,10 @@ class KisBroker:
         exchange: str = "NASD",
         execution_policy: str = REGULAR_LIMIT_EXECUTION,
     ) -> Dict[str, Any]:
+        # Defense in depth: service callers are expected to check before
+        # reserving an order, but the real broker boundary must not rely on
+        # every present and future caller remembering to do so.
+        trading_state.require_trading_enabled(environment, symbol)
         if execution_policy == RESERVED_MOO_EXECUTION:
             return kis_order.place_overseas_reserved_market_on_open_sell(
                 environment=environment,

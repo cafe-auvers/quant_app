@@ -17,6 +17,7 @@ from src.core.order_state import (
 from src.services.broker import Broker, KisBroker
 from src.services.order_ledger import ORDERS_FILE, reserve_order_if_no_matching_open, upsert_order
 from src.services import trading_state
+from src.services.trading_state import TradingDisabledError
 
 logger = logging.getLogger(__name__)
 
@@ -30,21 +31,6 @@ class DuplicateOpenOrderError(RuntimeError):
             f"Open {order.side.value} {order.intent.value} order already exists for "
             f"{order.symbol} in {order.environment} account {order.account_no}. "
             "Reconcile or cancel it before submitting another order."
-        )
-
-
-class TradingDisabledError(RuntimeError):
-    """Raised when a guarded order submission is attempted while the live-trading
-    kill switch is off. Independent of PROD/SIM environment selection -- this
-    gate applies to every guarded submission, not just live PROD orders."""
-
-    def __init__(self, environment: str, symbol: str) -> None:
-        self.environment = environment
-        self.symbol = symbol
-        super().__init__(
-            f"Live trading is disabled (kill switch off); refused to submit "
-            f"{environment} order for {symbol}. Enable trading from the toolbar "
-            "before submitting orders."
         )
 
 
@@ -102,12 +88,8 @@ def submit_guarded_overseas_order(
     machine itself has no broker-specific knowledge and doesn't change based
     on which ``Broker`` implementation runs underneath it.
     """
-    broker = broker or KisBroker()
-    if not trading_state.is_trading_enabled():
-        raise TradingDisabledError(
-            environment=str(environment or "").upper(),
-            symbol=str(symbol or "").upper(),
-        )
+    trading_state.require_trading_enabled(environment, symbol)
+    broker = KisBroker() if broker is None else broker
     if quantity <= 0:
         raise ValueError(f"quantity must be positive, got {quantity}")
 
@@ -152,6 +134,19 @@ def submit_guarded_overseas_order(
     if match is not None:
         raise DuplicateOpenOrderError(match)
 
+    # Re-check after the durable duplicate-order reservation. The user may
+    # disable trading while validation or local file I/O is in progress. In
+    # that case no broker request was attempted, so close the reserved row as
+    # REJECTED instead of leaving an ambiguous/open order behind.
+    try:
+        trading_state.require_trading_enabled(environment, symbol)
+    except TradingDisabledError as exc:
+        order.status = OrderStatus.REJECTED
+        order.error_message = str(exc)
+        order.touch()
+        upsert_order(order, path=path)
+        raise
+
     # Once we are about to issue the non-idempotent broker request, a process
     # crash or lost response must be treated as potentially submitted.  This
     # blocks a retry until reconciliation checks the broker.
@@ -170,6 +165,15 @@ def submit_guarded_overseas_order(
             exchange=exchange,
             execution_policy=execution_policy,
         )
+    except TradingDisabledError as exc:
+        # The broker boundary guarantees that no HTTP submission was attempted
+        # when this exception is raised, so this is a clear local rejection,
+        # never an ambiguous submission state.
+        order.status = OrderStatus.REJECTED
+        order.error_message = str(exc)
+        order.touch()
+        upsert_order(order, path=path)
+        return order
     except Exception as exc:
         if kis_order.is_ambiguous_order_submission_error(exc):
             order.status = OrderStatus.UNKNOWN_SUBMISSION_STATE
