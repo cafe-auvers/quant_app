@@ -5,6 +5,7 @@ import logging
 import re
 import time
 import random
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set, Tuple
@@ -39,7 +40,7 @@ from src.utils.config import DATA_DIR, get_mysql_config
 from src.utils.data_loader import download_price_history, _extract_symbol_history, compute_stock_metrics
 from src.utils.market_calendar import expected_latest_market_data_date
 
-_ensured_engines: set = set()
+_ensured_engines: weakref.WeakSet[Engine] = weakref.WeakSet()
 _MYSQL_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
 _MYSQL_HOST_FORBIDDEN_CHARACTERS = frozenset("/\\@?#")
 MYSQL_CONNECT_TIMEOUT_SECONDS = 3
@@ -2908,13 +2909,12 @@ def _get_price_history_table(metadata: MetaData) -> Table:
 
 
 def _ensure_price_history_table(engine: Engine) -> Table:
-    engine_key = id(engine)
     metadata = MetaData()
     price_history = _get_price_history_table(metadata)
-    if engine_key not in _ensured_engines:
+    if engine not in _ensured_engines:
         metadata.create_all(engine)
         _ensure_price_history_interval_column(engine)
-        _ensured_engines.add(engine_key)
+        _ensured_engines.add(engine)
     return price_history
 
 

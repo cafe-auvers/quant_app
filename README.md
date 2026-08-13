@@ -49,12 +49,20 @@ UI mixins keep PyQt tab construction, widget callbacks, table refreshes, and log
 
 ## Setup
 
-1. Install dependencies: `pip install -r requirements.txt`
+1. Install the tested dependency graph: `python -m pip install --require-hashes -r requirements.lock`
 2. Configure local database and KIS credentials in `.env` when needed.
 3. Run the app: `python main.py`
 4. Run tests: `pytest -q`
 
 The app can run without MySQL. Database-backed scanning and cache freshness features require valid `MYSQL_*` settings.
+
+`requirements.txt` contains the intentionally supported direct dependency ranges.
+`requirements.lock` pins the full Python 3.11/3.12 dependency graph and package
+hashes used by CI and production machines. After intentionally changing a range,
+regenerate the lock with `uv pip compile requirements.txt --python-platform
+windows --python-version 3.11 --generate-hashes -o
+requirements.lock`, then test both
+supported Python versions before committing it.
 
 If you're running this across two machines (a dev laptop + an always-on
 data-refresh PC, sharing one MySQL database over LAN/Tailscale), see

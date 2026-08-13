@@ -2,7 +2,6 @@ from pathlib import Path
 import datetime as dt
 
 import pandas as pd
-import pytest
 from sqlalchemy import MetaData, create_engine, insert
 
 from src.core.position_sizer import PositionSizer
@@ -621,16 +620,6 @@ def test_local_chart_html_does_not_embed_tradingview():
     assert "<iframe" not in chart_html.lower()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "The local SVG chart never gained an ADR/growth-metrics row when "
-        "_format_chart_header_metrics was split into a Close-only header and a "
-        "separate _format_chart_adr_metrics() chip row (the TradingView lightweight "
-        "chart calls both; _generate_local_chart_html only calls the former). "
-        "Real gap, deliberately deferred out of P0 scope -- see docs/next_steps_plan.md."
-    ),
-)
 def test_local_chart_html_renders_adr_row():
     history = pd.DataFrame(
         {
@@ -645,7 +634,9 @@ def test_local_chart_html_renders_adr_row():
 
     chart_html = MainWindow._generate_local_chart_html("AAPL", history)
 
+    assert 'id="adr-metrics"' in chart_html
     assert "ADR" in chart_html
+    assert "1M" in chart_html
 
 
 def test_tradingview_widget_html_uses_watchlist_symbol():

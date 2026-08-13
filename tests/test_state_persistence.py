@@ -27,6 +27,10 @@ def _patch_app_state_paths(monkeypatch, tmp_path):
     }
     for name, path in paths.items():
         monkeypatch.setattr(app_state, name, path)
+    # Local-save tests must never discover or write to a developer's real synced
+    # Drive folder. Keep the backup inputs temporary as a second containment layer.
+    monkeypatch.setattr(app_state, "CLOUD_BACKUP_FILES", tuple(paths.values()))
+    monkeypatch.setattr(app_state, "resolve_backup_root", lambda: None)
     return paths
 
 

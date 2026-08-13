@@ -1608,7 +1608,7 @@ class ChartsRenderMixin:
         height = 360 if compact else (840 if has_indicators else 620)
         left = 62 if compact else 72
         right = 28 if compact else 190
-        top = 38 if compact else 46
+        top = 38 if compact else 64
         chart_bottom = 230 if compact else 420
         volume_top = 254 if compact else 458
         bottom = 322 if compact else (602 if has_indicators else 580)
@@ -1702,6 +1702,23 @@ class ChartsRenderMixin:
         change_percent = (change / first_close * 100) if first_close else 0.0
         line_color = "#4ade80" if change >= 0 else "#f87171"
         header_metrics = ChartsRenderMixin._format_chart_header_metrics(chart_history, options)
+        adr_metrics_svg = ""
+        if not compact:
+            metric_x = left
+            metric_elements = []
+            for label, value, value_color in ChartsRenderMixin._chart_adr_metric_values(
+                chart_history,
+                options,
+            ):
+                metric_elements.append(
+                    f'<text x="{metric_x}" y="50" font-size="13" font-weight="600">'
+                    f'<tspan fill="#94a3b8">{html.escape(label)}</tspan>'
+                    f'<tspan fill="{value_color}"> {html.escape(value)}</tspan>'
+                    f'</text>'
+                )
+                metric_x += max(92, (len(label) + len(value) + 3) * 8)
+            if metric_elements:
+                adr_metrics_svg = f'<g id="adr-metrics">{"".join(metric_elements)}</g>'
         label_indices = sorted({0, len(dates) // 2, len(dates) - 1})
         date_labels = [
             f'<text x="{x_for(data_slot_offset + index):.1f}" y="{height - 18}" fill="#aaa" font-size="12" text-anchor="middle">{html.escape(dates[index])}</text>'
@@ -1911,6 +1928,7 @@ class ChartsRenderMixin:
                     <text x="{left + (90 if compact else 120)}" y="28" fill="{line_color}" font-size="{13 if compact else 16}">
                         {html.escape(header_metrics)}
                     </text>
+                    {adr_metrics_svg}
                     {''.join(grid_lines)}
                     {''.join(price_labels)}
                     <g id="pan-preview-layer">
@@ -2613,18 +2631,40 @@ class ChartsRenderMixin:
     @staticmethod
     def _format_chart_adr_metrics(history: pd.DataFrame, options: Optional[dict] = None) -> str:
         """Returns ADR and growth metrics as HTML chips for the second header row."""
+        chips = []
+        for label, value, value_color in ChartsRenderMixin._chart_adr_metric_values(
+            history,
+            options,
+        ):
+            if label == "ADR":
+                chips.append(
+                    f'<span class="adr-chip"><span class="label">{label}</span>{value}</span>'
+                )
+            else:
+                chips.append(
+                    f'<span class="adr-chip"><span class="label">{label}</span>'
+                    f'<span style="color:{value_color}">{value}</span></span>'
+                )
+        return "".join(chips)
+
+    @staticmethod
+    def _chart_adr_metric_values(
+        history: pd.DataFrame,
+        options: Optional[dict] = None,
+    ) -> List[Tuple[str, str, str]]:
+        """Return ADR/growth labels, formatted values, and display colors."""
         options = ChartsRenderMixin._normalize_chart_options(options)
         close = history["Close"].astype(float)
         high = history["High"].astype(float)
         low = history["Low"].astype(float)
-        chips = []
+        metrics = []
 
         if options["show_adr"]:
             prev_close = close.shift(1)
             adr = ((high - low) / prev_close).replace([float("inf"), float("-inf")], pd.NA)
             adr_value = adr.rolling(20, min_periods=5).mean().iloc[-1] * 100
-            val = ChartsRenderMixin._format_percent_metric(adr_value)
-            chips.append(f'<span class="adr-chip"><span class="label">ADR</span>{val}</span>')
+            value = ChartsRenderMixin._format_percent_metric(adr_value)
+            metrics.append(("ADR", value, "#e2e8f0"))
 
         growth_periods = [
             ("1M", 21, options["show_growth_1m"]),
@@ -2635,14 +2675,11 @@ class ChartsRenderMixin:
             if not enabled:
                 continue
             value = ChartsRenderMixin._growth_percent(close, bars)
-            val = ChartsRenderMixin._format_percent_metric(value)
+            formatted_value = ChartsRenderMixin._format_percent_metric(value)
             color = "#22c55e" if value is not None and value >= 0 else "#ef4444"
-            chips.append(
-                f'<span class="adr-chip"><span class="label">{label}</span>'
-                f'<span style="color:{color}">{val}</span></span>'
-            )
+            metrics.append((label, formatted_value, color))
 
-        return "".join(chips)
+        return metrics
     @staticmethod
     def _growth_percent(close: pd.Series, bars: int) -> Optional[float]:
         if len(close) <= bars:

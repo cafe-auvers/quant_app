@@ -12,11 +12,11 @@ import src.utils.db_loader as db_loader
 @pytest.fixture
 def engine():
     value = create_engine("sqlite:///:memory:", future=True)
-    db_loader._ensured_engines.discard(id(value))
+    db_loader._ensured_engines.discard(value)
     try:
         yield value
     finally:
-        db_loader._ensured_engines.discard(id(value))
+        db_loader._ensured_engines.discard(value)
         value.dispose()
 
 

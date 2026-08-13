@@ -108,6 +108,19 @@ def _raw_engines():
     )
 
 
+def test_price_history_schema_cache_tracks_engine_objects():
+    engine = create_engine("sqlite:///:memory:", future=True)
+    try:
+        table = db_loader._ensure_price_history_table(engine)
+
+        assert engine in db_loader._ensured_engines
+        with engine.begin() as conn:
+            conn.execute(insert(table), _daily_bar("A", 1, 100))
+    finally:
+        db_loader._ensured_engines.discard(engine)
+        engine.dispose()
+
+
 @pytest.mark.parametrize(
     ("table_name", "expected_order"),
     [
