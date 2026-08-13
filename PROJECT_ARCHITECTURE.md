@@ -70,10 +70,11 @@ flowchart TB
         Daily --> Scanner
         Scanner --> Watchlist[Watchlist]
         Watchlist --> Analysis[Rulebook review and deterministic / optional AI score]
-        Watchlist --> ORB[ORB range, breakout validation, and position sizing]
+        Watchlist --> ORB[ORBStrategy range and trigger signal]
         IntradayCache --> ORB
+        ORB --> ORBRisk[ORB position sizing and risk validation]
         Analysis --> Buylist[Buy Dashboard / Buylist]
-        ORB --> Buylist
+        ORBRisk --> Buylist
         Scanner -. optional add .-> Buylist
         Daily --> Charts[Daily, hourly, and TradingView charts]
         IntradayCache --> Charts
@@ -147,7 +148,8 @@ flowchart LR
         UI[MainWindow and tab mixins\nwidgets, tables, dialogs, charts]
         Controllers[UI controllers\naccount, scanner, watchlist, chart, execution]
         Workers[QThread workers\nnetwork, refresh, scanner, review,\norder submission/query/cancel, reconciliation,\nPC status polling]
-        Core[Core domain\nscanner, watchlist, ORB, scoring,\nexecution queue, order state]
+        Core[Core domain\nscanner, watchlist, scoring,\nexecution queue, order state]
+        Strategy[Strategy contracts and plugins\nMarketSnapshot, PortfolioSnapshot, Signal,\nORBStrategy]
         Risk[Risk\nposition sizing]
         Services[Services\napp state, intraday orchestration,\norder ledger, guarded execution, reconciliation,\ncross-machine state sync, PC remote control,\nruntime heartbeats, historical refresh control,\ncloud/env backup]
         Utils[Utilities\nconfig, storage, market calendar, logging,\nloaders, DB and local-mirror helpers]
@@ -158,6 +160,7 @@ flowchart LR
         Workers <--> Core
         Controllers <--> Services
         Workers <--> Services
+        Core --> Strategy
         Core <--> Risk
         Services <--> Risk
         Core --> Utils
@@ -206,7 +209,7 @@ flowchart LR
 
     classDef boundary fill:#eaf2ff,stroke:#2b6cb0,color:#102a43;
     classDef store fill:#f0fff4,stroke:#2f855a,color:#1c4532;
-    class UI,Controllers,Workers,Core,Risk,Services,Utils boundary;
+    class UI,Controllers,Workers,Core,Strategy,Risk,Services,Utils boundary;
     class Json,Rulebooks,Env,Mirror,DeviceRole,Historical,MySQL,Listener,KIS,Yahoo,OpenAI,Drive store;
 ```
 
@@ -221,6 +224,7 @@ quant_app/
   src/
     ui/                           PyQt windows, UI controllers, workers, chart bridge, UI constants
     core/                         Trading domain models and pure business logic
+    strategy/                     Strategy-neutral snapshots/signals and built-in strategy plugins
     infrastructure/              Database engines, schemas, refresh orchestration, mirrors, and repositories
     risk/                         Pre-trade risk/sizing checks (position sizing today)
     services/                     App-state persistence, order lifecycle, PC sync, and backup services
@@ -355,13 +359,36 @@ The service layer contains persistence and lifecycle logic that is not specific 
 |---|---|
 | `src/core/scanner.py` | `StockScanner`, `ScanRule`, and comparison operators for rule-based filtering |
 | `src/core/watchlist.py` | `Watchlist`, `TradePlanManager`, `BuylistManager`, and persistence-ready dataclasses |
-| `src/core/orb.py` | Opening range breakout range calculation, signal evaluation, and intraday resampling |
-| `src/core/execution_queue.py` | Dynamic ORB execution queue strategy, queue item/candidate state, environment-symbol queue keys, duplicate-pending candidate rejection, and display-state helpers |
+| `src/core/orb.py` | Static compatibility surface for strategy-owned ORB range/entry helpers, plus legacy display signals and intraday resampling |
+| `src/core/execution_queue.py` | Dynamic execution workflow for the built-in ORB plugin: queue item/candidate state, risk planning, environment-symbol keys, duplicate-pending rejection, and display-state helpers |
 | `src/core/trade_reviewer.py` | Rulebook-backed trade setup review model |
 | `src/core/scoring.py` | Deterministic scoring, optional OpenAI review, fallback analysis, and HTML rendering |
 | `src/core/order_state.py` | Broker order lifecycle enums and `BrokerOrder` persistence model |
 
 The buylist is the local monitoring model. Broker orders are now tracked separately in the order ledger and only applied back to buylist positions after fill evidence is confirmed.
+
+## Strategy
+
+`src/strategy/` is independent of PyQt, risk enforcement, order services, brokers, and persistence. It defines the stable boundary intended for live, paper, and future backtest use:
+
+```text
+MarketSnapshot + PortfolioSnapshot
+  -> Strategy.generate_signal()
+  -> Signal | None
+  -> risk plan / PreTradeRiskDecision
+  -> OrderIntent
+  -> guarded execution
+  -> Broker
+```
+
+| Module | Responsibility |
+|---|---|
+| `src/strategy/base.py` | Immutable `MarketSnapshot`, `PortfolioSnapshot`, and `Signal` contracts plus the runtime-checkable `Strategy` protocol |
+| `src/strategy/orb/config.py` | Existing ORB window, buffer, market-open, completion, and probe configuration |
+| `src/strategy/orb/signals.py` | ORB range and fail-closed entry assessment models plus the combined strategy evaluation |
+| `src/strategy/orb/strategy.py` | `ORBStrategy`, opening-range calculation, and the existing buffered breakout/entry classification |
+
+The live execution queue calls `ORBStrategy.evaluate()` and requires its generic entry `Signal` before an ORB candidate can become `EXECUTE_READY`. `src/core/orb.py` re-exports the same calculation functions so older UI and test imports do not create a second implementation. ORB remains one plugin; generic contracts do not depend on ORB, risk, execution, or KIS.
 
 ## Risk
 
@@ -497,7 +524,7 @@ Source priority for cached ORB/chart reads:
 
 KIS intraday is disabled by default. `src/api/kis_intraday.py` does not hardcode unverified endpoint paths, TR IDs, raw output names, or raw OHLCV field names. Enabling it requires explicit `.env` endpoint/TR ID/field mappings verified from official KIS documentation or a successful manual API test.
 
-The ORB engine in `src/core/orb.py` remains source-agnostic. It consumes normalized `Open`, `High`, `Low`, `Close`, `Volume` DataFrames for the existing 1m, 5m, and 30m windows.
+`src/strategy/orb/` remains source-agnostic. It consumes normalized `Open`, `High`, `Low`, `Close`, `Volume` DataFrames for the existing 1m, 5m, and 30m live windows. `src/core/orb.py` retains compatible imports and resampling helpers for existing callers.
 
 ## KIS Integration
 
@@ -614,7 +641,8 @@ Scanner setups are persisted in `data/scanner_setups.json`. Rules use labels fro
 Watchlist symbol
   -> latest daily/hourly/intraday history
   -> deterministic score and optional AI review
-  -> ORB range from 1m/5m/30m bars
+  -> ORBStrategy receives one MarketSnapshot per 1m/5m/30m window
+  -> common Signal or no actionable signal
   -> account/risk-aware position plan
   -> BuylistMixin builds ExecutionQueueRefreshRequest for queued or selected symbols
   -> BuylistExecutionController.refresh_execution_queue()
@@ -663,7 +691,7 @@ pytest -q
 
 `.github/workflows/ci.yml` runs both commands on `windows-latest` with Python 3.11 and 3.12 for every push/PR to `master` (Windows matches the app's actual runtime platform, avoiding Qt/PyQt5 Linux system-library setup). CI installs the hash-verified `requirements.lock`, runs `pip check`, and expects zero failed or xfailed tests on `master` -- no "green except known failures". GitHub must separately require the two matrix checks; the repository-side setup and exact check names are documented in `.github/BRANCH_PROTECTION.md`.
 
-Coverage includes scanner rules, scoring, position sizing, ORB logic, execution queue strategy, watchlist and buylist persistence, local JSON backup/recovery and shutdown flushing, MySQL helper behavior, KIS account config/profile parsing, selected `MainWindow` formatting/helpers, refactor boundaries, buylist execution queue refresh request/result behavior, and KIS order lifecycle safety.
+Coverage includes scanner rules, scoring, position sizing, strategy protocol/ORB characterization and layer boundaries, execution queue behavior, watchlist and buylist persistence, local JSON backup/recovery and shutdown flushing, MySQL helper behavior, KIS account config/profile parsing, selected `MainWindow` formatting/helpers, refactor boundaries, buylist execution queue refresh request/result behavior, and KIS order lifecycle safety.
 Buylist execution controller coverage includes selected-symbol queueing, missing symbols, unavailable queue manager failures, duplicate pending/open-order propagation, callback failures, refreshed counts, and result status counts.
 Intraday provider coverage includes KIS disabled/configuration errors, yfinance fallback behavior, source-priority cache loading, ORB invariance across normalized provider data, 1m-to-5m resampling, and worker signal payload shape.
 Two-machine/backup coverage includes the local SQLite mirror (`test_local_mirror.py`), cross-machine state sync (`test_state_sync.py`), runtime heartbeats (`test_pc_runtime_status.py`), the standalone refresh subprocess (`test_historical_refresh_control.py`, `test_run_daily_refresh.py`), selective/derived refresh caching (`test_historical_selective_refresh.py`, `test_derived_refresh_cache.py`), hourly backfill policy (`test_hourly_backfill_policy.py`), broker order query/cancel (`test_broker_order_query_cancel.py`), and cloud/env backup (`test_cloud_backup.py`, `test_env_backup.py`).

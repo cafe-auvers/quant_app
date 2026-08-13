@@ -16,7 +16,6 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import pandas as pd
 
-from src.core.orb import calculate_orb_range, evaluate_orb_entry_signal
 from src.risk.orb_position import (
     MAX_CAPITAL_PERCENT,
     MIN_CAPITAL_PERCENT,
@@ -24,6 +23,8 @@ from src.risk.orb_position import (
     score_orb_position_recommendation,
     validate_orb_position_values,
 )
+from src.strategy import MarketSnapshot, PortfolioSnapshot
+from src.strategy.orb import ORBStrategy, ORBStrategyConfig
 
 logger = logging.getLogger(__name__)
 
@@ -511,7 +512,20 @@ def build_orb_candidate(
             symbol, window, OrbCandidateStatus.NOT_AVAILABLE, "intraday data missing"
         )
 
-    orb_range = calculate_orb_range(symbol, intraday, window)
+    breakout = _optional_float(breakout_price)
+    price = _optional_float(current_price)
+    strategy_evaluation = ORBStrategy(
+        ORBStrategyConfig(window=window, buffer_pct=buffer_pct)
+    ).evaluate(
+        MarketSnapshot(
+            symbol=symbol,
+            current_price=price,
+            bars=intraday,
+            metadata={"breakout_price": breakout},
+        ),
+        PortfolioSnapshot(equity=account_size),
+    )
+    orb_range = strategy_evaluation.orb_range
     if orb_range is None:
         return _candidate_unavailable(
             symbol, window, OrbCandidateStatus.FORMING, "ORB window has not completed"
@@ -519,8 +533,6 @@ def build_orb_candidate(
 
     orb_high = float(orb_range.high)
     orb_low = float(orb_range.low)
-    breakout = _optional_float(breakout_price)
-    price = _optional_float(current_price)
     candidate_stop = _optional_float(stop_loss) or orb_low
     warnings: List[str] = []
 
@@ -561,13 +573,11 @@ def build_orb_candidate(
     if price is None or price <= 0:
         warnings.append("Current price is unavailable")
 
-    entry_signal = evaluate_orb_entry_signal(
-        orb_high=orb_high,
-        orb_low=orb_low,
-        breakout_price=breakout,
-        current_price=price or 0.0,
-        buffer_pct=buffer_pct,
-    )
+    entry_signal = strategy_evaluation.entry
+    if entry_signal is None:
+        return _candidate_unavailable(
+            symbol, window, OrbCandidateStatus.FORMING, "ORB window has not completed"
+        )
     breakout_trigger = float(entry_signal.breakout_trigger)
     entry_trigger = float(entry_signal.entry_trigger)
 
@@ -697,6 +707,29 @@ def build_orb_candidate(
             valid=False,
             warnings=[],
             reason=reason,
+        )
+
+    if strategy_evaluation.signal is None:
+        return OrbCandidate(
+            symbol=symbol,
+            window=window,
+            orb_high=orb_high,
+            orb_low=orb_low,
+            breakout_price=breakout,
+            breakout_trigger=breakout_trigger,
+            entry_trigger=entry_trigger,
+            current_price=price,
+            stop_loss=candidate_stop,
+            shares=int(sizing["shares"]),
+            capital_percent=float(sizing["capital_percent"]),
+            stop_loss_percent=float(sizing["stop_loss_percent"]),
+            stop_adr=sizing.get("sl_adr"),
+            risk_percent=risk_percent,
+            score=score,
+            status=OrbCandidateStatus.REJECTED,
+            valid=False,
+            warnings=["ORB strategy did not emit an entry signal"],
+            reason="ORB strategy did not emit an entry signal",
         )
 
     return OrbCandidate(

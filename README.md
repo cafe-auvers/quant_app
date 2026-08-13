@@ -10,6 +10,7 @@ A desktop trading dashboard for US-market swing trading with scanner workflows, 
 - Rule-based scanner presets backed by a KIS-registered US universe, Yahoo/KIS data paths, and MySQL caches.
 - Watchlist management with user-entered `breakout_price` levels for setup validation.
 - ORB planning where entry is valid only after price clears both ORB high and the buffered breakout price.
+- A strategy-neutral `MarketSnapshot -> Strategy -> Signal` interface, with the existing ORB behavior as the first plugin.
 - Buy dashboard monitoring with partial-exit and EMA-close exit workflow support.
 - Daily, hourly, TradingView, and intraday chart views with persisted drawings and breakout markers.
 - Shutdown-safe local JSON persistence with atomic writes, rolling `.bak` recovery, and save-status metadata.
@@ -35,7 +36,9 @@ src/
     controllers/                Testable workflow controllers for UI-owned workflows
     mixins/                     Tab rendering, widget callbacks, and UI glue inherited by MainWindow
   api/                          KIS account, order, intraday, and daily-price adapters
-  core/                         Scanner, watchlist, ORB, scoring, sizing, order and execution queue models
+  core/                         Scanner, watchlist, scoring, order and execution queue models
+  strategy/                     Strategy contracts and the built-in ORB plugin
+  risk/                         Position sizing and final pre-trade approval
   services/                     App-state, intraday, order ledger, execution, reconciliation
   utils/                        Storage, config, Yahoo data loading, MySQL cache helpers
 config/                         Non-secret configuration templates
