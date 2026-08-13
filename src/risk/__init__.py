@@ -16,6 +16,12 @@ from src.risk.orb_position import (
     score_orb_position_recommendation,
     validate_orb_position_values,
 )
+from src.risk.pre_trade import (
+    PreTradeRiskDecision,
+    PreTradeRiskRejectedError,
+    assess_orb_entry_candidate,
+    require_pre_trade_risk_approval,
+)
 
 __all__ = [
     "MAX_CAPITAL_PERCENT",
@@ -25,8 +31,12 @@ __all__ = [
     "PositionSize",
     "PositionSizer",
     "SizingMethod",
+    "PreTradeRiskDecision",
+    "PreTradeRiskRejectedError",
+    "assess_orb_entry_candidate",
     "calculate_orb_position_values",
     "is_orb_position_plan_valid",
     "score_orb_position_recommendation",
+    "require_pre_trade_risk_approval",
     "validate_orb_position_values",
 ]

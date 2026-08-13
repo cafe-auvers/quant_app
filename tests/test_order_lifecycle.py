@@ -35,6 +35,7 @@ from src.services.order_ledger import (
 )
 from src.services import order_execution_service
 from src.services.order_execution_service import DuplicateOpenOrderError, submit_guarded_overseas_order
+from src.risk.pre_trade import PreTradeRiskDecision
 from src.services.order_reconciliation import reconcile_orders_with_snapshot
 import src.ui.mixins.buylist_mixin as buylist_mixin_module
 import src.ui.main_window as main_window_module
@@ -236,6 +237,7 @@ def test_guarded_submission_does_not_call_broker_with_corrupt_ledger(
             quantity=1,
             limit_price=100.0,
             path=path,
+            pre_trade_risk_decision=PreTradeRiskDecision.approve(1),
         )
 
 
@@ -330,6 +332,7 @@ def test_submit_guarded_order_proceeds_normally_once_trading_enabled(monkeypatch
         quantity=1,
         limit_price=100.0,
         path=path,
+        pre_trade_risk_decision=PreTradeRiskDecision.approve(1),
     )
 
     assert order.status == OrderStatus.ACCEPTED
@@ -363,6 +366,7 @@ def test_submit_guarded_order_persists_created_before_api_and_accepted_after(
         quantity=3,
         limit_price=191.23,
         path=path,
+        pre_trade_risk_decision=PreTradeRiskDecision.approve(3),
     )
 
     assert captured_statuses == [OrderStatus.CREATED]
@@ -408,6 +412,7 @@ def test_disabling_during_local_reservation_prevents_broker_call(
             quantity=1,
             limit_price=100.0,
             path=path,
+            pre_trade_risk_decision=PreTradeRiskDecision.approve(1),
         )
 
     [persisted] = load_orders(path=path)
@@ -471,6 +476,7 @@ def test_submit_guarded_order_blocks_duplicate_but_isolates_account_env_and_clos
             quantity=1,
             limit_price=100.0,
             path=path,
+            pre_trade_risk_decision=PreTradeRiskDecision.approve(1),
         )
 
     other_account = submit_guarded_overseas_order(
@@ -482,6 +488,7 @@ def test_submit_guarded_order_blocks_duplicate_but_isolates_account_env_and_clos
         quantity=1,
         limit_price=100.0,
         path=path,
+        pre_trade_risk_decision=PreTradeRiskDecision.approve(1),
     )
     other_env = submit_guarded_overseas_order(
         environment="PROD",
@@ -492,6 +499,7 @@ def test_submit_guarded_order_blocks_duplicate_but_isolates_account_env_and_clos
         quantity=1,
         limit_price=100.0,
         path=path,
+        pre_trade_risk_decision=PreTradeRiskDecision.approve(1),
     )
 
     assert other_account.status == OrderStatus.ACCEPTED
@@ -519,6 +527,7 @@ def test_same_symbol_account_with_closed_previous_order_does_not_block(
         quantity=1,
         limit_price=100.0,
         path=path,
+        pre_trade_risk_decision=PreTradeRiskDecision.approve(1),
     )
 
     assert order.status == OrderStatus.ACCEPTED
@@ -552,6 +561,7 @@ def test_concurrent_guarded_submissions_reserve_only_one_order(
                     quantity=1,
                     limit_price=100.0,
                     path=path,
+                    pre_trade_risk_decision=PreTradeRiskDecision.approve(1),
                 )
             )
         except DuplicateOpenOrderError as exc:
@@ -656,6 +666,7 @@ def test_unknown_submission_order_is_open_persistent_and_blocks_duplicate(
             quantity=1,
             limit_price=100.0,
             path=path,
+            pre_trade_risk_decision=PreTradeRiskDecision.approve(1),
         )
 
 
@@ -693,6 +704,7 @@ def test_submit_guarded_order_persists_unknown_state_on_ambiguous_error(
         quantity=3,
         limit_price=191.23,
         path=path,
+        pre_trade_risk_decision=PreTradeRiskDecision.approve(3),
     )
 
     loaded = load_orders(path=path)
@@ -2127,6 +2139,7 @@ def test_submit_kis_sell_order_uses_environment_and_live_price_without_current_p
             account_no=None,
             intent=OrderIntent.UNKNOWN,
             buylist_symbol_key="",
+            pre_trade_risk_decision=None,
         ):
             self.environment = environment
             self.symbol = symbol
@@ -2138,6 +2151,7 @@ def test_submit_kis_sell_order_uses_environment_and_live_price_without_current_p
             self.account_no = account_no
             self.intent = intent
             self.buylist_symbol_key = buylist_symbol_key
+            self.pre_trade_risk_decision = pre_trade_risk_decision
             self.finished_order = FakeSignal()
             self.error_occurred = FakeSignal()
             self.started = False
@@ -2297,6 +2311,7 @@ def test_submit_kis_buy_order_honors_explicit_order_price_over_live_price(monkey
             account_no=None,
             intent=OrderIntent.UNKNOWN,
             buylist_symbol_key="",
+            pre_trade_risk_decision=None,
         ):
             self.environment = environment
             self.symbol = symbol
@@ -2306,6 +2321,7 @@ def test_submit_kis_buy_order_honors_explicit_order_price_over_live_price(monkey
             self.account_no = account_no
             self.intent = intent
             self.buylist_symbol_key = buylist_symbol_key
+            self.pre_trade_risk_decision = pre_trade_risk_decision
             self.finished_order = FakeSignal()
             self.error_occurred = FakeSignal()
             self.started = False
@@ -2337,7 +2353,13 @@ def test_submit_kis_buy_order_honors_explicit_order_price_over_live_price(monkey
 
     monkeypatch.setattr(buylist_mixin_module, "KisOrderWorker", FakeKisOrderWorker)
 
-    MainWindow._submit_kis_buy_order(window, item, quantity=7, order_price=123.45)
+    MainWindow._submit_kis_buy_order(
+        window,
+        item,
+        quantity=7,
+        order_price=123.45,
+        pre_trade_risk_decision=PreTradeRiskDecision.approve(7),
+    )
 
     assert len(created_workers) == 1
     worker = created_workers[0]
@@ -2345,6 +2367,7 @@ def test_submit_kis_buy_order_honors_explicit_order_price_over_live_price(monkey
     assert worker.quantity == 7
     assert worker.side == "buy"
     assert worker.intent == OrderIntent.ENTRY
+    assert worker.pre_trade_risk_decision == PreTradeRiskDecision.approve(7)
     assert worker.started is True
     assert any("BUY submitted for AAPL: 7 shares @ limit $123.45" in message for message in logs)
 
@@ -2400,7 +2423,13 @@ def test_submit_kis_buy_order_uses_the_account_selected_in_the_ui(monkeypatch):
 
     monkeypatch.setattr(buylist_mixin_module, "KisOrderWorker", FakeKisOrderWorker)
 
-    MainWindow._submit_kis_buy_order(window, item, quantity=3, order_price=101.0)
+    MainWindow._submit_kis_buy_order(
+        window,
+        item,
+        quantity=3,
+        order_price=101.0,
+        pre_trade_risk_decision=PreTradeRiskDecision.approve(3),
+    )
 
     assert len(created_workers) == 1
     assert created_workers[0].account_no == "22222222-01"

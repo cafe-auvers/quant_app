@@ -10,13 +10,14 @@ importing ``src.api.kis_order`` directly, which is what lets a future
 same ``Broker`` protocol later without ``OrderExecutionService`` -- or ORB, or
 anything above it -- changing at all.
 
-``KisBroker`` is the sole real implementation today. Every method here is a
-direct, uninterpreted passthrough to the corresponding ``kis_order``/
-``kis_account_snapshot_dual`` call -- no new retry, validation, or state logic
-is introduced.
+``KisBroker`` is the sole real implementation today. It contains the small
+amount of KIS-specific response/error normalization required to keep the
+execution and reconciliation services broker-neutral; no retry or lifecycle
+state logic is introduced here.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol
 
 from src.api import kis_account_snapshot_dual, kis_order
@@ -27,6 +28,49 @@ from src.core.order_state import (
     OrderSide,
 )
 from src.services import trading_state
+
+
+@dataclass(frozen=True)
+class BrokerSubmissionResult:
+    """Broker-neutral acknowledgement of an order submission request.
+
+    This represents acceptance only, never a fill. ``raw_response`` is kept
+    for durable diagnostics while ``broker_order_id`` gives the execution
+    service one normalized field independent of the broker's response shape.
+    """
+
+    broker_order_id: str
+    raw_response: Dict[str, Any]
+
+
+def _extract_kis_broker_order_id(response: Dict[str, Any]) -> str:
+    """Normalize KIS regular/reserved order identifiers at the adapter edge."""
+    candidates = (
+        "OVRS_RSVN_ODNO",
+        "ovrs_rsvn_odno",
+        "ODNO",
+        "odno",
+        "order_no",
+        "ORD_NO",
+    )
+
+    def walk(value: Any) -> str:
+        if isinstance(value, dict):
+            for key in candidates:
+                if value.get(key):
+                    return str(value[key])
+            for item in value.values():
+                found = walk(item)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for item in value:
+                found = walk(item)
+                if found:
+                    return found
+        return ""
+
+    return walk(response)
 
 
 class Broker(Protocol):
@@ -43,12 +87,16 @@ class Broker(Protocol):
         limit_price: float,
         exchange: str = "NASD",
         execution_policy: str = REGULAR_LIMIT_EXECUTION,
-    ) -> Dict[str, Any]:
-        """Submit an order. Returns the raw broker response.
+    ) -> BrokerSubmissionResult:
+        """Submit an order and return a normalized acceptance result.
 
         Acceptance only -- callers must never treat a returned response as a
         fill; see PROJECT_ARCHITECTURE.md's KIS Order Lifecycle section.
         """
+        ...
+
+    def is_ambiguous_submission_error(self, error: BaseException) -> bool:
+        """Whether an exception may have occurred after broker submission."""
         ...
 
     def cancel_order(
@@ -83,7 +131,7 @@ class Broker(Protocol):
         environment: str,
         account_no: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Fetch the current overseas account snapshot (holdings, cash)."""
+        """Fetch the current account position snapshot used for reconciliation."""
         ...
 
 
@@ -101,30 +149,38 @@ class KisBroker:
         limit_price: float,
         exchange: str = "NASD",
         execution_policy: str = REGULAR_LIMIT_EXECUTION,
-    ) -> Dict[str, Any]:
+    ) -> BrokerSubmissionResult:
         # Defense in depth: service callers are expected to check before
         # reserving an order, but the real broker boundary must not rely on
         # every present and future caller remembering to do so.
         trading_state.require_trading_enabled(environment, symbol)
         if execution_policy == RESERVED_MOO_EXECUTION:
-            return kis_order.place_overseas_reserved_market_on_open_sell(
+            response = kis_order.place_overseas_reserved_market_on_open_sell(
                 environment=environment,
                 account_no=account_no,
                 symbol=symbol,
                 quantity=quantity,
                 exchange=exchange,
             )
-        side_value = side.value if isinstance(side, OrderSide) else str(side)
-        return kis_order.place_overseas_order(
-            environment=environment,
-            account_no=account_no,
-            symbol=symbol,
-            quantity=quantity,
-            price=limit_price,
-            side=side_value.lower(),
-            exchange=exchange,
-            order_type="limit",
+        else:
+            side_value = side.value if isinstance(side, OrderSide) else str(side)
+            response = kis_order.place_overseas_order(
+                environment=environment,
+                account_no=account_no,
+                symbol=symbol,
+                quantity=quantity,
+                price=limit_price,
+                side=side_value.lower(),
+                exchange=exchange,
+                order_type="limit",
+            )
+        return BrokerSubmissionResult(
+            broker_order_id=_extract_kis_broker_order_id(response),
+            raw_response=response,
         )
+
+    def is_ambiguous_submission_error(self, error: BaseException) -> bool:
+        return kis_order.is_ambiguous_order_submission_error(error)
 
     def cancel_order(
         self,
@@ -165,7 +221,7 @@ class KisBroker:
     ) -> Dict[str, Any]:
         return kis_account_snapshot_dual.fetch_account_snapshot(
             environment,
-            include_domestic=False,
+            include_domestic=True,
             include_overseas=True,
             account_no=account_no,
         )

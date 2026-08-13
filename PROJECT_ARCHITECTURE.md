@@ -322,9 +322,9 @@ Most workers live in `src/ui/workers.py`; KIS order submission/query/cancel and 
 | `SingleStockAiWorker` | `workers.py` | Review one stock/setup |
 | `PcRemoteStatusWorker` | `workers.py` | Check database, remote-control listener, and remote `main.py` health independently |
 | `KisOrderWorker` | `order_workers.py` | Submit KIS overseas orders and emit broker acceptance/rejection state |
-| `OrderReconciliationWorker` | `order_workers.py` | Fetch account snapshots and reconcile open broker orders against holdings deltas |
-| `KisOrderQueryWorker` | `order_workers.py` | Query and reconcile unresolved orders via snapshot-based lookup |
-| `KisOrderCancelWorker` | `order_workers.py` | Cancel a locally tracked order and reconcile the result |
+| `OrderReconciliationWorker` | `order_workers.py` | Fetch position snapshots through an injected `Broker` and reconcile open orders against holdings deltas |
+| `KisOrderQueryWorker` | `order_workers.py` | Query and reconcile unresolved orders through an injectable `Broker` |
+| `KisOrderCancelWorker` | `order_workers.py` | Cancel a locally tracked order through an injectable `Broker` and reconcile the result |
 
 ## Service Layer
 
@@ -337,8 +337,8 @@ Most workers live in `src/ui/workers.py`; KIS order submission/query/cancel and 
 | `src/services/yfinance_intraday_provider.py` | yfinance intraday fallback provider preserving existing retry behavior |
 | `src/services/order_ledger.py` | Persistent local order ledger stored at `data/orders.json` |
 | `src/services/trading_state.py` | In-memory `TRADING_ENABLED` kill switch -- disabled by default on every launch, no persistence; blank, falsy, or malformed configured values lock it off, while a truthy value only permits the per-session UI toggle |
-| `src/services/broker.py` | `Broker` protocol (`submit_order`/`cancel_order`/`get_order`/`get_positions`) and `KisBroker`, a thin passthrough to `src.api.kis_order`/`kis_account_snapshot_dual` -- guarded submission and direct query/cancel reconciliation depend on this abstraction instead of the KIS API directly |
-| `src/services/order_execution_service.py` | Guarded KIS order submission with durable idempotency before and after API calls; gated by `trading_state` and routed through an injectable `Broker` (defaults to `KisBroker`) |
+| `src/services/broker.py` | `Broker` protocol (`submit_order`/`cancel_order`/`get_order`/`get_positions`/ambiguous-error classification), normalized `BrokerSubmissionResult`, and `KisBroker`; all KIS response-field parsing stays at this adapter boundary |
+| `src/services/order_execution_service.py` | Broker-neutral guarded order submission with durable idempotency before and after API calls; gated by `trading_state`, an entry-only `PreTradeRiskDecision`, and an injectable `Broker` (defaults to `KisBroker`) |
 | `src/services/order_reconciliation.py` | Conservative account-snapshot reconciliation plus injectable broker order query/cancel for accepted/working orders |
 | `src/services/historical_refresh_control.py` | Launches, polls, and terminates the standalone `historical.py` subprocess; owns its status-file schema and PID liveness checks |
 | `src/services/state_sync.py` | Conflict-safe cross-machine sync of user-managed state (watchlist/buylist/trade plans) through a revision-tracked MySQL table; only the `main` device pushes, others pull-only |
@@ -369,8 +369,9 @@ The buylist is the local monitoring model. Broker orders are now tracked separat
 |---|---|
 | `src/risk/position_sizer.py` | `PositionSizer` -- fixed-risk, fixed-percent, volatility-based, and Kelly position sizing calculations |
 | `src/risk/orb_position.py` | Shared ORB sizing metrics, 10%/30% capital-allocation limits, 15%/66% stop-to-ADR limits, validation warnings, and recommendation score used by the queue, worker, and watchlist UI |
+| `src/risk/pre_trade.py` | Immutable, quantity-bound `PreTradeRiskDecision`, final entry-order approval enforcement, and immediate ORB-candidate revalidation |
 
-`PositionSizer` and the duplicated ORB position-plan checks now live under `src/risk/` with their existing formulas and thresholds. `src/core/position_sizer.py` is a compatibility import for older scripts; new code imports from `src.risk`. The duplicate-open-order guard remains in `src/services/order_ledger.py` (`reserve_order_if_no_matching_open`) rather than moving here, since it is inherently coupled to the order ledger's file I/O rather than being a standalone calculation.
+`PositionSizer` and the duplicated ORB position-plan checks now live under `src/risk/` with their existing formulas and thresholds. `src/core/position_sizer.py` is a compatibility import for older scripts; new code imports from `src.risk`. Immediately before an entry is submitted, the selected ORB candidate is revalidated into a `PreTradeRiskDecision`; `submit_guarded_overseas_order()` rejects missing, rejected, or quantity-mismatched decisions before creating a ledger row. Exit intents deliberately do not require entry-risk approval, so protective liquidation remains available. The duplicate-open-order guard remains in `src/services/order_ledger.py` (`reserve_order_if_no_matching_open`) rather than moving here, since it is inherently coupled to the order ledger's file I/O rather than being a standalone calculation.
 
 ## Data and Persistence
 
@@ -551,19 +552,21 @@ Buy/Sell UI action or EXECUTE_READY execution queue submit action
   -> BuylistExecutionController submit command validation
   -> KisOrderWorker
   -> submit_guarded_overseas_order()
+  -> ENTRY only: require quantity-bound PreTradeRiskDecision before ledger creation
   -> duplicate-open-order check in data/orders.json by environment, account, symbol, side, and intent
   -> BrokerOrder(status=CREATED) written to data/orders.json before KIS API call
   -> BrokerOrder(status=UNKNOWN_SUBMISSION_STATE) written before request is sent
-  -> KisBroker.submit_order() -> src.api.kis_order placement endpoint
+  -> KisBroker.submit_order() -> normalized BrokerSubmissionResult + src.api.kis_order placement endpoint
   -> BrokerOrder(status=ACCEPTED or REJECTED) written with raw submit response/error
   -> UI status becomes BUY_SUBMITTED / SELL_SUBMITTED / PARTIAL_EXIT_SUBMITTED
-  -> OrderReconciliationWorker compares KIS holdings snapshots
+  -> OrderReconciliationWorker compares Broker.get_positions() snapshots
   -> confirmed fills update buylist shares, cost, sold status, and partial-exit stop behavior
 ```
 
 Important safety rules:
 
 - Execution queue submit actions are gated to `EXECUTE_READY` queue rows before KIS order submission starts.
+- Entry orders require an approved `PreTradeRiskDecision` for the exact submitted quantity. Missing/rejected/mismatched approvals fail before ledger reservation or a broker call; exits are exempt so risk controls cannot block liquidation.
 - Manual PROD partial/full exits outside the U.S. regular session use KIS's
   reserved U.S. sell endpoint with market-on-open execution. The selected
   quantity and `RESERVED_MOO` policy are persisted before the broker call, so
@@ -656,7 +659,7 @@ python -m compileall main.py src tests -q
 pytest -q
 ```
 
-`.github/workflows/ci.yml` runs both commands on `windows-latest` with Python 3.11 and 3.12 for every push/PR to `master` (Windows matches the app's actual runtime platform, avoiding Qt/PyQt5 Linux system-library setup). CI installs the hash-verified `requirements.lock`, runs `pip check`, and expects zero failed or xfailed tests on `master` -- no "green except known failures".
+`.github/workflows/ci.yml` runs both commands on `windows-latest` with Python 3.11 and 3.12 for every push/PR to `master` (Windows matches the app's actual runtime platform, avoiding Qt/PyQt5 Linux system-library setup). CI installs the hash-verified `requirements.lock`, runs `pip check`, and expects zero failed or xfailed tests on `master` -- no "green except known failures". GitHub must separately require the two matrix checks; the repository-side setup and exact check names are documented in `.github/BRANCH_PROTECTION.md`.
 
 Coverage includes scanner rules, scoring, position sizing, ORB logic, execution queue strategy, watchlist and buylist persistence, local JSON backup/recovery and shutdown flushing, MySQL helper behavior, KIS account config/profile parsing, selected `MainWindow` formatting/helpers, refactor boundaries, buylist execution queue refresh request/result behavior, and KIS order lifecycle safety.
 Buylist execution controller coverage includes selected-symbol queueing, missing symbols, unavailable queue manager failures, duplicate pending/open-order propagation, callback failures, refreshed counts, and result status counts.

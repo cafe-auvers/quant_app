@@ -261,6 +261,7 @@ class BuylistOrdersMixin:
         quantity: Optional[int] = None,
         limit_price: Optional[float] = None,
         order_price: Optional[float] = None,
+        pre_trade_risk_decision: Optional[PreTradeRiskDecision] = None,
     ) -> None:
         """Submit a KIS buy order without treating broker acceptance as a fill."""
         submission_guard = getattr(
@@ -288,6 +289,7 @@ class BuylistOrdersMixin:
             self._warn_order_account_unavailable(item, env)
             return
         intent = OrderIntent.ENTRY
+        risk_candidate = None
         if self._is_pre_entry_execution_queue_buylist_item(item):
             manager = self.__dict__.get("execution_queue_manager")
             if manager is None:
@@ -307,6 +309,8 @@ class BuylistOrdersMixin:
                 if queue_item is not None
                 else ""
             )
+            if candidate is not None:
+                risk_candidate = candidate
             if candidate is not None and queue_status == "EXECUTE_READY":
                 if quantity is None:
                     quantity = int(getattr(candidate, "shares", 0) or 0)
@@ -374,6 +378,10 @@ class BuylistOrdersMixin:
                 item, "Order price and share quantity must be positive finite values."
             )
             return
+        if pre_trade_risk_decision is None:
+            pre_trade_risk_decision = assess_orb_entry_candidate(
+                risk_candidate, quantity
+            )
         try:
             worker = KisOrderWorker(
                 env,
@@ -384,6 +392,7 @@ class BuylistOrdersMixin:
                 account_no=account_no,
                 intent=intent,
                 buylist_symbol_key=f"{env}:{item.symbol}",
+                pre_trade_risk_decision=pre_trade_risk_decision,
             )
             self.kis_order_worker = worker
             self._track_buylist_order_worker(worker)

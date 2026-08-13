@@ -51,11 +51,15 @@ def test_account_and_order_reconciliation_workers_keep_separate_state(
         client_order_id="client-1",
         execution_policy="REGULAR_LIMIT",
     )
-    monkeypatch.setattr(
-        order_workers,
-        "fetch_account_snapshot",
-        lambda *args, **kwargs: {"kind": "reconciliation"},
-    )
+    class ReconciliationBroker:
+        def __init__(self):
+            self.position_calls = []
+
+        def get_positions(self, **kwargs):
+            self.position_calls.append(kwargs)
+            return {"kind": "reconciliation"}
+
+    reconciliation_broker = ReconciliationBroker()
     monkeypatch.setattr(
         order_workers,
         "reconcile_orders_with_snapshot",
@@ -67,6 +71,7 @@ def test_account_and_order_reconciliation_workers_keep_separate_state(
         "PROD",
         "12345678-01",
         [open_order],
+        broker=reconciliation_broker,
     )
     reconciliation_worker.finished_reconciliation.connect(
         lambda orders, snapshot: reconciliation_results.append((orders, snapshot))
@@ -80,6 +85,9 @@ def test_account_and_order_reconciliation_workers_keep_separate_state(
         ([open_order], {"kind": "reconciliation"})
     ]
     assert reconciliation_errors == []
+    assert reconciliation_broker.position_calls == [
+        {"environment": "PROD", "account_no": "12345678-01"}
+    ]
 
 
 def test_scanner_worker_loads_cold_universe_off_the_calling_ui_path(monkeypatch):

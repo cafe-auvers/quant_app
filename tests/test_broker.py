@@ -1,8 +1,8 @@
 """Tests for the thin Broker abstraction (src/services/broker.py).
 
-These verify KisBroker is a faithful, uninterpreted passthrough to the
-existing src.api.kis_order / kis_account_snapshot_dual calls -- no new
-retry/validation/state logic should exist here. OrderExecutionService's own
+These verify KisBroker is a thin adapter around the existing src.api.kis_order
+/ kis_account_snapshot_dual calls, including response/error normalization but
+no retry/lifecycle logic. OrderExecutionService's own
 state-machine behavior (CREATED -> UNKNOWN_SUBMISSION_STATE -> ACCEPTED/
 REJECTED) is covered separately in test_order_lifecycle.py.
 """
@@ -14,7 +14,8 @@ from src.core.order_state import (
     RESERVED_MOO_EXECUTION,
     OrderSide,
 )
-from src.services.broker import KisBroker
+from src.risk.pre_trade import PreTradeRiskDecision
+from src.services.broker import BrokerSubmissionResult, KisBroker
 from src.services import trading_state
 from src.services.trading_state import TradingDisabledError
 
@@ -86,7 +87,10 @@ def test_submit_order_regular_limit_calls_place_overseas_order(
         execution_policy=REGULAR_LIMIT_EXECUTION,
     )
 
-    assert result["output"]["ODNO"] == "OK"
+    assert result == BrokerSubmissionResult(
+        broker_order_id="OK",
+        raw_response={"rt_cd": "0", "output": {"ODNO": "OK"}},
+    )
     assert captured == {
         "environment": "PROD",
         "account_no": "12345678-01",
@@ -126,7 +130,13 @@ def test_submit_order_reserved_moo_calls_reserved_endpoint(
         execution_policy=RESERVED_MOO_EXECUTION,
     )
 
-    assert result["output"]["OVRS_RSVN_ODNO"] == "RSV-1"
+    assert result == BrokerSubmissionResult(
+        broker_order_id="RSV-1",
+        raw_response={
+            "rt_cd": "0",
+            "output": {"OVRS_RSVN_ODNO": "RSV-1"},
+        },
+    )
     assert captured == {
         "environment": "PROD",
         "account_no": "12345678-01",
@@ -202,7 +212,7 @@ def test_get_order_regular_vs_reserved_routes_to_different_endpoints(monkeypatch
     ) == ["reserved"]
 
 
-def test_get_positions_delegates_to_overseas_only_snapshot(monkeypatch):
+def test_get_positions_delegates_to_full_reconciliation_snapshot(monkeypatch):
     captured = {}
 
     def fake_fetch_account_snapshot(environment, **kwargs):
@@ -219,7 +229,7 @@ def test_get_positions_delegates_to_overseas_only_snapshot(monkeypatch):
     assert result == {"overseas": {"holdings": []}}
     assert captured == {
         "environment": "SIM",
-        "include_domestic": False,
+        "include_domestic": True,
         "include_overseas": True,
         "account_no": "12345678",
     }
@@ -241,7 +251,13 @@ def test_submit_guarded_overseas_order_accepts_injected_broker(monkeypatch, tmp_
 
         def submit_order(self, **kwargs):
             self.calls.append(kwargs)
-            return {"rt_cd": "0", "output": {"ODNO": "FAKE-1"}}
+            return BrokerSubmissionResult(
+                broker_order_id="FAKE-1",
+                raw_response={"accepted": True},
+            )
+
+        def is_ambiguous_submission_error(self, _error):
+            return False
 
     fake_broker = FakeBroker()
     monkeypatch.setattr(
@@ -260,6 +276,7 @@ def test_submit_guarded_overseas_order_accepts_injected_broker(monkeypatch, tmp_
         limit_price=100.0,
         path=path,
         broker=fake_broker,
+        pre_trade_risk_decision=PreTradeRiskDecision.approve(1),
     )
 
     assert order.broker_order_id == "FAKE-1"

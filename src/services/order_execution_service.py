@@ -1,11 +1,10 @@
-"""Durable guarded order submission for KIS overseas orders."""
+"""Durable, broker-neutral guarded submission for overseas orders."""
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Optional
 
-from src.api import kis_order
 from src.core.order_state import (
     REGULAR_LIMIT_EXECUTION,
     RESERVED_MOO_EXECUTION,
@@ -14,7 +13,11 @@ from src.core.order_state import (
     OrderSide,
     OrderStatus,
 )
-from src.services.broker import Broker, KisBroker
+from src.risk.pre_trade import (
+    PreTradeRiskDecision,
+    require_pre_trade_risk_approval,
+)
+from src.services.broker import Broker, BrokerSubmissionResult, KisBroker
 from src.services.order_ledger import ORDERS_FILE, reserve_order_if_no_matching_open, upsert_order
 from src.services import trading_state
 from src.services.trading_state import TradingDisabledError
@@ -34,35 +37,6 @@ class DuplicateOpenOrderError(RuntimeError):
         )
 
 
-def _extract_broker_order_id(response: Dict[str, Any]) -> Optional[str]:
-    candidates = (
-        "OVRS_RSVN_ODNO",
-        "ovrs_rsvn_odno",
-        "ODNO",
-        "odno",
-        "order_no",
-        "ORD_NO",
-    )
-
-    def walk(value: Any) -> Optional[str]:
-        if isinstance(value, dict):
-            for key in candidates:
-                if value.get(key):
-                    return str(value[key])
-            for item in value.values():
-                found = walk(item)
-                if found:
-                    return found
-        elif isinstance(value, list):
-            for item in value:
-                found = walk(item)
-                if found:
-                    return found
-        return None
-
-    return walk(response)
-
-
 def submit_guarded_overseas_order(
     *,
     environment: str,
@@ -77,19 +51,21 @@ def submit_guarded_overseas_order(
     allow_duplicate: bool = False,
     path: Path = ORDERS_FILE,
     broker: Optional[Broker] = None,
+    pre_trade_risk_decision: Optional[PreTradeRiskDecision] = None,
 ) -> BrokerOrder:
-    """Submit a KIS order with a durable local idempotency guard.
+    """Submit an overseas order with a durable local idempotency guard.
 
     This function records local intent before touching the KIS API. A returned
     ACCEPTED order means only that KIS received the order request; it never
     implies a broker fill or local position change.
 
     ``broker`` defaults to ``KisBroker()`` (the real KIS API) -- this state
-    machine itself has no broker-specific knowledge and doesn't change based
-    on which ``Broker`` implementation runs underneath it.
+    machine itself has no KIS-specific knowledge and doesn't change based on
+    which ``Broker`` implementation runs underneath it. ENTRY orders must
+    carry an explicit risk approval bound to the requested quantity; exit
+    orders deliberately remain available without entry-risk approval.
     """
     trading_state.require_trading_enabled(environment, symbol)
-    broker = KisBroker() if broker is None else broker
     if quantity <= 0:
         raise ValueError(f"quantity must be positive, got {quantity}")
 
@@ -112,6 +88,11 @@ def submit_guarded_overseas_order(
         limit_price = 0.0
     elif limit_price <= 0:
         raise ValueError(f"limit_price must be positive, got {limit_price}")
+
+    if intent == OrderIntent.ENTRY:
+        require_pre_trade_risk_approval(pre_trade_risk_decision, quantity)
+
+    broker = KisBroker() if broker is None else broker
 
     order = BrokerOrder.create(
         environment=environment,
@@ -155,7 +136,7 @@ def submit_guarded_overseas_order(
     upsert_order(order, path=path)
 
     try:
-        response = broker.submit_order(
+        submission = broker.submit_order(
             environment=environment,
             account_no=account_no,
             symbol=symbol,
@@ -165,6 +146,10 @@ def submit_guarded_overseas_order(
             exchange=exchange,
             execution_policy=execution_policy,
         )
+        if not isinstance(submission, BrokerSubmissionResult):
+            raise TypeError(
+                "Broker.submit_order() must return BrokerSubmissionResult"
+            )
     except TradingDisabledError as exc:
         # The broker boundary guarantees that no HTTP submission was attempted
         # when this exception is raised, so this is a clear local rejection,
@@ -175,10 +160,17 @@ def submit_guarded_overseas_order(
         upsert_order(order, path=path)
         return order
     except Exception as exc:
-        if kis_order.is_ambiguous_order_submission_error(exc):
+        try:
+            ambiguous = broker.is_ambiguous_submission_error(exc)
+        except Exception:
+            # An invalid/custom broker that cannot classify an error must fail
+            # conservatively: the non-idempotent request may have reached it.
+            ambiguous = True
+            logger.exception("Broker failed to classify submission error")
+        if ambiguous:
             order.status = OrderStatus.UNKNOWN_SUBMISSION_STATE
             logger.warning(
-                "KIS guarded order submission result unknown for %s %s %s account %s: %s",
+                "Broker order submission result unknown for %s %s %s account %s: %s",
                 environment,
                 side.value,
                 symbol,
@@ -193,8 +185,8 @@ def submit_guarded_overseas_order(
         return order
 
     order.status = OrderStatus.ACCEPTED
-    order.broker_order_id = _extract_broker_order_id(response) or ""
-    order.raw_submit_response = response
+    order.broker_order_id = submission.broker_order_id
+    order.raw_submit_response = submission.raw_response
     order.filled_quantity = 0
     order.remaining_quantity = order.quantity_requested
     order.touch()
