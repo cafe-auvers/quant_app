@@ -456,6 +456,7 @@ class BuylistOrdersMixin:
                 pre_trade_risk_decision=pre_trade_risk_decision,
                 strategy_id=strategy_id,
                 plan_id=plan_id,
+                **self._current_execution_lease_kwargs(),
             )
             worker.signal_payload = signal_payload
             raw_candidate_status = getattr(risk_candidate, "status", "")
@@ -592,6 +593,7 @@ class BuylistOrdersMixin:
                 "account_no": account_no,
                 "intent": intent,
                 "buylist_symbol_key": f"{env}:{item.symbol}",
+                **self._current_execution_lease_kwargs(),
             }
             if execution_policy == RESERVED_MOO_EXECUTION:
                 worker_kwargs["execution_policy"] = execution_policy

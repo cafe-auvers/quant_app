@@ -197,6 +197,44 @@ def get_runtime_process_status(
     )
 
 
+def heartbeat_row_is_stale(
+    conn,
+    engine: Engine,
+    hostname: str,
+    *,
+    process_name: str = MAIN_APP_PROCESS,
+    max_age_seconds: int = DEFAULT_HEARTBEAT_MAX_AGE_SECONDS,
+) -> bool:
+    """Decide staleness using the caller's own connection/transaction.
+
+    Unlike ``get_runtime_process_status`` (which opens its own short-lived
+    connection), this reuses ``conn`` so it can participate in an outer
+    transaction -- e.g. the same row lock that atomically transfers
+    main-device ownership in ``state_sync.claim_main_device_if_stale``.
+    Returns True (safe to treat as stale) when there is no row, the process
+    is marked inactive, or the heartbeat age computed from the database
+    server's own clock exceeds ``max_age_seconds``.
+    """
+    hostname = _normalized_hostname(hostname)
+    process_name = str(process_name or "").strip().lower()
+    if not hostname or not process_name:
+        return True
+    table = _ensure_runtime_status_table(engine)
+    row = conn.execute(
+        select(table.c.active, table.c.heartbeat_at).where(
+            table.c.hostname == hostname,
+            table.c.process_name == process_name,
+        )
+    ).first()
+    if row is None or not bool(row.active):
+        return True
+    server_now = conn.execute(select(_server_now(engine))).scalar()
+    if row.heartbeat_at is None or server_now is None:
+        return True
+    age_seconds = max(0.0, (server_now - row.heartbeat_at).total_seconds())
+    return age_seconds > max(0, int(max_age_seconds))
+
+
 def safe_mark_runtime_process_stopped(engine: Optional[Engine]) -> None:
     """Best-effort shutdown marker for UI teardown paths."""
     if engine is None:

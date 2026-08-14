@@ -6,8 +6,15 @@ what lets main.py's GUI actually show up).
 
 Registers an "at logon" Task Scheduler task that runs
 scripts/pc_morning_routine.ps1 (git sync -> gated 1d/1h refresh -> launch
-main.py) every time this account logs in -- i.e. every morning, right after
-the BIOS wake + auto-login.
+main.py) every time this account logs in.
+
+As of the S3-sleep automatic-handoff setup (see
+Configure-AutomaticSleep.ps1 / Configure-MarketHoursWake.ps1), this also
+registers a second, Daily @ 08:00 trigger with WakeToRun enabled -- a normal
+S3 resume does NOT fire AtLogOn (the interactive session was never logged
+out, just suspended), so without this second trigger the 08:00 morning data
+refresh would stop firing on every day except after a genuine reboot.
+AtLogOn is kept as a defensive fallback for exactly that reboot case.
 
 Usage:
     .\scripts\setup_pc_morning_task.ps1
@@ -25,13 +32,18 @@ $TaskName = "QuantApp_MorningRoutine"
 $action = New-ScheduledTaskAction -Execute "powershell.exe" `
     -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$RoutineScript`"" `
     -WorkingDirectory $RepoRoot
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:COMPUTERNAME\$env:USERNAME"
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew
+$atLogonTrigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:COMPUTERNAME\$env:USERNAME"
+$dailyWakeTrigger = New-ScheduledTaskTrigger -Daily -At "08:00"
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable -MultipleInstances IgnoreNew -WakeToRun
 
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings `
-    -Description "Runs pc_morning_routine.ps1 (git sync, data refresh, launch main.py) at logon." -Force | Out-Null
+Register-ScheduledTask -TaskName $TaskName -Action $action `
+    -Trigger @($atLogonTrigger, $dailyWakeTrigger) -Settings $settings `
+    -Description ("Runs pc_morning_routine.ps1 (git sync, data refresh, launch main.py) " +
+        "at logon AND daily at 08:00 (WakeToRun, for the normal S3-resume case where " +
+        "AtLogOn does not fire).") -Force | Out-Null
 
-Write-Host "Registered task '$TaskName' -- fires at logon for $env:COMPUTERNAME\$env:USERNAME."
+Write-Host "Registered task '$TaskName' -- fires at logon for $env:COMPUTERNAME\$env:USERNAME, and daily at 08:00 (wakes the PC if asleep)."
 Write-Host ""
 Write-Host "-- Reference commands -----------------------------------------------------"
 Write-Host "Run it right now (don't wait for a logon) : Start-ScheduledTask -TaskName '$TaskName'"

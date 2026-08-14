@@ -97,6 +97,52 @@ NON_PRE_ENTRY_BUYLIST_STATUSES = {
     "SELL_RESERVED",
 }
 
+# --- Handoff-safety status sets (cross-machine main-device takeover) -------
+# Purpose-built, non-overlapping categories -- deliberately more precise
+# than one broad "in-flight" set, since these statuses mean materially
+# different things: a working broker order is not the same risk as a held
+# position, which is not the same as an unconfirmed pre-entry trigger.
+# Reused by both the existing monitor cycle (buylist/monitoring.py's
+# _skip_statuses) and the handoff-reconciliation path so the two can never
+# silently drift apart.
+
+# A broker order may or may not have actually reached KIS -- must always be
+# reconciled against the broker directly before anything else touches it.
+BROKER_UNCERTAIN_STATUSES = {
+    ExecutionQueueStatus.ORDER_PENDING.value,
+    ExecutionQueueStatus.ORDER_SUBMITTED.value,
+    ExecutionQueueStatus.UNKNOWN_SUBMISSION_STATE.value,
+    "BUY_SUBMITTED",
+    "BUY_PARTIAL",
+    "SELL_SUBMITTED",
+    "PARTIAL_EXIT_SUBMITTED",
+    "SELL_RESERVED",
+    "PARTIAL_EXIT_RESERVED",
+}
+
+# A live position exists and needs stop-loss monitoring.
+POSITION_HOLDING_STATUSES = {"BOUGHT"}
+
+# An unconfirmed pre-entry strategy trigger -- no broker order necessarily
+# exists yet. A synced EXECUTE_READY here must never be trusted directly;
+# it has to be re-evaluated against fresh intraday data and a fresh risk
+# approval before an entry can fire on a newly-main device.
+PRE_ENTRY_QUEUE_STATUSES = {
+    ExecutionQueueStatus.ORB_FORMING.value,
+    ExecutionQueueStatus.WAITING_BREAKOUT.value,
+    ExecutionQueueStatus.ARMED.value,
+    ExecutionQueueStatus.EXECUTE_READY.value,
+}
+
+# Everything a device taking over main-device status must reset runtime-only
+# pending flags for and reconcile against the broker before resuming
+# auto-submission. Deliberately excludes legacy "ACTIVE" -- monitoring
+# already refuses legacy ACTIVE auto-buy (see monitoring.py), and the
+# handoff path must not resurrect it.
+HANDOFF_MONITORABLE_STATUSES = (
+    BROKER_UNCERTAIN_STATUSES | POSITION_HOLDING_STATUSES | PRE_ENTRY_QUEUE_STATUSES
+)
+
 class OrbCandidateStatus(str, Enum):
     NOT_AVAILABLE = "NOT_AVAILABLE"
     FORMING = "FORMING"

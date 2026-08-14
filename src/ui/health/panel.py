@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import logging
 from dataclasses import replace
@@ -397,6 +398,16 @@ class HealthPanelMixin:
             self.__dict__.get("kis_startup_worker"),
         )
         mirror_tickers = list(self.__dict__.get("universe_tickers") or []) or None
+
+        state_sync_role = self.__dict__.get("state_sync_role")
+        is_main_device = bool(state_sync_role and state_sync_role.is_main)
+        last_reconcile = self.__dict__.get("_last_successful_reconcile_at")
+        lease_age_seconds = None
+        if is_main_device and last_reconcile is not None:
+            lease_age_seconds = (
+                dt.datetime.now(dt.timezone.utc) - last_reconcile
+            ).total_seconds()
+        handoff_worker = self.__dict__.get("handoff_reconciliation_worker")
         return HealthContext(
             db_source=str(self.__dict__.get("db_engine_source", "none")),
             db_initializing=bool(self.__dict__.get("db_initializing", False)),
@@ -419,6 +430,18 @@ class HealthPanelMixin:
             ),
             reconciliation_last_error=str(
                 self.__dict__.get("_last_order_reconciliation_error", "")
+            ),
+            is_main_device=is_main_device,
+            main_device_hostname=str(
+                self.__dict__.get("_last_main_device_hostname", "")
+            ),
+            lease_age_seconds=lease_age_seconds,
+            auto_claim_enabled=bool(self.__dict__.get("_auto_claim_main_enabled", False)),
+            handoff_reconciliation_running=bool(
+                handoff_worker is not None and handoff_worker.isRunning()
+            ),
+            handoff_blocked_symbols=tuple(
+                self.__dict__.get("_last_handoff_blocked_symbols", ())
             ),
         )
 

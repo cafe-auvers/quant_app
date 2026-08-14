@@ -7,6 +7,10 @@ from typing import List, Optional, Tuple
 from PyQt5.QtCore import QTimer
 from PyQt5.QtWidgets import QLabel, QPushButton
 
+from src.core.execution_queue import (
+    BROKER_UNCERTAIN_STATUSES,
+    POSITION_HOLDING_STATUSES,
+)
 from src.core.order_state import OrderIntent, OrderSide
 
 from .constants import US_MARKET_ZONE
@@ -136,15 +140,13 @@ class BuylistMonitoringMixin:
         if not hasattr(self, "buylist_manager"):
             return
 
-        from src.core.execution_queue import ExecutionQueueStatus
+        from src.core.execution_queue import (
+            ExecutionQueueStatus,
+            PRE_ENTRY_QUEUE_STATUSES,
+        )
 
         manager = self.__dict__.get("execution_queue_manager")
-        pre_entry_watching = {
-            ExecutionQueueStatus.ORB_FORMING.value,
-            ExecutionQueueStatus.WAITING_BREAKOUT.value,
-            ExecutionQueueStatus.ARMED.value,
-            ExecutionQueueStatus.EXECUTE_READY.value,
-        }
+        pre_entry_watching = PRE_ENTRY_QUEUE_STATUSES
         submitted_entry_statuses = {
             ExecutionQueueStatus.ORDER_PENDING.value,
             ExecutionQueueStatus.ORDER_SUBMITTED.value,
@@ -258,19 +260,13 @@ class BuylistMonitoringMixin:
             == "SELL_SUBMITTED"
         ]
 
-        # Execution queue items whose trigger hasn't fired yet
-        _skip_statuses = {
-            "BOUGHT",
-            "BUY_SUBMITTED",
-            "BUY_PARTIAL",
-            "SELL_SUBMITTED",
-            "PARTIAL_EXIT_SUBMITTED",
-            "SELL_RESERVED",
-            "PARTIAL_EXIT_RESERVED",
-            "SOLD",
-            "ORDER_SUBMITTED",
-            "ORDER_PENDING",
-        }
+        # Execution queue items whose trigger hasn't fired yet. Sourced from
+        # the shared handoff-safety constants (src/core/execution_queue.py)
+        # plus the terminal "SOLD" status, so this can never silently drift
+        # from what handoff reconciliation treats as broker-uncertain/held.
+        _skip_statuses = (
+            BROKER_UNCERTAIN_STATUSES | POSITION_HOLDING_STATUSES | {"SOLD"}
+        )
         queue_watching_items = [
             it
             for it in items

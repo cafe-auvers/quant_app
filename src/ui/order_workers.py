@@ -16,6 +16,11 @@ from src.core.order_state import (
 from src.risk.pre_trade import PreTradeRiskDecision
 from src.services.broker import Broker, KisBroker
 from src.services.event_journal import record_event
+from src.services.execution_authority import ExecutionAuthority, LeaseHandle
+from src.services.handoff_reconciliation import (
+    PostClaimReconciliationResult,
+    run_post_claim_broker_reconciliation,
+)
 from src.services.order_reconciliation import reconcile_orders_with_snapshot
 
 
@@ -45,6 +50,9 @@ class KisOrderWorker(QThread):
         event_recorder: Optional[Callable[..., Any]] = None,
         signal_payload: Optional[dict[str, Any]] = None,
         signal_event_type: str = "SIGNAL_CREATED",
+        execution_authority: Optional[ExecutionAuthority] = None,
+        execution_lease: Optional[LeaseHandle] = None,
+        lease_engine: Optional[Any] = None,
     ) -> None:
         super().__init__()
         self.environment = environment
@@ -65,6 +73,13 @@ class KisOrderWorker(QThread):
         self.event_recorder = event_recorder or record_event
         self.signal_payload = signal_payload
         self.signal_event_type = signal_event_type
+        # Main-device lease fencing (cross-machine handoff safety). None on
+        # every existing caller until MainWindow starts threading a lease
+        # through -- submit_guarded_overseas_order treats a missing lease as
+        # "no fencing requested," so this stays backward compatible.
+        self.execution_authority = execution_authority
+        self.execution_lease = execution_lease
+        self.lease_engine = lease_engine
 
     def run(self) -> None:
         try:
@@ -93,10 +108,57 @@ class KisOrderWorker(QThread):
                 event_recorder=self.event_recorder,
                 signal_payload=self.signal_payload,
                 signal_event_type=self.signal_event_type,
+                execution_authority=self.execution_authority,
+                execution_lease=self.execution_lease,
+                lease_engine=self.lease_engine,
             )
             self.finished_order.emit(order)
         except Exception as exc:
             self.error_occurred.emit(str(exc))
+
+
+class HandoffReconciliationWorker(QThread):
+    """Run post-claim broker reconciliation off the Qt thread.
+
+    Mirrors OrderReconciliationWorker's pattern (broker calls must never
+    block the Qt event loop). Fired once immediately after a device becomes
+    main via automatic cross-machine handoff; the monitor timer and kill
+    switch are only allowed to activate once ``finished_reconciliation``
+    reports ``ok=True`` -- see MainWindow._begin_post_claim_handoff.
+    """
+
+    finished_reconciliation = pyqtSignal(object)  # PostClaimReconciliationResult
+    error_occurred = pyqtSignal(str)
+
+    def __init__(
+        self,
+        buylist_manager,
+        *,
+        environment: str = "PROD",
+        account_no: str = "",
+        broker: Optional[Broker] = None,
+    ) -> None:
+        super().__init__()
+        self.buylist_manager = buylist_manager
+        self.environment = environment
+        self.account_no = account_no
+        self.broker = KisBroker() if broker is None else broker
+
+    def run(self) -> None:
+        try:
+            result = run_post_claim_broker_reconciliation(
+                self.buylist_manager,
+                environment=self.environment,
+                account_no=self.account_no,
+                broker=self.broker,
+                event_recorder=record_event,
+            )
+            self.finished_reconciliation.emit(result)
+        except Exception as exc:
+            self.error_occurred.emit(str(exc))
+            self.finished_reconciliation.emit(
+                PostClaimReconciliationResult(ok=False, errors=[str(exc)])
+            )
 
 
 class OrderReconciliationWorker(QThread):

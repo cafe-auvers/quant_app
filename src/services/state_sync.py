@@ -35,6 +35,7 @@ from sqlalchemy import (
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import SQLAlchemyError
 
+from src.services.runtime_status import MAIN_APP_PROCESS, heartbeat_row_is_stale
 from src.utils.config import DATA_DIR
 from src.utils.storage import load_json, save_json
 
@@ -43,9 +44,17 @@ logger = logging.getLogger(__name__)
 WATCHLIST_KEY = "watchlist"
 BUYLIST_KEY = "buylist"
 TRADE_PLANS_KEY = "trade_plans"
+# Cross-machine handoff needs the execution queue too -- a valid automated
+# entry today must be queue-backed (legacy ACTIVE entry automation is
+# retired), so without syncing this a device that takes over main-device
+# status can receive a buylist item showing EXECUTE_READY with no matching
+# queue item at all. Dynamic per-item candidate/status data synced this way
+# is never trusted directly -- the handoff-reconciliation path re-validates
+# it against fresh intraday data before resuming auto-submission.
+EXECUTION_QUEUE_KEY = "execution_queue"
 MAIN_DEVICE_KEY = "__main_device__"
 
-SYNCED_STATE_KEYS = (WATCHLIST_KEY, BUYLIST_KEY, TRADE_PLANS_KEY)
+SYNCED_STATE_KEYS = (WATCHLIST_KEY, BUYLIST_KEY, TRADE_PLANS_KEY, EXECUTION_QUEUE_KEY)
 LOCAL_DEVICE_ROLE_FILE = DATA_DIR / "device_role.json"
 
 PULL_OK = "ok"
@@ -98,6 +107,7 @@ class MainDevice:
     hostname: str
     revision: int
     updated_at: datetime
+    lease_token: str = ""
 
 
 @dataclass(frozen=True)
@@ -276,6 +286,7 @@ def pull_state(engine: Optional[Engine], state_key: str) -> PullResult:
 def _main_device_from_state(state: RemoteState) -> MainDevice:
     device_id = str(state.payload.get("device_id") or "").strip()
     hostname = str(state.payload.get("hostname") or "").strip()
+    lease_token = str(state.payload.get("lease_token") or "").strip()
     if not device_id:
         raise ValueError("Main-device ownership row has no device_id")
     return MainDevice(
@@ -283,6 +294,7 @@ def _main_device_from_state(state: RemoteState) -> MainDevice:
         hostname=hostname,
         revision=state.revision,
         updated_at=state.updated_at,
+        lease_token=lease_token,
     )
 
 
@@ -302,11 +314,21 @@ def claim_main_device(
     engine: Optional[Engine],
     role: LocalDeviceRole,
 ) -> OwnershipResult:
-    """Atomically make ``role`` the sole remote writer."""
+    """Atomically make ``role`` the sole remote writer.
+
+    Mints a fresh ``lease_token`` on every claim (manual or bootstrap) so
+    ``ExecutionAuthority.require_current_lease`` has something to fence
+    order submission against -- a device only trades while its cached token
+    still matches the live ownership row.
+    """
     if engine is None:
         return OwnershipResult(False, error="State sync database is unavailable.")
     payload_json = json.dumps(
-        {"device_id": role.device_id, "hostname": role.hostname},
+        {
+            "device_id": role.device_id,
+            "hostname": role.hostname,
+            "lease_token": str(uuid.uuid4()),
+        },
         separators=(",", ":"),
     )
     try:
@@ -338,6 +360,178 @@ def claim_main_device(
         return OwnershipResult(True, main_device=_main_device_from_state(state))
     except (SQLAlchemyError, ValueError, TypeError) as exc:
         logger.info("Could not claim main-device ownership: %s", exc)
+        return OwnershipResult(False, error=str(exc))
+
+
+def claim_main_device_if_stale(
+    engine: Optional[Engine],
+    role: LocalDeviceRole,
+    *,
+    expected_owner_device_id: str,
+    heartbeat_cutoff_seconds: int = 60,
+) -> OwnershipResult:
+    """Atomically transfer ownership away from a confirmed-stale owner.
+
+    This is the only safe way to auto-claim on behalf of an unattended
+    device (e.g. a PC taking over after the laptop went dark). A naive
+    "check heartbeat, then call ``claim_main_device``" sequence has a
+    time-of-check/time-of-use gap: the previous owner can reconnect and
+    resume its heartbeat between the caller's staleness observation and the
+    claim. This function re-verifies both the current owner's identity and
+    heartbeat staleness *inside the same row lock* that performs the
+    transfer, using the database server's own clock throughout
+    (``heartbeat_row_is_stale``), so nothing can change underneath it.
+
+    Mints a fresh ``lease_token`` on success, exactly like ``claim_main_device``.
+    """
+    if engine is None:
+        return OwnershipResult(False, error="State sync database is unavailable.")
+    expected_owner_device_id = str(expected_owner_device_id or "").strip()
+    if not expected_owner_device_id:
+        return OwnershipResult(False, error="No expected owner device to verify against.")
+    try:
+        table = _ensure_state_sync_table(engine)
+        with engine.begin() as conn:
+            row = _select_row(conn, table, MAIN_DEVICE_KEY, for_update=True)
+            if row is None:
+                return OwnershipResult(
+                    False,
+                    error="Ownership was already released; use claim_main_device for a clean handoff.",
+                )
+            current_state = _remote_state_from_row(row, MAIN_DEVICE_KEY)
+            current_owner = _main_device_from_state(current_state)
+            if current_owner.device_id != expected_owner_device_id:
+                return OwnershipResult(
+                    False,
+                    error=(
+                        "Ownership changed since it was observed stale "
+                        f"(now {current_owner.device_id!r}, expected {expected_owner_device_id!r})."
+                    ),
+                )
+            if not heartbeat_row_is_stale(
+                conn,
+                engine,
+                current_owner.hostname,
+                process_name=MAIN_APP_PROCESS,
+                max_age_seconds=heartbeat_cutoff_seconds,
+            ):
+                return OwnershipResult(
+                    False,
+                    error="Previous owner's heartbeat is fresh again; not claiming.",
+                )
+
+            payload_json = json.dumps(
+                {
+                    "device_id": role.device_id,
+                    "hostname": role.hostname,
+                    "lease_token": str(uuid.uuid4()),
+                },
+                separators=(",", ":"),
+            )
+            current_revision = int(row.revision or 1)
+            conn.execute(
+                table.update()
+                .where(table.c.state_key == MAIN_DEVICE_KEY)
+                .where(table.c.revision == current_revision)
+                .values(
+                    payload=payload_json,
+                    revision=current_revision + 1,
+                    updated_at=_server_now(engine),
+                    updated_by_host=role.hostname,
+                    updated_by_device=role.device_id,
+                )
+            )
+            written_row = _select_row(conn, table, MAIN_DEVICE_KEY)
+        if written_row is None:
+            return OwnershipResult(False, error="Stale-owner claim was not persisted.")
+        state = _remote_state_from_row(written_row, MAIN_DEVICE_KEY)
+        return OwnershipResult(True, main_device=_main_device_from_state(state))
+    except (SQLAlchemyError, ValueError, TypeError) as exc:
+        logger.info("Could not atomically claim stale main-device ownership: %s", exc)
+        return OwnershipResult(False, error=str(exc))
+
+
+def claim_main_device_if_unclaimed(
+    engine: Optional[Engine],
+    role: LocalDeviceRole,
+) -> OwnershipResult:
+    """Atomically claim ownership only if the row is still genuinely missing.
+
+    The clean-handoff counterpart to ``claim_main_device_if_stale``: after a
+    device observes "no owner" (a released row), something else could still
+    have claimed it in the gap before this call actually runs. Re-checking
+    inside the same row lock that performs the insert closes that race the
+    same way ``claim_main_device_if_stale`` closes it for the stale-heartbeat
+    case -- a blind ``claim_main_device`` call here would silently steal the
+    lease back from whatever legitimately claimed it in between.
+    """
+    if engine is None:
+        return OwnershipResult(False, error="State sync database is unavailable.")
+    try:
+        table = _ensure_state_sync_table(engine)
+        with engine.begin() as conn:
+            row = _select_row(conn, table, MAIN_DEVICE_KEY, for_update=True)
+            if row is not None:
+                return OwnershipResult(
+                    False,
+                    error="Ownership was claimed by another device before this claim ran.",
+                )
+            payload_json = json.dumps(
+                {
+                    "device_id": role.device_id,
+                    "hostname": role.hostname,
+                    "lease_token": str(uuid.uuid4()),
+                },
+                separators=(",", ":"),
+            )
+            conn.execute(
+                table.insert().values(
+                    state_key=MAIN_DEVICE_KEY,
+                    payload=payload_json,
+                    revision=1,
+                    updated_at=_server_now(engine),
+                    updated_by_host=role.hostname,
+                    updated_by_device=role.device_id,
+                )
+            )
+            written_row = _select_row(conn, table, MAIN_DEVICE_KEY)
+        if written_row is None:
+            return OwnershipResult(False, error="Unclaimed-row claim was not persisted.")
+        state = _remote_state_from_row(written_row, MAIN_DEVICE_KEY)
+        return OwnershipResult(True, main_device=_main_device_from_state(state))
+    except (SQLAlchemyError, ValueError, TypeError) as exc:
+        logger.info("Could not atomically claim unclaimed main-device ownership: %s", exc)
+        return OwnershipResult(False, error=str(exc))
+
+
+def release_main_device(engine: Optional[Engine], role: LocalDeviceRole) -> OwnershipResult:
+    """Delete the ownership row iff still held by ``role``; a no-op otherwise.
+
+    Deletion (not blanking the payload) is deliberate: ``get_main_device()``
+    already treats a missing row as a clean, well-tested "unclaimed" state
+    (``PULL_MISSING``) that ``reconcile_state_with_remote`` already knows how
+    to bootstrap from. Blanking the payload would instead make
+    ``_main_device_from_state`` raise, which ``get_main_device`` turns into a
+    fatal ownership-read error -- stalling reconciliation on *both* devices
+    until someone manually re-claims.
+    """
+    if engine is None:
+        return OwnershipResult(False, error="State sync database is unavailable.")
+    try:
+        table = _ensure_state_sync_table(engine)
+        with engine.begin() as conn:
+            row = _select_row(conn, table, MAIN_DEVICE_KEY, for_update=True)
+            if row is None:
+                return OwnershipResult(True)
+            current_state = _remote_state_from_row(row, MAIN_DEVICE_KEY)
+            current_owner = _main_device_from_state(current_state)
+            if current_owner.device_id != role.device_id:
+                # Not ours to release -- ownership already moved on.
+                return OwnershipResult(True)
+            conn.execute(table.delete().where(table.c.state_key == MAIN_DEVICE_KEY))
+        return OwnershipResult(True)
+    except (SQLAlchemyError, ValueError, TypeError) as exc:
+        logger.info("Could not release main-device ownership: %s", exc)
         return OwnershipResult(False, error=str(exc))
 
 

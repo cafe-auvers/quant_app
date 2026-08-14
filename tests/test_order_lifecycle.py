@@ -2241,6 +2241,7 @@ def test_submit_kis_sell_order_uses_environment_and_live_price_without_current_p
             pre_trade_risk_decision=None,
             strategy_id="",
             plan_id="",
+            **_kwargs,
         ):
             self.environment = environment
             self.symbol = symbol
@@ -2417,6 +2418,7 @@ def test_submit_kis_buy_order_honors_explicit_order_price_over_live_price(monkey
             pre_trade_risk_decision=None,
             strategy_id="",
             plan_id="",
+            **_kwargs,
         ):
             self.environment = environment
             self.symbol = symbol

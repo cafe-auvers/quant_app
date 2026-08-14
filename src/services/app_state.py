@@ -18,8 +18,14 @@ from src.services.cloud_backup import (
     backup_state_files,
     resolve_backup_root,
 )
+from src.services.runtime_status import (
+    DEFAULT_HEARTBEAT_MAX_AGE_SECONDS,
+    MAIN_APP_PROCESS,
+    get_runtime_process_status,
+)
 from src.services.state_sync import (
     BUYLIST_KEY,
+    EXECUTION_QUEUE_KEY,
     PULL_ERROR,
     PULL_OK,
     PUSH_CONFLICT,
@@ -30,9 +36,12 @@ from src.services.state_sync import (
     WATCHLIST_KEY,
     LocalDeviceRole,
     claim_main_device,
+    claim_main_device_if_stale,
+    claim_main_device_if_unclaimed,
     get_main_device,
     pull_state,
     push_state,
+    release_main_device,
     set_local_device_main,
 )
 from src.utils.config import DATA_DIR
@@ -44,6 +53,10 @@ logger = logging.getLogger(__name__)
 WATCHLIST_FILE = DATA_DIR / "watchlist.json"
 BUYLIST_FILE = DATA_DIR / "buylist.json"
 TRADE_PLANS_FILE = DATA_DIR / "trade_plans.json"
+# Same physical file as src/ui/buylist/constants.py's EXECUTION_QUEUE_FILE --
+# defined independently here (like the three files above) rather than
+# importing from src/ui so this services-layer module has no UI dependency.
+EXECUTION_QUEUE_FILE = DATA_DIR / "execution_queue.json"
 SCANNER_SETUPS_FILE = DATA_DIR / "scanner_setups.json"
 CHART_DRAWINGS_FILE = DATA_DIR / "chart_drawings.json"
 TAB_OPTIONS_FILE = DATA_DIR / "tab_options.json"
@@ -350,6 +363,12 @@ class StateSaveManager:
             WATCHLIST_KEY: watchlist_dict,
             BUYLIST_KEY: buylist_dict,
             TRADE_PLANS_KEY: trade_manager_dict,
+            # Not one of this method's explicit params (execution_queue.json
+            # is saved independently by _save_execution_queue_state, not
+            # through StateSaveManager) -- read fresh from disk here instead
+            # of widening this method's signature and every one of its
+            # call sites just to thread one more dict through.
+            EXECUTION_QUEUE_KEY: load_json(EXECUTION_QUEUE_FILE, {}),
         }
         sync_entries = _read_sync_entries(self._metadata_path())
         written_entries: Dict[str, Dict[str, Any]] = {}
@@ -839,6 +858,7 @@ def _synced_key_to_file() -> Dict[str, Path]:
         WATCHLIST_KEY: WATCHLIST_FILE,
         BUYLIST_KEY: BUYLIST_FILE,
         TRADE_PLANS_KEY: TRADE_PLANS_FILE,
+        EXECUTION_QUEUE_KEY: EXECUTION_QUEUE_FILE,
     }
 
 
@@ -850,6 +870,11 @@ class StateReconcileResult:
     is_main_device: bool = False
     main_device_hostname: str = ""
     local_role: LocalDeviceRole | None = None
+    # Populated whenever ``is_main_device`` is True -- the current
+    # main-device lease token, cached by MainWindow and threaded into every
+    # live order submission so ExecutionAuthority can re-verify it at the
+    # actual broker boundary. Empty whenever this device isn't main.
+    lease_token: str = ""
 
 
 def _demote_after_lost_ownership(
@@ -857,6 +882,7 @@ def _demote_after_lost_ownership(
     result: StateReconcileResult,
 ) -> LocalDeviceRole:
     result.is_main_device = False
+    result.lease_token = ""
     try:
         role = set_local_device_main(role, False)
     except Exception as exc:
@@ -928,6 +954,9 @@ def reconcile_state_with_remote(
         result.local_role = role
         result.is_main_device = is_main
         result.main_device_hostname = main_device.hostname if main_device else ""
+        result.lease_token = (
+            main_device.lease_token if is_main and main_device else ""
+        )
 
         # Once startup reconciliation has established the base revisions, the
         # exclusive writer only needs to verify that it still owns the lease.
@@ -1084,6 +1113,187 @@ def activate_device_as_main(
             local_role=LocalDeviceRole(role.device_id, role.hostname, True),
         )
     return reconcile_state_with_remote(engine, role, save_lock=save_lock)
+
+
+def should_auto_claim_main(
+    engine,
+    role: LocalDeviceRole,
+    *,
+    other_hostname: str = "",
+    max_heartbeat_age_seconds: int = DEFAULT_HEARTBEAT_MAX_AGE_SECONDS,
+) -> tuple[bool, str, str]:
+    """Decide whether this (unattended) device should auto-claim main status.
+
+    Returns ``(should_claim, expected_owner_device_id, reason)``. This is a
+    read-only observation, not the claim itself -- the caller must pass
+    ``expected_owner_device_id`` into ``claim_main_device_if_stale`` so the
+    actual claim re-verifies both facts atomically instead of trusting what
+    was true at observation time (closing the check-then-claim race).
+    """
+    if role.is_main:
+        return False, "", ""
+    ownership = get_main_device(engine)
+    if not ownership.success:
+        # Unknown state (DB hiccup) -- do not act on it.
+        return False, "", ""
+    main_device = ownership.main_device
+    if main_device is None:
+        return True, "", "ownership released (clean handoff)"
+    if main_device.device_id == role.device_id:
+        # Defensive: shouldn't happen if role.is_main was accurate.
+        return False, "", ""
+    status = get_runtime_process_status(
+        engine,
+        main_device.hostname or other_hostname,
+        process_name=MAIN_APP_PROCESS,
+        max_age_seconds=max_heartbeat_age_seconds,
+    )
+    if status.observed and not status.active:
+        age = f"{status.age_seconds:.0f}s" if status.age_seconds is not None else "unknown"
+        return True, main_device.device_id, f"stale heartbeat ({age})"
+    return False, "", ""
+
+
+def auto_claim_main_device_if_stale(
+    engine,
+    role: LocalDeviceRole,
+    *,
+    expected_owner_device_id: str,
+    heartbeat_cutoff_seconds: int = DEFAULT_HEARTBEAT_MAX_AGE_SECONDS,
+    save_lock: threading.Lock | None = None,
+) -> StateReconcileResult:
+    """Automatic, fenced equivalent of ``activate_device_as_main``.
+
+    Used only for unattended handoff (``should_auto_claim_main`` said yes) --
+    the manual "Use This Device as Main" button keeps using
+    ``activate_device_as_main``/plain ``claim_main_device`` unchanged. The
+    claim itself goes through a fenced primitive that re-verifies the
+    expected state atomically inside the same row lock, instead of trusting
+    the caller's earlier observation:
+
+    - ``expected_owner_device_id`` empty (clean handoff -- ownership was
+      released) uses ``claim_main_device_if_unclaimed``, which still
+      re-checks the row is genuinely empty at claim time rather than
+      blindly overwriting whatever might have claimed it in the interim.
+    - Non-empty (stale-heartbeat fallback) uses ``claim_main_device_if_stale``,
+      re-verifying both the expected owner and heartbeat staleness.
+    """
+    if engine is None:
+        return StateReconcileResult(
+            errors=["State sync database is unavailable."],
+            local_role=role,
+        )
+
+    # Same reasoning as activate_device_as_main: a device that missed its
+    # startup pull must never turn an automatic claim into a blind overwrite
+    # of newer remote buylist/execution-queue state.
+    pull_only_role = LocalDeviceRole(role.device_id, role.hostname, False)
+    prepared = reconcile_state_with_remote(engine, pull_only_role, save_lock=save_lock)
+    if prepared.errors or prepared.conflict_keys:
+        return prepared
+
+    expected_owner_device_id = str(expected_owner_device_id or "").strip()
+    if expected_owner_device_id:
+        ownership = claim_main_device_if_stale(
+            engine,
+            role,
+            expected_owner_device_id=expected_owner_device_id,
+            heartbeat_cutoff_seconds=heartbeat_cutoff_seconds,
+        )
+    else:
+        ownership = claim_main_device_if_unclaimed(engine, role)
+    if not ownership.success:
+        return StateReconcileResult(
+            errors=[ownership.error or "Could not auto-claim main-device ownership."],
+            local_role=role,
+        )
+    try:
+        role = set_local_device_main(role, True)
+    except Exception as exc:
+        return StateReconcileResult(
+            errors=[f"Main ownership changed, but the local role could not be saved: {exc}"],
+            is_main_device=True,
+            main_device_hostname=role.hostname,
+            lease_token=ownership.main_device.lease_token if ownership.main_device else "",
+            local_role=LocalDeviceRole(role.device_id, role.hostname, True),
+        )
+    return reconcile_state_with_remote(engine, role, save_lock=save_lock)
+
+
+def release_main_device_and_demote(
+    engine,
+    role: LocalDeviceRole,
+) -> tuple[bool, LocalDeviceRole, str]:
+    """Release ownership (if held) and persist this device as pull-only.
+
+    Returns ``(released_cleanly, updated_role, error)``. Demoting the local
+    role is not optional here: without it, ``reconcile_state_with_remote``'s
+    own bootstrap branch ("owner row missing + local role.is_main == True" ->
+    self-claim) would let this device silently re-claim its own just-released
+    row on its very next reconcile tick.
+    """
+    error = ""
+    released = True
+    if role.is_main:
+        result = release_main_device(engine, role)
+        released = result.success
+        if not released:
+            error = result.error
+    try:
+        role = set_local_device_main(role, False)
+    except Exception as exc:
+        error = error or f"Could not persist pull-only device role: {exc}"
+    return released, role, error
+
+
+def publish_handoff_snapshot(
+    engine,
+    role: LocalDeviceRole,
+    buylist_dict: Dict[str, Any],
+    execution_queue_dict: Dict[str, Any],
+    *,
+    metadata_path: Path | None = None,
+) -> bool:
+    """Strictly push buylist + execution-queue state before releasing ownership.
+
+    Unlike ``StateSaveManager._push_to_remote`` (best-effort -- a failed
+    remote push there is logged and the overall local save still reports
+    success), this returns False unless every push that was attempted
+    actually committed. Callers must treat a False return as an *unclean*
+    handoff: the next device can still pick it up via the stale-heartbeat
+    fallback, but should hold a stricter reconciliation bar before trusting
+    the synced snapshot, since it might not reflect this device's last
+    moments before shutdown.
+    """
+    if engine is None:
+        return False
+    path = metadata_path or STATE_METADATA_FILE
+    sync_entries = _read_sync_entries(path)
+    payloads = {
+        BUYLIST_KEY: buylist_dict,
+        EXECUTION_QUEUE_KEY: execution_queue_dict,
+    }
+    updates: Dict[str, Dict[str, Any]] = {}
+    for state_key, payload in payloads.items():
+        entry = sync_entries.get(state_key)
+        has_base, base_revision, base_hash = _base_sync_values(entry)
+        payload_hash = _state_payload_hash(payload)
+        if has_base and payload_hash == base_hash:
+            continue  # Unchanged -- already published, nothing to do.
+        expected_revision = base_revision if has_base else 0
+        result = push_state(
+            engine,
+            state_key,
+            payload,
+            device_id=role.device_id,
+            expected_revision=expected_revision,
+        )
+        if result.status != PUSH_WRITTEN:
+            return False
+        updates[state_key] = _sync_entry(result.revision, payload_hash, result.updated_at)
+    if updates:
+        _update_sync_entries(updates, path)
+    return True
 
 
 def save_app_state(

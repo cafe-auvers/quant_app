@@ -4,6 +4,7 @@ import datetime as dt
 import logging
 import math
 import os
+import platform
 import subprocess
 import sys
 import tempfile
@@ -37,19 +38,24 @@ from src.infrastructure.database.mirror_engine import resolve_data_engine
 from src.infrastructure.database.mirror_freshness import (
     local_mirror_hourly_is_stale, local_mirror_is_stale)
 from src.services import trading_state
-from src.services.app_state import (SETTINGS_FILE, SaveResult,
-                                    StateReconcileResult,
+from src.services.app_state import (EXECUTION_QUEUE_FILE, SETTINGS_FILE,
+                                    SaveResult, StateReconcileResult,
                                     activate_device_as_main,
+                                    auto_claim_main_device_if_stale,
                                     get_state_save_manager, load_buylist_state,
                                     load_chart_drawings_state,
                                     load_scanner_setups_state,
                                     load_tab_options_state,
                                     load_trade_plans_state,
                                     load_watchlist_state,
+                                    publish_handoff_snapshot,
                                     reconcile_state_with_remote,
-                                    save_app_state)
+                                    release_main_device_and_demote,
+                                    save_app_state, should_auto_claim_main)
 from src.services.cloud_backup import (restore_state_directory,
                                        restore_state_files)
+from src.services.execution_authority import ExecutionAuthority, LeaseHandle
+from src.services.handoff_reconciliation import reset_runtime_only_order_flags
 from src.services.historical_refresh_control import (MODE_1D, MODE_1H,
                                                      is_refresh_running,
                                                      read_status,
@@ -58,6 +64,8 @@ from src.services.order_ledger import (append_order, find_open_orders,
                                        has_open_order, load_order_ledger,
                                        merge_orders, save_order_ledger,
                                        update_order)
+from src.services.runtime_status import safe_mark_runtime_process_stopped
+from src.services.sleep_readiness import write_sleep_readiness_snapshot
 from src.services.state_sync import LocalDeviceRole, load_local_device_role
 from src.ui.buylist import BuylistMixin
 from src.ui.charts.controller import ChartsControllerMixin
@@ -75,8 +83,9 @@ from src.ui.mixins.dashboard_mixin import DashboardMixin
 from src.ui.mixins.scanner_mixin import ScannerMixin
 from src.ui.mixins.sidebar_mixin import SidebarMixin
 from src.ui.mixins.watchlist_mixin import WatchlistMixin
+from src.ui.order_workers import HandoffReconciliationWorker
 from src.ui.workers import PcRemoteStatusWorker, WatchlistAiWorker
-from src.utils.config import DATA_DIR, ROOT_DIR, RULEBOOK_DIR
+from src.utils.config import DATA_DIR, ROOT_DIR, RULEBOOK_DIR, get_env_value
 from src.utils.data_loader import get_default_universe
 from src.utils.intraday_helpers import \
     extract_latest_opening_bar as _extract_latest_opening_bar
@@ -248,6 +257,8 @@ class StateSyncWorker(QThread):
         activate: bool = False,
         ownership_only_when_main: bool = False,
         generation: int = 0,
+        auto_claim: bool = False,
+        expected_owner_device_id: str = "",
     ) -> None:
         super().__init__()
         self.engine = engine
@@ -256,10 +267,24 @@ class StateSyncWorker(QThread):
         self.activate = activate
         self.ownership_only_when_main = ownership_only_when_main
         self.generation = int(generation)
+        # Automatic cross-machine handoff: claims via the fenced
+        # claim_main_device_if_stale primitive (re-verifying the expected
+        # owner + heartbeat staleness atomically) instead of the plain
+        # manual-activation path. See should_auto_claim_main /
+        # auto_claim_main_device_if_stale in src/services/app_state.py.
+        self.auto_claim = auto_claim
+        self.expected_owner_device_id = expected_owner_device_id
 
     def run(self) -> None:
         try:
-            if self.activate:
+            if self.auto_claim:
+                result = auto_claim_main_device_if_stale(
+                    self.engine,
+                    self.role,
+                    expected_owner_device_id=self.expected_owner_device_id,
+                    save_lock=self.save_lock,
+                )
+            elif self.activate:
                 result = activate_device_as_main(
                     self.engine,
                     self.role,
@@ -359,6 +384,33 @@ class MainWindow(
         self.state_sync_worker = None
         self._last_state_sync_notice = ""
         self._initial_state_sync_complete = False
+        # Main-device lease fencing: the token this device believes it
+        # currently holds (empty when pull-only), refreshed by
+        # _on_state_sync_completed whenever a claim/reconcile confirms it,
+        # and threaded into every live order submission via
+        # _current_execution_lease_kwargs so ExecutionAuthority can re-verify
+        # it at the actual broker boundary.
+        self._current_lease_token = ""
+        self._last_successful_reconcile_at: Optional[dt.datetime] = None
+
+        # Automatic cross-machine handoff (laptop <-> PC). Both env flags
+        # default OFF -- only the unattended device (the PC, per the deployed
+        # .env) should ever set AUTO_CLAIM_MAIN_ON_HANDOFF, and only after
+        # EXPECTED_AUTO_CLAIM_HOSTNAME confirms this is that specific
+        # machine, so a copied .env can't silently arm this elsewhere. The
+        # laptop deliberately never auto-reclaims on startup -- it stays
+        # pull-only until "Use This Device as Main" is clicked manually.
+        self._auto_claim_main_enabled = self._handoff_env_flag_true(
+            "AUTO_CLAIM_MAIN_ON_HANDOFF"
+        ) and self._expected_auto_claim_hostname_matches()
+        self._auto_arm_trading_on_handoff = self._handoff_env_flag_true(
+            "AUTO_ARM_TRADING_ON_HANDOFF"
+        )
+        self.handoff_reconciliation_worker = None
+        self._handoff_generation = 0
+        self._state_sync_auto_claim = False
+        self._last_main_device_hostname = ""
+        self._last_handoff_blocked_symbols: Tuple[str, ...] = ()
         self.kis_account_snapshots: dict[tuple[str, str], dict] = {}
         self._kis_api_last_success_at = ""
         self._kis_api_last_error = ""
@@ -937,7 +989,13 @@ class MainWindow(
             )
             self.run_all_scanners(show_warnings=False)
 
-    def _start_state_sync(self, *, activate: bool = False) -> None:
+    def _start_state_sync(
+        self,
+        *,
+        activate: bool = False,
+        auto_claim: bool = False,
+        expected_owner_device_id: str = "",
+    ) -> None:
         """Start one ownership/state reconciliation in a background worker."""
         if self.__dict__.get("_database_shutting_down", False):
             return
@@ -959,16 +1017,20 @@ class MainWindow(
             self.pc_db_engine,
             self.state_sync_role,
             self._ensure_save_lock(),
-            activate=activate,
+            activate=activate or auto_claim,
             ownership_only_when_main=(
                 not activate
+                and not auto_claim
                 and self.state_sync_role.is_main
                 and self._initial_state_sync_complete
             ),
             generation=self.__dict__.get("_database_transition_generation", 0),
+            auto_claim=auto_claim,
+            expected_owner_device_id=expected_owner_device_id,
         )
         self.state_sync_worker = worker
-        self._state_sync_action = "activate" if activate else "reconcile"
+        self._state_sync_action = "activate" if (activate or auto_claim) else "reconcile"
+        self._state_sync_auto_claim = auto_claim
         worker.completed.connect(self._on_state_sync_completed)
         self._track_worker("state_sync_worker", worker)
         if activate and hasattr(self, "main_device_button"):
@@ -1001,6 +1063,7 @@ class MainWindow(
         if not result.errors:
             self._initial_state_sync_complete = True
             self._pc_database_coordination_ready = True
+            self._last_successful_reconcile_at = dt.datetime.now(dt.timezone.utc)
             self._bind_remote_state_engine(
                 self.pc_db_engine,
                 is_main_device=result.is_main_device,
@@ -1011,15 +1074,27 @@ class MainWindow(
                 self.pc_db_engine,
                 is_main_device=False,
             )
+        self._current_lease_token = result.lease_token if result.is_main_device else ""
+        if result.main_device_hostname:
+            self._last_main_device_hostname = result.main_device_hostname
         self._update_main_device_button(
             main_hostname=result.main_device_hostname,
         )
 
         action = getattr(self, "_state_sync_action", "reconcile")
+        was_auto_claim = bool(self._state_sync_auto_claim)
+        self._state_sync_auto_claim = False
         if action == "activate" and result.is_main_device:
-            self.append_log(
-                "This device is now the exclusive main device; the other device is pull-only."
-            )
+            if was_auto_claim:
+                self.append_log(
+                    "Automatic handoff: claimed main-device ownership "
+                    f"({result.main_device_hostname or platform.node()}); "
+                    "reconciling against the broker before resuming monitoring."
+                )
+            else:
+                self.append_log(
+                    "This device is now the exclusive main device; the other device is pull-only."
+                )
         elif previous_main and not result.is_main_device:
             owner = result.main_device_hostname or "another device"
             self.append_log(
@@ -1040,6 +1115,13 @@ class MainWindow(
         if "trade_plans" in updated_keys:
             self.trade_manager = self._load_trade_plans()
             self.populate_trade_plan_table()
+        if "execution_queue" in updated_keys:
+            # Lazily reloaded on next access (_ensure_execution_queue_manager
+            # caches on self.execution_queue_manager) -- just drop the stale
+            # cached instance so the freshly-pulled file wins.
+            self.__dict__.pop("execution_queue_manager", None)
+            if hasattr(self, "populate_buylist_dashboard"):
+                self.populate_buylist_dashboard()
 
         notices = []
         if result.conflict_keys:
@@ -1054,6 +1136,158 @@ class MainWindow(
             self.append_log(notice)
         self._last_state_sync_notice = notice
         self.update_dashboard_summary()
+
+        if action == "activate" and result.is_main_device and not result.errors:
+            if was_auto_claim:
+                self._begin_post_claim_handoff()
+            return
+
+        # Automatic handoff detection: only ever runs on a device explicitly
+        # configured for it (PC's .env only, hostname-guarded), only on a
+        # plain reconcile tick (never re-entering while an activation is
+        # already in flight), and never while this device is already main.
+        if (
+            action != "activate"
+            and self._auto_claim_main_enabled
+            and not result.is_main_device
+            and not (self.state_sync_worker and self.state_sync_worker.isRunning())
+        ):
+            should_claim, expected_owner_device_id, reason = should_auto_claim_main(
+                self.pc_db_engine,
+                self.state_sync_role,
+                other_hostname=result.main_device_hostname,
+            )
+            if should_claim:
+                self.append_log(f"Automatic handoff: claiming main device ({reason}).")
+                self._start_state_sync(
+                    auto_claim=True,
+                    expected_owner_device_id=expected_owner_device_id,
+                )
+
+    # --- Automatic cross-machine handoff: post-claim reconciliation --------
+    # The safety-critical sequence that must run before a device that just
+    # auto-claimed main-device status is allowed to resume monitoring/live
+    # order submission. Never entered from the manual "Use This Device as
+    # Main" button (see the was_auto_claim guard above) -- that flow keeps
+    # its existing behavior unchanged.
+
+    def _begin_post_claim_handoff(self) -> None:
+        """Lock pending flags, then reconcile against the broker off-thread."""
+        self._handoff_generation += 1
+        generation = self._handoff_generation
+
+        reset_items = reset_runtime_only_order_flags(self.buylist_manager)
+        if reset_items:
+            symbols = ", ".join(sorted({item.symbol for item in reset_items}))
+            self.append_log(
+                f"Automatic handoff: locked {len(reset_items)} in-flight PROD "
+                f"item(s) pending broker reconciliation ({symbols})."
+            )
+            self._save_buylist_state()
+            self.populate_buylist_dashboard()
+
+        account_no = ""
+        if hasattr(self, "_first_account_no_for_environment"):
+            account_no = self._first_account_no_for_environment("PROD") or ""
+
+        worker = HandoffReconciliationWorker(
+            self.buylist_manager, environment="PROD", account_no=account_no
+        )
+        self.handoff_reconciliation_worker = worker
+        worker.finished_reconciliation.connect(
+            lambda outcome, gen=generation: self._on_post_claim_reconciliation_finished(
+                outcome, gen
+            )
+        )
+        worker.error_occurred.connect(self._on_post_claim_reconciliation_error)
+        self._track_worker("handoff_reconciliation_worker", worker)
+        worker.start()
+
+    def _on_post_claim_reconciliation_finished(self, outcome, generation: int) -> None:
+        if generation != self._handoff_generation:
+            # Superseded by a newer handoff attempt.
+            return
+        if not self.state_sync_role.is_main:
+            # Lost the lease while reconciliation was running -- an old
+            # retry/reconciliation pass must never resume monitoring or arm
+            # trading after that.
+            return
+        self._save_buylist_state()
+        self.populate_buylist_dashboard()
+        self._last_handoff_blocked_symbols = tuple(outcome.blocked_symbols)
+        if outcome.ok:
+            self.append_log(
+                f"Automatic handoff: broker reconciliation clean for "
+                f"{len(outcome.reconciled_symbols)} symbol(s)."
+            )
+            self._auto_arm_trading_kill_switch()
+            started = self._ensure_buylist_monitor_running("PROD")
+            self.append_log(
+                "Automatic handoff complete: monitor "
+                f"{'started' if started else 'already running'}"
+                f"{', live trading armed' if trading_state.is_trading_enabled() else ' (live trading NOT armed)'}."
+            )
+        else:
+            blocked = ", ".join(outcome.blocked_symbols) or "unknown"
+            self.append_log(
+                f"Automatic handoff BLOCKED pending broker reconciliation for: "
+                f"{blocked}. Retrying in 30s."
+            )
+            if outcome.errors:
+                self.append_log(f"Reconciliation error(s): {'; '.join(outcome.errors)}")
+            if not self.state_sync_role.is_main:
+                # Lost the lease while we were blocked -- stop retrying.
+                return
+            QTimer.singleShot(30_000, self._retry_post_claim_handoff_if_still_main)
+
+    def _retry_post_claim_handoff_if_still_main(self) -> None:
+        if not self.state_sync_role.is_main:
+            return
+        if self.__dict__.get("_database_shutting_down", False):
+            return
+        self._begin_post_claim_handoff()
+
+    def _on_post_claim_reconciliation_error(self, message: str) -> None:
+        self.append_log(f"Automatic handoff: reconciliation worker failed: {message}")
+
+    def _auto_arm_trading_kill_switch(self) -> None:
+        """Arm live trading after a clean automatic handoff -- gated, not automatic-by-default.
+
+        Deliberately a narrower, separately-configured policy from
+        AUTO_CLAIM_MAIN_ON_HANDOFF: the kill switch otherwise starts
+        disabled on every launch and is only armed by an explicit in-process
+        UI click. Every condition below must hold, not just "we are main."
+        """
+        if not self._auto_arm_trading_on_handoff:
+            self.append_log(
+                "Live trading NOT auto-armed: AUTO_ARM_TRADING_ON_HANDOFF is not set."
+            )
+            return
+        if trading_state.is_trading_locked_disabled():
+            self.append_log(
+                "Live trading remains locked off by TRADING_ENABLED; "
+                "automatic handoff cannot arm it."
+            )
+            return
+        if not self.state_sync_role.is_main or not self._current_lease_token:
+            self.append_log("Live trading NOT auto-armed: lease is not currently held.")
+            return
+        if not self.__dict__.get("_pc_database_ready", False):
+            self.append_log("Live trading NOT auto-armed: shared database is not reachable.")
+            return
+        trading_state.set_trading_enabled(True)
+        button = getattr(self, "trading_enabled_button", None)
+        if button is not None:
+            button.blockSignals(True)
+            try:
+                button.setChecked(True)
+            finally:
+                button.blockSignals(False)
+        if hasattr(self, "_refresh_trading_enabled_widget"):
+            self._refresh_trading_enabled_widget()
+        self.append_log(
+            "Live trading auto-armed (automatic PC handoff, broker reconciliation clean)."
+        )
 
     def _update_main_device_button(self, *, main_hostname: str = "") -> None:
         button = getattr(self, "main_device_button", None)
@@ -1112,8 +1346,62 @@ class MainWindow(
         if reply == QMessageBox.Yes:
             self._start_state_sync(activate=True)
 
+    # Bounded age past which a cached "I am main" belief is no longer trusted
+    # for order submission. Defense in depth against network partition: a
+    # device that loses its connection to MySQL while still believing it's
+    # main can never learn it's been demoted (its own reconciles just start
+    # failing), so this makes it stop trading on its own before it could
+    # even hear about an ownership change -- independent of, and in addition
+    # to, ExecutionAuthority's live re-check at the actual broker boundary.
+    _RECONCILE_FRESHNESS_MAX_AGE_SECONDS = 90
+
+    @staticmethod
+    def _handoff_env_flag_true(key: str) -> bool:
+        value = get_env_value(key)
+        if value is None:
+            return False
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _expected_auto_claim_hostname_matches() -> bool:
+        """Cheap insurance against a copy-pasted .env arming this elsewhere.
+
+        No ``EXPECTED_AUTO_CLAIM_HOSTNAME`` configured means "not set up for
+        auto-claim on this machine" -- fails closed, not open.
+        """
+        expected = get_env_value("EXPECTED_AUTO_CLAIM_HOSTNAME")
+        if not expected or not expected.strip():
+            return False
+        return expected.strip().lower() == platform.node().strip().lower()
+
+    def _current_execution_lease_kwargs(self) -> Dict[str, Any]:
+        """Build the ExecutionAuthority/lease kwargs for a live order submission.
+
+        Returns an all-None dict (no fencing requested) for lightweight
+        test/dummy windows or whenever this device isn't main -- consistent
+        with _state_sync_allows_order_submission already blocking non-main
+        submission earlier in the same call chain. When main, threads the
+        current lease token so ExecutionAuthority can re-verify it stayed
+        current all the way to the actual broker boundary.
+        """
+        role = self.__dict__.get("state_sync_role")
+        lease_token = self.__dict__.get("_current_lease_token", "")
+        if role is None or not role.is_main or not lease_token:
+            return {
+                "execution_authority": None,
+                "execution_lease": None,
+                "lease_engine": None,
+            }
+        return {
+            "execution_authority": ExecutionAuthority(),
+            "execution_lease": LeaseHandle(
+                device_id=role.device_id, lease_token=lease_token
+            ),
+            "lease_engine": self.__dict__.get("pc_db_engine"),
+        }
+
     def _state_sync_allows_order_submission(self) -> bool:
-        """Allow broker submissions only from the active main device."""
+        """Allow broker submissions only from the active, recently-confirmed main device."""
         role = self.__dict__.get("state_sync_role")
         if role is None:
             # Lightweight test/dummy windows do not initialize sync state.
@@ -1122,6 +1410,23 @@ class MainWindow(
         allowed = bool(
             role.is_main and getattr(manager, "_is_main_device", role.is_main)
         )
+        if allowed:
+            last_reconcile = self.__dict__.get("_last_successful_reconcile_at")
+            if last_reconcile is None:
+                allowed = False
+            else:
+                age_seconds = (
+                    dt.datetime.now(dt.timezone.utc) - last_reconcile
+                ).total_seconds()
+                if age_seconds > self._RECONCILE_FRESHNESS_MAX_AGE_SECONDS:
+                    allowed = False
+                    self.append_log(
+                        "KIS order submission blocked: last successful state "
+                        f"sync was {age_seconds:.0f}s ago (stale beyond "
+                        f"{self._RECONCILE_FRESHNESS_MAX_AGE_SECONDS}s) -- this "
+                        "device may have lost its connection and been "
+                        "superseded elsewhere."
+                    )
         if allowed:
             return True
         self.append_log(
@@ -1740,6 +2045,7 @@ class MainWindow(
         timers = [
             self.__dict__.get("live_data_timer"),
             self.__dict__.get("state_sync_timer"),
+            self.__dict__.get("sleep_readiness_timer"),
             self.__dict__.get("pc_status_timer"),
             self.__dict__.get("local_mirror_sync_timer"),
             self.__dict__.get("market_status_timer"),
@@ -1773,6 +2079,7 @@ class MainWindow(
             self.fx_rate_worker,
             getattr(self, "broker_order_query_worker", None),
             getattr(self, "broker_order_cancel_worker", None),
+            getattr(self, "handoff_reconciliation_worker", None),
             *getattr(self, "_buylist_order_workers", []),
             *getattr(self, "_buylist_aux_workers", []),
             *list(getattr(self, "_tracked_workers", {})),
@@ -1803,14 +2110,13 @@ class MainWindow(
             )
             event.ignore()
             return
-        from src.services.runtime_status import \
-            safe_mark_runtime_process_stopped
-
-        safe_mark_runtime_process_stopped(
-            self.pc_db_engine
-            if getattr(self, "_pc_database_ready", False)
-            else None
-        )
+        # Strict shutdown ordering for a clean cross-machine handoff:
+        # finish the final local save (already attempts a best-effort remote
+        # push) -> strictly re-verify that push actually landed -> demote +
+        # release the main-device lease -> mark the runtime heartbeat
+        # stopped. Getting this order wrong is exactly how a released
+        # laptop could re-claim its own just-vacated row on its very next
+        # reconcile (see _release_main_device_ownership_for_shutdown).
         save_result = self._flush_state_saves_for_shutdown(timeout=5.0)
         if not save_result.success:
             message = save_result.error or "Unknown local state save error."
@@ -1820,7 +2126,48 @@ class MainWindow(
                 "Local Save Warning",
                 f"Final local state save failed:\n\n{message}",
             )
+
+        self._release_main_device_ownership_for_shutdown()
+
+        safe_mark_runtime_process_stopped(
+            self.pc_db_engine
+            if getattr(self, "_pc_database_ready", False)
+            else None
+        )
         super().closeEvent(event)
+
+    def _release_main_device_ownership_for_shutdown(self) -> None:
+        """Strict handoff publish + release, called once during closeEvent.
+
+        Extracted as its own method (rather than inlined in the already-long
+        closeEvent) so it's independently testable. A no-op for a pull-only
+        device or when the shared database isn't ready -- most shutdowns
+        never touch the network at all.
+        """
+        if not getattr(self, "_pc_database_ready", False):
+            return
+        if not self.state_sync_role.is_main:
+            return
+
+        execution_queue_payload = load_json(EXECUTION_QUEUE_FILE, {})
+        published = publish_handoff_snapshot(
+            self.pc_db_engine,
+            self.state_sync_role,
+            self.buylist_manager.to_dict(),
+            execution_queue_payload,
+        )
+        if not published:
+            self.append_log(
+                "Handoff publish did not confirm remotely; the next device "
+                "will only pick this up via the stale-heartbeat fallback."
+            )
+
+        released, self.state_sync_role, release_error = release_main_device_and_demote(
+            self.pc_db_engine, self.state_sync_role
+        )
+        self._current_lease_token = ""
+        if not released and release_error:
+            self.append_log(f"Main-device release failed: {release_error}")
 
     def _track_worker(
         self,
@@ -2204,6 +2551,21 @@ class MainWindow(
         self.state_sync_timer.setInterval(15_000)
         self.state_sync_timer.timeout.connect(self._start_state_sync)
         self.state_sync_timer.start()
+
+        # Cross-process signal for the PC's guarded-sleep automation (see
+        # src/services/sleep_readiness.py and scripts/Invoke-GuardedSleep.ps1)
+        # -- PowerShell/Task Scheduler cannot inspect this running Qt process
+        # directly, so a small JSON snapshot is written periodically instead.
+        self.sleep_readiness_timer = QTimer(self)
+        self.sleep_readiness_timer.setInterval(30_000)
+        self.sleep_readiness_timer.timeout.connect(self._write_sleep_readiness_snapshot)
+        self.sleep_readiness_timer.start()
+
+    def _write_sleep_readiness_snapshot(self) -> None:
+        try:
+            write_sleep_readiness_snapshot(self)
+        except Exception:
+            logger.debug("Sleep-readiness snapshot write failed", exc_info=True)
 
     def append_log(self, message: str) -> None:
         """Request an in-app log update from any thread."""

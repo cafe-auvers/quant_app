@@ -63,6 +63,13 @@ class HealthContext:
     reconciliation_running: bool = False
     reconciliation_last_success_at: str = ""
     reconciliation_last_error: str = ""
+    # Cross-machine main-device handoff (laptop <-> PC).
+    is_main_device: bool = False
+    main_device_hostname: str = ""
+    lease_age_seconds: Optional[float] = None
+    auto_claim_enabled: bool = False
+    handoff_reconciliation_running: bool = False
+    handoff_blocked_symbols: Sequence[str] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -481,6 +488,49 @@ def _reconciliation_check(context: HealthContext) -> HealthCheck:
     )
 
 
+def _main_device_handoff_check(context: HealthContext) -> HealthCheck:
+    """Surface cross-machine main-device/lease state without digging through logs."""
+    if context.handoff_reconciliation_running:
+        return HealthCheck(
+            "Main-device handoff",
+            HealthLevel.UNKNOWN,
+            "Reconciling against the broker before resuming monitoring",
+            "Automatic handoff in progress -- monitoring and live trading stay off until this clears.",
+        )
+    if context.handoff_blocked_symbols:
+        symbols = ", ".join(sorted(context.handoff_blocked_symbols)[:8])
+        return HealthCheck(
+            "Main-device handoff",
+            HealthLevel.CRITICAL,
+            f"{len(context.handoff_blocked_symbols)} symbol(s) blocked pending reconciliation",
+            f"Blocked: {symbols}. Monitoring will not resume for these until reconciliation clears.",
+        )
+    if context.is_main_device:
+        detail = (
+            f"Lease age: {context.lease_age_seconds:.0f}s."
+            if context.lease_age_seconds is not None
+            else "Lease age unknown."
+        )
+        return HealthCheck(
+            "Main-device handoff",
+            HealthLevel.HEALTHY,
+            "This device is the exclusive main device",
+            detail,
+        )
+    owner = context.main_device_hostname or "another device"
+    detail = (
+        "Automatic claim is armed on this device."
+        if context.auto_claim_enabled
+        else "This device is pull-only; automatic claim is not armed here."
+    )
+    return HealthCheck(
+        "Main-device handoff",
+        HealthLevel.HEALTHY,
+        f"Pull-only -- main device is {owner}",
+        detail,
+    )
+
+
 def collect_health_snapshot(context: HealthContext) -> HealthSnapshot:
     """Run read-only local probes and combine them with cached runtime state."""
     token_check, configured = inspect_kis_token()
@@ -501,6 +551,7 @@ def collect_health_snapshot(context: HealthContext) -> HealthSnapshot:
             _mysql_check(context),
             _mirror_check(context),
             _reconciliation_check(context),
+            _main_device_handoff_check(context),
             journal_check,
             HealthCheck(
                 "Application heartbeat",

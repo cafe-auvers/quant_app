@@ -23,6 +23,11 @@ from src.risk.pre_trade import (
 )
 from src.services import trading_state
 from src.services.broker import Broker, BrokerSubmissionResult, KisBroker
+from src.services.execution_authority import (
+    ExecutionAuthority,
+    LeaseExpiredError,
+    LeaseHandle,
+)
 from src.services.order_ledger import (
     ORDERS_FILE,
     reserve_order_if_no_matching_open,
@@ -65,6 +70,9 @@ def submit_guarded_overseas_order(
     event_recorder: Optional[Callable[..., Any]] = None,
     signal_payload: Optional[dict[str, Any]] = None,
     signal_event_type: str = "SIGNAL_CREATED",
+    execution_authority: Optional[ExecutionAuthority] = None,
+    execution_lease: Optional[LeaseHandle] = None,
+    lease_engine: Optional[Any] = None,
 ) -> BrokerOrder:
     """Submit an overseas order with a durable local idempotency guard.
 
@@ -155,6 +163,10 @@ def submit_guarded_overseas_order(
                 plan_id=plan_id,
             )
 
+    def require_current_lease() -> None:
+        if execution_authority is not None:
+            execution_authority.require_current_lease(lease_engine, execution_lease)
+
     order = BrokerOrder.create(
         environment=environment,
         account_no=account_no,
@@ -201,14 +213,16 @@ def submit_guarded_overseas_order(
         raise DuplicateOpenOrderError(match)
     emit_event("ORDER_RESERVED", order)
 
-    # Re-check both the kill switch and short-lived entry approval after the
-    # durable duplicate-order reservation. Either can change/expire while
-    # waiting for the ledger lock. No broker request was attempted, so close
-    # the reserved row as REJECTED instead of leaving an open order behind.
+    # Re-check the kill switch, short-lived entry approval, and (when a lease
+    # was supplied) main-device authority after the durable duplicate-order
+    # reservation. Any of these can change/expire while waiting for the
+    # ledger lock. No broker request was attempted, so close the reserved
+    # row as REJECTED instead of leaving an open order behind.
     try:
         trading_state.require_trading_enabled(environment, symbol)
         require_current_entry_approval()
-    except (TradingDisabledError, PreTradeRiskRejectedError) as exc:
+        require_current_lease()
+    except (TradingDisabledError, PreTradeRiskRejectedError, LeaseExpiredError) as exc:
         order.status = OrderStatus.REJECTED
         order.error_message = str(exc)
         order.touch()
@@ -227,13 +241,14 @@ def submit_guarded_overseas_order(
     emit_event("ORDER_SUBMISSION_STARTED", order)
 
     # The synchronous journal write above may contend or fsync slowly. Recheck
-    # both gates at the last possible service boundary so neither a newly
-    # disabled kill switch nor an expired entry approval can cross into the
-    # non-idempotent broker call.
+    # every gate at the last possible service boundary so neither a newly
+    # disabled kill switch, an expired entry approval, nor a lost main-device
+    # lease can cross into the non-idempotent broker call.
     try:
         trading_state.require_trading_enabled(environment, symbol)
         require_current_entry_approval()
-    except (TradingDisabledError, PreTradeRiskRejectedError) as exc:
+        require_current_lease()
+    except (TradingDisabledError, PreTradeRiskRejectedError, LeaseExpiredError) as exc:
         order.status = OrderStatus.REJECTED
         order.error_message = str(exc)
         order.touch()

@@ -1,6 +1,7 @@
 """Conflict-safe cross-machine state synchronization tests."""
 from __future__ import annotations
 
+import datetime as dt
 from types import SimpleNamespace
 
 from sqlalchemy import MetaData, create_engine, text
@@ -9,9 +10,27 @@ from sqlalchemy.pool import NullPool
 from sqlalchemy.schema import CreateTable
 
 from src.services import app_state
+from src.services import runtime_status
 from src.services import state_sync as ss
 import src.ui.main_window as main_window_module
 from src.ui.main_window import MainWindow
+
+
+def _make_heartbeat_stale(engine, hostname: str, *, minutes: float = 5) -> None:
+    """Force a previously-recorded heartbeat to look old, like test_pc_runtime_status.py."""
+    stale_time = (
+        dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+        - dt.timedelta(minutes=minutes)
+    )
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE app_runtime_status "
+                "SET heartbeat_at = :heartbeat_at "
+                "WHERE hostname = :hostname AND process_name = 'main.py'"
+            ),
+            {"heartbeat_at": stale_time, "hostname": hostname.lower()},
+        )
 
 
 def _make_engine(tmp_path):
@@ -28,6 +47,7 @@ def _use_machine(monkeypatch, root):
         "WATCHLIST_FILE": root / "watchlist.json",
         "BUYLIST_FILE": root / "buylist.json",
         "TRADE_PLANS_FILE": root / "trade_plans.json",
+        "EXECUTION_QUEUE_FILE": root / "execution_queue.json",
         "STATE_METADATA_FILE": root / "state_metadata.json",
         "SCANNER_SETUPS_FILE": root / "scanner_setups.json",
         "CHART_DRAWINGS_FILE": root / "chart_drawings.json",
@@ -152,7 +172,12 @@ def test_pull_only_pc_cannot_seed_or_overwrite_first_sync(monkeypatch, tmp_path)
 
     _use_machine(monkeypatch, tmp_path / "pc")
     pulled = app_state.reconcile_state_with_remote(engine, pc)
-    assert pulled.updated_keys == {"watchlist", "buylist", "trade_plans"}
+    assert pulled.updated_keys == {
+        "watchlist",
+        "buylist",
+        "trade_plans",
+        "execution_queue",
+    }
     assert app_state.load_json(pc_paths["WATCHLIST_FILE"], {}) == current
 
 
@@ -510,3 +535,299 @@ def test_main_device_button_reflects_exclusive_role():
     window._update_main_device_button(main_hostname="PC")
     assert window.main_device_button.text == "Use This Device as Main"
     assert "PC" in window.main_device_button.tooltip
+
+
+# --- Fenced ownership primitives (automatic cross-machine handoff) --------
+
+
+def test_release_main_device_clears_ownership_row_when_owned_by_role(tmp_path):
+    engine = _make_engine(tmp_path)
+    laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    assert ss.claim_main_device(engine, laptop).success
+
+    result = ss.release_main_device(engine, laptop)
+
+    assert result.success
+    assert ss.get_main_device(engine).main_device is None
+
+
+def test_release_main_device_is_noop_when_not_owner(tmp_path):
+    engine = _make_engine(tmp_path)
+    laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    pc = ss.LocalDeviceRole("pc-id", "PC", False)
+    assert ss.claim_main_device(engine, laptop).success
+
+    result = ss.release_main_device(engine, pc)
+
+    assert result.success
+    assert ss.get_main_device(engine).main_device.device_id == "laptop-id"
+
+
+def test_release_main_device_noop_when_already_unclaimed(tmp_path):
+    engine = _make_engine(tmp_path)
+    laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+
+    result = ss.release_main_device(engine, laptop)
+
+    assert result.success
+    assert ss.get_main_device(engine).main_device is None
+
+
+def test_claim_main_device_if_stale_succeeds_when_owner_and_heartbeat_match(tmp_path):
+    engine = _make_engine(tmp_path)
+    laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    pc = ss.LocalDeviceRole("pc-id", "PC", False)
+    assert ss.claim_main_device(engine, laptop).success
+    runtime_status.record_runtime_heartbeat(engine, hostname="LAPTOP", pid=1)
+    _make_heartbeat_stale(engine, "LAPTOP")
+
+    result = ss.claim_main_device_if_stale(
+        engine,
+        pc,
+        expected_owner_device_id="laptop-id",
+        heartbeat_cutoff_seconds=60,
+    )
+
+    assert result.success
+    owner = ss.get_main_device(engine).main_device
+    assert owner.device_id == "pc-id"
+    assert owner.lease_token
+    # A fresh lease token every claim -- the whole point of fencing.
+    assert owner.lease_token != ""
+
+
+def test_claim_main_device_if_stale_fails_when_owner_changed(tmp_path):
+    engine = _make_engine(tmp_path)
+    laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    desktop = ss.LocalDeviceRole("desktop-id", "DESKTOP", False)
+    pc = ss.LocalDeviceRole("pc-id", "PC", False)
+    assert ss.claim_main_device(engine, laptop).success
+    # Ownership moved on (e.g. someone else already claimed) since the
+    # caller last observed "laptop-id" as the owner.
+    assert ss.claim_main_device(engine, desktop).success
+
+    result = ss.claim_main_device_if_stale(
+        engine,
+        pc,
+        expected_owner_device_id="laptop-id",
+        heartbeat_cutoff_seconds=60,
+    )
+
+    assert not result.success
+    assert ss.get_main_device(engine).main_device.device_id == "desktop-id"
+
+
+def test_claim_main_device_if_stale_fails_when_heartbeat_fresh_again(tmp_path):
+    """The core TOCTOU race this primitive exists to close.
+
+    The caller observed a stale heartbeat earlier, but by the time it
+    actually claims (inside the same atomic transaction), the owner has
+    reconnected and resumed its heartbeat -- the claim must be rejected.
+    """
+    engine = _make_engine(tmp_path)
+    laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    pc = ss.LocalDeviceRole("pc-id", "PC", False)
+    assert ss.claim_main_device(engine, laptop).success
+    runtime_status.record_runtime_heartbeat(engine, hostname="LAPTOP", pid=1)
+    # No staleness applied -- heartbeat is fresh "again" (or still).
+
+    result = ss.claim_main_device_if_stale(
+        engine,
+        pc,
+        expected_owner_device_id="laptop-id",
+        heartbeat_cutoff_seconds=60,
+    )
+
+    assert not result.success
+    assert ss.get_main_device(engine).main_device.device_id == "laptop-id"
+
+
+def test_claim_main_device_if_stale_fails_when_ownership_released(tmp_path):
+    engine = _make_engine(tmp_path)
+    pc = ss.LocalDeviceRole("pc-id", "PC", False)
+
+    result = ss.claim_main_device_if_stale(
+        engine,
+        pc,
+        expected_owner_device_id="laptop-id",
+        heartbeat_cutoff_seconds=60,
+    )
+
+    assert not result.success
+
+
+# --- should_auto_claim_main -------------------------------------------
+
+
+def test_should_auto_claim_main_true_when_ownership_unclaimed(tmp_path):
+    engine = _make_engine(tmp_path)
+    pc = ss.LocalDeviceRole("pc-id", "PC", False)
+
+    should_claim, expected_owner, reason = app_state.should_auto_claim_main(
+        engine, pc
+    )
+
+    assert should_claim is True
+    assert expected_owner == ""
+    assert "released" in reason
+
+
+def test_should_auto_claim_main_false_when_already_main(tmp_path):
+    engine = _make_engine(tmp_path)
+    pc = ss.LocalDeviceRole("pc-id", "PC", True)
+
+    should_claim, expected_owner, reason = app_state.should_auto_claim_main(
+        engine, pc
+    )
+
+    assert should_claim is False
+    assert expected_owner == ""
+    assert reason == ""
+
+
+def test_should_auto_claim_main_false_when_owner_heartbeat_fresh(tmp_path):
+    engine = _make_engine(tmp_path)
+    laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    pc = ss.LocalDeviceRole("pc-id", "PC", False)
+    assert ss.claim_main_device(engine, laptop).success
+    runtime_status.record_runtime_heartbeat(engine, hostname="LAPTOP", pid=1)
+
+    should_claim, expected_owner, reason = app_state.should_auto_claim_main(
+        engine, pc, other_hostname="LAPTOP"
+    )
+
+    assert should_claim is False
+    assert expected_owner == ""
+
+
+def test_should_auto_claim_main_true_when_owner_heartbeat_stale(tmp_path):
+    engine = _make_engine(tmp_path)
+    laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    pc = ss.LocalDeviceRole("pc-id", "PC", False)
+    assert ss.claim_main_device(engine, laptop).success
+    runtime_status.record_runtime_heartbeat(engine, hostname="LAPTOP", pid=1)
+    _make_heartbeat_stale(engine, "LAPTOP")
+
+    should_claim, expected_owner, reason = app_state.should_auto_claim_main(
+        engine, pc, other_hostname="LAPTOP"
+    )
+
+    assert should_claim is True
+    assert expected_owner == "laptop-id"
+    assert "stale heartbeat" in reason
+
+
+def test_should_auto_claim_main_false_when_owner_never_reported_heartbeat(tmp_path):
+    """No heartbeat row at all (e.g. an old/pre-heartbeat device) -- do not act on unknown state."""
+    engine = _make_engine(tmp_path)
+    laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    pc = ss.LocalDeviceRole("pc-id", "PC", False)
+    assert ss.claim_main_device(engine, laptop).success
+
+    should_claim, expected_owner, reason = app_state.should_auto_claim_main(
+        engine, pc, other_hostname="LAPTOP"
+    )
+
+    assert should_claim is False
+
+
+# --- End-to-end automatic handoff sequence ------------------------------
+
+
+def test_full_handoff_release_then_pc_auto_claims_via_stale_primitive(
+    monkeypatch, tmp_path
+):
+    engine = _make_engine(tmp_path)
+    laptop_paths = _use_machine(monkeypatch, tmp_path / "laptop")
+    _save_local_state(laptop_paths, {"items": [{"symbol": "AAPL"}]})
+    laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    app_state.reconcile_state_with_remote(engine, laptop)
+    assert ss.get_main_device(engine).main_device.device_id == "laptop-id"
+
+    # Clean release, as MainWindow._release_main_device_ownership_for_shutdown does.
+    released, demoted_role, error = app_state.release_main_device_and_demote(
+        engine, laptop
+    )
+    assert released
+    assert not error
+    assert demoted_role.is_main is False
+    assert ss.get_main_device(engine).main_device is None
+
+    _use_machine(monkeypatch, tmp_path / "pc")
+    pc = ss.LocalDeviceRole("pc-id", "PC", False)
+    should_claim, expected_owner, reason = app_state.should_auto_claim_main(engine, pc)
+    assert should_claim is True
+    assert "released" in reason
+
+    claimed = app_state.auto_claim_main_device_if_stale(
+        engine, pc, expected_owner_device_id=expected_owner
+    )
+
+    assert claimed.is_main_device is True
+    assert claimed.lease_token
+    assert app_state.load_json(
+        _use_machine(monkeypatch, tmp_path / "pc")["WATCHLIST_FILE"], {}
+    ) == {"items": [{"symbol": "AAPL"}]}
+
+
+def test_released_laptop_does_not_self_reclaim_on_next_reconcile(monkeypatch, tmp_path):
+    """Covers the gap the first design draft missed: demote must be persisted.
+
+    Without persisting is_main=False locally, reconcile_state_with_remote's
+    own bootstrap branch ("owner row missing + local role.is_main == True"
+    -> self-claim) would let a released laptop silently re-claim its own
+    just-vacated row on its very next tick.
+    """
+    engine = _make_engine(tmp_path)
+    laptop_paths = _use_machine(monkeypatch, tmp_path / "laptop")
+    _save_local_state(laptop_paths, {"items": []})
+    laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    app_state.reconcile_state_with_remote(engine, laptop)
+
+    released, demoted_role, _error = app_state.release_main_device_and_demote(
+        engine, laptop
+    )
+    assert released
+    assert demoted_role.is_main is False
+
+    # Simulate the laptop staying open and its 15s reconcile timer firing
+    # again with the (correctly) demoted local role.
+    again = app_state.reconcile_state_with_remote(engine, demoted_role)
+
+    assert again.is_main_device is False
+    assert ss.get_main_device(engine).main_device is None
+
+
+def test_publish_handoff_snapshot_requires_both_pushes_to_land(tmp_path):
+    engine = _make_engine(tmp_path)
+    laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    assert ss.claim_main_device(engine, laptop).success
+
+    published = app_state.publish_handoff_snapshot(
+        engine,
+        laptop,
+        {"items": [{"symbol": "AAPL"}]},
+        {"items": {}},
+        metadata_path=tmp_path / "state_metadata.json",
+    )
+
+    assert published is True
+    buylist_remote = ss.pull_state(engine, ss.BUYLIST_KEY)
+    assert buylist_remote.status == ss.PULL_OK
+    assert buylist_remote.state.payload == {"items": [{"symbol": "AAPL"}]}
+    queue_remote = ss.pull_state(engine, ss.EXECUTION_QUEUE_KEY)
+    assert queue_remote.status == ss.PULL_OK
+
+
+def test_publish_handoff_snapshot_fails_when_database_unavailable(tmp_path):
+    laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+
+    published = app_state.publish_handoff_snapshot(
+        None,
+        laptop,
+        {"items": []},
+        {"items": {}},
+        metadata_path=tmp_path / "state_metadata.json",
+    )
+
+    assert published is False

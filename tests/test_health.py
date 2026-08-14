@@ -79,6 +79,43 @@ def test_unreadable_order_ledger_is_critical():
     assert "unreadable" in check.summary.lower()
 
 
+def test_main_device_handoff_check_healthy_when_main():
+    check = health._main_device_handoff_check(
+        health.HealthContext(is_main_device=True, lease_age_seconds=12.0)
+    )
+
+    assert check.level == health.HealthLevel.HEALTHY
+    assert "exclusive main device" in check.summary.lower()
+    assert "12" in check.detail
+
+
+def test_main_device_handoff_check_healthy_pull_only():
+    check = health._main_device_handoff_check(
+        health.HealthContext(is_main_device=False, main_device_hostname="LAPTOP")
+    )
+
+    assert check.level == health.HealthLevel.HEALTHY
+    assert "LAPTOP" in check.summary
+
+
+def test_main_device_handoff_check_unknown_while_reconciling():
+    check = health._main_device_handoff_check(
+        health.HealthContext(handoff_reconciliation_running=True)
+    )
+
+    assert check.level == health.HealthLevel.UNKNOWN
+
+
+def test_main_device_handoff_check_critical_when_symbols_blocked():
+    check = health._main_device_handoff_check(
+        health.HealthContext(handoff_blocked_symbols=("AAPL", "MSFT"))
+    )
+
+    assert check.level == health.HealthLevel.CRITICAL
+    assert "AAPL" in check.detail
+    assert "MSFT" in check.detail
+
+
 def test_kis_api_health_requires_recent_verified_timestamp():
     now = dt.datetime(2026, 8, 14, 0, 0, tzinfo=dt.timezone.utc)
 

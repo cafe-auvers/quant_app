@@ -102,9 +102,15 @@ Note: the `AtLogOn` trigger fires on *any* logon, not only the scheduled
 morning routine as a side effect. Harmless (the freshness check behaves the
 same regardless of when it runs), just worth knowing.
 
-Live trading/monitoring is out of scope for this machine -- the PC is off
-for the entire US trading session, so it can only ever refresh the prior
-completed session's data, never watch positions in real time.
+Live trading/monitoring was originally out of scope for this machine, since
+it used to be off for the entire US trading session. **This changed** with
+the automatic laptop↔PC handoff feature below -- the PC now also sleeps
+(S3) instead of fully powering off, and wakes for the market session too, so
+it can actually take over monitoring/trading when the laptop shuts down. See
+"Automatic laptop↔PC trading handoff" further down for the full picture; the
+original 08:00-10:00 KST BIOS-driven window described above is kept as the
+data-refresh leg of one continuous overnight-into-morning awake span, not
+replaced.
 
 ## What's built
 
@@ -326,3 +332,156 @@ Run `python scripts\sync_local_mirror_from_pc.py` while the PC is reachable
 to force an immediate mirror top-up and print per-table row counts and
 watermarks. The local database and its WAL/SHM sidecars are runtime data and
 must not be committed.
+
+## Automatic laptop↔PC trading handoff
+
+> **Status: implemented and unit-tested (792+ tests), but never run against
+> a real PC, real S3 sleep/wake cycle, or real KIS credentials.** Follow the
+> runbook below and the verification checklist before trusting this with a
+> live position. Leave `AUTO_ARM_TRADING_ON_HANDOFF` off for the first
+> several real cycles even after the wake/sleep mechanics are confirmed
+> working.
+
+### What it does
+
+Activate a buylist item's monitoring on the laptop, then turn the laptop
+off (or it loses power/network) -- the PC automatically claims main-device
+status, reconciles against the broker (never trusting synced state alone),
+and resumes monitoring/live order submission. No confirmation dialog on
+either machine.
+
+### Software pieces (all in this repo, already tested)
+
+- **Fenced ownership claim**: `state_sync.claim_main_device_if_stale` /
+  `claim_main_device_if_unclaimed` atomically re-verify the expected owner
+  (or that the row is still genuinely unclaimed) inside the same row lock
+  that transfers ownership -- closing the check-then-claim race a naive
+  "check heartbeat, then claim" sequence would have.
+- **Lease fencing at the broker boundary**: every claim mints a fresh
+  `lease_token`; `src/services/execution_authority.py`'s
+  `ExecutionAuthority.require_current_lease` re-verifies it live inside
+  `submit_guarded_overseas_order`, immediately before the non-idempotent
+  broker call -- not just at the UI-level "am I main" check.
+  `_state_sync_allows_order_submission` also gained a bounded-age
+  requirement (fails closed if the last successful reconcile is >90s old)
+  as defense in depth against network partition.
+- **`execution_queue` is now a 4th synced state key** (alongside watchlist/
+  buylist/trade_plans) -- a valid automated entry is queue-backed since
+  legacy `ACTIVE` entry automation was retired, so the queue has to cross
+  machines too. A synced `EXECUTE_READY` is never trusted directly.
+- **Broker-truth reconciliation before resuming** (`src/services/
+  handoff_reconciliation.py`): the moment a device becomes main, every
+  in-flight PROD item's runtime pending flags are forced to "assume
+  something might be pending" (closing the gap where a freshly-synced
+  `BuylistItem` silently defaults to "nothing pending"), then reconciled
+  against `Broker.get_order(..., symbol="")` (account-wide open-order
+  discovery, not scoped to this device's local ledger) and
+  `Broker.get_positions(...)`. Monitoring/trading only resume once every
+  in-flight symbol clears unambiguously.
+- **Strict shutdown ordering**: `closeEvent` now finishes the final local
+  save, strictly re-publishes buylist + execution_queue to MySQL
+  (`publish_handoff_snapshot` -- returns failure, not just a log line, if
+  the push didn't actually land), demotes the local role to pull-only
+  *before* releasing the lease (so a still-open laptop can't self-reclaim
+  its own just-vacated row on the next 15s reconcile tick), then releases.
+- **Kill switch auto-arm is a separate, stricter gate**
+  (`_auto_arm_trading_kill_switch`) from the claim itself -- requires its
+  own `AUTO_ARM_TRADING_ON_HANDOFF` flag, a currently-held lease, a reachable
+  database, and a clean reconciliation pass. `TRADING_ENABLED`'s existing
+  environment hard-lock is untouched and always wins.
+- **Health tab**: a new "Main-device handoff" check shows lease age,
+  pull-only owner, reconciliation-in-progress, and any blocked symbols.
+
+### Required `.env` flags (PC only -- never set these on the laptop)
+
+```
+AUTO_CLAIM_MAIN_ON_HANDOFF=1
+EXPECTED_AUTO_CLAIM_HOSTNAME=<the PC's exact hostname>
+AUTO_ARM_TRADING_ON_HANDOFF=1
+```
+
+`EXPECTED_AUTO_CLAIM_HOSTNAME` must match `platform.node()` exactly on the
+PC or auto-claim silently stays off -- cheap insurance against an
+accidentally copy-pasted `.env`. The laptop deliberately never auto-reclaims
+on startup; it stays pull-only until "Use This Device as Main" is clicked
+manually.
+
+### Wake/sleep model: S3 instead of full shutdown
+
+The BIOS RTC wake alarm only fires once per day and requires a full
+power-off (S5) beforehand -- it can't add a second wake window for market
+hours. Moving to sleep (S3) lets Windows' own Task Scheduler `WakeToRun`
+handle multiple daily wake times instead.
+
+**New/changed scripts** (all in `scripts/`):
+
+| Script | Purpose |
+|---|---|
+| `Invoke-GuardedSleep.ps1` | New. The sleep guard -- mirrors `Invoke-GuardedShutdown.ps1`'s historical.py guard, adds a second guard reading `data/sleep_readiness.json` (written every 30s by `MainWindow`, see `src/services/sleep_readiness.py`), then calls Win32 `SetSuspendState` instead of `shutdown.exe`. |
+| `Configure-AutomaticSleep.ps1` | New. Registers the `Automatic-PC-Sleep` task (10:00 KST daily) running the guard above. Separate task/file from `Configure-AutomaticShutdown.ps1` so the old shutdown task can stay registered-but-disabled as a rollback path. |
+| `Configure-MarketHoursWake.ps1` | New. Registers `QuantApp_EveningWake` (~21:45 KST daily, `WakeToRun`) running `pc_wake_healthcheck.ps1`. |
+| `pc_wake_healthcheck.ps1` | New. Runs on the evening wake. Deliberately does **no** git/pip updates (would risk a mixed-version runtime under an already-running `main.py`) -- only confirms `main.py`/the remote listener are alive, relaunching only if a forced reboot broke the S3 resume. |
+| `setup_pc_morning_task.ps1` | Modified. Added a second `Daily @ 08:00 WakeToRun` trigger alongside the existing `AtLogOn` one -- a normal S3 resume does not fire `AtLogOn`, so without this the 08:00 data refresh would stop firing except after a genuine reboot. `AtLogOn` is kept as that reboot-case fallback. |
+
+**Window shape**: one continuous overnight-into-morning awake span --
+wake ~21:45 KST → through the DST-bracketed session (widest case 22:00-06:00
+KST) → straight into the existing 08:00-10:00 data-refresh window → sleep at
+10:00 KST. No second sleep/wake cycle for the ~90-minute gap between session
+end and 08:00 -- that would double the daily wake-failure surface for
+negligible power savings. Actual order-submission gating always comes from
+the app's own session-open logic, never from PC wake timing, so DST drift in
+the wake time itself is harmless idle time either way.
+
+### Manual runbook (Administrator, on the PC)
+
+1. `powercfg /availablesleepstates` -- confirm S3 is offered on this board
+   (unverified on this specific motherboard; flag it if S3 isn't listed).
+2. `powercfg /change standby-timeout-ac 0` -- disable Windows' own idle-sleep
+   timer so only the scheduled task controls sleeping.
+3. Leave the existing BIOS RTC 08:00 wake alarm enabled -- it's a harmless,
+   useful fallback for the one case S3 can't recover from itself: a genuine
+   full power-off (S3 has no standby power to resume from that).
+4. `git pull`, then:
+   ```powershell
+   .\scripts\Configure-AutomaticSleep.ps1 -SleepTime 10:00 -DaysOfWeek Everyday
+   .\scripts\Configure-MarketHoursWake.ps1 -WakeTime 21:45
+   .\scripts\setup_pc_morning_task.ps1        # re-run to add the Daily 08:00 WakeToRun trigger
+   .\scripts\Configure-AutomaticShutdown.ps1 -DisableTask   # keep the old task registered but inert
+   ```
+5. Set the three `.env` flags above (PC only).
+
+### Verification checklist (do this before trusting it with a live position)
+
+- [ ] `(Get-ScheduledTask -TaskName 'QuantApp_EveningWake').Settings.WakeToRun -eq $true`
+- [ ] `.\scripts\Configure-AutomaticSleep.ps1 -TestMode` -- physically confirm
+      true S3 (fans off, blinking power LED), not S4/hibernate.
+- [ ] Let the PC sleep overnight for real at least once; confirm the
+      scheduled wake actually resumes it (check remotely via Tailscale
+      `pc_remote_control_listener` PING).
+- [ ] `Get-Process -Name python | Select Id,StartTime` before and after the
+      sleep -- same PID/StartTime proves a true resume, not a relaunch.
+- [ ] Check `data\logs\pc_wake_healthcheck.log` and confirm MySQL/KIS
+      connections actually recover post-resume in the live app log (no
+      existing test coverage for connection behavior across a real S3
+      resume -- this is the biggest unverified assumption in the whole
+      feature).
+- [ ] Run the two-process dry run from the implementation plan (a throwaway
+      test engine + a **stub** broker, never real KIS credentials) end to
+      end before ever enabling `AUTO_ARM_TRADING_ON_HANDOFF` against a real
+      account.
+- [ ] Once software behavior is trusted, enable `AUTO_ARM_TRADING_ON_HANDOFF`
+      and watch the Health tab's "Main-device handoff" check closely for the
+      first several real handoffs.
+
+### Known residual risks (accepted, not solved by this design)
+
+- Broker API outage during handoff: reconciliation retries with backoff and
+  refuses to trade until it gets an unambiguous snapshot -- correct
+  fail-safe, but the position is unprotected until it (or KIS) recovers.
+- `orders.json`/`event_journal.jsonl` stay local-only per device. Broker-truth
+  discovery makes this a completeness gap for the PC's own order-history
+  view, not a correctness problem for reconciliation itself.
+- A forced reboot during the sleep window (e.g. Windows Update) is recovered
+  via the retained `AtLogOn` fallback and the stale-heartbeat claim path
+  rather than the clean-release path -- the less-clean of the two, but still
+  fully gated by broker reconciliation before anything trades.
