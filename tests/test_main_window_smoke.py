@@ -10,6 +10,7 @@ from src.core.watchlist import BuylistManager, TradePlanManager, Watchlist
 from src.services.state_sync import LocalDeviceRole
 from src.ui import main_window as main_window_module
 from src.ui.charts import controller_layout
+from src.ui.health import panel as health_panel_module
 
 _APP = None
 
@@ -24,6 +25,7 @@ def test_main_window_constructs_and_closes_offscreen_without_external_io(monkeyp
     _APP = QApplication.instance() or QApplication([])
 
     monkeypatch.setattr(controller_layout, "QWebEngineView", None)
+    monkeypatch.setattr(health_panel_module, "QWebEngineView", None)
     monkeypatch.setattr(QTimer, "start", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(QTimer, "singleShot", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(main_window_module, "load_order_ledger", lambda: [])
