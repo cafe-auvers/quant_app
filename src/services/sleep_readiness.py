@@ -59,10 +59,18 @@ def build_sleep_readiness_snapshot(main_window: Any) -> Dict[str, Any]:
     handoff_worker = getattr(main_window, "handoff_reconciliation_worker", None)
     is_running = getattr(handoff_worker, "isRunning", None)
     reconciliation_running = bool(handoff_worker is not None and callable(is_running) and is_running())
+    reconciliation_required = bool(
+        getattr(main_window, "_handoff_reconciliation_required", False)
+    )
 
     safe_to_sleep = not (
         is_main_device
-        and (in_flight_count > 0 or bool(open_orders) or reconciliation_running)
+        and (
+            in_flight_count > 0
+            or bool(open_orders)
+            or reconciliation_running
+            or reconciliation_required
+        )
     )
 
     return {
@@ -72,6 +80,7 @@ def build_sleep_readiness_snapshot(main_window: Any) -> Dict[str, Any]:
         "in_flight_prod_symbol_count": in_flight_count,
         "has_open_broker_orders": bool(open_orders),
         "handoff_reconciliation_in_progress": reconciliation_running,
+        "handoff_reconciliation_required": reconciliation_required,
         "safe_to_sleep": safe_to_sleep,
     }
 

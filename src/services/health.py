@@ -69,6 +69,7 @@ class HealthContext:
     lease_age_seconds: Optional[float] = None
     auto_claim_enabled: bool = False
     handoff_reconciliation_running: bool = False
+    handoff_reconciliation_required: bool = False
     handoff_blocked_symbols: Sequence[str] = field(default_factory=tuple)
 
 
@@ -504,6 +505,13 @@ def _main_device_handoff_check(context: HealthContext) -> HealthCheck:
             HealthLevel.CRITICAL,
             f"{len(context.handoff_blocked_symbols)} symbol(s) blocked pending reconciliation",
             f"Blocked: {symbols}. Monitoring will not resume for these until reconciliation clears.",
+        )
+    if context.handoff_reconciliation_required:
+        return HealthCheck(
+            "Main-device handoff",
+            HealthLevel.CRITICAL,
+            "Trading fenced until handoff reconciliation completes",
+            "The device may hold the lease, but broker reconciliation and durable state publication have not both completed.",
         )
     if context.is_main_device:
         detail = (

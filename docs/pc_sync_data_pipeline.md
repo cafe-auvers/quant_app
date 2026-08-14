@@ -335,7 +335,7 @@ must not be committed.
 
 ## Automatic laptop↔PC trading handoff
 
-> **Status: implemented and unit-tested (792+ tests), but never run against
+> **Status: implemented and unit-tested, but never run against
 > a real PC, real S3 sleep/wake cycle, or real KIS credentials.** Follow the
 > runbook below and the verification checklist before trusting this with a
 > live position. Leave `AUTO_ARM_TRADING_ON_HANDOFF` off for the first
@@ -374,16 +374,23 @@ either machine.
   in-flight PROD item's runtime pending flags are forced to "assume
   something might be pending" (closing the gap where a freshly-synced
   `BuylistItem` silently defaults to "nothing pending"), then reconciled
-  against `Broker.get_order(..., symbol="")` (account-wide open-order
-  discovery, not scoped to this device's local ledger) and
-  `Broker.get_positions(...)`. Monitoring/trading only resume once every
-  in-flight symbol clears unambiguously.
+  per persisted `kis_account_no` against completeness-aware, account-wide
+  regular open/history **and reserved-order** discovery plus
+  `Broker.get_positions(...)`. Missing accounts, incomplete pagination,
+  partial endpoint failures, unknown/symbol-less results, open orders, or a
+  broker position attached to stale pre-entry state all fail closed.
+  Monitoring/trading only resume once every in-flight symbol clears
+  unambiguously **and** the broker-corrected state has been synchronously saved
+  and strictly republished. The manual **Use This Device as Main** path uses
+  the same reconciliation fence and never auto-arms live trading.
 - **Strict shutdown ordering**: `closeEvent` now finishes the final local
   save, strictly re-publishes buylist + execution_queue to MySQL
   (`publish_handoff_snapshot` -- returns failure, not just a log line, if
-  the push didn't actually land), demotes the local role to pull-only
-  *before* releasing the lease (so a still-open laptop can't self-reclaim
-  its own just-vacated row on the next 15s reconcile tick), then releases.
+  the push didn't actually land), persists the local pull-only role, disables
+  the remote writer binding, and only then releases the lease. If the final
+  local save, strict publication, local demotion, or writer fencing fails,
+  ownership is retained; the next device must wait for the stale-heartbeat
+  fenced takeover path rather than seeing a false clean handoff.
 - **Kill switch auto-arm is a separate, stricter gate**
   (`_auto_arm_trading_kill_switch`) from the claim itself -- requires its
   own `AUTO_ARM_TRADING_ON_HANDOFF` flag, a currently-held lease, a reachable
@@ -392,19 +399,21 @@ either machine.
 - **Health tab**: a new "Main-device handoff" check shows lease age,
   pull-only owner, reconciliation-in-progress, and any blocked symbols.
 
-### Required `.env` flags (PC only -- never set these on the laptop)
+### `.env` flags (PC only -- never set these on the laptop)
 
 ```
-AUTO_CLAIM_MAIN_ON_HANDOFF=1
+AUTO_CLAIM_MAIN_ON_HANDOFF=0
 EXPECTED_AUTO_CLAIM_HOSTNAME=<the PC's exact hostname>
-AUTO_ARM_TRADING_ON_HANDOFF=1
+AUTO_ARM_TRADING_ON_HANDOFF=0
 ```
 
 `EXPECTED_AUTO_CLAIM_HOSTNAME` must match `platform.node()` exactly on the
 PC or auto-claim silently stays off -- cheap insurance against an
 accidentally copy-pasted `.env`. The laptop deliberately never auto-reclaims
 on startup; it stays pull-only until "Use This Device as Main" is clicked
-manually.
+manually. Keep both automation flags at `0` until the physical S3/wake and
+post-resume MySQL/KIS checks below pass. Enable auto-claim first; leave
+auto-arm off through several supervised handoffs.
 
 ### Wake/sleep model: S3 instead of full shutdown
 
@@ -478,6 +487,12 @@ the wake time itself is harmless idle time either way.
 - Broker API outage during handoff: reconciliation retries with backoff and
   refuses to trade until it gets an unambiguous snapshot -- correct
   fail-safe, but the position is unprotected until it (or KIS) recovers.
+- Shared-MySQL outage while a device is main: after the 90-second lease-
+  freshness limit, **all** KIS submissions fail closed, including stop-loss
+  and other protective exits. This is the intentional split-brain policy.
+  Treat a MySQL CRITICAL health result during a live position as a high-
+  severity operational alert and be prepared to manage the position directly
+  in KIS until coordination recovers.
 - `orders.json`/`event_journal.jsonl` stay local-only per device. Broker-truth
   discovery makes this a completeness gap for the PC's own order-history
   view, not a correctness problem for reconciliation itself.

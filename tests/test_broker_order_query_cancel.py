@@ -148,6 +148,49 @@ def test_query_overseas_order_returns_unknown_not_found_without_credentials(monk
     assert snapshot.broker_order_id == "KIS-404"
 
 
+def test_kis_order_query_fails_closed_when_open_order_source_fails(monkeypatch):
+    class FakeClient:
+        def __init__(self, config):
+            self.config = config
+
+        def authenticate(self, force_refresh=False):
+            return "token"
+
+        def _get_with_headers(self, endpoint, tr_id, params, tr_cont=""):
+            if endpoint.endswith("/inquire-nccs"):
+                raise RuntimeError("open endpoint unavailable")
+            return {"rt_cd": "0", "output": []}, {}
+
+    fake_config = SimpleNamespace(
+        cano="12345678",
+        account_product_code="01",
+        base_url="https://kis.example",
+    )
+    monkeypatch.setattr(kis_order, "load_config", lambda *a, **k: fake_config)
+    monkeypatch.setattr(kis_order, "KisAccountClient", FakeClient)
+
+    with pytest.raises(RuntimeError, match="open-order discovery failed"):
+        kis_order.query_overseas_order(
+            environment="PROD",
+            account_no="12345678-01",
+            symbol="",
+        )
+
+
+def test_kis_pagination_fails_closed_on_continuation_without_cursor():
+    class FakeClient:
+        def _get_with_headers(self, endpoint, tr_id, params, tr_cont=""):
+            return {"rt_cd": "0", "output": []}, {"tr_cont": "F"}
+
+    with pytest.raises(RuntimeError, match="continuation was requested without a cursor"):
+        kis_order._query_pages(
+            FakeClient(),
+            endpoint="/test",
+            tr_id="TEST",
+            params={"CTX_AREA_FK200": "", "CTX_AREA_NK200": ""},
+        )
+
+
 def test_kis_reserved_order_query_parses_broker_reservation_fill(monkeypatch):
     class FakeClient:
         def __init__(self, config):

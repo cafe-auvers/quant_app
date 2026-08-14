@@ -411,6 +411,8 @@ class MainWindow(
         self._state_sync_auto_claim = False
         self._last_main_device_hostname = ""
         self._last_handoff_blocked_symbols: Tuple[str, ...] = ()
+        self._handoff_reconciliation_required = False
+        self._handoff_allow_auto_arm = False
         self.kis_account_snapshots: dict[tuple[str, str], dict] = {}
         self._kis_api_last_success_at = ""
         self._kis_api_last_error = ""
@@ -1013,6 +1015,12 @@ class MainWindow(
                     "Wait for the current state synchronization to finish, then try again.",
                 )
             return
+        if activate or auto_claim:
+            self._handoff_reconciliation_required = True
+            self._handoff_allow_auto_arm = bool(auto_claim)
+            trading_state.set_trading_enabled(False)
+            if self.__dict__.get("trading_enabled_button") is not None:
+                self._refresh_trading_enabled_widget()
         worker = StateSyncWorker(
             self.pc_db_engine,
             self.state_sync_role,
@@ -1138,8 +1146,20 @@ class MainWindow(
         self.update_dashboard_summary()
 
         if action == "activate" and result.is_main_device and not result.errors:
-            if was_auto_claim:
-                self._begin_post_claim_handoff()
+            self._begin_post_claim_handoff(allow_auto_arm=was_auto_claim)
+            return
+        if action == "activate" and not result.is_main_device:
+            self._handoff_reconciliation_required = False
+            self._handoff_allow_auto_arm = False
+        elif (
+            action != "activate"
+            and result.is_main_device
+            and not result.errors
+            and self.__dict__.get("_handoff_reconciliation_required", False)
+        ):
+            self._begin_post_claim_handoff(
+                allow_auto_arm=self.__dict__.get("_handoff_allow_auto_arm", False)
+            )
             return
 
         # Automatic handoff detection: only ever runs on a device explicitly
@@ -1165,16 +1185,28 @@ class MainWindow(
                 )
 
     # --- Automatic cross-machine handoff: post-claim reconciliation --------
-    # The safety-critical sequence that must run before a device that just
-    # auto-claimed main-device status is allowed to resume monitoring/live
-    # order submission. Never entered from the manual "Use This Device as
-    # Main" button (see the was_auto_claim guard above) -- that flow keeps
-    # its existing behavior unchanged.
+    # The safety-critical sequence that must run before a newly-main device
+    # may resume monitoring/live order submission. Manual activation uses the
+    # same fence, but is never granted automatic kill-switch arming.
 
-    def _begin_post_claim_handoff(self) -> None:
+    def _begin_post_claim_handoff(self, *, allow_auto_arm: bool = False) -> None:
         """Lock pending flags, then reconcile against the broker off-thread."""
+        existing_worker = self.__dict__.get("handoff_reconciliation_worker")
+        if existing_worker is not None and existing_worker.isRunning():
+            return
         self._handoff_generation += 1
         generation = self._handoff_generation
+        self._handoff_reconciliation_required = True
+        self._handoff_allow_auto_arm = bool(allow_auto_arm)
+
+        # A takeover is an all-orders fence, not merely a per-item UI flag.
+        # This also protects manual "Use This Device as Main" activation if
+        # live trading happened to be enabled in this process beforehand.
+        trading_state.set_trading_enabled(False)
+        if self.__dict__.get("trading_enabled_button") is not None:
+            self._refresh_trading_enabled_widget()
+        if self.__dict__.get("_buylist_prod_monitor_active", False):
+            self._toggle_buylist_monitor("PROD")
 
         reset_items = reset_runtime_only_order_flags(self.buylist_manager)
         if reset_items:
@@ -1186,12 +1218,8 @@ class MainWindow(
             self._save_buylist_state()
             self.populate_buylist_dashboard()
 
-        account_no = ""
-        if hasattr(self, "_first_account_no_for_environment"):
-            account_no = self._first_account_no_for_environment("PROD") or ""
-
         worker = HandoffReconciliationWorker(
-            self.buylist_manager, environment="PROD", account_no=account_no
+            self.buylist_manager, environment="PROD"
         )
         self.handoff_reconciliation_worker = worker
         worker.finished_reconciliation.connect(
@@ -1212,15 +1240,34 @@ class MainWindow(
             # retry/reconciliation pass must never resume monitoring or arm
             # trading after that.
             return
-        self._save_buylist_state()
+        persisted, persistence_error = self._persist_post_claim_reconciliation_state()
         self.populate_buylist_dashboard()
+        if not persisted:
+            self._handoff_reconciliation_required = True
+            blocked = tuple(outcome.blocked_symbols or outcome.reconciled_symbols)
+            self._last_handoff_blocked_symbols = blocked or ("STATE_SYNC",)
+            self.append_log(
+                "Automatic handoff BLOCKED: reconciled state was not durably "
+                f"published ({persistence_error}). Retrying in 30s."
+            )
+            if self.state_sync_role.is_main:
+                QTimer.singleShot(
+                    30_000, self._retry_post_claim_handoff_if_still_main
+                )
+            return
         self._last_handoff_blocked_symbols = tuple(outcome.blocked_symbols)
         if outcome.ok:
+            self._handoff_reconciliation_required = False
             self.append_log(
                 f"Automatic handoff: broker reconciliation clean for "
                 f"{len(outcome.reconciled_symbols)} symbol(s)."
             )
-            self._auto_arm_trading_kill_switch()
+            if self.__dict__.get("_handoff_allow_auto_arm", False):
+                self._auto_arm_trading_kill_switch()
+            else:
+                self.append_log(
+                    "Live trading remains disabled after manual main-device transfer."
+                )
             started = self._ensure_buylist_monitor_running("PROD")
             self.append_log(
                 "Automatic handoff complete: monitor "
@@ -1240,12 +1287,33 @@ class MainWindow(
                 return
             QTimer.singleShot(30_000, self._retry_post_claim_handoff_if_still_main)
 
+    def _persist_post_claim_reconciliation_state(self) -> tuple[bool, str]:
+        """Durably save and strictly publish broker-corrected handoff state."""
+        save_result = self._save_state_now(timeout=5.0, supersede_pending=True)
+        if not save_result.success:
+            return False, save_result.error or "local state save failed"
+        execution_queue_payload = load_json(EXECUTION_QUEUE_FILE, {})
+        try:
+            published = publish_handoff_snapshot(
+                self.pc_db_engine,
+                self.state_sync_role,
+                self.buylist_manager.to_dict(),
+                execution_queue_payload,
+            )
+        except Exception as exc:
+            return False, str(exc)
+        if not published:
+            return False, "shared MySQL did not confirm the handoff state"
+        return True, ""
+
     def _retry_post_claim_handoff_if_still_main(self) -> None:
         if not self.state_sync_role.is_main:
             return
         if self.__dict__.get("_database_shutting_down", False):
             return
-        self._begin_post_claim_handoff()
+        self._begin_post_claim_handoff(
+            allow_auto_arm=self.__dict__.get("_handoff_allow_auto_arm", False)
+        )
 
     def _on_post_claim_reconciliation_error(self, message: str) -> None:
         self.append_log(f"Automatic handoff: reconciliation worker failed: {message}")
@@ -1338,8 +1406,10 @@ class MainWindow(
             self,
             "Use This Device as Main",
             "Transfer main-device ownership to this device?\n\n"
-            "The other device will become pull-only. Remote revisions are checked so "
-            "stale state cannot overwrite newer data.",
+            "The other device will be lease-fenced and become pull-only. Remote "
+            "revisions are checked so stale state cannot overwrite newer data.\n\n"
+            "This device will query every assigned KIS account before monitoring "
+            "can resume. Live trading will remain disabled after the transfer.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -1406,10 +1476,17 @@ class MainWindow(
         if role is None:
             # Lightweight test/dummy windows do not initialize sync state.
             return True
+        if self.__dict__.get("_handoff_reconciliation_required", False):
+            self.append_log(
+                "KIS order submission blocked: main-device handoff broker "
+                "reconciliation has not completed cleanly."
+            )
+            return False
         manager = self._state_save_manager()
         allowed = bool(
             role.is_main and getattr(manager, "_is_main_device", role.is_main)
         )
+        coordination_stale = False
         if allowed:
             last_reconcile = self.__dict__.get("_last_successful_reconcile_at")
             if last_reconcile is None:
@@ -1420,6 +1497,7 @@ class MainWindow(
                 ).total_seconds()
                 if age_seconds > self._RECONCILE_FRESHNESS_MAX_AGE_SECONDS:
                     allowed = False
+                    coordination_stale = True
                     self.append_log(
                         "KIS order submission blocked: last successful state "
                         f"sync was {age_seconds:.0f}s ago (stale beyond "
@@ -1429,6 +1507,21 @@ class MainWindow(
                     )
         if allowed:
             return True
+        if coordination_stale:
+            self.append_log(
+                "CRITICAL: shared-MySQL lease coordination is stale. All KIS "
+                "orders, including protective exits, remain blocked to prevent "
+                "split-brain execution. Manage the position directly in KIS if needed."
+            )
+            QMessageBox.warning(
+                self,
+                "Trading safety lock",
+                "Shared-MySQL lease coordination is stale. All KIS submissions, "
+                "including protective exits, are blocked to prevent two devices "
+                "from trading at once.\n\nRestore MySQL coordination or manage any "
+                "live position directly in KIS.",
+            )
+            return False
         self.append_log(
             "KIS order submission blocked because this device is pull-only."
         )
@@ -2127,7 +2220,9 @@ class MainWindow(
                 f"Final local state save failed:\n\n{message}",
             )
 
-        self._release_main_device_ownership_for_shutdown()
+        self._release_main_device_ownership_for_shutdown(
+            final_save_succeeded=save_result.success
+        )
 
         safe_mark_runtime_process_stopped(
             self.pc_db_engine
@@ -2136,7 +2231,9 @@ class MainWindow(
         )
         super().closeEvent(event)
 
-    def _release_main_device_ownership_for_shutdown(self) -> None:
+    def _release_main_device_ownership_for_shutdown(
+        self, *, final_save_succeeded: bool = True
+    ) -> bool:
         """Strict handoff publish + release, called once during closeEvent.
 
         Extracted as its own method (rather than inlined in the already-long
@@ -2145,29 +2242,47 @@ class MainWindow(
         never touch the network at all.
         """
         if not getattr(self, "_pc_database_ready", False):
-            return
+            return False
         if not self.state_sync_role.is_main:
-            return
+            return True
+        if not final_save_succeeded:
+            self.append_log(
+                "Main-device ownership retained: final local state save failed; "
+                "the next device must use stale-heartbeat takeover."
+            )
+            return False
 
         execution_queue_payload = load_json(EXECUTION_QUEUE_FILE, {})
-        published = publish_handoff_snapshot(
-            self.pc_db_engine,
-            self.state_sync_role,
-            self.buylist_manager.to_dict(),
-            execution_queue_payload,
-        )
+        try:
+            published = publish_handoff_snapshot(
+                self.pc_db_engine,
+                self.state_sync_role,
+                self.buylist_manager.to_dict(),
+                execution_queue_payload,
+            )
+        except Exception as exc:
+            published = False
+            self.append_log(f"Handoff publication failed: {exc}")
         if not published:
             self.append_log(
-                "Handoff publish did not confirm remotely; the next device "
-                "will only pick this up via the stale-heartbeat fallback."
+                "Main-device ownership retained because the final handoff "
+                "snapshot was not confirmed remotely; the next device must "
+                "use stale-heartbeat takeover."
             )
+            return False
 
         released, self.state_sync_role, release_error = release_main_device_and_demote(
-            self.pc_db_engine, self.state_sync_role
+            self.pc_db_engine,
+            self.state_sync_role,
+            disable_remote_writer=lambda: self._bind_remote_state_engine(
+                self.pc_db_engine, is_main_device=False
+            ),
         )
-        self._current_lease_token = ""
+        if not self.state_sync_role.is_main:
+            self._current_lease_token = ""
         if not released and release_error:
             self.append_log(f"Main-device release failed: {release_error}")
+        return released
 
     def _track_worker(
         self,

@@ -440,6 +440,9 @@ class HealthPanelMixin:
             handoff_reconciliation_running=bool(
                 handoff_worker is not None and handoff_worker.isRunning()
             ),
+            handoff_reconciliation_required=bool(
+                self.__dict__.get("_handoff_reconciliation_required", False)
+            ),
             handoff_blocked_symbols=tuple(
                 self.__dict__.get("_last_handoff_blocked_symbols", ())
             ),

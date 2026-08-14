@@ -798,6 +798,88 @@ def test_released_laptop_does_not_self_reclaim_on_next_reconcile(monkeypatch, tm
     assert ss.get_main_device(engine).main_device is None
 
 
+def test_release_demotes_and_disables_writer_before_deleting_ownership(monkeypatch):
+    role = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    calls = []
+
+    def fake_demote(current, is_main):
+        calls.append("demote")
+        return ss.LocalDeviceRole(current.device_id, current.hostname, is_main)
+
+    def fake_release(_engine, current):
+        calls.append("release")
+        assert current.is_main is True
+        return SimpleNamespace(success=True, error="")
+
+    monkeypatch.setattr(app_state, "set_local_device_main", fake_demote)
+    monkeypatch.setattr(app_state, "release_main_device", fake_release)
+
+    released, demoted, error = app_state.release_main_device_and_demote(
+        object(),
+        role,
+        disable_remote_writer=lambda: calls.append("disable_writer"),
+    )
+
+    assert released is True
+    assert demoted.is_main is False
+    assert error == ""
+    assert calls == ["demote", "disable_writer", "release"]
+
+
+def test_release_retains_ownership_when_local_demotion_fails(monkeypatch):
+    role = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    release_calls = []
+    monkeypatch.setattr(
+        app_state,
+        "set_local_device_main",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    monkeypatch.setattr(
+        app_state,
+        "release_main_device",
+        lambda *a, **k: release_calls.append(True),
+    )
+
+    released, unchanged, error = app_state.release_main_device_and_demote(
+        object(), role
+    )
+
+    assert released is False
+    assert unchanged == role
+    assert "disk full" in error
+    assert release_calls == []
+
+
+def test_release_retains_ownership_when_writer_cannot_be_disabled(monkeypatch):
+    role = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    release_calls = []
+    monkeypatch.setattr(
+        app_state,
+        "set_local_device_main",
+        lambda current, is_main: ss.LocalDeviceRole(
+            current.device_id, current.hostname, is_main
+        ),
+    )
+    monkeypatch.setattr(
+        app_state,
+        "release_main_device",
+        lambda *a, **k: release_calls.append(True),
+    )
+
+    released, demoted, error = app_state.release_main_device_and_demote(
+        object(),
+        role,
+        disable_remote_writer=lambda: (_ for _ in ()).throw(
+            RuntimeError("writer still bound")
+        ),
+    )
+
+    assert released is False
+    assert demoted.is_main is False
+    assert "writer still bound" in error
+    assert release_calls == []
+
+
 def test_publish_handoff_snapshot_requires_both_pushes_to_land(tmp_path):
     engine = _make_engine(tmp_path)
     laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)

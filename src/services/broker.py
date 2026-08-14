@@ -24,10 +24,12 @@ from src.api import kis_account_snapshot_dual, kis_order
 from src.core.order_state import (
     REGULAR_LIMIT_EXECUTION,
     RESERVED_MOO_EXECUTION,
+    BrokerOrderDiscoveryResult,
     BrokerOrderStatusSnapshot,
     OrderSide,
 )
 from src.services import trading_state
+from src.utils.config import get_env_value
 
 
 @dataclass(frozen=True)
@@ -125,6 +127,15 @@ class Broker(Protocol):
         """Query broker-side order/reservation status snapshots."""
         ...
 
+    def discover_orders(
+        self,
+        *,
+        environment: str,
+        account_no: str,
+    ) -> BrokerOrderDiscoveryResult:
+        """Discover all regular and reserved orders with source completeness."""
+        ...
+
     def get_positions(
         self,
         *,
@@ -212,6 +223,88 @@ class KisBroker:
             else kis_order.query_overseas_order
         )
         return query_fn(environment=environment, account_no=account_no, **kwargs)
+
+    @staticmethod
+    def _authoritative_snapshots(
+        snapshots: List[BrokerOrderStatusSnapshot],
+    ) -> List[BrokerOrderStatusSnapshot]:
+        """Drop only the compatibility sentinel for an authoritative empty query."""
+        return [
+            snapshot
+            for snapshot in snapshots
+            if not (
+                snapshot.status.value == "UNKNOWN"
+                and bool(snapshot.raw_response.get("not_found"))
+            )
+        ]
+
+    def discover_orders(
+        self,
+        *,
+        environment: str,
+        account_no: str,
+    ) -> BrokerOrderDiscoveryResult:
+        """Query every broker order ledger needed for safe device handoff."""
+        result = BrokerOrderDiscoveryResult()
+        prefix = f"KIS_{str(environment or '').strip().upper()}"
+        exchange_values = get_env_value(
+            f"{prefix}_OVERSEAS_EXCHANGES", "NASD,NYSE,AMEX"
+        ) or "NASD,NYSE,AMEX"
+        exchanges = list(
+            dict.fromkeys(
+                value.strip().upper()
+                for value in exchange_values.split(",")
+                if value.strip()
+            )
+        ) or ["NASD", "NYSE", "AMEX"]
+
+        regular_complete = True
+        reserved_complete = True
+        for exchange in exchanges:
+            try:
+                regular = kis_order.query_overseas_order(
+                    environment=environment,
+                    account_no=account_no,
+                    symbol="",
+                    exchange=exchange,
+                )
+                result.snapshots.extend(self._authoritative_snapshots(regular))
+            except Exception as exc:
+                regular_complete = False
+                result.errors.append(
+                    f"Regular order discovery failed for {exchange}: {exc}"
+                )
+
+            try:
+                reserved = kis_order.query_overseas_reserved_order(
+                    environment=environment,
+                    account_no=account_no,
+                    symbol="",
+                    exchange=exchange,
+                )
+                result.snapshots.extend(self._authoritative_snapshots(reserved))
+            except Exception as exc:
+                reserved_complete = False
+                result.errors.append(
+                    f"Reserved order discovery failed for {exchange}: {exc}"
+                )
+
+        by_key = {}
+        for snapshot in result.snapshots:
+            key = (
+                snapshot.account_no,
+                snapshot.symbol,
+                snapshot.broker_order_id,
+                snapshot.status.value,
+                snapshot.filled_quantity,
+                snapshot.remaining_quantity,
+            )
+            by_key[key] = snapshot
+        result.snapshots = list(by_key.values())
+        result.open_orders_complete = regular_complete
+        result.history_complete = regular_complete
+        result.reserved_orders_complete = reserved_complete
+        return result
 
     def get_positions(
         self,

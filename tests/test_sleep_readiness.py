@@ -6,7 +6,9 @@ from types import SimpleNamespace
 from src.services.sleep_readiness import build_sleep_readiness_snapshot
 
 
-def _window(*, is_main, items=(), open_orders=(), reconciling=False):
+def _window(
+    *, is_main, items=(), open_orders=(), reconciling=False, reconciliation_required=False
+):
     handoff_worker = None
     if reconciling:
         handoff_worker = SimpleNamespace(isRunning=lambda: True)
@@ -15,6 +17,7 @@ def _window(*, is_main, items=(), open_orders=(), reconciling=False):
         buylist_manager=SimpleNamespace(items=list(items)),
         order_ledger=list(open_orders),
         handoff_reconciliation_worker=handoff_worker,
+        _handoff_reconciliation_required=reconciliation_required,
     )
 
 
@@ -52,6 +55,15 @@ def test_main_device_reconciling_is_unsafe_to_sleep():
     snapshot = build_sleep_readiness_snapshot(window)
 
     assert snapshot["handoff_reconciliation_in_progress"] is True
+    assert snapshot["safe_to_sleep"] is False
+
+
+def test_main_device_waiting_for_handoff_reconciliation_is_unsafe_to_sleep():
+    window = _window(is_main=True, reconciliation_required=True)
+
+    snapshot = build_sleep_readiness_snapshot(window)
+
+    assert snapshot["handoff_reconciliation_required"] is True
     assert snapshot["safe_to_sleep"] is False
 
 

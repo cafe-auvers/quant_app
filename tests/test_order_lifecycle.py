@@ -2084,6 +2084,54 @@ def test_buylist_activate_explicitly_retires_legacy_entry(monkeypatch):
     assert "No BUY order was submitted" in logs[0]
 
 
+def test_buylist_activation_persists_selected_account_for_safe_handoff(monkeypatch):
+    item = SimpleNamespace(
+        symbol="AAPL",
+        monitoring_status="WAITING_BREAKOUT",
+        kis_account_no="",
+        orb_monitor_enabled=False,
+    )
+    window = MainWindow.__new__(MainWindow)
+    window._buylist_selected_item = lambda _env: item
+    window._is_execution_queue_buylist_item = lambda _item: True
+    window._selected_order_account_for_item = lambda _item, _env: "12345678-01"
+    window._warn_order_account_unavailable = lambda *a: pytest.fail(
+        "configured account should be accepted"
+    )
+    window._buylist_prod_monitor_active = True
+    window._save_state = lambda: None
+    window.populate_buylist_dashboard = lambda: None
+    monkeypatch.setattr(
+        buylist_actions_module.QMessageBox, "information", lambda *a, **k: None
+    )
+
+    MainWindow._buylist_activate_selected(window, "PROD")
+
+    assert item.kis_account_no == "12345678-01"
+    assert item.orb_monitor_enabled is True
+
+
+def test_buylist_activation_blocks_when_no_account_can_be_persisted():
+    item = SimpleNamespace(
+        symbol="AAPL",
+        monitoring_status="WAITING_BREAKOUT",
+        kis_account_no="",
+        orb_monitor_enabled=False,
+    )
+    window = MainWindow.__new__(MainWindow)
+    window._buylist_selected_item = lambda _env: item
+    window._is_execution_queue_buylist_item = lambda _item: True
+    window._selected_order_account_for_item = lambda _item, _env: None
+    warnings = []
+    window._warn_order_account_unavailable = lambda *a: warnings.append(True)
+    window._save_state = lambda: pytest.fail("blocked activation must not save")
+
+    MainWindow._buylist_activate_selected(window, "PROD")
+
+    assert warnings == [True]
+    assert item.orb_monitor_enabled is False
+
+
 def test_buylist_move_to_breakeven_requires_bought_position(monkeypatch):
     warnings = []
     item = SimpleNamespace(

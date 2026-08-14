@@ -116,6 +116,15 @@ def test_main_device_handoff_check_critical_when_symbols_blocked():
     assert "MSFT" in check.detail
 
 
+def test_main_device_handoff_check_critical_when_execution_fence_remains():
+    check = health._main_device_handoff_check(
+        health.HealthContext(handoff_reconciliation_required=True)
+    )
+
+    assert check.level == health.HealthLevel.CRITICAL
+    assert "fenced" in check.summary.lower()
+
+
 def test_kis_api_health_requires_recent_verified_timestamp():
     now = dt.datetime(2026, 8, 14, 0, 0, tzinfo=dt.timezone.utc)
 

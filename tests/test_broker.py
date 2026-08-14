@@ -10,7 +10,9 @@ import pytest
 
 from src.api import kis_account_snapshot_dual, kis_order
 from src.core.order_state import (REGULAR_LIMIT_EXECUTION,
-                                  RESERVED_MOO_EXECUTION, OrderSide)
+                                  RESERVED_MOO_EXECUTION,
+                                  BrokerOrderStatusSnapshot, OrderSide,
+                                  OrderStatus)
 from src.risk.pre_trade import PreTradeRiskDecision
 from src.services import trading_state
 from src.services.broker import BrokerSubmissionResult, KisBroker
@@ -207,6 +209,79 @@ def test_get_order_regular_vs_reserved_routes_to_different_endpoints(monkeypatch
     assert broker.get_order(
         environment="PROD", account_no="12345678-01", is_reserved=True
     ) == ["reserved"]
+
+
+def test_discover_orders_requires_regular_and_reserved_sources(monkeypatch):
+    regular = BrokerOrderStatusSnapshot(
+        environment="PROD",
+        account_no="12345678-01",
+        symbol="AAPL",
+        status=OrderStatus.WORKING,
+    )
+    reserved = BrokerOrderStatusSnapshot(
+        environment="PROD",
+        account_no="12345678-01",
+        symbol="MSFT",
+        side=OrderSide.SELL,
+        status=OrderStatus.ACCEPTED,
+    )
+    monkeypatch.setattr(
+        kis_order, "query_overseas_order", lambda **kwargs: [regular]
+    )
+    monkeypatch.setattr(
+        kis_order, "query_overseas_reserved_order", lambda **kwargs: [reserved]
+    )
+
+    result = KisBroker().discover_orders(
+        environment="PROD", account_no="12345678-01"
+    )
+
+    assert result.complete is True
+    assert result.snapshots == [regular, reserved]
+
+
+def test_discover_orders_reports_partial_regular_source_failure(monkeypatch):
+    monkeypatch.setattr(
+        kis_order,
+        "query_overseas_order",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("nccs unavailable")),
+    )
+    monkeypatch.setattr(
+        kis_order, "query_overseas_reserved_order", lambda **kwargs: []
+    )
+
+    result = KisBroker().discover_orders(
+        environment="PROD", account_no="12345678-01"
+    )
+
+    assert result.complete is False
+    assert result.open_orders_complete is False
+    assert result.reserved_orders_complete is True
+    assert any("nccs unavailable" in error for error in result.errors)
+
+
+def test_discover_orders_checks_every_configured_exchange(monkeypatch):
+    regular_calls = []
+    reserved_calls = []
+    monkeypatch.setenv("KIS_PROD_OVERSEAS_EXCHANGES", "NASD,NYSE,AMEX")
+    monkeypatch.setattr(
+        kis_order,
+        "query_overseas_order",
+        lambda **kwargs: regular_calls.append(kwargs) or [],
+    )
+    monkeypatch.setattr(
+        kis_order,
+        "query_overseas_reserved_order",
+        lambda **kwargs: reserved_calls.append(kwargs) or [],
+    )
+
+    result = KisBroker().discover_orders(
+        environment="PROD", account_no="12345678-01"
+    )
+
+    assert result.complete is True
+    assert {call["exchange"] for call in regular_calls} == {"NASD", "NYSE", "AMEX"}
+    assert {call["exchange"] for call in reserved_calls} == {"NASD", "NYSE", "AMEX"}
 
 
 def test_get_positions_delegates_to_full_reconciliation_snapshot(monkeypatch):

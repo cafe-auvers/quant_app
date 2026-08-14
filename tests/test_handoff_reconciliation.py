@@ -12,7 +12,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.core.order_state import BrokerOrderStatusSnapshot, OrderSide, OrderStatus
+from src.core.order_state import (
+    BrokerOrderDiscoveryResult,
+    BrokerOrderStatusSnapshot,
+    OrderSide,
+    OrderStatus,
+)
 from src.services.handoff_reconciliation import (
     PostClaimReconciliationResult,
     in_flight_buylist_items,
@@ -39,6 +44,17 @@ class StubBroker:
             raise self.raise_on_get_order
         return self.open_orders
 
+    def discover_orders(self, **kwargs):
+        self.get_order_calls.append(kwargs)
+        if self.raise_on_get_order:
+            raise self.raise_on_get_order
+        return BrokerOrderDiscoveryResult(
+            snapshots=list(self.open_orders),
+            open_orders_complete=True,
+            history_complete=True,
+            reserved_orders_complete=True,
+        )
+
     def get_positions(self, **kwargs):
         self.get_positions_calls.append(kwargs)
         if self.raise_on_get_positions:
@@ -52,13 +68,22 @@ class StubBroker:
         raise AssertionError("Reconciliation must never submit a broker order")
 
 
-def _item(symbol, *, environment="PROD", status="BOUGHT", shares_held=0, avg_cost=0.0):
+def _item(
+    symbol,
+    *,
+    environment="PROD",
+    status="BOUGHT",
+    shares_held=0,
+    avg_cost=0.0,
+    kis_account_no="12345678-01",
+):
     return SimpleNamespace(
         symbol=symbol,
         environment=environment,
         monitoring_status=status,
         shares_held=shares_held,
         avg_cost=avg_cost,
+        kis_account_no=kis_account_no,
     )
 
 
@@ -163,8 +188,8 @@ def test_reconciliation_clears_symbol_when_broker_confirms_no_open_order():
     assert result.blocked_symbols == []
     assert item._buy_order_pending is False
     assert item._stop_order_pending is False
-    # Account-wide discovery: symbol="" so nothing is scoped to a local ledger.
-    assert broker.get_order_calls[0]["symbol"] == ""
+    # Account-wide discovery is partitioned by the item's persisted account.
+    assert broker.get_order_calls[0]["account_no"] == "12345678-01"
 
 
 def test_reconciliation_blocks_symbol_with_open_broker_order_local_ledger_never_knew_about():
@@ -225,6 +250,113 @@ def test_reconciliation_corrects_shares_held_from_broker_truth_when_unambiguous(
     assert result.reconciled_symbols == ["AAPL"]
     assert item.shares_held == 15
     assert item.avg_cost == 101.5
+
+
+def test_reconciliation_blocks_pre_entry_item_when_broker_already_has_position():
+    item = _item("AAPL", status="EXECUTE_READY", shares_held=0)
+    broker = StubBroker(
+        open_orders=[],
+        positions=_holdings("AAPL", 10, 101.5),
+    )
+
+    result = run_post_claim_broker_reconciliation(_manager(item), broker=broker)
+
+    assert result.ok is False
+    assert result.blocked_symbols == ["AAPL"]
+    assert not hasattr(item, "_buy_order_pending") or item._buy_order_pending is not False
+
+
+def test_reconciliation_blocks_account_on_unknown_symbol_less_snapshot():
+    item = _item("AAPL", status="EXECUTE_READY")
+    unknown = _open_order_snapshot("", status=OrderStatus.UNKNOWN)
+    broker = StubBroker(open_orders=[unknown], positions={})
+
+    result = run_post_claim_broker_reconciliation(_manager(item), broker=broker)
+
+    assert result.ok is False
+    assert result.blocked_symbols == ["AAPL"]
+    assert any("ambiguous" in error.lower() for error in result.errors)
+
+
+def test_reconciliation_blocks_account_when_any_order_source_is_incomplete():
+    item = _item("AAPL", status="EXECUTE_READY")
+
+    class IncompleteBroker(StubBroker):
+        def discover_orders(self, **kwargs):
+            return BrokerOrderDiscoveryResult(
+                open_orders_complete=False,
+                history_complete=True,
+                reserved_orders_complete=True,
+                errors=["inquire-nccs unavailable"],
+            )
+
+    result = run_post_claim_broker_reconciliation(
+        _manager(item), broker=IncompleteBroker()
+    )
+
+    assert result.ok is False
+    assert result.blocked_symbols == ["AAPL"]
+    assert any("inquire-nccs" in error for error in result.errors)
+
+
+def test_reconciliation_blocks_reserved_open_order():
+    item = _item("AAPL", status="SELL_RESERVED", shares_held=10)
+    reserved = _open_order_snapshot("AAPL", side=OrderSide.SELL)
+    broker = StubBroker(
+        open_orders=[reserved],
+        positions=_holdings("AAPL", 10, 100.0),
+    )
+
+    result = run_post_claim_broker_reconciliation(_manager(item), broker=broker)
+
+    assert result.ok is False
+    assert result.blocked_symbols == ["AAPL"]
+
+
+def test_reconciliation_partitions_items_by_persisted_account():
+    first = _item("AAPL", status="BOUGHT", shares_held=10, kis_account_no="11111111-01")
+    second = _item("MSFT", status="BOUGHT", shares_held=5, kis_account_no="22222222-01")
+
+    class MultiAccountBroker(StubBroker):
+        def discover_orders(self, **kwargs):
+            self.get_order_calls.append(kwargs)
+            return BrokerOrderDiscoveryResult(
+                open_orders_complete=True,
+                history_complete=True,
+                reserved_orders_complete=True,
+            )
+
+        def get_positions(self, **kwargs):
+            self.get_positions_calls.append(kwargs)
+            if kwargs["account_no"] == "11111111-01":
+                return _holdings("AAPL", 10, 100.0)
+            return _holdings("MSFT", 5, 200.0)
+
+    broker = MultiAccountBroker()
+    result = run_post_claim_broker_reconciliation(
+        _manager(first, second), broker=broker
+    )
+
+    assert result.ok is True
+    assert {call["account_no"] for call in broker.get_order_calls} == {
+        "11111111-01",
+        "22222222-01",
+    }
+    assert {call["account_no"] for call in broker.get_positions_calls} == {
+        "11111111-01",
+        "22222222-01",
+    }
+
+
+def test_reconciliation_blocks_item_without_persisted_account():
+    item = _item("AAPL", status="EXECUTE_READY", kis_account_no="")
+    broker = StubBroker()
+
+    result = run_post_claim_broker_reconciliation(_manager(item), broker=broker)
+
+    assert result.ok is False
+    assert result.blocked_symbols == ["AAPL"]
+    assert broker.get_order_calls == []
 
 
 def test_reconciliation_blocks_all_in_flight_symbols_on_open_order_query_failure():

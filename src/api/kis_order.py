@@ -488,8 +488,18 @@ def _query_pages(
         header_tr_cont = str(
             headers.get("tr_cont") or headers.get("tr-cont") or ""
         ).strip()
-        if header_tr_cont not in {"F", "M"} or (not next_fk200 and not next_nk200):
-            break
+        if header_tr_cont not in {"F", "M"}:
+            return pages
+        if not next_fk200 and not next_nk200:
+            raise RuntimeError(
+                f"KIS pagination was incomplete for {endpoint}: "
+                "continuation was requested without a cursor"
+            )
+        if page_index + 1 >= max(1, max_pages):
+            raise RuntimeError(
+                f"KIS pagination was incomplete for {endpoint}: "
+                f"more than {max_pages} pages were reported"
+            )
         fk200, nk200 = next_fk200, next_nk200
         tr_cont = "N"
         time.sleep(0.2)
@@ -549,6 +559,7 @@ def query_overseas_order(
         logger.warning(
             "KIS open-order query failed for %s %s: %s", env_key, account_no, exc
         )
+        raise RuntimeError(f"KIS open-order discovery failed: {exc}") from exc
 
     for page in all_pages["open"]:
         for row in _output_rows(page):

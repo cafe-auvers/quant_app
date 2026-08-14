@@ -36,8 +36,9 @@ from typing import Any, Callable, Dict, List, Optional
 from src.core.execution_queue import (
     HANDOFF_MONITORABLE_STATUSES,
     POSITION_HOLDING_STATUSES,
+    PRE_ENTRY_QUEUE_STATUSES,
 )
-from src.core.order_state import is_open_status
+from src.core.order_state import BrokerOrderDiscoveryResult, OrderStatus, is_open_status
 from src.services.broker import Broker, KisBroker
 from src.services.event_journal import EventType, record_event
 # Reused rather than reimplemented -- this is the same holdings-lookup logic
@@ -87,18 +88,14 @@ def run_post_claim_broker_reconciliation(
     buylist_manager,
     *,
     environment: str = "PROD",
-    account_no: str = "",
     broker: Optional[Broker] = None,
     event_recorder: Optional[Callable[..., Any]] = None,
 ) -> PostClaimReconciliationResult:
     """Reconcile every in-flight PROD item against broker truth.
 
-    Uses broker-truth discovery, not the local order ledger:
-    ``broker.get_order(..., symbol="")`` queries KIS's account-wide
-    open-order/history endpoints (``inquire-nccs``/``inquire-ccnl`` via
-    ``src/api/kis_order.py``'s ``query_overseas_order``) rather than being
-    scoped to any local ledger, so this can see an order the *other* device
-    placed that this device's own ``orders.json`` has never heard of.
+    Uses broker-truth discovery, not the local order ledger. Items are
+    partitioned by their persisted ``kis_account_no`` and each account's
+    regular open/history and reserved-order ledgers are queried in full.
 
     A symbol only clears (flags reset to False) when the broker snapshot is
     unambiguous: no open order for that symbol, and holdings agree with (or
@@ -113,7 +110,14 @@ def run_post_claim_broker_reconciliation(
     if not items:
         return result
 
-    def emit(event_type: EventType, *, symbol: str = "", reason: str = "", payload: Optional[Dict[str, Any]] = None) -> None:
+    def emit(
+        event_type: EventType,
+        *,
+        account_no: str = "",
+        symbol: str = "",
+        reason: str = "",
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
         recorder = event_recorder or record_event
         try:
             recorder(
@@ -128,85 +132,178 @@ def run_post_claim_broker_reconciliation(
             # Observability must never block or alter the reconciliation outcome.
             logger.exception("Handoff reconciliation event recorder failed for %s", event_type)
 
-    emit(EventType.RECONCILIATION_STARTED, payload={"symbol_count": len(items)})
-
-    try:
-        open_order_snapshots = broker.get_order(
-            environment=environment, account_no=account_no, symbol=""
-        )
-    except Exception as exc:
-        result.ok = False
-        result.errors.append(f"Account-wide open-order query failed: {exc}")
-        result.blocked_symbols = sorted({str(item.symbol or "").upper() for item in items})
-        emit(EventType.RECONCILIATION_FAILED, reason=str(exc))
-        return result
-
-    try:
-        positions = broker.get_positions(environment=environment, account_no=account_no)
-    except Exception as exc:
-        result.ok = False
-        result.errors.append(f"Position query failed: {exc}")
-        result.blocked_symbols = sorted({str(item.symbol or "").upper() for item in items})
-        emit(EventType.RECONCILIATION_FAILED, reason=str(exc))
-        return result
-
-    open_orders_by_symbol: Dict[str, List[Any]] = {}
-    for snapshot in open_order_snapshots:
-        if is_open_status(getattr(snapshot, "status", None)):
-            key = str(getattr(snapshot, "symbol", "") or "").upper()
-            open_orders_by_symbol.setdefault(key, []).append(snapshot)
-
+    accounts: Dict[str, List[Any]] = {}
+    unassigned: List[Any] = []
     for item in items:
-        symbol = str(item.symbol or "").upper()
-        matching_open_orders = open_orders_by_symbol.get(symbol, [])
-        if matching_open_orders:
-            result.blocked_symbols.append(symbol)
+        item_account = str(getattr(item, "kis_account_no", "") or "").strip()
+        if item_account:
+            accounts.setdefault(item_account, []).append(item)
+        else:
+            unassigned.append(item)
+
+    emit(
+        EventType.RECONCILIATION_STARTED,
+        payload={"symbol_count": len(items), "account_count": len(accounts)},
+    )
+
+    for item in unassigned:
+        symbol = str(getattr(item, "symbol", "") or "").upper()
+        result.blocked_symbols.append(symbol)
+        result.errors.append(
+            f"{symbol or 'unknown symbol'} has no assigned KIS account; manual review required"
+        )
+        emit(
+            EventType.RECONCILIATION_WARNING,
+            symbol=symbol,
+            reason="missing persisted kis_account_no",
+        )
+
+    for item_account, account_items in accounts.items():
+        account_symbols = sorted(
+            {str(getattr(item, "symbol", "") or "").upper() for item in account_items}
+        )
+
+        try:
+            discovery = broker.discover_orders(
+                environment=environment,
+                account_no=item_account,
+            )
+        except Exception as exc:
+            discovery = BrokerOrderDiscoveryResult(errors=[str(exc)])
+
+        if not isinstance(discovery, BrokerOrderDiscoveryResult) or not discovery.complete:
+            errors = (
+                discovery.errors
+                if isinstance(discovery, BrokerOrderDiscoveryResult)
+                else ["Broker returned an invalid order-discovery result"]
+            )
+            detail = "; ".join(errors) or "one or more order sources were incomplete"
+            result.blocked_symbols.extend(account_symbols)
+            result.errors.append(f"Account {item_account} order discovery incomplete: {detail}")
             emit(
-                EventType.RECONCILIATION_WARNING,
-                symbol=symbol,
-                reason=f"{len(matching_open_orders)} open broker order(s) found",
+                EventType.RECONCILIATION_FAILED,
+                account_no=item_account,
+                reason=detail,
             )
             continue
 
-        broker_qty, broker_avg_cost, _ = _holding_for_symbol(positions, symbol)
-        local_shares = int(getattr(item, "shares_held", 0) or 0)
-        status = str(getattr(item, "monitoring_status", "") or "").upper()
+        ambiguous_snapshots = [
+            snapshot
+            for snapshot in discovery.snapshots
+            if str(
+                getattr(
+                    getattr(snapshot, "status", OrderStatus.UNKNOWN),
+                    "value",
+                    getattr(snapshot, "status", OrderStatus.UNKNOWN),
+                )
+            ).upper()
+            == OrderStatus.UNKNOWN.value
+            or not str(getattr(snapshot, "symbol", "") or "").strip()
+            or str(getattr(snapshot, "account_no", "") or "").strip()
+            not in {"", item_account}
+            or str(getattr(snapshot, "environment", "") or "").upper()
+            not in {"", environment.upper()}
+        ]
+        if ambiguous_snapshots:
+            result.blocked_symbols.extend(account_symbols)
+            detail = (
+                f"{len(ambiguous_snapshots)} unknown or symbol-less broker snapshot(s)"
+            )
+            result.errors.append(f"Account {item_account} order discovery ambiguous: {detail}")
+            emit(
+                EventType.RECONCILIATION_FAILED,
+                account_no=item_account,
+                reason=detail,
+            )
+            continue
 
-        if status in POSITION_HOLDING_STATUSES:
-            if broker_qty <= 0:
-                # Unambiguous disagreement: local state says BOUGHT but the
-                # broker shows no position (e.g. a sell filled on the other
-                # device that this one never heard about). Stay blocked for
-                # manual review rather than silently dropping the position.
+        try:
+            positions = broker.get_positions(
+                environment=environment,
+                account_no=item_account,
+            )
+        except Exception as exc:
+            result.blocked_symbols.extend(account_symbols)
+            result.errors.append(f"Account {item_account} position query failed: {exc}")
+            emit(
+                EventType.RECONCILIATION_FAILED,
+                account_no=item_account,
+                reason=str(exc),
+            )
+            continue
+
+        open_orders_by_symbol: Dict[str, List[Any]] = {}
+        for snapshot in discovery.snapshots:
+            if is_open_status(getattr(snapshot, "status", None)):
+                key = str(getattr(snapshot, "symbol", "") or "").upper()
+                open_orders_by_symbol.setdefault(key, []).append(snapshot)
+
+        for item in account_items:
+            symbol = str(getattr(item, "symbol", "") or "").upper()
+            matching_open_orders = open_orders_by_symbol.get(symbol, [])
+            if matching_open_orders:
                 result.blocked_symbols.append(symbol)
                 emit(
                     EventType.RECONCILIATION_WARNING,
+                    account_no=item_account,
+                    symbol=symbol,
+                    reason=f"{len(matching_open_orders)} open broker order(s) found",
+                )
+                continue
+
+            broker_qty, broker_avg_cost, _ = _holding_for_symbol(positions, symbol)
+            local_shares = int(getattr(item, "shares_held", 0) or 0)
+            status = str(getattr(item, "monitoring_status", "") or "").upper()
+
+            if status in PRE_ENTRY_QUEUE_STATUSES and broker_qty > 0:
+                result.blocked_symbols.append(symbol)
+                emit(
+                    EventType.RECONCILIATION_WARNING,
+                    account_no=item_account,
                     symbol=symbol,
                     reason=(
-                        f"local shares_held={local_shares} but broker shows no "
-                        "position; needs manual review"
+                        f"pre-entry state but broker already holds {int(broker_qty)} "
+                        "share(s); possible fill before state sync"
                     ),
                 )
                 continue
-            local_avg_cost = float(getattr(item, "avg_cost", 0.0) or 0.0)
-            if int(broker_qty) != local_shares or (
-                broker_avg_cost > 0 and abs(broker_avg_cost - local_avg_cost) > 1e-6
-            ):
-                item.shares_held = int(broker_qty)
-                if broker_avg_cost > 0:
-                    item.avg_cost = broker_avg_cost
-                emit(
-                    EventType.RECONCILIATION_WARNING,
-                    symbol=symbol,
-                    reason="corrected shares_held/avg_cost from broker truth",
-                )
 
-        item._buy_order_pending = False
-        item._stop_order_pending = False
-        item._exit_order_pending = False
-        result.reconciled_symbols.append(symbol)
+            if status in POSITION_HOLDING_STATUSES:
+                if broker_qty <= 0:
+                    result.blocked_symbols.append(symbol)
+                    emit(
+                        EventType.RECONCILIATION_WARNING,
+                        account_no=item_account,
+                        symbol=symbol,
+                        reason=(
+                            f"local shares_held={local_shares} but broker shows no "
+                            "position; needs manual review"
+                        ),
+                    )
+                    continue
+                local_avg_cost = float(getattr(item, "avg_cost", 0.0) or 0.0)
+                if int(broker_qty) != local_shares or (
+                    broker_avg_cost > 0
+                    and abs(broker_avg_cost - local_avg_cost) > 1e-6
+                ):
+                    item.shares_held = int(broker_qty)
+                    if broker_avg_cost > 0:
+                        item.avg_cost = broker_avg_cost
+                    emit(
+                        EventType.RECONCILIATION_WARNING,
+                        account_no=item_account,
+                        symbol=symbol,
+                        reason="corrected shares_held/avg_cost from broker truth",
+                    )
 
-    result.ok = not result.blocked_symbols
+            item._buy_order_pending = False
+            item._stop_order_pending = False
+            item._exit_order_pending = False
+            result.reconciled_symbols.append(symbol)
+
+    result.blocked_symbols = sorted(set(result.blocked_symbols))
+    result.reconciled_symbols = sorted(set(result.reconciled_symbols))
+    result.ok = not result.blocked_symbols and not result.errors
     emit(
         EventType.RECONCILIATION_COMPLETED if result.ok else EventType.RECONCILIATION_WARNING,
         payload={

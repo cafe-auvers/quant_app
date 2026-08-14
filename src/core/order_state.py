@@ -4,7 +4,7 @@ from __future__ import annotations
 import datetime as dt
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 
@@ -197,6 +197,31 @@ class BrokerOrderStatusSnapshot:
             limit_price=float(data.get("limit_price", 0.0) or 0.0),
             raw_response=data.get("raw_response") if isinstance(data.get("raw_response"), dict) else {},
             checked_at=str(data.get("checked_at") or utc_now_iso()),
+        )
+
+
+@dataclass
+class BrokerOrderDiscoveryResult:
+    """Completeness-aware account-wide broker order discovery.
+
+    An empty snapshot list is only trustworthy when every required source is
+    complete.  Handoff code must fail closed on any incomplete flag or error;
+    this prevents a partial KIS outage from looking like "no open orders".
+    """
+
+    snapshots: List[BrokerOrderStatusSnapshot] = field(default_factory=list)
+    open_orders_complete: bool = False
+    history_complete: bool = False
+    reserved_orders_complete: bool = False
+    errors: List[str] = field(default_factory=list)
+
+    @property
+    def complete(self) -> bool:
+        return bool(
+            self.open_orders_complete
+            and self.history_complete
+            and self.reserved_orders_complete
+            and not self.errors
         )
 
 

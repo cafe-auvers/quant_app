@@ -91,8 +91,13 @@ def _base_window(*, is_main=False, lease_token="", pc_engine=None, db_ready=True
     window.handoff_reconciliation_worker = None
     window._handoff_generation = 0
     window._state_sync_auto_claim = False
+    window._handoff_reconciliation_required = False
+    window._handoff_allow_auto_arm = False
     window.state_sync_worker = None
     window.state_save_manager = SimpleNamespace(_is_main_device=is_main)
+    window._bind_remote_state_engine = lambda _engine, *, is_main_device=None: setattr(
+        window.state_save_manager, "_is_main_device", bool(is_main_device)
+    )
     logs = []
     window.append_log = logs.append
     window._logs = logs
@@ -171,6 +176,17 @@ def test_order_submission_blocked_when_never_reconciled(monkeypatch):
     monkeypatch.setattr(main_window_module.QMessageBox, "warning", lambda *a: None)
 
     assert MainWindow._state_sync_allows_order_submission(window) is False
+
+
+def test_order_submission_blocked_until_handoff_reconciliation_is_clean():
+    window = _base_window(is_main=True, lease_token="tok-1")
+    window.state_sync_role = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    window.state_save_manager = SimpleNamespace(_is_main_device=True)
+    window._last_successful_reconcile_at = dt.datetime.now(dt.timezone.utc)
+    window._handoff_reconciliation_required = True
+
+    assert MainWindow._state_sync_allows_order_submission(window) is False
+    assert any("handoff" in message.lower() for message in window._logs)
 
 
 # --- _auto_arm_trading_kill_switch gate checklist --------------------------
@@ -252,6 +268,11 @@ def _handoff_window():
     window._auto_arm_trading_kill_switch = lambda: setattr(
         calls, "auto_armed", calls.auto_armed + 1
     )
+    window._persist_post_claim_reconciliation_state = lambda: (
+        setattr(calls, "save_buylist", calls.save_buylist + 1) or True,
+        "",
+    )
+    window._handoff_allow_auto_arm = True
     window._calls = calls
     return window
 
@@ -288,6 +309,34 @@ def test_post_claim_blocked_never_starts_monitor_or_arms_and_schedules_retry(
     assert window._calls.retries[0][0] == 30_000
 
 
+def test_post_claim_clean_broker_result_stays_blocked_if_state_publish_fails(
+    monkeypatch,
+):
+    window = _handoff_window()
+    window._handoff_generation = 1
+    window._persist_post_claim_reconciliation_state = lambda: (
+        False,
+        "MySQL unavailable",
+    )
+    monkeypatch.setattr(
+        main_window_module.QTimer,
+        "singleShot",
+        staticmethod(lambda ms, fn: window._calls.retries.append((ms, fn))),
+    )
+
+    MainWindow._on_post_claim_reconciliation_finished(
+        window,
+        PostClaimReconciliationResult(ok=True, reconciled_symbols=["AAPL"]),
+        1,
+    )
+
+    assert window._handoff_reconciliation_required is True
+    assert window._last_handoff_blocked_symbols == ("AAPL",)
+    assert window._calls.monitor_started == []
+    assert window._calls.auto_armed == 0
+    assert window._calls.retries[0][0] == 30_000
+
+
 def test_post_claim_stale_generation_is_ignored():
     window = _handoff_window()
     window._handoff_generation = 2  # a newer handoff attempt has already started
@@ -316,7 +365,7 @@ def test_retry_post_claim_handoff_noop_when_no_longer_main():
     window = _handoff_window()
     window.state_sync_role = ss.LocalDeviceRole("laptop-id", "LAPTOP", False)
     started = []
-    window._begin_post_claim_handoff = lambda: started.append(True)
+    window._begin_post_claim_handoff = lambda **kwargs: started.append(kwargs)
 
     MainWindow._retry_post_claim_handoff_if_still_main(window)
 
@@ -327,11 +376,11 @@ def test_retry_post_claim_handoff_reattempts_when_still_main():
     window = _handoff_window()
     started = []
     window.__dict__["_database_shutting_down"] = False
-    window._begin_post_claim_handoff = lambda: started.append(True)
+    window._begin_post_claim_handoff = lambda **kwargs: started.append(kwargs)
 
     MainWindow._retry_post_claim_handoff_if_still_main(window)
 
-    assert started == [True]
+    assert started == [{"allow_auto_arm": True}]
 
 
 # --- _begin_post_claim_handoff: reset flags + construct worker -------------
@@ -351,10 +400,9 @@ def test_begin_post_claim_handoff_locks_in_flight_items_and_starts_worker(monkey
     created_workers = []
 
     class FakeHandoffReconciliationWorker:
-        def __init__(self, buylist_manager, *, environment, account_no):
+        def __init__(self, buylist_manager, *, environment):
             self.buylist_manager = buylist_manager
             self.environment = environment
-            self.account_no = account_no
             self.finished_reconciliation = _SignalStub()
             self.error_occurred = _SignalStub()
             self.finished = _SignalStub()
@@ -377,7 +425,6 @@ def test_begin_post_claim_handoff_locks_in_flight_items_and_starts_worker(monkey
     assert len(created_workers) == 1
     worker = created_workers[0]
     assert worker.environment == "PROD"
-    assert worker.account_no == "12345678-01"
     assert worker.started is True
     assert window._calls.save_buylist == 1
 
@@ -456,7 +503,9 @@ def test_successful_auto_claim_activation_begins_post_claim_handoff():
     window._state_sync_action = "activate"
     window._state_sync_auto_claim = True
     begun = []
-    window._begin_post_claim_handoff = lambda: begun.append(True)
+    window._begin_post_claim_handoff = lambda **kwargs: begun.append(
+        kwargs["allow_auto_arm"]
+    )
     result = StateReconcileResult(
         is_main_device=True,
         lease_token="tok-1",
@@ -470,14 +519,16 @@ def test_successful_auto_claim_activation_begins_post_claim_handoff():
     assert window._current_lease_token == "tok-1"
 
 
-def test_manual_activation_does_not_begin_post_claim_handoff():
-    """Regression guard: manual 'Use This Device as Main' must not auto-arm trading."""
+def test_manual_activation_begins_reconciliation_without_auto_arm_permission():
+    """Manual 'Use This Device as Main' reconciles but cannot auto-arm trading."""
     window = _sync_completed_window(auto_claim_enabled=True)
     window.state_sync_role = ss.LocalDeviceRole("pc-id", "PC", False)
     window._state_sync_action = "activate"
     window._state_sync_auto_claim = False  # manual button click, not auto-claim
     begun = []
-    window._begin_post_claim_handoff = lambda: begun.append(True)
+    window._begin_post_claim_handoff = lambda **kwargs: begun.append(
+        kwargs["allow_auto_arm"]
+    )
     result = StateReconcileResult(
         is_main_device=True,
         lease_token="tok-1",
@@ -487,7 +538,40 @@ def test_manual_activation_does_not_begin_post_claim_handoff():
 
     MainWindow._on_state_sync_completed(window, result, 0)
 
+    assert begun == [False]
+
+
+def test_claim_with_sync_error_keeps_execution_fenced_until_later_reconcile():
+    window = _sync_completed_window(auto_claim_enabled=False)
+    window.state_sync_role = ss.LocalDeviceRole("pc-id", "PC", False)
+    window._state_sync_action = "activate"
+    window._state_sync_auto_claim = False
+    window._handoff_reconciliation_required = True
+    begun = []
+    window._begin_post_claim_handoff = lambda **kwargs: begun.append(kwargs)
+
+    claimed_with_error = StateReconcileResult(
+        is_main_device=True,
+        lease_token="tok-1",
+        local_role=ss.LocalDeviceRole("pc-id", "PC", True),
+        main_device_hostname="PC",
+        errors=["remote state pull failed"],
+    )
+    MainWindow._on_state_sync_completed(window, claimed_with_error, 0)
+
+    assert window._handoff_reconciliation_required is True
     assert begun == []
+
+    window._state_sync_action = "reconcile"
+    clean = StateReconcileResult(
+        is_main_device=True,
+        lease_token="tok-1",
+        local_role=ss.LocalDeviceRole("pc-id", "PC", True),
+        main_device_hostname="PC",
+    )
+    MainWindow._on_state_sync_completed(window, clean, 0)
+
+    assert begun == [{"allow_auto_arm": False}]
 
 
 # --- _release_main_device_ownership_for_shutdown (closeEvent extraction) ---
@@ -516,9 +600,58 @@ def test_release_ownership_for_shutdown_publishes_and_releases(monkeypatch, tmp_
     window.state_sync_role = role
     window.buylist_manager = SimpleNamespace(to_dict=lambda: {"items": []})
     monkeypatch.setattr(main_window_module, "load_json", lambda *a, **k: {})
+    monkeypatch.setattr(
+        main_window_module, "publish_handoff_snapshot", lambda *a, **k: True
+    )
 
     MainWindow._release_main_device_ownership_for_shutdown(window)
 
     assert ss.get_main_device(engine).main_device is None
     assert window.state_sync_role.is_main is False
     assert window._current_lease_token == ""
+
+
+def test_shutdown_retains_ownership_when_strict_publication_fails(
+    monkeypatch, tmp_path
+):
+    engine = _make_engine(tmp_path)
+    role = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    assert ss.claim_main_device(engine, role).success
+    window = _base_window(is_main=True, lease_token="tok-1", pc_engine=engine)
+    window.state_sync_role = role
+    window.buylist_manager = SimpleNamespace(to_dict=lambda: {"items": []})
+    monkeypatch.setattr(main_window_module, "load_json", lambda *a, **k: {})
+    monkeypatch.setattr(
+        main_window_module, "publish_handoff_snapshot", lambda *a, **k: False
+    )
+
+    released = MainWindow._release_main_device_ownership_for_shutdown(window)
+
+    assert released is False
+    assert ss.get_main_device(engine).main_device.device_id == "laptop-id"
+    assert window.state_sync_role.is_main is True
+    assert window.state_save_manager._is_main_device is True
+
+
+def test_shutdown_retains_ownership_when_final_local_save_failed(
+    monkeypatch, tmp_path
+):
+    engine = _make_engine(tmp_path)
+    role = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    assert ss.claim_main_device(engine, role).success
+    window = _base_window(is_main=True, lease_token="tok-1", pc_engine=engine)
+    window.state_sync_role = role
+    published = []
+    monkeypatch.setattr(
+        main_window_module,
+        "publish_handoff_snapshot",
+        lambda *a, **k: published.append(True) or True,
+    )
+
+    released = MainWindow._release_main_device_ownership_for_shutdown(
+        window, final_save_succeeded=False
+    )
+
+    assert released is False
+    assert published == []
+    assert ss.get_main_device(engine).main_device.device_id == "laptop-id"

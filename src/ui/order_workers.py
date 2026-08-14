@@ -135,13 +135,11 @@ class HandoffReconciliationWorker(QThread):
         buylist_manager,
         *,
         environment: str = "PROD",
-        account_no: str = "",
         broker: Optional[Broker] = None,
     ) -> None:
         super().__init__()
         self.buylist_manager = buylist_manager
         self.environment = environment
-        self.account_no = account_no
         self.broker = KisBroker() if broker is None else broker
 
     def run(self) -> None:
@@ -149,7 +147,6 @@ class HandoffReconciliationWorker(QThread):
             result = run_post_claim_broker_reconciliation(
                 self.buylist_manager,
                 environment=self.environment,
-                account_no=self.account_no,
                 broker=self.broker,
                 event_recorder=record_event,
             )

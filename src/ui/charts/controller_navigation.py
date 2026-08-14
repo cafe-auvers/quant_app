@@ -503,6 +503,11 @@ class ChartsNavigationMixin:
                 )
                 return
             if self._is_execution_queue_buylist_item(item):
+                account_no = self._selected_order_account_for_item(item, env)
+                if not account_no:
+                    self._warn_order_account_unavailable(item, env)
+                    return
+                item.kis_account_no = account_no
                 item.orb_monitor_enabled = True
                 self._ensure_buylist_monitor_running(env)
             else:

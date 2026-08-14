@@ -1223,27 +1223,34 @@ def auto_claim_main_device_if_stale(
 def release_main_device_and_demote(
     engine,
     role: LocalDeviceRole,
+    *,
+    disable_remote_writer: Callable[[], None] | None = None,
 ) -> tuple[bool, LocalDeviceRole, str]:
-    """Release ownership (if held) and persist this device as pull-only.
+    """Persist pull-only state, fence local writes, then release ownership.
 
-    Returns ``(released_cleanly, updated_role, error)``. Demoting the local
-    role is not optional here: without it, ``reconcile_state_with_remote``'s
-    own bootstrap branch ("owner row missing + local role.is_main == True" ->
-    self-claim) would let this device silently re-claim its own just-released
-    row on its very next reconcile tick.
+    The ordering is safety-critical. If local demotion or writer fencing fails,
+    the remote ownership row is deliberately retained so another device must
+    use the stale-heartbeat takeover path instead of observing a clean release.
     """
-    error = ""
-    released = True
-    if role.is_main:
-        result = release_main_device(engine, role)
-        released = result.success
-        if not released:
-            error = result.error
+    if not role.is_main:
+        return True, role, ""
+
+    owning_role = role
     try:
         role = set_local_device_main(role, False)
     except Exception as exc:
-        error = error or f"Could not persist pull-only device role: {exc}"
-    return released, role, error
+        return False, owning_role, f"Could not persist pull-only device role: {exc}"
+
+    if disable_remote_writer is not None:
+        try:
+            disable_remote_writer()
+        except Exception as exc:
+            return False, role, f"Could not disable remote state writer: {exc}"
+
+    result = release_main_device(engine, owning_role)
+    if not result.success:
+        return False, role, result.error or "Could not release main-device ownership."
+    return True, role, ""
 
 
 def publish_handoff_snapshot(
