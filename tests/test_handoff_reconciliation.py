@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import src.services.handoff_reconciliation as handoff_reconciliation
 from src.core.order_state import (
     BrokerOrderDiscoveryResult,
     BrokerOrderStatusSnapshot,
@@ -31,7 +32,10 @@ class StubBroker:
 
     def __init__(self, *, open_orders=None, positions=None, raise_on_get_order=None, raise_on_get_positions=None):
         self.open_orders = open_orders or []
-        self.positions = positions or {}
+        self.positions = positions if positions is not None else {
+            "domestic": {"holdings": []},
+            "overseas": {"holdings": []},
+        }
         self.raise_on_get_order = raise_on_get_order
         self.raise_on_get_positions = raise_on_get_positions
         self.get_order_calls = []
@@ -91,6 +95,16 @@ def _manager(*items):
     return SimpleNamespace(items=list(items))
 
 
+@pytest.fixture(autouse=True)
+def _configured_prod_account(monkeypatch):
+    """Keep broker-account inventory deterministic and independent of .env."""
+    monkeypatch.setattr(
+        handoff_reconciliation,
+        "get_configured_account_numbers",
+        lambda _environment: ["12345678-01"],
+    )
+
+
 def _open_order_snapshot(symbol, side=OrderSide.SELL, status=OrderStatus.WORKING):
     return BrokerOrderStatusSnapshot(
         environment="PROD",
@@ -103,6 +117,7 @@ def _open_order_snapshot(symbol, side=OrderSide.SELL, status=OrderStatus.WORKING
 
 def _holdings(symbol, quantity, average_price):
     return {
+        "domestic": {"holdings": []},
         "overseas": {
             "holdings": [
                 {"symbol": symbol, "quantity": quantity, "average_price": average_price}
@@ -163,7 +178,7 @@ def test_reset_runtime_only_order_flags_handles_empty_manager():
 # --- run_post_claim_broker_reconciliation ---------------------------------
 
 
-def test_reconciliation_is_ok_noop_when_nothing_in_flight():
+def test_reconciliation_audits_configured_account_when_nothing_in_flight():
     manager = _manager(_item("AAPL", status="WATCHING"))
     broker = StubBroker()
 
@@ -171,7 +186,87 @@ def test_reconciliation_is_ok_noop_when_nothing_in_flight():
 
     assert result.ok is True
     assert result.reconciled_symbols == []
+    assert broker.get_order_calls == [
+        {"environment": "PROD", "account_no": "12345678-01"}
+    ]
+    assert broker.get_positions_calls == [
+        {"environment": "PROD", "account_no": "12345678-01"}
+    ]
+
+
+def test_reconciliation_blocks_open_order_when_local_in_flight_state_is_empty():
+    broker = StubBroker(open_orders=[_open_order_snapshot("MSFT", side=OrderSide.BUY)])
+
+    result = run_post_claim_broker_reconciliation(_manager(), broker=broker)
+
+    assert result.ok is False
+    assert result.blocked_symbols == ["MSFT"]
+    assert any("unmatched open broker order" in error for error in result.errors)
+
+
+def test_reconciliation_blocks_position_when_local_in_flight_state_is_empty():
+    broker = StubBroker(positions=_holdings("MSFT", 7, 401.25))
+
+    result = run_post_claim_broker_reconciliation(_manager(), broker=broker)
+
+    assert result.ok is False
+    assert result.blocked_symbols == ["MSFT"]
+    assert any("unmatched broker holding" in error for error in result.errors)
+
+
+def test_reconciliation_blocks_entire_account_for_unmatched_order():
+    item = _item("AAPL", status="BOUGHT", shares_held=10, avg_cost=100.0)
+    item._buy_order_pending = True
+    broker = StubBroker(
+        open_orders=[_open_order_snapshot("MSFT", side=OrderSide.BUY)],
+        positions=_holdings("AAPL", 10, 100.0),
+    )
+
+    result = run_post_claim_broker_reconciliation(_manager(item), broker=broker)
+
+    assert result.ok is False
+    assert result.blocked_symbols == ["AAPL", "MSFT"]
+    assert result.reconciled_symbols == []
+    assert item._buy_order_pending is True
+
+
+def test_reconciliation_blocks_symbol_left_watching_by_failed_publication():
+    """A stale pre-submission snapshot must not hide the submitted order."""
+    stale_item = _item("MSFT", status="WATCHING")
+    broker = StubBroker(open_orders=[_open_order_snapshot("MSFT", side=OrderSide.BUY)])
+
+    result = run_post_claim_broker_reconciliation(
+        _manager(stale_item), broker=broker
+    )
+
+    assert result.ok is False
+    assert result.blocked_symbols == ["MSFT"]
+    assert result.reconciled_symbols == []
+
+
+def test_reconciliation_queries_every_configured_account_with_empty_state():
+    accounts = ["11111111-01", "22222222-01"]
+    broker = StubBroker()
+
+    result = run_post_claim_broker_reconciliation(
+        _manager(), broker=broker, configured_account_numbers=accounts
+    )
+
+    assert result.ok is True
+    assert {call["account_no"] for call in broker.get_order_calls} == set(accounts)
+    assert {call["account_no"] for call in broker.get_positions_calls} == set(accounts)
+
+
+def test_reconciliation_fails_closed_without_configured_prod_accounts():
+    broker = StubBroker()
+
+    result = run_post_claim_broker_reconciliation(
+        _manager(), broker=broker, configured_account_numbers=[]
+    )
+
+    assert result.ok is False
     assert broker.get_order_calls == []
+    assert any("No configured PROD KIS accounts" in error for error in result.errors)
 
 
 def test_reconciliation_clears_symbol_when_broker_confirms_no_open_order():
@@ -334,7 +429,9 @@ def test_reconciliation_partitions_items_by_persisted_account():
 
     broker = MultiAccountBroker()
     result = run_post_claim_broker_reconciliation(
-        _manager(first, second), broker=broker
+        _manager(first, second),
+        broker=broker,
+        configured_account_numbers=["11111111-01", "22222222-01"],
     )
 
     assert result.ok is True
@@ -356,7 +453,9 @@ def test_reconciliation_blocks_item_without_persisted_account():
 
     assert result.ok is False
     assert result.blocked_symbols == ["AAPL"]
-    assert broker.get_order_calls == []
+    # Configured accounts are always audited even when the item itself cannot
+    # be mapped to one.
+    assert broker.get_order_calls[0]["account_no"] == "12345678-01"
 
 
 def test_reconciliation_blocks_all_in_flight_symbols_on_open_order_query_failure():
@@ -368,6 +467,9 @@ def test_reconciliation_blocks_all_in_flight_symbols_on_open_order_query_failure
     assert result.ok is False
     assert set(result.blocked_symbols) == {"AAPL", "MSFT"}
     assert result.errors
+    # Position discovery is an independent account-wide check and must still
+    # run when order discovery fails.
+    assert len(broker.get_positions_calls) == 1
 
 
 def test_reconciliation_blocks_all_in_flight_symbols_on_positions_query_failure():

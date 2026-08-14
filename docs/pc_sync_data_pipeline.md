@@ -373,16 +373,18 @@ either machine.
   handoff_reconciliation.py`): the moment a device becomes main, every
   in-flight PROD item's runtime pending flags are forced to "assume
   something might be pending" (closing the gap where a freshly-synced
-  `BuylistItem` silently defaults to "nothing pending"), then reconciled
-  per persisted `kis_account_no` against completeness-aware, account-wide
-  regular open/history **and reserved-order** discovery plus
-  `Broker.get_positions(...)`. Missing accounts, incomplete pagination,
-  partial endpoint failures, unknown/symbol-less results, open orders, or a
-  broker position attached to stale pre-entry state all fail closed.
-  Monitoring/trading only resume once every in-flight symbol clears
-  unambiguously **and** the broker-corrected state has been synchronously saved
-  and strictly republished. The manual **Use This Device as Main** path uses
-  the same reconciliation fence and never auto-arms live trading.
+  `BuylistItem` silently defaults to "nothing pending"). Independently of
+  that synchronized state, every configured PROD account is then queried
+  for completeness-aware, account-wide regular open/history and
+  **reserved-order** discovery plus `Broker.get_positions(...)`. Missing or
+  unconfigured accounts, incomplete pagination, partial endpoint failures,
+  malformed results, any open order, or any nonzero holding without a local
+  `BOUGHT` item all fail closed for the entire account. This also catches an
+  order/position omitted by a failed final publication or a stale snapshot.
+  Monitoring/trading only resume once every configured account clears
+  unambiguously **and** the broker-corrected state has been synchronously
+  saved and strictly republished. The manual **Use This Device as Main** path
+  uses the same reconciliation fence and never auto-arms live trading.
 - **Strict shutdown ordering**: `closeEvent` now finishes the final local
   save, strictly re-publishes buylist + execution_queue to MySQL
   (`publish_handoff_snapshot` -- returns failure, not just a log line, if
@@ -496,6 +498,11 @@ the wake time itself is harmless idle time either way.
 - `orders.json`/`event_journal.jsonl` stay local-only per device. Broker-truth
   discovery makes this a completeness gap for the PC's own order-history
   view, not a correctness problem for reconciliation itself.
+- Configured KIS accounts are treated as dedicated dashboard accounts during
+  handoff. A discretionary holding or order that is not represented by the
+  synchronized buylist blocks the handoff. Do not enable unattended auto-arm
+  for a shared account unless a synchronized exposure registry/allowlist is
+  added first.
 - A forced reboot during the sleep window (e.g. Windows Update) is recovered
   via the retained `AtLogOn` fallback and the stale-heartbeat claim path
   rather than the clean-release path -- the less-clean of the two, but still
