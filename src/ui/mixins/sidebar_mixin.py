@@ -161,6 +161,12 @@ class SidebarMixin:
             self._flush_dirty_watchlist_and_dashboard()
         if not hasattr(self, "stock_sidebar"):
             return
+        if self.tabs.currentWidget() is self.__dict__.get("health_widget"):
+            self.stock_sidebar.setVisible(False)
+            refresh_health = getattr(self, "refresh_health_panel", None)
+            if callable(refresh_health):
+                refresh_health()
+            return
         self.stock_sidebar.setVisible(True)
         if self.tabs.currentWidget() is self.intraday_charts_widget:
             self._set_sidebar_source_to_watchlist()

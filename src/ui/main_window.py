@@ -70,6 +70,7 @@ from src.ui.dialogs import (BackupEnvDialog, RestoreBackupDialog,
                             RestoreEnvDialog, SettingsDialog)
 from src.ui.filter_catalog import (DEFAULT_SCANNER_SETUPS, DEFAULT_SETTINGS,
                                    DEFAULT_TAB_OPTIONS)
+from src.ui.health import HealthPanelMixin
 from src.ui.mixins.dashboard_mixin import DashboardMixin
 from src.ui.mixins.scanner_mixin import ScannerMixin
 from src.ui.mixins.sidebar_mixin import SidebarMixin
@@ -282,6 +283,7 @@ class StateSyncWorker(QThread):
 
 class MainWindow(
     SidebarMixin,
+    HealthPanelMixin,
     DashboardMixin,
     ScannerMixin,
     WatchlistMixin,
@@ -358,6 +360,8 @@ class MainWindow(
         self._last_state_sync_notice = ""
         self._initial_state_sync_complete = False
         self.kis_account_snapshots: dict[tuple[str, str], dict] = {}
+        self._kis_api_last_success_at = ""
+        self._kis_api_last_error = ""
         self.latest_intraday_prices: dict[str, float] = {}
         self.latest_intraday_sources: dict[tuple[str, str], str] = {}
         self.intraday_fetch_attempts: dict[str, dt.datetime] = {}
@@ -397,6 +401,9 @@ class MainWindow(
         self.kis_startup_worker = None
         self.order_reconciliation_worker = None
         self._pending_reconciliation_groups: List[Tuple[str, str]] = []
+        self._last_order_reconciliation_at = ""
+        self._last_order_reconciliation_error = ""
+        self._health_probe_worker = None
         self.kis_retry_timer = None
         self.fx_rate_worker = None
         self._tracked_workers: dict[QThread, tuple[str, Optional[str]]] = {}
@@ -1898,6 +1905,10 @@ class MainWindow(
             "tradingview", self.tradingview_widget, "TradingView Chart"
         )
         self._build_tradingview_tab()
+
+        self.health_widget = QWidget()
+        self._add_configured_tab("health", self.health_widget, "Health")
+        self._build_health_tab()
 
         self.intraday_charts_widget = QWidget()
         self._add_configured_tab(

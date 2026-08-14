@@ -14,6 +14,7 @@ from src.core.order_state import (OPEN_ORDER_STATUSES, REGULAR_LIMIT_EXECUTION,
 from src.risk.pre_trade import (PreTradeRiskDecision,
                                 assess_orb_entry_candidate,
                                 orb_candidate_plan_id)
+from src.services.event_journal import EventType, record_event
 from src.services.order_ledger import (append_order, find_open_orders,
                                        has_open_order, load_order_ledger,
                                        merge_orders, update_order)
@@ -407,6 +408,27 @@ class BuylistOrdersMixin:
                 item, "Order price and share quantity must be positive finite values."
             )
             return
+        signal_payload = {
+            field: getattr(risk_candidate, field, None)
+            for field in (
+                "window",
+                "orb_high",
+                "orb_low",
+                "breakout_price",
+                "breakout_trigger",
+                "entry_trigger",
+                "current_price",
+                "stop_loss",
+                "shares",
+                "capital_percent",
+                "stop_loss_percent",
+                "stop_adr",
+                "risk_percent",
+                "score",
+                "reason",
+                "warnings",
+            )
+        }
         if pre_trade_risk_decision is None:
             plan_id = orb_candidate_plan_id(risk_candidate)
             pre_trade_risk_decision = assess_orb_entry_candidate(
@@ -435,6 +457,7 @@ class BuylistOrdersMixin:
                 strategy_id=strategy_id,
                 plan_id=plan_id,
             )
+            worker.signal_payload = signal_payload
             self.kis_order_worker = worker
             self._track_buylist_order_worker(worker)
             worker.finished_order.connect(
@@ -875,12 +898,20 @@ class BuylistOrdersMixin:
             )
         )
         self.order_reconciliation_worker.error_occurred.connect(
-            lambda message: self.append_log(f"Order reconciliation failed: {message}")
+            lambda message, env=environment, acct=account_no: self._on_order_reconciliation_error(
+                env, acct, message
+            )
         )
         self._track_worker(
             "order_reconciliation_worker", self.order_reconciliation_worker
         )
         self.order_reconciliation_worker.start()
+        record_event(
+            EventType.RECONCILIATION_STARTED,
+            environment=environment,
+            account_no=account_no,
+            quantity=len(grouped[(environment, account_no)]),
+        )
         self.append_log(
             f"Reconciling {len(grouped[(environment, account_no)])} open broker order(s) for {environment} {account_no or '<unknown account>'}"
         )
@@ -892,16 +923,103 @@ class BuylistOrdersMixin:
         updated_orders: List[BrokerOrder],
         snapshot: dict,
     ) -> None:
+        self._last_order_reconciliation_at = dt.datetime.now().astimezone().isoformat(
+            timespec="seconds"
+        )
+        self._last_order_reconciliation_error = ""
+        self._kis_api_last_success_at = self._last_order_reconciliation_at
+        self._kis_api_last_error = ""
         self.kis_account_snapshots[(environment, account_no)] = snapshot or {}
+        previous_orders = {
+            order.client_order_id: order for order in load_order_ledger()
+        }
+        status_events = {
+            OrderStatus.ACCEPTED: EventType.ORDER_ACCEPTED,
+            OrderStatus.WORKING: EventType.ORDER_WORKING,
+            OrderStatus.PARTIALLY_FILLED: EventType.ORDER_PARTIALLY_FILLED,
+            OrderStatus.FILLED: EventType.ORDER_FILLED,
+            OrderStatus.CANCELLED: EventType.ORDER_CANCELLED,
+            OrderStatus.REJECTED: EventType.ORDER_REJECTED,
+            OrderStatus.UNKNOWN: EventType.RECONCILIATION_WARNING,
+            OrderStatus.UNKNOWN_SUBMISSION_STATE: EventType.RECONCILIATION_WARNING,
+        }
+        transition_events = []
+        for order in updated_orders:
+            previous = previous_orders.get(order.client_order_id)
+            status_changed = previous is None or previous.status != order.status
+            fill_changed = previous is None or (
+                previous.filled_quantity != order.filled_quantity
+            )
+            event_type = status_events.get(order.status)
+            if event_type is None or (not status_changed and not fill_changed):
+                continue
+            transition_events.append(
+                (
+                    event_type,
+                    {
+                        "symbol": order.symbol,
+                        "order_id": order.client_order_id,
+                        "broker_order_id": order.broker_order_id,
+                        "environment": order.environment,
+                        "account_no": order.account_no,
+                        "price": order.avg_fill_price or order.limit_price,
+                        "quantity": (
+                            order.filled_quantity
+                            if order.status
+                            in {OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED}
+                            else order.quantity_requested
+                        ),
+                        "reason": order.error_message,
+                        "payload": {
+                            "previous_status": (
+                                previous.status.value if previous is not None else ""
+                            ),
+                            "status": order.status.value,
+                            "filled_quantity": order.filled_quantity,
+                            "remaining_quantity": order.remaining_quantity,
+                        },
+                    },
+                )
+            )
+        # Persist broker truth and derived positions before best-effort
+        # observability. A slow or unavailable journal cannot delay the safety-
+        # critical order-ledger update.
         merge_orders(updated_orders)
         self.order_ledger = load_order_ledger()
         self.apply_confirmed_order_fills_to_buylist(updated_orders)
         self.sync_buylist_positions_from_kis_snapshots(
             {(environment, account_no): snapshot}
         )
+        for event_type, event_fields in transition_events:
+            record_event(event_type, **event_fields)
+        record_event(
+            EventType.RECONCILIATION_COMPLETED,
+            environment=environment,
+            account_no=account_no,
+            quantity=len(updated_orders),
+            payload={
+                "statuses": {
+                    order.client_order_id: order.status.value
+                    for order in updated_orders
+                }
+            },
+        )
 
         if self._pending_reconciliation_groups:
             QTimer.singleShot(1000, self.reconcile_open_orders)
+
+    def _on_order_reconciliation_error(
+        self, environment: str, account_no: str, message: str
+    ) -> None:
+        self._last_order_reconciliation_error = str(message)
+        self._kis_api_last_error = str(message)
+        self.append_log(f"Order reconciliation failed: {message}")
+        record_event(
+            EventType.RECONCILIATION_FAILED,
+            environment=environment,
+            account_no=account_no,
+            reason=str(message),
+        )
 
     @staticmethod
     def _buylist_to_float(value: Any) -> float:
@@ -950,6 +1068,7 @@ class BuylistOrdersMixin:
         self, updated_orders: List[BrokerOrder]
     ) -> None:
         changed = False
+        position_events = []
         for order in updated_orders:
             try:
                 item = self.buylist_manager.get(order.symbol, order.environment)
@@ -973,6 +1092,24 @@ class BuylistOrdersMixin:
                 continue
 
             if order.side == OrderSide.BUY:
+                position_events.append(
+                    (
+                        (
+                            EventType.POSITION_OPENED
+                            if applied_qty == 0
+                            else EventType.POSITION_UPDATED
+                        ),
+                        {
+                            "symbol": order.symbol,
+                            "order_id": order.client_order_id,
+                            "broker_order_id": order.broker_order_id,
+                            "environment": order.environment,
+                            "account_no": order.account_no,
+                            "price": order.avg_fill_price,
+                            "quantity": filled_qty,
+                        },
+                    )
+                )
                 if order.account_no:
                     item.kis_account_no = str(order.account_no)
                 manager = self.__dict__.get("execution_queue_manager")
@@ -1015,6 +1152,26 @@ class BuylistOrdersMixin:
             if order.account_no:
                 item.kis_account_no = str(order.account_no)
             remaining_shares = max(0, previous_shares - newly_filled_qty)
+            position_events.append(
+                (
+                    (
+                        EventType.POSITION_CLOSED
+                        if remaining_shares <= 0
+                        else EventType.POSITION_UPDATED
+                    ),
+                    {
+                        "symbol": order.symbol,
+                        "order_id": order.client_order_id,
+                        "broker_order_id": order.broker_order_id,
+                        "environment": order.environment,
+                        "account_no": order.account_no,
+                        "price": order.avg_fill_price,
+                        "quantity": remaining_shares,
+                        "reason": order.intent.value,
+                        "payload": {"shares_sold": newly_filled_qty},
+                    },
+                )
+            )
             item.shares_held = remaining_shares
             item.kis_order_id = order.broker_order_id or order.client_order_id
             if order.intent in {
@@ -1041,6 +1198,8 @@ class BuylistOrdersMixin:
             self._save_buylist_state()
             self.populate_buylist_dashboard()
             self.order_ledger = load_order_ledger()
+        for event_type, event_fields in position_events:
+            record_event(event_type, **event_fields)
 
     def request_cancel_order(self, client_order_id: str) -> bool:
         self.order_ledger = load_order_ledger()
@@ -1068,6 +1227,15 @@ class BuylistOrdersMixin:
             )
             return False
         try:
+            record_event(
+                EventType.ORDER_CANCEL_REQUESTED,
+                symbol=target.symbol,
+                order_id=target.client_order_id,
+                broker_order_id=target.broker_order_id,
+                environment=target.environment,
+                account_no=target.account_no,
+                quantity=target.remaining_quantity,
+            )
             from src.services.order_reconciliation import \
                 cancel_and_reconcile_order
 
@@ -1084,6 +1252,16 @@ class BuylistOrdersMixin:
         self.append_log(
             f"Cancel requested for {updated.symbol} {updated.side.value} order {client_order_id}: {updated.status.value}"
         )
+        if updated.status == OrderStatus.CANCELLED:
+            record_event(
+                EventType.ORDER_CANCELLED,
+                symbol=updated.symbol,
+                order_id=updated.client_order_id,
+                broker_order_id=updated.broker_order_id,
+                environment=updated.environment,
+                account_no=updated.account_no,
+                quantity=updated.remaining_quantity,
+            )
         return True
 
     def _on_order_error(self, symbol: str, side: str, error: str, item=None) -> None:

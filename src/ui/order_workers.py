@@ -1,15 +1,21 @@
 """QThread adapters for durable order submission and reconciliation services."""
+
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, Callable, List, Optional
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
-from src.core.order_state import (REGULAR_LIMIT_EXECUTION,
-                                  RESERVED_MOO_EXECUTION, BrokerOrder,
-                                  OrderIntent, OrderSide)
+from src.core.order_state import (
+    REGULAR_LIMIT_EXECUTION,
+    RESERVED_MOO_EXECUTION,
+    BrokerOrder,
+    OrderIntent,
+    OrderSide,
+)
 from src.risk.pre_trade import PreTradeRiskDecision
 from src.services.broker import Broker, KisBroker
+from src.services.event_journal import record_event
 from src.services.order_reconciliation import reconcile_orders_with_snapshot
 
 
@@ -36,6 +42,8 @@ class KisOrderWorker(QThread):
         pre_trade_risk_decision: Optional[PreTradeRiskDecision] = None,
         strategy_id: str = "",
         plan_id: str = "",
+        event_recorder: Optional[Callable[..., Any]] = None,
+        signal_payload: Optional[dict[str, Any]] = None,
     ) -> None:
         super().__init__()
         self.environment = environment
@@ -53,11 +61,14 @@ class KisOrderWorker(QThread):
         self.pre_trade_risk_decision = pre_trade_risk_decision
         self.strategy_id = strategy_id
         self.plan_id = plan_id
+        self.event_recorder = event_recorder or record_event
+        self.signal_payload = signal_payload
 
     def run(self) -> None:
         try:
-            from src.services.order_execution_service import \
-                submit_guarded_overseas_order
+            from src.services.order_execution_service import (
+                submit_guarded_overseas_order,
+            )
 
             order = submit_guarded_overseas_order(
                 environment=self.environment,
@@ -77,6 +88,8 @@ class KisOrderWorker(QThread):
                 pre_trade_risk_decision=self.pre_trade_risk_decision,
                 strategy_id=self.strategy_id,
                 plan_id=self.plan_id,
+                event_recorder=self.event_recorder,
+                signal_payload=self.signal_payload,
             )
             self.finished_order.emit(order)
         except Exception as exc:
@@ -109,8 +122,9 @@ class OrderReconciliationWorker(QThread):
                 order.execution_policy == RESERVED_MOO_EXECUTION
                 for order in self.open_orders
             ):
-                from src.services.order_reconciliation import \
-                    query_and_reconcile_unresolved_orders
+                from src.services.order_reconciliation import (
+                    query_and_reconcile_unresolved_orders,
+                )
 
                 direct_updates = query_and_reconcile_unresolved_orders(
                     environment=self.environment,
@@ -163,8 +177,9 @@ class KisOrderQueryWorker(QThread):
 
     def run(self) -> None:
         try:
-            from src.services.order_reconciliation import \
-                query_and_reconcile_unresolved_orders
+            from src.services.order_reconciliation import (
+                query_and_reconcile_unresolved_orders,
+            )
 
             updated = query_and_reconcile_unresolved_orders(
                 environment=self.environment,
@@ -191,21 +206,16 @@ class KisOrderCancelWorker(QThread):
     finished_cancel = pyqtSignal(object)
     error_occurred = pyqtSignal(str)
 
-    def __init__(
-        self, client_order_id: str, broker: Optional[Broker] = None
-    ) -> None:
+    def __init__(self, client_order_id: str, broker: Optional[Broker] = None) -> None:
         super().__init__()
         self.client_order_id = client_order_id
         self.broker = broker
 
     def run(self) -> None:
         try:
-            from src.services.order_reconciliation import \
-                cancel_and_reconcile_order
+            from src.services.order_reconciliation import cancel_and_reconcile_order
 
-            order = cancel_and_reconcile_order(
-                self.client_order_id, broker=self.broker
-            )
+            order = cancel_and_reconcile_order(self.client_order_id, broker=self.broker)
             self.finished_cancel.emit(order)
         except Exception as exc:
             self.error_occurred.emit(str(exc))

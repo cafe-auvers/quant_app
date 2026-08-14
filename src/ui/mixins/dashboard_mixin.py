@@ -464,6 +464,13 @@ class DashboardMixin:
         self.kis_startup_worker.start()
 
     def _on_startup_kis_accounts_finished(self, snapshots: dict, errors: list) -> None:
+        if snapshots:
+            self._kis_api_last_success_at = dt.datetime.now().astimezone().isoformat(
+                timespec="seconds"
+            )
+        self._kis_api_last_error = (
+            self._format_kis_error_message(str(errors[0])) if errors else ""
+        )
         self.kis_account_snapshots.update(snapshots)
         self.sync_buylist_positions_from_kis_snapshots(snapshots)
         selected_profile = self._selected_dashboard_kis_profile()
@@ -571,6 +578,10 @@ class DashboardMixin:
     def _on_kis_snapshot_finished(
         self, snapshot: dict, requested_profile: Optional[dict] = None
     ) -> None:
+        self._kis_api_last_success_at = dt.datetime.now().astimezone().isoformat(
+            timespec="seconds"
+        )
+        self._kis_api_last_error = ""
         self._schedule_kis_refresh_button_enable()
         # The combo can change while the worker is in flight.  Store and sync
         # under the profile that made the request, not the current selection.
@@ -629,6 +640,7 @@ class DashboardMixin:
     ) -> None:
         self._schedule_kis_refresh_button_enable()
         friendly_message = self._format_kis_error_message(error_message)
+        self._kis_api_last_error = friendly_message
         profile_label = (
             str(requested_profile.get("label") or "")
             if isinstance(requested_profile, dict)
@@ -856,6 +868,10 @@ class DashboardMixin:
     def _on_trade_account_snapshot_finished(
         self, snapshot: dict, requested_profile: Optional[dict] = None
     ) -> None:
+        self._kis_api_last_success_at = dt.datetime.now().astimezone().isoformat(
+            timespec="seconds"
+        )
+        self._kis_api_last_error = ""
         # Use the request's profile.  A user can change the sizing account
         # before the background request returns.
         profile = requested_profile or (
@@ -891,6 +907,7 @@ class DashboardMixin:
         self, error_message: str, requested_profile: Optional[dict] = None
     ) -> None:
         friendly_message = self._format_kis_error_message(error_message)
+        self._kis_api_last_error = friendly_message
         profile_label = (
             str(requested_profile.get("label") or "")
             if isinstance(requested_profile, dict)

@@ -55,6 +55,7 @@ config/kis_config.py
 data/*.csv
 data/*.json
 data/*.json.bak
+data/*.jsonl
 data/*.lock
 data/cache/
 

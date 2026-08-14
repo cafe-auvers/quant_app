@@ -82,6 +82,9 @@ def test_main_window_constructs_and_closes_offscreen_without_external_io(monkeyp
     window.show()
     assert window.centralWidget() is not None
     assert window.tabs.count() > 0
+    tab_labels = [window.tabs.tabText(index) for index in range(window.tabs.count())]
+    tradingview_index = tab_labels.index("TradingView Chart")
+    assert tab_labels[tradingview_index + 1] == "Health"
 
     assert window.close() is True
     assert window._database_shutting_down is True

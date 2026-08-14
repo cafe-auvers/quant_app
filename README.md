@@ -11,6 +11,7 @@ A desktop trading dashboard for US-market swing trading with scanner workflows, 
 - Watchlist management with user-entered `breakout_price` levels for setup validation.
 - ORB planning where entry is valid only after price clears both ORB high and the buffered breakout price.
 - A strategy-neutral `MarketSnapshot -> Strategy -> Signal` interface, with the existing ORB behavior as the first plugin.
+- An append-only, redacted trading event journal and a read-only Health tab for KIS, MySQL, mirror freshness, and reconciliation status.
 - Buy dashboard monitoring with partial-exit and EMA-close exit workflow support.
 - Daily, hourly, TradingView, and intraday chart views with persisted drawings and breakout markers.
 - Shutdown-safe local JSON persistence with atomic writes, rolling `.bak` recovery, and save-status metadata.
@@ -34,6 +35,7 @@ src/
     main_window.py              MainWindow shell, state loading, menus, tabs, shared helpers
     dialogs.py                  Settings and scanner-filter dialogs
     controllers/                Testable workflow controllers for UI-owned workflows
+    health/                     Production health panel and background probe
     mixins/                     Tab rendering, widget callbacks, and UI glue inherited by MainWindow
   api/                          KIS account, order, intraday, and daily-price adapters
   core/                         Scanner, watchlist, scoring, order and execution queue models
@@ -90,6 +92,7 @@ Only enable KIS intraday after the endpoint, TR ID, request parameters, output f
   over price protection and still depends on KIS accepting and forwarding the
   reservation.
 - Use `data/orders.json` as the durable local order ledger for idempotency and restart protection.
+- Use the Health tab next to TradingView Chart to inspect local production checks and the newest `data/event_journal.jsonl` lifecycle events. Health refreshes do not place orders or call KIS.
 - Keep `data/legacy_non_prod_*.json`; these files preserve filtered paper-trading state without making it actionable.
 - Keep local JSON `.bak` files and `data/state_metadata.json` with the rest of local runtime state.
 - Do not bypass reconciliation when updating buylist position state after order submission.

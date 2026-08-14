@@ -8,7 +8,20 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from src.services import trading_state  # noqa: E402  (needs sys.path set up above)
+from src.services import (
+    event_journal,
+    trading_state,
+)  # noqa: E402  (needs sys.path set up above)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_event_journal(monkeypatch, tmp_path):
+    """Never let UI/lifecycle tests append synthetic events to local runtime data."""
+    monkeypatch.setattr(
+        event_journal,
+        "EVENT_JOURNAL_FILE",
+        tmp_path / "event_journal.jsonl",
+    )
 
 
 @pytest.fixture(autouse=True)

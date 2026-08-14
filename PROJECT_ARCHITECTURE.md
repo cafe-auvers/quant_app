@@ -271,6 +271,7 @@ Supporting UI modules:
 | `src/ui/controllers/` | Workflow controllers for account sync, scanner runs, watchlist ORB refreshes, chart data loading, and buylist execution queue actions |
 | `src/ui/buylist/` | Static buy-dashboard view, action, monitoring, and order mixins plus thin policy and execution-queue adapters |
 | `src/ui/charts/` | Static chart controller/render composites, focused controller and renderer modules, deterministic render-option/interaction models, and chart-data service |
+| `src/ui/health/` | Separate Health tab, background read-only probe, status rendering, and redacted event-journal viewer |
 | `src/ui/mixins/sidebar_mixin.py` | Left sidebar source switching, selected-symbol routing, and sidebar actions |
 | `src/ui/mixins/dashboard_mixin.py` | Dashboard tab, KIS account snapshot UI, profile selection widgets, FX/account-size display, summary widgets |
 | `src/ui/mixins/scanner_mixin.py` | Scanner tab, scanner setup/rule UI, worker signal wiring, scanner result table actions |
@@ -306,6 +307,7 @@ Current tab construction in `_setup_tabs()`:
 | `buylist` | Buy Dashboard | `_build_buylist_tab()` |
 | `charts` | Charts | `_build_charts_tab()` |
 | `tradingview` | TradingView Chart | `_build_tradingview_tab()` |
+| `health` | Health | `_build_health_tab()` |
 | `intraday_charts` | Intraday Charts | `_build_intraday_charts_tab()` |
 
 `data/tab_options.json` persists tab visibility. The legacy `_build_trade_plan_tab()` method still exists for compatibility and tests, but it is not currently added by `_setup_tabs()`.
@@ -329,6 +331,7 @@ Most workers live in `src/ui/workers.py`; KIS order submission/query/cancel and 
 | `OrderReconciliationWorker` | `order_workers.py` | Fetch position snapshots through an injected `Broker` and reconcile open orders against holdings deltas |
 | `KisOrderQueryWorker` | `order_workers.py` | Query and reconcile unresolved orders through an injectable `Broker` |
 | `KisOrderCancelWorker` | `order_workers.py` | Cancel a locally tracked order through an injectable `Broker` and reconcile the result |
+| `HealthProbeWorker` | `health/panel.py` | Run local read-only production checks and load recent redacted journal events without blocking Qt |
 
 ## Service Layer
 
@@ -344,6 +347,8 @@ Most workers live in `src/ui/workers.py`; KIS order submission/query/cancel and 
 | `src/services/broker.py` | `Broker` protocol (`submit_order`/`cancel_order`/`get_order`/`get_positions`/ambiguous-error classification), normalized `BrokerSubmissionResult`, and `KisBroker`; all KIS response-field parsing stays at this adapter boundary |
 | `src/services/order_execution_service.py` | Broker-neutral guarded order submission with durable idempotency before and after API calls; gated by `trading_state`, an entry-only `PreTradeRiskDecision`, and an injectable `Broker` (defaults to `KisBroker`) |
 | `src/services/order_reconciliation.py` | Conservative account-snapshot reconciliation plus injectable broker order query/cancel for accepted/working orders |
+| `src/services/event_journal.py` | Append-only JSONL trading audit events with cross-thread/process locking, account masking, recursive secret redaction, non-destructive file rotation, and a best-effort execution adapter |
+| `src/services/health.py` | Framework-neutral read-only health model for KIS configuration/token metadata, cached KIS API results, MySQL availability, local-mirror freshness, and unresolved-order reconciliation state |
 | `src/services/historical_refresh_control.py` | Launches, polls, and terminates the standalone `historical.py` subprocess; owns its status-file schema and PID liveness checks |
 | `src/services/state_sync.py` | Conflict-safe cross-machine sync of user-managed state (watchlist/buylist/trade plans) through a revision-tracked MySQL table; only the `main` device pushes, others pull-only |
 | `src/services/runtime_status.py` | Database-backed runtime heartbeats so any device can see whether `main.py` is currently running elsewhere |
@@ -416,6 +421,7 @@ Local JSON state is read/written through `src/utils/storage.py` and service help
 | `data/chart_drawings.json` | Saved chart line drawings; watchlist breakout prices are persisted in `data/watchlist.json` |
 | `data/tab_options.json` | Tab visibility settings |
 | `data/orders.json` | Local broker-order ledger, created when the first order is recorded |
+| `data/event_journal.jsonl` | Append-only, gitignored trading lifecycle journal; timestamped archives preserve earlier events when the active file rotates |
 | `data/state_metadata.json` | Optional sidecar with last successful/failed app-state save time, last error, and files written |
 | `data/us_kis_tickers.csv` | Cached KIS-registered US stock universe used by scanner refreshes |
 | `data/sp500_tickers.csv` | Cached S&P 500 fallback universe |
@@ -429,6 +435,12 @@ Local JSON state is read/written through `src/utils/storage.py` and service help
 Critical local state files keep one rolling `.bak` backup beside the JSON file, including watchlist, buylist, trade plans, orders, and execution queue state. The app does not wrap existing JSON payloads in a schema envelope, so legacy loaders keep their current formats.
 
 The production-only migration archives legacy non-production buylist and execution queue rows before filtering them. Archived rows are never relabeled as `PROD` and cannot submit live orders. Historical non-production broker orders remain in `data/orders.json` for audit history but are excluded from startup reconciliation.
+
+## Production Observability
+
+The Health tab is registered immediately after TradingView Chart. Opening it starts a background, read-only probe and hides the stock-selection sidebar. It reports KIS token metadata (never the token), the most recent cached KIS account-call result, cached MySQL reachability, daily/hourly local-mirror freshness, unresolved or unknown broker orders, and an application heartbeat. Mirror SQL and universe loading run in the worker; the Qt event loop is not blocked. A health refresh deliberately does not authenticate with KIS, submit/cancel an order, or mutate database state.
+
+Live execution emits correlated lifecycle records from `SIGNAL_CREATED`, `RISK_APPROVED`/`RISK_REJECTED`, and `ORDER_INTENT_CREATED` through durable reservation/submission/acceptance, reconciliation, confirmed fills, and position updates/closure. Every record has a UTC timestamp and event ID; order, broker-order, signal/plan, symbol, strategy, price, and quantity fields make a trade reconstructable. Full account numbers are masked, secret-like payload keys are recursively redacted, and raw broker responses are never journaled. `record_event()` is best effort, and the guarded order service also isolates an injected recorder exception, so an unavailable journal cannot change an order outcome or provoke a retry.
 
 `MainWindow.closeEvent()` requests interruption for active background workers, waits with one shared bounded shutdown budget, then attempts a final synchronous app-state save and waits briefly for pending background saves. Normal UI save calls still schedule background saves through `save_app_state()`, but those threads are tracked and non-daemon.
 

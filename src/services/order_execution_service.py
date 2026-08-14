@@ -1,23 +1,33 @@
 """Durable, broker-neutral guarded submission for overseas orders."""
+
 from __future__ import annotations
 
 import logging
 import math
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Optional
 
-from src.core.order_state import (REGULAR_LIMIT_EXECUTION,
-                                  RESERVED_MOO_EXECUTION, BrokerOrder,
-                                  OrderIntent, OrderSide, OrderStatus)
-from src.risk.pre_trade import (PreTradeRiskDecision,
-                                PreTradeRiskRejectedError,
-                                normalize_share_quantity,
-                                require_pre_trade_risk_approval)
+from src.core.order_state import (
+    REGULAR_LIMIT_EXECUTION,
+    RESERVED_MOO_EXECUTION,
+    BrokerOrder,
+    OrderIntent,
+    OrderSide,
+    OrderStatus,
+)
+from src.risk.pre_trade import (
+    PreTradeRiskDecision,
+    PreTradeRiskRejectedError,
+    normalize_share_quantity,
+    require_pre_trade_risk_approval,
+)
 from src.services import trading_state
 from src.services.broker import Broker, BrokerSubmissionResult, KisBroker
-from src.services.order_ledger import (ORDERS_FILE,
-                                       reserve_order_if_no_matching_open,
-                                       upsert_order)
+from src.services.order_ledger import (
+    ORDERS_FILE,
+    reserve_order_if_no_matching_open,
+    upsert_order,
+)
 from src.services.trading_state import TradingDisabledError
 
 logger = logging.getLogger(__name__)
@@ -52,6 +62,8 @@ def submit_guarded_overseas_order(
     pre_trade_risk_decision: Optional[PreTradeRiskDecision] = None,
     strategy_id: str = "",
     plan_id: str = "",
+    event_recorder: Optional[Callable[..., Any]] = None,
+    signal_payload: Optional[dict[str, Any]] = None,
 ) -> BrokerOrder:
     """Submit an overseas order with a durable local idempotency guard.
 
@@ -65,17 +77,45 @@ def submit_guarded_overseas_order(
     carry a fresh risk approval bound to the complete order fingerprint; exit
     orders deliberately remain available without entry-risk approval.
     """
+
+    def emit_event(event_type: str, order: BrokerOrder, **extra: Any) -> None:
+        if event_recorder is None:
+            return
+        try:
+            event_recorder(
+                event_type,
+                strategy_id=strategy_id,
+                symbol=order.symbol,
+                signal_id=plan_id,
+                order_id=order.client_order_id,
+                broker_order_id=order.broker_order_id,
+                environment=order.environment,
+                account_no=order.account_no,
+                price=order.limit_price,
+                quantity=order.quantity_requested,
+                payload={
+                    "side": order.side.value,
+                    "intent": order.intent.value,
+                    "execution_policy": order.execution_policy,
+                    "plan_id": plan_id,
+                    **extra,
+                },
+            )
+        except Exception:
+            # Observability must never alter order state or induce a retry.
+            logger.exception("Trading event recorder failed for %s", event_type)
+
     trading_state.require_trading_enabled(environment, symbol)
     environment = str(environment or "").upper()
     account_no = str(account_no or "")
     symbol = str(symbol or "").upper()
     side = side if isinstance(side, OrderSide) else OrderSide(str(side).upper())
-    intent = intent if isinstance(intent, OrderIntent) else OrderIntent(str(intent).upper())
+    intent = (
+        intent if isinstance(intent, OrderIntent) else OrderIntent(str(intent).upper())
+    )
     quantity = normalize_share_quantity(quantity)
     exchange = str(exchange or "").strip().upper()
-    execution_policy = str(
-        execution_policy or REGULAR_LIMIT_EXECUTION
-    ).strip().upper()
+    execution_policy = str(execution_policy or REGULAR_LIMIT_EXECUTION).strip().upper()
     if execution_policy not in {
         REGULAR_LIMIT_EXECUTION,
         RESERVED_MOO_EXECUTION,
@@ -114,10 +154,6 @@ def submit_guarded_overseas_order(
                 plan_id=plan_id,
             )
 
-    require_current_entry_approval()
-
-    broker = KisBroker() if broker is None else broker
-
     order = BrokerOrder.create(
         environment=environment,
         account_no=account_no,
@@ -131,6 +167,32 @@ def submit_guarded_overseas_order(
         execution_policy=execution_policy,
         buylist_symbol_key=f"{environment}:{account_no}:{symbol}",
     )
+    if signal_payload:
+        emit_event(
+            (
+                "SIGNAL_CREATED"
+                if getattr(pre_trade_risk_decision, "approved", False)
+                else "SIGNAL_REJECTED"
+            ),
+            order,
+            **signal_payload,
+        )
+    if intent == OrderIntent.ENTRY:
+        try:
+            require_current_entry_approval()
+        except PreTradeRiskRejectedError as exc:
+            emit_event("RISK_REJECTED", order, reason=str(exc))
+            raise
+        emit_event(
+            "RISK_APPROVED",
+            order,
+            evaluated_at=getattr(pre_trade_risk_decision, "evaluated_at", None),
+            expires_at=getattr(pre_trade_risk_decision, "expires_at", None),
+        )
+    emit_event("ORDER_INTENT_CREATED", order)
+
+    broker = KisBroker() if broker is None else broker
+
     match = reserve_order_if_no_matching_open(
         order,
         allow_duplicate=allow_duplicate,
@@ -138,6 +200,7 @@ def submit_guarded_overseas_order(
     )
     if match is not None:
         raise DuplicateOpenOrderError(match)
+    emit_event("ORDER_RESERVED", order)
 
     # Re-check both the kill switch and short-lived entry approval after the
     # durable duplicate-order reservation. Either can change/expire while
@@ -151,6 +214,7 @@ def submit_guarded_overseas_order(
         order.error_message = str(exc)
         order.touch()
         upsert_order(order, path=path)
+        emit_event("ORDER_REJECTED", order, reason=str(exc))
         raise
 
     # Once we are about to issue the non-idempotent broker request, a process
@@ -159,6 +223,7 @@ def submit_guarded_overseas_order(
     order.status = OrderStatus.UNKNOWN_SUBMISSION_STATE
     order.touch()
     upsert_order(order, path=path)
+    emit_event("ORDER_SUBMISSION_STARTED", order)
 
     try:
         submission = broker.submit_order(
@@ -172,9 +237,7 @@ def submit_guarded_overseas_order(
             execution_policy=execution_policy,
         )
         if not isinstance(submission, BrokerSubmissionResult):
-            raise TypeError(
-                "Broker.submit_order() must return BrokerSubmissionResult"
-            )
+            raise TypeError("Broker.submit_order() must return BrokerSubmissionResult")
     except TradingDisabledError as exc:
         # The broker boundary guarantees that no HTTP submission was attempted
         # when this exception is raised, so this is a clear local rejection,
@@ -183,6 +246,7 @@ def submit_guarded_overseas_order(
         order.error_message = str(exc)
         order.touch()
         upsert_order(order, path=path)
+        emit_event("ORDER_REJECTED", order, reason=str(exc))
         return order
     except Exception as exc:
         try:
@@ -207,6 +271,11 @@ def submit_guarded_overseas_order(
         order.error_message = str(exc)
         order.touch()
         upsert_order(order, path=path)
+        emit_event(
+            "ORDER_SUBMISSION_UNKNOWN" if ambiguous else "ORDER_REJECTED",
+            order,
+            reason=str(exc),
+        )
         return order
 
     order.status = OrderStatus.ACCEPTED
@@ -216,4 +285,5 @@ def submit_guarded_overseas_order(
     order.remaining_quantity = order.quantity_requested
     order.touch()
     upsert_order(order, path=path)
+    emit_event("ORDER_ACCEPTED", order)
     return order

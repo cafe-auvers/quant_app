@@ -104,6 +104,7 @@ DEFAULT_TAB_OPTIONS = {
     "watchlist": True,
     "charts": False,
     "tradingview": True,
+    "health": True,
     "intraday_charts": False,
     "trade_plan": True,
 }
