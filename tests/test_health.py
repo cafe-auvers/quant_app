@@ -1,8 +1,10 @@
+import datetime as dt
 import json
 from types import SimpleNamespace
 
 from src.core.order_state import BrokerOrder, OrderIntent, OrderSide, OrderStatus
 from src.services import health
+from src.services.event_journal import EventJournalStatus
 
 
 def test_kis_token_health_uses_only_cache_metadata(monkeypatch, tmp_path):
@@ -52,6 +54,7 @@ def test_health_snapshot_surfaces_stale_data_and_unknown_orders(monkeypatch):
         mirror_engine=object(),
         mirror_tickers=["NVDA"],
         kis_snapshot_count=1,
+        kis_last_success_at=dt.datetime.now(dt.timezone.utc).isoformat(),
         orders=[order],
     )
 
@@ -62,6 +65,7 @@ def test_health_snapshot_surfaces_stale_data_and_unknown_orders(monkeypatch):
     assert checks["MySQL"].level == health.HealthLevel.WARNING
     assert checks["Data mirror"].level == health.HealthLevel.WARNING
     assert checks["Reconciliation"].level == health.HealthLevel.CRITICAL
+    assert "Event journal" in checks
     assert "NVDA" in checks["Reconciliation"].detail
     assert snapshot.overall_level == health.HealthLevel.CRITICAL
 
@@ -73,3 +77,120 @@ def test_unreadable_order_ledger_is_critical():
 
     assert check.level == health.HealthLevel.CRITICAL
     assert "unreadable" in check.summary.lower()
+
+
+def test_kis_api_health_requires_recent_verified_timestamp():
+    now = dt.datetime(2026, 8, 14, 0, 0, tzinfo=dt.timezone.utc)
+
+    recent = health._kis_api_check(
+        health.HealthContext(
+            kis_snapshot_count=1,
+            kis_last_success_at=(now - dt.timedelta(minutes=5)).isoformat(),
+        ),
+        True,
+        now=now,
+    )
+    stale = health._kis_api_check(
+        health.HealthContext(
+            kis_snapshot_count=1,
+            kis_last_success_at=(now - dt.timedelta(hours=2)).isoformat(),
+        ),
+        True,
+        now=now,
+    )
+    unknown = health._kis_api_check(
+        health.HealthContext(kis_snapshot_count=1),
+        True,
+        now=now,
+    )
+
+    assert recent.level == health.HealthLevel.HEALTHY
+    assert stale.level == health.HealthLevel.WARNING
+    assert unknown.level == health.HealthLevel.UNKNOWN
+
+
+def test_mysql_health_executes_current_read_only_probe():
+    executed = []
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, statement):
+            executed.append(str(statement))
+
+    class Engine:
+        def connect(self):
+            return Connection()
+
+    check = health._mysql_check(
+        health.HealthContext(
+            db_source="pc",
+            pc_database_ready=True,
+            pc_database_engine=Engine(),
+        )
+    )
+
+    assert check.level == health.HealthLevel.HEALTHY
+    assert executed == ["SELECT 1"]
+    assert "verified now" in check.summary.lower()
+
+
+def test_mysql_health_does_not_report_cached_state_as_current_success():
+    cached = health._mysql_check(
+        health.HealthContext(db_source="pc", pc_database_ready=True)
+    )
+
+    class BrokenEngine:
+        def connect(self):
+            raise OSError("database offline")
+
+    failed = health._mysql_check(
+        health.HealthContext(
+            db_source="pc",
+            pc_database_ready=True,
+            pc_database_engine=BrokenEngine(),
+        )
+    )
+
+    assert cached.level == health.HealthLevel.WARNING
+    assert "last known" in cached.summary.lower()
+    assert failed.level == health.HealthLevel.CRITICAL
+    assert "database offline" in failed.detail
+
+
+def _journal_status(**overrides):
+    values = {
+        "path": SimpleNamespace(),
+        "directory_writable": True,
+        "lock_available": True,
+        "lock_stale": False,
+        "last_write_at": "2026-08-14T00:00:00+00:00",
+        "last_error": "",
+        "last_error_at": "",
+        "latest_event_at": "2026-08-14T00:00:00+00:00",
+        "active_file_size": 1024,
+        "archive_count": 2,
+        "archive_bytes": 2048,
+        "available_disk_space": 10 * 1024 * 1024 * 1024,
+        "inspection_error": "",
+    }
+    values.update(overrides)
+    return EventJournalStatus(**values)
+
+
+def test_event_journal_health_surfaces_write_failure_and_storage_metrics():
+    failed = health._event_journal_check(
+        _journal_status(last_error="disk unavailable", last_error_at="now")
+    )
+    healthy = health._event_journal_check(_journal_status())
+
+    assert failed.level == health.HealthLevel.CRITICAL
+    assert "disk unavailable" in failed.detail
+    assert "active:" in failed.detail
+    assert "archives: 2" in failed.detail
+    assert "disk free:" in failed.detail
+    assert healthy.level == health.HealthLevel.HEALTHY

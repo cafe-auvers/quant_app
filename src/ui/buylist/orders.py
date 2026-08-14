@@ -458,6 +458,15 @@ class BuylistOrdersMixin:
                 plan_id=plan_id,
             )
             worker.signal_payload = signal_payload
+            raw_candidate_status = getattr(risk_candidate, "status", "")
+            candidate_status = str(
+                getattr(raw_candidate_status, "value", raw_candidate_status) or ""
+            ).upper()
+            worker.signal_event_type = (
+                "SIGNAL_CREATED"
+                if risk_candidate is not None and candidate_status == "EXECUTE_READY"
+                else "SIGNAL_REJECTED"
+            )
             self.kis_order_worker = worker
             self._track_buylist_order_worker(worker)
             worker.finished_order.connect(

@@ -92,7 +92,7 @@ Only enable KIS intraday after the endpoint, TR ID, request parameters, output f
   over price protection and still depends on KIS accepting and forwarding the
   reservation.
 - Use `data/orders.json` as the durable local order ledger for idempotency and restart protection.
-- Use the Health tab next to TradingView Chart to inspect local production checks and the newest `data/event_journal.jsonl` lifecycle events. Health refreshes do not place orders or call KIS.
+- Use the Health tab next to TradingView Chart to inspect current MySQL connectivity, KIS response age, mirror/reconciliation state, journal write health/free space, and the newest `data/event_journal.jsonl` lifecycle events. Health refreshes do not place orders or call KIS.
 - Keep `data/legacy_non_prod_*.json`; these files preserve filtered paper-trading state without making it actionable.
 - Keep local JSON `.bak` files and `data/state_metadata.json` with the rest of local runtime state.
 - Do not bypass reconciliation when updating buylist position state after order submission.

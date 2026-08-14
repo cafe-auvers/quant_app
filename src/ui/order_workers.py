@@ -44,6 +44,7 @@ class KisOrderWorker(QThread):
         plan_id: str = "",
         event_recorder: Optional[Callable[..., Any]] = None,
         signal_payload: Optional[dict[str, Any]] = None,
+        signal_event_type: str = "SIGNAL_CREATED",
     ) -> None:
         super().__init__()
         self.environment = environment
@@ -63,6 +64,7 @@ class KisOrderWorker(QThread):
         self.plan_id = plan_id
         self.event_recorder = event_recorder or record_event
         self.signal_payload = signal_payload
+        self.signal_event_type = signal_event_type
 
     def run(self) -> None:
         try:
@@ -90,6 +92,7 @@ class KisOrderWorker(QThread):
                 plan_id=self.plan_id,
                 event_recorder=self.event_recorder,
                 signal_payload=self.signal_payload,
+                signal_event_type=self.signal_event_type,
             )
             self.finished_order.emit(order)
         except Exception as exc:

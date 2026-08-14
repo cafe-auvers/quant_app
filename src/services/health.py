@@ -10,13 +10,25 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, List, Optional, Sequence
 
+from sqlalchemy import text
+
 from src.api.kis_account_snapshot_dual import KisEnvironment, load_config
 from src.core.order_state import BrokerOrder, OrderStatus, is_open_status
 from src.infrastructure.database.mirror_freshness import (
     local_mirror_hourly_is_stale,
     local_mirror_is_stale,
 )
+from src.services.event_journal import (
+    MAX_JOURNAL_ARCHIVES,
+    EventJournalStatus,
+    inspect_event_journal,
+    scrub_sensitive_text,
+)
 from src.utils.market_calendar import expected_latest_market_data_date
+
+KIS_API_HEALTH_MAX_AGE = dt.timedelta(minutes=15)
+JOURNAL_DISK_CRITICAL_BYTES = 512 * 1024 * 1024
+JOURNAL_DISK_WARNING_BYTES = 2 * 1024 * 1024 * 1024
 
 
 class HealthLevel(str, Enum):
@@ -39,6 +51,7 @@ class HealthContext:
     db_source: str = "none"
     db_initializing: bool = False
     pc_database_ready: bool = False
+    pc_database_engine: Any = None
     mirror_engine: Any = None
     mirror_tickers: Optional[Sequence[str]] = None
     kis_snapshot_count: int = 0
@@ -79,7 +92,7 @@ def inspect_kis_token(now_epoch: Optional[int] = None) -> tuple[HealthCheck, boo
                 "KIS token",
                 HealthLevel.CRITICAL,
                 "KIS production credentials are incomplete",
-                str(exc),
+                scrub_sensitive_text(exc),
             ),
             False,
         )
@@ -114,7 +127,7 @@ def inspect_kis_token(now_epoch: Optional[int] = None) -> tuple[HealthCheck, boo
                 "KIS token",
                 HealthLevel.WARNING,
                 "Token cache is unreadable",
-                str(exc),
+                scrub_sensitive_text(exc),
             ),
             True,
         )
@@ -146,7 +159,22 @@ def inspect_kis_token(now_epoch: Optional[int] = None) -> tuple[HealthCheck, boo
     )
 
 
-def _kis_api_check(context: HealthContext, configured: bool) -> HealthCheck:
+def _parse_health_timestamp(value: str) -> Optional[dt.datetime]:
+    try:
+        parsed = dt.datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _kis_api_check(
+    context: HealthContext,
+    configured: bool,
+    *,
+    now: Optional[dt.datetime] = None,
+) -> HealthCheck:
     if not configured:
         return HealthCheck(
             "KIS API",
@@ -163,19 +191,42 @@ def _kis_api_check(context: HealthContext, configured: bool) -> HealthCheck:
             "KIS API",
             HealthLevel.CRITICAL,
             "Most recent account request failed",
-            context.kis_last_error,
+            scrub_sensitive_text(context.kis_last_error),
         )
     if context.kis_snapshot_count:
-        suffix = (
-            f" Last success: {context.kis_last_success_at}."
-            if context.kis_last_success_at
-            else ""
-        )
+        last_success = _parse_health_timestamp(context.kis_last_success_at)
+        if last_success is None:
+            return HealthCheck(
+                "KIS API",
+                HealthLevel.UNKNOWN,
+                f"{context.kis_snapshot_count} cached snapshot(s) have no verified age",
+                "Refresh the KIS account snapshot before relying on this status.",
+            )
+        current = now or dt.datetime.now(dt.timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=dt.timezone.utc)
+        age = current.astimezone(dt.timezone.utc) - last_success
+        if age < dt.timedelta(minutes=-1):
+            return HealthCheck(
+                "KIS API",
+                HealthLevel.UNKNOWN,
+                "KIS verification timestamp is in the future",
+                f"Recorded success: {context.kis_last_success_at}.",
+            )
+        age_seconds = max(0, int(age.total_seconds()))
+        if age > KIS_API_HEALTH_MAX_AGE:
+            return HealthCheck(
+                "KIS API",
+                HealthLevel.WARNING,
+                f"Last verified response is {age_seconds // 60} minute(s) old",
+                f"Last success: {context.kis_last_success_at}. Refresh before trading.",
+            )
         return HealthCheck(
             "KIS API",
             HealthLevel.HEALTHY,
-            f"{context.kis_snapshot_count} account snapshot(s) loaded",
-            suffix.strip(),
+            f"Verified {age_seconds} second(s) ago",
+            f"{context.kis_snapshot_count} account snapshot(s); last success: "
+            f"{context.kis_last_success_at}.",
         )
     return HealthCheck(
         "KIS API",
@@ -188,9 +239,29 @@ def _kis_api_check(context: HealthContext, configured: bool) -> HealthCheck:
 def _mysql_check(context: HealthContext) -> HealthCheck:
     if context.db_initializing:
         return HealthCheck("MySQL", HealthLevel.UNKNOWN, "Database probe is running")
+    if context.pc_database_engine is not None:
+        try:
+            with context.pc_database_engine.connect() as connection:
+                connection.execute(text("SELECT 1"))
+        except Exception as exc:
+            return HealthCheck(
+                "MySQL",
+                HealthLevel.CRITICAL,
+                "Current read-only database probe failed",
+                scrub_sensitive_text(exc),
+            )
+        return HealthCheck(
+            "MySQL",
+            HealthLevel.HEALTHY,
+            "Primary database verified now",
+            "A read-only SELECT 1 probe succeeded.",
+        )
     if context.pc_database_ready or context.db_source == "pc":
         return HealthCheck(
-            "MySQL", HealthLevel.HEALTHY, "Primary database is reachable"
+            "MySQL",
+            HealthLevel.WARNING,
+            "Primary database was last known reachable",
+            "No engine was available for a current read-only probe.",
         )
     if context.db_source == "local_mirror":
         return HealthCheck(
@@ -204,6 +275,94 @@ def _mysql_check(context: HealthContext) -> HealthCheck:
         HealthLevel.WARNING,
         "No database source is available",
         "Database-backed scanning and cache freshness are degraded.",
+    )
+
+
+def _format_bytes(value: int) -> str:
+    number = float(max(0, value))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if number < 1024 or unit == "TB":
+            return f"{number:.1f} {unit}"
+        number /= 1024
+    return f"{number:.1f} TB"
+
+
+def _event_journal_check(status: EventJournalStatus) -> HealthCheck:
+    detail = (
+        f"Last write: {status.last_write_at or 'none this session'}; "
+        f"latest event: {status.latest_event_at or 'none'}; "
+        f"active: {_format_bytes(status.active_file_size)}; "
+        f"archives: {status.archive_count} ({_format_bytes(status.archive_bytes)}); "
+        f"disk free: {_format_bytes(status.available_disk_space)}."
+    )
+    if status.inspection_error:
+        return HealthCheck(
+            "Event journal",
+            HealthLevel.CRITICAL,
+            "Journal storage inspection failed",
+            f"{status.inspection_error} {detail}",
+        )
+    if status.last_error:
+        return HealthCheck(
+            "Event journal",
+            HealthLevel.CRITICAL,
+            "Most recent journal operation failed",
+            f"{status.last_error} Error time: {status.last_error_at}. {detail}",
+        )
+    if not status.directory_writable:
+        return HealthCheck(
+            "Event journal",
+            HealthLevel.CRITICAL,
+            "Journal directory is not writable",
+            detail,
+        )
+    if status.available_disk_space < JOURNAL_DISK_CRITICAL_BYTES:
+        return HealthCheck(
+            "Event journal",
+            HealthLevel.CRITICAL,
+            "Disk space is critically low",
+            detail,
+        )
+    if not status.lock_available:
+        return HealthCheck(
+            "Event journal",
+            HealthLevel.WARNING,
+            "Journal lock is currently busy",
+            detail,
+        )
+    if status.lock_stale:
+        return HealthCheck(
+            "Event journal",
+            HealthLevel.WARNING,
+            "A stale journal lock was detected",
+            f"The next writer will recover it automatically. {detail}",
+        )
+    if status.archive_count > MAX_JOURNAL_ARCHIVES:
+        return HealthCheck(
+            "Event journal",
+            HealthLevel.WARNING,
+            "Journal archive retention is overdue",
+            detail,
+        )
+    if status.available_disk_space < JOURNAL_DISK_WARNING_BYTES:
+        return HealthCheck(
+            "Event journal",
+            HealthLevel.WARNING,
+            "Journal disk space is getting low",
+            detail,
+        )
+    if not status.last_write_at and not status.latest_event_at:
+        return HealthCheck(
+            "Event journal",
+            HealthLevel.UNKNOWN,
+            "Journal is writable but no event exists yet",
+            detail,
+        )
+    return HealthCheck(
+        "Event journal",
+        HealthLevel.HEALTHY,
+        "Journal storage is operational",
+        detail,
     )
 
 
@@ -227,7 +386,7 @@ def _mirror_check(context: HealthContext) -> HealthCheck:
                 "Data mirror",
                 HealthLevel.WARNING,
                 "Tracked universe could not be loaded",
-                str(exc),
+                scrub_sensitive_text(exc),
             )
     try:
         daily_stale = local_mirror_is_stale(
@@ -241,7 +400,7 @@ def _mirror_check(context: HealthContext) -> HealthCheck:
             "Data mirror",
             HealthLevel.WARNING,
             "Mirror freshness check failed",
-            str(exc),
+            scrub_sensitive_text(exc),
         )
     stale_parts = [
         label
@@ -269,7 +428,7 @@ def _reconciliation_check(context: HealthContext) -> HealthCheck:
             "Reconciliation",
             HealthLevel.CRITICAL,
             "Local order ledger is unreadable",
-            context.order_ledger_error,
+            scrub_sensitive_text(context.order_ledger_error),
         )
     open_orders = [order for order in context.orders if is_open_status(order.status)]
     unknown_orders = [
@@ -288,7 +447,7 @@ def _reconciliation_check(context: HealthContext) -> HealthCheck:
             "Reconciliation",
             HealthLevel.CRITICAL,
             "Most recent reconciliation failed",
-            context.reconciliation_last_error,
+            scrub_sensitive_text(context.reconciliation_last_error),
         )
     if unknown_orders:
         symbols = ", ".join(sorted({order.symbol for order in unknown_orders})[:8])
@@ -325,6 +484,15 @@ def _reconciliation_check(context: HealthContext) -> HealthCheck:
 def collect_health_snapshot(context: HealthContext) -> HealthSnapshot:
     """Run read-only local probes and combine them with cached runtime state."""
     token_check, configured = inspect_kis_token()
+    try:
+        journal_check = _event_journal_check(inspect_event_journal())
+    except Exception as exc:
+        journal_check = HealthCheck(
+            "Event journal",
+            HealthLevel.CRITICAL,
+            "Journal health check failed",
+            scrub_sensitive_text(exc),
+        )
     return HealthSnapshot(
         checked_at=dt.datetime.now().astimezone().isoformat(timespec="seconds"),
         checks=[
@@ -333,6 +501,7 @@ def collect_health_snapshot(context: HealthContext) -> HealthSnapshot:
             _mysql_check(context),
             _mirror_check(context),
             _reconciliation_check(context),
+            journal_check,
             HealthCheck(
                 "Application heartbeat",
                 HealthLevel.HEALTHY,

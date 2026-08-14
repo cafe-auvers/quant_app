@@ -12,9 +12,12 @@ import datetime as dt
 import json
 import logging
 import os
+import re
+import shutil
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional
@@ -24,9 +27,12 @@ from src.utils.config import DATA_DIR
 
 EVENT_JOURNAL_FILE = DATA_DIR / "event_journal.jsonl"
 MAX_JOURNAL_BYTES = 25 * 1024 * 1024
+MAX_JOURNAL_ARCHIVES = 20
 _LOCK_TIMEOUT_SECONDS = 2.0
 _STALE_LOCK_SECONDS = 30.0
 _THREAD_LOCK = threading.RLock()
+_STATUS_LOCK = threading.Lock()
+_RUNTIME_STATUS: Dict[str, Dict[str, str]] = {}
 logger = logging.getLogger(__name__)
 
 
@@ -65,6 +71,29 @@ _SENSITIVE_KEY_PARTS = (
     "secret",
     "token",
 )
+_SENSITIVE_ASSIGNMENT_RE = re.compile(
+    r"(?i)(\b(?:access_token|authorization|app_secret|password|passwd|secret|token|"
+    r"app_key|appkey)\b[\"']?\s*[:=]\s*[\"']?)([^\s\"'&,;}]+)"
+)
+_BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
+_ACCOUNT_RE = re.compile(r"(?<!\d)(\d{8}-?\d{2})(?!\d)")
+
+
+@dataclass(frozen=True)
+class EventJournalStatus:
+    path: Path
+    directory_writable: bool
+    lock_available: bool
+    lock_stale: bool
+    last_write_at: str
+    last_error: str
+    last_error_at: str
+    latest_event_at: str
+    active_file_size: int
+    archive_count: int
+    archive_bytes: int
+    available_disk_space: int
+    inspection_error: str = ""
 
 
 def mask_account_number(account_no: Any) -> str:
@@ -78,26 +107,84 @@ def mask_account_number(account_no: Any) -> str:
     return f"{compact[:2]}{'*' * max(4, len(compact) - 4)}{compact[-2:]}"
 
 
-def _safe_payload(value: Any, *, key: str = "", depth: int = 0) -> Any:
+def scrub_sensitive_text(value: Any, *, account_no: Any = "") -> str:
+    """Remove credentials and account identifiers from unstructured text."""
+    text = str(value or "")
+    account_text = str(account_no or "").strip()
+    if account_text:
+        masked = mask_account_number(account_text)
+        variants = {account_text, account_text.replace("-", "")}
+        for variant in sorted(
+            (item for item in variants if item), key=len, reverse=True
+        ):
+            text = text.replace(variant, masked)
+    text = _ACCOUNT_RE.sub(lambda match: mask_account_number(match.group(1)), text)
+    text = _BEARER_RE.sub("Bearer [REDACTED]", text)
+    return _SENSITIVE_ASSIGNMENT_RE.sub(r"\1[REDACTED]", text)
+
+
+def _safe_payload(
+    value: Any,
+    *,
+    key: str = "",
+    depth: int = 0,
+    account_no: Any = "",
+) -> Any:
     normalized_key = str(key).strip().lower()
     if any(part in normalized_key for part in _SENSITIVE_KEY_PARTS):
         return "[REDACTED]"
     if depth > 6:
         return "[TRUNCATED]"
-    if value is None or isinstance(value, (bool, int, float, str)):
+    if value is None or isinstance(value, (bool, int, float)):
         return value
+    if isinstance(value, str):
+        return scrub_sensitive_text(value, account_no=account_no)
     if isinstance(value, Enum):
         return value.value
     if isinstance(value, dict):
         return {
-            str(item_key): _safe_payload(item, key=str(item_key), depth=depth + 1)
+            str(item_key): _safe_payload(
+                item,
+                key=str(item_key),
+                depth=depth + 1,
+                account_no=account_no,
+            )
             for item_key, item in value.items()
         }
     if isinstance(value, (list, tuple, set)):
-        return [_safe_payload(item, depth=depth + 1) for item in value]
+        return [
+            _safe_payload(item, depth=depth + 1, account_no=account_no)
+            for item in value
+        ]
     if isinstance(value, (dt.date, dt.datetime)):
         return value.isoformat()
-    return str(value)
+    return scrub_sensitive_text(value, account_no=account_no)
+
+
+def _status_key(path: Path) -> str:
+    return os.path.normcase(str(Path(path).resolve(strict=False)))
+
+
+def _record_write_success(path: Path, timestamp: str) -> None:
+    with _STATUS_LOCK:
+        status = _RUNTIME_STATUS.setdefault(_status_key(path), {})
+        status["last_write_at"] = timestamp
+        status["last_error"] = ""
+        status["last_error_at"] = ""
+
+
+def _record_write_error(
+    path: Path, error: BaseException | str, *, account_no: Any = ""
+) -> None:
+    with _STATUS_LOCK:
+        status = _RUNTIME_STATUS.setdefault(_status_key(path), {})
+        status["last_error"] = scrub_sensitive_text(error, account_no=account_no)
+        status["last_error_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def reset_event_journal_runtime_status_for_tests() -> None:
+    with _STATUS_LOCK:
+        _RUNTIME_STATUS.clear()
 
 
 @contextmanager
@@ -141,16 +228,45 @@ def _exclusive_journal_lock(path: Path) -> Iterator[None]:
                 pass
 
 
-def _rotate_if_needed(path: Path, incoming_bytes: int) -> None:
+def _archive_paths(path: Path, *, newest_first: bool = True) -> List[Path]:
+    archive_name = re.compile(
+        rf"^{re.escape(path.stem)}\.\d{{8}}T\d{{6}}-\d+{re.escape(path.suffix)}$"
+    )
+    parent = path.parent.resolve(strict=False)
+    candidates = [
+        candidate
+        for candidate in path.parent.glob(f"{path.stem}.*{path.suffix}")
+        if archive_name.fullmatch(candidate.name)
+        and candidate.resolve(strict=False).parent == parent
+    ]
+    return sorted(
+        candidates,
+        key=lambda candidate: (candidate.stat().st_mtime_ns, candidate.name),
+        reverse=newest_first,
+    )
+
+
+def _rotate_if_needed(path: Path, incoming_bytes: int) -> bool:
     try:
         current_size = path.stat().st_size
     except FileNotFoundError:
-        return
+        return False
     if current_size + incoming_bytes <= MAX_JOURNAL_BYTES:
-        return
+        return False
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S")
     archive = path.with_name(f"{path.stem}.{stamp}-{time.time_ns()}{path.suffix}")
     os.replace(path, archive)
+    return True
+
+
+def _enforce_archive_retention(path: Path) -> None:
+    """Keep newest archives only; never delete outside the journal directory."""
+    archive_limit = max(0, int(MAX_JOURNAL_ARCHIVES))
+    parent = path.parent.resolve(strict=False)
+    for archive in _archive_paths(path)[archive_limit:]:
+        if archive.resolve(strict=False).parent != parent:
+            raise OSError(f"Refusing to prune journal archive outside {parent}")
+        archive.unlink()
 
 
 def append_event(
@@ -170,6 +286,7 @@ def append_event(
     path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Append one validated event and return the exact redacted record."""
+    path = Path(path or EVENT_JOURNAL_FILE)
     event_name = (
         (event_type.value if isinstance(event_type, EventType) else str(event_type))
         .strip()
@@ -177,34 +294,46 @@ def append_event(
     )
     if not event_name:
         raise ValueError("event_type is required")
+    safe_account = mask_account_number(account_no)
     record: Dict[str, Any] = {
         "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
         "event_id": uuid4().hex,
         "event_type": event_name,
-        "strategy_id": str(strategy_id or ""),
+        "strategy_id": scrub_sensitive_text(strategy_id, account_no=account_no),
         "symbol": str(symbol or "").strip().upper(),
-        "signal_id": str(signal_id or ""),
-        "order_id": str(order_id or ""),
-        "broker_order_id": str(broker_order_id or ""),
+        "signal_id": scrub_sensitive_text(signal_id, account_no=account_no),
+        "order_id": scrub_sensitive_text(order_id, account_no=account_no),
+        "broker_order_id": scrub_sensitive_text(broker_order_id, account_no=account_no),
         "environment": str(environment or "").strip().upper(),
-        "account": mask_account_number(account_no),
+        "account": safe_account,
         "price": price,
         "quantity": quantity,
-        "reason": str(reason or ""),
-        "payload": _safe_payload(payload or {}),
+        "reason": scrub_sensitive_text(reason, account_no=account_no),
+        "payload": _safe_payload(payload or {}, account_no=account_no),
     }
     encoded = (
         json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
     ).encode("utf-8")
-    path = Path(path or EVENT_JOURNAL_FILE)
-    with _exclusive_journal_lock(path):
-        _rotate_if_needed(path, len(encoded))
-        descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
-        try:
-            os.write(descriptor, encoded)
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+    try:
+        with _exclusive_journal_lock(path):
+            _rotate_if_needed(path, len(encoded))
+            descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+            try:
+                os.write(descriptor, encoded)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            _record_write_success(path, record["timestamp"])
+            # Retention runs only after the replacement active file has been
+            # opened, written, and fsynced successfully.
+            try:
+                _enforce_archive_retention(path)
+            except OSError as exc:
+                _record_write_error(path, exc)
+                logger.exception("Could not prune old event-journal archives")
+    except Exception as exc:
+        _record_write_error(path, exc, account_no=account_no)
+        raise
     return record
 
 
@@ -213,7 +342,12 @@ def record_event(event_type: EventType | str, **kwargs: Any) -> bool:
     try:
         append_event(event_type, **kwargs)
         return True
-    except Exception:
+    except Exception as exc:
+        _record_write_error(
+            Path(kwargs.get("path") or EVENT_JOURNAL_FILE),
+            exc,
+            account_no=kwargs.get("account_no", ""),
+        )
         logger.exception("Could not append %s to the trading event journal", event_type)
         return False
 
@@ -261,6 +395,72 @@ def load_recent_events(
             if len(events) >= limit:
                 return events
     return events
+
+
+def inspect_event_journal(path: Optional[Path] = None) -> EventJournalStatus:
+    """Return read-only storage and runtime-write health for the journal."""
+    path = Path(path or EVENT_JOURNAL_FILE)
+    inspection_errors: List[str] = []
+    try:
+        active_file_size = path.stat().st_size
+    except FileNotFoundError:
+        active_file_size = 0
+    except OSError as exc:
+        active_file_size = 0
+        inspection_errors.append(str(exc))
+
+    try:
+        archives = _archive_paths(path)
+        archive_bytes = sum(archive.stat().st_size for archive in archives)
+    except OSError as exc:
+        archives = []
+        archive_bytes = 0
+        inspection_errors.append(str(exc))
+
+    existing_parent = path.parent
+    while not existing_parent.exists() and existing_parent != existing_parent.parent:
+        existing_parent = existing_parent.parent
+    directory_writable = bool(
+        existing_parent.is_dir() and os.access(existing_parent, os.W_OK)
+    )
+    try:
+        available_disk_space = shutil.disk_usage(existing_parent).free
+    except OSError as exc:
+        available_disk_space = 0
+        inspection_errors.append(str(exc))
+
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_stale = False
+    lock_available = True
+    if lock_path.exists():
+        try:
+            lock_stale = time.time() - lock_path.stat().st_mtime > _STALE_LOCK_SECONDS
+            lock_available = lock_stale
+        except OSError as exc:
+            lock_available = False
+            inspection_errors.append(str(exc))
+
+    latest_events = load_recent_events(limit=1, path=path)
+    latest_event_at = (
+        str(latest_events[0].get("timestamp") or "") if latest_events else ""
+    )
+    with _STATUS_LOCK:
+        runtime = dict(_RUNTIME_STATUS.get(_status_key(path), {}))
+    return EventJournalStatus(
+        path=path,
+        directory_writable=directory_writable,
+        lock_available=lock_available,
+        lock_stale=lock_stale,
+        last_write_at=str(runtime.get("last_write_at") or ""),
+        last_error=str(runtime.get("last_error") or ""),
+        last_error_at=str(runtime.get("last_error_at") or ""),
+        latest_event_at=latest_event_at,
+        active_file_size=max(0, int(active_file_size)),
+        archive_count=len(archives),
+        archive_bytes=max(0, int(archive_bytes)),
+        available_disk_space=max(0, int(available_disk_space)),
+        inspection_error="; ".join(inspection_errors),
+    )
 
 
 EventRecorder = Callable[..., bool]

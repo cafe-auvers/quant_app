@@ -146,6 +146,9 @@ class HealthPanelMixin:
 
     def _health_context(self) -> HealthContext:
         reconciliation_worker = self.__dict__.get("order_reconciliation_worker")
+        pc_database_engine = self.__dict__.get("pc_db_engine")
+        if pc_database_engine is None:
+            pc_database_engine = self.__dict__.get("_pc_probe_engine")
         kis_workers = (
             self.__dict__.get("kis_account_worker"),
             self.__dict__.get("kis_startup_worker"),
@@ -155,6 +158,7 @@ class HealthPanelMixin:
             db_source=str(self.__dict__.get("db_engine_source", "none")),
             db_initializing=bool(self.__dict__.get("db_initializing", False)),
             pc_database_ready=bool(self.__dict__.get("_pc_database_ready", False)),
+            pc_database_engine=pc_database_engine,
             mirror_engine=self.__dict__.get("_local_mirror_engine"),
             mirror_tickers=mirror_tickers,
             kis_snapshot_count=len(self.__dict__.get("kis_account_snapshots", {})),

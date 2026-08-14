@@ -64,6 +64,7 @@ def submit_guarded_overseas_order(
     plan_id: str = "",
     event_recorder: Optional[Callable[..., Any]] = None,
     signal_payload: Optional[dict[str, Any]] = None,
+    signal_event_type: str = "SIGNAL_CREATED",
 ) -> BrokerOrder:
     """Submit an overseas order with a durable local idempotency guard.
 
@@ -168,15 +169,13 @@ def submit_guarded_overseas_order(
         buylist_symbol_key=f"{environment}:{account_no}:{symbol}",
     )
     if signal_payload:
-        emit_event(
-            (
-                "SIGNAL_CREATED"
-                if getattr(pre_trade_risk_decision, "approved", False)
-                else "SIGNAL_REJECTED"
-            ),
-            order,
-            **signal_payload,
-        )
+        # A strategy signal and its position-risk decision are separate facts.
+        # Risk rejection below must not rewrite an actionable strategy output
+        # as SIGNAL_REJECTED.
+        normalized_signal_event = str(signal_event_type or "").strip().upper()
+        if normalized_signal_event not in {"SIGNAL_CREATED", "SIGNAL_REJECTED"}:
+            normalized_signal_event = "SIGNAL_CREATED"
+        emit_event(normalized_signal_event, order, **signal_payload)
     if intent == OrderIntent.ENTRY:
         try:
             require_current_entry_approval()
@@ -214,6 +213,8 @@ def submit_guarded_overseas_order(
         order.error_message = str(exc)
         order.touch()
         upsert_order(order, path=path)
+        if isinstance(exc, PreTradeRiskRejectedError):
+            emit_event("RISK_REJECTED", order, reason=str(exc))
         emit_event("ORDER_REJECTED", order, reason=str(exc))
         raise
 
@@ -224,6 +225,23 @@ def submit_guarded_overseas_order(
     order.touch()
     upsert_order(order, path=path)
     emit_event("ORDER_SUBMISSION_STARTED", order)
+
+    # The synchronous journal write above may contend or fsync slowly. Recheck
+    # both gates at the last possible service boundary so neither a newly
+    # disabled kill switch nor an expired entry approval can cross into the
+    # non-idempotent broker call.
+    try:
+        trading_state.require_trading_enabled(environment, symbol)
+        require_current_entry_approval()
+    except (TradingDisabledError, PreTradeRiskRejectedError) as exc:
+        order.status = OrderStatus.REJECTED
+        order.error_message = str(exc)
+        order.touch()
+        upsert_order(order, path=path)
+        if isinstance(exc, PreTradeRiskRejectedError):
+            emit_event("RISK_REJECTED", order, reason=str(exc))
+        emit_event("ORDER_REJECTED", order, reason=str(exc))
+        raise
 
     try:
         submission = broker.submit_order(

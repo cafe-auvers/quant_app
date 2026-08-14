@@ -17,11 +17,14 @@ from src.services import (
 @pytest.fixture(autouse=True)
 def _isolate_event_journal(monkeypatch, tmp_path):
     """Never let UI/lifecycle tests append synthetic events to local runtime data."""
+    event_journal.reset_event_journal_runtime_status_for_tests()
     monkeypatch.setattr(
         event_journal,
         "EVENT_JOURNAL_FILE",
         tmp_path / "event_journal.jsonl",
     )
+    yield
+    event_journal.reset_event_journal_runtime_status_for_tests()
 
 
 @pytest.fixture(autouse=True)
