@@ -73,6 +73,11 @@ def submit_guarded_overseas_order(
     execution_authority: Optional[ExecutionAuthority] = None,
     execution_lease: Optional[LeaseHandle] = None,
     lease_engine: Optional[Any] = None,
+    attempt_group_id: str = "",
+    attempt_number: int = 1,
+    attempt_deadline_at: Optional[str] = None,
+    capital_reservation_id: str = "",
+    replaces_client_order_id: str = "",
 ) -> BrokerOrder:
     """Submit an overseas order with a durable local idempotency guard.
 
@@ -85,6 +90,15 @@ def submit_guarded_overseas_order(
     which ``Broker`` implementation runs underneath it. ENTRY orders must
     carry a fresh risk approval bound to the complete order fingerprint; exit
     orders deliberately remain available without entry-risk approval.
+
+    ``attempt_group_id``/``attempt_number``/``attempt_deadline_at``/
+    ``capital_reservation_id``/``replaces_client_order_id`` are optional
+    metadata from :mod:`src.services.entry_attempt_manager`
+    (buydashboard_to_kanban.md section 446-469); they are stamped onto the
+    constructed ``BrokerOrder`` and otherwise do not change this function's
+    existing gate order (kill switch -> risk -> lease -> duplicate reserve ->
+    re-checks -> submit). Callers outside the new entry-attempt engine can
+    omit them entirely.
     """
 
     def emit_event(event_type: str, order: BrokerOrder, **extra: Any) -> None:
@@ -179,6 +193,11 @@ def submit_guarded_overseas_order(
         status=OrderStatus.CREATED,
         execution_policy=execution_policy,
         buylist_symbol_key=f"{environment}:{account_no}:{symbol}",
+        attempt_group_id=attempt_group_id,
+        attempt_number=attempt_number,
+        attempt_deadline_at=attempt_deadline_at,
+        capital_reservation_id=capital_reservation_id,
+        replaces_client_order_id=replaces_client_order_id,
     )
     if signal_payload:
         # A strategy signal and its position-risk decision are separate facts.

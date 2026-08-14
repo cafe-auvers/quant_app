@@ -4,20 +4,17 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import time
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, List, Optional, TypeVar
+from typing import Any, Callable, Iterable, List, Optional, TypeVar
 
 from src.core.order_state import (BrokerOrder, OrderIntent, OrderSide,
                                   OrderStatus, is_open_status)
 from src.utils.config import DATA_DIR
+from src.utils.file_lock import exclusive_file_lock
 from src.utils.storage import save_json
 
 ORDERS_FILE = DATA_DIR / "orders.json"
-_LOCK_TIMEOUT_SECONDS = 5.0
-_STALE_LOCK_SECONDS = 30.0
 logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
@@ -26,45 +23,11 @@ class OrderLedgerCorruptionError(RuntimeError):
     """Raised when existing order-ledger state cannot be trusted."""
 
 
-@contextmanager
-def _exclusive_ledger_lock(path: Path) -> Iterator[None]:
-    """Serialize short ledger transactions across threads and processes."""
-    lock_path = Path(path).with_suffix(Path(path).suffix + ".lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
-    descriptor: Optional[int] = None
-    while descriptor is None:
-        try:
-            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(descriptor, f"{os.getpid()} {time.time()}".encode("ascii"))
-        except (FileExistsError, PermissionError) as exc:
-            # Windows can surface an exclusive-create collision as
-            # PermissionError while another process still owns the file.
-            # Only treat it as contention when the lock actually exists;
-            # genuine directory/ACL failures must remain visible.
-            if isinstance(exc, PermissionError) and not lock_path.exists():
-                raise
-            try:
-                stale = time.time() - lock_path.stat().st_mtime > _STALE_LOCK_SECONDS
-            except OSError:
-                stale = False
-            if stale:
-                try:
-                    lock_path.unlink()
-                except OSError:
-                    pass
-                continue
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"Timed out waiting for order-ledger lock: {lock_path}")
-            time.sleep(0.05)
-    try:
-        yield
-    finally:
-        os.close(descriptor)
-        try:
-            lock_path.unlink()
-        except OSError:
-            pass
+# Re-exported under its original private name: this module's lock behavior
+# moved to src.utils.file_lock so src.services.capital_allocator can share
+# it, but existing callers/tests still reach it as
+# ``order_ledger._exclusive_ledger_lock``.
+_exclusive_ledger_lock = exclusive_file_lock
 
 
 def _parse_orders_payload(data: Any, source: Path) -> List[BrokerOrder]:

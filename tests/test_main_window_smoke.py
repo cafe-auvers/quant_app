@@ -87,6 +87,10 @@ def test_main_window_constructs_and_closes_offscreen_without_external_io(monkeyp
     tab_labels = [window.tabs.tabText(index) for index in range(window.tabs.count())]
     tradingview_index = tab_labels.index("TradingView Chart")
     assert tab_labels[tradingview_index + 1] == "Health"
+    assert "Buy Board" in tab_labels
+    from src.ui.buyboard.columns import BOARD_COLUMN_ORDER
+
+    assert set(window.buyboard_columns.keys()) == set(BOARD_COLUMN_ORDER)
 
     assert window.close() is True
     assert window._database_shutting_down is True

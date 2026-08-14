@@ -17,6 +17,45 @@ from src.services.kis_intraday_provider import fetch_kis_intraday
 from src.services.yfinance_intraday_provider import fetch_yfinance_intraday
 
 
+class ExecutionGradeDataUnavailableError(RuntimeError):
+    """No KIS-sourced intraday data is available for an execution decision.
+
+    Callers (entry-trigger evaluation, stop-loss checks -- the new engine in
+    ``buydashboard_to_kanban.md`` section 21) must treat this as
+    DATA_UNAVAILABLE and take no action. It is a distinct exception rather
+    than an empty/None return specifically so a caller cannot forget to
+    check the source before acting on stale or substitute data.
+    """
+
+
+def fetch_execution_grade_intraday(request: IntradayRequest) -> IntradayResult:
+    """KIS-only intraday fetch for entry/stop decisions (spec section
+    807-833: "For new entry decisions: KIS real-time quote required ...
+    yfinance must not authorize a live order"; "For open-position stop
+    protection: ... yfinance must not be the sole hard-stop trigger
+    source").
+
+    Unlike :func:`fetch_intraday_with_fallback` (display/charting, where a
+    yfinance fallback is an acceptable, clearly-labeled substitute), this
+    function never returns yfinance-sourced bars -- regardless of
+    ``request.allow_fallback`` -- so an execution caller can never
+    accidentally opt into a fallback source for a live decision.
+    """
+    if not is_kis_intraday_enabled():
+        raise ExecutionGradeDataUnavailableError(
+            "KIS intraday is disabled/unconfigured; no execution-grade data source available."
+        )
+    try:
+        kis_result = fetch_kis_intraday(request)
+    except Exception as exc:
+        raise ExecutionGradeDataUnavailableError(f"KIS intraday failed: {exc}") from exc
+    if kis_result.bars.empty:
+        raise ExecutionGradeDataUnavailableError(
+            "; ".join(kis_result.warnings) or "KIS intraday returned no bars."
+        )
+    return kis_result
+
+
 def fetch_intraday_with_fallback(request: IntradayRequest) -> IntradayResult:
     warnings = []
     if is_kis_intraday_enabled():

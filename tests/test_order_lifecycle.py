@@ -619,11 +619,16 @@ def test_concurrent_guarded_submissions_reserve_only_one_order(
 
 
 def test_order_ledger_lock_retries_windows_permission_collision(monkeypatch, tmp_path):
+    # order_ledger._exclusive_ledger_lock is a re-export of
+    # src.utils.file_lock.exclusive_file_lock (shared with
+    # src.services.capital_allocator) -- the retry loop itself, and the
+    # os/time names it actually calls, now live in that module.
     from src.services import order_ledger
+    from src.utils import file_lock
 
     path = tmp_path / "orders.json"
     lock_path = path.with_suffix(".json.lock")
-    original_open = order_ledger.os.open
+    original_open = file_lock.os.open
     calls = {"count": 0}
 
     def windows_open(candidate, flags, mode=0o777):
@@ -636,8 +641,8 @@ def test_order_ledger_lock_retries_windows_permission_collision(monkeypatch, tmp
     def release_other_owner(_seconds):
         lock_path.unlink()
 
-    monkeypatch.setattr(order_ledger.os, "open", windows_open)
-    monkeypatch.setattr(order_ledger.time, "sleep", release_other_owner)
+    monkeypatch.setattr(file_lock.os, "open", windows_open)
+    monkeypatch.setattr(file_lock.time, "sleep", release_other_owner)
 
     with order_ledger._exclusive_ledger_lock(path):
         assert lock_path.exists()

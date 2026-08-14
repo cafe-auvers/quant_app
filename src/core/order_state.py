@@ -251,6 +251,20 @@ class BrokerOrder:
     buylist_key: str = ""
     buylist_symbol_key: str = ""
 
+    # --- Entry-attempt / capital-reservation extension ----------------
+    # buydashboard_to_kanban.md section 446-469: extends BrokerOrder rather
+    # than replacing it. All new fields default to a value that makes an
+    # order that never went through the attempt engine behave exactly as it
+    # did before this extension -- every existing caller/test is unaffected.
+    attempt_group_id: str = ""  # all retries belonging to one planned entry
+    attempt_number: int = 1  # 1, 2, 3, ...
+    attempt_deadline_at: Optional[str] = None  # 15s application deadline (ISO8601)
+    retry_eligible: bool = True  # whether the strategy may attempt again
+    replaces_client_order_id: str = ""  # previous cancelled attempt
+    capital_reservation_id: str = ""  # links this order to reserved capital
+    cancel_requested_at: Optional[str] = None
+    terminal_reason: str = ""  # filled, EOD, user cancelled, risk invalid, ...
+
     def __post_init__(self) -> None:
         self.environment = str(self.environment or "").upper()
         self.account_no = str(self.account_no or "")
@@ -273,6 +287,18 @@ class BrokerOrder:
         self.avg_fill_price = float(self.avg_fill_price or 0.0)
         self.buylist_key = str(self.buylist_key or self.buylist_symbol_key or f"{self.environment}:{self.account_no}:{self.symbol}")
         self.buylist_symbol_key = str(self.buylist_symbol_key or self.buylist_key or self.symbol)
+        self.attempt_group_id = str(self.attempt_group_id or "")
+        self.attempt_number = int(self.attempt_number or 1)
+        self.attempt_deadline_at = (
+            str(self.attempt_deadline_at) if self.attempt_deadline_at else None
+        )
+        self.retry_eligible = bool(self.retry_eligible)
+        self.replaces_client_order_id = str(self.replaces_client_order_id or "")
+        self.capital_reservation_id = str(self.capital_reservation_id or "")
+        self.cancel_requested_at = (
+            str(self.cancel_requested_at) if self.cancel_requested_at else None
+        )
+        self.terminal_reason = str(self.terminal_reason or "")
 
     @classmethod
     def create(
@@ -289,6 +315,11 @@ class BrokerOrder:
         status: OrderStatus | str = OrderStatus.CREATED,
         execution_policy: str = REGULAR_LIMIT_EXECUTION,
         buylist_symbol_key: str = "",
+        attempt_group_id: str = "",
+        attempt_number: int = 1,
+        attempt_deadline_at: Optional[str] = None,
+        capital_reservation_id: str = "",
+        replaces_client_order_id: str = "",
     ) -> "BrokerOrder":
         return cls(
             client_order_id=generate_client_order_id(
@@ -311,6 +342,11 @@ class BrokerOrder:
             remaining_quantity=int(quantity_requested or 0),
             buylist_key=buylist_symbol_key or f"{str(environment or '').upper()}:{account_no or ''}:{str(symbol).upper()}",
             buylist_symbol_key=buylist_symbol_key or f"{str(environment or '').upper()}:{account_no or ''}:{str(symbol).upper()}",
+            attempt_group_id=attempt_group_id,
+            attempt_number=attempt_number,
+            attempt_deadline_at=attempt_deadline_at,
+            capital_reservation_id=capital_reservation_id,
+            replaces_client_order_id=replaces_client_order_id,
         )
 
     def is_open(self) -> bool:
@@ -348,6 +384,14 @@ class BrokerOrder:
             "error_message": self.error_message,
             "buylist_key": self.buylist_key,
             "buylist_symbol_key": self.buylist_symbol_key,
+            "attempt_group_id": self.attempt_group_id,
+            "attempt_number": self.attempt_number,
+            "attempt_deadline_at": self.attempt_deadline_at,
+            "retry_eligible": self.retry_eligible,
+            "replaces_client_order_id": self.replaces_client_order_id,
+            "capital_reservation_id": self.capital_reservation_id,
+            "cancel_requested_at": self.cancel_requested_at,
+            "terminal_reason": self.terminal_reason,
         }
 
     @classmethod
@@ -378,4 +422,12 @@ class BrokerOrder:
             error_message=str(data.get("error_message", "")),
             buylist_key=str(data.get("buylist_key", "")),
             buylist_symbol_key=str(data.get("buylist_symbol_key", "")),
+            attempt_group_id=str(data.get("attempt_group_id", "")),
+            attempt_number=int(data.get("attempt_number", 1) or 1),
+            attempt_deadline_at=data.get("attempt_deadline_at"),
+            retry_eligible=bool(data.get("retry_eligible", True)),
+            replaces_client_order_id=str(data.get("replaces_client_order_id", "")),
+            capital_reservation_id=str(data.get("capital_reservation_id", "")),
+            cancel_requested_at=data.get("cancel_requested_at"),
+            terminal_reason=str(data.get("terminal_reason", "")),
         )

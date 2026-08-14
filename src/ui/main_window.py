@@ -68,6 +68,7 @@ from src.services.runtime_status import safe_mark_runtime_process_stopped
 from src.services.sleep_readiness import write_sleep_readiness_snapshot
 from src.services.state_sync import LocalDeviceRole, load_local_device_role
 from src.ui.buylist import BuylistMixin
+from src.ui.buyboard import BuyboardMixin
 from src.ui.charts.controller import ChartsControllerMixin
 from src.ui.charts.renderer import ChartsRenderMixin
 from src.ui.controllers import (AccountController, BuylistController,
@@ -313,6 +314,7 @@ class MainWindow(
     ScannerMixin,
     WatchlistMixin,
     BuylistMixin,
+    BuyboardMixin,
     ChartsControllerMixin,
     ChartsRenderMixin,
     QMainWindow,
@@ -2357,6 +2359,14 @@ class MainWindow(
         self.buylist_widget = QWidget()
         self._add_configured_tab("buylist", self.buylist_widget, "Buy Dashboard")
         self._build_buylist_tab()
+
+        # New Kanban Buy Board (buydashboard_to_kanban.md). Additive: the
+        # Buy Dashboard tab above remains the live, authoritative trading
+        # surface until BUYBOARD_ENGINE_ENABLED is explicitly turned on (see
+        # src.core.execution_config.is_buyboard_engine_enabled).
+        self.buyboard_widget = QWidget()
+        self._add_configured_tab("buyboard", self.buyboard_widget, "Buy Board")
+        self._build_buyboard_tab()
 
         self.charts_widget = QWidget()
         self._add_configured_tab("charts", self.charts_widget, "Charts")

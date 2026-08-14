@@ -76,6 +76,14 @@ class ExecutionQueueStatus(str, Enum):
     FILLED = "FILLED"
     EXPIRED = "EXPIRED"
     REJECTED = "REJECTED"
+    # A valid trigger fired but account capital was reserved elsewhere at the
+    # moment it fired (buydashboard_to_kanban.md section 9.4, 384-389). Kept
+    # as a distinct status rather than folded into ``resolve_queue_status``'s
+    # existing candidate-based resolution (section 24's "expose the capital
+    # result separately") -- callers that own capital reservation (the new
+    # entry-attempt engine) set/clear this explicitly; it is never derived
+    # from ORB candidate state alone.
+    WAITING_FOR_CAPITAL = "WAITING_FOR_CAPITAL"
 
 
 UNKNOWN_SUBMISSION_ORDER_STATUS_VALUES = {
