@@ -98,6 +98,7 @@ RATE_LIMIT_MSG_CODES = {
 }
 MAX_RATE_LIMIT_RETRIES = 3
 RATE_LIMIT_BACKOFF_SECONDS = (1.0, 2.0, 4.0)
+MAX_BALANCE_PAGES = 20
 TOKEN_CACHE_LOCK_TIMEOUT_SECONDS = 90.0
 TOKEN_CACHE_STALE_LOCK_SECONDS = 180.0
 
@@ -369,8 +370,67 @@ class KisAccountClient:
             self._save_cached_token(token=str(token), expires_in=expires_in)
         return str(token)
 
+    def _query_balance_pages(
+        self,
+        *,
+        endpoint: str,
+        tr_id: str,
+        params: Dict[str, str],
+        cursor_width: int,
+        max_pages: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Fetch every balance page or raise instead of returning partial data."""
+        page_limit = max(1, int(max_pages or MAX_BALANCE_PAGES))
+        fk_key = f"CTX_AREA_FK{cursor_width}"
+        nk_key = f"CTX_AREA_NK{cursor_width}"
+        fk_value = str(params.get(fk_key, "") or "")
+        nk_value = str(params.get(nk_key, "") or "")
+        pages: List[Dict[str, Any]] = []
+
+        for page_index in range(page_limit):
+            page_params = dict(params)
+            page_params[fk_key] = fk_value
+            page_params[nk_key] = nk_value
+            data, headers = self._get_with_headers(
+                endpoint,
+                tr_id=tr_id,
+                params=page_params,
+                tr_cont="" if page_index == 0 else "N",
+            )
+            pages.append(data)
+
+            header_tr_cont = str(
+                headers.get("tr_cont") or headers.get("tr-cont") or ""
+            ).strip().upper()
+            if header_tr_cont not in {"F", "M"}:
+                return pages
+
+            next_fk = str(
+                data.get(fk_key.lower()) or data.get(fk_key) or ""
+            ).strip()
+            next_nk = str(
+                data.get(nk_key.lower()) or data.get(nk_key) or ""
+            ).strip()
+            if not next_fk and not next_nk:
+                raise KisApiError(
+                    f"KIS balance pagination was incomplete for {endpoint}: "
+                    "continuation was requested without a cursor"
+                )
+            if page_index + 1 >= page_limit:
+                raise KisApiError(
+                    f"KIS balance pagination was incomplete for {endpoint}: "
+                    f"more than {page_limit} pages were reported"
+                )
+
+            fk_value, nk_value = next_fk, next_nk
+            time.sleep(0.2)
+
+        raise KisApiError(
+            f"KIS balance pagination was incomplete for {endpoint}"
+        )
+
     def get_domestic_balance(self) -> Dict[str, Any]:
-        """Fetch domestic stock holdings and account summary."""
+        """Fetch all domestic stock holdings and the account summary."""
         params = {
             "CANO": self.config.cano,
             "ACNT_PRDT_CD": self.config.account_product_code,
@@ -384,15 +444,24 @@ class KisAccountClient:
             "CTX_AREA_FK100": "",
             "CTX_AREA_NK100": "",
         }
-        data = self._get(
-            DOMESTIC_BALANCE_ENDPOINT,
+        pages = self._query_balance_pages(
+            endpoint=DOMESTIC_BALANCE_ENDPOINT,
             tr_id=self.config.domestic_balance_tr_id,
             params=params,
+            cursor_width=100,
+        )
+        holdings: List[Dict[str, Any]] = []
+        for page in pages:
+            holdings.extend(self._normalize_domestic_holdings(page))
+        summary_page = next(
+            (page for page in pages if self._as_list(page.get("output2"))),
+            pages[-1],
         )
         return {
-            "summary": self._normalize_domestic_summary(data),
-            "holdings": self._normalize_domestic_holdings(data),
-            "raw": data,
+            "summary": self._normalize_domestic_summary(summary_page),
+            "holdings": holdings,
+            "raw": pages[0],
+            "raw_pages": pages,
         }
 
     def get_overseas_balance(self) -> Dict[str, Any]:
@@ -402,51 +471,30 @@ class KisAccountClient:
         raw_by_exchange: Dict[str, Any] = {}
 
         for exchange in self.config.overseas_exchanges:
-            fk200 = ""
-            nk200 = ""
             exchange_rows: List[Dict[str, Any]] = []
-            page_count = 0
-
-            while True:
-                page_count += 1
-                params = {
-                    "CANO": self.config.cano,
-                    "ACNT_PRDT_CD": self.config.account_product_code,
-                    "OVRS_EXCG_CD": exchange,
-                    "TR_CRCY_CD": self.config.overseas_currency,
-                    "CTX_AREA_FK200": fk200,
-                    "CTX_AREA_NK200": nk200,
-                }
-                data, headers = self._get_with_headers(
-                    OVERSEAS_BALANCE_ENDPOINT,
-                    tr_id=self.config.overseas_balance_tr_id,
-                    params=params,
-                    tr_cont="" if page_count == 1 else "N",
-                )
-                raw_by_exchange.setdefault(exchange, []).append(data)
+            params = {
+                "CANO": self.config.cano,
+                "ACNT_PRDT_CD": self.config.account_product_code,
+                "OVRS_EXCG_CD": exchange,
+                "TR_CRCY_CD": self.config.overseas_currency,
+                "CTX_AREA_FK200": "",
+                "CTX_AREA_NK200": "",
+            }
+            pages = self._query_balance_pages(
+                endpoint=OVERSEAS_BALANCE_ENDPOINT,
+                tr_id=self.config.overseas_balance_tr_id,
+                params=params,
+                cursor_width=200,
+            )
+            raw_by_exchange[exchange] = pages
+            for data in pages:
                 rows = self._as_list(data.get("output1"))
                 exchange_rows.extend(rows)
-
-                next_fk200 = str(
-                    data.get("ctx_area_fk200") or data.get("CTX_AREA_FK200") or ""
-                )
-                next_nk200 = str(
-                    data.get("ctx_area_nk200") or data.get("CTX_AREA_NK200") or ""
-                )
-                tr_cont = str(
-                    headers.get("tr_cont") or headers.get("tr-cont") or ""
-                ).strip()
-
-                # KIS pagination commonly returns tr_cont = F/M when more rows exist.
-                has_more = tr_cont in {"F", "M"} and (next_fk200 or next_nk200)
-                if not has_more or page_count >= 20:
-                    summary = self._normalize_overseas_summary(data)
-                    if summary:
-                        summaries[exchange] = summary
-                    break
-
-                fk200, nk200 = next_fk200, next_nk200
-                time.sleep(0.2)
+            summary_page = next(
+                (page for page in reversed(pages) if self._as_list(page.get("output2"))),
+                pages[-1],
+            )
+            summaries[exchange] = self._normalize_overseas_summary(summary_page)
 
             for row in exchange_rows:
                 normalized = self._normalize_overseas_holding(row, exchange=exchange)
@@ -893,36 +941,44 @@ def load_config(
     )
 
 
-def get_configured_account_numbers(environment: KisEnvironment) -> List[str]:
+def get_configured_account_numbers(
+    environment: KisEnvironment,
+    *,
+    strict: bool = True,
+) -> List[str]:
     """Return configured account numbers for a profile.
 
     KIS does not expose a general "list my accounts" call in the read-only
     balance/quote flow used here, so the dashboard offers accounts configured
-    locally.
+    locally. Strict callers fail on every malformed nonempty value so a typo
+    cannot silently remove an account from handoff reconciliation.
     """
     if load_dotenv is not None:
         load_dotenv()
 
     prefix = f"KIS_{environment.value}"
-    raw_values: List[str] = []
+    raw_values: List[Tuple[str, str]] = []
     single = os.getenv(f"{prefix}_ACCOUNT_NO", "").strip()
     if single:
-        raw_values.append(single)
+        raw_values.append((f"{prefix}_ACCOUNT_NO", single))
 
     accounts_csv = os.getenv(f"{prefix}_ACCOUNTS", "").strip()
     if accounts_csv:
         raw_values.extend(
-            item.strip() for item in accounts_csv.split(",") if item.strip()
+            (f"{prefix}_ACCOUNTS", item.strip())
+            for item in accounts_csv.split(",")
+            if item.strip()
         )
 
     for index in range(1, 21):
         numbered = os.getenv(f"{prefix}_ACCOUNT_NO_{index}", "").strip()
         if numbered:
-            raw_values.append(numbered)
+            raw_values.append((f"{prefix}_ACCOUNT_NO_{index}", numbered))
 
     account_numbers: List[str] = []
+    invalid_sources = set()
     seen = set()
-    for raw_value in raw_values:
+    for source, raw_value in raw_values:
         try:
             default_product_code = (
                 os.getenv(f"{prefix}_ACCOUNT_PRODUCT_CODE", "01").strip() or "01"
@@ -931,11 +987,17 @@ def get_configured_account_numbers(environment: KisEnvironment) -> List[str]:
                 raw_value, default_product_code=default_product_code
             )
         except ValueError:
+            invalid_sources.add(source)
             continue
         normalized = f"{cano}-{product_code}"
         if normalized not in seen:
             account_numbers.append(normalized)
             seen.add(normalized)
+    if strict and invalid_sources:
+        raise ValueError(
+            "Invalid nonempty KIS account configuration in: "
+            + ", ".join(sorted(invalid_sources))
+        )
     return account_numbers
 
 
@@ -943,7 +1005,7 @@ def discover_account_profiles() -> List[Dict[str, str]]:
     """Build dashboard account choices from configured production accounts."""
     profiles: List[Dict[str, str]] = []
     environment = KisEnvironment.PROD
-    for account_no in get_configured_account_numbers(environment):
+    for account_no in get_configured_account_numbers(environment, strict=False):
         default_product_code = (
             os.getenv("KIS_PROD_ACCOUNT_PRODUCT_CODE", "01").strip() or "01"
         )

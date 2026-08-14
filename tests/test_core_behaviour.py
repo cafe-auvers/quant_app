@@ -2,6 +2,7 @@ from pathlib import Path
 import datetime as dt
 
 import pandas as pd
+import pytest
 from sqlalchemy import MetaData, create_engine, insert
 
 from src.risk.position_sizer import PositionSizer
@@ -2123,6 +2124,22 @@ def test_kis_account_profile_discovery_reads_multiple_configured_accounts(monkey
     assert prod_profiles[0]["label"] == "PROD 12******-01"
     assert all(profile["environment"] == "PROD" for profile in profiles)
     assert list(KisEnvironment) == [KisEnvironment.PROD]
+
+
+def test_kis_account_inventory_strict_mode_rejects_malformed_nonempty_value(monkeypatch):
+    monkeypatch.setattr(kis_snapshot, "load_dotenv", None)
+    for key in [
+        "KIS_PROD_ACCOUNT_NO",
+        "KIS_PROD_ACCOUNTS",
+        "KIS_PROD_ACCOUNT_NO_1",
+        "KIS_PROD_ACCOUNT_NO_2",
+    ]:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("KIS_PROD_ACCOUNT_NO", "12345678-01")
+    monkeypatch.setenv("KIS_PROD_ACCOUNTS", "87654321-01, typo")
+
+    with pytest.raises(ValueError, match="KIS_PROD_ACCOUNTS"):
+        kis_snapshot.get_configured_account_numbers(KisEnvironment.PROD)
 
 
 def test_kis_snapshot_helpers_format_summary_and_holdings():

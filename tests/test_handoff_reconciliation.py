@@ -269,6 +269,23 @@ def test_reconciliation_fails_closed_without_configured_prod_accounts():
     assert any("No configured PROD KIS accounts" in error for error in result.errors)
 
 
+def test_reconciliation_fails_closed_when_account_inventory_is_invalid(monkeypatch):
+    monkeypatch.setattr(
+        handoff_reconciliation,
+        "get_configured_account_numbers",
+        lambda _environment: (_ for _ in ()).throw(
+            ValueError("Invalid nonempty KIS account configuration")
+        ),
+    )
+    broker = StubBroker()
+
+    result = run_post_claim_broker_reconciliation(_manager(), broker=broker)
+
+    assert result.ok is False
+    assert broker.get_order_calls == []
+    assert any("Could not enumerate configured PROD" in error for error in result.errors)
+
+
 def test_reconciliation_clears_symbol_when_broker_confirms_no_open_order():
     item = _item("AAPL", status="BOUGHT", shares_held=10, avg_cost=100.0)
     item._buy_order_pending = True
@@ -480,6 +497,26 @@ def test_reconciliation_blocks_all_in_flight_symbols_on_positions_query_failure(
 
     assert result.ok is False
     assert result.blocked_symbols == ["AAPL"]
+
+
+def test_partial_position_pagination_cannot_clear_runtime_flags():
+    item = _item("AAPL", status="BOUGHT", shares_held=10, avg_cost=100.0)
+    item._buy_order_pending = True
+    item._stop_order_pending = True
+    item._exit_order_pending = True
+    broker = StubBroker(
+        raise_on_get_positions=RuntimeError(
+            "KIS balance pagination was incomplete: more pages were reported"
+        )
+    )
+
+    result = run_post_claim_broker_reconciliation(_manager(item), broker=broker)
+
+    assert result.ok is False
+    assert result.blocked_symbols == ["AAPL"]
+    assert item._buy_order_pending is True
+    assert item._stop_order_pending is True
+    assert item._exit_order_pending is True
 
 
 def test_reconciliation_never_calls_submit_order(monkeypatch):

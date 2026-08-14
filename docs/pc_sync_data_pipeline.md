@@ -381,6 +381,11 @@ either machine.
   malformed results, any open order, or any nonzero holding without a local
   `BOUGHT` item all fail closed for the entire account. This also catches an
   order/position omitted by a failed final publication or a stale snapshot.
+  Both domestic and overseas balance calls follow every KIS continuation
+  page; a continuation without a cursor or one that exceeds the page limit
+  raises instead of returning a partial position snapshot. Malformed nonempty
+  PROD account settings likewise block the handoff rather than silently
+  disappearing from the account inventory.
   Monitoring/trading only resume once every configured account clears
   unambiguously **and** the broker-corrected state has been synchronously
   saved and strictly republished. The manual **Use This Device as Main** path
