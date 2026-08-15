@@ -516,7 +516,9 @@ def test_sell_all_retries_remainder_when_no_order_is_working(tmp_path):
 
 
 def test_sell_all_does_not_resubmit_while_an_order_is_still_working(tmp_path):
-    working = _pending_order(status=OrderStatus.WORKING, filled=0)
+    # A not-yet-expired deadline: this tests "no resubmission while still
+    # working," not the separate TTL-cancel-escalation behavior below.
+    working = _pending_order(status=OrderStatus.WORKING, filled=0, deadline_seconds_ago=-30)
     submitted = []
     engine = _make_engine(tmp_path)
     engine._position_callbacks = PositionActionCallbacks(
@@ -524,6 +526,7 @@ def test_sell_all_does_not_resubmit_while_an_order_is_still_working(tmp_path):
         submit_sell_order=lambda **kw: submitted.append(kw),
         refresh_orderable_quantity=lambda *a: 260,
         find_open_sell_order=lambda card: working,
+        reconcile_sell_order=lambda order: order,
     )
     card = _open_card(board_status=BoardStatus.SELL_ALL, broker_quantity=260, orderable_quantity=260)
 
@@ -651,7 +654,9 @@ def test_partial_sell_request_is_actually_submitted(tmp_path):
 
 
 def test_partial_sell_does_not_resubmit_while_order_is_working(tmp_path):
-    working = _pending_order(status=OrderStatus.WORKING, filled=0)
+    # A not-yet-expired deadline: this tests "no resubmission while still
+    # working," not the separate TTL-cancel-escalation behavior below.
+    working = _pending_order(status=OrderStatus.WORKING, filled=0, deadline_seconds_ago=-30)
     submitted = []
     engine = _make_engine(tmp_path)
     engine._position_callbacks = PositionActionCallbacks(
@@ -1210,6 +1215,174 @@ def test_partial_sell_rejection_backs_off_instead_of_retrying_every_tick(tmp_pat
 
     engine.run_heartbeat([card])
     assert len(attempts) == 1  # still cooling down
+
+
+# --- Exit order TTL / cancel-confirm / reprice cycle (previously unbounded) -
+# Code review: "does not appear to impose a deadline on a still-working Sell
+# All order... a significant unattended-trading risk." Mirrors the entry
+# side's two-phase cancel (request -> broker confirmation), applied to both
+# Partial Sell (PARTIAL_EXIT_ATTEMPT_TTL_SECONDS) and Sell All
+# (SELL_ALL_ATTEMPT_TTL_SECONDS), plus EXIT_CANCEL_CONFIRMATION_TIMEOUT_SECONDS
+# stall detection.
+
+
+def _working_sell_order(*, filled=0, deadline_seconds_ago=20, intent=OrderIntent.MANUAL_EXIT, now=None):
+    reference = now or dt.datetime.now(dt.timezone.utc)
+    deadline = reference - dt.timedelta(seconds=deadline_seconds_ago)
+    order = BrokerOrder.create(
+        environment="PROD", account_no="1", symbol="AAPL", side=OrderSide.SELL,
+        intent=intent, quantity_requested=100, limit_price=90.0,
+        status=OrderStatus.WORKING, attempt_deadline_at=deadline.isoformat(),
+    )
+    order.filled_quantity = filled
+    return order
+
+
+def test_sell_all_cancels_stuck_order_once_ttl_passes(tmp_path):
+    """SELL_ALL_ATTEMPT_TTL_SECONDS: a working Sell All order past its
+    deadline is cancelled -- previously this could sit open indefinitely."""
+    tracker = _StatefulOrderTracker(_working_sell_order())
+    submitted = []
+    engine = _make_engine(tmp_path)
+    engine._position_callbacks = PositionActionCallbacks(
+        cancel_order=tracker.cancel_order,
+        submit_sell_order=lambda **kw: submitted.append(kw),
+        refresh_orderable_quantity=lambda *a: 260,
+        find_open_sell_order=tracker.find,
+        reconcile_sell_order=tracker.reconcile,
+    )
+    card = _open_card(board_status=BoardStatus.SELL_ALL, broker_quantity=260, orderable_quantity=260)
+
+    changed = engine.run_heartbeat([card])
+
+    assert changed == [card]
+    assert card.exit_cancel_in_flight is True
+    assert tracker.cancel_calls == [tracker.order.client_order_id]
+    assert submitted == []  # never overlaps a replacement with the unconfirmed cancel
+
+    # A second tick before confirmation must not resend the cancel.
+    changed_again = engine.run_heartbeat([card])
+    assert changed_again == []
+    assert len(tracker.cancel_calls) == 1
+
+
+def test_sell_all_resubmits_remainder_once_prior_ttl_cancel_is_gone_from_open_orders(tmp_path):
+    """Once a TTL-cancelled Sell All order is confirmed and no longer
+    reported "open" by the broker/ledger, the remainder is resubmitted --
+    the exit-side counterpart of
+    test_ttl_cancelled_remainder_is_actually_resubmitted_on_a_later_tick."""
+    submitted = []
+
+    def submit_sell_order(**kw):
+        submitted.append(kw)
+        return BrokerOrder.create(
+            environment=kw["environment"], account_no=kw["account_no"], symbol=kw["symbol"],
+            side=OrderSide.SELL, intent=OrderIntent.MANUAL_EXIT, quantity_requested=kw["quantity"],
+            limit_price=90.0, status=OrderStatus.ACCEPTED,
+        )
+
+    engine = _make_engine(tmp_path)
+    engine._position_callbacks = PositionActionCallbacks(
+        cancel_order=lambda cid: None,
+        submit_sell_order=submit_sell_order,
+        refresh_orderable_quantity=lambda *a: 220,  # 40 shares already filled by the cancelled attempt
+        find_open_sell_order=lambda card: None,
+    )
+    card = _open_card(board_status=BoardStatus.SELL_ALL, broker_quantity=260, orderable_quantity=260)
+    card.exit_cancel_in_flight = True  # a prior tick already requested the cancel
+    card.exit_cancel_requested_at = dt.datetime.now(dt.timezone.utc)
+
+    changed = engine.run_heartbeat([card])
+
+    assert changed == [card]
+    assert card.exit_cancel_in_flight is False  # cleared once no order is left open
+    assert card.broker_quantity == 220
+    assert len(submitted) == 1
+    assert submitted[0]["quantity"] == 220
+
+
+def test_partial_sell_cancels_stuck_order_once_ttl_passes_and_applies_partial_fill(tmp_path):
+    tracker = _StatefulOrderTracker(_working_sell_order(filled=30, intent=OrderIntent.PARTIAL_EXIT))
+    engine = _make_engine(tmp_path)
+    engine._position_callbacks = PositionActionCallbacks(
+        cancel_order=tracker.cancel_order,
+        submit_sell_order=lambda **kw: None,
+        refresh_orderable_quantity=lambda *a: 270,  # 300 - 30 already filled
+        find_open_sell_order=tracker.find,
+        reconcile_sell_order=tracker.reconcile,
+    )
+    card = _open_card(
+        board_status=BoardStatus.PARTIAL_SELL, broker_quantity=300, orderable_quantity=300,
+        stop_type=StopType.ORB_LOW, active_stop_price=95.0,
+    )
+    card.pending_partial_sell_quantity = 100
+
+    first = engine.run_heartbeat([card])
+    assert first == [card]
+    assert card.exit_cancel_in_flight is True
+    assert tracker.cancel_calls == [tracker.order.client_order_id]
+    assert card.board_status == BoardStatus.PARTIAL_SELL  # not yet resolved
+
+    tracker.resolve(OrderStatus.CANCELLED, filled=30)
+    second = engine.run_heartbeat([card])
+
+    assert second == [card]
+    assert card.exit_cancel_in_flight is False
+    assert card.board_status == BoardStatus.OPEN_POSITION
+    assert card.broker_quantity == 270
+    assert card.stop_type == StopType.BREAKEVEN  # a real (partial) fill happened
+
+
+def test_partial_sell_ttl_cancel_before_deadline_is_untouched(tmp_path):
+    working = _working_sell_order(deadline_seconds_ago=-30, intent=OrderIntent.PARTIAL_EXIT)
+    engine = _make_engine(tmp_path)
+    engine._market_data.subscribe(["AAPL"])
+    engine._market_data.poll_once()  # avoid an unrelated DATA_STALE change
+    engine._position_callbacks = PositionActionCallbacks(
+        cancel_order=lambda cid: pytest.fail("must not cancel before the deadline"),
+        submit_sell_order=lambda **kw: None,
+        refresh_orderable_quantity=lambda *a: 300,
+        find_open_sell_order=lambda card: working,
+        reconcile_sell_order=lambda order: order,
+    )
+    card = _open_card(board_status=BoardStatus.PARTIAL_SELL, broker_quantity=300, orderable_quantity=300)
+    card.pending_partial_sell_quantity = 100
+
+    assert engine.run_heartbeat([card]) == []
+
+
+def test_exit_cancel_unconfirmed_past_timeout_flags_warning_without_resending_cancel(tmp_path):
+    clock_time = dt.datetime(2026, 1, 5, 14, 30, tzinfo=dt.timezone.utc)
+    tracker = _StatefulOrderTracker(_working_sell_order(now=clock_time))
+    engine = _make_engine(tmp_path)
+    engine._position_callbacks = PositionActionCallbacks(
+        cancel_order=tracker.cancel_order,
+        submit_sell_order=lambda **kw: None,
+        refresh_orderable_quantity=lambda *a: 260,
+        find_open_sell_order=tracker.find,
+        reconcile_sell_order=tracker.reconcile,
+    )
+    engine._clock = lambda: clock_time
+    card = _open_card(board_status=BoardStatus.SELL_ALL, broker_quantity=260, orderable_quantity=260)
+
+    engine.run_heartbeat([card])  # requests the cancel at clock_time
+    assert len(tracker.cancel_calls) == 1
+
+    # Advance the clock well past EXIT_CANCEL_CONFIRMATION_TIMEOUT_SECONDS
+    # without the broker ever confirming the cancel.
+    engine._clock = lambda: clock_time + dt.timedelta(
+        seconds=execution_config.EXIT_CANCEL_CONFIRMATION_TIMEOUT_SECONDS + 1
+    )
+    changed = engine.run_heartbeat([card])
+
+    assert changed == [card]
+    assert "EXIT_CANCEL_STALLED" in card.warnings
+    assert len(tracker.cancel_calls) == 1  # never resent
+
+    # Once the broker finally confirms, the warning clears.
+    tracker.resolve(OrderStatus.CANCELLED)
+    engine.run_heartbeat([card])
+    assert "EXIT_CANCEL_STALLED" not in card.warnings
 
 
 # --- P1-5: one bad card must not block every other card's tick -------------

@@ -95,6 +95,11 @@ _OUTCOME_TO_ENTRY_RUNTIME_STATUS = {
 }
 
 _DATA_STALE_WARNING = "DATA_STALE"
+# Section 5's PARTIAL_EXIT_ATTEMPT_TTL_SECONDS / SELL_ALL_ATTEMPT_TTL_SECONDS /
+# EXIT_CANCEL_CONFIRMATION_TIMEOUT_SECONDS: surfaced on the card the same way
+# _DATA_STALE_WARNING already is, so a liquidation cancel that the broker
+# will not confirm is visible on the board, not just in the log.
+_EXIT_CANCEL_STALLED_WARNING = "EXIT_CANCEL_STALLED"
 
 
 def _utc_now() -> datetime:
@@ -279,6 +284,7 @@ class TradingEngine:
             self._process_partial_sell_requests,
             self._reconcile_partial_sell_fills,
             self._process_queued_market_open_sells,
+            self._reconcile_sell_all_orders,
             self._retry_incomplete_sell_alls,
             self._detect_stale_position_quotes,
             self._run_eod_cleanup_if_due,
@@ -498,7 +504,7 @@ class TradingEngine:
                     "cancel_requested",
                     "eod_cancel_requested",
                 )
-                deadline_passed = self._entry_deadline_passed(refreshed, now)
+                deadline_passed = self._attempt_deadline_passed(refreshed, now)
                 already_has_position = card.broker_quantity > 0
 
                 # Review finding P0-6: record *why* a cancel is being
@@ -542,7 +548,13 @@ class TradingEngine:
         return changed
 
     @staticmethod
-    def _entry_deadline_passed(order: BrokerOrder, now: datetime) -> bool:
+    def _attempt_deadline_passed(order: BrokerOrder, now: datetime) -> bool:
+        """Generic ``order.attempt_deadline_at`` check -- shared by entry
+        orders (ENTRY_ATTEMPT_TTL_SECONDS) and exit orders
+        (PARTIAL_EXIT_ATTEMPT_TTL_SECONDS/SELL_ALL_ATTEMPT_TTL_SECONDS); the
+        field itself carries no notion of which TTL produced it, only when
+        submission stamped the deadline.
+        """
         if not order.attempt_deadline_at:
             return False
         try:
@@ -865,12 +877,16 @@ class TradingEngine:
                 quantity = min(card.pending_partial_sell_quantity, remaining)
                 if quantity <= 0:
                     continue
+                deadline = now + timedelta(
+                    seconds=execution_config.PARTIAL_EXIT_ATTEMPT_TTL_SECONDS
+                )
                 order = self._position_callbacks.submit_sell_order(
                     environment=card.environment,
                     account_no=card.account_no,
                     symbol=card.symbol,
                     quantity=quantity,
                     reason="partial_sell",
+                    attempt_deadline_at=deadline.isoformat(),
                 )
                 if order is not None and order.status == OrderStatus.REJECTED:
                     self._back_off_exit_retry(card, order.error_message or "Partial sell rejected")
@@ -905,18 +921,31 @@ class TradingEngine:
         """Once the PARTIAL_EXIT order resolves, apply the fill and move
         the stop to breakeven (spec section 596-603), returning the card to
         Open Positions.
+
+        Also owns the PARTIAL_EXIT_ATTEMPT_TTL_SECONDS cancel escalation
+        (code review: a working exit order previously had no deadline at
+        all) -- folded into this same reconcile pass, rather than a
+        separate stage, so a status transition observed here is never
+        re-reconciled (and its fill silently dropped) by a second call this
+        same tick.
         """
         changed: List[TradeCardState] = []
+        now = self._clock()
         for card in cards:
             if card.board_status != BoardStatus.PARTIAL_SELL:
                 continue
             try:
                 order = self._position_callbacks.find_open_sell_order(card)
                 if order is None:
+                    if self._clear_exit_cancel_tracking(card):
+                        changed.append(card)
                     continue
                 refreshed = self._position_callbacks.reconcile_sell_order(order)
                 if refreshed.status.value not in ("FILLED", "CANCELLED", "REJECTED", "EXPIRED"):
+                    if self._escalate_exit_cancel_if_due(card, refreshed, now):
+                        changed.append(card)
                     continue
+                self._clear_exit_cancel_tracking(card)
                 remaining = self._position_callbacks.refresh_orderable_quantity(
                     card.environment, card.account_no, card.symbol
                 )
@@ -960,6 +989,99 @@ class TradingEngine:
                 logger.exception("_process_queued_market_open_sells failed for %s", card.symbol)
         return changed
 
+    # -- Exit-order TTL/cancel-confirm helpers, shared by Partial Sell and --
+    # -- Sell All (code review: neither previously had any deadline at all) --
+
+    def _clear_exit_cancel_tracking(self, card: TradeCardState) -> bool:
+        """Resets the exit-side cancel-in-flight bookkeeping. Returns True
+        if anything actually changed, so callers only report the card as
+        touched when this had an effect.
+        """
+        changed = card.exit_cancel_in_flight or card.exit_cancel_requested_at is not None
+        card.exit_cancel_in_flight = False
+        card.exit_cancel_requested_at = None
+        if _EXIT_CANCEL_STALLED_WARNING in card.warnings:
+            card.warnings = [w for w in card.warnings if w != _EXIT_CANCEL_STALLED_WARNING]
+            changed = True
+        return changed
+
+    def _escalate_exit_cancel_if_due(
+        self, card: TradeCardState, order: BrokerOrder, now: datetime
+    ) -> bool:
+        """Called for a still-open (non-terminal) Partial Sell/Sell All
+        order every heartbeat tick. Requests a cancel once its
+        ``attempt_deadline_at`` (stamped at submission time from
+        ``PARTIAL_EXIT_ATTEMPT_TTL_SECONDS``/``SELL_ALL_ATTEMPT_TTL_SECONDS``)
+        passes, and -- mirroring the entry side's two-phase cancel -- never
+        re-requests one that is already in flight; instead it watches
+        ``EXIT_CANCEL_CONFIRMATION_TIMEOUT_SECONDS`` and flags the card if
+        the broker still hasn't confirmed the cancel by then, so a stalled
+        liquidation is visible rather than silently waiting forever.
+        """
+        if card.exit_cancel_in_flight:
+            requested_at = card.exit_cancel_requested_at
+            if requested_at is not None:
+                stuck_seconds = (now - requested_at).total_seconds()
+                if stuck_seconds > execution_config.EXIT_CANCEL_CONFIRMATION_TIMEOUT_SECONDS:
+                    logger.error(
+                        "Exit cancel for %s (%s:%s) unconfirmed %.0fs after cancel "
+                        "request -- broker order %s may need manual attention",
+                        card.symbol, card.environment, card.account_no,
+                        stuck_seconds, order.client_order_id,
+                    )
+                    if _EXIT_CANCEL_STALLED_WARNING not in card.warnings:
+                        card.warnings = [*card.warnings, _EXIT_CANCEL_STALLED_WARNING]
+                        return True
+            return False
+        if not self._attempt_deadline_passed(order, now):
+            return False
+        self._position_callbacks.cancel_order(order.client_order_id)
+        card.exit_cancel_in_flight = True
+        card.exit_cancel_requested_at = now
+        return True
+
+    def _reconcile_sell_all_orders(self, cards: List[TradeCardState]) -> List[TradeCardState]:
+        """Sell All's working order previously had no reconciliation of its
+        own in this engine at all -- ``_retry_incomplete_sell_alls`` only
+        ever checked whether ``find_open_sell_order`` returned nothing,
+        which stays true forever for a WORKING/PARTIALLY_FILLED order until
+        something else reconciles it. This queries/reconciles it every
+        heartbeat tick and applies the same SELL_ALL_ATTEMPT_TTL_SECONDS
+        cancel escalation the review asked for, so a stalled liquidation is
+        cancelled and repriced instead of sitting open indefinitely.
+        """
+        changed: List[TradeCardState] = []
+        now = self._clock()
+        for card in cards:
+            if card.board_status != BoardStatus.SELL_ALL or card.sell_all_at_market_open:
+                continue
+            try:
+                order = self._position_callbacks.find_open_sell_order(card)
+                if order is None:
+                    if self._clear_exit_cancel_tracking(card):
+                        changed.append(card)
+                    continue
+                refreshed = self._position_callbacks.reconcile_sell_order(order)
+                if refreshed.is_open():
+                    if self._escalate_exit_cancel_if_due(card, refreshed, now):
+                        changed.append(card)
+                    continue
+                # Terminal (filled/cancelled/rejected/expired) -- refresh the
+                # broker-truth remaining quantity immediately so the UI and
+                # _retry_incomplete_sell_alls (which runs later this same
+                # tick) both see current reality rather than waiting a full
+                # extra heartbeat to notice the order is gone.
+                remaining = self._position_callbacks.refresh_orderable_quantity(
+                    card.environment, card.account_no, card.symbol
+                )
+                card.broker_quantity = remaining
+                card.orderable_quantity = remaining
+                self._clear_exit_cancel_tracking(card)
+                changed.append(card)
+            except Exception:
+                logger.exception("_reconcile_sell_all_orders failed for %s", card.symbol)
+        return changed
+
     # -- Sell All reprice/retry until flat (section 707-709, review P0-2/P1-4) --
 
     def _retry_incomplete_sell_alls(self, cards: List[TradeCardState]) -> List[TradeCardState]:
@@ -1001,12 +1123,14 @@ class TradingEngine:
                     continue
                 card.broker_quantity = remaining
                 card.orderable_quantity = remaining
+                deadline = now + timedelta(seconds=execution_config.SELL_ALL_ATTEMPT_TTL_SECONDS)
                 order = self._position_callbacks.submit_sell_order(
                     environment=card.environment,
                     account_no=card.account_no,
                     symbol=card.symbol,
                     quantity=remaining,
                     reason="sell_all_retry",
+                    attempt_deadline_at=deadline.isoformat(),
                 )
                 if order is not None and order.status == OrderStatus.REJECTED:
                     self._back_off_exit_retry(card, order.error_message or "Sell All rejected")

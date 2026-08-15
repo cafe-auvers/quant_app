@@ -7,6 +7,7 @@ from typing import List, Optional, Tuple
 from PyQt5.QtCore import QTimer
 from PyQt5.QtWidgets import QLabel, QPushButton
 
+from src.core.execution_config import is_buyboard_engine_enabled
 from src.core.execution_queue import (
     BROKER_UNCERTAIN_STATUSES,
     POSITION_HOLDING_STATUSES,
@@ -17,6 +18,36 @@ from .constants import US_MARKET_ZONE
 
 
 class BuylistMonitoringMixin:
+    def _legacy_auto_execution_blocked(self, env: str, symbol: str = "") -> bool:
+        """Mutual-exclusion guard between the legacy 60-second monitor and
+        the new Kanban trading engine (code review: "There must never be two
+        separate automated monitors capable of submitting orders for the
+        same account and symbol"). Once ``BUYBOARD_ENGINE_ENABLED=true``,
+        ``src.services.trading_engine`` owns every automatic entry/exit
+        decision; the legacy Buy Dashboard's monitor becomes
+        display/manual-emergency-only. This blocks only *automatic*
+        triggers (the 60s cycle, auto-replace, auto-reprice) -- a
+        user-clicked button (Activate, Sell All, Sell 1/3-1/2, ...) is
+        unaffected, matching "legacy dashboard becomes display/manual-
+        emergency-only" rather than fully disabling the tab.
+        """
+        if not is_buyboard_engine_enabled():
+            return False
+        # self.__dict__.get(...), not getattr(self, ...): on a QObject whose
+        # __init__ never ran (some lightweight test doubles), PyQt5 raises
+        # RuntimeError for an unset attribute instead of AttributeError, which
+        # getattr's default does not catch -- src.ui.main_window already
+        # works around the same issue this way (see _sync_buyboard_runtime_worker).
+        if not self.__dict__.get("_legacy_auto_execution_notice_logged", False):
+            self._legacy_auto_execution_notice_logged = True
+            self.append_log(
+                "[Buylist] Legacy automatic order submission is suppressed "
+                "(BUYBOARD_ENGINE_ENABLED=true) -- the Buy Board engine now "
+                "owns automatic entry/exit execution. The Buy Dashboard "
+                "remains available for manual/emergency actions."
+            )
+        return True
+
     def _toggle_buylist_monitor(self, env: str) -> None:
         """Toggle the production monitor timer."""
         active_attr = f"_buylist_{env.lower()}_monitor_active"
@@ -68,6 +99,8 @@ class BuylistMonitoringMixin:
         """Auto-submit EXECUTE_READY execution-queue items when the monitor is active for env."""
         active_attr = f"_buylist_{env.lower()}_monitor_active"
         if not getattr(self, active_attr, False):
+            return
+        if self._legacy_auto_execution_blocked(env):
             return
         if not hasattr(self, "buylist_manager"):
             return
@@ -319,7 +352,9 @@ class BuylistMonitoringMixin:
                 continue
 
             if item.monitoring_status == "BOUGHT":
-                auto_order_blocked = self._buylist_auto_order_blocked(item)
+                auto_order_blocked = self._buylist_auto_order_blocked(
+                    item
+                ) or self._legacy_auto_execution_blocked(env, item.symbol)
                 exit_order_pending = getattr(item, "_exit_order_pending", False)
                 if (
                     item.stop_loss > 0

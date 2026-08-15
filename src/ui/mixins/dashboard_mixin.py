@@ -1034,6 +1034,26 @@ class DashboardMixin:
                 if breakdown:
                     account_value_krw = breakdown["total_krw"]
                     account_value_usd = account_value_krw / usd_krw_rate
+                    if profile:
+                        # buydashboard_to_kanban.md P0-1: the Kanban entry
+                        # engine's buying_power_provider must reflect real,
+                        # recently-refreshed KIS state, never a manual
+                        # figure -- record it here, the same place/moment
+                        # the legacy dashboard's own account-size field is
+                        # refreshed, so the new engine and the legacy
+                        # dashboard are never sized off different data.
+                        # ovrs_cash_usd is *usable cash* (excludes existing
+                        # stock holdings' value); account_value_usd is the
+                        # full-equity risk-sizing base.
+                        from src.services import buying_power_cache
+
+                        buying_power_cache.record_snapshot(
+                            environment=environment,
+                            account_no=account_no,
+                            usable_buying_power_usd=breakdown["ovrs_cash_usd"],
+                            total_equity_usd=account_value_usd,
+                            source="kis_account_snapshot",
+                        )
                     old_block = self.account_size_input.blockSignals(True)
                     self.account_size_input.setText(f"{account_value_usd:.2f}")
                     self.account_size_input.blockSignals(old_block)

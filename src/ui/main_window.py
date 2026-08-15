@@ -1515,14 +1515,25 @@ class MainWindow(
             if lease_kwargs.get("execution_authority") is None:
                 return  # not actually main by the time we got here -- do not start
 
-            manual_sizes = self.__dict__.get("manual_account_sizes") or {"PROD": 10000.0}
             queue_manager = self.__dict__.get("execution_queue_manager")
+
+            # Review finding P0-1: this must be the real, per-account,
+            # staleness-aware KIS buying power the legacy dashboard's own
+            # KisAccountWorker already fetches (recorded into the cache by
+            # DashboardMixin.apply_cached_trade_account_size every time that
+            # worker completes) -- never a manual/hardcoded account-size
+            # figure, and never the same number for two different accounts.
+            from src.services import buying_power_cache
+
+            buying_power_provider = buying_power_cache.make_buying_power_provider()
+            account_equity_provider = buying_power_cache.make_account_equity_provider()
 
             new_worker = BuyboardRuntimeWorker(
                 db_engine=self.pc_db_engine,
                 environment="PROD",
                 account_no="",  # unscoped -- processes every PROD account's cards
-                buying_power_provider=lambda env, acct: float(manual_sizes.get(env, 10000.0)),
+                buying_power_provider=buying_power_provider,
+                account_equity_provider=account_equity_provider,
                 execution_queue_item_lookup=(
                     (lambda symbol, env: queue_manager.get_item(symbol, env))
                     if queue_manager is not None

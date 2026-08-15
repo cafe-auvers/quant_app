@@ -53,6 +53,19 @@ MAX_ENTRY_ATTEMPTS_PER_SYMBOL_PER_MINUTE = _env_int(
 # not be resubmitted on literally every 1-second heartbeat tick.
 EXIT_RETRY_COOLDOWN_SECONDS = _env_int("EXIT_RETRY_COOLDOWN_SECONDS", 5)
 
+# --- Exit order TTL / cancel-confirm / reprice cycle (code review: "a
+# partially filled working [Sell All] order could remain open indefinitely
+# ... a significant unattended-trading risk"). Mirrors the entry side's
+# ENTRY_ATTEMPT_TTL_SECONDS two-phase cancel (request -> await broker
+# confirmation) rather than treating a cancel request as an immediate
+# cancellation -- see src.services.trading_engine's exit-order
+# reconciliation stages.
+PARTIAL_EXIT_ATTEMPT_TTL_SECONDS = _env_int("PARTIAL_EXIT_ATTEMPT_TTL_SECONDS", 10)
+SELL_ALL_ATTEMPT_TTL_SECONDS = _env_int("SELL_ALL_ATTEMPT_TTL_SECONDS", 5)
+EXIT_CANCEL_CONFIRMATION_TIMEOUT_SECONDS = _env_int(
+    "EXIT_CANCEL_CONFIRMATION_TIMEOUT_SECONDS", 10
+)
+
 # Discount applied to the last trade price when no live bid is available to
 # build a marketable SELL limit (code review finding P0-3's production sell
 # adapter). Mirrors the existing legacy Buy Dashboard's

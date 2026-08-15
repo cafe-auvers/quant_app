@@ -61,12 +61,24 @@ What this module fully wires
 
 What production activation still needs to supply
 --------------------------------------------------
-- ``buying_power_provider``/``account_equity_provider``: this module does
-  not invent a new synchronous KIS balance query. The legacy dashboard
-  already fetches account balance asynchronously via ``KisAccountWorker``
-  (src/ui/workers.py) to avoid blocking the UI thread; the same
-  cached/most-recently-refreshed value should be handed in here rather than
-  querying KIS synchronously from a 1-second heartbeat tick.
+- ``buying_power_provider``/``account_equity_provider``: wired as of review
+  finding P0-1's fix -- ``src.ui.main_window._sync_buyboard_runtime_worker``
+  now passes :func:`src.services.buying_power_cache.make_buying_power_provider`/
+  ``make_account_equity_provider`` rather than the old manual/hardcoded
+  account-size figure. This module still does not invent a new synchronous
+  KIS balance query itself: the legacy dashboard's ``KisAccountWorker``
+  (src/ui/workers.py) fetches account balance asynchronously as it always
+  has, and ``DashboardMixin.apply_cached_trade_account_size`` records each
+  fresh snapshot into that cache the moment it arrives. The providers built
+  from that cache are per-account (unlike the figure they replaced) and
+  fail closed -- return 0.0 -- whenever no snapshot has been recorded for
+  the exact ``(environment, account_no)`` being asked about, or the
+  snapshot is older than ``DEFAULT_MAX_SNAPSHOT_AGE_SECONDS`` (15s). This
+  means capital is never reserved off a stale or wrong-account balance, but
+  it also means the cache must actually be warm before this engine can size
+  or reserve anything for an account -- the account's KIS balance should be
+  loaded (Watchlist tab's "Use KIS Balance", or an equivalent periodic
+  refresh) before relying on automatic entries for that account.
 - A real tick-level KIS quote for ``RealtimeMarketDataService`` (no such
   endpoint is used anywhere in this codebase yet -- see
   :mod:`src.services.realtime_market_data`'s module docstring). The
@@ -78,8 +90,8 @@ What production activation still needs to supply
   on a background thread (mirroring the existing ``KisOrderWorker``/
   ``KisAccountWorker`` ``QThread`` pattern), not the UI thread -- every
   callback here performs real KIS network I/O. ``src.ui.buyboard.runtime_worker``
-  now provides that thread; it still needs to be handed a real
-  ``buying_power_provider`` before ``BUYBOARD_ENGINE_ENABLED`` is turned on.
+  now provides that thread and is handed the real, cache-backed
+  ``buying_power_provider`` described above.
 - An ORB-evaluation caller: this module does not itself recompute ORB
   candidates for BUY_TODAY/WATCHLIST/BUYLIST cards --
   :mod:`src.services.trade_card_orb_bridge`'s ``TradeCardOrbEvaluator``

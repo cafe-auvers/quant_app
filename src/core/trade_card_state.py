@@ -236,6 +236,13 @@ class TradeCardState:
     next_exit_retry_at: Optional[datetime] = None
     exit_attempt_count: int = 0
     last_exit_error: str = ""
+    # True from the moment a cancel has been requested for this card's
+    # working Partial Sell/Sell All order until the broker confirms a
+    # terminal status -- the exit-side counterpart of
+    # entry_cancel_in_flight, closing the review finding that a stalled
+    # working exit order previously had no TTL/cancel/reprice cycle at all.
+    exit_cancel_in_flight: bool = False
+    exit_cancel_requested_at: Optional[datetime] = None
 
     # Capital (section 22 correlation, not the reservation record itself)
     capital_reservation_id: str = ""
@@ -318,6 +325,12 @@ class TradeCardState:
         )
         self.exit_attempt_count = int(self.exit_attempt_count or 0)
         self.last_exit_error = str(self.last_exit_error or "")
+        self.exit_cancel_in_flight = bool(self.exit_cancel_in_flight)
+        self.exit_cancel_requested_at = (
+            _parse_timestamp(self.exit_cancel_requested_at)
+            if self.exit_cancel_requested_at
+            else None
+        )
         self.capital_reservation_id = str(self.capital_reservation_id or "")
         self.created_at = _parse_timestamp(self.created_at)
         self.updated_at = _parse_timestamp(self.updated_at)
@@ -386,6 +399,12 @@ class TradeCardState:
             "next_exit_retry_at": self.next_exit_retry_at.isoformat() if self.next_exit_retry_at else None,
             "exit_attempt_count": self.exit_attempt_count,
             "last_exit_error": self.last_exit_error,
+            "exit_cancel_in_flight": self.exit_cancel_in_flight,
+            "exit_cancel_requested_at": (
+                self.exit_cancel_requested_at.isoformat()
+                if self.exit_cancel_requested_at
+                else None
+            ),
             "capital_reservation_id": self.capital_reservation_id,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),

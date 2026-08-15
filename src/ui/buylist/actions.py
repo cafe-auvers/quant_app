@@ -507,6 +507,8 @@ class BuylistActionsMixin:
         active_attr = f"_buylist_{env.lower()}_monitor_active"
         if not getattr(self, active_attr, False):
             return
+        if self._legacy_auto_execution_blocked(env):
+            return
         worker = self.__dict__.get("broker_order_cancel_worker")
         if worker is not None and worker.isRunning():
             return
@@ -647,7 +649,7 @@ class BuylistActionsMixin:
     ) -> None:
         if getattr(item, "_stop_reprice_pending", False):
             return
-        if self._buylist_auto_order_blocked(item):
+        if self._buylist_auto_order_blocked(item) or self._legacy_auto_execution_blocked(env, item.symbol):
             return
         try:
             stop_loss = float(getattr(item, "stop_loss", 0.0) or 0.0)

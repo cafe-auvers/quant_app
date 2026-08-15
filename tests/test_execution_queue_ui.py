@@ -577,3 +577,71 @@ def test_legacy_active_row_is_blocked_once_before_auto_buy(monkeypatch, tmp_path
     ]
     assert len(matching_logs) == 1
     assert "only EXECUTE_READY execution-queue" in matching_logs[0]
+
+
+def test_stop_hit_auto_sell_is_suppressed_when_buyboard_engine_enabled(
+    monkeypatch, tmp_path
+):
+    """Mutual-exclusion guard (buydashboard_to_kanban.md review): once the
+    new Buy Board engine owns execution, the legacy 60-second monitor must
+    never also submit a stop-loss SELL for the same position."""
+    window = _build_queue_window(monkeypatch, tmp_path)
+    monkeypatch.setenv("BUYBOARD_ENGINE_ENABLED", "true")
+    logs = []
+    submissions = []
+    item = SimpleNamespace(
+        symbol="AAPL",
+        environment="PROD",
+        monitoring_status="BOUGHT",
+        breakout_method="",
+        stop_loss=98.0,
+        shares_held=10,
+        auto_order_block_reason="",
+        _stop_order_pending=False,
+        _exit_order_pending=False,
+        _auto_order_block_notice_logged=False,
+    )
+    window.buylist_manager = SimpleNamespace(items=[item])
+    window.latest_intraday_prices = {"AAPL": 90.0}  # below the 98.0 stop
+    window.append_log = logs.append
+    window._buylist_refresh_item_data = lambda _item: None
+    window._populate_buylist_env_table = lambda _env: None
+    window._submit_kis_sell_order = lambda *_args, **_kwargs: submissions.append(True)
+
+    MainWindow._run_buylist_monitor_cycle(window, "PROD")
+
+    assert submissions == []
+    assert item._stop_order_pending is False
+    assert any(
+        "Legacy automatic order submission is suppressed" in message
+        for message in logs
+    )
+
+
+def test_auto_submit_execute_ready_is_suppressed_when_buyboard_engine_enabled(
+    monkeypatch, tmp_path
+):
+    window = _build_queue_window(monkeypatch, tmp_path)
+    monkeypatch.setenv("BUYBOARD_ENGINE_ENABLED", "true")
+    logs = []
+    submissions = []
+    item = SimpleNamespace(
+        symbol="AAPL",
+        environment="PROD",
+        monitoring_status="EXECUTE_READY",
+        breakout_method="execution_queue:1m",
+        orb_monitor_enabled=True,
+        _buy_order_pending=False,
+    )
+    window._buylist_prod_monitor_active = True
+    window.buylist_manager = SimpleNamespace(items=[item])
+    window.append_log = logs.append
+    window._submit_kis_buy_order = lambda *_args, **_kwargs: submissions.append(True)
+
+    MainWindow._auto_submit_execute_ready_queue_items(window, "PROD")
+
+    assert submissions == []
+    assert any(
+        "Legacy automatic order submission is suppressed" in message
+        for message in logs
+    )
