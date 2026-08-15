@@ -19,16 +19,41 @@ What this module fully wires
   ``PositionActionCallbacks``, ``EodActionCallbacks``) against the real
   local order ledger and KIS via :mod:`src.services.order_reconciliation`
   and :class:`src.services.broker.KisBroker`.
+- The production SELL adapter (review finding P0-3): ``submit_sell_order``
+  maps trading_engine.py's ``reason`` string to a real ``OrderIntent`` and
+  prices the order from a live quote -- the original version forwarded
+  ``reason`` straight into ``submit_guarded_overseas_order``, which does
+  not accept it and has no default for the required
+  ``side``/``intent``/``limit_price``, so every real Partial Sell/Sell All
+  would have raised ``TypeError``.
+- A single, consistent entry ``plan_id`` (review finding P0-4) shared by
+  the risk decision and the actual submission -- previously
+  ``_revalidate_and_approve`` and the ``submit_order`` wrapper computed two
+  *different* values, so the pre-trade gate's exact-fingerprint check would
+  have rejected every real entry.
+- Cumulative, broker-truth fill accounting (review finding P0-5): a second
+  or third entry attempt's fill is now read back from
+  ``broker.get_positions()`` (``EntryDeadlineLookup.refresh_broker_position``)
+  instead of being compared against/overwriting the running total from a
+  previous attempt.
+- Real, holiday-aware NYSE market-session hooks (review finding P0-8) via
+  :mod:`src.utils.market_calendar`, instead of ``TradingEngine``'s
+  always-open/never-EOD test defaults.
 - Capital reservations against the shared database
-  (:mod:`src.services.capital_reservation_repository`), not only the local
-  JSON ledger.
+  (:mod:`src.services.capital_reservation_repository`), threaded into both
+  ``EntryAttemptManager`` and ``EodTradingService`` (review finding P1-1) --
+  previously accepted as a parameter here but never actually passed
+  anywhere.
 - A lightweight pre-trade risk revalidation built from the card's own
   persisted ORB fields (``entry_trigger``/``stop_adr``/``breakout_price``),
   reusing :mod:`src.risk.orb_position`'s existing bounds
   (``is_orb_position_plan_valid``) -- every ENTRY submission still requires
   and receives a fresh, order-fingerprint-bound
   :class:`~src.risk.pre_trade.PreTradeRiskDecision` (section 149-164's
-  gate remains enforced, nothing bypasses it).
+  gate remains enforced, nothing bypasses it) -- and re-sizes the
+  submitted quantity down (never up) to what's actually safe at the live
+  price really being submitted (review finding P1-9), not the stale share
+  count computed against the original ORB trigger price.
 - Main-device lease fencing via the existing
   :class:`~src.services.execution_authority.ExecutionAuthority` /
   :class:`~src.services.execution_authority.LeaseHandle`, exactly like the
@@ -36,19 +61,31 @@ What this module fully wires
 
 What production activation still needs to supply
 --------------------------------------------------
-- ``buying_power_provider``: this module does not invent a new synchronous
-  KIS balance query. The legacy dashboard already fetches account balance
-  asynchronously via ``KisAccountWorker`` (src/ui/workers.py) to avoid
-  blocking the UI thread; the same cached/most-recently-refreshed value
-  should be handed in here rather than querying KIS synchronously from a
-  1-second heartbeat tick.
+- ``buying_power_provider``/``account_equity_provider``: this module does
+  not invent a new synchronous KIS balance query. The legacy dashboard
+  already fetches account balance asynchronously via ``KisAccountWorker``
+  (src/ui/workers.py) to avoid blocking the UI thread; the same
+  cached/most-recently-refreshed value should be handed in here rather than
+  querying KIS synchronously from a 1-second heartbeat tick.
 - A real tick-level KIS quote for ``RealtimeMarketDataService`` (no such
   endpoint is used anywhere in this codebase yet -- see
-  :mod:`src.services.realtime_market_data`'s module docstring).
+  :mod:`src.services.realtime_market_data`'s module docstring). The
+  fallback wired in here (``_kis_only_quote_fetcher``) polls the latest
+  1-minute bar close, which is materially coarser than a real tick and is
+  not sufficient for detecting an intraminute stop-loss touch that
+  recovers before the bar closes.
 - Running the assembled ``TradingEngine``/``RestPollingMarketDataService``
   on a background thread (mirroring the existing ``KisOrderWorker``/
   ``KisAccountWorker`` ``QThread`` pattern), not the UI thread -- every
-  callback here performs real KIS network I/O.
+  callback here performs real KIS network I/O. ``src.ui.buyboard.runtime_worker``
+  now provides that thread; it still needs to be handed a real
+  ``buying_power_provider`` before ``BUYBOARD_ENGINE_ENABLED`` is turned on.
+- An ORB-evaluation caller: this module does not itself recompute ORB
+  candidates for BUY_TODAY/WATCHLIST/BUYLIST cards --
+  :mod:`src.services.trade_card_orb_bridge`'s ``TradeCardOrbEvaluator``
+  (review finding P0-2) needs to be invoked, on some cadence, with the
+  ``ExecutionQueueItem`` the legacy execution queue already recomputes, so
+  a card can ever actually reach ``EXECUTE_READY``.
 
 None of this is activated automatically: constructing a
 :class:`BuyboardRuntime` does not start anything, and nothing in
@@ -62,6 +99,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
+from sqlalchemy.engine import Engine
+
+from src.core import execution_config
 from src.core.order_state import (
     BrokerOrder,
     BrokerOrderDiscoveryResult,
@@ -72,7 +112,7 @@ from src.core.order_state import (
     is_open_status,
 )
 from src.core.trade_card_state import TradeCardState
-from src.risk.orb_position import is_orb_position_plan_valid
+from src.risk.orb_position import calculate_orb_position_values, is_orb_position_plan_valid
 from src.risk.pre_trade import PreTradeRiskDecision
 from src.services import capital_allocator, capital_reservation_repository
 from src.services import order_ledger
@@ -87,17 +127,74 @@ from src.services.intraday_data_service import (
     fetch_execution_grade_intraday,
 )
 from src.services.intraday_provider import IntradayInterval, IntradayRequest
-from src.services.position_manager import PositionActionCallbacks, PositionManager
+from src.services.position_manager import (
+    BrokerHolding,
+    PositionActionCallbacks,
+    PositionManager,
+    extract_overseas_holdings,
+)
 from src.services.realtime_market_data import (
     QuoteSnapshot,
     RealtimeMarketDataService,
     RestPollingMarketDataService,
 )
 from src.services.trading_engine import EntryDeadlineLookup, TradingEngine
+from src.utils.market_calendar import (
+    is_regular_session_open,
+    seconds_until_regular_session_close,
+)
 
 logger = logging.getLogger(__name__)
 
 RISK_STRATEGY_ID = "ORB_KANBAN"
+
+# Review finding P0-3: trading_engine.py's submit_sell_order(...) calls pass
+# a "reason" string (never a submit_guarded_overseas_order keyword) instead
+# of side/intent/limit_price. This maps that reason to the correct
+# OrderIntent for the adapter below.
+_SELL_REASON_TO_INTENT = {
+    "partial_sell": OrderIntent.PARTIAL_EXIT,
+    "sell_all": OrderIntent.MANUAL_EXIT,
+    "sell_all_retry": OrderIntent.MANUAL_EXIT,
+    "stop_loss": OrderIntent.STOP_LOSS,
+}
+
+
+def _entry_plan_id(card: TradeCardState) -> str:
+    """Built once, used for *both* the risk decision and the actual
+    submission (review finding P0-4). The pre-trade gate requires an exact
+    fingerprint match including ``plan_id`` -- previously
+    ``_revalidate_and_approve`` built one value here while
+    ``build_buyboard_runtime``'s ``submit_order`` wrapper independently
+    built a *different* one (``f"{environment}:{symbol}"``, missing the
+    ORB window) for the actual submission, so every entry would have been
+    rejected with "Pre-trade risk approval does not match the requested
+    order" the first time this ran against a real order.
+    """
+    return f"{card.environment}:{card.symbol}:{card.selected_orb_window or 'unknown'}"
+
+
+def _marketable_sell_limit_price(quote: Optional[QuoteSnapshot]) -> Optional[float]:
+    """A marketable SELL limit: the live bid if one is cached (guaranteed
+    at/above what a market order would clear at this instant), else a small
+    discount off the last trade price -- mirrors the existing legacy Buy
+    Dashboard's ``src.ui.buylist.constants.STOP_LOSS_SELL_LIMIT_DISCOUNT_PCT``
+    approach (same number, re-declared as
+    ``execution_config.SELL_MARKETABLE_DISCOUNT_PCT`` rather than importing
+    across the services/ui boundary).
+    """
+    if quote is None:
+        return None
+    if quote.bid:
+        return float(quote.bid)
+    if quote.last_price:
+        return float(quote.last_price) * (1.0 - execution_config.SELL_MARKETABLE_DISCOUNT_PCT)
+    return None
+
+
+def _eod_window_reached() -> bool:
+    seconds_left = seconds_until_regular_session_close()
+    return 0 <= seconds_left <= execution_config.EOD_ENTRY_CLEANUP_SECONDS_BEFORE_CLOSE
 
 
 # --- Order lookup/reconciliation, wired to the real local ledger + KIS -----
@@ -192,6 +289,20 @@ def _refresh_orderable_quantity(environment: str, account_no: str, symbol: str, 
     return 0
 
 
+def _refresh_broker_position(card: TradeCardState, *, broker: Broker) -> Optional[BrokerHolding]:
+    """The preferred (review finding P0-5) source for a card's *cumulative*
+    position after any fill -- broker truth is correct across any number of
+    entry attempts by construction, unlike comparing/accumulating a single
+    order's ``filled_quantity``. Wired into
+    ``EntryDeadlineLookup.refresh_broker_position`` below.
+    """
+    snapshot = broker.get_positions(environment=card.environment, account_no=card.account_no)
+    for holding in extract_overseas_holdings(snapshot):
+        if holding.symbol == card.symbol:
+            return holding
+    return None
+
+
 # --- Lightweight pre-trade risk revalidation ---------------------------
 
 
@@ -248,7 +359,7 @@ def _revalidate_and_approve(
             f"capital_percent={sizing['capital_percent']:.1f}%, sl_adr={card.stop_adr}"
         )
 
-    plan_id = f"{card.environment}:{card.symbol}:{card.selected_orb_window or 'unknown'}"
+    plan_id = _entry_plan_id(card)
     if reasons:
         logger.info("Pre-trade risk revalidation rejected %s: %s", card.symbol, "; ".join(reasons))
         return PreTradeRiskDecision.reject(
@@ -301,7 +412,8 @@ def build_buyboard_runtime(
     *,
     buying_power_provider: Callable[[str, str], float],
     card_lookup: Callable[[str, str, str], Optional[TradeCardState]],
-    capital_reservation_engine=None,
+    account_equity_provider: Optional[Callable[[str, str], float]] = None,
+    capital_reservation_engine: Optional[Engine] = None,
     execution_authority: Optional[ExecutionAuthority] = None,
     execution_lease: Optional[LeaseHandle] = None,
     lease_engine=None,
@@ -318,8 +430,24 @@ def build_buyboard_runtime(
     from a background thread (never the UI thread -- every callback here
     performs real network I/O) and persisting the cards it returns via
     :mod:`src.services.trade_card_repository`.
+
+    ``account_equity_provider`` (review finding P1-9) is the *risk-sizing*
+    base (total account equity) as opposed to ``buying_power_provider``'s
+    *capital-availability* base (spendable cash) -- they can differ once
+    existing positions are marked. Defaults to ``buying_power_provider``
+    when not supplied separately, which is not a new limitation: the
+    legacy Buy Dashboard's own ORB sizing
+    (``src.ui.mixins.dashboard_mixin``'s ``manual_account_sizes``) already
+    uses one manually-maintained figure for both today.
+
+    ``capital_reservation_engine``, when supplied, makes capital
+    reservations visible across devices (review finding P1-1) -- threaded
+    into both :class:`~src.services.entry_attempt_manager.EntryAttemptManager`
+    and :class:`~src.services.eod_trading_service.EodTradingService`, which
+    previously accepted this parameter but never actually used it.
     """
     resolved_broker = broker or KisBroker()
+    resolved_equity_provider = account_equity_provider or buying_power_provider
 
     def submit_order(**kwargs):
         environment = kwargs["environment"]
@@ -327,31 +455,73 @@ def build_buyboard_runtime(
         symbol = kwargs["symbol"]
         card = card_lookup(environment, account_no, symbol)
         account_size = buying_power_provider(environment, account_no)
+
+        quantity = kwargs["quantity"]
+        limit_price = kwargs["limit_price"]
+        # card.risk_percent is a *fraction* (e.g. 0.01 for 1%), matching
+        # calculate_orb_position_values' own validation
+        # (risk_fraction <= 1.0) and how the legacy dashboard already
+        # stores it (risk_percent / 100.0 at input time) -- an unset/zero
+        # value has no trustworthy risk budget to resize against, so the
+        # resize is skipped entirely rather than guessing a fallback
+        # percentage (a wrong guess here would either do nothing or size a
+        # real order off a fabricated risk budget).
+        if (
+            card is not None
+            and kwargs.get("intent") == OrderIntent.ENTRY
+            and card.entry_orb_low
+            and card.risk_percent
+            and card.risk_percent > 0
+        ):
+            # Review finding P1-9: planned_quantity/target_position_quantity
+            # were sized off the original ORB trigger price, but the entry
+            # engine may submit at a higher, more-marketable live price
+            # (P0-9) -- resize down (never up) to what's actually safe at
+            # the price really being submitted, using the same
+            # calculate_orb_position_values the legacy dashboard's sizing
+            # already uses, rather than trusting a share count computed
+            # against a since-moved price.
+            equity = resolved_equity_provider(environment, account_no)
+            sizing = calculate_orb_position_values(
+                account_size=equity,
+                risk_percent=card.risk_percent,
+                entry_price=limit_price,
+                stop_price=card.entry_orb_low,
+                adr_percent=None,
+            )
+            safe_shares = int(sizing.get("shares", 0) or 0)
+            if safe_shares > 0:
+                quantity = min(quantity, safe_shares)
+
         decision = (
             _revalidate_and_approve(
                 card,
-                quantity=kwargs["quantity"],
-                limit_price=kwargs["limit_price"],
+                quantity=quantity,
+                limit_price=limit_price,
                 exchange=kwargs.get("exchange", "NASD"),
                 account_size=account_size,
             )
             if card is not None
             else None
         )
+        plan_id = _entry_plan_id(card) if card is not None else f"{environment}:{symbol}"
+        submit_kwargs = dict(kwargs)
+        submit_kwargs["quantity"] = quantity
         return submit_guarded_overseas_order(
             broker=resolved_broker,
             pre_trade_risk_decision=decision,
             strategy_id=RISK_STRATEGY_ID,
-            plan_id=f"{environment}:{symbol}",
+            plan_id=plan_id,
             execution_authority=execution_authority,
             execution_lease=execution_lease,
             lease_engine=lease_engine,
-            **kwargs,
+            **submit_kwargs,
         )
 
     entry_attempt_manager = EntryAttemptManager(
         buying_power_provider=buying_power_provider,
         submit_order=submit_order,
+        capital_reservation_engine=capital_reservation_engine,
     )
 
     position_manager = PositionManager()
@@ -359,15 +529,44 @@ def build_buyboard_runtime(
     entry_deadline_lookup = EntryDeadlineLookup(
         find_open_entry_order=_find_open_entry_order,
         reconcile_order=lambda order: _reconcile_order(order, broker=resolved_broker),
+        refresh_broker_position=lambda card: _refresh_broker_position(card, broker=resolved_broker),
+        persist_order=order_ledger.upsert_order,
     )
 
     def submit_sell_order(**kwargs):
+        """Adapter for trading_engine.py's submit_sell_order(...) calls
+        (review finding P0-3): those calls pass
+        environment/account_no/symbol/quantity/reason -- ``reason`` is not
+        a ``submit_guarded_overseas_order`` keyword, and that function also
+        requires ``side``/``intent``/``limit_price``, which were never
+        supplied here before. This builds all three from what actually
+        arrives: side is always SELL, intent comes from the reason
+        (``_SELL_REASON_TO_INTENT``), and limit_price comes from the live
+        quote (falling back to a small discount off the last trade when no
+        bid is cached yet).
+        """
+        submit_kwargs = dict(kwargs)
+        reason = submit_kwargs.pop("reason", "sell_all")
+        intent = _SELL_REASON_TO_INTENT.get(reason, OrderIntent.MANUAL_EXIT)
+        symbol = submit_kwargs["symbol"]
+        quote = resolved_market_data.latest_quote(symbol)
+        limit_price = _marketable_sell_limit_price(quote)
+        if limit_price is None:
+            raise ExecutionGradeDataUnavailableError(
+                f"No live quote available to price a marketable SELL for {symbol}"
+            )
+        exchange = submit_kwargs.pop("exchange", "NASD")
         return submit_guarded_overseas_order(
             broker=resolved_broker,
+            side=OrderSide.SELL,
+            intent=intent,
+            limit_price=limit_price,
+            exchange=exchange,
+            plan_id=f"{submit_kwargs.get('environment', '')}:{symbol}:SELL:{reason}",
             execution_authority=execution_authority,
             execution_lease=execution_lease,
             lease_engine=lease_engine,
-            **kwargs,
+            **submit_kwargs,
         )
 
     position_callbacks = PositionActionCallbacks(
@@ -391,6 +590,7 @@ def build_buyboard_runtime(
         position_manager=position_manager,
         callbacks=eod_callbacks,
         reservations_path=capital_allocator.RESERVATIONS_FILE,
+        capital_reservation_engine=capital_reservation_engine,
     )
 
     resolved_market_data = market_data
@@ -411,6 +611,13 @@ def build_buyboard_runtime(
         position_callbacks=position_callbacks,
         entry_deadline_lookup=entry_deadline_lookup,
         eod_service=eod_service,
+        # Review finding P0-8: real, holiday-aware NYSE session hooks
+        # instead of TradingEngine's always-open/never-EOD test defaults --
+        # without these, premarket Sell All queuing never reliably fired,
+        # a stop-triggered liquidation could attempt a regular-hours order
+        # outside the session, and EOD cleanup never ran in production.
+        market_is_open=is_regular_session_open,
+        eod_window_reached=_eod_window_reached,
     )
 
     return BuyboardRuntime(

@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
+from sqlalchemy.engine import Engine
+
 from src.core.order_state import BrokerOrder, BrokerOrderDiscoveryResult, OrderStatus
 from src.core.trade_card_state import (
     BoardStatus,
@@ -23,7 +25,11 @@ from src.core.trade_card_state import (
     TradeCardState,
 )
 from src.services import capital_allocator
-from src.services.entry_attempt_manager import EntryAttemptManager
+from src.services.entry_attempt_manager import (
+    AttemptDeadlineAction,
+    EntryAttemptManager,
+    EntryCancelReason,
+)
 from src.services.position_manager import (
     BrokerHolding,
     PositionManager,
@@ -75,6 +81,7 @@ class EodTradingService:
         position_manager: PositionManager,
         callbacks: EodActionCallbacks,
         reservations_path: Optional[Path] = None,
+        capital_reservation_engine: Optional[Engine] = None,
     ) -> None:
         self._entry_attempt_manager = entry_attempt_manager
         self._position_manager = position_manager
@@ -84,6 +91,10 @@ class EodTradingService:
         # will not pick up a later monkeypatch/override -- same reasoning
         # as EntryAttemptManager.__init__.
         self._reservations_path = reservations_path or capital_allocator.RESERVATIONS_FILE
+        # Review finding P1-1: mirror capital-reservation releases to the
+        # shared database too, when one is available, for the same
+        # cross-device-visibility reason EntryAttemptManager does.
+        self._capital_reservation_engine = capital_reservation_engine
 
     def run_eod_cleanup(self, cards: List[TradeCardState]) -> List[TradeCardState]:
         """Section 13's table, applied to every card. The caller owns the
@@ -129,13 +140,32 @@ class EodTradingService:
         card.entry_trigger = None
         self._entry_attempt_manager.reset_symbol(card.environment, card.account_no, card.symbol)
         if card.capital_reservation_id:
-            capital_allocator.release_reservation(card.capital_reservation_id, path=self._reservations_path)
+            capital_allocator.release_reservation(
+                card.capital_reservation_id,
+                path=self._reservations_path,
+                engine=self._capital_reservation_engine,
+            )
             card.capital_reservation_id = ""
         return True
 
-    # -- Entry Pending at EOD (section 517-529) --------------------------
+    # -- Entry Pending at EOD (section 517-529, review finding P0-7) -----
 
     def _resolve_entry_pending_at_eod(self, card: TradeCardState) -> bool:
+        """Drives the *same* two-phase request-then-confirm cancellation
+        state machine (:meth:`EntryAttemptManager.resolve_entry_order`) the
+        normal intraday heartbeat uses, instead of calling ``cancel_order``
+        and immediately assuming the cancellation succeeded. Review finding
+        P0-7: the old version released the capital reservation and moved
+        the card to Buylist/Open Positions in the same call that requested
+        the cancel -- if the broker actually filled part or all of the
+        order *after* that instant, the fill would be silently orphaned
+        (no card, no reservation, no stop). Now:
+
+        ENTRY_PENDING -> (cancel requested, EOD reason stamped) ->
+        AWAIT_CANCEL_CONFIRMATION -> next call confirms ->
+        zero fill -> Buylist / any fill -> Open Positions / still
+        unresolved -> stays Entry Pending (Reconciling).
+        """
         order = self._callbacks.find_open_entry_order(card)
         if order is None:
             # P1-15: the local lookup alone cannot confirm "no order
@@ -161,35 +191,60 @@ class EodTradingService:
             card.entry_runtime_status = EntryRuntimeStatus.DATA_UNAVAILABLE
             return True
 
-        if refreshed.filled_quantity <= 0:
-            # Section 517-521: zero fills.
-            if refreshed.status not in _ALREADY_TERMINAL_STATUSES:
-                self._callbacks.cancel_order(refreshed.client_order_id)
-            if refreshed.capital_reservation_id:
-                capital_allocator.release_reservation(refreshed.capital_reservation_id, path=self._reservations_path)
-            card.board_status = BoardStatus.BUYLIST
-            card.entry_runtime_status = None
-            card.capital_reservation_id = ""
+        if not card.entry_cancel_in_flight:
+            card.entry_cancel_reason = EntryCancelReason.EOD.value
+        action = self._entry_attempt_manager.resolve_entry_order(
+            refreshed,
+            at_deadline=True,
+            cancel_requested=True,
+            cancel_order=lambda o: self._callbacks.cancel_order(o.client_order_id),
+        )
+
+        if action in (
+            AttemptDeadlineAction.STILL_WORKING,
+            AttemptDeadlineAction.BLOCK_SYMBOL_PENDING_RECONCILIATION,
+        ):
+            # Unresolved -- stays Entry Pending/Reconciling; capital stays
+            # reserved until a later EOD pass (or startup reconciliation)
+            # resolves it.
+            if card.entry_runtime_status != EntryRuntimeStatus.DATA_UNAVAILABLE:
+                card.entry_runtime_status = EntryRuntimeStatus.DATA_UNAVAILABLE
+                return True
+            return False
+
+        if action == AttemptDeadlineAction.AWAIT_CANCEL_CONFIRMATION:
+            if card.entry_cancel_in_flight:
+                return False
+            card.entry_cancel_in_flight = True
             return True
 
-        # Section 522-525: any fill -- cancel the remaining entry quantity,
-        # reconcile the actual filled position, move to Open Positions.
-        if refreshed.status not in _ALREADY_TERMINAL_STATUSES:
-            self._callbacks.cancel_order(refreshed.client_order_id)
-        if refreshed.capital_reservation_id:
-            capital_allocator.release_reservation(refreshed.capital_reservation_id, path=self._reservations_path)
-        card.board_status = BoardStatus.OPEN_POSITION
-        card.broker_quantity = refreshed.filled_quantity
-        card.orderable_quantity = refreshed.filled_quantity
-        card.average_entry_price = refreshed.avg_fill_price
-        card.entry_remaining_target_quantity = 0  # stop attempting completion at EOD
-        card.position_runtime_status = PositionRuntimeStatus.OPEN
+        # Every remaining action is terminal -- the broker has confirmed a
+        # final status for the cancel EOD requested; resolve_entry_order
+        # has already settled/released the capital reservation.
+        card.entry_cancel_in_flight = False
+        card.entry_cancel_reason = ""
         card.capital_reservation_id = ""
-        self._position_manager.apply_first_fill_stop(
-            card,
-            entry_orb_low=card.entry_orb_low or 0.0,
-            entry_orb_window=card.entry_orb_window or card.selected_orb_window or "",
-        )
+
+        if refreshed.filled_quantity > 0:
+            # Section 522-525: confirmed cancelled with a fill (or, rarely,
+            # confirmed FILLED outright) -- reconcile the actual filled
+            # position and move to Open Positions.
+            card.board_status = BoardStatus.OPEN_POSITION
+            card.broker_quantity = refreshed.filled_quantity
+            card.orderable_quantity = refreshed.filled_quantity
+            card.average_entry_price = refreshed.avg_fill_price
+            card.entry_remaining_target_quantity = 0  # stop attempting completion at EOD
+            card.position_runtime_status = PositionRuntimeStatus.OPEN
+            self._position_manager.apply_first_fill_stop(
+                card,
+                entry_orb_low=card.entry_orb_low or 0.0,
+                entry_orb_window=card.entry_orb_window or card.selected_orb_window or "",
+            )
+            card.entry_runtime_status = None
+            return True
+
+        # Section 517-521: confirmed cancelled with zero fill.
+        card.board_status = BoardStatus.BUYLIST
         card.entry_runtime_status = None
         return True
 
@@ -199,8 +254,21 @@ class EodTradingService:
         if card.entry_remaining_target_quantity <= 0:
             return False
         order = self._callbacks.find_open_entry_order(card)
+        # Section 530-533: stop attempting to complete the target at EOD
+        # regardless of what the cancel eventually resolves to -- unlike
+        # the ENTRY_PENDING case above, an already-open position stays open
+        # either way, so there is no Buylist/Open-Positions branch to wait
+        # for. Still request+track the cancel through two-phase
+        # confirmation (rather than assuming it immediately succeeded) so a
+        # late fill from *this* order is protected and its capital
+        # reservation is actually settled instead of silently orphaned --
+        # entry_cancel_in_flight keeps _reconcile_entry_orders tracking it
+        # on the next heartbeat regardless of board_status/remaining target.
         if order is not None:
             self._callbacks.cancel_order(order.client_order_id)
+            if not card.entry_cancel_in_flight:
+                card.entry_cancel_in_flight = True
+                card.entry_cancel_reason = EntryCancelReason.EOD.value
         card.entry_remaining_target_quantity = 0
         card.position_runtime_status = PositionRuntimeStatus.OPEN
         return True

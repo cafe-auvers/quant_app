@@ -193,6 +193,15 @@ class TradeCardState:
     # working entry order until the broker confirms a terminal status --
     # distinguishes "cancel in flight" from "cancel confirmed" (P0-7).
     entry_cancel_in_flight: bool = False
+    # *Why* entry_cancel_in_flight was set -- an EntryCancelReason value
+    # (src.services.entry_attempt_manager.EntryCancelReason), stored as a
+    # plain string so a restart/DB round trip never needs an enum import
+    # here. Review finding P0-6: only an automatic TTL-driven cancel should
+    # preserve entry_remaining_target_quantity and retry the remainder --
+    # a USER_CANCEL/EOD/EXIT_ALL cancel must not resume buying after the
+    # broker confirms it. Set the moment a cancel is requested; cleared once
+    # it resolves.
+    entry_cancel_reason: str = ""
 
     # Position / broker-derived state (section 5.3, 231-233)
     position_runtime_status: PositionRuntimeStatus = PositionRuntimeStatus.NONE
@@ -214,6 +223,19 @@ class TradeCardState:
     # position/exit engine (which owns the actual sell submission) has the
     # user's requested size without the board layer submitting orders itself.
     pending_partial_sell_quantity: int = 0
+    # Shares "spoken for" by a currently-working exit order (partial sell or
+    # sell-all), set once the order is actually submitted. Review finding
+    # P1-3: broker_quantity/orderable_quantity must stay broker-authoritative
+    # -- this is a separate, purely informational field so the engine never
+    # has to *guess* orderable_quantity before a fill/rejection is confirmed.
+    reserved_sell_quantity: int = 0
+    # Exit-order retry backoff (review finding P1-4): mirrors the entry
+    # side's next_retry_at/entry_attempt_count so a rejected Sell All /
+    # Partial Sell submission cannot be resubmitted every single heartbeat
+    # tick.
+    next_exit_retry_at: Optional[datetime] = None
+    exit_attempt_count: int = 0
+    last_exit_error: str = ""
 
     # Capital (section 22 correlation, not the reservation record itself)
     capital_reservation_id: str = ""
@@ -271,6 +293,7 @@ class TradeCardState:
         self.entry_attempt_group_id = str(self.entry_attempt_group_id or "")
         self.entry_attempt_count = int(self.entry_attempt_count or 0)
         self.entry_cancel_in_flight = bool(self.entry_cancel_in_flight)
+        self.entry_cancel_reason = str(self.entry_cancel_reason or "")
         self.position_runtime_status = _enum_from_value(
             self.position_runtime_status,
             PositionRuntimeStatus,
@@ -289,6 +312,12 @@ class TradeCardState:
         self.exit_all_required = bool(self.exit_all_required)
         self.sell_all_at_market_open = bool(self.sell_all_at_market_open)
         self.pending_partial_sell_quantity = int(self.pending_partial_sell_quantity or 0)
+        self.reserved_sell_quantity = int(self.reserved_sell_quantity or 0)
+        self.next_exit_retry_at = (
+            _parse_timestamp(self.next_exit_retry_at) if self.next_exit_retry_at else None
+        )
+        self.exit_attempt_count = int(self.exit_attempt_count or 0)
+        self.last_exit_error = str(self.last_exit_error or "")
         self.capital_reservation_id = str(self.capital_reservation_id or "")
         self.created_at = _parse_timestamp(self.created_at)
         self.updated_at = _parse_timestamp(self.updated_at)
@@ -341,6 +370,7 @@ class TradeCardState:
             "entry_attempt_group_id": self.entry_attempt_group_id,
             "entry_attempt_count": self.entry_attempt_count,
             "entry_cancel_in_flight": self.entry_cancel_in_flight,
+            "entry_cancel_reason": self.entry_cancel_reason,
             "position_runtime_status": self.position_runtime_status.value,
             "broker_quantity": self.broker_quantity,
             "orderable_quantity": self.orderable_quantity,
@@ -352,6 +382,10 @@ class TradeCardState:
             "exit_all_required": self.exit_all_required,
             "sell_all_at_market_open": self.sell_all_at_market_open,
             "pending_partial_sell_quantity": self.pending_partial_sell_quantity,
+            "reserved_sell_quantity": self.reserved_sell_quantity,
+            "next_exit_retry_at": self.next_exit_retry_at.isoformat() if self.next_exit_retry_at else None,
+            "exit_attempt_count": self.exit_attempt_count,
+            "last_exit_error": self.last_exit_error,
             "capital_reservation_id": self.capital_reservation_id,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
@@ -395,6 +429,7 @@ class TradeCardState:
             entry_attempt_group_id=str(data.get("entry_attempt_group_id", "")),
             entry_attempt_count=int(data.get("entry_attempt_count", 0) or 0),
             entry_cancel_in_flight=bool(data.get("entry_cancel_in_flight", False)),
+            entry_cancel_reason=str(data.get("entry_cancel_reason", "")),
             position_runtime_status=data.get(
                 "position_runtime_status", PositionRuntimeStatus.NONE
             ),
@@ -412,6 +447,10 @@ class TradeCardState:
             pending_partial_sell_quantity=int(
                 data.get("pending_partial_sell_quantity", 0) or 0
             ),
+            reserved_sell_quantity=int(data.get("reserved_sell_quantity", 0) or 0),
+            next_exit_retry_at=data.get("next_exit_retry_at"),
+            exit_attempt_count=int(data.get("exit_attempt_count", 0) or 0),
+            last_exit_error=str(data.get("last_exit_error", "")),
             capital_reservation_id=str(data.get("capital_reservation_id", "")),
             created_at=data.get("created_at") or _utc_now(),
             updated_at=data.get("updated_at") or _utc_now(),

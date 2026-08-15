@@ -110,6 +110,13 @@ def test_buy_today_with_a_working_order_is_left_for_the_entry_pending_branch(tmp
 
 
 def test_entry_pending_zero_fill_cancels_releases_capital_and_returns_to_buylist(tmp_path):
+    """Review finding P0-7: EOD must not assume a requested cancellation is
+    already complete -- it now drives the same two-phase
+    request-then-confirm state machine the intraday heartbeat uses, so a
+    still-working order only reaches AWAIT_CANCEL_CONFIRMATION on the first
+    pass and only resolves to Buylist once a *later* pass sees the broker
+    actually confirm CANCELLED.
+    """
     reservation = capital_allocator.reserve_capital_for_entry(
         environment="PROD", account_no="1", symbol="AAPL", attempt_group_id="g1",
         requested_notional=1000.0, buying_power_provider=lambda: 10_000.0,
@@ -120,10 +127,18 @@ def test_entry_pending_zero_fill_cancels_releases_capital_and_returns_to_buylist
     card = _card(board_status=BoardStatus.ENTRY_PENDING)
 
     changed = service.run_eod_cleanup([card])
-
     assert changed == [card]
     assert cancelled == [order.client_order_id]
+    assert card.board_status == BoardStatus.ENTRY_PENDING  # not moved yet
+    assert card.entry_cancel_in_flight is True
+    stored = capital_allocator.load_reservations(tmp_path / "reservations.json")[0]
+    assert stored.is_open()  # not released until the cancel is confirmed
+
+    order.status = OrderStatus.CANCELLED  # broker confirms, asynchronously
+    changed = service.run_eod_cleanup([card])
+    assert changed == [card]
     assert card.board_status == BoardStatus.BUYLIST
+    assert card.entry_cancel_in_flight is False
     stored = capital_allocator.load_reservations(tmp_path / "reservations.json")[0]
     assert not stored.is_open()
 
@@ -142,6 +157,8 @@ def test_entry_pending_zero_fill_already_cancelled_does_not_double_cancel(tmp_pa
 
 
 def test_entry_pending_with_partial_fill_cancels_remainder_and_moves_to_open_position(tmp_path):
+    """Review finding P0-7: the partial fill is not locked in as final
+    until a *later* pass sees the broker actually confirm the cancel."""
     order = _order(status=OrderStatus.PARTIALLY_FILLED, filled=30, avg_fill_price=101.0)
     service, cancelled, _ = _service(tmp_path, find_order=lambda card: order, reconcile_order=lambda o: o)
     card = _card(board_status=BoardStatus.ENTRY_PENDING, target_position_quantity=100)
@@ -149,15 +166,21 @@ def test_entry_pending_with_partial_fill_cancels_remainder_and_moves_to_open_pos
     card.entry_orb_window = "5m"
 
     changed = service.run_eod_cleanup([card])
-
     assert changed == [card]
     assert cancelled == [order.client_order_id]
+    assert card.board_status == BoardStatus.ENTRY_PENDING  # not moved yet
+    assert card.entry_cancel_in_flight is True
+
+    order.status = OrderStatus.CANCELLED  # broker confirms, 30 shares locked in
+    changed = service.run_eod_cleanup([card])
+    assert changed == [card]
     assert card.board_status == BoardStatus.OPEN_POSITION
     assert card.broker_quantity == 30
     assert card.average_entry_price == 101.0
     assert card.entry_remaining_target_quantity == 0  # stop attempting completion
     assert card.stop_type == StopType.ORB_LOW
     assert card.active_stop_price == 95.0
+    assert card.entry_cancel_in_flight is False
 
 
 def test_entry_pending_fully_filled_moves_to_open_position_without_cancel(tmp_path):

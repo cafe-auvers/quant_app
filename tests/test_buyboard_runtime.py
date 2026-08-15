@@ -244,3 +244,284 @@ def test_refresh_orderable_quantity_returns_zero_when_symbol_absent():
     broker = _FakeBroker()
     quantity = runtime_module._refresh_orderable_quantity("PROD", "1", "AAPL", broker=broker)
     assert quantity == 0
+
+
+# --- P0-4: entry plan_id is consistent between approval and submission -----
+
+
+def test_entry_plan_id_matches_between_risk_decision_and_submission(monkeypatch):
+    broker = _FakeBroker()
+    card = _card()
+    captured = {}
+
+    def fake_submit_guarded(**kwargs):
+        captured.update(kwargs)
+        return BrokerOrder.create(
+            environment=kwargs["environment"], account_no=kwargs["account_no"], symbol=kwargs["symbol"],
+            side=OrderSide.BUY, intent=OrderIntent.ENTRY, quantity_requested=kwargs["quantity"],
+            limit_price=kwargs["limit_price"], status=OrderStatus.ACCEPTED,
+        )
+
+    monkeypatch.setattr(runtime_module, "submit_guarded_overseas_order", fake_submit_guarded)
+
+    runtime = runtime_module.build_buyboard_runtime(
+        buying_power_provider=lambda env, acct: 10_000.0,
+        card_lookup=lambda env, acct, sym: card,
+        broker=broker,
+    )
+    runtime.entry_attempt_manager._submit_order(
+        environment="PROD", account_no="1", symbol="AAPL", side=OrderSide.BUY,
+        intent=OrderIntent.ENTRY, quantity=20, limit_price=100.0, exchange="NASD",
+        attempt_group_id="g1", attempt_number=1, attempt_deadline_at=None,
+        capital_reservation_id="",
+    )
+
+    decision = captured["pre_trade_risk_decision"]
+    assert decision.plan_id == captured["plan_id"]
+    assert captured["plan_id"] == runtime_module._entry_plan_id(card)
+    assert captured["plan_id"] == "PROD:AAPL:5m"
+
+
+# --- P1-9: submitted quantity is resized to the actual live price ----------
+
+
+def test_submit_order_resizes_quantity_down_at_a_higher_live_price(monkeypatch):
+    broker = _FakeBroker()
+    card = _card(entry_orb_low=95.0, risk_percent=0.01)  # $5/share risk, 1% risk budget
+    captured = {}
+
+    def fake_submit_guarded(**kwargs):
+        captured.update(kwargs)
+        return BrokerOrder.create(
+            environment=kwargs["environment"], account_no=kwargs["account_no"], symbol=kwargs["symbol"],
+            side=OrderSide.BUY, intent=OrderIntent.ENTRY, quantity_requested=kwargs["quantity"],
+            limit_price=kwargs["limit_price"], status=OrderStatus.ACCEPTED,
+        )
+
+    monkeypatch.setattr(runtime_module, "submit_guarded_overseas_order", fake_submit_guarded)
+
+    runtime = runtime_module.build_buyboard_runtime(
+        buying_power_provider=lambda env, acct: 10_000.0,
+        card_lookup=lambda env, acct, sym: card,
+        broker=broker,
+    )
+    # 10_000 * 1% = 100 total risk. At $5/share (entry 100, stop 95) that's
+    # 20 shares (matches the plan). At an actual submit price of 145 (stop
+    # unchanged at 95 -> $50/share risk), only 2 shares are safe.
+    runtime.entry_attempt_manager._submit_order(
+        environment="PROD", account_no="1", symbol="AAPL", side=OrderSide.BUY,
+        intent=OrderIntent.ENTRY, quantity=20, limit_price=145.0, exchange="NASD",
+        attempt_group_id="g1", attempt_number=1, attempt_deadline_at=None,
+        capital_reservation_id="",
+    )
+
+    assert captured["quantity"] == 2
+    # The risk decision must be built for the *same* (resized) quantity
+    # actually submitted, not the original, or the fingerprint gate would
+    # reject a mismatched order.
+    assert captured["pre_trade_risk_decision"].quantity == 2
+
+
+def test_submit_order_does_not_resize_up_at_a_lower_live_price(monkeypatch):
+    broker = _FakeBroker()
+    card = _card(entry_orb_low=95.0, risk_percent=0.5)  # generous risk budget
+    captured = {}
+    monkeypatch.setattr(
+        runtime_module,
+        "submit_guarded_overseas_order",
+        lambda **kwargs: (captured.update(kwargs) or BrokerOrder.create(
+            environment=kwargs["environment"], account_no=kwargs["account_no"], symbol=kwargs["symbol"],
+            side=OrderSide.BUY, intent=OrderIntent.ENTRY, quantity_requested=kwargs["quantity"],
+            limit_price=kwargs["limit_price"], status=OrderStatus.ACCEPTED,
+        )),
+    )
+    runtime = runtime_module.build_buyboard_runtime(
+        buying_power_provider=lambda env, acct: 100_000.0,
+        card_lookup=lambda env, acct, sym: card,
+        broker=broker,
+    )
+    runtime.entry_attempt_manager._submit_order(
+        environment="PROD", account_no="1", symbol="AAPL", side=OrderSide.BUY,
+        intent=OrderIntent.ENTRY, quantity=20, limit_price=96.0, exchange="NASD",
+        attempt_group_id="g1", attempt_number=1, attempt_deadline_at=None,
+        capital_reservation_id="",
+    )
+    assert captured["quantity"] == 20  # never resized above the originally requested amount
+
+
+def test_submit_order_skips_resize_without_a_trustworthy_risk_percent(monkeypatch):
+    broker = _FakeBroker()
+    card = _card(entry_orb_low=95.0, risk_percent=0.0)
+    captured = {}
+    monkeypatch.setattr(
+        runtime_module,
+        "submit_guarded_overseas_order",
+        lambda **kwargs: (captured.update(kwargs) or BrokerOrder.create(
+            environment=kwargs["environment"], account_no=kwargs["account_no"], symbol=kwargs["symbol"],
+            side=OrderSide.BUY, intent=OrderIntent.ENTRY, quantity_requested=kwargs["quantity"],
+            limit_price=kwargs["limit_price"], status=OrderStatus.ACCEPTED,
+        )),
+    )
+    runtime = runtime_module.build_buyboard_runtime(
+        buying_power_provider=lambda env, acct: 10_000.0,
+        card_lookup=lambda env, acct, sym: card,
+        broker=broker,
+    )
+    runtime.entry_attempt_manager._submit_order(
+        environment="PROD", account_no="1", symbol="AAPL", side=OrderSide.BUY,
+        intent=OrderIntent.ENTRY, quantity=20, limit_price=500.0, exchange="NASD",
+        attempt_group_id="g1", attempt_number=1, attempt_deadline_at=None,
+        capital_reservation_id="",
+    )
+    assert captured["quantity"] == 20  # no trustworthy risk_percent -> no resize attempted
+
+
+# --- P0-3: the production SELL adapter --------------------------------------
+
+
+def _market_data_with_quote(symbol, *, bid=None, last_price=100.0):
+    from src.services.realtime_market_data import QuoteSnapshot, RestPollingMarketDataService
+
+    market_data = RestPollingMarketDataService(
+        quote_fetcher=lambda s: QuoteSnapshot(symbol=s, last_price=last_price, bid=bid)
+    )
+    market_data.subscribe([symbol])
+    market_data.poll_once()
+    return market_data
+
+
+def test_submit_sell_order_maps_partial_sell_reason_and_prices_from_live_bid(monkeypatch):
+    broker = _FakeBroker()
+    captured = {}
+
+    def fake_submit_guarded(**kwargs):
+        captured.update(kwargs)
+        return BrokerOrder.create(
+            environment=kwargs["environment"], account_no=kwargs["account_no"], symbol=kwargs["symbol"],
+            side=kwargs["side"], intent=kwargs["intent"], quantity_requested=kwargs["quantity"],
+            limit_price=kwargs["limit_price"], status=OrderStatus.ACCEPTED,
+        )
+
+    monkeypatch.setattr(runtime_module, "submit_guarded_overseas_order", fake_submit_guarded)
+    market_data = _market_data_with_quote("AAPL", bid=99.5)
+
+    runtime = runtime_module.build_buyboard_runtime(
+        buying_power_provider=lambda env, acct: 100_000.0,
+        card_lookup=lambda env, acct, sym: None,
+        broker=broker,
+        market_data=market_data,
+    )
+
+    order = runtime.trading_engine._position_callbacks.submit_sell_order(
+        environment="PROD", account_no="1", symbol="AAPL", quantity=50, reason="partial_sell",
+    )
+
+    assert order.status == OrderStatus.ACCEPTED
+    assert captured["side"] == OrderSide.SELL
+    assert captured["intent"] == OrderIntent.PARTIAL_EXIT
+    assert captured["limit_price"] == pytest.approx(99.5)  # uses the live bid
+    assert captured["quantity"] == 50
+    assert "reason" not in captured  # never forwarded to submit_guarded_overseas_order
+
+
+def test_submit_sell_order_maps_sell_all_reasons_to_manual_exit_and_discounts_last_price(monkeypatch):
+    broker = _FakeBroker()
+    captured = {}
+
+    def fake_submit_guarded(**kwargs):
+        captured.update(kwargs)
+        return BrokerOrder.create(
+            environment=kwargs["environment"], account_no=kwargs["account_no"], symbol=kwargs["symbol"],
+            side=kwargs["side"], intent=kwargs["intent"], quantity_requested=kwargs["quantity"],
+            limit_price=kwargs["limit_price"], status=OrderStatus.ACCEPTED,
+        )
+
+    monkeypatch.setattr(runtime_module, "submit_guarded_overseas_order", fake_submit_guarded)
+    market_data = _market_data_with_quote("AAPL", last_price=50.0)  # no bid cached
+
+    runtime = runtime_module.build_buyboard_runtime(
+        buying_power_provider=lambda env, acct: 100_000.0,
+        card_lookup=lambda env, acct, sym: None,
+        broker=broker,
+        market_data=market_data,
+    )
+
+    for reason in ("sell_all", "sell_all_retry"):
+        runtime.trading_engine._position_callbacks.submit_sell_order(
+            environment="PROD", account_no="1", symbol="AAPL", quantity=100, reason=reason,
+        )
+        assert captured["intent"] == OrderIntent.MANUAL_EXIT
+        assert captured["limit_price"] == pytest.approx(50.0 * (1 - 0.005))
+
+
+def test_submit_sell_order_raises_without_a_live_quote():
+    from src.services.realtime_market_data import QuoteSnapshot, RestPollingMarketDataService
+
+    broker = _FakeBroker()
+    market_data = RestPollingMarketDataService(quote_fetcher=lambda s: QuoteSnapshot(symbol=s, last_price=100.0))
+    # never subscribed/polled -> latest_quote() is None
+
+    runtime = runtime_module.build_buyboard_runtime(
+        buying_power_provider=lambda env, acct: 100_000.0,
+        card_lookup=lambda env, acct, sym: None,
+        broker=broker,
+        market_data=market_data,
+    )
+    with pytest.raises(runtime_module.ExecutionGradeDataUnavailableError):
+        runtime.trading_engine._position_callbacks.submit_sell_order(
+            environment="PROD", account_no="1", symbol="AAPL", quantity=10, reason="sell_all",
+        )
+
+
+# --- P0-5: broker-truth cumulative fill refresh -----------------------------
+
+
+def test_refresh_broker_position_finds_matching_holding():
+    from src.services.position_manager import BrokerHolding
+
+    broker = _FakeBroker()
+    broker.positions = {
+        "overseas": {"holdings": [{"symbol": "AAPL", "quantity": 40, "average_price": 101.25}]}
+    }
+    card = _card(symbol="AAPL")
+    holding = runtime_module._refresh_broker_position(card, broker=broker)
+    assert holding == BrokerHolding(symbol="AAPL", quantity=40, average_price=101.25)
+
+
+def test_refresh_broker_position_returns_none_when_symbol_absent():
+    broker = _FakeBroker()
+    card = _card(symbol="AAPL")
+    assert runtime_module._refresh_broker_position(card, broker=broker) is None
+
+
+# --- P0-8: real market-session hooks are wired ------------------------------
+
+
+def test_build_buyboard_runtime_wires_real_market_session_hooks():
+    broker = _FakeBroker()
+    runtime = runtime_module.build_buyboard_runtime(
+        buying_power_provider=lambda env, acct: 100_000.0,
+        card_lookup=lambda env, acct, sym: None,
+        broker=broker,
+    )
+    # Not asserting a specific True/False (depends on real wall-clock time)
+    # -- only that the engine is no longer using the always-open/never-EOD
+    # test defaults.
+    assert runtime.trading_engine._market_is_open_fn is runtime_module.is_regular_session_open
+    assert runtime.trading_engine._eod_window_reached_fn is runtime_module._eod_window_reached
+
+
+# --- P1-1: capital_reservation_engine is actually threaded through ----------
+
+
+def test_build_buyboard_runtime_threads_capital_reservation_engine():
+    broker = _FakeBroker()
+    sentinel_engine = object()
+    runtime = runtime_module.build_buyboard_runtime(
+        buying_power_provider=lambda env, acct: 100_000.0,
+        card_lookup=lambda env, acct, sym: None,
+        broker=broker,
+        capital_reservation_engine=sentinel_engine,
+    )
+    assert runtime.entry_attempt_manager._capital_reservation_engine is sentinel_engine
+    assert runtime.eod_service._capital_reservation_engine is sentinel_engine

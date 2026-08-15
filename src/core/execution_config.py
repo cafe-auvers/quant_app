@@ -47,6 +47,20 @@ MAX_ENTRY_ATTEMPTS_PER_SYMBOL_PER_MINUTE = _env_int(
     "MAX_ENTRY_ATTEMPTS_PER_SYMBOL_PER_MINUTE", 4
 )
 
+# --- Exit (Sell All / Partial Sell) retry backoff (code review finding P1-4) -
+# A liquidation must retry aggressively (an open position with no working
+# sell order is real, ongoing risk) but a rejected/erroring submission must
+# not be resubmitted on literally every 1-second heartbeat tick.
+EXIT_RETRY_COOLDOWN_SECONDS = _env_int("EXIT_RETRY_COOLDOWN_SECONDS", 5)
+
+# Discount applied to the last trade price when no live bid is available to
+# build a marketable SELL limit (code review finding P0-3's production sell
+# adapter). Mirrors the existing legacy Buy Dashboard's
+# ``src.ui.buylist.constants.STOP_LOSS_SELL_LIMIT_DISCOUNT_PCT`` -- same
+# number, re-declared here rather than importing across the services/ui
+# boundary.
+SELL_MARKETABLE_DISCOUNT_PCT = _env_float("SELL_MARKETABLE_DISCOUNT_PCT", 0.005)
+
 # --- One-second engine cadence (section 771-806) -----------------------------
 ENGINE_HEARTBEAT_SECONDS = _env_int("ENGINE_HEARTBEAT_SECONDS", 1)
 PENDING_ORDER_RECONCILIATION_SECONDS = _env_int(

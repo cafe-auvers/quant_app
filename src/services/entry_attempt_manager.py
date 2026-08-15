@@ -37,6 +37,8 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 from uuid import uuid4
 
+from sqlalchemy.engine import Engine
+
 from src.core import execution_config
 from src.core.order_state import BrokerOrder, OrderIntent, OrderSide, OrderStatus
 from src.services import capital_allocator
@@ -46,6 +48,26 @@ from src.services.order_execution_service import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class EntryCancelReason(str, Enum):
+    """Why an entry-order cancellation was requested. Code review finding
+    P0-6: the *only* reason a cancelled attempt should preserve
+    ``entry_remaining_target_quantity`` and retry the remainder is an
+    automatic 15-second TTL repricing cancel -- a cancel the user asked for,
+    that EOD forced, or that an exit-all/stop escalation forced must all
+    stop trying to acquire more shares once confirmed. This module stays
+    unaware of ``TradeCardState`` by design (see the module docstring), so
+    it never reads or writes this itself -- :mod:`src.services.trading_engine`
+    is what decides which reason applies and persists it on the card
+    (``TradeCardState.entry_cancel_reason``) for the terminal resolution to
+    read back once the broker confirms the cancel.
+    """
+
+    TTL_REPRICE = "TTL_REPRICE"
+    USER_CANCEL = "USER_CANCEL"
+    EOD = "EOD"
+    EXIT_ALL = "EXIT_ALL"
 
 
 def _utc_now() -> datetime:
@@ -173,6 +195,7 @@ class EntryAttemptManager:
         submit_order: Callable[..., BrokerOrder] = submit_guarded_overseas_order,
         clock: Callable[[], datetime] = _utc_now,
         reservations_path: Optional[Path] = None,
+        capital_reservation_engine: Optional[Engine] = None,
     ) -> None:
         self._buying_power_provider = buying_power_provider
         self._submit_order = submit_order
@@ -183,6 +206,14 @@ class EntryAttemptManager:
         # default parameters are bound at import time and will not pick up
         # a later monkeypatch of capital_allocator.RESERVATIONS_FILE.
         self._reservations_path = reservations_path or capital_allocator.RESERVATIONS_FILE
+        # Code review finding P1-1: build_buyboard_runtime() accepted a
+        # capital_reservation_engine but never actually passed it anywhere,
+        # so PC/laptop capital reservations were never centrally
+        # coordinated even when a database engine was available. Every
+        # capital_allocator call below now threads this through --
+        # ``None`` (the default, and every existing test) preserves the
+        # original local-JSON-only behavior exactly.
+        self._capital_reservation_engine = capital_reservation_engine
         self._symbol_locks: Dict[Tuple[str, str, str], threading.Lock] = {}
         self._locks_guard = threading.Lock()
         self._state: Dict[Tuple[str, str, str], _SymbolAttemptState] = {}
@@ -290,17 +321,38 @@ class EntryAttemptManager:
         attempt_group_id = state.attempt_group_id
         attempt_number = state.attempt_count + 1
 
-        reservation = capital_allocator.reserve_capital_for_entry(
-            environment=trigger.environment,
-            account_no=trigger.account_no,
-            symbol=trigger.symbol,
-            attempt_group_id=attempt_group_id,
-            requested_notional=trigger.notional,
-            buying_power_provider=lambda: self._buying_power_provider(
-                trigger.environment, trigger.account_no
-            ),
-            path=self._reservations_path,
-        )
+        try:
+            reservation = capital_allocator.reserve_capital_for_entry(
+                environment=trigger.environment,
+                account_no=trigger.account_no,
+                symbol=trigger.symbol,
+                attempt_group_id=attempt_group_id,
+                requested_notional=trigger.notional,
+                buying_power_provider=lambda: self._buying_power_provider(
+                    trigger.environment, trigger.account_no
+                ),
+                path=self._reservations_path,
+                engine=self._capital_reservation_engine,
+            )
+        except Exception as exc:  # noqa: BLE001 - surfaced via AttemptResult
+            # Review finding P1-1: a central-reservation-database failure
+            # must block this attempt (fail closed), not be swallowed into
+            # "capital looks available" from the local ledger alone -- and
+            # must not abort every *other* symbol's attempt in the same
+            # process_triggers() batch, so this is caught here rather than
+            # left to propagate.
+            logger.exception(
+                "Capital reservation check raised for %s -- blocking this attempt", trigger.symbol
+            )
+            state.cooldown_until = now + timedelta(seconds=execution_config.ENTRY_RETRY_COOLDOWN_SECONDS)
+            return AttemptResult(
+                trigger,
+                AttemptOutcome.REJECTED,
+                attempt_group_id=attempt_group_id,
+                attempt_count=state.attempt_count,
+                retry_at=state.cooldown_until,
+                detail=f"Capital reservation check failed: {exc}",
+            )
         if reservation is None:
             return AttemptResult(
                 trigger,
@@ -329,7 +381,9 @@ class EntryAttemptManager:
             )
         except DuplicateOpenOrderError as exc:
             capital_allocator.release_reservation(
-                reservation.reservation_id, path=self._reservations_path
+                reservation.reservation_id,
+                path=self._reservations_path,
+                engine=self._capital_reservation_engine,
             )
             return AttemptResult(
                 trigger,
@@ -341,7 +395,9 @@ class EntryAttemptManager:
             )
         except Exception as exc:  # noqa: BLE001 - surfaced via AttemptResult
             capital_allocator.release_reservation(
-                reservation.reservation_id, path=self._reservations_path
+                reservation.reservation_id,
+                path=self._reservations_path,
+                engine=self._capital_reservation_engine,
             )
             state.cooldown_until = now + timedelta(seconds=execution_config.ENTRY_RETRY_COOLDOWN_SECONDS)
             logger.exception("Entry submission raised for %s", trigger.symbol)
@@ -360,7 +416,9 @@ class EntryAttemptManager:
 
         if order.status == OrderStatus.REJECTED:
             capital_allocator.release_reservation(
-                reservation.reservation_id, path=self._reservations_path
+                reservation.reservation_id,
+                path=self._reservations_path,
+                engine=self._capital_reservation_engine,
             )
             state.cooldown_until = now + timedelta(seconds=execution_config.ENTRY_RETRY_COOLDOWN_SECONDS)
             return AttemptResult(
@@ -459,12 +517,17 @@ class EntryAttemptManager:
             # Section 872-874: consume capital corresponding to the filled
             # quantity -- that money is genuinely spent, not "available."
             capital_allocator.consume_reservation(
-                order.capital_reservation_id, filled_notional, path=self._reservations_path
+                order.capital_reservation_id,
+                filled_notional,
+                path=self._reservations_path,
+                engine=self._capital_reservation_engine,
             )
         # Section 876: release whatever of the reservation remains
         # unconsumed once we know no more fills are coming for this attempt.
         capital_allocator.release_reservation(
-            order.capital_reservation_id, path=self._reservations_path
+            order.capital_reservation_id,
+            path=self._reservations_path,
+            engine=self._capital_reservation_engine,
         )
 
     def reset_symbol(self, environment: str, account_no: str, symbol: str) -> None:

@@ -111,23 +111,34 @@ def list_active_reservations(
     """Every RESERVED/PARTIALLY_CONSUMED row for this account -- the same
     set :func:`src.core.capital_reservation.available_for_new_entries`
     subtracts from buying power, but read from the database so every device
-    sees the same in-flight reservations."""
+    sees the same in-flight reservations.
+
+    Deliberately does *not* catch ``SQLAlchemyError`` (code review finding
+    P1-1): this is the availability *read* path a new entry's capital check
+    depends on. Silently returning ``[]`` on a database outage would make
+    every reservation another device is holding invisible, which is exactly
+    the double-spend this table exists to prevent -- a caller that wants
+    cross-device coordination must find out the read failed and block the
+    new entry (fail closed), not quietly fall back to trusting the local
+    ledger alone as if it were still authoritative.
+    :func:`src.services.capital_allocator.reserve_capital_for_entry` is the
+    caller that matters here; it does not catch this either, and
+    :class:`src.services.entry_attempt_manager.EntryAttemptManager` catches
+    it only to turn it into a blocked/cooldown attempt for *this* symbol,
+    never into "treat capital as available."
+    """
     if engine is None:
         return []
-    try:
-        table = _ensure_table(engine)
-        with engine.connect() as conn:
-            rows = conn.execute(
-                select(table).where(
-                    table.c.environment == str(environment or "").upper(),
-                    table.c.account_no == str(account_no or ""),
-                    table.c.status.in_(_ACTIVE_STATUS_VALUES),
-                )
-            ).fetchall()
-        return [_row_to_reservation(row) for row in rows]
-    except SQLAlchemyError as exc:
-        logger.info("capital_reservation_repository: list_active_reservations failed: %s", exc)
-        return []
+    table = _ensure_table(engine)
+    with engine.connect() as conn:
+        rows = conn.execute(
+            select(table).where(
+                table.c.environment == str(environment or "").upper(),
+                table.c.account_no == str(account_no or ""),
+                table.c.status.in_(_ACTIVE_STATUS_VALUES),
+            )
+        ).fetchall()
+    return [_row_to_reservation(row) for row in rows]
 
 
 def save_reservation(engine: Optional[Engine], reservation: CapitalReservation) -> None:

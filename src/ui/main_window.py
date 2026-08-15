@@ -1085,6 +1085,7 @@ class MainWindow(
                 is_main_device=False,
             )
         self._current_lease_token = result.lease_token if result.is_main_device else ""
+        self._sync_buyboard_runtime_worker()
         if result.main_device_hostname:
             self._last_main_device_hostname = result.main_device_hostname
         self._update_main_device_button(
@@ -1471,6 +1472,73 @@ class MainWindow(
             ),
             "lease_engine": self.__dict__.get("pc_db_engine"),
         }
+
+    def _sync_buyboard_runtime_worker(self) -> None:
+        """Starts/stops :class:`~src.ui.buyboard.runtime_worker.BuyboardRuntimeWorker`
+        to track main-device status and
+        :func:`src.core.execution_config.is_buyboard_engine_enabled`
+        (code review finding P0-1: nothing previously constructed or
+        started this engine even when the flag was on). Safe to call
+        repeatedly/idempotently -- called after every state-sync
+        reconciliation pass and on tab setup, which is exactly when both
+        of those inputs can change.
+
+        Deliberately defensive: this entire branch is inert while the flag
+        is off (the default), and any unexpected failure here must never
+        prevent the rest of the application (least of all the legacy Buy
+        Dashboard) from working, so every lookup is best-effort and the
+        whole thing is wrapped in a broad try/except.
+        """
+        try:
+            from src.core.execution_config import is_buyboard_engine_enabled
+
+            worker = self.__dict__.get("_buyboard_runtime_worker")
+            role = self.__dict__.get("state_sync_role")
+            should_run = (
+                is_buyboard_engine_enabled()
+                and role is not None
+                and role.is_main
+                and bool(self.__dict__.get("_current_lease_token"))
+                and self.__dict__.get("pc_db_engine") is not None
+            )
+            if not should_run:
+                if worker is not None and worker.isRunning():
+                    worker.request_stop()
+                    worker.requestInterruption()
+                return
+            if worker is not None and worker.isRunning():
+                return  # already running with the current lease/engine
+
+            from src.ui.buyboard.runtime_worker import BuyboardRuntimeWorker
+
+            lease_kwargs = self._current_execution_lease_kwargs()
+            if lease_kwargs.get("execution_authority") is None:
+                return  # not actually main by the time we got here -- do not start
+
+            manual_sizes = self.__dict__.get("manual_account_sizes") or {"PROD": 10000.0}
+            queue_manager = self.__dict__.get("execution_queue_manager")
+
+            new_worker = BuyboardRuntimeWorker(
+                db_engine=self.pc_db_engine,
+                environment="PROD",
+                account_no="",  # unscoped -- processes every PROD account's cards
+                buying_power_provider=lambda env, acct: float(manual_sizes.get(env, 10000.0)),
+                execution_queue_item_lookup=(
+                    (lambda symbol, env: queue_manager.get_item(symbol, env))
+                    if queue_manager is not None
+                    else None
+                ),
+                **lease_kwargs,
+            )
+            new_worker.board_changed.connect(self.refresh_buyboard)
+            new_worker.error_occurred.connect(self.append_log)
+            new_worker.alert.connect(self.append_log)
+            self._track_worker("_buyboard_runtime_worker", new_worker)
+            self._buyboard_runtime_worker = new_worker
+            new_worker.start()
+            self.append_log("Buy Board engine started (BUYBOARD_ENGINE_ENABLED=true, main device).")
+        except Exception:
+            logger.exception("Failed to sync the Buy Board runtime worker")
 
     def _state_sync_allows_order_submission(self) -> bool:
         """Allow broker submissions only from the active, recently-confirmed main device."""
@@ -2175,6 +2243,7 @@ class MainWindow(
             getattr(self, "broker_order_query_worker", None),
             getattr(self, "broker_order_cancel_worker", None),
             getattr(self, "handoff_reconciliation_worker", None),
+            getattr(self, "_buyboard_runtime_worker", None),
             *getattr(self, "_buylist_order_workers", []),
             *getattr(self, "_buylist_aux_workers", []),
             *list(getattr(self, "_tracked_workers", {})),
@@ -2282,6 +2351,7 @@ class MainWindow(
         )
         if not self.state_sync_role.is_main:
             self._current_lease_token = ""
+            self._sync_buyboard_runtime_worker()
         if not released and release_error:
             self.append_log(f"Main-device release failed: {release_error}")
         return released
@@ -2367,6 +2437,11 @@ class MainWindow(
         self.buyboard_widget = QWidget()
         self._add_configured_tab("buyboard", self.buyboard_widget, "Buy Board")
         self._build_buyboard_tab()
+        # P0-1: attempt to start the engine worker now too -- covers the
+        # case where this device is already main and the flag is already
+        # on at startup, rather than waiting for the next state-sync pass.
+        # A no-op whenever BUYBOARD_ENGINE_ENABLED is unset (the default).
+        self._sync_buyboard_runtime_worker()
 
         self.charts_widget = QWidget()
         self._add_configured_tab("charts", self.charts_widget, "Charts")

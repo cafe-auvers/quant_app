@@ -67,7 +67,7 @@ def _order(symbol="AAPL", *, status=OrderStatus.ACCEPTED, filled=0, avg_fill_pri
     return order
 
 
-def _manager(tmp_path, submit_order, buying_power=100_000.0, clock=None):
+def _manager(tmp_path, submit_order, buying_power=100_000.0, clock=None, capital_reservation_engine=None):
     reservations_path = tmp_path / "reservations.json"
 
     def provider(_environment, _account_no):
@@ -80,6 +80,8 @@ def _manager(tmp_path, submit_order, buying_power=100_000.0, clock=None):
     )
     if clock is not None:
         kwargs["clock"] = clock
+    if capital_reservation_engine is not None:
+        kwargs["capital_reservation_engine"] = capital_reservation_engine
     manager = EntryAttemptManager(**kwargs)
     return manager, reservations_path
 
@@ -417,3 +419,80 @@ def test_reset_symbol_clears_cooldown(tmp_path):
     manager._submit_order = fake_submit_after_reset
     result = manager.attempt_entry(_trigger())
     assert result.outcome == AttemptOutcome.SUBMITTED
+
+
+# --- P1-1: capital_reservation_engine is actually used -----------------------
+
+
+def test_capital_reservation_engine_is_passed_to_the_allocator(tmp_path, monkeypatch):
+    """build_buyboard_runtime accepted this parameter but never passed it
+    anywhere -- confirm EntryAttemptManager actually forwards it into every
+    capital_allocator call, not just stores it unused."""
+    captured_engines = []
+    original = capital_allocator.reserve_capital_for_entry
+
+    def spy(**kwargs):
+        captured_engines.append(kwargs.get("engine"))
+        return original(**kwargs)
+
+    monkeypatch.setattr(capital_allocator, "reserve_capital_for_entry", spy)
+    sentinel_engine = object()
+    manager, _ = _manager(
+        tmp_path, lambda **kw: _order(status=OrderStatus.ACCEPTED), capital_reservation_engine=sentinel_engine
+    )
+
+    manager.attempt_entry(_trigger())
+
+    assert captured_engines == [sentinel_engine]
+
+
+def test_capital_reservation_db_failure_blocks_only_that_symbols_attempt(tmp_path, monkeypatch):
+    """Review finding P1-1: a central-reservation database failure must
+    block the affected symbol's entry (fail closed) rather than silently
+    falling back to "capital looks available" -- and must not prevent a
+    *different* symbol's attempt in the same batch from succeeding."""
+
+    def flaky_reserve(**kwargs):
+        if kwargs["symbol"] == "AAPL":
+            raise RuntimeError("simulated database outage")
+        return capital_allocator_original(**kwargs)
+
+    capital_allocator_original = capital_allocator.reserve_capital_for_entry
+    monkeypatch.setattr(capital_allocator, "reserve_capital_for_entry", flaky_reserve)
+
+    submitted = []
+
+    def fake_submit(**kw):
+        submitted.append(kw["symbol"])
+        return _order(symbol=kw["symbol"], status=OrderStatus.ACCEPTED)
+
+    manager, _ = _manager(tmp_path, fake_submit)
+
+    results = manager.process_triggers([_trigger(symbol="AAPL"), _trigger(symbol="NVDA")])
+
+    by_symbol = {r.trigger.symbol: r for r in results}
+    assert by_symbol["AAPL"].outcome == AttemptOutcome.REJECTED
+    assert by_symbol["AAPL"].retry_at is not None
+    assert by_symbol["NVDA"].outcome == AttemptOutcome.SUBMITTED
+    assert submitted == ["NVDA"]
+
+
+# --- P1-1: the database read path fails loud instead of hiding reservations -
+
+
+def test_list_active_reservations_propagates_database_errors(tmp_path):
+    from sqlalchemy import create_engine
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from src.services import capital_reservation_repository
+
+    # A real engine pointed at a directory that does not exist -- connect()
+    # genuinely fails, exercising the real SQLAlchemy error path rather
+    # than a hand-rolled fake.
+    broken_engine = create_engine(
+        f"sqlite:///{tmp_path / 'does-not-exist' / 'db.sqlite'}", future=True
+    )
+    with pytest.raises(SQLAlchemyError):
+        capital_reservation_repository.list_active_reservations(
+            broken_engine, environment="PROD", account_no="1"
+        )

@@ -8,6 +8,9 @@ from zoneinfo import ZoneInfo
 
 KST_ZONE = ZoneInfo("Asia/Seoul")
 MARKET_DATA_READY_TIME_KST = dt.time(7, 0)
+US_MARKET_ZONE = ZoneInfo("America/New_York")
+US_MARKET_OPEN_TIME = dt.time(9, 30)
+US_MARKET_CLOSE_TIME = dt.time(16, 0)
 
 
 def _nearest_weekday(day: dt.date) -> dt.date:
@@ -82,6 +85,43 @@ def previous_nyse_trading_day(day: dt.date) -> dt.date:
     while day.weekday() >= 5 or day in nyse_holidays(day.year):
         day -= dt.timedelta(days=1)
     return day
+
+
+def _as_us_market_time(now: Optional[dt.datetime]) -> dt.datetime:
+    moment = now or dt.datetime.now(US_MARKET_ZONE)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=US_MARKET_ZONE)
+    return moment.astimezone(US_MARKET_ZONE)
+
+
+def is_regular_session_open(now: Optional[dt.datetime] = None) -> bool:
+    """True during NYSE regular trading hours (9:30-16:00 America/New_York),
+    Monday-Friday, excluding the holidays :func:`nyse_holidays` already
+    tracks.
+
+    Several UI modules already copy the plain ``US_MARKET_OPEN_TIME <= t <
+    US_MARKET_CLOSE_TIME`` check inline (without holiday awareness); this is
+    the one holiday-aware version, added for the Kanban execution engine's
+    market-session hooks (code review finding P0-8) so ``TradingEngine``
+    never has to guess "is the market open" from a hardcoded ``True``.
+    """
+    moment = _as_us_market_time(now)
+    if moment.weekday() >= 5 or moment.date() in nyse_holidays(moment.year):
+        return False
+    return US_MARKET_OPEN_TIME <= moment.time() < US_MARKET_CLOSE_TIME
+
+
+def seconds_until_regular_session_close(now: Optional[dt.datetime] = None) -> float:
+    """Seconds from ``now`` until 16:00 America/New_York *today's date*.
+
+    Deliberately does not check whether the market is open right now (a
+    caller checking "are we within N seconds of the close" wants this to
+    stay small/negative after the close, not jump to tomorrow) -- pair with
+    :func:`is_regular_session_open` when session-open-ness also matters.
+    """
+    moment = _as_us_market_time(now)
+    close_at = moment.replace(hour=16, minute=0, second=0, microsecond=0)
+    return (close_at - moment).total_seconds()
 
 
 def expected_latest_market_data_date(now: Optional[dt.datetime] = None) -> dt.date:

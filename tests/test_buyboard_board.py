@@ -1,0 +1,222 @@
+"""Tests for src.ui.buyboard.board (review findings P1-7, P1-8)."""
+from __future__ import annotations
+
+import os
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import pytest
+from PyQt5.QtWidgets import QApplication, QMenu, QWidget
+from sqlalchemy import create_engine
+from sqlalchemy.pool import NullPool
+
+from src.core.trade_card_state import BoardStatus, TradeCardState
+from src.services import trade_card_repository as repo
+from src.ui.buyboard import board as board_module
+from src.ui.buyboard.drag_commands import CancelEntry, ReorderCard
+
+_APP = None
+
+
+def _ensure_app():
+    global _APP
+    _APP = QApplication.instance() or QApplication([])
+
+
+@pytest.fixture(autouse=True)
+def _isolate_local_trade_card_snapshot(monkeypatch, tmp_path):
+    monkeypatch.setattr(repo, "LOCAL_TRADE_CARDS_FILE", tmp_path / "trade_cards.json")
+
+
+def _card(**overrides):
+    fields = dict(environment="PROD", account_no="1", symbol="AAPL", kanban_priority=0)
+    fields.update(overrides)
+    return TradeCardState(**fields)
+
+
+class _FakeMainWindow(QWidget):
+    """Just enough surface for _renumber_column_after_swap /
+    _handle_card_context_menu. A real (if invisible) QWidget subclass --
+    board.py constructs QMenu(main_window), which requires a real
+    QWidget-or-None parent.
+    """
+
+    def __init__(self, engine, *, cards=()):
+        _ensure_app()
+        super().__init__()
+        self._engine = engine
+        self.dispatched = []
+        # Applies a dispatched ReorderCard's target_priority directly onto
+        # the matching card object, the same effect the real
+        # apply_board_command -> repository round trip has -- so tests can
+        # assert on the resulting priorities without re-implementing that
+        # plumbing themselves.
+        self._cards_by_symbol = {card.symbol: card for card in cards}
+
+    def _buyboard_engine(self):
+        return self._engine
+
+    def _buyboard_dispatch_command(self, command):
+        self.dispatched.append(command)
+        from src.ui.buyboard.drag_commands import ReorderCard
+
+        if isinstance(command, ReorderCard):
+            card = self._cards_by_symbol.get(command.symbol)
+            if card is not None:
+                card.kanban_priority = command.target_priority
+        return True
+
+
+# --- P1-7: renumbering never produces duplicate priorities ------------------
+
+
+def test_renumber_after_swap_gives_every_sibling_a_distinct_priority():
+    """The historical bug: every card defaults to kanban_priority=0, so
+    neighbor+/-1 arithmetic collides the moment a *second* card is moved
+    past a still-zero neighbor."""
+    low = _card(symbol="LOW", kanban_priority=0)
+    mid = _card(symbol="MID", kanban_priority=0)
+    high = _card(symbol="HIGH", kanban_priority=0)
+    window = _FakeMainWindow(engine=None, cards=[high, mid, low])
+    siblings = [high, mid, low]  # already sorted -kanban_priority (all tied at 0)
+
+    # Move LOW (index 2) up past MID (index 1).
+    board_module._renumber_column_after_swap(window, siblings, 2, 1)
+
+    # Now move HIGH (index 0 in the *original* list -- simulating a second,
+    # independent right-click) down past whatever is now above it.
+    window.dispatched.clear()
+    board_module._renumber_column_after_swap(window, [high, mid, low], 0, 1)
+
+    final_priorities = [high.kanban_priority, mid.kanban_priority, low.kanban_priority]
+    assert len(set(final_priorities)) == 3  # never a duplicate
+
+
+def test_renumber_after_swap_dispatches_only_for_cards_whose_priority_changed():
+    # base = 3 * 10 = 30 -> target priorities by position are 30/20/10.
+    # HIGH already sits at position 0's target (20 is NOT 30 though -- pick
+    # values where exactly one card's target coincidentally already
+    # matches its current value, to prove that one is skipped).
+    high = _card(symbol="HIGH", kanban_priority=20)  # position 1 after the swap -> target 20, unchanged
+    mid = _card(symbol="MID", kanban_priority=10)  # position 0 after the swap -> target 30, changed
+    low = _card(symbol="LOW", kanban_priority=0)  # position 2, unaffected by the swap -> target 10, changed
+    window = _FakeMainWindow(engine=None, cards=[high, mid, low])
+    siblings = [high, mid, low]  # display order: HIGH, MID, LOW
+
+    # Swap index 1 (MID) and index 0 (HIGH) -- MID moves to the top.
+    board_module._renumber_column_after_swap(window, siblings, 1, 0)
+
+    dispatched_symbols = {cmd.symbol for cmd in window.dispatched}
+    assert dispatched_symbols == {"MID", "LOW"}
+    assert "HIGH" not in dispatched_symbols  # its target priority (20) already matched
+
+
+def test_renumber_after_swap_actually_reorders_the_column():
+    high = _card(symbol="HIGH", kanban_priority=20)
+    mid = _card(symbol="MID", kanban_priority=10)
+    low = _card(symbol="LOW", kanban_priority=0)
+    window = _FakeMainWindow(engine=None, cards=[high, mid, low])
+    siblings = [high, mid, low]  # display order: HIGH, MID, LOW (highest priority first)
+
+    # Swap index 2 (LOW) and index 1 (MID): LOW moves ahead of MID in
+    # display order, HIGH is untouched and stays on top.
+    board_module._renumber_column_after_swap(window, siblings, 2, 1)
+
+    assert high.kanban_priority > low.kanban_priority > mid.kanban_priority
+
+
+def test_renumber_commands_carry_the_correct_card_version_for_optimistic_concurrency():
+    a = _card(symbol="AAA", kanban_priority=5, version=3)
+    b = _card(symbol="BBB", kanban_priority=0, version=7)
+    window = _FakeMainWindow(engine=None, cards=[a, b])
+
+    board_module._renumber_column_after_swap(window, [a, b], 0, 1)
+
+    by_symbol = {cmd.symbol: cmd for cmd in window.dispatched}
+    assert by_symbol["AAA"].expected_card_version == 3
+    assert by_symbol["BBB"].expected_card_version == 7
+    assert all(isinstance(cmd, ReorderCard) for cmd in window.dispatched)
+
+
+# --- P1-8: Cancel Entry / Remove from Today are exposed in the UI ----------
+
+
+def _make_engine(tmp_path):
+    return create_engine(f"sqlite:///{tmp_path / 'cards.db'}", future=True, poolclass=NullPool)
+
+
+def _find_action_by_text(menu: QMenu, text: str):
+    for action in menu.actions():
+        if action.text() == text:
+            return action
+    return None
+
+
+def test_context_menu_offers_remove_from_today_for_buy_today_card(tmp_path, monkeypatch):
+    _ensure_app()
+    engine = _make_engine(tmp_path)
+    card = repo.create_trade_card(engine, _card(board_status=BoardStatus.BUY_TODAY))
+    window = _FakeMainWindow(engine)
+
+    captured_menu = {}
+
+    def fake_exec(self, pos):
+        captured_menu["menu"] = self
+        return _find_action_by_text(self, "Remove from Today")
+
+    monkeypatch.setattr(QMenu, "exec_", fake_exec)
+
+    payload = {
+        "environment": card.environment, "account_no": card.account_no,
+        "symbol": card.symbol, "version": card.version,
+    }
+    board_module._handle_card_context_menu(window, payload, None)
+
+    assert _find_action_by_text(captured_menu["menu"], "Remove from Today") is not None
+    assert len(window.dispatched) == 1
+    assert isinstance(window.dispatched[0], CancelEntry)
+
+
+def test_context_menu_offers_cancel_entry_for_entry_pending_card(tmp_path, monkeypatch):
+    _ensure_app()
+    engine = _make_engine(tmp_path)
+    card = repo.create_trade_card(engine, _card(board_status=BoardStatus.ENTRY_PENDING))
+    window = _FakeMainWindow(engine)
+
+    monkeypatch.setattr(QMenu, "exec_", lambda self, pos: _find_action_by_text(self, "Cancel Entry"))
+
+    payload = {
+        "environment": card.environment, "account_no": card.account_no,
+        "symbol": card.symbol, "version": card.version,
+    }
+    board_module._handle_card_context_menu(window, payload, None)
+
+    assert len(window.dispatched) == 1
+    assert isinstance(window.dispatched[0], CancelEntry)
+
+
+def test_context_menu_has_no_cancel_entry_action_for_open_position(tmp_path, monkeypatch):
+    _ensure_app()
+    engine = _make_engine(tmp_path)
+    card = repo.create_trade_card(
+        engine, _card(board_status=BoardStatus.OPEN_POSITION, broker_quantity=10, average_entry_price=100.0)
+    )
+    window = _FakeMainWindow(engine)
+
+    captured_menu = {}
+
+    def fake_exec(self, pos):
+        captured_menu["menu"] = self
+        return None  # user dismisses the menu
+
+    monkeypatch.setattr(QMenu, "exec_", fake_exec)
+
+    payload = {
+        "environment": card.environment, "account_no": card.account_no,
+        "symbol": card.symbol, "version": card.version,
+    }
+    board_module._handle_card_context_menu(window, payload, None)
+
+    assert _find_action_by_text(captured_menu["menu"], "Cancel Entry") is None
+    assert _find_action_by_text(captured_menu["menu"], "Remove from Today") is None
+    assert _find_action_by_text(captured_menu["menu"], "Move Stop to Breakeven") is not None

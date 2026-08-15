@@ -888,4 +888,417 @@ def test_eod_cleanup_is_a_no_op_without_an_eod_service_wired(tmp_path):
     card = _buy_today_card(entry_runtime_status=EntryRuntimeStatus.ARMED)
 
     engine.run_heartbeat([card])
+
+
+# --- P0-5: cumulative fill accounting across multiple entry attempts -------
+
+
+def test_second_attempt_fill_accumulates_via_broker_refresh(tmp_path):
+    """A completion order's own filled_quantity starts back at 0 -- without
+    a broker-truth refresh this either gets ignored (below the running
+    total) or overwrites it. Wiring refresh_broker_position makes the
+    cumulative total correct regardless."""
+    from src.services.position_manager import BrokerHolding
+
+    second_attempt_order = _pending_order(status=OrderStatus.FILLED, filled=10, avg_fill_price=105.0)
+    engine = _make_engine(tmp_path, find_order=lambda card: second_attempt_order, reconcile_order=lambda o: o)
+    engine._entry_deadline_lookup.refresh_broker_position = (
+        lambda card: BrokerHolding(symbol="AAPL", quantity=40, average_price=101.25)
+    )
+    # Simulates a card already holding 30 shares from a first attempt,
+    # still trying to complete a target of 100.
+    card = _open_card(
+        board_status=BoardStatus.ENTRY_PENDING,
+        broker_quantity=30,
+        orderable_quantity=30,
+        average_entry_price=100.0,
+        target_position_quantity=100,
+        stop_type=StopType.ORB_LOW,
+        active_stop_price=95.0,
+    )
+
+    changed = engine.run_heartbeat([card])
+
+    assert changed == [card]
+    # Broker truth (40, not 30+10=40 coincidentally matching here by design
+    # of the fixture, but read from the refresh callback, not computed
+    # locally) drives the cumulative total.
+    assert card.broker_quantity == 40
+    assert card.average_entry_price == 101.25
+    assert card.entry_remaining_target_quantity == 60
+    assert card.board_status == BoardStatus.OPEN_POSITION
+
+
+def test_second_attempt_fill_accumulates_via_delta_fallback(tmp_path):
+    """Without a broker-refresh callback wired, the fallback adds only the
+    *new* delta of this specific order's fill (order.applied_filled_quantity
+    tracks what was already folded in), instead of comparing/overwriting
+    against the card's running cumulative total."""
+    second_attempt_order = _pending_order(status=OrderStatus.FILLED, filled=10, avg_fill_price=110.0)
+    engine = _make_engine(tmp_path, find_order=lambda card: second_attempt_order, reconcile_order=lambda o: o)
+    card = _open_card(
+        board_status=BoardStatus.ENTRY_PENDING,
+        broker_quantity=30,
+        orderable_quantity=30,
+        average_entry_price=100.0,
+        target_position_quantity=100,
+    )
+
+    changed = engine.run_heartbeat([card])
+
+    assert changed == [card]
+    assert card.broker_quantity == 40  # 30 (attempt 1) + 10 (attempt 2), not overwritten to 10
+    assert card.average_entry_price == pytest.approx((30 * 100.0 + 10 * 110.0) / 40)
+    assert card.entry_remaining_target_quantity == 60
+
+
+def test_protected_fill_does_not_double_count_within_the_same_tick(tmp_path):
+    """MOVE_TO_OPEN_POSITION calls _protect_new_fill a second time in the
+    same tick (once via the fill_protected check, once inside resolution) --
+    the delta-fallback must not apply the same fill twice."""
+    order = _pending_order(status=OrderStatus.FILLED, filled=10, avg_fill_price=100.0)
+    engine = _make_engine(tmp_path, find_order=lambda card: order, reconcile_order=lambda o: o)
+    card = _open_card(board_status=BoardStatus.ENTRY_PENDING, broker_quantity=0, orderable_quantity=0)
+
+    engine.run_heartbeat([card])
+
+    assert card.broker_quantity == 10  # not 20
+
+
+# --- P0-6: only an automatic TTL cancel preserves/retries the remainder ----
+
+
+def test_ttl_cancel_with_partial_fill_preserves_remaining_target(tmp_path):
+    """Contrast with test_cancel_requested_partial_fill_keeps_shares_but_stops_completion
+    (a USER_CANCEL): an automatic TTL-deadline cancellation with a partial
+    fill must keep entry_remaining_target_quantity so the remainder is
+    retried, per the agreed rule ("cancel the remainder and reattempt while
+    the entry remains valid")."""
+    tracker = _StatefulOrderTracker(
+        _pending_order(status=OrderStatus.PARTIALLY_FILLED, filled=4, avg_fill_price=100.0)
+    )
+    engine = _make_engine(tmp_path, find_order=tracker.find, reconcile_order=tracker.reconcile)
+    engine._position_callbacks.cancel_order = tracker.cancel_order
+    card = _open_card(board_status=BoardStatus.ENTRY_PENDING, broker_quantity=0, orderable_quantity=0)
+    card.target_position_quantity = 10
+    # No entry_block_reason set -- this is a plain TTL deadline cancel, not
+    # a user cancel.
+
+    first = engine.run_heartbeat([card])
+    assert first == [card]
+    assert card.board_status == BoardStatus.OPEN_POSITION
+    assert card.broker_quantity == 4
+
+    tracker.resolve(OrderStatus.CANCELLED, filled=4)
+    second = engine.run_heartbeat([card])
+
+    assert second == [card]
+    assert card.board_status == BoardStatus.OPEN_POSITION
+    assert card.broker_quantity == 4
+    assert card.entry_remaining_target_quantity == 6  # preserved, will be retried
+    assert card.position_runtime_status == PositionRuntimeStatus.ENTRY_COMPLETING
+    assert card.entry_cancel_in_flight is False
+
+
+def test_ttl_cancelled_remainder_is_actually_resubmitted_on_a_later_tick(tmp_path):
+    """The preserved remaining target from a TTL cancel is picked back up
+    by _process_entry_completion once no order is working."""
+    submitted = []
+
+    def submit_order(**kw):
+        submitted.append(kw)
+        return BrokerOrder.create(
+            environment=kw["environment"], account_no=kw["account_no"], symbol=kw["symbol"],
+            side=OrderSide.BUY, intent=OrderIntent.ENTRY, quantity_requested=kw["quantity"],
+            limit_price=kw["limit_price"], status=OrderStatus.ACCEPTED,
+        )
+
+    engine = _make_engine(tmp_path, submit_order=submit_order, find_order=lambda card: None)
+    engine._market_data.subscribe(["AAPL"])
+    engine._market_data.poll_once()
+    card = _open_card(
+        board_status=BoardStatus.OPEN_POSITION,
+        broker_quantity=6,
+        orderable_quantity=6,
+        target_position_quantity=10,
+        entry_remaining_target_quantity=4,
+        entry_trigger=100.0,
+    )
+
+    changed = engine.run_heartbeat([card])
+
+    assert changed == [card]
+    assert len(submitted) == 1
+    assert submitted[0]["quantity"] == 4
+    assert card.entry_runtime_status == EntryRuntimeStatus.ORDER_PENDING
+
+
+# --- P0-8: injectable market-session hooks ----------------------------------
+
+
+def test_market_closed_blocks_new_entry_attempts(tmp_path):
+    engine = _make_engine(tmp_path)
+    engine._market_is_open_fn = lambda: False
+    engine._market_data.subscribe(["AAPL"])
+    engine._market_data.poll_once()
+    card = _buy_today_card()
+
+    assert engine.run_heartbeat([card]) == []
     assert card.board_status == BoardStatus.BUY_TODAY
+    assert card.entry_runtime_status == EntryRuntimeStatus.EXECUTE_READY  # untouched
+
+
+def test_market_closed_blocks_entry_completion_retry(tmp_path):
+    engine = _make_engine(tmp_path)
+    engine._market_is_open_fn = lambda: False
+    engine._market_data.subscribe(["AAPL"])
+    engine._market_data.poll_once()
+    card = _open_card(
+        board_status=BoardStatus.OPEN_POSITION,
+        entry_remaining_target_quantity=4,
+        target_position_quantity=10,
+        entry_trigger=100.0,
+    )
+
+    assert engine.run_heartbeat([card]) == []
+
+
+def test_market_closed_defers_an_immediate_sell_all_retry(tmp_path):
+    """A stop-triggered Sell All (not the queued-at-open path) must not
+    fire a regular-hours order while the market happens to be closed."""
+    submitted = []
+    engine = _make_engine(tmp_path)
+    engine._market_is_open_fn = lambda: False
+    engine._position_callbacks = PositionActionCallbacks(
+        cancel_order=lambda cid: None,
+        submit_sell_order=lambda **kw: submitted.append(kw),
+        refresh_orderable_quantity=lambda *a: 260,
+        find_open_sell_order=lambda card: None,
+    )
+    card = _open_card(board_status=BoardStatus.SELL_ALL, broker_quantity=260, orderable_quantity=260)
+
+    changed = engine.run_heartbeat([card])
+    assert submitted == []
+    # broker_quantity/orderable_quantity are still refreshed even though no
+    # order is submitted while the market is closed.
+    assert changed == []
+
+
+# --- P1-2: a rejected/zero-fill partial sell is not a completed exit -------
+
+
+def test_partial_sell_rejected_returns_to_open_position_without_breakeven(tmp_path):
+    rejected_order = _pending_order(status=OrderStatus.REJECTED, filled=0)
+    engine = _make_engine(tmp_path)
+    engine._position_callbacks = PositionActionCallbacks(
+        cancel_order=lambda cid: None,
+        submit_sell_order=lambda **kw: None,
+        refresh_orderable_quantity=lambda *a: 300,  # unchanged -- nothing sold
+        find_open_sell_order=lambda card: rejected_order,
+        reconcile_sell_order=lambda order: order,
+    )
+    card = _open_card(
+        board_status=BoardStatus.PARTIAL_SELL,
+        broker_quantity=300,
+        orderable_quantity=300,
+        stop_type=StopType.ORB_LOW,
+        active_stop_price=95.0,
+    )
+    card.pending_partial_sell_quantity = 100
+    card.reserved_sell_quantity = 100
+
+    changed = engine.run_heartbeat([card])
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.OPEN_POSITION
+    assert card.broker_quantity == 300
+    assert card.pending_partial_sell_quantity == 0
+    assert card.reserved_sell_quantity == 0
+    # The original stop stands -- must NOT have been moved to breakeven.
+    assert card.stop_type == StopType.ORB_LOW
+    assert card.active_stop_price == 95.0
+
+
+# --- P1-3: orderable_quantity stays broker-authoritative --------------------
+
+
+def test_partial_sell_submission_does_not_guess_orderable_quantity(tmp_path):
+    engine = _make_engine(tmp_path)
+    engine._position_callbacks = PositionActionCallbacks(
+        cancel_order=lambda cid: None,
+        submit_sell_order=lambda **kw: None,
+        refresh_orderable_quantity=lambda *a: 300,
+        find_open_sell_order=lambda card: None,
+    )
+    card = _open_card(board_status=BoardStatus.PARTIAL_SELL, broker_quantity=300, orderable_quantity=300)
+    card.pending_partial_sell_quantity = 100
+
+    changed = engine.run_heartbeat([card])
+
+    assert changed == [card]
+    # Broker-authoritative fields are untouched until the order actually
+    # resolves -- only the informational reserved_sell_quantity moves.
+    assert card.orderable_quantity == 300
+    assert card.broker_quantity == 300
+    assert card.reserved_sell_quantity == 100
+
+
+# --- P1-4: exit retry backoff after a rejected submission -------------------
+
+
+def test_sell_all_rejection_backs_off_instead_of_retrying_every_tick(tmp_path):
+    attempts = []
+
+    def submit_sell_order(**kw):
+        attempts.append(kw)
+        return BrokerOrder.create(
+            environment=kw["environment"], account_no=kw["account_no"], symbol=kw["symbol"],
+            side=OrderSide.SELL, intent=OrderIntent.MANUAL_EXIT, quantity_requested=kw["quantity"],
+            limit_price=100.0, status=OrderStatus.REJECTED,
+        )
+
+    engine = _make_engine(tmp_path)
+    engine._position_callbacks = PositionActionCallbacks(
+        cancel_order=lambda cid: None,
+        submit_sell_order=submit_sell_order,
+        refresh_orderable_quantity=lambda *a: 260,
+        find_open_sell_order=lambda card: None,
+    )
+    card = _open_card(board_status=BoardStatus.SELL_ALL, broker_quantity=260, orderable_quantity=260)
+
+    engine.run_heartbeat([card])
+    assert len(attempts) == 1
+    assert card.exit_attempt_count == 1
+    assert card.next_exit_retry_at is not None
+    assert card.last_exit_error
+
+    # A second tick immediately after must not resubmit yet.
+    engine.run_heartbeat([card])
+    assert len(attempts) == 1
+
+    # Once the cooldown has passed, it tries again.
+    card.next_exit_retry_at = card.next_exit_retry_at.replace(year=2000)
+    engine.run_heartbeat([card])
+    assert len(attempts) == 2
+    assert card.exit_attempt_count == 2
+
+
+def test_partial_sell_rejection_backs_off_instead_of_retrying_every_tick(tmp_path):
+    attempts = []
+
+    def submit_sell_order(**kw):
+        attempts.append(kw)
+        return BrokerOrder.create(
+            environment=kw["environment"], account_no=kw["account_no"], symbol=kw["symbol"],
+            side=OrderSide.SELL, intent=OrderIntent.PARTIAL_EXIT, quantity_requested=kw["quantity"],
+            limit_price=100.0, status=OrderStatus.REJECTED,
+        )
+
+    engine = _make_engine(tmp_path)
+    engine._position_callbacks = PositionActionCallbacks(
+        cancel_order=lambda cid: None,
+        submit_sell_order=submit_sell_order,
+        refresh_orderable_quantity=lambda *a: 300,
+        find_open_sell_order=lambda card: None,
+    )
+    card = _open_card(board_status=BoardStatus.PARTIAL_SELL, broker_quantity=300, orderable_quantity=300)
+    card.pending_partial_sell_quantity = 100
+
+    engine.run_heartbeat([card])
+    assert len(attempts) == 1
+    assert card.next_exit_retry_at is not None
+
+    engine.run_heartbeat([card])
+    assert len(attempts) == 1  # still cooling down
+
+
+# --- P1-5: one bad card must not block every other card's tick -------------
+
+
+def test_one_symbols_broker_error_does_not_block_other_symbols_entry(tmp_path):
+    def flaky_find_order(card):
+        if card.symbol == "AAPL":
+            raise RuntimeError("simulated KIS outage for AAPL")
+        return None
+
+    submitted = []
+
+    def submit_order(**kw):
+        submitted.append(kw["symbol"])
+        return BrokerOrder.create(
+            environment=kw["environment"], account_no=kw["account_no"], symbol=kw["symbol"],
+            side=OrderSide.BUY, intent=OrderIntent.ENTRY, quantity_requested=kw["quantity"],
+            limit_price=kw["limit_price"], status=OrderStatus.ACCEPTED,
+        )
+
+    engine = _make_engine(tmp_path, submit_order=submit_order)
+    # AAPL already has an (erroring) open order to reconcile; NVDA is a
+    # fresh Buy Today candidate that should still get processed this tick.
+    engine._entry_deadline_lookup.find_open_entry_order = flaky_find_order
+    engine._market_data.subscribe(["AAPL", "NVDA"])
+    engine._market_data.poll_once()
+
+    aapl = _open_card(symbol="AAPL", board_status=BoardStatus.ENTRY_PENDING, broker_quantity=0)
+    nvda = _buy_today_card(symbol="NVDA")
+
+    changed = engine.run_heartbeat([aapl, nvda])
+
+    assert nvda in changed
+    assert nvda.board_status == BoardStatus.ENTRY_PENDING
+    assert submitted == ["NVDA"]
+
+
+def test_one_symbols_reconciliation_error_does_not_block_stale_quote_flagging(tmp_path):
+    """A hard failure processing one card in a stage must not prevent a
+    later, unrelated stage from processing every card that tick."""
+
+    def flaky_find_open_sell_order(card):
+        raise RuntimeError("simulated broker error")
+
+    engine = _make_engine(tmp_path)
+    engine._position_callbacks = PositionActionCallbacks(
+        cancel_order=lambda cid: None,
+        submit_sell_order=lambda **kw: None,
+        refresh_orderable_quantity=lambda *a: 300,
+        find_open_sell_order=flaky_find_open_sell_order,
+    )
+    partial = _open_card(symbol="AAPL", board_status=BoardStatus.PARTIAL_SELL)
+    partial.pending_partial_sell_quantity = 100
+    other_open = _open_card(symbol="NVDA")  # no live quote polled -> goes stale
+
+    changed = engine.run_heartbeat([partial, other_open])
+
+    assert other_open in changed
+    assert "DATA_STALE" in other_open.warnings
+
+
+# --- P1-6: a quote tick must reach every card holding that symbol ----------
+
+
+def test_evaluate_quote_updates_every_account_holding_the_same_symbol(tmp_path):
+    engine = _make_engine(tmp_path)
+    account_one = _open_card(account_no="1")
+    account_two = _open_card(account_no="2")
+    quote = QuoteSnapshot(symbol="AAPL", last_price=90.0)  # below both stops
+
+    changed = engine.evaluate_quote([account_one, account_two], quote)
+
+    assert account_one in changed
+    assert account_two in changed
+    assert account_one.exit_all_required is True
+    assert account_two.exit_all_required is True
+
+
+def test_evaluate_quote_one_accounts_failure_does_not_block_the_other(tmp_path):
+    engine = _make_engine(tmp_path)
+    broken = _open_card(account_no="1", board_status=BoardStatus.PARTIAL_SELL)
+    healthy = _open_card(account_no="2")
+    engine._position_callbacks.find_open_sell_order = lambda card: (
+        (_ for _ in ()).throw(RuntimeError("simulated failure")) if card.account_no == "1" else None
+    )
+    quote = QuoteSnapshot(symbol="AAPL", last_price=90.0)
+
+    changed = engine.evaluate_quote([broken, healthy], quote)
+
+    assert healthy in changed
+    assert healthy.exit_all_required is True

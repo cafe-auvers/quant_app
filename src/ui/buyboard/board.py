@@ -29,6 +29,7 @@ from . import dialogs
 from .columns import BOARD_COLUMN_ORDER, BOARD_COLUMN_TITLES, BoardColumnList
 from .drag_commands import (
     ActivateForToday,
+    CancelEntry,
     CancelQueuedSellAll,
     MoveToBuylist,
     MoveToWatchlist,
@@ -119,7 +120,8 @@ def _quote_lookup_for(main_window) -> Optional[Callable[[str], Optional[float]]]
     live price available" -- until the engine is actually running; cards
     then show plain position facts instead of a fabricated P&L.
     """
-    runtime = getattr(main_window, "buyboard_runtime", None)
+    worker = getattr(main_window, "_buyboard_runtime_worker", None)
+    runtime = getattr(worker, "runtime", None)
     market_data = getattr(runtime, "market_data", None) if runtime is not None else None
     if market_data is None:
         return None
@@ -257,14 +259,49 @@ def _column_cards_sorted(main_window, board_status: BoardStatus) -> List[TradeCa
     )
 
 
+def _renumber_column_after_swap(
+    main_window, siblings: List[TradeCardState], from_index: int, to_index: int
+) -> None:
+    """Fully renumbers every card in this column after swapping the
+    positions of ``siblings[from_index]``/``siblings[to_index]`` (review
+    finding P1-7).
+
+    The previous version set the moved card's priority to
+    ``neighbor.kanban_priority +/- 1``, which collides the instant two
+    siblings already share a priority -- every card defaults to
+    ``kanban_priority=0``, so that is the common case (e.g. two untouched
+    cards in the same column), not a rare edge case: moving card A up past
+    card B (both still 0) sets A to 1; moving a *different* card C up past
+    B (still 0) later also sets C to 1, silently duplicating A's priority.
+    A full renumbering to clean, strictly-descending values can never
+    produce a duplicate, and self-heals any duplicates already on the
+    board from before this fix.
+    """
+    reordered = list(siblings)
+    reordered[from_index], reordered[to_index] = reordered[to_index], reordered[from_index]
+    base = len(reordered) * 10
+    for position, sibling in enumerate(reordered):
+        target_priority = base - position * 10
+        if sibling.kanban_priority == target_priority:
+            continue
+        command = ReorderCard(
+            environment=sibling.environment,
+            account_no=sibling.account_no,
+            symbol=sibling.symbol,
+            expected_card_version=sibling.version,
+            target_priority=target_priority,
+        )
+        main_window._buyboard_dispatch_command(command)
+
+
 def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
-    """Right-click actions: stop management (review finding P1-9) and
-    Kanban-priority reordering (review finding P1-8). Commands and dialogs
-    for breakeven/manual stops already existed
-    (:mod:`src.ui.buyboard.drag_commands`, :mod:`src.ui.buyboard.dialogs`)
-    but nothing in the board UI ever exposed them; ``kanban_priority`` was
-    carried on every card from Phase 1 on but nothing ever let the user
-    change it.
+    """Right-click actions: cancelling a still-pending entry (review
+    finding P1-8), stop management (review finding P1-9), and
+    Kanban-priority reordering (review finding P1-8/P1-7). Commands for
+    all of these already existed (:mod:`src.ui.buyboard.drag_commands`,
+    :mod:`src.ui.buyboard.controller`) but nothing in the board UI ever
+    exposed a Cancel Entry action, and reordering could silently create
+    duplicate priorities.
     """
     environment = str(payload.get("environment", ""))
     account_no = str(payload.get("account_no", ""))
@@ -278,7 +315,17 @@ def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
         return
 
     menu = QMenu(main_window)
-    breakeven_action = manual_stop_action = None
+    cancel_entry_action = breakeven_action = manual_stop_action = None
+    if card.board_status in (BoardStatus.BUY_TODAY, BoardStatus.ENTRY_PENDING):
+        # Section 989-990 / review finding P1-8: Entry Pending is a
+        # system-only drop target (no drag can reach it, and none can
+        # leave it either), so a right-click action is the only way to
+        # ever cancel a working entry from the board -- without this the
+        # only escape was the legacy Buy Dashboard tab.
+        cancel_entry_action = menu.addAction(
+            "Remove from Today" if card.board_status == BoardStatus.BUY_TODAY else "Cancel Entry"
+        )
+        menu.addSeparator()
     if card.board_status in (BoardStatus.OPEN_POSITION, BoardStatus.PARTIAL_SELL):
         breakeven_action = menu.addAction("Move Stop to Breakeven")
         manual_stop_action = menu.addAction("Set Manual Stop…")
@@ -295,7 +342,12 @@ def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
     if chosen is None:
         return
 
-    if chosen is breakeven_action:
+    if chosen is cancel_entry_action:
+        command = CancelEntry(
+            environment=environment, account_no=account_no, symbol=symbol, expected_card_version=version
+        )
+        main_window._buyboard_dispatch_command(command)
+    elif chosen is breakeven_action:
         if not is_buyboard_engine_enabled():
             QMessageBox.information(
                 main_window, "Buy Board", "The new execution engine is not enabled yet."
@@ -323,22 +375,6 @@ def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
         )
         main_window._buyboard_dispatch_command(command)
     elif chosen is move_up_action and index is not None and index > 0:
-        neighbor = siblings[index - 1]
-        command = ReorderCard(
-            environment=environment,
-            account_no=account_no,
-            symbol=symbol,
-            expected_card_version=version,
-            target_priority=neighbor.kanban_priority + 1,
-        )
-        main_window._buyboard_dispatch_command(command)
+        _renumber_column_after_swap(main_window, siblings, index, index - 1)
     elif chosen is move_down_action and index is not None and index < len(siblings) - 1:
-        neighbor = siblings[index + 1]
-        command = ReorderCard(
-            environment=environment,
-            account_no=account_no,
-            symbol=symbol,
-            expected_card_version=version,
-            target_priority=neighbor.kanban_priority - 1,
-        )
-        main_window._buyboard_dispatch_command(command)
+        _renumber_column_after_swap(main_window, siblings, index, index + 1)
