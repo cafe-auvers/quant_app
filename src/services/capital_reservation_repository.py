@@ -167,6 +167,19 @@ def list_active_reservations(
     return [_row_to_reservation(row) for row in rows]
 
 
+def fetch_reservation(
+    engine: Optional[Engine], reservation_id: str
+) -> Optional[CapitalReservation]:
+    if engine is None:
+        return None
+    table = _ensure_table(engine)
+    with engine.connect() as conn:
+        row = conn.execute(
+            select(table).where(table.c.reservation_id == str(reservation_id or ""))
+        ).first()
+    return _row_to_reservation(row) if row is not None else None
+
+
 def save_reservation(engine: Optional[Engine], reservation: CapitalReservation) -> None:
     """Insert-or-update (upsert) by ``reservation_id``. Best-effort: a
     database write failure is logged, not raised -- the local JSON ledger
@@ -216,6 +229,10 @@ class DuplicateReservationError(RuntimeError):
     across two submission attempts), never in ordinary operation."""
 
 
+class InsufficientAvailableCapitalError(RuntimeError):
+    """The authoritative transaction cannot reserve the requested notional."""
+
+
 # --- shared-transaction primitive (Workstream 3, PR2) -----------------------
 
 
@@ -252,6 +269,35 @@ def insert_reservation(conn: Connection, reservation: CapitalReservation) -> Cap
         )
     )
     return reservation
+
+
+def insert_reservation_if_available(
+    conn: Connection,
+    reservation: CapitalReservation,
+    *,
+    buying_power: float,
+) -> CapitalReservation:
+    """Validate account availability and insert within the caller's transaction."""
+    table = _get_capital_reservations_table(MetaData())
+    if reservation.requested_notional > 0:
+        rows = conn.execute(
+            select(table.c.remaining_reserved_notional)
+            .where(
+                table.c.environment == reservation.environment,
+                table.c.account_no == reservation.account_no,
+                table.c.status.in_(_ACTIVE_STATUS_VALUES),
+            )
+            .with_for_update()
+        ).fetchall()
+        reserved = sum(float(row.remaining_reserved_notional or 0.0) for row in rows)
+        available = float(buying_power or 0.0) - reserved
+        if available < reservation.requested_notional:
+            raise InsufficientAvailableCapitalError(
+                f"Capital reservation denied for {reservation.environment}/"
+                f"{reservation.account_no}/{reservation.symbol}: requested "
+                f"{reservation.requested_notional:.2f}, available {available:.2f}"
+            )
+    return insert_reservation(conn, reservation)
 
 
 def update_reservation(conn: Connection, reservation: CapitalReservation) -> CapitalReservation:

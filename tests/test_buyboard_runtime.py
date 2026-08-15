@@ -12,6 +12,7 @@ from src.core.order_state import (
     OrderSide,
     OrderStatus,
 )
+from src.core.execution_result import UnifiedExecutionStatus
 from src.core.trade_card_state import BoardStatus, TradeCardState
 from src.services import buyboard_runtime as runtime_module
 from src.services import execution_workflow_service as workflow_module
@@ -19,6 +20,15 @@ from src.services.broker import BrokerSubmissionResult
 from src.services.intraday_provider import IntradayProviderName, IntradayResult
 from src.services.realtime_market_data import QuoteSnapshot
 from src.services.trading_engine import TradingEngine
+
+
+@pytest.fixture(autouse=True)
+def _legacy_mode_by_default(monkeypatch):
+    monkeypatch.setattr(
+        runtime_module.execution_config,
+        "is_buyboard_engine_enabled",
+        lambda: False,
+    )
 
 
 def _card(**overrides):
@@ -150,7 +160,7 @@ def test_build_buyboard_runtime_assembles_a_working_engine():
     assert runtime.broker is broker
 
 
-def test_build_buyboard_runtime_refuses_guarded_activation_outright(monkeypatch):
+def test_build_buyboard_runtime_rejects_enabled_plain_broker(monkeypatch):
     """PR2's third review pass, finding 2: DefaultExecutionLeaseProtocol
     can never satisfy the gateway's own epoch-verification gate, and
     AllowAllMutationBudget is a testing placeholder -- constructing a
@@ -163,54 +173,36 @@ def test_build_buyboard_runtime_refuses_guarded_activation_outright(monkeypatch)
 
     monkeypatch.setattr(execution_config, "is_buyboard_engine_enabled", lambda: True)
     cards = {}
-    with pytest.raises(RuntimeError, match="epoch-verifying"):
+    with pytest.raises(RuntimeError, match="plain broker overrides"):
         runtime_module.build_buyboard_runtime(
             buying_power_provider=lambda env, acct: 100_000.0,
             card_lookup=lambda env, acct, sym: cards.get((env, acct, sym)),
         )
 
 
-def test_submit_callback_reaches_the_guarded_gateway_not_wrongmode(tmp_path, trading_enabled):
-    """Finding 1 (third pass): before this fix, the real submit callback
-    called submit_guarded_overseas_order directly, which calls the
-    gateway's Broker-protocol submit_order -- a method the gateway now
-    correctly rejects in GUARDED_ENGINE mode (WrongGatewayModeError).
-    Proves entry_attempt_manager's real submit path now routes through
-    execution_workflow_service.request_submit, which dispatches to
-    submit_guarded instead, using a real GUARDED_ENGINE gateway
-    (constructed via an explicit broker= override, bypassing
-    build_buyboard_runtime's own composition-root refusal -- a separate,
-    correct guard covered by finding 2's own test), and reaches
-    progressively deeper into the real B2 gate sequence as each field is
-    correctly threaded through: ownership (ExecutionOwnershipMismatchError
-    if strategy_instance_id is wrong/missing -- see the H1 tests) is
-    satisfied here, and the call then correctly reaches the lease gate.
-
-    It stops there, honestly, rather than forcing a full success:
-    build_buyboard_runtime has no source of a real, epoch-verified
-    ExecutionLease today (it only has the legacy LeaseHandle/
-    execution_authority triple, a distinct, LEGACY_COMPATIBILITY-only
-    concept) -- LeaseNotVerifiedError here is the *correct*, current
-    behavior, not a bug, and further wiring a real guarded-mode lease
-    through this module is out of this pass's scope (logged in the doc's
-    change log, not silently assumed done).
-    """
+def test_submit_callback_reaches_the_guarded_gateway_not_wrongmode(
+    tmp_path, trading_enabled, monkeypatch
+):
+    """The enabled runtime reaches submit_guarded with durable identity."""
     from sqlalchemy import create_engine
     from sqlalchemy.pool import NullPool
 
+    from src.core.execution_mode import ExecutionLease
     from src.core.execution_ownership import ExecutionOwner, ExecutionOwnership
-    from src.services.execution_command_gateway import ExecutionCommandGateway, LeaseNotVerifiedError
-    from src.services.execution_lease_protocol import DefaultExecutionLeaseProtocol
+    from src.services.execution_command_gateway import ExecutionCommandGateway
+    from src.services.execution_lease_protocol import FakeExecutionLeaseProtocol
     from src.services.execution_ownership_repository import assign_ownership
     from src.services.mutation_budget_protocol import AllowAllMutationBudget
     from fakes.fake_execution_broker import FakeExecutionBroker
 
     engine = create_engine(f"sqlite:///{tmp_path / 'guarded.db'}", future=True, poolclass=NullPool)
     fake_broker = FakeExecutionBroker()
+    lease = ExecutionLease(device_id="dev-1", lease_token="tok-1", lease_epoch=1)
     guarded_gateway = ExecutionCommandGateway(
         real_broker=fake_broker, engine=engine, mode_override=True,
-        lease_protocol=DefaultExecutionLeaseProtocol(engine=engine),
+        lease_protocol=FakeExecutionLeaseProtocol(current=lease),
         mutation_budget=AllowAllMutationBudget(),
+        buying_power_provider=lambda environment, account_no: 100_000.0,
     )
     assign_ownership(
         engine,
@@ -220,22 +212,32 @@ def test_submit_callback_reaches_the_guarded_gateway_not_wrongmode(tmp_path, tra
         ),
     )
 
+    card = _card()
+    persisted = []
+    monkeypatch.setattr(
+        runtime_module.execution_config,
+        "is_buyboard_engine_enabled",
+        lambda: True,
+    )
     runtime = runtime_module.build_buyboard_runtime(
         buying_power_provider=lambda env, acct: 100_000.0,
-        card_lookup=lambda env, acct, sym: None,
+        card_lookup=lambda env, acct, sym: card,
         broker=guarded_gateway,
         strategy_instance_id="orb",
+        execution_lease=lease,
+        persist_card_before_execution=lambda current: persisted.append(current.to_dict()),
     )
 
     fake_broker.queue_acceptance(broker_order_id="B-GUARDED-1")
-    with pytest.raises(LeaseNotVerifiedError):
-        runtime.entry_attempt_manager._submit_order(
-            environment="PROD", account_no="1", symbol="AAPL", side=OrderSide.BUY,
-            intent=OrderIntent.ENTRY, quantity=10, limit_price=100.0, exchange="NASD",
-            attempt_group_id="g1", attempt_number=1, attempt_deadline_at=None,
-            capital_reservation_id="",
-        )
-    assert fake_broker.submit_calls == []  # correctly never reached the broker without a real lease
+    result = runtime.entry_attempt_manager._submit_order(
+        environment="PROD", account_no="1", symbol="AAPL", side=OrderSide.BUY,
+        intent=OrderIntent.ENTRY, quantity=10, limit_price=100.0, exchange="NASD",
+        attempt_group_id="g1", attempt_number=1, attempt_deadline_at=None,
+        capital_reservation_id="",
+    )
+    assert result.status == UnifiedExecutionStatus.ACKNOWLEDGED
+    assert persisted and persisted[0]["entry_client_order_id"]
+    assert len(fake_broker.submit_calls) == 1
 
 
 def test_submit_order_wrapper_supplies_a_fresh_risk_decision(monkeypatch):
@@ -266,7 +268,7 @@ def test_submit_order_wrapper_supplies_a_fresh_risk_decision(monkeypatch):
         capital_reservation_id="",
     )
 
-    assert order.status == OrderStatus.ACCEPTED
+    assert order.status == UnifiedExecutionStatus.ACKNOWLEDGED
     assert captured["pre_trade_risk_decision"] is not None
     assert captured["pre_trade_risk_decision"].approved is True
     assert captured["strategy_id"] == runtime_module.RISK_STRATEGY_ID
@@ -519,7 +521,7 @@ def test_submit_sell_order_maps_partial_sell_reason_and_prices_from_live_bid(mon
         environment="PROD", account_no="1", symbol="AAPL", quantity=50, reason="partial_sell",
     )
 
-    assert order.status == OrderStatus.ACCEPTED
+    assert order.status == UnifiedExecutionStatus.ACKNOWLEDGED
     assert captured["side"] == OrderSide.SELL
     assert captured["intent"] == OrderIntent.PARTIAL_EXIT
     assert captured["limit_price"] == pytest.approx(99.5)  # uses the live bid

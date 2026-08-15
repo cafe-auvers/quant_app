@@ -15,16 +15,14 @@ module only threads whatever identity it's given (or mints a fresh one
 when none is given, which is correct for a **new** decision, never a
 replay of an old one).
 
-``LEGACY_COMPATIBILITY`` mode (today, always) is unchanged from the first
+``LEGACY_COMPATIBILITY`` mode is unchanged at the broker boundary from the first
 version of this PR: ``request_submit``/``request_cancel`` still call
 :func:`~src.services.order_execution_service.submit_guarded_overseas_order`/
 :func:`~src.services.order_reconciliation.cancel_and_reconcile_order`
 exactly as before, with the gateway bound as their ``broker=``. Return
-shape genuinely differs by mode -- a ``BrokerOrder`` in
-``LEGACY_COMPATIBILITY``, an ``ExecutionOrderRecord`` in
-``GUARDED_ENGINE`` -- since those are the two modes' actual persisted
-representations; unifying that is Workstream 13 (UI projection) territory,
-not this PR's.
+shape is normalized in both modes to ``ExecutionSubmissionResult`` so
+entry/exit orchestration never needs to guess which persistence model it
+received.
 """
 from __future__ import annotations
 
@@ -39,7 +37,13 @@ from src.brokers.execution_broker_protocol import (
 )
 from src.core.execution_mode import ExecutionMode, ExecutionSource
 from src.core.execution_order_record import ExecutionOrderRecord
-from src.core.execution_request import CancelExecutionRequest, ReplaceExecutionRequest, SubmitExecutionRequest
+from src.core.execution_request import (
+    CancelExecutionRequest,
+    CancelIntent,
+    ReplaceExecutionRequest,
+    SubmitExecutionRequest,
+)
+from src.core.execution_result import ExecutionSubmissionResult
 from src.core.order_state import (
     REGULAR_LIMIT_EXECUTION,
     BrokerOrder,
@@ -119,9 +123,10 @@ def request_submit(
     lease: Optional[ExecutionLease] = None,
     attempt_group_id: str = "",
     attempt_number: int = 1,
+    attempt_deadline_at: Optional[str] = None,
     strategy_instance_id: str = "",
     **legacy_kwargs: Any,
-) -> Any:
+) -> ExecutionSubmissionResult:
     """The single shared submission entry point (INV-21).
 
     ``client_order_id``, in ``GUARDED_ENGINE`` mode: pass the *same*
@@ -146,15 +151,20 @@ def request_submit(
             client_order_id=stable_id, environment=environment, account_no=account_no, symbol=symbol,
             side=side, intent=intent, quantity=quantity, limit_price=limit_price, exchange=exchange,
             execution_policy=execution_policy, attempt_group_id=attempt_group_id,
-            attempt_number=attempt_number, lease=lease, source=source,
+            attempt_number=attempt_number, attempt_deadline_at=attempt_deadline_at,
+            lease=lease, source=source,
             strategy_instance_id=strategy_instance_id,
         )
-        return resolved_gateway.submit_guarded(request)
-    return submit_guarded_overseas_order(
+        return ExecutionSubmissionResult.from_execution_order(
+            resolved_gateway.submit_guarded(request)
+        )
+    order = submit_guarded_overseas_order(
         environment=environment, account_no=account_no, symbol=symbol, side=side, intent=intent,
         quantity=quantity, limit_price=limit_price, exchange=exchange, execution_policy=execution_policy,
-        path=path, broker=_SourceBoundGatewayBroker(resolved_gateway, source), **legacy_kwargs,
+        path=path, broker=_SourceBoundGatewayBroker(resolved_gateway, source),
+        attempt_deadline_at=attempt_deadline_at, **legacy_kwargs,
     )
+    return ExecutionSubmissionResult.from_broker_order(order)
 
 
 def request_cancel(
@@ -195,6 +205,26 @@ def request_cancel(
         return resolved_gateway.cancel_guarded(request)
     return cancel_and_reconcile_order(
         client_order_id, path=path, broker=_SourceBoundGatewayBroker(resolved_gateway, source)
+    )
+
+
+def request_cancel_intent(
+    intent: CancelIntent,
+    *,
+    gateway: Optional[ExecutionCommandGateway] = None,
+    path: Path = ORDERS_FILE,
+) -> Any:
+    """Route a complete cancellation intent through the shared workflow."""
+    return request_cancel(
+        source=intent.source,
+        client_order_id=intent.client_order_id,
+        gateway=gateway,
+        path=path,
+        cancel_command_id=intent.cancel_command_id,
+        lease=intent.lease,
+        environment=intent.environment,
+        account_no=intent.account_no,
+        strategy_instance_id=intent.strategy_instance_id,
     )
 
 

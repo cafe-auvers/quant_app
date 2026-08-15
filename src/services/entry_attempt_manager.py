@@ -40,14 +40,28 @@ from uuid import uuid4
 from sqlalchemy.engine import Engine
 
 from src.core import execution_config
+from src.core.execution_result import ExecutionSubmissionResult, UnifiedExecutionStatus
 from src.core.order_state import BrokerOrder, OrderIntent, OrderSide, OrderStatus
 from src.services import capital_allocator
+from src.services.capital_reservation_repository import InsufficientAvailableCapitalError
+from src.services.execution_command_gateway import (
+    AmbiguousPostBrokerPersistenceError,
+    GuardedSubmissionAmbiguousError,
+)
+from src.services.execution_command_repository import DuplicateCommandError
 from src.services.order_execution_service import (
     DuplicateOpenOrderError,
     submit_guarded_overseas_order,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _default_submit_order(**kwargs) -> ExecutionSubmissionResult:
+    kwargs.pop("client_order_id", None)
+    return ExecutionSubmissionResult.from_broker_order(
+        submit_guarded_overseas_order(**kwargs)
+    )
 
 
 class EntryCancelReason(str, Enum):
@@ -87,6 +101,9 @@ class EntryTrigger:
     limit_price: float
     notional: float
     exchange: str = "NASD"
+    attempt_group_id: str = ""
+    attempt_number: int = 0
+    client_order_id: str = ""
 
 
 class AttemptOutcome(str, Enum):
@@ -97,13 +114,14 @@ class AttemptOutcome(str, Enum):
     COOLDOWN = "COOLDOWN"
     RATE_LIMITED = "RATE_LIMITED"
     REJECTED = "REJECTED"
+    UNRESOLVED = "UNRESOLVED"
 
 
 @dataclass
 class AttemptResult:
     trigger: EntryTrigger
     outcome: AttemptOutcome
-    order: Optional[BrokerOrder] = None
+    submission: Optional[ExecutionSubmissionResult] = None
     reservation_id: str = ""
     attempt_group_id: str = ""
     attempt_count: int = 0
@@ -192,10 +210,11 @@ class EntryAttemptManager:
         self,
         *,
         buying_power_provider: Callable[[str, str], float],
-        submit_order: Callable[..., BrokerOrder] = submit_guarded_overseas_order,
+        submit_order: Callable[..., ExecutionSubmissionResult] = _default_submit_order,
         clock: Callable[[], datetime] = _utc_now,
         reservations_path: Optional[Path] = None,
         capital_reservation_engine: Optional[Engine] = None,
+        gateway_owns_capital_reservation: bool = False,
     ) -> None:
         self._buying_power_provider = buying_power_provider
         self._submit_order = submit_order
@@ -214,6 +233,7 @@ class EntryAttemptManager:
         # ``None`` (the default, and every existing test) preserves the
         # original local-JSON-only behavior exactly.
         self._capital_reservation_engine = capital_reservation_engine
+        self._gateway_owns_capital_reservation = bool(gateway_owns_capital_reservation)
         self._symbol_locks: Dict[Tuple[str, str, str], threading.Lock] = {}
         self._locks_guard = threading.Lock()
         self._state: Dict[Tuple[str, str, str], _SymbolAttemptState] = {}
@@ -316,24 +336,28 @@ class EntryAttemptManager:
                 detail="Max entry attempts per symbol per minute reached",
             )
 
+        if trigger.attempt_group_id:
+            state.attempt_group_id = trigger.attempt_group_id
         if not state.attempt_group_id:
             state.attempt_group_id = uuid4().hex
         attempt_group_id = state.attempt_group_id
-        attempt_number = state.attempt_count + 1
+        attempt_number = trigger.attempt_number or (state.attempt_count + 1)
 
+        reservation = None
         try:
-            reservation = capital_allocator.reserve_capital_for_entry(
-                environment=trigger.environment,
-                account_no=trigger.account_no,
-                symbol=trigger.symbol,
-                attempt_group_id=attempt_group_id,
-                requested_notional=trigger.notional,
-                buying_power_provider=lambda: self._buying_power_provider(
-                    trigger.environment, trigger.account_no
-                ),
-                path=self._reservations_path,
-                engine=self._capital_reservation_engine,
-            )
+            if not self._gateway_owns_capital_reservation:
+                reservation = capital_allocator.reserve_capital_for_entry(
+                    environment=trigger.environment,
+                    account_no=trigger.account_no,
+                    symbol=trigger.symbol,
+                    attempt_group_id=attempt_group_id,
+                    requested_notional=trigger.notional,
+                    buying_power_provider=lambda: self._buying_power_provider(
+                        trigger.environment, trigger.account_no
+                    ),
+                    path=self._reservations_path,
+                    engine=self._capital_reservation_engine,
+                )
         except Exception as exc:  # noqa: BLE001 - surfaced via AttemptResult
             # Review finding P1-1: a central-reservation-database failure
             # must block this attempt (fail closed), not be swallowed into
@@ -353,7 +377,7 @@ class EntryAttemptManager:
                 retry_at=state.cooldown_until,
                 detail=f"Capital reservation check failed: {exc}",
             )
-        if reservation is None:
+        if reservation is None and not self._gateway_owns_capital_reservation:
             return AttemptResult(
                 trigger,
                 AttemptOutcome.WAITING_FOR_CAPITAL,
@@ -364,7 +388,7 @@ class EntryAttemptManager:
 
         deadline = now + timedelta(seconds=execution_config.ENTRY_ATTEMPT_TTL_SECONDS)
         try:
-            order = self._submit_order(
+            submission = self._submit_order(
                 environment=trigger.environment,
                 account_no=trigger.account_no,
                 symbol=trigger.symbol,
@@ -376,35 +400,60 @@ class EntryAttemptManager:
                 attempt_group_id=attempt_group_id,
                 attempt_number=attempt_number,
                 attempt_deadline_at=deadline.isoformat(),
-                capital_reservation_id=reservation.reservation_id,
+                capital_reservation_id=(reservation.reservation_id if reservation else ""),
+                client_order_id=trigger.client_order_id or None,
                 **submit_kwargs,
             )
-        except DuplicateOpenOrderError as exc:
-            capital_allocator.release_reservation(
-                reservation.reservation_id,
-                path=self._reservations_path,
-                engine=self._capital_reservation_engine,
+        except InsufficientAvailableCapitalError as exc:
+            return AttemptResult(
+                trigger,
+                AttemptOutcome.WAITING_FOR_CAPITAL,
+                attempt_group_id=attempt_group_id,
+                attempt_count=state.attempt_count,
+                detail=str(exc),
             )
+        except (
+            GuardedSubmissionAmbiguousError,
+            AmbiguousPostBrokerPersistenceError,
+            DuplicateCommandError,
+        ) as exc:
+            state.attempt_count = max(state.attempt_count, attempt_number)
+            state.attempt_timestamps.append(now)
+            return AttemptResult(
+                trigger,
+                AttemptOutcome.UNRESOLVED,
+                attempt_group_id=attempt_group_id,
+                attempt_count=state.attempt_count,
+                detail=str(exc),
+            )
+        except DuplicateOpenOrderError as exc:
+            if reservation is not None:
+                capital_allocator.release_reservation(
+                    reservation.reservation_id,
+                    path=self._reservations_path,
+                    engine=self._capital_reservation_engine,
+                )
             return AttemptResult(
                 trigger,
                 AttemptOutcome.DUPLICATE_ORDER,
-                reservation_id=reservation.reservation_id,
+                reservation_id=reservation.reservation_id if reservation else "",
                 attempt_group_id=attempt_group_id,
                 attempt_count=state.attempt_count,
                 detail=str(exc),
             )
         except Exception as exc:  # noqa: BLE001 - surfaced via AttemptResult
-            capital_allocator.release_reservation(
-                reservation.reservation_id,
-                path=self._reservations_path,
-                engine=self._capital_reservation_engine,
-            )
+            if reservation is not None:
+                capital_allocator.release_reservation(
+                    reservation.reservation_id,
+                    path=self._reservations_path,
+                    engine=self._capital_reservation_engine,
+                )
             state.cooldown_until = now + timedelta(seconds=execution_config.ENTRY_RETRY_COOLDOWN_SECONDS)
             logger.exception("Entry submission raised for %s", trigger.symbol)
             return AttemptResult(
                 trigger,
                 AttemptOutcome.REJECTED,
-                reservation_id=reservation.reservation_id,
+                reservation_id=reservation.reservation_id if reservation else "",
                 attempt_group_id=attempt_group_id,
                 attempt_count=state.attempt_count,
                 retry_at=state.cooldown_until,
@@ -414,29 +463,33 @@ class EntryAttemptManager:
         state.attempt_count = attempt_number
         state.attempt_timestamps.append(now)
 
-        if order.status == OrderStatus.REJECTED:
-            capital_allocator.release_reservation(
-                reservation.reservation_id,
-                path=self._reservations_path,
-                engine=self._capital_reservation_engine,
-            )
+        reservation_id = submission.capital_reservation_id or (
+            reservation.reservation_id if reservation else ""
+        )
+        if submission.status == UnifiedExecutionStatus.REJECTED:
+            if reservation is not None:
+                capital_allocator.release_reservation(
+                    reservation.reservation_id,
+                    path=self._reservations_path,
+                    engine=self._capital_reservation_engine,
+                )
             state.cooldown_until = now + timedelta(seconds=execution_config.ENTRY_RETRY_COOLDOWN_SECONDS)
             return AttemptResult(
                 trigger,
                 AttemptOutcome.REJECTED,
-                order=order,
-                reservation_id=reservation.reservation_id,
+                submission=submission,
+                reservation_id=reservation_id,
                 attempt_group_id=attempt_group_id,
                 attempt_count=state.attempt_count,
                 retry_at=state.cooldown_until,
-                detail=order.error_message,
+                detail=submission.error_message,
             )
 
         return AttemptResult(
             trigger,
             AttemptOutcome.SUBMITTED,
-            order=order,
-            reservation_id=reservation.reservation_id,
+            submission=submission,
+            reservation_id=reservation_id,
             attempt_group_id=attempt_group_id,
             attempt_count=state.attempt_count,
         )

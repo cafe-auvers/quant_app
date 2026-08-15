@@ -79,6 +79,7 @@ def _guarded_gateway(tmp_path, *, lease_protocol=None, mutation_budget=None):
         real_broker=broker, engine=engine, mode_override=True,
         lease_protocol=lease_protocol or protocol,
         mutation_budget=mutation_budget or AllowAllMutationBudget(),
+        buying_power_provider=lambda environment, account_no: 100_000.0,
     )
     return gateway, broker, engine
 
@@ -189,7 +190,12 @@ def test_build_guarded_execution_gateway_requires_every_dependency(tmp_path):
     with pytest.raises(TypeError):
         build_guarded_execution_gateway()  # missing everything
     with pytest.raises(gw_module.GuardedEngineRequiresDatabaseError):
-        build_guarded_execution_gateway(engine=None, lease_protocol=protocol, mutation_budget=AllowAllMutationBudget())
+        build_guarded_execution_gateway(
+            engine=None,
+            lease_protocol=protocol,
+            mutation_budget=AllowAllMutationBudget(),
+            buying_power_provider=lambda environment, account_no: 100_000.0,
+        )
 
 
 # --- A1/A2: atomic pre-submission transaction ----------------------------
@@ -261,6 +267,7 @@ def test_replaying_the_same_stable_client_order_id_on_a_fresh_gateway_makes_zero
     first_gateway = ExecutionCommandGateway(
         real_broker=first_broker, engine=engine, mode_override=True,
         lease_protocol=protocol, mutation_budget=AllowAllMutationBudget(),
+        buying_power_provider=lambda environment, account_no: 100_000.0,
     )
     request = _submit_request(client_order_id="STABLE-ID-1", lease=lease)
     with pytest.raises(GuardedSubmissionAmbiguousError):
@@ -274,6 +281,7 @@ def test_replaying_the_same_stable_client_order_id_on_a_fresh_gateway_makes_zero
     second_gateway = ExecutionCommandGateway(
         real_broker=second_broker, engine=engine, mode_override=True,
         lease_protocol=protocol, mutation_budget=AllowAllMutationBudget(),
+        buying_power_provider=lambda environment, account_no: 100_000.0,
     )
     with pytest.raises(DuplicateCommandError):
         second_gateway.submit_guarded(request)

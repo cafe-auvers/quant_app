@@ -133,7 +133,7 @@ PR's behavior composes correctly, plus the Gate 1 run in full.
 | 0 | KIS protocol capability verification | NOT STARTED — capability-specific adapters remain gated; skeleton complete |
 | 1 | Freeze requirements and invariants (this document) | DONE — revision 3.1 signed off |
 | 2 | Durable order ownership and command ledger | PR1 IMPLEMENTED, not activated — merged to `master` (`5b50e1d`): schemas, all three state machines, durable repositories, command ledger. Excludes A4a's KIS-specific correlation-key adapter (stays gated on Workstream 0). |
-| 3 | One guarded execution gateway | PR2 IMPLEMENTED, not activated — `ExecutionCommandGateway` (`src/services/execution_command_gateway.py`): dual-mode, with genuinely separate call shapes per mode (`submit_order`/`cancel_order` for `LEGACY_COMPATIBILITY`; `submit_guarded`/`cancel_guarded`/`replace_guarded` taking explicit request models with caller-generated stable command identities for `GUARDED_ENGINE`). Full A1-A11/B1-B4 sequence, a real lease-epoch gate, H1 ownership enforcement, a mutation-budget seam for Workstream 10, and an explicit `build_guarded_execution_gateway` composition root that fails at startup rather than first submission — tested against a deterministic fake broker and through the real `ExecutionWorkflowService` entry points, not only direct gateway calls. |
+| 3 | One guarded execution gateway | PR2 IMPLEMENTED, not activated — `ExecutionCommandGateway` (`src/services/execution_command_gateway.py`): dual-mode, with genuinely separate call shapes per mode (`submit_order`/`cancel_order` for `LEGACY_COMPATIBILITY`; `submit_guarded`/`cancel_guarded`/`replace_guarded` taking explicit request models with caller-generated stable command identities for `GUARDED_ENGINE`). Full A1-A11/B1-B4 sequence, one authoritative atomic capital reservation with an in-transaction availability check, a real lease-epoch gate, H1 ownership enforcement, a mutation-budget seam for Workstream 10, and fail-closed guarded runtime composition. Runtime-level tests cover restart-restored caller identity, normalized results, full-context tracked cancellation, Partial Sell/Sell All, one-reservation entry, and unresolved post-broker persistence without retry. |
 | 4 | Account-level reconciliation engine | NOT STARTED |
 | 5 | Production KIS real-time market data | NOT STARTED |
 | 6 | Runtime readiness and device handoff | NOT STARTED |
@@ -1416,10 +1416,8 @@ and stays `false` in unattended/automatic form until Gate 5 passes.
 - 2026-08-16 (PR2, third pass): A third review found the second pass's own
   fixes had left the *real* Kanban runtime composition broken -- correct
   in isolation, not actually wired together. Seven findings, six resolved
-  in this pass; two (double capital reservation, restart-persisted
-  card-level command identity) require deeper integration with the
-  pre-existing `EntryAttemptManager`/`PositionManager`/`TradeCardState`
-  infrastructure and are explicitly logged as open, not silently deferred.
+  in that pass; the two deeper integration findings recorded below were
+  subsequently closed by the fourth pass in this same PR2 branch.
 
   **Finding 1 (buyboard_runtime called the wrong API) -- fixed.**
   `build_buyboard_runtime`'s `submit_order`/`submit_sell_order`/
@@ -1451,12 +1449,11 @@ and stays `false` in unattended/automatic form until Gate 5 passes.
   in `submit_sell_order` (the SELL adapter, review finding P0-3) needed
   the identical fix.
 
-  Still open, explicitly: `PositionActionCallbacks.cancel_order`'s
-  existing interface only supplies `client_order_id` to `_cancel_order`,
-  with no `environment`/`account_no` -- so `_cancel_order` cannot itself
-  drive a `GUARDED_ENGINE` cancel yet (finding 9's account/environment-
-  match gate would see blank values and reject). Widening that callback
-  interface is deferred alongside findings 4/5 below.
+  Historical note, resolved in the fourth pass below:
+  `PositionActionCallbacks.cancel_order` originally supplied only
+  `client_order_id`; it now carries a durable `CancelIntent` containing
+  environment, account, cancel command ID, lease, source, and strategy
+  identity.
 
   **Finding 2 (guarded composition root uses a lease verifier that can
   never pass) -- fixed.** `build_buyboard_runtime` now refuses
@@ -1504,8 +1501,8 @@ and stays `false` in unattended/automatic form until Gate 5 passes.
   anticipated a lighter floor here; a full fencing-token design remains a
   further enhancement, not built in this pass).
 
-  **Findings 4 and 5 -- explicitly not resolved in this pass, logged
-  rather than silently deferred.** Both require modifying pre-existing,
+  **Findings 4 and 5 -- not resolved in the third pass, then closed by the
+  fourth pass below.** Both required modifying pre-existing,
   already-tested legacy modules (`entry_attempt_manager.py`,
   `position_manager.py`, `TradeCardState`) outside every file this PR has
   otherwise touched, with real regression risk to code that has nothing
@@ -1535,17 +1532,57 @@ and stays `false` in unattended/automatic form until Gate 5 passes.
     surfaced concretely while fixing finding 1, once `submit_order`'s
     real callback could reach the gateway at all.
 
-  Both are made practically inert by finding 2's fix: `build_buyboard_runtime`
-  now refuses `GUARDED_ENGINE` construction unconditionally, so neither
-  double-reservation nor the restart-identity gap is reachable through the
-  real composition root today, regardless of the flag. Resolving them
-  properly -- a single authoritative reservation model, a real
-  `client_order_id` persisted in durable entry-attempt/card state, and a
-  `GUARDED_ENGINE`-aware projection of the gateway's result back into
-  `EntryAttemptManager`'s own expectations -- needs its own deliberately
-  scoped pass against those legacy modules specifically, not a rushed
-  patch layered under this PR's existing scope.
+  That was the third-pass state only; the fourth pass below supersedes the
+  temporary unconditional refusal and closes both integration gaps.
 
   Full test suite: 1552 passed (was 1541). `python -m compileall`: clean.
   No visible GitHub CI yet for this pass -- still local results only,
   per the review's own note; a PR/CI run remains to be opened.
+
+- 2026-08-16 (PR2, fourth hardening pass): Closed every remaining
+  third-pass integration finding through the actual Buy Board runtime
+  callback graph.
+
+  **Durable logical execution identity.** `TradeCardState` now persists
+  entry/exit client-order IDs, attempt-group and pending-attempt numbers,
+  stable cancel-command IDs, and unresolved-submission flags. The runtime
+  derives `client_order_id` deterministically from durable attempt state,
+  commits it with optimistic concurrency before the gateway call, reloads
+  it after restart, and never mints another ID while that command is
+  unresolved.
+
+  **One capital owner.** `EntryAttemptManager` no longer creates a separate
+  reservation in guarded mode. The gateway alone locks current active
+  reservations, validates live available buying power, and inserts exactly
+  one reservation beside the command and PREPARED order in the same A1
+  transaction. Insufficient capital rolls the transaction back before any
+  broker call.
+
+  **Common result projection.** Both compatibility and guarded submission
+  paths return `ExecutionSubmissionResult` with `UnifiedExecutionStatus`,
+  broker/client identities, quantities, reservation identity, and
+  ambiguity. `EntryAttemptManager` and `TradingEngine` consume this single
+  contract rather than branching on `BrokerOrder` versus
+  `ExecutionOrderRecord`.
+
+  **Full cancellation context.** Tracked entry/exit cancellation now uses
+  a durable `CancelIntent` containing client and cancel command IDs,
+  environment, account, epoch-bearing lease, source, and strategy instance.
+  The intent is persisted before `request_cancel_intent` reaches
+  `cancel_guarded`.
+
+  **No mode downgrade.** When `BUYBOARD_ENGINE_ENABLED=true`,
+  `build_buyboard_runtime` accepts only a validated
+  `ExecutionCommandGateway(mode=GUARDED_ENGINE)` plus an epoch-bearing
+  lease, mutation budget, buying-power provider, strategy identity, and
+  durable card-persistence callback. A plain broker or legacy gateway is
+  rejected at composition time. With the flag false, compatibility
+  composition remains available.
+
+  **Real composition scenarios.** Tests now drive the assembled runtime and
+  prove one entry creates one reservation, insufficient capital makes no
+  broker call, caller identity survives a repository reload, tracked cancel
+  reaches `cancel_guarded`, Partial Sell and Sell All reach
+  `submit_guarded`, blank/mismatched strategy identity is rejected, a plain
+  broker cannot downgrade enabled mode, and a post-broker persistence
+  ambiguity remains unresolved without automatic retry.

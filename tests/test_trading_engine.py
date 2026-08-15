@@ -7,6 +7,7 @@ import pytest
 
 from src.core import execution_config
 from src.core.order_state import BrokerOrder, OrderIntent, OrderSide, OrderStatus
+from src.core.execution_result import ExecutionSubmissionResult
 from src.core.trade_card_state import (
     BoardStatus,
     EntryRuntimeStatus,
@@ -61,13 +62,21 @@ def _buy_today_card(**overrides):
 
 
 def _make_engine(tmp_path, *, submit_order=None, buying_power=100_000.0, find_order=None, reconcile_order=None):
+    raw_submit = submit_order or (lambda **kw: BrokerOrder.create(
+        environment=kw["environment"], account_no=kw["account_no"], symbol=kw["symbol"],
+        side=OrderSide.BUY, intent=OrderIntent.ENTRY, quantity_requested=kw["quantity"],
+        limit_price=kw["limit_price"], status=OrderStatus.ACCEPTED,
+    ))
+
+    def normalized_submit(**kwargs):
+        result = raw_submit(**kwargs)
+        if isinstance(result, BrokerOrder):
+            return ExecutionSubmissionResult.from_broker_order(result)
+        return result
+
     manager = EntryAttemptManager(
         buying_power_provider=lambda e, a: buying_power,
-        submit_order=submit_order or (lambda **kw: BrokerOrder.create(
-            environment=kw["environment"], account_no=kw["account_no"], symbol=kw["symbol"],
-            side=OrderSide.BUY, intent=OrderIntent.ENTRY, quantity_requested=kw["quantity"],
-            limit_price=kw["limit_price"], status=OrderStatus.ACCEPTED,
-        )),
+        submit_order=normalized_submit,
         # Isolated per-test reservations ledger -- never the real
         # production data/capital_reservations.json (see the identical
         # concern documented in test_entry_attempt_manager.py).

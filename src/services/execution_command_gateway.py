@@ -80,7 +80,8 @@ from src.core.order_state import (
 from src.services import trading_state
 from src.services.capital_reservation_repository import (
     ensure_capital_reservations_table,
-    insert_reservation,
+    fetch_reservation,
+    insert_reservation_if_available,
     update_reservation,
 )
 from src.services.execution_command_repository import (
@@ -213,6 +214,10 @@ class GuardedEngineRequiresMutationBudgetError(GuardedExecutionError):
     module's own docstring."""
 
 
+class GuardedEngineRequiresBuyingPowerProviderError(GuardedExecutionError):
+    """GUARDED_ENGINE cannot validate entry capital without live buying power."""
+
+
 class LeaseNotVerifiedError(GuardedExecutionError):
     """``GUARDED_ENGINE`` mode requires a lease that is both present and
     whose epoch the configured
@@ -327,6 +332,7 @@ class ExecutionCommandGateway:
         engine: Optional[Engine] = None,
         lease_protocol: Optional[ExecutionLeaseProtocol] = None,
         mutation_budget: Optional[MutationBudgetProtocol] = None,
+        buying_power_provider: Optional[Callable[[str, str], float]] = None,
         mode_override: Optional[bool] = None,
         ownership_registry: Optional[_OwnershipRegistry] = None,
     ) -> None:
@@ -336,12 +342,28 @@ class ExecutionCommandGateway:
             engine=engine
         )
         self._mutation_budget = mutation_budget
+        self._buying_power_provider = buying_power_provider
         self._mode_override = mode_override
         self._ownership = ownership_registry or _OwnershipRegistry()
 
     @property
     def mode(self) -> ExecutionMode:
         return resolve_execution_mode(self._mode_override)
+
+    @property
+    def database_engine(self) -> Optional[Engine]:
+        return self._engine
+
+    def require_guarded_runtime_ready(self) -> None:
+        """Fail during composition if any guarded production gate is absent."""
+        self._require_guarded_mode()
+        self._require_engine()
+        self._require_mutation_budget()
+        self._require_buying_power_provider()
+        if not getattr(self._lease_protocol, "epoch_verified", False):
+            raise LeaseNotVerifiedError(
+                "The configured guarded gateway cannot verify lease epochs"
+            )
 
     # --- ExecutionBrokerProtocol: LEGACY_COMPATIBILITY only ---------------------
 
@@ -603,6 +625,14 @@ class ExecutionCommandGateway:
             )
         return self._mutation_budget
 
+    def _require_buying_power_provider(self) -> Callable[[str, str], float]:
+        if self._buying_power_provider is None:
+            raise GuardedEngineRequiresBuyingPowerProviderError(
+                "GUARDED_ENGINE mode requires a buying_power_provider so A1 can "
+                "validate actual available capital inside the reservation transaction"
+            )
+        return self._buying_power_provider
+
     def _require_verified_lease(self, lease: Optional[ExecutionLease]) -> None:
         if lease is None:
             raise LeaseNotVerifiedError(
@@ -720,6 +750,11 @@ class ExecutionCommandGateway:
         # creates a (zero-notional) reservation row so the record's
         # capital_reservation_id/audit trail stays uniform across sides.
         requested_notional = quantity * limit_price if request.side == OrderSide.BUY else 0.0
+        buying_power = (
+            float(self._require_buying_power_provider()(environment, account_no) or 0.0)
+            if requested_notional > 0
+            else 0.0
+        )
 
         reservation = CapitalReservation.create(
             environment=environment, account_no=account_no, symbol=symbol,
@@ -738,6 +773,7 @@ class ExecutionCommandGateway:
             environment=environment, account_no=account_no, symbol=symbol, side=request.side,
             intent=request.intent, client_order_id=client_order_id,
             attempt_group_id=request.attempt_group_id, attempt_number=request.attempt_number,
+            attempt_deadline_at=request.attempt_deadline_at,
             submitted_quantity=quantity, submitted_limit_price=limit_price, exchange=request.exchange,
             execution_policy=request.execution_policy,
             owner_device_id=request.lease.device_id if request.lease else "",
@@ -753,7 +789,9 @@ class ExecutionCommandGateway:
         ensure_capital_reservations_table(engine)
         with engine.begin() as conn:
             insert_command(conn, command)
-            insert_reservation(conn, reservation)
+            insert_reservation_if_available(
+                conn, reservation, buying_power=buying_power
+            )
             insert_execution_order(conn, record)
 
         # 7 + 8. separate durable transaction: PREPARED -> SUBMITTING.
@@ -921,6 +959,15 @@ class ExecutionCommandGateway:
                 raise GuardedCancellationAmbiguousError(str(exc)) from exc
             raise GuardedCancellationRejectedError(str(exc)) from exc
 
+        record.filled_quantity = max(record.filled_quantity, snapshot.filled_quantity)
+        if snapshot.avg_fill_price:
+            record.average_fill_price = snapshot.avg_fill_price
+        record.remaining_quantity = max(
+            0,
+            snapshot.remaining_quantity
+            if snapshot.remaining_quantity
+            else record.submitted_quantity - record.filled_quantity,
+        )
         if snapshot.status == OrderStatus.CANCELLED:
             apply_status_transition(record, ExecutionOrderStatus.CANCELLED)
         elif snapshot.status == OrderStatus.FILLED:
@@ -940,6 +987,22 @@ class ExecutionCommandGateway:
                 update_command_response(
                     conn, cancel_idempotency_key, status="ACKNOWLEDGED", broker_response=snapshot.raw_response
                 )
+                if record.status in (
+                    ExecutionOrderStatus.CANCELLED,
+                    ExecutionOrderStatus.FILLED,
+                ) and record.capital_reservation_id:
+                    reservation = fetch_reservation(
+                        engine, record.capital_reservation_id
+                    )
+                    if reservation is not None and reservation.is_open():
+                        filled_notional = record.filled_quantity * (
+                            record.average_fill_price or record.submitted_limit_price
+                        )
+                        if filled_notional > 0:
+                            reservation.consume(filled_notional)
+                        if reservation.is_open():
+                            reservation.release()
+                        update_reservation(conn, reservation)
 
         self._persist_or_raise_ambiguous(
             _persist_cancel_success, context=f"cancel {request.client_order_id!r} success persistence",
@@ -958,9 +1021,9 @@ def get_default_execution_gateway() -> ExecutionCommandGateway:
     """The gateway every existing legacy call site is migrated to use as
     its default ``broker=`` (Workstream 9) -- wraps the real
     :class:`~src.services.broker.KisBroker` with no database engine,
-    lease protocol, or mutation budget configured, since production never
-    selects ``GUARDED_ENGINE`` mode (``BUYBOARD_ENGINE_ENABLED`` stays
-    ``false``) and this singleton is never used for it. See
+    lease protocol, mutation budget, or buying-power provider configured.
+    This singleton is therefore compatibility-only; guarded runtimes use
+    an explicitly constructed gateway instead. See
     :mod:`src.services.buyboard_runtime`'s guarded composition root
     (finding 10) for the ``GUARDED_ENGINE``-capable gateway construction.
     """
@@ -977,6 +1040,7 @@ def build_guarded_execution_gateway(
     engine: Engine,
     lease_protocol: ExecutionLeaseProtocol,
     mutation_budget: MutationBudgetProtocol,
+    buying_power_provider: Callable[[str, str], float],
     real_broker: Optional[Broker] = None,
 ) -> ExecutionCommandGateway:
     """The explicit ``GUARDED_ENGINE``-capable composition root (finding
@@ -992,7 +1056,12 @@ def build_guarded_execution_gateway(
         raise LeaseNotVerifiedError("build_guarded_execution_gateway requires lease_protocol")
     if mutation_budget is None:
         raise GuardedEngineRequiresMutationBudgetError("build_guarded_execution_gateway requires mutation_budget")
+    if buying_power_provider is None:
+        raise GuardedEngineRequiresBuyingPowerProviderError(
+            "build_guarded_execution_gateway requires buying_power_provider"
+        )
     return ExecutionCommandGateway(
         real_broker=real_broker if real_broker is not None else KisBroker(),
         engine=engine, lease_protocol=lease_protocol, mutation_budget=mutation_budget,
+        buying_power_provider=buying_power_provider,
     )

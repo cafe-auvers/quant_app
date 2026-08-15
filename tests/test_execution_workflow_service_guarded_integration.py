@@ -14,6 +14,7 @@ from sqlalchemy.pool import NullPool
 
 from src.core.execution_mode import ExecutionLease, ExecutionSource
 from src.core.execution_order_record import ExecutionOrderStatus
+from src.core.execution_result import UnifiedExecutionStatus
 from src.core.order_state import OrderIntent, OrderSide
 from src.services import execution_workflow_service as workflow
 from src.services.execution_command_gateway import ExecutionCommandGateway
@@ -39,6 +40,7 @@ def _guarded_gateway(tmp_path, broker=None):
     gateway = ExecutionCommandGateway(
         real_broker=broker, engine=engine, mode_override=True,
         lease_protocol=lease_protocol, mutation_budget=AllowAllMutationBudget(),
+        buying_power_provider=lambda environment, account_no: 100_000.0,
     )
     # H1: these integration tests exercise submit/cancel/replace mechanics
     # through a KANBAN_BOARD caller, not ownership gating itself (that has
@@ -75,7 +77,7 @@ def test_request_submit_through_the_real_workflow_reaches_acknowledged(tmp_path)
         side=OrderSide.BUY, intent=OrderIntent.ENTRY, quantity=10, limit_price=100.0,
         gateway=gateway, client_order_id="WF-CID-1", lease=LEASE, strategy_instance_id="test",
     )
-    assert record.status == ExecutionOrderStatus.ACKNOWLEDGED
+    assert record.status == UnifiedExecutionStatus.ACKNOWLEDGED
     assert record.broker_order_id == "B-1"
 
     persisted = fetch_execution_order(engine, "WF-CID-1")
@@ -158,6 +160,7 @@ def test_restart_idempotency_through_the_workflow_layers_own_stable_identity(tmp
     first_gateway = ExecutionCommandGateway(
         real_broker=first_broker, engine=engine, mode_override=True,
         lease_protocol=lease_protocol, mutation_budget=AllowAllMutationBudget(),
+        buying_power_provider=lambda environment, account_no: 100_000.0,
     )
 
     from src.services.execution_command_gateway import GuardedSubmissionAmbiguousError
@@ -178,6 +181,7 @@ def test_restart_idempotency_through_the_workflow_layers_own_stable_identity(tmp
     second_gateway = ExecutionCommandGateway(
         real_broker=second_broker, engine=engine, mode_override=True,
         lease_protocol=lease_protocol, mutation_budget=AllowAllMutationBudget(),
+        buying_power_provider=lambda environment, account_no: 100_000.0,
     )
     with pytest.raises(DuplicateCommandError):
         workflow.request_submit(

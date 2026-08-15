@@ -36,7 +36,7 @@ import json
 import logging
 import threading
 import weakref
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy import (
     BigInteger,
@@ -186,6 +186,7 @@ def _record_to_payload(record: ExecutionOrderRecord) -> Dict[str, Any]:
         "broker_order_id": record.broker_order_id,
         "attempt_group_id": record.attempt_group_id,
         "attempt_number": record.attempt_number,
+        "attempt_deadline_at": record.attempt_deadline_at,
         "submitted_quantity": record.submitted_quantity,
         "submitted_limit_price": record.submitted_limit_price,
         "exchange": record.exchange,
@@ -228,6 +229,7 @@ def _payload_to_record(payload: Dict[str, Any]) -> ExecutionOrderRecord:
         broker_order_id=payload.get("broker_order_id", ""),
         attempt_group_id=payload.get("attempt_group_id", ""),
         attempt_number=payload.get("attempt_number", 1),
+        attempt_deadline_at=payload.get("attempt_deadline_at"),
         submitted_quantity=payload.get("submitted_quantity", 0),
         submitted_limit_price=payload.get("submitted_limit_price", 0.0),
         exchange=payload.get("exchange", ""),
@@ -478,3 +480,25 @@ def fetch_execution_order(engine: Engine, client_order_id: str) -> Optional[Exec
     ensure_execution_orders_table(engine)
     with engine.begin() as conn:
         return get_execution_order(conn, client_order_id)
+
+
+def list_execution_orders_for_card(
+    engine: Engine,
+    *,
+    environment: str,
+    account_no: str,
+    symbol: str,
+) -> List[ExecutionOrderRecord]:
+    """Return durable guarded orders for one card, newest records first."""
+    table = ensure_execution_orders_table(engine)
+    with engine.begin() as conn:
+        rows = conn.execute(
+            select(table)
+            .where(
+                table.c.environment == str(environment or "").upper(),
+                table.c.account_no == str(account_no or ""),
+                table.c.symbol == str(symbol or "").upper(),
+            )
+            .order_by(table.c.id.desc())
+        ).fetchall()
+    return [_row_to_record(row) for row in rows]

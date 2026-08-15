@@ -19,12 +19,96 @@ generate or persist that identity; it only carries it.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+import hashlib
+import re
 from typing import Optional
 
 from src.core.execution_mode import ExecutionSource
 from src.core.order_state import REGULAR_LIMIT_EXECUTION, OrderIntent, OrderSide
 from src.services.execution_lease_protocol import ExecutionLease
+
+
+def derive_execution_client_order_id(
+    *,
+    attempt_group_id: str,
+    attempt_number: int,
+    environment: str,
+    account_no: str,
+    symbol: str,
+    intent: OrderIntent | str,
+) -> str:
+    """Derive a restart-stable ID from durable logical-attempt state."""
+    intent_value = intent.value if isinstance(intent, OrderIntent) else str(intent or "")
+    canonical = "|".join(
+        (
+            str(attempt_group_id or "").strip(),
+            str(int(attempt_number)),
+            str(environment or "").strip().upper(),
+            str(account_no or "").strip(),
+            str(symbol or "").strip().upper(),
+            intent_value.strip().upper(),
+        )
+    )
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:20].upper()
+    prefix = re.sub(r"[^A-Z0-9_-]+", "-", canonical.upper()).strip("-")[:100]
+    return f"{prefix}-{digest}"
+
+
+@dataclass(frozen=True, eq=False)
+class CancelIntent:
+    """Complete, restart-replayable context for a tracked cancellation."""
+
+    client_order_id: str
+    cancel_command_id: str
+    environment: str
+    account_no: str
+    lease: Optional[ExecutionLease]
+    strategy_instance_id: str
+    source: ExecutionSource
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "client_order_id", str(self.client_order_id or "").strip())
+        object.__setattr__(self, "cancel_command_id", str(self.cancel_command_id or "").strip())
+        object.__setattr__(self, "environment", str(self.environment or "").upper())
+        object.__setattr__(self, "account_no", str(self.account_no or ""))
+        object.__setattr__(self, "strategy_instance_id", str(self.strategy_instance_id or ""))
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, str):
+            return self.client_order_id == other
+        if not isinstance(other, CancelIntent):
+            return False
+        return (
+            self.client_order_id,
+            self.cancel_command_id,
+            self.environment,
+            self.account_no,
+            self.lease,
+            self.strategy_instance_id,
+            self.source,
+        ) == (
+            other.client_order_id,
+            other.cancel_command_id,
+            other.environment,
+            other.account_no,
+            other.lease,
+            other.strategy_instance_id,
+            other.source,
+        )
+
+    def __hash__(self) -> int:
+        return hash(
+            (
+                self.client_order_id,
+                self.cancel_command_id,
+                self.environment,
+                self.account_no,
+                self.lease,
+                self.strategy_instance_id,
+                self.source,
+            )
+        )
 
 
 @dataclass(frozen=True)
@@ -46,6 +130,7 @@ class SubmitExecutionRequest:
     execution_policy: str = REGULAR_LIMIT_EXECUTION
     attempt_group_id: str = ""
     attempt_number: int = 1
+    attempt_deadline_at: Optional[str] = None
     lease: Optional[ExecutionLease] = None
     source: ExecutionSource = ExecutionSource.SYSTEM
     replaces_execution_order_id: str = ""

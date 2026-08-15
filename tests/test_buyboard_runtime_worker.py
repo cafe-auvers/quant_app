@@ -47,6 +47,16 @@ def _dummy_market_data() -> RestPollingMarketDataService:
         quote_fetcher=lambda symbol: QuoteSnapshot(symbol=symbol, last_price=100.0)
     )
 
+
+def _build_test_runtime(**kwargs):
+    """Compose legacy wiring while engine-decision tests force heartbeat enabled."""
+    original = runtime_module.execution_config.is_buyboard_engine_enabled
+    runtime_module.execution_config.is_buyboard_engine_enabled = lambda: False
+    try:
+        return runtime_module.build_buyboard_runtime(**kwargs)
+    finally:
+        runtime_module.execution_config.is_buyboard_engine_enabled = original
+
 _APP = None
 
 
@@ -191,7 +201,7 @@ def test_startup_reconciliation_restores_retry_state_and_persists_changes(tmp_pa
     import datetime as dt
 
     worker, engine = _worker(tmp_path)
-    worker.runtime = runtime_module.build_buyboard_runtime(
+    worker.runtime = _build_test_runtime(
         buying_power_provider=worker._buying_power_provider,
         card_lookup=worker._card_lookup,
         broker=worker._broker,
@@ -224,7 +234,7 @@ def test_startup_reconciliation_discovers_a_manual_broker_position(tmp_path):
         "overseas": {"holdings": [{"symbol": "NVDA", "quantity": 10, "average_price": 200.0}]}
     }
     worker, engine = _worker(tmp_path, broker=broker)
-    worker.runtime = runtime_module.build_buyboard_runtime(
+    worker.runtime = _build_test_runtime(
         buying_power_provider=worker._buying_power_provider,
         card_lookup=worker._card_lookup,
         broker=worker._broker,
@@ -259,7 +269,7 @@ def test_startup_reconciliation_scopes_each_account_to_its_own_holdings(tmp_path
     # (main_window.py's unscoped worker) -- self._distinct_account_numbers
     # must derive both real accounts purely from the seeded cards.
     worker, engine = _worker(tmp_path, broker=broker, account_no="")
-    worker.runtime = runtime_module.build_buyboard_runtime(
+    worker.runtime = _build_test_runtime(
         buying_power_provider=worker._buying_power_provider,
         card_lookup=worker._card_lookup,
         broker=worker._broker,
@@ -305,7 +315,7 @@ def test_startup_reconciliation_marks_incomplete_when_one_account_fails(tmp_path
 
     broker = _PartiallyFailingBroker()
     worker, engine = _worker(tmp_path, broker=broker, account_no="")
-    worker.runtime = runtime_module.build_buyboard_runtime(
+    worker.runtime = _build_test_runtime(
         buying_power_provider=worker._buying_power_provider,
         card_lookup=worker._card_lookup,
         broker=worker._broker,
@@ -340,7 +350,7 @@ def test_startup_reconciliation_does_not_cross_account_boundaries(tmp_path):
 
     broker = _AccountTwoOrderDiscoveryFailingBroker()
     worker, engine = _worker(tmp_path, broker=broker, account_no="")
-    worker.runtime = runtime_module.build_buyboard_runtime(
+    worker.runtime = _build_test_runtime(
         buying_power_provider=worker._buying_power_provider,
         card_lookup=worker._card_lookup,
         broker=worker._broker,
@@ -380,7 +390,7 @@ def test_startup_reconciliation_fully_resolves_a_buy_today_fill_in_one_pass(tmp_
         "overseas": {"holdings": [{"symbol": "AAPL", "quantity": 10, "average_price": 101.0}]}
     }
     worker, engine = _worker(tmp_path, broker=broker)
-    worker.runtime = runtime_module.build_buyboard_runtime(
+    worker.runtime = _build_test_runtime(
         buying_power_provider=worker._buying_power_provider,
         card_lookup=worker._card_lookup,
         broker=worker._broker,
@@ -414,7 +424,7 @@ def test_run_one_cycle_excludes_cards_from_accounts_with_startup_errors(tmp_path
 
     broker = _FakeBroker()
     worker, engine = _worker(tmp_path, broker=broker)
-    worker.runtime = runtime_module.build_buyboard_runtime(
+    worker.runtime = _build_test_runtime(
         buying_power_provider=worker._buying_power_provider,
         card_lookup=worker._card_lookup,
         broker=worker._broker,
@@ -458,7 +468,7 @@ def test_periodic_reconciliation_success_clears_startup_reconciliation_error(tmp
 
     broker = _FakeBroker()
     worker, engine = _worker(tmp_path, broker=broker)
-    worker.runtime = runtime_module.build_buyboard_runtime(
+    worker.runtime = _build_test_runtime(
         buying_power_provider=worker._buying_power_provider,
         card_lookup=worker._card_lookup,
         broker=worker._broker,
@@ -481,7 +491,7 @@ def test_periodic_reconciliation_success_clears_startup_reconciliation_error(tmp
 
 def test_startup_reconciliation_complete_when_every_account_succeeds(tmp_path):
     worker, engine = _worker(tmp_path, account_no="1")
-    worker.runtime = runtime_module.build_buyboard_runtime(
+    worker.runtime = _build_test_runtime(
         buying_power_provider=worker._buying_power_provider,
         card_lookup=worker._card_lookup,
         broker=worker._broker,
@@ -542,7 +552,7 @@ def test_periodic_refresh_populates_buying_power_cache_on_first_cycle(tmp_path, 
         }
     }
     worker, engine = _worker(tmp_path, broker=broker)
-    worker.runtime = runtime_module.build_buyboard_runtime(
+    worker.runtime = _build_test_runtime(
         buying_power_provider=worker._buying_power_provider,
         card_lookup=worker._card_lookup,
         broker=worker._broker,
@@ -568,7 +578,7 @@ def test_periodic_refresh_does_not_requery_before_its_interval(tmp_path, monkeyp
 
     broker = _FakeBroker()
     worker, engine = _worker(tmp_path, broker=broker)
-    worker.runtime = runtime_module.build_buyboard_runtime(
+    worker.runtime = _build_test_runtime(
         buying_power_provider=worker._buying_power_provider,
         card_lookup=worker._card_lookup,
         broker=worker._broker,
@@ -596,7 +606,7 @@ def test_periodic_refresh_requeries_once_the_interval_has_elapsed(tmp_path, monk
 
     broker = _FakeBroker()
     worker, engine = _worker(tmp_path, broker=broker)
-    worker.runtime = runtime_module.build_buyboard_runtime(
+    worker.runtime = _build_test_runtime(
         buying_power_provider=worker._buying_power_provider,
         card_lookup=worker._card_lookup,
         broker=worker._broker,
@@ -632,7 +642,7 @@ def test_periodic_reconciliation_discovers_external_position_change(tmp_path, mo
     broker = _FakeBroker()
     broker.positions = {"overseas": {"holdings": []}}  # broker now reports flat
     worker, engine = _worker(tmp_path, broker=broker)
-    worker.runtime = runtime_module.build_buyboard_runtime(
+    worker.runtime = _build_test_runtime(
         buying_power_provider=worker._buying_power_provider,
         card_lookup=worker._card_lookup,
         broker=worker._broker,
@@ -672,7 +682,7 @@ def test_periodic_refresh_also_reconciles_unresolved_entry_order_state(tmp_path,
 
     broker = _FakeBroker()  # discover_orders defaults to a complete, empty result
     worker, engine = _worker(tmp_path, broker=broker)
-    worker.runtime = runtime_module.build_buyboard_runtime(
+    worker.runtime = _build_test_runtime(
         buying_power_provider=worker._buying_power_provider,
         card_lookup=worker._card_lookup,
         broker=worker._broker,
@@ -797,7 +807,7 @@ def test_one_cycle_persists_engine_changes(tmp_path, monkeypatch):
     monkeypatch.setattr(trading_engine_module, "is_buyboard_engine_enabled", lambda: True)
 
     worker, engine = _worker(tmp_path)
-    worker.runtime = runtime_module.build_buyboard_runtime(
+    worker.runtime = _build_test_runtime(
         buying_power_provider=worker._buying_power_provider,
         card_lookup=worker._card_lookup,
         broker=worker._broker,
@@ -831,7 +841,7 @@ def test_one_cycle_scoped_to_the_workers_account(tmp_path, monkeypatch):
     monkeypatch.setattr(trading_engine_module, "is_buyboard_engine_enabled", lambda: True)
 
     worker, engine = _worker(tmp_path)
-    worker.runtime = runtime_module.build_buyboard_runtime(
+    worker.runtime = _build_test_runtime(
         buying_power_provider=worker._buying_power_provider,
         card_lookup=worker._card_lookup,
         broker=worker._broker,
@@ -846,7 +856,7 @@ def test_one_cycle_scoped_to_the_workers_account(tmp_path, monkeypatch):
 
 def test_sync_orb_plans_applies_the_execution_queue_bridge(tmp_path):
     worker, engine = _worker(tmp_path)
-    worker.runtime = runtime_module.build_buyboard_runtime(
+    worker.runtime = _build_test_runtime(
         buying_power_provider=worker._buying_power_provider,
         card_lookup=worker._card_lookup,
         broker=worker._broker,
@@ -887,7 +897,7 @@ def test_sync_orb_plans_skips_positioned_cards(tmp_path):
 
 def test_sync_quote_subscriptions_adds_and_removes(tmp_path):
     worker, engine = _worker(tmp_path)
-    worker.runtime = runtime_module.build_buyboard_runtime(
+    worker.runtime = _build_test_runtime(
         buying_power_provider=worker._buying_power_provider,
         card_lookup=worker._card_lookup,
         broker=worker._broker,
