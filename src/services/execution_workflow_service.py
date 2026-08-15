@@ -87,6 +87,20 @@ class _SourceBoundGatewayBroker:
         return self._gateway.get_positions(**kwargs)
 
 
+def _resolved_mode(gateway_or_broker: Any) -> ExecutionMode:
+    """``gateway`` parameters throughout this module accept anything
+    conforming to ``Broker`` (matching every existing legacy call site's
+    own ``broker: Optional[Broker]`` flexibility -- e.g.
+    ``build_buyboard_runtime``'s own ``broker=`` override, which tests use
+    to inject a bare hand-rolled fake, not necessarily an
+    ``ExecutionCommandGateway``). A plain ``Broker`` has no concept of
+    ``GUARDED_ENGINE`` mode at all, so it is treated as
+    ``LEGACY_COMPATIBILITY`` -- the only mode meaningful for something
+    that doesn't expose a ``mode`` in the first place.
+    """
+    return getattr(gateway_or_broker, "mode", ExecutionMode.LEGACY_COMPATIBILITY)
+
+
 def request_submit(
     *,
     source: ExecutionSource,
@@ -105,6 +119,7 @@ def request_submit(
     lease: Optional[ExecutionLease] = None,
     attempt_group_id: str = "",
     attempt_number: int = 1,
+    strategy_instance_id: str = "",
     **legacy_kwargs: Any,
 ) -> Any:
     """The single shared submission entry point (INV-21).
@@ -115,19 +130,24 @@ def request_submit(
     broker); omit it for a genuinely new submission, and a fresh one is
     minted here, once.
 
+    ``strategy_instance_id`` is required (non-blank) whenever ``source``
+    is ``KANBAN_BOARD`` and the target symbol's persisted ownership is
+    ``KANBAN`` (H1) -- the gateway rejects a blank or mismatched one.
+
     ``**legacy_kwargs`` are ``submit_guarded_overseas_order``'s own
     remaining parameters (``pre_trade_risk_decision``,
     ``execution_authority``, ``execution_lease``, etc.), used only in
     ``LEGACY_COMPATIBILITY`` mode and passed through unchanged.
     """
     resolved_gateway = gateway or get_default_execution_gateway()
-    if resolved_gateway.mode == ExecutionMode.GUARDED_ENGINE:
+    if _resolved_mode(resolved_gateway) == ExecutionMode.GUARDED_ENGINE:
         stable_id = client_order_id or generate_client_order_id(environment, account_no, symbol, side, intent)
         request = SubmitExecutionRequest(
             client_order_id=stable_id, environment=environment, account_no=account_no, symbol=symbol,
             side=side, intent=intent, quantity=quantity, limit_price=limit_price, exchange=exchange,
             execution_policy=execution_policy, attempt_group_id=attempt_group_id,
             attempt_number=attempt_number, lease=lease, source=source,
+            strategy_instance_id=strategy_instance_id,
         )
         return resolved_gateway.submit_guarded(request)
     return submit_guarded_overseas_order(
@@ -147,6 +167,7 @@ def request_cancel(
     lease: Optional[ExecutionLease] = None,
     environment: str = "",
     account_no: str = "",
+    strategy_instance_id: str = "",
 ) -> Any:
     """The single shared cancellation entry point (INV-21).
 
@@ -164,11 +185,12 @@ def request_cancel(
     mode does not need them (the local order ledger already knows).
     """
     resolved_gateway = gateway or get_default_execution_gateway()
-    if resolved_gateway.mode == ExecutionMode.GUARDED_ENGINE:
+    if _resolved_mode(resolved_gateway) == ExecutionMode.GUARDED_ENGINE:
         stable_cancel_id = cancel_command_id or f"{client_order_id}:{uuid4().hex[:12]}"
         request = CancelExecutionRequest(
             client_order_id=client_order_id, cancel_command_id=stable_cancel_id,
             environment=environment, account_no=account_no, lease=lease, source=source,
+            strategy_instance_id=strategy_instance_id,
         )
         return resolved_gateway.cancel_guarded(request)
     return cancel_and_reconcile_order(
@@ -188,6 +210,7 @@ def request_replace(
     lease: Optional[ExecutionLease] = None,
     environment: str = "",
     account_no: str = "",
+    strategy_instance_id: str = "",
 ) -> ExecutionOrderRecord:
     """``GUARDED_ENGINE`` only -- no legacy or Kanban call site performs a
     broker-level replace today (confirmed by codebase survey); raises
@@ -195,7 +218,7 @@ def request_replace(
     gateway's own ``replace_guarded`` would if reached directly.
     """
     resolved_gateway = gateway or get_default_execution_gateway()
-    if resolved_gateway.mode != ExecutionMode.GUARDED_ENGINE:
+    if _resolved_mode(resolved_gateway) != ExecutionMode.GUARDED_ENGINE:
         raise NotImplementedError(
             "request_replace is only available in GUARDED_ENGINE mode -- no legacy call site "
             "performs a broker-level replace today"
@@ -206,5 +229,6 @@ def request_replace(
         client_order_id=client_order_id, replace_command_id=stable_replace_id,
         new_client_order_id=stable_new_id, new_quantity=new_quantity, new_limit_price=new_limit_price,
         environment=environment, account_no=account_no, lease=lease, source=source,
+        strategy_instance_id=strategy_instance_id,
     )
     return resolved_gateway.replace_guarded(request)

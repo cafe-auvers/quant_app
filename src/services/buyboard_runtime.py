@@ -114,6 +114,7 @@ from typing import Callable, Optional
 from sqlalchemy.engine import Engine
 
 from src.core import execution_config
+from src.core.execution_mode import ExecutionSource
 from src.core.order_state import (
     BrokerOrder,
     BrokerOrderDiscoveryResult,
@@ -131,9 +132,8 @@ from src.services import capital_allocator, capital_reservation_repository
 from src.services import order_ledger
 from src.services import order_reconciliation
 from src.services.broker import Broker, KisBroker
-from src.services.execution_command_gateway import build_guarded_execution_gateway, get_default_execution_gateway
-from src.services.execution_lease_protocol import DefaultExecutionLeaseProtocol
-from src.services.mutation_budget_protocol import AllowAllMutationBudget
+from src.services.execution_command_gateway import get_default_execution_gateway
+from src.services.execution_workflow_service import request_cancel, request_submit
 from src.services.entry_attempt_manager import EntryAttemptManager
 from src.services.eod_trading_service import EodActionCallbacks, EodTradingService
 from src.services.execution_authority import ExecutionAuthority, LeaseHandle
@@ -261,9 +261,20 @@ def _reconcile_order(order: BrokerOrder, *, broker: Broker) -> BrokerOrder:
     return refreshed if refreshed is not None else order
 
 
-def _cancel_order(client_order_id: str, *, broker: Broker) -> None:
+def _cancel_order(client_order_id: str, *, broker: Broker, strategy_instance_id: str = "") -> None:
+    # Workstream 9 (PR2 third pass, finding 1): route through the shared
+    # workflow service, not order_reconciliation directly -- request_cancel
+    # is the one entry point both legacy and Kanban use (INV-21). In
+    # LEGACY_COMPATIBILITY mode (the only mode a real BuyboardRuntime can
+    # ever be constructed in today -- see build_buyboard_runtime's own
+    # guarded-activation refusal) this calls cancel_and_reconcile_order
+    # exactly as before, just via the gateway's Broker-protocol adapter;
+    # nothing about the actual cancel behavior changes.
     try:
-        order_reconciliation.cancel_and_reconcile_order(client_order_id, broker=broker)
+        request_cancel(
+            source=ExecutionSource.KANBAN_BOARD, client_order_id=client_order_id, gateway=broker,
+            strategy_instance_id=strategy_instance_id,
+        )
     except ValueError as exc:
         # Already terminal / already cancelled / not found -- the caller
         # (entry_attempt_manager/position_manager) only ever calls this on
@@ -530,8 +541,19 @@ def build_buyboard_runtime(
     lease_engine=None,
     broker: Optional[Broker] = None,
     market_data: Optional[RealtimeMarketDataService] = None,
+    strategy_instance_id: str = "",
 ) -> BuyboardRuntime:
     """Assembles every engine piece with real callback implementations.
+
+    ``strategy_instance_id`` identifies *this* engine instance for H1's
+    persisted execution-ownership check (Workstream 9) -- every
+    submission/cancellation/replace this runtime makes uses
+    ``ExecutionSource.KANBAN_BOARD`` plus this ``strategy_instance_id``.
+    Required (non-blank) for a symbol whose H1 ownership is actually
+    assigned ``KANBAN`` in ``GUARDED_ENGINE`` mode; irrelevant in
+    ``LEGACY_COMPATIBILITY`` mode (the only mode a real ``BuyboardRuntime``
+    is constructed in today), where the gateway's B2 sequence isn't run
+    at all.
 
     ``buying_power_provider``/``card_lookup`` are the two seams this module
     cannot responsibly fill in itself (see the module docstring) --
@@ -568,28 +590,32 @@ def build_buyboard_runtime(
     # automatically"), so in practice this change affects only this
     # module's own tests today, not any live production path.
     #
-    # PR2's second review pass (finding 10): when the flag *is* true, this
-    # is where the GUARDED_ENGINE-capable gateway must actually be built,
-    # with every dependency it needs -- failing fast, here, at startup
-    # composition, rather than constructing a gateway missing an engine
-    # that would only discover the problem at the first real submission
-    # (GuardedEngineRequiresDatabaseError). AllowAllMutationBudget is an
-    # explicit, visible placeholder for Workstream 10's real rate-limit-
-    # aware implementation (PR6) -- see that module's own docstring for
-    # why this must never be a silent gateway default.
+    # PR2's third review pass (finding 2): DefaultExecutionLeaseProtocol
+    # always reports epoch_verified=False (it is honest that it has no
+    # real epoch authority to check against -- Workstream 5/6's job), and
+    # the gateway's own B2 gate refuses every GUARDED_ENGINE call whose
+    # lease protocol can't prove that. Building this composition anyway
+    # would "succeed" at startup and then fail on the very first guarded
+    # command -- exactly the "fails at first submission, not at startup"
+    # outcome finding 10 (second pass) already meant to close. There is
+    # currently no real epoch-verifying lease authority anywhere in this
+    # codebase, and AllowAllMutationBudget is documented as a testing
+    # placeholder, not an activation-capable production dependency -- so
+    # GUARDED_ENGINE activation is refused here outright, unconditionally,
+    # until Workstream 5/6 supplies a real lease-epoch authority and
+    # Workstream 10 supplies a real mutation-budget implementation. This
+    # has no production effect today: BUYBOARD_ENGINE_ENABLED stays false
+    # for the whole duration of this program (frozen-contract rule 4), so
+    # this branch is exercised only by this module's own tests.
     if broker is not None:
         resolved_broker = broker
     elif execution_config.is_buyboard_engine_enabled():
-        if capital_reservation_engine is None:
-            raise RuntimeError(
-                "BUYBOARD_ENGINE_ENABLED=true requires capital_reservation_engine to build the "
-                "GUARDED_ENGINE-capable execution gateway -- refusing to start rather than "
-                "building a gateway that would only fail at the first real submission"
-            )
-        resolved_broker = build_guarded_execution_gateway(
-            engine=capital_reservation_engine,
-            lease_protocol=DefaultExecutionLeaseProtocol(engine=capital_reservation_engine),
-            mutation_budget=AllowAllMutationBudget(),
+        raise RuntimeError(
+            "BUYBOARD_ENGINE_ENABLED=true requires a real, epoch-verifying execution-lease "
+            "authority (Workstream 5/6) and a real mutation-budget implementation (Workstream 10) "
+            "-- neither exists in this codebase yet. Refusing to construct a BuyboardRuntime whose "
+            "GUARDED_ENGINE gateway is guaranteed to reject every destructive command at the lease "
+            "gate, rather than constructing one that only fails on the first real submission."
         )
     else:
         resolved_broker = get_default_execution_gateway()
@@ -653,8 +679,20 @@ def build_buyboard_runtime(
         plan_id = _entry_plan_id(card) if card is not None else f"{environment}:{symbol}"
         submit_kwargs = dict(kwargs)
         submit_kwargs["quantity"] = quantity
-        return submit_guarded_overseas_order(
-            broker=resolved_broker,
+        # Workstream 9 (PR2 third pass, finding 1): route through the
+        # shared workflow service, not submit_guarded_overseas_order
+        # directly -- request_submit is the one entry point both legacy
+        # and Kanban use (INV-21). In LEGACY_COMPATIBILITY mode (the only
+        # mode a real BuyboardRuntime can ever be constructed in today --
+        # see build_buyboard_runtime's own guarded-activation refusal)
+        # request_submit forwards every one of these same keyword
+        # arguments straight to submit_guarded_overseas_order unchanged;
+        # nothing about this function's own risk revalidation, gate
+        # sequence, or the actual broker call changes.
+        return request_submit(
+            source=ExecutionSource.KANBAN_BOARD,
+            gateway=resolved_broker,
+            strategy_instance_id=strategy_instance_id,
             pre_trade_risk_decision=decision,
             strategy_id=RISK_STRATEGY_ID,
             plan_id=plan_id,
@@ -702,8 +740,14 @@ def build_buyboard_runtime(
                 f"No live quote available to price a marketable SELL for {symbol}"
             )
         exchange = submit_kwargs.pop("exchange", "NASD")
-        return submit_guarded_overseas_order(
-            broker=resolved_broker,
+        # Workstream 9 (PR2 third pass, finding 1): route through the
+        # shared workflow service -- see submit_order's identical comment
+        # above for why this is safe and behavior-preserving in the only
+        # mode a real BuyboardRuntime can be constructed in today.
+        return request_submit(
+            source=ExecutionSource.KANBAN_BOARD,
+            gateway=resolved_broker,
+            strategy_instance_id=strategy_instance_id,
             side=OrderSide.SELL,
             intent=intent,
             limit_price=limit_price,
@@ -716,7 +760,9 @@ def build_buyboard_runtime(
         )
 
     position_callbacks = PositionActionCallbacks(
-        cancel_order=lambda client_order_id: _cancel_order(client_order_id, broker=resolved_broker),
+        cancel_order=lambda client_order_id: _cancel_order(
+            client_order_id, broker=resolved_broker, strategy_instance_id=strategy_instance_id
+        ),
         submit_sell_order=submit_sell_order,
         refresh_orderable_quantity=lambda environment, account_no, symbol: _refresh_orderable_quantity(
             environment, account_no, symbol, broker=resolved_broker
@@ -728,7 +774,9 @@ def build_buyboard_runtime(
     eod_callbacks = EodActionCallbacks(
         find_open_entry_order=_find_open_entry_order,
         reconcile_order=lambda order: _reconcile_order(order, broker=resolved_broker),
-        cancel_order=lambda client_order_id: _cancel_order(client_order_id, broker=resolved_broker),
+        cancel_order=lambda client_order_id: _cancel_order(
+            client_order_id, broker=resolved_broker, strategy_instance_id=strategy_instance_id
+        ),
         discover_all_orders=lambda card: _discover_all_orders(card, broker=resolved_broker),
         # Review finding P0: a historical filled order discovered from
         # KIS's ~14-day order-history window must not resurrect a position

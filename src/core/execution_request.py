@@ -49,12 +49,19 @@ class SubmitExecutionRequest:
     lease: Optional[ExecutionLease] = None
     source: ExecutionSource = ExecutionSource.SYSTEM
     replaces_execution_order_id: str = ""
+    # H1 (Workstream 9): required, non-blank whenever source is
+    # KANBAN_BOARD and the symbol's persisted execution_owner is KANBAN --
+    # the gateway checks this against ExecutionOwnership.strategy_instance_id
+    # so one Kanban strategy instance can never act on a symbol assigned to
+    # a different one (review finding 3, third pass).
+    strategy_instance_id: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "client_order_id", str(self.client_order_id or "").strip())
         object.__setattr__(self, "environment", str(self.environment or "").upper())
         object.__setattr__(self, "account_no", str(self.account_no or ""))
         object.__setattr__(self, "symbol", str(self.symbol or "").upper())
+        object.__setattr__(self, "strategy_instance_id", str(self.strategy_instance_id or ""))
 
 
 @dataclass(frozen=True)
@@ -77,12 +84,14 @@ class CancelExecutionRequest:
     account_no: str
     lease: Optional[ExecutionLease] = None
     source: ExecutionSource = ExecutionSource.SYSTEM
+    strategy_instance_id: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "client_order_id", str(self.client_order_id or "").strip())
         object.__setattr__(self, "cancel_command_id", str(self.cancel_command_id or "").strip())
         object.__setattr__(self, "environment", str(self.environment or "").upper())
         object.__setattr__(self, "account_no", str(self.account_no or ""))
+        object.__setattr__(self, "strategy_instance_id", str(self.strategy_instance_id or ""))
 
 
 @dataclass(frozen=True)
@@ -102,6 +111,7 @@ class ReplaceExecutionRequest:
     account_no: str
     lease: Optional[ExecutionLease] = None
     source: ExecutionSource = ExecutionSource.SYSTEM
+    strategy_instance_id: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "client_order_id", str(self.client_order_id or "").strip())
@@ -109,3 +119,4 @@ class ReplaceExecutionRequest:
         object.__setattr__(self, "new_client_order_id", str(self.new_client_order_id or "").strip())
         object.__setattr__(self, "environment", str(self.environment or "").upper())
         object.__setattr__(self, "account_no", str(self.account_no or ""))
+        object.__setattr__(self, "strategy_instance_id", str(self.strategy_instance_id or ""))

@@ -437,24 +437,113 @@ class ExecutionCommandGateway:
             return self._do_cancel(request, record=record, permission_check=is_cancellable)
 
     def replace_guarded(self, request: ReplaceExecutionRequest) -> ExecutionOrderRecord:
-        """Composed, never a synthetic first-class broker status: cancel
-        the existing exact order (authorized by ``REPLACE``, not
-        ``CANCEL`` -- finding 7), confirm a safe (``CANCELLED``) outcome,
-        then submit a brand-new order linked via
-        ``replaces_execution_order_id``. The original record is never
-        mutated into the replacement.
+        """Composed, never a synthetic first-class broker status: validate
+        the *entire* replacement request first (review finding 6, third
+        pass -- an invalid or duplicate replacement request must make
+        zero cancel calls, never cancel a perfectly good order only to
+        discover afterward that the replacement itself was invalid), then
+        persist a durable parent ``replace`` command *before* either
+        broker call, then cancel the existing exact order (authorized by
+        ``REPLACE``, not ``CANCEL`` -- finding 7 of the second pass),
+        confirm a safe (``CANCELLED``) outcome, then submit a brand-new
+        order linked via ``replaces_execution_order_id``. The original
+        record is never mutated into the replacement.
+
+        The parent ``replace`` command's own row
+        (``idempotency_key=f"REPLACE:{replace_command_id}"``) is what lets
+        restart recovery distinguish "a replace was requested" from either
+        sub-step: its own status only ever finalizes to ``COMPLETED`` on
+        full success; a replace that stopped partway (cancel confirmed,
+        replacement not yet submitted) is reconstructed from the *linked*
+        cancel/submit sub-commands' own already-durable statuses, not from
+        additional intermediate writes to the parent row -- the command
+        ledger's compare-and-set persistence (B4b) is deliberately a
+        single ``REQUESTED -> one terminal state`` transition, not a
+        multi-step state machine, and this reuses that as-is rather than
+        fighting it.
         """
         self._require_guarded_mode()
+        engine = self._require_engine()
+        mutation_budget = self._require_mutation_budget()
+
         original = self._fetch_record(request.client_order_id)
         if original is None:
             raise OrderNotFoundForCancelError(f"No ExecutionOrderRecord for client_order_id={request.client_order_id!r}")
         key = _recovery_key(original.environment, original.account_no, original.symbol)
         with self._ownership.claim(key, request.source):
+            # 1. validate the replacement request completely -- before
+            # anything is mutated or cancelled.
+            if original.environment != request.environment or original.account_no != request.account_no:
+                raise CancelNotPermittedError(
+                    f"client_order_id={request.client_order_id!r} belongs to "
+                    f"{original.environment}/{original.account_no}, not the requested "
+                    f"{request.environment}/{request.account_no}"
+                )
+            new_quantity = int(request.new_quantity)
+            if new_quantity <= 0:
+                raise ValueError(f"new_quantity must be positive, got {new_quantity}")
+            if original.execution_policy == RESERVED_MOO_EXECUTION:
+                new_limit_price = 0.0
+            else:
+                new_limit_price = float(request.new_limit_price)
+                if not math.isfinite(new_limit_price) or new_limit_price <= 0:
+                    raise ValueError(f"new_limit_price must be positive and finite, got {new_limit_price}")
+            if not request.new_client_order_id:
+                raise ValueError(
+                    "ReplaceExecutionRequest.new_client_order_id must be a non-blank, caller-generated "
+                    "stable identity"
+                )
+            if self._fetch_record(request.new_client_order_id) is not None:
+                raise ValueError(
+                    f"new_client_order_id={request.new_client_order_id!r} already exists -- a replacement "
+                    "must use a fresh identity, never reuse an existing order's"
+                )
+
+            # 2. verify replace ownership/permission.
+            self._require_ownership(
+                original.environment, original.account_no, original.symbol, request.source,
+                request.strategy_instance_id,
+            )
+            if not _cancellable_for_replace(original):
+                raise CancelNotPermittedError(
+                    f"client_order_id={request.client_order_id!r} is not currently replaceable "
+                    f"(status={original.status.value}, recovery_state={original.recovery_state.value}, "
+                    f"origin={original.origin.value})"
+                )
+
+            # 3. verify lease.
+            self._require_verified_lease(request.lease)
+
+            # 4. preflight both the cancel and submit mutation budgets
+            # before committing to either broker call.
+            mutation_budget.require_available(CommandType.REPLACE)
+            mutation_budget.require_available(CommandType.CANCEL)
+            mutation_budget.require_available(CommandType.SUBMIT)
+
+            # 5. persist the durable parent replace command/intention --
+            # before either broker call, so a crash between the cancel and
+            # the resubmit leaves durable evidence a replace was in
+            # progress, not just two independent-looking sub-commands.
+            replace_idempotency_key = f"REPLACE:{request.replace_command_id}"
+            replace_command = ExecutionCommand(
+                idempotency_key=replace_idempotency_key, command_type="replace",
+                environment=original.environment, account_no=original.account_no, symbol=original.symbol,
+                lease_epoch=request.lease.lease_epoch if request.lease else 0,
+                owner_device_id=request.lease.device_id if request.lease else "",
+                lease_token=request.lease.lease_token if request.lease else "",
+                target_broker_order_id=original.broker_order_id, source=request.source.value,
+            )
+            ensure_execution_commands_table(engine)
+            with engine.begin() as conn:
+                insert_command(conn, replace_command)
+
+            # 6. cancel the original.
             cancel_request = CancelExecutionRequest(
                 client_order_id=request.client_order_id,
                 cancel_command_id=f"{request.replace_command_id}:CANCEL",
                 environment=request.environment, account_no=request.account_no,
                 lease=request.lease, source=request.source,
+                strategy_instance_id=request.strategy_instance_id,
             )
             self._do_cancel(cancel_request, record=original, permission_check=_cancellable_for_replace)
             cancelled = self._fetch_record(request.client_order_id)
@@ -465,16 +554,30 @@ class ExecutionCommandGateway:
                     f"CANCELLED outcome (status={status}) -- a fill or an ambiguous cancel outcome must "
                     "be resolved before a replace can proceed"
                 )
+
+            # 7. submit the linked replacement.
             submit_request = SubmitExecutionRequest(
                 client_order_id=request.new_client_order_id, environment=cancelled.environment,
                 account_no=cancelled.account_no, symbol=cancelled.symbol, side=cancelled.side,
-                intent=cancelled.intent, quantity=request.new_quantity, limit_price=request.new_limit_price,
+                intent=cancelled.intent, quantity=new_quantity, limit_price=new_limit_price,
                 exchange=cancelled.exchange, execution_policy=cancelled.execution_policy,
                 attempt_group_id=cancelled.attempt_group_id, attempt_number=cancelled.attempt_number + 1,
-                lease=request.lease, source=request.source,
+                lease=request.lease, source=request.source, strategy_instance_id=request.strategy_instance_id,
                 replaces_execution_order_id=request.client_order_id,
             )
-            return self._do_submit(submit_request)
+            result = self._do_submit(submit_request)
+
+            # The parent replace command finalizes only on full success --
+            # a replace that fails partway (e.g. the submit leg raises)
+            # deliberately leaves this row at REQUESTED; restart recovery
+            # reconstructs "how far did this get" from the cancel/submit
+            # sub-commands' own already-durable statuses, per this
+            # method's own docstring.
+            with engine.begin() as conn:
+                update_command_response(
+                    conn, replace_idempotency_key, status="COMPLETED", broker_response={}
+                )
+            return result
 
     # --- internal guards ---------------------------------------------------
 
@@ -516,7 +619,10 @@ class ExecutionCommandGateway:
                 "(see DefaultExecutionLeaseProtocol.epoch_verified)"
             )
 
-    def _require_ownership(self, environment: str, account_no: str, symbol: str, source: ExecutionSource) -> None:
+    def _require_ownership(
+        self, environment: str, account_no: str, symbol: str, source: ExecutionSource,
+        strategy_instance_id: str = "",
+    ) -> None:
         engine = self._require_engine()
         ensure_execution_ownership_table(engine)
         ownership = get_ownership(engine, environment=environment, account_no=account_no, symbol=symbol)
@@ -529,6 +635,16 @@ class ExecutionCommandGateway:
             if source != ExecutionSource.KANBAN_BOARD:
                 raise ExecutionOwnershipMismatchError(
                     f"{environment}/{account_no}/{symbol} is KANBAN-owned; {source.value} is not authorized"
+                )
+            # H1: "KANBAN plus strategy_instance_id" -- ownership is not
+            # satisfied by the source alone; the calling strategy instance
+            # must be the exact one this symbol is assigned to, so one
+            # Kanban strategy can never act on a symbol assigned to a
+            # different one (review finding 3, third pass).
+            if not strategy_instance_id or strategy_instance_id != ownership.strategy_instance_id:
+                raise ExecutionOwnershipMismatchError(
+                    f"{environment}/{account_no}/{symbol} is KANBAN-owned by strategy_instance_id="
+                    f"{ownership.strategy_instance_id!r}; {strategy_instance_id!r} is not authorized"
                 )
             return
         # LEGACY (the H2 default, or an explicit assignment)
@@ -571,7 +687,7 @@ class ExecutionCommandGateway:
         trading_state.require_trading_enabled(environment, symbol)
 
         # H1/B2: persisted execution ownership.
-        self._require_ownership(environment, account_no, symbol, request.source)
+        self._require_ownership(environment, account_no, symbol, request.source, request.strategy_instance_id)
 
         # 2. execution lease and lease epoch -- required, never fails open.
         self._require_verified_lease(request.lease)
@@ -645,6 +761,19 @@ class ExecutionCommandGateway:
         with engine.begin() as conn:
             update_execution_order(conn, record, expected_version=record.version)
 
+        # Finding 7 (third pass): re-verify ownership and lease immediately
+        # before the actual broker call, not only once, earlier, before the
+        # journal/SUBMITTING commit -- another device could transfer
+        # ownership or advance the lease epoch during that interval. This
+        # is a re-check against the current authoritative state at the
+        # last possible moment, not yet a persisted fencing-token/version
+        # proof threaded through the command row itself (a further
+        # enhancement -- see the module's own follow-up notes); it still
+        # closes the concrete race: a stale authorization can no longer
+        # reach the broker.
+        self._require_ownership(environment, account_no, symbol, request.source, request.strategy_instance_id)
+        self._require_verified_lease(request.lease)
+
         # 9. only now call the broker.
         try:
             submission = self._real_broker.submit_order(
@@ -716,7 +845,9 @@ class ExecutionCommandGateway:
                 f"{request.environment}/{request.account_no}"
             )
 
-        self._require_ownership(record.environment, record.account_no, record.symbol, request.source)
+        self._require_ownership(
+            record.environment, record.account_no, record.symbol, request.source, request.strategy_instance_id
+        )
         self._require_verified_lease(request.lease)
         mutation_budget.require_available(CommandType.CANCEL)
 
@@ -747,6 +878,14 @@ class ExecutionCommandGateway:
             insert_command(conn, command)
             apply_status_transition(record, ExecutionOrderStatus.CANCEL_PENDING)
             update_execution_order(conn, record, expected_version=record.version)
+
+        # Finding 7 (third pass): re-verify ownership and lease immediately
+        # before the actual broker call -- see _do_submit's identical
+        # re-check for the full reasoning.
+        self._require_ownership(
+            record.environment, record.account_no, record.symbol, request.source, request.strategy_instance_id
+        )
+        self._require_verified_lease(request.lease)
 
         quantity = record.remaining_quantity or record.submitted_quantity
         try:

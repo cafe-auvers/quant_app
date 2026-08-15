@@ -73,7 +73,7 @@ def test_request_submit_through_the_real_workflow_reaches_acknowledged(tmp_path)
     record = workflow.request_submit(
         source=ExecutionSource.KANBAN_BOARD, environment="PROD", account_no="12345678-01", symbol="AAPL",
         side=OrderSide.BUY, intent=OrderIntent.ENTRY, quantity=10, limit_price=100.0,
-        gateway=gateway, client_order_id="WF-CID-1", lease=LEASE,
+        gateway=gateway, client_order_id="WF-CID-1", lease=LEASE, strategy_instance_id="test",
     )
     assert record.status == ExecutionOrderStatus.ACKNOWLEDGED
     assert record.broker_order_id == "B-1"
@@ -89,13 +89,13 @@ def test_request_submit_then_request_cancel_using_the_same_client_order_id_reach
     workflow.request_submit(
         source=ExecutionSource.KANBAN_BOARD, environment="PROD", account_no="12345678-01", symbol="AAPL",
         side=OrderSide.BUY, intent=OrderIntent.ENTRY, quantity=10, limit_price=100.0,
-        gateway=gateway, client_order_id="WF-CID-2", lease=LEASE,
+        gateway=gateway, client_order_id="WF-CID-2", lease=LEASE, strategy_instance_id="test",
     )
 
     broker.queue_cancel_confirmed()
     cancelled = workflow.request_cancel(
         source=ExecutionSource.KANBAN_BOARD, client_order_id="WF-CID-2", gateway=gateway,
-        environment="PROD", account_no="12345678-01", lease=LEASE,
+        environment="PROD", account_no="12345678-01", lease=LEASE, strategy_instance_id="test",
     )
     assert cancelled.status == ExecutionOrderStatus.CANCELLED
 
@@ -110,7 +110,7 @@ def test_request_replace_preserves_the_original_and_creates_a_linked_replacement
     workflow.request_submit(
         source=ExecutionSource.KANBAN_BOARD, environment="PROD", account_no="12345678-01", symbol="AAPL",
         side=OrderSide.BUY, intent=OrderIntent.ENTRY, quantity=10, limit_price=100.0,
-        gateway=gateway, client_order_id="WF-CID-3", lease=LEASE,
+        gateway=gateway, client_order_id="WF-CID-3", lease=LEASE, strategy_instance_id="test",
     )
 
     broker.queue_cancel_confirmed()
@@ -118,7 +118,7 @@ def test_request_replace_preserves_the_original_and_creates_a_linked_replacement
     replacement = workflow.request_replace(
         source=ExecutionSource.KANBAN_BOARD, client_order_id="WF-CID-3", new_quantity=5,
         new_limit_price=101.0, gateway=gateway, environment="PROD", account_no="12345678-01", lease=LEASE,
-        new_client_order_id="WF-CID-3-REPLACEMENT",
+        new_client_order_id="WF-CID-3-REPLACEMENT", strategy_instance_id="test",
     )
     assert replacement.status == ExecutionOrderStatus.ACKNOWLEDGED
     assert replacement.replaces_execution_order_id == "WF-CID-3"
@@ -166,7 +166,7 @@ def test_restart_idempotency_through_the_workflow_layers_own_stable_identity(tmp
         workflow.request_submit(
             source=ExecutionSource.KANBAN_BOARD, environment="PROD", account_no="12345678-01", symbol="AAPL",
             side=OrderSide.BUY, intent=OrderIntent.ENTRY, quantity=10, limit_price=100.0,
-            gateway=first_gateway, client_order_id="RESTART-STABLE-ID", lease=LEASE,
+            gateway=first_gateway, client_order_id="RESTART-STABLE-ID", lease=LEASE, strategy_instance_id="test",
         )
     assert len(first_broker.submit_calls) == 1
 
@@ -183,7 +183,7 @@ def test_restart_idempotency_through_the_workflow_layers_own_stable_identity(tmp
         workflow.request_submit(
             source=ExecutionSource.KANBAN_BOARD, environment="PROD", account_no="12345678-01", symbol="AAPL",
             side=OrderSide.BUY, intent=OrderIntent.ENTRY, quantity=10, limit_price=100.0,
-            gateway=second_gateway, client_order_id="RESTART-STABLE-ID", lease=LEASE,
+            gateway=second_gateway, client_order_id="RESTART-STABLE-ID", lease=LEASE, strategy_instance_id="test",
         )
     assert second_broker.submit_calls == []
 
@@ -199,12 +199,12 @@ def test_request_submit_without_a_client_order_id_mints_a_fresh_one_each_call(tm
     first = workflow.request_submit(
         source=ExecutionSource.KANBAN_BOARD, environment="PROD", account_no="12345678-01",
         symbol="AAPL", side=OrderSide.BUY, intent=OrderIntent.ENTRY, quantity=10, limit_price=100.0,
-        gateway=gateway, lease=LEASE,
+        gateway=gateway, lease=LEASE, strategy_instance_id="test",
     )
     second = workflow.request_submit(
         source=ExecutionSource.KANBAN_BOARD, environment="PROD", account_no="12345678-01",
         symbol="MSFT", side=OrderSide.BUY, intent=OrderIntent.ENTRY, quantity=5, limit_price=50.0,
-        gateway=gateway, lease=LEASE,
+        gateway=gateway, lease=LEASE, strategy_instance_id="test",
     )
     assert first.client_order_id != second.client_order_id
 
@@ -216,11 +216,11 @@ def test_request_cancel_without_a_cancel_command_id_mints_a_fresh_one(tmp_path):
     workflow.request_submit(
         source=ExecutionSource.KANBAN_BOARD, environment="PROD", account_no="12345678-01", symbol="AAPL",
         side=OrderSide.BUY, intent=OrderIntent.ENTRY, quantity=10, limit_price=100.0,
-        gateway=gateway, client_order_id="WF-CID-4", lease=LEASE,
+        gateway=gateway, client_order_id="WF-CID-4", lease=LEASE, strategy_instance_id="test",
     )
     broker.queue_cancel_confirmed()
     cancelled = workflow.request_cancel(
         source=ExecutionSource.KANBAN_BOARD, client_order_id="WF-CID-4", gateway=gateway,
-        environment="PROD", account_no="12345678-01", lease=LEASE,
+        environment="PROD", account_no="12345678-01", lease=LEASE, strategy_instance_id="test",
     )
     assert cancelled.status == ExecutionOrderStatus.CANCELLED

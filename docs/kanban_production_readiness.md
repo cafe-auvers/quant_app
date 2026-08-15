@@ -1413,3 +1413,139 @@ and stays `false` in unattended/automatic form until Gate 5 passes.
   pass released it; only a `BUY` actually needs to reserve buying power.
 
   Full test suite: 1541 passed (was 1516). `python -m compileall`: clean.
+- 2026-08-16 (PR2, third pass): A third review found the second pass's own
+  fixes had left the *real* Kanban runtime composition broken -- correct
+  in isolation, not actually wired together. Seven findings, six resolved
+  in this pass; two (double capital reservation, restart-persisted
+  card-level command identity) require deeper integration with the
+  pre-existing `EntryAttemptManager`/`PositionManager`/`TradeCardState`
+  infrastructure and are explicitly logged as open, not silently deferred.
+
+  **Finding 1 (buyboard_runtime called the wrong API) -- fixed.**
+  `build_buyboard_runtime`'s `submit_order`/`submit_sell_order`/
+  `_cancel_order` now call `execution_workflow_service.request_submit`/
+  `request_cancel` instead of `submit_guarded_overseas_order`/
+  `cancel_and_reconcile_order` directly -- the latter call the gateway's
+  `Broker`-protocol methods, which the gateway (correctly, per the second
+  pass) now rejects outright in `GUARDED_ENGINE` mode
+  (`WrongGatewayModeError`). Safe for the only reachable mode
+  (`LEGACY_COMPATIBILITY`): `request_submit`/`request_cancel` forward
+  every keyword argument to the exact same legacy functions unchanged,
+  proven by the full existing `test_buyboard_runtime.py` suite passing
+  with no behavioral difference (only the wrapped `broker` object's
+  identity changes, from the raw broker to a thin source-attribution
+  adapter around it). `_resolved_mode` (new,
+  `execution_workflow_service.py`) treats a plain `Broker` (no `.mode`
+  attribute -- e.g. a test double injected via `build_buyboard_runtime`'s
+  own `broker=` override) as implicitly `LEGACY_COMPATIBILITY`, preserving
+  that existing flexibility rather than requiring every caller to wrap a
+  fake in a full gateway.
+
+  Fixing this surfaced two further, smaller gaps, both closed: (a)
+  `build_buyboard_runtime` had no `strategy_instance_id` concept at all,
+  so it could never satisfy H1's "KANBAN plus strategy_instance_id"
+  requirement (finding 3, below) even after routing was fixed -- added as
+  a new `build_buyboard_runtime(..., strategy_instance_id="")` parameter,
+  threaded through every submission/cancellation this runtime makes; (b)
+  a second, previously-missed direct call to `submit_guarded_overseas_order`
+  in `submit_sell_order` (the SELL adapter, review finding P0-3) needed
+  the identical fix.
+
+  Still open, explicitly: `PositionActionCallbacks.cancel_order`'s
+  existing interface only supplies `client_order_id` to `_cancel_order`,
+  with no `environment`/`account_no` -- so `_cancel_order` cannot itself
+  drive a `GUARDED_ENGINE` cancel yet (finding 9's account/environment-
+  match gate would see blank values and reject). Widening that callback
+  interface is deferred alongside findings 4/5 below.
+
+  **Finding 2 (guarded composition root uses a lease verifier that can
+  never pass) -- fixed.** `build_buyboard_runtime` now refuses
+  `GUARDED_ENGINE` activation outright (`RuntimeError` at composition
+  time) whenever `BUYBOARD_ENGINE_ENABLED=true` and no explicit `broker=`
+  override is supplied -- `DefaultExecutionLeaseProtocol.epoch_verified`
+  is permanently `False` (Workstream 5/6 doesn't exist yet) and
+  `AllowAllMutationBudget` is a testing placeholder, so the previous
+  composition would have "succeeded" at startup and failed only on the
+  first real command. This has no production effect (the flag stays
+  `false` for the whole program) but closes a real internal
+  inconsistency between the gateway's own fail-closed lease gate and its
+  composition root.
+
+  **Finding 3 (H1 stores but doesn't enforce `strategy_instance_id`) --
+  fixed.** All three request models
+  (`SubmitExecutionRequest`/`CancelExecutionRequest`/`ReplaceExecutionRequest`)
+  now carry `strategy_instance_id`; `_require_ownership` rejects a blank
+  or mismatched one for a `KANBAN`-owned symbol -- one Kanban strategy
+  instance can no longer act on a symbol assigned to a different one.
+
+  **Finding 6 (replace could cancel a valid order before validating the
+  replacement) -- fixed.** `replace_guarded` now validates the *entire*
+  replacement request (account/environment match, quantity, price, a
+  fresh `new_client_order_id`, ownership/permission, lease, both
+  mutation budgets) before ever cancelling the original, and persists a
+  durable parent `replace` command row (`REPLACE:{replace_command_id}`)
+  before either broker call -- restart recovery reconstructs "how far did
+  this get" from the parent row plus its linked cancel/submit sub-commands'
+  own already-durable statuses, rather than needing new intermediate-state
+  writes (the command ledger's compare-and-set persistence is a single
+  `REQUESTED -> one terminal state` transition by design, not a
+  multi-step state machine, and this reuses that as-is). Tests prove an
+  invalid quantity/price, a duplicate `new_client_order_id`, and an
+  account/environment mismatch all make zero cancel calls.
+
+  **Finding 7 (no re-fencing immediately before the broker call) --
+  fixed, "at minimum."** `_do_submit`/`_do_cancel` now re-verify ownership
+  and lease a second time, immediately before the actual broker call, not
+  only once earlier before the journal/status-transition commit -- closes
+  the concrete race where another device transfers ownership or advances
+  the lease epoch in that window. This is a fresh re-check against current
+  state, not yet a persisted fencing-token/version proof threaded through
+  the command row itself (the review's "at minimum" framing already
+  anticipated a lighter floor here; a full fencing-token design remains a
+  further enhancement, not built in this pass).
+
+  **Findings 4 and 5 -- explicitly not resolved in this pass, logged
+  rather than silently deferred.** Both require modifying pre-existing,
+  already-tested legacy modules (`entry_attempt_manager.py`,
+  `position_manager.py`, `TradeCardState`) outside every file this PR has
+  otherwise touched, with real regression risk to code that has nothing
+  to do with the guarded engine:
+  - Finding 4: restart-safe idempotency currently depends on whatever
+    calls `request_submit` durably remembering and resupplying the same
+    `client_order_id` after a real process crash. Nothing in
+    `EntryAttemptManager`'s own persisted state
+    (`attempt_group_id`/attempt count) currently derives or persists a
+    gateway `client_order_id` before invoking submission, so there is
+    nothing yet to restore. This PR's own restart test (both pass 2's
+    direct-gateway version and this pass's workflow-layer version)
+    proves the *gateway's* replay behavior is correct given a stable
+    identity; it does not prove the application can reconstruct that
+    identity after a crash, because nothing durably tracks it yet.
+  - Finding 5: `EntryAttemptManager` reserves capital via the existing
+    best-effort `capital_allocator`/`save_reservation` path *before*
+    calling its `submit_order` callback; the gateway's own A1 transaction
+    reserves *again*, independently, inside `_do_submit`. If
+    `GUARDED_ENGINE` mode were ever actually reachable through
+    `EntryAttemptManager` today, a successful entry would double-reserve
+    buying power (a conservative-direction bug -- it would under-utilize
+    capital, not risk overspending it, but it is still wrong). The
+    guarded result (`ExecutionOrderRecord`) also isn't projected back
+    into whatever shape `EntryAttemptManager`/`TradingEngine` expects
+    from a submission (they were built against `BrokerOrder`); this
+    surfaced concretely while fixing finding 1, once `submit_order`'s
+    real callback could reach the gateway at all.
+
+  Both are made practically inert by finding 2's fix: `build_buyboard_runtime`
+  now refuses `GUARDED_ENGINE` construction unconditionally, so neither
+  double-reservation nor the restart-identity gap is reachable through the
+  real composition root today, regardless of the flag. Resolving them
+  properly -- a single authoritative reservation model, a real
+  `client_order_id` persisted in durable entry-attempt/card state, and a
+  `GUARDED_ENGINE`-aware projection of the gateway's result back into
+  `EntryAttemptManager`'s own expectations -- needs its own deliberately
+  scoped pass against those legacy modules specifically, not a rushed
+  patch layered under this PR's existing scope.
+
+  Full test suite: 1552 passed (was 1541). `python -m compileall`: clean.
+  No visible GitHub CI yet for this pass -- still local results only,
+  per the review's own note; a PR/CI run remains to be opened.

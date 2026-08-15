@@ -508,8 +508,47 @@ def test_kanban_owned_symbol_accepts_kanban_source(tmp_path):
         ),
     )
     broker.queue_acceptance()
-    record = gateway.submit_guarded(_submit_request(source=ExecutionSource.KANBAN_BOARD))
+    record = gateway.submit_guarded(
+        _submit_request(source=ExecutionSource.KANBAN_BOARD, strategy_instance_id="orb-1")
+    )
     assert record.status == ExecutionOrderStatus.ACKNOWLEDGED
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_kanban_owned_symbol_rejects_a_blank_strategy_instance_id(tmp_path):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    assign_ownership(
+        engine,
+        ExecutionOwnership(
+            environment="PROD", account_no="12345678-01", symbol="AAPL", owner=ExecutionOwner.KANBAN,
+            strategy_instance_id="orb-1",
+        ),
+    )
+    broker.queue_acceptance()
+    with pytest.raises(ExecutionOwnershipMismatchError):
+        gateway.submit_guarded(_submit_request(source=ExecutionSource.KANBAN_BOARD))  # no strategy_instance_id
+    assert broker.submit_calls == []
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_kanban_owned_symbol_rejects_a_different_strategy_instance_id(tmp_path):
+    """Finding 3 (third pass): H1 is 'KANBAN plus strategy_instance_id' --
+    one Kanban strategy instance must never be able to act on a symbol
+    assigned to a different one."""
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    assign_ownership(
+        engine,
+        ExecutionOwnership(
+            environment="PROD", account_no="12345678-01", symbol="AAPL", owner=ExecutionOwner.KANBAN,
+            strategy_instance_id="orb-1",
+        ),
+    )
+    broker.queue_acceptance()
+    with pytest.raises(ExecutionOwnershipMismatchError):
+        gateway.submit_guarded(
+            _submit_request(source=ExecutionSource.KANBAN_BOARD, strategy_instance_id="some-other-strategy")
+        )
+    assert broker.submit_calls == []
 
 
 @pytest.mark.usefixtures("trading_enabled")
@@ -525,6 +564,63 @@ def test_unassigned_symbol_defaults_legacy_and_rejects_kanban(tmp_path):
     # the unassigned/LEGACY default.
     record = gateway.submit_guarded(_submit_request(source=ExecutionSource.LEGACY_BUY_DASHBOARD))
     assert record.status == ExecutionOrderStatus.ACKNOWLEDGED
+
+
+# --- finding 7: last-instant re-fencing immediately before the broker call --
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_an_ownership_transfer_between_the_initial_check_and_the_broker_call_blocks_submission(tmp_path, monkeypatch):
+    """Simulates another device reassigning ownership away from this
+    source in the window between the gateway's initial B2 check and the
+    actual broker call -- the last-instant re-check (finding 7, third
+    pass) must catch it, not just the earlier one."""
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    broker.queue_acceptance()
+
+    real_get_ownership = gw_module.get_ownership
+    calls = {"n": 0}
+
+    def _ownership_changes_after_first_check(engine_arg, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real_get_ownership(engine_arg, **kwargs)
+        # Second call (the last-instant re-check): ownership has been
+        # transferred to MANUAL in the interim.
+        return ExecutionOwnership(**{**kwargs, "owner": ExecutionOwner.MANUAL})
+
+    monkeypatch.setattr(gw_module, "get_ownership", _ownership_changes_after_first_check)
+
+    with pytest.raises(ExecutionOwnershipMismatchError):
+        gateway.submit_guarded(_submit_request())
+    assert broker.submit_calls == []  # the broker was never actually reached
+    assert calls["n"] == 2  # both the initial check and the re-check ran
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_a_lease_epoch_advance_between_the_initial_check_and_the_broker_call_blocks_submission(tmp_path):
+    """Simulates another device's handoff advancing the lease epoch in the
+    window between the initial check and the actual broker call."""
+
+    class _EpochAdvancesAfterFirstCall:
+        epoch_verified = True
+
+        def __init__(self):
+            self.calls = 0
+
+        def require_current(self, lease):
+            self.calls += 1
+            if self.calls >= 2:
+                raise gw_module.LeaseNotCurrentError("epoch advanced by another device")
+
+    lease_protocol = _EpochAdvancesAfterFirstCall()
+    gateway, broker, engine = _guarded_gateway(tmp_path, lease_protocol=lease_protocol)
+    broker.queue_acceptance()
+
+    with pytest.raises(LeaseNotVerifiedError):
+        gateway.submit_guarded(_submit_request())
+    assert broker.submit_calls == []
+    assert lease_protocol.calls == 2
 
 
 # --- cancellation -----------------------------------------------------------
@@ -732,6 +828,83 @@ def test_replace_preserves_the_original_order_and_creates_a_linked_new_record(tm
     assert new_record.status == ExecutionOrderStatus.ACKNOWLEDGED
     assert new_record.replaces_execution_order_id == "CID-1"
     assert new_record.submitted_quantity == 5
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_replace_persists_a_durable_parent_command_that_finalizes_on_success(tmp_path):
+    """Finding 6 (third pass): the parent replace command's own row is
+    what lets restart recovery distinguish a replace-in-progress from an
+    independent cancel/submit pair."""
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    _submit_and_acknowledge(gateway, broker)
+    broker.queue_cancel_confirmed()
+    broker.queue_acceptance(broker_order_id="B-2")
+
+    gateway.replace_guarded(_replace_request())
+
+    parent = get_command_by_idempotency_key(engine, "REPLACE:REPLACE-1")
+    assert parent is not None
+    assert parent.status == "COMPLETED"
+    assert parent.command_type == "replace"
+
+    # The linked sub-commands are independently visible too.
+    assert get_command_by_idempotency_key(engine, "CANCEL:REPLACE-1:CANCEL") is not None
+    assert get_command_by_idempotency_key(engine, "SUBMIT:CID-1-REPLACEMENT") is not None
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_an_invalid_replacement_quantity_makes_zero_cancel_calls(tmp_path):
+    """Finding 6: validate the entire replacement request before ever
+    cancelling the perfectly good original order."""
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    _submit_and_acknowledge(gateway, broker)
+
+    with pytest.raises(ValueError):
+        gateway.replace_guarded(_replace_request(new_quantity=0))
+    assert broker.cancel_calls == []
+    assert len(broker.submit_calls) == 1  # only the original submission, no replacement attempted
+    # The original is untouched.
+    original = fetch_execution_order(engine, "CID-1")
+    assert original.status == ExecutionOrderStatus.ACKNOWLEDGED
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_an_invalid_replacement_price_makes_zero_cancel_calls(tmp_path):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    _submit_and_acknowledge(gateway, broker)
+
+    with pytest.raises(ValueError):
+        gateway.replace_guarded(_replace_request(new_limit_price=-1.0))
+    assert broker.cancel_calls == []
+    original = fetch_execution_order(engine, "CID-1")
+    assert original.status == ExecutionOrderStatus.ACKNOWLEDGED
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_a_duplicate_new_client_order_id_makes_zero_cancel_calls(tmp_path):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    _submit_and_acknowledge(gateway, broker)
+    # A second, unrelated order already occupies the identity the replace
+    # request wants to reuse.
+    broker.queue_acceptance(broker_order_id="B-EXISTING")
+    gateway.submit_guarded(_submit_request(client_order_id="CID-1-REPLACEMENT"))
+
+    with pytest.raises(ValueError):
+        gateway.replace_guarded(_replace_request())  # new_client_order_id="CID-1-REPLACEMENT"
+    assert broker.cancel_calls == []
+
+    original = fetch_execution_order(engine, "CID-1")
+    assert original.status == ExecutionOrderStatus.ACKNOWLEDGED  # untouched, never cancelled
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_replace_rejects_an_account_environment_mismatch_before_any_cancel_call(tmp_path):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    _submit_and_acknowledge(gateway, broker)
+
+    with pytest.raises(CancelNotPermittedError):
+        gateway.replace_guarded(_replace_request(account_no="99999999-01"))
+    assert broker.cancel_calls == []
 
 
 @pytest.mark.usefixtures("trading_enabled")

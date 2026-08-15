@@ -14,6 +14,7 @@ from src.core.order_state import (
 )
 from src.core.trade_card_state import BoardStatus, TradeCardState
 from src.services import buyboard_runtime as runtime_module
+from src.services import execution_workflow_service as workflow_module
 from src.services.broker import BrokerSubmissionResult
 from src.services.intraday_provider import IntradayProviderName, IntradayResult
 from src.services.realtime_market_data import QuoteSnapshot
@@ -149,6 +150,94 @@ def test_build_buyboard_runtime_assembles_a_working_engine():
     assert runtime.broker is broker
 
 
+def test_build_buyboard_runtime_refuses_guarded_activation_outright(monkeypatch):
+    """PR2's third review pass, finding 2: DefaultExecutionLeaseProtocol
+    can never satisfy the gateway's own epoch-verification gate, and
+    AllowAllMutationBudget is a testing placeholder -- constructing a
+    GUARDED_ENGINE composition with either would "succeed" at startup and
+    then fail on the very first submission. Refuse outright instead, with
+    no broker= override to bypass it (a caller-supplied broker is the one
+    escape hatch, used only by other tests / explicit fake-broker wiring,
+    never by real BUYBOARD_ENGINE_ENABLED=true activation)."""
+    from src.core import execution_config
+
+    monkeypatch.setattr(execution_config, "is_buyboard_engine_enabled", lambda: True)
+    cards = {}
+    with pytest.raises(RuntimeError, match="epoch-verifying"):
+        runtime_module.build_buyboard_runtime(
+            buying_power_provider=lambda env, acct: 100_000.0,
+            card_lookup=lambda env, acct, sym: cards.get((env, acct, sym)),
+        )
+
+
+def test_submit_callback_reaches_the_guarded_gateway_not_wrongmode(tmp_path, trading_enabled):
+    """Finding 1 (third pass): before this fix, the real submit callback
+    called submit_guarded_overseas_order directly, which calls the
+    gateway's Broker-protocol submit_order -- a method the gateway now
+    correctly rejects in GUARDED_ENGINE mode (WrongGatewayModeError).
+    Proves entry_attempt_manager's real submit path now routes through
+    execution_workflow_service.request_submit, which dispatches to
+    submit_guarded instead, using a real GUARDED_ENGINE gateway
+    (constructed via an explicit broker= override, bypassing
+    build_buyboard_runtime's own composition-root refusal -- a separate,
+    correct guard covered by finding 2's own test), and reaches
+    progressively deeper into the real B2 gate sequence as each field is
+    correctly threaded through: ownership (ExecutionOwnershipMismatchError
+    if strategy_instance_id is wrong/missing -- see the H1 tests) is
+    satisfied here, and the call then correctly reaches the lease gate.
+
+    It stops there, honestly, rather than forcing a full success:
+    build_buyboard_runtime has no source of a real, epoch-verified
+    ExecutionLease today (it only has the legacy LeaseHandle/
+    execution_authority triple, a distinct, LEGACY_COMPATIBILITY-only
+    concept) -- LeaseNotVerifiedError here is the *correct*, current
+    behavior, not a bug, and further wiring a real guarded-mode lease
+    through this module is out of this pass's scope (logged in the doc's
+    change log, not silently assumed done).
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.pool import NullPool
+
+    from src.core.execution_ownership import ExecutionOwner, ExecutionOwnership
+    from src.services.execution_command_gateway import ExecutionCommandGateway, LeaseNotVerifiedError
+    from src.services.execution_lease_protocol import DefaultExecutionLeaseProtocol
+    from src.services.execution_ownership_repository import assign_ownership
+    from src.services.mutation_budget_protocol import AllowAllMutationBudget
+    from fakes.fake_execution_broker import FakeExecutionBroker
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'guarded.db'}", future=True, poolclass=NullPool)
+    fake_broker = FakeExecutionBroker()
+    guarded_gateway = ExecutionCommandGateway(
+        real_broker=fake_broker, engine=engine, mode_override=True,
+        lease_protocol=DefaultExecutionLeaseProtocol(engine=engine),
+        mutation_budget=AllowAllMutationBudget(),
+    )
+    assign_ownership(
+        engine,
+        ExecutionOwnership(
+            environment="PROD", account_no="1", symbol="AAPL", owner=ExecutionOwner.KANBAN,
+            strategy_instance_id="orb",
+        ),
+    )
+
+    runtime = runtime_module.build_buyboard_runtime(
+        buying_power_provider=lambda env, acct: 100_000.0,
+        card_lookup=lambda env, acct, sym: None,
+        broker=guarded_gateway,
+        strategy_instance_id="orb",
+    )
+
+    fake_broker.queue_acceptance(broker_order_id="B-GUARDED-1")
+    with pytest.raises(LeaseNotVerifiedError):
+        runtime.entry_attempt_manager._submit_order(
+            environment="PROD", account_no="1", symbol="AAPL", side=OrderSide.BUY,
+            intent=OrderIntent.ENTRY, quantity=10, limit_price=100.0, exchange="NASD",
+            attempt_group_id="g1", attempt_number=1, attempt_deadline_at=None,
+            capital_reservation_id="",
+        )
+    assert fake_broker.submit_calls == []  # correctly never reached the broker without a real lease
+
+
 def test_submit_order_wrapper_supplies_a_fresh_risk_decision(monkeypatch):
     broker = _FakeBroker()
     card = _card()
@@ -162,7 +251,7 @@ def test_submit_order_wrapper_supplies_a_fresh_risk_decision(monkeypatch):
             limit_price=kwargs["limit_price"], status=OrderStatus.ACCEPTED,
         )
 
-    monkeypatch.setattr(runtime_module, "submit_guarded_overseas_order", fake_submit_guarded)
+    monkeypatch.setattr(workflow_module, "submit_guarded_overseas_order", fake_submit_guarded)
 
     runtime = runtime_module.build_buyboard_runtime(
         buying_power_provider=lambda env, acct: 10_000.0,  # 2000/10000 = 20%, inside the 10-30% band
@@ -181,7 +270,11 @@ def test_submit_order_wrapper_supplies_a_fresh_risk_decision(monkeypatch):
     assert captured["pre_trade_risk_decision"] is not None
     assert captured["pre_trade_risk_decision"].approved is True
     assert captured["strategy_id"] == runtime_module.RISK_STRATEGY_ID
-    assert captured["broker"] is broker
+    # Workstream 9 (PR2 third pass): the broker kwarg is now the shared
+    # workflow service's source-attribution adapter, not the raw broker
+    # directly -- it still delegates every call to the exact same
+    # configured broker underneath.
+    assert captured["broker"]._gateway is broker
 
 
 def test_submit_order_wrapper_denies_when_card_is_unknown(monkeypatch):
@@ -197,7 +290,7 @@ def test_submit_order_wrapper_denies_when_card_is_unknown(monkeypatch):
             limit_price=kwargs["limit_price"], status=OrderStatus.REJECTED,
         )
 
-    monkeypatch.setattr(runtime_module, "submit_guarded_overseas_order", fake_submit_guarded)
+    monkeypatch.setattr(workflow_module, "submit_guarded_overseas_order", fake_submit_guarded)
 
     runtime = runtime_module.build_buyboard_runtime(
         buying_power_provider=lambda env, acct: 100_000.0,
@@ -272,7 +365,7 @@ def test_entry_plan_id_matches_between_risk_decision_and_submission(monkeypatch)
             limit_price=kwargs["limit_price"], status=OrderStatus.ACCEPTED,
         )
 
-    monkeypatch.setattr(runtime_module, "submit_guarded_overseas_order", fake_submit_guarded)
+    monkeypatch.setattr(workflow_module, "submit_guarded_overseas_order", fake_submit_guarded)
 
     runtime = runtime_module.build_buyboard_runtime(
         buying_power_provider=lambda env, acct: 10_000.0,
@@ -308,7 +401,7 @@ def test_submit_order_resizes_quantity_down_at_a_higher_live_price(monkeypatch):
             limit_price=kwargs["limit_price"], status=OrderStatus.ACCEPTED,
         )
 
-    monkeypatch.setattr(runtime_module, "submit_guarded_overseas_order", fake_submit_guarded)
+    monkeypatch.setattr(workflow_module, "submit_guarded_overseas_order", fake_submit_guarded)
 
     runtime = runtime_module.build_buyboard_runtime(
         buying_power_provider=lambda env, acct: 10_000.0,
@@ -337,7 +430,7 @@ def test_submit_order_does_not_resize_up_at_a_lower_live_price(monkeypatch):
     card = _card(entry_orb_low=95.0, risk_percent=0.5)  # generous risk budget
     captured = {}
     monkeypatch.setattr(
-        runtime_module,
+        workflow_module,
         "submit_guarded_overseas_order",
         lambda **kwargs: (captured.update(kwargs) or BrokerOrder.create(
             environment=kwargs["environment"], account_no=kwargs["account_no"], symbol=kwargs["symbol"],
@@ -364,7 +457,7 @@ def test_submit_order_skips_resize_without_a_trustworthy_risk_percent(monkeypatc
     card = _card(entry_orb_low=95.0, risk_percent=0.0)
     captured = {}
     monkeypatch.setattr(
-        runtime_module,
+        workflow_module,
         "submit_guarded_overseas_order",
         lambda **kwargs: (captured.update(kwargs) or BrokerOrder.create(
             environment=kwargs["environment"], account_no=kwargs["account_no"], symbol=kwargs["symbol"],
@@ -412,7 +505,7 @@ def test_submit_sell_order_maps_partial_sell_reason_and_prices_from_live_bid(mon
             limit_price=kwargs["limit_price"], status=OrderStatus.ACCEPTED,
         )
 
-    monkeypatch.setattr(runtime_module, "submit_guarded_overseas_order", fake_submit_guarded)
+    monkeypatch.setattr(workflow_module, "submit_guarded_overseas_order", fake_submit_guarded)
     market_data = _market_data_with_quote("AAPL", bid=99.5)
 
     runtime = runtime_module.build_buyboard_runtime(
@@ -446,7 +539,7 @@ def test_submit_sell_order_maps_sell_all_reasons_to_manual_exit_and_discounts_la
             limit_price=kwargs["limit_price"], status=OrderStatus.ACCEPTED,
         )
 
-    monkeypatch.setattr(runtime_module, "submit_guarded_overseas_order", fake_submit_guarded)
+    monkeypatch.setattr(workflow_module, "submit_guarded_overseas_order", fake_submit_guarded)
     market_data = _market_data_with_quote("AAPL", last_price=50.0)  # no bid cached
 
     runtime = runtime_module.build_buyboard_runtime(
