@@ -43,6 +43,7 @@ from src.services.position_manager import (
     PositionManager,
     _default_cancel_intent_factory,
     extract_overseas_holdings,
+    request_cancel_with_lifecycle,
 )
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,7 @@ class EodActionCallbacks:
     cancel_intent_factory: Callable[[TradeCardState, str, str], CancelIntent] = (
         _default_cancel_intent_factory
     )
+    persist_cancel_state: Callable[[TradeCardState], None] = lambda card: None
     # Full account-wide discovery (open orders + history + reserved orders)
     # for this card's symbol. Code review finding P1-15: "no local order
     # found" must never by itself be treated as "no order exists" -- only a
@@ -120,7 +122,14 @@ class EodActionCallbacks:
     def request_cancel(
         self, card: TradeCardState, client_order_id: str, *, scope: str = "ENTRY"
     ) -> None:
-        self.cancel_order(self.cancel_intent_factory(card, client_order_id, scope))
+        request_cancel_with_lifecycle(
+            card=card,
+            client_order_id=client_order_id,
+            scope=scope,
+            cancel_order=self.cancel_order,
+            cancel_intent_factory=self.cancel_intent_factory,
+            persist_cancel_state=self.persist_cancel_state,
+        )
 
 
 class EodTradingService:

@@ -952,6 +952,7 @@ def build_buyboard_runtime(
             environment, account_no, symbol, broker=resolved_broker
         ),
         cancel_intent_factory=cancel_intent_factory,
+        persist_cancel_state=persist_execution_identity,
         find_open_sell_order=lambda card: find_runtime_order(
             card, side=OrderSide.SELL
         ),
@@ -965,6 +966,7 @@ def build_buyboard_runtime(
         reconcile_order=reconcile_runtime_order,
         cancel_order=lambda intent: _cancel_order(intent, broker=resolved_broker),
         cancel_intent_factory=cancel_intent_factory,
+        persist_cancel_state=persist_execution_identity,
         discover_all_orders=lambda card: _discover_all_orders(card, broker=resolved_broker),
         # Review finding P0: a historical filled order discovered from
         # KIS's ~14-day order-history window must not resurrect a position

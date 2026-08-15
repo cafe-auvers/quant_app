@@ -1,8 +1,10 @@
 """End-to-end guarded composition coverage for the PR2 fourth pass."""
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
 
 from fakes.fake_execution_broker import FakeExecutionBroker
@@ -113,6 +115,24 @@ def _persist_owned_card(engine, card: TradeCardState) -> TradeCardState:
         ),
     )
     return card
+
+
+def _cancel_commands(engine):
+    with engine.connect() as conn:
+        return conn.execute(
+            text(
+                "SELECT idempotency_key, status FROM execution_commands "
+                "WHERE command_type = 'cancel' ORDER BY id"
+            )
+        ).fetchall()
+
+
+def _submit_guarded_entry(runtime, broker, market_data, card) -> None:
+    broker.queue_acceptance(broker_order_id=f"B-{card.symbol}-ENTRY")
+    market_data.subscribe([card.symbol])
+    market_data.poll_once()
+    runtime.trading_engine.run_heartbeat([card])
+    assert card.board_status == BoardStatus.ENTRY_PENDING
 
 
 @pytest.mark.usefixtures("trading_enabled")
@@ -240,6 +260,130 @@ def test_tracked_cancel_carries_full_context_to_cancel_guarded(tmp_path, monkeyp
     assert fetch_execution_order(engine, card.entry_client_order_id).status == (
         ExecutionOrderStatus.CANCELLED
     )
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_entry_cancel_rejection_clears_id_and_next_heartbeat_uses_a_new_one(
+    tmp_path, monkeypatch
+):
+    runtime, broker, gateway, engine, market_data = _make_runtime(
+        tmp_path, monkeypatch
+    )
+    card = _persist_owned_card(engine, _card())
+    _submit_guarded_entry(runtime, broker, market_data, card)
+    card.entry_block_reason = "cancel_requested"
+
+    broker.queue_cancel_rejected()
+    runtime.trading_engine.run_heartbeat([card])
+
+    first_commands = _cancel_commands(engine)
+    assert len(broker.cancel_calls) == 1
+    assert len(first_commands) == 1
+    assert first_commands[0].status == "FAILED"
+    first_id = first_commands[0].idempotency_key.removeprefix("CANCEL:")
+    persisted = trade_card_repository.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert card.entry_cancel_command_id == ""
+    assert card.entry_cancel_in_flight is False
+    assert persisted.entry_cancel_command_id == ""
+    assert persisted.entry_cancel_in_flight is False
+
+    broker.queue_cancel_confirmed()
+    runtime.trading_engine.run_heartbeat([card])
+
+    second_commands = _cancel_commands(engine)
+    assert len(broker.cancel_calls) == 2
+    assert len(second_commands) == 2
+    assert card.entry_cancel_command_id
+    assert card.entry_cancel_command_id != first_id
+    assert second_commands[1].idempotency_key == f"CANCEL:{card.entry_cancel_command_id}"
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_exit_cancel_rejection_clears_id_and_next_heartbeat_uses_a_new_one(
+    tmp_path, monkeypatch
+):
+    runtime, broker, gateway, engine, market_data = _make_runtime(
+        tmp_path, monkeypatch
+    )
+    card = _persist_owned_card(
+        engine,
+        _card(
+            board_status=BoardStatus.PARTIAL_SELL,
+            pending_partial_sell_quantity=2,
+            broker_quantity=10,
+            orderable_quantity=10,
+        ),
+    )
+    market_data.subscribe([card.symbol])
+    market_data.poll_once()
+    broker.queue_acceptance(broker_order_id="B-AAPL-EXIT")
+    runtime.trading_engine._position_callbacks.submit_sell_order(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        quantity=2,
+        reason="partial_sell",
+        attempt_deadline_at=(
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).isoformat(),
+        trade_card=card,
+    )
+
+    broker.queue_cancel_rejected()
+    runtime.trading_engine.run_heartbeat([card])
+
+    first_commands = _cancel_commands(engine)
+    assert len(broker.cancel_calls) == 1
+    assert len(first_commands) == 1
+    assert first_commands[0].status == "FAILED"
+    first_id = first_commands[0].idempotency_key.removeprefix("CANCEL:")
+    persisted = trade_card_repository.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert card.exit_cancel_command_id == ""
+    assert card.exit_cancel_in_flight is False
+    assert card.exit_cancel_requested_at is None
+    assert persisted.exit_cancel_command_id == ""
+    assert persisted.exit_cancel_in_flight is False
+
+    broker.queue_cancel_confirmed()
+    runtime.trading_engine.run_heartbeat([card])
+
+    second_commands = _cancel_commands(engine)
+    assert len(broker.cancel_calls) == 2
+    assert len(second_commands) == 2
+    assert card.exit_cancel_command_id
+    assert card.exit_cancel_command_id != first_id
+    assert second_commands[1].idempotency_key == f"CANCEL:{card.exit_cancel_command_id}"
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_ambiguous_cancel_preserves_id_and_blocks_additional_broker_calls(
+    tmp_path, monkeypatch
+):
+    runtime, broker, gateway, engine, market_data = _make_runtime(
+        tmp_path, monkeypatch
+    )
+    card = _persist_owned_card(engine, _card())
+    _submit_guarded_entry(runtime, broker, market_data, card)
+    card.entry_block_reason = "cancel_requested"
+
+    broker.queue_cancel_timeout()
+    runtime.trading_engine.run_heartbeat([card])
+
+    cancel_id = card.entry_cancel_command_id
+    persisted = trade_card_repository.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert cancel_id
+    assert card.entry_cancel_in_flight is True
+    assert persisted.entry_cancel_command_id == cancel_id
+    assert persisted.entry_cancel_in_flight is True
+    assert len(broker.cancel_calls) == 1
+
+    runtime.trading_engine.run_heartbeat([card])
+
+    persisted = trade_card_repository.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert len(broker.cancel_calls) == 1
+    assert card.entry_cancel_command_id == cancel_id
+    assert persisted.entry_cancel_command_id == cancel_id
+    assert persisted.entry_cancel_in_flight is True
 
 
 @pytest.mark.usefixtures("trading_enabled")

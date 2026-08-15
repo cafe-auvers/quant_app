@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
@@ -29,6 +30,10 @@ from src.core.trade_card_state import (
     PositionRuntimeStatus,
     StopType,
     TradeCardState,
+)
+from src.services.execution_command_gateway import (
+    GuardedCancellationAmbiguousError,
+    GuardedCancellationRejectedError,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,6 +51,46 @@ def _default_cancel_intent_factory(
         strategy_instance_id="",
         source=ExecutionSource.KANBAN_BOARD,
     )
+
+
+def request_cancel_with_lifecycle(
+    *,
+    card: TradeCardState,
+    client_order_id: str,
+    scope: str,
+    cancel_order: Callable[[CancelIntent], None],
+    cancel_intent_factory: Callable[[TradeCardState, str, str], CancelIntent],
+    persist_cancel_state: Callable[[TradeCardState], None],
+) -> None:
+    """Apply caller-owned cancel identity rules around one gateway call."""
+    normalized_scope = str(scope or "").upper()
+    intent = cancel_intent_factory(card, client_order_id, normalized_scope)
+    try:
+        cancel_order(intent)
+    except GuardedCancellationAmbiguousError:
+        # The broker may have acted. Keep the same command identity and
+        # mark the cancel in flight so no heartbeat issues another call.
+        if normalized_scope == "ENTRY":
+            card.entry_cancel_in_flight = True
+        else:
+            card.exit_cancel_in_flight = True
+            if card.exit_cancel_requested_at is None:
+                card.exit_cancel_requested_at = datetime.now(timezone.utc)
+        persist_cancel_state(card)
+    except GuardedCancellationRejectedError:
+        # The broker explicitly did not act. This decision is complete and
+        # its command ID must never be replayed; the next heartbeat may mint
+        # a fresh ID for a genuinely new cancel decision.
+        if normalized_scope == "ENTRY":
+            card.entry_cancel_command_id = ""
+            card.entry_cancel_in_flight = False
+            card.entry_cancel_reason = ""
+        else:
+            card.exit_cancel_command_id = ""
+            card.exit_cancel_in_flight = False
+            card.exit_cancel_requested_at = None
+        persist_cancel_state(card)
+        raise
 
 
 def round_up_to_valid_tick(price: float, tick_size: float = 0.01) -> float:
@@ -116,6 +161,7 @@ class PositionActionCallbacks:
     cancel_intent_factory: Callable[[TradeCardState, str, str], CancelIntent] = (
         _default_cancel_intent_factory
     )
+    persist_cancel_state: Callable[[TradeCardState], None] = lambda card: None
     # Finds this card's currently-working exit (SELL) order, if any -- used
     # by callers (src.services.trading_engine) that need to cancel a
     # specific in-flight partial-sell order before escalating to a full
@@ -133,7 +179,14 @@ class PositionActionCallbacks:
     def request_cancel(
         self, card: TradeCardState, client_order_id: str, *, scope: str
     ) -> None:
-        self.cancel_order(self.cancel_intent_factory(card, client_order_id, scope))
+        request_cancel_with_lifecycle(
+            card=card,
+            client_order_id=client_order_id,
+            scope=scope,
+            cancel_order=self.cancel_order,
+            cancel_intent_factory=self.cancel_intent_factory,
+            persist_cancel_state=self.persist_cancel_state,
+        )
 
 
 @dataclass(frozen=True)
