@@ -244,17 +244,62 @@ def test_first_trigger_reserves_capital_second_waits(tmp_path):
     "status,filled,expected",
     [
         (OrderStatus.FILLED, 10, AttemptDeadlineAction.MOVE_TO_OPEN_POSITION),
-        (OrderStatus.PARTIALLY_FILLED, 4, AttemptDeadlineAction.CANCEL_REMAINDER_AND_RETRY),
+        # PARTIALLY_FILLED/WORKING/ACCEPTED are all "still working" from a
+        # pure status read -- whether to escalate to a cancel request
+        # depends on the deadline/cancel_requested flags, which only
+        # resolve_entry_order (not this pure function) has (code review
+        # finding P0-7: a cancel is never assumed, only requested and later
+        # confirmed).
+        (OrderStatus.PARTIALLY_FILLED, 4, AttemptDeadlineAction.STILL_WORKING),
+        (OrderStatus.WORKING, 0, AttemptDeadlineAction.STILL_WORKING),
+        (OrderStatus.ACCEPTED, 0, AttemptDeadlineAction.STILL_WORKING),
+        (OrderStatus.CANCEL_REQUESTED, 0, AttemptDeadlineAction.AWAIT_CANCEL_CONFIRMATION),
+        (OrderStatus.CANCELLED, 0, AttemptDeadlineAction.CONFIRMED_CANCELLED_ZERO_FILL),
+        (OrderStatus.CANCELLED, 4, AttemptDeadlineAction.CONFIRMED_CANCELLED_WITH_FILL),
         (OrderStatus.UNKNOWN_SUBMISSION_STATE, 0, AttemptDeadlineAction.BLOCK_SYMBOL_PENDING_RECONCILIATION),
         (OrderStatus.UNKNOWN, 0, AttemptDeadlineAction.BLOCK_SYMBOL_PENDING_RECONCILIATION),
         (OrderStatus.REJECTED, 0, AttemptDeadlineAction.RELEASE_AND_RETRY_AFTER_COOLDOWN),
-        (OrderStatus.WORKING, 0, AttemptDeadlineAction.CANCEL_AND_RETRY_AFTER_COOLDOWN),
-        (OrderStatus.ACCEPTED, 0, AttemptDeadlineAction.CANCEL_AND_RETRY_AFTER_COOLDOWN),
     ],
 )
 def test_decide_attempt_deadline_action(status, filled, expected):
     order = _order(status=status, filled=filled)
     assert decide_attempt_deadline_action(order) == expected
+
+
+def test_resolve_entry_order_still_working_before_deadline_does_nothing(tmp_path):
+    order = _order(status=OrderStatus.ACCEPTED, filled=0)
+    manager, _ = _manager(tmp_path, lambda **kw: None)
+    cancels = []
+    action = manager.resolve_entry_order(
+        order, at_deadline=False, cancel_requested=False, cancel_order=cancels.append
+    )
+    assert action == AttemptDeadlineAction.STILL_WORKING
+    assert cancels == []
+
+
+def test_resolve_entry_order_requests_cancel_at_deadline_but_does_not_finalize(tmp_path):
+    """P0-7: the first call past the deadline only requests the cancel --
+    capital settlement/cooldown must not happen until a later call sees a
+    broker-confirmed terminal status."""
+    order = _order(status=OrderStatus.ACCEPTED, filled=0, reservation_id="res-1")
+    manager, _ = _manager(tmp_path, lambda **kw: None)
+    cancels = []
+    action = manager.resolve_entry_order(
+        order, at_deadline=True, cancel_requested=False, cancel_order=cancels.append
+    )
+    assert action == AttemptDeadlineAction.AWAIT_CANCEL_CONFIRMATION
+    assert cancels == [order]
+
+
+def test_resolve_entry_order_repeated_await_does_not_resend_cancel(tmp_path):
+    order = _order(status=OrderStatus.CANCEL_REQUESTED, filled=0)
+    manager, _ = _manager(tmp_path, lambda **kw: None)
+    cancels = []
+    action = manager.resolve_entry_order(
+        order, at_deadline=True, cancel_requested=False, cancel_order=cancels.append
+    )
+    assert action == AttemptDeadlineAction.AWAIT_CANCEL_CONFIRMATION
+    assert cancels == []  # already requested -- must not resend
 
 
 def test_handle_attempt_deadline_full_fill_consumes_reservation(tmp_path):
@@ -279,7 +324,10 @@ def test_handle_attempt_deadline_full_fill_consumes_reservation(tmp_path):
     assert not stored.is_open()
 
 
-def test_handle_attempt_deadline_zero_fill_cancels_and_cools_down(tmp_path):
+def test_handle_attempt_deadline_zero_fill_only_requests_cancel_first_call(tmp_path):
+    """P0-7: capital must stay reserved and no cooldown starts until a
+    *later* call observes the broker-confirmed CANCELLED status -- the
+    first call at the deadline only sends the cancel request."""
     manager, path = _manager(tmp_path, lambda **kw: None)
     reservation = capital_allocator.reserve_capital_for_entry(
         environment="PROD",
@@ -295,8 +343,32 @@ def test_handle_attempt_deadline_zero_fill_cancels_and_cools_down(tmp_path):
     cancels = []
     action = manager.handle_attempt_deadline(order, cancel_order=cancels.append)
 
-    assert action == AttemptDeadlineAction.CANCEL_AND_RETRY_AFTER_COOLDOWN
+    assert action == AttemptDeadlineAction.AWAIT_CANCEL_CONFIRMATION
     assert cancels == [order]
+    stored = capital_allocator.load_reservations(path)[0]
+    assert stored.is_open()  # not yet released
+
+
+def test_handle_attempt_deadline_finalizes_once_broker_confirms_cancelled(tmp_path):
+    manager, path = _manager(tmp_path, lambda **kw: None)
+    reservation = capital_allocator.reserve_capital_for_entry(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        attempt_group_id="g1",
+        requested_notional=1000.0,
+        buying_power_provider=lambda: 10_000.0,
+        path=path,
+    )
+    order = _order(status=OrderStatus.ACCEPTED, filled=0, reservation_id=reservation.reservation_id)
+    manager.handle_attempt_deadline(order, cancel_order=lambda o: None)  # first tick: request only
+
+    order.status = OrderStatus.CANCELLED  # broker confirms on a later tick
+    cancels = []
+    action = manager.handle_attempt_deadline(order, cancel_order=cancels.append)
+
+    assert action == AttemptDeadlineAction.CONFIRMED_CANCELLED_ZERO_FILL
+    assert cancels == []  # no cancel resent -- it's already terminal
     stored = capital_allocator.load_reservations(path)[0]
     assert stored.status.value == "RELEASED"
 

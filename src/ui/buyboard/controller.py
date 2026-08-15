@@ -45,6 +45,7 @@ from .drag_commands import (
     CancelQueuedSellAll,
     MoveToBuylist,
     MoveToWatchlist,
+    ReorderCard,
     RequestPartialSell,
     RequestSellAll,
     SetBreakevenStop,
@@ -102,6 +103,8 @@ def apply_board_command(
         _apply_set_manual_stop(card, command)
     elif isinstance(command, CancelQueuedSellAll):
         _apply_cancel_queued_sell_all(card)
+    elif isinstance(command, ReorderCard):
+        card.kanban_priority = command.target_priority
     else:
         target_status = _SIMPLE_MOVE_TARGET_STATUS.get(type(command))
         if target_status is None:

@@ -16,6 +16,15 @@ Deliberately synchronous and side-effect-explicit (no internal thread or
 timer loop) so :mod:`src.services.trading_engine`'s 1-second heartbeat
 (Phase 5) can drive it, and so tests can call it directly without racing
 real wall-clock time.
+
+Order resolution is a two-phase state machine (fixed after code review):
+a cancel request is never treated as a completed cancellation. Capital is
+only settled and a retry cooldown only starts once the broker has actually
+confirmed a terminal status (FILLED/CANCELLED/REJECTED) --
+:func:`resolve_entry_order` is called every heartbeat tick for any working
+order (not only at the 15s deadline), so a fill is protected the moment it
+is observed and a cancel-in-flight order is never resubmitted against or
+assumed gone.
 """
 from __future__ import annotations
 
@@ -75,37 +84,69 @@ class AttemptResult:
     order: Optional[BrokerOrder] = None
     reservation_id: str = ""
     attempt_group_id: str = ""
+    attempt_count: int = 0
+    # When set, the caller should persist this onto the card
+    # (TradeCardState.next_retry_at) so retry timing survives a restart --
+    # this engine's own in-memory _SymbolAttemptState is only a same-process
+    # cache, not the durable record.
+    retry_at: Optional[datetime] = None
     detail: str = ""
 
 
 class AttemptDeadlineAction(str, Enum):
-    """The decision table at the 15s deadline, spec section 401-444."""
+    """The outcome of one :func:`resolve_entry_order` call. Renamed from a
+    plain "deadline" concept -- code review flagged that treating a cancel
+    *request* as a completed cancellation could orphan/duplicate orders, so
+    this now distinguishes "cancel just requested" from "cancel broker-
+    confirmed" (section 401-444, corrected per review finding P0-7).
+    """
 
-    MOVE_TO_OPEN_POSITION = "MOVE_TO_OPEN_POSITION"  # fully filled
-    CANCEL_REMAINDER_AND_RETRY = "CANCEL_REMAINDER_AND_RETRY"  # partial fill
-    CANCEL_AND_RETRY_AFTER_COOLDOWN = "CANCEL_AND_RETRY_AFTER_COOLDOWN"  # zero fill
-    RELEASE_AND_RETRY_AFTER_COOLDOWN = "RELEASE_AND_RETRY_AFTER_COOLDOWN"  # rejected
+    STILL_WORKING = "STILL_WORKING"  # order open, no fill yet, not at deadline
+    MOVE_TO_OPEN_POSITION = "MOVE_TO_OPEN_POSITION"  # broker-confirmed FILLED
+    AWAIT_CANCEL_CONFIRMATION = "AWAIT_CANCEL_CONFIRMATION"  # cancel requested, not yet confirmed
+    CONFIRMED_CANCELLED_ZERO_FILL = "CONFIRMED_CANCELLED_ZERO_FILL"  # broker-confirmed CANCELLED, nothing filled
+    CONFIRMED_CANCELLED_WITH_FILL = "CONFIRMED_CANCELLED_WITH_FILL"  # broker-confirmed CANCELLED, partial fill stands
+    RELEASE_AND_RETRY_AFTER_COOLDOWN = "RELEASE_AND_RETRY_AFTER_COOLDOWN"  # broker-confirmed REJECTED
     BLOCK_SYMBOL_PENDING_RECONCILIATION = "BLOCK_SYMBOL_PENDING_RECONCILIATION"  # unknown
+
+    # Retained for backward compatibility with anything that still branches
+    # on the pre-review action names.
+    CANCEL_REMAINDER_AND_RETRY = "CANCEL_REMAINDER_AND_RETRY"
+    CANCEL_AND_RETRY_AFTER_COOLDOWN = "CANCEL_AND_RETRY_AFTER_COOLDOWN"
+
+
+_TERMINAL_ACTIONS = {
+    AttemptDeadlineAction.MOVE_TO_OPEN_POSITION,
+    AttemptDeadlineAction.CONFIRMED_CANCELLED_ZERO_FILL,
+    AttemptDeadlineAction.CONFIRMED_CANCELLED_WITH_FILL,
+    AttemptDeadlineAction.RELEASE_AND_RETRY_AFTER_COOLDOWN,
+}
 
 
 def decide_attempt_deadline_action(order: BrokerOrder) -> AttemptDeadlineAction:
     """Pure decision from the order's *already-reconciled* status/fill --
-    this function does not query KIS or mutate anything. Callers
-    (:meth:`EntryAttemptManager.handle_attempt_deadline`) perform the
-    resulting action using :mod:`src.services.order_reconciliation` for the
-    actual broker calls.
+    this function does not query KIS or mutate anything and does not by
+    itself decide whether to *request* a cancel (that needs to know
+    whether the 15s deadline has actually passed, which
+    :func:`resolve_entry_order` supplies).
     """
     if order.status == OrderStatus.FILLED:
         return AttemptDeadlineAction.MOVE_TO_OPEN_POSITION
-    if order.status == OrderStatus.PARTIALLY_FILLED and order.filled_quantity > 0:
-        return AttemptDeadlineAction.CANCEL_REMAINDER_AND_RETRY
+    if order.status == OrderStatus.CANCELLED:
+        return (
+            AttemptDeadlineAction.CONFIRMED_CANCELLED_WITH_FILL
+            if order.filled_quantity > 0
+            else AttemptDeadlineAction.CONFIRMED_CANCELLED_ZERO_FILL
+        )
+    if order.status == OrderStatus.CANCEL_REQUESTED:
+        return AttemptDeadlineAction.AWAIT_CANCEL_CONFIRMATION
     if order.status in (OrderStatus.UNKNOWN_SUBMISSION_STATE, OrderStatus.UNKNOWN):
         return AttemptDeadlineAction.BLOCK_SYMBOL_PENDING_RECONCILIATION
     if order.status == OrderStatus.REJECTED:
         return AttemptDeadlineAction.RELEASE_AND_RETRY_AFTER_COOLDOWN
-    # WORKING/ACCEPTED/CREATED/CANCEL_REQUESTED with zero fill at the
-    # deadline: the zero-fill path (section 423-429).
-    return AttemptDeadlineAction.CANCEL_AND_RETRY_AFTER_COOLDOWN
+    # WORKING/ACCEPTED/CREATED, open (possibly partially filled) --
+    # whether to escalate to a cancel request is resolve_entry_order's call.
+    return AttemptDeadlineAction.STILL_WORKING
 
 
 @dataclass
@@ -158,6 +199,34 @@ class EntryAttemptManager:
                 self._symbol_locks[key] = lock
             return lock
 
+    def restore_symbol_state(
+        self,
+        environment: str,
+        account_no: str,
+        symbol: str,
+        *,
+        cooldown_until: Optional[datetime] = None,
+        attempt_group_id: str = "",
+        attempt_count: int = 0,
+    ) -> None:
+        """Seeds this process's in-memory retry bookkeeping from a card's
+        persisted ``next_retry_at``/``entry_attempt_group_id``/
+        ``entry_attempt_count`` fields (review finding P0-4: retry
+        bookkeeping must survive a restart, not live only in this
+        in-process cache). Call once per card during startup/reconciliation
+        before the first heartbeat runs.
+        """
+        if not (cooldown_until or attempt_group_id or attempt_count):
+            return
+        key = self._symbol_key(environment, account_no, symbol)
+        state = self._state.setdefault(key, _SymbolAttemptState())
+        if cooldown_until is not None:
+            state.cooldown_until = cooldown_until
+        if attempt_group_id:
+            state.attempt_group_id = attempt_group_id
+        if attempt_count:
+            state.attempt_count = attempt_count
+
     def process_triggers(self, triggers: List[EntryTrigger], **submit_kwargs) -> List[AttemptResult]:
         """Section 9.4 priority: earlier trigger timestamp wins; ties broken
         by higher kanban_priority, then deterministic symbol order. The
@@ -198,16 +267,21 @@ class EntryAttemptManager:
                 trigger,
                 AttemptOutcome.COOLDOWN,
                 attempt_group_id=state.attempt_group_id,
+                attempt_count=state.attempt_count,
+                retry_at=state.cooldown_until,
                 detail=f"Cooling down until {state.cooldown_until.isoformat()}",
             )
 
         one_minute_ago = now - timedelta(minutes=1)
         state.attempt_timestamps = [ts for ts in state.attempt_timestamps if ts >= one_minute_ago]
         if len(state.attempt_timestamps) >= execution_config.MAX_ENTRY_ATTEMPTS_PER_SYMBOL_PER_MINUTE:
+            retry_at = min(state.attempt_timestamps) + timedelta(minutes=1)
             return AttemptResult(
                 trigger,
                 AttemptOutcome.RATE_LIMITED,
                 attempt_group_id=state.attempt_group_id,
+                attempt_count=state.attempt_count,
+                retry_at=retry_at,
                 detail="Max entry attempts per symbol per minute reached",
             )
 
@@ -232,6 +306,7 @@ class EntryAttemptManager:
                 trigger,
                 AttemptOutcome.WAITING_FOR_CAPITAL,
                 attempt_group_id=attempt_group_id,
+                attempt_count=state.attempt_count,
                 detail="Capital not currently available",
             )
 
@@ -261,6 +336,7 @@ class EntryAttemptManager:
                 AttemptOutcome.DUPLICATE_ORDER,
                 reservation_id=reservation.reservation_id,
                 attempt_group_id=attempt_group_id,
+                attempt_count=state.attempt_count,
                 detail=str(exc),
             )
         except Exception as exc:  # noqa: BLE001 - surfaced via AttemptResult
@@ -274,6 +350,8 @@ class EntryAttemptManager:
                 AttemptOutcome.REJECTED,
                 reservation_id=reservation.reservation_id,
                 attempt_group_id=attempt_group_id,
+                attempt_count=state.attempt_count,
+                retry_at=state.cooldown_until,
                 detail=str(exc),
             )
 
@@ -291,6 +369,8 @@ class EntryAttemptManager:
                 order=order,
                 reservation_id=reservation.reservation_id,
                 attempt_group_id=attempt_group_id,
+                attempt_count=state.attempt_count,
+                retry_at=state.cooldown_until,
                 detail=order.error_message,
             )
 
@@ -300,52 +380,76 @@ class EntryAttemptManager:
             order=order,
             reservation_id=reservation.reservation_id,
             attempt_group_id=attempt_group_id,
+            attempt_count=state.attempt_count,
         )
 
-    def handle_attempt_deadline(
+    def resolve_entry_order(
         self,
         order: BrokerOrder,
         *,
+        at_deadline: bool,
+        cancel_requested: bool,
         cancel_order: Callable[[BrokerOrder], None],
     ) -> AttemptDeadlineAction:
-        """Applies the section 401-444 decision table's bookkeeping side
-        effects (capital settlement, retry cooldown) for an order whose
-        15-second attempt window has elapsed and which
-        :mod:`src.services.order_reconciliation` has just refreshed to a
-        final/near-final status.
+        """Called every heartbeat tick for *any* order this engine is
+        tracking (review finding P0-6: not only at the 15s deadline) so a
+        fill is observed as soon as it happens. Only escalates to
+        requesting a cancel when ``at_deadline`` or ``cancel_requested`` is
+        True, and -- review finding P0-7 -- never treats a just-requested
+        cancel as complete: capital is settled and a retry cooldown starts
+        only once the broker has actually confirmed a terminal status on a
+        *later* call, once ``order.status`` has moved past
+        ``CANCEL_REQUESTED``.
 
-        The actual broker cancel call is injected via ``cancel_order`` so
-        this module never talks to KIS directly -- mirrors how
-        :mod:`src.services.order_execution_service` receives a ``Broker``
-        rather than importing one.
+        The caller applies any fill to the card itself (this module has no
+        knowledge of ``TradeCardState``) -- this method only owns capital
+        settlement and retry-cooldown bookkeeping.
         """
         action = decide_attempt_deadline_action(order)
         key = self._symbol_key(order.environment, order.account_no, order.symbol)
         state = self._state.setdefault(key, _SymbolAttemptState())
         now = self._clock()
 
+        if action == AttemptDeadlineAction.STILL_WORKING:
+            if at_deadline or cancel_requested:
+                cancel_order(order)
+                return AttemptDeadlineAction.AWAIT_CANCEL_CONFIRMATION
+            return action
+
+        if action == AttemptDeadlineAction.AWAIT_CANCEL_CONFIRMATION:
+            # Already requested (either by us on a previous tick, or the
+            # order already carried CANCEL_REQUESTED) -- do not resend, do
+            # not settle anything yet. Wait for the broker to actually
+            # resolve it.
+            return action
+
         if action == AttemptDeadlineAction.BLOCK_SYMBOL_PENDING_RECONCILIATION:
             # Capital stays reserved until reconciliation resolves the order
             # to a known state -- section 436-442: "Query KIS open orders
             # and executions. Resolve accepted / filled / not submitted."
-            # Other symbols' locks/state are completely untouched.
             return action
 
-        if action in (
-            AttemptDeadlineAction.CANCEL_REMAINDER_AND_RETRY,
-            AttemptDeadlineAction.CANCEL_AND_RETRY_AFTER_COOLDOWN,
-        ):
-            cancel_order(order)
-
+        # Every remaining action is terminal -- settle capital now.
         self._settle_reservation_for_order(order)
-
         if action in (
-            AttemptDeadlineAction.CANCEL_AND_RETRY_AFTER_COOLDOWN,
+            AttemptDeadlineAction.CONFIRMED_CANCELLED_ZERO_FILL,
             AttemptDeadlineAction.RELEASE_AND_RETRY_AFTER_COOLDOWN,
         ):
             state.cooldown_until = now + timedelta(seconds=execution_config.ENTRY_RETRY_COOLDOWN_SECONDS)
-
         return action
+
+    # Backward-compatible name for the same call, kept because tests and
+    # any external caller written against the original single-phase API
+    # still reach it under this name; behavior is identical.
+    def handle_attempt_deadline(
+        self,
+        order: BrokerOrder,
+        *,
+        cancel_order: Callable[[BrokerOrder], None],
+    ) -> AttemptDeadlineAction:
+        return self.resolve_entry_order(
+            order, at_deadline=True, cancel_requested=False, cancel_order=cancel_order
+        )
 
     def _settle_reservation_for_order(self, order: BrokerOrder) -> None:
         if not order.capital_reservation_id:

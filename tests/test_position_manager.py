@@ -149,6 +149,10 @@ def test_on_partial_exit_filled_moves_stop_to_breakeven_not_raw_avg_cost():
 
 
 def test_stop_triggered_during_partial_sell_sequence():
+    """Cancels the working partial-sell order and sets intent; per code
+    review finding P1-4, actually submitting the liquidation is deferred to
+    the trading engine's retry stage (which only submits once the cancel is
+    broker-confirmed) rather than done inline here."""
     card = _open_card(broker_quantity=300, orderable_quantity=300)
     card.board_status = BoardStatus.PARTIAL_SELL
     card.pending_partial_sell_quantity = 100
@@ -158,7 +162,7 @@ def test_stop_triggered_during_partial_sell_sequence():
     callbacks = PositionActionCallbacks(
         cancel_order=cancelled.append,
         submit_sell_order=lambda **kw: submitted.append(kw),
-        refresh_orderable_quantity=lambda *a: 260,  # 40 shares filled before the stop hit
+        refresh_orderable_quantity=lambda *a: 260,
     )
 
     manager = PositionManager()
@@ -168,35 +172,34 @@ def test_stop_triggered_during_partial_sell_sequence():
 
     assert card.exit_all_required is True
     assert cancelled == ["co-1"]
-    assert card.broker_quantity == 260
-    assert card.orderable_quantity == 260
     assert card.pending_partial_sell_quantity == 0
     assert card.board_status == BoardStatus.SELL_ALL
     assert card.position_runtime_status == PositionRuntimeStatus.LIQUIDATING
-    assert len(submitted) == 1
-    assert submitted[0]["quantity"] == 260
+    assert submitted == []  # no order submitted inline
 
 
-def test_stop_triggered_during_partial_sell_skips_submit_when_already_flat():
+def test_stop_triggered_during_partial_sell_without_a_working_order_does_not_cancel():
     card = _open_card(broker_quantity=0, orderable_quantity=0)
     card.board_status = BoardStatus.PARTIAL_SELL
 
-    submitted = []
+    cancelled = []
     callbacks = PositionActionCallbacks(
-        cancel_order=lambda cid: None,
-        submit_sell_order=lambda **kw: submitted.append(kw),
+        cancel_order=cancelled.append,
+        submit_sell_order=lambda **kw: None,
         refresh_orderable_quantity=lambda *a: 0,
     )
     PositionManager().handle_stop_triggered_during_partial_sell(
         card, callbacks=callbacks, working_partial_sell_client_order_id=None
     )
-    assert submitted == []
+    assert cancelled == []
+    assert card.board_status == BoardStatus.SELL_ALL
 
 
 # --- Sell All workflow (spec section 699-732) -------------------------------
 
 
-def test_start_sell_all_cancels_buy_and_submits_liquidation():
+def test_start_sell_all_cancels_buy_but_does_not_submit_inline():
+    """Submission is owned by the trading engine's retry stage (P1-4)."""
     card = _open_card(broker_quantity=300, orderable_quantity=300)
     cancelled = []
     submitted = []
@@ -211,7 +214,7 @@ def test_start_sell_all_cancels_buy_and_submits_liquidation():
     assert cancelled == ["buy-co-1"]
     assert card.board_status == BoardStatus.SELL_ALL
     assert card.position_runtime_status == PositionRuntimeStatus.LIQUIDATING
-    assert submitted[0]["quantity"] == 300
+    assert submitted == []
 
 
 def test_queue_sell_all_at_market_open():
@@ -245,6 +248,11 @@ def test_confirm_flat_closes_card_and_clears_stop():
 
 
 def test_discover_manual_position_creates_new_card_with_membership_preserved():
+    """Section 534-562, corrected per code review finding P1-3: a manual
+    position with no known stop must NOT get one silently invented at
+    average cost (which could immediately trigger a Sell All if the price
+    is already below cost) -- it stays unprotected-but-flagged until the
+    user sets a real stop."""
     manager = PositionManager()
     card = manager.discover_manual_position(
         None,
@@ -260,8 +268,26 @@ def test_discover_manual_position_creates_new_card_with_membership_preserved():
     assert card.buylist_member is True
     assert card.return_to_buylist_after_close is True
     assert card.broker_quantity == 50
-    assert card.stop_type == StopType.MANUAL_PRICE
-    assert card.active_stop_price == 250.0
+    assert card.stop_type is None
+    assert card.active_stop_price is None
+    assert card.entry_block_reason == "manual_position_requires_stop"
+    assert "STOP_REQUIRED" in card.warnings
+
+
+def test_discover_manual_position_stop_required_never_auto_triggers_stop():
+    manager = PositionManager()
+    card = manager.discover_manual_position(
+        None,
+        environment="PROD",
+        account_no="1",
+        symbol="TSLA",
+        name="Tesla Inc.",
+        broker_quantity=50,
+        average_entry_price=250.0,
+    )
+    # Price already crashed below cost at discovery time -- must not
+    # auto-trigger a stop with no active_stop_price set.
+    assert evaluate_stop_trigger(card, 10.0) is False
 
 
 def test_discover_manual_position_updates_existing_card_without_overwriting_known_stop():
@@ -386,3 +412,86 @@ def test_reconcile_scoped_to_requested_account_only():
     assert discovered.account_no == "1"
     assert discovered.broker_quantity == 75
     assert other_account_card.broker_quantity == 100  # untouched
+
+
+# --- Reconciliation preserves in-progress intent (code review P1-1/P1-2) --
+
+
+def test_reconcile_preserves_sell_all_intent_when_quantity_matches():
+    card = _open_card(broker_quantity=100, orderable_quantity=0)
+    card.board_status = BoardStatus.SELL_ALL
+    card.exit_all_required = True
+    holdings = [BrokerHolding(symbol="AAPL", quantity=100, average_price=100.0)]
+
+    changed = PositionManager().reconcile_broker_positions(
+        [card], holdings, environment="PROD", account_no="1"
+    )
+
+    assert changed == []
+    assert card.board_status == BoardStatus.SELL_ALL
+    assert card.exit_all_required is True
+
+
+def test_reconcile_updates_facts_but_preserves_sell_all_status_on_change():
+    card = _open_card(broker_quantity=100, orderable_quantity=0)
+    card.board_status = BoardStatus.SELL_ALL
+    card.exit_all_required = True
+    holdings = [BrokerHolding(symbol="AAPL", quantity=60, average_price=100.0)]  # partial fill happened
+
+    changed = PositionManager().reconcile_broker_positions(
+        [card], holdings, environment="PROD", account_no="1"
+    )
+
+    assert changed == [card]
+    assert card.broker_quantity == 60
+    assert card.board_status == BoardStatus.SELL_ALL  # intent preserved
+    assert card.exit_all_required is True
+
+
+def test_reconcile_preserves_partial_sell_and_entry_pending_intent():
+    partial = _open_card(symbol="AAPL", broker_quantity=100)
+    partial.board_status = BoardStatus.PARTIAL_SELL
+    pending = _open_card(
+        symbol="MSFT", broker_quantity=0, orderable_quantity=0, average_entry_price=0.0
+    )
+    pending.board_status = BoardStatus.ENTRY_PENDING
+    holdings = [
+        BrokerHolding(symbol="AAPL", quantity=100, average_price=100.0),
+        BrokerHolding(symbol="MSFT", quantity=0, average_price=0.0),
+    ]
+
+    changed = PositionManager().reconcile_broker_positions(
+        [partial, pending], holdings, environment="PROD", account_no="1"
+    )
+
+    assert changed == []
+    assert partial.board_status == BoardStatus.PARTIAL_SELL
+    assert pending.board_status == BoardStatus.ENTRY_PENDING
+
+
+def test_reconcile_detects_average_price_change_even_when_quantity_matches():
+    card = _open_card(symbol="AAPL", broker_quantity=100, average_entry_price=100.0)
+    holdings = [BrokerHolding(symbol="AAPL", quantity=100, average_price=105.0)]
+
+    changed = PositionManager().reconcile_broker_positions(
+        [card], holdings, environment="PROD", account_no="1"
+    )
+
+    assert changed == [card]
+    assert card.average_entry_price == 105.0
+
+
+def test_reconcile_sell_all_position_fully_liquidated_zeroes_quantity_without_forcing_closed():
+    card = _open_card(broker_quantity=100, orderable_quantity=0)
+    card.board_status = BoardStatus.SELL_ALL
+
+    changed = PositionManager().reconcile_broker_positions(
+        [card], [], environment="PROD", account_no="1"
+    )
+
+    assert changed == [card]
+    assert card.broker_quantity == 0
+    # Reconciliation zeroes the quantity but does not itself flip the card
+    # to Closed -- that stays owned by the Sell All retry stage so the rest
+    # of its bookkeeping (stop clearing etc.) happens through one path.
+    assert card.board_status == BoardStatus.SELL_ALL

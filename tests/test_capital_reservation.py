@@ -11,6 +11,7 @@ from src.core.capital_reservation import (
     available_for_new_entries,
 )
 from src.services import capital_allocator as allocator
+from src.services import capital_reservation_repository
 
 
 # --- CapitalReservation lifecycle -------------------------------------------
@@ -209,3 +210,126 @@ def test_two_near_simultaneous_triggers_do_not_both_reserve_the_same_capital(tmp
     successes = [r for r in results if r is not None]
     assert len(successes) == 1
     assert len(allocator.load_reservations(path)) == 1
+
+
+# --- P1-12: database-backed capital reservations (cross-device) ------------
+
+
+def _sqlite_engine(tmp_path):
+    from sqlalchemy import create_engine
+    from sqlalchemy.pool import NullPool
+
+    return create_engine(f"sqlite:///{tmp_path / 'capital.db'}", future=True, poolclass=NullPool)
+
+
+def test_reserve_capital_with_engine_mirrors_to_database(tmp_path):
+    engine = _sqlite_engine(tmp_path)
+    path = tmp_path / "reservations.json"
+
+    reservation = allocator.reserve_capital_for_entry(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        attempt_group_id="g1",
+        requested_notional=1000.0,
+        buying_power_provider=lambda: 10_000.0,
+        path=path,
+        engine=engine,
+    )
+
+    assert reservation is not None
+    db_active = capital_reservation_repository.list_active_reservations(
+        engine, environment="PROD", account_no="1"
+    )
+    assert len(db_active) == 1
+    assert db_active[0].reservation_id == reservation.reservation_id
+
+
+def test_reservation_from_another_device_blocks_local_availability_check(tmp_path):
+    """Cross-device visibility is the whole point of P1-12: a reservation
+    this process's local JSON ledger has never seen (because another
+    device made it) must still count against available capital."""
+    engine = _sqlite_engine(tmp_path)
+    path = tmp_path / "reservations.json"
+
+    other_device_reservation = CapitalReservation.create(
+        environment="PROD", account_no="1", symbol="NVDA", attempt_group_id="g-other",
+        requested_notional=9000.0,
+    )
+    capital_reservation_repository.save_reservation(engine, other_device_reservation)
+
+    # This process's local ledger knows nothing about the NVDA reservation.
+    result = allocator.reserve_capital_for_entry(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        attempt_group_id="g1",
+        requested_notional=5000.0,
+        buying_power_provider=lambda: 10_000.0,
+        path=path,
+        engine=engine,
+    )
+
+    assert result is None  # only 1000 left after the other device's 9000
+
+
+def test_consume_and_release_mirror_to_database(tmp_path):
+    engine = _sqlite_engine(tmp_path)
+    path = tmp_path / "reservations.json"
+
+    reservation = allocator.reserve_capital_for_entry(
+        environment="PROD", account_no="1", symbol="AAPL", attempt_group_id="g1",
+        requested_notional=1000.0, buying_power_provider=lambda: 10_000.0,
+        path=path, engine=engine,
+    )
+    allocator.consume_reservation(reservation.reservation_id, 400.0, path=path, engine=engine)
+    allocator.release_reservation(reservation.reservation_id, path=path, engine=engine)
+
+    db_active = capital_reservation_repository.list_active_reservations(
+        engine, environment="PROD", account_no="1"
+    )
+    assert db_active == []  # released -- no longer active
+
+
+def test_engine_none_never_touches_database(tmp_path):
+    """Default behavior (engine=None) must be identical to before this
+    module existed -- purely local JSON, no database calls at all."""
+    path = tmp_path / "reservations.json"
+    reservation = allocator.reserve_capital_for_entry(
+        environment="PROD", account_no="1", symbol="AAPL", attempt_group_id="g1",
+        requested_notional=1000.0, buying_power_provider=lambda: 10_000.0,
+        path=path,
+    )
+    assert reservation is not None
+    # No engine was ever touched -- nothing to assert against a database,
+    # this just needs to not raise/behave differently from before.
+
+
+def test_reconcile_stale_reservations_releases_orphaned_entries(tmp_path):
+    engine = _sqlite_engine(tmp_path)
+    orphan = CapitalReservation.create(
+        environment="PROD", account_no="1", symbol="AAPL", attempt_group_id="g1",
+        requested_notional=1000.0,
+    )
+    still_working = CapitalReservation.create(
+        environment="PROD", account_no="1", symbol="NVDA", attempt_group_id="g2",
+        requested_notional=2000.0,
+    )
+    capital_reservation_repository.save_reservation(engine, orphan)
+    capital_reservation_repository.save_reservation(engine, still_working)
+
+    released = capital_reservation_repository.reconcile_stale_reservations(
+        engine, environment="PROD", account_no="1", open_broker_order_symbols=["NVDA"]
+    )
+
+    assert [r.symbol for r in released] == ["AAPL"]
+    remaining_active = capital_reservation_repository.list_active_reservations(
+        engine, environment="PROD", account_no="1"
+    )
+    assert [r.symbol for r in remaining_active] == ["NVDA"]
+
+
+def test_list_active_reservations_returns_empty_for_no_engine():
+    assert capital_reservation_repository.list_active_reservations(
+        None, environment="PROD", account_no="1"
+    ) == []

@@ -110,6 +110,25 @@ class SetManualStop(BoardCommand):
         object.__setattr__(self, "price", float(self.price or 0.0))
 
 
+@dataclass(frozen=True)
+class ReorderCard(BoardCommand):
+    """Sets this card's ``kanban_priority`` within its column (spec section
+    379: "higher Kanban priority wins" on a simultaneous-trigger tie).
+    Review finding P1-8: the model carried ``kanban_priority`` from Phase 1
+    on, but nothing let the user actually change it -- this is that
+    command. ``target_priority`` is the new absolute value, not a delta;
+    the board layer computes it from the card's current neighbors (see
+    ``board.py``'s "Move Up"/"Move Down" actions) so this command itself
+    stays a simple, order-independent set.
+    """
+
+    target_priority: int = 0
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        object.__setattr__(self, "target_priority", int(self.target_priority or 0))
+
+
 AnyBoardCommand = Union[
     MoveToWatchlist,
     MoveToBuylist,
@@ -120,4 +139,5 @@ AnyBoardCommand = Union[
     CancelQueuedSellAll,
     SetBreakevenStop,
     SetManualStop,
+    ReorderCard,
 ]

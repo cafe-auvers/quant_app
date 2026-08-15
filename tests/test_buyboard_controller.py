@@ -32,11 +32,24 @@ from src.ui.buyboard.drag_commands import (
     CancelQueuedSellAll,
     MoveToBuylist,
     MoveToWatchlist,
+    ReorderCard,
     RequestPartialSell,
     RequestSellAll,
     SetBreakevenStop,
     SetManualStop,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_local_trade_card_snapshot(monkeypatch, tmp_path):
+    """create_trade_card/update_trade_card (called both directly below and
+    indirectly through every apply_board_command(...) call) write a local
+    backup snapshot alongside the database write (review finding P1-13).
+    Redirect it to an isolated per-test file so none of the ~20
+    apply_board_command calls in this module accidentally touch the real
+    production data/trade_cards.json.
+    """
+    monkeypatch.setattr(repo, "LOCAL_TRADE_CARDS_FILE", tmp_path / "trade_cards.json")
 
 
 def _make_engine(tmp_path):
@@ -279,3 +292,28 @@ def test_cancel_queued_sell_all_refuses_when_actively_working(tmp_path):
     card = _seed(engine, board_status=BoardStatus.SELL_ALL, sell_all_at_market_open=False)
     with pytest.raises(CommandRejectedError):
         apply_board_command(engine, _cmd(CancelQueuedSellAll, card))
+
+
+# --- Reorder (spec section 379, code review finding P1-8) ------------------
+
+
+def test_reorder_card_sets_kanban_priority(tmp_path):
+    engine = _make_engine(tmp_path)
+    card = _seed(engine, board_status=BoardStatus.BUY_TODAY, kanban_priority=0)
+    result = apply_board_command(engine, _cmd(ReorderCard, card, target_priority=5))
+    assert result.kanban_priority == 5
+
+
+def test_reorder_card_does_not_change_board_status(tmp_path):
+    engine = _make_engine(tmp_path)
+    card = _seed(engine, board_status=BoardStatus.BUY_TODAY, kanban_priority=0)
+    result = apply_board_command(engine, _cmd(ReorderCard, card, target_priority=5))
+    assert result.board_status == BoardStatus.BUY_TODAY
+
+
+def test_reorder_card_respects_stale_version(tmp_path):
+    engine = _make_engine(tmp_path)
+    card = _seed(engine, board_status=BoardStatus.BUY_TODAY, kanban_priority=0)
+    apply_board_command(engine, _cmd(ReorderCard, card, target_priority=1))  # bumps version
+    with pytest.raises(TradeCardVersionConflictError):
+        apply_board_command(engine, _cmd(ReorderCard, card, target_priority=2))  # stale version

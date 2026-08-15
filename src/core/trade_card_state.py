@@ -181,6 +181,18 @@ class TradeCardState:
     # Entry runtime (Buy Today substate badge, section 3)
     entry_runtime_status: Optional[EntryRuntimeStatus] = None
     entry_block_reason: str = ""
+    # Durable retry bookkeeping (code-review finding P0-4): mirrors
+    # EntryAttemptManager's in-process cooldown/attempt-group state onto the
+    # persisted card so a restart does not lose it. next_retry_at is when a
+    # RETRY_COOLDOWN/WAITING_FOR_CAPITAL/DATA_UNAVAILABLE card is next
+    # allowed to try EXECUTE_READY again.
+    next_retry_at: Optional[datetime] = None
+    entry_attempt_group_id: str = ""
+    entry_attempt_count: int = 0
+    # True from the moment a cancel has been requested for this card's
+    # working entry order until the broker confirms a terminal status --
+    # distinguishes "cancel in flight" from "cancel confirmed" (P0-7).
+    entry_cancel_in_flight: bool = False
 
     # Position / broker-derived state (section 5.3, 231-233)
     position_runtime_status: PositionRuntimeStatus = PositionRuntimeStatus.NONE
@@ -255,6 +267,10 @@ class TradeCardState:
                 EntryRuntimeStatus.ORB_FORMING,
             )
         self.entry_block_reason = str(self.entry_block_reason or "")
+        self.next_retry_at = _parse_timestamp(self.next_retry_at) if self.next_retry_at else None
+        self.entry_attempt_group_id = str(self.entry_attempt_group_id or "")
+        self.entry_attempt_count = int(self.entry_attempt_count or 0)
+        self.entry_cancel_in_flight = bool(self.entry_cancel_in_flight)
         self.position_runtime_status = _enum_from_value(
             self.position_runtime_status,
             PositionRuntimeStatus,
@@ -321,6 +337,10 @@ class TradeCardState:
                 else None
             ),
             "entry_block_reason": self.entry_block_reason,
+            "next_retry_at": self.next_retry_at.isoformat() if self.next_retry_at else None,
+            "entry_attempt_group_id": self.entry_attempt_group_id,
+            "entry_attempt_count": self.entry_attempt_count,
+            "entry_cancel_in_flight": self.entry_cancel_in_flight,
             "position_runtime_status": self.position_runtime_status.value,
             "broker_quantity": self.broker_quantity,
             "orderable_quantity": self.orderable_quantity,
@@ -371,6 +391,10 @@ class TradeCardState:
             stop_adr=data.get("stop_adr"),
             entry_runtime_status=data.get("entry_runtime_status"),
             entry_block_reason=str(data.get("entry_block_reason", "")),
+            next_retry_at=data.get("next_retry_at"),
+            entry_attempt_group_id=str(data.get("entry_attempt_group_id", "")),
+            entry_attempt_count=int(data.get("entry_attempt_count", 0) or 0),
+            entry_cancel_in_flight=bool(data.get("entry_cancel_in_flight", False)),
             position_runtime_status=data.get(
                 "position_runtime_status", PositionRuntimeStatus.NONE
             ),

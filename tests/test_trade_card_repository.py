@@ -52,7 +52,7 @@ def _buylist_item(symbol="AAPL", **overrides) -> BuylistItem:
 
 def test_create_then_get_round_trips(tmp_path):
     engine = _make_engine(tmp_path)
-    created = repo.create_trade_card(engine, _card())
+    created = repo.create_trade_card(engine, _card(), local_snapshot_path=tmp_path / "trade_cards.json")
     assert created.version == 1
     fetched = repo.get_trade_card(engine, "PROD", "1", "AAPL")
     assert fetched is not None
@@ -62,17 +62,17 @@ def test_create_then_get_round_trips(tmp_path):
 
 def test_create_duplicate_raises_version_conflict(tmp_path):
     engine = _make_engine(tmp_path)
-    repo.create_trade_card(engine, _card())
+    repo.create_trade_card(engine, _card(), local_snapshot_path=tmp_path / "trade_cards.json")
     with pytest.raises(repo.TradeCardVersionConflictError):
-        repo.create_trade_card(engine, _card())
+        repo.create_trade_card(engine, _card(), local_snapshot_path=tmp_path / "trade_cards.json")
 
 
 def test_update_with_correct_expected_version_succeeds(tmp_path):
     engine = _make_engine(tmp_path)
-    repo.create_trade_card(engine, _card())
+    repo.create_trade_card(engine, _card(), local_snapshot_path=tmp_path / "trade_cards.json")
     fetched = repo.get_trade_card(engine, "PROD", "1", "AAPL")
     fetched.board_status = BoardStatus.BUYLIST
-    updated = repo.update_trade_card(engine, fetched, expected_version=fetched.version)
+    updated = repo.update_trade_card(engine, fetched, expected_version=fetched.version, local_snapshot_path=tmp_path / "trade_cards.json")
     assert updated.version == 2
     refetched = repo.get_trade_card(engine, "PROD", "1", "AAPL")
     assert refetched.board_status == BoardStatus.BUYLIST
@@ -82,18 +82,18 @@ def test_update_with_correct_expected_version_succeeds(tmp_path):
 def test_update_with_stale_expected_version_rejected(tmp_path):
     """This is the PC/laptop contradictory-drag guard (spec section 317-319)."""
     engine = _make_engine(tmp_path)
-    repo.create_trade_card(engine, _card())
+    repo.create_trade_card(engine, _card(), local_snapshot_path=tmp_path / "trade_cards.json")
 
     # Device A reads version 1 and successfully writes -> version becomes 2.
     device_a_view = repo.get_trade_card(engine, "PROD", "1", "AAPL")
     device_a_view.board_status = BoardStatus.BUYLIST
-    repo.update_trade_card(engine, device_a_view, expected_version=1)
+    repo.update_trade_card(engine, device_a_view, expected_version=1, local_snapshot_path=tmp_path / "trade_cards.json")
 
     # Device B independently read version 1 earlier and now tries to write
     # against that stale version -- must be rejected, not silently applied.
     device_b_view = _card(board_status=BoardStatus.BUY_TODAY)
     with pytest.raises(repo.TradeCardVersionConflictError):
-        repo.update_trade_card(engine, device_b_view, expected_version=1)
+        repo.update_trade_card(engine, device_b_view, expected_version=1, local_snapshot_path=tmp_path / "trade_cards.json")
 
     # The winning write from device A must still be intact.
     final = repo.get_trade_card(engine, "PROD", "1", "AAPL")
@@ -104,13 +104,13 @@ def test_update_with_stale_expected_version_rejected(tmp_path):
 def test_update_missing_card_raises_not_found(tmp_path):
     engine = _make_engine(tmp_path)
     with pytest.raises(repo.TradeCardNotFoundError):
-        repo.update_trade_card(engine, _card(), expected_version=1)
+        repo.update_trade_card(engine, _card(), expected_version=1, local_snapshot_path=tmp_path / "trade_cards.json")
 
 
 def test_list_trade_cards_filters_by_account(tmp_path):
     engine = _make_engine(tmp_path)
-    repo.create_trade_card(engine, _card(symbol="AAPL", account_no="1"))
-    repo.create_trade_card(engine, _card(symbol="MSFT", account_no="2"))
+    repo.create_trade_card(engine, _card(symbol="AAPL", account_no="1"), local_snapshot_path=tmp_path / "trade_cards.json")
+    repo.create_trade_card(engine, _card(symbol="MSFT", account_no="2"), local_snapshot_path=tmp_path / "trade_cards.json")
     assert {c.symbol for c in repo.list_trade_cards(engine, account_no="1")} == {"AAPL"}
     assert {c.symbol for c in repo.list_trade_cards(engine)} == {"AAPL", "MSFT"}
 
@@ -129,12 +129,72 @@ def test_local_snapshot_round_trip(tmp_path):
 def test_sync_local_snapshot_from_database(tmp_path):
     engine = _make_engine(tmp_path)
     snapshot_path = tmp_path / "trade_cards.json"
-    repo.create_trade_card(engine, _card())
+    repo.create_trade_card(engine, _card(), local_snapshot_path=tmp_path / "trade_cards.json")
     cards = repo.list_trade_cards(engine)
     repo.save_local_trade_cards_snapshot(cards, path=snapshot_path)
     restored = repo.load_local_trade_cards_snapshot(path=snapshot_path)
     assert len(restored) == 1
     assert restored[0].symbol == "AAPL"
+
+
+def test_create_trade_card_writes_local_snapshot_immediately(tmp_path):
+    """Code review finding P1-13: the snapshot must update on every
+    successful write, not only via an explicit migration sync call."""
+    engine = _make_engine(tmp_path)
+    snapshot_path = tmp_path / "trade_cards.json"
+    repo.create_trade_card(engine, _card(), local_snapshot_path=snapshot_path)
+
+    restored = repo.load_local_trade_cards_snapshot(path=snapshot_path)
+    assert len(restored) == 1
+    assert restored[0].symbol == "AAPL"
+
+
+def test_update_trade_card_refreshes_local_snapshot_immediately(tmp_path):
+    engine = _make_engine(tmp_path)
+    snapshot_path = tmp_path / "trade_cards.json"
+    repo.create_trade_card(engine, _card(), local_snapshot_path=snapshot_path)
+    fetched = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    fetched.board_status = BoardStatus.BUYLIST
+
+    repo.update_trade_card(
+        engine, fetched, expected_version=fetched.version, local_snapshot_path=snapshot_path
+    )
+
+    restored = repo.load_local_trade_cards_snapshot(path=snapshot_path)
+    assert len(restored) == 1
+    assert restored[0].board_status == BoardStatus.BUYLIST
+    assert restored[0].version == 2
+
+
+def test_snapshot_write_is_a_per_card_upsert_not_a_full_replace(tmp_path):
+    """A write for one symbol must not clobber another symbol's entry
+    already in the snapshot."""
+    engine = _make_engine(tmp_path)
+    snapshot_path = tmp_path / "trade_cards.json"
+    repo.create_trade_card(
+        engine, _card(symbol="AAPL"), local_snapshot_path=snapshot_path
+    )
+    repo.create_trade_card(
+        engine, _card(symbol="MSFT"), local_snapshot_path=snapshot_path
+    )
+
+    restored = repo.load_local_trade_cards_snapshot(path=snapshot_path)
+    assert {c.symbol for c in restored} == {"AAPL", "MSFT"}
+
+
+def test_local_snapshot_write_falls_back_to_module_default_path(tmp_path, monkeypatch):
+    """No explicit local_snapshot_path -- must resolve LOCAL_TRADE_CARDS_FILE
+    dynamically at call time (so a monkeypatch of the module attribute is
+    honored), not from a value frozen as a function-default at import time."""
+    engine = _make_engine(tmp_path)
+    isolated_path = tmp_path / "trade_cards.json"
+    monkeypatch.setattr(repo, "LOCAL_TRADE_CARDS_FILE", isolated_path)
+
+    repo.create_trade_card(engine, _card())  # no local_snapshot_path passed
+
+    assert isolated_path.exists()
+    restored = repo.load_local_trade_cards_snapshot(path=isolated_path)
+    assert len(restored) == 1
 
 
 # --- Migration from legacy BuylistItem (spec section 25) -------------------

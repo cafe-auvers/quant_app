@@ -4,11 +4,11 @@ draggable ``QListWidget`` each one uses.
 from __future__ import annotations
 
 import json
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Optional
 
 from PyQt5.QtCore import QMimeData, Qt
 from PyQt5.QtGui import QDrag
-from PyQt5.QtWidgets import QAbstractItemView, QListWidget, QListWidgetItem
+from PyQt5.QtWidgets import QAbstractItemView, QListWidget, QListWidgetItem, QMenu
 
 from src.core.trade_card_state import BoardStatus, TradeCardState
 
@@ -59,11 +59,13 @@ class BoardColumnList(QListWidget):
         self,
         board_status: BoardStatus,
         on_card_dropped: Callable[[dict, BoardStatus], None],
+        on_card_context_menu: Optional[Callable[[dict, "object"], None]] = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self.board_status = board_status
         self._on_card_dropped = on_card_dropped
+        self._on_card_context_menu = on_card_context_menu
         self.setDragDropMode(QAbstractItemView.DragDrop)
         self.setSelectionMode(QAbstractItemView.SingleSelection)
         self.setSpacing(6)
@@ -71,6 +73,19 @@ class BoardColumnList(QListWidget):
         self.setDragEnabled(True)
         self.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.setStyleSheet("QListWidget { background: palette(alternate-base); }")
+        if on_card_context_menu is not None:
+            self.setContextMenuPolicy(Qt.CustomContextMenu)
+            self.customContextMenuRequested.connect(self._show_card_context_menu)
+
+    # -- right-click actions (P1-9: stop management) ---------------------
+    def _show_card_context_menu(self, position) -> None:
+        item = self.itemAt(position)
+        if item is None or self._on_card_context_menu is None:
+            return
+        payload = item.data(Qt.UserRole)
+        if not payload:
+            return
+        self._on_card_context_menu(payload, self.mapToGlobal(position))
 
     # -- drag source ---------------------------------------------------
     def startDrag(self, supportedActions) -> None:  # noqa: N802 - Qt override
@@ -123,11 +138,26 @@ class BoardColumnList(QListWidget):
         event.accept()
         self._on_card_dropped(payload, self.board_status)
 
-    def set_cards(self, cards: List[TradeCardState]) -> None:
+    def set_cards(
+        self,
+        cards: List[TradeCardState],
+        quote_lookup: Optional[Callable[[str], Optional[float]]] = None,
+    ) -> None:
+        """``quote_lookup``, when supplied, returns the live last price for
+        a symbol (e.g. from a running ``RealtimeMarketDataService``) so
+        cards can show real P&L instead of none at all (section P1-7).
+
+        Sorted by ``kanban_priority`` descending (higher priority first) --
+        section 379's "higher Kanban priority wins" is otherwise invisible
+        (review finding P1-8): without this, ``ReorderCard`` could change
+        the stored value but the column would render in the same order
+        regardless.
+        """
         self.clear()
-        for card in cards:
+        for card in sorted(cards, key=lambda c: -c.kanban_priority):
             item = QListWidgetItem(self)
             item.setData(Qt.UserRole, card_drag_payload(card))
-            widget = TradeCardWidget(card)
+            current_price = quote_lookup(card.symbol) if quote_lookup is not None else None
+            widget = TradeCardWidget(card, current_price=current_price)
             item.setSizeHint(widget.sizeHint())
             self.setItemWidget(item, widget)

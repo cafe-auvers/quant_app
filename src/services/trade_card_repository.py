@@ -25,6 +25,7 @@ import threading
 import weakref
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from sqlalchemy import (
@@ -174,7 +175,39 @@ def list_trade_cards(
         return []
 
 
-def create_trade_card(engine: Engine, card: TradeCardState) -> TradeCardState:
+def _upsert_local_snapshot_card(
+    card: TradeCardState, path: Optional[Path] = None
+) -> None:
+    """Refreshes just this one card's entry in the local backup snapshot.
+
+    Code review finding P1-13: the module docstring above promises "a local
+    JSON snapshot is written alongside every successful database write," but
+    ``create_trade_card``/``update_trade_card`` previously never called
+    this -- the snapshot only ever updated via the migration path's
+    explicit ``sync_local_snapshot_from_database`` call. This closes that
+    gap with a single-record upsert (read-modify-write the snapshot file,
+    not a full re-fetch of every card from the database) so it stays cheap
+    enough to call on every write.
+
+    ``path`` defaults to ``None`` -- resolved against the *current* value of
+    the module-level ``LOCAL_TRADE_CARDS_FILE`` at call time, not frozen as
+    a function-default value at import time. This is deliberate: a bound
+    default (``path=LOCAL_TRADE_CARDS_FILE``) would not pick up a test's
+    ``monkeypatch.setattr(trade_card_repository, "LOCAL_TRADE_CARDS_FILE", ...)``,
+    which is exactly the class of bug that made the local capital-reservation
+    ledger accidentally write to production `data/` earlier in this project
+    (see the identical fix in ``EntryAttemptManager``/``capital_allocator``).
+    """
+    resolved_path = path or LOCAL_TRADE_CARDS_FILE
+    cards = load_local_trade_cards_snapshot(path=resolved_path)
+    cards = [existing for existing in cards if existing.card_key != card.card_key]
+    cards.append(card)
+    save_local_trade_cards_snapshot(cards, path=resolved_path)
+
+
+def create_trade_card(
+    engine: Engine, card: TradeCardState, *, local_snapshot_path: Optional[Path] = None
+) -> TradeCardState:
     """Insert a brand-new card. Raises ``TradeCardVersionConflictError`` if a
     row for this (environment, account_no, symbol) already exists -- callers
     that intend to update an existing card must use ``update_trade_card``
@@ -202,6 +235,7 @@ def create_trade_card(engine: Engine, card: TradeCardState) -> TradeCardState:
             raise TradeCardVersionConflictError(
                 f"A trade card already exists for {card.card_key}"
             ) from exc
+    _upsert_local_snapshot_card(card, path=local_snapshot_path)
     return card
 
 
@@ -210,6 +244,7 @@ def update_trade_card(
     card: TradeCardState,
     *,
     expected_version: int,
+    local_snapshot_path: Optional[Path] = None,
 ) -> TradeCardState:
     """Conditionally update an existing row: the write only applies if the
     stored ``version`` still equals ``expected_version`` (spec section 317's
@@ -248,11 +283,12 @@ def update_trade_card(
                 f"Expected version {expected_version} for {card.card_key}, "
                 f"stored version is {existing.version}"
             )
+    _upsert_local_snapshot_card(card, path=local_snapshot_path)
     return card
 
 
 def upsert_trade_card_unconditionally(
-    engine: Engine, card: TradeCardState
+    engine: Engine, card: TradeCardState, *, local_snapshot_path: Optional[Path] = None
 ) -> TradeCardState:
     """Insert-or-blind-overwrite, bypassing the optimistic-version check.
 
@@ -264,8 +300,10 @@ def upsert_trade_card_unconditionally(
     """
     existing = get_trade_card(engine, card.environment, card.account_no, card.symbol)
     if existing is None:
-        return create_trade_card(engine, card)
-    return update_trade_card(engine, card, expected_version=existing.version)
+        return create_trade_card(engine, card, local_snapshot_path=local_snapshot_path)
+    return update_trade_card(
+        engine, card, expected_version=existing.version, local_snapshot_path=local_snapshot_path
+    )
 
 
 # --- Local JSON snapshot (backup/recovery tier, section 905) ---------------
@@ -466,8 +504,13 @@ def migrate_buylist_to_trade_cards(
 
     for row in report.rows:
         if row.action == "create":
-            create_trade_card(engine, row.card)
+            create_trade_card(engine, row.card, local_snapshot_path=local_snapshot_path)
         elif row.action == "update":
-            update_trade_card(engine, row.card, expected_version=row.card.version)
+            update_trade_card(
+                engine,
+                row.card,
+                expected_version=row.card.version,
+                local_snapshot_path=local_snapshot_path,
+            )
     sync_local_snapshot_from_database(engine, path=local_snapshot_path)
     return report

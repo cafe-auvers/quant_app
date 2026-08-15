@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
-from src.core.order_state import BrokerOrder, OrderStatus
+from src.core.order_state import BrokerOrder, BrokerOrderDiscoveryResult, OrderStatus
 from src.core.trade_card_state import (
     BoardStatus,
     EntryRuntimeStatus,
@@ -53,6 +53,18 @@ class EodActionCallbacks:
     find_open_entry_order: Callable[[TradeCardState], Optional[BrokerOrder]]
     reconcile_order: Callable[[BrokerOrder], BrokerOrder]
     cancel_order: Callable[[str], None]  # by client_order_id
+    # Full account-wide discovery (open orders + history + reserved orders)
+    # for this card's symbol. Code review finding P1-15: "no local order
+    # found" must never by itself be treated as "no order exists" -- only a
+    # *complete* discovery query (BrokerOrderDiscoveryResult.complete,
+    # i.e. every source succeeded with no errors) can confirm that.
+    # Optional/defaulted to an always-complete-empty result so existing
+    # callers/tests that never exercise the "no order" path are unaffected.
+    discover_all_orders: Callable[[TradeCardState], BrokerOrderDiscoveryResult] = (
+        lambda card: BrokerOrderDiscoveryResult(
+            open_orders_complete=True, history_complete=True, reserved_orders_complete=True
+        )
+    )
 
 
 class EodTradingService:
@@ -100,6 +112,14 @@ class EodTradingService:
             # (should already be ENTRY_PENDING); leave it for that branch
             # rather than silently discarding a live order's trail here.
             return False
+        # P1-15: a single "not found" lookup is not proof nothing was
+        # submitted -- confirm with a full account-wide discovery query
+        # before treating this as safe. An incomplete/failed discovery
+        # leaves the card exactly where it is for a later heartbeat to
+        # retry, rather than silently resetting on a possibly-stale view.
+        discovery = self._callbacks.discover_all_orders(card)
+        if not discovery.complete:
+            return False
         card.board_status = BoardStatus.BUYLIST
         card.entry_runtime_status = None
         card.entry_block_reason = ""
@@ -118,9 +138,17 @@ class EodTradingService:
     def _resolve_entry_pending_at_eod(self, card: TradeCardState) -> bool:
         order = self._callbacks.find_open_entry_order(card)
         if order is None:
-            # No trace of a working order despite the card believing one
-            # exists -- nothing to cancel/reconcile; treat as the no-order
-            # case rather than stranding the card in Entry Pending forever.
+            # P1-15: the local lookup alone cannot confirm "no order
+            # exists" -- require a complete account-wide discovery first.
+            # An incomplete query must leave the card in
+            # Entry Pending/Reconciling (section 526-529's "do not assume
+            # cancellation" applies just as much to "assume no order").
+            discovery = self._callbacks.discover_all_orders(card)
+            if not discovery.complete:
+                if card.entry_runtime_status != EntryRuntimeStatus.DATA_UNAVAILABLE:
+                    card.entry_runtime_status = EntryRuntimeStatus.DATA_UNAVAILABLE
+                    return True
+                return False
             card.board_status = BoardStatus.BUYLIST
             card.entry_runtime_status = None
             return True
@@ -178,6 +206,75 @@ class EodTradingService:
         return True
 
 
+def reconcile_unresolved_orders_at_startup(
+    cards: List[TradeCardState],
+    *,
+    position_manager: PositionManager,
+    callbacks: EodActionCallbacks,
+) -> List[TradeCardState]:
+    """Section 1029 ("Application restart with unknown order") and Phase 6's
+    "Run full startup reconciliation" (section 1070-1075): review finding
+    P1-16 -- a restart must resolve every ENTRY_PENDING card's *order*
+    state, not only broker *positions* (which
+    :func:`run_startup_reconciliation`/``reconcile_broker_positions``
+    already covers).
+
+    Unlike EOD cleanup, this never forces a cancellation -- a still-working
+    order is left alone for the normal heartbeat to keep managing; this
+    only applies what reconciliation already reveals (a fill, or a
+    broker-confirmed terminal status), and still refuses to assume "no
+    order" from anything less than a complete discovery query (P1-15).
+    """
+    changed: List[TradeCardState] = []
+    for card in cards:
+        if card.board_status != BoardStatus.ENTRY_PENDING:
+            continue
+        order = callbacks.find_open_entry_order(card)
+        if order is None:
+            discovery = callbacks.discover_all_orders(card)
+            if not discovery.complete:
+                if card.entry_runtime_status != EntryRuntimeStatus.DATA_UNAVAILABLE:
+                    card.entry_runtime_status = EntryRuntimeStatus.DATA_UNAVAILABLE
+                    changed.append(card)
+                continue
+            card.board_status = BoardStatus.BUYLIST
+            card.entry_runtime_status = None
+            changed.append(card)
+            continue
+
+        refreshed = callbacks.reconcile_order(order)
+        if refreshed.status in _UNRESOLVED_STATUSES:
+            if card.entry_runtime_status != EntryRuntimeStatus.DATA_UNAVAILABLE:
+                card.entry_runtime_status = EntryRuntimeStatus.DATA_UNAVAILABLE
+                changed.append(card)
+            continue
+
+        if refreshed.filled_quantity > 0:
+            card.board_status = BoardStatus.OPEN_POSITION
+            card.broker_quantity = refreshed.filled_quantity
+            card.orderable_quantity = refreshed.filled_quantity
+            card.average_entry_price = refreshed.avg_fill_price
+            card.entry_remaining_target_quantity = 0
+            card.position_runtime_status = PositionRuntimeStatus.OPEN
+            position_manager.apply_first_fill_stop(
+                card,
+                entry_orb_low=card.entry_orb_low or 0.0,
+                entry_orb_window=card.entry_orb_window or card.selected_orb_window or "",
+            )
+            card.entry_runtime_status = None
+            changed.append(card)
+        elif refreshed.status in _ALREADY_TERMINAL_STATUSES:
+            # Terminal with zero fill (CANCELLED/REJECTED/EXPIRED) --
+            # confirmed gone, safe to return to Buylist.
+            card.board_status = BoardStatus.BUYLIST
+            card.entry_runtime_status = None
+            changed.append(card)
+        # else: genuinely still working (ACCEPTED/WORKING/CANCEL_REQUESTED)
+        # -- leave it for the normal heartbeat; a restart must not force a
+        # cancellation just because the process came back up.
+    return changed
+
+
 def run_startup_reconciliation(
     cards: List[TradeCardState],
     *,
@@ -186,6 +283,7 @@ def run_startup_reconciliation(
     position_snapshot: Optional[Dict],
     position_manager: PositionManager,
     symbol_name_lookup: Callable[[str], str] = lambda symbol: symbol,
+    order_callbacks: Optional[EodActionCallbacks] = None,
 ) -> List[TradeCardState]:
     """Section 1070-1075 ("Run full startup reconciliation") and the
     "Application restart with open positions" / "Broker position exists
@@ -205,12 +303,29 @@ def run_startup_reconciliation(
     so the next heartbeat pass (:mod:`src.services.trading_engine`) resumes
     exactly where it left off once this function has corrected quantities
     against broker truth.
+
+    ``order_callbacks``, when supplied, additionally reconciles every
+    ENTRY_PENDING card's *order* state via
+    :func:`reconcile_unresolved_orders_at_startup` (review finding P1-16) --
+    positions alone are not enough to safely resume: an order that filled
+    or was cancelled entirely while the process was down needs the same
+    broker-truth correction a live position quantity gets.
     """
     holdings: List[BrokerHolding] = extract_overseas_holdings(position_snapshot)
-    return position_manager.reconcile_broker_positions(
+    changed = position_manager.reconcile_broker_positions(
         cards,
         holdings,
         environment=environment,
         account_no=account_no,
         symbol_name_lookup=symbol_name_lookup,
     )
+    if order_callbacks is not None:
+        order_changed = reconcile_unresolved_orders_at_startup(
+            cards, position_manager=position_manager, callbacks=order_callbacks
+        )
+        seen = {id(card) for card in changed}
+        for card in order_changed:
+            if id(card) not in seen:
+                seen.add(id(card))
+                changed.append(card)
+    return changed

@@ -27,10 +27,13 @@ import threading
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
+from sqlalchemy.engine import Engine
+
 from src.core.capital_reservation import (
     CapitalReservation,
     available_for_new_entries,
 )
+from src.services import capital_reservation_repository
 from src.utils.config import DATA_DIR
 from src.utils.file_lock import exclusive_file_lock
 from src.utils.storage import load_json, save_json
@@ -101,6 +104,7 @@ def reserve_capital_for_entry(
     requested_notional: float,
     buying_power_provider: Callable[[], float],
     path: Path = RESERVATIONS_FILE,
+    engine: Optional[Engine] = None,
 ) -> Optional[CapitalReservation]:
     """Section 9.3's short account-level transaction.
 
@@ -109,6 +113,14 @@ def reserve_capital_for_entry(
     treat that as WAITING_FOR_CAPITAL and retry later; it must never submit
     the order anyway and let KIS reject it for insufficient funds
     (section 391).
+
+    ``engine``, when supplied (code review finding P1-12), makes the shared
+    database -- not just this process's local JSON ledger -- authoritative
+    for the availability check: any reservation another device made is
+    merged in via :func:`src.services.capital_reservation_repository.list_active_reservations`
+    before computing what's left, and the new reservation is mirrored to
+    the database in addition to the local ledger. ``engine=None`` (the
+    default) preserves the original local-JSON-only behavior exactly.
     """
     if requested_notional <= 0:
         raise ValueError("requested_notional must be positive")
@@ -117,6 +129,14 @@ def reserve_capital_for_entry(
         with exclusive_file_lock(path):
             reservations = _load_unlocked(path)
             active = find_active_reservations(reservations, environment, account_no)
+            if engine is not None:
+                db_active = capital_reservation_repository.list_active_reservations(
+                    engine, environment=environment, account_no=account_no
+                )
+                known_ids = {reservation.reservation_id for reservation in active}
+                active = active + [
+                    reservation for reservation in db_active if reservation.reservation_id not in known_ids
+                ]
             buying_power = float(buying_power_provider() or 0.0)
             available = available_for_new_entries(buying_power, active)
             if available < requested_notional:
@@ -140,11 +160,17 @@ def reserve_capital_for_entry(
             )
             reservations.append(reservation)
             _save_unlocked(reservations, path)
+            if engine is not None:
+                capital_reservation_repository.save_reservation(engine, reservation)
             return reservation
 
 
 def _mutate_reservation(
-    reservation_id: str, mutation: Callable[[CapitalReservation], None], *, path: Path
+    reservation_id: str,
+    mutation: Callable[[CapitalReservation], None],
+    *,
+    path: Path,
+    engine: Optional[Engine] = None,
 ) -> Optional[CapitalReservation]:
     with exclusive_file_lock(path):
         reservations = _load_unlocked(path)
@@ -153,33 +179,45 @@ def _mutate_reservation(
                 continue
             mutation(reservation)
             _save_unlocked(reservations, path)
+            if engine is not None:
+                capital_reservation_repository.save_reservation(engine, reservation)
             return reservation
     return None
 
 
 def consume_reservation(
-    reservation_id: str, notional: float, *, path: Path = RESERVATIONS_FILE
+    reservation_id: str,
+    notional: float,
+    *,
+    path: Path = RESERVATIONS_FILE,
+    engine: Optional[Engine] = None,
 ) -> Optional[CapitalReservation]:
     """Apply a fill (section 872-874: "Consume capital corresponding to
     filled quantity")."""
     return _mutate_reservation(
-        reservation_id, lambda reservation: reservation.consume(notional), path=path
+        reservation_id, lambda reservation: reservation.consume(notional), path=path, engine=engine
     )
 
 
 def release_reservation(
-    reservation_id: str, *, path: Path = RESERVATIONS_FILE
+    reservation_id: str,
+    *,
+    path: Path = RESERVATIONS_FILE,
+    engine: Optional[Engine] = None,
 ) -> Optional[CapitalReservation]:
     """Give back the unfilled remainder (section 876: "Release reservation
     when remainder is cancelled")."""
     return _mutate_reservation(
-        reservation_id, lambda reservation: reservation.release(), path=path
+        reservation_id, lambda reservation: reservation.release(), path=path, engine=engine
     )
 
 
 def expire_reservation(
-    reservation_id: str, *, path: Path = RESERVATIONS_FILE
+    reservation_id: str,
+    *,
+    path: Path = RESERVATIONS_FILE,
+    engine: Optional[Engine] = None,
 ) -> Optional[CapitalReservation]:
     return _mutate_reservation(
-        reservation_id, lambda reservation: reservation.expire(), path=path
+        reservation_id, lambda reservation: reservation.expire(), path=path, engine=engine
     )

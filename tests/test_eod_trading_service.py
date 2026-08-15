@@ -3,7 +3,13 @@ from __future__ import annotations
 
 import pytest
 
-from src.core.order_state import BrokerOrder, OrderIntent, OrderSide, OrderStatus
+from src.core.order_state import (
+    BrokerOrder,
+    BrokerOrderDiscoveryResult,
+    OrderIntent,
+    OrderSide,
+    OrderStatus,
+)
 from src.core.trade_card_state import (
     BoardStatus,
     EntryRuntimeStatus,
@@ -38,7 +44,7 @@ def _order(*, status, filled=0, avg_fill_price=0.0, reservation_id=""):
     return order
 
 
-def _service(tmp_path, *, find_order=None, reconcile_order=None):
+def _service(tmp_path, *, find_order=None, reconcile_order=None, discover_all_orders=None):
     cancelled = []
     manager = EntryAttemptManager(
         buying_power_provider=lambda e, a: 100_000.0,
@@ -49,6 +55,11 @@ def _service(tmp_path, *, find_order=None, reconcile_order=None):
         find_open_entry_order=find_order or (lambda card: None),
         reconcile_order=reconcile_order or (lambda order: order),
         cancel_order=cancelled.append,
+        **(
+            {"discover_all_orders": discover_all_orders}
+            if discover_all_orders is not None
+            else {}
+        ),
     )
     service = EodTradingService(
         entry_attempt_manager=manager,
@@ -226,6 +237,7 @@ def test_startup_reconciliation_preserves_correct_open_position():
     card = _card(
         board_status=BoardStatus.OPEN_POSITION,
         broker_quantity=20,
+        average_entry_price=100.0,
         position_runtime_status=PositionRuntimeStatus.OPEN,
     )
     changed = run_startup_reconciliation(
@@ -243,3 +255,189 @@ def test_startup_reconciliation_handles_missing_snapshot_gracefully():
         [], environment="PROD", account_no="1", position_snapshot=None, position_manager=PositionManager()
     )
     assert changed == []
+
+
+# --- P1-15: "no local order found" requires complete broker discovery -----
+
+
+def test_buy_today_with_no_order_is_not_reset_when_discovery_is_incomplete(tmp_path):
+    incomplete = BrokerOrderDiscoveryResult(
+        open_orders_complete=False, history_complete=True, reserved_orders_complete=True
+    )
+    service, cancelled, _ = _service(tmp_path, discover_all_orders=lambda card: incomplete)
+    card = _card(board_status=BoardStatus.BUY_TODAY, entry_orb_high=105.0)
+
+    changed = service.run_eod_cleanup([card])
+
+    assert changed == []
+    assert card.board_status == BoardStatus.BUY_TODAY
+    assert card.entry_orb_high == 105.0  # nothing was reset
+
+
+def test_buy_today_with_no_order_resets_once_discovery_is_complete(tmp_path):
+    complete = BrokerOrderDiscoveryResult(
+        open_orders_complete=True, history_complete=True, reserved_orders_complete=True
+    )
+    service, cancelled, _ = _service(tmp_path, discover_all_orders=lambda card: complete)
+    card = _card(board_status=BoardStatus.BUY_TODAY, entry_orb_high=105.0)
+
+    changed = service.run_eod_cleanup([card])
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.BUYLIST
+    assert card.entry_orb_high is None
+
+
+def test_entry_pending_with_no_order_stays_reconciling_when_discovery_incomplete(tmp_path):
+    incomplete = BrokerOrderDiscoveryResult(
+        open_orders_complete=True, history_complete=False, reserved_orders_complete=True,
+        errors=["KIS history query timed out"],
+    )
+    service, cancelled, _ = _service(tmp_path, discover_all_orders=lambda card: incomplete)
+    card = _card(board_status=BoardStatus.ENTRY_PENDING)
+
+    changed = service.run_eod_cleanup([card])
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.ENTRY_PENDING  # never assumed cancelled
+    assert card.entry_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE
+
+
+def test_entry_pending_with_no_order_moves_to_buylist_once_discovery_confirms_nothing(tmp_path):
+    complete = BrokerOrderDiscoveryResult(
+        open_orders_complete=True, history_complete=True, reserved_orders_complete=True
+    )
+    service, cancelled, _ = _service(tmp_path, discover_all_orders=lambda card: complete)
+    card = _card(board_status=BoardStatus.ENTRY_PENDING)
+
+    changed = service.run_eod_cleanup([card])
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.BUYLIST
+
+
+# --- P1-16: startup reconciliation also resolves unresolved orders --------
+
+
+def test_startup_order_reconciliation_applies_a_fill_that_happened_offline(tmp_path):
+    from src.services.eod_trading_service import (
+        EodActionCallbacks,
+        reconcile_unresolved_orders_at_startup,
+    )
+
+    order = _order(status=OrderStatus.FILLED, filled=100, avg_fill_price=101.0)
+    callbacks = EodActionCallbacks(
+        find_open_entry_order=lambda card: order,
+        reconcile_order=lambda o: o,
+        cancel_order=lambda cid: None,
+    )
+    card = _card(board_status=BoardStatus.ENTRY_PENDING, target_position_quantity=100)
+    card.entry_orb_low = 95.0
+
+    changed = reconcile_unresolved_orders_at_startup(
+        [card], position_manager=PositionManager(), callbacks=callbacks
+    )
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.OPEN_POSITION
+    assert card.broker_quantity == 100
+    assert card.stop_type == StopType.ORB_LOW
+
+
+def test_startup_order_reconciliation_confirms_cancellation_that_happened_offline(tmp_path):
+    from src.services.eod_trading_service import (
+        EodActionCallbacks,
+        reconcile_unresolved_orders_at_startup,
+    )
+
+    order = _order(status=OrderStatus.CANCELLED, filled=0)
+    callbacks = EodActionCallbacks(
+        find_open_entry_order=lambda card: order,
+        reconcile_order=lambda o: o,
+        cancel_order=lambda cid: None,
+    )
+    card = _card(board_status=BoardStatus.ENTRY_PENDING)
+
+    changed = reconcile_unresolved_orders_at_startup(
+        [card], position_manager=PositionManager(), callbacks=callbacks
+    )
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.BUYLIST
+
+
+def test_startup_order_reconciliation_leaves_still_working_order_untouched(tmp_path):
+    from src.services.eod_trading_service import (
+        EodActionCallbacks,
+        reconcile_unresolved_orders_at_startup,
+    )
+
+    order = _order(status=OrderStatus.WORKING, filled=0)
+    callbacks = EodActionCallbacks(
+        find_open_entry_order=lambda card: order,
+        reconcile_order=lambda o: o,
+        cancel_order=lambda cid: None,
+    )
+    card = _card(board_status=BoardStatus.ENTRY_PENDING)
+
+    changed = reconcile_unresolved_orders_at_startup(
+        [card], position_manager=PositionManager(), callbacks=callbacks
+    )
+
+    assert changed == []  # a restart must not force a cancellation
+    assert card.board_status == BoardStatus.ENTRY_PENDING
+
+
+def test_startup_order_reconciliation_respects_incomplete_discovery(tmp_path):
+    from src.services.eod_trading_service import (
+        EodActionCallbacks,
+        reconcile_unresolved_orders_at_startup,
+    )
+
+    incomplete = BrokerOrderDiscoveryResult(open_orders_complete=False)
+    callbacks = EodActionCallbacks(
+        find_open_entry_order=lambda card: None,
+        reconcile_order=lambda o: o,
+        cancel_order=lambda cid: None,
+        discover_all_orders=lambda card: incomplete,
+    )
+    card = _card(board_status=BoardStatus.ENTRY_PENDING)
+
+    changed = reconcile_unresolved_orders_at_startup(
+        [card], position_manager=PositionManager(), callbacks=callbacks
+    )
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.ENTRY_PENDING
+    assert card.entry_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE
+
+
+def test_run_startup_reconciliation_composes_positions_and_orders(tmp_path):
+    from src.services.eod_trading_service import EodActionCallbacks
+
+    order = _order(status=OrderStatus.FILLED, filled=50, avg_fill_price=200.0)
+    order_callbacks = EodActionCallbacks(
+        find_open_entry_order=lambda card: order if card.symbol == "MSFT" else None,
+        reconcile_order=lambda o: o,
+        cancel_order=lambda cid: None,
+    )
+    open_position_card = _card(
+        symbol="AAPL", board_status=BoardStatus.OPEN_POSITION, broker_quantity=20,
+        average_entry_price=100.0, position_runtime_status=PositionRuntimeStatus.OPEN,
+    )
+    entry_pending_card = _card(symbol="MSFT", board_status=BoardStatus.ENTRY_PENDING)
+
+    changed = run_startup_reconciliation(
+        [open_position_card, entry_pending_card],
+        environment="PROD",
+        account_no="1",
+        position_snapshot={"overseas": {"holdings": [{"symbol": "AAPL", "quantity": 20, "average_price": 100.0}]}},
+        position_manager=PositionManager(),
+        order_callbacks=order_callbacks,
+    )
+
+    assert entry_pending_card in changed
+    assert entry_pending_card.board_status == BoardStatus.OPEN_POSITION
+    assert entry_pending_card.broker_quantity == 50
+    # The already-correct AAPL position must not show up as changed.
+    assert open_position_card not in changed

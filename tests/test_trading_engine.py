@@ -236,16 +236,75 @@ def test_entry_pending_card_moves_to_open_position_on_full_fill_at_deadline(tmp_
     assert card.active_stop_price == 97.0
 
 
-def test_entry_pending_card_returns_to_buy_today_on_zero_fill_timeout(tmp_path):
-    order = _pending_order(status=OrderStatus.ACCEPTED, filled=0)
-    engine = _make_engine(tmp_path, find_order=lambda card: order, reconcile_order=lambda o: o)
+class _StatefulOrderTracker:
+    """Simulates the real two-phase cancel lifecycle for tests: the order's
+    status only becomes CANCEL_REQUESTED once ``cancel_order`` actually
+    fires, and only advances to a terminal status when the test calls
+    ``resolve(...)`` -- modeling a later heartbeat tick observing the
+    broker's actual confirmation instead of assuming it happened
+    immediately (review finding P0-7).
+    """
+
+    def __init__(self, order):
+        self.order = order
+        self.cancel_calls: list[str] = []
+
+    def find(self, card):
+        return self.order
+
+    def reconcile(self, order):
+        return self.order
+
+    def cancel_order(self, client_order_id):
+        self.cancel_calls.append(client_order_id)
+        self.order.status = OrderStatus.CANCEL_REQUESTED
+
+    def resolve(self, status, *, filled=None, avg_fill_price=None):
+        self.order.status = status
+        if filled is not None:
+            self.order.filled_quantity = filled
+        if avg_fill_price is not None:
+            self.order.avg_fill_price = avg_fill_price
+
+
+def test_entry_pending_zero_fill_timeout_only_requests_cancel_first_tick(tmp_path):
+    """P0-7: the first tick past the deadline must only *request* the
+    cancel -- capital stays reserved and board_status stays ENTRY_PENDING
+    until a later tick observes the broker's actual confirmation."""
+    tracker = _StatefulOrderTracker(_pending_order(status=OrderStatus.ACCEPTED, filled=0))
+    engine = _make_engine(tmp_path, find_order=tracker.find, reconcile_order=tracker.reconcile)
+    engine._position_callbacks.cancel_order = tracker.cancel_order
     card = _open_card(board_status=BoardStatus.ENTRY_PENDING, broker_quantity=0, orderable_quantity=0)
 
     changed = engine.run_heartbeat([card])
 
     assert changed == [card]
+    assert card.board_status == BoardStatus.ENTRY_PENDING  # not yet resolved
+    assert card.entry_cancel_in_flight is True
+    assert tracker.cancel_calls == [tracker.order.client_order_id]
+
+    # A second tick before the broker confirms anything must not resend the
+    # cancel or change the card.
+    changed_again = engine.run_heartbeat([card])
+    assert changed_again == []
+    assert len(tracker.cancel_calls) == 1
+
+
+def test_entry_pending_card_returns_to_buy_today_once_cancel_confirmed(tmp_path):
+    tracker = _StatefulOrderTracker(_pending_order(status=OrderStatus.ACCEPTED, filled=0))
+    engine = _make_engine(tmp_path, find_order=tracker.find, reconcile_order=tracker.reconcile)
+    engine._position_callbacks.cancel_order = tracker.cancel_order
+    card = _open_card(board_status=BoardStatus.ENTRY_PENDING, broker_quantity=0, orderable_quantity=0)
+
+    engine.run_heartbeat([card])  # requests the cancel
+    tracker.resolve(OrderStatus.CANCELLED)  # broker confirms on a later tick
+    changed = engine.run_heartbeat([card])
+
+    assert changed == [card]
     assert card.board_status == BoardStatus.BUY_TODAY
     assert card.entry_runtime_status == EntryRuntimeStatus.RETRY_COOLDOWN
+    assert card.entry_cancel_in_flight is False
+    assert card.next_retry_at is not None
 
 
 def test_entry_pending_card_before_deadline_is_untouched(tmp_path):
@@ -270,6 +329,7 @@ def test_unknown_submission_state_blocks_only_that_symbol_and_keeps_capital(tmp_
     assert aapl in changed
     assert aapl.entry_runtime_status == EntryRuntimeStatus.ORDER_PENDING
     assert aapl.board_status == BoardStatus.ENTRY_PENDING  # unresolved, not bounced back
+    assert aapl.entry_cancel_in_flight is False  # never even attempted a cancel
     # NVDA (a different symbol) must still be able to submit normally.
     assert nvda.board_status == BoardStatus.ENTRY_PENDING
 
@@ -306,48 +366,79 @@ def test_queued_sell_all_does_not_fire_before_market_open(tmp_path):
 # --- User-initiated CancelEntry on a working order (spec section 298-304) --
 
 
-def test_cancel_requested_zero_fill_moves_straight_to_buylist_no_retry(tmp_path):
+def test_cancel_requested_zero_fill_moves_to_buylist_once_confirmed(tmp_path):
     """The buyboard controller only *flags* cancel_requested (never moves
-    the card off ENTRY_PENDING itself) -- the engine must resolve it here,
-    and a user-requested cancel must never bounce to BUY_TODAY for a retry."""
-    order = _pending_order(status=OrderStatus.ACCEPTED, filled=0, deadline_seconds_ago=-1000)  # far from its deadline
-    engine = _make_engine(tmp_path, find_order=lambda card: order, reconcile_order=lambda o: o)
+    the card off ENTRY_PENDING itself) -- the engine resolves it here. Per
+    P0-7, the cancel is only requested on the first tick and only finalized
+    (Buylist, no retry) once a later tick sees it broker-confirmed."""
+    tracker = _StatefulOrderTracker(
+        _pending_order(status=OrderStatus.ACCEPTED, filled=0, deadline_seconds_ago=-1000)
+    )
+    engine = _make_engine(tmp_path, find_order=tracker.find, reconcile_order=tracker.reconcile)
+    engine._position_callbacks.cancel_order = tracker.cancel_order
     card = _open_card(board_status=BoardStatus.ENTRY_PENDING, broker_quantity=0, orderable_quantity=0)
     card.entry_block_reason = "cancel_requested"
 
-    changed = engine.run_heartbeat([card])
+    first = engine.run_heartbeat([card])
+    assert first == [card]
+    assert card.board_status == BoardStatus.ENTRY_PENDING  # not yet finalized
+    assert tracker.cancel_calls  # but the cancel was requested right away, not deferred
 
-    assert changed == [card]
+    tracker.resolve(OrderStatus.CANCELLED)
+    second = engine.run_heartbeat([card])
+
+    assert second == [card]
     assert card.board_status == BoardStatus.BUYLIST
     assert card.entry_runtime_status is None
     assert card.entry_block_reason == ""
 
 
 def test_cancel_requested_partial_fill_keeps_shares_but_stops_completion(tmp_path):
-    order = _pending_order(
-        status=OrderStatus.PARTIALLY_FILLED, filled=4, avg_fill_price=100.0, deadline_seconds_ago=-1000
+    tracker = _StatefulOrderTracker(
+        _pending_order(
+            status=OrderStatus.PARTIALLY_FILLED,
+            filled=4,
+            avg_fill_price=100.0,
+            deadline_seconds_ago=-1000,
+        )
     )
-    engine = _make_engine(tmp_path, find_order=lambda card: order, reconcile_order=lambda o: o)
+    engine = _make_engine(tmp_path, find_order=tracker.find, reconcile_order=tracker.reconcile)
+    engine._position_callbacks.cancel_order = tracker.cancel_order
     card = _open_card(board_status=BoardStatus.ENTRY_PENDING, broker_quantity=0, orderable_quantity=0)
     card.target_position_quantity = 10
     card.entry_block_reason = "cancel_requested"
 
-    changed = engine.run_heartbeat([card])
+    first = engine.run_heartbeat([card])
+    # The fill itself is protected immediately (P0-6), even before the
+    # cancel of the remainder is confirmed.
+    assert first == [card]
+    assert card.board_status == BoardStatus.OPEN_POSITION
+    assert card.broker_quantity == 4
 
-    assert changed == [card]
+    tracker.resolve(OrderStatus.CANCELLED, filled=4)
+    second = engine.run_heartbeat([card])
+
+    assert second == [card]
     assert card.board_status == BoardStatus.OPEN_POSITION  # real shares kept
     assert card.broker_quantity == 4
     assert card.entry_remaining_target_quantity == 0  # not retried
     assert card.position_runtime_status == PositionRuntimeStatus.OPEN
 
 
-def test_cancel_requested_before_deadline_still_resolves_immediately(tmp_path):
+def test_cancel_requested_before_deadline_still_requests_immediately(tmp_path):
     """A cancel request must not wait for the 15s attempt deadline."""
-    order = _pending_order(status=OrderStatus.ACCEPTED, filled=0, deadline_seconds_ago=-1000)
-    engine = _make_engine(tmp_path, find_order=lambda card: order, reconcile_order=lambda o: o)
-    card = _open_card(board_status=BoardStatus.ENTRY_PENDING)
+    tracker = _StatefulOrderTracker(
+        _pending_order(status=OrderStatus.ACCEPTED, filled=0, deadline_seconds_ago=-1000)
+    )
+    engine = _make_engine(tmp_path, find_order=tracker.find, reconcile_order=tracker.reconcile)
+    engine._position_callbacks.cancel_order = tracker.cancel_order
+    card = _open_card(board_status=BoardStatus.ENTRY_PENDING, broker_quantity=0, orderable_quantity=0)
     card.entry_block_reason = "cancel_requested"
 
+    engine.run_heartbeat([card])
+    assert tracker.cancel_calls  # requested on the very first tick, not deferred to a deadline
+
+    tracker.resolve(OrderStatus.CANCELLED)
     changed = engine.run_heartbeat([card])
     assert changed == [card]
     assert card.board_status == BoardStatus.BUYLIST
@@ -477,4 +568,324 @@ def test_disconnected_market_data_blocks_entry_even_with_a_fresh_cached_quote(tm
 
     assert changed == [card]
     assert card.entry_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE
+    assert card.board_status == BoardStatus.BUY_TODAY
+
+
+# --- P0-4: retry-state recovery ---------------------------------------------
+
+
+def test_recovers_retry_cooldown_card_once_next_retry_at_passes(tmp_path):
+    clock_time = dt.datetime(2026, 1, 5, 14, 30, tzinfo=dt.timezone.utc)
+    engine = _make_engine(tmp_path)
+    engine._clock = lambda: clock_time
+    engine._market_data.subscribe(["AAPL"])
+    engine._market_data.poll_once()
+    card = _buy_today_card(entry_runtime_status=EntryRuntimeStatus.RETRY_COOLDOWN)
+    card.next_retry_at = clock_time - dt.timedelta(seconds=1)  # already due
+
+    changed = engine.run_heartbeat([card])
+
+    assert card in changed
+    assert card.board_status == BoardStatus.ENTRY_PENDING or card.entry_runtime_status != EntryRuntimeStatus.RETRY_COOLDOWN
+
+
+def test_does_not_recover_retry_cooldown_card_before_next_retry_at(tmp_path):
+    clock_time = dt.datetime(2026, 1, 5, 14, 30, tzinfo=dt.timezone.utc)
+    engine = _make_engine(tmp_path)
+    engine._clock = lambda: clock_time
+    card = _buy_today_card(entry_runtime_status=EntryRuntimeStatus.RETRY_COOLDOWN)
+    card.next_retry_at = clock_time + dt.timedelta(seconds=30)  # not due yet
+
+    engine.run_heartbeat([card])
+    assert card.entry_runtime_status == EntryRuntimeStatus.RETRY_COOLDOWN
+
+
+def test_recovers_waiting_for_capital_card_every_tick(tmp_path):
+    engine = _make_engine(tmp_path)
+    engine._market_data.subscribe(["AAPL"])
+    engine._market_data.poll_once()
+    card = _buy_today_card(entry_runtime_status=EntryRuntimeStatus.WAITING_FOR_CAPITAL)
+
+    changed = engine.run_heartbeat([card])
+
+    assert card in changed
+    assert card.board_status == BoardStatus.ENTRY_PENDING
+
+
+def test_recovers_data_unavailable_card_once_quote_is_fresh_again(tmp_path):
+    engine = _make_engine(tmp_path)
+    card = _buy_today_card(entry_runtime_status=EntryRuntimeStatus.DATA_UNAVAILABLE)
+
+    engine.run_heartbeat([card])
+    assert card.entry_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE
+
+    engine._market_data.subscribe(["AAPL"])
+    engine._market_data.poll_once()
+    changed = engine.run_heartbeat([card])
+
+    assert card in changed
+    assert card.board_status == BoardStatus.ENTRY_PENDING
+
+
+# --- P0-3: Partial Sell is actually submitted and reconciled ---------------
+
+
+def test_partial_sell_request_is_actually_submitted(tmp_path):
+    submitted = []
+    engine = _make_engine(tmp_path)
+    engine._position_callbacks = PositionActionCallbacks(
+        cancel_order=lambda cid: None,
+        submit_sell_order=lambda **kw: submitted.append(kw),
+        refresh_orderable_quantity=lambda *a: 300,
+        find_open_sell_order=lambda card: None,
+    )
+    card = _open_card(board_status=BoardStatus.PARTIAL_SELL, broker_quantity=300, orderable_quantity=300)
+    card.pending_partial_sell_quantity = 100
+
+    changed = engine.run_heartbeat([card])
+
+    assert changed == [card]
+    assert len(submitted) == 1
+    assert submitted[0]["quantity"] == 100
+    assert submitted[0]["reason"] == "partial_sell"
+
+
+def test_partial_sell_does_not_resubmit_while_order_is_working(tmp_path):
+    working = _pending_order(status=OrderStatus.WORKING, filled=0)
+    submitted = []
+    engine = _make_engine(tmp_path)
+    engine._position_callbacks = PositionActionCallbacks(
+        cancel_order=lambda cid: None,
+        submit_sell_order=lambda **kw: submitted.append(kw),
+        refresh_orderable_quantity=lambda *a: 300,
+        find_open_sell_order=lambda card: working,
+        reconcile_sell_order=lambda order: order,
+    )
+    card = _open_card(board_status=BoardStatus.PARTIAL_SELL, broker_quantity=300, orderable_quantity=300)
+    card.pending_partial_sell_quantity = 100
+
+    engine.run_heartbeat([card])
+    assert submitted == []
+
+
+def test_partial_sell_fill_moves_stop_to_breakeven_and_returns_to_open_position(tmp_path):
+    filled_order = _pending_order(status=OrderStatus.FILLED, filled=100, avg_fill_price=101.0)
+    engine = _make_engine(tmp_path)
+    engine._position_callbacks = PositionActionCallbacks(
+        cancel_order=lambda cid: None,
+        submit_sell_order=lambda **kw: None,
+        refresh_orderable_quantity=lambda *a: 200,
+        find_open_sell_order=lambda card: filled_order,
+        reconcile_sell_order=lambda order: order,
+    )
+    card = _open_card(
+        board_status=BoardStatus.PARTIAL_SELL,
+        broker_quantity=300,
+        orderable_quantity=200,
+        stop_type=StopType.ORB_LOW,
+        active_stop_price=95.0,
+    )
+    card.pending_partial_sell_quantity = 100
+
+    changed = engine.run_heartbeat([card])
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.OPEN_POSITION
+    assert card.broker_quantity == 200
+    assert card.pending_partial_sell_quantity == 0
+    assert card.stop_type == StopType.BREAKEVEN
+
+
+# --- P0-2: Sell All is actually submitted the first tick --------------------
+
+
+def test_sell_all_submits_on_the_very_first_tick(tmp_path):
+    submitted = []
+    engine = _make_engine(tmp_path)
+    engine._position_callbacks = PositionActionCallbacks(
+        cancel_order=lambda cid: None,
+        submit_sell_order=lambda **kw: submitted.append(kw),
+        refresh_orderable_quantity=lambda *a: 300,
+        find_open_sell_order=lambda card: None,
+    )
+    card = _open_card(broker_quantity=300, orderable_quantity=300)
+    card.board_status = BoardStatus.SELL_ALL
+    card.exit_all_required = True
+
+    changed = engine.run_heartbeat([card])
+
+    assert changed == [card]
+    assert len(submitted) == 1
+    assert submitted[0]["quantity"] == 300
+
+
+# --- P0-5: partial entry fill's remaining target is actually retried -------
+
+
+def test_entry_completion_resubmits_for_remaining_target(tmp_path):
+    submitted = []
+
+    def fake_submit(**kwargs):
+        submitted.append(kwargs)
+        return BrokerOrder.create(
+            environment=kwargs["environment"], account_no=kwargs["account_no"], symbol=kwargs["symbol"],
+            side=OrderSide.BUY, intent=OrderIntent.ENTRY, quantity_requested=kwargs["quantity"],
+            limit_price=kwargs["limit_price"], status=OrderStatus.ACCEPTED,
+        )
+
+    engine = _make_engine(tmp_path, submit_order=fake_submit)
+    engine._market_data.subscribe(["AAPL"])
+    engine._market_data.poll_once()
+    card = _open_card(broker_quantity=30, orderable_quantity=30)
+    card.entry_remaining_target_quantity = 70
+    card.entry_trigger = 100.0
+    card.position_runtime_status = PositionRuntimeStatus.ENTRY_COMPLETING
+
+    changed = engine.run_heartbeat([card])
+
+    assert changed == [card]
+    assert len(submitted) == 1
+    assert submitted[0]["quantity"] == 70
+    assert card.entry_runtime_status == EntryRuntimeStatus.ORDER_PENDING
+
+
+def test_entry_completion_does_not_retry_while_stop_triggered(tmp_path):
+    submitted = []
+    engine = _make_engine(tmp_path, submit_order=lambda **kw: submitted.append(kw))
+    engine._market_data.subscribe(["AAPL"])
+    engine._market_data.poll_once()
+    card = _open_card(broker_quantity=30, orderable_quantity=30, exit_all_required=True)
+    card.entry_remaining_target_quantity = 70
+    card.entry_trigger = 100.0
+
+    engine.run_heartbeat([card])
+    assert submitted == []
+
+
+def test_entry_completion_does_not_retry_while_an_order_is_already_working(tmp_path):
+    working = _pending_order(status=OrderStatus.WORKING, filled=0)
+    submitted = []
+    engine = _make_engine(
+        tmp_path, submit_order=lambda **kw: submitted.append(kw), find_order=lambda card: working
+    )
+    engine._market_data.subscribe(["AAPL"])
+    engine._market_data.poll_once()
+    card = _open_card(broker_quantity=30, orderable_quantity=30)
+    card.entry_remaining_target_quantity = 70
+    card.entry_trigger = 100.0
+
+    engine.run_heartbeat([card])
+    assert submitted == []
+
+
+# --- P0-9: marketable price uses the live quote -----------------------------
+
+
+def test_marketable_entry_price_uses_higher_of_trigger_and_live_quote(tmp_path):
+    submitted = []
+
+    def fake_submit(**kwargs):
+        submitted.append(kwargs)
+        return BrokerOrder.create(
+            environment=kwargs["environment"], account_no=kwargs["account_no"], symbol=kwargs["symbol"],
+            side=OrderSide.BUY, intent=OrderIntent.ENTRY, quantity_requested=kwargs["quantity"],
+            limit_price=kwargs["limit_price"], status=OrderStatus.ACCEPTED,
+        )
+
+    engine = _make_engine(tmp_path, submit_order=fake_submit)
+    engine._market_data = RestPollingMarketDataService(
+        quote_fetcher=lambda s: QuoteSnapshot(symbol=s, last_price=105.0, bid=104.9, ask=105.1)
+    )
+    engine._market_data.subscribe(["AAPL"])
+    engine._market_data.poll_once()
+    card = _buy_today_card(entry_trigger=100.0)
+
+    engine.run_heartbeat([card])
+
+    assert len(submitted) == 1
+    assert submitted[0]["limit_price"] == pytest.approx(105.1)
+
+
+# --- P1-6: stale-quote protection for existing positions --------------------
+
+
+def test_open_position_flagged_data_stale_when_quote_missing(tmp_path):
+    engine = _make_engine(tmp_path)
+    card = _open_card()
+
+    changed = engine.run_heartbeat([card])
+
+    assert changed == [card]
+    assert "DATA_STALE" in card.warnings
+
+
+def test_open_position_stale_flag_clears_once_fresh_quote_arrives(tmp_path):
+    engine = _make_engine(tmp_path)
+    card = _open_card()
+    engine.run_heartbeat([card])
+    assert "DATA_STALE" in card.warnings
+
+    engine._market_data.subscribe(["AAPL"])
+    engine._market_data.poll_once()
+    changed = engine.run_heartbeat([card])
+
+    assert changed == [card]
+    assert "DATA_STALE" not in card.warnings
+
+
+# --- P1-14: EOD cleanup is actually invoked from the heartbeat -------------
+
+
+def test_eod_cleanup_runs_when_wired_and_window_reached(tmp_path):
+    from src.services.eod_trading_service import EodActionCallbacks, EodTradingService
+
+    engine = _make_engine(tmp_path)
+    eod_callbacks = EodActionCallbacks(
+        find_open_entry_order=lambda card: None,
+        reconcile_order=lambda order: order,
+        cancel_order=lambda cid: None,
+    )
+    engine._eod_service = EodTradingService(
+        entry_attempt_manager=engine._entry_attempt_manager,
+        position_manager=engine._position_manager,
+        callbacks=eod_callbacks,
+        reservations_path=tmp_path / "reservations.json",
+    )
+    engine._eod_window_reached = lambda: True
+    card = _buy_today_card(entry_runtime_status=EntryRuntimeStatus.ARMED)
+
+    changed = engine.run_heartbeat([card])
+
+    assert card in changed
+    assert card.board_status == BoardStatus.BUYLIST
+
+
+def test_eod_cleanup_does_not_run_outside_the_window(tmp_path):
+    from src.services.eod_trading_service import EodActionCallbacks, EodTradingService
+
+    engine = _make_engine(tmp_path)
+    eod_callbacks = EodActionCallbacks(
+        find_open_entry_order=lambda card: None,
+        reconcile_order=lambda order: order,
+        cancel_order=lambda cid: None,
+    )
+    engine._eod_service = EodTradingService(
+        entry_attempt_manager=engine._entry_attempt_manager,
+        position_manager=engine._position_manager,
+        callbacks=eod_callbacks,
+        reservations_path=tmp_path / "reservations.json",
+    )
+    # engine._eod_window_reached left at its default (False)
+    card = _buy_today_card(entry_runtime_status=EntryRuntimeStatus.ARMED)
+
+    engine.run_heartbeat([card])
+    assert card.board_status == BoardStatus.BUY_TODAY
+
+
+def test_eod_cleanup_is_a_no_op_without_an_eod_service_wired(tmp_path):
+    engine = _make_engine(tmp_path)  # no eod_service passed
+    engine._eod_window_reached = lambda: True
+    card = _buy_today_card(entry_runtime_status=EntryRuntimeStatus.ARMED)
+
+    engine.run_heartbeat([card])
     assert card.board_status == BoardStatus.BUY_TODAY

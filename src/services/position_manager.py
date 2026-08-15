@@ -60,6 +60,10 @@ def compute_breakeven_stop_price(
     return round_up_to_valid_tick(raw_breakeven)
 
 
+def _prices_match(a: float, b: float, *, tolerance: float = 1e-6) -> bool:
+    return abs(float(a or 0.0) - float(b or 0.0)) <= tolerance
+
+
 def minimum_manual_stop_price(card: TradeCardState) -> float:
     """Section 646-659: a manual stop can tighten risk but never widen it
     below breakeven or below the current active stop."""
@@ -94,12 +98,16 @@ class PositionActionCallbacks:
     # Finds this card's currently-working exit (SELL) order, if any -- used
     # by callers (src.services.trading_engine) that need to cancel a
     # specific in-flight partial-sell order before escalating to a full
-    # liquidation (section 671-697's "stop triggered during partial sell").
-    # Optional/defaulted so existing callers that never need it are
-    # unaffected.
+    # liquidation (section 671-697's "stop triggered during partial sell"),
+    # and to avoid ever submitting a replacement sell order while a cancel
+    # is still in flight (code review finding P1-4). Optional/defaulted so
+    # existing callers that never need it are unaffected.
     find_open_sell_order: Callable[[TradeCardState], Optional[BrokerOrder]] = (
         lambda card: None
     )
+    # Refreshes one sell order's status from the broker without cancelling
+    # it -- the exit-side counterpart of EntryDeadlineLookup.reconcile_order.
+    reconcile_sell_order: Callable[[BrokerOrder], BrokerOrder] = lambda order: order
 
 
 @dataclass(frozen=True)
@@ -213,28 +221,22 @@ class PositionManager:
         own state (exit_all_required + the board_status move below, which
         makes :func:`src.ui.buyboard.controller._apply_partial_sell`'s
         OPEN_POSITION-only guard block any further partial-sell command).
-        Steps 3-7 use the injected callbacks; step 8 ("continue until flat")
-        is the caller's heartbeat re-invoking this engine, not a loop here.
+        Step 3 requests the cancel here; steps 4-7 (refresh quantity, submit
+        the actual liquidation) are deliberately left to the trading
+        engine's retry stage rather than done inline here (code review
+        finding P1-4: a replacement sell must never be submitted while the
+        cancel of the previous one is still unconfirmed -- the retry stage
+        only submits once ``find_open_sell_order`` reports nothing working,
+        which stays true of the cancelled order until the broker actually
+        confirms it). Step 8 ("continue until flat") is likewise the
+        caller's heartbeat re-invoking the retry stage, not a loop here.
         """
         card.exit_all_required = True
         if working_partial_sell_client_order_id:
             callbacks.cancel_order(working_partial_sell_client_order_id)  # step 3
-        remaining = callbacks.refresh_orderable_quantity(  # steps 4 & 6
-            card.environment, card.account_no, card.symbol
-        )
-        card.broker_quantity = remaining
-        card.orderable_quantity = remaining
         card.pending_partial_sell_quantity = 0
         card.board_status = BoardStatus.SELL_ALL
         card.position_runtime_status = PositionRuntimeStatus.LIQUIDATING
-        if remaining > 0:
-            callbacks.submit_sell_order(  # step 7
-                environment=card.environment,
-                account_no=card.account_no,
-                symbol=card.symbol,
-                quantity=remaining,
-                reason="stop_triggered_during_partial_sell",
-            )
         return card
 
     # --- Sell All (section 18) -------------------------------------------
@@ -246,29 +248,19 @@ class PositionManager:
         callbacks: PositionActionCallbacks,
         working_buy_client_order_id: Optional[str] = None,
     ) -> TradeCardState:
-        """Section 699-709 steps 1-6. Reprice/retry-until-flat (step 8) and
-        the Closed transition (step 9, via :meth:`confirm_flat`) are driven
-        by the caller re-invoking this engine on subsequent heartbeats, not
-        a loop in this single call.
+        """Section 699-709 steps 1-3: sets intent and cancels any
+        conflicting working BUY order. Steps 4-6 (refresh orderable
+        quantity, submit the liquidation), the reprice/retry loop (step 8),
+        and the Closed transition (step 9, via :meth:`confirm_flat`) are
+        all owned by the trading engine's retry stage -- see
+        :meth:`handle_stop_triggered_during_partial_sell`'s docstring for
+        why submission does not happen inline here (P1-4).
         """
         card.exit_all_required = True
         if working_buy_client_order_id:
             callbacks.cancel_order(working_buy_client_order_id)  # step 3
-        remaining = callbacks.refresh_orderable_quantity(  # steps 4-5
-            card.environment, card.account_no, card.symbol
-        )
-        card.broker_quantity = remaining
-        card.orderable_quantity = remaining
         card.board_status = BoardStatus.SELL_ALL
         card.position_runtime_status = PositionRuntimeStatus.LIQUIDATING
-        if remaining > 0:
-            callbacks.submit_sell_order(  # step 6
-                environment=card.environment,
-                account_no=card.account_no,
-                symbol=card.symbol,
-                quantity=remaining,
-                reason="sell_all",
-            )
         return card
 
     def queue_sell_all_at_market_open(self, card: TradeCardState) -> TradeCardState:
@@ -331,12 +323,18 @@ class PositionManager:
         card.position_runtime_status = PositionRuntimeStatus.OPEN
         if card.stop_type is None:
             # No ORB/entry history exists for a manually-purchased position
-            # -- section 620 forbids inventing one, so this starts at a
-            # conservative manual stop pinned to cost until the user (or a
-            # later SetBreakevenStop/SetManualStop command) adjusts it.
-            card.stop_type = StopType.MANUAL_PRICE
-            card.active_stop_price = average_entry_price
-            card.stop_quantity = broker_quantity
+            # -- section 620 forbids inventing one. Code review finding
+            # P1-3: silently pinning a stop at average cost is unsafe,
+            # because if the current price is already below cost the very
+            # next tick would trigger an immediate Sell All the instant the
+            # engine notices this position. Instead, leave active_stop_price
+            # unset (evaluate_stop_trigger never fires with no stop price),
+            # flag the card for the user, and block new automated entries
+            # for this symbol until an explicit SetManualStop/
+            # SetBreakevenStop command sets a real stop.
+            card.entry_block_reason = "manual_position_requires_stop"
+            if "STOP_REQUIRED" not in card.warnings:
+                card.warnings = [*card.warnings, "STOP_REQUIRED"]
         return card
 
     def reconcile_manual_exit(self, card: TradeCardState, *, broker_quantity: int) -> TradeCardState:
@@ -367,8 +365,19 @@ class PositionManager:
         by the caller on the ``FULL_RECONCILIATION_SECONDS`` cadence
         (section 804-806).
 
-        Broker truth always wins. Returns every card that was created or
-        mutated so the caller can persist them.
+        Broker truth always wins for *quantity and average price*. It does
+        not win for board_status/exit intent: code review finding P1-1
+        flagged that the original version routed every quantity-matching
+        SELL_ALL/PARTIAL_SELL/ENTRY_PENDING card through
+        :meth:`discover_manual_position`, which forces ``board_status`` back
+        to OPEN_POSITION -- silently cancelling an in-progress liquidation
+        or partial sell out from under the user/engine. A card already
+        known to the application only has its broker-derived facts
+        refreshed here; :meth:`discover_manual_position` (which does move
+        board_status) is reserved for genuinely new/unknown positions.
+
+        Returns every card that was created or mutated so the caller can
+        persist them.
         """
         changed: List[TradeCardState] = []
         holdings_by_symbol = {holding.symbol: holding for holding in holdings}
@@ -378,33 +387,76 @@ class PositionManager:
             if card.environment == environment and card.account_no == account_no
         }
 
+        # Statuses where the application already has an authoritative,
+        # in-progress intent that broker reconciliation must not overwrite.
+        _INTENT_PRESERVING_STATUSES = {
+            BoardStatus.SELL_ALL,
+            BoardStatus.PARTIAL_SELL,
+            BoardStatus.ENTRY_PENDING,
+        }
+
         for symbol, holding in holdings_by_symbol.items():
             card = cards_by_symbol.get(symbol)
-            already_correct = (
-                card is not None
-                and card.board_status == BoardStatus.OPEN_POSITION
-                and card.broker_quantity == holding.quantity
-            )
-            if already_correct:
+            if card is None:
+                changed.append(
+                    self.discover_manual_position(
+                        None,
+                        environment=environment,
+                        account_no=account_no,
+                        symbol=symbol,
+                        name=symbol_name_lookup(symbol),
+                        broker_quantity=holding.quantity,
+                        average_entry_price=holding.average_price,
+                    )
+                )
                 continue
-            updated = self.discover_manual_position(
-                card,
-                environment=environment,
-                account_no=account_no,
-                symbol=symbol,
-                name=symbol_name_lookup(symbol) if card is None else card.name,
-                broker_quantity=holding.quantity,
-                average_entry_price=holding.average_price,
+
+            # P1-2: compare quantity *and* average price, not quantity alone
+            # -- an unchanged share count with a changed average cost (e.g.
+            # an averaging-down purchase that nets back to the same size)
+            # must still update the card.
+            facts_changed = card.broker_quantity != holding.quantity or not _prices_match(
+                card.average_entry_price, holding.average_price
             )
-            changed.append(updated)
+
+            if card.board_status in _INTENT_PRESERVING_STATUSES:
+                if facts_changed:
+                    card.broker_quantity = holding.quantity
+                    card.average_entry_price = holding.average_price
+                    changed.append(card)
+                continue
+
+            if card.board_status != BoardStatus.OPEN_POSITION or facts_changed:
+                changed.append(
+                    self.discover_manual_position(
+                        card,
+                        environment=environment,
+                        account_no=account_no,
+                        symbol=symbol,
+                        name=card.name,
+                        broker_quantity=holding.quantity,
+                        average_entry_price=holding.average_price,
+                    )
+                )
 
         # Section 14 "manual sale discovered": a card believes it holds
         # shares the broker no longer reports at all.
         for symbol, card in cards_by_symbol.items():
             if symbol in holdings_by_symbol:
                 continue
-            if card.broker_quantity > 0:
-                self.reconcile_manual_exit(card, broker_quantity=0)
+            if card.broker_quantity <= 0:
+                continue
+            if card.board_status == BoardStatus.SELL_ALL:
+                # Expected outcome of a liquidation in progress -- let the
+                # normal Sell All retry stage (which already checks
+                # orderable_quantity) drive the Closed transition so the
+                # rest of that sequence's bookkeeping stays consistent,
+                # rather than jumping to Closed from a reconciliation pass.
+                card.broker_quantity = 0
+                card.orderable_quantity = 0
                 changed.append(card)
+                continue
+            self.reconcile_manual_exit(card, broker_quantity=0)
+            changed.append(card)
 
         return changed
