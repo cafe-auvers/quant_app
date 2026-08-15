@@ -19,6 +19,20 @@ every reservation write mirrors here in addition to the local JSON ledger
 remain for migration, backup, and recovery"). When no engine is supplied
 (the default, and every existing test), behavior is unchanged from before
 this module existed -- purely local-JSON.
+
+``insert_reservation`` (Workstream 3, PR2, A1) is a second, distinct write
+path added alongside the above, not a replacement for it: the guarded
+execution gateway's atomic pre-submission transaction ("insert
+``ExecutionCommand``, create capital reservation, create ``PREPARED``
+``ExecutionOrderRecord``, all in one transaction") needs a reservation write
+that (a) takes an already-open ``Connection`` so it can be composed with
+``execution_command_repository.insert_command``/
+``execution_order_repository.insert_execution_order`` into one commit, and
+(b) raises on failure rather than the existing ``save_reservation``'s
+best-effort log-and-continue -- a reservation that silently failed to write
+would leave the "atomic" transaction not actually atomic. ``save_reservation``
+itself is unchanged and still used by the pre-existing ``capital_allocator.py``
+mirror path.
 """
 from __future__ import annotations
 
@@ -37,7 +51,7 @@ from sqlalchemy import (
     func,
     select,
 )
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import SQLAlchemyError
 
 from src.core.capital_reservation import CapitalReservation, CapitalReservationStatus
@@ -69,6 +83,18 @@ def _get_capital_reservations_table(metadata: MetaData) -> Table:
         Column("released_at", DateTime, nullable=True),
         Column("updated_at", DateTime, nullable=False),
     )
+
+
+def ensure_capital_reservations_table(engine: Engine) -> Table:
+    """Public, idempotent table-creation entry point (Workstream 3, PR2) --
+    matches ``execution_order_repository.ensure_execution_orders_table``'s
+    naming/pattern. Callers composing :func:`insert_reservation`/
+    :func:`update_reservation` into their own transaction must call this
+    *before* opening it: those two primitives intentionally do not ensure
+    the table themselves, since ``metadata.create_all`` opens its own
+    connection from the engine's pool, which for a file-based SQLite
+    database can contend with a transaction already open on ``conn``."""
+    return _ensure_table(engine)
 
 
 def _ensure_table(engine: Engine) -> Table:
@@ -181,6 +207,77 @@ def save_reservation(engine: Optional[Engine], reservation: CapitalReservation) 
                 )
     except SQLAlchemyError as exc:
         logger.warning("capital_reservation_repository: save_reservation failed: %s", exc)
+
+
+class DuplicateReservationError(RuntimeError):
+    """A row for this ``reservation_id`` already exists -- ``reservation_id``
+    is a fresh UUID per :meth:`CapitalReservation.create`, so this should
+    only ever fire on a genuine caller bug (re-using a reservation object
+    across two submission attempts), never in ordinary operation."""
+
+
+# --- shared-transaction primitive (Workstream 3, PR2) -----------------------
+
+
+def insert_reservation(conn: Connection, reservation: CapitalReservation) -> CapitalReservation:
+    """The A1 atomic-transaction write: takes an already-open ``Connection``
+    so a caller (the execution gateway) can compose it with the command
+    journal and order-record writes into one commit, and raises on failure
+    instead of :func:`save_reservation`'s best-effort log-and-continue --
+    see the module docstring. Callers must call
+    :func:`ensure_capital_reservations_table` before opening the
+    transaction this participates in -- this function does not ensure the
+    table itself (see that function's own docstring)."""
+    table = _get_capital_reservations_table(MetaData())
+    existing = conn.execute(
+        select(table.c.reservation_id).where(table.c.reservation_id == reservation.reservation_id)
+    ).first()
+    if existing is not None:
+        raise DuplicateReservationError(
+            f"CapitalReservation {reservation.reservation_id!r} already exists"
+        )
+    conn.execute(
+        table.insert().values(
+            reservation_id=reservation.reservation_id,
+            environment=reservation.environment,
+            account_no=reservation.account_no,
+            symbol=reservation.symbol,
+            attempt_group_id=reservation.attempt_group_id,
+            requested_notional=reservation.requested_notional,
+            remaining_reserved_notional=reservation.remaining_reserved_notional,
+            status=reservation.status.value,
+            created_at=reservation.created_at,
+            released_at=reservation.released_at,
+            updated_at=_server_now(conn.engine),
+        )
+    )
+    return reservation
+
+
+def update_reservation(conn: Connection, reservation: CapitalReservation) -> CapitalReservation:
+    """Companion to :func:`insert_reservation` for the same caller-owned-
+    transaction composability -- used by the gateway to release a
+    reservation (on a clean rejection) inside the same transaction as the
+    order-record/command-response update, rather than a separate best-effort
+    write after the fact. Same table-must-already-exist requirement as
+    :func:`insert_reservation`."""
+    table = _get_capital_reservations_table(MetaData())
+    result = conn.execute(
+        table.update()
+        .where(table.c.reservation_id == reservation.reservation_id)
+        .values(
+            requested_notional=reservation.requested_notional,
+            remaining_reserved_notional=reservation.remaining_reserved_notional,
+            status=reservation.status.value,
+            released_at=reservation.released_at,
+            updated_at=_server_now(conn.engine),
+        )
+    )
+    if result.rowcount == 0:
+        raise RuntimeError(
+            f"CapitalReservation {reservation.reservation_id!r} not found for update"
+        )
+    return reservation
 
 
 def reconcile_stale_reservations(

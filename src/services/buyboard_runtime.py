@@ -131,6 +131,7 @@ from src.services import capital_allocator, capital_reservation_repository
 from src.services import order_ledger
 from src.services import order_reconciliation
 from src.services.broker import Broker, KisBroker
+from src.services.execution_command_gateway import get_default_execution_gateway
 from src.services.entry_attempt_manager import EntryAttemptManager
 from src.services.eod_trading_service import EodActionCallbacks, EodTradingService
 from src.services.execution_authority import ExecutionAuthority, LeaseHandle
@@ -554,7 +555,17 @@ def build_buyboard_runtime(
     and :class:`~src.services.eod_trading_service.EodTradingService`, which
     previously accepted this parameter but never actually used it.
     """
-    resolved_broker = broker or KisBroker()
+    # Workstream 9 (PR2): the default broker is the shared execution
+    # gateway, not a raw KisBroker -- this module's own broker calls
+    # (submit via submit_guarded_overseas_order, cancel via
+    # order_reconciliation.cancel_and_reconcile_order and the direct
+    # discovered-order cancel below) now route through the same single
+    # mutation boundary the legacy Buy Dashboard uses. This module is
+    # itself only ever constructed when BUYBOARD_ENGINE_ENABLED is true
+    # (see the module docstring's "None of this is activated
+    # automatically"), so in practice this change affects only this
+    # module's own tests today, not any live production path.
+    resolved_broker = broker or get_default_execution_gateway()
     resolved_equity_provider = account_equity_provider or buying_power_provider
 
     def submit_order(**kwargs):

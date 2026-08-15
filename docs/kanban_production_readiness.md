@@ -132,14 +132,14 @@ PR's behavior composes correctly, plus the Gate 1 run in full.
 |---|---|---|
 | 0 | KIS protocol capability verification | NOT STARTED — capability-specific adapters remain gated; skeleton complete |
 | 1 | Freeze requirements and invariants (this document) | DONE — revision 3.1 signed off |
-| 2 | Durable order ownership and command ledger | NOT STARTED |
-| 3 | One guarded execution gateway | NOT STARTED |
+| 2 | Durable order ownership and command ledger | PR1 IMPLEMENTED, not activated — merged to `master` (`5b50e1d`): schemas, all three state machines, durable repositories, command ledger. Excludes A4a's KIS-specific correlation-key adapter (stays gated on Workstream 0). |
+| 3 | One guarded execution gateway | PR2 IMPLEMENTED, not activated — `ExecutionCommandGateway` (`src/services/execution_command_gateway.py`): dual-mode (`LEGACY_COMPATIBILITY`/`GUARDED_ENGINE`), full A1-A11/B1-B4 sequence for submit/cancel/replace, tested against a deterministic fake broker. |
 | 4 | Account-level reconciliation engine | NOT STARTED |
 | 5 | Production KIS real-time market data | NOT STARTED |
 | 6 | Runtime readiness and device handoff | NOT STARTED |
 | 7 | Complete test program | NOT STARTED — matrix fully specified; distributed across PR1-7, capstone in PR8 |
 | 8 | Migration and cutover | NOT STARTED |
-| 9 | Legacy/Kanban ownership isolation | NOT STARTED |
+| 9 | Legacy/Kanban ownership isolation | PR2 IMPLEMENTED (partial), not activated — `ExecutionWorkflowService` is the one workflow service both the legacy Buy Dashboard's submission/cancellation entry points and the Kanban runtime (`buyboard_runtime.py`) now default to; an architecture test enforces no direct KIS-mutation call site outside the gateway/adapter. In-process mutual exclusion per `(environment, account_no, symbol)` is enforced regardless of mode; H1's full *persisted*, multi-strategy `execution_owner` table (`src/core/execution_ownership.py`) is not yet built — deferred, tracked here rather than silently assumed done. |
 | 10 | Rate-limit and command-priority scheduling | NOT STARTED |
 | 11 | Database-outage behavior | NOT STARTED |
 | 12 | External-alert delivery | NOT STARTED |
@@ -1257,3 +1257,44 @@ and stays `false` in unattended/automatic form until Gate 5 passes.
   received PR1 and is not used for PR2 onward. Workstream 1's sign-off
   (revision 3.1) is unaffected -- this is a release-process correction,
   not a reopening of the requirements content itself.
+- 2026-08-15: PR2 (Workstreams 3 + 9) implemented on
+  `feature/kanban-pr2-execution-gateway`, targeting `master` per revision
+  3.3. Not a contract revision -- an implementation-status note, same as
+  PR1's landing wasn't. `ExecutionCommandGateway`
+  (`src/services/execution_command_gateway.py`) implements the full A1-A11
+  submit sequence and the B1-B4 cancel/replace sequence described above,
+  dual-mode per `src.core.execution_mode.ExecutionMode`:
+  `LEGACY_COMPATIBILITY` (a transparent pass-through to the real broker --
+  today's mode, always, since `BUYBOARD_ENGINE_ENABLED` stays `false`) and
+  `GUARDED_ENGINE` (the new sequence, implemented and tested, never
+  selected in production by this PR). `ExecutionWorkflowService`
+  (`src/services/execution_workflow_service.py`) is the one workflow
+  service both the legacy Buy Dashboard and Kanban now default to;
+  `order_execution_service.submit_guarded_overseas_order` and
+  `order_reconciliation.cancel_and_reconcile_order` -- the two real,
+  already-shared choke points both surfaces' submission and cancellation
+  ultimately went through even before this PR -- now default their
+  `broker=` parameter to the gateway instead of a raw `KisBroker`, with no
+  other change to either function's own gate sequence, call signature, or
+  behavior (proven by dedicated characterization tests, not merely
+  asserted). An architecture test statically scans the codebase and fails
+  if any module outside an explicit, narrow allowlist constructs a
+  `KisBroker` or calls a KIS order-mutation function directly, plus a
+  runtime test proving the sanctioned path actually reaches the real
+  broker adapter through the gateway.
+
+  Two scope boundaries logged explicitly rather than silently assumed
+  complete: (1) `_cancel_discovered_order`'s auto-cancel of an unowned,
+  no-local-record broker order (`buyboard_runtime.py`) was left untouched
+  -- it is a Workstream 4 (account reconciliation / A4b) concern, and
+  fixing its underlying auto-cancel policy (not merely rerouting the same
+  call through a new pipe) is that workstream's job, not PR2's; it still
+  only runs when `BUYBOARD_ENGINE_ENABLED=true`, which stays false. (2) H1's
+  full requirement -- a *persisted*, multi-strategy `execution_owner` table
+  per account+symbol (`src/core/execution_ownership.py`) -- is not built;
+  PR2 instead enforces a lighter, in-process mutual-exclusion claim per
+  `(environment, account_no, symbol)` inside the gateway itself, which
+  satisfies "legacy background workers cannot continue issuing orders in
+  parallel with the gateway" but not H1's full durable-ownership-table
+  scope. Full test suite: 1516 passed (was 1474 after PR1's second
+  hardening pass). `python -m compileall`: clean.

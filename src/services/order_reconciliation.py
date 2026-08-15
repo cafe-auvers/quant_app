@@ -18,6 +18,7 @@ from src.core.order_state import (
 )
 from src.services.order_ledger import ORDERS_FILE, load_orders, mutate_order
 from src.services.broker import Broker, KisBroker
+from src.services.execution_command_gateway import get_default_execution_gateway
 
 
 def _to_float(value: Any) -> float:
@@ -408,7 +409,12 @@ def cancel_and_reconcile_order(
     broker: Optional[Broker] = None,
 ) -> BrokerOrder:
     """Cancel one known broker-side open order and persist the local status."""
-    broker = KisBroker() if broker is None else broker
+    # Workstream 9 (PR2): the default broker is the shared execution
+    # gateway, not a raw KisBroker -- see order_execution_service.py's
+    # identical change and src.core.execution_mode's module docstring for
+    # why this changes nothing about the actual cancel behavior while
+    # BUYBOARD_ENGINE_ENABLED stays false.
+    broker = get_default_execution_gateway() if broker is None else broker
 
     orders = load_orders(path)
     target: Optional[BrokerOrder] = None

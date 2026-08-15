@@ -111,6 +111,12 @@ class ExecutionCommand:
     response_hash: str = ""
     command_id: Optional[int] = None
     version: int = 1
+    # Workstream 9 (PR2): which frontend/caller issued this command --
+    # src.core.execution_mode.ExecutionSource's value, or "" for a command
+    # journaled before this field existed / by a caller that hasn't been
+    # migrated to attribute a source yet. Purely observational -- nothing
+    # in this module gates on it.
+    source: str = ""
 
     def __post_init__(self) -> None:
         self.idempotency_key = str(self.idempotency_key or "").strip()
@@ -137,6 +143,7 @@ class ExecutionCommand:
         )
         self.response_hash = str(self.response_hash or "")
         self.version = int(self.version or 1)
+        self.source = str(self.source or "")
 
 
 def _get_execution_commands_table(metadata: MetaData) -> Table:
@@ -158,6 +165,7 @@ def _get_execution_commands_table(metadata: MetaData) -> Table:
         Column("redacted_response", Text(length=16_777_215), nullable=False, server_default="{}"),
         Column("response_hash", String(64), nullable=False, server_default=""),
         Column("version", BigInteger, nullable=False, server_default="1"),
+        Column("source", String(32), nullable=False, server_default=""),
         UniqueConstraint("idempotency_key", name="uq_execution_commands_idempotency_key"),
     )
 
@@ -212,6 +220,7 @@ def _row_to_command(row) -> ExecutionCommand:
         response_hash=row.response_hash,
         command_id=row.id,
         version=row.version,
+        source=getattr(row, "source", "") or "",
     )
 
 
@@ -243,6 +252,7 @@ def insert_command(conn: Connection, command: ExecutionCommand) -> ExecutionComm
                 redacted_response=json.dumps(command.redacted_response, separators=(",", ":")),
                 response_hash=command.response_hash,
                 version=command.version,
+                source=command.source,
             )
         )
     except IntegrityError as exc:
