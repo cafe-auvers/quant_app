@@ -22,12 +22,13 @@ from src.risk.pre_trade import (
     require_pre_trade_risk_approval,
 )
 from src.services import trading_state
-from src.services.broker import Broker, BrokerSubmissionResult, KisBroker
+from src.services.broker import Broker, BrokerSubmissionResult
 from src.services.execution_authority import (
     ExecutionAuthority,
     LeaseExpiredError,
     LeaseHandle,
 )
+from src.services.execution_command_gateway import get_default_execution_gateway
 from src.services.order_ledger import (
     ORDERS_FILE,
     reserve_order_if_no_matching_open,
@@ -221,7 +222,15 @@ def submit_guarded_overseas_order(
         )
     emit_event("ORDER_INTENT_CREATED", order)
 
-    broker = KisBroker() if broker is None else broker
+    # Workstream 9 (PR2): the default broker is the shared execution
+    # gateway, not a raw KisBroker -- the gateway is the single component
+    # permitted to invoke destructive broker operations. In
+    # LEGACY_COMPATIBILITY mode (BUYBOARD_ENGINE_ENABLED=false, always
+    # today) the gateway is a transparent pass-through to the exact same
+    # real KisBroker this used to construct directly, so nothing about
+    # this function's own gate sequence, timing, or broker call behavior
+    # changes -- see src.core.execution_mode's module docstring.
+    broker = get_default_execution_gateway() if broker is None else broker
 
     match = reserve_order_if_no_matching_open(
         order,

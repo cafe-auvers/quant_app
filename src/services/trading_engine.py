@@ -55,6 +55,7 @@ from typing import Callable, Dict, List, Optional
 
 from src.core import execution_config
 from src.core.execution_config import is_buyboard_engine_enabled
+from src.core.execution_result import UnifiedExecutionStatus
 from src.core.order_state import BrokerOrder, OrderStatus
 from src.core.trade_card_state import (
     BoardStatus,
@@ -69,6 +70,11 @@ from src.services.entry_attempt_manager import (
     EntryCancelReason,
     EntryTrigger,
 )
+from src.services.execution_command_gateway import (
+    AmbiguousPostBrokerPersistenceError,
+    GuardedSubmissionAmbiguousError,
+)
+from src.services.execution_command_repository import DuplicateCommandError
 from src.services.eod_trading_service import EodTradingService
 from src.services.position_manager import (
     BrokerHolding,
@@ -92,6 +98,7 @@ _OUTCOME_TO_ENTRY_RUNTIME_STATUS = {
     AttemptOutcome.RATE_LIMITED: EntryRuntimeStatus.RETRY_COOLDOWN,
     AttemptOutcome.REJECTED: EntryRuntimeStatus.RETRY_COOLDOWN,
     AttemptOutcome.DUPLICATE_ORDER: EntryRuntimeStatus.ORDER_PENDING,
+    AttemptOutcome.UNRESOLVED: EntryRuntimeStatus.ORDER_PENDING,
 }
 
 _DATA_STALE_WARNING = "DATA_STALE"
@@ -148,6 +155,7 @@ class TradingEngine:
         eod_service: Optional[EodTradingService] = None,
         market_is_open: Optional[Callable[[], bool]] = None,
         eod_window_reached: Optional[Callable[[], bool]] = None,
+        prepare_entry_attempt: Optional[Callable[[TradeCardState], None]] = None,
         clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         self._entry_attempt_manager = entry_attempt_manager
@@ -165,6 +173,7 @@ class TradingEngine:
         # caller that doesn't supply one.
         self._market_is_open_fn = market_is_open or (lambda: True)
         self._eod_window_reached_fn = eod_window_reached or (lambda: False)
+        self._prepare_entry_attempt = prepare_entry_attempt or (lambda card: None)
         self._clock = clock
 
     @staticmethod
@@ -407,6 +416,7 @@ class TradingEngine:
                 price = self._marketable_entry_price(card, quote)
                 if not price or card.planned_quantity <= 0:
                     continue
+                self._prepare_entry_attempt(card)
                 key = f"{card.environment}:{card.account_no}:{card.symbol}"
                 trigger_cards[key] = card
                 triggers.append(
@@ -419,6 +429,9 @@ class TradingEngine:
                         quantity=card.planned_quantity,
                         limit_price=price,
                         notional=card.planned_quantity * price,
+                        attempt_group_id=card.entry_attempt_group_id,
+                        attempt_number=card.entry_pending_attempt_number,
+                        client_order_id=card.entry_client_order_id,
                     )
                 )
             except Exception:
@@ -436,11 +449,21 @@ class TradingEngine:
             if card is None:
                 continue
             try:
-                if result.outcome == AttemptOutcome.SUBMITTED:
+                if result.outcome in (
+                    AttemptOutcome.SUBMITTED,
+                    AttemptOutcome.DUPLICATE_ORDER,
+                    AttemptOutcome.UNRESOLVED,
+                ):
                     card.board_status = BoardStatus.ENTRY_PENDING
                     card.entry_runtime_status = EntryRuntimeStatus.ORDER_PENDING
                     card.entry_attempt_group_id = result.attempt_group_id
                     card.entry_attempt_count = result.attempt_count
+                    card.entry_submission_unresolved = (
+                        result.outcome != AttemptOutcome.SUBMITTED
+                    )
+                    if result.submission is not None:
+                        card.entry_client_order_id = result.submission.client_order_id
+                        card.capital_reservation_id = result.submission.capital_reservation_id
                     card.next_retry_at = None
                 elif result.outcome == AttemptOutcome.SYMBOL_LOCKED:
                     continue  # transient, another in-process attempt is running
@@ -451,6 +474,10 @@ class TradingEngine:
                     card.entry_attempt_group_id = result.attempt_group_id
                     card.entry_attempt_count = result.attempt_count
                     card.next_retry_at = result.retry_at  # P0-4: persist so a restart doesn't lose it
+                    if result.outcome == AttemptOutcome.REJECTED:
+                        card.entry_client_order_id = ""
+                        card.entry_pending_attempt_number = 0
+                        card.entry_submission_unresolved = False
                 changed.append(card)
             except Exception:
                 logger.exception("_evaluate_buy_today failed to apply a result for %s", card.symbol)
@@ -527,7 +554,9 @@ class TradingEngine:
                     refreshed,
                     at_deadline=deadline_passed,
                     cancel_requested=cancel_requested,
-                    cancel_order=lambda o: self._position_callbacks.cancel_order(o.client_order_id),
+                    cancel_order=lambda o: self._position_callbacks.request_cancel(
+                        card, o.client_order_id, scope="ENTRY"
+                    ),
                 )
                 resolved = self._apply_entry_resolution(
                     card,
@@ -691,6 +720,10 @@ class TradingEngine:
             card.entry_block_reason = ""
             card.entry_cancel_in_flight = False
             card.entry_cancel_reason = ""
+            card.entry_cancel_command_id = ""
+            card.entry_client_order_id = ""
+            card.entry_pending_attempt_number = 0
+            card.entry_submission_unresolved = False
             card.next_retry_at = None
             return True
 
@@ -709,6 +742,10 @@ class TradingEngine:
             card.entry_block_reason = ""
             card.entry_cancel_in_flight = False
             card.entry_cancel_reason = ""
+            card.entry_cancel_command_id = ""
+            card.entry_client_order_id = ""
+            card.entry_pending_attempt_number = 0
+            card.entry_submission_unresolved = False
             card.next_retry_at = None
             if not card.exit_all_required:
                 card.position_runtime_status = (
@@ -722,6 +759,10 @@ class TradingEngine:
             card.entry_cancel_in_flight = False
             reason = card.entry_cancel_reason
             card.entry_cancel_reason = ""
+            card.entry_cancel_command_id = ""
+            card.entry_client_order_id = ""
+            card.entry_pending_attempt_number = 0
+            card.entry_submission_unresolved = False
             retry_remainder = reason == EntryCancelReason.TTL_REPRICE.value
             if already_has_position:
                 # A completion attempt for the remainder was cancelled with
@@ -752,6 +793,10 @@ class TradingEngine:
         if action == AttemptDeadlineAction.RELEASE_AND_RETRY_AFTER_COOLDOWN:
             card.entry_cancel_in_flight = False
             card.entry_cancel_reason = ""
+            card.entry_cancel_command_id = ""
+            card.entry_client_order_id = ""
+            card.entry_pending_attempt_number = 0
+            card.entry_submission_unresolved = False
             if already_has_position:
                 card.entry_remaining_target_quantity = 0
                 if not card.exit_all_required:
@@ -801,6 +846,8 @@ class TradingEngine:
                 continue
             if card.exit_all_required:
                 continue  # a stop/liquidation is in progress -- do not buy more
+            if card.entry_submission_unresolved:
+                continue
             try:
                 if self._entry_deadline_lookup.find_open_entry_order(card) is not None:
                     continue  # already retrying, handled by _reconcile_entry_orders
@@ -810,6 +857,7 @@ class TradingEngine:
                 price = self._marketable_entry_price(card, quote)
                 if not price:
                     continue
+                self._prepare_entry_attempt(card)
                 key = f"{card.environment}:{card.account_no}:{card.symbol}"
                 trigger_cards[key] = card
                 triggers.append(
@@ -822,6 +870,9 @@ class TradingEngine:
                         quantity=card.entry_remaining_target_quantity,
                         limit_price=price,
                         notional=card.entry_remaining_target_quantity * price,
+                        attempt_group_id=card.entry_attempt_group_id,
+                        attempt_number=card.entry_pending_attempt_number,
+                        client_order_id=card.entry_client_order_id,
                     )
                 )
             except Exception:
@@ -838,14 +889,28 @@ class TradingEngine:
             if card is None or result.outcome == AttemptOutcome.SYMBOL_LOCKED:
                 continue
             try:
-                if result.outcome == AttemptOutcome.SUBMITTED:
+                if result.outcome in (
+                    AttemptOutcome.SUBMITTED,
+                    AttemptOutcome.DUPLICATE_ORDER,
+                    AttemptOutcome.UNRESOLVED,
+                ):
                     card.entry_runtime_status = EntryRuntimeStatus.ORDER_PENDING
+                    card.entry_submission_unresolved = (
+                        result.outcome != AttemptOutcome.SUBMITTED
+                    )
+                    if result.submission is not None:
+                        card.entry_client_order_id = result.submission.client_order_id
+                        card.capital_reservation_id = result.submission.capital_reservation_id
                     card.next_retry_at = None
                 else:
                     card.entry_runtime_status = _OUTCOME_TO_ENTRY_RUNTIME_STATUS.get(
                         result.outcome, card.entry_runtime_status
                     )
                     card.next_retry_at = result.retry_at
+                    if result.outcome == AttemptOutcome.REJECTED:
+                        card.entry_client_order_id = ""
+                        card.entry_pending_attempt_number = 0
+                        card.entry_submission_unresolved = False
                 changed.append(card)
             except Exception:
                 logger.exception("_process_entry_completion failed to apply a result for %s", card.symbol)
@@ -865,6 +930,8 @@ class TradingEngine:
             if card.board_status != BoardStatus.PARTIAL_SELL:
                 continue
             if card.pending_partial_sell_quantity <= 0:
+                continue
+            if card.exit_submission_unresolved:
                 continue
             if card.next_exit_retry_at is not None and now < card.next_exit_retry_at:
                 continue  # P1-4: back off after a rejected/errored submission
@@ -887,8 +954,9 @@ class TradingEngine:
                     quantity=quantity,
                     reason="partial_sell",
                     attempt_deadline_at=deadline.isoformat(),
+                    trade_card=card,
                 )
-                if order is not None and order.status == OrderStatus.REJECTED:
+                if order is not None and order.status == UnifiedExecutionStatus.REJECTED:
                     self._back_off_exit_retry(card, order.error_message or "Partial sell rejected")
                     changed.append(card)
                     continue
@@ -901,6 +969,15 @@ class TradingEngine:
                 card.next_exit_retry_at = None
                 card.last_exit_error = ""
                 changed.append(card)
+            except (
+                GuardedSubmissionAmbiguousError,
+                AmbiguousPostBrokerPersistenceError,
+                DuplicateCommandError,
+            ) as exc:
+                card.exit_submission_unresolved = True
+                card.next_exit_retry_at = None
+                card.last_exit_error = f"UNRESOLVED: {exc}"[:500]
+                changed.append(card)
             except Exception as exc:
                 logger.exception("_process_partial_sell_requests failed for %s", card.symbol)
                 self._back_off_exit_retry(card, str(exc))
@@ -912,6 +989,9 @@ class TradingEngine:
         submission must not be resubmitted on literally every 1-second
         heartbeat tick."""
         card.exit_attempt_count += 1
+        card.exit_client_order_id = ""
+        card.exit_pending_attempt_number = 0
+        card.exit_submission_unresolved = False
         card.last_exit_error = str(error or "")[:500]
         card.next_exit_retry_at = self._clock() + timedelta(
             seconds=execution_config.EXIT_RETRY_COOLDOWN_SECONDS
@@ -965,6 +1045,9 @@ class TradingEngine:
                     card.position_runtime_status = PositionRuntimeStatus.OPEN
                 card.pending_partial_sell_quantity = 0
                 card.reserved_sell_quantity = 0
+                card.exit_client_order_id = ""
+                card.exit_pending_attempt_number = 0
+                card.exit_submission_unresolved = False
                 card.next_exit_retry_at = None
                 card.last_exit_error = ""
                 changed.append(card)
@@ -1000,6 +1083,7 @@ class TradingEngine:
         changed = card.exit_cancel_in_flight or card.exit_cancel_requested_at is not None
         card.exit_cancel_in_flight = False
         card.exit_cancel_requested_at = None
+        card.exit_cancel_command_id = ""
         if _EXIT_CANCEL_STALLED_WARNING in card.warnings:
             card.warnings = [w for w in card.warnings if w != _EXIT_CANCEL_STALLED_WARNING]
             changed = True
@@ -1035,7 +1119,7 @@ class TradingEngine:
             return False
         if not self._attempt_deadline_passed(order, now):
             return False
-        self._position_callbacks.cancel_order(order.client_order_id)
+        self._position_callbacks.request_cancel(card, order.client_order_id, scope="EXIT")
         card.exit_cancel_in_flight = True
         card.exit_cancel_requested_at = now
         return True
@@ -1077,6 +1161,9 @@ class TradingEngine:
                 card.broker_quantity = remaining
                 card.orderable_quantity = remaining
                 self._clear_exit_cancel_tracking(card)
+                card.exit_client_order_id = ""
+                card.exit_pending_attempt_number = 0
+                card.exit_submission_unresolved = False
                 changed.append(card)
             except Exception:
                 logger.exception("_reconcile_sell_all_orders failed for %s", card.symbol)
@@ -1102,6 +1189,8 @@ class TradingEngine:
                 continue
             if card.next_exit_retry_at is not None and now < card.next_exit_retry_at:
                 continue  # P1-4: back off after a rejected/errored submission
+            if card.exit_submission_unresolved:
+                continue
             try:
                 if self._position_callbacks.find_open_sell_order(card) is not None:
                     continue  # already working, or its cancel hasn't confirmed yet
@@ -1131,12 +1220,22 @@ class TradingEngine:
                     quantity=remaining,
                     reason="sell_all_retry",
                     attempt_deadline_at=deadline.isoformat(),
+                    trade_card=card,
                 )
-                if order is not None and order.status == OrderStatus.REJECTED:
+                if order is not None and order.status == UnifiedExecutionStatus.REJECTED:
                     self._back_off_exit_retry(card, order.error_message or "Sell All rejected")
                 else:
                     card.next_exit_retry_at = None
                     card.last_exit_error = ""
+                changed.append(card)
+            except (
+                GuardedSubmissionAmbiguousError,
+                AmbiguousPostBrokerPersistenceError,
+                DuplicateCommandError,
+            ) as exc:
+                card.exit_submission_unresolved = True
+                card.next_exit_retry_at = None
+                card.last_exit_error = f"UNRESOLVED: {exc}"[:500]
                 changed.append(card)
             except Exception as exc:
                 logger.exception("_retry_incomplete_sell_alls failed for %s", card.symbol)

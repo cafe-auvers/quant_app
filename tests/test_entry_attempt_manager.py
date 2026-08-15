@@ -6,6 +6,7 @@ import datetime as dt
 import pytest
 
 from src.core.order_state import BrokerOrder, OrderIntent, OrderSide, OrderStatus
+from src.core.execution_result import ExecutionSubmissionResult, UnifiedExecutionStatus
 from src.risk.pre_trade import PreTradeRiskDecision
 from src.services import capital_allocator
 from src.services.entry_attempt_manager import (
@@ -73,9 +74,15 @@ def _manager(tmp_path, submit_order, buying_power=100_000.0, clock=None, capital
     def provider(_environment, _account_no):
         return buying_power
 
+    def normalized_submit(**kwargs):
+        result = submit_order(**kwargs)
+        if isinstance(result, BrokerOrder):
+            return ExecutionSubmissionResult.from_broker_order(result)
+        return result
+
     kwargs = dict(
         buying_power_provider=provider,
-        submit_order=submit_order,
+        submit_order=normalized_submit,
         reservations_path=reservations_path,
     )
     if clock is not None:
@@ -99,7 +106,7 @@ def test_successful_attempt_submits_and_reserves_capital(tmp_path):
     manager, _ = _manager(tmp_path, fake_submit)
     result = manager.attempt_entry(_trigger())
     assert result.outcome == AttemptOutcome.SUBMITTED
-    assert result.order.status == OrderStatus.ACCEPTED
+    assert result.submission.status == UnifiedExecutionStatus.ACKNOWLEDGED
     assert result.reservation_id
 
 

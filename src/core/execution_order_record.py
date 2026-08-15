@@ -403,6 +403,7 @@ class ExecutionOrderRecord:
     broker_order_id: str = ""
     attempt_group_id: str = ""
     attempt_number: int = 1
+    attempt_deadline_at: Optional[str] = None
 
     submitted_quantity: int = 0
     submitted_limit_price: float = 0.0
@@ -464,6 +465,9 @@ class ExecutionOrderRecord:
             raise ValueError("ExecutionOrderRecord requires a client_order_id")
         self.broker_order_id = str(self.broker_order_id or "")
         self.attempt_number = int(self.attempt_number or 1)
+        self.attempt_deadline_at = (
+            str(self.attempt_deadline_at) if self.attempt_deadline_at else None
+        )
         self.submitted_quantity = int(self.submitted_quantity or 0)
         self.submitted_limit_price = float(self.submitted_limit_price or 0.0)
         self.exchange = str(self.exchange or "").upper()

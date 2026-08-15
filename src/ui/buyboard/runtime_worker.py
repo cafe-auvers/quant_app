@@ -223,6 +223,7 @@ class BuyboardRuntimeWorker(QThread):
                 execution_lease=self._execution_lease,
                 lease_engine=self._lease_engine,
                 broker=self._broker,
+                persist_card_before_execution=self._persist_execution_identity,
             )
             self._run_startup_reconciliation()
         except Exception as exc:  # noqa: BLE001 - must not crash the app
@@ -264,6 +265,10 @@ class BuyboardRuntimeWorker(QThread):
 
     def _card_lookup(self, environment: str, account_no: str, symbol: str) -> Optional[TradeCardState]:
         return repo.get_trade_card(self._db_engine, environment, account_no, symbol)
+
+    def _persist_execution_identity(self, card: TradeCardState) -> None:
+        """Durably commit command identity before a guarded gateway call."""
+        repo.update_trade_card(self._db_engine, card, expected_version=card.version)
 
     # -- startup reconciliation ----------------------------------------------
 
@@ -329,8 +334,8 @@ class BuyboardRuntimeWorker(QThread):
         return EodActionCallbacks(
             find_open_entry_order=buyboard_runtime_module._find_open_entry_order,
             reconcile_order=lambda order: buyboard_runtime_module._reconcile_order(order, broker=broker),
-            cancel_order=lambda client_order_id: buyboard_runtime_module._cancel_order(
-                client_order_id, broker=broker
+            cancel_order=lambda intent: buyboard_runtime_module._cancel_order(
+                intent, broker=broker
             ),
             discover_all_orders=lambda card: buyboard_runtime_module._discover_all_orders(card, broker=broker),
             # Review finding P0: a historical filled order discovered from
@@ -370,7 +375,7 @@ class BuyboardRuntimeWorker(QThread):
             )
 
         broker = self.runtime.broker
-        order_callbacks = self._build_order_callbacks(broker)
+        order_callbacks = self.runtime.eod_service._callbacks
 
         now = datetime.now(timezone.utc)
         changed_ids: set = set()
@@ -600,7 +605,7 @@ class BuyboardRuntimeWorker(QThread):
             if card.account_no:
                 by_account.setdefault(card.account_no, []).append(card)
 
-        order_callbacks = self._build_order_callbacks(self.runtime.broker)
+        order_callbacks = self.runtime.eod_service._callbacks
 
         # Review finding: "accounts without existing cards remain
         # undiscoverable" -- _distinct_account_numbers (not a plain

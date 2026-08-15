@@ -132,14 +132,14 @@ PR's behavior composes correctly, plus the Gate 1 run in full.
 |---|---|---|
 | 0 | KIS protocol capability verification | NOT STARTED — capability-specific adapters remain gated; skeleton complete |
 | 1 | Freeze requirements and invariants (this document) | DONE — revision 3.1 signed off |
-| 2 | Durable order ownership and command ledger | NOT STARTED |
-| 3 | One guarded execution gateway | NOT STARTED |
+| 2 | Durable order ownership and command ledger | PR1 IMPLEMENTED, not activated — merged to `master` (`5b50e1d`): schemas, all three state machines, durable repositories, command ledger. Excludes A4a's KIS-specific correlation-key adapter (stays gated on Workstream 0). |
+| 3 | One guarded execution gateway | PR2 IMPLEMENTED, not activated — `ExecutionCommandGateway` (`src/services/execution_command_gateway.py`): dual-mode, with genuinely separate call shapes per mode (`submit_order`/`cancel_order` for `LEGACY_COMPATIBILITY`; `submit_guarded`/`cancel_guarded`/`replace_guarded` taking explicit request models with caller-generated stable command identities for `GUARDED_ENGINE`). Full A1-A11/B1-B4 sequence, one authoritative atomic capital reservation with an in-transaction availability check, a real lease-epoch gate, H1 ownership enforcement, a mutation-budget seam for Workstream 10, and fail-closed guarded runtime composition. Runtime-level tests cover restart-restored caller identity, normalized results, full-context tracked cancellation, Partial Sell/Sell All, one-reservation entry, and unresolved post-broker persistence without retry. |
 | 4 | Account-level reconciliation engine | NOT STARTED |
 | 5 | Production KIS real-time market data | NOT STARTED |
 | 6 | Runtime readiness and device handoff | NOT STARTED |
 | 7 | Complete test program | NOT STARTED — matrix fully specified; distributed across PR1-7, capstone in PR8 |
 | 8 | Migration and cutover | NOT STARTED |
-| 9 | Legacy/Kanban ownership isolation | NOT STARTED |
+| 9 | Legacy/Kanban ownership isolation | PR2 IMPLEMENTED, not activated — `ExecutionWorkflowService` is the one workflow service both the legacy Buy Dashboard's submission/cancellation entry points and the Kanban runtime (`buyboard_runtime.py`) now default to; an architecture test enforces no direct KIS-mutation call site outside the gateway/adapter. H1's persisted, multi-strategy `execution_owner` table (`src/core/execution_ownership.py` + `execution_ownership_repository.py`) is built and enforced at the gateway (B2) in `GUARDED_ENGINE` mode — `MANUAL` rejects every application source, `KANBAN` accepts only `KANBAN_BOARD`, unassigned defaults `LEGACY` (H2) and rejects `KANBAN_BOARD`. In-process mutual exclusion per `(environment, account_no, symbol)` is enforced additionally, regardless of mode, as a same-process race guard distinct from H1's durable assignment. |
 | 10 | Rate-limit and command-priority scheduling | NOT STARTED |
 | 11 | Database-outage behavior | NOT STARTED |
 | 12 | External-alert delivery | NOT STARTED |
@@ -1257,3 +1257,332 @@ and stays `false` in unattended/automatic form until Gate 5 passes.
   received PR1 and is not used for PR2 onward. Workstream 1's sign-off
   (revision 3.1) is unaffected -- this is a release-process correction,
   not a reopening of the requirements content itself.
+- 2026-08-15: PR2 (Workstreams 3 + 9) implemented on
+  `feature/kanban-pr2-execution-gateway`, targeting `master` per revision
+  3.3. Not a contract revision -- an implementation-status note, same as
+  PR1's landing wasn't. `ExecutionCommandGateway`
+  (`src/services/execution_command_gateway.py`) implements the full A1-A11
+  submit sequence and the B1-B4 cancel/replace sequence described above,
+  dual-mode per `src.core.execution_mode.ExecutionMode`:
+  `LEGACY_COMPATIBILITY` (a transparent pass-through to the real broker --
+  today's mode, always, since `BUYBOARD_ENGINE_ENABLED` stays `false`) and
+  `GUARDED_ENGINE` (the new sequence, implemented and tested, never
+  selected in production by this PR). `ExecutionWorkflowService`
+  (`src/services/execution_workflow_service.py`) is the one workflow
+  service both the legacy Buy Dashboard and Kanban now default to;
+  `order_execution_service.submit_guarded_overseas_order` and
+  `order_reconciliation.cancel_and_reconcile_order` -- the two real,
+  already-shared choke points both surfaces' submission and cancellation
+  ultimately went through even before this PR -- now default their
+  `broker=` parameter to the gateway instead of a raw `KisBroker`, with no
+  other change to either function's own gate sequence, call signature, or
+  behavior (proven by dedicated characterization tests, not merely
+  asserted). An architecture test statically scans the codebase and fails
+  if any module outside an explicit, narrow allowlist constructs a
+  `KisBroker` or calls a KIS order-mutation function directly, plus a
+  runtime test proving the sanctioned path actually reaches the real
+  broker adapter through the gateway.
+
+  Two scope boundaries logged explicitly rather than silently assumed
+  complete: (1) `_cancel_discovered_order`'s auto-cancel of an unowned,
+  no-local-record broker order (`buyboard_runtime.py`) was left untouched
+  -- it is a Workstream 4 (account reconciliation / A4b) concern, and
+  fixing its underlying auto-cancel policy (not merely rerouting the same
+  call through a new pipe) is that workstream's job, not PR2's; it still
+  only runs when `BUYBOARD_ENGINE_ENABLED=true`, which stays false. (2) H1's
+  full requirement -- a *persisted*, multi-strategy `execution_owner` table
+  per account+symbol (`src/core/execution_ownership.py`) -- is not built;
+  PR2 instead enforces a lighter, in-process mutual-exclusion claim per
+  `(environment, account_no, symbol)` inside the gateway itself, which
+  satisfies "legacy background workers cannot continue issuing orders in
+  parallel with the gateway" but not H1's full durable-ownership-table
+  scope. Full test suite: 1516 passed (was 1474 after PR1's second
+  hardening pass). `python -m compileall`: clean.
+- 2026-08-15 (PR2, second pass): A second code-review round on PR2's
+  implementation found the guarded path was not yet safe or usable
+  through the real production workflow, despite passing tests -- several
+  tests proved repository primitives or direct gateway calls rather than
+  the actual restart and workflow scenarios their names implied. Not a
+  contract revision (per rule 1: corrected in code and tests, not by
+  narrowing the requirement) except where explicitly noted below.
+
+  **Caller-stable command identity (was: a fresh UUID+timestamp minted
+  inside the gateway on every call, making restart-safe idempotency
+  impossible in principle).** `src/core/execution_request.py` adds
+  `SubmitExecutionRequest`/`CancelExecutionRequest`/`ReplaceExecutionRequest`,
+  each carrying an identity the *caller* (`ExecutionWorkflowService`)
+  generates once, before the first gateway call, and must reuse to replay
+  the *same* logical decision. `ExecutionCommandGateway.submit_order`/
+  `cancel_order` (the `Broker`-protocol methods) are now
+  `LEGACY_COMPATIBILITY`-only and raise `WrongGatewayModeError` if reached
+  in `GUARDED_ENGINE` mode; `submit_guarded`/`cancel_guarded`/
+  `replace_guarded` (taking the new request models) are `GUARDED_ENGINE`-
+  only. This is the "do not force the execution gateway to masquerade as
+  the old minimal Broker protocol" correction -- the two modes now have
+  genuinely different call shapes rather than one shape straining to
+  serve both. `ExecutionWorkflowService.request_submit`/`request_cancel`/
+  (new) `request_replace` are the real, mode-aware entry points a caller
+  actually uses; both are exercised end-to-end in
+  `tests/test_execution_workflow_service_guarded_integration.py`,
+  including a restart-idempotency test that constructs a *second* gateway
+  instance and replays the same stable identity.
+
+  **Post-broker persistence failure (was: a raw database exception could
+  escape after the broker had already accepted a submission or answered a
+  cancel, with nothing telling the caller not to treat it as a rejection
+  or safe to retry).** New `AmbiguousPostBrokerPersistenceError`, raised
+  whenever the write that records a broker outcome fails after the broker
+  call itself already completed -- the durable record is left at whatever
+  status it held before that write (never silently advanced), and the
+  exception is explicit that a caller must never resubmit/re-cancel and
+  must never reclassify it as `REJECTED`/`FAILED`.
+
+  **Guarded lease gate (was: `lease=None` silently meant "unfenced," and
+  `lease_epoch` was accepted without being verified against anything).**
+  `GUARDED_ENGINE` mode now requires an explicit lease and a lease
+  protocol that reports `epoch_verified=True`; `DefaultExecutionLeaseProtocol`
+  always reports `epoch_verified=False` (honest about not having a real
+  epoch authority yet -- Workstream 5/6's job), so it can never itself
+  satisfy a `GUARDED_ENGINE` call today. `LeaseNotVerifiedError` covers a
+  missing lease, an unverifiable epoch, and a stale epoch uniformly.
+
+  **H1 implemented, not deferred.** `src/core/execution_ownership.py` +
+  `src/services/execution_ownership_repository.py`: a real, persisted
+  `execution_owner` (`LEGACY`/`KANBAN`/`MANUAL`) per
+  `(environment, account_no, symbol)`, with `strategy_instance_id` required
+  for `KANBAN`, defaulting to `LEGACY` when unassigned (H2) --
+  `ExecutionCommandGateway._require_ownership` enforces it as part of the
+  B2 sequence in `GUARDED_ENGINE` mode. The lighter in-process mutual-
+  exclusion registry from the first PR2 pass is kept, but now explicitly
+  described as a same-process race guard distinct from H1's own durable
+  assignment, not a substitute for it.
+
+  **Ownership-registry concurrency bug fixed.** The registry's earlier
+  same-source reentrancy allowance tracked only the source *value*, not
+  which caller/thread held it -- two different threads sharing a source
+  could each believe they held the claim, and one finishing would drop
+  the other's protection too. Fixed by removing the reentrancy allowance
+  entirely (nothing in the gateway actually needed it -- `replace_guarded`
+  already called its internal methods directly, never through the public
+  claiming methods) in favor of strict, unconditional per-key exclusion.
+  A real multithreaded contention test now exercises this directly.
+
+  **`REPLACE` permission enforced independently of `CANCEL`.**
+  `replace_guarded`'s internal cancel step is now authorized by
+  `AdoptedOrderPermission.REPLACE` (via a new `_cancellable_for_replace`
+  predicate, parallel to but distinct from `is_cancellable`, which stays
+  untouched as part of PR1's frozen contract), not by `CANCEL` -- a
+  `USER_ADOPTED` record with `CANCEL` but not `REPLACE` can no longer have
+  a replacement submitted on its behalf.
+
+  **Cancel idempotency key corrected.** Was `f"{client_order_id}:CANCEL:{attempt_number}"`
+  -- `attempt_number` belongs to the *submission* attempt, so an explicitly
+  rejected cancel (order returns to `WORKING`) permanently blocked every
+  later, genuinely new cancel decision for that order, since the key never
+  changed. Now `f"CANCEL:{cancel_command_id}"`, where `cancel_command_id`
+  is the caller's own stable identity for *that specific cancel decision*
+  -- a replay of an unresolved cancel reuses it; a new decision mints a
+  new one.
+
+  **Cancel account/environment mismatch now checked.** `_do_cancel`
+  compares the caller-supplied `environment`/`account_no` against the
+  order record's own persisted values and raises `CancelNotPermittedError`
+  on a mismatch, instead of silently using the record's real values and
+  ignoring what the caller asked for.
+
+  **`MutationBudgetProtocol` seam added** (`src/services/mutation_budget_protocol.py`)
+  for Workstream 10's future rate-limit-aware implementation --
+  `GUARDED_ENGINE` mode requires one to be explicitly injected
+  (`GuardedEngineRequiresMutationBudgetError` otherwise); `AllowAllMutationBudget`
+  exists for tests and for the guarded composition root to use *visibly*,
+  never as a silent gateway default.
+
+  **Guarded composition root added.** `build_guarded_execution_gateway`
+  requires every `GUARDED_ENGINE` dependency (engine, lease protocol,
+  mutation budget) as an explicit keyword argument, so a missing one fails
+  immediately and loudly rather than only at the first real submission.
+  `buyboard_runtime.build_buyboard_runtime` now selects it when
+  `BUYBOARD_ENGINE_ENABLED=true` (failing fast if `capital_reservation_engine`
+  wasn't supplied), and the process-wide `get_default_execution_gateway()`
+  singleton stays `LEGACY_COMPATIBILITY`-only, exactly as before.
+
+  **Exit-order capital reservation corrected.** A `SELL` submission now
+  reserves zero notional (was: `quantity * limit_price`, the same as a
+  `BUY` entry) -- a regular partial sell or Sell All was incorrectly
+  reducing capital available for new entries until a later reconciliation
+  pass released it; only a `BUY` actually needs to reserve buying power.
+
+  Full test suite: 1541 passed (was 1516). `python -m compileall`: clean.
+- 2026-08-16 (PR2, third pass): A third review found the second pass's own
+  fixes had left the *real* Kanban runtime composition broken -- correct
+  in isolation, not actually wired together. Seven findings, six resolved
+  in that pass; the two deeper integration findings recorded below were
+  subsequently closed by the fourth pass in this same PR2 branch.
+
+  **Finding 1 (buyboard_runtime called the wrong API) -- fixed.**
+  `build_buyboard_runtime`'s `submit_order`/`submit_sell_order`/
+  `_cancel_order` now call `execution_workflow_service.request_submit`/
+  `request_cancel` instead of `submit_guarded_overseas_order`/
+  `cancel_and_reconcile_order` directly -- the latter call the gateway's
+  `Broker`-protocol methods, which the gateway (correctly, per the second
+  pass) now rejects outright in `GUARDED_ENGINE` mode
+  (`WrongGatewayModeError`). Safe for the only reachable mode
+  (`LEGACY_COMPATIBILITY`): `request_submit`/`request_cancel` forward
+  every keyword argument to the exact same legacy functions unchanged,
+  proven by the full existing `test_buyboard_runtime.py` suite passing
+  with no behavioral difference (only the wrapped `broker` object's
+  identity changes, from the raw broker to a thin source-attribution
+  adapter around it). `_resolved_mode` (new,
+  `execution_workflow_service.py`) treats a plain `Broker` (no `.mode`
+  attribute -- e.g. a test double injected via `build_buyboard_runtime`'s
+  own `broker=` override) as implicitly `LEGACY_COMPATIBILITY`, preserving
+  that existing flexibility rather than requiring every caller to wrap a
+  fake in a full gateway.
+
+  Fixing this surfaced two further, smaller gaps, both closed: (a)
+  `build_buyboard_runtime` had no `strategy_instance_id` concept at all,
+  so it could never satisfy H1's "KANBAN plus strategy_instance_id"
+  requirement (finding 3, below) even after routing was fixed -- added as
+  a new `build_buyboard_runtime(..., strategy_instance_id="")` parameter,
+  threaded through every submission/cancellation this runtime makes; (b)
+  a second, previously-missed direct call to `submit_guarded_overseas_order`
+  in `submit_sell_order` (the SELL adapter, review finding P0-3) needed
+  the identical fix.
+
+  Historical note, resolved in the fourth pass below:
+  `PositionActionCallbacks.cancel_order` originally supplied only
+  `client_order_id`; it now carries a durable `CancelIntent` containing
+  environment, account, cancel command ID, lease, source, and strategy
+  identity.
+
+  **Finding 2 (guarded composition root uses a lease verifier that can
+  never pass) -- fixed.** `build_buyboard_runtime` now refuses
+  `GUARDED_ENGINE` activation outright (`RuntimeError` at composition
+  time) whenever `BUYBOARD_ENGINE_ENABLED=true` and no explicit `broker=`
+  override is supplied -- `DefaultExecutionLeaseProtocol.epoch_verified`
+  is permanently `False` (Workstream 5/6 doesn't exist yet) and
+  `AllowAllMutationBudget` is a testing placeholder, so the previous
+  composition would have "succeeded" at startup and failed only on the
+  first real command. This has no production effect (the flag stays
+  `false` for the whole program) but closes a real internal
+  inconsistency between the gateway's own fail-closed lease gate and its
+  composition root.
+
+  **Finding 3 (H1 stores but doesn't enforce `strategy_instance_id`) --
+  fixed.** All three request models
+  (`SubmitExecutionRequest`/`CancelExecutionRequest`/`ReplaceExecutionRequest`)
+  now carry `strategy_instance_id`; `_require_ownership` rejects a blank
+  or mismatched one for a `KANBAN`-owned symbol -- one Kanban strategy
+  instance can no longer act on a symbol assigned to a different one.
+
+  **Finding 6 (replace could cancel a valid order before validating the
+  replacement) -- fixed.** `replace_guarded` now validates the *entire*
+  replacement request (account/environment match, quantity, price, a
+  fresh `new_client_order_id`, ownership/permission, lease, both
+  mutation budgets) before ever cancelling the original, and persists a
+  durable parent `replace` command row (`REPLACE:{replace_command_id}`)
+  before either broker call -- restart recovery reconstructs "how far did
+  this get" from the parent row plus its linked cancel/submit sub-commands'
+  own already-durable statuses, rather than needing new intermediate-state
+  writes (the command ledger's compare-and-set persistence is a single
+  `REQUESTED -> one terminal state` transition by design, not a
+  multi-step state machine, and this reuses that as-is). Tests prove an
+  invalid quantity/price, a duplicate `new_client_order_id`, and an
+  account/environment mismatch all make zero cancel calls.
+
+  **Finding 7 (no re-fencing immediately before the broker call) --
+  fixed, "at minimum."** `_do_submit`/`_do_cancel` now re-verify ownership
+  and lease a second time, immediately before the actual broker call, not
+  only once earlier before the journal/status-transition commit -- closes
+  the concrete race where another device transfers ownership or advances
+  the lease epoch in that window. This is a fresh re-check against current
+  state, not yet a persisted fencing-token/version proof threaded through
+  the command row itself (the review's "at minimum" framing already
+  anticipated a lighter floor here; a full fencing-token design remains a
+  further enhancement, not built in this pass).
+
+  **Findings 4 and 5 -- not resolved in the third pass, then closed by the
+  fourth pass below.** Both required modifying pre-existing,
+  already-tested legacy modules (`entry_attempt_manager.py`,
+  `position_manager.py`, `TradeCardState`) outside every file this PR has
+  otherwise touched, with real regression risk to code that has nothing
+  to do with the guarded engine:
+  - Finding 4: restart-safe idempotency currently depends on whatever
+    calls `request_submit` durably remembering and resupplying the same
+    `client_order_id` after a real process crash. Nothing in
+    `EntryAttemptManager`'s own persisted state
+    (`attempt_group_id`/attempt count) currently derives or persists a
+    gateway `client_order_id` before invoking submission, so there is
+    nothing yet to restore. This PR's own restart test (both pass 2's
+    direct-gateway version and this pass's workflow-layer version)
+    proves the *gateway's* replay behavior is correct given a stable
+    identity; it does not prove the application can reconstruct that
+    identity after a crash, because nothing durably tracks it yet.
+  - Finding 5: `EntryAttemptManager` reserves capital via the existing
+    best-effort `capital_allocator`/`save_reservation` path *before*
+    calling its `submit_order` callback; the gateway's own A1 transaction
+    reserves *again*, independently, inside `_do_submit`. If
+    `GUARDED_ENGINE` mode were ever actually reachable through
+    `EntryAttemptManager` today, a successful entry would double-reserve
+    buying power (a conservative-direction bug -- it would under-utilize
+    capital, not risk overspending it, but it is still wrong). The
+    guarded result (`ExecutionOrderRecord`) also isn't projected back
+    into whatever shape `EntryAttemptManager`/`TradingEngine` expects
+    from a submission (they were built against `BrokerOrder`); this
+    surfaced concretely while fixing finding 1, once `submit_order`'s
+    real callback could reach the gateway at all.
+
+  That was the third-pass state only; the fourth pass below supersedes the
+  temporary unconditional refusal and closes both integration gaps.
+
+  Full test suite: 1552 passed (was 1541). `python -m compileall`: clean.
+  No visible GitHub CI yet for this pass -- still local results only,
+  per the review's own note; a PR/CI run remains to be opened.
+
+- 2026-08-16 (PR2, fourth hardening pass): Closed every remaining
+  third-pass integration finding through the actual Buy Board runtime
+  callback graph.
+
+  **Durable logical execution identity.** `TradeCardState` now persists
+  entry/exit client-order IDs, attempt-group and pending-attempt numbers,
+  stable cancel-command IDs, and unresolved-submission flags. The runtime
+  derives `client_order_id` deterministically from durable attempt state,
+  commits it with optimistic concurrency before the gateway call, reloads
+  it after restart, and never mints another ID while that command is
+  unresolved.
+
+  **One capital owner.** `EntryAttemptManager` no longer creates a separate
+  reservation in guarded mode. The gateway alone locks current active
+  reservations, validates live available buying power, and inserts exactly
+  one reservation beside the command and PREPARED order in the same A1
+  transaction. Insufficient capital rolls the transaction back before any
+  broker call.
+
+  **Common result projection.** Both compatibility and guarded submission
+  paths return `ExecutionSubmissionResult` with `UnifiedExecutionStatus`,
+  broker/client identities, quantities, reservation identity, and
+  ambiguity. `EntryAttemptManager` and `TradingEngine` consume this single
+  contract rather than branching on `BrokerOrder` versus
+  `ExecutionOrderRecord`.
+
+  **Full cancellation context.** Tracked entry/exit cancellation now uses
+  a durable `CancelIntent` containing client and cancel command IDs,
+  environment, account, epoch-bearing lease, source, and strategy instance.
+  The intent is persisted before `request_cancel_intent` reaches
+  `cancel_guarded`.
+
+  **No mode downgrade.** When `BUYBOARD_ENGINE_ENABLED=true`,
+  `build_buyboard_runtime` accepts only a validated
+  `ExecutionCommandGateway(mode=GUARDED_ENGINE)` plus an epoch-bearing
+  lease, mutation budget, buying-power provider, strategy identity, and
+  durable card-persistence callback. A plain broker or legacy gateway is
+  rejected at composition time. With the flag false, compatibility
+  composition remains available.
+
+  **Real composition scenarios.** Tests now drive the assembled runtime and
+  prove one entry creates one reservation, insufficient capital makes no
+  broker call, caller identity survives a repository reload, tracked cancel
+  reaches `cancel_guarded`, Partial Sell and Sell All reach
+  `submit_guarded`, blank/mismatched strategy identity is rejected, a plain
+  broker cannot downgrade enabled mode, and a post-broker persistence
+  ambiguity remains unresolved without automatic retry.

@@ -182,6 +182,14 @@ def _mutate_reservation(
             if engine is not None:
                 capital_reservation_repository.save_reservation(engine, reservation)
             return reservation
+        if engine is not None:
+            reservation = capital_reservation_repository.fetch_reservation(
+                engine, reservation_id
+            )
+            if reservation is not None:
+                mutation(reservation)
+                capital_reservation_repository.save_reservation(engine, reservation)
+                return reservation
     return None
 
 

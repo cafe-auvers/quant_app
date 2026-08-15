@@ -17,6 +17,7 @@ from typing import Callable, Dict, List, Optional
 
 from sqlalchemy.engine import Engine
 
+from src.core.execution_request import CancelIntent
 from src.core.order_state import (
     BrokerOrder,
     BrokerOrderDiscoveryResult,
@@ -40,7 +41,9 @@ from src.services.entry_attempt_manager import (
 from src.services.position_manager import (
     BrokerHolding,
     PositionManager,
+    _default_cancel_intent_factory,
     extract_overseas_holdings,
+    request_cancel_with_lifecycle,
 )
 
 logger = logging.getLogger(__name__)
@@ -65,7 +68,11 @@ class EodActionCallbacks:
 
     find_open_entry_order: Callable[[TradeCardState], Optional[BrokerOrder]]
     reconcile_order: Callable[[BrokerOrder], BrokerOrder]
-    cancel_order: Callable[[str], None]  # by client_order_id
+    cancel_order: Callable[[CancelIntent], None]
+    cancel_intent_factory: Callable[[TradeCardState, str, str], CancelIntent] = (
+        _default_cancel_intent_factory
+    )
+    persist_cancel_state: Callable[[TradeCardState], None] = lambda card: None
     # Full account-wide discovery (open orders + history + reserved orders)
     # for this card's symbol. Code review finding P1-15: "no local order
     # found" must never by itself be treated as "no order exists" -- only a
@@ -111,6 +118,18 @@ class EodActionCallbacks:
     cancel_discovered_order: Callable[[TradeCardState, BrokerOrderStatusSnapshot], None] = (
         lambda card, snapshot: None
     )
+
+    def request_cancel(
+        self, card: TradeCardState, client_order_id: str, *, scope: str = "ENTRY"
+    ) -> None:
+        request_cancel_with_lifecycle(
+            card=card,
+            client_order_id=client_order_id,
+            scope=scope,
+            cancel_order=self.cancel_order,
+            cancel_intent_factory=self.cancel_intent_factory,
+            persist_cancel_state=self.persist_cancel_state,
+        )
 
 
 class EodTradingService:
@@ -253,7 +272,9 @@ class EodTradingService:
             refreshed,
             at_deadline=True,
             cancel_requested=True,
-            cancel_order=lambda o: self._callbacks.cancel_order(o.client_order_id),
+            cancel_order=lambda o: self._callbacks.request_cancel(
+                card, o.client_order_id, scope="ENTRY"
+            ),
         )
 
         if action in (
@@ -279,6 +300,7 @@ class EodTradingService:
         # has already settled/released the capital reservation.
         card.entry_cancel_in_flight = False
         card.entry_cancel_reason = ""
+        card.entry_cancel_command_id = ""
         card.capital_reservation_id = ""
 
         if refreshed.filled_quantity > 0:
@@ -321,7 +343,7 @@ class EodTradingService:
         # entry_cancel_in_flight keeps _reconcile_entry_orders tracking it
         # on the next heartbeat regardless of board_status/remaining target.
         if order is not None:
-            self._callbacks.cancel_order(order.client_order_id)
+            self._callbacks.request_cancel(card, order.client_order_id, scope="ENTRY")
             if not card.entry_cancel_in_flight:
                 card.entry_cancel_in_flight = True
                 card.entry_cancel_reason = EntryCancelReason.EOD.value

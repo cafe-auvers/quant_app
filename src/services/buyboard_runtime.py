@@ -109,11 +109,19 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
+from uuid import uuid4
 
 from sqlalchemy.engine import Engine
 
 from src.core import execution_config
+from src.core.execution_mode import ExecutionLease, ExecutionMode, ExecutionSource
+from src.core.execution_request import (
+    CancelIntent,
+    derive_execution_client_order_id,
+)
+from src.core.execution_order_record import ExecutionOrderStatus
+from src.core.execution_result import broker_order_from_execution_record
 from src.core.order_state import (
     BrokerOrder,
     BrokerOrderDiscoveryResult,
@@ -131,10 +139,18 @@ from src.services import capital_allocator, capital_reservation_repository
 from src.services import order_ledger
 from src.services import order_reconciliation
 from src.services.broker import Broker, KisBroker
+from src.services.execution_command_gateway import (
+    ExecutionCommandGateway,
+    get_default_execution_gateway,
+)
+from src.services.execution_workflow_service import request_cancel_intent, request_submit
+from src.services.execution_order_repository import (
+    fetch_execution_order,
+    list_execution_orders_for_card,
+)
 from src.services.entry_attempt_manager import EntryAttemptManager
 from src.services.eod_trading_service import EodActionCallbacks, EodTradingService
 from src.services.execution_authority import ExecutionAuthority, LeaseHandle
-from src.services.order_execution_service import submit_guarded_overseas_order
 from src.services.intraday_data_service import (
     ExecutionGradeDataUnavailableError,
     fetch_execution_grade_intraday,
@@ -258,15 +274,20 @@ def _reconcile_order(order: BrokerOrder, *, broker: Broker) -> BrokerOrder:
     return refreshed if refreshed is not None else order
 
 
-def _cancel_order(client_order_id: str, *, broker: Broker) -> None:
+def _cancel_order(intent: CancelIntent, *, broker: Broker) -> None:
+    # Workstream 9 (PR2 third pass, finding 1): route through the shared
+    # workflow service, not order_reconciliation directly -- request_cancel
+    # is the one entry point both legacy and Kanban use (INV-21). In
+    # LEGACY_COMPATIBILITY delegates to cancel_and_reconcile_order through
+    # the gateway adapter; GUARDED_ENGINE consumes the full CancelIntent.
     try:
-        order_reconciliation.cancel_and_reconcile_order(client_order_id, broker=broker)
+        request_cancel_intent(intent, gateway=broker)
     except ValueError as exc:
         # Already terminal / already cancelled / not found -- the caller
         # (entry_attempt_manager/position_manager) only ever calls this on
         # an order it believes is still open; a stale belief is not a bug
         # here, just logged so it's visible.
-        logger.info("Cancel request for %s was a no-op: %s", client_order_id, exc)
+        logger.info("Cancel request for %s was a no-op: %s", intent.client_order_id, exc)
 
 
 def _discover_all_orders(card: TradeCardState, *, broker: Broker) -> BrokerOrderDiscoveryResult:
@@ -523,12 +544,22 @@ def build_buyboard_runtime(
     account_equity_provider: Optional[Callable[[str, str], float]] = None,
     capital_reservation_engine: Optional[Engine] = None,
     execution_authority: Optional[ExecutionAuthority] = None,
-    execution_lease: Optional[LeaseHandle] = None,
+    execution_lease: Optional[Any] = None,
     lease_engine=None,
     broker: Optional[Broker] = None,
     market_data: Optional[RealtimeMarketDataService] = None,
+    strategy_instance_id: str = "",
+    persist_card_before_execution: Optional[Callable[[TradeCardState], None]] = None,
 ) -> BuyboardRuntime:
     """Assembles every engine piece with real callback implementations.
+
+    ``strategy_instance_id`` identifies *this* engine instance for H1's
+    persisted execution-ownership check (Workstream 9) -- every
+    submission/cancellation/replace this runtime makes uses
+    ``ExecutionSource.KANBAN_BOARD`` plus this ``strategy_instance_id``.
+    Required (non-blank) for ``GUARDED_ENGINE`` composition and checked
+    against every KANBAN-owned symbol. It is irrelevant in
+    ``LEGACY_COMPATIBILITY`` mode.
 
     ``buying_power_provider``/``card_lookup`` are the two seams this module
     cannot responsibly fill in itself (see the module docstring) --
@@ -554,8 +585,143 @@ def build_buyboard_runtime(
     and :class:`~src.services.eod_trading_service.EodTradingService`, which
     previously accepted this parameter but never actually used it.
     """
-    resolved_broker = broker or KisBroker()
+    # Workstream 9 (PR2): the default broker is the shared execution
+    # gateway, not a raw KisBroker -- this module's own broker calls
+    # (submit via submit_guarded_overseas_order, cancel via
+    # order_reconciliation.cancel_and_reconcile_order and the direct
+    # discovered-order cancel below) now route through the same single
+    # mutation boundary the legacy Buy Dashboard uses. This composition
+    # remains inert until its caller drives the heartbeat;
+    # the feature flag selects which gateway mode is permitted here.
+    #
+    # Fourth pass: enabled mode accepts only a fully configured guarded
+    # gateway and rejects every plain-broker/legacy-mode downgrade at this
+    # composition boundary. Missing lease, epoch verification, mutation
+    # budget, buying-power validation, durable card persistence, or
+    # strategy identity therefore fails at startup, before a callback can
+    # reach the broker.
+    engine_enabled = execution_config.is_buyboard_engine_enabled()
+    if engine_enabled:
+        if not isinstance(broker, ExecutionCommandGateway):
+            raise RuntimeError(
+                "BUYBOARD_ENGINE_ENABLED=true accepts only an ExecutionCommandGateway "
+                "in GUARDED_ENGINE mode; plain broker overrides cannot downgrade execution"
+            )
+        if broker.mode != ExecutionMode.GUARDED_ENGINE:
+            raise RuntimeError(
+                "BUYBOARD_ENGINE_ENABLED=true requires gateway.mode=GUARDED_ENGINE"
+            )
+        broker.require_guarded_runtime_ready()
+        if not isinstance(execution_lease, ExecutionLease):
+            raise RuntimeError(
+                "BUYBOARD_ENGINE_ENABLED=true requires an epoch-bearing ExecutionLease"
+            )
+        if not str(strategy_instance_id or "").strip():
+            raise RuntimeError(
+                "BUYBOARD_ENGINE_ENABLED=true requires strategy_instance_id"
+            )
+        if persist_card_before_execution is None:
+            raise RuntimeError(
+                "BUYBOARD_ENGINE_ENABLED=true requires durable card persistence before execution"
+            )
+        resolved_broker = broker
+    else:
+        if isinstance(broker, ExecutionCommandGateway) and broker.mode != ExecutionMode.LEGACY_COMPATIBILITY:
+            raise RuntimeError(
+                "BUYBOARD_ENGINE_ENABLED=false cannot compose a GUARDED_ENGINE gateway"
+            )
+        resolved_broker = broker if broker is not None else get_default_execution_gateway()
+    guarded_mode = (
+        isinstance(resolved_broker, ExecutionCommandGateway)
+        and resolved_broker.mode == ExecutionMode.GUARDED_ENGINE
+    )
+    guarded_lease = execution_lease if isinstance(execution_lease, ExecutionLease) else None
+    legacy_lease = execution_lease if isinstance(execution_lease, LeaseHandle) else None
     resolved_equity_provider = account_equity_provider or buying_power_provider
+
+    def persist_execution_identity(card: TradeCardState) -> None:
+        if guarded_mode:
+            assert persist_card_before_execution is not None
+            persist_card_before_execution(card)
+
+    def prepare_entry_identity(
+        card: TradeCardState, *, attempt_group_id: str, attempt_number: int
+    ) -> tuple[str, str, int]:
+        if card.entry_client_order_id:
+            return (
+                card.entry_client_order_id,
+                card.entry_attempt_group_id or attempt_group_id,
+                card.entry_pending_attempt_number or attempt_number,
+            )
+        group_id = card.entry_attempt_group_id or attempt_group_id or uuid4().hex
+        number = max(1, int(attempt_number or card.entry_attempt_count + 1))
+        card.entry_attempt_group_id = group_id
+        card.entry_pending_attempt_number = number
+        card.entry_client_order_id = derive_execution_client_order_id(
+            attempt_group_id=group_id,
+            attempt_number=number,
+            environment=card.environment,
+            account_no=card.account_no,
+            symbol=card.symbol,
+            intent=OrderIntent.ENTRY,
+        )
+        card.entry_submission_unresolved = False
+        persist_execution_identity(card)
+        return card.entry_client_order_id, group_id, number
+
+    def prepare_entry_attempt(card: TradeCardState) -> None:
+        prepare_entry_identity(
+            card,
+            attempt_group_id=card.entry_attempt_group_id,
+            attempt_number=card.entry_pending_attempt_number or card.entry_attempt_count + 1,
+        )
+
+    def prepare_exit_identity(
+        card: TradeCardState, *, intent: OrderIntent
+    ) -> tuple[str, str, int]:
+        if card.exit_client_order_id:
+            return (
+                card.exit_client_order_id,
+                card.exit_attempt_group_id,
+                card.exit_pending_attempt_number or max(1, card.exit_attempt_count + 1),
+            )
+        group_id = card.exit_attempt_group_id or uuid4().hex
+        number = max(1, card.exit_attempt_count + 1)
+        card.exit_attempt_group_id = group_id
+        card.exit_pending_attempt_number = number
+        card.exit_client_order_id = derive_execution_client_order_id(
+            attempt_group_id=group_id,
+            attempt_number=number,
+            environment=card.environment,
+            account_no=card.account_no,
+            symbol=card.symbol,
+            intent=intent,
+        )
+        card.exit_submission_unresolved = False
+        persist_execution_identity(card)
+        return card.exit_client_order_id, group_id, number
+
+    def cancel_intent_factory(
+        card: TradeCardState, client_order_id: str, scope: str
+    ) -> CancelIntent:
+        field_name = (
+            "entry_cancel_command_id" if str(scope).upper() == "ENTRY"
+            else "exit_cancel_command_id"
+        )
+        cancel_command_id = getattr(card, field_name)
+        if not cancel_command_id:
+            cancel_command_id = f"{client_order_id}:CANCEL:{uuid4().hex}"
+            setattr(card, field_name, cancel_command_id)
+            persist_execution_identity(card)
+        return CancelIntent(
+            client_order_id=client_order_id,
+            cancel_command_id=cancel_command_id,
+            environment=card.environment,
+            account_no=card.account_no,
+            lease=guarded_lease,
+            strategy_instance_id=strategy_instance_id,
+            source=ExecutionSource.KANBAN_BOARD,
+        )
 
     def submit_order(**kwargs):
         environment = kwargs["environment"]
@@ -615,28 +781,107 @@ def build_buyboard_runtime(
         plan_id = _entry_plan_id(card) if card is not None else f"{environment}:{symbol}"
         submit_kwargs = dict(kwargs)
         submit_kwargs["quantity"] = quantity
-        return submit_guarded_overseas_order(
-            broker=resolved_broker,
+        if guarded_mode and not submit_kwargs.get("client_order_id"):
+            if card is None:
+                raise RuntimeError(
+                    f"No durable TradeCardState exists for guarded entry {environment}/{account_no}/{symbol}"
+                )
+            client_order_id, attempt_group_id, attempt_number = prepare_entry_identity(
+                card,
+                attempt_group_id=submit_kwargs.get("attempt_group_id", ""),
+                attempt_number=submit_kwargs.get("attempt_number", 1),
+            )
+            submit_kwargs["client_order_id"] = client_order_id
+            submit_kwargs["attempt_group_id"] = attempt_group_id
+            submit_kwargs["attempt_number"] = attempt_number
+        # Workstream 9 (PR2 third pass, finding 1): route through the
+        # shared workflow service, not submit_guarded_overseas_order
+        # directly -- request_submit is the one entry point both legacy
+        # and Kanban use (INV-21). It normalizes the two persistence models
+        # into one workflow result while preserving this function's risk
+        # revalidation and gate sequence.
+        return request_submit(
+            source=ExecutionSource.KANBAN_BOARD,
+            gateway=resolved_broker,
+            strategy_instance_id=strategy_instance_id,
+            lease=guarded_lease,
             pre_trade_risk_decision=decision,
             strategy_id=RISK_STRATEGY_ID,
             plan_id=plan_id,
             execution_authority=execution_authority,
-            execution_lease=execution_lease,
+            execution_lease=legacy_lease,
             lease_engine=lease_engine,
             **submit_kwargs,
         )
 
+    authoritative_reservation_engine = (
+        resolved_broker.database_engine
+        if guarded_mode and isinstance(resolved_broker, ExecutionCommandGateway)
+        else capital_reservation_engine
+    )
     entry_attempt_manager = EntryAttemptManager(
         buying_power_provider=buying_power_provider,
         submit_order=submit_order,
-        capital_reservation_engine=capital_reservation_engine,
+        capital_reservation_engine=authoritative_reservation_engine,
+        gateway_owns_capital_reservation=guarded_mode,
     )
 
     position_manager = PositionManager()
 
+    guarded_open_statuses = {
+        ExecutionOrderStatus.PREPARED,
+        ExecutionOrderStatus.SUBMITTING,
+        ExecutionOrderStatus.ACKNOWLEDGED,
+        ExecutionOrderStatus.WORKING,
+        ExecutionOrderStatus.PARTIALLY_FILLED,
+        ExecutionOrderStatus.CANCEL_PENDING,
+        ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE,
+    }
+
+    def find_runtime_order(
+        card: TradeCardState,
+        *,
+        side: OrderSide,
+        intent: Optional[OrderIntent] = None,
+    ) -> Optional[BrokerOrder]:
+        if not guarded_mode:
+            return _find_open_order(
+                environment=card.environment,
+                account_no=card.account_no,
+                symbol=card.symbol,
+                side=side,
+                intent=intent,
+            )
+        assert isinstance(resolved_broker, ExecutionCommandGateway)
+        engine = resolved_broker.database_engine
+        assert engine is not None
+        for record in list_execution_orders_for_card(
+            engine,
+            environment=card.environment,
+            account_no=card.account_no,
+            symbol=card.symbol,
+        ):
+            if record.status not in guarded_open_statuses or record.side != side:
+                continue
+            if intent is not None and record.intent != intent:
+                continue
+            return broker_order_from_execution_record(record)
+        return None
+
+    def reconcile_runtime_order(order: BrokerOrder) -> BrokerOrder:
+        if not guarded_mode:
+            return _reconcile_order(order, broker=resolved_broker)
+        assert isinstance(resolved_broker, ExecutionCommandGateway)
+        engine = resolved_broker.database_engine
+        assert engine is not None
+        record = fetch_execution_order(engine, order.client_order_id)
+        return broker_order_from_execution_record(record) if record is not None else order
+
     entry_deadline_lookup = EntryDeadlineLookup(
-        find_open_entry_order=_find_open_entry_order,
-        reconcile_order=lambda order: _reconcile_order(order, broker=resolved_broker),
+        find_open_entry_order=lambda card: find_runtime_order(
+            card, side=OrderSide.BUY, intent=OrderIntent.ENTRY
+        ),
+        reconcile_order=reconcile_runtime_order,
         refresh_broker_position=lambda card: _refresh_broker_position(card, broker=resolved_broker),
         persist_order=order_ledger.upsert_order,
     )
@@ -654,6 +899,7 @@ def build_buyboard_runtime(
         bid is cached yet).
         """
         submit_kwargs = dict(kwargs)
+        supplied_card = submit_kwargs.pop("trade_card", None)
         reason = submit_kwargs.pop("reason", "sell_all")
         intent = _SELL_REASON_TO_INTENT.get(reason, OrderIntent.MANUAL_EXIT)
         symbol = submit_kwargs["symbol"]
@@ -664,33 +910,63 @@ def build_buyboard_runtime(
                 f"No live quote available to price a marketable SELL for {symbol}"
             )
         exchange = submit_kwargs.pop("exchange", "NASD")
-        return submit_guarded_overseas_order(
-            broker=resolved_broker,
+        card = supplied_card or card_lookup(
+            submit_kwargs.get("environment", ""),
+            submit_kwargs.get("account_no", ""),
+            symbol,
+        )
+        if guarded_mode:
+            if card is None:
+                raise RuntimeError(
+                    f"No durable TradeCardState exists for guarded exit {symbol}"
+                )
+            client_order_id, attempt_group_id, attempt_number = prepare_exit_identity(
+                card, intent=intent
+            )
+            submit_kwargs["client_order_id"] = client_order_id
+            submit_kwargs["attempt_group_id"] = attempt_group_id
+            submit_kwargs["attempt_number"] = attempt_number
+        # Workstream 9 (PR2 third pass, finding 1): route through the
+        # shared workflow service -- see submit_order's identical comment
+        # above for the shared guarded/compatibility contract.
+        return request_submit(
+            source=ExecutionSource.KANBAN_BOARD,
+            gateway=resolved_broker,
+            strategy_instance_id=strategy_instance_id,
+            lease=guarded_lease,
             side=OrderSide.SELL,
             intent=intent,
             limit_price=limit_price,
             exchange=exchange,
             plan_id=f"{submit_kwargs.get('environment', '')}:{symbol}:SELL:{reason}",
             execution_authority=execution_authority,
-            execution_lease=execution_lease,
+            execution_lease=legacy_lease,
             lease_engine=lease_engine,
             **submit_kwargs,
         )
 
     position_callbacks = PositionActionCallbacks(
-        cancel_order=lambda client_order_id: _cancel_order(client_order_id, broker=resolved_broker),
+        cancel_order=lambda intent: _cancel_order(intent, broker=resolved_broker),
         submit_sell_order=submit_sell_order,
         refresh_orderable_quantity=lambda environment, account_no, symbol: _refresh_orderable_quantity(
             environment, account_no, symbol, broker=resolved_broker
         ),
-        find_open_sell_order=_find_open_sell_order,
-        reconcile_sell_order=lambda order: _reconcile_order(order, broker=resolved_broker),
+        cancel_intent_factory=cancel_intent_factory,
+        persist_cancel_state=persist_execution_identity,
+        find_open_sell_order=lambda card: find_runtime_order(
+            card, side=OrderSide.SELL
+        ),
+        reconcile_sell_order=reconcile_runtime_order,
     )
 
     eod_callbacks = EodActionCallbacks(
-        find_open_entry_order=_find_open_entry_order,
-        reconcile_order=lambda order: _reconcile_order(order, broker=resolved_broker),
-        cancel_order=lambda client_order_id: _cancel_order(client_order_id, broker=resolved_broker),
+        find_open_entry_order=lambda card: find_runtime_order(
+            card, side=OrderSide.BUY, intent=OrderIntent.ENTRY
+        ),
+        reconcile_order=reconcile_runtime_order,
+        cancel_order=lambda intent: _cancel_order(intent, broker=resolved_broker),
+        cancel_intent_factory=cancel_intent_factory,
+        persist_cancel_state=persist_execution_identity,
         discover_all_orders=lambda card: _discover_all_orders(card, broker=resolved_broker),
         # Review finding P0: a historical filled order discovered from
         # KIS's ~14-day order-history window must not resurrect a position
@@ -703,7 +979,7 @@ def build_buyboard_runtime(
         position_manager=position_manager,
         callbacks=eod_callbacks,
         reservations_path=capital_allocator.RESERVATIONS_FILE,
-        capital_reservation_engine=capital_reservation_engine,
+        capital_reservation_engine=authoritative_reservation_engine,
     )
 
     resolved_market_data = market_data
@@ -731,6 +1007,7 @@ def build_buyboard_runtime(
         # outside the session, and EOD cleanup never ran in production.
         market_is_open=is_regular_session_open,
         eod_window_reached=_eod_window_reached,
+        prepare_entry_attempt=prepare_entry_attempt if guarded_mode else None,
     )
 
     return BuyboardRuntime(
