@@ -1,7 +1,10 @@
 # Kanban Production Readiness — Requirements & Invariants
 
 Status: **SIGNED OFF — Workstream 1 complete, revision 3.1**
-Branch: `feature/kanban-production-readiness`
+Branch: PR1 merged to `master` (commit `5b50e1d`, PR #4). PR2 onward branch
+directly off `master` (revision 3.3 — see rule 3 / [PR structure](#pr-structure-revision-3)).
+The formerly-planned `feature/kanban-production-readiness` integration
+branch is deprecated; see the revision 3.3 change-log entry.
 Base: `109c2c4` ("kanban fix 8")
 Supersedes: the "kanban fix 1" .. "kanban fix 8" review-and-patch cycle described in
 `buydashboard_to_kanban.md`. That cycle repeatedly closed a reported defect
@@ -41,6 +44,20 @@ Workstream 0 gate was broader than necessary, blocking capability-
 independent schema/state-machine work in PR1 that doesn't actually depend
 on any KIS-specific behavior.
 
+Revision 3.3 is a process correction, not an architecture change: PR1 was
+opened and merged as PR #4, discovering along the way that the repository's
+actual `.github/workflows/ci.yml` only triggers on `branches: [master]` —
+a PR opened against an intermediate long-lived integration branch, as
+revision 3's PR structure originally specified, would show zero CI checks,
+silently defeating rule 2's "needs a passing test" requirement. Rather than
+maintaining a branch whose only purpose (deferring one merge event) CI
+never actually validated, this revision replaces the integration-branch
+requirement: every PR (1-8) targets `master` directly, reviewed and CI-gated
+like any other PR. `BUYBOARD_ENGINE_ENABLED=false` and each workstream's own
+feature flags remain the sole activation gate — landing a PR's code on
+`master` is explicitly not equivalent to activating it. See the revision
+3.3 change-log entry for the full detail.
+
 ## How to use this document
 
 This is the frozen contract every workstream in this branch implements
@@ -57,12 +74,14 @@ Rules while this program is open:
    its workstream is considered done. "Passing test" means the specific
    scenario in the row, not just "the suite is green."
 3. **Staged release train, not one mega-PR** (revision 2's "one PR" rule is
-   replaced — see [PR structure](#pr-structure-revision-3)). Each stacked PR
-   is fully tested and reviewable on its own, but none of them individually
-   changes runtime behavior in production — every new code path stays behind
-   `BUYBOARD_ENGINE_ENABLED=false` and the relevant feature flags until the
-   final integration PR and Gate 1 both pass. No partial *activation*, even
-   though the PRs land incrementally.
+   replaced — see [PR structure](#pr-structure-revision-3)). Each PR (1-8)
+   is its own pull request, targeting `master` directly *(revision 3.3 —
+   the originally-planned long-lived integration branch is deprecated; see
+   the PR structure section)*, fully tested and reviewable on its own. None
+   of them individually changes runtime behavior in production — every new
+   code path stays behind `BUYBOARD_ENGINE_ENABLED=false` and the relevant
+   feature flags until PR8's own Gate 1 run passes. No partial *activation*,
+   even though the PRs land on `master` incrementally.
 4. `BUYBOARD_ENGINE_ENABLED` stays `false` in production for the entire
    duration of this program, regardless of how much of it is complete.
 5. **Workstream 0 gates specific capability-dependent code, not all of
@@ -78,9 +97,17 @@ Rules while this program is open:
 ## PR structure (revision 3)
 
 Replaces revision 2's "one branch, one PR" rule — 13 workstreams in a single
-PR would be unreviewable and unrevertable. All PRs target the same
-long-lived integration branch (`feature/kanban-production-readiness`); the
-branch itself only merges to `master` once, per rule 3 above.
+PR would be unreviewable and unrevertable. **Revision 3.3 correction:**
+each PR (1-8) targets `master` directly, not a long-lived integration
+branch as originally specified here — the repository's actual CI
+(`.github/workflows/ci.yml`) only triggers on `branches: [master]`, so a PR
+against an intermediate integration branch would carry no CI signal at all,
+contradicting rule 2's "needs a passing test" requirement and this
+document's own repeated expectation of visible CI per PR. There is no
+longer a separate "the branch merges to master once" event — each PR lands
+on `master` as soon as it is reviewed and its own CI is green, inert until
+its feature flag is explicitly flipped. `feature/kanban-production-readiness`
+is deprecated (never received PR1 and is not used going forward).
 
 | PR | Workstreams | Contents |
 |---|---|---|
@@ -1200,3 +1227,33 @@ and stays `false` in unattended/automatic form until Gate 5 passes.
   malformed `requested_at` instead of silently substituting the current
   time. Finished moving broker-response/raw-payload redaction to the
   shared `src/utils/redaction.py` utility across all three PR1 modules.
+- 2026-08-15 (revision 3.3): Process correction, not an architecture
+  change. PR1 (`feature/kanban-pr1-order-schemas`, commit `0864b45`) was
+  opened as PR #4 and merged directly to `master` (merge commit `5b50e1d`)
+  rather than against the `feature/kanban-production-readiness` integration
+  branch rule 3 and the original PR-structure section specified. The
+  content merged is verified identical to what was reviewed -- same
+  commit, same 1474-passed/compileall-clean result, no divergence -- only
+  the target branch differed from the plan. Investigating why surfaced a
+  real gap in the plan itself: the repository's actual
+  `.github/workflows/ci.yml` triggers only on `branches: [master]`, for
+  both `push` and `pull_request`. A PR opened against an intermediate
+  long-lived integration branch, as originally specified, would therefore
+  carry **zero** CI checks -- silently defeating rule 2's "needs a passing
+  test" requirement and this document's own repeated expectation of
+  visible CI per PR. Rather than reverting PR1 and maintaining a branch
+  whose only purpose (deferring one eventual merge to `master`) CI never
+  actually validated, this revision formally replaces the integration-
+  branch requirement: rule 3 and the PR-structure section now specify that
+  every PR (1-8) targets `master` directly, each reviewed and CI-gated on
+  its own, same as PR1 turned out to actually be.
+  `BUYBOARD_ENGINE_ENABLED=false` and each workstream's own feature flags
+  remain the sole activation gate -- landing a PR's code on `master` is
+  explicitly not
+  equivalent to activating it, and nothing merged in PR1 is wired into any
+  existing entry point yet (the execution gateway that would do that
+  wiring is Workstream 3 / PR2, not yet started). The
+  `feature/kanban-production-readiness` branch is deprecated: it never
+  received PR1 and is not used for PR2 onward. Workstream 1's sign-off
+  (revision 3.1) is unaffected -- this is a release-process correction,
+  not a reopening of the requirements content itself.
