@@ -515,6 +515,7 @@ def test_cancel_discovered_order_cancels_the_remaining_quantity_by_broker_order_
         environment="PROD", account_no="1", symbol="AAPL", side=OrderSide.BUY,
         status=OrderStatus.PARTIALLY_FILLED, broker_order_id="B-42",
         quantity_requested=100, filled_quantity=30, remaining_quantity=70,
+        raw_response={"ovrs_excg_cd": "NASD"},
     )
     runtime_module._cancel_discovered_order(card, snapshot, broker=broker)
     assert len(broker.cancel_calls) == 1
@@ -527,6 +528,40 @@ def test_cancel_discovered_order_cancels_the_remaining_quantity_by_broker_order_
     assert call["symbol"] == "AAPL"
     assert call["side"] == "BUY"
     assert call["is_reserved"] is False
+    assert call["exchange"] == "NASD"
+
+
+def test_cancel_discovered_order_uses_the_snapshots_own_exchange_not_a_hardcoded_default():
+    """Review finding: a hardcoded "NASD" default would silently misroute
+    (or fail) a cancel for a genuinely NYSE/AMEX order -- the real
+    exchange must be recovered from the snapshot's own raw KIS row."""
+    broker = _FakeBroker()
+    card = _card(symbol="AAPL")
+    snapshot = BrokerOrderStatusSnapshot(
+        environment="PROD", account_no="1", symbol="AAPL", side=OrderSide.BUY,
+        status=OrderStatus.WORKING, broker_order_id="B-8",
+        quantity_requested=50, filled_quantity=0, remaining_quantity=50,
+        raw_response={"OVRS_EXCG_CD": "NYSE"},
+    )
+    runtime_module._cancel_discovered_order(card, snapshot, broker=broker)
+    assert broker.cancel_calls[0]["exchange"] == "NYSE"
+
+
+def test_cancel_discovered_order_refuses_to_guess_an_exchange_it_cannot_determine():
+    """Review finding: "if exchange ownership cannot be established,
+    automatic cancellation should not guess" -- a snapshot whose raw
+    response carries no recognizable exchange field must not fall back to
+    a hardcoded default at all."""
+    broker = _FakeBroker()
+    card = _card(symbol="AAPL")
+    snapshot = BrokerOrderStatusSnapshot(
+        environment="PROD", account_no="1", symbol="AAPL", side=OrderSide.BUY,
+        status=OrderStatus.WORKING, broker_order_id="B-11",
+        quantity_requested=50, filled_quantity=0, remaining_quantity=50,
+        raw_response={},
+    )
+    runtime_module._cancel_discovered_order(card, snapshot, broker=broker)
+    assert broker.cancel_calls == []
 
 
 def test_cancel_discovered_order_falls_back_to_requested_minus_filled_when_remaining_is_unset():
@@ -536,6 +571,7 @@ def test_cancel_discovered_order_falls_back_to_requested_minus_filled_when_remai
         environment="PROD", account_no="1", symbol="AAPL", side=OrderSide.BUY,
         status=OrderStatus.WORKING, broker_order_id="B-7",
         quantity_requested=50, filled_quantity=0, remaining_quantity=0,
+        raw_response={"ovrs_excg_cd": "NASD"},
     )
     runtime_module._cancel_discovered_order(card, snapshot, broker=broker)
     assert broker.cancel_calls[0]["quantity"] == 50
@@ -548,6 +584,7 @@ def test_cancel_discovered_order_is_a_no_op_without_a_broker_order_id():
         environment="PROD", account_no="1", symbol="AAPL", side=OrderSide.BUY,
         status=OrderStatus.WORKING, broker_order_id="",
         quantity_requested=50, filled_quantity=0,
+        raw_response={"ovrs_excg_cd": "NASD"},
     )
     runtime_module._cancel_discovered_order(card, snapshot, broker=broker)
     assert broker.cancel_calls == []
@@ -561,6 +598,7 @@ def test_cancel_discovered_order_never_raises_when_the_broker_call_fails():
         environment="PROD", account_no="1", symbol="AAPL", side=OrderSide.BUY,
         status=OrderStatus.WORKING, broker_order_id="B-9",
         quantity_requested=50, filled_quantity=0, remaining_quantity=50,
+        raw_response={"ovrs_excg_cd": "NASD"},
     )
     # Must not propagate -- a cancel-attempt failure must not stop the
     # rest of reconciliation for other cards.

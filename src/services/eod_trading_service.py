@@ -392,7 +392,19 @@ def _find_matching_broker_entry_snapshot(
         return None
     open_candidates = [c for c in candidates if is_open_status(c.status)]
     if open_candidates:
-        return BrokerEntryMatch(max(open_candidates, key=lambda c: c.checked_at))
+        chosen = max(open_candidates, key=lambda c: c.checked_at)
+        # Review finding P0: "the authoritative holding fix does not cover
+        # open partial orders" -- a still-open order's own filled_quantity
+        # (e.g. 30/100) can undercount what the account actually holds
+        # right now (accumulated from more than this one order, or simply
+        # stale relative to a fill that landed since this snapshot was
+        # queried); fetch current holdings for this branch too, on the
+        # same lazy "only when there is a fill to validate" terms as the
+        # terminal-fill branch below, so _apply_discovered_entry_match can
+        # prefer live broker truth here as well instead of only for
+        # already-terminal matches.
+        current_holding = get_current_holding() if chosen.filled_quantity > 0 else None
+        return BrokerEntryMatch(chosen, current_holding=current_holding)
     terminal_with_fill = [c for c in candidates if c.filled_quantity > 0]
     current_holding = get_current_holding() if terminal_with_fill else None
     holding_confirmed = current_holding is not None and current_holding.quantity > 0
@@ -410,6 +422,57 @@ def _find_matching_broker_entry_snapshot(
     )
 
 
+def _snapshot_plausibly_belongs_to_card(
+    card: TradeCardState, snapshot: BrokerOrderStatusSnapshot
+) -> bool:
+    """Review finding P0: "automatic cancellation is unsafe while order
+    identity remains weak" -- :func:`_find_matching_broker_entry_snapshot`
+    matches purely on account/symbol/side, which is loose enough to also
+    match an unrelated order the user placed manually, directly at the
+    broker, for the same symbol (the app never submitted anything for this
+    card at all). That was only ever a cosmetic risk while a match merely
+    set a warning; now that a match can trigger an actual best-effort
+    broker-side cancel (:func:`_try_cancel_discovered_remainder`), firing
+    it against an order this card's own plan did not produce would cancel
+    a live order that has nothing to do with this application.
+
+    This is a deliberately narrow, best-effort corroboration -- there is
+    no broker order ID, client order ID, or submission timestamp recorded
+    anywhere to check against for an order discovery found with *nothing*
+    local tracking it (that is the entire premise of this code path) --
+    not the fuller "submission session/attempt window" fingerprint a
+    persisted order record could support. Requires the snapshot's own
+    requested quantity to exactly match this card's planned order size and
+    its limit price to fall within a generous band of this card's planned
+    entry trigger; anything unset or outside tolerance fails closed. A
+    failed check never blocks recovery of a confirmed fill (still handled
+    by the caller) -- it only withholds the destructive cancel action,
+    leaving the card flagged UNRECONCILED_BROKER_ORDER for manual review
+    instead, matching this module's "ambiguous stays alert-and-block-only"
+    rule everywhere else.
+    """
+    expected_quantity = card.planned_quantity or card.target_position_quantity
+    if expected_quantity <= 0 or snapshot.quantity_requested <= 0:
+        return False
+    if snapshot.quantity_requested != expected_quantity:
+        return False
+    expected_price = card.entry_trigger
+    if not expected_price or expected_price <= 0 or snapshot.limit_price <= 0:
+        return False
+    tolerance = max(expected_price * 0.05, 0.01)
+    if abs(snapshot.limit_price - expected_price) > tolerance:
+        return False
+    return True
+
+
+def _remove_warnings(card: TradeCardState, *names: str) -> None:
+    if not card.warnings:
+        return
+    remove = set(names)
+    if any(w in remove for w in card.warnings):
+        card.warnings = [w for w in card.warnings if w not in remove]
+
+
 def _try_cancel_discovered_remainder(
     card: TradeCardState, snapshot: BrokerOrderStatusSnapshot, *, callbacks: EodActionCallbacks
 ) -> None:
@@ -417,8 +480,19 @@ def _try_cancel_discovered_remainder(
     remainder -- see :attr:`EodActionCallbacks.cancel_discovered_order`.
     Never raises: a cancel-attempt failure must not stop the rest of
     reconciliation, and the card is flagged with UNRECONCILED_BROKER_ORDER
-    by the caller regardless of whether this succeeds.
+    by the caller regardless of whether this succeeds. Gated on
+    :func:`_snapshot_plausibly_belongs_to_card` (review finding P0) --
+    a weak account/symbol/side-only match must never itself trigger the
+    actual broker-side cancel.
     """
+    if not _snapshot_plausibly_belongs_to_card(card, snapshot):
+        logger.warning(
+            "Refusing to auto-cancel a discovered order for %s: ownership could not be "
+            "positively established against this card's plan (broker_order_id=%s) -- "
+            "left flagged for manual review instead.",
+            card.symbol, snapshot.broker_order_id,
+        )
+        return
     try:
         callbacks.cancel_discovered_order(card, snapshot)
     except Exception:
@@ -497,12 +571,24 @@ def _apply_discovered_entry_match(
             if "UNRECONCILED_BROKER_ORDER" not in card.warnings:
                 card.warnings = [*card.warnings, "UNRECONCILED_BROKER_ORDER"]
             _try_cancel_discovered_remainder(card, snapshot, callbacks=callbacks)
+        else:
+            # Review finding: a prior pass may have flagged
+            # UNRECONCILED_BROKER_ORDER while this exact remainder was
+            # still open; now that the same snapshot resolves to a
+            # terminal status (cancelled, or simply finished filling), the
+            # warning is stale and must not keep alerting as "still needs
+            # manual review" forever.
+            _remove_warnings(card, "UNRECONCILED_BROKER_ORDER")
         return True
     if snapshot.status in _ALREADY_TERMINAL_STATUSES:
         # Terminal with zero fill (CANCELLED/REJECTED/EXPIRED) --
-        # confirmed gone, safe to return to Buylist.
+        # confirmed gone, safe to return to Buylist. Review finding: clear
+        # any recovery-related warnings a prior pass may have set for this
+        # same discovered order -- nothing about it is still relevant once
+        # the card is back to a clean Buylist state.
         card.board_status = BoardStatus.BUYLIST
         card.entry_runtime_status = None
+        _remove_warnings(card, "UNRECONCILED_BROKER_ORDER", "ORDER_RECOVERED_FROM_BROKER_DISCOVERY")
         return True
     # A real broker order is still open/working with nothing local
     # tracking it -- never abandon it to Buylist. The local order record
@@ -538,17 +624,36 @@ def _mark_buy_today_order_discovered(
     rest of the trading day).
 
     Returns:
-    - ``None`` if a local order was already found (the card's
-      board_status is simply stale; leave it for the ENTRY_PENDING path)
-      or discovery was incomplete (retry later).
-    - ``True`` if a matching broker order was found and the card was
-      moved to ENTRY_PENDING/DATA_UNAVAILABLE.
+    - ``None`` if discovery was incomplete (retry later).
+    - ``True`` if a local order was found (the card's board_status was
+      simply stale -- moved to ENTRY_PENDING/ORDER_PENDING here, mirroring
+      the normal ``AttemptOutcome.SUBMITTED`` transition) or a matching
+      broker order was found via discovery (card moved to
+      ENTRY_PENDING/DATA_UNAVAILABLE, flagged UNRECONCILED_BROKER_ORDER).
     - ``False`` if discovery is complete and confirms nothing exists --
       the caller decides what "safe, no order" means in its own context.
     """
     order = callbacks.find_open_entry_order(card)
     if order is not None:
-        return None
+        # Review finding P0: "a local order with stale BUY_TODAY card
+        # state remains uncorrected" -- a real local order already exists
+        # (e.g. a crash landed between the broker confirming submission
+        # and this card's board_status being updated to ENTRY_PENDING),
+        # but leaving board_status at BUY_TODAY keeps it outside
+        # TradingEngine._entry_tracking_scope entirely: no fill ever gets
+        # a stop attached, no cancellation is ever tracked. The duplicate-
+        # order guard (order_execution_service.DuplicateOpenOrderError)
+        # already stops _evaluate_buy_today from submitting a second
+        # broker order for this symbol, but that alone does not resume
+        # normal reconciliation for the order that already exists -- only
+        # actually moving the card does.
+        card.board_status = BoardStatus.ENTRY_PENDING
+        card.entry_runtime_status = EntryRuntimeStatus.ORDER_PENDING
+        if getattr(order, "attempt_group_id", ""):
+            card.entry_attempt_group_id = order.attempt_group_id
+        if getattr(order, "attempt_number", 0):
+            card.entry_attempt_count = order.attempt_number
+        return True
     # P1-15: a single "not found" lookup is not proof nothing was
     # submitted -- confirm with a full account-wide discovery query first.
     discovery = callbacks.discover_all_orders(card)
@@ -588,6 +693,72 @@ def reconcile_buy_today_orders(
                 changed.append(card)
         except Exception:
             logger.exception("reconcile_buy_today_orders failed for %s", card.symbol)
+    return changed
+
+
+def reconcile_untracked_position_remainders(
+    cards: List[TradeCardState], *, callbacks: EodActionCallbacks
+) -> List[TradeCardState]:
+    """Review finding P0: "a partially filled discovered order is not
+    retried on the next reconciliation pass" -- once
+    :func:`_apply_discovered_entry_match` recovers a discovery-matched fill
+    into OPEN_POSITION, the card falls out of every other reconciliation
+    sweep for good: :func:`reconcile_unresolved_orders_at_startup` only
+    ever revisits ENTRY_PENDING cards, and the recovered card's
+    ``entry_remaining_target_quantity`` is deliberately left at zero (no
+    local order record exists to safely hand the remainder back to normal
+    completion tracking). A single failed
+    :attr:`EodActionCallbacks.cancel_discovered_order` attempt was
+    therefore the last word on a broker-side remainder that might still be
+    filling, unattended, indefinitely.
+
+    This is the periodic/startup sweep that keeps chasing that remainder:
+    every OPEN_POSITION card still flagged ``UNRECONCILED_BROKER_ORDER``
+    gets rediscovered and, while still open at the broker, gets another
+    best-effort direct cancel attempt (also review finding P0: gated by
+    the same :func:`_snapshot_plausibly_belongs_to_card` ownership check
+    every other automatic cancel uses). Once discovery no longer finds an
+    open match for it -- confirmed cancelled, confirmed fully filled, or
+    simply gone -- current holdings (when available) are applied as the
+    final authoritative quantity/price and the warning is cleared, so this
+    stops being reprocessed by future passes.
+    """
+    changed: List[TradeCardState] = []
+    for card in cards:
+        if card.board_status != BoardStatus.OPEN_POSITION:
+            continue
+        if "UNRECONCILED_BROKER_ORDER" not in card.warnings:
+            continue
+        try:
+            discovery = callbacks.discover_all_orders(card)
+            if not discovery.complete:
+                continue  # retry next pass -- do not guess either way
+            match = _find_matching_broker_entry_snapshot(
+                discovery, card, get_current_holding=lambda: callbacks.get_current_holding(card)
+            )
+            if match is not None and is_open_status(match.snapshot.status):
+                _try_cancel_discovered_remainder(card, match.snapshot, callbacks=callbacks)
+                continue
+            # Nothing open matches this card any more -- either the
+            # remainder resolved (cancelled, or finished filling) or it's
+            # no longer discoverable. Current holdings, if available,
+            # remain authoritative for the final quantity/price, the same
+            # rule every other discovery-recovered fill in this module
+            # uses.
+            if (
+                match is not None
+                and match.current_holding is not None
+                and match.current_holding.quantity > 0
+            ):
+                card.broker_quantity = match.current_holding.quantity
+                card.orderable_quantity = match.current_holding.quantity
+                card.average_entry_price = (
+                    match.current_holding.average_price or card.average_entry_price
+                )
+            _remove_warnings(card, "UNRECONCILED_BROKER_ORDER")
+            changed.append(card)
+        except Exception:
+            logger.exception("reconcile_untracked_position_remainders failed for %s", card.symbol)
     return changed
 
 

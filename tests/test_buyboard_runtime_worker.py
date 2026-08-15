@@ -20,7 +20,12 @@ from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
 from src.core.execution_queue import ExecutionQueueItem, OrbCandidate, OrbCandidateStatus
-from src.core.order_state import BrokerOrderDiscoveryResult
+from src.core.order_state import (
+    BrokerOrderDiscoveryResult,
+    BrokerOrderStatusSnapshot,
+    OrderSide,
+    OrderStatus,
+)
 from src.core.trade_card_state import BoardStatus, EntryRuntimeStatus, TradeCardState
 from src.services import buyboard_runtime as runtime_module
 from src.services import trade_card_repository as repo
@@ -169,6 +174,7 @@ def test_build_order_callbacks_wires_cancel_discovered_order_to_the_broker(tmp_p
         environment="PROD", account_no="1", symbol="AAPL", side=OrderSide.BUY,
         status=OrderStatus.WORKING, broker_order_id="B-99",
         quantity_requested=25, filled_quantity=0, remaining_quantity=25,
+        raw_response={"ovrs_excg_cd": "NASD"},
     )
 
     callbacks.cancel_discovered_order(card, snapshot)
@@ -347,6 +353,50 @@ def test_startup_reconciliation_does_not_cross_account_boundaries(tmp_path):
     assert "1" not in worker.startup_reconciliation_errors
     assert "2" in worker.startup_reconciliation_errors
     assert "1" in worker._account_reconciled_at
+
+
+def test_startup_reconciliation_fully_resolves_a_buy_today_fill_in_one_pass(tmp_path):
+    """Review finding P0: "BUY_TODAY recovery still has startup and
+    two-pass gaps" -- reconcile_buy_today_orders must run *before* the
+    ENTRY_PENDING sweep within a single startup pass, so a BUY_TODAY card
+    transitioned to ENTRY_PENDING by discovery is immediately picked up
+    and fully resolved (fill applied, moved to OPEN_POSITION) in this
+    exact same call -- not left at ENTRY_PENDING/DATA_UNAVAILABLE for a
+    later cycle (up to FULL_RECONCILIATION_SECONDS away) to notice.
+    Startup previously did not call reconcile_buy_today_orders at all.
+    """
+    broker = _FakeBroker()
+    broker.discover_result = BrokerOrderDiscoveryResult(
+        open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
+        snapshots=[
+            BrokerOrderStatusSnapshot(
+                environment="PROD", account_no="1", symbol="AAPL", side=OrderSide.BUY,
+                status=OrderStatus.FILLED, quantity_requested=10, filled_quantity=10,
+                avg_fill_price=101.0,
+            )
+        ],
+    )
+    broker.positions = {
+        "overseas": {"holdings": [{"symbol": "AAPL", "quantity": 10, "average_price": 101.0}]}
+    }
+    worker, engine = _worker(tmp_path, broker=broker)
+    worker.runtime = runtime_module.build_buyboard_runtime(
+        buying_power_provider=worker._buying_power_provider,
+        card_lookup=worker._card_lookup,
+        broker=worker._broker,
+    )
+    _seed_card(
+        engine, account_no="1", symbol="AAPL", board_status=BoardStatus.BUY_TODAY,
+        planned_quantity=10,
+    )
+
+    worker._run_startup_reconciliation()
+
+    card = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    # Fully resolved in this one pass, not merely transitioned to
+    # ENTRY_PENDING/DATA_UNAVAILABLE and left for a later cycle.
+    assert card.board_status == BoardStatus.OPEN_POSITION
+    assert card.broker_quantity == 10
 
 
 def test_run_one_cycle_excludes_cards_from_accounts_with_startup_errors(tmp_path, monkeypatch):

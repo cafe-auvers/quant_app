@@ -273,6 +273,23 @@ def _discover_all_orders(card: TradeCardState, *, broker: Broker) -> BrokerOrder
     return broker.discover_orders(environment=card.environment, account_no=card.account_no)
 
 
+def _exchange_from_snapshot(snapshot: BrokerOrderStatusSnapshot) -> str:
+    """Best-effort KIS exchange-code recovery from a discovered snapshot's
+    raw response row -- see :func:`_cancel_discovered_order`. Returns ""
+    (never a guessed default) when it cannot be found, so the caller can
+    fail closed instead of silently targeting the wrong exchange.
+    """
+    row = snapshot.raw_response or {}
+    if not isinstance(row, dict):
+        return ""
+    for key in ("ovrs_excg_cd", "OVRS_EXCG_CD", "excg_cd", "EXCG_CD", "exchange"):
+        for candidate in (key, key.lower(), key.upper()):
+            value = row.get(candidate)
+            if value:
+                return str(value).strip().upper()
+    return ""
+
+
 def _cancel_discovered_order(
     card: TradeCardState, snapshot: BrokerOrderStatusSnapshot, *, broker: Broker
 ) -> None:
@@ -298,15 +315,29 @@ def _cancel_discovered_order(
     (``_find_matching_broker_entry_snapshot`` filters on
     ``side == OrderSide.BUY``), which is never submitted as reserved-MOO.
 
-    Exchange is not part of a discovered snapshot (KIS's cancel endpoint
-    needs one regardless of the order's actual listing exchange to route
-    the request); defaults to "NASD" like every other broker-boundary
-    fallback in this module.
+    Exchange is not a structured field on a discovered snapshot, but KIS's
+    cancel endpoint requires one (``OVRS_EXCG_CD``) to route the request.
+    Review finding: a hardcoded "NASD" default here would silently
+    misroute (or simply fail) a cancel for a genuinely NYSE/AMEX order --
+    the broader discovery code explicitly queries multiple exchanges, so
+    this is not merely theoretical. Recovered from the snapshot's own raw
+    KIS response row (``snapshot.raw_response``) via
+    :func:`_exchange_from_snapshot` instead; if it cannot be determined,
+    this refuses to guess and no-ops, matching this module's fail-closed
+    pattern everywhere else automatic cancellation is involved.
     """
     broker_order_id = str(snapshot.broker_order_id or "").strip()
     if not broker_order_id:
         logger.warning(
             "Cannot cancel discovered order for %s: snapshot has no broker_order_id", card.symbol
+        )
+        return
+    exchange = _exchange_from_snapshot(snapshot)
+    if not exchange:
+        logger.warning(
+            "Cannot cancel discovered order for %s: exchange could not be determined from "
+            "the discovered snapshot (broker_order_id=%s) -- refusing to guess",
+            card.symbol, broker_order_id,
         )
         return
     remaining = snapshot.remaining_quantity or max(
@@ -328,7 +359,7 @@ def _cancel_discovered_order(
             broker_order_id=broker_order_id,
             quantity=remaining,
             side=snapshot.side.value,
-            exchange="NASD",
+            exchange=exchange,
         )
     except Exception:
         logger.exception(

@@ -45,11 +45,14 @@ def _order(*, status, filled=0, avg_fill_price=0.0, reservation_id=""):
     return order
 
 
-def _snapshot(*, status, filled=0, avg_fill_price=0.0, symbol="AAPL", account_no="1", side=OrderSide.BUY):
+def _snapshot(
+    *, status, filled=0, avg_fill_price=0.0, symbol="AAPL", account_no="1", side=OrderSide.BUY,
+    quantity_requested=10, limit_price=0.0, broker_order_id="",
+):
     return BrokerOrderStatusSnapshot(
         environment="PROD", account_no=account_no, symbol=symbol, side=side,
-        status=status, quantity_requested=10, filled_quantity=filled,
-        avg_fill_price=avg_fill_price,
+        status=status, quantity_requested=quantity_requested, filled_quantity=filled,
+        avg_fill_price=avg_fill_price, limit_price=limit_price, broker_order_id=broker_order_id,
     )
 
 
@@ -113,14 +116,28 @@ def test_buy_today_with_no_order_returns_to_buylist_and_clears_runtime_values(tm
     assert cancelled == []  # nothing to cancel -- no order exists
 
 
-def test_buy_today_with_a_working_order_is_left_for_the_entry_pending_branch(tmp_path):
+def test_buy_today_with_a_working_order_moves_to_entry_pending_instead_of_staying_stranded(
+    tmp_path,
+):
+    """Review finding P0: "a local order with stale BUY_TODAY card state
+    remains uncorrected" -- a real local order already exists (e.g. a
+    crash landed between the broker confirming submission and the card's
+    board_status being updated), so leaving board_status at BUY_TODAY kept
+    it outside continuous entry-order tracking entirely (no fill ever got
+    a stop attached). It must move to ENTRY_PENDING so a later
+    ENTRY_PENDING pass (EOD's own two-phase cancel, or the normal
+    heartbeat) actually resolves this exact order instead of leaving it
+    stranded -- this single run_eod_cleanup pass only makes the
+    transition; run_eod_cleanup's own per-card if/elif dispatch means the
+    ENTRY_PENDING branch itself only runs on a subsequent pass."""
     order = _order(status=OrderStatus.ACCEPTED)
     service, cancelled, _ = _service(tmp_path, find_order=lambda card: order)
     card = _card(board_status=BoardStatus.BUY_TODAY)
 
     changed = service.run_eod_cleanup([card])
-    assert changed == []
-    assert card.board_status == BoardStatus.BUY_TODAY
+    assert changed == [card]
+    assert card.board_status == BoardStatus.ENTRY_PENDING
+    assert card.entry_runtime_status == EntryRuntimeStatus.ORDER_PENDING
 
 
 # --- Entry Pending with zero fills (section 517-521) ------------------------
@@ -612,6 +629,51 @@ def test_startup_order_reconciliation_flags_a_partially_filled_working_discovere
     assert "UNRECONCILED_BROKER_ORDER" in card.warnings
 
 
+def test_startup_order_reconciliation_prefers_current_holding_over_an_open_orders_own_fill_count(
+    tmp_path,
+):
+    """Review finding P0: "the authoritative holding fix does not cover
+    open partial orders" -- the P0-3 fix only fetched current holdings for
+    *terminal* matches; a still-open PARTIALLY_FILLED order's own
+    filled_quantity (e.g. 30/100) can undercount what the account actually
+    holds right now (accumulated from more than this one order, or simply
+    stale relative to a fill that landed since this snapshot was queried).
+    Current holdings (50) must win over the order snapshot's own count
+    (30), the same rule already applied to terminal matches."""
+    from src.services.eod_trading_service import (
+        EodActionCallbacks,
+        reconcile_unresolved_orders_at_startup,
+    )
+
+    complete = BrokerOrderDiscoveryResult(
+        open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
+        snapshots=[_snapshot(status=OrderStatus.PARTIALLY_FILLED, filled=30, avg_fill_price=101.0)],
+    )
+    callbacks = EodActionCallbacks(
+        find_open_entry_order=lambda card: None,
+        reconcile_order=lambda o: o,
+        cancel_order=lambda cid: None,
+        discover_all_orders=lambda card: complete,
+        get_current_holding=lambda card: BrokerHolding(
+            symbol="AAPL", quantity=50, average_price=102.0
+        ),
+    )
+    card = _card(board_status=BoardStatus.ENTRY_PENDING, target_position_quantity=100)
+    card.entry_orb_low = 95.0
+
+    changed = reconcile_unresolved_orders_at_startup(
+        [card], position_manager=PositionManager(), callbacks=callbacks
+    )
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.OPEN_POSITION
+    # Broker-truth current holding wins, not the order snapshot's own
+    # (undercounted) fill quantity.
+    assert card.broker_quantity == 50
+    assert card.orderable_quantity == 50
+    assert card.average_entry_price == 102.0
+
+
 def test_startup_order_reconciliation_never_resurrects_a_stale_historical_fill(tmp_path):
     """Review finding P0: "broker-order matching is too broad and can
     match old orders" -- KIS order-history discovery defaults to ~14 days,
@@ -691,7 +753,12 @@ def test_startup_order_reconciliation_attempts_a_direct_cancel_of_a_fully_untrac
         reconcile_unresolved_orders_at_startup,
     )
 
-    snapshot = _snapshot(status=OrderStatus.WORKING, filled=0)
+    # Ownership gate (review finding P0: "automatic cancellation is unsafe
+    # while order identity remains weak") requires the snapshot's own
+    # requested quantity/limit price to match this card's own plan --
+    # matching them here is exactly what makes this cancel attempt safe to
+    # fire automatically, unlike the ownership-gate test below.
+    snapshot = _snapshot(status=OrderStatus.WORKING, filled=0, quantity_requested=10, limit_price=100.0)
     complete = BrokerOrderDiscoveryResult(
         open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
         snapshots=[snapshot],
@@ -704,7 +771,8 @@ def test_startup_order_reconciliation_attempts_a_direct_cancel_of_a_fully_untrac
         discover_all_orders=lambda card: complete,
         cancel_discovered_order=lambda card, snap: cancel_attempts.append((card, snap)),
     )
-    card = _card(board_status=BoardStatus.ENTRY_PENDING)
+    card = _card(board_status=BoardStatus.ENTRY_PENDING, planned_quantity=10)
+    card.entry_trigger = 100.0
 
     changed = reconcile_unresolved_orders_at_startup(
         [card], position_manager=PositionManager(), callbacks=callbacks
@@ -712,6 +780,52 @@ def test_startup_order_reconciliation_attempts_a_direct_cancel_of_a_fully_untrac
 
     assert changed == [card]
     assert cancel_attempts == [(card, snapshot)]
+
+
+def test_startup_order_reconciliation_does_not_auto_cancel_an_order_that_does_not_match_the_cards_own_plan(
+    tmp_path,
+):
+    """Review finding P0: "automatic cancellation is unsafe while order
+    identity remains weak" -- matching is still only account/symbol/side,
+    loose enough to also match an order the user placed manually, directly
+    at the broker, for the same symbol (e.g. AAPL is in Buy Today, the
+    engine never submitted anything, and the user separately buys AAPL in
+    KIS). The card is still recovered/flagged for manual review (that part
+    is unchanged and safe either way), but the destructive direct-cancel
+    callback must never fire against an order whose quantity/price don't
+    plausibly match what this card's own plan would have submitted."""
+    from src.services.eod_trading_service import (
+        EodActionCallbacks,
+        reconcile_unresolved_orders_at_startup,
+    )
+
+    # A manual order for a completely different size/price than this
+    # card's own plan -- nothing ties it back to this application.
+    snapshot = _snapshot(status=OrderStatus.WORKING, filled=0, quantity_requested=500, limit_price=250.0)
+    complete = BrokerOrderDiscoveryResult(
+        open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
+        snapshots=[snapshot],
+    )
+    cancel_attempts = []
+    callbacks = EodActionCallbacks(
+        find_open_entry_order=lambda card: None,
+        reconcile_order=lambda o: o,
+        cancel_order=lambda cid: None,
+        discover_all_orders=lambda card: complete,
+        cancel_discovered_order=lambda card, snap: cancel_attempts.append((card, snap)),
+    )
+    card = _card(board_status=BoardStatus.ENTRY_PENDING, planned_quantity=10)
+    card.entry_trigger = 100.0
+
+    changed = reconcile_unresolved_orders_at_startup(
+        [card], position_manager=PositionManager(), callbacks=callbacks
+    )
+
+    assert changed == [card]
+    # Still flagged for a human to look at -- just never auto-cancelled.
+    assert card.entry_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE
+    assert "UNRECONCILED_BROKER_ORDER" in card.warnings
+    assert cancel_attempts == []
 
 
 def test_startup_order_reconciliation_attempts_a_direct_cancel_of_an_untracked_partial_fill_remainder(
@@ -726,7 +840,10 @@ def test_startup_order_reconciliation_attempts_a_direct_cancel_of_an_untracked_p
         reconcile_unresolved_orders_at_startup,
     )
 
-    snapshot = _snapshot(status=OrderStatus.PARTIALLY_FILLED, filled=30, avg_fill_price=101.0)
+    snapshot = _snapshot(
+        status=OrderStatus.PARTIALLY_FILLED, filled=30, avg_fill_price=101.0,
+        quantity_requested=100, limit_price=100.0,
+    )
     complete = BrokerOrderDiscoveryResult(
         open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
         snapshots=[snapshot],
@@ -744,6 +861,7 @@ def test_startup_order_reconciliation_attempts_a_direct_cancel_of_an_untracked_p
     )
     card = _card(board_status=BoardStatus.ENTRY_PENDING, target_position_quantity=100)
     card.entry_orb_low = 95.0
+    card.entry_trigger = 100.0  # ownership gate: matches the snapshot's own limit_price
 
     changed = reconcile_unresolved_orders_at_startup(
         [card], position_manager=PositionManager(), callbacks=callbacks
@@ -764,12 +882,19 @@ def test_startup_order_reconciliation_survives_a_failing_direct_cancel_attempt(t
         reconcile_unresolved_orders_at_startup,
     )
 
+    boom_calls = []
+
     def _boom(card, snap):
+        boom_calls.append((card, snap))
         raise RuntimeError("KIS is down")
 
     complete = BrokerOrderDiscoveryResult(
         open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
-        snapshots=[_snapshot(status=OrderStatus.WORKING, filled=0)],
+        # Ownership gate: matches this card's own plan below, so the
+        # cancel attempt is actually made (and fails) rather than being
+        # withheld -- this test is specifically about surviving that
+        # failure, not about the ownership gate itself.
+        snapshots=[_snapshot(status=OrderStatus.WORKING, filled=0, quantity_requested=10, limit_price=100.0)],
     )
     callbacks = EodActionCallbacks(
         find_open_entry_order=lambda card: None,
@@ -778,7 +903,8 @@ def test_startup_order_reconciliation_survives_a_failing_direct_cancel_attempt(t
         discover_all_orders=lambda card: complete,
         cancel_discovered_order=_boom,
     )
-    card = _card(board_status=BoardStatus.ENTRY_PENDING)
+    card = _card(board_status=BoardStatus.ENTRY_PENDING, planned_quantity=10)
+    card.entry_trigger = 100.0
 
     changed = reconcile_unresolved_orders_at_startup(
         [card], position_manager=PositionManager(), callbacks=callbacks
@@ -787,6 +913,7 @@ def test_startup_order_reconciliation_survives_a_failing_direct_cancel_attempt(t
     assert changed == [card]
     assert card.board_status == BoardStatus.ENTRY_PENDING
     assert "UNRECONCILED_BROKER_ORDER" in card.warnings
+    assert len(boom_calls) == 1  # the cancel attempt was actually made, and failed
 
 
 def test_startup_order_reconciliation_moves_to_buylist_only_when_genuinely_no_match(tmp_path):
@@ -842,6 +969,84 @@ def test_startup_order_reconciliation_terminal_zero_fill_match_moves_to_buylist(
 
     assert changed == [card]
     assert card.board_status == BoardStatus.BUYLIST
+
+
+def test_startup_order_reconciliation_clears_stale_recovery_warnings_on_terminal_zero_fill(
+    tmp_path,
+):
+    """Review finding: "state cleanup issue" -- when a discovered zero-fill
+    order later becomes terminal, the card returns to Buylist, but a prior
+    pass's UNRECONCILED_BROKER_ORDER/ORDER_RECOVERED_FROM_BROKER_DISCOVERY
+    warnings must not survive it -- runtime_worker treats
+    UNRECONCILED_BROKER_ORDER as a CRITICAL, always-visible notification,
+    so leaving it set after the order it refers to is actually gone would
+    be a permanent false alarm."""
+    from src.services.eod_trading_service import (
+        EodActionCallbacks,
+        reconcile_unresolved_orders_at_startup,
+    )
+
+    complete = BrokerOrderDiscoveryResult(
+        open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
+        snapshots=[_snapshot(status=OrderStatus.CANCELLED, filled=0)],
+    )
+    callbacks = EodActionCallbacks(
+        find_open_entry_order=lambda card: None,
+        reconcile_order=lambda o: o,
+        cancel_order=lambda cid: None,
+        discover_all_orders=lambda card: complete,
+    )
+    card = _card(board_status=BoardStatus.ENTRY_PENDING)
+    card.warnings = ["UNRECONCILED_BROKER_ORDER", "ORDER_RECOVERED_FROM_BROKER_DISCOVERY"]
+
+    changed = reconcile_unresolved_orders_at_startup(
+        [card], position_manager=PositionManager(), callbacks=callbacks
+    )
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.BUYLIST
+    assert card.warnings == []
+
+
+def test_startup_order_reconciliation_clears_unreconciled_warning_once_a_remainder_finishes_filling(
+    tmp_path,
+):
+    """Same finding, for the filled+terminal case: once a previously-open
+    partial-fill remainder resolves to a clean, fully-terminal fill, the
+    "still genuinely live and untracked" warning from the earlier pass no
+    longer applies and must be cleared -- ORDER_RECOVERED_FROM_BROKER_DISCOVERY
+    stays (still true/useful context that this position was recovered via
+    discovery, not normal tracking)."""
+    from src.services.eod_trading_service import (
+        EodActionCallbacks,
+        reconcile_unresolved_orders_at_startup,
+    )
+
+    complete = BrokerOrderDiscoveryResult(
+        open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
+        snapshots=[_snapshot(status=OrderStatus.FILLED, filled=100, avg_fill_price=101.0)],
+    )
+    callbacks = EodActionCallbacks(
+        find_open_entry_order=lambda card: None,
+        reconcile_order=lambda o: o,
+        cancel_order=lambda cid: None,
+        discover_all_orders=lambda card: complete,
+        get_current_holding=lambda card: BrokerHolding(
+            symbol="AAPL", quantity=100, average_price=101.0
+        ),
+    )
+    card = _card(board_status=BoardStatus.ENTRY_PENDING)
+    card.entry_orb_low = 95.0
+    card.warnings = ["UNRECONCILED_BROKER_ORDER"]
+
+    changed = reconcile_unresolved_orders_at_startup(
+        [card], position_manager=PositionManager(), callbacks=callbacks
+    )
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.OPEN_POSITION
+    assert "UNRECONCILED_BROKER_ORDER" not in card.warnings
+    assert "ORDER_RECOVERED_FROM_BROKER_DISCOVERY" in card.warnings
 
 
 def test_buy_today_reset_does_not_orphan_a_matching_broker_order(tmp_path):
@@ -924,6 +1129,205 @@ def test_reconcile_buy_today_orders_leaves_a_genuinely_order_free_card_alone(tmp
 
     assert changed == []
     assert card.board_status == BoardStatus.BUY_TODAY
+
+
+def test_reconcile_buy_today_orders_moves_a_stale_card_with_an_existing_local_order_to_entry_pending(
+    tmp_path,
+):
+    """Review finding P0: "a local order with stale BUY_TODAY card state
+    remains uncorrected" -- a crash between the broker confirming
+    submission and this card's board_status being updated to ENTRY_PENDING
+    (the normal AttemptOutcome.SUBMITTED transition) previously left this
+    exact scenario uncorrected forever: find_open_entry_order finds a real
+    local order, but the card stays BUY_TODAY, outside continuous
+    entry-order tracking (no fill ever gets a stop attached). It must move
+    to ENTRY_PENDING/ORDER_PENDING -- the normal, non-emergency transition
+    -- not merely get flagged UNRECONCILED_BROKER_ORDER."""
+    from src.services.eod_trading_service import (
+        EodActionCallbacks,
+        reconcile_buy_today_orders,
+    )
+
+    order = _order(status=OrderStatus.ACCEPTED)
+    order.attempt_group_id = "grp-123"
+    order.attempt_number = 2
+    callbacks = EodActionCallbacks(
+        find_open_entry_order=lambda card: order,
+        reconcile_order=lambda o: o,
+        cancel_order=lambda cid: None,
+    )
+    card = _card(board_status=BoardStatus.BUY_TODAY)
+
+    changed = reconcile_buy_today_orders([card], callbacks=callbacks)
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.ENTRY_PENDING
+    assert card.entry_runtime_status == EntryRuntimeStatus.ORDER_PENDING
+    # A real local order tracks this -- not "unreconciled."
+    assert "UNRECONCILED_BROKER_ORDER" not in card.warnings
+    assert card.entry_attempt_group_id == "grp-123"
+    assert card.entry_attempt_count == 2
+
+
+# --- Review finding P0: an untracked remainder must be retried until -------
+# --- the broker actually resolves it, not left after one attempt -----------
+
+
+def test_reconcile_untracked_position_remainders_retries_the_cancel_while_still_open(tmp_path):
+    """Review finding P0: "a partially filled discovered order is not
+    retried on the next reconciliation pass" -- reconcile_unresolved_orders_at_startup
+    only ever revisits ENTRY_PENDING cards, so an OPEN_POSITION card left
+    with a live, untracked remainder previously fell out of every sweep
+    for good after one cancel attempt. This sweep must keep retrying it."""
+    from src.services.eod_trading_service import (
+        EodActionCallbacks,
+        reconcile_untracked_position_remainders,
+    )
+
+    snapshot = _snapshot(
+        status=OrderStatus.WORKING, filled=0, quantity_requested=70, limit_price=100.0,
+        broker_order_id="B-70",
+    )
+    complete = BrokerOrderDiscoveryResult(
+        open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
+        snapshots=[snapshot],
+    )
+    cancel_attempts = []
+    callbacks = EodActionCallbacks(
+        find_open_entry_order=lambda card: None,
+        reconcile_order=lambda o: o,
+        cancel_order=lambda cid: None,
+        discover_all_orders=lambda card: complete,
+        cancel_discovered_order=lambda card, snap: cancel_attempts.append(snap.broker_order_id),
+    )
+    card = _card(
+        board_status=BoardStatus.OPEN_POSITION, broker_quantity=30, planned_quantity=70,
+    )
+    card.entry_trigger = 100.0
+    card.warnings = ["UNRECONCILED_BROKER_ORDER"]
+
+    changed = reconcile_untracked_position_remainders([card], callbacks=callbacks)
+
+    # Still open -- retried, but nothing about the card's own state
+    # resolves yet (the warning stays; there is nothing new to persist).
+    assert changed == []
+    assert cancel_attempts == ["B-70"]
+    assert "UNRECONCILED_BROKER_ORDER" in card.warnings
+    assert card.board_status == BoardStatus.OPEN_POSITION
+
+
+def test_reconcile_untracked_position_remainders_clears_the_warning_once_confirmed_terminal(
+    tmp_path,
+):
+    """Once discovery no longer finds an open match (cancelled, or the
+    remainder finished filling), the card must stop being reprocessed --
+    current holdings, when available, are applied as the final
+    authoritative quantity and the warning is cleared."""
+    from src.services.eod_trading_service import (
+        EodActionCallbacks,
+        reconcile_untracked_position_remainders,
+    )
+
+    complete = BrokerOrderDiscoveryResult(
+        open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
+        snapshots=[_snapshot(status=OrderStatus.FILLED, filled=100, avg_fill_price=101.0)],
+    )
+    callbacks = EodActionCallbacks(
+        find_open_entry_order=lambda card: None,
+        reconcile_order=lambda o: o,
+        cancel_order=lambda cid: None,
+        discover_all_orders=lambda card: complete,
+        get_current_holding=lambda card: BrokerHolding(
+            symbol="AAPL", quantity=100, average_price=101.0
+        ),
+    )
+    card = _card(board_status=BoardStatus.OPEN_POSITION, broker_quantity=30)
+    card.warnings = ["UNRECONCILED_BROKER_ORDER"]
+
+    changed = reconcile_untracked_position_remainders([card], callbacks=callbacks)
+
+    assert changed == [card]
+    assert "UNRECONCILED_BROKER_ORDER" not in card.warnings
+    assert card.broker_quantity == 100  # the now-complete fill, broker-confirmed
+    assert card.orderable_quantity == 100
+    assert card.average_entry_price == 101.0
+
+
+def test_reconcile_untracked_position_remainders_clears_the_warning_when_nothing_matches_any_more(
+    tmp_path,
+):
+    """No match at all (order aged out of visibility, or simply gone) --
+    same conclusion as a confirmed-terminal match: nothing further to
+    retry, so stop reprocessing this card."""
+    from src.services.eod_trading_service import (
+        EodActionCallbacks,
+        reconcile_untracked_position_remainders,
+    )
+
+    empty = BrokerOrderDiscoveryResult(
+        open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
+    )
+    callbacks = EodActionCallbacks(
+        find_open_entry_order=lambda card: None,
+        reconcile_order=lambda o: o,
+        cancel_order=lambda cid: None,
+        discover_all_orders=lambda card: empty,
+    )
+    card = _card(board_status=BoardStatus.OPEN_POSITION, broker_quantity=30)
+    card.warnings = ["UNRECONCILED_BROKER_ORDER"]
+
+    changed = reconcile_untracked_position_remainders([card], callbacks=callbacks)
+
+    assert changed == [card]
+    assert "UNRECONCILED_BROKER_ORDER" not in card.warnings
+    assert card.broker_quantity == 30  # no holding confirmation -- left alone
+
+
+def test_reconcile_untracked_position_remainders_retries_later_when_discovery_is_incomplete(
+    tmp_path,
+):
+    from src.services.eod_trading_service import (
+        EodActionCallbacks,
+        reconcile_untracked_position_remainders,
+    )
+
+    incomplete = BrokerOrderDiscoveryResult(open_orders_complete=False)
+    callbacks = EodActionCallbacks(
+        find_open_entry_order=lambda card: None,
+        reconcile_order=lambda o: o,
+        cancel_order=lambda cid: None,
+        discover_all_orders=lambda card: incomplete,
+    )
+    card = _card(board_status=BoardStatus.OPEN_POSITION, broker_quantity=30)
+    card.warnings = ["UNRECONCILED_BROKER_ORDER"]
+
+    changed = reconcile_untracked_position_remainders([card], callbacks=callbacks)
+
+    assert changed == []
+    assert "UNRECONCILED_BROKER_ORDER" in card.warnings  # not guessed away either
+
+
+def test_reconcile_untracked_position_remainders_ignores_cards_without_the_warning(tmp_path):
+    from src.services.eod_trading_service import (
+        EodActionCallbacks,
+        reconcile_untracked_position_remainders,
+    )
+
+    calls = []
+    callbacks = EodActionCallbacks(
+        find_open_entry_order=lambda card: None,
+        reconcile_order=lambda o: o,
+        cancel_order=lambda cid: None,
+        discover_all_orders=lambda card: calls.append(card) or BrokerOrderDiscoveryResult(
+            open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
+        ),
+    )
+    card = _card(board_status=BoardStatus.OPEN_POSITION, broker_quantity=30)
+
+    changed = reconcile_untracked_position_remainders([card], callbacks=callbacks)
+
+    assert changed == []
+    assert calls == []  # never even queried -- nothing flagged this card
 
 
 def test_entry_pending_eod_recovers_a_filled_order_missing_from_ledger(tmp_path):

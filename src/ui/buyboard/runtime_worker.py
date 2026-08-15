@@ -43,6 +43,7 @@ from src.services.eod_trading_service import (
     EodActionCallbacks,
     reconcile_buy_today_orders,
     reconcile_unresolved_orders_at_startup,
+    reconcile_untracked_position_remainders,
     run_startup_reconciliation,
 )
 from src.services.execution_authority import ExecutionAuthority, LeaseExpiredError, LeaseHandle
@@ -391,14 +392,45 @@ class BuyboardRuntimeWorker(QThread):
                 # account's own reconciliation failure regardless of
                 # whose card actually caused it.
                 account_cards = [card for card in cards if card.account_no == account_no]
-                account_changed = run_startup_reconciliation(
-                    account_cards,
-                    environment=self._environment,
-                    account_no=account_no,
-                    position_snapshot=position_snapshot,
-                    position_manager=self.runtime.position_manager,
-                    order_callbacks=order_callbacks,
+                # Review finding P0: "BUY_TODAY recovery still has startup
+                # and two-pass gaps" -- this must run *before*
+                # run_startup_reconciliation's own ENTRY_PENDING sweep
+                # (not only in the periodic path below) so a BUY_TODAY
+                # card transitioned to ENTRY_PENDING here is fully
+                # processed -- fill applied or remainder cancel attempted
+                # -- in this exact same startup pass, rather than waiting
+                # up to FULL_RECONCILIATION_SECONDS for the next periodic
+                # cycle to notice it.
+                buy_today_changed = reconcile_buy_today_orders(
+                    account_cards, callbacks=order_callbacks
                 )
+                account_changed = list(
+                    run_startup_reconciliation(
+                        account_cards,
+                        environment=self._environment,
+                        account_no=account_no,
+                        position_snapshot=position_snapshot,
+                        position_manager=self.runtime.position_manager,
+                        order_callbacks=order_callbacks,
+                    )
+                )
+                seen_account_ids = {id(card) for card in account_changed}
+                for card in buy_today_changed:
+                    if id(card) not in seen_account_ids:
+                        seen_account_ids.add(id(card))
+                        account_changed.append(card)
+                # Review finding P0: "a partially filled discovered order
+                # is not retried on the next reconciliation pass" -- catch
+                # up any OPEN_POSITION card left with a live, untracked
+                # remainder from a prior run (including one this exact
+                # pass just created above) immediately at startup too.
+                remainder_changed = reconcile_untracked_position_remainders(
+                    account_cards, callbacks=order_callbacks
+                )
+                for card in remainder_changed:
+                    if id(card) not in seen_account_ids:
+                        seen_account_ids.add(id(card))
+                        account_changed.append(card)
             except Exception as exc:
                 # Review finding P0: this account did NOT get reconciled --
                 # startup_reconciliation_complete below must reflect that,
@@ -633,12 +665,6 @@ class BuyboardRuntimeWorker(QThread):
                 # undiscovered until the next application restart. This
                 # does not yet cover reserved/cancelled/rejected order
                 # history or capital-reservation repair (still open).
-                order_changed = reconcile_unresolved_orders_at_startup(
-                    account_cards,
-                    position_manager=self.runtime.position_manager,
-                    callbacks=order_callbacks,
-                )
-                changed.extend(order_changed)
                 # Review finding P0: "BUY_TODAY broker-order recovery is
                 # effectively EOD-only" -- reconcile_unresolved_orders_at_startup
                 # only ever looks at ENTRY_PENDING cards, so a BUY_TODAY
@@ -646,11 +672,35 @@ class BuyboardRuntimeWorker(QThread):
                 # eligible for _evaluate_buy_today (and a genuine duplicate
                 # submission) for the rest of the trading day, since
                 # EodTradingService's equivalent check only runs once the
-                # EOD window is reached.
+                # EOD window is reached. Review finding P0: "BUY_TODAY
+                # recovery still has startup and two-pass gaps" -- this
+                # must run *before* the ENTRY_PENDING sweep below (not
+                # after), so a card transitioned to ENTRY_PENDING here is
+                # fully processed -- fill applied or remainder cancel
+                # attempted -- in this exact same pass, instead of waiting
+                # a further FULL_RECONCILIATION_SECONDS for the next cycle
+                # to notice the transition.
                 buy_today_changed = reconcile_buy_today_orders(
                     account_cards, callbacks=order_callbacks
                 )
                 changed.extend(buy_today_changed)
+                order_changed = reconcile_unresolved_orders_at_startup(
+                    account_cards,
+                    position_manager=self.runtime.position_manager,
+                    callbacks=order_callbacks,
+                )
+                changed.extend(order_changed)
+                # Review finding P0: "a partially filled discovered order
+                # is not retried on the next reconciliation pass" -- an
+                # OPEN_POSITION card left with a live, untracked remainder
+                # (including one just created by either sweep above) falls
+                # out of both of them for good otherwise; keep chasing it
+                # here every reconciliation cycle until the broker
+                # actually resolves it.
+                remainder_changed = reconcile_untracked_position_remainders(
+                    account_cards, callbacks=order_callbacks
+                )
+                changed.extend(remainder_changed)
                 self._account_reconciled_at[account_no] = now
                 # Review finding P0: "unknown accounts can be incorrectly
                 # considered healthy" -- a full position+order
