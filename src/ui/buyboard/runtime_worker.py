@@ -39,7 +39,11 @@ from src.core.execution_config import is_buyboard_engine_enabled
 from src.core.trade_card_state import BoardStatus, TradeCardState
 from src.services import buyboard_runtime as buyboard_runtime_module
 from src.services import trade_card_repository as repo
-from src.services.eod_trading_service import EodActionCallbacks, run_startup_reconciliation
+from src.services.eod_trading_service import (
+    EodActionCallbacks,
+    reconcile_unresolved_orders_at_startup,
+    run_startup_reconciliation,
+)
 from src.services.execution_authority import ExecutionAuthority, LeaseExpiredError, LeaseHandle
 from src.services.position_manager import extract_overseas_holdings
 from src.services.trade_card_orb_bridge import TradeCardOrbEvaluator
@@ -97,6 +101,7 @@ class BuyboardRuntimeWorker(QThread):
         capital_reservation_engine: Optional[Engine] = None,
         execution_queue_item_lookup: Optional[Callable[[str, str], object]] = None,
         heartbeat_seconds: Optional[float] = None,
+        account_discovery: Optional[Callable[[], List[str]]] = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -110,6 +115,15 @@ class BuyboardRuntimeWorker(QThread):
         self._execution_lease = execution_lease
         self._lease_engine = lease_engine
         self._capital_reservation_engine = capital_reservation_engine
+        # Review finding: "accounts without existing cards remain
+        # undiscoverable" -- the unscoped production worker derived query
+        # targets purely from already-loaded cards, so a manually-purchased
+        # position on a configured KIS account with zero TradeCards was
+        # never found. Injected (not a hard import inside
+        # _distinct_account_numbers) so tests stay hermetic against
+        # whatever KIS accounts happen to be configured in the developer's
+        # own .env -- defaults to the real KIS-config-backed discovery.
+        self._account_discovery = account_discovery or self._default_account_discovery
         # How this worker finds the legacy execution queue's already-computed
         # ORB candidate for a symbol (review finding P0-2) -- typically
         # ``lambda symbol, env: main_window.execution_queue_manager.get_item(symbol, env)``.
@@ -144,7 +158,23 @@ class BuyboardRuntimeWorker(QThread):
         # the UI thread (simple attribute reads/writes are GIL-atomic in
         # CPython; this is an advisory health signal, not a lock).
         self.last_heartbeat_at: Optional[datetime] = None
+        # Review finding P0: last_heartbeat_at only updates once a full
+        # cycle *completes* -- a cycle performs several sequential KIS
+        # calls (account snapshot, quote polling, order/position
+        # reconciliation) and a single slow one can legitimately take
+        # longer than a tight health threshold even though the worker is
+        # actively working, not stuck. Set at the *start* of every cycle
+        # attempt (before any network call), so a health check can tell
+        # "demonstrably still iterating, just slow this cycle" apart from
+        # "the loop has not run in a long time" (crashed/hung/stopped).
+        self.last_cycle_started_at: Optional[datetime] = None
         self.startup_reconciliation_complete: bool = False
+        # Populated by _run_startup_reconciliation: account_no -> error
+        # message for any account whose broker truth could not be fetched
+        # at startup. Non-empty implies startup_reconciliation_complete is
+        # False -- no automatic order execution should begin for an
+        # unreconciled account.
+        self.startup_reconciliation_errors: Dict[str, str] = {}
         # card_key set already alerted via self.alert for a stalled exit
         # cancel -- see _emit_stalled_liquidation_alerts.
         self._alerted_stalled_card_keys: set = set()
@@ -185,6 +215,7 @@ class BuyboardRuntimeWorker(QThread):
             if not self._lease_still_current():
                 logger.info("BuyboardRuntimeWorker stopping: main-device lease no longer current")
                 break
+            self.last_cycle_started_at = datetime.now(timezone.utc)
             try:
                 self._run_one_cycle()
                 self.last_heartbeat_at = datetime.now(timezone.utc)
@@ -216,11 +247,13 @@ class BuyboardRuntimeWorker(QThread):
 
     def _distinct_account_numbers(self, cards: List[TradeCardState]) -> List[str]:
         """Real account numbers this worker must query broker state for:
-        every account already referenced by a loaded card, plus this
-        worker's own configured ``self._account_no`` when it is a specific
-        (non-blank) account -- guaranteeing a scoped worker always queries
-        its own account even before any card exists for it (needed to ever
-        discover a first manual position with zero pre-existing cards).
+        every account already referenced by a loaded card, this worker's
+        own configured ``self._account_no`` when it is a specific
+        (non-blank) account, and -- for the unscoped production worker --
+        every account configured in KIS at all, so a manually-purchased
+        position on an account with zero pre-existing cards is still
+        discoverable (review finding: "accounts without existing cards
+        remain undiscoverable").
 
         Previously, startup reconciliation called
         ``broker.get_positions(account_no="")`` once (the unscoped
@@ -243,7 +276,42 @@ class BuyboardRuntimeWorker(QThread):
         for card in cards:
             if card.account_no and card.account_no not in seen:
                 seen.append(card.account_no)
+        if not self._account_no:
+            # Only meaningful for the unscoped production worker -- a
+            # specifically-scoped worker already covers its own account via
+            # the seed above and has no business reaching into every other
+            # configured account.
+            for account_no in self._account_discovery():
+                if account_no and account_no not in seen:
+                    seen.append(account_no)
         return seen
+
+    @staticmethod
+    def _default_account_discovery() -> List[str]:
+        try:
+            from src.api.kis_account_snapshot_dual import discover_account_profiles
+
+            return [
+                str(profile.get("account_no") or "")
+                for profile in discover_account_profiles()
+                if profile.get("account_no")
+            ]
+        except Exception:
+            logger.exception("Failed to discover configured KIS account profiles")
+            return []
+
+    @staticmethod
+    def _build_order_callbacks(broker) -> EodActionCallbacks:
+        """Shared by startup and periodic reconciliation -- both need the
+        exact same broker-boundary order callbacks."""
+        return EodActionCallbacks(
+            find_open_entry_order=buyboard_runtime_module._find_open_entry_order,
+            reconcile_order=lambda order: buyboard_runtime_module._reconcile_order(order, broker=broker),
+            cancel_order=lambda client_order_id: buyboard_runtime_module._cancel_order(
+                client_order_id, broker=broker
+            ),
+            discover_all_orders=lambda card: buyboard_runtime_module._discover_all_orders(card, broker=broker),
+        )
 
     def _run_startup_reconciliation(self) -> None:
         """Restores retry bookkeeping (review finding P0-4's predecessor,
@@ -266,36 +334,36 @@ class BuyboardRuntimeWorker(QThread):
             )
 
         broker = self.runtime.broker
-        order_callbacks = EodActionCallbacks(
-            find_open_entry_order=buyboard_runtime_module._find_open_entry_order,
-            reconcile_order=lambda order: buyboard_runtime_module._reconcile_order(order, broker=broker),
-            cancel_order=lambda client_order_id: buyboard_runtime_module._cancel_order(
-                client_order_id, broker=broker
-            ),
-            discover_all_orders=lambda card: buyboard_runtime_module._discover_all_orders(card, broker=broker),
-        )
+        order_callbacks = self._build_order_callbacks(broker)
 
         now = datetime.now(timezone.utc)
         changed_ids: set = set()
         changed: List[TradeCardState] = []
-        for account_no in self._distinct_account_numbers(cards):
+        expected_accounts = self._distinct_account_numbers(cards)
+        self.startup_reconciliation_errors = {}
+        for account_no in expected_accounts:
             try:
                 position_snapshot = broker.get_positions(
                     environment=self._environment, account_no=account_no
                 )
-            except Exception:
-                logger.exception(
-                    "Startup reconciliation: get_positions failed for account %s", account_no
+                account_changed = run_startup_reconciliation(
+                    cards,
+                    environment=self._environment,
+                    account_no=account_no,
+                    position_snapshot=position_snapshot,
+                    position_manager=self.runtime.position_manager,
+                    order_callbacks=order_callbacks,
                 )
+            except Exception as exc:
+                # Review finding P0: this account did NOT get reconciled --
+                # startup_reconciliation_complete below must reflect that,
+                # not report blanket success while one account's broker
+                # truth was never actually checked.
+                logger.exception(
+                    "Startup reconciliation failed for account %s", account_no
+                )
+                self.startup_reconciliation_errors[account_no] = str(exc)
                 continue
-            account_changed = run_startup_reconciliation(
-                cards,
-                environment=self._environment,
-                account_no=account_no,
-                position_snapshot=position_snapshot,
-                position_manager=self.runtime.position_manager,
-                order_callbacks=order_callbacks,
-            )
             for card in account_changed:
                 if id(card) not in changed_ids:
                     changed_ids.add(id(card))
@@ -307,7 +375,13 @@ class BuyboardRuntimeWorker(QThread):
         self._persist_changed(changed)
         if changed:
             self.board_changed.emit()
-        self.startup_reconciliation_complete = True
+        # Review finding P0: "startup reconciliation reports success after
+        # account failures" -- this previously was set unconditionally,
+        # so one account's get_positions failure still left the health
+        # check believing every account (including the failed one) had
+        # been validated against broker truth, silently suppressing legacy
+        # protection for a symbol nothing had actually reconciled.
+        self.startup_reconciliation_complete = not self.startup_reconciliation_errors
 
     # -- per-cycle heartbeat --------------------------------------------------
 
@@ -395,7 +469,15 @@ class BuyboardRuntimeWorker(QThread):
             if card.account_no:
                 by_account.setdefault(card.account_no, []).append(card)
 
-        for account_no, account_cards in by_account.items():
+        order_callbacks = self._build_order_callbacks(self.runtime.broker)
+
+        # Review finding: "accounts without existing cards remain
+        # undiscoverable" -- _distinct_account_numbers (not a plain
+        # card-account grouping) also covers every configured-but-cardless
+        # account, with an empty account_cards list; reconcile_broker_positions
+        # correctly treats every holding found there as newly discovered.
+        for account_no in self._distinct_account_numbers(cards):
+            account_cards = by_account.get(account_no, [])
             has_active_entry_candidate = any(
                 card.board_status in (BoardStatus.BUY_TODAY, BoardStatus.ENTRY_PENDING)
                 for card in account_cards
@@ -442,6 +524,22 @@ class BuyboardRuntimeWorker(QThread):
                     account_no=account_no,
                 )
                 changed.extend(account_changed)
+                # Review finding P1: "full reconciliation still reconciles
+                # positions, not the full account" -- this reruns the same
+                # order-ledger discovery startup already does (an
+                # ENTRY_PENDING card whose order lookup comes back empty
+                # gets a full broker-order discovery query rather than
+                # being assumed cancelled), on the same 60s cadence, so an
+                # order-state drift that occurred mid-session is not left
+                # undiscovered until the next application restart. This
+                # does not yet cover reserved/cancelled/rejected order
+                # history or capital-reservation repair (still open).
+                order_changed = reconcile_unresolved_orders_at_startup(
+                    account_cards,
+                    position_manager=self.runtime.position_manager,
+                    callbacks=order_callbacks,
+                )
+                changed.extend(order_changed)
                 self._account_reconciled_at[account_no] = now
 
         return changed

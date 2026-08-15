@@ -21,8 +21,8 @@ from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import (QApplication, QDialog, QHBoxLayout, QLabel,
                              QLineEdit, QMainWindow, QMessageBox, QProgressBar,
-                             QPushButton, QSizePolicy, QTabWidget, QTextEdit,
-                             QVBoxLayout, QWidget)
+                             QPushButton, QSizePolicy, QStyle, QSystemTrayIcon,
+                             QTabWidget, QTextEdit, QVBoxLayout, QWidget)
 
 try:
     from PyQt5.QtWebEngineWidgets import QWebEngineView
@@ -327,6 +327,16 @@ class MainWindow(
     def __init__(self):
         """Initialize the main window."""
         super().__init__()
+        # Pure-Python marker (never touches the C++ side) that __init__
+        # actually ran -- tests widely use MainWindow.__new__(MainWindow)
+        # to build a lightweight double whose Qt base was never
+        # constructed; calling most QWidget methods on one of those is
+        # undefined behavior in PyQt5, up to and including a
+        # process-crashing access violation (not a catchable Python
+        # exception) rather than a clean AttributeError/RuntimeError. Any
+        # code that touches real Qt widget APIs on `self` outside of a
+        # normal event-driven callback should check this first.
+        self._qt_base_initialized = True
         # ``append_log`` is also passed to the plain Python thread used for
         # background state saves.  Always cross back through a Qt signal before
         # touching the QTextEdit so that every widget mutation runs on the GUI
@@ -1482,12 +1492,70 @@ class MainWindow(
             "lease_engine": self.__dict__.get("pc_db_engine"),
         }
 
-    # Maximum age of BuyboardRuntimeWorker.last_heartbeat_at before the new
-    # engine is no longer trusted to be actively protecting positions.
-    # Generous relative to ENGINE_HEARTBEAT_SECONDS (default 1s) so a single
-    # slow cycle never flips this, while still catching a genuinely stalled
-    # or crashed worker quickly.
+    # Maximum age of BuyboardRuntimeWorker.last_cycle_started_at (the
+    # *attempt*-start signal, not completion) before the new engine is no
+    # longer trusted to be actively iterating at all. Review finding P0:
+    # a completion-only heartbeat flips "unhealthy" the moment one cycle's
+    # sequential KIS calls (account snapshot, quote polling, order/position
+    # reconciliation) run long, even though the worker is demonstrably
+    # still working -- deliberately generous (an account refresh cycle can
+    # legitimately involve several KIS calls with retry/backoff) so a single
+    # slow cycle never triggers legacy fail-open, while still catching a
+    # genuinely stalled/crashed loop within roughly a minute.
+    _BUYBOARD_ENGINE_CYCLE_STALL_MAX_AGE_SECONDS = 45.0
+    # Fallback threshold against last_heartbeat_at (cycle *completion*) --
+    # only consulted when last_cycle_started_at itself is unavailable
+    # (e.g. an older/minimal worker double), so this class still fails
+    # closed rather than trusting an untracked worker indefinitely.
     _BUYBOARD_ENGINE_HEARTBEAT_MAX_AGE_SECONDS = 15.0
+
+    def _ensure_critical_tray_icon(self) -> Optional[QSystemTrayIcon]:
+        """Lazily creates and shows a system tray icon the first time a
+        CRITICAL trading alert needs to reach the user outside the app's
+        own log pane (review: "a card warning is insufficient when the
+        user is asleep" / "the app is minimized"). Created on first use,
+        not at startup, so an installation that never enables the Buy
+        Board engine never gets a tray icon it has no use for. Reuses the
+        app's own window icon if one is ever set; otherwise falls back to
+        a standard critical-icon glyph so this needs zero new icon assets.
+        """
+        if not self.__dict__.get("_qt_base_initialized", False):
+            # A lightweight test/dummy window whose Qt base never ran --
+            # see the comment on _qt_base_initialized in __init__. Touching
+            # QSystemTrayIcon/windowIcon()/style() here is not just
+            # unsupported, it has been observed to crash the process
+            # outright (access violation), which a try/except cannot catch.
+            return None
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return None
+        tray = self.__dict__.get("_critical_tray_icon")
+        if tray is not None:
+            return tray
+        icon = self.windowIcon()
+        if icon.isNull():
+            icon = self.style().standardIcon(QStyle.SP_MessageBoxCritical)
+        tray = QSystemTrayIcon(icon, self)
+        tray.setToolTip("quant_app -- Buy Board critical alerts")
+        tray.show()
+        self._critical_tray_icon = tray
+        return tray
+
+    def _show_critical_notification(self, title: str, message: str) -> None:
+        """Routes a CRITICAL trading event to both the in-app log (the
+        prior, sole behavior) and a native OS notification, so it reaches
+        the user with the app minimized or unfocused too (review: "that
+        does not protect unattended trading when the user is asleep / the
+        app is minimized"). Never lets a notification-plumbing failure
+        interrupt trading logic -- logging still happens even if the tray
+        icon can't be created (headless environment, no tray support, ...).
+        """
+        self.append_log(message)
+        try:
+            tray = self._ensure_critical_tray_icon()
+            if tray is not None:
+                tray.showMessage(title, message, QSystemTrayIcon.Critical, 15000)
+        except Exception:
+            logger.exception("Failed to show critical tray notification")
 
     def _buyboard_engine_healthy(self) -> bool:
         """Review finding: "legacy execution suppression depends only on
@@ -1498,13 +1566,15 @@ class MainWindow(
 
         Requires everything the review's own ``ExecutionOwnerState`` sketch
         does: the worker exists, is running, has completed startup
-        reconciliation, and produced a heartbeat recently -- true broker
-        lease currency is already covered by
+        reconciliation for *every* discovered account (a partial failure
+        there no longer reports blanket success -- see
+        ``BuyboardRuntimeWorker.startup_reconciliation_errors``), and is
+        demonstrably still iterating -- true broker lease currency is
+        already covered by
         :meth:`_current_execution_lease_kwargs`/``ExecutionAuthority``,
         which the worker itself stops on
         (:meth:`~src.ui.buyboard.runtime_worker.BuyboardRuntimeWorker._lease_still_current`);
-        a lease loss shows up here indirectly as the worker's heartbeat
-        going stale once its loop exits.
+        a lease loss shows up here indirectly once its loop actually exits.
         """
         worker = self.__dict__.get("_buyboard_runtime_worker")
         if worker is None:
@@ -1517,12 +1587,20 @@ class MainWindow(
             return False
         if not getattr(worker, "startup_reconciliation_complete", False):
             return False
+        if getattr(worker, "startup_reconciliation_errors", None):
+            return False
+        now = dt.datetime.now(dt.timezone.utc)
+        cycle_started = getattr(worker, "last_cycle_started_at", None)
+        if cycle_started is not None:
+            started_age = (now - cycle_started).total_seconds()
+            if started_age <= self._BUYBOARD_ENGINE_CYCLE_STALL_MAX_AGE_SECONDS:
+                # Actively iterating -- even if the in-flight cycle itself
+                # is slow, this is "busy," not "dead."
+                return True
         last_heartbeat = getattr(worker, "last_heartbeat_at", None)
         if last_heartbeat is None:
             return False
-        age_seconds = (
-            dt.datetime.now(dt.timezone.utc) - last_heartbeat
-        ).total_seconds()
+        age_seconds = (now - last_heartbeat).total_seconds()
         return age_seconds <= self._BUYBOARD_ENGINE_HEARTBEAT_MAX_AGE_SECONDS
 
     def _sync_buyboard_runtime_worker(self) -> None:
@@ -1595,7 +1673,9 @@ class MainWindow(
             )
             new_worker.board_changed.connect(self.refresh_buyboard)
             new_worker.error_occurred.connect(self.append_log)
-            new_worker.alert.connect(self.append_log)
+            new_worker.alert.connect(
+                lambda message: self._show_critical_notification("Buy Board Alert", message)
+            )
             self._track_worker("_buyboard_runtime_worker", new_worker)
             self._buyboard_runtime_worker = new_worker
             new_worker.start()

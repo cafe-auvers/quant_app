@@ -649,7 +649,9 @@ class BuylistActionsMixin:
     ) -> None:
         if getattr(item, "_stop_reprice_pending", False):
             return
-        if self._buylist_auto_order_blocked(item) or self._legacy_auto_execution_blocked(env, item.symbol):
+        if self._buylist_auto_order_blocked(item) or self._legacy_auto_execution_blocked(
+            env, item.symbol, is_protective_exit=True
+        ):
             return
         try:
             stop_loss = float(getattr(item, "stop_loss", 0.0) or 0.0)

@@ -701,3 +701,110 @@ def test_stop_hit_auto_sell_stays_active_when_buyboard_engine_flag_on_but_unheal
     assert any(
         "Buy Board engine is not confirmed healthy" in message for message in logs
     )
+
+
+def test_auto_submit_execute_ready_stays_blocked_when_buyboard_engine_flag_on_but_unhealthy(
+    monkeypatch, tmp_path
+):
+    """Review finding P0: unlike protective exits, a *new automatic entry*
+    must stay blocked on the legacy side too while the Buy Board engine's
+    health is uncertain -- starting a fresh position off an engine whose
+    true state is unknown is never safe, even as a fail-safe."""
+    window = _build_queue_window(monkeypatch, tmp_path)
+    monkeypatch.setenv("BUYBOARD_ENGINE_ENABLED", "true")
+    window._buyboard_runtime_worker = None  # never started / already stopped
+    logs = []
+    submissions = []
+    item = SimpleNamespace(
+        symbol="AAPL",
+        environment="PROD",
+        monitoring_status="EXECUTE_READY",
+        breakout_method="execution_queue:1m",
+        orb_monitor_enabled=True,
+        _buy_order_pending=False,
+    )
+    window._buylist_prod_monitor_active = True
+    window.buylist_manager = SimpleNamespace(items=[item])
+    window.append_log = logs.append
+    window._submit_kis_buy_order = lambda *_args, **_kwargs: submissions.append(True)
+
+    MainWindow._auto_submit_execute_ready_queue_items(window, "PROD")
+
+    assert submissions == []  # entries stay frozen on both engines
+    assert any("CRITICAL" in message for message in logs)
+
+
+def test_buyboard_engine_healthy_true_for_a_recently_started_slow_cycle(tmp_path):
+    """Review finding P0: last_heartbeat_at only updates on *completion* --
+    a single cycle performing several sequential KIS calls can legitimately
+    run long while the worker is demonstrably still active. A recent
+    last_cycle_started_at must be enough, even with a stale last_heartbeat_at.
+    """
+    window = MainWindow.__new__(MainWindow)
+    now = dt.datetime.now(dt.timezone.utc)
+    window._buyboard_runtime_worker = SimpleNamespace(
+        isRunning=lambda: True,
+        startup_reconciliation_complete=True,
+        startup_reconciliation_errors={},
+        last_cycle_started_at=now - dt.timedelta(seconds=5),  # cycle in flight, still recent
+        last_heartbeat_at=now - dt.timedelta(seconds=40),  # last *completed* cycle is old
+    )
+
+    assert window._buyboard_engine_healthy() is True
+
+
+def test_buyboard_engine_healthy_false_when_cycle_start_itself_is_stale(tmp_path):
+    window = MainWindow.__new__(MainWindow)
+    now = dt.datetime.now(dt.timezone.utc)
+    window._buyboard_runtime_worker = SimpleNamespace(
+        isRunning=lambda: True,
+        startup_reconciliation_complete=True,
+        startup_reconciliation_errors={},
+        last_cycle_started_at=now - dt.timedelta(seconds=90),
+        last_heartbeat_at=now - dt.timedelta(seconds=90),
+    )
+
+    assert window._buyboard_engine_healthy() is False
+
+
+def test_buyboard_engine_healthy_false_with_startup_reconciliation_errors(tmp_path):
+    """Review finding P0: startup_reconciliation_complete alone is not
+    enough -- an account-level failure recorded in
+    startup_reconciliation_errors must also fail the health check."""
+    window = MainWindow.__new__(MainWindow)
+    now = dt.datetime.now(dt.timezone.utc)
+    window._buyboard_runtime_worker = SimpleNamespace(
+        isRunning=lambda: True,
+        startup_reconciliation_complete=False,
+        startup_reconciliation_errors={"2": "simulated KIS outage"},
+        last_cycle_started_at=now,
+        last_heartbeat_at=now,
+    )
+
+    assert window._buyboard_engine_healthy() is False
+
+
+# --- Critical notification (review: "a card warning is insufficient when --
+# --- the user is asleep") ----------------------------------------------------
+
+
+def test_ensure_critical_tray_icon_is_a_safe_no_op_on_an_uninitialized_window():
+    """MainWindow.__new__(MainWindow) test doubles never ran __init__, so
+    their Qt C++ base was never constructed -- touching QSystemTrayIcon/
+    windowIcon()/style() on one is undefined behavior in PyQt5 (this has
+    been observed to crash the process outright, not raise a catchable
+    exception). _qt_base_initialized must gate this before any Qt call."""
+    window = MainWindow.__new__(MainWindow)
+    assert "_qt_base_initialized" not in window.__dict__
+
+    assert window._ensure_critical_tray_icon() is None
+
+
+def test_show_critical_notification_still_logs_without_a_tray_icon():
+    window = MainWindow.__new__(MainWindow)
+    logs = []
+    window.append_log = logs.append
+
+    window._show_critical_notification("Test Alert", "something is wrong")
+
+    assert logs == ["something is wrong"]

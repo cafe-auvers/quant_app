@@ -1,7 +1,21 @@
+import os
 import sys
 from pathlib import Path
 
 import pytest
+
+# Force the headless Qt platform for the whole test session before any test
+# module gets a chance to construct a QApplication. Individual test files
+# (e.g. test_buyboard_runtime_worker.py) previously set this themselves with
+# os.environ.setdefault(...), which only worked by accident of pytest's
+# alphabetical collection order importing that file (and therefore setting
+# this) before other UI test files ran -- a standalone run of one of those
+# other files (or any reordering) would construct QApplication against the
+# real native platform instead, where calling most QWidget methods on a
+# MainWindow.__new__() test double (whose C++ base was never initialized)
+# is undefined behavior rather than a catchable Python exception -- up to
+# and including a hard process-crashing access violation.
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]

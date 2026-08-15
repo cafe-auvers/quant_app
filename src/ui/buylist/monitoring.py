@@ -18,7 +18,9 @@ from .constants import US_MARKET_ZONE
 
 
 class BuylistMonitoringMixin:
-    def _legacy_auto_execution_blocked(self, env: str, symbol: str = "") -> bool:
+    def _legacy_auto_execution_blocked(
+        self, env: str, symbol: str = "", *, is_protective_exit: bool = False
+    ) -> bool:
         """Mutual-exclusion guard between the legacy 60-second monitor and
         the new Kanban trading engine (code review: "There must never be two
         separate automated monitors capable of submitting orders for the
@@ -30,6 +32,17 @@ class BuylistMonitoringMixin:
         user-clicked button (Activate, Sell All, Sell 1/3-1/2, ...) is
         unaffected, matching "legacy dashboard becomes display/manual-
         emergency-only" rather than fully disabling the tab.
+
+        ``is_protective_exit`` (review finding P0: "the fallback re-enables
+        legacy entries as well as exits" -- a single symmetric on/off
+        switch was too blunt): when the Buy Board engine's health is
+        uncertain, a *new automatic entry* must stay blocked on both sides
+        (starting a fresh position off an engine whose true state is
+        unknown is never safe), but an existing position's *stop-loss
+        protection* must fail open to the legacy monitor rather than leave
+        the position with no automatic protection at all. Pass
+        ``is_protective_exit=True`` only from a stop-loss/liquidation call
+        site; entry call sites use the default.
         """
         if not is_buyboard_engine_enabled():
             return False
@@ -48,15 +61,29 @@ class BuylistMonitoringMixin:
         if not engine_healthy:
             if not self.__dict__.get("_buyboard_engine_unhealthy_notice_logged", False):
                 self._buyboard_engine_unhealthy_notice_logged = True
-                self.append_log(
+                message = (
                     "CRITICAL: BUYBOARD_ENGINE_ENABLED=true but the Buy Board "
                     "engine is not confirmed healthy (not running, lease lost, "
                     "startup reconciliation incomplete, or no recent heartbeat) "
-                    "-- legacy automatic monitoring remains ACTIVE as a "
-                    "fail-safe so positions are not left unprotected. "
-                    "Investigate the Buy Board engine immediately."
+                    "-- legacy stop-loss protection remains ACTIVE as a "
+                    "fail-safe, but new automatic entries stay BLOCKED on both "
+                    "engines until health is confirmed. Investigate the Buy "
+                    "Board engine immediately."
                 )
-            return False  # fail open: let the legacy monitor keep protecting
+                # Review: a log-only alert "does not protect unattended
+                # trading when the user is asleep / the app is minimized."
+                # notify falls back to append_log for any caller (test
+                # double, minimal window) that doesn't define the richer
+                # notification method.
+                notify = getattr(self, "_show_critical_notification", None)
+                if callable(notify):
+                    notify("Buy Board Engine Unhealthy", message)
+                else:
+                    self.append_log(message)
+            # Fail open only for protective exits; a new entry must not
+            # start on either engine while the authoritative one's state is
+            # unknown.
+            return not is_protective_exit
         self._buyboard_engine_unhealthy_notice_logged = False
         # self.__dict__.get(...), not getattr(self, ...): on a QObject whose
         # __init__ never ran (some lightweight test doubles), PyQt5 raises
@@ -380,7 +407,9 @@ class BuylistMonitoringMixin:
             if item.monitoring_status == "BOUGHT":
                 auto_order_blocked = self._buylist_auto_order_blocked(
                     item
-                ) or self._legacy_auto_execution_blocked(env, item.symbol)
+                ) or self._legacy_auto_execution_blocked(
+                    env, item.symbol, is_protective_exit=True
+                )
                 exit_order_pending = getattr(item, "_exit_order_pending", False)
                 if (
                     item.stop_loss > 0

@@ -111,6 +111,11 @@ def _worker(
 ):
     _ensure_app()
     engine = _db_engine(tmp_path)
+    # account_discovery defaults to [] (not the real KIS-config-backed
+    # discovery) so these tests stay hermetic regardless of what KIS
+    # accounts happen to be configured in the developer's own .env --
+    # tests that specifically want to exercise discovery override it.
+    kwargs.setdefault("account_discovery", lambda: [])
     worker = BuyboardRuntimeWorker(
         db_engine=engine,
         environment="PROD",
@@ -241,6 +246,83 @@ def test_distinct_account_numbers_includes_the_workers_own_scoped_account(tmp_pa
     position with zero pre-existing cards)."""
     worker, _ = _worker(tmp_path, account_no="1")
     assert worker._distinct_account_numbers([]) == ["1"]
+
+
+def test_startup_reconciliation_marks_incomplete_when_one_account_fails(tmp_path):
+    """Review finding P0: "startup reconciliation reports success after
+    account failures" -- one account's get_positions failure must not
+    leave startup_reconciliation_complete True; the health check must be
+    able to tell a genuinely-unreconciled account apart from a clean run.
+    """
+
+    class _PartiallyFailingBroker(_FakeBroker):
+        def get_positions(self, *, environment, account_no=None):
+            self.get_positions_calls.append(account_no)
+            if account_no == "2":
+                raise RuntimeError("simulated KIS outage for account 2")
+            return {"overseas": {"holdings": []}}
+
+    broker = _PartiallyFailingBroker()
+    worker, engine = _worker(tmp_path, broker=broker, account_no="")
+    worker.runtime = runtime_module.build_buyboard_runtime(
+        buying_power_provider=worker._buying_power_provider,
+        card_lookup=worker._card_lookup,
+        broker=worker._broker,
+    )
+    _seed_card(engine, account_no="1", symbol="AAPL", board_status=BoardStatus.WATCHLIST)
+    _seed_card(engine, account_no="2", symbol="MSFT", board_status=BoardStatus.WATCHLIST)
+
+    worker._run_startup_reconciliation()
+
+    assert worker.startup_reconciliation_complete is False
+    assert "2" in worker.startup_reconciliation_errors
+    assert "1" not in worker.startup_reconciliation_errors
+    # The healthy account's own reconciliation still ran.
+    assert "1" in worker._account_reconciled_at
+    assert "2" not in worker._account_reconciled_at
+
+
+def test_startup_reconciliation_complete_when_every_account_succeeds(tmp_path):
+    worker, engine = _worker(tmp_path, account_no="1")
+    worker.runtime = runtime_module.build_buyboard_runtime(
+        buying_power_provider=worker._buying_power_provider,
+        card_lookup=worker._card_lookup,
+        broker=worker._broker,
+    )
+
+    worker._run_startup_reconciliation()
+
+    assert worker.startup_reconciliation_complete is True
+    assert worker.startup_reconciliation_errors == {}
+
+
+def test_distinct_account_numbers_discovers_cardless_configured_accounts(tmp_path):
+    """Review finding P1: "accounts without existing cards remain
+    undiscoverable" -- a configured KIS account with zero TradeCards must
+    still be queried by the unscoped production worker."""
+    worker, _ = _worker(
+        tmp_path, account_no="", account_discovery=lambda: ["9", "1"]
+    )
+    card = TradeCardState(environment="PROD", account_no="1", symbol="AAPL")
+
+    accounts = worker._distinct_account_numbers([card])
+
+    assert set(accounts) == {"1", "9"}
+
+
+def test_distinct_account_numbers_does_not_discover_for_a_scoped_worker(tmp_path):
+    """A specifically-scoped worker must not reach into every configured
+    account -- only its own."""
+    discovery_calls = []
+    worker, _ = _worker(
+        tmp_path, account_no="1",
+        account_discovery=lambda: discovery_calls.append(True) or ["9"],
+    )
+
+    accounts = worker._distinct_account_numbers([])
+
+    assert accounts == ["1"]
+    assert discovery_calls == []
 
 
 # --- Periodic buying-power refresh / full reconciliation (review findings) --
@@ -375,6 +457,43 @@ def test_periodic_reconciliation_discovers_external_position_change(tmp_path, mo
     card = repo.get_trade_card(engine, "PROD", "1", "AAPL")
     assert card.board_status == BoardStatus.CLOSED
     assert card.broker_quantity == 0
+
+
+def test_periodic_refresh_also_reconciles_unresolved_entry_order_state(tmp_path, monkeypatch):
+    """Review finding P1: "full reconciliation still reconciles positions,
+    not the full account" -- the periodic pass must also resolve an
+    ENTRY_PENDING card whose local order lookup finds nothing (not just
+    broker positions), the same way startup reconciliation already does."""
+    import datetime as dt
+
+    from src.core import execution_config
+
+    monkeypatch.setattr(execution_config, "is_buyboard_engine_enabled", lambda: True)
+    import src.services.trading_engine as trading_engine_module
+
+    monkeypatch.setattr(trading_engine_module, "is_buyboard_engine_enabled", lambda: True)
+
+    broker = _FakeBroker()  # discover_orders defaults to a complete, empty result
+    worker, engine = _worker(tmp_path, broker=broker)
+    worker.runtime = runtime_module.build_buyboard_runtime(
+        buying_power_provider=worker._buying_power_provider,
+        card_lookup=worker._card_lookup,
+        broker=worker._broker,
+        market_data=_dummy_market_data(),
+    )
+    _seed_card(engine, board_status=BoardStatus.ENTRY_PENDING, broker_quantity=0)
+    worker._account_balance_refreshed_at["1"] = dt.datetime.now(dt.timezone.utc)
+    worker._account_reconciled_at["1"] = dt.datetime.now(dt.timezone.utc) - dt.timedelta(
+        seconds=execution_config.FULL_RECONCILIATION_SECONDS + 1
+    )
+
+    worker._run_one_cycle()
+
+    card = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    # No order was ever actually submitted (empty local ledger); a complete
+    # broker-wide discovery finding nothing means the entry never went
+    # through -- returns to Buylist rather than sitting stuck forever.
+    assert card.board_status == BoardStatus.BUYLIST
 
 
 # --- Stalled-liquidation critical alert (review: "a card warning is --------
