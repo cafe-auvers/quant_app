@@ -131,7 +131,9 @@ from src.services import capital_allocator, capital_reservation_repository
 from src.services import order_ledger
 from src.services import order_reconciliation
 from src.services.broker import Broker, KisBroker
-from src.services.execution_command_gateway import get_default_execution_gateway
+from src.services.execution_command_gateway import build_guarded_execution_gateway, get_default_execution_gateway
+from src.services.execution_lease_protocol import DefaultExecutionLeaseProtocol
+from src.services.mutation_budget_protocol import AllowAllMutationBudget
 from src.services.entry_attempt_manager import EntryAttemptManager
 from src.services.eod_trading_service import EodActionCallbacks, EodTradingService
 from src.services.execution_authority import ExecutionAuthority, LeaseHandle
@@ -565,7 +567,32 @@ def build_buyboard_runtime(
     # (see the module docstring's "None of this is activated
     # automatically"), so in practice this change affects only this
     # module's own tests today, not any live production path.
-    resolved_broker = broker or get_default_execution_gateway()
+    #
+    # PR2's second review pass (finding 10): when the flag *is* true, this
+    # is where the GUARDED_ENGINE-capable gateway must actually be built,
+    # with every dependency it needs -- failing fast, here, at startup
+    # composition, rather than constructing a gateway missing an engine
+    # that would only discover the problem at the first real submission
+    # (GuardedEngineRequiresDatabaseError). AllowAllMutationBudget is an
+    # explicit, visible placeholder for Workstream 10's real rate-limit-
+    # aware implementation (PR6) -- see that module's own docstring for
+    # why this must never be a silent gateway default.
+    if broker is not None:
+        resolved_broker = broker
+    elif execution_config.is_buyboard_engine_enabled():
+        if capital_reservation_engine is None:
+            raise RuntimeError(
+                "BUYBOARD_ENGINE_ENABLED=true requires capital_reservation_engine to build the "
+                "GUARDED_ENGINE-capable execution gateway -- refusing to start rather than "
+                "building a gateway that would only fail at the first real submission"
+            )
+        resolved_broker = build_guarded_execution_gateway(
+            engine=capital_reservation_engine,
+            lease_protocol=DefaultExecutionLeaseProtocol(engine=capital_reservation_engine),
+            mutation_budget=AllowAllMutationBudget(),
+        )
+    else:
+        resolved_broker = get_default_execution_gateway()
     resolved_equity_provider = account_equity_provider or buying_power_provider
 
     def submit_order(**kwargs):

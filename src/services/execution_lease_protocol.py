@@ -20,12 +20,20 @@ change PR2 must not make.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Optional, Protocol
 
 from sqlalchemy.engine import Engine
 
+from src.core.execution_mode import ExecutionLease
 from src.services.execution_authority import ExecutionAuthority, LeaseExpiredError, LeaseHandle
+
+__all__ = [
+    "ExecutionLease",
+    "ExecutionLeaseProtocol",
+    "DefaultExecutionLeaseProtocol",
+    "FakeExecutionLeaseProtocol",
+    "LeaseNotCurrentError",
+]
 
 
 class LeaseNotCurrentError(RuntimeError):
@@ -33,16 +41,6 @@ class LeaseNotCurrentError(RuntimeError):
     caller's cached lease (device/token/epoch) no longer matches what is
     currently authoritative. Never silently ignored; a stale lease must
     block every destructive call in ``GUARDED_ENGINE`` mode (A6/B2)."""
-
-
-@dataclass(frozen=True)
-class ExecutionLease:
-    """A device's belief about which execution lease it currently holds,
-    including the epoch dimension ``LeaseHandle`` doesn't have."""
-
-    device_id: str
-    lease_token: str
-    lease_epoch: int = 0
 
 
 class ExecutionLeaseProtocol(Protocol):
@@ -87,10 +85,17 @@ class FakeExecutionLeaseProtocol:
     :class:`DefaultExecutionLeaseProtocol`) without a real ``state_sync``
     database. This is the double PR2's own ``GUARDED_ENGINE`` tests use to
     exercise the strict epoch gate the doc calls for.
+
+    ``epoch_verified`` defaults to ``True`` -- this fake stands in for "the
+    future, real epoch-verifying authority" (Workstream 5/6), unlike
+    :class:`DefaultExecutionLeaseProtocol` (which is honest that it cannot
+    verify one yet). Set it to ``False`` on an instance to exercise the
+    gateway's "epoch cannot be verified -- reject" path instead.
     """
 
-    def __init__(self, *, current: Optional[ExecutionLease] = None) -> None:
+    def __init__(self, *, current: Optional[ExecutionLease] = None, epoch_verified: bool = True) -> None:
         self.current = current
+        self.epoch_verified = epoch_verified
 
     def grant(self, lease: ExecutionLease) -> None:
         self.current = lease

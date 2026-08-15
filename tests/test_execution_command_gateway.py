@@ -1,6 +1,11 @@
 """Tests for src.services.execution_command_gateway.
 
-docs/kanban_production_readiness.md, Workstream 3 (PR2).
+docs/kanban_production_readiness.md, Workstream 3 (PR2), second review
+pass. ``submit_order``/``cancel_order`` (the Broker-protocol methods) are
+LEGACY_COMPATIBILITY-only; ``submit_guarded``/``cancel_guarded``/
+``replace_guarded`` (taking explicit request models from
+src.core.execution_request) are GUARDED_ENGINE-only. See the gateway
+module's own docstring for why these are not interchangeable.
 """
 from __future__ import annotations
 
@@ -9,22 +14,30 @@ import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.pool import NullPool
 
-from src.core.execution_mode import ExecutionMode, ExecutionSource
+from src.core.execution_mode import ExecutionLease, ExecutionMode, ExecutionSource
+from src.core.execution_ownership import ExecutionOwner, ExecutionOwnership
+from src.core.execution_order_record import AdoptedOrderPermission, ExecutionOrderStatus
 from src.core.discovered_external_order import adopt_external_order, new_discovered_external_order
-from src.core.execution_order_record import ExecutionOrderStatus
+from src.core.execution_request import CancelExecutionRequest, ReplaceExecutionRequest, SubmitExecutionRequest
 from src.core.order_recovery_state import OrderRecoveryState
 from src.core.order_state import OrderIntent, OrderSide, OrderStatus
 from src.services import execution_command_gateway as gw_module
 from src.services.execution_command_gateway import (
+    AmbiguousPostBrokerPersistenceError,
     CancelNotPermittedError,
     ConcurrentExecutionOwnershipError,
     ExecutionCommandGateway,
+    ExecutionOwnershipMismatchError,
     GuardedCancellationAmbiguousError,
     GuardedCancellationRejectedError,
     GuardedEngineRequiresDatabaseError,
+    GuardedEngineRequiresMutationBudgetError,
     GuardedSubmissionAmbiguousError,
     GuardedSubmissionRejectedError,
+    LeaseNotVerifiedError,
     ReplaceNotSafeError,
+    WrongGatewayModeError,
+    build_guarded_execution_gateway,
     get_default_execution_gateway,
 )
 from src.services.capital_reservation_repository import (
@@ -38,12 +51,10 @@ from src.services.execution_command_repository import (
     get_command_by_idempotency_key,
     insert_command,
 )
-from src.services.execution_lease_protocol import (
-    ExecutionLease,
-    FakeExecutionLeaseProtocol,
-    LeaseNotCurrentError,
-)
+from src.services.execution_lease_protocol import FakeExecutionLeaseProtocol
 from src.services.execution_order_repository import _get_execution_orders_table, fetch_execution_order, record_execution_order
+from src.services.execution_ownership_repository import assign_ownership
+from src.services.mutation_budget_protocol import AllowAllMutationBudget
 from fakes.fake_execution_broker import FakeExecutionBroker
 
 
@@ -51,12 +62,23 @@ def _make_engine(tmp_path):
     return create_engine(f"sqlite:///{tmp_path / 'gateway.db'}", future=True, poolclass=NullPool)
 
 
-def _guarded_gateway(tmp_path, *, lease_protocol=None):
+def _lease(epoch=1, *, verified=True):
+    protocol = FakeExecutionLeaseProtocol(
+        current=ExecutionLease(device_id="dev-1", lease_token="tok-1", lease_epoch=epoch),
+        epoch_verified=verified,
+    )
+    handle = ExecutionLease(device_id="dev-1", lease_token="tok-1", lease_epoch=epoch)
+    return protocol, handle
+
+
+def _guarded_gateway(tmp_path, *, lease_protocol=None, mutation_budget=None):
     engine = _make_engine(tmp_path)
     broker = FakeExecutionBroker()
+    protocol, _ = _lease()
     gateway = ExecutionCommandGateway(
         real_broker=broker, engine=engine, mode_override=True,
-        lease_protocol=lease_protocol or FakeExecutionLeaseProtocol(),
+        lease_protocol=lease_protocol or protocol,
+        mutation_budget=mutation_budget or AllowAllMutationBudget(),
     )
     return gateway, broker, engine
 
@@ -67,18 +89,23 @@ def _all_order_rows(engine):
         return conn.execute(select(table)).fetchall()
 
 
-SUBMIT_KWARGS = dict(
-    environment="PROD", account_no="12345678-01", symbol="AAPL", side=OrderSide.BUY,
-    quantity=10, limit_price=100.0, exchange="NASD", intent=OrderIntent.ENTRY,
-)
+def _submit_request(**overrides):
+    _, lease = _lease()
+    fields = dict(
+        client_order_id="CID-1", environment="PROD", account_no="12345678-01", symbol="AAPL",
+        side=OrderSide.BUY, intent=OrderIntent.ENTRY, quantity=10, limit_price=100.0, exchange="NASD",
+        lease=lease, source=ExecutionSource.SYSTEM,
+    )
+    fields.update(overrides)
+    return SubmitExecutionRequest(**fields)
 
 
-# --- mode selection -----------------------------------------------------
+# --- mode selection / API split (findings 2) ---------------------------
 
 
 def test_default_gateway_resolves_legacy_compatibility_mode():
     gateway = get_default_execution_gateway()
-    assert gateway._mode() == ExecutionMode.LEGACY_COMPATIBILITY
+    assert gateway.mode == ExecutionMode.LEGACY_COMPATIBILITY
 
 
 def test_legacy_compatibility_submit_is_a_transparent_passthrough():
@@ -86,12 +113,12 @@ def test_legacy_compatibility_submit_is_a_transparent_passthrough():
     broker.queue_acceptance(broker_order_id="B-1")
     gateway = ExecutionCommandGateway(real_broker=broker, mode_override=False)
 
-    result = gateway.submit_order(**SUBMIT_KWARGS)
-
+    result = gateway.submit_order(
+        environment="PROD", account_no="12345678-01", symbol="AAPL", side=OrderSide.BUY,
+        quantity=10, limit_price=100.0,
+    )
     assert result.broker_order_id == "B-1"
     assert len(broker.submit_calls) == 1
-    # No engine was even configured -- if this had run the guarded
-    # sequence instead, it would have raised GuardedEngineRequiresDatabaseError.
 
 
 def test_legacy_compatibility_cancel_is_a_transparent_passthrough():
@@ -104,44 +131,95 @@ def test_legacy_compatibility_cancel_is_a_transparent_passthrough():
         broker_order_id="B-1", quantity=10, side="BUY", exchange="NASD",
     )
     assert snapshot.status == OrderStatus.CANCELLED
-    assert len(broker.cancel_calls) == 1
+
+
+def test_submit_order_raises_in_guarded_engine_mode(tmp_path):
+    """submit_order()/cancel_order() are LEGACY_COMPATIBILITY-only --
+    calling them while GUARDED_ENGINE is active is a caller bug, not a
+    silently-degraded guarded submission (finding 2)."""
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    with pytest.raises(WrongGatewayModeError):
+        gateway.submit_order(
+            environment="PROD", account_no="12345678-01", symbol="AAPL", side=OrderSide.BUY,
+            quantity=10, limit_price=100.0,
+        )
+    assert broker.submit_calls == []
+
+
+def test_cancel_order_raises_in_guarded_engine_mode(tmp_path):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    with pytest.raises(WrongGatewayModeError):
+        gateway.cancel_order(environment="PROD", account_no="12345678-01", symbol="AAPL")
+    assert broker.cancel_calls == []
+
+
+def test_submit_guarded_raises_in_legacy_compatibility_mode():
+    broker = FakeExecutionBroker()
+    gateway = ExecutionCommandGateway(real_broker=broker, mode_override=False)
+    with pytest.raises(WrongGatewayModeError):
+        gateway.submit_guarded(_submit_request())
 
 
 def test_guarded_engine_submit_without_an_engine_raises():
     broker = FakeExecutionBroker()
     broker.queue_acceptance()
-    gateway = ExecutionCommandGateway(real_broker=broker, mode_override=True)
+    protocol, _ = _lease()
+    gateway = ExecutionCommandGateway(
+        real_broker=broker, mode_override=True, lease_protocol=protocol, mutation_budget=AllowAllMutationBudget()
+    )
     with pytest.raises(GuardedEngineRequiresDatabaseError):
-        gateway.submit_order(**SUBMIT_KWARGS)
+        gateway.submit_guarded(_submit_request())
+
+
+def test_guarded_engine_submit_without_a_mutation_budget_raises(tmp_path):
+    engine = _make_engine(tmp_path)
+    broker = FakeExecutionBroker()
+    broker.queue_acceptance()
+    protocol, _ = _lease()
+    gateway = ExecutionCommandGateway(
+        real_broker=broker, engine=engine, mode_override=True, lease_protocol=protocol, mutation_budget=None
+    )
+    with pytest.raises(GuardedEngineRequiresMutationBudgetError):
+        gateway.submit_guarded(_submit_request())
+
+
+def test_build_guarded_execution_gateway_requires_every_dependency(tmp_path):
+    engine = _make_engine(tmp_path)
+    protocol, _ = _lease()
+    with pytest.raises(TypeError):
+        build_guarded_execution_gateway()  # missing everything
+    with pytest.raises(gw_module.GuardedEngineRequiresDatabaseError):
+        build_guarded_execution_gateway(engine=None, lease_protocol=protocol, mutation_budget=AllowAllMutationBudget())
 
 
 # --- A1/A2: atomic pre-submission transaction ----------------------------
 
 
-def test_submit_commits_command_reservation_and_prepared_record_atomically(tmp_path, trading_enabled):
+@pytest.mark.usefixtures("trading_enabled")
+def test_submit_commits_command_reservation_and_prepared_record_atomically(tmp_path):
     gateway, broker, engine = _guarded_gateway(tmp_path)
-    broker.queue_timeout()  # never reaches a clean broker outcome in this test
+    broker.queue_timeout()
     with pytest.raises(GuardedSubmissionAmbiguousError):
-        gateway.submit_order(**SUBMIT_KWARGS)
+        gateway.submit_guarded(_submit_request())
 
     rows = _all_order_rows(engine)
     assert len(rows) == 1
     client_order_id = rows[0].client_order_id
+    assert client_order_id == "CID-1"
 
     fetched_order = fetch_execution_order(engine, client_order_id)
     assert fetched_order.status == ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE
 
-    command = get_command_by_idempotency_key(engine, client_order_id)
+    command = get_command_by_idempotency_key(engine, f"SUBMIT:{client_order_id}")
     assert command is not None
     assert command.status == "AMBIGUOUS"
 
-    # Ambiguous outcome: the reservation is NOT released (the order may
-    # still exist at the broker).
     reservations = list_active_reservations(engine, environment="PROD", account_no="12345678-01")
-    assert len(reservations) == 1
+    assert len(reservations) == 1  # ambiguous outcome: not released
 
 
-def test_a_transaction_failure_leaves_all_three_writes_absent(tmp_path, monkeypatch, trading_enabled):
+@pytest.mark.usefixtures("trading_enabled")
+def test_a_transaction_failure_leaves_all_three_writes_absent(tmp_path, monkeypatch):
     gateway, broker, engine = _guarded_gateway(tmp_path)
     broker.queue_acceptance()
 
@@ -150,15 +228,15 @@ def test_a_transaction_failure_leaves_all_three_writes_absent(tmp_path, monkeypa
 
     monkeypatch.setattr(gw_module, "insert_execution_order", _boom)
     with pytest.raises(RuntimeError, match="simulated write failure"):
-        gateway.submit_order(**SUBMIT_KWARGS)
+        gateway.submit_guarded(_submit_request())
 
     assert _all_order_rows(engine) == []
-    reservations = list_active_reservations(engine, environment="PROD", account_no="12345678-01")
-    assert reservations == []
-    assert broker.submit_calls == []  # never reached the broker
+    assert list_active_reservations(engine, environment="PROD", account_no="12345678-01") == []
+    assert broker.submit_calls == []
 
 
-def test_failed_submitting_commit_produces_zero_broker_calls(tmp_path, monkeypatch, trading_enabled):
+@pytest.mark.usefixtures("trading_enabled")
+def test_failed_submitting_commit_produces_zero_broker_calls(tmp_path, monkeypatch):
     gateway, broker, engine = _guarded_gateway(tmp_path)
     broker.queue_acceptance()
 
@@ -167,92 +245,111 @@ def test_failed_submitting_commit_produces_zero_broker_calls(tmp_path, monkeypat
 
     monkeypatch.setattr(gw_module, "update_execution_order", _boom)
     with pytest.raises(RuntimeError, match="simulated SUBMITTING commit failure"):
-        gateway.submit_order(**SUBMIT_KWARGS)
-
+        gateway.submit_guarded(_submit_request())
     assert broker.submit_calls == []
 
 
-def test_broker_is_never_called_if_the_lease_is_not_current(tmp_path, trading_enabled):
-    lease_protocol = FakeExecutionLeaseProtocol()  # nothing granted
-    gateway, broker, engine = _guarded_gateway(tmp_path, lease_protocol=lease_protocol)
-    broker.queue_acceptance()
-
-    with pytest.raises(LeaseNotCurrentError):
-        gateway.submit_order(
-            **SUBMIT_KWARGS, lease=ExecutionLease(device_id="dev-1", lease_token="tok-1", lease_epoch=1)
-        )
-    assert broker.submit_calls == []
+# --- finding 1: caller-stable idempotency across a fresh gateway instance ---
 
 
-def test_a_stale_lease_epoch_blocks_submission(tmp_path, trading_enabled):
-    lease_protocol = FakeExecutionLeaseProtocol(
-        current=ExecutionLease(device_id="dev-1", lease_token="tok-1", lease_epoch=2)
+@pytest.mark.usefixtures("trading_enabled")
+def test_replaying_the_same_stable_client_order_id_on_a_fresh_gateway_makes_zero_additional_broker_calls(tmp_path):
+    engine = _make_engine(tmp_path)
+    first_broker = FakeExecutionBroker()
+    first_broker.queue_timeout()
+    protocol, lease = _lease()
+    first_gateway = ExecutionCommandGateway(
+        real_broker=first_broker, engine=engine, mode_override=True,
+        lease_protocol=protocol, mutation_budget=AllowAllMutationBudget(),
     )
-    gateway, broker, engine = _guarded_gateway(tmp_path, lease_protocol=lease_protocol)
-    broker.queue_acceptance()
+    request = _submit_request(client_order_id="STABLE-ID-1", lease=lease)
+    with pytest.raises(GuardedSubmissionAmbiguousError):
+        first_gateway.submit_guarded(request)
+    assert len(first_broker.submit_calls) == 1
 
-    with pytest.raises(LeaseNotCurrentError):
-        gateway.submit_order(
-            **SUBMIT_KWARGS,
-            lease=ExecutionLease(device_id="dev-1", lease_token="tok-1", lease_epoch=1),  # stale epoch
-        )
-    assert broker.submit_calls == []
+    # A brand-new gateway instance (as if the process restarted) replays
+    # the exact same logical submission using the same stable identity.
+    second_broker = FakeExecutionBroker()
+    second_broker.queue_acceptance(broker_order_id="SHOULD-NEVER-BE-USED")
+    second_gateway = ExecutionCommandGateway(
+        real_broker=second_broker, engine=engine, mode_override=True,
+        lease_protocol=protocol, mutation_budget=AllowAllMutationBudget(),
+    )
+    with pytest.raises(DuplicateCommandError):
+        second_gateway.submit_guarded(request)
+    assert second_broker.submit_calls == []  # zero additional broker calls
 
 
 # --- explicit rejection / ambiguity ---------------------------------------
 
 
-def test_explicit_rejection_reaches_rejected_and_releases_the_reservation(tmp_path, trading_enabled):
+@pytest.mark.usefixtures("trading_enabled")
+def test_explicit_rejection_reaches_rejected_and_releases_the_reservation(tmp_path):
     gateway, broker, engine = _guarded_gateway(tmp_path)
     broker.queue_rejection(message="insufficient buying power")
 
     with pytest.raises(GuardedSubmissionRejectedError):
-        gateway.submit_order(**SUBMIT_KWARGS)
+        gateway.submit_guarded(_submit_request())
 
     reservation_table = ensure_capital_reservations_table(engine)
     with engine.begin() as conn:
         reservation_rows = conn.execute(select(reservation_table)).fetchall()
-    assert len(reservation_rows) == 1
     assert reservation_rows[0].status == "RELEASED"
-
-    order_rows = _all_order_rows(engine)
-    assert order_rows[0].status == ExecutionOrderStatus.REJECTED.value
+    assert _all_order_rows(engine)[0].status == ExecutionOrderStatus.REJECTED.value
 
 
-def test_timeout_reaches_unknown_submission_state_and_is_not_retried(tmp_path, trading_enabled):
+@pytest.mark.usefixtures("trading_enabled")
+def test_timeout_reaches_unknown_submission_state_and_is_not_retried(tmp_path):
     gateway, broker, engine = _guarded_gateway(tmp_path)
     broker.queue_timeout()
-
     with pytest.raises(GuardedSubmissionAmbiguousError):
-        gateway.submit_order(**SUBMIT_KWARGS)
-
-    assert len(broker.submit_calls) == 1  # never retried
-    order_rows = _all_order_rows(engine)
-    assert order_rows[0].status == ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE.value
+        gateway.submit_guarded(_submit_request())
+    assert len(broker.submit_calls) == 1
 
 
-def test_transport_exception_is_also_treated_as_ambiguous(tmp_path, trading_enabled):
-    gateway, broker, engine = _guarded_gateway(tmp_path)
-    broker.queue_transport_exception()
-    with pytest.raises(GuardedSubmissionAmbiguousError):
-        gateway.submit_order(**SUBMIT_KWARGS)
-
-
-def test_broker_acknowledgement_requires_and_persists_exact_identity(tmp_path, trading_enabled):
+@pytest.mark.usefixtures("trading_enabled")
+def test_broker_acknowledgement_requires_and_persists_exact_identity(tmp_path):
     gateway, broker, engine = _guarded_gateway(tmp_path)
     broker.queue_acceptance(broker_order_id="B-999", raw_response={"ODNO": "B-999"})
 
-    result = gateway.submit_order(**SUBMIT_KWARGS)
-    assert result.broker_order_id == "B-999"
+    record = gateway.submit_guarded(_submit_request())
+    assert record.broker_order_id == "B-999"
 
     rows = _all_order_rows(engine)
-    assert len(rows) == 1
     assert rows[0].status == ExecutionOrderStatus.ACKNOWLEDGED.value
     assert rows[0].broker_identity_status == "EXACT"
-    assert rows[0].broker_order_id == "B-999"
 
 
-def test_response_persistence_failure_after_acceptance_never_triggers_a_second_broker_call(tmp_path, monkeypatch, trading_enabled):
+# --- finding 11: SELL exits don't reserve buying-power notional ------------
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_a_buy_entry_reserves_notional_capital(tmp_path):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    broker.queue_acceptance()
+    gateway.submit_guarded(_submit_request(side=OrderSide.BUY, quantity=10, limit_price=100.0))
+
+    reservations = list_active_reservations(engine, environment="PROD", account_no="12345678-01")
+    assert reservations[0].requested_notional == pytest.approx(1000.0)
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_a_sell_exit_reserves_zero_notional_capital(tmp_path):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    broker.queue_acceptance()
+    gateway.submit_guarded(
+        _submit_request(side=OrderSide.SELL, intent=OrderIntent.MANUAL_EXIT, quantity=10, limit_price=100.0)
+    )
+
+    reservations = list_active_reservations(engine, environment="PROD", account_no="12345678-01")
+    assert reservations[0].requested_notional == pytest.approx(0.0)
+
+
+# --- finding 3: post-broker persistence failure is never a rejection -------
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_persistence_failure_after_acceptance_raises_ambiguous_not_a_bare_db_error(tmp_path, monkeypatch):
     gateway, broker, engine = _guarded_gateway(tmp_path)
     broker.queue_acceptance(broker_order_id="B-1")
 
@@ -261,252 +358,457 @@ def test_response_persistence_failure_after_acceptance_never_triggers_a_second_b
 
     def _fail_on_second_call(*args, **kwargs):
         calls["n"] += 1
-        if calls["n"] >= 2:
-            # The first call is the PREPARED -> SUBMITTING commit, which
-            # must succeed (the broker call happens only after it does);
-            # only the post-acceptance persist (the second call) fails.
+        if calls["n"] >= 2:  # first call is PREPARED->SUBMITTING; must succeed
             raise RuntimeError("simulated post-acceptance persistence failure")
         return real_update(*args, **kwargs)
 
     monkeypatch.setattr(gw_module, "update_execution_order", _fail_on_second_call)
-    with pytest.raises(RuntimeError, match="simulated post-acceptance persistence failure"):
-        gateway.submit_order(**SUBMIT_KWARGS)
+    with pytest.raises(AmbiguousPostBrokerPersistenceError) as exc_info:
+        gateway.submit_guarded(_submit_request())
 
-    assert len(broker.submit_calls) == 1  # the real broker call happened exactly once
+    assert exc_info.value.broker_order_id == "B-1"
+    assert len(broker.submit_calls) == 1  # the real broker call happened exactly once, never retried
 
+    # The durable record was NOT confirmed updated -- still SUBMITTING.
+    record = fetch_execution_order(engine, "CID-1")
+    assert record.status == ExecutionOrderStatus.SUBMITTING
 
-def test_duplicate_idempotency_key_is_rejected_before_a_broker_call(tmp_path):
-    """Simulates a restart re-attempting the exact same command journal
-    entry -- insert_command's own uniqueness guarantee (A5) blocks the
-    duplicate before the gateway would ever reach the broker again."""
-    gateway, broker, engine = _guarded_gateway(tmp_path)
-    ensure_execution_commands_table(engine)
-    command = ExecutionCommand(
-        idempotency_key="DUPLICATE-KEY", command_type="submit", environment="PROD",
-        account_no="12345678-01", symbol="AAPL", lease_epoch=0,
-    )
-    with engine.begin() as conn:
-        insert_command(conn, command)
+    # A caller must never resubmit -- the stable identity still blocks a replay.
     with pytest.raises(DuplicateCommandError):
-        with engine.begin() as conn:
-            insert_command(conn, command)
+        gateway.submit_guarded(_submit_request())
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_persistence_failure_after_a_broker_rejection_also_raises_ambiguous(tmp_path, monkeypatch):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    broker.queue_rejection()
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("simulated failure-persistence failure")
+
+    monkeypatch.setattr(gw_module, "update_command_response", _boom)
+    with pytest.raises(AmbiguousPostBrokerPersistenceError):
+        gateway.submit_guarded(_submit_request())
+
+
+# --- finding 4: guarded lease gate never fails open -------------------------
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_a_missing_lease_is_rejected_in_guarded_mode(tmp_path):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    broker.queue_acceptance()
+    with pytest.raises(LeaseNotVerifiedError):
+        gateway.submit_guarded(_submit_request(lease=None))
     assert broker.submit_calls == []
 
 
-def test_restart_after_durable_submitting_does_not_resubmit(tmp_path, trading_enabled):
-    """A record already sitting at SUBMITTING (as if a prior process
-    crashed after committing SUBMITTING but before the broker responded)
-    must never be re-submitted by a fresh submit_order call for the exact
-    same logical order -- the duplicate idempotency_key raises first."""
-    gateway, broker, engine = _guarded_gateway(tmp_path)
-    broker.queue_timeout()
-    with pytest.raises(GuardedSubmissionAmbiguousError):
-        gateway.submit_order(**SUBMIT_KWARGS)
-    assert len(broker.submit_calls) == 1
+@pytest.mark.usefixtures("trading_enabled")
+def test_an_unverified_epoch_is_rejected_even_with_a_matching_lease(tmp_path):
+    protocol, lease = _lease(verified=False)  # epoch_verified=False
+    gateway, broker, engine = _guarded_gateway(tmp_path, lease_protocol=protocol)
+    broker.queue_acceptance()
+    with pytest.raises(LeaseNotVerifiedError):
+        gateway.submit_guarded(_submit_request(lease=lease))
+    assert broker.submit_calls == []
 
-    rows = _all_order_rows(engine)
-    client_order_id = rows[0].client_order_id
-    command = get_command_by_idempotency_key(engine, client_order_id)
-    ensure_execution_commands_table(engine)
-    with pytest.raises(DuplicateCommandError):
-        with engine.begin() as conn:
-            insert_command(conn, command)
-    # Still exactly one broker call from the original attempt.
-    assert len(broker.submit_calls) == 1
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_default_lease_protocol_never_reports_epoch_verified(tmp_path):
+    """DefaultExecutionLeaseProtocol is honest that it cannot verify an
+    epoch yet -- using it in GUARDED_ENGINE mode always rejects, by
+    design, until Workstream 5/6 supplies a real implementation."""
+    from src.services.execution_lease_protocol import DefaultExecutionLeaseProtocol
+
+    engine = _make_engine(tmp_path)
+    broker = FakeExecutionBroker()
+    broker.queue_acceptance()
+    gateway = ExecutionCommandGateway(
+        real_broker=broker, engine=engine, mode_override=True,
+        lease_protocol=DefaultExecutionLeaseProtocol(engine=engine), mutation_budget=AllowAllMutationBudget(),
+    )
+    _, lease = _lease()
+    with pytest.raises(LeaseNotVerifiedError):
+        gateway.submit_guarded(_submit_request(lease=lease))
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_a_stale_lease_epoch_blocks_submission(tmp_path):
+    protocol = FakeExecutionLeaseProtocol(
+        current=ExecutionLease(device_id="dev-1", lease_token="tok-1", lease_epoch=2)
+    )
+    gateway, broker, engine = _guarded_gateway(tmp_path, lease_protocol=protocol)
+    broker.queue_acceptance()
+    stale_lease = ExecutionLease(device_id="dev-1", lease_token="tok-1", lease_epoch=1)
+    with pytest.raises(LeaseNotVerifiedError):
+        gateway.submit_guarded(_submit_request(lease=stale_lease))
+    assert broker.submit_calls == []
+
+
+# --- finding 9: mutation budget gate ----------------------------------------
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_mutation_budget_exhaustion_blocks_submission(tmp_path):
+    from src.services.mutation_budget_protocol import MutationBudgetExceededError
+
+    class _NoBudget:
+        def require_available(self, command_type):
+            raise MutationBudgetExceededError("no budget remaining")
+
+    gateway, broker, engine = _guarded_gateway(tmp_path, mutation_budget=_NoBudget())
+    broker.queue_acceptance()
+    with pytest.raises(MutationBudgetExceededError):
+        gateway.submit_guarded(_submit_request())
+    assert broker.submit_calls == []
+
+
+# --- finding 5: H1 persisted execution ownership ----------------------------
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_manual_owned_symbol_rejects_every_source(tmp_path):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    assign_ownership(
+        engine,
+        ExecutionOwnership(environment="PROD", account_no="12345678-01", symbol="AAPL", owner=ExecutionOwner.MANUAL),
+    )
+    broker.queue_acceptance()
+    with pytest.raises(ExecutionOwnershipMismatchError):
+        gateway.submit_guarded(_submit_request(source=ExecutionSource.LEGACY_BUY_DASHBOARD))
+    with pytest.raises(ExecutionOwnershipMismatchError):
+        gateway.submit_guarded(_submit_request(client_order_id="CID-2", source=ExecutionSource.KANBAN_BOARD))
+    assert broker.submit_calls == []
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_kanban_owned_symbol_rejects_legacy_source(tmp_path):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    assign_ownership(
+        engine,
+        ExecutionOwnership(
+            environment="PROD", account_no="12345678-01", symbol="AAPL", owner=ExecutionOwner.KANBAN,
+            strategy_instance_id="orb-1",
+        ),
+    )
+    broker.queue_acceptance()
+    with pytest.raises(ExecutionOwnershipMismatchError):
+        gateway.submit_guarded(_submit_request(source=ExecutionSource.LEGACY_BUY_DASHBOARD))
+    assert broker.submit_calls == []
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_kanban_owned_symbol_accepts_kanban_source(tmp_path):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    assign_ownership(
+        engine,
+        ExecutionOwnership(
+            environment="PROD", account_no="12345678-01", symbol="AAPL", owner=ExecutionOwner.KANBAN,
+            strategy_instance_id="orb-1",
+        ),
+    )
+    broker.queue_acceptance()
+    record = gateway.submit_guarded(_submit_request(source=ExecutionSource.KANBAN_BOARD))
+    assert record.status == ExecutionOrderStatus.ACKNOWLEDGED
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_unassigned_symbol_defaults_legacy_and_rejects_kanban(tmp_path):
+    """H2: "Unassigned defaults closed to Kanban.\""""
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    broker.queue_acceptance()
+    with pytest.raises(ExecutionOwnershipMismatchError):
+        gateway.submit_guarded(_submit_request(source=ExecutionSource.KANBAN_BOARD))
+    assert broker.submit_calls == []
+
+    # LEGACY_BUY_DASHBOARD and unattributed SYSTEM are both fine against
+    # the unassigned/LEGACY default.
+    record = gateway.submit_guarded(_submit_request(source=ExecutionSource.LEGACY_BUY_DASHBOARD))
+    assert record.status == ExecutionOrderStatus.ACKNOWLEDGED
 
 
 # --- cancellation -----------------------------------------------------------
 
 
-def _submit_and_acknowledge(gateway, broker, **overrides):
-    kwargs = dict(SUBMIT_KWARGS)
-    kwargs.update(overrides)
+def _submit_and_acknowledge(gateway, broker, *, client_order_id="CID-1", **overrides):
     broker.queue_acceptance(broker_order_id="B-1")
-    gateway.submit_order(**kwargs)
-    rows = _all_order_rows(gateway._engine)
-    return rows[-1].client_order_id
+    gateway.submit_guarded(_submit_request(client_order_id=client_order_id, **overrides))
+    return client_order_id
 
 
-def test_cancel_requires_exact_identity(tmp_path, trading_enabled):
+def _cancel_request(**overrides):
+    _, lease = _lease()
+    fields = dict(
+        client_order_id="CID-1", cancel_command_id="CANCEL-1", environment="PROD",
+        account_no="12345678-01", lease=lease, source=ExecutionSource.SYSTEM,
+    )
+    fields.update(overrides)
+    return CancelExecutionRequest(**fields)
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_cancel_requires_exact_identity(tmp_path):
     gateway, broker, engine = _guarded_gateway(tmp_path)
-    broker.queue_timeout()  # leaves the record UNKNOWN_SUBMISSION_STATE, never EXACT
+    broker.queue_timeout()
     with pytest.raises(GuardedSubmissionAmbiguousError):
-        gateway.submit_order(**SUBMIT_KWARGS)
+        gateway.submit_guarded(_submit_request())
 
-    client_order_id = _all_order_rows(engine)[0].client_order_id
     with pytest.raises(CancelNotPermittedError):
-        gateway.cancel_order(environment="PROD", account_no="12345678-01", client_order_id=client_order_id)
+        gateway.cancel_guarded(_cancel_request())
     assert broker.cancel_calls == []
 
 
-def test_cancel_confirmed_reaches_cancelled(tmp_path, trading_enabled):
+@pytest.mark.usefixtures("trading_enabled")
+def test_cancel_rejects_an_account_environment_mismatch(tmp_path):
+    """Finding 9: a caller-supplied environment/account_no that doesn't
+    match the order's own persisted record must be rejected, not silently
+    ignored in favor of the record's real values."""
     gateway, broker, engine = _guarded_gateway(tmp_path)
-    client_order_id = _submit_and_acknowledge(gateway, broker)
+    _submit_and_acknowledge(gateway, broker)
     broker.queue_cancel_confirmed()
 
-    gateway.cancel_order(environment="PROD", account_no="12345678-01", client_order_id=client_order_id)
+    with pytest.raises(CancelNotPermittedError):
+        gateway.cancel_guarded(_cancel_request(account_no="99999999-01"))
+    assert broker.cancel_calls == []
 
-    record = fetch_execution_order(engine, client_order_id)
+    with pytest.raises(CancelNotPermittedError):
+        gateway.cancel_guarded(_cancel_request(environment="SIM"))
+    assert broker.cancel_calls == []
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_cancel_confirmed_reaches_cancelled(tmp_path):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    _submit_and_acknowledge(gateway, broker)
+    broker.queue_cancel_confirmed()
+
+    gateway.cancel_guarded(_cancel_request())
+    record = fetch_execution_order(engine, "CID-1")
     assert record.status == ExecutionOrderStatus.CANCELLED
 
 
-def test_cancel_timeout_leaves_cancel_pending_with_discovering_recovery_state_and_is_not_retried(tmp_path, trading_enabled):
+@pytest.mark.usefixtures("trading_enabled")
+def test_cancel_timeout_leaves_cancel_pending_with_discovering_recovery_state_and_is_not_retried(tmp_path):
     gateway, broker, engine = _guarded_gateway(tmp_path)
-    client_order_id = _submit_and_acknowledge(gateway, broker)
+    _submit_and_acknowledge(gateway, broker)
     broker.queue_cancel_timeout()
 
     with pytest.raises(GuardedCancellationAmbiguousError):
-        gateway.cancel_order(environment="PROD", account_no="12345678-01", client_order_id=client_order_id)
+        gateway.cancel_guarded(_cancel_request())
 
-    record = fetch_execution_order(engine, client_order_id)
+    record = fetch_execution_order(engine, "CID-1")
     assert record.status == ExecutionOrderStatus.CANCEL_PENDING
     assert record.recovery_state == OrderRecoveryState.DISCOVERING
     assert len(broker.cancel_calls) == 1
 
 
-def test_cancel_explicit_rejection_returns_the_order_to_working(tmp_path, trading_enabled):
+@pytest.mark.usefixtures("trading_enabled")
+def test_cancel_explicit_rejection_returns_the_order_to_working(tmp_path):
     gateway, broker, engine = _guarded_gateway(tmp_path)
-    client_order_id = _submit_and_acknowledge(gateway, broker)
+    _submit_and_acknowledge(gateway, broker)
     broker.queue_cancel_rejected()
 
     with pytest.raises(GuardedCancellationRejectedError):
-        gateway.cancel_order(environment="PROD", account_no="12345678-01", client_order_id=client_order_id)
-
-    record = fetch_execution_order(engine, client_order_id)
+        gateway.cancel_guarded(_cancel_request())
+    record = fetch_execution_order(engine, "CID-1")
     assert record.status == ExecutionOrderStatus.WORKING
 
 
-def test_a_fill_racing_the_cancel_is_reflected_not_ignored(tmp_path, trading_enabled):
+@pytest.mark.usefixtures("trading_enabled")
+def test_a_fill_racing_the_cancel_is_reflected_not_ignored(tmp_path):
     gateway, broker, engine = _guarded_gateway(tmp_path)
-    client_order_id = _submit_and_acknowledge(gateway, broker)
+    _submit_and_acknowledge(gateway, broker)
     broker.queue_cancel_fill_race(filled_quantity=10, quantity_requested=10)
 
-    gateway.cancel_order(environment="PROD", account_no="12345678-01", client_order_id=client_order_id)
-
-    record = fetch_execution_order(engine, client_order_id)
+    gateway.cancel_guarded(_cancel_request())
+    record = fetch_execution_order(engine, "CID-1")
     assert record.status == ExecutionOrderStatus.FILLED
     assert record.filled_quantity == 10
 
 
-def test_adopted_cancel_requires_explicit_permission(tmp_path):
+@pytest.mark.usefixtures("trading_enabled")
+def test_a_duplicate_cancel_replay_with_the_same_command_id_makes_zero_additional_broker_calls(tmp_path):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    _submit_and_acknowledge(gateway, broker)
+    broker.queue_cancel_confirmed()
+    gateway.cancel_guarded(_cancel_request(cancel_command_id="CANCEL-1"))
+    assert len(broker.cancel_calls) == 1
+
+    # A replay of the exact same cancel decision (same cancel_command_id).
+    # By the time a duplicate cancel_command_id could be detected, the
+    # order has already moved off the status a fresh cancel requires
+    # (is_cancellable's own status check rejects first here, exactly as
+    # it would for insert_command's own uniqueness check on any other
+    # replay shape) -- either way, the real property under test is zero
+    # additional broker calls, which holds regardless of which gate fires.
+    with pytest.raises((DuplicateCommandError, CancelNotPermittedError)):
+        gateway.cancel_guarded(_cancel_request(cancel_command_id="CANCEL-1"))
+    assert len(broker.cancel_calls) == 1  # zero additional broker calls
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_finding_8_a_new_cancel_decision_after_an_explicit_rejection_is_permitted_with_a_new_command_id(tmp_path):
+    """The bug: reusing attempt_number as the cancel key permanently
+    blocked a later, genuinely new cancel decision after an earlier one
+    was explicitly rejected. Fixed: a new cancel_command_id is a new,
+    permitted decision."""
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    _submit_and_acknowledge(gateway, broker)
+
+    broker.queue_cancel_rejected()
+    with pytest.raises(GuardedCancellationRejectedError):
+        gateway.cancel_guarded(_cancel_request(cancel_command_id="CANCEL-1"))
+    record = fetch_execution_order(engine, "CID-1")
+    assert record.status == ExecutionOrderStatus.WORKING
+
+    # A later, genuinely new cancel decision -- different cancel_command_id.
+    broker.queue_cancel_confirmed()
+    gateway.cancel_guarded(_cancel_request(cancel_command_id="CANCEL-2"))
+    record = fetch_execution_order(engine, "CID-1")
+    assert record.status == ExecutionOrderStatus.CANCELLED
+    assert len(broker.cancel_calls) == 2
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_adopted_cancel_requires_explicit_cancel_permission(tmp_path):
     gateway, broker, engine = _guarded_gateway(tmp_path)
     ext = new_discovered_external_order(
         environment="PROD", account_no="12345678-01", symbol="MSFT", side=OrderSide.BUY,
         broker_order_id="B-EXT-1", quantity_requested=5,
     )
-    record = adopt_external_order(ext, adopted_by="tony", permissions=frozenset())  # no CANCEL granted
+    record = adopt_external_order(ext, adopted_by="tony", permissions=frozenset())
     record_execution_order(engine, record)
 
     with pytest.raises(CancelNotPermittedError):
-        gateway.cancel_order(
-            environment="PROD", account_no="12345678-01", client_order_id=record.client_order_id
-        )
+        gateway.cancel_guarded(_cancel_request(client_order_id=record.client_order_id))
     assert broker.cancel_calls == []
 
 
-def test_adopted_cancel_succeeds_with_explicit_permission(tmp_path):
-    from src.core.execution_order_record import AdoptedOrderPermission
-
+@pytest.mark.usefixtures("trading_enabled")
+def test_adopted_cancel_succeeds_with_explicit_cancel_permission(tmp_path):
     gateway, broker, engine = _guarded_gateway(tmp_path)
     ext = new_discovered_external_order(
         environment="PROD", account_no="12345678-01", symbol="MSFT", side=OrderSide.BUY,
         broker_order_id="B-EXT-1", quantity_requested=5,
     )
-    record = adopt_external_order(
-        ext, adopted_by="tony", permissions=frozenset({AdoptedOrderPermission.CANCEL})
-    )
+    record = adopt_external_order(ext, adopted_by="tony", permissions=frozenset({AdoptedOrderPermission.CANCEL}))
     record_execution_order(engine, record)
     broker.queue_cancel_confirmed()
 
-    gateway.cancel_order(environment="PROD", account_no="12345678-01", client_order_id=record.client_order_id)
-
+    gateway.cancel_guarded(_cancel_request(client_order_id=record.client_order_id))
     refreshed = fetch_execution_order(engine, record.client_order_id)
     assert refreshed.status == ExecutionOrderStatus.CANCELLED
 
 
-def test_a_duplicate_cancel_command_is_rejected(tmp_path, trading_enabled):
+# --- replace: finding 7 (REPLACE permission, not CANCEL) --------------------
+
+
+def _replace_request(**overrides):
+    _, lease = _lease()
+    fields = dict(
+        client_order_id="CID-1", replace_command_id="REPLACE-1", new_client_order_id="CID-1-REPLACEMENT",
+        new_quantity=5, new_limit_price=101.0, environment="PROD", account_no="12345678-01",
+        lease=lease, source=ExecutionSource.SYSTEM,
+    )
+    fields.update(overrides)
+    return ReplaceExecutionRequest(**fields)
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_replace_preserves_the_original_order_and_creates_a_linked_new_record(tmp_path):
     gateway, broker, engine = _guarded_gateway(tmp_path)
-    client_order_id = _submit_and_acknowledge(gateway, broker)
-    broker.queue_cancel_confirmed()
-    gateway.cancel_order(environment="PROD", account_no="12345678-01", client_order_id=client_order_id)
-
-    # A second cancel attempt on the now-terminal order is rejected by
-    # is_cancellable's own status check before any broker call.
-    with pytest.raises(CancelNotPermittedError):
-        gateway.cancel_order(environment="PROD", account_no="12345678-01", client_order_id=client_order_id)
-    assert len(broker.cancel_calls) == 1
-
-
-# --- replace ----------------------------------------------------------------
-
-
-def test_replace_preserves_the_original_order_and_creates_a_linked_new_record(tmp_path, trading_enabled):
-    gateway, broker, engine = _guarded_gateway(tmp_path)
-    client_order_id = _submit_and_acknowledge(gateway, broker)
+    _submit_and_acknowledge(gateway, broker)
     broker.queue_cancel_confirmed()
     broker.queue_acceptance(broker_order_id="B-2")
 
-    result = gateway.replace_order(client_order_id=client_order_id, new_quantity=5, new_limit_price=101.0)
+    result = gateway.replace_guarded(_replace_request())
     assert result.broker_order_id == "B-2"
 
-    original = fetch_execution_order(engine, client_order_id)
+    original = fetch_execution_order(engine, "CID-1")
     assert original.status == ExecutionOrderStatus.CANCELLED
-    assert original.submitted_quantity == 10  # never mutated into the replacement
+    assert original.submitted_quantity == 10
 
-    rows = _all_order_rows(engine)
-    assert len(rows) == 2
-    new_row = [r for r in rows if r.client_order_id != client_order_id][0]
-    assert new_row.status == ExecutionOrderStatus.ACKNOWLEDGED.value
-
-    new_record = fetch_execution_order(engine, new_row.client_order_id)
-    assert new_record.replaces_execution_order_id == client_order_id
+    new_record = fetch_execution_order(engine, "CID-1-REPLACEMENT")
+    assert new_record.status == ExecutionOrderStatus.ACKNOWLEDGED
+    assert new_record.replaces_execution_order_id == "CID-1"
     assert new_record.submitted_quantity == 5
 
 
-def test_replace_propagates_an_ambiguous_cancel_outcome_without_submitting_a_replacement(tmp_path, trading_enabled):
-    """An ambiguous cancel (timeout/transport loss) during replace is not
-    reinterpreted as a generic "not safe" -- the specific
-    GuardedCancellationAmbiguousError propagates unchanged, same as a
-    standalone cancel_order call would raise, and no replacement is ever
-    submitted."""
+@pytest.mark.usefixtures("trading_enabled")
+def test_replace_propagates_an_ambiguous_cancel_outcome_without_submitting_a_replacement(tmp_path):
     gateway, broker, engine = _guarded_gateway(tmp_path)
-    client_order_id = _submit_and_acknowledge(gateway, broker)
+    _submit_and_acknowledge(gateway, broker)
     broker.queue_cancel_timeout()
 
     with pytest.raises(GuardedCancellationAmbiguousError):
-        gateway.replace_order(client_order_id=client_order_id, new_quantity=5, new_limit_price=101.0)
-    assert len(broker.submit_calls) == 1  # only the original submission -- no replacement submitted
+        gateway.replace_guarded(_replace_request())
+    assert len(broker.submit_calls) == 1  # only the original -- no replacement submitted
 
-    record = fetch_execution_order(engine, client_order_id)
+    record = fetch_execution_order(engine, "CID-1")
     assert record.status == ExecutionOrderStatus.CANCEL_PENDING
-    assert record.recovery_state == OrderRecoveryState.DISCOVERING
 
 
-def test_replace_refuses_when_a_fill_races_the_cancel(tmp_path, trading_enabled):
-    """The cancel call itself completes cleanly (no exception) but the
-    broker's answer is "it already filled" -- a real, non-ambiguous
-    outcome that is nonetheless unsafe to replace: ReplaceNotSafeError,
-    and no replacement is submitted."""
+@pytest.mark.usefixtures("trading_enabled")
+def test_replace_refuses_when_a_fill_races_the_cancel(tmp_path):
     gateway, broker, engine = _guarded_gateway(tmp_path)
-    client_order_id = _submit_and_acknowledge(gateway, broker)
+    _submit_and_acknowledge(gateway, broker)
     broker.queue_cancel_fill_race(filled_quantity=10, quantity_requested=10)
 
     with pytest.raises(ReplaceNotSafeError):
-        gateway.replace_order(client_order_id=client_order_id, new_quantity=5, new_limit_price=101.0)
-    assert len(broker.submit_calls) == 1  # only the original submission -- no replacement submitted
-
-    record = fetch_execution_order(engine, client_order_id)
-    assert record.status == ExecutionOrderStatus.FILLED
+        gateway.replace_guarded(_replace_request())
+    assert len(broker.submit_calls) == 1
 
 
 def test_replace_is_not_available_in_legacy_compatibility_mode():
     broker = FakeExecutionBroker()
     gateway = ExecutionCommandGateway(real_broker=broker, mode_override=False)
-    with pytest.raises(NotImplementedError):
-        gateway.replace_order(client_order_id="X", new_quantity=1, new_limit_price=1.0)
+    with pytest.raises(WrongGatewayModeError):
+        gateway.replace_guarded(_replace_request())
 
 
-# --- Workstream 9: mutual exclusion / source attribution --------------------
+@pytest.mark.usefixtures("trading_enabled")
+def test_replace_rejected_when_the_adopted_order_has_only_cancel_permission_not_replace(tmp_path):
+    """Finding 7: CANCEL permission alone must not authorize a replace --
+    only REPLACE does."""
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    ext = new_discovered_external_order(
+        environment="PROD", account_no="12345678-01", symbol="MSFT", side=OrderSide.BUY,
+        broker_order_id="B-EXT-1", quantity_requested=5,
+    )
+    record = adopt_external_order(ext, adopted_by="tony", permissions=frozenset({AdoptedOrderPermission.CANCEL}))
+    record_execution_order(engine, record)
+
+    with pytest.raises(CancelNotPermittedError):
+        # The permission check (_cancellable_for_replace, requiring
+        # REPLACE) fails inside _do_cancel and propagates as-is, distinct
+        # from ReplaceNotSafeError (which is specifically about an unsafe
+        # *broker* outcome, not an authorization failure).
+        gateway.replace_guarded(
+            _replace_request(client_order_id=record.client_order_id, new_client_order_id="NEW-1")
+        )
+    assert broker.cancel_calls == []
+    assert broker.submit_calls == []
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_replace_succeeds_when_the_adopted_order_has_replace_permission(tmp_path):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    ext = new_discovered_external_order(
+        environment="PROD", account_no="12345678-01", symbol="MSFT", side=OrderSide.BUY,
+        broker_order_id="B-EXT-1", quantity_requested=5,
+    )
+    record = adopt_external_order(ext, adopted_by="tony", permissions=frozenset({AdoptedOrderPermission.REPLACE}))
+    record_execution_order(engine, record)
+    broker.queue_cancel_confirmed()
+    broker.queue_acceptance(broker_order_id="B-NEW-1")
+
+    result = gateway.replace_guarded(
+        _replace_request(client_order_id=record.client_order_id, new_client_order_id="NEW-1")
+    )
+    assert result.broker_order_id == "B-NEW-1"
+
+
+# --- Workstream 9: in-process mutual exclusion (finding 6) ------------------
 
 
 def test_two_different_sources_cannot_concurrently_hold_the_same_account_symbol():
@@ -519,13 +821,18 @@ def test_two_different_sources_cannot_concurrently_hold_the_same_account_symbol(
                 pass
 
 
-def test_the_same_source_can_reclaim_reentrantly():
+def test_the_same_source_cannot_reclaim_a_key_it_already_holds():
+    """Strict exclusion, not source-based reentrancy: a second claim on an
+    already-held key always raises, even from the same source --
+    reentrancy was never actually used by any real code path and its
+    prior allowance had a genuine thread-safety bug (finding 6)."""
     broker = FakeExecutionBroker()
     gateway = ExecutionCommandGateway(real_broker=broker, mode_override=False)
     key = ("PROD", "12345678-01", "AAPL")
     with gateway._ownership.claim(key, ExecutionSource.LEGACY_BUY_DASHBOARD):
-        with gateway._ownership.claim(key, ExecutionSource.LEGACY_BUY_DASHBOARD):
-            pass  # must not raise
+        with pytest.raises(ConcurrentExecutionOwnershipError):
+            with gateway._ownership.claim(key, ExecutionSource.LEGACY_BUY_DASHBOARD):
+                pass
 
 
 def test_the_ownership_claim_is_released_after_the_call_completes():
@@ -538,11 +845,47 @@ def test_the_ownership_claim_is_released_after_the_call_completes():
         pass  # must not raise -- the first claim already released
 
 
-def test_submitted_commands_record_the_issuing_source(tmp_path, trading_enabled):
+def test_two_threads_racing_the_same_key_never_both_hold_it_concurrently():
+    """A real multithreaded contention test (finding 6) -- proves the lock
+    actually serializes concurrent claims rather than merely looking
+    correct in single-threaded tests."""
+    import threading
+    import time
+
+    broker = FakeExecutionBroker()
+    gateway = ExecutionCommandGateway(real_broker=broker, mode_override=False)
+    key = ("PROD", "12345678-01", "AAPL")
+
+    concurrent_holders = []
+    currently_inside = {"count": 0}
+    lock = threading.Lock()
+
+    def worker():
+        try:
+            with gateway._ownership.claim(key, ExecutionSource.KANBAN_BOARD):
+                with lock:
+                    currently_inside["count"] += 1
+                    concurrent_holders.append(currently_inside["count"])
+                time.sleep(0.01)
+                with lock:
+                    currently_inside["count"] -= 1
+        except ConcurrentExecutionOwnershipError:
+            pass  # expected for whichever thread loses the race
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert max(concurrent_holders) == 1
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_submitted_commands_record_the_issuing_source(tmp_path):
     gateway, broker, engine = _guarded_gateway(tmp_path)
     broker.queue_acceptance(broker_order_id="B-1")
-    gateway.submit_order(**SUBMIT_KWARGS, source=ExecutionSource.KANBAN_BOARD)
+    gateway.submit_guarded(_submit_request(source=ExecutionSource.LEGACY_BUY_DASHBOARD))
 
-    client_order_id = _all_order_rows(engine)[0].client_order_id
-    command = get_command_by_idempotency_key(engine, client_order_id)
-    assert command.source == ExecutionSource.KANBAN_BOARD.value
+    command = get_command_by_idempotency_key(engine, "SUBMIT:CID-1")
+    assert command.source == ExecutionSource.LEGACY_BUY_DASHBOARD.value

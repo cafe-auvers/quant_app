@@ -37,6 +37,7 @@ exists and passes its own tests.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
@@ -69,3 +70,20 @@ class ExecutionSource(str, Enum):
     LEGACY_BUY_DASHBOARD = "LEGACY_BUY_DASHBOARD"
     KANBAN_BOARD = "KANBAN_BOARD"
     SYSTEM = "SYSTEM"  # unspecified/legacy caller that hasn't threaded a source through yet
+
+
+@dataclass(frozen=True)
+class ExecutionLease:
+    """A device's belief about which execution lease it currently holds,
+    including the ``lease_epoch`` dimension PR1's schemas added. A pure
+    value type -- lives in ``src.core`` (not ``src.services``, which does
+    the actual I/O-backed verification) so both core request models
+    (:mod:`src.core.execution_request`) and the services-layer protocol
+    that verifies it (:mod:`src.services.execution_lease_protocol`) can
+    depend on it without ``src.core`` depending on ``src.services``,
+    which nothing else in this codebase does either.
+    """
+
+    device_id: str
+    lease_token: str
+    lease_epoch: int = 0
