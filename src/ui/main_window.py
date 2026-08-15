@@ -1599,6 +1599,19 @@ class MainWindow(
             return False
         errors = getattr(worker, "startup_reconciliation_errors", None) or {}
         if account_no is not None:
+            # Review finding P0: "unknown accounts can be incorrectly
+            # considered healthy" -- checking only "not in
+            # startup_reconciliation_errors" treated an account that was
+            # never discovered/processed at all (a stale/unconfigured
+            # kis_account_no, or one genuinely not reached yet) the same
+            # as a cleanly-reconciled one. Health requires *positive*
+            # confirmation via startup_reconciled_accounts, not merely
+            # absence from the error set -- this also correctly fails a
+            # blank account_no closed (an empty string can never be a
+            # member of that set) rather than needing special-casing.
+            reconciled = getattr(worker, "startup_reconciled_accounts", None) or set()
+            if account_no not in reconciled:
+                return False
             if account_no in errors:
                 return False
         elif errors:

@@ -67,7 +67,13 @@ class BuylistMonitoringMixin:
         # it is the *presence of an unhealthy worker* that must fail open,
         # not merely "nobody checked."
         health_check = getattr(self, "_buyboard_engine_healthy", None)
-        engine_healthy = health_check(account_no or None) if callable(health_check) else True
+        # account_no is passed through as-given, deliberately NOT
+        # collapsed via "account_no or None" -- review finding P0: "blank
+        # kis_account_no values are also converted into a global health
+        # check rather than failing safely." A blank/unresolved account
+        # must fail its own (never-positively-confirmed) account-specific
+        # check, not silently fall back to the coarser global one.
+        engine_healthy = health_check(account_no) if callable(health_check) else True
         if not engine_healthy:
             logged = self.__dict__.setdefault("_buyboard_engine_unhealthy_notice_logged", set())
             if account_no not in logged:

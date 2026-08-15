@@ -7,6 +7,7 @@ import pytest
 from src.core.order_state import (
     BrokerOrder,
     BrokerOrderDiscoveryResult,
+    BrokerOrderStatusSnapshot,
     OrderIntent,
     OrderSide,
     OrderStatus,
@@ -42,6 +43,7 @@ class _FakeBroker:
 
     def __init__(self):
         self.cancel_calls = []
+        self.cancel_order_error = None
         self.discover_result = BrokerOrderDiscoveryResult(
             open_orders_complete=True, history_complete=True, reserved_orders_complete=True
         )
@@ -55,7 +57,15 @@ class _FakeBroker:
 
     def cancel_order(self, **kwargs):
         self.cancel_calls.append(kwargs)
-        raise AssertionError("not exercised in these tests")
+        if getattr(self, "cancel_order_error", None) is not None:
+            raise self.cancel_order_error
+        return BrokerOrderStatusSnapshot(
+            environment=kwargs.get("environment", "PROD"),
+            account_no=kwargs.get("account_no", "1"),
+            symbol=kwargs.get("symbol", ""),
+            broker_order_id=kwargs.get("broker_order_id", ""),
+            status=OrderStatus.CANCELLED,
+        )
 
     def get_order(self, **kwargs):
         return []
@@ -492,6 +502,70 @@ def test_refresh_broker_position_returns_none_when_symbol_absent():
     broker = _FakeBroker()
     card = _card(symbol="AAPL")
     assert runtime_module._refresh_broker_position(card, broker=broker) is None
+
+
+# --- Review finding P0-4: cancel an untracked discovered order's ------------
+# --- remainder directly by broker_order_id ----------------------------------
+
+
+def test_cancel_discovered_order_cancels_the_remaining_quantity_by_broker_order_id():
+    broker = _FakeBroker()
+    card = _card(symbol="AAPL")
+    snapshot = BrokerOrderStatusSnapshot(
+        environment="PROD", account_no="1", symbol="AAPL", side=OrderSide.BUY,
+        status=OrderStatus.PARTIALLY_FILLED, broker_order_id="B-42",
+        quantity_requested=100, filled_quantity=30, remaining_quantity=70,
+    )
+    runtime_module._cancel_discovered_order(card, snapshot, broker=broker)
+    assert len(broker.cancel_calls) == 1
+    call = broker.cancel_calls[0]
+    # Keyed by the snapshot's own broker_order_id, not any local
+    # client_order_id -- there is none, by construction, for a discovered
+    # order with nothing local tracking it.
+    assert call["broker_order_id"] == "B-42"
+    assert call["quantity"] == 70  # the unfilled remainder, not the total
+    assert call["symbol"] == "AAPL"
+    assert call["side"] == "BUY"
+    assert call["is_reserved"] is False
+
+
+def test_cancel_discovered_order_falls_back_to_requested_minus_filled_when_remaining_is_unset():
+    broker = _FakeBroker()
+    card = _card(symbol="AAPL")
+    snapshot = BrokerOrderStatusSnapshot(
+        environment="PROD", account_no="1", symbol="AAPL", side=OrderSide.BUY,
+        status=OrderStatus.WORKING, broker_order_id="B-7",
+        quantity_requested=50, filled_quantity=0, remaining_quantity=0,
+    )
+    runtime_module._cancel_discovered_order(card, snapshot, broker=broker)
+    assert broker.cancel_calls[0]["quantity"] == 50
+
+
+def test_cancel_discovered_order_is_a_no_op_without_a_broker_order_id():
+    broker = _FakeBroker()
+    card = _card(symbol="AAPL")
+    snapshot = BrokerOrderStatusSnapshot(
+        environment="PROD", account_no="1", symbol="AAPL", side=OrderSide.BUY,
+        status=OrderStatus.WORKING, broker_order_id="",
+        quantity_requested=50, filled_quantity=0,
+    )
+    runtime_module._cancel_discovered_order(card, snapshot, broker=broker)
+    assert broker.cancel_calls == []
+
+
+def test_cancel_discovered_order_never_raises_when_the_broker_call_fails():
+    broker = _FakeBroker()
+    broker.cancel_order_error = RuntimeError("KIS is down")
+    card = _card(symbol="AAPL")
+    snapshot = BrokerOrderStatusSnapshot(
+        environment="PROD", account_no="1", symbol="AAPL", side=OrderSide.BUY,
+        status=OrderStatus.WORKING, broker_order_id="B-9",
+        quantity_requested=50, filled_quantity=0, remaining_quantity=50,
+    )
+    # Must not propagate -- a cancel-attempt failure must not stop the
+    # rest of reconciliation for other cards.
+    runtime_module._cancel_discovered_order(card, snapshot, broker=broker)
+    assert len(broker.cancel_calls) == 1
 
 
 # --- P0-8: real market-session hooks are wired ------------------------------

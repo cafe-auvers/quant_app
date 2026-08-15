@@ -76,6 +76,7 @@ class _FakeBroker:
         # genuinely different holdings.
         self.positions_by_account: dict = {}
         self.get_positions_calls: list = []
+        self.cancel_calls: list = []
 
     def submit_order(self, **kwargs):
         return BrokerSubmissionResult(broker_order_id="B-1", raw_response={})
@@ -84,7 +85,16 @@ class _FakeBroker:
         return False
 
     def cancel_order(self, **kwargs):
-        raise AssertionError("not exercised in these tests")
+        self.cancel_calls.append(kwargs)
+        from src.core.order_state import BrokerOrderStatusSnapshot, OrderStatus
+
+        return BrokerOrderStatusSnapshot(
+            environment=kwargs.get("environment", "PROD"),
+            account_no=kwargs.get("account_no", "1"),
+            symbol=kwargs.get("symbol", ""),
+            broker_order_id=kwargs.get("broker_order_id", ""),
+            status=OrderStatus.CANCELLED,
+        )
 
     def get_order(self, **kwargs):
         return []
@@ -141,6 +151,31 @@ def _seed_card(engine, **overrides):
 def test_construction_builds_nothing(tmp_path):
     worker, _ = _worker(tmp_path)
     assert worker.runtime is None
+
+
+# --- Order callbacks (review finding P0-4) -----------------------------------
+
+
+def test_build_order_callbacks_wires_cancel_discovered_order_to_the_broker(tmp_path):
+    """Review finding P0-4: an untracked discovered order's cancel
+    callback must actually reach the real broker (keyed by the
+    snapshot's own broker_order_id), not silently no-op."""
+    from src.core.order_state import BrokerOrderStatusSnapshot, OrderSide, OrderStatus
+
+    broker = _FakeBroker()
+    callbacks = BuyboardRuntimeWorker._build_order_callbacks(broker)
+    card = TradeCardState(environment="PROD", account_no="1", symbol="AAPL")
+    snapshot = BrokerOrderStatusSnapshot(
+        environment="PROD", account_no="1", symbol="AAPL", side=OrderSide.BUY,
+        status=OrderStatus.WORKING, broker_order_id="B-99",
+        quantity_requested=25, filled_quantity=0, remaining_quantity=25,
+    )
+
+    callbacks.cancel_discovered_order(card, snapshot)
+
+    assert len(broker.cancel_calls) == 1
+    assert broker.cancel_calls[0]["broker_order_id"] == "B-99"
+    assert broker.cancel_calls[0]["quantity"] == 25
 
 
 # --- Startup reconciliation --------------------------------------------------
@@ -280,6 +315,38 @@ def test_startup_reconciliation_marks_incomplete_when_one_account_fails(tmp_path
     # The healthy account's own reconciliation still ran.
     assert "1" in worker._account_reconciled_at
     assert "2" not in worker._account_reconciled_at
+
+
+def test_startup_reconciliation_does_not_cross_account_boundaries(tmp_path):
+    """Review finding P0: "startup order reconciliation is still not
+    account-scoped" -- account 1's own reconciliation must not even look
+    at account 2's cards. Without scoping, account 1's iteration would
+    also process account 2's ENTRY_PENDING card (the unfiltered cards
+    list included it) and get wrongly marked failed by account 2's own
+    discover_orders callback raising."""
+
+    class _AccountTwoOrderDiscoveryFailingBroker(_FakeBroker):
+        def discover_orders(self, *, environment, account_no):
+            self.get_positions_calls.append(f"discover:{account_no}")
+            if account_no == "2":
+                raise RuntimeError("simulated KIS outage discovering account 2's orders")
+            return self.discover_result
+
+    broker = _AccountTwoOrderDiscoveryFailingBroker()
+    worker, engine = _worker(tmp_path, broker=broker, account_no="")
+    worker.runtime = runtime_module.build_buyboard_runtime(
+        buying_power_provider=worker._buying_power_provider,
+        card_lookup=worker._card_lookup,
+        broker=worker._broker,
+    )
+    _seed_card(engine, account_no="1", symbol="AAPL", board_status=BoardStatus.WATCHLIST)
+    _seed_card(engine, account_no="2", symbol="MSFT", board_status=BoardStatus.ENTRY_PENDING)
+
+    worker._run_startup_reconciliation()
+
+    assert "1" not in worker.startup_reconciliation_errors
+    assert "2" in worker.startup_reconciliation_errors
+    assert "1" in worker._account_reconciled_at
 
 
 def test_run_one_cycle_excludes_cards_from_accounts_with_startup_errors(tmp_path, monkeypatch):

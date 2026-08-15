@@ -117,6 +117,7 @@ from src.core import execution_config
 from src.core.order_state import (
     BrokerOrder,
     BrokerOrderDiscoveryResult,
+    BrokerOrderStatusSnapshot,
     OrderIntent,
     OrderSide,
     OrderStatus,
@@ -270,6 +271,70 @@ def _cancel_order(client_order_id: str, *, broker: Broker) -> None:
 
 def _discover_all_orders(card: TradeCardState, *, broker: Broker) -> BrokerOrderDiscoveryResult:
     return broker.discover_orders(environment=card.environment, account_no=card.account_no)
+
+
+def _cancel_discovered_order(
+    card: TradeCardState, snapshot: BrokerOrderStatusSnapshot, *, broker: Broker
+) -> None:
+    """Best-effort direct cancel of a discovered order's unfilled remainder
+    -- see :attr:`EodActionCallbacks.cancel_discovered_order`. Unlike
+    :func:`_cancel_order`, there is no local :class:`BrokerOrder` record to
+    look up or persist a reconciled result to (that is the entire point --
+    this only runs when local tracking has already been lost), so this
+    calls ``broker.cancel_order`` directly, keyed by the snapshot's own
+    ``broker_order_id``, and never raises.
+
+    Always uses the regular (non-reserved) cancel endpoint: discovery
+    folds regular and reserved-MOO snapshots into one list with no flag
+    marking which source an order came from, so the two genuinely
+    different broker cancel calls (regular needs
+    symbol/quantity/side/exchange; reserved needs only broker_order_id/
+    reservation_date) can't be told apart from a snapshot alone in
+    general. This is safe specifically here because reserved-MOO
+    execution is exclusively a sell-side mechanism in this codebase
+    (``KisBroker.submit_order`` only ever routes it to
+    ``place_overseas_reserved_market_on_open_sell``) and every candidate
+    reaching this function is a BUY entry order
+    (``_find_matching_broker_entry_snapshot`` filters on
+    ``side == OrderSide.BUY``), which is never submitted as reserved-MOO.
+
+    Exchange is not part of a discovered snapshot (KIS's cancel endpoint
+    needs one regardless of the order's actual listing exchange to route
+    the request); defaults to "NASD" like every other broker-boundary
+    fallback in this module.
+    """
+    broker_order_id = str(snapshot.broker_order_id or "").strip()
+    if not broker_order_id:
+        logger.warning(
+            "Cannot cancel discovered order for %s: snapshot has no broker_order_id", card.symbol
+        )
+        return
+    remaining = snapshot.remaining_quantity or max(
+        0, snapshot.quantity_requested - snapshot.filled_quantity
+    )
+    if remaining <= 0:
+        remaining = snapshot.quantity_requested
+    if remaining <= 0:
+        logger.warning(
+            "Cannot cancel discovered order for %s: no remaining quantity to cancel", card.symbol
+        )
+        return
+    try:
+        broker.cancel_order(
+            environment=snapshot.environment,
+            account_no=snapshot.account_no,
+            is_reserved=False,
+            symbol=snapshot.symbol,
+            broker_order_id=broker_order_id,
+            quantity=remaining,
+            side=snapshot.side.value,
+            exchange="NASD",
+        )
+    except Exception:
+        logger.exception(
+            "Direct cancel of discovered order failed for %s (broker_order_id=%s)",
+            card.symbol, broker_order_id,
+        )
 
 
 def _kis_only_quote_fetcher(symbol: str) -> QuoteSnapshot:

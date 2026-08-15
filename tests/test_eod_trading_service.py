@@ -530,6 +530,43 @@ def test_startup_order_reconciliation_recovers_a_filled_order_missing_from_ledge
     assert "ORDER_RECOVERED_FROM_BROKER_DISCOVERY" in card.warnings
 
 
+def test_startup_order_reconciliation_uses_current_holding_as_authoritative_quantity(tmp_path):
+    """Review finding P0: "current holdings confirm existence, but not
+    authoritative quantity" -- a historical order for 100 shares with only
+    10 currently held (e.g. a later partial sell the snapshot knows
+    nothing about) must record 10, not the stale historical 100."""
+    from src.services.eod_trading_service import (
+        EodActionCallbacks,
+        reconcile_unresolved_orders_at_startup,
+    )
+
+    complete = BrokerOrderDiscoveryResult(
+        open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
+        snapshots=[_snapshot(status=OrderStatus.FILLED, filled=100, avg_fill_price=101.5)],
+    )
+    callbacks = EodActionCallbacks(
+        find_open_entry_order=lambda card: None,
+        reconcile_order=lambda o: o,
+        cancel_order=lambda cid: None,
+        discover_all_orders=lambda card: complete,
+        get_current_holding=lambda card: BrokerHolding(
+            symbol="AAPL", quantity=10, average_price=105.0
+        ),
+    )
+    card = _card(board_status=BoardStatus.ENTRY_PENDING)
+
+    changed = reconcile_unresolved_orders_at_startup(
+        [card], position_manager=PositionManager(), callbacks=callbacks
+    )
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.OPEN_POSITION
+    # Broker-truth current holding wins, not the stale historical fill.
+    assert card.broker_quantity == 10
+    assert card.orderable_quantity == 10
+    assert card.average_entry_price == 105.0
+
+
 def test_startup_order_reconciliation_flags_a_partially_filled_working_discovered_order(tmp_path):
     """Review finding P0: "a partially filled working broker order is
     treated as completed" -- a matching PARTIALLY_FILLED snapshot (still
@@ -641,6 +678,117 @@ def test_startup_order_reconciliation_keeps_a_still_working_order_missing_from_l
     assert "UNRECONCILED_BROKER_ORDER" in card.warnings
 
 
+def test_startup_order_reconciliation_attempts_a_direct_cancel_of_a_fully_untracked_working_order(
+    tmp_path,
+):
+    """Review finding P0-4: "untracked partially filled orders are still
+    not controlled" -- a matching broker order still open at the broker
+    with nothing local tracking it must not just be flagged; a best-effort
+    direct cancel (keyed by the snapshot's own broker_order_id) must be
+    attempted so it doesn't keep filling unnoticed."""
+    from src.services.eod_trading_service import (
+        EodActionCallbacks,
+        reconcile_unresolved_orders_at_startup,
+    )
+
+    snapshot = _snapshot(status=OrderStatus.WORKING, filled=0)
+    complete = BrokerOrderDiscoveryResult(
+        open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
+        snapshots=[snapshot],
+    )
+    cancel_attempts = []
+    callbacks = EodActionCallbacks(
+        find_open_entry_order=lambda card: None,
+        reconcile_order=lambda o: o,
+        cancel_order=lambda cid: None,
+        discover_all_orders=lambda card: complete,
+        cancel_discovered_order=lambda card, snap: cancel_attempts.append((card, snap)),
+    )
+    card = _card(board_status=BoardStatus.ENTRY_PENDING)
+
+    changed = reconcile_unresolved_orders_at_startup(
+        [card], position_manager=PositionManager(), callbacks=callbacks
+    )
+
+    assert changed == [card]
+    assert cancel_attempts == [(card, snapshot)]
+
+
+def test_startup_order_reconciliation_attempts_a_direct_cancel_of_an_untracked_partial_fill_remainder(
+    tmp_path,
+):
+    """Same review finding P0-4, but for the partially-filled case: the
+    confirmed fill is recovered into Open Positions, and the broker's own
+    still-open remainder is *also* sent a best-effort direct cancel, not
+    merely flagged."""
+    from src.services.eod_trading_service import (
+        EodActionCallbacks,
+        reconcile_unresolved_orders_at_startup,
+    )
+
+    snapshot = _snapshot(status=OrderStatus.PARTIALLY_FILLED, filled=30, avg_fill_price=101.0)
+    complete = BrokerOrderDiscoveryResult(
+        open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
+        snapshots=[snapshot],
+    )
+    cancel_attempts = []
+    callbacks = EodActionCallbacks(
+        find_open_entry_order=lambda card: None,
+        reconcile_order=lambda o: o,
+        cancel_order=lambda cid: None,
+        discover_all_orders=lambda card: complete,
+        get_current_holding=lambda card: BrokerHolding(
+            symbol="AAPL", quantity=30, average_price=101.0
+        ),
+        cancel_discovered_order=lambda card, snap: cancel_attempts.append((card, snap)),
+    )
+    card = _card(board_status=BoardStatus.ENTRY_PENDING, target_position_quantity=100)
+    card.entry_orb_low = 95.0
+
+    changed = reconcile_unresolved_orders_at_startup(
+        [card], position_manager=PositionManager(), callbacks=callbacks
+    )
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.OPEN_POSITION
+    assert card.broker_quantity == 30
+    assert cancel_attempts == [(card, snapshot)]
+
+
+def test_startup_order_reconciliation_survives_a_failing_direct_cancel_attempt(tmp_path):
+    """A cancel-attempt failure (e.g. KIS temporarily unreachable) must
+    never stop the rest of reconciliation -- the card is still flagged
+    for attention regardless."""
+    from src.services.eod_trading_service import (
+        EodActionCallbacks,
+        reconcile_unresolved_orders_at_startup,
+    )
+
+    def _boom(card, snap):
+        raise RuntimeError("KIS is down")
+
+    complete = BrokerOrderDiscoveryResult(
+        open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
+        snapshots=[_snapshot(status=OrderStatus.WORKING, filled=0)],
+    )
+    callbacks = EodActionCallbacks(
+        find_open_entry_order=lambda card: None,
+        reconcile_order=lambda o: o,
+        cancel_order=lambda cid: None,
+        discover_all_orders=lambda card: complete,
+        cancel_discovered_order=_boom,
+    )
+    card = _card(board_status=BoardStatus.ENTRY_PENDING)
+
+    changed = reconcile_unresolved_orders_at_startup(
+        [card], position_manager=PositionManager(), callbacks=callbacks
+    )
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.ENTRY_PENDING
+    assert "UNRECONCILED_BROKER_ORDER" in card.warnings
+
+
 def test_startup_order_reconciliation_moves_to_buylist_only_when_genuinely_no_match(tmp_path):
     """Original behavior preserved: a complete discovery query that
     genuinely contains nothing for this symbol still safely returns the
@@ -720,6 +868,62 @@ def test_buy_today_reset_does_not_orphan_a_matching_broker_order(tmp_path):
     assert card.board_status == BoardStatus.ENTRY_PENDING
     assert card.entry_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE
     assert "UNRECONCILED_BROKER_ORDER" in card.warnings
+
+
+def test_reconcile_buy_today_orders_runs_outside_the_eod_window(tmp_path):
+    """Review finding P0: "BUY_TODAY broker-order recovery is effectively
+    EOD-only" -- reconcile_buy_today_orders (intended for the periodic 60s
+    cadence, not only EOD cleanup) must independently perform the same
+    "does a real broker order already exist" check."""
+    from src.services.eod_trading_service import (
+        EodActionCallbacks,
+        reconcile_buy_today_orders,
+    )
+
+    complete = BrokerOrderDiscoveryResult(
+        open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
+        snapshots=[_snapshot(status=OrderStatus.WORKING, filled=0)],
+    )
+    callbacks = EodActionCallbacks(
+        find_open_entry_order=lambda card: None,
+        reconcile_order=lambda o: o,
+        cancel_order=lambda cid: None,
+        discover_all_orders=lambda card: complete,
+    )
+    card = _card(board_status=BoardStatus.BUY_TODAY)
+
+    changed = reconcile_buy_today_orders([card], callbacks=callbacks)
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.ENTRY_PENDING
+    assert card.entry_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE
+    assert "UNRECONCILED_BROKER_ORDER" in card.warnings
+
+
+def test_reconcile_buy_today_orders_leaves_a_genuinely_order_free_card_alone(tmp_path):
+    """Unlike EOD's own reset, periodic reconciliation must not touch a
+    genuinely order-free Buy Today card -- that stays EOD's job so a
+    fresh candidate is not reset out from under the user mid-session."""
+    from src.services.eod_trading_service import (
+        EodActionCallbacks,
+        reconcile_buy_today_orders,
+    )
+
+    empty = BrokerOrderDiscoveryResult(
+        open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
+    )
+    callbacks = EodActionCallbacks(
+        find_open_entry_order=lambda card: None,
+        reconcile_order=lambda o: o,
+        cancel_order=lambda cid: None,
+        discover_all_orders=lambda card: empty,
+    )
+    card = _card(board_status=BoardStatus.BUY_TODAY)
+
+    changed = reconcile_buy_today_orders([card], callbacks=callbacks)
+
+    assert changed == []
+    assert card.board_status == BoardStatus.BUY_TODAY
 
 
 def test_entry_pending_eod_recovers_a_filled_order_missing_from_ledger(tmp_path):

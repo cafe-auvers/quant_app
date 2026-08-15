@@ -41,6 +41,7 @@ from src.services import buyboard_runtime as buyboard_runtime_module
 from src.services import trade_card_repository as repo
 from src.services.eod_trading_service import (
     EodActionCallbacks,
+    reconcile_buy_today_orders,
     reconcile_unresolved_orders_at_startup,
     run_startup_reconciliation,
 )
@@ -185,6 +186,16 @@ class BuyboardRuntimeWorker(QThread):
         # False -- no automatic order execution should begin for an
         # unreconciled account.
         self.startup_reconciliation_errors: Dict[str, str] = {}
+        # Positive confirmation set: account numbers that have actually
+        # completed a successful reconciliation at least once (startup or
+        # periodic). Review finding P0: "unknown accounts can be
+        # incorrectly considered healthy" -- checking only "not in
+        # startup_reconciliation_errors" treats an account that was never
+        # discovered/processed at all (a stale or unconfigured
+        # kis_account_no, or one genuinely not reached yet) the same as a
+        # cleanly-reconciled one. Health must require *positive*
+        # membership here, not merely absence from the error set.
+        self.startup_reconciled_accounts: set = set()
         # warning name -> card_key set already alerted via self.alert for
         # that warning -- see _emit_stalled_liquidation_alerts.
         self._alerted_card_keys_by_warning: Dict[str, set] = {}
@@ -328,6 +339,13 @@ class BuyboardRuntimeWorker(QThread):
             get_current_holding=lambda card: buyboard_runtime_module._refresh_broker_position(
                 card, broker=broker
             ),
+            # Review finding P0: an untracked broker order's unfilled
+            # remainder must not simply be left to keep filling unnoticed
+            # -- attempt a direct best-effort cancel keyed by the
+            # snapshot's own broker_order_id.
+            cancel_discovered_order=lambda card, snapshot: buyboard_runtime_module._cancel_discovered_order(
+                card, snapshot, broker=broker
+            ),
         )
 
     def _run_startup_reconciliation(self) -> None:
@@ -363,8 +381,18 @@ class BuyboardRuntimeWorker(QThread):
                 position_snapshot = broker.get_positions(
                     environment=self._environment, account_no=account_no
                 )
+                # Review finding P0: "startup order reconciliation is
+                # still not account-scoped" -- passing the full unfiltered
+                # cards list here meant every account's loop iteration
+                # reprocessed every OTHER account's ENTRY_PENDING cards
+                # too (using this account's broker/holdings responses,
+                # not theirs), and a single card-level callback failure
+                # for one account's card got attributed as *this*
+                # account's own reconciliation failure regardless of
+                # whose card actually caused it.
+                account_cards = [card for card in cards if card.account_no == account_no]
                 account_changed = run_startup_reconciliation(
-                    cards,
+                    account_cards,
                     environment=self._environment,
                     account_no=account_no,
                     position_snapshot=position_snapshot,
@@ -388,6 +416,7 @@ class BuyboardRuntimeWorker(QThread):
             self._record_buying_power(account_no, position_snapshot)
             self._account_balance_refreshed_at[account_no] = now
             self._account_reconciled_at[account_no] = now
+            self.startup_reconciled_accounts.add(account_no)
 
         self._persist_changed(changed)
         if changed:
@@ -610,7 +639,25 @@ class BuyboardRuntimeWorker(QThread):
                     callbacks=order_callbacks,
                 )
                 changed.extend(order_changed)
+                # Review finding P0: "BUY_TODAY broker-order recovery is
+                # effectively EOD-only" -- reconcile_unresolved_orders_at_startup
+                # only ever looks at ENTRY_PENDING cards, so a BUY_TODAY
+                # card whose local order record was lost previously stayed
+                # eligible for _evaluate_buy_today (and a genuine duplicate
+                # submission) for the rest of the trading day, since
+                # EodTradingService's equivalent check only runs once the
+                # EOD window is reached.
+                buy_today_changed = reconcile_buy_today_orders(
+                    account_cards, callbacks=order_callbacks
+                )
+                changed.extend(buy_today_changed)
                 self._account_reconciled_at[account_no] = now
+                # Review finding P0: "unknown accounts can be incorrectly
+                # considered healthy" -- a full position+order
+                # reconciliation just succeeded for this account (whether
+                # or not it had ever run before), so it now has positive
+                # confirmation too.
+                self.startup_reconciled_accounts.add(account_no)
                 # Review finding P0: "no periodic recovery path that
                 # removes an account from startup_reconciliation_errors...
                 # this can leave the application permanently reporting the

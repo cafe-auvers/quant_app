@@ -590,6 +590,7 @@ def _healthy_buyboard_worker():
         startup_reconciliation_ran=True,
         startup_reconciliation_complete=True,
         startup_reconciliation_errors={},
+        startup_reconciled_accounts={"1"},
         last_heartbeat_at=dt.datetime.now(dt.timezone.utc),
     )
 
@@ -608,6 +609,7 @@ def test_stop_hit_auto_sell_is_suppressed_when_buyboard_engine_enabled(
     item = SimpleNamespace(
         symbol="AAPL",
         environment="PROD",
+        kis_account_no="1",
         monitoring_status="BOUGHT",
         breakout_method="",
         stop_loss=98.0,
@@ -645,6 +647,7 @@ def test_auto_submit_execute_ready_is_suppressed_when_buyboard_engine_enabled(
     item = SimpleNamespace(
         symbol="AAPL",
         environment="PROD",
+        kis_account_no="1",
         monitoring_status="EXECUTE_READY",
         breakout_method="execution_queue:1m",
         orb_monitor_enabled=True,
@@ -720,6 +723,7 @@ def test_one_accounts_startup_failure_does_not_reopen_legacy_exits_for_another_a
         startup_reconciliation_ran=True,
         startup_reconciliation_complete=False,  # account "2" failed
         startup_reconciliation_errors={"2": "simulated KIS outage"},
+        startup_reconciled_accounts={"1"},
         last_heartbeat_at=dt.datetime.now(dt.timezone.utc),
     )
     logs = []
@@ -865,6 +869,7 @@ def test_buyboard_engine_healthy_is_account_scoped(tmp_path):
         startup_reconciliation_ran=True,
         startup_reconciliation_complete=False,
         startup_reconciliation_errors={"2": "simulated KIS outage"},
+        startup_reconciled_accounts={"1"},
         last_cycle_started_at=now,
         last_heartbeat_at=now,
     )
@@ -872,6 +877,28 @@ def test_buyboard_engine_healthy_is_account_scoped(tmp_path):
     assert window._buyboard_engine_healthy(account_no="1") is True
     assert window._buyboard_engine_healthy(account_no="2") is False
     assert window._buyboard_engine_healthy() is False  # global check still fails closed
+
+
+def test_buyboard_engine_healthy_false_for_an_account_never_positively_confirmed(tmp_path):
+    """Review finding P0: "unknown accounts can be incorrectly considered
+    healthy" -- an account absent from startup_reconciliation_errors but
+    ALSO never actually reconciled (a stale/unconfigured kis_account_no,
+    or one genuinely not reached yet) must not be treated as healthy just
+    because nothing marked it as failed either."""
+    window = MainWindow.__new__(MainWindow)
+    now = dt.datetime.now(dt.timezone.utc)
+    window._buyboard_runtime_worker = SimpleNamespace(
+        isRunning=lambda: True,
+        startup_reconciliation_ran=True,
+        startup_reconciliation_complete=True,
+        startup_reconciliation_errors={},
+        startup_reconciled_accounts={"1"},  # "9" was never discovered/processed
+        last_cycle_started_at=now,
+        last_heartbeat_at=now,
+    )
+
+    assert window._buyboard_engine_healthy(account_no="9") is False
+    assert window._buyboard_engine_healthy(account_no="") is False  # blank fails safely too
 
 
 # --- Critical notification (review: "a card warning is insufficient when --
