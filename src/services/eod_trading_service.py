@@ -17,7 +17,14 @@ from typing import Callable, Dict, List, Optional
 
 from sqlalchemy.engine import Engine
 
-from src.core.order_state import BrokerOrder, BrokerOrderDiscoveryResult, OrderStatus
+from src.core.order_state import (
+    BrokerOrder,
+    BrokerOrderDiscoveryResult,
+    BrokerOrderStatusSnapshot,
+    OrderSide,
+    OrderStatus,
+    is_open_status,
+)
 from src.core.trade_card_state import (
     BoardStatus,
     EntryRuntimeStatus,
@@ -131,6 +138,17 @@ class EodTradingService:
         discovery = self._callbacks.discover_all_orders(card)
         if not discovery.complete:
             return False
+        # Review finding P0 (same pattern as reconcile_unresolved_orders_at_startup):
+        # a complete discovery query confirms the local ledger has nothing,
+        # but not that the broker has nothing -- a matching snapshot means
+        # this card's board_status is stale (an order genuinely exists),
+        # so resetting to Buylist here would silently orphan it. Leave the
+        # card alone; the next heartbeat's own reconciliation (which
+        # expects ENTRY_PENDING) needs the status corrected first, which
+        # is outside this method's job of resetting a genuinely order-free
+        # Buy Today card.
+        if _find_matching_broker_entry_snapshot(discovery, card) is not None:
+            return False
         card.board_status = BoardStatus.BUYLIST
         card.entry_runtime_status = None
         card.entry_block_reason = ""
@@ -179,9 +197,49 @@ class EodTradingService:
                     card.entry_runtime_status = EntryRuntimeStatus.DATA_UNAVAILABLE
                     return True
                 return False
-            card.board_status = BoardStatus.BUYLIST
-            card.entry_runtime_status = None
-            return True
+            # Review finding P0 (same pattern as
+            # reconcile_unresolved_orders_at_startup): a complete discovery
+            # query confirms the local ledger has nothing, but not that the
+            # broker has nothing -- moving straight to Buylist without ever
+            # inspecting discovery.snapshots would silently orphan a real
+            # broker order the local ledger lost track of, right as the
+            # session is ending.
+            matching = _find_matching_broker_entry_snapshot(discovery, card)
+            if matching is None:
+                card.board_status = BoardStatus.BUYLIST
+                card.entry_runtime_status = None
+                return True
+            if matching.filled_quantity > 0:
+                card.board_status = BoardStatus.OPEN_POSITION
+                card.broker_quantity = matching.filled_quantity
+                card.orderable_quantity = matching.filled_quantity
+                card.average_entry_price = matching.avg_fill_price or card.average_entry_price
+                card.entry_remaining_target_quantity = 0
+                card.position_runtime_status = PositionRuntimeStatus.OPEN
+                self._position_manager.apply_first_fill_stop(
+                    card,
+                    entry_orb_low=card.entry_orb_low or 0.0,
+                    entry_orb_window=card.entry_orb_window or card.selected_orb_window or "",
+                )
+                card.entry_runtime_status = None
+                if "ORDER_RECOVERED_FROM_BROKER_DISCOVERY" not in card.warnings:
+                    card.warnings = [*card.warnings, "ORDER_RECOVERED_FROM_BROKER_DISCOVERY"]
+                return True
+            if matching.status in _ALREADY_TERMINAL_STATUSES:
+                card.board_status = BoardStatus.BUYLIST
+                card.entry_runtime_status = None
+                return True
+            # Still open at the broker with nothing local tracking it --
+            # never abandon it to Buylist right before the session ends.
+            # Flag it for attention rather than attempt an automatic
+            # cancel against an order this process cannot fully verify
+            # ownership of from a snapshot alone.
+            changed_here = card.entry_runtime_status != EntryRuntimeStatus.DATA_UNAVAILABLE
+            card.entry_runtime_status = EntryRuntimeStatus.DATA_UNAVAILABLE
+            if "UNRECONCILED_BROKER_ORDER" not in card.warnings:
+                card.warnings = [*card.warnings, "UNRECONCILED_BROKER_ORDER"]
+                changed_here = True
+            return changed_here
 
         refreshed = self._callbacks.reconcile_order(order)
 
@@ -274,6 +332,31 @@ class EodTradingService:
         return True
 
 
+def _find_matching_broker_entry_snapshot(
+    discovery: BrokerOrderDiscoveryResult, card: TradeCardState
+) -> Optional[BrokerOrderStatusSnapshot]:
+    """Finds this card's BUY entry among a *complete* broker-wide
+    discovery query, so a local-ledger lookup miss is never treated as
+    broker truth on its own (review finding P0). Prefers a still-open
+    snapshot (the working order to leave alone); falls back to the most
+    recently checked filled/terminal one when nothing is open, so a fill
+    that raced the local write is still found.
+    """
+    candidates = [
+        snapshot
+        for snapshot in discovery.snapshots
+        if snapshot.account_no == card.account_no
+        and snapshot.symbol == card.symbol
+        and snapshot.side == OrderSide.BUY
+    ]
+    if not candidates:
+        return None
+    open_candidates = [c for c in candidates if is_open_status(c.status)]
+    if open_candidates:
+        return max(open_candidates, key=lambda c: c.checked_at)
+    return max(candidates, key=lambda c: c.checked_at)
+
+
 def reconcile_unresolved_orders_at_startup(
     cards: List[TradeCardState],
     *,
@@ -305,9 +388,61 @@ def reconcile_unresolved_orders_at_startup(
                     card.entry_runtime_status = EntryRuntimeStatus.DATA_UNAVAILABLE
                     changed.append(card)
                 continue
-            card.board_status = BoardStatus.BUYLIST
-            card.entry_runtime_status = None
-            changed.append(card)
+            # Review finding P0: a *complete* discovery query confirms the
+            # local ledger has nothing open for this symbol, but that is
+            # not the same as confirming the broker has nothing either --
+            # the previous version moved straight to Buylist without ever
+            # inspecting discovery.snapshots, which would silently orphan
+            # a real broker order (filled or still working) that the local
+            # ledger simply lost track of (a lost write, a restart mid-
+            # submission, a record from another device/process, ...).
+            matching = _find_matching_broker_entry_snapshot(discovery, card)
+            if matching is None:
+                # Confirmed by a complete broker-wide query, not merely a
+                # local lookup miss -- genuinely nothing to recover.
+                card.board_status = BoardStatus.BUYLIST
+                card.entry_runtime_status = None
+                changed.append(card)
+                continue
+            if matching.filled_quantity > 0:
+                # Protect the fill immediately, exactly like a locally-
+                # tracked order's fill is protected below -- an untracked
+                # filled position is the dangerous case this guards
+                # against.
+                card.board_status = BoardStatus.OPEN_POSITION
+                card.broker_quantity = matching.filled_quantity
+                card.orderable_quantity = matching.filled_quantity
+                card.average_entry_price = matching.avg_fill_price or card.average_entry_price
+                card.entry_remaining_target_quantity = 0
+                card.position_runtime_status = PositionRuntimeStatus.OPEN
+                position_manager.apply_first_fill_stop(
+                    card,
+                    entry_orb_low=card.entry_orb_low or 0.0,
+                    entry_orb_window=card.entry_orb_window or card.selected_orb_window or "",
+                )
+                card.entry_runtime_status = None
+                if "ORDER_RECOVERED_FROM_BROKER_DISCOVERY" not in card.warnings:
+                    card.warnings = [*card.warnings, "ORDER_RECOVERED_FROM_BROKER_DISCOVERY"]
+                changed.append(card)
+                continue
+            if matching.status in _ALREADY_TERMINAL_STATUSES:
+                # Terminal with zero fill (CANCELLED/REJECTED/EXPIRED) --
+                # confirmed gone, safe to return to Buylist.
+                card.board_status = BoardStatus.BUYLIST
+                card.entry_runtime_status = None
+                changed.append(card)
+                continue
+            # A real broker order is still open/working with nothing local
+            # tracking it -- never abandon it to Buylist. It cannot yet be
+            # automatically cancelled/repriced (the local order record
+            # itself still needs reconstruction, not implemented here), so
+            # this only flags it for attention rather than pretending it
+            # doesn't exist.
+            if card.entry_runtime_status != EntryRuntimeStatus.DATA_UNAVAILABLE:
+                card.entry_runtime_status = EntryRuntimeStatus.DATA_UNAVAILABLE
+            if "UNRECONCILED_BROKER_ORDER" not in card.warnings:
+                card.warnings = [*card.warnings, "UNRECONCILED_BROKER_ORDER"]
+                changed.append(card)
             continue
 
         refreshed = callbacks.reconcile_order(order)

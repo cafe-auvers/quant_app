@@ -282,6 +282,86 @@ def test_startup_reconciliation_marks_incomplete_when_one_account_fails(tmp_path
     assert "2" not in worker._account_reconciled_at
 
 
+def test_run_one_cycle_excludes_cards_from_accounts_with_startup_errors(tmp_path, monkeypatch):
+    """Review finding P0: "the worker still enters its normal runtime loop
+    ... regardless of whether reconciliation completed successfully" --
+    Buy Board must not decide entries/exits for an account whose broker
+    truth was never confirmed, even though the worker as a whole keeps
+    running (and keeps retrying that account's periodic refresh)."""
+    from src.core import execution_config
+
+    monkeypatch.setattr(execution_config, "is_buyboard_engine_enabled", lambda: True)
+    import src.services.trading_engine as trading_engine_module
+
+    monkeypatch.setattr(trading_engine_module, "is_buyboard_engine_enabled", lambda: True)
+
+    broker = _FakeBroker()
+    worker, engine = _worker(tmp_path, broker=broker)
+    worker.runtime = runtime_module.build_buyboard_runtime(
+        buying_power_provider=worker._buying_power_provider,
+        card_lookup=worker._card_lookup,
+        broker=worker._broker,
+        market_data=_dummy_market_data(),
+    )
+    card = _seed_card(
+        engine,
+        board_status=BoardStatus.BUY_TODAY,
+        entry_runtime_status=EntryRuntimeStatus.RETRY_COOLDOWN,
+    )
+    import datetime as dt
+
+    card.next_retry_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=1)  # already due
+    repo.update_trade_card(engine, card, expected_version=card.version)
+    # Account "1" never actually reconciled at startup.
+    worker.startup_reconciliation_errors = {"1": "simulated KIS outage"}
+    # Prevent the periodic-refresh path (which legitimately still runs for
+    # every account) from clearing the error out from under this test.
+    worker._account_balance_refreshed_at["1"] = dt.datetime.now(dt.timezone.utc)
+    worker._account_reconciled_at["1"] = dt.datetime.now(dt.timezone.utc)
+
+    worker._run_one_cycle()
+
+    stored = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    # Never touched: still RETRY_COOLDOWN, not recovered to EXECUTE_READY.
+    assert stored.entry_runtime_status == EntryRuntimeStatus.RETRY_COOLDOWN
+
+
+def test_periodic_reconciliation_success_clears_startup_reconciliation_error(tmp_path, monkeypatch):
+    """Review finding P0: "no periodic recovery path that removes an
+    account from startup_reconciliation_errors ... this can leave the
+    application permanently reporting the Buy Board as unhealthy.\""""
+    import datetime as dt
+
+    from src.core import execution_config
+
+    monkeypatch.setattr(execution_config, "is_buyboard_engine_enabled", lambda: True)
+    import src.services.trading_engine as trading_engine_module
+
+    monkeypatch.setattr(trading_engine_module, "is_buyboard_engine_enabled", lambda: True)
+
+    broker = _FakeBroker()
+    worker, engine = _worker(tmp_path, broker=broker)
+    worker.runtime = runtime_module.build_buyboard_runtime(
+        buying_power_provider=worker._buying_power_provider,
+        card_lookup=worker._card_lookup,
+        broker=worker._broker,
+        market_data=_dummy_market_data(),
+    )
+    _seed_card(engine, board_status=BoardStatus.WATCHLIST)
+    # Simulates a prior startup failure for this account that has since
+    # become reachable again.
+    worker.startup_reconciliation_errors = {"1": "simulated KIS outage"}
+    worker.startup_reconciliation_complete = False
+    long_ago = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)
+    worker._account_balance_refreshed_at["1"] = long_ago
+    worker._account_reconciled_at["1"] = long_ago
+
+    worker._run_one_cycle()
+
+    assert "1" not in worker.startup_reconciliation_errors
+    assert worker.startup_reconciliation_complete is True
+
+
 def test_startup_reconciliation_complete_when_every_account_succeeds(tmp_path):
     worker, engine = _worker(tmp_path, account_no="1")
     worker.runtime = runtime_module.build_buyboard_runtime(

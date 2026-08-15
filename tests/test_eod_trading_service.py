@@ -6,6 +6,7 @@ import pytest
 from src.core.order_state import (
     BrokerOrder,
     BrokerOrderDiscoveryResult,
+    BrokerOrderStatusSnapshot,
     OrderIntent,
     OrderSide,
     OrderStatus,
@@ -42,6 +43,14 @@ def _order(*, status, filled=0, avg_fill_price=0.0, reservation_id=""):
     order.filled_quantity = filled
     order.avg_fill_price = avg_fill_price
     return order
+
+
+def _snapshot(*, status, filled=0, avg_fill_price=0.0, symbol="AAPL", account_no="1", side=OrderSide.BUY):
+    return BrokerOrderStatusSnapshot(
+        environment="PROD", account_no=account_no, symbol=symbol, side=side,
+        status=status, quantity_requested=10, filled_quantity=filled,
+        avg_fill_price=avg_fill_price,
+    )
 
 
 def _service(tmp_path, *, find_order=None, reconcile_order=None, discover_all_orders=None):
@@ -433,6 +442,182 @@ def test_startup_order_reconciliation_respects_incomplete_discovery(tmp_path):
     assert changed == [card]
     assert card.board_status == BoardStatus.ENTRY_PENDING
     assert card.entry_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE
+
+
+# --- P0: complete discovery must be matched against snapshots, not just ----
+# --- trusted as "nothing exists" the moment the local lookup misses --------
+
+
+def test_startup_order_reconciliation_recovers_a_filled_order_missing_from_ledger(tmp_path):
+    """A complete discovery query finding a real FILLED broker order that
+    the local ledger simply lost track of must protect the position, not
+    silently move the card to Buylist and orphan a filled, unprotected
+    position."""
+    from src.services.eod_trading_service import (
+        EodActionCallbacks,
+        reconcile_unresolved_orders_at_startup,
+    )
+
+    complete = BrokerOrderDiscoveryResult(
+        open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
+        snapshots=[_snapshot(status=OrderStatus.FILLED, filled=100, avg_fill_price=101.5)],
+    )
+    callbacks = EodActionCallbacks(
+        find_open_entry_order=lambda card: None,
+        reconcile_order=lambda o: o,
+        cancel_order=lambda cid: None,
+        discover_all_orders=lambda card: complete,
+    )
+    card = _card(board_status=BoardStatus.ENTRY_PENDING)
+    card.entry_orb_low = 95.0
+
+    changed = reconcile_unresolved_orders_at_startup(
+        [card], position_manager=PositionManager(), callbacks=callbacks
+    )
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.OPEN_POSITION
+    assert card.broker_quantity == 100
+    assert card.average_entry_price == 101.5
+    assert card.stop_type == StopType.ORB_LOW
+    assert "ORDER_RECOVERED_FROM_BROKER_DISCOVERY" in card.warnings
+
+
+def test_startup_order_reconciliation_keeps_a_still_working_order_missing_from_ledger(tmp_path):
+    """A matching broker order that is still open (not filled, not
+    terminal) must not be abandoned to Buylist either -- there is nothing
+    left tracking or eventually cancelling it."""
+    from src.services.eod_trading_service import (
+        EodActionCallbacks,
+        reconcile_unresolved_orders_at_startup,
+    )
+
+    complete = BrokerOrderDiscoveryResult(
+        open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
+        snapshots=[_snapshot(status=OrderStatus.WORKING, filled=0)],
+    )
+    callbacks = EodActionCallbacks(
+        find_open_entry_order=lambda card: None,
+        reconcile_order=lambda o: o,
+        cancel_order=lambda cid: None,
+        discover_all_orders=lambda card: complete,
+    )
+    card = _card(board_status=BoardStatus.ENTRY_PENDING)
+
+    changed = reconcile_unresolved_orders_at_startup(
+        [card], position_manager=PositionManager(), callbacks=callbacks
+    )
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.ENTRY_PENDING  # not orphaned to Buylist
+    assert card.entry_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE
+    assert "UNRECONCILED_BROKER_ORDER" in card.warnings
+
+
+def test_startup_order_reconciliation_moves_to_buylist_only_when_genuinely_no_match(tmp_path):
+    """Original behavior preserved: a complete discovery query that
+    genuinely contains nothing for this symbol still safely returns the
+    card to Buylist."""
+    from src.services.eod_trading_service import (
+        EodActionCallbacks,
+        reconcile_unresolved_orders_at_startup,
+    )
+
+    complete = BrokerOrderDiscoveryResult(
+        open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
+        snapshots=[_snapshot(status=OrderStatus.FILLED, filled=5, symbol="MSFT")],
+    )
+    callbacks = EodActionCallbacks(
+        find_open_entry_order=lambda card: None,
+        reconcile_order=lambda o: o,
+        cancel_order=lambda cid: None,
+        discover_all_orders=lambda card: complete,
+    )
+    card = _card(board_status=BoardStatus.ENTRY_PENDING, symbol="AAPL")
+
+    changed = reconcile_unresolved_orders_at_startup(
+        [card], position_manager=PositionManager(), callbacks=callbacks
+    )
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.BUYLIST
+
+
+def test_startup_order_reconciliation_terminal_zero_fill_match_moves_to_buylist(tmp_path):
+    from src.services.eod_trading_service import (
+        EodActionCallbacks,
+        reconcile_unresolved_orders_at_startup,
+    )
+
+    complete = BrokerOrderDiscoveryResult(
+        open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
+        snapshots=[_snapshot(status=OrderStatus.CANCELLED, filled=0)],
+    )
+    callbacks = EodActionCallbacks(
+        find_open_entry_order=lambda card: None,
+        reconcile_order=lambda o: o,
+        cancel_order=lambda cid: None,
+        discover_all_orders=lambda card: complete,
+    )
+    card = _card(board_status=BoardStatus.ENTRY_PENDING)
+
+    changed = reconcile_unresolved_orders_at_startup(
+        [card], position_manager=PositionManager(), callbacks=callbacks
+    )
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.BUYLIST
+
+
+def test_buy_today_reset_does_not_orphan_a_matching_broker_order(tmp_path):
+    """Same fix, applied to EodTradingService's EOD "Buy Today with no
+    submitted order" reset -- a matching snapshot means the card's status
+    is stale (an order genuinely exists), not that resetting is safe."""
+    complete = BrokerOrderDiscoveryResult(
+        open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
+        snapshots=[_snapshot(status=OrderStatus.WORKING, filled=0)],
+    )
+    service, cancelled, _ = _service(tmp_path, discover_all_orders=lambda card: complete)
+    card = _card(board_status=BoardStatus.BUY_TODAY)
+
+    changed = service.run_eod_cleanup([card])
+
+    assert changed == []
+    assert card.board_status == BoardStatus.BUY_TODAY  # not reset out from under a live order
+
+
+def test_entry_pending_eod_recovers_a_filled_order_missing_from_ledger(tmp_path):
+    """Same fix, applied to EodTradingService's "Entry Pending at EOD"
+    path."""
+    complete = BrokerOrderDiscoveryResult(
+        open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
+        snapshots=[_snapshot(status=OrderStatus.FILLED, filled=100, avg_fill_price=101.5)],
+    )
+    service, cancelled, _ = _service(tmp_path, discover_all_orders=lambda card: complete)
+    card = _card(board_status=BoardStatus.ENTRY_PENDING)
+    card.entry_orb_low = 95.0
+
+    changed = service.run_eod_cleanup([card])
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.OPEN_POSITION
+    assert card.broker_quantity == 100
+
+
+def test_entry_pending_eod_keeps_a_still_working_order_missing_from_ledger(tmp_path):
+    complete = BrokerOrderDiscoveryResult(
+        open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
+        snapshots=[_snapshot(status=OrderStatus.WORKING, filled=0)],
+    )
+    service, cancelled, _ = _service(tmp_path, discover_all_orders=lambda card: complete)
+    card = _card(board_status=BoardStatus.ENTRY_PENDING)
+
+    changed = service.run_eod_cleanup([card])
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.ENTRY_PENDING
+    assert "UNRECONCILED_BROKER_ORDER" in card.warnings
+    assert cancelled == []  # never guesses a cancel against an unverified snapshot
 
 
 def test_run_startup_reconciliation_composes_positions_and_orders(tmp_path):

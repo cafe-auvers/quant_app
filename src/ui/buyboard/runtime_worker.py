@@ -400,15 +400,36 @@ class BuyboardRuntimeWorker(QThread):
                     changed_ids.add(id(card))
                     changed.append(card)
 
+        # The periodic refresh runs over *every* account regardless of
+        # readiness -- it is the recovery path for a failed one -- but
+        # everything after it (ORB sync, quote subscriptions, entry/exit
+        # evaluation) must not process a card whose account_no is still in
+        # startup_reconciliation_errors. Review finding P0: "the worker
+        # still enters its normal runtime loop after
+        # _run_startup_reconciliation() regardless of whether
+        # reconciliation completed successfully" -- Buy Board deciding
+        # entries or exits for an account it has never actually confirmed
+        # broker truth for (or whose latest refresh just failed) would be
+        # acting on a local view that might not match the broker at all.
+        # This is a global (per-worker), not per-card, health signal
+        # already -- the legacy monitor's own health check
+        # (main_window._buyboard_engine_healthy) already fails open for
+        # every account's protective exits whenever this dict is
+        # non-empty, so excluding these cards here does not leave them
+        # unprotected.
         _track(self._refresh_account_state_if_due(cards))
-        _track(self._sync_orb_plans(cards))
-        self._sync_quote_subscriptions(cards)
+        ready_cards = [
+            card for card in cards if card.account_no not in self.startup_reconciliation_errors
+        ]
+
+        _track(self._sync_orb_plans(ready_cards))
+        self._sync_quote_subscriptions(ready_cards)
 
         for quote in self.runtime.market_data.poll_once():
-            _track(self.runtime.trading_engine.evaluate_quote(cards, quote))
+            _track(self.runtime.trading_engine.evaluate_quote(ready_cards, quote))
 
-        _track(self.runtime.trading_engine.run_heartbeat(cards))
-        self._emit_stalled_liquidation_alerts(cards)
+        _track(self.runtime.trading_engine.run_heartbeat(ready_cards))
+        self._emit_stalled_liquidation_alerts(ready_cards)
 
         self._persist_changed(changed)
         if changed:
@@ -541,6 +562,20 @@ class BuyboardRuntimeWorker(QThread):
                 )
                 changed.extend(order_changed)
                 self._account_reconciled_at[account_no] = now
+                # Review finding P0: "no periodic recovery path that
+                # removes an account from startup_reconciliation_errors...
+                # this can leave the application permanently reporting the
+                # Buy Board as unhealthy" -- a startup failure was
+                # specifically a failure to fetch/reconcile this exact
+                # account's broker truth; a later periodic cycle doing
+                # that same fetch+reconcile successfully is genuine
+                # recovery, so clear it and let health be recomputed.
+                if self.startup_reconciliation_errors.pop(account_no, None) is not None:
+                    self.startup_reconciliation_complete = not self.startup_reconciliation_errors
+                    logger.info(
+                        "Account %s recovered from a prior startup reconciliation failure",
+                        account_no,
+                    )
 
         return changed
 
