@@ -355,6 +355,39 @@ def fetch_discovered_external_order(
         return get_discovered_external_order(conn, external_order_id)
 
 
+def save_discovered_external_order(
+    engine: Engine,
+    order: DiscoveredExternalOrder,
+    *,
+    expected_version: int,
+) -> DiscoveredExternalOrder:
+    ensure_discovered_external_orders_table(engine)
+    with engine.begin() as conn:
+        return update_discovered_external_order(
+            conn, order, expected_version=expected_version
+        )
+
+
+def list_discovered_external_orders_for_account(
+    engine: Engine,
+    *,
+    environment: str,
+    account_no: str,
+) -> list[DiscoveredExternalOrder]:
+    """Return the permanent A4b audit records for one account."""
+    table = ensure_discovered_external_orders_table(engine)
+    with engine.begin() as conn:
+        rows = conn.execute(
+            select(table)
+            .where(
+                table.c.environment == str(environment or "").upper(),
+                table.c.account_no == str(account_no or ""),
+            )
+            .order_by(table.c.id.asc())
+        ).fetchall()
+    return [_row_to_order(row) for row in rows]
+
+
 # --- atomic adoption (revision 3.2) -------------------------------------
 
 

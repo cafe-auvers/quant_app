@@ -134,7 +134,7 @@ PR's behavior composes correctly, plus the Gate 1 run in full.
 | 1 | Freeze requirements and invariants (this document) | DONE — revision 3.1 signed off |
 | 2 | Durable order ownership and command ledger | PR1 IMPLEMENTED, not activated — merged to `master` (`5b50e1d`): schemas, all three state machines, durable repositories, command ledger. Excludes A4a's KIS-specific correlation-key adapter (stays gated on Workstream 0). |
 | 3 | One guarded execution gateway | PR2 IMPLEMENTED, not activated — `ExecutionCommandGateway` (`src/services/execution_command_gateway.py`): dual-mode, with genuinely separate call shapes per mode (`submit_order`/`cancel_order` for `LEGACY_COMPATIBILITY`; `submit_guarded`/`cancel_guarded`/`replace_guarded` taking explicit request models with caller-generated stable command identities for `GUARDED_ENGINE`). Full A1-A11/B1-B4 sequence, one authoritative atomic capital reservation with an in-transaction availability check, a real lease-epoch gate, H1 ownership enforcement, a mutation-budget seam for Workstream 10, and fail-closed guarded runtime composition. Runtime-level tests cover restart-restored caller identity, normalized results, full-context tracked cancellation, Partial Sell/Sell All, one-reservation entry, and unresolved post-broker persistence without retry. |
-| 4 | Account-level reconciliation engine | NOT STARTED |
+| 4 | Account-level reconciliation engine | PR3 IMPLEMENTED, not activated — one immutable `AccountBrokerSnapshot` per account/pass, per-source `SnapshotCompleteness`, a pure `ReconciliationPlan` reducer, durable two-generation absence evidence, full C4 category coverage, conservative A4a/A4b precedence, corrected emergency Sell All quantity, and one startup/periodic runtime pass replacing the three ordered EOD sweeps. KIS submission-time mapping and production threshold calibration remain gated on Workstream 0; without verified broker submission time, A4a stays manual and unmatched broker orders remain separate `DiscoveredExternalOrder`s. |
 | 5 | Production KIS real-time market data | NOT STARTED |
 | 6 | Runtime readiness and device handoff | NOT STARTED |
 | 7 | Complete test program | NOT STARTED — matrix fully specified; distributed across PR1-7, capstone in PR8 |
@@ -1045,18 +1045,18 @@ owned cards).
 
 Every row must have an explicit reducer branch and at least one fault-injection scenario from Workstream 7 (F1/F4):
 
-- [ ] Entry BUY
-- [ ] Entry completion BUY (remaining target after a partial fill)
-- [ ] Partial Sell
-- [ ] Sell All
-- [ ] Stop-loss Sell
-- [ ] Reserved market-on-open Sell
-- [ ] Unknown submission state
-- [ ] Rejected / cancelled / expired order
-- [ ] Manual broker position (no local card)
-- [ ] `DiscoveredExternalOrder` (no local card, A4b)
-- [ ] Capital reservation with no live order
-- [ ] Live order with no capital reservation
+- [x] Entry BUY
+- [x] Entry completion BUY (remaining target after a partial fill)
+- [x] Partial Sell
+- [x] Sell All
+- [x] Stop-loss Sell
+- [x] Reserved market-on-open Sell
+- [x] Unknown submission state
+- [x] Rejected / cancelled / expired order
+- [x] Manual broker position (no local card)
+- [x] `DiscoveredExternalOrder` (no local card, A4b)
+- [x] Capital reservation with no live order
+- [x] Live order with no capital reservation
 
 ## Activation gates (recap, owning invariants noted)
 
@@ -1096,6 +1096,13 @@ and stays `false` in unattended/automatic form until Gate 5 passes.
 
 ## Change log
 
+- 2026-08-16 (PR3): Implemented Workstream 4's account-level reconciliation
+  engine and runtime integration. Added deterministic account snapshots and
+  plans, action-specific completeness, durable absence generations, all C4
+  classifications, conservative unowned-order handling, emergency Sell All
+  exposure math, and removed the three order-dependent EOD reconciliation
+  sweeps. Production A4a correlation and timing calibration remain gated on
+  the unverified Workstream 0 capability matrix.
 - 2026-08-15: Initial draft, branch created from `109c2c4` ("kanban fix 8").
 - 2026-08-15 (revision 2): Incorporated first architecture review. Added
   Workstream 0, INV-20, rewrote A4 (single version), atomic pre-submission

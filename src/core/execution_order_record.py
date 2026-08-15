@@ -434,6 +434,17 @@ class ExecutionOrderRecord:
     last_broker_seen_at: Optional[str] = None
     last_reconciled_at: Optional[str] = None
 
+    # Workstream 4/C3: two independent, sufficiently-separated complete
+    # broker snapshots are required before an exact order's disappearance
+    # can resolve terminal.  These live on the order so the evidence
+    # survives restart and device handoff.
+    absence_count: int = 0
+    last_absence_snapshot_id: str = ""
+    last_absence_observed_at: Optional[str] = None
+    last_absence_session_date: Optional[str] = None
+    last_absence_broker_order_id: str = ""
+    last_absence_holding_quantity: Optional[int] = None
+
     origin: OrderOrigin = OrderOrigin.APPLICATION
     broker_identity_status: BrokerIdentityStatus = BrokerIdentityStatus.NOT_ASSIGNED
     recovery_state: OrderRecoveryState = OrderRecoveryState.NONE
@@ -479,6 +490,21 @@ class ExecutionOrderRecord:
         self.filled_quantity = int(self.filled_quantity or 0)
         self.remaining_quantity = int(self.remaining_quantity or 0)
         self.average_fill_price = float(self.average_fill_price or 0.0)
+        self.absence_count = max(0, int(self.absence_count or 0))
+        self.last_absence_snapshot_id = str(self.last_absence_snapshot_id or "")
+        self.last_absence_observed_at = (
+            str(self.last_absence_observed_at) if self.last_absence_observed_at else None
+        )
+        self.last_absence_session_date = (
+            str(self.last_absence_session_date) if self.last_absence_session_date else None
+        )
+        self.last_absence_broker_order_id = str(
+            self.last_absence_broker_order_id or ""
+        )
+        if self.last_absence_holding_quantity is not None:
+            self.last_absence_holding_quantity = max(
+                0, int(self.last_absence_holding_quantity or 0)
+            )
         self.origin = _strict_enum(self.origin, OrderOrigin)
         self.broker_identity_status = _strict_enum(self.broker_identity_status, BrokerIdentityStatus)
         self.recovery_state = _strict_enum(self.recovery_state, OrderRecoveryState)

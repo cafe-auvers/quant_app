@@ -168,32 +168,6 @@ def test_construction_builds_nothing(tmp_path):
     assert worker.runtime is None
 
 
-# --- Order callbacks (review finding P0-4) -----------------------------------
-
-
-def test_build_order_callbacks_wires_cancel_discovered_order_to_the_broker(tmp_path):
-    """Review finding P0-4: an untracked discovered order's cancel
-    callback must actually reach the real broker (keyed by the
-    snapshot's own broker_order_id), not silently no-op."""
-    from src.core.order_state import BrokerOrderStatusSnapshot, OrderSide, OrderStatus
-
-    broker = _FakeBroker()
-    callbacks = BuyboardRuntimeWorker._build_order_callbacks(broker)
-    card = TradeCardState(environment="PROD", account_no="1", symbol="AAPL")
-    snapshot = BrokerOrderStatusSnapshot(
-        environment="PROD", account_no="1", symbol="AAPL", side=OrderSide.BUY,
-        status=OrderStatus.WORKING, broker_order_id="B-99",
-        quantity_requested=25, filled_quantity=0, remaining_quantity=25,
-        raw_response={"ovrs_excg_cd": "NASD"},
-    )
-
-    callbacks.cancel_discovered_order(card, snapshot)
-
-    assert len(broker.cancel_calls) == 1
-    assert broker.cancel_calls[0]["broker_order_id"] == "B-99"
-    assert broker.cancel_calls[0]["quantity"] == 25
-
-
 # --- Startup reconciliation --------------------------------------------------
 
 
@@ -366,15 +340,8 @@ def test_startup_reconciliation_does_not_cross_account_boundaries(tmp_path):
 
 
 def test_startup_reconciliation_fully_resolves_a_buy_today_fill_in_one_pass(tmp_path):
-    """Review finding P0: "BUY_TODAY recovery still has startup and
-    two-pass gaps" -- reconcile_buy_today_orders must run *before* the
-    ENTRY_PENDING sweep within a single startup pass, so a BUY_TODAY card
-    transitioned to ENTRY_PENDING by discovery is immediately picked up
-    and fully resolved (fill applied, moved to OPEN_POSITION) in this
-    exact same call -- not left at ENTRY_PENDING/DATA_UNAVAILABLE for a
-    later cycle (up to FULL_RECONCILIATION_SECONDS away) to notice.
-    Startup previously did not call reconcile_buy_today_orders at all.
-    """
+    """The account reducer consumes holdings and orders together, so a
+    startup fill cannot be stranded behind a second ordered sweep/pass."""
     broker = _FakeBroker()
     broker.discover_result = BrokerOrderDiscoveryResult(
         open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
