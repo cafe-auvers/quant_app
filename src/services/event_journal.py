@@ -24,6 +24,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional
 from uuid import uuid4
 
 from src.utils.config import DATA_DIR
+from src.utils.redaction import mask_account_number, redact_payload, scrub_sensitive_text
 
 EVENT_JOURNAL_FILE = DATA_DIR / "event_journal.jsonl"
 MAX_JOURNAL_BYTES = 25 * 1024 * 1024
@@ -62,23 +63,6 @@ class EventType(str, Enum):
     RECONCILIATION_WARNING = "RECONCILIATION_WARNING"
 
 
-_SENSITIVE_KEY_PARTS = (
-    "access_token",
-    "authorization",
-    "app_secret",
-    "password",
-    "passwd",
-    "secret",
-    "token",
-)
-_SENSITIVE_ASSIGNMENT_RE = re.compile(
-    r"(?i)(\b(?:access_token|authorization|app_secret|password|passwd|secret|token|"
-    r"app_key|appkey)\b[\"']?\s*[:=]\s*[\"']?)([^\s\"'&,;}]+)"
-)
-_BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
-_ACCOUNT_RE = re.compile(r"(?<!\d)(\d{8}-?\d{2})(?!\d)")
-
-
 @dataclass(frozen=True)
 class EventJournalStatus:
     path: Path
@@ -96,69 +80,13 @@ class EventJournalStatus:
     inspection_error: str = ""
 
 
-def mask_account_number(account_no: Any) -> str:
-    """Return a useful correlation label without persisting the full account."""
-    text = str(account_no or "").strip()
-    if not text:
-        return ""
-    compact = text.replace("-", "")
-    if len(compact) <= 4:
-        return "*" * len(compact)
-    return f"{compact[:2]}{'*' * max(4, len(compact) - 4)}{compact[-2:]}"
-
-
-def scrub_sensitive_text(value: Any, *, account_no: Any = "") -> str:
-    """Remove credentials and account identifiers from unstructured text."""
-    text = str(value or "")
-    account_text = str(account_no or "").strip()
-    if account_text:
-        masked = mask_account_number(account_text)
-        variants = {account_text, account_text.replace("-", "")}
-        for variant in sorted(
-            (item for item in variants if item), key=len, reverse=True
-        ):
-            text = text.replace(variant, masked)
-    text = _ACCOUNT_RE.sub(lambda match: mask_account_number(match.group(1)), text)
-    text = _BEARER_RE.sub("Bearer [REDACTED]", text)
-    return _SENSITIVE_ASSIGNMENT_RE.sub(r"\1[REDACTED]", text)
-
-
-def _safe_payload(
-    value: Any,
-    *,
-    key: str = "",
-    depth: int = 0,
-    account_no: Any = "",
-) -> Any:
-    normalized_key = str(key).strip().lower()
-    if any(part in normalized_key for part in _SENSITIVE_KEY_PARTS):
-        return "[REDACTED]"
-    if depth > 6:
-        return "[TRUNCATED]"
-    if value is None or isinstance(value, (bool, int, float)):
-        return value
-    if isinstance(value, str):
-        return scrub_sensitive_text(value, account_no=account_no)
-    if isinstance(value, Enum):
-        return value.value
-    if isinstance(value, dict):
-        return {
-            str(item_key): _safe_payload(
-                item,
-                key=str(item_key),
-                depth=depth + 1,
-                account_no=account_no,
-            )
-            for item_key, item in value.items()
-        }
-    if isinstance(value, (list, tuple, set)):
-        return [
-            _safe_payload(item, depth=depth + 1, account_no=account_no)
-            for item in value
-        ]
-    if isinstance(value, (dt.date, dt.datetime)):
-        return value.isoformat()
-    return scrub_sensitive_text(value, account_no=account_no)
+# mask_account_number/scrub_sensitive_text are re-exported (imported above)
+# from src.utils.redaction (revision 3.2 of
+# docs/kanban_production_readiness.md) -- moved there so core-layer modules
+# don't need to import a private function from this services-layer module.
+# _safe_payload is kept here as a thin alias to the shared redact_payload so
+# every existing internal call site below is unaffected by the move.
+_safe_payload = redact_payload
 
 
 def _status_key(path: Path) -> str:
