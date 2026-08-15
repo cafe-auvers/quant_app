@@ -148,6 +148,7 @@ environment doesn't have.
 | External correlation key | Whether `MGCO_APTM_ODNO` (or any other field) accepts a unique application-supplied ID on submission | Submit test orders in simulation with a unique token in `MGCO_APTM_ODNO`, inspect the response | A4a uses the `UNKNOWN_SUBMISSION_STATE` path unconditionally — no heuristic-matching fallback is ever treated as ownership |
 | Correlation recovery | Whether that value is echoed back in submission responses, open-order queries, history queries, and execution notices | Cross-check one test order's token across all four query surfaces | Same fallback as above |
 | Broker order ID | Exact response field name; whether it's present immediately on submission ack or only appears later | Inspect real submission/query responses | `ACKNOWLEDGED` status waits for it; a submission ack with no ID yet keeps the record at `SUBMITTING` |
+| Broker-order identity uniqueness scope | Whether a broker order ID is unique only within (environment, account, exchange, session/trading-date) or has a wider or narrower actual scope — i.e. whether IDs are ever reused across sessions/trading dates, and whether the same numeric ID can independently exist on two different exchanges for the same account | Inspect real order IDs across multiple sessions/trading dates and, where the account trades more than one exchange, across exchanges; ask whether KIS documents an explicit reuse/rollover policy | `broker_identity_key` (PR1, revision 3.2) is provisionally scoped to `environment:account_no:broker_order_id` only — narrower than a true `(environment, account, exchange, session_date, broker_order_id)` key. If IDs are confirmed to repeat across sessions/trading dates or independently across exchanges, the key must be widened before Workstream 0's gate lifts on any capability that depends on long-lived exact-identity uniqueness; until then this is a known, provisional gap, not a silently-assumed-safe one |
 | History latency | Time from submit/cancel to appearance in `inquire-ccnl`/`inquire-nccs` | Timed test submissions, repeated across a session | Reconciliation retry interval (Workstream 4) must exceed the measured worst-case latency with margin |
 | History completeness | Max date range, pagination behavior, exchange coverage, whether cancelled/rejected orders appear at all | Boundary-condition queries | `SnapshotCompleteness` (C1) requires every configured exchange/source to individually succeed |
 | WebSocket symbol key format | Exact subscription key format per exchange | Inspect the official sample's subscribe payloads + a live test subscribe | Blocks D1 implementation until confirmed |
@@ -1165,3 +1166,37 @@ and stays `false` in unattended/automatic form until Gate 5 passes.
   caller-owned transaction/connection, not only their own, since A1's
   atomicity requirement needs three repositories' writes composed into a
   single commit once Workstream 3 orchestrates them.
+- 2026-08-15 (revision 3.2, continued): Second PR1 hardening pass. Added a
+  narrow Workstream 0 capability-matrix row, "Broker-order identity
+  uniqueness scope" -- PR1's `broker_identity_key` is provisionally scoped
+  to `environment:account_no:broker_order_id`; whether that scope actually
+  matches KIS's real ID-reuse/rollover behavior (across sessions/trading
+  dates, and across exchanges for a multi-exchange account) is unverified
+  without live credentials, so it is logged as a known, provisional gap
+  rather than a silently-assumed-safe one. Corrected PR1's implementation
+  to match: `execution_orders.broker_identity_key` and
+  `discovered_external_orders.broker_identity_key` are now real database
+  `UNIQUE` constraints (the prior application-level "SELECT then INSERT"
+  check alone was a race between two concurrent transactions that could
+  both pass the check and commit duplicate claims). Added
+  `ExecutionOrderRecord.validate_consistency` -- an aggregate invariant
+  check independent of how the record was built, called at construction,
+  after every status transition, and before every repository write, since
+  a corrupted persisted payload or a record built by direct construction
+  otherwise bypassed the per-field checks entirely. Fixed both
+  repositories' optimistic-concurrency updates, which were mutating the
+  caller's in-memory `version` before the write was confirmed to have
+  applied -- a rejected write left the caller believing a version the
+  database never actually stored. Added immutable-identity-field
+  protection (`environment`/`account_no`/`symbol`, plus `broker_order_id`
+  for discovered orders) so an update can no longer silently change what a
+  record's own indexed columns say it is. Hardened
+  `execution_command_repository.update_command_response`: it now looks up
+  the command's own stored `account_no` for redaction rather than trusting
+  an optional caller-supplied parameter, and it is now a compare-and-set
+  write (`status='REQUESTED' AND version=expected_version`) so a second
+  write to an already-recorded response fails loudly instead of silently
+  overwriting the real outcome. Made `_parse_dt` raise on a blank or
+  malformed `requested_at` instead of silently substituting the current
+  time. Finished moving broker-response/raw-payload redaction to the
+  shared `src/utils/redaction.py` utility across all three PR1 modules.

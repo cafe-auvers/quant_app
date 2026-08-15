@@ -420,8 +420,11 @@ def test_is_cancellable_false_for_a_user_adopted_record_without_cancel_permissio
 
 
 def test_is_cancellable_true_for_a_user_adopted_record_with_cancel_permission_granted():
-    rec = _record(adoption_permissions=frozenset({AdoptedOrderPermission.CANCEL}))
-    rec.origin = OrderOrigin.USER_ADOPTED
+    rec = _record(
+        origin=OrderOrigin.USER_ADOPTED,
+        adopted_from_external_order_id="EXT-1",
+        adoption_permissions=frozenset({AdoptedOrderPermission.CANCEL}),
+    )
     _acknowledged(rec)
     apply_status_transition(rec, ExecutionOrderStatus.WORKING)
     assert is_cancellable(rec)
@@ -430,3 +433,148 @@ def test_is_cancellable_true_for_a_user_adopted_record_with_cancel_permission_gr
 def test_invalid_adoption_permission_raises_rather_than_silently_defaulting():
     with pytest.raises(ValueError):
         _record(adoption_permissions=frozenset({"NOT_A_REAL_PERMISSION"}))
+
+
+# --- validate_consistency (revision 3.2) -------------------------------------
+#
+# Every status/identity combination the state machine can legally reach,
+# and every invalid combination someone could otherwise build by direct
+# construction or by corrupting a persisted payload. Checked both at
+# construction (__post_init__) and it's the same function
+# apply_status_transition and the repository layer call.
+
+
+from src.core.execution_order_record import (  # noqa: E402
+    InvalidExecutionOrderConsistencyError,
+    validate_consistency,
+)
+
+
+@pytest.mark.parametrize(
+    "status,identity",
+    [
+        (ExecutionOrderStatus.PREPARED, BrokerIdentityStatus.NOT_ASSIGNED),
+        (ExecutionOrderStatus.CANCELLED_LOCALLY, BrokerIdentityStatus.NOT_ASSIGNED),
+        (ExecutionOrderStatus.SUBMITTING, BrokerIdentityStatus.AMBIGUOUS),
+        (ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE, BrokerIdentityStatus.AMBIGUOUS),
+        (ExecutionOrderStatus.NOT_ACCEPTED_CONFIRMED, BrokerIdentityStatus.NO_BROKER_ORDER_CONFIRMED),
+        (ExecutionOrderStatus.REJECTED, BrokerIdentityStatus.NO_BROKER_ORDER_CONFIRMED),
+        (ExecutionOrderStatus.ACKNOWLEDGED, BrokerIdentityStatus.EXACT),
+        (ExecutionOrderStatus.WORKING, BrokerIdentityStatus.EXACT),
+        (ExecutionOrderStatus.PARTIALLY_FILLED, BrokerIdentityStatus.EXACT),
+        (ExecutionOrderStatus.FILLED, BrokerIdentityStatus.EXACT),
+        (ExecutionOrderStatus.CANCEL_PENDING, BrokerIdentityStatus.EXACT),
+        (ExecutionOrderStatus.CANCELLED, BrokerIdentityStatus.EXACT),
+        (ExecutionOrderStatus.EXPIRED, BrokerIdentityStatus.EXACT),
+    ],
+)
+def test_validate_consistency_accepts_every_legal_status_identity_combination(status, identity):
+    kwargs = dict(status=status, broker_identity_status=identity)
+    if identity == BrokerIdentityStatus.EXACT:
+        kwargs["broker_order_id"] = "B-1"
+    rec = _record(**kwargs)  # must not raise
+    validate_consistency(rec)  # must not raise
+
+
+@pytest.mark.parametrize(
+    "status,identity",
+    [
+        (ExecutionOrderStatus.PREPARED, BrokerIdentityStatus.AMBIGUOUS),
+        (ExecutionOrderStatus.PREPARED, BrokerIdentityStatus.EXACT),
+        (ExecutionOrderStatus.SUBMITTING, BrokerIdentityStatus.NOT_ASSIGNED),
+        (ExecutionOrderStatus.SUBMITTING, BrokerIdentityStatus.EXACT),
+        (ExecutionOrderStatus.NOT_ACCEPTED_CONFIRMED, BrokerIdentityStatus.NOT_ASSIGNED),
+        (ExecutionOrderStatus.NOT_ACCEPTED_CONFIRMED, BrokerIdentityStatus.AMBIGUOUS),
+        (ExecutionOrderStatus.ACKNOWLEDGED, BrokerIdentityStatus.NOT_ASSIGNED),
+        (ExecutionOrderStatus.ACKNOWLEDGED, BrokerIdentityStatus.AMBIGUOUS),
+        (ExecutionOrderStatus.WORKING, BrokerIdentityStatus.NO_BROKER_ORDER_CONFIRMED),
+        (ExecutionOrderStatus.CANCELLED_LOCALLY, BrokerIdentityStatus.EXACT),
+    ],
+)
+def test_validate_consistency_rejects_every_illegal_status_identity_combination(status, identity):
+    kwargs = dict(status=status, broker_identity_status=identity)
+    if identity == BrokerIdentityStatus.EXACT:
+        kwargs["broker_order_id"] = "B-1"
+    with pytest.raises(InvalidExecutionOrderConsistencyError):
+        _record(**kwargs)
+
+
+def test_validate_consistency_rejects_no_broker_order_confirmed_carrying_a_broker_order_id():
+    rec = _record(status=ExecutionOrderStatus.REJECTED, broker_identity_status=BrokerIdentityStatus.NO_BROKER_ORDER_CONFIRMED)
+    rec.broker_order_id = "B-1"  # corrupt it after construction
+    with pytest.raises(InvalidExecutionOrderConsistencyError):
+        validate_consistency(rec)
+
+
+def test_validate_consistency_rejects_application_origin_with_adoption_permissions():
+    rec = _record()
+    rec.adoption_permissions = frozenset({AdoptedOrderPermission.CANCEL})
+    with pytest.raises(InvalidExecutionOrderConsistencyError):
+        validate_consistency(rec)
+
+
+def test_validate_consistency_rejects_user_adopted_origin_without_an_adoption_source():
+    rec = _record()
+    rec.origin = OrderOrigin.USER_ADOPTED
+    with pytest.raises(InvalidExecutionOrderConsistencyError):
+        validate_consistency(rec)
+
+
+def test_validate_consistency_accepts_user_adopted_origin_with_an_adoption_source():
+    rec = _record(origin=OrderOrigin.USER_ADOPTED, adopted_from_external_order_id="EXT-1")
+    validate_consistency(rec)  # must not raise
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("submitted_quantity", -1),
+        ("filled_quantity", -1),
+        ("remaining_quantity", -1),
+    ],
+)
+def test_validate_consistency_rejects_negative_quantities(field, value):
+    rec = _record(submitted_quantity=10)
+    setattr(rec, field, value)
+    with pytest.raises(InvalidExecutionOrderConsistencyError):
+        validate_consistency(rec)
+
+
+def test_validate_consistency_rejects_filled_quantity_exceeding_submitted():
+    rec = _record(submitted_quantity=10)
+    rec.filled_quantity = 11
+    with pytest.raises(InvalidExecutionOrderConsistencyError):
+        validate_consistency(rec)
+
+
+def test_validate_consistency_rejects_filled_plus_remaining_exceeding_submitted():
+    rec = _record(submitted_quantity=10)
+    rec.filled_quantity = 5
+    rec.remaining_quantity = 6
+    with pytest.raises(InvalidExecutionOrderConsistencyError):
+        validate_consistency(rec)
+
+
+def test_validate_consistency_rejects_attempt_number_below_one():
+    rec = _record()
+    rec.attempt_number = 0
+    with pytest.raises(InvalidExecutionOrderConsistencyError):
+        validate_consistency(rec)
+
+
+def test_validate_consistency_rejects_negative_lease_epoch():
+    rec = _record()
+    rec.lease_epoch = -1
+    with pytest.raises(InvalidExecutionOrderConsistencyError):
+        validate_consistency(rec)
+
+
+def test_apply_status_transition_revalidates_consistency_after_the_transition():
+    """A transition helper that mutates status but not the record's own
+    (already-corrupted) quantities must still be caught -- validate_consistency
+    runs at the end of every transition, not only at construction."""
+    rec = _record(submitted_quantity=10)
+    rec.filled_quantity = 10
+    rec.remaining_quantity = 10  # already inconsistent (10 + 10 > 10), planted directly
+    with pytest.raises(InvalidExecutionOrderConsistencyError):
+        apply_status_transition(rec, ExecutionOrderStatus.SUBMITTING)

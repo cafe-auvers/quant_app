@@ -126,7 +126,6 @@ def test_record_command_response_round_trips(tmp_path):
 
     updated = repo.record_command_response(
         engine, "IDEMP-1", status="ACKNOWLEDGED", broker_response={"broker_order_id": "B-1"},
-        account_no="12345678-01",
     )
     assert updated.status == "ACKNOWLEDGED"
     assert updated.redacted_response == {"broker_order_id": "B-1"}
@@ -146,7 +145,6 @@ def test_record_command_response_redacts_the_broker_response(tmp_path):
         "IDEMP-1",
         status="ACKNOWLEDGED",
         broker_response={"account_no": "12345678-01", "access_token": "SECRET", "order_note": "no digits here"},
-        account_no="12345678-01",
     )
     assert updated.redacted_response["access_token"] == "[REDACTED]"
     assert "12345678-01" not in str(updated.redacted_response)
@@ -204,3 +202,77 @@ def test_insert_command_and_update_command_response_compose_in_one_transaction(t
 
     fetched = repo.get_command_by_idempotency_key(engine, "ONE-TXN")
     assert fetched.status == "ACKNOWLEDGED"
+
+
+# --- account_no lookup / compare-and-set (revision 3.2 hardening) ----------
+
+
+def test_update_command_response_redacts_using_the_commands_own_stored_account_no(tmp_path):
+    """No caller-supplied account_no parameter exists any more -- redaction
+    must still work, using the account_no the command itself was recorded
+    with."""
+    engine = _make_engine(tmp_path)
+    repo.record_command(engine, _command(account_no="12345678-01"))
+
+    updated = repo.record_command_response(
+        engine,
+        "IDEMP-1",
+        status="ACKNOWLEDGED",
+        broker_response={"account_no": "12345678-01", "note": "plain"},
+    )
+    assert "12345678-01" not in str(updated.redacted_response)
+    assert updated.redacted_response["note"] == "plain"
+
+
+def test_update_command_response_rejects_a_second_write_to_an_already_acknowledged_command(tmp_path):
+    """Compare-and-set guard (revision 3.2): once a response has been
+    recorded, a second write -- stale retry, race, or bug -- must fail
+    loudly rather than silently overwrite the real, already-recorded
+    outcome."""
+    engine = _make_engine(tmp_path)
+    repo.record_command(engine, _command())
+    repo.record_command_response(
+        engine, "IDEMP-1", status="ACKNOWLEDGED", broker_response={"broker_order_id": "B-1"}
+    )
+
+    with pytest.raises(repo.CommandResponseConflictError):
+        repo.record_command_response(
+            engine, "IDEMP-1", status="FAILED", broker_response={"error": "late retry"}
+        )
+
+    # The original, real outcome must survive untouched.
+    fetched = repo.get_command_by_idempotency_key(engine, "IDEMP-1")
+    assert fetched.status == "ACKNOWLEDGED"
+    assert fetched.redacted_response == {"broker_order_id": "B-1"}
+
+
+def test_update_command_response_rejects_a_stale_expected_version(tmp_path):
+    engine = _make_engine(tmp_path)
+    recorded = repo.record_command(engine, _command())
+    assert recorded.version == 1
+
+    with pytest.raises(repo.CommandResponseConflictError):
+        repo.record_command_response(
+            engine,
+            "IDEMP-1",
+            status="ACKNOWLEDGED",
+            broker_response={"broker_order_id": "B-1"},
+            expected_version=99,
+        )
+    # A rejected write must not have applied.
+    assert repo.get_command_by_idempotency_key(engine, "IDEMP-1").status == "REQUESTED"
+
+
+# --- _parse_dt / requested_at integrity (revision 3.2) ----------------------
+
+
+def test_insert_command_rejects_a_blank_requested_at(tmp_path):
+    engine = _make_engine(tmp_path)
+    with pytest.raises(ValueError):
+        repo.record_command(engine, _command(requested_at=""))
+
+
+def test_insert_command_rejects_a_malformed_requested_at(tmp_path):
+    engine = _make_engine(tmp_path)
+    with pytest.raises(ValueError):
+        repo.record_command(engine, _command(requested_at="not-a-timestamp"))

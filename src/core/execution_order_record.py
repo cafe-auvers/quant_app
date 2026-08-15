@@ -168,6 +168,26 @@ def validate_status_transition(current: ExecutionOrderStatus, target: ExecutionO
         )
 
 
+def compute_broker_identity_key(environment: str, account_no: str, broker_order_id: str) -> str:
+    """The canonical key a *real* database UNIQUE constraint enforces
+    (revision 3.2) so two different local records can never both claim
+    the same exact broker order -- an application-level "SELECT then
+    INSERT" check alone is a race between concurrent transactions; only a
+    DB-level constraint on this key is actually race-safe.
+
+    Scoped to environment+account+broker_order_id for now -- this is the
+    conservative, almost-certainly-correct scope (a broker_order_id is at
+    minimum unique within one account in one environment); whether it also
+    needs to be scoped by exchange or session date is exactly what
+    Workstream 0's "broker-order identity uniqueness scope" capability row
+    must verify against the real API before this key is ever narrowed
+    further. Widening later is easy; silently missing a real collision
+    because the key was too broad is not, so this starts as broad as
+    plausible rather than guessing narrower.
+    """
+    return f"{str(environment or '').upper()}:{str(account_no or '')}:{str(broker_order_id or '').strip()}"
+
+
 class OrderOrigin(str, Enum):
     APPLICATION = "APPLICATION"  # created via the normal submission flow
     USER_ADOPTED = "USER_ADOPTED"  # created by adopting a DiscoveredExternalOrder
@@ -224,6 +244,84 @@ _STATUSES_REQUIRING_EXACT_IDENTITY: FrozenSet[ExecutionOrderStatus] = frozenset(
 _STATUSES_IMPLYING_NO_BROKER_ORDER_CONFIRMED: FrozenSet[ExecutionOrderStatus] = frozenset(
     {ExecutionOrderStatus.REJECTED, ExecutionOrderStatus.NOT_ACCEPTED_CONFIRMED}
 )
+
+
+class InvalidExecutionOrderConsistencyError(RuntimeError):
+    """Raised by :func:`validate_consistency` -- an aggregate-level
+    invariant was violated, regardless of *how* the record reached that
+    state (direct construction, a corrupted persisted payload, or a
+    transition that somehow bypassed :func:`apply_status_transition`).
+    Revision 3.2: the per-field checks elsewhere in this module (e.g.
+    ``EXACT`` requires a ``broker_order_id``) only ever covered the field
+    they were attached to -- this is the whole-record check.
+    """
+
+
+# Which BrokerIdentityStatus values are legal for which ExecutionOrderStatus
+# -- the "expected combinations" table in docs/kanban_production_readiness.md,
+# encoded. REJECTED allows both NO_BROKER_ORDER_CONFIRMED (never accepted)
+# and EXACT (a late rejection of a real, already-acknowledged order) --
+# both are legal outcomes for that one status.
+_LEGAL_IDENTITY_STATUSES_FOR_STATUS: Dict[ExecutionOrderStatus, FrozenSet[BrokerIdentityStatus]] = {
+    ExecutionOrderStatus.PREPARED: frozenset({BrokerIdentityStatus.NOT_ASSIGNED}),
+    ExecutionOrderStatus.CANCELLED_LOCALLY: frozenset({BrokerIdentityStatus.NOT_ASSIGNED}),
+    ExecutionOrderStatus.SUBMITTING: frozenset({BrokerIdentityStatus.AMBIGUOUS}),
+    ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE: frozenset({BrokerIdentityStatus.AMBIGUOUS}),
+    ExecutionOrderStatus.NOT_ACCEPTED_CONFIRMED: frozenset({BrokerIdentityStatus.NO_BROKER_ORDER_CONFIRMED}),
+    ExecutionOrderStatus.REJECTED: frozenset(
+        {BrokerIdentityStatus.NO_BROKER_ORDER_CONFIRMED, BrokerIdentityStatus.EXACT}
+    ),
+    ExecutionOrderStatus.ACKNOWLEDGED: frozenset({BrokerIdentityStatus.EXACT}),
+    ExecutionOrderStatus.WORKING: frozenset({BrokerIdentityStatus.EXACT}),
+    ExecutionOrderStatus.PARTIALLY_FILLED: frozenset({BrokerIdentityStatus.EXACT}),
+    ExecutionOrderStatus.FILLED: frozenset({BrokerIdentityStatus.EXACT}),
+    ExecutionOrderStatus.CANCEL_PENDING: frozenset({BrokerIdentityStatus.EXACT}),
+    ExecutionOrderStatus.CANCELLED: frozenset({BrokerIdentityStatus.EXACT}),
+    ExecutionOrderStatus.EXPIRED: frozenset({BrokerIdentityStatus.EXACT}),
+}
+
+
+def validate_consistency(record: "ExecutionOrderRecord") -> None:
+    """Aggregate-level invariant checks (revision 3.2), independent of how
+    the record was built. Called from :meth:`ExecutionOrderRecord.__post_init__`,
+    the end of :func:`apply_status_transition`, and before every
+    repository insert/update -- a corrupted persisted payload or a record
+    built by direct construction (bypassing the transition helper) is
+    caught at the point it's touched, not silently trusted.
+    """
+    legal_identities = _LEGAL_IDENTITY_STATUSES_FOR_STATUS.get(record.status)
+    if legal_identities is not None and record.broker_identity_status not in legal_identities:
+        raise InvalidExecutionOrderConsistencyError(
+            f"status={record.status.value} is not consistent with "
+            f"broker_identity_status={record.broker_identity_status.value}"
+        )
+    if (
+        record.broker_identity_status == BrokerIdentityStatus.NO_BROKER_ORDER_CONFIRMED
+        and record.broker_order_id
+    ):
+        raise InvalidExecutionOrderConsistencyError(
+            "broker_identity_status=NO_BROKER_ORDER_CONFIRMED must not carry a broker_order_id"
+        )
+    if record.origin == OrderOrigin.APPLICATION and record.adoption_permissions:
+        raise InvalidExecutionOrderConsistencyError(
+            "adoption_permissions must be empty for origin=APPLICATION records"
+        )
+    if record.origin == OrderOrigin.USER_ADOPTED and not record.adopted_from_external_order_id:
+        raise InvalidExecutionOrderConsistencyError(
+            "origin=USER_ADOPTED requires adopted_from_external_order_id (the audit-trail link)"
+        )
+    if record.submitted_quantity < 0 or record.filled_quantity < 0 or record.remaining_quantity < 0:
+        raise InvalidExecutionOrderConsistencyError("quantities must not be negative")
+    if record.filled_quantity > record.submitted_quantity:
+        raise InvalidExecutionOrderConsistencyError("filled_quantity must not exceed submitted_quantity")
+    if record.filled_quantity + record.remaining_quantity > record.submitted_quantity:
+        raise InvalidExecutionOrderConsistencyError(
+            "filled_quantity + remaining_quantity must not exceed submitted_quantity"
+        )
+    if record.attempt_number < 1:
+        raise InvalidExecutionOrderConsistencyError("attempt_number must be >= 1")
+    if record.lease_epoch < 0:
+        raise InvalidExecutionOrderConsistencyError("lease_epoch must not be negative")
 
 
 def apply_status_transition(
@@ -284,6 +382,7 @@ def apply_status_transition(
         record.acknowledged_at = now
 
     record.status = target
+    validate_consistency(record)
 
 
 @dataclass
@@ -390,6 +489,7 @@ class ExecutionOrderRecord:
             raise ValueError(
                 "broker_identity_status cannot be EXACT without a confirmed broker_order_id"
             )
+        validate_consistency(self)
 
 
 def mark_broker_identity_exact(record: ExecutionOrderRecord, broker_order_id: str) -> None:

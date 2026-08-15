@@ -38,6 +38,7 @@ from src.core.execution_order_record import (
 )
 from src.core.order_recovery_state import OrderRecoveryState
 from src.core.order_state import OrderIntent, OrderSide, generate_client_order_id, utc_now_iso
+from src.utils.redaction import hash_redacted_payload, redact_payload
 
 
 class ExternalOrderDisposition(str, Enum):
@@ -77,6 +78,26 @@ def validate_disposition_transition(
         )
 
 
+# (revision 3.2) A DiscoveredExternalOrder's broker_status is informational
+# only, but it must still describe a status a *broker snapshot* could
+# actually report -- never one of the application-only bookkeeping
+# statuses (PREPARED/SUBMITTING/UNKNOWN_SUBMISSION_STATE/CANCELLED_LOCALLY/
+# NOT_ACCEPTED_CONFIRMED) that only ever exist on this application's own
+# ExecutionOrderRecord, since this app never submitted this order.
+BROKER_OBSERVABLE_STATUSES: FrozenSet[ExecutionOrderStatus] = frozenset(
+    {
+        ExecutionOrderStatus.ACKNOWLEDGED,
+        ExecutionOrderStatus.WORKING,
+        ExecutionOrderStatus.PARTIALLY_FILLED,
+        ExecutionOrderStatus.FILLED,
+        ExecutionOrderStatus.CANCEL_PENDING,
+        ExecutionOrderStatus.CANCELLED,
+        ExecutionOrderStatus.EXPIRED,
+        ExecutionOrderStatus.REJECTED,
+    }
+)
+
+
 def is_unreconciled_external_order(disposition: ExternalOrderDisposition) -> bool:
     """The ``UNRECONCILED_BROKER_ORDER``-equivalent alert for a discovered
     external order: derived from ``disposition``, never itself
@@ -87,18 +108,15 @@ def is_unreconciled_external_order(disposition: ExternalOrderDisposition) -> boo
 
 
 def _redact_raw_response(raw: Any, *, account_no: str) -> Dict[str, Any]:
-    """Runs a raw broker payload through the codebase's existing
-    centralized redaction logic (:mod:`src.services.event_journal`) before
-    it is ever persisted (revision 3.2) -- an unredacted raw response could
-    otherwise carry account numbers, tokens, or other authorization data
-    into the database. Imported lazily to avoid a hard import-time
-    dependency from this core module onto the services layer.
+    """Runs a raw broker payload through the codebase's shared,
+    dependency-neutral redaction utility (:mod:`src.utils.redaction`)
+    before it is ever persisted (revision 3.2) -- an unredacted raw
+    response could otherwise carry account numbers, tokens, or other
+    authorization data into the database.
     """
-    from src.services.event_journal import _safe_payload  # local import: core -> services boundary
-
     if not isinstance(raw, dict):
         raw = {"raw": raw}
-    return _safe_payload(raw, account_no=account_no)
+    return redact_payload(raw, account_no=account_no)
 
 
 @dataclass
@@ -152,6 +170,11 @@ class DiscoveredExternalOrder:
         self.filled_quantity = int(self.filled_quantity or 0)
         self.limit_price = float(self.limit_price or 0.0)
         self.broker_status = _strict_enum(self.broker_status, ExecutionOrderStatus)
+        if self.broker_status not in BROKER_OBSERVABLE_STATUSES:
+            raise ValueError(
+                f"broker_status={self.broker_status.value} is not a status a broker snapshot "
+                "could actually report -- it looks like an application-only bookkeeping status"
+            )
         self.disposition = _strict_enum(self.disposition, ExternalOrderDisposition)
         self.version = int(self.version or 1)
         # Always redact, not only when the value isn't already a dict --
@@ -182,13 +205,8 @@ def new_discovered_external_order(
     raw KIS payload is involved; use the dataclass constructor directly
     only when there is no raw payload to redact (e.g. in tests).
     """
-    import hashlib
-    import json
-
     redacted = _redact_raw_response(raw_response or {}, account_no=account_no)
-    response_hash = hashlib.sha256(
-        json.dumps(redacted, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    response_hash = hash_redacted_payload(redacted)
     order = DiscoveredExternalOrder(
         environment=environment,
         account_no=account_no,

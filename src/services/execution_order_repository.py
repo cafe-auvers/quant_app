@@ -16,6 +16,17 @@ reservation, satisfying A1's atomicity requirement. Convenience wrappers
 that open and commit their own transaction are provided for callers that
 don't need cross-table atomicity.
 
+Exact broker-order identity uniqueness is enforced by a real database
+``UNIQUE`` constraint on ``broker_identity_key`` (revision 3.2), not only
+an application-level pre-check -- a "SELECT then INSERT" check alone is a
+race between two concurrent transactions that can both pass the check and
+commit duplicate claims; only the database itself can make that atomic.
+The pre-check in :func:`insert_execution_order`/:func:`update_execution_order`
+remains as a fast, friendly failure for the common (non-racing) case, but
+the constraint is the actual authority -- see
+:func:`_diagnose_and_raise_integrity_error`, which turns a raw
+``IntegrityError`` from either path into the same typed exception.
+
 This module is purely a repository: it does not decide what to submit,
 validate gateway gates, or call the broker.
 """
@@ -25,7 +36,6 @@ import json
 import logging
 import threading
 import weakref
-from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from sqlalchemy import (
@@ -50,6 +60,8 @@ from src.core.execution_order_record import (
     ExecutionOrderRecord,
     ExecutionOrderStatus,
     OrderOrigin,
+    compute_broker_identity_key,
+    validate_consistency,
 )
 from src.core.order_recovery_state import OrderRecoveryState
 from src.core.order_state import OrderIntent, OrderSide
@@ -69,7 +81,15 @@ class BrokerIdentityConflictError(RuntimeError):
     """Another *different* local record already holds this exact
     ``broker_order_id`` as ``EXACT`` -- a genuine ownership conflict, never
     silently allowed (mirrors :func:`~src.core.execution_order_record.mark_broker_identity_exact`'s
-    same-record contradiction check, extended here across records)."""
+    same-record contradiction check, extended here across records). Backed
+    by a real database ``UNIQUE`` constraint on ``broker_identity_key``,
+    not only an application-level check -- see the module docstring."""
+
+
+class DuplicateAdoptionError(RuntimeError):
+    """Another *different* local record already claims adoption from this
+    exact ``DiscoveredExternalOrder`` -- two adoptions of the same external
+    order must never both succeed."""
 
 
 class ExecutionOrderNotFoundError(RuntimeError):
@@ -79,6 +99,15 @@ class ExecutionOrderNotFoundError(RuntimeError):
 class ExecutionOrderVersionConflictError(RuntimeError):
     """Optimistic-concurrency conflict -- another writer already changed
     this row. Callers must reload and retry, never blindly overwrite."""
+
+
+class ImmutableFieldChangedError(RuntimeError):
+    """``environment``/``account_no``/``symbol`` changed between the read
+    and the write of the same ``client_order_id`` (revision 3.2) -- these
+    are treated as immutable identity fields specifically so the indexed
+    relational columns and the JSON payload can never silently diverge.
+    A record that genuinely needs to move symbol/account is a new record
+    (a new ``client_order_id``), not a mutation of an existing one."""
 
 
 def _get_execution_orders_table(metadata: MetaData) -> Table:
@@ -94,11 +123,23 @@ def _get_execution_orders_table(metadata: MetaData) -> Table:
         Column("origin", String(24), nullable=False),
         Column("broker_identity_status", String(32), nullable=False),
         Column("broker_order_id", String(64), nullable=False, server_default=""),
+        # NULL (not "") whenever broker_identity_status != EXACT, so many
+        # non-EXACT rows can coexist under the UNIQUE constraint below --
+        # SQL NULL is never equal to anything, including another NULL, for
+        # uniqueness purposes, unlike an empty string.
+        Column("broker_identity_key", String(200), nullable=True),
         Column("recovery_state", String(40), nullable=False),
+        # NULL (not "") whenever this record was not created by adoption --
+        # same NULL-vs-empty-string reasoning as broker_identity_key.
+        Column("adopted_from_external_order_id", String(64), nullable=True),
         Column("version", BigInteger, nullable=False, server_default="1"),
         Column("payload", Text(length=16_777_215), nullable=False),
         Column("updated_at", DateTime, nullable=False),
         UniqueConstraint("client_order_id", name="uq_execution_orders_client_order_id"),
+        UniqueConstraint("broker_identity_key", name="uq_execution_orders_broker_identity_key"),
+        UniqueConstraint(
+            "adopted_from_external_order_id", name="uq_execution_orders_adopted_from_external_order_id"
+        ),
     )
 
 
@@ -119,6 +160,16 @@ def _server_now(engine: Engine):
     if engine.dialect.name == "mysql":
         return func.utc_timestamp(6)
     return func.current_timestamp()
+
+
+def _identity_key_or_none(record: ExecutionOrderRecord) -> Optional[str]:
+    if record.broker_identity_status != BrokerIdentityStatus.EXACT or not record.broker_order_id:
+        return None
+    return compute_broker_identity_key(record.environment, record.account_no, record.broker_order_id)
+
+
+def _adoption_source_or_none(record: ExecutionOrderRecord) -> Optional[str]:
+    return record.adopted_from_external_order_id or None
 
 
 # --- (de)serialization --------------------------------------------------
@@ -217,13 +268,17 @@ def _row_to_record(row) -> ExecutionOrderRecord:
 
 
 def _check_broker_identity_conflict(conn: Connection, record: ExecutionOrderRecord) -> None:
-    if record.broker_identity_status != BrokerIdentityStatus.EXACT or not record.broker_order_id:
+    """Fast, friendly pre-check for the common (non-racing) case -- the
+    database's own UNIQUE constraint on ``broker_identity_key`` is what
+    actually makes this race-safe; see :func:`_diagnose_and_raise_integrity_error`.
+    """
+    key = _identity_key_or_none(record)
+    if key is None:
         return
     table = _get_execution_orders_table(MetaData())
     existing = conn.execute(
         select(table.c.client_order_id).where(
-            table.c.broker_order_id == record.broker_order_id,
-            table.c.broker_identity_status == BrokerIdentityStatus.EXACT.value,
+            table.c.broker_identity_key == key,
             table.c.client_order_id != record.client_order_id,
         )
     ).first()
@@ -235,14 +290,60 @@ def _check_broker_identity_conflict(conn: Connection, record: ExecutionOrderReco
         )
 
 
+def _diagnose_and_raise_integrity_error(
+    conn: Connection, record: ExecutionOrderRecord, exc: IntegrityError
+) -> None:
+    """Turns a raw ``IntegrityError`` from a failed insert/update into the
+    specific, typed exception it actually represents -- the real,
+    race-safe enforcement (the pre-checks above only catch the common
+    non-racing case). Always raises; never returns normally.
+    """
+    table = _get_execution_orders_table(MetaData())
+    existing_by_client_id = conn.execute(
+        select(table.c.id).where(table.c.client_order_id == record.client_order_id)
+    ).first()
+    if existing_by_client_id is not None:
+        raise DuplicateExecutionOrderError(
+            f"ExecutionOrderRecord for client_order_id={record.client_order_id!r} already exists"
+        ) from exc
+
+    key = _identity_key_or_none(record)
+    if key is not None:
+        existing_by_identity = conn.execute(
+            select(table.c.client_order_id).where(table.c.broker_identity_key == key)
+        ).first()
+        if existing_by_identity is not None:
+            raise BrokerIdentityConflictError(
+                f"broker_order_id={record.broker_order_id!r} is already EXACT on "
+                f"client_order_id={existing_by_identity.client_order_id!r}"
+            ) from exc
+
+    adoption_source = _adoption_source_or_none(record)
+    if adoption_source is not None:
+        existing_by_adoption = conn.execute(
+            select(table.c.client_order_id).where(
+                table.c.adopted_from_external_order_id == adoption_source
+            )
+        ).first()
+        if existing_by_adoption is not None:
+            raise DuplicateAdoptionError(
+                f"external_order_id={adoption_source!r} was already adopted as "
+                f"client_order_id={existing_by_adoption.client_order_id!r}"
+            ) from exc
+
+    raise exc
+
+
 def insert_execution_order(conn: Connection, record: ExecutionOrderRecord) -> ExecutionOrderRecord:
     """A1: the durable ``ExecutionOrderRecord`` write, part of the atomic
     pre-submission transaction (command + reservation + this record).
     Takes an already-open ``Connection``. Raises
-    :class:`DuplicateExecutionOrderError` on a repeated ``client_order_id``
-    and :class:`BrokerIdentityConflictError` if another record already
-    holds this exact ``broker_order_id``.
+    :class:`DuplicateExecutionOrderError` on a repeated ``client_order_id``,
+    :class:`BrokerIdentityConflictError` if another record already holds
+    this exact ``broker_order_id``, or :class:`DuplicateAdoptionError` if
+    another record already claims this exact adoption source.
     """
+    validate_consistency(record)
     _check_broker_identity_conflict(conn, record)
     table = _get_execution_orders_table(MetaData())
     engine = conn.engine
@@ -257,16 +358,16 @@ def insert_execution_order(conn: Connection, record: ExecutionOrderRecord) -> Ex
                 origin=record.origin.value,
                 broker_identity_status=record.broker_identity_status.value,
                 broker_order_id=record.broker_order_id,
+                broker_identity_key=_identity_key_or_none(record),
                 recovery_state=record.recovery_state.value,
+                adopted_from_external_order_id=_adoption_source_or_none(record),
                 version=record.version,
                 payload=json.dumps(_record_to_payload(record), separators=(",", ":")),
                 updated_at=_server_now(engine),
             )
         )
     except IntegrityError as exc:
-        raise DuplicateExecutionOrderError(
-            f"ExecutionOrderRecord for client_order_id={record.client_order_id!r} already exists"
-        ) from exc
+        _diagnose_and_raise_integrity_error(conn, record, exc)
     return record
 
 
@@ -275,46 +376,78 @@ def update_execution_order(
 ) -> ExecutionOrderRecord:
     """Optimistic-concurrency update, mirroring
     :func:`src.services.trade_card_repository.update_trade_card`'s
-    pattern. Raises :class:`ExecutionOrderVersionConflictError` if the
-    stored version no longer matches ``expected_version``, and
-    :class:`BrokerIdentityConflictError` on a cross-record identity
-    conflict, same as :func:`insert_execution_order`.
+    pattern -- with two revision-3.2 corrections that pattern didn't have:
+
+    - ``record.version`` is assigned the new value only *after* the update
+      is confirmed to have actually applied (``rowcount == 1``) -- not
+      before, which would leave the caller's in-memory object claiming a
+      version the database never actually stored on a conflict.
+    - ``environment``/``account_no``/``symbol`` are treated as immutable:
+      compared against the currently-stored row before the write, raising
+      :class:`ImmutableFieldChangedError` rather than letting the indexed
+      relational columns and the JSON payload silently diverge.
     """
-    _check_broker_identity_conflict(conn, record)
+    validate_consistency(record)
     table = _get_execution_orders_table(MetaData())
     engine = conn.engine
+
+    current = conn.execute(
+        select(table.c.environment, table.c.account_no, table.c.symbol, table.c.version).where(
+            table.c.client_order_id == record.client_order_id
+        )
+    ).first()
+    if current is None:
+        raise ExecutionOrderNotFoundError(
+            f"No ExecutionOrderRecord for client_order_id={record.client_order_id!r}"
+        )
+    if (
+        current.environment != record.environment
+        or current.account_no != record.account_no
+        or current.symbol != record.symbol
+    ):
+        raise ImmutableFieldChangedError(
+            f"client_order_id={record.client_order_id!r}: environment/account_no/symbol "
+            "must not change after creation"
+        )
+
+    _check_broker_identity_conflict(conn, record)
     next_version = int(expected_version) + 1
-    record.version = next_version
-    result = conn.execute(
-        table.update()
-        .where(
-            table.c.client_order_id == record.client_order_id,
-            table.c.version == int(expected_version),
-        )
-        .values(
-            status=record.status.value,
-            origin=record.origin.value,
-            broker_identity_status=record.broker_identity_status.value,
-            broker_order_id=record.broker_order_id,
-            recovery_state=record.recovery_state.value,
-            version=next_version,
-            payload=json.dumps(_record_to_payload(record), separators=(",", ":")),
-            updated_at=_server_now(engine),
-        )
-    )
-    if result.rowcount == 0:
-        table2 = _get_execution_orders_table(MetaData())
-        existing = conn.execute(
-            select(table2).where(table2.c.client_order_id == record.client_order_id)
-        ).first()
-        if existing is None:
-            raise ExecutionOrderNotFoundError(
-                f"No ExecutionOrderRecord for client_order_id={record.client_order_id!r}"
+    # Build the persisted payload with the *new* version already in it --
+    # the version column and the JSON payload's own "version" field must
+    # never disagree, so this must not read record.version (which is only
+    # updated below, once the write is confirmed to have applied).
+    payload_dict = _record_to_payload(record)
+    payload_dict["version"] = next_version
+    try:
+        result = conn.execute(
+            table.update()
+            .where(
+                table.c.client_order_id == record.client_order_id,
+                table.c.version == int(expected_version),
             )
+            .values(
+                status=record.status.value,
+                origin=record.origin.value,
+                broker_identity_status=record.broker_identity_status.value,
+                broker_order_id=record.broker_order_id,
+                broker_identity_key=_identity_key_or_none(record),
+                recovery_state=record.recovery_state.value,
+                adopted_from_external_order_id=_adoption_source_or_none(record),
+                version=next_version,
+                payload=json.dumps(payload_dict, separators=(",", ":")),
+                updated_at=_server_now(engine),
+            )
+        )
+    except IntegrityError as exc:
+        _diagnose_and_raise_integrity_error(conn, record, exc)
+        raise  # unreachable -- _diagnose_and_raise_integrity_error always raises
+
+    if result.rowcount == 0:
         raise ExecutionOrderVersionConflictError(
             f"client_order_id={record.client_order_id!r} version conflict "
-            f"(expected {expected_version}, stored {existing.version})"
+            f"(expected {expected_version}, stored {current.version})"
         )
+    record.version = next_version
     return record
 
 

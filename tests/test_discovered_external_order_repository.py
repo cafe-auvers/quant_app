@@ -70,6 +70,91 @@ def test_stored_redacted_response_survives_the_round_trip(tmp_path):
     assert fetched.response_hash == ext.response_hash
 
 
+# --- broker identity uniqueness (revision 3.2) ------------------------------
+
+
+def test_the_same_real_broker_order_discovered_twice_is_rejected(tmp_path):
+    """Two independent discoveries of the exact same real broker order
+    (e.g. two overlapping reconciliation sweeps, each minting its own
+    random external_order_id) must not create two rows -- the second
+    discovery is a duplicate of the first, not a new external order."""
+    engine = _make_engine(tmp_path)
+    first = _external(broker_order_id="B-999")
+    repo.record_discovered_external_order(engine, first)
+
+    second = _external(broker_order_id="B-999")  # same broker order, fresh external_order_id
+    assert second.external_order_id != first.external_order_id
+    with pytest.raises(repo.DuplicateBrokerOrderDiscoveryError):
+        repo.record_discovered_external_order(engine, second)
+
+    # Still exactly the one original row.
+    assert repo.fetch_discovered_external_order(engine, first.external_order_id) is not None
+    assert repo.fetch_discovered_external_order(engine, second.external_order_id) is None
+
+
+def test_a_different_broker_order_is_not_treated_as_a_duplicate(tmp_path):
+    engine = _make_engine(tmp_path)
+    repo.record_discovered_external_order(engine, _external(broker_order_id="B-1"))
+    repo.record_discovered_external_order(engine, _external(broker_order_id="B-2"))  # must not raise
+
+
+def test_the_database_constraint_itself_rejects_a_duplicate_discovery(tmp_path):
+    """This table has no application-level pre-check at all (unlike
+    execution_orders) -- the UNIQUE constraint on broker_identity_key is
+    the *only* thing enforcing this, so exercising it directly (via the
+    normal insert path, which relies solely on the constraint plus
+    IntegrityError translation) is the real proof of race-safety."""
+    engine = _make_engine(tmp_path)
+    repo.record_discovered_external_order(engine, _external(broker_order_id="B-999"))
+    with pytest.raises(repo.DuplicateBrokerOrderDiscoveryError):
+        repo.record_discovered_external_order(engine, _external(broker_order_id="B-999"))
+
+
+# --- Optimistic concurrency / immutability (revision 3.2) -------------------
+
+
+def test_update_rejects_a_changed_broker_order_id(tmp_path):
+    engine = _make_engine(tmp_path)
+    ext = _external()
+    repo.record_discovered_external_order(engine, ext)
+    fetched = repo.fetch_discovered_external_order(engine, ext.external_order_id)
+    fetched.broker_order_id = "B-DIFFERENT"
+    with pytest.raises(repo.ImmutableFieldChangedError):
+        with engine.begin() as conn:
+            repo.update_discovered_external_order(conn, fetched, expected_version=fetched.version)
+
+    on_disk = repo.fetch_discovered_external_order(engine, ext.external_order_id)
+    assert on_disk.broker_order_id == "B-999"
+    assert on_disk.version == 1
+
+
+def test_update_with_a_stale_expected_version_leaves_the_caller_object_and_row_unchanged(tmp_path):
+    engine = _make_engine(tmp_path)
+    ext = _external()
+    repo.record_discovered_external_order(engine, ext)
+
+    with engine.begin() as conn:
+        from src.core.discovered_external_order import ExternalOrderDisposition
+
+        current = repo.get_discovered_external_order(conn, ext.external_order_id)
+        current.disposition = ExternalOrderDisposition.DISMISSED_TERMINAL
+        repo.update_discovered_external_order(conn, current, expected_version=current.version)
+
+    stale = repo.fetch_discovered_external_order(engine, ext.external_order_id)
+    stale.version = 1  # pretend we're still holding the old version
+    with pytest.raises(repo.ExternalOrderVersionConflictError):
+        with engine.begin() as conn:
+            repo.update_discovered_external_order(conn, stale, expected_version=1)
+    # A rejected write must leave the caller's in-memory object exactly as
+    # it was -- version must only ever move to a value the database
+    # actually confirmed.
+    assert stale.version == 1
+
+    on_disk = repo.fetch_discovered_external_order(engine, ext.external_order_id)
+    assert on_disk.version == 2
+    assert on_disk.disposition == ExternalOrderDisposition.DISMISSED_TERMINAL
+
+
 # --- Atomic adoption (revision 3.2) -----------------------------------------
 
 

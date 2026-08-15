@@ -29,7 +29,6 @@ atomicity.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import threading
@@ -53,6 +52,8 @@ from sqlalchemy import (
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import IntegrityError
 
+from src.utils.redaction import hash_redacted_payload, redact_payload
+
 logger = logging.getLogger(__name__)
 
 _ensured_engines: "weakref.WeakSet[Engine]" = weakref.WeakSet()
@@ -71,23 +72,26 @@ class CommandNotFoundError(RuntimeError):
     """No command exists for the requested ``idempotency_key``."""
 
 
-def _redact_broker_response(response: Any, *, account_no: str) -> Dict[str, Any]:
-    """Runs a raw broker response through the codebase's existing
-    centralized redaction logic before it is ever persisted (revision
-    3.2) -- see :func:`src.core.discovered_external_order._redact_raw_response`
-    for the same pattern applied to a discovered order's own payload.
-    """
-    from src.services.event_journal import _safe_payload
+class CommandResponseConflictError(RuntimeError):
+    """The compare-and-set guard on :func:`update_command_response` failed
+    (revision 3.2): the stored row was no longer ``status='REQUESTED'`` at
+    ``expected_version``, so this write did not apply. A broker response
+    must never silently overwrite an already-recorded response -- once the
+    row is ACKNOWLEDGED/FAILED, that outcome is final; a caller retrying a
+    stale write is a bug and must find out, not fail open and clobber the
+    real outcome."""
 
+
+def _redact_broker_response(response: Any, *, account_no: str) -> Dict[str, Any]:
+    """Runs a raw broker response through the codebase's shared,
+    dependency-neutral redaction utility (:mod:`src.utils.redaction`)
+    before it is ever persisted (revision 3.2) -- see
+    :func:`src.core.discovered_external_order._redact_raw_response` for
+    the same pattern applied to a discovered order's own payload.
+    """
     if not isinstance(response, dict):
         response = {"raw": response}
-    return _safe_payload(response, account_no=account_no)
-
-
-def _hash_response(redacted: Dict[str, Any]) -> str:
-    return hashlib.sha256(
-        json.dumps(redacted, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    return redact_payload(response, account_no=account_no)
 
 
 @dataclass
@@ -172,13 +176,19 @@ def ensure_execution_commands_table(engine: Engine) -> Table:
 
 
 def _parse_dt(value: str) -> datetime:
+    """Raises on a blank or malformed timestamp (revision 3.2) rather than
+    silently substituting ``now()`` -- a corrupted or truncated
+    ``requested_at`` is a data-integrity problem the caller needs to find
+    out about, not a routine gap papered over with the current time (which
+    would misrepresent when the command was actually requested, an audit
+    field B4a's whole point is to get right)."""
     text = str(value or "").strip()
     if not text:
-        return datetime.now(timezone.utc)
+        raise ValueError("requested_at must not be blank")
     try:
         return datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
-        return datetime.now(timezone.utc)
+    except ValueError as exc:
+        raise ValueError(f"requested_at={value!r} is not a valid ISO-8601 timestamp") from exc
 
 
 def _row_to_command(row) -> ExecutionCommand:
@@ -249,7 +259,7 @@ def update_command_response(
     *,
     status: str,
     broker_response: Dict[str, Any],
-    account_no: str = "",
+    expected_version: Optional[int] = None,
 ) -> ExecutionCommand:
     """B4b: the post-call broker-response persist. Takes an already-open
     ``Connection`` for the same composability reason as
@@ -257,23 +267,57 @@ def update_command_response(
     license to retry the broker call (INV-23) -- that rule is enforced by
     the execution gateway (Workstream 3), not this repository; this
     function only records the outcome once the gateway has already
-    decided not to retry. ``broker_response`` is redacted before storage
-    (revision 3.2).
+    decided not to retry.
+
+    Two revision-3.2 corrections over the original version:
+
+    - ``account_no`` for redaction is looked up from the command's *own*
+      stored row, never trusted from an optional caller-supplied
+      parameter -- a caller that forgets (or gets it wrong) must not be
+      able to silently defeat redaction of its own command's response.
+    - The update is a compare-and-set: it only applies while the stored
+      row is still ``status='REQUESTED'`` at ``expected_version``,
+      incrementing the version on success. A second write to an
+      already-ACKNOWLEDGED/FAILED row -- whether a stale retry, a race, or
+      a bug -- must fail loudly (:class:`CommandResponseConflictError`)
+      rather than fail open and overwrite a real, already-recorded
+      outcome. ``expected_version`` defaults to the command's own
+      ``version=1`` construction default when omitted, matching the
+      common single-write case.
     """
     table = _get_execution_commands_table(MetaData())
-    redacted = _redact_broker_response(broker_response or {}, account_no=account_no)
-    response_hash = _hash_response(redacted)
+    current = conn.execute(
+        select(table.c.account_no, table.c.status, table.c.version).where(
+            table.c.idempotency_key == idempotency_key
+        )
+    ).first()
+    if current is None:
+        raise CommandNotFoundError(f"No command found for idempotency_key={idempotency_key!r}")
+
+    guard_version = int(current.version if expected_version is None else expected_version)
+    redacted = _redact_broker_response(broker_response or {}, account_no=current.account_no)
+    response_hash = hash_redacted_payload(redacted)
+    next_version = guard_version + 1
     result = conn.execute(
         table.update()
-        .where(table.c.idempotency_key == idempotency_key)
+        .where(
+            table.c.idempotency_key == idempotency_key,
+            table.c.status == "REQUESTED",
+            table.c.version == guard_version,
+        )
         .values(
             status=str(status or "").upper(),
             redacted_response=json.dumps(redacted, separators=(",", ":")),
             response_hash=response_hash,
+            version=next_version,
         )
     )
     if result.rowcount == 0:
-        raise CommandNotFoundError(f"No command found for idempotency_key={idempotency_key!r}")
+        raise CommandResponseConflictError(
+            f"idempotency_key={idempotency_key!r} response update rejected -- expected "
+            f"status=REQUESTED and version={guard_version}, found status={current.status!r} "
+            f"version={current.version}"
+        )
     row = conn.execute(select(table).where(table.c.idempotency_key == idempotency_key)).first()
     return _row_to_command(row)
 
@@ -309,12 +353,16 @@ def record_command_response(
     *,
     status: str,
     broker_response: Dict[str, Any],
-    account_no: str = "",
+    expected_version: Optional[int] = None,
 ) -> ExecutionCommand:
     """Convenience wrapper around :func:`update_command_response` that
     opens and commits its own transaction."""
     ensure_execution_commands_table(engine)
     with engine.begin() as conn:
         return update_command_response(
-            conn, idempotency_key, status=status, broker_response=broker_response, account_no=account_no
+            conn,
+            idempotency_key,
+            status=status,
+            broker_response=broker_response,
+            expected_version=expected_version,
         )
