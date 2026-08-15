@@ -28,7 +28,8 @@ new engine activity on the next tick without requiring an app restart.
 from __future__ import annotations
 
 import logging
-from typing import Callable, List, Optional
+from datetime import datetime, timezone
+from typing import Callable, Dict, List, Optional, Tuple
 
 from PyQt5.QtCore import QThread, pyqtSignal
 from sqlalchemy.engine import Engine
@@ -40,6 +41,7 @@ from src.services import buyboard_runtime as buyboard_runtime_module
 from src.services import trade_card_repository as repo
 from src.services.eod_trading_service import EodActionCallbacks, run_startup_reconciliation
 from src.services.execution_authority import ExecutionAuthority, LeaseExpiredError, LeaseHandle
+from src.services.position_manager import extract_overseas_holdings
 from src.services.trade_card_orb_bridge import TradeCardOrbEvaluator
 
 logger = logging.getLogger(__name__)
@@ -120,6 +122,32 @@ class BuyboardRuntimeWorker(QThread):
         self._orb_evaluator = TradeCardOrbEvaluator()
         self._stop_requested = False
         self.runtime: Optional[buyboard_runtime_module.BuyboardRuntime] = None
+        # Per real account_no (never this worker's own possibly-blank
+        # self._account_no -- review finding: this worker is intentionally
+        # account-unscoped and processes every PROD account's cards).
+        # Tracks when each account's KIS balance/buying-power was last
+        # refreshed (ACTIVE_ACCOUNT_REFRESH_SECONDS/IDLE_ACCOUNT_REFRESH_SECONDS
+        # cadence -- previously unused constants; nothing populated the
+        # buying-power cache on any cadence at all) and when each account's
+        # positions were last fully reconciled against broker truth
+        # (FULL_RECONCILIATION_SECONDS cadence -- previously only ever run
+        # once at startup).
+        self._account_balance_refreshed_at: Dict[str, datetime] = {}
+        self._account_reconciled_at: Dict[str, datetime] = {}
+        # Review: "legacy execution suppression depends only on the feature
+        # flag" -- it did not verify the new engine was actually running,
+        # holding its lease, and producing recent heartbeats, so a silently
+        # stopped/failed worker with the flag still on left no automatic
+        # engine protecting positions at all. main_window.py's
+        # _buyboard_engine_healthy() reads these to require confirmed
+        # health before suppressing the legacy monitor -- safe to read from
+        # the UI thread (simple attribute reads/writes are GIL-atomic in
+        # CPython; this is an advisory health signal, not a lock).
+        self.last_heartbeat_at: Optional[datetime] = None
+        self.startup_reconciliation_complete: bool = False
+        # card_key set already alerted via self.alert for a stalled exit
+        # cancel -- see _emit_stalled_liquidation_alerts.
+        self._alerted_stalled_card_keys: set = set()
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -159,6 +187,7 @@ class BuyboardRuntimeWorker(QThread):
                 break
             try:
                 self._run_one_cycle()
+                self.last_heartbeat_at = datetime.now(timezone.utc)
             except Exception:  # noqa: BLE001 - one bad cycle must not kill the loop
                 logger.exception("BuyboardRuntimeWorker heartbeat cycle failed")
                 self.error_occurred.emit("Buy Board engine heartbeat failed -- see logs for detail.")
@@ -185,11 +214,44 @@ class BuyboardRuntimeWorker(QThread):
 
     # -- startup reconciliation ----------------------------------------------
 
+    def _distinct_account_numbers(self, cards: List[TradeCardState]) -> List[str]:
+        """Real account numbers this worker must query broker state for:
+        every account already referenced by a loaded card, plus this
+        worker's own configured ``self._account_no`` when it is a specific
+        (non-blank) account -- guaranteeing a scoped worker always queries
+        its own account even before any card exists for it (needed to ever
+        discover a first manual position with zero pre-existing cards).
+
+        Previously, startup reconciliation called
+        ``broker.get_positions(account_no="")`` once (the unscoped
+        production worker's own blank ``self._account_no``) and reconciled
+        *every* account's cards against whatever single account that empty
+        string happened to resolve to (``load_config``'s config-default
+        account) -- for any card whose real ``account_no`` differed,
+        ``PositionManager.reconcile_broker_positions`` would find no
+        matching existing card for each of that other account's real
+        holdings (its internal match requires ``card.account_no ==
+        account_no``, and no real card ever has an empty ``account_no``)
+        and spuriously treat every one of them as a newly-discovered manual
+        position under a phantom blank-account-no card, while never
+        validating the querying account's own cards against its own real
+        holdings at all.
+        """
+        seen: List[str] = []
+        if self._account_no:
+            seen.append(self._account_no)
+        for card in cards:
+            if card.account_no and card.account_no not in seen:
+                seen.append(card.account_no)
+        return seen
+
     def _run_startup_reconciliation(self) -> None:
         """Restores retry bookkeeping (review finding P0-4's predecessor,
         section 1070-1075's "Run full startup reconciliation") and corrects
         every card's positions/orders against broker truth before the first
-        heartbeat tick runs.
+        heartbeat tick runs -- looping per real account_no (see
+        :meth:`_distinct_account_numbers`) rather than issuing one
+        broker call for the worker's own blank account scope.
         """
         assert self.runtime is not None
         cards = repo.list_trade_cards(self._db_engine, environment=self._environment)
@@ -203,9 +265,6 @@ class BuyboardRuntimeWorker(QThread):
                 attempt_count=card.entry_attempt_count,
             )
 
-        position_snapshot = self.runtime.broker.get_positions(
-            environment=self._environment, account_no=self._account_no
-        )
         broker = self.runtime.broker
         order_callbacks = EodActionCallbacks(
             find_open_entry_order=buyboard_runtime_module._find_open_entry_order,
@@ -215,17 +274,40 @@ class BuyboardRuntimeWorker(QThread):
             ),
             discover_all_orders=lambda card: buyboard_runtime_module._discover_all_orders(card, broker=broker),
         )
-        changed = run_startup_reconciliation(
-            cards,
-            environment=self._environment,
-            account_no=self._account_no,
-            position_snapshot=position_snapshot,
-            position_manager=self.runtime.position_manager,
-            order_callbacks=order_callbacks,
-        )
+
+        now = datetime.now(timezone.utc)
+        changed_ids: set = set()
+        changed: List[TradeCardState] = []
+        for account_no in self._distinct_account_numbers(cards):
+            try:
+                position_snapshot = broker.get_positions(
+                    environment=self._environment, account_no=account_no
+                )
+            except Exception:
+                logger.exception(
+                    "Startup reconciliation: get_positions failed for account %s", account_no
+                )
+                continue
+            account_changed = run_startup_reconciliation(
+                cards,
+                environment=self._environment,
+                account_no=account_no,
+                position_snapshot=position_snapshot,
+                position_manager=self.runtime.position_manager,
+                order_callbacks=order_callbacks,
+            )
+            for card in account_changed:
+                if id(card) not in changed_ids:
+                    changed_ids.add(id(card))
+                    changed.append(card)
+            self._record_buying_power(account_no, position_snapshot)
+            self._account_balance_refreshed_at[account_no] = now
+            self._account_reconciled_at[account_no] = now
+
         self._persist_changed(changed)
         if changed:
             self.board_changed.emit()
+        self.startup_reconciliation_complete = True
 
     # -- per-cycle heartbeat --------------------------------------------------
 
@@ -244,6 +326,7 @@ class BuyboardRuntimeWorker(QThread):
                     changed_ids.add(id(card))
                     changed.append(card)
 
+        _track(self._refresh_account_state_if_due(cards))
         _track(self._sync_orb_plans(cards))
         self._sync_quote_subscriptions(cards)
 
@@ -251,10 +334,167 @@ class BuyboardRuntimeWorker(QThread):
             _track(self.runtime.trading_engine.evaluate_quote(cards, quote))
 
         _track(self.runtime.trading_engine.run_heartbeat(cards))
+        self._emit_stalled_liquidation_alerts(cards)
 
         self._persist_changed(changed)
         if changed:
             self.board_changed.emit()
+
+    _EXIT_CANCEL_STALLED_WARNING = "EXIT_CANCEL_STALLED"
+
+    def _emit_stalled_liquidation_alerts(self, cards: List[TradeCardState]) -> None:
+        """Review: "EXIT_CANCEL_STALLED is currently primarily a card
+        warning/log condition... this must produce a critical external
+        notification. A card warning is insufficient when the user is
+        asleep." ``TradingEngine`` stays broker/UI-agnostic by design (it
+        already sets the warning purely on the card); this is the seam
+        that actually has a notification channel (``self.alert``, wired by
+        ``main_window.py`` to ``append_log`` today, and to any real
+        push-notification channel in the future) -- fires once when the
+        warning first appears on a card and again if it reappears after
+        having cleared, never on every tick while it persists.
+        """
+        stalled_now = {
+            card.card_key
+            for card in cards
+            if self._EXIT_CANCEL_STALLED_WARNING in card.warnings
+        }
+        newly_stalled = stalled_now - self._alerted_stalled_card_keys
+        for card in cards:
+            if card.card_key in newly_stalled:
+                self.alert.emit(
+                    f"CRITICAL: liquidation cancel unconfirmed for {card.symbol} "
+                    f"({card.environment}:{card.account_no}) beyond "
+                    f"EXIT_CANCEL_CONFIRMATION_TIMEOUT_SECONDS -- broker order "
+                    f"may need manual attention."
+                )
+        self._alerted_stalled_card_keys = stalled_now
+
+    # -- periodic per-account KIS refresh (review: no cadence populated the --
+    # -- buying-power cache or re-reconciled positions after startup) --------
+
+    def _refresh_account_state_if_due(self, cards: List[TradeCardState]) -> List[TradeCardState]:
+        """Refreshes each real account's KIS buying power
+        (``ACTIVE_ACCOUNT_REFRESH_SECONDS``/``IDLE_ACCOUNT_REFRESH_SECONDS``
+        -- previously-unused constants; nothing populated
+        :mod:`src.services.buying_power_cache` on any cadence, so its 15s
+        freshness window could only ever be re-armed by whatever the legacy
+        dashboard's manual/reactive triggers happened to do, silently
+        capital-blocking every automatic entry once that window lapsed) and
+        fully reconciles each account's positions against broker truth
+        (``FULL_RECONCILIATION_SECONDS`` -- previously only ever run once,
+        at worker startup, so a manual purchase/sale, an externally
+        cancelled order, or a late fill made mid-session was never
+        discovered). Both need the same per-account KIS snapshot, so this
+        fetches it once per account per due cycle and feeds both.
+        """
+        changed: List[TradeCardState] = []
+        now = datetime.now(timezone.utc)
+        by_account: Dict[str, List[TradeCardState]] = {}
+        for card in cards:
+            if card.account_no:
+                by_account.setdefault(card.account_no, []).append(card)
+
+        for account_no, account_cards in by_account.items():
+            has_active_entry_candidate = any(
+                card.board_status in (BoardStatus.BUY_TODAY, BoardStatus.ENTRY_PENDING)
+                for card in account_cards
+            )
+            balance_interval = (
+                execution_config.ACTIVE_ACCOUNT_REFRESH_SECONDS
+                if has_active_entry_candidate
+                else execution_config.IDLE_ACCOUNT_REFRESH_SECONDS
+            )
+            balance_age = self._age_seconds(self._account_balance_refreshed_at.get(account_no), now)
+            reconcile_age = self._age_seconds(self._account_reconciled_at.get(account_no), now)
+            balance_due = balance_age is None or balance_age >= balance_interval
+            reconcile_due = (
+                reconcile_age is None
+                or reconcile_age >= execution_config.FULL_RECONCILIATION_SECONDS
+            )
+            if not balance_due and not reconcile_due:
+                continue
+
+            try:
+                position_snapshot = self.runtime.broker.get_positions(
+                    environment=self._environment, account_no=account_no
+                )
+            except Exception:
+                # Neither timestamp is updated on failure -- both stay due
+                # and are retried next cycle; the buying-power cache
+                # continues aging toward its own fail-closed threshold
+                # rather than being refreshed with a guess.
+                logger.exception(
+                    "Periodic account refresh: get_positions failed for account %s", account_no
+                )
+                continue
+
+            if balance_due:
+                self._record_buying_power(account_no, position_snapshot)
+                self._account_balance_refreshed_at[account_no] = now
+
+            if reconcile_due:
+                holdings = extract_overseas_holdings(position_snapshot)
+                account_changed = self.runtime.position_manager.reconcile_broker_positions(
+                    account_cards,
+                    holdings,
+                    environment=self._environment,
+                    account_no=account_no,
+                )
+                changed.extend(account_changed)
+                self._account_reconciled_at[account_no] = now
+
+        return changed
+
+    @staticmethod
+    def _age_seconds(then: Optional[datetime], now: datetime) -> Optional[float]:
+        if then is None:
+            return None
+        return (now - then).total_seconds()
+
+    def _record_buying_power(self, account_no: str, position_snapshot: dict) -> None:
+        from src.services import buying_power_cache
+
+        usable_usd, equity_usd = self._extract_account_balance(position_snapshot)
+        buying_power_cache.record_snapshot(
+            environment=self._environment,
+            account_no=account_no,
+            usable_buying_power_usd=usable_usd,
+            total_equity_usd=equity_usd,
+            source="buyboard_runtime_periodic_refresh",
+        )
+
+    @staticmethod
+    def _extract_account_balance(snapshot: dict) -> Tuple[float, float]:
+        """(usable_buying_power_usd, total_equity_usd) from a raw KIS
+        account snapshot -- reuses
+        ``DashboardMixin._extract_kis_account_value_krw`` directly rather
+        than re-implementing this parsing (it has already been hardened
+        against several KIS response quirks; see its own docstring) and
+        ``FxRateWorker._extract_usd_krw_from_snapshot`` to find a KIS-
+        embedded USD/KRW rate, so this periodic background refresh never
+        needs a UI widget or an extra yfinance network call from this
+        thread. Without an embedded rate, ``total_equity_usd`` falls back
+        to the overseas-only (pure USD, no conversion needed) cash+stock
+        total, which understates -- never overstates -- equity when the
+        account also holds KRW-denominated assets, the safe direction to
+        err for a risk-sizing base.
+        """
+        from src.ui.mixins.dashboard_mixin import DashboardMixin
+        from src.ui.workers import FxRateWorker
+
+        fx_rate = FxRateWorker._extract_usd_krw_from_snapshot(snapshot) or 0.0
+        breakdown = DashboardMixin._extract_kis_account_value_krw(
+            snapshot, fx_rate=fx_rate if fx_rate > 0 else 1.0, return_breakdown=True
+        )
+        if not breakdown:
+            return 0.0, 0.0
+        usable_usd = float(breakdown.get("ovrs_cash_usd", 0.0) or 0.0)
+        if fx_rate > 0:
+            equity_usd = float(breakdown.get("total_krw", 0.0) or 0.0) / fx_rate
+        else:
+            equity_usd = usable_usd + float(breakdown.get("ovrs_stock_usd", 0.0) or 0.0)
+        return usable_usd, equity_usd
 
     def _sync_orb_plans(self, cards: List[TradeCardState]) -> List[TradeCardState]:
         """Review finding P0-2: without this, a card dragged to Buy Today

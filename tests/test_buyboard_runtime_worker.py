@@ -26,7 +26,21 @@ from src.services import buyboard_runtime as runtime_module
 from src.services import trade_card_repository as repo
 from src.services.broker import BrokerSubmissionResult
 from src.services.execution_authority import ExecutionAuthority, LeaseExpiredError, LeaseHandle
+from src.services.realtime_market_data import QuoteSnapshot, RestPollingMarketDataService
 from src.ui.buyboard.runtime_worker import BuyboardRuntimeWorker
+
+
+def _dummy_market_data() -> RestPollingMarketDataService:
+    """A lightweight, network-free quote source for tests that care about
+    real elapsed time between _run_one_cycle() calls -- the default
+    KIS-only quote fetcher build_buyboard_runtime() falls back to makes a
+    genuine (slow, failing-without-credentials) network call for every
+    subscribed symbol, which otherwise burns several real seconds per
+    cycle and corrupts any test asserting on refresh-interval timing.
+    """
+    return RestPollingMarketDataService(
+        quote_fetcher=lambda symbol: QuoteSnapshot(symbol=symbol, last_price=100.0)
+    )
 
 _APP = None
 
@@ -41,12 +55,27 @@ def _isolate_local_trade_card_snapshot(monkeypatch, tmp_path):
     monkeypatch.setattr(repo, "LOCAL_TRADE_CARDS_FILE", tmp_path / "trade_cards.json")
 
 
+@pytest.fixture(autouse=True)
+def _isolated_buying_power_cache():
+    from src.services import buying_power_cache
+
+    buying_power_cache.clear()
+    yield
+    buying_power_cache.clear()
+
+
 class _FakeBroker:
     def __init__(self):
         self.discover_result = BrokerOrderDiscoveryResult(
             open_orders_complete=True, history_complete=True, reserved_orders_complete=True
         )
         self.positions = {"overseas": {"holdings": []}}
+        # Optional per-account override -- when set, get_positions returns
+        # positions_by_account.get(account_no) instead of the single shared
+        # self.positions, so multi-account tests can give two accounts
+        # genuinely different holdings.
+        self.positions_by_account: dict = {}
+        self.get_positions_calls: list = []
 
     def submit_order(self, **kwargs):
         return BrokerSubmissionResult(broker_order_id="B-1", raw_response={})
@@ -64,6 +93,11 @@ class _FakeBroker:
         return self.discover_result
 
     def get_positions(self, *, environment, account_no=None):
+        self.get_positions_calls.append(account_no)
+        if self.positions_by_account:
+            return self.positions_by_account.get(
+                account_no, {"overseas": {"holdings": []}}
+            )
         return self.positions
 
 
@@ -71,13 +105,16 @@ def _db_engine(tmp_path):
     return create_engine(f"sqlite:///{tmp_path / 'cards.db'}", future=True, poolclass=NullPool)
 
 
-def _worker(tmp_path, *, broker=None, execution_authority=None, execution_lease=None, **kwargs):
+def _worker(
+    tmp_path, *, broker=None, execution_authority=None, execution_lease=None,
+    account_no="1", **kwargs,
+):
     _ensure_app()
     engine = _db_engine(tmp_path)
     worker = BuyboardRuntimeWorker(
         db_engine=engine,
         environment="PROD",
-        account_no="1",
+        account_no=account_no,
         buying_power_provider=lambda env, acct: 100_000.0,
         broker=broker or _FakeBroker(),
         execution_authority=execution_authority,
@@ -157,6 +194,238 @@ def test_startup_reconciliation_discovers_a_manual_broker_position(tmp_path):
     assert card.board_status == BoardStatus.OPEN_POSITION
     assert card.broker_quantity == 10
     assert emitted == [True]
+
+
+def test_startup_reconciliation_scopes_each_account_to_its_own_holdings(tmp_path):
+    """Regression for the multi-account bug: a single unscoped
+    ``get_positions(account_no="")`` call previously reconciled *every*
+    account's cards against one account's holdings, spuriously discovering
+    phantom blank-account-no positions for every other account's real
+    holdings. Each real account_no must be queried and reconciled
+    independently.
+    """
+    broker = _FakeBroker()
+    broker.positions_by_account = {
+        "1": {"overseas": {"holdings": [{"symbol": "AAPL", "quantity": 10, "average_price": 100.0}]}},
+        "2": {"overseas": {"holdings": [{"symbol": "MSFT", "quantity": 5, "average_price": 300.0}]}},
+    }
+    # account_no="" here models the real production wiring
+    # (main_window.py's unscoped worker) -- self._distinct_account_numbers
+    # must derive both real accounts purely from the seeded cards.
+    worker, engine = _worker(tmp_path, broker=broker, account_no="")
+    worker.runtime = runtime_module.build_buyboard_runtime(
+        buying_power_provider=worker._buying_power_provider,
+        card_lookup=worker._card_lookup,
+        broker=worker._broker,
+    )
+    _seed_card(engine, account_no="1", symbol="AAPL", board_status=BoardStatus.WATCHLIST)
+    _seed_card(engine, account_no="2", symbol="MSFT", board_status=BoardStatus.WATCHLIST)
+
+    worker._run_startup_reconciliation()
+
+    aapl = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    msft = repo.get_trade_card(engine, "PROD", "2", "MSFT")
+    assert aapl.board_status == BoardStatus.OPEN_POSITION
+    assert aapl.broker_quantity == 10
+    assert msft.board_status == BoardStatus.OPEN_POSITION
+    assert msft.broker_quantity == 5
+    # No phantom blank-account-no card was created for either symbol.
+    assert repo.get_trade_card(engine, "PROD", "", "AAPL") is None
+    assert repo.get_trade_card(engine, "PROD", "", "MSFT") is None
+    assert set(broker.get_positions_calls) == {"1", "2"}
+
+
+def test_distinct_account_numbers_includes_the_workers_own_scoped_account(tmp_path):
+    """A specifically-scoped worker must always query its own account even
+    before any card exists for it (needed to discover a first manual
+    position with zero pre-existing cards)."""
+    worker, _ = _worker(tmp_path, account_no="1")
+    assert worker._distinct_account_numbers([]) == ["1"]
+
+
+# --- Periodic buying-power refresh / full reconciliation (review findings) --
+
+
+def test_periodic_refresh_populates_buying_power_cache_on_first_cycle(tmp_path, monkeypatch):
+    from src.core import execution_config
+    from src.services import buying_power_cache
+
+    monkeypatch.setattr(execution_config, "is_buyboard_engine_enabled", lambda: True)
+    import src.services.trading_engine as trading_engine_module
+
+    monkeypatch.setattr(trading_engine_module, "is_buyboard_engine_enabled", lambda: True)
+
+    broker = _FakeBroker()
+    broker.positions = {
+        "overseas": {
+            "holdings": [],
+            "summary_by_exchange": {"NASD": {"cash_balance_usd": 5000.0}},
+        }
+    }
+    worker, engine = _worker(tmp_path, broker=broker)
+    worker.runtime = runtime_module.build_buyboard_runtime(
+        buying_power_provider=worker._buying_power_provider,
+        card_lookup=worker._card_lookup,
+        broker=worker._broker,
+        market_data=_dummy_market_data(),
+    )
+    _seed_card(engine, board_status=BoardStatus.BUY_TODAY)
+
+    worker._run_one_cycle()
+
+    snapshot = buying_power_cache.get_snapshot("PROD", "1")
+    assert snapshot is not None
+    assert snapshot.usable_buying_power_usd == 5000.0
+    assert "1" in worker._account_balance_refreshed_at
+
+
+def test_periodic_refresh_does_not_requery_before_its_interval(tmp_path, monkeypatch):
+    from src.core import execution_config
+
+    monkeypatch.setattr(execution_config, "is_buyboard_engine_enabled", lambda: True)
+    import src.services.trading_engine as trading_engine_module
+
+    monkeypatch.setattr(trading_engine_module, "is_buyboard_engine_enabled", lambda: True)
+
+    broker = _FakeBroker()
+    worker, engine = _worker(tmp_path, broker=broker)
+    worker.runtime = runtime_module.build_buyboard_runtime(
+        buying_power_provider=worker._buying_power_provider,
+        card_lookup=worker._card_lookup,
+        broker=worker._broker,
+        market_data=_dummy_market_data(),
+    )
+    _seed_card(engine, board_status=BoardStatus.BUY_TODAY)
+
+    worker._run_one_cycle()
+    calls_after_first = len(broker.get_positions_calls)
+    assert calls_after_first >= 1
+
+    worker._run_one_cycle()  # immediately after -- well within the refresh interval
+    assert len(broker.get_positions_calls) == calls_after_first
+
+
+def test_periodic_refresh_requeries_once_the_interval_has_elapsed(tmp_path, monkeypatch):
+    import datetime as dt
+
+    from src.core import execution_config
+
+    monkeypatch.setattr(execution_config, "is_buyboard_engine_enabled", lambda: True)
+    import src.services.trading_engine as trading_engine_module
+
+    monkeypatch.setattr(trading_engine_module, "is_buyboard_engine_enabled", lambda: True)
+
+    broker = _FakeBroker()
+    worker, engine = _worker(tmp_path, broker=broker)
+    worker.runtime = runtime_module.build_buyboard_runtime(
+        buying_power_provider=worker._buying_power_provider,
+        card_lookup=worker._card_lookup,
+        broker=worker._broker,
+        market_data=_dummy_market_data(),
+    )
+    _seed_card(engine, board_status=BoardStatus.BUY_TODAY)
+
+    worker._run_one_cycle()
+    calls_after_first = len(broker.get_positions_calls)
+
+    # Force both cadences to look overdue without waiting in real time.
+    long_ago = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)
+    worker._account_balance_refreshed_at["1"] = long_ago
+    worker._account_reconciled_at["1"] = long_ago
+
+    worker._run_one_cycle()
+    assert len(broker.get_positions_calls) == calls_after_first + 1
+
+
+def test_periodic_reconciliation_discovers_external_position_change(tmp_path, monkeypatch):
+    """FULL_RECONCILIATION_SECONDS cadence: a manual sale made mid-session
+    (broker quantity dropped to zero) must be discovered without waiting
+    for another application restart."""
+    import datetime as dt
+
+    from src.core import execution_config
+
+    monkeypatch.setattr(execution_config, "is_buyboard_engine_enabled", lambda: True)
+    import src.services.trading_engine as trading_engine_module
+
+    monkeypatch.setattr(trading_engine_module, "is_buyboard_engine_enabled", lambda: True)
+
+    broker = _FakeBroker()
+    broker.positions = {"overseas": {"holdings": []}}  # broker now reports flat
+    worker, engine = _worker(tmp_path, broker=broker)
+    worker.runtime = runtime_module.build_buyboard_runtime(
+        buying_power_provider=worker._buying_power_provider,
+        card_lookup=worker._card_lookup,
+        broker=worker._broker,
+        market_data=_dummy_market_data(),
+    )
+    _seed_card(
+        engine,
+        board_status=BoardStatus.OPEN_POSITION,
+        broker_quantity=10,
+        orderable_quantity=10,
+    )
+    worker._account_balance_refreshed_at["1"] = dt.datetime.now(dt.timezone.utc)
+    worker._account_reconciled_at["1"] = dt.datetime.now(dt.timezone.utc) - dt.timedelta(
+        seconds=execution_config.FULL_RECONCILIATION_SECONDS + 1
+    )
+
+    worker._run_one_cycle()
+
+    card = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert card.board_status == BoardStatus.CLOSED
+    assert card.broker_quantity == 0
+
+
+# --- Stalled-liquidation critical alert (review: "a card warning is --------
+# --- insufficient when the user is asleep") ---------------------------------
+
+
+def test_stalled_cancel_warning_fires_alert_exactly_once(tmp_path):
+    worker, _ = _worker(tmp_path)
+    alerts = []
+    worker.alert.connect(alerts.append)
+    card = TradeCardState(
+        environment="PROD", account_no="1", symbol="AAPL",
+        board_status=BoardStatus.SELL_ALL, warnings=["EXIT_CANCEL_STALLED"],
+    )
+
+    worker._emit_stalled_liquidation_alerts([card])
+    worker._emit_stalled_liquidation_alerts([card])  # still stalled next tick
+
+    assert len(alerts) == 1
+    assert "CRITICAL" in alerts[0]
+    assert "AAPL" in alerts[0]
+
+
+def test_stalled_cancel_alert_fires_again_after_resolving_and_recurring(tmp_path):
+    worker, _ = _worker(tmp_path)
+    alerts = []
+    worker.alert.connect(alerts.append)
+    card = TradeCardState(
+        environment="PROD", account_no="1", symbol="AAPL",
+        board_status=BoardStatus.SELL_ALL, warnings=["EXIT_CANCEL_STALLED"],
+    )
+
+    worker._emit_stalled_liquidation_alerts([card])
+    card.warnings = []  # resolved
+    worker._emit_stalled_liquidation_alerts([card])
+    card.warnings = ["EXIT_CANCEL_STALLED"]  # stalls again
+    worker._emit_stalled_liquidation_alerts([card])
+
+    assert len(alerts) == 2
+
+
+def test_no_stalled_warning_does_not_alert(tmp_path):
+    worker, _ = _worker(tmp_path)
+    alerts = []
+    worker.alert.connect(alerts.append)
+    card = TradeCardState(
+        environment="PROD", account_no="1", symbol="AAPL", board_status=BoardStatus.SELL_ALL,
+    )
+
+    worker._emit_stalled_liquidation_alerts([card])
+    assert alerts == []
 
 
 # --- One heartbeat cycle ------------------------------------------------------

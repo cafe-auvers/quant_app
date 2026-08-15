@@ -33,6 +33,31 @@ class BuylistMonitoringMixin:
         """
         if not is_buyboard_engine_enabled():
             return False
+        # Review finding P0: flag-only suppression is unsafe -- if the new
+        # engine has stopped or failed while the flag stays on, this would
+        # leave *both* engines dark with nothing protecting open positions.
+        # Only actually suppress once _buyboard_engine_healthy() confirms
+        # the worker is running, has finished startup reconciliation, and
+        # produced a recent heartbeat; a health-check method that does not
+        # exist at all (a lightweight test/dummy window not modeling the
+        # new engine) is treated as healthy for backward compatibility --
+        # it is the *presence of an unhealthy worker* that must fail open,
+        # not merely "nobody checked."
+        health_check = getattr(self, "_buyboard_engine_healthy", None)
+        engine_healthy = health_check() if callable(health_check) else True
+        if not engine_healthy:
+            if not self.__dict__.get("_buyboard_engine_unhealthy_notice_logged", False):
+                self._buyboard_engine_unhealthy_notice_logged = True
+                self.append_log(
+                    "CRITICAL: BUYBOARD_ENGINE_ENABLED=true but the Buy Board "
+                    "engine is not confirmed healthy (not running, lease lost, "
+                    "startup reconciliation incomplete, or no recent heartbeat) "
+                    "-- legacy automatic monitoring remains ACTIVE as a "
+                    "fail-safe so positions are not left unprotected. "
+                    "Investigate the Buy Board engine immediately."
+                )
+            return False  # fail open: let the legacy monitor keep protecting
+        self._buyboard_engine_unhealthy_notice_logged = False
         # self.__dict__.get(...), not getattr(self, ...): on a QObject whose
         # __init__ never ran (some lightweight test doubles), PyQt5 raises
         # RuntimeError for an unset attribute instead of AttributeError, which
@@ -42,9 +67,10 @@ class BuylistMonitoringMixin:
             self._legacy_auto_execution_notice_logged = True
             self.append_log(
                 "[Buylist] Legacy automatic order submission is suppressed "
-                "(BUYBOARD_ENGINE_ENABLED=true) -- the Buy Board engine now "
-                "owns automatic entry/exit execution. The Buy Dashboard "
-                "remains available for manual/emergency actions."
+                "(BUYBOARD_ENGINE_ENABLED=true, Buy Board engine confirmed "
+                "healthy) -- the Buy Board engine now owns automatic "
+                "entry/exit execution. The Buy Dashboard remains available "
+                "for manual/emergency actions."
             )
         return True
 

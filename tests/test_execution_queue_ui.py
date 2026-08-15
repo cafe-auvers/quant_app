@@ -1,3 +1,4 @@
+import datetime as dt
 from types import SimpleNamespace
 
 import pandas as pd
@@ -579,6 +580,18 @@ def test_legacy_active_row_is_blocked_once_before_auto_buy(monkeypatch, tmp_path
     assert "only EXECUTE_READY execution-queue" in matching_logs[0]
 
 
+def _healthy_buyboard_worker():
+    """A fake BuyboardRuntimeWorker reporting confirmed health, for tests
+    exercising legacy-suppression behavior once the new engine is
+    genuinely up (review finding: suppression must be heartbeat/health-
+    backed, not only the BUYBOARD_ENGINE_ENABLED flag)."""
+    return SimpleNamespace(
+        isRunning=lambda: True,
+        startup_reconciliation_complete=True,
+        last_heartbeat_at=dt.datetime.now(dt.timezone.utc),
+    )
+
+
 def test_stop_hit_auto_sell_is_suppressed_when_buyboard_engine_enabled(
     monkeypatch, tmp_path
 ):
@@ -587,6 +600,7 @@ def test_stop_hit_auto_sell_is_suppressed_when_buyboard_engine_enabled(
     never also submit a stop-loss SELL for the same position."""
     window = _build_queue_window(monkeypatch, tmp_path)
     monkeypatch.setenv("BUYBOARD_ENGINE_ENABLED", "true")
+    window._buyboard_runtime_worker = _healthy_buyboard_worker()
     logs = []
     submissions = []
     item = SimpleNamespace(
@@ -623,6 +637,7 @@ def test_auto_submit_execute_ready_is_suppressed_when_buyboard_engine_enabled(
 ):
     window = _build_queue_window(monkeypatch, tmp_path)
     monkeypatch.setenv("BUYBOARD_ENGINE_ENABLED", "true")
+    window._buyboard_runtime_worker = _healthy_buyboard_worker()
     logs = []
     submissions = []
     item = SimpleNamespace(
@@ -644,4 +659,45 @@ def test_auto_submit_execute_ready_is_suppressed_when_buyboard_engine_enabled(
     assert any(
         "Legacy automatic order submission is suppressed" in message
         for message in logs
+    )
+
+
+def test_stop_hit_auto_sell_stays_active_when_buyboard_engine_flag_on_but_unhealthy(
+    monkeypatch, tmp_path
+):
+    """Review finding P0: "legacy execution suppression depends only on
+    the feature flag" -- if the new engine has stopped/failed while the
+    flag stays on, the legacy monitor must fail OPEN (keep protecting)
+    rather than also going dark, and must raise a critical alert."""
+    window = _build_queue_window(monkeypatch, tmp_path)
+    monkeypatch.setenv("BUYBOARD_ENGINE_ENABLED", "true")
+    window._buyboard_runtime_worker = None  # never started / already stopped
+    logs = []
+    submissions = []
+    item = SimpleNamespace(
+        symbol="AAPL",
+        environment="PROD",
+        monitoring_status="BOUGHT",
+        breakout_method="",
+        stop_loss=98.0,
+        shares_held=10,
+        auto_order_block_reason="",
+        _stop_order_pending=False,
+        _exit_order_pending=False,
+        _auto_order_block_notice_logged=False,
+    )
+    window.buylist_manager = SimpleNamespace(items=[item])
+    window.latest_intraday_prices = {"AAPL": 90.0}  # below the 98.0 stop
+    window.append_log = logs.append
+    window._buylist_refresh_item_data = lambda _item: None
+    window._populate_buylist_env_table = lambda _env: None
+    window._submit_kis_sell_order = lambda *_args, **_kwargs: submissions.append(True)
+
+    MainWindow._run_buylist_monitor_cycle(window, "PROD")
+
+    # Fails open: the legacy monitor still protects the position.
+    assert submissions == [True]
+    assert any("CRITICAL" in message for message in logs)
+    assert any(
+        "Buy Board engine is not confirmed healthy" in message for message in logs
     )

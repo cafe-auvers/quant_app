@@ -592,6 +592,12 @@ class DashboardMixin:
             self.kis_account_snapshots[
                 (environment, account_no)
             ] = snapshot
+            # setdefault, not a plain attribute access: lightweight test
+            # doubles (SimpleNamespace) that model kis_account_snapshots
+            # without this newer sibling dict must not crash here.
+            self.__dict__.setdefault("kis_account_snapshot_fetched_at", {})[
+                (environment, account_no)
+            ] = dt.datetime.now(dt.timezone.utc)
             self.sync_buylist_positions_from_kis_snapshots(
                 {(environment, account_no): snapshot}
             )
@@ -888,9 +894,14 @@ class DashboardMixin:
             )
         ).upper()
         if profile:
-            self.kis_account_snapshots[(environment, profile.get("account_no", ""))] = (
-                snapshot
-            )
+            account_key = (environment, profile.get("account_no", ""))
+            self.kis_account_snapshots[account_key] = snapshot
+            # setdefault, not a plain attribute access: lightweight test
+            # doubles (SimpleNamespace) that model kis_account_snapshots
+            # without this newer sibling dict must not crash here.
+            self.__dict__.setdefault("kis_account_snapshot_fetched_at", {})[
+                account_key
+            ] = dt.datetime.now(dt.timezone.utc)
             self.sync_buylist_positions_from_kis_snapshots(
                 {(environment, profile.get("account_no", "")): snapshot}
             )
@@ -1045,15 +1056,32 @@ class DashboardMixin:
                         # ovrs_cash_usd is *usable cash* (excludes existing
                         # stock holdings' value); account_value_usd is the
                         # full-equity risk-sizing base.
-                        from src.services import buying_power_cache
+                        #
+                        # received_at is deliberately the real KIS fetch
+                        # moment (kis_account_snapshot_fetched_at), not
+                        # "now": this method also runs on many triggers that
+                        # merely recompute display from an *already-cached*
+                        # snapshot (env/account combo change, FX refresh,
+                        # ...) with no new network call at all -- stamping
+                        # "now" on every one of those would let stale broker
+                        # data keep re-arming the 15s freshness window
+                        # indefinitely, defeating the fail-closed check
+                        # entirely. Skip recording rather than guess when we
+                        # don't actually know the real fetch time.
+                        fetched_at = self.__dict__.get(
+                            "kis_account_snapshot_fetched_at", {}
+                        ).get((environment, account_no))
+                        if fetched_at is not None:
+                            from src.services import buying_power_cache
 
-                        buying_power_cache.record_snapshot(
-                            environment=environment,
-                            account_no=account_no,
-                            usable_buying_power_usd=breakdown["ovrs_cash_usd"],
-                            total_equity_usd=account_value_usd,
-                            source="kis_account_snapshot",
-                        )
+                            buying_power_cache.record_snapshot(
+                                environment=environment,
+                                account_no=account_no,
+                                usable_buying_power_usd=breakdown["ovrs_cash_usd"],
+                                total_equity_usd=account_value_usd,
+                                source="kis_account_snapshot",
+                                received_at=fetched_at,
+                            )
                     old_block = self.account_size_input.blockSignals(True)
                     self.account_size_input.setText(f"{account_value_usd:.2f}")
                     self.account_size_input.blockSignals(old_block)

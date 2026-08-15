@@ -416,6 +416,15 @@ class MainWindow(
         self._handoff_reconciliation_required = False
         self._handoff_allow_auto_arm = False
         self.kis_account_snapshots: dict[tuple[str, str], dict] = {}
+        # When each kis_account_snapshots entry was actually fetched from
+        # KIS (review: "record_snapshot() assigns the current time unless a
+        # timestamp is explicitly passed... it can potentially record stale
+        # broker data as if it were freshly fetched" -- apply_cached_trade_account_size
+        # recomputes display from this cache on many unrelated triggers, not
+        # only on an actual new fetch, so it must not stamp buying_power_cache
+        # with "now" itself). Set only at the two real fetch-completion sites
+        # (_on_kis_snapshot_finished, _on_trade_account_snapshot_finished).
+        self.kis_account_snapshot_fetched_at: dict[tuple[str, str], dt.datetime] = {}
         self._kis_api_last_success_at = ""
         self._kis_api_last_error = ""
         self.latest_intraday_prices: dict[str, float] = {}
@@ -1472,6 +1481,49 @@ class MainWindow(
             ),
             "lease_engine": self.__dict__.get("pc_db_engine"),
         }
+
+    # Maximum age of BuyboardRuntimeWorker.last_heartbeat_at before the new
+    # engine is no longer trusted to be actively protecting positions.
+    # Generous relative to ENGINE_HEARTBEAT_SECONDS (default 1s) so a single
+    # slow cycle never flips this, while still catching a genuinely stalled
+    # or crashed worker quickly.
+    _BUYBOARD_ENGINE_HEARTBEAT_MAX_AGE_SECONDS = 15.0
+
+    def _buyboard_engine_healthy(self) -> bool:
+        """Review finding: "legacy execution suppression depends only on
+        the feature flag" -- it did not verify the new engine was actually
+        running, holding its lease, and producing recent heartbeats, so a
+        silently stopped/failed worker with the flag still on left *no*
+        automatic engine protecting positions at all (both suppressed).
+
+        Requires everything the review's own ``ExecutionOwnerState`` sketch
+        does: the worker exists, is running, has completed startup
+        reconciliation, and produced a heartbeat recently -- true broker
+        lease currency is already covered by
+        :meth:`_current_execution_lease_kwargs`/``ExecutionAuthority``,
+        which the worker itself stops on
+        (:meth:`~src.ui.buyboard.runtime_worker.BuyboardRuntimeWorker._lease_still_current`);
+        a lease loss shows up here indirectly as the worker's heartbeat
+        going stale once its loop exits.
+        """
+        worker = self.__dict__.get("_buyboard_runtime_worker")
+        if worker is None:
+            return False
+        try:
+            if not worker.isRunning():
+                return False
+        except RuntimeError:
+            # The underlying Qt C++ object was already deleted.
+            return False
+        if not getattr(worker, "startup_reconciliation_complete", False):
+            return False
+        last_heartbeat = getattr(worker, "last_heartbeat_at", None)
+        if last_heartbeat is None:
+            return False
+        age_seconds = (
+            dt.datetime.now(dt.timezone.utc) - last_heartbeat
+        ).total_seconds()
+        return age_seconds <= self._BUYBOARD_ENGINE_HEARTBEAT_MAX_AGE_SECONDS
 
     def _sync_buyboard_runtime_worker(self) -> None:
         """Starts/stops :class:`~src.ui.buyboard.runtime_worker.BuyboardRuntimeWorker`
