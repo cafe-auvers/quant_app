@@ -7,7 +7,7 @@ in that document's revision 3.1. This is a deliberately separate dimension
 from :class:`~src.core.execution_order_record.ExecutionOrderStatus` (the
 order's own broker-facing lifecycle) -- an order can be, say, ``WORKING``
 (a perfectly normal broker status) while its ``recovery_state`` is
-``OWNERSHIP_UNCERTAIN`` (the application isn't sure it's tracking the right
+``BROKER_IDENTITY_UNCERTAIN`` (the application isn't sure it's tracking the right
 order at all). Conflating the two was never done here, unlike the review
 history's earlier ``UNRECONCILED_BROKER_ORDER`` warning, which *was* used as
 both a user-facing label and (via string membership checks) the sweep
@@ -30,7 +30,7 @@ from typing import FrozenSet
 class OrderRecoveryState(str, Enum):
     NONE = "NONE"
     DISCOVERING = "DISCOVERING"
-    OWNERSHIP_UNCERTAIN = "OWNERSHIP_UNCERTAIN"
+    BROKER_IDENTITY_UNCERTAIN = "BROKER_IDENTITY_UNCERTAIN"
     CANCEL_REQUIRED = "CANCEL_REQUIRED"
     CANCEL_REQUESTED = "CANCEL_REQUESTED"
     AWAITING_CANCEL_CONFIRMATION = "AWAITING_CANCEL_CONFIRMATION"
@@ -51,9 +51,9 @@ TERMINAL_RECOVERY_STATES: FrozenSet[OrderRecoveryState] = frozenset(
 _SPECIFIC_TRANSITIONS = {
     OrderRecoveryState.NONE: frozenset({OrderRecoveryState.DISCOVERING}),
     OrderRecoveryState.DISCOVERING: frozenset(
-        {OrderRecoveryState.NONE, OrderRecoveryState.OWNERSHIP_UNCERTAIN}
+        {OrderRecoveryState.NONE, OrderRecoveryState.BROKER_IDENTITY_UNCERTAIN}
     ),
-    OrderRecoveryState.OWNERSHIP_UNCERTAIN: frozenset({OrderRecoveryState.CANCEL_REQUIRED}),
+    OrderRecoveryState.BROKER_IDENTITY_UNCERTAIN: frozenset({OrderRecoveryState.CANCEL_REQUIRED}),
     OrderRecoveryState.CANCEL_REQUIRED: frozenset({OrderRecoveryState.CANCEL_REQUESTED}),
     OrderRecoveryState.CANCEL_REQUESTED: frozenset(
         {OrderRecoveryState.AWAITING_CANCEL_CONFIRMATION}

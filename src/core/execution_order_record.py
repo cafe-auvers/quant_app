@@ -1,15 +1,18 @@
 """Durable local identity for every broker order the application submits.
 
 ``docs/kanban_production_readiness.md``, Workstream 2 (A1-A3, A6), signed
-off in that document's revision 3.1. This is the fix for INV-1 ("every
-broker order submitted by the application has a durable local identity")
--- prior recovery code repeatedly had to *infer* whether a discovered
-broker order belonged to this application from account+symbol+side+
-quantity+price, because no durable "we submitted this exact order" record
-survived a crash between broker acceptance and local persistence. An
-:class:`ExecutionOrderRecord` is that record, written atomically (with its
-capital reservation and command) *before* the broker is ever called --
-see :func:`~src.services.execution_command_gateway` (Workstream 3) for the
+off in that document's revision 3.1, amended by revision 3.2 (a narrow
+errata pass discovered during PR1 implementation -- see that document's
+change log for the exact list). This is the fix for INV-1 ("every broker
+order submitted by the application has a durable local identity") -- prior
+recovery code repeatedly had to *infer* whether a discovered broker order
+belonged to this application from account+symbol+side+quantity+price,
+because no durable "we submitted this exact order" record survived a crash
+between broker acceptance and local persistence. An :class:`ExecutionOrderRecord`
+is that record, written atomically (with its capital reservation and
+command) *before* the broker is ever called -- see
+:mod:`src.services.execution_order_repository` for its durable persistence
+and :func:`~src.services.execution_command_gateway` (Workstream 3) for the
 atomic pre-submission transaction this record's ``PREPARED``/``SUBMITTING``
 states exist to support.
 
@@ -26,17 +29,27 @@ field was wrong):
   broker call has happened yet) -- it is not "verified" just because the
   application created it. Only :func:`mark_broker_identity_exact` may ever
   set ``broker_identity_status=EXACT``, and only alongside a real
-  ``broker_order_id``.
+  ``broker_order_id`` -- enforced (not merely encouraged) by
+  :func:`apply_status_transition` at the point identity actually becomes
+  load-bearing (``ACKNOWLEDGED``), and immutable once ``EXACT`` except for
+  idempotent reconfirmation of the same ID (revision 3.2).
 
 A broker order discovered with *no* matching ``ExecutionOrderRecord`` at
 all is a fundamentally different object -- see
 :class:`~src.core.discovered_external_order.DiscoveredExternalOrder`, which
 is never created here and never becomes one of these except through an
-explicit, audited adoption.
+explicit, audited adoption (see :class:`AdoptedOrderPermission`, revision
+3.2, for the resulting record's scoped authority).
+
+Every enum coercion in this module fails closed (raises on an unrecognized
+value) rather than silently substituting a default -- revision 3.2: unlike
+a broker response snapshot (where an unrecognized value defaulting to
+``UNKNOWN`` is acceptable), a corrupted or invalid value for this record's
+*own* authoritative fields must never be silently reinterpreted as
+something else.
 """
 from __future__ import annotations
 
-import datetime as dt
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, FrozenSet, Optional
@@ -100,6 +113,11 @@ _ALLOWED_STATUS_TRANSITIONS: Dict[ExecutionOrderStatus, FrozenSet[ExecutionOrder
             ExecutionOrderStatus.PARTIALLY_FILLED,
             ExecutionOrderStatus.FILLED,
             ExecutionOrderStatus.REJECTED,
+            # revision 3.2: an urgent cancel must not be forced to wait for
+            # a separate WORKING observation that may not have arrived yet
+            # -- ACKNOWLEDGED already means the order is live at the
+            # broker (broker_order_id known).
+            ExecutionOrderStatus.CANCEL_PENDING,
         }
     ),
     ExecutionOrderStatus.WORKING: frozenset(
@@ -123,6 +141,12 @@ _ALLOWED_STATUS_TRANSITIONS: Dict[ExecutionOrderStatus, FrozenSet[ExecutionOrder
             ExecutionOrderStatus.CANCELLED,
             ExecutionOrderStatus.FILLED,
             ExecutionOrderStatus.PARTIALLY_FILLED,
+            # revision 3.2: the broker can explicitly reject the cancel
+            # request itself (the order simply keeps working), or a
+            # time-in-force expiry can race the cancel -- neither
+            # previously had a valid outcome in this table.
+            ExecutionOrderStatus.WORKING,
+            ExecutionOrderStatus.EXPIRED,
         }
     ),
 }
@@ -144,6 +168,35 @@ def validate_status_transition(current: ExecutionOrderStatus, target: ExecutionO
         )
 
 
+class OrderOrigin(str, Enum):
+    APPLICATION = "APPLICATION"  # created via the normal submission flow
+    USER_ADOPTED = "USER_ADOPTED"  # created by adopting a DiscoveredExternalOrder
+
+
+class BrokerIdentityStatus(str, Enum):
+    NOT_ASSIGNED = "NOT_ASSIGNED"  # no broker call made yet (PREPARED)
+    AMBIGUOUS = "AMBIGUOUS"  # broker call made, outcome unknown
+    EXACT = "EXACT"  # broker_order_id confirmed
+    # revision 3.2: the confirmed-negative counterpart to EXACT. AMBIGUOUS
+    # means "outcome unknown"; once REJECTED/NOT_ACCEPTED_CONFIRMED is
+    # reached with no broker_order_id ever assigned, there is no longer
+    # anything unknown -- staying AMBIGUOUS would be stale and wrong.
+    NO_BROKER_ORDER_CONFIRMED = "NO_BROKER_ORDER_CONFIRMED"
+
+
+class AdoptedOrderPermission(str, Enum):
+    """(revision 3.2) The specific actions an adoption UI actually granted
+    for a ``USER_ADOPTED`` :class:`ExecutionOrderRecord` -- ``origin ==
+    USER_ADOPTED`` alone must never imply blanket authority over an order
+    the application never submitted. Empty/unused for ``origin ==
+    APPLICATION`` records, which already have full authority over what
+    they themselves created."""
+
+    LINK_TO_CARD = "LINK_TO_CARD"
+    CANCEL = "CANCEL"
+    REPLACE = "REPLACE"
+
+
 # Reaching either of these means a broker call was actually made and its
 # outcome isn't known yet -- per the "expected combinations" table,
 # broker_identity_status should read AMBIGUOUS by the time an
@@ -151,6 +204,25 @@ def validate_status_transition(current: ExecutionOrderStatus, target: ExecutionO
 # know that much.
 _STATUSES_IMPLYING_AMBIGUOUS_IDENTITY: FrozenSet[ExecutionOrderStatus] = frozenset(
     {ExecutionOrderStatus.SUBMITTING, ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE}
+)
+
+# ACKNOWLEDGED is the sole gateway into WORKING/PARTIALLY_FILLED/FILLED/
+# CANCEL_PENDING/CANCELLED (see the transition table above) -- enforcing
+# exact identity at this one transition point transitively covers that
+# whole subgraph (revision 3.2: this is now a hard requirement, not merely
+# a documented expectation the caller could forget to satisfy).
+_STATUSES_REQUIRING_EXACT_IDENTITY: FrozenSet[ExecutionOrderStatus] = frozenset(
+    {ExecutionOrderStatus.ACKNOWLEDGED}
+)
+
+# A confirmed-negative outcome reached while identity was still merely
+# AMBIGUOUS (never EXACT) means no broker order ever existed -- distinct
+# from a *late* REJECTED reached from ACKNOWLEDGED/WORKING, where a real
+# broker_order_id was already confirmed and identity correctly stays EXACT
+# (the order existed and is now terminal, which is different from having
+# never existed at all) (revision 3.2).
+_STATUSES_IMPLYING_NO_BROKER_ORDER_CONFIRMED: FrozenSet[ExecutionOrderStatus] = frozenset(
+    {ExecutionOrderStatus.REJECTED, ExecutionOrderStatus.NOT_ACCEPTED_CONFIRMED}
 )
 
 
@@ -165,35 +237,53 @@ def apply_status_transition(
     is caught at the point of the attempted mutation rather than
     discovered later by an inconsistent record.
 
-    When ``target`` is ``SUBMITTING``/``UNKNOWN_SUBMISSION_STATE`` and
-    identity is still ``NOT_ASSIGNED``, ``broker_identity_status`` is
-    promoted to ``AMBIGUOUS`` automatically -- the status alone already
-    implies that much, no new evidence needed. Reaching ``ACKNOWLEDGED``
-    (or any later status) with exact identity confirmed requires passing
-    ``broker_order_id`` here (routed through
-    :func:`mark_broker_identity_exact`) -- ``EXACT`` is never inferred
-    from the status transition alone (A3's own rule).
+    - ``target`` in (``SUBMITTING``, ``UNKNOWN_SUBMISSION_STATE``) with
+      identity still ``NOT_ASSIGNED`` promotes ``broker_identity_status``
+      to ``AMBIGUOUS`` automatically -- the status alone already implies
+      that much.
+    - ``target == ACKNOWLEDGED`` **requires** exact identity: either
+      ``broker_order_id`` is supplied here (routed through
+      :func:`mark_broker_identity_exact`), or ``broker_identity_status``
+      must already be ``EXACT`` -- otherwise this raises (revision 3.2).
+      ``EXACT`` is never inferred from the status transition alone.
+    - ``target`` in (``REJECTED``, ``NOT_ACCEPTED_CONFIRMED``) reached
+      while identity was still ``AMBIGUOUS`` demotes it to the confirmed-
+      negative ``NO_BROKER_ORDER_CONFIRMED`` (revision 3.2) -- a *late*
+      rejection reached with identity already ``EXACT`` is left ``EXACT``,
+      since a real broker order did exist.
     """
     validate_status_transition(record.status, target)
+
+    if target in _STATUSES_REQUIRING_EXACT_IDENTITY:
+        if broker_order_id is not None:
+            mark_broker_identity_exact(record, broker_order_id)
+        if record.broker_identity_status != BrokerIdentityStatus.EXACT:
+            raise ValueError(
+                f"Cannot transition to {target.value} without a confirmed broker_order_id "
+                "-- pass broker_order_id= or ensure broker_identity_status is already EXACT"
+            )
+    elif broker_order_id is not None:
+        mark_broker_identity_exact(record, broker_order_id)
+
     if (
         target in _STATUSES_IMPLYING_AMBIGUOUS_IDENTITY
         and record.broker_identity_status == BrokerIdentityStatus.NOT_ASSIGNED
     ):
         record.broker_identity_status = BrokerIdentityStatus.AMBIGUOUS
-    if broker_order_id is not None:
-        mark_broker_identity_exact(record, broker_order_id)
+
+    if (
+        target in _STATUSES_IMPLYING_NO_BROKER_ORDER_CONFIRMED
+        and record.broker_identity_status == BrokerIdentityStatus.AMBIGUOUS
+    ):
+        record.broker_identity_status = BrokerIdentityStatus.NO_BROKER_ORDER_CONFIRMED
+
+    now = utc_now_iso()
+    if target == ExecutionOrderStatus.SUBMITTING:
+        record.submission_started_at = now
+    if target == ExecutionOrderStatus.ACKNOWLEDGED:
+        record.acknowledged_at = now
+
     record.status = target
-
-
-class OrderOrigin(str, Enum):
-    APPLICATION = "APPLICATION"  # created via the normal submission flow
-    USER_ADOPTED = "USER_ADOPTED"  # created by adopting a DiscoveredExternalOrder
-
-
-class BrokerIdentityStatus(str, Enum):
-    NOT_ASSIGNED = "NOT_ASSIGNED"  # no broker call made yet (PREPARED)
-    AMBIGUOUS = "AMBIGUOUS"  # broker call made, outcome unknown
-    EXACT = "EXACT"  # broker_order_id confirmed
 
 
 @dataclass
@@ -219,7 +309,16 @@ class ExecutionOrderRecord:
     submitted_limit_price: float = 0.0
     exchange: str = ""
     execution_policy: str = REGULAR_LIMIT_EXECUTION
-    submitted_at: str = field(default_factory=utc_now_iso)
+    # revision 3.2: three separate timestamps, not one. prepared_at is when
+    # this record was first constructed (PREPARED); it is NOT proof a
+    # broker call ever actually started -- that is submission_started_at,
+    # set atomically with the SUBMITTING transition (apply_status_transition
+    # above). A4a's candidate-fingerprint matching must use
+    # submission_started_at, not prepared_at, for its submission time
+    # window.
+    prepared_at: str = field(default_factory=utc_now_iso)
+    submission_started_at: Optional[str] = None
+    acknowledged_at: Optional[str] = None
     market_session_date: Optional[str] = None
 
     owner_device_id: str = ""
@@ -239,6 +338,12 @@ class ExecutionOrderRecord:
     broker_identity_status: BrokerIdentityStatus = BrokerIdentityStatus.NOT_ASSIGNED
     recovery_state: OrderRecoveryState = OrderRecoveryState.NONE
 
+    # (revision 3.2) The exact actions a USER_ADOPTED record's adoption
+    # granted -- see AdoptedOrderPermission. Always empty for
+    # origin=APPLICATION records (unused; the application has full
+    # authority over its own submissions already).
+    adoption_permissions: FrozenSet[AdoptedOrderPermission] = field(default_factory=frozenset)
+
     # Set only by replace_order's composed cancel-then-new-record operation
     # (see docs/kanban_production_readiness.md, "replace_order is not a
     # first-class status") and by adopt_external_order respectively.
@@ -253,8 +358,8 @@ class ExecutionOrderRecord:
         self.environment = str(self.environment or "").upper()
         self.account_no = str(self.account_no or "")
         self.symbol = str(self.symbol or "").upper()
-        self.side = _coerce_enum(self.side, OrderSide, OrderSide.BUY)
-        self.intent = _coerce_enum(self.intent, OrderIntent, OrderIntent.UNKNOWN)
+        self.side = _strict_enum(self.side, OrderSide)
+        self.intent = _strict_enum(self.intent, OrderIntent)
         self.client_order_id = str(self.client_order_id or "").strip()
         if not self.client_order_id:
             raise ValueError("ExecutionOrderRecord requires a client_order_id")
@@ -267,16 +372,15 @@ class ExecutionOrderRecord:
         self.owner_device_id = str(self.owner_device_id or "")
         self.lease_token = str(self.lease_token or "")
         self.lease_epoch = int(self.lease_epoch or 0)
-        self.status = _coerce_enum(self.status, ExecutionOrderStatus, ExecutionOrderStatus.PREPARED)
+        self.status = _strict_enum(self.status, ExecutionOrderStatus)
         self.filled_quantity = int(self.filled_quantity or 0)
         self.remaining_quantity = int(self.remaining_quantity or 0)
         self.average_fill_price = float(self.average_fill_price or 0.0)
-        self.origin = _coerce_enum(self.origin, OrderOrigin, OrderOrigin.APPLICATION)
-        self.broker_identity_status = _coerce_enum(
-            self.broker_identity_status, BrokerIdentityStatus, BrokerIdentityStatus.NOT_ASSIGNED
-        )
-        self.recovery_state = _coerce_enum(
-            self.recovery_state, OrderRecoveryState, OrderRecoveryState.NONE
+        self.origin = _strict_enum(self.origin, OrderOrigin)
+        self.broker_identity_status = _strict_enum(self.broker_identity_status, BrokerIdentityStatus)
+        self.recovery_state = _strict_enum(self.recovery_state, OrderRecoveryState)
+        self.adoption_permissions = frozenset(
+            _strict_enum(perm, AdoptedOrderPermission) for perm in (self.adoption_permissions or ())
         )
         self.version = int(self.version or 1)
         # A3's own rule, enforced at construction too (not just via
@@ -293,10 +397,23 @@ def mark_broker_identity_exact(record: ExecutionOrderRecord, broker_order_id: st
     (A3: "``broker_identity_status`` only ever reaches ``EXACT`` alongside
     a confirmed ``broker_order_id`` -- never inferred from ``origin``
     alone"). Refuses without a real, non-empty ``broker_order_id``.
+
+    Idempotent for the *same* ID (a later reconfirmation is harmless); a
+    different ID once already ``EXACT`` is a contradiction and raises,
+    never silently overwrites (revision 3.2).
     """
     broker_order_id = str(broker_order_id or "").strip()
     if not broker_order_id:
         raise ValueError("broker_identity_status cannot become EXACT without a confirmed broker_order_id")
+    if (
+        record.broker_identity_status == BrokerIdentityStatus.EXACT
+        and record.broker_order_id
+        and record.broker_order_id != broker_order_id
+    ):
+        raise ValueError(
+            f"Contradiction: broker identity already EXACT as {record.broker_order_id!r}, "
+            f"cannot reassign to {broker_order_id!r}"
+        )
     record.broker_order_id = broker_order_id
     record.broker_identity_status = BrokerIdentityStatus.EXACT
 
@@ -309,25 +426,52 @@ _CANCELLABLE_STATUSES: FrozenSet[ExecutionOrderStatus] = frozenset(
     if ExecutionOrderStatus.CANCEL_PENDING in targets
 )
 
+# (revision 3.2) An explicit allow-list, not a `!= BROKER_IDENTITY_UNCERTAIN`
+# deny-list -- the deny-list wrongly permitted DISCOVERING, MANUAL_
+# INTERVENTION_REQUIRED, and an already-in-flight cancel
+# (CANCEL_REQUESTED/AWAITING_CANCEL_CONFIRMATION) to accept a second,
+# duplicate cancel command. CANCEL_REQUIRED is included because that state
+# specifically represents "a cancel decision has just been made, about to
+# be requested" -- the same cancel flow this predicate is gating, not a
+# competing one.
+_CANCEL_ELIGIBLE_RECOVERY_STATES: FrozenSet[OrderRecoveryState] = frozenset(
+    {OrderRecoveryState.NONE, OrderRecoveryState.CANCEL_REQUIRED}
+)
+
 
 def is_cancellable(record: ExecutionOrderRecord) -> bool:
     """B2/B3's cancel-gate identity check, as a reusable predicate: exact
-    broker identity, application/user-adopted origin, non-ambiguous
-    recovery, and a status that can actually reach ``CANCEL_PENDING`` --
+    broker identity, application/user-adopted origin (with, for
+    ``USER_ADOPTED``, the adoption having actually granted ``CANCEL`` --
+    revision 3.2), a recovery state on the explicit cancel-eligible
+    allow-list, and a status that can actually reach ``CANCEL_PENDING`` --
     never ``origin`` alone (revision 3.1's central correction)."""
+    if record.origin not in (OrderOrigin.APPLICATION, OrderOrigin.USER_ADOPTED):
+        return False
+    if (
+        record.origin == OrderOrigin.USER_ADOPTED
+        and AdoptedOrderPermission.CANCEL not in record.adoption_permissions
+    ):
+        return False
     return (
-        record.origin in (OrderOrigin.APPLICATION, OrderOrigin.USER_ADOPTED)
-        and record.broker_identity_status == BrokerIdentityStatus.EXACT
+        record.broker_identity_status == BrokerIdentityStatus.EXACT
         and bool(record.broker_order_id)
-        and record.recovery_state != OrderRecoveryState.OWNERSHIP_UNCERTAIN
+        and record.recovery_state in _CANCEL_ELIGIBLE_RECOVERY_STATES
         and record.status in _CANCELLABLE_STATUSES
     )
 
 
-def _coerce_enum(value: Any, enum_cls: type, default: Enum) -> Enum:
+def _strict_enum(value: Any, enum_cls: type) -> Enum:
+    """Fail-closed enum coercion for this record's own authoritative
+    fields (revision 3.2) -- unlike a broker response snapshot (where an
+    unrecognized value defaulting to e.g. ``UNKNOWN`` is acceptable), a
+    corrupted or invalid value read back for one of *this* record's own
+    fields must never be silently reinterpreted as something else; it must
+    raise so the corruption is caught, not masked.
+    """
     if isinstance(value, enum_cls):
         return value
     try:
         return enum_cls(str(value).upper())
-    except (TypeError, ValueError):
-        return default
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid {enum_cls.__name__} value: {value!r}") from exc

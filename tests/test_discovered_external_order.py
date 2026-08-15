@@ -1,12 +1,14 @@
 """Tests for src.core.discovered_external_order.
 
-docs/kanban_production_readiness.md, Workstream 2, A4b, revision 3.1.
+docs/kanban_production_readiness.md, Workstream 2, A4b, revisions 3.1 and
+3.2.
 """
 from __future__ import annotations
 
 import pytest
 
 from src.core.execution_order_record import (
+    AdoptedOrderPermission,
     BrokerIdentityStatus,
     ExecutionOrderRecord,
     ExecutionOrderStatus,
@@ -19,6 +21,7 @@ from src.core.discovered_external_order import (
     adopt_external_order,
     allowed_disposition_transitions,
     is_unreconciled_external_order,
+    new_discovered_external_order,
     validate_disposition_transition,
 )
 from src.core.order_recovery_state import OrderRecoveryState
@@ -54,6 +57,48 @@ def test_gets_a_generated_external_order_id():
     b = _external()
     assert a.external_order_id
     assert a.external_order_id != b.external_order_id
+
+
+def test_invalid_side_raises_rather_than_silently_defaulting():
+    with pytest.raises(ValueError):
+        _external(side="NOT_A_REAL_SIDE")
+
+
+def test_invalid_broker_status_raises_rather_than_silently_defaulting():
+    with pytest.raises(ValueError):
+        _external(broker_status="NOT_A_REAL_STATUS")
+
+
+# --- Redaction (revision 3.2) -------------------------------------------
+
+
+def test_new_discovered_external_order_redacts_the_raw_response_before_storage():
+    order = new_discovered_external_order(
+        environment="PROD", account_no="1", symbol="AAPL", side=OrderSide.BUY,
+        broker_order_id="B-1", quantity_requested=10,
+        raw_response={
+            "account_no": "12345678-01",
+            "access_token": "SUPER_SECRET_TOKEN",
+            "authorization": "Bearer abc123",
+            "symbol": "AAPL",
+        },
+    )
+    assert order.redacted_response["access_token"] == "[REDACTED]"
+    assert "SUPER_SECRET_TOKEN" not in str(order.redacted_response)
+    assert "Bearer abc123" not in str(order.redacted_response)
+    assert "12345678-01" not in str(order.redacted_response)
+    assert order.redacted_response["symbol"] == "AAPL"
+    assert order.response_hash  # integrity/dedup hash was computed
+
+
+def test_new_discovered_external_order_redacts_nested_sensitive_fields():
+    order = new_discovered_external_order(
+        environment="PROD", account_no="1", symbol="AAPL", side=OrderSide.BUY,
+        broker_order_id="B-1",
+        raw_response={"nested": {"password": "hunter2", "ok": "fine"}},
+    )
+    assert order.redacted_response["nested"]["password"] == "[REDACTED]"
+    assert order.redacted_response["nested"]["ok"] == "fine"
 
 
 # --- ExternalOrderDisposition transition table -------------------------
@@ -160,6 +205,26 @@ def test_adoption_of_a_dismissed_terminal_order_raises():
     ext.disposition = ExternalOrderDisposition.DISMISSED_TERMINAL
     with pytest.raises(InvalidExternalOrderDispositionTransitionError):
         adopt_external_order(ext, adopted_by="tony")
+
+
+# --- AdoptedOrderPermission scoping (revision 3.2) --------------------------
+
+
+def test_adoption_defaults_to_no_permissions_granted():
+    """permissions is never defaulted to "everything" merely because
+    adoption happened -- the caller must explicitly widen it."""
+    ext = _external()
+    record = adopt_external_order(ext, adopted_by="tony")
+    assert record.adoption_permissions == frozenset()
+
+
+def test_adoption_grants_exactly_the_permissions_passed():
+    ext = _external()
+    record = adopt_external_order(
+        ext, adopted_by="tony", permissions=frozenset({AdoptedOrderPermission.CANCEL})
+    )
+    assert record.adoption_permissions == frozenset({AdoptedOrderPermission.CANCEL})
+    assert AdoptedOrderPermission.REPLACE not in record.adoption_permissions
 
 
 def test_a4b_never_auto_cancels_or_attaches_to_a_card():

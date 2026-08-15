@@ -30,8 +30,8 @@ def test_every_encoded_valid_transition_is_accepted(frm, to):
     [
         (OrderRecoveryState.NONE, OrderRecoveryState.DISCOVERING),
         (OrderRecoveryState.DISCOVERING, OrderRecoveryState.NONE),
-        (OrderRecoveryState.DISCOVERING, OrderRecoveryState.OWNERSHIP_UNCERTAIN),
-        (OrderRecoveryState.OWNERSHIP_UNCERTAIN, OrderRecoveryState.CANCEL_REQUIRED),
+        (OrderRecoveryState.DISCOVERING, OrderRecoveryState.BROKER_IDENTITY_UNCERTAIN),
+        (OrderRecoveryState.BROKER_IDENTITY_UNCERTAIN, OrderRecoveryState.CANCEL_REQUIRED),
         (OrderRecoveryState.CANCEL_REQUIRED, OrderRecoveryState.CANCEL_REQUESTED),
         (OrderRecoveryState.CANCEL_REQUESTED, OrderRecoveryState.AWAITING_CANCEL_CONFIRMATION),
         (OrderRecoveryState.AWAITING_CANCEL_CONFIRMATION, OrderRecoveryState.TERMINAL_RECONCILED),
@@ -46,7 +46,7 @@ def test_every_documented_transition_table_row_matches_the_written_contract(frm,
     [
         OrderRecoveryState.NONE,
         OrderRecoveryState.DISCOVERING,
-        OrderRecoveryState.OWNERSHIP_UNCERTAIN,
+        OrderRecoveryState.BROKER_IDENTITY_UNCERTAIN,
         OrderRecoveryState.CANCEL_REQUIRED,
         OrderRecoveryState.CANCEL_REQUESTED,
         OrderRecoveryState.AWAITING_CANCEL_CONFIRMATION,
@@ -61,10 +61,10 @@ def test_any_non_terminal_state_can_escalate_to_manual_intervention_required(frm
 @pytest.mark.parametrize(
     "frm,to",
     [
-        (OrderRecoveryState.NONE, OrderRecoveryState.OWNERSHIP_UNCERTAIN),
+        (OrderRecoveryState.NONE, OrderRecoveryState.BROKER_IDENTITY_UNCERTAIN),
         (OrderRecoveryState.NONE, OrderRecoveryState.TERMINAL_RECONCILED),
-        (OrderRecoveryState.OWNERSHIP_UNCERTAIN, OrderRecoveryState.NONE),
-        (OrderRecoveryState.OWNERSHIP_UNCERTAIN, OrderRecoveryState.TERMINAL_RECONCILED),
+        (OrderRecoveryState.BROKER_IDENTITY_UNCERTAIN, OrderRecoveryState.NONE),
+        (OrderRecoveryState.BROKER_IDENTITY_UNCERTAIN, OrderRecoveryState.TERMINAL_RECONCILED),
         (OrderRecoveryState.CANCEL_REQUIRED, OrderRecoveryState.AWAITING_CANCEL_CONFIRMATION),
     ],
 )
@@ -89,7 +89,7 @@ def test_terminal_states_have_no_outbound_transitions(terminal_state):
     "state",
     [
         OrderRecoveryState.DISCOVERING,
-        OrderRecoveryState.OWNERSHIP_UNCERTAIN,
+        OrderRecoveryState.BROKER_IDENTITY_UNCERTAIN,
         OrderRecoveryState.CANCEL_REQUIRED,
         OrderRecoveryState.CANCEL_REQUESTED,
         OrderRecoveryState.AWAITING_CANCEL_CONFIRMATION,

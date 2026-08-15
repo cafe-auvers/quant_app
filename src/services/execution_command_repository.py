@@ -1,9 +1,9 @@
 """Durable command idempotency ledger.
 
 ``docs/kanban_production_readiness.md``, Workstream 2 (A5), signed off in
-that document's revision 3.1: "A unique constraint on the idempotency key
-must prevent duplicate submit, cancel, and replace operations after
-restart or device handoff." (INV-15).
+that document's revision 3.1, amended by revision 3.2: "A unique constraint
+on the idempotency key must prevent duplicate submit, cancel, and replace
+operations after restart or device handoff." (INV-15).
 
 Follows the same pattern :mod:`src.services.trade_card_repository` already
 uses for its own table (a SQLAlchemy ``Table`` + idempotent
@@ -16,9 +16,20 @@ docstring for the full failure-domain split (mandatory journal vs.
 broker-response persistence vs. supplementary audit log). This module is
 purely a repository: it does not decide what commands to issue, validate
 gateway gates, or call the broker.
+
+Every write primitive here (``insert_command``/``update_command_response``)
+accepts an already-open SQLAlchemy ``Connection`` (revision 3.2) so a
+caller -- the execution gateway, once it exists (Workstream 3) -- can
+compose this table's write into a single transaction alongside
+``execution_orders`` and a capital reservation, satisfying A1's atomicity
+requirement. ``record_command``/``update_command_response`` remain as
+convenience wrappers that open and commit their own transaction, for
+callers (and this module's own tests) that don't need cross-table
+atomicity.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
@@ -39,7 +50,7 @@ from sqlalchemy import (
     UniqueConstraint,
     select,
 )
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import IntegrityError
 
 logger = logging.getLogger(__name__)
@@ -60,6 +71,25 @@ class CommandNotFoundError(RuntimeError):
     """No command exists for the requested ``idempotency_key``."""
 
 
+def _redact_broker_response(response: Any, *, account_no: str) -> Dict[str, Any]:
+    """Runs a raw broker response through the codebase's existing
+    centralized redaction logic before it is ever persisted (revision
+    3.2) -- see :func:`src.core.discovered_external_order._redact_raw_response`
+    for the same pattern applied to a discovered order's own payload.
+    """
+    from src.services.event_journal import _safe_payload
+
+    if not isinstance(response, dict):
+        response = {"raw": response}
+    return _safe_payload(response, account_no=account_no)
+
+
+def _hash_response(redacted: Dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(redacted, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 @dataclass
 class ExecutionCommand:
     idempotency_key: str
@@ -68,10 +98,13 @@ class ExecutionCommand:
     account_no: str
     symbol: str
     lease_epoch: int
+    owner_device_id: str = ""
+    lease_token: str = ""
     target_broker_order_id: str = ""
     requested_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     status: str = "REQUESTED"  # REQUESTED -> ACKNOWLEDGED | FAILED (B4b's post-call persist)
-    broker_response: Dict[str, Any] = field(default_factory=dict)
+    redacted_response: Dict[str, Any] = field(default_factory=dict)
+    response_hash: str = ""
     command_id: Optional[int] = None
     version: int = 1
 
@@ -86,10 +119,19 @@ class ExecutionCommand:
         self.account_no = str(self.account_no or "")
         self.symbol = str(self.symbol or "").upper()
         self.lease_epoch = int(self.lease_epoch or 0)
+        self.owner_device_id = str(self.owner_device_id or "")
+        self.lease_token = str(self.lease_token or "")
         self.target_broker_order_id = str(self.target_broker_order_id or "")
         self.status = str(self.status or "REQUESTED").upper()
-        if not isinstance(self.broker_response, dict):
-            self.broker_response = {"raw": self.broker_response}
+        # Always redact, not only when the value isn't already a dict --
+        # a caller passing an unredacted dict directly must not bypass
+        # redaction just because it's already the right container type.
+        # Idempotent when the value has already been redacted (e.g.
+        # reconstructing from a stored, already-redacted row).
+        self.redacted_response = _redact_broker_response(
+            self.redacted_response, account_no=self.account_no
+        )
+        self.response_hash = str(self.response_hash or "")
         self.version = int(self.version or 1)
 
 
@@ -104,16 +146,19 @@ def _get_execution_commands_table(metadata: MetaData) -> Table:
         Column("account_no", String(32), nullable=False),
         Column("symbol", String(20), nullable=False),
         Column("lease_epoch", BigInteger, nullable=False, server_default="0"),
+        Column("owner_device_id", String(64), nullable=False, server_default=""),
+        Column("lease_token", String(128), nullable=False, server_default=""),
         Column("target_broker_order_id", String(64), nullable=False, server_default=""),
         Column("requested_at", DateTime, nullable=False),
         Column("status", String(24), nullable=False, server_default="REQUESTED"),
-        Column("broker_response", Text(length=16_777_215), nullable=False, server_default="{}"),
+        Column("redacted_response", Text(length=16_777_215), nullable=False, server_default="{}"),
+        Column("response_hash", String(64), nullable=False, server_default=""),
         Column("version", BigInteger, nullable=False, server_default="1"),
         UniqueConstraint("idempotency_key", name="uq_execution_commands_idempotency_key"),
     )
 
 
-def _ensure_execution_commands_table(engine: Engine) -> Table:
+def ensure_execution_commands_table(engine: Engine) -> Table:
     metadata = MetaData()
     table = _get_execution_commands_table(metadata)
     if engine in _ensured_engines:
@@ -138,9 +183,9 @@ def _parse_dt(value: str) -> datetime:
 
 def _row_to_command(row) -> ExecutionCommand:
     try:
-        broker_response = json.loads(row.broker_response or "{}")
+        redacted_response = json.loads(row.redacted_response or "{}")
     except (TypeError, ValueError):
-        broker_response = {}
+        redacted_response = {}
     return ExecutionCommand(
         idempotency_key=row.idempotency_key,
         command_type=row.command_type,
@@ -148,39 +193,48 @@ def _row_to_command(row) -> ExecutionCommand:
         account_no=row.account_no,
         symbol=row.symbol,
         lease_epoch=row.lease_epoch,
+        owner_device_id=row.owner_device_id,
+        lease_token=row.lease_token,
         target_broker_order_id=row.target_broker_order_id,
         requested_at=row.requested_at.isoformat() if row.requested_at else "",
         status=row.status,
-        broker_response=broker_response,
+        redacted_response=redacted_response,
+        response_hash=row.response_hash,
         command_id=row.id,
         version=row.version,
     )
 
 
-def record_command(engine: Engine, command: ExecutionCommand) -> ExecutionCommand:
+# --- shared-transaction primitives (revision 3.2) ---------------------------
+
+
+def insert_command(conn: Connection, command: ExecutionCommand) -> ExecutionCommand:
     """B4a: the mandatory command journal write, made *before* any broker
-    call. Raises :class:`DuplicateCommandError` on a repeated
-    ``idempotency_key`` -- the caller must not then call the broker a
-    second time.
+    call. Takes an already-open ``Connection`` so a caller can compose
+    this write into a larger atomic transaction (A1). Raises
+    :class:`DuplicateCommandError` on a repeated ``idempotency_key`` --
+    the caller must not then call the broker a second time.
     """
-    table = _ensure_execution_commands_table(engine)
+    table = _get_execution_commands_table(MetaData())
     try:
-        with engine.begin() as conn:
-            result = conn.execute(
-                table.insert().values(
-                    idempotency_key=command.idempotency_key,
-                    command_type=command.command_type,
-                    environment=command.environment,
-                    account_no=command.account_no,
-                    symbol=command.symbol,
-                    lease_epoch=command.lease_epoch,
-                    target_broker_order_id=command.target_broker_order_id,
-                    requested_at=_parse_dt(command.requested_at),
-                    status=command.status,
-                    broker_response=json.dumps(command.broker_response, separators=(",", ":")),
-                    version=command.version,
-                )
+        result = conn.execute(
+            table.insert().values(
+                idempotency_key=command.idempotency_key,
+                command_type=command.command_type,
+                environment=command.environment,
+                account_no=command.account_no,
+                symbol=command.symbol,
+                lease_epoch=command.lease_epoch,
+                owner_device_id=command.owner_device_id,
+                lease_token=command.lease_token,
+                target_broker_order_id=command.target_broker_order_id,
+                requested_at=_parse_dt(command.requested_at),
+                status=command.status,
+                redacted_response=json.dumps(command.redacted_response, separators=(",", ":")),
+                response_hash=command.response_hash,
+                version=command.version,
             )
+        )
     except IntegrityError as exc:
         raise DuplicateCommandError(
             f"Command with idempotency_key={command.idempotency_key!r} was already recorded"
@@ -189,43 +243,78 @@ def record_command(engine: Engine, command: ExecutionCommand) -> ExecutionComman
     return command
 
 
-def get_command_by_idempotency_key(engine: Engine, idempotency_key: str) -> Optional[ExecutionCommand]:
-    table = _ensure_execution_commands_table(engine)
-    with engine.begin() as conn:
-        row = conn.execute(
-            select(table).where(table.c.idempotency_key == idempotency_key)
-        ).first()
+def update_command_response(
+    conn: Connection,
+    idempotency_key: str,
+    *,
+    status: str,
+    broker_response: Dict[str, Any],
+    account_no: str = "",
+) -> ExecutionCommand:
+    """B4b: the post-call broker-response persist. Takes an already-open
+    ``Connection`` for the same composability reason as
+    :func:`insert_command`. A failure here must never be treated as
+    license to retry the broker call (INV-23) -- that rule is enforced by
+    the execution gateway (Workstream 3), not this repository; this
+    function only records the outcome once the gateway has already
+    decided not to retry. ``broker_response`` is redacted before storage
+    (revision 3.2).
+    """
+    table = _get_execution_commands_table(MetaData())
+    redacted = _redact_broker_response(broker_response or {}, account_no=account_no)
+    response_hash = _hash_response(redacted)
+    result = conn.execute(
+        table.update()
+        .where(table.c.idempotency_key == idempotency_key)
+        .values(
+            status=str(status or "").upper(),
+            redacted_response=json.dumps(redacted, separators=(",", ":")),
+            response_hash=response_hash,
+        )
+    )
+    if result.rowcount == 0:
+        raise CommandNotFoundError(f"No command found for idempotency_key={idempotency_key!r}")
+    row = conn.execute(select(table).where(table.c.idempotency_key == idempotency_key)).first()
+    return _row_to_command(row)
+
+
+def get_command(conn: Connection, idempotency_key: str) -> Optional[ExecutionCommand]:
+    table = _get_execution_commands_table(MetaData())
+    row = conn.execute(select(table).where(table.c.idempotency_key == idempotency_key)).first()
     return _row_to_command(row) if row is not None else None
 
 
-def update_command_response(
+# --- standalone convenience wrappers (own transaction each) -----------------
+
+
+def record_command(engine: Engine, command: ExecutionCommand) -> ExecutionCommand:
+    """Convenience wrapper around :func:`insert_command` that opens and
+    commits its own transaction, for callers that don't need cross-table
+    atomicity (e.g. tests, or a command that genuinely has no reservation/
+    order-record counterpart)."""
+    ensure_execution_commands_table(engine)
+    with engine.begin() as conn:
+        return insert_command(conn, command)
+
+
+def get_command_by_idempotency_key(engine: Engine, idempotency_key: str) -> Optional[ExecutionCommand]:
+    ensure_execution_commands_table(engine)
+    with engine.begin() as conn:
+        return get_command(conn, idempotency_key)
+
+
+def record_command_response(
     engine: Engine,
     idempotency_key: str,
     *,
     status: str,
     broker_response: Dict[str, Any],
+    account_no: str = "",
 ) -> ExecutionCommand:
-    """B4b: the post-call broker-response persist. A failure here must
-    never be treated as license to retry the broker call (INV-23) -- that
-    rule is enforced by the execution gateway (Workstream 3), not this
-    repository; this function only records the outcome once the gateway
-    has already decided not to retry.
-    """
-    table = _ensure_execution_commands_table(engine)
+    """Convenience wrapper around :func:`update_command_response` that
+    opens and commits its own transaction."""
+    ensure_execution_commands_table(engine)
     with engine.begin() as conn:
-        result = conn.execute(
-            table.update()
-            .where(table.c.idempotency_key == idempotency_key)
-            .values(
-                status=str(status or "").upper(),
-                broker_response=json.dumps(broker_response or {}, separators=(",", ":")),
-            )
+        return update_command_response(
+            conn, idempotency_key, status=status, broker_response=broker_response, account_no=account_no
         )
-        if result.rowcount == 0:
-            raise CommandNotFoundError(
-                f"No command found for idempotency_key={idempotency_key!r}"
-            )
-        row = conn.execute(
-            select(table).where(table.c.idempotency_key == idempotency_key)
-        ).first()
-    return _row_to_command(row)

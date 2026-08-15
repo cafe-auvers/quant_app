@@ -216,7 +216,22 @@ created either via A1's own submission flow or via explicit adoption of a
       NOT_ASSIGNED = "NOT_ASSIGNED"      # no broker call made yet (PREPARED)
       AMBIGUOUS = "AMBIGUOUS"            # broker call made, outcome unknown (SUBMITTING/UNKNOWN_SUBMISSION_STATE)
       EXACT = "EXACT"                    # broker_order_id confirmed (ACKNOWLEDGED and beyond, or a completed adoption)
+      NO_BROKER_ORDER_CONFIRMED = "NO_BROKER_ORDER_CONFIRMED"  # (revision 3.2) confirmed no broker order exists -- REJECTED/NOT_ACCEPTED_CONFIRMED reached from AMBIGUOUS, not EXACT
   ```
+
+  *(Revision 3.2 addition: `NO_BROKER_ORDER_CONFIRMED`.)* `AMBIGUOUS` means
+  "a broker call was made, outcome unknown" -- once that outcome is
+  confirmed negative (an explicit `REJECTED` response, or A4a's inferred
+  `NOT_ACCEPTED_CONFIRMED`) with no `broker_order_id` ever having been
+  assigned, `AMBIGUOUS` is stale and wrong: there is no longer anything
+  unknown about it. `NO_BROKER_ORDER_CONFIRMED` is the confirmed-negative
+  counterpart to `EXACT`'s confirmed-positive. This transition is
+  automatic, driven by the status transition itself (`REJECTED`/
+  `NOT_ACCEPTED_CONFIRMED` reached while identity was `AMBIGUOUS`, not
+  `EXACT`) -- it never applies to a *late* rejection reached from
+  `ACKNOWLEDGED`/`WORKING`, where a real `broker_order_id` was already
+  confirmed and stays `EXACT` (the order existed and is now merely
+  terminal, which is different from having never existed).
 
   Expected combinations:
 
@@ -224,15 +239,27 @@ created either via A1's own submission flow or via explicit adoption of a
   |---|---|---|
   | `PREPARED` | `APPLICATION` | `NOT_ASSIGNED` |
   | `SUBMITTING` / `UNKNOWN_SUBMISSION_STATE` | `APPLICATION` | `AMBIGUOUS` |
-  | `ACKNOWLEDGED` and beyond | `APPLICATION` | `EXACT` |
+  | `ACKNOWLEDGED` and beyond (except as below) | `APPLICATION` | `EXACT` -- **required**, not merely typical: a transition into `ACKNOWLEDGED` without a confirmed `broker_order_id` (either already `EXACT`, or supplied in that same transition) must raise, not persist an inconsistent record |
+  | `REJECTED` / `NOT_ACCEPTED_CONFIRMED` reached while identity was still `AMBIGUOUS` | `APPLICATION` | `NO_BROKER_ORDER_CONFIRMED` *(revision 3.2)* |
+  | `REJECTED` reached from `ACKNOWLEDGED`/`WORKING` (a late rejection) | `APPLICATION` | `EXACT` -- the broker order genuinely existed |
   | adopted external order | `USER_ADOPTED` | `EXACT` (adoption requires the discovered order's own exact `broker_order_id`; there is no adopted-but-ambiguous state) |
 
   The cancellation gate (B2/B3) requires **all** of: `origin in
   (APPLICATION, USER_ADOPTED)`, `broker_identity_status == EXACT`,
-  `broker_order_id is not null`, `recovery_state` not ambiguous, and the
-  order's current status is cancellable — never `origin` alone, which is
+  `broker_order_id is not null`, `recovery_state` in an explicit allow-list
+  (`NONE` or `CANCEL_REQUIRED` -- *revision 3.2*: not merely "anything
+  other than `BROKER_IDENTITY_UNCERTAIN`", which would have also wrongly
+  permitted `DISCOVERING`, `MANUAL_INTERVENTION_REQUIRED`, or a cancel
+  already in flight via `CANCEL_REQUESTED`/`AWAITING_CANCEL_CONFIRMATION`
+  to accept a second, duplicate cancel command), and a current status that
+  can actually reach `CANCEL_PENDING` -- never `origin` alone, which is
   precisely the gap a `PREPARED`-is-"verified" reading of revision 3 could
-  have opened.
+  have opened. Once `broker_identity_status` reaches `EXACT`, it is
+  immutable except for idempotent re-confirmation of the *same*
+  `broker_order_id` -- an attempt to set it to a *different* `broker_order_id`
+  is a contradiction and must raise, never silently overwrite (same "any
+  contradiction escalates" posture as `OrderRecoveryState`/
+  `ExternalOrderDisposition`).
 
 A broker order discovered with no local submission history at all is a
 fundamentally different object: a **`DiscoveredExternalOrder`**, not an
@@ -257,12 +284,15 @@ belongs to `ExecutionOrderRecord` specifically. See
 | `ACKNOWLEDGED` | `WORKING` | Broker confirms the order is live/queued |
 | `ACKNOWLEDGED` | `PARTIALLY_FILLED` / `FILLED` | Immediate fill observed |
 | `ACKNOWLEDGED` | `REJECTED` | Late exchange-side rejection after broker-level acceptance |
+| `ACKNOWLEDGED` | `CANCEL_PENDING` | *(revision 3.2)* A cancel command was submitted immediately after acknowledgement, before a separate `WORKING` observation arrived — the acknowledged order is already live at the broker (`broker_order_id` known), so there is no safety reason to force a wait for `WORKING` before an urgent cancel can be requested |
 | `WORKING` | `PARTIALLY_FILLED` / `FILLED` / `REJECTED` / `EXPIRED` | Fill, late rejection, or time-in-force expiry |
 | `WORKING` | `CANCEL_PENDING` | A cancel command (B1/B3) was submitted |
 | `PARTIALLY_FILLED` | `FILLED` / `EXPIRED` | Remainder fills or expires |
 | `PARTIALLY_FILLED` | `CANCEL_PENDING` | A cancel command was submitted for the remainder |
 | `CANCEL_PENDING` | `CANCELLED` | Broker confirms the cancel |
 | `CANCEL_PENDING` | `FILLED` / `PARTIALLY_FILLED` | A fill raced the cancel — must be handled explicitly, never assumed impossible |
+| `CANCEL_PENDING` | `WORKING` | *(revision 3.2)* The broker explicitly rejects the cancel request itself (e.g. the order had already progressed past the point a cancel could apply) — the order is simply still working, unchanged |
+| `CANCEL_PENDING` | `EXPIRED` | *(revision 3.2)* Time-in-force expiry races the cancel request — same "must be handled explicitly" rule as a racing fill |
 
 Terminal (no outbound transitions): `FILLED`, `CANCELLED`, `REJECTED`,
 `EXPIRED`, `CANCELLED_LOCALLY`, `NOT_ACCEPTED_CONFIRMED`. Any transition
@@ -282,9 +312,9 @@ applies to both halves without modification.
 |---|---|---|
 | `NONE` | `DISCOVERING` | An ambiguity is detected: a record stuck at `SUBMITTING` after restart (A4a). *(Revision 3.1: A4b no longer routes through this table at all — a `DiscoveredExternalOrder` isn't an `ExecutionOrderRecord` and never was `NONE` to begin with; see `ExternalOrderDisposition` below.)* |
 | `DISCOVERING` | `NONE` | A4a resolves cleanly via exact identity (correlation key, if Workstream 0 confirms one exists) |
-| `DISCOVERING` | `OWNERSHIP_UNCERTAIN` | A4a cannot resolve via exact identity within a bounded attempt count |
-| `OWNERSHIP_UNCERTAIN` | `CANCEL_REQUIRED` | Broker identity becomes exact (A4a's correlation key appears late) and the resolved order needs cancelling |
-| `OWNERSHIP_UNCERTAIN` | `MANUAL_INTERVENTION_REQUIRED` | Bounded retries exhausted with no resolution |
+| `DISCOVERING` | `BROKER_IDENTITY_UNCERTAIN` | A4a cannot resolve via exact identity within a bounded attempt count |
+| `BROKER_IDENTITY_UNCERTAIN` | `CANCEL_REQUIRED` | Broker identity becomes exact (A4a's correlation key appears late) and the resolved order needs cancelling |
+| `BROKER_IDENTITY_UNCERTAIN` | `MANUAL_INTERVENTION_REQUIRED` | Bounded retries exhausted with no resolution |
 | `CANCEL_REQUIRED` | `CANCEL_REQUESTED` | Gateway (B1/B3) accepts the cancel command |
 | `CANCEL_REQUESTED` | `AWAITING_CANCEL_CONFIRMATION` | Cancel submitted, awaiting broker confirmation |
 | `AWAITING_CANCEL_CONFIRMATION` | `TERMINAL_RECONCILED` | Broker confirms terminal (cancelled, or a late fill reconciled) |
@@ -334,11 +364,53 @@ DiscoveredExternalOrder(disposition=DISCOVERED_UNOWNED)
         broker_order_id=<the discovered order's own exact ID>,
         adopted_from_external_order_id=<the DiscoveredExternalOrder's ID>,
         recovery_state=NONE,
+        adoption_permissions=<the specific AdoptedOrderPermission set the
+                               adoption UI actually granted>,
     )
   → only this new ExecutionOrderRecord may ever be linked to a card or
     reach the cancel gateway (B2/B3), and only for the specific actions
-    the adoption UI explicitly authorized
+    the adoption UI explicitly authorized (see AdoptedOrderPermission below)
 ```
+
+**Adoption permission scoping** *(revision 3.2)* — "only for the specific
+actions the adoption UI explicitly authorized" needs a concrete mechanism,
+not just prose. `USER_ADOPTED` origin alone must not imply blanket
+authority to cancel or replace an order the application never submitted:
+
+```python
+class AdoptedOrderPermission(str, Enum):
+    LINK_TO_CARD = "LINK_TO_CARD"  # may be associated with a TradeCardState at all
+    CANCEL = "CANCEL"              # may reach the cancel gateway (B2/B3)
+    REPLACE = "REPLACE"            # may reach the replace gateway (B2/B3)
+```
+
+`ExecutionOrderRecord.adoption_permissions` (a set of `AdoptedOrderPermission`,
+empty for `origin=APPLICATION` records -- the application's own submissions
+never need this, they already have full authority over what they
+themselves created) is populated once, at adoption time, from exactly what
+the adoption UI presented and the user granted -- never defaulted to "all
+permissions" merely because `origin == USER_ADOPTED`. B2/B3's identity gate
+(revised above) additionally requires, for `USER_ADOPTED` records
+specifically, that the action being attempted is present in
+`adoption_permissions`.
+
+Persistence for both `ExecutionOrderRecord` and `DiscoveredExternalOrder`
+*(revision 3.2 clarification, not new scope -- A1's "Persisted state"
+column already said "`ExecutionOrderRecord` row," this makes the durable-
+table requirement explicit rather than leaving it implied)*: both need
+real, restart-surviving tables (`execution_orders`,
+`discovered_external_orders`), not merely in-memory dataclasses -- INV-1
+and INV-22 are only actually guaranteed once these survive a crash, which
+an in-memory-only representation cannot do. Adoption itself
+(`DiscoveredExternalOrder` → new `ExecutionOrderRecord`) must be one atomic
+transaction: insert the new `execution_orders` row and update the
+`discovered_external_orders` row's `disposition` together, or neither --
+never one committed without the other. Every repository function A1/A5
+need must additionally support being handed an already-open, caller-owned
+transaction/connection (not only opening and committing its own), since
+A1's own atomicity requirement (command + reservation + order record, one
+transaction) needs to compose three separate repositories' writes into a
+single commit once the execution gateway (Workstream 3) orchestrates them.
 
 ### Atomic pre-submission transaction (INV-16), with the commit-ordering fix
 
@@ -392,7 +464,7 @@ IF Workstream 0 confirms a verified, externally-echoed correlation key:
     speculatively before Workstream 0 has evidence.)
 
 ELSE (default, conservative assumption until Workstream 0 says otherwise):
-    mark UNKNOWN_SUBMISSION_STATE / recovery_state=OWNERSHIP_UNCERTAIN
+    mark UNKNOWN_SUBMISSION_STATE / recovery_state=BROKER_IDENTITY_UNCERTAIN
     block further entry commands for this exact account+symbol
     discover *candidates* using the persisted actual fingerprint
         (submitted_quantity, submitted_limit_price, side, symbol, account,
@@ -458,7 +530,7 @@ claims it:
    UNKNOWN_SUBMISSION_STATE ExecutionOrderRecord -- A4a resolves it
    directly, broker_identity_status -> EXACT.
 3. Heuristic candidate: the order plausibly corresponds to an
-   OWNERSHIP_UNCERTAIN ExecutionOrderRecord's fingerprint (A4a's candidate
+   BROKER_IDENTITY_UNCERTAIN ExecutionOrderRecord's fingerprint (A4a's candidate
    list) -- it stays a non-owning candidate attached to that record's own
    recovery state. It is NOT independently cancellable (B3 still requires
    broker_identity_status == EXACT), and it does NOT also spawn a
@@ -479,7 +551,7 @@ failure domains). B2/B3 updated for the A4a/A4b split and Workstream 9:
 |---|---|---|---|---|---|---|---|
 | B1. `submit_order`/`cancel_order`/`replace_order` (the last, composed per A's transition table) are the *only* production entry points that call `broker.submit_order`/`broker.cancel_order`. | `src/services/execution_command_gateway.py` (new) | n/a (routes to A) | delegates | A direct call to `broker.*` from outside the gateway fails the architecture test. | N/A | `test_architecture_no_direct_broker_mutation_outside_gateway` | Workstream 3 |
 | B2. Before any KIS call, the gateway validates, in order: engine flag, admin/session kill switches, current lease + epoch match, account/environment match, **execution ownership** (H1: this account+symbol belongs to this caller's engine), exact broker-order identity (cancel/replace only — `origin in (APPLICATION, USER_ADOPTED)` **and** `broker_identity_status == EXACT` **and** `broker_order_id` is set; a `USER_ADOPTED` record's adoption must have explicitly authorized this specific action), idempotency key, current order status, quantity validity, rate-limit budget. | same | n/a | gate, then delegate | Any single gate failing rejects the whole command with a specific, logged reason. | N/A | one test per gate, including `test_gateway_rejects_a_symbol_not_owned_by_the_calling_engine`, `test_gateway_rejects_cancel_without_exact_broker_identity` | Workstream 3 |
-| B3. `cancel_order`/`replace_order` require `origin in (APPLICATION, USER_ADOPTED)` **and** `broker_identity_status == EXACT` (revision 3.1 — identity, not origin alone). A `DiscoveredExternalOrder` (never an `ExecutionOrderRecord`, per A4b) can never reach these calls, and neither can an `ExecutionOrderRecord` still at `broker_identity_status == AMBIGUOUS` even though its `origin` is already `APPLICATION`. | same | reads A | `broker.cancel_order` | An `OWNERSHIP_UNCERTAIN` record, or any `DiscoveredExternalOrder`, cannot reach the cancel gateway — stays alert-only. | N/A | `test_gateway_cancel_requires_exact_broker_identity_not_origin_alone`, `test_a_submitting_records_ambiguous_broker_identity_cannot_reach_the_cancel_gateway`, `test_a_discovered_external_order_can_never_reach_the_cancel_gateway` | Workstream 3 |
+| B3. `cancel_order`/`replace_order` require `origin in (APPLICATION, USER_ADOPTED)` **and** `broker_identity_status == EXACT` (revision 3.1 — identity, not origin alone). A `DiscoveredExternalOrder` (never an `ExecutionOrderRecord`, per A4b) can never reach these calls, and neither can an `ExecutionOrderRecord` still at `broker_identity_status == AMBIGUOUS` even though its `origin` is already `APPLICATION`. | same | reads A | `broker.cancel_order` | An `BROKER_IDENTITY_UNCERTAIN` record, or any `DiscoveredExternalOrder`, cannot reach the cancel gateway — stays alert-only. | N/A | `test_gateway_cancel_requires_exact_broker_identity_not_origin_alone`, `test_a_submitting_records_ambiguous_broker_identity_cannot_reach_the_cancel_gateway`, `test_a_discovered_external_order_can_never_reach_the_cancel_gateway` | Workstream 3 |
 | B4a. The mandatory command journal (A1/A5) is written *before* every broker call; if it fails, the broker is never called. | `execution_command_repository.py` | `execution_commands` row, pre-call | none (blocks the call) | Journal write failure = command never sent. | N/A | `test_command_journal_write_failure_prevents_the_broker_call` | Workstream 3 |
 | B4b. The broker-response persist happens after the call; if it fails, the action is never retried — local state goes `UNKNOWN_SUBMISSION_STATE` and A4a is triggered immediately. This rule is authoritative over any retry policy elsewhere (INV-23) — Workstream 10's scheduler must defer to it, never override it. | same | `ExecutionOrderRecord`/`execution_commands.broker_response`, post-call | none (does not retry) | Response-persist failure ≠ resubmission. | A4a. | `test_broker_response_persist_failure_never_triggers_a_retry`, `test_rate_limit_scheduler_never_retries_an_ambiguous_mutation_response` | Workstream 3 |
 | B4c. The supplementary audit/event log may fail non-blockingly, only because B4a already guarantees a durable command record exists regardless. | `execution_command_repository.py` / event journal | audit trail | n/a | A logging failure here never blocks or duplicates the broker action. | N/A | `test_supplementary_audit_log_failure_does_not_block_or_duplicate_the_broker_call` | Workstream 3 |
@@ -792,7 +864,7 @@ gateway makes its first live call under the new schema):
 | Requirement | Owning module | Persisted state | Broker action | Failure behavior | Recovery behavior | Tests | Activation criterion |
 |---|---|---|---|---|---|---|---|
 | G1. Schema version tracked; migration converts existing order-ledger, trade-card, and capital-reservation records. | `src/services/schema_migration.py` (new) | schema version marker | none | Migration failure aborts startup. | Idempotent re-run on next startup. | `test_migration_is_idempotent` | Workstream 8 |
-| G2. First launch after migration: back up → migrate → mark unresolved legacy orders `OWNERSHIP_UNCERTAIN` → full reconciliation → block entries until complete. | same | backup + migrated records | discovery only | n/a | n/a | `test_first_launch_after_migration_blocks_entries_until_reconciliation_completes` | Workstream 8 |
+| G2. First launch after migration: back up → migrate → mark unresolved legacy orders `BROKER_IDENTITY_UNCERTAIN` → full reconciliation → block entries until complete. | same | backup + migrated records | discovery only | n/a | n/a | `test_first_launch_after_migration_blocks_entries_until_reconciliation_completes` | Workstream 8 |
 | G3. Rollback safety gated by `post_migration_broker_mutation_occurred`, per the correction above. | same | backup artifact, the marker | none pre-marker; full downgrade procedure post-marker | Direct restore attempted post-marker is refused, not silently allowed. | The downgrade procedure above. | `test_rollback_allowed_before_any_post_migration_broker_mutation`, `test_direct_restore_refused_after_a_post_migration_broker_mutation` | Workstream 8 |
 | G4. Mixed-version prevention: two devices never run different schema versions simultaneously against the same account. | `runtime_worker.py` startup check | schema version check | none | Startup refuses on a version mismatch with an active lease holder on the other version. | Resolved by upgrading/downgrading the mismatched device. | `test_startup_refuses_to_proceed_on_schema_version_mismatch_with_an_active_lease` | Workstream 8 |
 
@@ -1059,3 +1131,37 @@ and stays `false` in unattended/automatic form until Gate 5 passes.
 - 2026-08-15: Revision 3.1 approved by the project owner. Workstream 1
   signed off; subsequent changes require an explicit logged contract
   revision.
+- 2026-08-15 (revision 3.2): Narrow errata discovered during PR1
+  implementation, per rule 1 ("a reason to stop and revise this document
+  explicitly, not to quietly code around it") -- code was not written
+  around these gaps; the contract was corrected first. Added
+  `ACKNOWLEDGED -> CANCEL_PENDING` (an urgent cancel must not be forced to
+  wait for a `WORKING` observation that may not have arrived yet) and
+  `CANCEL_PENDING -> WORKING`/`CANCEL_PENDING -> EXPIRED` (an explicitly
+  rejected cancel, or a time-in-force expiry racing the cancel, both
+  previously had no valid outcome in the table) to the
+  `ExecutionOrderStatus` transition table. Added
+  `BrokerIdentityStatus.NO_BROKER_ORDER_CONFIRMED` -- `AMBIGUOUS` was
+  staying stale once non-acceptance was actually confirmed. Renamed
+  `OrderRecoveryState.OWNERSHIP_UNCERTAIN` to `BROKER_IDENTITY_UNCERTAIN`
+  throughout -- for A4a specifically, the application's own origin/
+  ownership was never in question, only the broker identity resolution;
+  the old name no longer matched revision 3.1's origin/identity split.
+  Made the cancellation gate's `recovery_state` check an explicit
+  allow-list (`NONE`/`CANCEL_REQUIRED`) instead of a `!=
+  BROKER_IDENTITY_UNCERTAIN` deny-list, which had wrongly permitted
+  `DISCOVERING`, `MANUAL_INTERVENTION_REQUIRED`, and an already-in-flight
+  cancel (`CANCEL_REQUESTED`/`AWAITING_CANCEL_CONFIRMATION`) to accept a
+  second, duplicate cancel command. Made `broker_identity_status == EXACT`
+  immutable except for idempotent same-ID reconfirmation -- reassigning a
+  different `broker_order_id` is now an explicit contradiction, not a
+  silent overwrite. Added `AdoptedOrderPermission` so a `USER_ADOPTED`
+  record's authority is exactly what the adoption UI granted, never
+  blanket authority implied by origin alone. Clarified (not expanded
+  scope) that `ExecutionOrderRecord`/`DiscoveredExternalOrder` need real
+  durable tables, not in-memory dataclasses, for INV-1/INV-22 to actually
+  hold across a restart, and that adoption must be one atomic transaction
+  across both tables. Clarified that A1/A5's repositories must support a
+  caller-owned transaction/connection, not only their own, since A1's
+  atomicity requirement needs three repositories' writes composed into a
+  single commit once Workstream 3 orchestrates them.
