@@ -1,6 +1,6 @@
 # Kanban Production Readiness — Requirements & Invariants
 
-Status: **DRAFT — Workstream 1, revision 3 (targeted amendments incorporated; pending sign-off)**
+Status: **DRAFT — Workstream 1, revision 3.1 (errata applied; ready for sign-off pending your confirmation)**
 Branch: `feature/kanban-production-readiness`
 Base: `109c2c4` ("kanban fix 8")
 Supersedes: the "kanban fix 1" .. "kanban fix 8" review-and-patch cycle described in
@@ -24,6 +24,22 @@ tables, stop-version concurrency, channel-specific subscription priority,
 migration-rollback safety after broker activity, mutation-retry rules, an
 external watchdog for the "app crashed" alert case) and the PR-structure
 change from one mega-PR to a staged release train.
+
+Revision 3.1 is a narrow errata pass responding to a third review that put
+revision 3 at ~98% complete — six precise corrections, not new architecture:
+`OrderOwnership` conflated application *origin* with exact broker *identity*
+(a `PREPARED` record was called "verified" before any broker call had even
+happened); A4b's `DiscoveredExternalOrder` was wrongly routed through
+`OrderRecoveryState`, a state machine that belongs to `ExecutionOrderRecord`
+only; nothing prevented a single discovered broker order from being
+classified as both an A4a candidate and a new A4b external order at once;
+`REJECTED` was being used for both an explicit broker rejection and an
+*inferred* non-acceptance, which need different evidentiary bars; the
+stop-version "synchronous drain" in D5 needed an actual lock/atomic-swap
+primitive to be a real guarantee rather than a hand-wave; and the
+Workstream 0 gate was broader than necessary, blocking capability-
+independent schema/state-machine work in PR1 that doesn't actually depend
+on any KIS-specific behavior.
 
 ## How to use this document
 
@@ -49,11 +65,15 @@ Rules while this program is open:
    though the PRs land incrementally.
 4. `BUYBOARD_ENGINE_ENABLED` stays `false` in production for the entire
    duration of this program, regardless of how much of it is complete.
-5. **Workstream 0 gates Workstreams 2 and 5.** No ownership-recovery code
-   (A4a/A4b) and no WebSocket client (D1) may be written until the relevant
-   capability-matrix rows in Workstream 0 are filled in with evidence from
-   the real KIS API. Workstream 0 requires live KIS credentials this
-   development environment does not have.
+5. **Workstream 0 gates specific capability-dependent code, not all of
+   Workstreams 2 and 5** (narrowed in revision 3.1 — see the "Workstream 0"
+   section below for the precise split). Everything capability-independent in
+   Workstream 2 (schemas, both transition tables, `DiscoveredExternalOrder`,
+   `ExternalOrderDisposition`, the command repository, A4b's conservative
+   default behavior) may proceed immediately, in parallel with Workstream 0.
+   Only A4a's KIS-specific correlation-key adapter and Workstream 5's
+   production WebSocket parsing/subscription/timestamp-mapping code are
+   gated on Workstream 0's evidence.
 
 ## PR structure (revision 3)
 
@@ -64,7 +84,7 @@ branch itself only merges to `master` once, per rule 3 above.
 
 | PR | Workstreams | Contents |
 |---|---|---|
-| PR1 | 0 (skeleton), 2 | Schemas, `ExecutionOrderStatus`/`OrderRecoveryState`/`OrderOwnership` state machines, `ExecutionOrderRecord`, `DiscoveredExternalOrder`, command repository |
+| PR1 | 0 (skeleton), 2 | Schemas, `ExecutionOrderStatus`/`OrderRecoveryState`/`OrderOrigin`/`BrokerIdentityStatus`/`ExternalOrderDisposition` state machines, `ExecutionOrderRecord`, `DiscoveredExternalOrder`, command repository, A4b's conservative default behavior — **excludes** A4a's KIS-specific correlation-key adapter, which stays gated on Workstream 0 |
 | PR2 | 3, 9 | Execution gateway + legacy/Kanban ownership enforcement (the gateway is where H1's rejection actually lives) |
 | PR3 | 4 | Account-level reconciliation engine |
 | PR4 | 5 | Market-data transport (WebSocket + accumulator) |
@@ -138,43 +158,87 @@ requires live KIS credentials this environment doesn't have.
 Required output: `docs/kis_capability_matrix.md` + `tests/fixtures/kis_protocol/`
 (redacted captured request/response and WS frame samples).
 
-**Gate**: no line of A4a/A4b or D1 is written until every row above has a
-filled-in, evidenced answer.
+**Gate (narrowed in revision 3.1):**
+
+```
+Gated on this matrix (do not write until evidenced):
+  - A4a's exact-correlation-key broker adapter
+  - exact broker-order recovery logic that depends on KIS's real behavior
+  - latency/completeness-dependent reconciliation thresholds (C1/C3)
+  - D1's production WebSocket parsers and subscription client
+  - D3's broker-timestamp field mapping
+  - D11's capacity-tier configuration
+
+NOT gated -- may proceed immediately, in parallel with Workstream 0:
+  - ExecutionOrderRecord / DiscoveredExternalOrder schemas
+  - ExecutionOrderStatus / OrderRecoveryState / OrderOrigin /
+    BrokerIdentityStatus / ExternalOrderDisposition state machines
+  - the command repository and its idempotency guarantee
+  - A4b's conservative "never auto-own, never auto-cancel" default
+    behavior (this rule does not depend on what KIS supports -- it is
+    conservative regardless)
+  - protocol interfaces and test harnesses (fake broker/fake WS server)
+```
 
 ---
 
 ## A. Durable order ownership and command ledger (Workstream 2)
 
-### Three enums, not two
+### Enums across two record types (revised in 3.1)
+
+`ExecutionOrderRecord` (an order the application itself is tracking,
+created either via A1's own submission flow or via explicit adoption of a
+`DiscoveredExternalOrder`) carries three independent dimensions:
 
 - **`ExecutionOrderStatus`** — the order's own broker-facing lifecycle (full
   transition table below).
 - **`OrderRecoveryState`** — whether the application currently trusts its
   own view of that status (full transition table below).
-- **`OrderOwnership`** *(new in revision 3)* — whether this record was
-  actually created by an application submission, or is a discovered
-  external order the application has no submission history for. This is the
-  fix for A4's original conflation:
+- **`OrderOrigin`** / **`BrokerIdentityStatus`** *(revision 3.1, replacing
+  revision 3's single `OrderOwnership`)* — application origin and exact
+  broker identity are genuinely different questions and collapsing them
+  into one field was imprecise: revision 3 said "every `ExecutionOrderRecord`
+  created via A1 is `APPLICATION_VERIFIED` from the moment it's created,"
+  which is true of *origin* but not of *broker identity* — at `PREPARED` no
+  broker call has even happened yet, and at `SUBMITTING` the application
+  definitely attempted a submission but the exact resulting broker order may
+  still be unknown. That distinction is exactly what A4a exists to protect,
+  so it needs its own field rather than being implied by "ownership."
 
   ```python
-  class OrderOwnership(str, Enum):
-      APPLICATION_VERIFIED = "APPLICATION_VERIFIED"  # we submitted this
-      USER_ADOPTED = "USER_ADOPTED"                  # we didn't, a human explicitly took it over
-      EXTERNAL_UNOWNED = "EXTERNAL_UNOWNED"           # default for anything discovered, not submitted
+  class OrderOrigin(str, Enum):
+      APPLICATION = "APPLICATION"        # created via A1's own submission flow
+      USER_ADOPTED = "USER_ADOPTED"      # created by adopting a DiscoveredExternalOrder
+
+  class BrokerIdentityStatus(str, Enum):
+      NOT_ASSIGNED = "NOT_ASSIGNED"      # no broker call made yet (PREPARED)
+      AMBIGUOUS = "AMBIGUOUS"            # broker call made, outcome unknown (SUBMITTING/UNKNOWN_SUBMISSION_STATE)
+      EXACT = "EXACT"                    # broker_order_id confirmed (ACKNOWLEDGED and beyond, or a completed adoption)
   ```
 
-  Every `ExecutionOrderRecord` created via the normal submission path (A1)
-  is `APPLICATION_VERIFIED` from the moment it's created — for our own
-  submissions, ownership was never actually in question; only the broker's
-  *status* can be ambiguous (that's `OrderRecoveryState`/A4a). A broker order
-  discovered with no local submission history is a fundamentally different
-  object: a **`DiscoveredExternalOrder`**, not an `ExecutionOrderRecord` —
-  keeping it out of the same table keeps INV-1 ("every order *submitted by
-  the application*") clean. It defaults to `EXTERNAL_UNOWNED` and only
-  becomes `USER_ADOPTED` through an explicit, audited user action in the UI
-  (never automatically, and adoption is recorded as adoption — the audit
-  trail must never make an adopted order look like it was application-
-  originated).
+  Expected combinations:
+
+  | `ExecutionOrderStatus` | `OrderOrigin` | `BrokerIdentityStatus` |
+  |---|---|---|
+  | `PREPARED` | `APPLICATION` | `NOT_ASSIGNED` |
+  | `SUBMITTING` / `UNKNOWN_SUBMISSION_STATE` | `APPLICATION` | `AMBIGUOUS` |
+  | `ACKNOWLEDGED` and beyond | `APPLICATION` | `EXACT` |
+  | adopted external order | `USER_ADOPTED` | `EXACT` (adoption requires the discovered order's own exact `broker_order_id`; there is no adopted-but-ambiguous state) |
+
+  The cancellation gate (B2/B3) requires **all** of: `origin in
+  (APPLICATION, USER_ADOPTED)`, `broker_identity_status == EXACT`,
+  `broker_order_id is not null`, `recovery_state` not ambiguous, and the
+  order's current status is cancellable — never `origin` alone, which is
+  precisely the gap a `PREPARED`-is-"verified" reading of revision 3 could
+  have opened.
+
+A broker order discovered with no local submission history at all is a
+fundamentally different object: a **`DiscoveredExternalOrder`**, not an
+`ExecutionOrderRecord` — keeping it out of the same table keeps INV-1
+("every order *submitted by the application*") clean, and (revision 3.1) it
+does not share `OrderRecoveryState` either, since that state machine
+belongs to `ExecutionOrderRecord` specifically. See
+`ExternalOrderDisposition` (next subsection) for its own lifecycle.
 
 ### `ExecutionOrderStatus` transition table
 
@@ -186,7 +250,8 @@ filled-in, evidenced answer.
 | `SUBMITTING` | `REJECTED` | Broker responded, explicitly rejected the submission |
 | `SUBMITTING` | `UNKNOWN_SUBMISSION_STATE` | Timeout, crash, or network loss before a response was durably persisted (see the SUBMITTING-commit rule below) |
 | `UNKNOWN_SUBMISSION_STATE` | `ACKNOWLEDGED` | A4a resolves: broker confirms the order exists, exact identity established |
-| `UNKNOWN_SUBMISSION_STATE` | `REJECTED` | A4a resolves: broker confirms it was never accepted |
+| `UNKNOWN_SUBMISSION_STATE` | `REJECTED` | The broker/exchange returns **explicit rejection evidence** for this exact submission — a real rejection response, never an inference |
+| `UNKNOWN_SUBMISSION_STATE` | `NOT_ACCEPTED_CONFIRMED` | *(revision 3.1)* A4a resolves **by inference**: exact correlation-key lookup plus complete broker-history evidence confirms no broker order was ever created for this submission — distinct from `REJECTED`'s explicit-evidence bar; see the corrected A4a below |
 | `ACKNOWLEDGED` | `WORKING` | Broker confirms the order is live/queued |
 | `ACKNOWLEDGED` | `PARTIALLY_FILLED` / `FILLED` | Immediate fill observed |
 | `ACKNOWLEDGED` | `REJECTED` | Late exchange-side rejection after broker-level acceptance |
@@ -198,8 +263,8 @@ filled-in, evidenced answer.
 | `CANCEL_PENDING` | `FILLED` / `PARTIALLY_FILLED` | A fill raced the cancel — must be handled explicitly, never assumed impossible |
 
 Terminal (no outbound transitions): `FILLED`, `CANCELLED`, `REJECTED`,
-`EXPIRED`, `CANCELLED_LOCALLY`. Any transition attempted from a terminal
-state raises (A3's existing rule).
+`EXPIRED`, `CANCELLED_LOCALLY`, `NOT_ACCEPTED_CONFIRMED`. Any transition
+attempted from a terminal state raises (A3's existing rule).
 
 `replace_order` is **not** a first-class status. It is a composed logical
 operation: cancel the existing `ExecutionOrderRecord` through the normal
@@ -213,10 +278,10 @@ applies to both halves without modification.
 
 | From | To | Trigger |
 |---|---|---|
-| `NONE` | `DISCOVERING` | An ambiguity is detected: a record stuck at `SUBMITTING` after restart (A4a), or a broker order discovered with no local match (A4b) |
+| `NONE` | `DISCOVERING` | An ambiguity is detected: a record stuck at `SUBMITTING` after restart (A4a). *(Revision 3.1: A4b no longer routes through this table at all — a `DiscoveredExternalOrder` isn't an `ExecutionOrderRecord` and never was `NONE` to begin with; see `ExternalOrderDisposition` below.)* |
 | `DISCOVERING` | `NONE` | A4a resolves cleanly via exact identity (correlation key, if Workstream 0 confirms one exists) |
-| `DISCOVERING` | `OWNERSHIP_UNCERTAIN` | A4a cannot resolve via exact identity within a bounded attempt count, or A4b always lands here (a `DiscoveredExternalOrder` is uncertain by definition until adopted) |
-| `OWNERSHIP_UNCERTAIN` | `CANCEL_REQUIRED` | Ownership becomes certain (A4a's correlation key appears late) and the resolved order needs cancelling |
+| `DISCOVERING` | `OWNERSHIP_UNCERTAIN` | A4a cannot resolve via exact identity within a bounded attempt count |
+| `OWNERSHIP_UNCERTAIN` | `CANCEL_REQUIRED` | Broker identity becomes exact (A4a's correlation key appears late) and the resolved order needs cancelling |
 | `OWNERSHIP_UNCERTAIN` | `MANUAL_INTERVENTION_REQUIRED` | Bounded retries exhausted with no resolution |
 | `CANCEL_REQUIRED` | `CANCEL_REQUESTED` | Gateway (B1/B3) accepts the cancel command |
 | `CANCEL_REQUESTED` | `AWAITING_CANCEL_CONFIRMATION` | Cancel submitted, awaiting broker confirmation |
@@ -228,6 +293,51 @@ applies to both halves without modification.
 `recovery_state not in (NONE, TERMINAL_RECONCILED)`, unchanged from
 revision 2 (INV-7).
 
+### `ExternalOrderDisposition` — `DiscoveredExternalOrder`'s own lifecycle (revision 3.1)
+
+`DiscoveredExternalOrder` (A4b) is a distinct record type with its own,
+much simpler lifecycle — it never shares `OrderRecoveryState` with an
+`ExecutionOrderRecord`, since it isn't one:
+
+```python
+class ExternalOrderDisposition(str, Enum):
+    DISCOVERED_UNOWNED = "DISCOVERED_UNOWNED"   # default, on creation
+    USER_ADOPTED = "USER_ADOPTED"               # explicit user action taken
+    DISMISSED_TERMINAL = "DISMISSED_TERMINAL"   # broker confirms it's gone, nothing was ever adopted
+```
+
+| From | To | Trigger |
+|---|---|---|
+| — | `DISCOVERED_UNOWNED` | A4b creates the record |
+| `DISCOVERED_UNOWNED` | `USER_ADOPTED` | An explicit, audited user "Adopt" action (L4) |
+| `DISCOVERED_UNOWNED` | `DISMISSED_TERMINAL` | Reconciliation (Workstream 4) later confirms this exact broker order reached a terminal broker-side status with no adoption ever having happened |
+
+`UNRECONCILED_BROKER_ORDER`-equivalent alerting for a `DiscoveredExternalOrder`
+is derived from `disposition == DISCOVERED_UNOWNED` — the same "derived,
+never authoritative" rule INV-7 already applies to `OrderRecoveryState`;
+revision 3.1 extends its scope to this record type too.
+
+**Adoption creates a brand-new, separate `ExecutionOrderRecord`** — the
+original `DiscoveredExternalOrder` is never mutated into one. It stays
+immutable (aside from its own `disposition` field) as the audit trail's
+permanent record of what was actually discovered and when:
+
+```
+DiscoveredExternalOrder(disposition=DISCOVERED_UNOWNED)
+  → explicit, audited user "Adopt" action (L4)
+  → disposition -> USER_ADOPTED (on the DiscoveredExternalOrder, preserved)
+  → creates a NEW ExecutionOrderRecord(
+        origin=USER_ADOPTED,
+        broker_identity_status=EXACT,
+        broker_order_id=<the discovered order's own exact ID>,
+        adopted_from_external_order_id=<the DiscoveredExternalOrder's ID>,
+        recovery_state=NONE,
+    )
+  → only this new ExecutionOrderRecord may ever be linked to a card or
+    reach the cancel gateway (B2/B3), and only for the specific actions
+    the adoption UI explicitly authorized
+```
+
 ### Atomic pre-submission transaction (INV-16), with the commit-ordering fix
 
 ```
@@ -235,7 +345,8 @@ calculate final quantity, price, exchange, order type (post risk-revalidation)
   → atomically persist, in one local transaction:
         execution_command (A5)
         capital_reservation
-        ExecutionOrderRecord(status=PREPARED, ownership=APPLICATION_VERIFIED)
+        ExecutionOrderRecord(status=PREPARED, origin=APPLICATION,
+                              broker_identity_status=NOT_ASSIGNED)
   → durably commit status=SUBMITTING  ***before*** any broker call is made
       (revision 3 fix: PREPARED-committed-but-SUBMITTING-write-failed must
       never fall through to calling the broker anyway -- that would reopen
@@ -260,11 +371,11 @@ Recovery semantics after a restart, made explicit:
 
 | Requirement | Owning module | Persisted state | Broker action | Failure behavior | Recovery behavior | Tests | Activation criterion |
 |---|---|---|---|---|---|---|---|
-| A1. Every submission's command, capital reservation, and `ExecutionOrderRecord(PREPARED, APPLICATION_VERIFIED)` are written atomically, before the broker call; `SUBMITTING` is durably committed before the call. | `src/core/execution_order_record.py` (new) | see above | none yet | The transaction fails to commit: nothing was submitted, nothing to recover. If `SUBMITTING` fails to commit, the broker is never called. | N/A | `test_prepare_writes_command_reservation_and_order_record_atomically`, `test_prepare_failure_leaves_no_partial_state`, `test_broker_is_never_called_if_the_submitting_commit_fails` | Workstream 2 |
+| A1. Every submission's command, capital reservation, and `ExecutionOrderRecord(PREPARED, origin=APPLICATION, broker_identity_status=NOT_ASSIGNED)` are written atomically, before the broker call; `SUBMITTING` is durably committed before the call. | `src/core/execution_order_record.py` (new) | see above | none yet | The transaction fails to commit: nothing was submitted, nothing to recover. If `SUBMITTING` fails to commit, the broker is never called. | N/A | `test_prepare_writes_command_reservation_and_order_record_atomically`, `test_prepare_failure_leaves_no_partial_state`, `test_broker_is_never_called_if_the_submitting_commit_fails` | Workstream 2 |
 | A2. `submitted_quantity`/`submitted_limit_price` recorded are the *actual* post-risk-revalidation values, written at `PREPARED`, before the KIS call. | `execution_command_gateway.py` (Workstream 3) writes via this module | `ExecutionOrderRecord.submitted_quantity/submitted_limit_price` at `PREPARED` | none yet | n/a (covered by A1) | n/a | `test_submitted_quantity_reflects_post_revalidation_size_not_the_original_plan` | Workstream 2 |
-| A3. Both `ExecutionOrderStatus` and `OrderRecoveryState` transitions are validated against the tables above; `UNRECONCILED_BROKER_ORDER` is derived, never authoritative. | `src/core/order_recovery_state.py` (new) | `ExecutionOrderRecord.status`, `.recovery_state` | none | An invalid transition raises; it does not silently overwrite. | N/A | one test per row in each transition table above, plus `test_unreconciled_broker_order_warning_is_derived_not_authoritative` | Workstream 2 |
-| A4a. Ambiguous **status** recovery (our own record stuck at `SUBMITTING` after restart) is resolved only by exact identity, per what Workstream 0 proves KIS supports. Ownership is never in question here — we know we submitted it. | `account_reconciliation.py` (Workstream 4) | `recovery_state=DISCOVERING` → resolved or `MANUAL_INTERVENTION_REQUIRED` | `discover_orders` | See A4a branches below. | See below. | `test_a4a_resolves_by_exact_correlation_key_when_supported`, `test_a4a_never_resubmits_a_submitting_record` | Workstream 2 + 4, gated on Workstream 0 |
-| A4b. Ambiguous **ownership** recovery (a broker order discovered with no matching `ExecutionOrderRecord` at all) creates a `DiscoveredExternalOrder(ownership=EXTERNAL_UNOWNED)` — never an `ExecutionOrderRecord`, never attached to a card, never cancelled/replaced, never capital-reserved-against, automatically. | same | `DiscoveredExternalOrder` row | none automatic | Always alert-and-display; never a card mutation. | Resolved only by an explicit, audited user "adopt" action → `ownership=USER_ADOPTED`. | `test_a4b_creates_a_discovered_external_order_not_an_execution_order_record`, `test_a4b_never_auto_cancels_or_attaches_to_a_card`, `test_user_adoption_is_explicit_and_recorded_as_adoption` | Workstream 2 + 4, gated on Workstream 0 |
+| A3. `ExecutionOrderStatus`, `OrderRecoveryState`, and `ExternalOrderDisposition` transitions are all validated against their respective tables above; `UNRECONCILED_BROKER_ORDER` (and its `DiscoveredExternalOrder` equivalent) is derived, never authoritative. `broker_identity_status` only ever reaches `EXACT` alongside a confirmed `broker_order_id` — never inferred from `origin` alone. | `src/core/order_recovery_state.py` (new) | `ExecutionOrderRecord.status`/`.recovery_state`/`.origin`/`.broker_identity_status`, `DiscoveredExternalOrder.disposition` | none | An invalid transition raises; it does not silently overwrite. | N/A | one test per row in each transition table above, plus `test_unreconciled_broker_order_warning_is_derived_not_authoritative`, `test_broker_identity_status_never_reaches_exact_without_a_confirmed_broker_order_id` | Workstream 2 |
+| A4a. Ambiguous **status** recovery (our own record stuck at `SUBMITTING` after restart, `broker_identity_status=AMBIGUOUS`) is resolved only by exact identity, per what Workstream 0 proves KIS supports. Origin is never in question here — we know we submitted it; only whether the broker accepted it is unknown. | `account_reconciliation.py` (Workstream 4) | `recovery_state=DISCOVERING` → resolved or `MANUAL_INTERVENTION_REQUIRED`; `broker_identity_status` → `EXACT` on success | `discover_orders` | See A4a branches below. | See below. | `test_a4a_resolves_by_exact_correlation_key_when_supported`, `test_a4a_never_resubmits_a_submitting_record`, `test_a4a_inferred_non_acceptance_uses_not_accepted_confirmed_not_rejected` | Workstream 2 + 4, gated on Workstream 0 |
+| A4b. Ambiguous **ownership** recovery (a broker order that reaches step 4 of the classification precedence below — nothing local claims it at all, not even heuristically) creates a `DiscoveredExternalOrder(disposition=DISCOVERED_UNOWNED)` — never an `ExecutionOrderRecord`, never attached to a card, never cancelled/replaced, never capital-reserved-against, automatically. | same | `DiscoveredExternalOrder` row | none automatic | Always alert-and-display; never a card mutation. | Resolved only by an explicit, audited user "adopt" action, which creates a *new*, separate `ExecutionOrderRecord(origin=USER_ADOPTED, broker_identity_status=EXACT)` — see `ExternalOrderDisposition`. | `test_a4b_creates_a_discovered_external_order_not_an_execution_order_record`, `test_a4b_never_auto_cancels_or_attaches_to_a_card`, `test_user_adoption_is_explicit_and_recorded_as_adoption`, `test_a_broker_order_used_as_an_a4a_candidate_is_not_also_created_as_an_external_order` | Workstream 2 + 4, gated on Workstream 0 |
 | A5. Command idempotency table with a unique constraint on `idempotency_key` prevents duplicate submit/cancel/replace after restart or handoff. | `src/services/execution_command_repository.py` (new) | `execution_commands` table | none directly | A duplicate command is rejected/no-ops instead of re-submitting. | N/A | `test_duplicate_submit_command_after_restart_is_rejected_by_idempotency_key`, `test_duplicate_cancel_command_after_lease_handoff_is_rejected` | Workstream 2 |
 | A6. `owner_device_id`/`lease_token`/`lease_epoch` are persisted per order and per command. | same as A1/A5 | fields on both records | none | A command whose `lease_epoch` doesn't match the current lease is rejected by the gateway. | N/A | `test_command_with_stale_lease_epoch_is_rejected_by_the_gateway` | Workstream 2 + 3 |
 
@@ -285,33 +396,76 @@ ELSE (default, conservative assumption until Workstream 0 says otherwise):
         (submitted_quantity, submitted_limit_price, side, symbol, account,
          submission time window -- never a bare account+symbol+side scan)
     NEVER automatically cancel or replace a candidate found this way
-    require MANUAL_INTERVENTION_REQUIRED unless/until exact identity appears
+        (candidates never reach broker_identity_status=EXACT)
+
+    IF Workstream 0 proves KIS supports a strong-enough absence confirmation
+       (exact correlation-key lookup + complete broker-history evidence that
+        no order was ever created for this exact submission):
+        resolve to NOT_ACCEPTED_CONFIRMED (revision 3.1) -- distinct from
+        REJECTED, which is reserved for an explicit broker rejection
+        response, never an inference
+    ELSE:
+        require MANUAL_INTERVENTION_REQUIRED unless/until exact identity
+        appears -- do not use NOT_ACCEPTED_CONFIRMED speculatively
 ```
 
 **A4b, written out in full** (the review's central correction):
 
 ```
-A broker order matches account+symbol+side with NO corresponding local
-ExecutionOrderRecord at all. This is an ownership question, not a status
-question -- the application has no record of ever submitting it. It may be
-a manual order, a legacy-engine order, another application, or a prior
-database generation.
+A broker order reaches step 4 of the reconciliation classification
+precedence below (revision 3.1) -- i.e. nothing local claims it, not even
+heuristically as an A4a candidate. This is an ownership question, not a
+status question -- the application has no record of ever submitting it. It
+may be a manual order, a legacy-engine order, another application, or a
+prior database generation.
 
-    create/update a DiscoveredExternalOrder(ownership=EXTERNAL_UNOWNED)
+    create/update a DiscoveredExternalOrder(disposition=DISCOVERED_UNOWNED)
     surface it as a distinct alert/UI element, separate from any card
     NEVER attach it to a TradeCardState automatically
     NEVER cancel or replace it automatically
     NEVER reserve or release capital based on assumed ownership of it
-    remains EXTERNAL_UNOWNED until a human explicitly adopts it
+    remains DISCOVERED_UNOWNED until a human explicitly adopts it, or
+        reconciliation confirms it reached a terminal broker status with
+        no adoption ever having happened (-> DISMISSED_TERMINAL)
 
-    IF a user explicitly adopts it:
-        ownership -> USER_ADOPTED
-        record who/when in the audit trail as an adoption, not as if the
-            application originally submitted it
-        only then may it be linked to a card and managed going forward,
-            and only for the specific actions the adoption UI explicitly
-            authorized
+    IF a user explicitly adopts it (L4's "Adopt" action):
+        creates a NEW, separate
+            ExecutionOrderRecord(origin=USER_ADOPTED, broker_identity_status=EXACT)
+        the original DiscoveredExternalOrder's own disposition becomes
+            USER_ADOPTED and is preserved as the audit trail of what was
+            actually discovered, never rewritten to look application-
+            originated -- see ExternalOrderDisposition above
 ```
+
+### Reconciliation classification precedence (revision 3.1)
+
+A single discovered broker order must never simultaneously become an A4a
+candidate for one local record *and* a new `DiscoveredExternalOrder` — that
+would both alert on it as unowned and treat it as a match candidate for an
+existing ambiguous submission, which is confusing and could let it be
+"resolved" twice, inconsistently. Classification is deterministic, applied
+in this order, and each broker order is consumed by the first step that
+claims it:
+
+```
+1. Exact match: broker_order_id equals a known ExecutionOrderRecord's own
+   broker_order_id -- this order is that record's own; no further
+   classification needed.
+2. Verified correlation-key match (only if Workstream 0 confirms one
+   exists): the order carries a correlation key matching an
+   UNKNOWN_SUBMISSION_STATE ExecutionOrderRecord -- A4a resolves it
+   directly, broker_identity_status -> EXACT.
+3. Heuristic candidate: the order plausibly corresponds to an
+   OWNERSHIP_UNCERTAIN ExecutionOrderRecord's fingerprint (A4a's candidate
+   list) -- it stays a non-owning candidate attached to that record's own
+   recovery state. It is NOT independently cancellable (B3 still requires
+   broker_identity_status == EXACT), and it does NOT also spawn a
+   DiscoveredExternalOrder.
+4. Everything not consumed by steps 1-3 becomes a DiscoveredExternalOrder
+   (A4b) -- genuinely nothing local claims it, even heuristically.
+```
+
+Test: `test_a_broker_order_used_as_an_a4a_candidate_is_not_also_created_as_an_external_order`.
 
 ## B. One guarded execution gateway (Workstream 3)
 
@@ -322,8 +476,8 @@ failure domains). B2/B3 updated for the A4a/A4b split and Workstream 9:
 | Requirement | Owning module | Persisted state | Broker action | Failure behavior | Recovery behavior | Tests | Activation criterion |
 |---|---|---|---|---|---|---|---|
 | B1. `submit_order`/`cancel_order`/`replace_order` (the last, composed per A's transition table) are the *only* production entry points that call `broker.submit_order`/`broker.cancel_order`. | `src/services/execution_command_gateway.py` (new) | n/a (routes to A) | delegates | A direct call to `broker.*` from outside the gateway fails the architecture test. | N/A | `test_architecture_no_direct_broker_mutation_outside_gateway` | Workstream 3 |
-| B2. Before any KIS call, the gateway validates, in order: engine flag, admin/session kill switches, current lease + epoch match, account/environment match, **execution ownership** (H1: this account+symbol belongs to this caller's engine), exact broker-order ownership (cancel/replace only — `ExecutionOrderRecord.ownership == APPLICATION_VERIFIED`, or `USER_ADOPTED` and the adoption explicitly authorized this action), idempotency key, current order status, quantity validity, rate-limit budget. | same | n/a | gate, then delegate | Any single gate failing rejects the whole command with a specific, logged reason. | N/A | one test per gate, including `test_gateway_rejects_a_symbol_not_owned_by_the_calling_engine`, `test_gateway_rejects_cancel_of_an_external_unowned_order` | Workstream 3 |
-| B3. `cancel_order`/`replace_order` require `ownership in (APPLICATION_VERIFIED, USER_ADOPTED)` — `EXTERNAL_UNOWNED` (every `DiscoveredExternalOrder` by default, per A4b) can never reach these calls. | same | reads A | `broker.cancel_order` | An `OWNERSHIP_UNCERTAIN`/`EXTERNAL_UNOWNED` candidate cannot reach the cancel gateway — stays alert-only. | N/A | `test_gateway_cancel_requires_application_verified_or_user_adopted_ownership`, `test_external_unowned_order_cannot_reach_the_cancel_gateway` | Workstream 3 |
+| B2. Before any KIS call, the gateway validates, in order: engine flag, admin/session kill switches, current lease + epoch match, account/environment match, **execution ownership** (H1: this account+symbol belongs to this caller's engine), exact broker-order identity (cancel/replace only — `origin in (APPLICATION, USER_ADOPTED)` **and** `broker_identity_status == EXACT` **and** `broker_order_id` is set; a `USER_ADOPTED` record's adoption must have explicitly authorized this specific action), idempotency key, current order status, quantity validity, rate-limit budget. | same | n/a | gate, then delegate | Any single gate failing rejects the whole command with a specific, logged reason. | N/A | one test per gate, including `test_gateway_rejects_a_symbol_not_owned_by_the_calling_engine`, `test_gateway_rejects_cancel_without_exact_broker_identity` | Workstream 3 |
+| B3. `cancel_order`/`replace_order` require `origin in (APPLICATION, USER_ADOPTED)` **and** `broker_identity_status == EXACT` (revision 3.1 — identity, not origin alone). A `DiscoveredExternalOrder` (never an `ExecutionOrderRecord`, per A4b) can never reach these calls, and neither can an `ExecutionOrderRecord` still at `broker_identity_status == AMBIGUOUS` even though its `origin` is already `APPLICATION`. | same | reads A | `broker.cancel_order` | An `OWNERSHIP_UNCERTAIN` record, or any `DiscoveredExternalOrder`, cannot reach the cancel gateway — stays alert-only. | N/A | `test_gateway_cancel_requires_exact_broker_identity_not_origin_alone`, `test_a_submitting_records_ambiguous_broker_identity_cannot_reach_the_cancel_gateway`, `test_a_discovered_external_order_can_never_reach_the_cancel_gateway` | Workstream 3 |
 | B4a. The mandatory command journal (A1/A5) is written *before* every broker call; if it fails, the broker is never called. | `execution_command_repository.py` | `execution_commands` row, pre-call | none (blocks the call) | Journal write failure = command never sent. | N/A | `test_command_journal_write_failure_prevents_the_broker_call` | Workstream 3 |
 | B4b. The broker-response persist happens after the call; if it fails, the action is never retried — local state goes `UNKNOWN_SUBMISSION_STATE` and A4a is triggered immediately. This rule is authoritative over any retry policy elsewhere (INV-23) — Workstream 10's scheduler must defer to it, never override it. | same | `ExecutionOrderRecord`/`execution_commands.broker_response`, post-call | none (does not retry) | Response-persist failure ≠ resubmission. | A4a. | `test_broker_response_persist_failure_never_triggers_a_retry`, `test_rate_limit_scheduler_never_retries_an_ambiguous_mutation_response` | Workstream 3 |
 | B4c. The supplementary audit/event log may fail non-blockingly, only because B4a already guarantees a durable command record exists regardless. | `execution_command_repository.py` / event journal | audit trail | n/a | A logging failure here never blocks or duplicates the broker action. | N/A | `test_supplementary_audit_log_failure_does_not_block_or_duplicate_the_broker_call` | Workstream 3 |
@@ -349,8 +503,8 @@ emergency_sell_quantity = fresh_broker_holdings_quantity
 Policy when the outstanding sell quantity itself can't be established:
 
 ```
-IF a known-owned (APPLICATION_VERIFIED/USER_ADOPTED) working exit order
-   exists for this symbol:
+IF a known-owned (origin in APPLICATION/USER_ADOPTED, broker_identity_status
+   EXACT) working exit order exists for this symbol:
     prefer cancelling/replacing that exact order over submitting a second,
     separate emergency order, when the gateway can do so within the
     outage's time budget.
@@ -408,15 +562,35 @@ per-tick version bookkeeping) or pushing full tick-path storage into the
 accumulator (which reopens the original lossy-queue problem in a different
 shape), the engine forces an immediate drain-and-evaluation of the current
 `PendingMarketState` against the **old** stop version *before* the new stop
-takes effect:
+takes effect.
+
+**Revision 3.1 correction:** "synchronously drain" is not itself sufficient
+without a real synchronization primitive shared between the market-data
+feed thread (which publishes ticks into the accumulator) and the engine
+thread (which changes stops) — without one, a trade arriving at the exact
+moment of a stop change could be attributed to the wrong version by a race.
+This must be an actual per-symbol lock (or an equivalent atomic
+compare-and-swap on the accumulator reference), acquired by *both* sides:
 
 ```
-stop price changes (v_old -> v_new) for a symbol
-  → engine drains and evaluates the current PendingMarketState against
-    v_old right now, synchronously, before v_new is installed
-  → PendingMarketState resets for the new drain window under v_new
-  → breached_stop_version, if set by this evaluation, refers unambiguously
-    to v_old and is handled (Sell All) before v_new governs anything
+Engine side (changing the stop, v_old -> v_new):
+  acquire per-symbol state lock
+  → atomically detach the PendingMarketState governed by v_old
+  → install v_new and a fresh PendingMarketState for it
+  → release the lock
+  → evaluate the detached accumulator against v_old (safe to do outside
+    the lock now that it's detached and no longer being written to)
+
+Feed side (publishing a trade/quote for this symbol):
+  acquire the same per-symbol state lock (or use the equivalent atomic
+    swap primitive) before writing into the currently-installed
+    PendingMarketState
+  → release after the write
+
+A trade arriving exactly during the engine's atomic detach-and-install
+step is therefore deterministically resolved to exactly one version --
+whichever side actually holds the lock at that instant -- never split
+across both, and never lost to the race.
 ```
 
 This keeps the accumulator itself simple (still just "coalesce, but never
@@ -424,7 +598,7 @@ drop an extreme or a breach," from revision 2) and keeps stop-version
 awareness where it already belongs — the trading engine, which is the only
 component that changes stops in the first place.
 
-Tests: `test_a_breach_between_two_higher_prices_in_one_drain_window_is_never_lost`, `test_a_stop_price_change_forces_a_drain_against_the_old_version_first`, `test_a_trade_after_a_stop_change_is_evaluated_against_the_new_version_only`, `test_latch_clears_only_on_explicit_engine_acknowledgement`.
+Tests: `test_a_breach_between_two_higher_prices_in_one_drain_window_is_never_lost`, `test_a_stop_price_change_forces_a_drain_against_the_old_version_first`, `test_a_trade_after_a_stop_change_is_evaluated_against_the_new_version_only`, `test_trade_arriving_exactly_during_stop_version_change_is_assigned_to_one_and_only_one_stop_version`, `test_latch_clears_only_on_explicit_engine_acknowledgement`.
 
 #### D9. Decision semantics (additions: emergency pricing)
 
@@ -748,7 +922,7 @@ owned cards).
 | L1. No Kanban UI module calls the broker, the execution gateway, the reconciliation engine, or the command repository directly — every action goes through the same workflow service the legacy Buy Dashboard uses. | `src/ui/buyboard/` (audit + enforce) | n/a | n/a | A direct call from a UI module fails an architecture test, same pattern as B1. | N/A | `test_architecture_no_kanban_ui_module_calls_broker_or_gateway_directly` | Workstream 13 |
 | L2. A drag/gesture on the board issues a *command request*; the card only reflects the new state once the workflow service (and, downstream, the gateway) confirms it — a drag never itself declares success. | `src/ui/buyboard/board.py` (modify) | n/a (UI state only) | n/a (delegates) | A rejected command reverts the card's visual position/state, with the rejection reason shown. | N/A | `test_a_rejected_drag_command_reverts_the_cards_visual_state` | Workstream 13 |
 | L3. Full parity matrix (below) — every legacy Buy Dashboard action has a Kanban equivalent that produces the *same underlying command* (tested by asserting on the command, not merely the resulting screen). | `src/ui/buyboard/` | varies per action | varies per action | n/a | n/a | one test per parity row below, asserting command equality, not just visual equivalence | Workstream 13 |
-| L4. `DiscoveredExternalOrder`s (A4b) render as a visually distinct element, never merged into a card's own state, with an explicit "Adopt" action that is the *only* path to `USER_ADOPTED` (INV-22). | `src/ui/buyboard/board.py` | n/a | n/a | n/a | n/a | `test_discovered_external_order_renders_distinctly_from_owned_cards`, `test_adopt_action_is_the_only_path_to_user_adopted_ownership` | Workstream 13 |
+| L4. `DiscoveredExternalOrder`s (A4b) render as a visually distinct element, never merged into a card's own state, with an explicit "Adopt" action that is the *only* path from `DiscoveredExternalOrder` to a `USER_ADOPTED` `ExecutionOrderRecord` (INV-22; see `ExternalOrderDisposition`). | `src/ui/buyboard/board.py` | n/a | n/a | n/a | n/a | `test_discovered_external_order_renders_distinctly_from_owned_cards`, `test_adopt_action_is_the_only_path_to_a_user_adopted_execution_order_record` | Workstream 13 |
 
 ### L3 parity matrix
 
@@ -856,3 +1030,27 @@ and stays `false` in unattended/automatic form until Gate 5 passes.
   engine without ever proving Kanban replaced the legacy dashboard's own
   actions. Replaced the single-PR rule with an 8-PR staged release train,
   each carrying its own required CI/test scope.
+- 2026-08-15 (revision 3.1): Narrow errata pass responding to a third
+  review. Replaced `OrderOwnership` with separate `OrderOrigin` (did the
+  application create this record) and `BrokerIdentityStatus` (is the exact
+  broker order known) fields — a `PREPARED` record is `origin=APPLICATION`
+  but `broker_identity_status=NOT_ASSIGNED`, not "verified," since no
+  broker call has happened yet; the cancel gate now requires exact identity,
+  not origin alone. Gave `DiscoveredExternalOrder` its own
+  `ExternalOrderDisposition` lifecycle instead of routing it through
+  `OrderRecoveryState` (which belongs to `ExecutionOrderRecord` only), and
+  specified that adoption creates a new, separate `ExecutionOrderRecord`
+  rather than mutating the original discovered record. Added the
+  reconciliation classification precedence (exact match → verified
+  correlation key → heuristic A4a candidate → only then
+  `DiscoveredExternalOrder`) so one broker order can never become both an
+  A4a candidate and a duplicate external-order alert. Split `REJECTED`
+  (explicit broker rejection) from the new `NOT_ACCEPTED_CONFIRMED`
+  (inferred non-acceptance via exact correlation + complete history), since
+  they need different evidentiary bars. Added the per-symbol lock/atomic-
+  swap primitive D5's stop-version synchronization boundary needs to be a
+  real guarantee rather than a hand-wave. Narrowed the Workstream 0 gate to
+  the specific KIS-capability-dependent code paths (A4a's adapter, D1/D3/D11)
+  rather than blocking all of Workstreams 2 and 5, unblocking PR1's
+  capability-independent schemas and state machines to start immediately
+  alongside Workstream 0 rather than after it.
