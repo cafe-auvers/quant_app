@@ -1,6 +1,6 @@
 # Kanban Production Readiness — Requirements & Invariants
 
-Status: **DRAFT — Workstream 1, revision 3.1 (errata applied; ready for sign-off pending your confirmation)**
+Status: **SIGNED OFF — Workstream 1 complete, revision 3.1**
 Branch: `feature/kanban-production-readiness`
 Base: `109c2c4` ("kanban fix 8")
 Supersedes: the "kanban fix 1" .. "kanban fix 8" review-and-patch cycle described in
@@ -103,8 +103,8 @@ PR's behavior composes correctly, plus the Gate 1 run in full.
 
 | # | Workstream | Status |
 |---|---|---|
-| 0 | KIS protocol capability verification | NOT STARTED — blocks Workstreams 2 (A4a/A4b) and 5 (D1); skeleton/fixtures scaffold may start now |
-| 1 | Freeze requirements and invariants (this document) | DRAFT rev. 3 — pending sign-off |
+| 0 | KIS protocol capability verification | NOT STARTED — capability-specific adapters remain gated; skeleton complete |
+| 1 | Freeze requirements and invariants (this document) | DONE — revision 3.1 signed off |
 | 2 | Durable order ownership and command ledger | NOT STARTED |
 | 3 | One guarded execution gateway | NOT STARTED |
 | 4 | Account-level reconciliation engine | NOT STARTED |
@@ -138,8 +138,10 @@ entries for their rationale). Revision 3 adds:
 ## 0. KIS protocol capability verification (Workstream 0)
 
 Unchanged from revision 2 — see the capability matrix, required outputs, and
-gate below. Still blocks A4a/A4b (Workstream 2) and D1 (Workstream 5); still
-requires live KIS credentials this environment doesn't have.
+gate below. Blocks only the capability-dependent portions of A4a, C1/C3,
+D1, D3, and D11 identified in the narrowed gate below — A4b's conservative
+default behavior is not blocked. Still requires live KIS credentials this
+environment doesn't have.
 
 | Capability | Required proof | Verification method | If unavailable, fallback |
 |---|---|---|---|
@@ -375,7 +377,7 @@ Recovery semantics after a restart, made explicit:
 | A2. `submitted_quantity`/`submitted_limit_price` recorded are the *actual* post-risk-revalidation values, written at `PREPARED`, before the KIS call. | `execution_command_gateway.py` (Workstream 3) writes via this module | `ExecutionOrderRecord.submitted_quantity/submitted_limit_price` at `PREPARED` | none yet | n/a (covered by A1) | n/a | `test_submitted_quantity_reflects_post_revalidation_size_not_the_original_plan` | Workstream 2 |
 | A3. `ExecutionOrderStatus`, `OrderRecoveryState`, and `ExternalOrderDisposition` transitions are all validated against their respective tables above; `UNRECONCILED_BROKER_ORDER` (and its `DiscoveredExternalOrder` equivalent) is derived, never authoritative. `broker_identity_status` only ever reaches `EXACT` alongside a confirmed `broker_order_id` — never inferred from `origin` alone. | `src/core/order_recovery_state.py` (new) | `ExecutionOrderRecord.status`/`.recovery_state`/`.origin`/`.broker_identity_status`, `DiscoveredExternalOrder.disposition` | none | An invalid transition raises; it does not silently overwrite. | N/A | one test per row in each transition table above, plus `test_unreconciled_broker_order_warning_is_derived_not_authoritative`, `test_broker_identity_status_never_reaches_exact_without_a_confirmed_broker_order_id` | Workstream 2 |
 | A4a. Ambiguous **status** recovery (our own record stuck at `SUBMITTING` after restart, `broker_identity_status=AMBIGUOUS`) is resolved only by exact identity, per what Workstream 0 proves KIS supports. Origin is never in question here — we know we submitted it; only whether the broker accepted it is unknown. | `account_reconciliation.py` (Workstream 4) | `recovery_state=DISCOVERING` → resolved or `MANUAL_INTERVENTION_REQUIRED`; `broker_identity_status` → `EXACT` on success | `discover_orders` | See A4a branches below. | See below. | `test_a4a_resolves_by_exact_correlation_key_when_supported`, `test_a4a_never_resubmits_a_submitting_record`, `test_a4a_inferred_non_acceptance_uses_not_accepted_confirmed_not_rejected` | Workstream 2 + 4, gated on Workstream 0 |
-| A4b. Ambiguous **ownership** recovery (a broker order that reaches step 4 of the classification precedence below — nothing local claims it at all, not even heuristically) creates a `DiscoveredExternalOrder(disposition=DISCOVERED_UNOWNED)` — never an `ExecutionOrderRecord`, never attached to a card, never cancelled/replaced, never capital-reserved-against, automatically. | same | `DiscoveredExternalOrder` row | none automatic | Always alert-and-display; never a card mutation. | Resolved only by an explicit, audited user "adopt" action, which creates a *new*, separate `ExecutionOrderRecord(origin=USER_ADOPTED, broker_identity_status=EXACT)` — see `ExternalOrderDisposition`. | `test_a4b_creates_a_discovered_external_order_not_an_execution_order_record`, `test_a4b_never_auto_cancels_or_attaches_to_a_card`, `test_user_adoption_is_explicit_and_recorded_as_adoption`, `test_a_broker_order_used_as_an_a4a_candidate_is_not_also_created_as_an_external_order` | Workstream 2 + 4, gated on Workstream 0 |
+| A4b. Ambiguous **ownership** recovery (a broker order that reaches step 4 of the classification precedence below — nothing local claims it at all, not even heuristically) creates a `DiscoveredExternalOrder(disposition=DISCOVERED_UNOWNED)` — never an `ExecutionOrderRecord`, never attached to a card, never cancelled/replaced, never capital-reserved-against, automatically. | same | `DiscoveredExternalOrder` row | none automatic | Always alert-and-display; never a card mutation. | Resolved only by an explicit, audited user "adopt" action, which creates a *new*, separate `ExecutionOrderRecord(origin=USER_ADOPTED, broker_identity_status=EXACT)` — see `ExternalOrderDisposition`. | `test_a4b_creates_a_discovered_external_order_not_an_execution_order_record`, `test_a4b_never_auto_cancels_or_attaches_to_a_card`, `test_user_adoption_is_explicit_and_recorded_as_adoption`, `test_a_broker_order_used_as_an_a4a_candidate_is_not_also_created_as_an_external_order` | Workstream 2 + 4 — capability-independent conservative behavior may proceed immediately |
 | A5. Command idempotency table with a unique constraint on `idempotency_key` prevents duplicate submit/cancel/replace after restart or handoff. | `src/services/execution_command_repository.py` (new) | `execution_commands` table | none directly | A duplicate command is rejected/no-ops instead of re-submitting. | N/A | `test_duplicate_submit_command_after_restart_is_rejected_by_idempotency_key`, `test_duplicate_cancel_command_after_lease_handoff_is_rejected` | Workstream 2 |
 | A6. `owner_device_id`/`lease_token`/`lease_epoch` are persisted per order and per command. | same as A1/A5 | fields on both records | none | A command whose `lease_epoch` doesn't match the current lease is rejected by the gateway. | N/A | `test_command_with_stale_lease_epoch_is_rejected_by_the_gateway` | Workstream 2 + 3 |
 
@@ -1054,3 +1056,6 @@ and stays `false` in unattended/automatic form until Gate 5 passes.
   rather than blocking all of Workstreams 2 and 5, unblocking PR1's
   capability-independent schemas and state machines to start immediately
   alongside Workstream 0 rather than after it.
+- 2026-08-15: Revision 3.1 approved by the project owner. Workstream 1
+  signed off; subsequent changes require an explicit logged contract
+  revision.
