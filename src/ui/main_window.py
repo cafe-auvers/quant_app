@@ -1557,7 +1557,7 @@ class MainWindow(
         except Exception:
             logger.exception("Failed to show critical tray notification")
 
-    def _buyboard_engine_healthy(self) -> bool:
+    def _buyboard_engine_healthy(self, account_no: Optional[str] = None) -> bool:
         """Review finding: "legacy execution suppression depends only on
         the feature flag" -- it did not verify the new engine was actually
         running, holding its lease, and producing recent heartbeats, so a
@@ -1566,15 +1566,25 @@ class MainWindow(
 
         Requires everything the review's own ``ExecutionOwnerState`` sketch
         does: the worker exists, is running, has completed startup
-        reconciliation for *every* discovered account (a partial failure
-        there no longer reports blanket success -- see
-        ``BuyboardRuntimeWorker.startup_reconciliation_errors``), and is
-        demonstrably still iterating -- true broker lease currency is
-        already covered by
+        reconciliation, and is demonstrably still iterating -- true broker
+        lease currency is already covered by
         :meth:`_current_execution_lease_kwargs`/``ExecutionAuthority``,
         which the worker itself stops on
         (:meth:`~src.ui.buyboard.runtime_worker.BuyboardRuntimeWorker._lease_still_current`);
         a lease loss shows up here indirectly once its loop actually exits.
+
+        ``account_no`` (review finding P0: "partial account failure still
+        creates cross-account dual execution" -- one account's startup
+        reconciliation failure previously made this method report globally
+        unhealthy, which fails legacy protective exits *open* for every
+        account, including ones the Buy Board engine had already fully
+        confirmed and was actively managing) scopes the
+        startup-reconciliation check to that specific account only: a
+        different account's outstanding failure no longer suppresses a
+        healthy account's own Buy Board ownership. Worker-level liveness
+        (running, heartbeat/cycle iteration) still applies globally -- a
+        genuinely stopped/crashed worker is unhealthy for every account
+        regardless. Omit ``account_no`` for a worker-wide check.
         """
         worker = self.__dict__.get("_buyboard_runtime_worker")
         if worker is None:
@@ -1585,9 +1595,13 @@ class MainWindow(
         except RuntimeError:
             # The underlying Qt C++ object was already deleted.
             return False
-        if not getattr(worker, "startup_reconciliation_complete", False):
+        if not getattr(worker, "startup_reconciliation_ran", False):
             return False
-        if getattr(worker, "startup_reconciliation_errors", None):
+        errors = getattr(worker, "startup_reconciliation_errors", None) or {}
+        if account_no is not None:
+            if account_no in errors:
+                return False
+        elif errors:
             return False
         now = dt.datetime.now(dt.timezone.utc)
         cycle_started = getattr(worker, "last_cycle_started_at", None)

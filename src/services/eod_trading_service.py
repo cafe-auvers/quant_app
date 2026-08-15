@@ -78,6 +78,22 @@ class EodActionCallbacks:
             open_orders_complete=True, history_complete=True, reserved_orders_complete=True
         )
     )
+    # Review finding P0: "broker-order matching is too broad and can match
+    # old orders" -- KIS regular-order discovery defaults to a ~14-day
+    # history window and BrokerOrderStatusSnapshot.checked_at is query
+    # time, not submission time, so a historical FILLED BUY for the same
+    # symbol that was later sold could otherwise be mistaken for this
+    # card's current missing entry order and wrongly resurrect a position.
+    # A historical fill is only trusted to reopen a position when the
+    # account's *current* holdings independently confirm the shares still
+    # exist -- see _find_matching_broker_entry_snapshot. Optional/defaulted
+    # to "unknown" (None): unknown holdings means that safety gate refuses
+    # to trust the historical fill rather than guessing either way, so
+    # existing callers/tests that never wire this are unaffected for the
+    # already-covered still-working-order and no-match paths.
+    get_current_holding: Callable[[TradeCardState], Optional[BrokerHolding]] = (
+        lambda card: None
+    )
 
 
 class EodTradingService:
@@ -141,14 +157,26 @@ class EodTradingService:
         # Review finding P0 (same pattern as reconcile_unresolved_orders_at_startup):
         # a complete discovery query confirms the local ledger has nothing,
         # but not that the broker has nothing -- a matching snapshot means
-        # this card's board_status is stale (an order genuinely exists),
-        # so resetting to Buylist here would silently orphan it. Leave the
-        # card alone; the next heartbeat's own reconciliation (which
-        # expects ENTRY_PENDING) needs the status corrected first, which
-        # is outside this method's job of resetting a genuinely order-free
-        # Buy Today card.
-        if _find_matching_broker_entry_snapshot(discovery, card) is not None:
-            return False
+        # this card's board_status is stale (an order genuinely exists).
+        matching = _find_matching_broker_entry_snapshot(
+            discovery, card, current_holding=self._callbacks.get_current_holding(card)
+        )
+        if matching is not None:
+            # Review finding P0: "Buy Today can remain eligible despite a
+            # discovered broker order" -- merely returning False here left
+            # the card at BUY_TODAY, where the *next* heartbeat tick's
+            # _evaluate_buy_today stage (which runs before EOD cleanup
+            # every tick) would still treat it as a fresh candidate and
+            # could submit a genuinely duplicate entry the instant its
+            # runtime status next reads EXECUTE_READY. Move it out of
+            # BUY_TODAY immediately so no further automatic submission is
+            # possible, and correctly reflect that an order exists rather
+            # than silently leaving the board stale.
+            card.board_status = BoardStatus.ENTRY_PENDING
+            card.entry_runtime_status = EntryRuntimeStatus.DATA_UNAVAILABLE
+            if "UNRECONCILED_BROKER_ORDER" not in card.warnings:
+                card.warnings = [*card.warnings, "UNRECONCILED_BROKER_ORDER"]
+            return True
         card.board_status = BoardStatus.BUYLIST
         card.entry_runtime_status = None
         card.entry_block_reason = ""
@@ -204,7 +232,9 @@ class EodTradingService:
             # inspecting discovery.snapshots would silently orphan a real
             # broker order the local ledger lost track of, right as the
             # session is ending.
-            matching = _find_matching_broker_entry_snapshot(discovery, card)
+            matching = _find_matching_broker_entry_snapshot(
+                discovery, card, current_holding=self._callbacks.get_current_holding(card)
+            )
             if matching is None:
                 card.board_status = BoardStatus.BUYLIST
                 card.entry_runtime_status = None
@@ -214,6 +244,13 @@ class EodTradingService:
                 card.broker_quantity = matching.filled_quantity
                 card.orderable_quantity = matching.filled_quantity
                 card.average_entry_price = matching.avg_fill_price or card.average_entry_price
+                # Review finding P0: "a partially filled working broker
+                # order is treated as completed" -- see the identical
+                # comment in reconcile_unresolved_orders_at_startup. Always
+                # zeroed (no local order record exists for the remainder
+                # to safely hand back to normal tracking), but the
+                # still-open case is flagged for urgent attention rather
+                # than treated as a clean, fully-settled fill.
                 card.entry_remaining_target_quantity = 0
                 card.position_runtime_status = PositionRuntimeStatus.OPEN
                 self._position_manager.apply_first_fill_stop(
@@ -224,6 +261,8 @@ class EodTradingService:
                 card.entry_runtime_status = None
                 if "ORDER_RECOVERED_FROM_BROKER_DISCOVERY" not in card.warnings:
                     card.warnings = [*card.warnings, "ORDER_RECOVERED_FROM_BROKER_DISCOVERY"]
+                if is_open_status(matching.status) and "UNRECONCILED_BROKER_ORDER" not in card.warnings:
+                    card.warnings = [*card.warnings, "UNRECONCILED_BROKER_ORDER"]
                 return True
             if matching.status in _ALREADY_TERMINAL_STATUSES:
                 card.board_status = BoardStatus.BUYLIST
@@ -333,14 +372,32 @@ class EodTradingService:
 
 
 def _find_matching_broker_entry_snapshot(
-    discovery: BrokerOrderDiscoveryResult, card: TradeCardState
+    discovery: BrokerOrderDiscoveryResult,
+    card: TradeCardState,
+    *,
+    current_holding: Optional[BrokerHolding] = None,
 ) -> Optional[BrokerOrderStatusSnapshot]:
     """Finds this card's BUY entry among a *complete* broker-wide
     discovery query, so a local-ledger lookup miss is never treated as
     broker truth on its own (review finding P0). Prefers a still-open
-    snapshot (the working order to leave alone); falls back to the most
-    recently checked filled/terminal one when nothing is open, so a fill
-    that raced the local write is still found.
+    snapshot (the working order to leave alone, matched on symbol/side
+    alone -- a genuinely still-open order surviving many days is rare
+    enough that the stricter check below is not worth the risk of
+    re-orphaning it); falls back to the most recently checked terminal
+    one when nothing is open.
+
+    Review finding P0: "broker-order matching is too broad and can match
+    old orders" -- KIS's regular-order discovery defaults to an ~14-day
+    history window, and ``checked_at`` is query time, not submission time,
+    so an unrelated historical BUY for the same symbol that was already
+    filled *and sold* days ago could otherwise be mistaken for this card's
+    current missing entry order and wrongly resurrect a closed-out
+    position. A terminal match with a fill is therefore only trusted when
+    ``current_holding`` independently confirms the account still actually
+    holds shares of this symbol right now -- unknown/absent confirmation
+    (``current_holding`` is ``None`` or zero) means the match is rejected
+    rather than guessed at either way, matching every other fail-closed
+    gate in this module.
     """
     candidates = [
         snapshot
@@ -354,6 +411,17 @@ def _find_matching_broker_entry_snapshot(
     open_candidates = [c for c in candidates if is_open_status(c.status)]
     if open_candidates:
         return max(open_candidates, key=lambda c: c.checked_at)
+    terminal_with_fill = [c for c in candidates if c.filled_quantity > 0]
+    holding_confirmed = current_holding is not None and current_holding.quantity > 0
+    if terminal_with_fill and not holding_confirmed:
+        # A filled match exists but nothing confirms the shares are still
+        # actually held -- fall back to the zero-fill terminal candidates
+        # only (a plain CANCELLED/REJECTED confirmation is harmless either
+        # way; only trusting a *fill* without confirmation is the danger).
+        zero_fill = [c for c in candidates if c.filled_quantity <= 0]
+        if not zero_fill:
+            return None
+        return max(zero_fill, key=lambda c: c.checked_at)
     return max(candidates, key=lambda c: c.checked_at)
 
 
@@ -396,7 +464,9 @@ def reconcile_unresolved_orders_at_startup(
             # a real broker order (filled or still working) that the local
             # ledger simply lost track of (a lost write, a restart mid-
             # submission, a record from another device/process, ...).
-            matching = _find_matching_broker_entry_snapshot(discovery, card)
+            matching = _find_matching_broker_entry_snapshot(
+                discovery, card, current_holding=callbacks.get_current_holding(card)
+            )
             if matching is None:
                 # Confirmed by a complete broker-wide query, not merely a
                 # local lookup miss -- genuinely nothing to recover.
@@ -413,6 +483,21 @@ def reconcile_unresolved_orders_at_startup(
                 card.broker_quantity = matching.filled_quantity
                 card.orderable_quantity = matching.filled_quantity
                 card.average_entry_price = matching.avg_fill_price or card.average_entry_price
+                # Review finding P0: "a partially filled working broker
+                # order is treated as completed" -- matching.status can
+                # itself be an *open* status (e.g. a PARTIALLY_FILLED
+                # snapshot, 30/100 filled, 70 still live at the broker).
+                # entry_remaining_target_quantity is still deliberately
+                # zeroed either way -- with no local order record for the
+                # remainder (reconstruction not implemented), letting the
+                # normal completion machinery see a nonzero remaining
+                # target would risk submitting a *second*, duplicate
+                # completion order on top of the one already working.
+                # Zeroing it only stops *this app* from submitting
+                # anything further; it does not mean the broker's own
+                # remaining order is gone, which is exactly why the
+                # still-open case is flagged for urgent manual attention
+                # below rather than treated as a clean, fully-settled fill.
                 card.entry_remaining_target_quantity = 0
                 card.position_runtime_status = PositionRuntimeStatus.OPEN
                 position_manager.apply_first_fill_stop(
@@ -423,6 +508,10 @@ def reconcile_unresolved_orders_at_startup(
                 card.entry_runtime_status = None
                 if "ORDER_RECOVERED_FROM_BROKER_DISCOVERY" not in card.warnings:
                     card.warnings = [*card.warnings, "ORDER_RECOVERED_FROM_BROKER_DISCOVERY"]
+                if is_open_status(matching.status) and "UNRECONCILED_BROKER_ORDER" not in card.warnings:
+                    # The broker's own remainder is still genuinely live
+                    # and untracked, not merely "recovered."
+                    card.warnings = [*card.warnings, "UNRECONCILED_BROKER_ORDER"]
                 changed.append(card)
                 continue
             if matching.status in _ALREADY_TERMINAL_STATUSES:
@@ -457,8 +546,29 @@ def reconcile_unresolved_orders_at_startup(
             card.broker_quantity = refreshed.filled_quantity
             card.orderable_quantity = refreshed.filled_quantity
             card.average_entry_price = refreshed.avg_fill_price
-            card.entry_remaining_target_quantity = 0
-            card.position_runtime_status = PositionRuntimeStatus.OPEN
+            # Review finding P0 (same pattern as the discovery-recovered
+            # branch above): only a genuinely *terminal* fill means
+            # completion has actually stopped. A still-open
+            # PARTIALLY_FILLED order (say 30/100 filled, 70 still working)
+            # must keep its real remaining target so the card stays in
+            # _reconcile_entry_orders' tracking scope -- unlike the
+            # discovery-recovered case, a real local order record already
+            # exists here (this is the "order is not None" branch), so the
+            # normal heartbeat can safely keep reconciling this exact
+            # order, and _process_entry_completion's own
+            # find_open_entry_order check already prevents it from
+            # submitting a duplicate for the remainder in the meantime.
+            still_open = is_open_status(refreshed.status)
+            card.entry_remaining_target_quantity = (
+                max(0, card.target_position_quantity - refreshed.filled_quantity)
+                if still_open
+                else 0
+            )
+            card.position_runtime_status = (
+                PositionRuntimeStatus.ENTRY_COMPLETING
+                if still_open and card.entry_remaining_target_quantity > 0
+                else PositionRuntimeStatus.OPEN
+            )
             position_manager.apply_first_fill_stop(
                 card,
                 entry_orb_low=card.entry_orb_low or 0.0,

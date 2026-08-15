@@ -19,7 +19,7 @@ from .constants import US_MARKET_ZONE
 
 class BuylistMonitoringMixin:
     def _legacy_auto_execution_blocked(
-        self, env: str, symbol: str = "", *, is_protective_exit: bool = False
+        self, env: str, symbol: str = "", *, account_no: str = "", is_protective_exit: bool = False
     ) -> bool:
         """Mutual-exclusion guard between the legacy 60-second monitor and
         the new Kanban trading engine (code review: "There must never be two
@@ -43,6 +43,16 @@ class BuylistMonitoringMixin:
         the position with no automatic protection at all. Pass
         ``is_protective_exit=True`` only from a stop-loss/liquidation call
         site; entry call sites use the default.
+
+        ``account_no`` (review finding P0: "partial account failure still
+        creates cross-account dual execution" -- a global health check
+        meant one account's startup-reconciliation failure suppressed
+        legacy protection for *every* account, including ones the Buy
+        Board engine had already fully confirmed and was actively
+        managing, giving that healthy account two simultaneously-active
+        exit engines) scopes the health check to the specific account this
+        call concerns. Always pass the item/card's real account number
+        from every call site.
         """
         if not is_buyboard_engine_enabled():
             return False
@@ -57,18 +67,19 @@ class BuylistMonitoringMixin:
         # it is the *presence of an unhealthy worker* that must fail open,
         # not merely "nobody checked."
         health_check = getattr(self, "_buyboard_engine_healthy", None)
-        engine_healthy = health_check() if callable(health_check) else True
+        engine_healthy = health_check(account_no or None) if callable(health_check) else True
         if not engine_healthy:
-            if not self.__dict__.get("_buyboard_engine_unhealthy_notice_logged", False):
-                self._buyboard_engine_unhealthy_notice_logged = True
+            logged = self.__dict__.setdefault("_buyboard_engine_unhealthy_notice_logged", set())
+            if account_no not in logged:
+                logged.add(account_no)
                 message = (
-                    "CRITICAL: BUYBOARD_ENGINE_ENABLED=true but the Buy Board "
-                    "engine is not confirmed healthy (not running, lease lost, "
-                    "startup reconciliation incomplete, or no recent heartbeat) "
-                    "-- legacy stop-loss protection remains ACTIVE as a "
-                    "fail-safe, but new automatic entries stay BLOCKED on both "
-                    "engines until health is confirmed. Investigate the Buy "
-                    "Board engine immediately."
+                    f"CRITICAL: BUYBOARD_ENGINE_ENABLED=true but the Buy Board "
+                    f"engine is not confirmed healthy for account {account_no or env} "
+                    "(not running, lease lost, startup reconciliation incomplete "
+                    "for this account, or no recent heartbeat) -- legacy "
+                    "stop-loss protection remains ACTIVE as a fail-safe, but new "
+                    "automatic entries stay BLOCKED on both engines until health "
+                    "is confirmed. Investigate the Buy Board engine immediately."
                 )
                 # Review: a log-only alert "does not protect unattended
                 # trading when the user is asleep / the app is minimized."
@@ -84,7 +95,9 @@ class BuylistMonitoringMixin:
             # start on either engine while the authoritative one's state is
             # unknown.
             return not is_protective_exit
-        self._buyboard_engine_unhealthy_notice_logged = False
+        logged = self.__dict__.get("_buyboard_engine_unhealthy_notice_logged")
+        if logged:
+            logged.discard(account_no)
         # self.__dict__.get(...), not getattr(self, ...): on a QObject whose
         # __init__ never ran (some lightweight test doubles), PyQt5 raises
         # RuntimeError for an unset attribute instead of AttributeError, which
@@ -153,8 +166,6 @@ class BuylistMonitoringMixin:
         active_attr = f"_buylist_{env.lower()}_monitor_active"
         if not getattr(self, active_attr, False):
             return
-        if self._legacy_auto_execution_blocked(env):
-            return
         if not hasattr(self, "buylist_manager"):
             return
         items = [it for it in self.buylist_manager.items if it.environment == env]
@@ -166,6 +177,13 @@ class BuylistMonitoringMixin:
             if not getattr(it, "orb_monitor_enabled", False):
                 continue
             if getattr(it, "_buy_order_pending", False):
+                continue
+            # Review finding P0: checked per-item (not once for the whole
+            # env) so one account's Buy Board health does not block -- or
+            # wrongly appear to clear -- another account's entries.
+            if self._legacy_auto_execution_blocked(
+                env, it.symbol, account_no=getattr(it, "kis_account_no", "") or ""
+            ):
                 continue
             auto_order_blocked = self._buylist_auto_order_blocked(it)
             if auto_order_blocked:
@@ -408,7 +426,10 @@ class BuylistMonitoringMixin:
                 auto_order_blocked = self._buylist_auto_order_blocked(
                     item
                 ) or self._legacy_auto_execution_blocked(
-                    env, item.symbol, is_protective_exit=True
+                    env,
+                    item.symbol,
+                    account_no=getattr(item, "kis_account_no", "") or "",
+                    is_protective_exit=True,
                 )
                 exit_order_pending = getattr(item, "_exit_order_pending", False)
                 if (

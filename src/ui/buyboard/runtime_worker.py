@@ -168,6 +168,16 @@ class BuyboardRuntimeWorker(QThread):
         # "demonstrably still iterating, just slow this cycle" apart from
         # "the loop has not run in a long time" (crashed/hung/stopped).
         self.last_cycle_started_at: Optional[datetime] = None
+        # True once _run_startup_reconciliation has completed a full pass
+        # over every account it discovered, *regardless* of whether any
+        # individual account failed -- distinct from
+        # startup_reconciliation_complete (which additionally requires
+        # zero errors *globally*). main_window._buyboard_engine_healthy
+        # needs this one alone for a per-account check (review finding P0:
+        # "partial account failure still creates cross-account dual
+        # execution" -- a different account's outstanding failure must not
+        # make a healthy account look like startup never ran at all).
+        self.startup_reconciliation_ran: bool = False
         self.startup_reconciliation_complete: bool = False
         # Populated by _run_startup_reconciliation: account_no -> error
         # message for any account whose broker truth could not be fetched
@@ -175,9 +185,9 @@ class BuyboardRuntimeWorker(QThread):
         # False -- no automatic order execution should begin for an
         # unreconciled account.
         self.startup_reconciliation_errors: Dict[str, str] = {}
-        # card_key set already alerted via self.alert for a stalled exit
-        # cancel -- see _emit_stalled_liquidation_alerts.
-        self._alerted_stalled_card_keys: set = set()
+        # warning name -> card_key set already alerted via self.alert for
+        # that warning -- see _emit_stalled_liquidation_alerts.
+        self._alerted_card_keys_by_warning: Dict[str, set] = {}
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -311,6 +321,13 @@ class BuyboardRuntimeWorker(QThread):
                 client_order_id, broker=broker
             ),
             discover_all_orders=lambda card: buyboard_runtime_module._discover_all_orders(card, broker=broker),
+            # Review finding P0: a historical filled order discovered from
+            # KIS's ~14-day order-history window must not resurrect a
+            # position the account no longer actually holds -- confirm
+            # against a fresh current-holdings lookup before trusting one.
+            get_current_holding=lambda card: buyboard_runtime_module._refresh_broker_position(
+                card, broker=broker
+            ),
         )
 
     def _run_startup_reconciliation(self) -> None:
@@ -375,12 +392,17 @@ class BuyboardRuntimeWorker(QThread):
         self._persist_changed(changed)
         if changed:
             self.board_changed.emit()
-        # Review finding P0: "startup reconciliation reports success after
-        # account failures" -- this previously was set unconditionally,
-        # so one account's get_positions failure still left the health
-        # check believing every account (including the failed one) had
-        # been validated against broker truth, silently suppressing legacy
-        # protection for a symbol nothing had actually reconciled.
+        # startup_reconciliation_ran is unconditional (a full pass over
+        # every discovered account happened, whatever its outcome);
+        # startup_reconciliation_complete additionally requires zero
+        # errors globally. Review finding P0: "startup reconciliation
+        # reports success after account failures" -- this previously was
+        # set unconditionally, so one account's get_positions failure
+        # still left the health check believing every account (including
+        # the failed one) had been validated against broker truth,
+        # silently suppressing legacy protection for a symbol nothing had
+        # actually reconciled.
+        self.startup_reconciliation_ran = True
         self.startup_reconciliation_complete = not self.startup_reconciliation_errors
 
     # -- per-cycle heartbeat --------------------------------------------------
@@ -429,41 +451,68 @@ class BuyboardRuntimeWorker(QThread):
             _track(self.runtime.trading_engine.evaluate_quote(ready_cards, quote))
 
         _track(self.runtime.trading_engine.run_heartbeat(ready_cards))
-        self._emit_stalled_liquidation_alerts(ready_cards)
+        # The full card set, not just ready_cards: UNRECONCILED_BROKER_ORDER
+        # can be set by _refresh_account_state_if_due's order reconciliation,
+        # which (deliberately) still runs for every account, including ones
+        # excluded from ready_cards.
+        self._emit_stalled_liquidation_alerts(cards)
 
         self._persist_changed(changed)
         if changed:
             self.board_changed.emit()
 
     _EXIT_CANCEL_STALLED_WARNING = "EXIT_CANCEL_STALLED"
+    _UNRECONCILED_BROKER_ORDER_WARNING = "UNRECONCILED_BROKER_ORDER"
+
+    # (warning name, alert-message builder) -- every critical, card-level
+    # warning that must reach the user outside the app's own log pane, not
+    # only EXIT_CANCEL_STALLED. Review finding P1: "UNRECONCILED_BROKER_ORDER
+    # should be a critical notification... not merely a card warning" -- a
+    # real broker order discovered with nothing local tracking it (see
+    # src.services.eod_trading_service) is exactly as urgent as a stalled
+    # liquidation cancel.
+    _CRITICAL_CARD_WARNINGS = (
+        (
+            _EXIT_CANCEL_STALLED_WARNING,
+            lambda card: (
+                f"CRITICAL: liquidation cancel unconfirmed for {card.symbol} "
+                f"({card.environment}:{card.account_no}) beyond "
+                f"EXIT_CANCEL_CONFIRMATION_TIMEOUT_SECONDS -- broker order "
+                f"may need manual attention."
+            ),
+        ),
+        (
+            _UNRECONCILED_BROKER_ORDER_WARNING,
+            lambda card: (
+                f"CRITICAL: a real broker order for {card.symbol} "
+                f"({card.environment}:{card.account_no}) was discovered with "
+                f"nothing local tracking it -- it cannot yet be automatically "
+                f"cancelled, repriced, or reconciled. Manual review required."
+            ),
+        ),
+    )
 
     def _emit_stalled_liquidation_alerts(self, cards: List[TradeCardState]) -> None:
-        """Review: "EXIT_CANCEL_STALLED is currently primarily a card
-        warning/log condition... this must produce a critical external
-        notification. A card warning is insufficient when the user is
-        asleep." ``TradingEngine`` stays broker/UI-agnostic by design (it
-        already sets the warning purely on the card); this is the seam
-        that actually has a notification channel (``self.alert``, wired by
-        ``main_window.py`` to ``append_log`` today, and to any real
-        push-notification channel in the future) -- fires once when the
-        warning first appears on a card and again if it reappears after
-        having cleared, never on every tick while it persists.
+        """Review: "a card warning/log condition... is insufficient when
+        the user is asleep." ``TradingEngine``/``EodTradingService`` stay
+        broker/UI-agnostic by design (they already set these warnings
+        purely on the card); this is the seam that actually has a
+        notification channel (``self.alert``, wired by ``main_window.py``
+        to both the log and a native OS notification). Fires once per
+        warning per card when it first appears, and again if it reappears
+        after having cleared -- never on every tick while it persists, to
+        avoid alert fatigue.
         """
-        stalled_now = {
-            card.card_key
-            for card in cards
-            if self._EXIT_CANCEL_STALLED_WARNING in card.warnings
-        }
-        newly_stalled = stalled_now - self._alerted_stalled_card_keys
-        for card in cards:
-            if card.card_key in newly_stalled:
-                self.alert.emit(
-                    f"CRITICAL: liquidation cancel unconfirmed for {card.symbol} "
-                    f"({card.environment}:{card.account_no}) beyond "
-                    f"EXIT_CANCEL_CONFIRMATION_TIMEOUT_SECONDS -- broker order "
-                    f"may need manual attention."
-                )
-        self._alerted_stalled_card_keys = stalled_now
+        for warning_name, build_message in self._CRITICAL_CARD_WARNINGS:
+            alerted = self._alerted_card_keys_by_warning.setdefault(warning_name, set())
+            present_now = {
+                card.card_key for card in cards if warning_name in card.warnings
+            }
+            newly_present = present_now - alerted
+            for card in cards:
+                if card.card_key in newly_present:
+                    self.alert.emit(build_message(card))
+            self._alerted_card_keys_by_warning[warning_name] = present_now
 
     # -- periodic per-account KIS refresh (review: no cadence populated the --
     # -- buying-power cache or re-reconciled positions after startup) --------

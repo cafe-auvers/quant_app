@@ -53,7 +53,10 @@ def _snapshot(*, status, filled=0, avg_fill_price=0.0, symbol="AAPL", account_no
     )
 
 
-def _service(tmp_path, *, find_order=None, reconcile_order=None, discover_all_orders=None):
+def _service(
+    tmp_path, *, find_order=None, reconcile_order=None, discover_all_orders=None,
+    get_current_holding=None,
+):
     cancelled = []
     manager = EntryAttemptManager(
         buying_power_provider=lambda e, a: 100_000.0,
@@ -67,6 +70,11 @@ def _service(tmp_path, *, find_order=None, reconcile_order=None, discover_all_or
         **(
             {"discover_all_orders": discover_all_orders}
             if discover_all_orders is not None
+            else {}
+        ),
+        **(
+            {"get_current_holding": get_current_holding}
+            if get_current_holding is not None
             else {}
         ),
     )
@@ -376,6 +384,40 @@ def test_startup_order_reconciliation_applies_a_fill_that_happened_offline(tmp_p
     assert card.stop_type == StopType.ORB_LOW
 
 
+def test_startup_order_reconciliation_keeps_remaining_target_for_a_locally_tracked_partial_fill(
+    tmp_path,
+):
+    """Review finding P0: "a partially filled working broker order is
+    treated as completed" -- unlike the discovery-recovered case, a real
+    local order record exists here, so the normal heartbeat can safely
+    keep reconciling it. entry_remaining_target_quantity must reflect the
+    genuine remainder (not be zeroed), so the card stays in
+    _reconcile_entry_orders' tracking scope."""
+    from src.services.eod_trading_service import (
+        EodActionCallbacks,
+        reconcile_unresolved_orders_at_startup,
+    )
+
+    order = _order(status=OrderStatus.PARTIALLY_FILLED, filled=30, avg_fill_price=101.0)
+    callbacks = EodActionCallbacks(
+        find_open_entry_order=lambda card: order,
+        reconcile_order=lambda o: o,
+        cancel_order=lambda cid: None,
+    )
+    card = _card(board_status=BoardStatus.ENTRY_PENDING, target_position_quantity=100)
+    card.entry_orb_low = 95.0
+
+    changed = reconcile_unresolved_orders_at_startup(
+        [card], position_manager=PositionManager(), callbacks=callbacks
+    )
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.OPEN_POSITION
+    assert card.broker_quantity == 30
+    assert card.entry_remaining_target_quantity == 70  # genuine remainder preserved
+    assert card.position_runtime_status == PositionRuntimeStatus.ENTRY_COMPLETING
+
+
 def test_startup_order_reconciliation_confirms_cancellation_that_happened_offline(tmp_path):
     from src.services.eod_trading_service import (
         EodActionCallbacks,
@@ -467,6 +509,11 @@ def test_startup_order_reconciliation_recovers_a_filled_order_missing_from_ledge
         reconcile_order=lambda o: o,
         cancel_order=lambda cid: None,
         discover_all_orders=lambda card: complete,
+        # Confirms the account still actually holds the shares -- required
+        # before a historical fill match is trusted (review finding P0).
+        get_current_holding=lambda card: BrokerHolding(
+            symbol="AAPL", quantity=100, average_price=101.5
+        ),
     )
     card = _card(board_status=BoardStatus.ENTRY_PENDING)
     card.entry_orb_low = 95.0
@@ -481,6 +528,86 @@ def test_startup_order_reconciliation_recovers_a_filled_order_missing_from_ledge
     assert card.average_entry_price == 101.5
     assert card.stop_type == StopType.ORB_LOW
     assert "ORDER_RECOVERED_FROM_BROKER_DISCOVERY" in card.warnings
+
+
+def test_startup_order_reconciliation_flags_a_partially_filled_working_discovered_order(tmp_path):
+    """Review finding P0: "a partially filled working broker order is
+    treated as completed" -- a matching PARTIALLY_FILLED snapshot (still
+    open at the broker, e.g. 30/100 filled) must protect the 30 filled
+    shares but must NOT be treated as a clean, fully-settled recovery --
+    the other 70 are still live at the broker with nothing tracking them,
+    which needs a distinct, more urgent flag."""
+    from src.services.eod_trading_service import (
+        EodActionCallbacks,
+        reconcile_unresolved_orders_at_startup,
+    )
+
+    complete = BrokerOrderDiscoveryResult(
+        open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
+        snapshots=[_snapshot(status=OrderStatus.PARTIALLY_FILLED, filled=30, avg_fill_price=101.0)],
+    )
+    callbacks = EodActionCallbacks(
+        find_open_entry_order=lambda card: None,
+        reconcile_order=lambda o: o,
+        cancel_order=lambda cid: None,
+        discover_all_orders=lambda card: complete,
+        get_current_holding=lambda card: BrokerHolding(
+            symbol="AAPL", quantity=30, average_price=101.0
+        ),
+    )
+    card = _card(board_status=BoardStatus.ENTRY_PENDING, target_position_quantity=100)
+    card.entry_orb_low = 95.0
+
+    changed = reconcile_unresolved_orders_at_startup(
+        [card], position_manager=PositionManager(), callbacks=callbacks
+    )
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.OPEN_POSITION
+    assert card.broker_quantity == 30  # the confirmed fill is protected
+    # Deliberately zeroed -- no local order exists for the remaining 70 to
+    # safely hand back to normal completion tracking; this only stops the
+    # app itself from submitting a duplicate order for the remainder.
+    assert card.entry_remaining_target_quantity == 0
+    assert "ORDER_RECOVERED_FROM_BROKER_DISCOVERY" in card.warnings
+    # Distinct from a clean recovery: the broker's own remainder is still
+    # genuinely live and untracked.
+    assert "UNRECONCILED_BROKER_ORDER" in card.warnings
+
+
+def test_startup_order_reconciliation_never_resurrects_a_stale_historical_fill(tmp_path):
+    """Review finding P0: "broker-order matching is too broad and can
+    match old orders" -- KIS order-history discovery defaults to ~14 days,
+    so a matching FILLED snapshot could be an unrelated trade from days
+    ago that was already sold, not the card's current missing entry. A
+    filled match is only trusted once current holdings independently
+    confirm the shares are still actually held; here they show zero, so
+    the card must NOT be reopened as a position."""
+    from src.services.eod_trading_service import (
+        EodActionCallbacks,
+        reconcile_unresolved_orders_at_startup,
+    )
+
+    complete = BrokerOrderDiscoveryResult(
+        open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
+        snapshots=[_snapshot(status=OrderStatus.FILLED, filled=100, avg_fill_price=101.5)],
+    )
+    callbacks = EodActionCallbacks(
+        find_open_entry_order=lambda card: None,
+        reconcile_order=lambda o: o,
+        cancel_order=lambda cid: None,
+        discover_all_orders=lambda card: complete,
+        get_current_holding=lambda card: None,  # already sold -- broker holds none
+    )
+    card = _card(board_status=BoardStatus.ENTRY_PENDING)
+
+    changed = reconcile_unresolved_orders_at_startup(
+        [card], position_manager=PositionManager(), callbacks=callbacks
+    )
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.BUYLIST
+    assert card.broker_quantity == 0
 
 
 def test_startup_order_reconciliation_keeps_a_still_working_order_missing_from_ledger(tmp_path):
@@ -572,7 +699,12 @@ def test_startup_order_reconciliation_terminal_zero_fill_match_moves_to_buylist(
 def test_buy_today_reset_does_not_orphan_a_matching_broker_order(tmp_path):
     """Same fix, applied to EodTradingService's EOD "Buy Today with no
     submitted order" reset -- a matching snapshot means the card's status
-    is stale (an order genuinely exists), not that resetting is safe."""
+    is stale (an order genuinely exists), not that resetting to Buylist is
+    safe. Review finding P0 ("Buy Today can remain eligible despite a
+    discovered broker order"): leaving it at BUY_TODAY unchanged was
+    itself unsafe -- the next heartbeat tick's entry-evaluation stage
+    could still treat it as a fresh candidate and submit a genuine
+    duplicate. It must move out of BUY_TODAY immediately instead."""
     complete = BrokerOrderDiscoveryResult(
         open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
         snapshots=[_snapshot(status=OrderStatus.WORKING, filled=0)],
@@ -582,8 +714,12 @@ def test_buy_today_reset_does_not_orphan_a_matching_broker_order(tmp_path):
 
     changed = service.run_eod_cleanup([card])
 
-    assert changed == []
-    assert card.board_status == BoardStatus.BUY_TODAY  # not reset out from under a live order
+    assert changed == [card]
+    # Moved out of BUY_TODAY so no further automatic entry submission is
+    # possible, and correctly reflects that a real order exists.
+    assert card.board_status == BoardStatus.ENTRY_PENDING
+    assert card.entry_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE
+    assert "UNRECONCILED_BROKER_ORDER" in card.warnings
 
 
 def test_entry_pending_eod_recovers_a_filled_order_missing_from_ledger(tmp_path):
@@ -593,7 +729,13 @@ def test_entry_pending_eod_recovers_a_filled_order_missing_from_ledger(tmp_path)
         open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
         snapshots=[_snapshot(status=OrderStatus.FILLED, filled=100, avg_fill_price=101.5)],
     )
-    service, cancelled, _ = _service(tmp_path, discover_all_orders=lambda card: complete)
+    service, cancelled, _ = _service(
+        tmp_path,
+        discover_all_orders=lambda card: complete,
+        get_current_holding=lambda card: BrokerHolding(
+            symbol="AAPL", quantity=100, average_price=101.5
+        ),
+    )
     card = _card(board_status=BoardStatus.ENTRY_PENDING)
     card.entry_orb_low = 95.0
 
@@ -602,6 +744,28 @@ def test_entry_pending_eod_recovers_a_filled_order_missing_from_ledger(tmp_path)
     assert changed == [card]
     assert card.board_status == BoardStatus.OPEN_POSITION
     assert card.broker_quantity == 100
+
+
+def test_entry_pending_eod_never_resurrects_a_stale_historical_fill(tmp_path):
+    """Review finding P0: same holdings-confirmation gate applied to the
+    EOD path -- an unconfirmed historical fill must not reopen a
+    position."""
+    complete = BrokerOrderDiscoveryResult(
+        open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
+        snapshots=[_snapshot(status=OrderStatus.FILLED, filled=100, avg_fill_price=101.5)],
+    )
+    service, cancelled, _ = _service(
+        tmp_path,
+        discover_all_orders=lambda card: complete,
+        get_current_holding=lambda card: None,
+    )
+    card = _card(board_status=BoardStatus.ENTRY_PENDING)
+
+    changed = service.run_eod_cleanup([card])
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.BUYLIST
+    assert card.broker_quantity == 0
 
 
 def test_entry_pending_eod_keeps_a_still_working_order_missing_from_ledger(tmp_path):

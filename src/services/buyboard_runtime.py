@@ -596,6 +596,11 @@ def build_buyboard_runtime(
         reconcile_order=lambda order: _reconcile_order(order, broker=resolved_broker),
         cancel_order=lambda client_order_id: _cancel_order(client_order_id, broker=resolved_broker),
         discover_all_orders=lambda card: _discover_all_orders(card, broker=resolved_broker),
+        # Review finding P0: a historical filled order discovered from
+        # KIS's ~14-day order-history window must not resurrect a position
+        # the account no longer actually holds -- confirm against a fresh
+        # current-holdings lookup before trusting one.
+        get_current_holding=lambda card: _refresh_broker_position(card, broker=resolved_broker),
     )
     eod_service = EodTradingService(
         entry_attempt_manager=entry_attempt_manager,

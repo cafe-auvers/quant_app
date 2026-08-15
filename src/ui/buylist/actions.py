@@ -507,8 +507,6 @@ class BuylistActionsMixin:
         active_attr = f"_buylist_{env.lower()}_monitor_active"
         if not getattr(self, active_attr, False):
             return
-        if self._legacy_auto_execution_blocked(env):
-            return
         worker = self.__dict__.get("broker_order_cancel_worker")
         if worker is not None and worker.isRunning():
             return
@@ -526,6 +524,13 @@ class BuylistActionsMixin:
             }:
                 continue
             if getattr(item, "_buy_replace_pending", False):
+                continue
+            # Review finding P0: checked per-item (not once for the whole
+            # env) so one account's Buy Board health does not block --
+            # or wrongly appear to clear -- another account's entries.
+            if self._legacy_auto_execution_blocked(
+                env, item.symbol, account_no=getattr(item, "kis_account_no", "") or ""
+            ):
                 continue
             queue_item = self._queue_item_for_buylist_item(item)
             replacement = self._better_ready_orb_candidate(queue_item)
@@ -650,7 +655,10 @@ class BuylistActionsMixin:
         if getattr(item, "_stop_reprice_pending", False):
             return
         if self._buylist_auto_order_blocked(item) or self._legacy_auto_execution_blocked(
-            env, item.symbol, is_protective_exit=True
+            env,
+            item.symbol,
+            account_no=getattr(item, "kis_account_no", "") or "",
+            is_protective_exit=True,
         ):
             return
         try:

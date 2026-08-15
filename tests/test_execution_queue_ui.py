@@ -587,7 +587,9 @@ def _healthy_buyboard_worker():
     backed, not only the BUYBOARD_ENGINE_ENABLED flag)."""
     return SimpleNamespace(
         isRunning=lambda: True,
+        startup_reconciliation_ran=True,
         startup_reconciliation_complete=True,
+        startup_reconciliation_errors={},
         last_heartbeat_at=dt.datetime.now(dt.timezone.utc),
     )
 
@@ -703,6 +705,52 @@ def test_stop_hit_auto_sell_stays_active_when_buyboard_engine_flag_on_but_unheal
     )
 
 
+def test_one_accounts_startup_failure_does_not_reopen_legacy_exits_for_another_account(
+    monkeypatch, tmp_path
+):
+    """Review finding P0: "partial account failure still creates
+    cross-account dual execution" -- account 1 reconciled fine and is
+    actively owned by a healthy Buy Board; account 2's startup failure
+    must not also fail legacy protective exits open for account 1's
+    position, giving it two simultaneously-active exit engines."""
+    window = _build_queue_window(monkeypatch, tmp_path)
+    monkeypatch.setenv("BUYBOARD_ENGINE_ENABLED", "true")
+    window._buyboard_runtime_worker = SimpleNamespace(
+        isRunning=lambda: True,
+        startup_reconciliation_ran=True,
+        startup_reconciliation_complete=False,  # account "2" failed
+        startup_reconciliation_errors={"2": "simulated KIS outage"},
+        last_heartbeat_at=dt.datetime.now(dt.timezone.utc),
+    )
+    logs = []
+    submissions = []
+    account_1_item = SimpleNamespace(
+        symbol="AAPL",
+        environment="PROD",
+        kis_account_no="1",  # reconciled fine
+        monitoring_status="BOUGHT",
+        breakout_method="",
+        stop_loss=98.0,
+        shares_held=10,
+        auto_order_block_reason="",
+        _stop_order_pending=False,
+        _exit_order_pending=False,
+        _auto_order_block_notice_logged=False,
+    )
+    window.buylist_manager = SimpleNamespace(items=[account_1_item])
+    window.latest_intraday_prices = {"AAPL": 90.0}  # below the 98.0 stop
+    window.append_log = logs.append
+    window._buylist_refresh_item_data = lambda _item: None
+    window._populate_buylist_env_table = lambda _env: None
+    window._submit_kis_sell_order = lambda *_args, **_kwargs: submissions.append(True)
+
+    MainWindow._run_buylist_monitor_cycle(window, "PROD")
+
+    # Account 1's own Buy Board ownership is healthy -- legacy must stay
+    # suppressed for it, even though account 2 is broken elsewhere.
+    assert submissions == []
+
+
 def test_auto_submit_execute_ready_stays_blocked_when_buyboard_engine_flag_on_but_unhealthy(
     monkeypatch, tmp_path
 ):
@@ -744,6 +792,7 @@ def test_buyboard_engine_healthy_true_for_a_recently_started_slow_cycle(tmp_path
     now = dt.datetime.now(dt.timezone.utc)
     window._buyboard_runtime_worker = SimpleNamespace(
         isRunning=lambda: True,
+        startup_reconciliation_ran=True,
         startup_reconciliation_complete=True,
         startup_reconciliation_errors={},
         last_cycle_started_at=now - dt.timedelta(seconds=5),  # cycle in flight, still recent
@@ -758,6 +807,7 @@ def test_buyboard_engine_healthy_false_when_cycle_start_itself_is_stale(tmp_path
     now = dt.datetime.now(dt.timezone.utc)
     window._buyboard_runtime_worker = SimpleNamespace(
         isRunning=lambda: True,
+        startup_reconciliation_ran=True,
         startup_reconciliation_complete=True,
         startup_reconciliation_errors={},
         last_cycle_started_at=now - dt.timedelta(seconds=90),
@@ -770,11 +820,13 @@ def test_buyboard_engine_healthy_false_when_cycle_start_itself_is_stale(tmp_path
 def test_buyboard_engine_healthy_false_with_startup_reconciliation_errors(tmp_path):
     """Review finding P0: startup_reconciliation_complete alone is not
     enough -- an account-level failure recorded in
-    startup_reconciliation_errors must also fail the health check."""
+    startup_reconciliation_errors must also fail the global (no
+    account_no) health check."""
     window = MainWindow.__new__(MainWindow)
     now = dt.datetime.now(dt.timezone.utc)
     window._buyboard_runtime_worker = SimpleNamespace(
         isRunning=lambda: True,
+        startup_reconciliation_ran=True,
         startup_reconciliation_complete=False,
         startup_reconciliation_errors={"2": "simulated KIS outage"},
         last_cycle_started_at=now,
@@ -782,6 +834,44 @@ def test_buyboard_engine_healthy_false_with_startup_reconciliation_errors(tmp_pa
     )
 
     assert window._buyboard_engine_healthy() is False
+
+
+def test_buyboard_engine_healthy_false_before_startup_reconciliation_ever_ran(tmp_path):
+    """A worker that hasn't completed even one startup pass yet must not
+    be treated as healthy just because its (empty-by-default) errors dict
+    happens to be empty."""
+    window = MainWindow.__new__(MainWindow)
+    now = dt.datetime.now(dt.timezone.utc)
+    window._buyboard_runtime_worker = SimpleNamespace(
+        isRunning=lambda: True,
+        startup_reconciliation_ran=False,
+        startup_reconciliation_complete=False,
+        startup_reconciliation_errors={},
+        last_cycle_started_at=now,
+        last_heartbeat_at=now,
+    )
+
+    assert window._buyboard_engine_healthy() is False
+
+
+def test_buyboard_engine_healthy_is_account_scoped(tmp_path):
+    """Review finding P0: "partial account failure still creates
+    cross-account dual execution" -- account 2's startup failure must not
+    make account 1 (which reconciled fine) look unhealthy too."""
+    window = MainWindow.__new__(MainWindow)
+    now = dt.datetime.now(dt.timezone.utc)
+    window._buyboard_runtime_worker = SimpleNamespace(
+        isRunning=lambda: True,
+        startup_reconciliation_ran=True,
+        startup_reconciliation_complete=False,
+        startup_reconciliation_errors={"2": "simulated KIS outage"},
+        last_cycle_started_at=now,
+        last_heartbeat_at=now,
+    )
+
+    assert window._buyboard_engine_healthy(account_no="1") is True
+    assert window._buyboard_engine_healthy(account_no="2") is False
+    assert window._buyboard_engine_healthy() is False  # global check still fails closed
 
 
 # --- Critical notification (review: "a card warning is insufficient when --

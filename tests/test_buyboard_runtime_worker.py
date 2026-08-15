@@ -627,6 +627,47 @@ def test_no_stalled_warning_does_not_alert(tmp_path):
     assert alerts == []
 
 
+def test_unreconciled_broker_order_warning_fires_alert_exactly_once(tmp_path):
+    """Review finding P1: "UNRECONCILED_BROKER_ORDER should be a critical
+    notification" -- not merely a card warning."""
+    worker, _ = _worker(tmp_path)
+    alerts = []
+    worker.alert.connect(alerts.append)
+    card = TradeCardState(
+        environment="PROD", account_no="1", symbol="AAPL",
+        board_status=BoardStatus.ENTRY_PENDING, warnings=["UNRECONCILED_BROKER_ORDER"],
+    )
+
+    worker._emit_stalled_liquidation_alerts([card])
+    worker._emit_stalled_liquidation_alerts([card])  # still present next tick
+
+    assert len(alerts) == 1
+    assert "CRITICAL" in alerts[0]
+    assert "AAPL" in alerts[0]
+
+
+def test_exit_cancel_stalled_and_unreconciled_broker_order_alert_independently(tmp_path):
+    """Two different critical warnings on two different cards must each
+    alert -- one warning's dedup state must not suppress the other."""
+    worker, _ = _worker(tmp_path)
+    alerts = []
+    worker.alert.connect(alerts.append)
+    stalled_exit = TradeCardState(
+        environment="PROD", account_no="1", symbol="AAPL",
+        board_status=BoardStatus.SELL_ALL, warnings=["EXIT_CANCEL_STALLED"],
+    )
+    unreconciled_order = TradeCardState(
+        environment="PROD", account_no="1", symbol="MSFT",
+        board_status=BoardStatus.ENTRY_PENDING, warnings=["UNRECONCILED_BROKER_ORDER"],
+    )
+
+    worker._emit_stalled_liquidation_alerts([stalled_exit, unreconciled_order])
+
+    assert len(alerts) == 2
+    assert any("AAPL" in message for message in alerts)
+    assert any("MSFT" in message for message in alerts)
+
+
 # --- One heartbeat cycle ------------------------------------------------------
 
 
