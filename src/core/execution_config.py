@@ -191,6 +191,25 @@ EMERGENCY_LEASE_ALLOWANCE_SECONDS = _env_float(
     "EMERGENCY_LEASE_ALLOWANCE_SECONDS", 30.0
 )
 
+# Workstream 10 / Workstream 0 boundary. These values are inert unless the
+# operator explicitly records that the KIS mutation limits were measured and
+# verified. Keeping VERIFIED false leaves all new-entry buckets UNKNOWN.
+KIS_MUTATION_BUDGET_VERIFIED = _env_bool(
+    "KIS_MUTATION_BUDGET_VERIFIED", False
+)
+KIS_SUBMIT_MUTATION_CAPACITY = _env_int(
+    "KIS_SUBMIT_MUTATION_CAPACITY", 0
+)
+KIS_CANCEL_MUTATION_CAPACITY = _env_int(
+    "KIS_CANCEL_MUTATION_CAPACITY", 0
+)
+KIS_REPLACE_MUTATION_CAPACITY = _env_int(
+    "KIS_REPLACE_MUTATION_CAPACITY", 0
+)
+KIS_MUTATION_BUDGET_WINDOW_SECONDS = _env_float(
+    "KIS_MUTATION_BUDGET_WINDOW_SECONDS", 1.0
+)
+
 # --- End of day (section 505-511) -------------------------------------------
 EOD_ENTRY_CLEANUP_SECONDS_BEFORE_CLOSE = _env_int(
     "EOD_ENTRY_CLEANUP_SECONDS_BEFORE_CLOSE", 60

@@ -607,12 +607,27 @@ def _request_scheduler_check(metrics: Any) -> HealthCheck:
     mutation_retries = int(
         getattr(metrics, "confirmed_mutation_retries", 0) or 0
     )
+    known_budgets = int(
+        getattr(metrics, "known_mutation_budget_buckets", 0) or 0
+    )
+    uncertain_budgets = int(
+        getattr(metrics, "uncertain_mutation_budget_buckets", 0) or 0
+    )
     detail = (
         f"queue={queued}, budget_rejections={budget_rejections}, "
         f"uncertain_entry_blocks={uncertain_entries}, read_retries={retries}, "
-        f"confirmed_mutation_retries={mutation_retries}."
+        f"confirmed_mutation_retries={mutation_retries}, "
+        f"known_mutation_budgets={known_budgets}, "
+        f"uncertain_mutation_budgets={uncertain_budgets}."
     )
-    if budget_rejections or uncertain_entries:
+    if known_budgets == 0:
+        return HealthCheck(
+            "KIS request scheduler",
+            HealthLevel.WARNING,
+            "WS0 mutation budgets are unverified; new entries are closed",
+            detail,
+        )
+    if budget_rejections or uncertain_entries or uncertain_budgets:
         return HealthCheck(
             "KIS request scheduler",
             HealthLevel.WARNING,

@@ -69,7 +69,7 @@ from src.core.execution_order_record import (
     is_cancellable,
     validate_consistency,
 )
-from src.core.execution_ownership import ExecutionOwner
+from src.core.execution_ownership import ExecutionOwner, ExecutionOwnershipProof
 from src.core.execution_request import CancelExecutionRequest, ReplaceExecutionRequest, SubmitExecutionRequest
 from src.core.order_recovery_state import OrderRecoveryState, validate_recovery_transition
 from src.core.order_state import (
@@ -411,6 +411,9 @@ class ExecutionCommandGateway:
         self._last_verified_lease: Optional[ExecutionLease] = None
         self._last_database_writable_state: Optional[bool] = None
         self._emergency_records: Dict[str, ExecutionOrderRecord] = {}
+        self._cached_ownership_proofs: Dict[
+            tuple[str, str, str], ExecutionOwnershipProof
+        ] = {}
 
     @property
     def mode(self) -> ExecutionMode:
@@ -552,7 +555,7 @@ class ExecutionCommandGateway:
         return writable
 
     def note_canonical_database_unavailable(self) -> None:
-        """Start the monotonic outage allowance at outage detection time."""
+        """Activate, but never extend, the last authoritative lease allowance."""
 
         if self._last_database_writable_state is False:
             return
@@ -956,11 +959,16 @@ class ExecutionCommandGateway:
             )
         if self._canonical_database_is_writable():
             self._last_verified_lease = lease
+            self._emergency_lease_allowance.record_verified(
+                lease,
+                verified_current=True,
+                handoff_pending=bool(self._handoff_pending_provider()),
+            )
 
     def _require_ownership(
         self, environment: str, account_no: str, symbol: str, source: ExecutionSource,
         strategy_instance_id: str = "",
-    ) -> None:
+    ):
         engine = self._require_engine()
         ensure_execution_ownership_table(engine)
         ownership = get_ownership(engine, environment=environment, account_no=account_no, symbol=symbol)
@@ -984,12 +992,75 @@ class ExecutionCommandGateway:
                     f"{environment}/{account_no}/{symbol} is KANBAN-owned by strategy_instance_id="
                     f"{ownership.strategy_instance_id!r}; {strategy_instance_id!r} is not authorized"
                 )
-            return
+            if self._canonical_database_is_writable():
+                proof = ExecutionOwnershipProof.from_ownership(ownership)
+                self._cached_ownership_proofs[
+                    (ownership.environment, ownership.account_no, ownership.symbol)
+                ] = proof
+            return ownership
         # LEGACY (the H2 default, or an explicit assignment)
         if source == ExecutionSource.KANBAN_BOARD:
             raise ExecutionOwnershipMismatchError(
                 f"{environment}/{account_no}/{symbol} is LEGACY-owned; KANBAN_BOARD is not authorized"
             )
+        return ownership
+
+    def note_canonical_ownership_verified(
+        self,
+        *,
+        environment: str,
+        account_no: str,
+        symbol: str,
+        source: ExecutionSource,
+        strategy_instance_id: str,
+    ) -> ExecutionOwnershipProof:
+        if not self._canonical_database_is_writable():
+            raise CanonicalDatabaseUnavailableError(
+                "Cannot cache execution ownership while the canonical database is unavailable"
+            )
+        key = (
+            str(environment or "").upper(),
+            str(account_no or ""),
+            str(symbol or "").upper(),
+        )
+        self._cached_ownership_proofs.pop(key, None)
+        ownership = self._require_ownership(
+            environment, account_no, symbol, source, strategy_instance_id
+        )
+        proof = ExecutionOwnershipProof.from_ownership(ownership)
+        if proof.owner != ExecutionOwner.KANBAN:
+            raise ExecutionOwnershipMismatchError(
+                "Emergency Kanban execution requires explicit KANBAN ownership"
+            )
+        return proof
+
+    def _require_cached_emergency_ownership(
+        self,
+        *,
+        environment: str,
+        account_no: str,
+        symbol: str,
+        source: ExecutionSource,
+        strategy_instance_id: str,
+    ) -> ExecutionOwnershipProof:
+        key = (
+            str(environment or "").upper(),
+            str(account_no or ""),
+            str(symbol or "").upper(),
+        )
+        proof = self._cached_ownership_proofs.get(key)
+        if (
+            proof is None
+            or proof.owner != ExecutionOwner.KANBAN
+            or source != ExecutionSource.KANBAN_BOARD
+            or not strategy_instance_id
+            or strategy_instance_id != proof.strategy_instance_id
+            or proof.version <= 0
+        ):
+            raise EmergencyActionNotPermittedError(
+                "Emergency mutation lacks exact cached KANBAN ownership/strategy proof"
+            )
+        return proof
 
     def _fetch_record(self, client_order_id: str) -> Optional[ExecutionOrderRecord]:
         engine = self._require_engine()
@@ -1083,6 +1154,13 @@ class ExecutionCommandGateway:
                 "Canonical database unavailable; ordinary and entry commands fail closed"
             )
         lease = self._require_emergency_allowance(request.lease)
+        ownership_proof = self._require_cached_emergency_ownership(
+            environment=request.environment,
+            account_no=request.account_no,
+            symbol=request.symbol,
+            source=request.source,
+            strategy_instance_id=request.strategy_instance_id,
+        )
         trading_state.require_trading_enabled(request.environment, request.symbol)
         quantity = int(request.quantity)
         limit_price = float(request.limit_price)
@@ -1098,6 +1176,7 @@ class ExecutionCommandGateway:
                 symbol=request.symbol,
                 lease=lease,
                 source=request.source.value,
+                ownership_proof=ownership_proof.to_dict(),
                 order_payload={
                     "client_order_id": request.client_order_id,
                     "side": request.side.value,
@@ -1200,16 +1279,29 @@ class ExecutionCommandGateway:
     ) -> ExecutionOrderRecord:
         if (
             not request.emergency
-            or request.side != OrderSide.SELL.value
+            or (
+                request.side != OrderSide.SELL.value
+                and not (
+                    request.side == OrderSide.BUY.value
+                    and request.protective_entry_completion
+                )
+            )
             or not request.symbol
             or not request.broker_order_id
             or request.quantity <= 0
         ):
             raise CanonicalDatabaseUnavailableError(
-                "Canonical database unavailable; only complete emergency SELL cancellation "
-                "requests may use the local journal"
+                "Canonical database unavailable; only exact protective SELL or "
+                "entry-completion BUY cancellations may use the local journal"
             )
         lease = self._require_emergency_allowance(request.lease)
+        ownership_proof = self._require_cached_emergency_ownership(
+            environment=request.environment,
+            account_no=request.account_no,
+            symbol=request.symbol,
+            source=request.source,
+            strategy_instance_id=request.strategy_instance_id,
+        )
         trading_state.require_trading_enabled(request.environment, request.symbol)
         idempotency_key = f"CANCEL:{request.cancel_command_id}"
         try:
@@ -1221,10 +1313,12 @@ class ExecutionCommandGateway:
                 symbol=request.symbol,
                 lease=lease,
                 source=request.source.value,
+                ownership_proof=ownership_proof.to_dict(),
                 target_broker_order_id=request.broker_order_id,
                 order_payload={
                     "client_order_id": request.client_order_id,
                     "side": request.side,
+                    "protective_entry_completion": request.protective_entry_completion,
                     "quantity": request.quantity,
                     "exchange": request.exchange,
                 },
@@ -1287,8 +1381,12 @@ class ExecutionCommandGateway:
             environment=request.environment,
             account_no=request.account_no,
             symbol=request.symbol,
-            side=OrderSide.SELL,
-            intent=OrderIntent.MANUAL_EXIT,
+            side=OrderSide(request.side),
+            intent=(
+                OrderIntent.ENTRY
+                if request.protective_entry_completion
+                else OrderIntent.MANUAL_EXIT
+            ),
             client_order_id=request.client_order_id,
             broker_order_id=request.broker_order_id,
             submitted_quantity=request.quantity,

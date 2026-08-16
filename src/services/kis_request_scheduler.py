@@ -83,6 +83,7 @@ class _BudgetBucket:
     capacity: int
     remaining: int
     reset_at: float
+    window_seconds: float
     knowledge: BudgetKnowledge
 
 
@@ -98,6 +99,8 @@ class SchedulerMetrics:
     budget_rejections: int = 0
     uncertain_entry_rejections: int = 0
     highest_waiting_priority: int = 0
+    known_mutation_budget_buckets: int = 0
+    uncertain_mutation_budget_buckets: int = 0
 
 
 @dataclass
@@ -162,12 +165,14 @@ class KisRequestScheduler:
                 capacity=policy.capacity,
                 remaining=policy.capacity,
                 reset_at=now + policy.window_seconds,
+                window_seconds=policy.window_seconds,
                 knowledge=BudgetKnowledge.KNOWN,
             )
         return _BudgetBucket(
             capacity=policy.capacity,
             remaining=min(policy.capacity, self._uncertain_protective_reserve),
             reset_at=now + policy.window_seconds,
+            window_seconds=policy.window_seconds,
             knowledge=BudgetKnowledge.UNCERTAIN,
         )
 
@@ -180,15 +185,14 @@ class KisRequestScheduler:
         if bucket is None:
             bucket = self._new_bucket(kind, now)
             self._buckets[key] = bucket
+            self._refresh_budget_metrics_locked()
         elif now >= bucket.reset_at:
-            policy = self._policies[kind]
-            bucket.capacity = policy.capacity
             bucket.remaining = (
-                policy.capacity
+                bucket.capacity
                 if bucket.knowledge == BudgetKnowledge.KNOWN
-                else min(policy.capacity, self._uncertain_protective_reserve)
+                else min(bucket.capacity, self._uncertain_protective_reserve)
             )
-            bucket.reset_at = now + policy.window_seconds
+            bucket.reset_at = now + bucket.window_seconds
         return bucket
 
     def synchronize_budget(
@@ -213,8 +217,44 @@ class KisRequestScheduler:
                 capacity=policy.capacity,
                 remaining=max(0, min(policy.capacity, int(remaining))),
                 reset_at=self._monotonic() + reset_after,
+                window_seconds=reset_after,
                 knowledge=BudgetKnowledge.KNOWN,
             )
+            self._refresh_budget_metrics_locked()
+
+    def configure_verified_mutation_budget(
+        self,
+        *,
+        account_no: str,
+        endpoint: str,
+        capacity: int,
+        window_seconds: float,
+    ) -> None:
+        """Initialize one account/endpoint budget from verified WS0 evidence.
+
+        This is intentionally idempotent. Re-running a heartbeat must never
+        refill a partially consumed window. A fresh scheduler process starts
+        uncertain again and can become known only when production composition
+        supplies an explicitly verified positive policy.
+        """
+
+        capacity = int(capacity)
+        window_seconds = float(window_seconds)
+        if capacity <= 0 or window_seconds <= 0:
+            raise ValueError("verified mutation budget must be positive")
+        key = self._key(RequestKind.MUTATION, account_no, endpoint)
+        with self._condition:
+            if key in self._buckets:
+                return
+            now = self._monotonic()
+            self._buckets[key] = _BudgetBucket(
+                capacity=capacity,
+                remaining=capacity,
+                reset_at=now + window_seconds,
+                window_seconds=window_seconds,
+                knowledge=BudgetKnowledge.KNOWN,
+            )
+            self._refresh_budget_metrics_locked()
 
     def mark_budget_uncertain(
         self, *, kind: RequestKind, account_no: str, endpoint: str
@@ -226,6 +266,25 @@ class KisRequestScheduler:
                 bucket.remaining = min(
                     bucket.remaining, self._uncertain_protective_reserve
                 )
+            self._refresh_budget_metrics_locked()
+
+    def _refresh_budget_metrics_locked(self) -> None:
+        mutation_buckets = [
+            bucket
+            for (kind, _account, _endpoint), bucket in self._buckets.items()
+            if kind == RequestKind.MUTATION
+        ]
+        self._metrics = replace(
+            self._metrics,
+            known_mutation_budget_buckets=sum(
+                bucket.knowledge == BudgetKnowledge.KNOWN
+                for bucket in mutation_buckets
+            ),
+            uncertain_mutation_budget_buckets=sum(
+                bucket.knowledge == BudgetKnowledge.UNCERTAIN
+                for bucket in mutation_buckets
+            ),
+        )
 
     def require_available(
         self,

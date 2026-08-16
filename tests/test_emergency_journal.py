@@ -84,6 +84,9 @@ def test_emergency_journal_checksum_corruption_fails_closed(tmp_path):
 def test_emergency_lease_allowance_expires_monotonically():
     now = [100.0]
     allowance = EmergencyLeaseAllowance(max_seconds=10, monotonic=lambda: now[0])
+    assert allowance.record_verified(
+        _lease(), verified_current=True, handoff_pending=False
+    )
     assert allowance.begin_outage(
         _lease(), verified_current=True, handoff_pending=False
     )
@@ -97,10 +100,30 @@ def test_emergency_lease_allowance_expires_monotonically():
 def test_handoff_pending_when_outage_begins_refuses_emergency_allowance():
     allowance = EmergencyLeaseAllowance(max_seconds=10)
 
+    assert allowance.record_verified(
+        _lease(), verified_current=True, handoff_pending=False
+    )
     assert allowance.begin_outage(
         _lease(), verified_current=True, handoff_pending=True
     ) is False
     with pytest.raises(EmergencyLeaseAllowanceError):
+        allowance.require_valid(_lease())
+
+
+def test_outage_detection_never_extends_last_verified_lease_allowance():
+    now = [0.0]
+    allowance = EmergencyLeaseAllowance(max_seconds=30, monotonic=lambda: now[0])
+    allowance.record_verified(
+        _lease(), verified_current=True, handoff_pending=False
+    )
+    now[0] = 29.0
+    assert allowance.begin_outage(
+        _lease(), verified_current=True, handoff_pending=False
+    )
+    assert allowance.snapshot.verified_at_monotonic == 0.0
+    assert allowance.snapshot.expires_at_monotonic == 30.0
+    now[0] = 30.0
+    with pytest.raises(EmergencyLeaseAllowanceError, match="expired"):
         allowance.require_valid(_lease())
 
 

@@ -17,6 +17,8 @@ from src.services.mutation_budget_protocol import (
     CommandType,
     MutationBudgetExceededError,
 )
+from src.services.broker import KisBroker
+from src.api.kis_account_snapshot_dual import KisApiError, KisRateLimitError
 
 
 def _scheduler(**kwargs):
@@ -246,3 +248,38 @@ def test_request_scheduler_metrics_are_exposed():
 
     assert metrics.completed_reads == 1
     assert snapshot["READ:acct:positions"]["remaining"] == 19
+
+
+def test_verified_configuration_initializes_once_without_heartbeat_refill():
+    scheduler = _scheduler()
+    scheduler.configure_verified_mutation_budget(
+        account_no="acct",
+        endpoint="submit_order",
+        capacity=2,
+        window_seconds=60,
+    )
+    scheduler.require_available(
+        CommandType.SUBMIT,
+        account_no="acct",
+        endpoint="submit_order",
+        is_new_entry=True,
+    )
+    scheduler.configure_verified_mutation_budget(
+        account_no="acct",
+        endpoint="submit_order",
+        capacity=2,
+        window_seconds=60,
+    )
+    assert scheduler.budget_snapshot()["MUTATION:acct:submit_order"]["remaining"] == 1
+
+
+def test_real_kis_classifier_only_retries_typed_rate_limit_rejections():
+    assert KisBroker.is_confirmed_pre_acceptance_rejection(
+        KisRateLimitError("KIS explicitly refused before acceptance")
+    )
+    assert not KisBroker.is_confirmed_pre_acceptance_rejection(
+        KisApiError("generic API failure may be ambiguous")
+    )
+    assert not KisBroker.is_confirmed_pre_acceptance_rejection(
+        TimeoutError("network timeout")
+    )

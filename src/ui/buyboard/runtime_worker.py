@@ -39,7 +39,7 @@ from sqlalchemy.engine import Engine
 from src.core import execution_config
 from src.core.account_broker_snapshot import AccountBrokerSnapshot, ReconciliationAction
 from src.core.execution_config import is_buyboard_engine_enabled
-from src.core.execution_mode import ExecutionLease
+from src.core.execution_mode import ExecutionLease, ExecutionSource
 from src.core.runtime_readiness import EngineReadiness, RuntimeDeviceState
 from src.core.execution_order_record import ExecutionOrderStatus
 from src.core.order_state import OrderSide
@@ -55,6 +55,7 @@ from src.services.account_reconciliation import (
 from src.services.execution_command_gateway import (
     AmbiguousPostBrokerPersistenceError,
     ExecutionCommandGateway,
+    ExecutionOwnershipMismatchError,
     GuardedCancellationRejectedError,
     GuardedSubmissionAmbiguousError,
     GuardedSubmissionRejectedError,
@@ -273,6 +274,7 @@ class BuyboardRuntimeWorker(QThread):
         self._market_stop_signatures: Dict[str, tuple] = {}
         self._market_stop_generations: Dict[str, int] = {}
         self._market_stop_symbols: set[str] = set()
+        self._recovery_reconciliation_required = False
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -325,6 +327,8 @@ class BuyboardRuntimeWorker(QThread):
     def _probe_database_writable(self) -> bool:
         """Exercise a write statement without changing application data."""
 
+        had_prior_probe = self._database_probe_completed
+        was_writable = self._database_writable
         self._database_probe_completed = True
         try:
             with self._db_engine.begin() as conn:
@@ -335,6 +339,11 @@ class BuyboardRuntimeWorker(QThread):
             self._database_writable = True
             if self.execution_gateway is not None:
                 self.execution_gateway.reconcile_emergency_journal()
+            if had_prior_probe and not was_writable:
+                # Journal folding restores command/order/card correlation,
+                # but broker truth may have advanced during the outage. No
+                # normal heartbeat is permitted until a complete fresh pass.
+                self._recovery_reconciliation_required = True
         except Exception:
             logger.exception("Buyboard runtime database write probe failed")
             self._database_writable = False
@@ -373,7 +382,12 @@ class BuyboardRuntimeWorker(QThread):
             )
             migration_manager = (
                 self._schema_migration_manager
-                or SchemaMigrationManager(self._db_engine)
+                or SchemaMigrationManager(
+                    self._db_engine,
+                    lease_protocol=DefaultExecutionLeaseProtocol(
+                        engine=self._lease_engine or self._db_engine
+                    ),
+                )
             )
             self._schema_migration_manager = migration_manager
             if self._standby_only:
@@ -477,6 +491,9 @@ class BuyboardRuntimeWorker(QThread):
                         "The authoritative execution lease is no longer current",
                     )
                     break
+                if database_writable and not self._complete_database_recovery():
+                    self.msleep(max(1, int(self._heartbeat_seconds * 1000)))
+                    continue
                 self.last_cycle_started_at = datetime.now(timezone.utc)
                 try:
                     allow_mutations = self.device_state == RuntimeDeviceState.ACTIVE
@@ -501,6 +518,24 @@ class BuyboardRuntimeWorker(QThread):
         finally:
             self._accepting_commands = False
             self._perform_shutdown_sequence()
+
+    def _complete_database_recovery(self) -> bool:
+        """Reconcile broker truth before reopening a recovered canonical DB."""
+
+        if not self._recovery_reconciliation_required:
+            return True
+        self._accepting_commands = False
+        self._run_startup_reconciliation(execute_commands=False)
+        if not self.startup_reconciliation_complete:
+            self.error_occurred.emit(
+                "Database recovered, but full broker reconciliation is incomplete; "
+                "execution remains closed."
+            )
+            return False
+        self._recovery_reconciliation_required = False
+        if self.device_state == RuntimeDeviceState.ACTIVE:
+            self._accepting_commands = True
+        return True
 
     def _advance_startup_readiness(self) -> None:
         readiness = self.engine_readiness(include_device_state=False)
@@ -671,6 +706,54 @@ class BuyboardRuntimeWorker(QThread):
                     seen.append(account_no)
         return seen
 
+    def _configure_verified_mutation_budgets(
+        self, cards: List[TradeCardState]
+    ) -> None:
+        """Activate only live-verified WS0 budgets, once per account/endpoint."""
+
+        configure = getattr(
+            self.request_scheduler, "configure_verified_mutation_budget", None
+        )
+        if not callable(configure) or not execution_config.KIS_MUTATION_BUDGET_VERIFIED:
+            return
+        policies = {
+            "submit_order": execution_config.KIS_SUBMIT_MUTATION_CAPACITY,
+            "cancel_order": execution_config.KIS_CANCEL_MUTATION_CAPACITY,
+            "replace_order": execution_config.KIS_REPLACE_MUTATION_CAPACITY,
+        }
+        for account_no in self._distinct_account_numbers(cards):
+            for endpoint, capacity in policies.items():
+                if int(capacity) <= 0:
+                    continue
+                configure(
+                    account_no=account_no,
+                    endpoint=endpoint,
+                    capacity=int(capacity),
+                    window_seconds=(
+                        execution_config.KIS_MUTATION_BUDGET_WINDOW_SECONDS
+                    ),
+                )
+
+    def _cache_emergency_ownership_proofs(
+        self, cards: List[TradeCardState]
+    ) -> None:
+        gateway = self.execution_gateway
+        if gateway is None or not self._database_writable:
+            return
+        for card in cards:
+            try:
+                gateway.note_canonical_ownership_verified(
+                    environment=card.environment,
+                    account_no=card.account_no,
+                    symbol=card.symbol,
+                    source=ExecutionSource.KANBAN_BOARD,
+                    strategy_instance_id=self._strategy_instance_id,
+                )
+            except ExecutionOwnershipMismatchError:
+                # Non-Kanban cards are intentionally not eligible for the
+                # bounded offline mutation path.
+                continue
+
     @staticmethod
     def _default_account_discovery() -> List[str]:
         try:
@@ -695,6 +778,8 @@ class BuyboardRuntimeWorker(QThread):
         """
         assert self.runtime is not None
         cards = repo.list_trade_cards(self._db_engine, environment=self._environment)
+        self._configure_verified_mutation_budgets(cards)
+        self._cache_emergency_ownership_proofs(cards)
         for card in cards:
             self.runtime.entry_attempt_manager.restore_symbol_state(
                 card.environment,
@@ -784,6 +869,8 @@ class BuyboardRuntimeWorker(QThread):
                 cards = [
                     card for card in cards if card.account_no == self._account_no
                 ]
+            self._configure_verified_mutation_budgets(cards)
+            self._cache_emergency_ownership_proofs(cards)
             self._cached_cards = cards
         else:
             # Observation continues from the last canonical snapshot. Only

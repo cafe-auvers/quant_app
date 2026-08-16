@@ -9,6 +9,9 @@ from src.services.external_alerting import (
     AlertIncidentStatus,
     CriticalAlertType,
     ExternalAlertingService,
+    LocalAlertSpool,
+    WebhookAlertDeliveryProvider,
+    build_external_alerting_service,
 )
 
 
@@ -44,6 +47,7 @@ def _service(tmp_path, *, provider=None, now=None, **kwargs):
         retry_base_seconds=1,
         acknowledgement_timeout_seconds=5,
         heartbeat_interval_seconds=10,
+        local_spool=LocalAlertSpool(tmp_path / "alert-spool.jsonl"),
         **kwargs,
     )
     return service, clock
@@ -127,3 +131,46 @@ def test_heartbeat_publication_failure_is_durable_and_retried(tmp_path):
         "FAILED",
         "PUBLISHED",
     ]
+
+
+def test_database_outage_spools_and_directly_delivers_critical_alert(tmp_path):
+    provider = FakeProvider()
+    service, _ = _service(tmp_path, provider=provider)
+    healthy_engine = service.engine
+
+    class UnavailableEngine:
+        def begin(self):
+            raise RuntimeError("canonical DB unavailable")
+
+    service.engine = UnavailableEngine()
+    service.sink(
+        CriticalAlertType.DATABASE_UNAVAILABLE.value,
+        "prod-db",
+        "canonical database unavailable",
+    )
+
+    assert len(provider.deliveries) == 1
+    assert provider.deliveries[0]["offline_spool"] is True
+    assert len(service.local_spool.pending_alerts()) == 1
+
+    service.engine = healthy_engine
+    service.process_due()
+    assert service.local_spool.pending_alerts() == []
+
+
+def test_enabled_runtime_composition_requires_real_external_provider_urls(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("EXTERNAL_ALERT_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("EXTERNAL_HEARTBEAT_WEBHOOK_URL", raising=False)
+    engine = create_engine(f"sqlite:///{tmp_path / 'factory.db'}", future=True)
+
+    with pytest.raises(ValueError, match="requires both"):
+        build_external_alerting_service(engine, device_id="pc-main")
+
+    monkeypatch.setenv("EXTERNAL_ALERT_WEBHOOK_URL", "https://alerts.example.test")
+    monkeypatch.setenv(
+        "EXTERNAL_HEARTBEAT_WEBHOOK_URL", "https://heartbeat.example.test"
+    )
+    service = build_external_alerting_service(engine, device_id="pc-main")
+    assert isinstance(service.provider, WebhookAlertDeliveryProvider)

@@ -66,7 +66,7 @@ def request_cancel_with_lifecycle(
     normalized_scope = str(scope or "").upper()
     intent = cancel_intent_factory(card, client_order_id, normalized_scope)
     try:
-        cancel_order(intent)
+        result = cancel_order(intent)
     except GuardedCancellationAmbiguousError:
         # The broker may have acted. Keep the same command identity and
         # mark the cancel in flight so no heartbeat issues another call.
@@ -91,6 +91,29 @@ def request_cancel_with_lifecycle(
             card.exit_cancel_requested_at = None
         persist_cancel_state(card)
         raise
+    else:
+        status = getattr(getattr(result, "status", None), "value", "")
+        if (
+            normalized_scope == "ENTRY"
+            and intent.emergency
+            and intent.protective_entry_completion
+            and status in {"FILLED", "CANCELLED", "REJECTED", "EXPIRED"}
+        ):
+            # This exact completion BUY is broker-terminal. During a DB
+            # outage there is no later canonical projection tick to clear
+            # the hard entry-cancel fence before the protective SELL, so
+            # retire only this caller-owned correlation locally. The
+            # emergency journal preserves it for recovery/audit.
+            card.entry_cancel_command_id = ""
+            card.entry_cancel_in_flight = False
+            card.entry_cancel_reason = ""
+            card.entry_client_order_id = ""
+            card.entry_pending_attempt_number = 0
+            card.entry_submission_unresolved = False
+            card.entry_remaining_target_quantity = 0
+            card.entry_attempt_group_id = ""
+            card.entry_attempt_count = 0
+            persist_cancel_state(card)
 
 
 def round_up_to_valid_tick(price: float, tick_size: float = 0.01) -> float:
@@ -155,7 +178,7 @@ def evaluate_stop_trigger(card: TradeCardState, current_price: float) -> bool:
 class PositionActionCallbacks:
     """Injected broker-boundary actions for the sequence methods below."""
 
-    cancel_order: Callable[[CancelIntent], None]
+    cancel_order: Callable[[CancelIntent], Any]
     submit_sell_order: Callable[..., ExecutionSubmissionResult]
     refresh_orderable_quantity: Callable[[str, str, str], int]  # (env, account, symbol) -> qty
     cancel_intent_factory: Callable[[TradeCardState, str, str], CancelIntent] = (

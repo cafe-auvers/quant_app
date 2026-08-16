@@ -43,6 +43,7 @@ from src.core.execution_order_record import (
 )
 from src.core.order_recovery_state import OrderRecoveryState, validate_recovery_transition
 from src.core.order_state import OrderIntent, OrderSide, OrderStatus
+from src.core.trade_card_state import BoardStatus, PositionRuntimeStatus
 from src.services.execution_command_repository import (
     ExecutionCommand,
     ensure_execution_commands_table,
@@ -56,6 +57,7 @@ from src.services.execution_order_repository import (
     insert_execution_order,
     update_execution_order,
 )
+from src.services import trade_card_repository as trade_card_repo
 from src.utils.config import DATA_DIR
 
 EMERGENCY_JOURNAL_FILE = DATA_DIR / "emergency_execution_journal.jsonl"
@@ -86,7 +88,8 @@ class EmergencyLeaseSnapshot:
     device_id: str
     lease_token: str
     lease_epoch: int
-    outage_started_monotonic: float
+    verified_at_monotonic: float
+    outage_started_monotonic: Optional[float]
     expires_at_monotonic: float
 
 
@@ -110,7 +113,7 @@ class EmergencyLeaseAllowance:
         self._snapshot: Optional[EmergencyLeaseSnapshot] = None
         self._lock = threading.RLock()
 
-    def begin_outage(
+    def record_verified(
         self,
         lease: Optional[ExecutionLease],
         *,
@@ -133,8 +136,43 @@ class EmergencyLeaseAllowance:
                 device_id=lease.device_id,
                 lease_token=lease.lease_token,
                 lease_epoch=int(lease.lease_epoch),
-                outage_started_monotonic=now,
+                verified_at_monotonic=now,
+                outage_started_monotonic=None,
                 expires_at_monotonic=now + self._max_seconds,
+            )
+            return True
+
+    def begin_outage(
+        self,
+        lease: Optional[ExecutionLease],
+        *,
+        verified_current: bool,
+        handoff_pending: bool,
+    ) -> bool:
+        """Activate the already-earned allowance without extending it."""
+
+        with self._lock:
+            snapshot = self._snapshot
+            now = self._monotonic()
+            if (
+                not verified_current
+                or handoff_pending
+                or lease is None
+                or snapshot is None
+                or now >= snapshot.expires_at_monotonic
+                or lease.device_id != snapshot.device_id
+                or lease.lease_token != snapshot.lease_token
+                or int(lease.lease_epoch or 0) != snapshot.lease_epoch
+            ):
+                self._snapshot = None
+                return False
+            self._snapshot = EmergencyLeaseSnapshot(
+                device_id=snapshot.device_id,
+                lease_token=snapshot.lease_token,
+                lease_epoch=snapshot.lease_epoch,
+                verified_at_monotonic=snapshot.verified_at_monotonic,
+                outage_started_monotonic=now,
+                expires_at_monotonic=snapshot.expires_at_monotonic,
             )
             return True
 
@@ -148,7 +186,11 @@ class EmergencyLeaseAllowance:
             now = self._monotonic()
             if snapshot is None:
                 raise EmergencyLeaseAllowanceError(
-                    "No lease was verified current when the database outage began"
+                    "No current lease proof is available for the database outage"
+                )
+            if snapshot.outage_started_monotonic is None:
+                raise EmergencyLeaseAllowanceError(
+                    "The canonical database outage has not activated emergency mode"
                 )
             if now >= snapshot.expires_at_monotonic:
                 raise EmergencyLeaseAllowanceError(
@@ -352,6 +394,7 @@ class EmergencyJournal:
         symbol: str,
         lease: ExecutionLease,
         source: str,
+        ownership_proof: Optional[Dict[str, Any]] = None,
         target_broker_order_id: str = "",
         order_payload: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -381,6 +424,7 @@ class EmergencyJournal:
                     "lease_token": lease.lease_token,
                     "lease_epoch": int(lease.lease_epoch),
                     "source": str(source or ""),
+                    "ownership_proof": dict(ownership_proof or {}),
                     "target_broker_order_id": str(target_broker_order_id or ""),
                     "order_payload": dict(order_payload or {}),
                     "reconciled": False,
@@ -436,6 +480,7 @@ class EmergencyJournal:
 
         ensure_execution_commands_table(engine)
         ensure_execution_orders_table(engine)
+        trade_card_table = trade_card_repo.ensure_trade_cards_table(engine)
         table = ensure_emergency_reconciliation_table(engine)
         entries = self.load_entries()
         outcomes = {
@@ -599,6 +644,54 @@ class EmergencyJournal:
                                 record.recovery_state = OrderRecoveryState.DISCOVERING
                         update_execution_order(
                             conn, record, expected_version=record.version
+                        )
+                if (
+                    request.get("command_type") == "submit"
+                    and str(order_payload.get("side") or "").upper()
+                    == OrderSide.SELL.value
+                ):
+                    row = conn.execute(
+                        select(trade_card_table).where(
+                            trade_card_table.c.environment
+                            == str(request["environment"]).upper(),
+                            trade_card_table.c.account_no == request["account_no"],
+                            trade_card_table.c.symbol
+                            == str(request["symbol"]).upper(),
+                        )
+                    ).first()
+                    if row is not None:
+                        card = trade_card_repo._row_to_card(row)
+                        attempt_number = max(
+                            1, int(order_payload.get("attempt_number") or 1)
+                        )
+                        outcome_status = str(
+                            (outcome or {}).get("status") or "AMBIGUOUS"
+                        ).upper()
+                        card.exit_all_required = True
+                        card.board_status = BoardStatus.SELL_ALL
+                        card.position_runtime_status = (
+                            PositionRuntimeStatus.LIQUIDATING
+                        )
+                        card.exit_attempt_group_id = str(
+                            order_payload.get("attempt_group_id") or ""
+                        )
+                        card.exit_attempt_count = max(
+                            int(card.exit_attempt_count or 0), attempt_number
+                        )
+                        if outcome_status == "FAILED":
+                            card.exit_client_order_id = ""
+                            card.exit_pending_attempt_number = 0
+                            card.exit_submission_unresolved = False
+                        else:
+                            card.exit_client_order_id = str(
+                                order_payload.get("client_order_id") or ""
+                            )
+                            card.exit_pending_attempt_number = attempt_number
+                            card.exit_submission_unresolved = (
+                                outcome_status != "ACKNOWLEDGED"
+                            )
+                        trade_card_repo.update_trade_card_in_transaction(
+                            conn, card, expected_version=card.version
                         )
                 if marker is None:
                     conn.execute(

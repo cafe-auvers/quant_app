@@ -30,6 +30,7 @@ from src.core.execution_order_record import (
     ExecutionOrderRecord,
     ExecutionOrderStatus,
 )
+from src.core.execution_mode import ExecutionLease
 from src.core.order_recovery_state import OrderRecoveryState
 from src.core.order_state import OrderStatus
 from src.core.schema_version import CURRENT_EXECUTION_SCHEMA_VERSION
@@ -42,6 +43,11 @@ from src.services.execution_order_repository import (
     ensure_execution_orders_table,
     fetch_execution_order,
     record_execution_order,
+)
+from src.services.execution_lease_protocol import (
+    DefaultExecutionLeaseProtocol,
+    ExecutionLeaseProtocol,
+    LeaseNotCurrentError,
 )
 from src.services.order_ledger import ORDERS_FILE, load_orders
 from src.services.trade_card_repository import (
@@ -64,6 +70,8 @@ class MigrationPhase(str, Enum):
     AWAITING_RECONCILIATION = "AWAITING_RECONCILIATION"
     READY = "READY"
     FAILED = "FAILED"
+    FORWARD_RECONCILING = "FORWARD_RECONCILING"
+    COMPATIBILITY_READY = "COMPATIBILITY_READY"
 
 
 class MigrationError(RuntimeError):
@@ -203,6 +211,7 @@ class SchemaMigrationManager:
         target_version: int = CURRENT_EXECUTION_SCHEMA_VERSION,
         migration_callback: Optional[Callable[[], None]] = None,
         fault_hook: Optional[Callable[[str], None]] = None,
+        lease_protocol: Optional[ExecutionLeaseProtocol] = None,
     ) -> None:
         self.engine = engine
         self.backup_path = Path(backup_path)
@@ -220,6 +229,9 @@ class SchemaMigrationManager:
         self.target_version = int(target_version)
         self._migration_callback = migration_callback
         self._fault_hook = fault_hook or (lambda _point: None)
+        self._lease_protocol = lease_protocol or DefaultExecutionLeaseProtocol(
+            engine=engine
+        )
         ensure_schema_migration_table(engine)
 
     @property
@@ -248,6 +260,28 @@ class SchemaMigrationManager:
             payload, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
+
+    def _require_live_lease(
+        self, *, device_id: str, lease_token: str, lease_epoch: int
+    ) -> ExecutionLease:
+        lease = ExecutionLease(
+            device_id=str(device_id or "").strip(),
+            lease_token=str(lease_token or "").strip(),
+            lease_epoch=int(lease_epoch or 0),
+        )
+        if not lease.device_id or not lease.lease_token or lease.lease_epoch <= 0:
+            raise MigrationCutoverOwnershipError(
+                "Migration operation requires an exact positive execution lease"
+            )
+        if not getattr(self._lease_protocol, "epoch_verified", False):
+            raise MigrationCutoverOwnershipError(
+                "Migration lease authority cannot verify epochs"
+            )
+        try:
+            self._lease_protocol.require_current(lease)
+        except LeaseNotCurrentError as exc:
+            raise MigrationCutoverOwnershipError(str(exc)) from exc
+        return lease
 
     def _build_backup_payload(self, source_version: int) -> Dict:
         inspector = inspect(self.engine)
@@ -415,13 +449,14 @@ class SchemaMigrationManager:
         lease_epoch: int,
         source_version: int = 0,
     ) -> MigrationState:
-        device_id = str(device_id or "").strip()
-        lease_token = str(lease_token or "").strip()
-        lease_epoch = int(lease_epoch or 0)
-        if not device_id or not lease_token or lease_epoch <= 0:
-            raise MigrationCutoverOwnershipError(
-                "Migration cutover requires an exact positive execution lease"
-            )
+        lease = self._require_live_lease(
+            device_id=device_id,
+            lease_token=lease_token,
+            lease_epoch=lease_epoch,
+        )
+        device_id = lease.device_id
+        lease_token = lease.lease_token
+        lease_epoch = lease.lease_epoch
         state = self.state
         if state.target_version != self.target_version:
             raise MigrationError("Migration target version does not match this runtime")
@@ -438,6 +473,11 @@ class SchemaMigrationManager:
         if state.phase == MigrationPhase.NOT_STARTED:
             payload = self._build_backup_payload(source_version)
             checksum = self._write_backup(payload)
+            self._require_live_lease(
+                device_id=device_id,
+                lease_token=lease_token,
+                lease_epoch=lease_epoch,
+            )
             state = self._update(
                 state,
                 source_version=int(source_version),
@@ -458,7 +498,17 @@ class SchemaMigrationManager:
             )
         if state.phase == MigrationPhase.MIGRATING:
             try:
+                self._require_live_lease(
+                    device_id=device_id,
+                    lease_token=lease_token,
+                    lease_epoch=lease_epoch,
+                )
                 self._apply_migration()
+                self._require_live_lease(
+                    device_id=device_id,
+                    lease_token=lease_token,
+                    lease_epoch=lease_epoch,
+                )
                 state = self._update(
                     state,
                     phase=MigrationPhase.AWAITING_RECONCILIATION.value,
@@ -543,8 +593,27 @@ class SchemaMigrationManager:
                 post_migration_broker_mutation_occurred=True,
             )
 
-    def rollback_direct(self) -> None:
+    def rollback_direct(
+        self,
+        *,
+        device_id: str,
+        lease_token: str,
+        lease_epoch: int,
+    ) -> None:
+        self._require_live_lease(
+            device_id=device_id,
+            lease_token=lease_token,
+            lease_epoch=lease_epoch,
+        )
         state = self.state
+        if (
+            state.cutover_device_id != str(device_id or "").strip()
+            or state.cutover_lease_token != str(lease_token or "").strip()
+            or state.cutover_lease_epoch != int(lease_epoch or 0)
+        ):
+            raise MigrationCutoverOwnershipError(
+                "Direct rollback requires the exact lease that owns cutover"
+            )
         if (
             state.post_migration_broker_mutation_occurred
             or self.local_mutation_marker_path.exists()
@@ -554,6 +623,11 @@ class SchemaMigrationManager:
                 "take a fresh broker snapshot and reconcile forward"
             )
         payload = self._read_validated_backup()
+        self._require_live_lease(
+            device_id=device_id,
+            lease_token=lease_token,
+            lease_epoch=lease_epoch,
+        )
         metadata = MetaData()
         inspector = inspect(self.engine)
         existing = set(inspector.get_table_names())
@@ -590,4 +664,67 @@ class SchemaMigrationManager:
             cutover_lease_token="",
             cutover_lease_epoch=0,
             reconciliation_complete=False,
+        )
+
+    def reconcile_forward_to_compatibility(
+        self,
+        *,
+        device_id: str,
+        lease_token: str,
+        lease_epoch: int,
+        broker_snapshot_provider: Callable[[], object],
+        full_reconciliation: Callable[[object], bool],
+        compatibility_transform: Callable[[object], None],
+    ) -> MigrationState:
+        """Forward-only downgrade after broker activity made restore unsafe.
+
+        The exact live lease is checked before every stage. A fresh broker
+        snapshot must reconcile completely before the explicit compatibility
+        transform runs; stale backup restoration is never part of this path.
+        """
+
+        self._require_live_lease(
+            device_id=device_id,
+            lease_token=lease_token,
+            lease_epoch=lease_epoch,
+        )
+        state = self.state
+        if not (
+            state.post_migration_broker_mutation_occurred
+            or self.local_mutation_marker_path.exists()
+        ):
+            raise MigrationError(
+                "Forward compatibility recovery is reserved for post-mutation cutover"
+            )
+        if state.phase != MigrationPhase.FORWARD_RECONCILING:
+            state = self._update(
+                state,
+                phase=MigrationPhase.FORWARD_RECONCILING.value,
+                reconciliation_complete=False,
+            )
+        snapshot = broker_snapshot_provider()
+        if snapshot is None:
+            raise MigrationError("Fresh broker snapshot was not available")
+        self._require_live_lease(
+            device_id=device_id,
+            lease_token=lease_token,
+            lease_epoch=lease_epoch,
+        )
+        if not bool(full_reconciliation(snapshot)):
+            raise MigrationError("Full broker reconciliation did not complete")
+        self._require_live_lease(
+            device_id=device_id,
+            lease_token=lease_token,
+            lease_epoch=lease_epoch,
+        )
+        compatibility_transform(snapshot)
+        self._require_live_lease(
+            device_id=device_id,
+            lease_token=lease_token,
+            lease_epoch=lease_epoch,
+        )
+        return self._update(
+            self.state,
+            phase=MigrationPhase.COMPATIBILITY_READY.value,
+            reconciliation_complete=True,
         )

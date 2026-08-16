@@ -21,6 +21,7 @@ from PyQt5.QtWidgets import QApplication
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
+from src.core import execution_config
 from src.core.account_broker_snapshot import AccountBrokerSnapshot, SnapshotCompleteness
 from src.core.execution_mode import ExecutionLease
 from src.core.runtime_readiness import EngineReadiness, RuntimeDeviceState
@@ -264,6 +265,47 @@ def _ready_runtime_state(**overrides):
 def test_construction_builds_nothing(tmp_path):
     worker, _ = _worker(tmp_path)
     assert worker.runtime is None
+
+
+def test_worker_activates_only_explicitly_verified_account_endpoint_budgets(
+    tmp_path, monkeypatch
+):
+    worker, engine = _worker(tmp_path)
+    card = _seed_card(engine)
+    monkeypatch.setattr(execution_config, "KIS_MUTATION_BUDGET_VERIFIED", True)
+    monkeypatch.setattr(execution_config, "KIS_SUBMIT_MUTATION_CAPACITY", 3)
+    monkeypatch.setattr(execution_config, "KIS_CANCEL_MUTATION_CAPACITY", 2)
+    monkeypatch.setattr(execution_config, "KIS_REPLACE_MUTATION_CAPACITY", 1)
+    monkeypatch.setattr(execution_config, "KIS_MUTATION_BUDGET_WINDOW_SECONDS", 5.0)
+
+    worker._configure_verified_mutation_budgets([card])
+
+    snapshot = worker.request_scheduler.budget_snapshot()
+    assert snapshot["MUTATION:1:submit_order"]["knowledge"] == "KNOWN"
+    assert snapshot["MUTATION:1:submit_order"]["capacity"] == 3
+    assert snapshot["MUTATION:1:cancel_order"]["capacity"] == 2
+    assert snapshot["MUTATION:1:replace_order"]["capacity"] == 1
+
+
+def test_database_recovery_forces_full_projection_before_reopening_commands(
+    tmp_path, monkeypatch
+):
+    worker, _ = _worker(tmp_path)
+    worker._recovery_reconciliation_required = True
+    worker._accepting_commands = True
+    worker.device_state = RuntimeDeviceState.ACTIVE
+    calls = []
+
+    def reconcile(*, execute_commands):
+        calls.append(execute_commands)
+        worker.startup_reconciliation_complete = True
+
+    monkeypatch.setattr(worker, "_run_startup_reconciliation", reconcile)
+
+    assert worker._complete_database_recovery() is True
+    assert calls == [False]
+    assert worker._recovery_reconciliation_required is False
+    assert worker._accepting_commands is True
 
 
 @pytest.mark.parametrize(

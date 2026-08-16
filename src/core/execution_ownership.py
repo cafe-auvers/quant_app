@@ -65,6 +65,39 @@ class ExecutionOwnership:
         self.version = int(self.version or 1)
 
 
+@dataclass(frozen=True)
+class ExecutionOwnershipProof:
+    """Exact healthy-DB ownership evidence carried into an outage journal."""
+
+    environment: str
+    account_no: str
+    symbol: str
+    owner: ExecutionOwner
+    strategy_instance_id: str
+    version: int
+
+    @classmethod
+    def from_ownership(cls, ownership: ExecutionOwnership) -> "ExecutionOwnershipProof":
+        return cls(
+            environment=ownership.environment,
+            account_no=ownership.account_no,
+            symbol=ownership.symbol,
+            owner=ownership.owner,
+            strategy_instance_id=ownership.strategy_instance_id,
+            version=int(ownership.version),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "environment": self.environment,
+            "account_no": self.account_no,
+            "symbol": self.symbol,
+            "owner": self.owner.value,
+            "strategy_instance_id": self.strategy_instance_id,
+            "version": self.version,
+        }
+
+
 # H1's own mapping from the application-facing
 # src.core.execution_mode.ExecutionSource to the persisted ExecutionOwner
 # that source is authorized to act as -- kept here (not in execution_mode,

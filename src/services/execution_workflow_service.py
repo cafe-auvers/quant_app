@@ -187,6 +187,7 @@ def request_cancel(
     account_no: str = "",
     strategy_instance_id: str = "",
     emergency: bool = False,
+    protective_entry_completion: bool = False,
     symbol: str = "",
     broker_order_id: str = "",
     quantity: int = 0,
@@ -220,7 +221,9 @@ def request_cancel(
             client_order_id=client_order_id, cancel_command_id=stable_cancel_id,
             environment=environment, account_no=account_no, lease=lease, source=source,
             strategy_instance_id=strategy_instance_id,
-            emergency=emergency, symbol=symbol, broker_order_id=broker_order_id,
+            emergency=emergency,
+            protective_entry_completion=protective_entry_completion,
+            symbol=symbol, broker_order_id=broker_order_id,
             quantity=quantity, side=side, exchange=exchange,
         )
         return resolved_gateway.cancel_guarded(request)
@@ -247,6 +250,7 @@ def request_cancel_intent(
         account_no=intent.account_no,
         strategy_instance_id=intent.strategy_instance_id,
         emergency=intent.emergency,
+        protective_entry_completion=intent.protective_entry_completion,
         symbol=intent.symbol,
         broker_order_id=intent.broker_order_id,
         quantity=intent.quantity,

@@ -6,11 +6,16 @@ responsible for reporting its own absence.
 """
 from __future__ import annotations
 
+import json
+import os
+import threading
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Protocol
 from uuid import uuid4
+from pathlib import Path
 
 from sqlalchemy import (
     Column,
@@ -24,6 +29,104 @@ from sqlalchemy import (
     select,
 )
 from sqlalchemy.engine import Engine
+
+from src.utils.config import DATA_DIR
+
+
+EXTERNAL_ALERT_SPOOL_FILE = DATA_DIR / "external_alert_spool.jsonl"
+
+
+class WebhookAlertDeliveryProvider:
+    """Production HTTPS delivery adapter for alerts and watchdog heartbeats."""
+
+    def __init__(
+        self,
+        *,
+        alert_url: str,
+        heartbeat_url: str,
+        bearer_token: str = "",
+        timeout_seconds: float = 10.0,
+    ) -> None:
+        for name, value in (("alert_url", alert_url), ("heartbeat_url", heartbeat_url)):
+            if not str(value or "").lower().startswith("https://"):
+                raise ValueError(f"{name} must be an HTTPS URL")
+        self.alert_url = str(alert_url)
+        self.heartbeat_url = str(heartbeat_url)
+        self.bearer_token = str(bearer_token or "")
+        self.timeout_seconds = max(0.1, float(timeout_seconds))
+
+    def _post(self, url: str, payload: Dict[str, Any]) -> str:
+        headers = {"Content-Type": "application/json"}
+        if self.bearer_token:
+            headers["Authorization"] = f"Bearer {self.bearer_token}"
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+            if int(response.status) < 200 or int(response.status) >= 300:
+                raise RuntimeError(f"alert webhook returned HTTP {response.status}")
+            return str(response.headers.get("X-Delivery-Id") or uuid4().hex)
+
+    def deliver(self, payload: Dict[str, Any]) -> str:
+        return self._post(self.alert_url, payload)
+
+    def publish_heartbeat(self, payload: Dict[str, Any]) -> str:
+        return self._post(self.heartbeat_url, payload)
+
+
+class LocalAlertSpool:
+    """Append-only, fsynced delivery evidence independent of canonical DB."""
+
+    def __init__(self, path: Path = EXTERNAL_ALERT_SPOOL_FILE) -> None:
+        self.path = Path(path)
+        self._lock = threading.RLock()
+
+    def append(self, event_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        record = {
+            "event_id": uuid4().hex,
+            "event_type": str(event_type).upper(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            **payload,
+        }
+        encoded = (json.dumps(record, separators=(",", ":")) + "\n").encode(
+            "utf-8"
+        )
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            descriptor = os.open(
+                self.path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600
+            )
+            try:
+                if os.write(descriptor, encoded) != len(encoded):
+                    raise OSError("Short external-alert spool append")
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        return record
+
+    def pending_alerts(self) -> List[Dict[str, Any]]:
+        if not self.path.exists():
+            return []
+        with self._lock:
+            entries = [
+                json.loads(line)
+                for line in self.path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        reconciled = {
+            str(entry.get("pending_event_id") or "")
+            for entry in entries
+            if entry.get("event_type") == "ALERT_RECONCILED"
+        }
+        return [
+            entry
+            for entry in entries
+            if entry.get("event_type") == "ALERT_PENDING"
+            and entry.get("event_id") not in reconciled
+        ]
 
 
 class CriticalAlertType(str, Enum):
@@ -167,6 +270,7 @@ class ExternalAlertingService:
         escalation_every_attempts: int = 2,
         max_escalation_level: int = 3,
         heartbeat_interval_seconds: float = 30.0,
+        local_spool: Optional[LocalAlertSpool] = None,
     ) -> None:
         self.engine = engine
         self.provider = provider
@@ -181,6 +285,8 @@ class ExternalAlertingService:
         self.heartbeat_interval_seconds = max(
             0.001, float(heartbeat_interval_seconds)
         )
+        self.local_spool = local_spool or LocalAlertSpool()
+        self._last_heartbeat_attempt_at: Optional[datetime] = None
         ensure_external_alert_tables(engine)
 
     @staticmethod
@@ -261,7 +367,54 @@ class ExternalAlertingService:
         return _row_to_incident(current)
 
     def sink(self, alert_class: str, dedupe_key: str, message: str) -> None:
-        self.raise_alert(alert_class, dedupe_key, message)
+        try:
+            self.raise_alert(alert_class, dedupe_key, message)
+            return
+        except Exception as db_error:
+            pending = self.local_spool.append(
+                "ALERT_PENDING",
+                {
+                    "alert_type": str(alert_class).upper(),
+                    "dedupe_key": str(dedupe_key),
+                    "message": str(message),
+                    "database_error": str(db_error),
+                },
+            )
+        payload = {
+            "incident_id": f"offline-{pending['event_id']}",
+            "alert_type": str(alert_class).upper(),
+            "dedupe_key": str(dedupe_key),
+            "message": str(message),
+            "device_id": self.device_id,
+            "requires_acknowledgement": True,
+            "offline_spool": True,
+        }
+        try:
+            delivery_id = str(self.provider.deliver(payload) or "")
+            status, error = "DELIVERED", ""
+        except Exception as exc:
+            delivery_id, status, error = "", "FAILED", str(exc)
+        self.local_spool.append(
+            "ALERT_DELIVERY_ATTEMPT",
+            {
+                "pending_event_id": pending["event_id"],
+                "status": status,
+                "provider_delivery_id": delivery_id,
+                "error": error,
+            },
+        )
+
+    def _drain_local_spool(self) -> int:
+        drained = 0
+        for pending in self.local_spool.pending_alerts():
+            self.raise_alert(
+                pending["alert_type"], pending["dedupe_key"], pending["message"]
+            )
+            self.local_spool.append(
+                "ALERT_RECONCILED", {"pending_event_id": pending["event_id"]}
+            )
+            drained += 1
+        return drained
 
     def due_incidents(self) -> List[AlertIncident]:
         now = _db_datetime(self._clock())
@@ -278,6 +431,7 @@ class ExternalAlertingService:
         return [_row_to_incident(row) for row in rows]
 
     def process_due(self) -> int:
+        self._drain_local_spool()
         processed = 0
         for incident in self.due_incidents():
             now = _as_utc(self._clock())
@@ -370,6 +524,7 @@ class ExternalAlertingService:
 
     def publish_heartbeat(self) -> bool:
         now = _as_utc(self._clock())
+        self._last_heartbeat_attempt_at = now
         payload = {
             "device_id": self.device_id,
             "published_at": now.isoformat(),
@@ -386,31 +541,46 @@ class ExternalAlertingService:
             error = str(exc)
             succeeded = False
         table = _heartbeat_table(MetaData())
-        with self.engine.begin() as conn:
-            conn.execute(
-                table.insert().values(
-                    device_id=self.device_id,
-                    attempted_at=_db_datetime(now),
-                    status=status,
-                    provider_delivery_id=provider_id,
-                    error=error,
+        try:
+            with self.engine.begin() as conn:
+                conn.execute(
+                    table.insert().values(
+                        device_id=self.device_id,
+                        attempted_at=_db_datetime(now),
+                        status=status,
+                        provider_delivery_id=provider_id,
+                        error=error,
+                    )
                 )
+        except Exception:
+            self.local_spool.append(
+                "HEARTBEAT_ATTEMPT",
+                {
+                    "device_id": self.device_id,
+                    "attempted_at": now.isoformat(),
+                    "status": status,
+                    "provider_delivery_id": provider_id,
+                    "error": error,
+                },
             )
         return succeeded
 
     def publish_heartbeat_if_due(self) -> bool:
         table = _heartbeat_table(MetaData())
         now = _as_utc(self._clock())
-        with self.engine.begin() as conn:
-            last = conn.execute(
-                select(table.c.attempted_at)
-                .where(
-                    table.c.device_id == self.device_id,
-                    table.c.status == "PUBLISHED",
-                )
-                .order_by(table.c.attempted_at.desc())
-                .limit(1)
-            ).scalar_one_or_none()
+        try:
+            with self.engine.begin() as conn:
+                last = conn.execute(
+                    select(table.c.attempted_at)
+                    .where(
+                        table.c.device_id == self.device_id,
+                        table.c.status == "PUBLISHED",
+                    )
+                    .order_by(table.c.attempted_at.desc())
+                    .limit(1)
+                ).scalar_one_or_none()
+        except Exception:
+            last = self._last_heartbeat_attempt_at
         if last is not None and (
             now - _as_utc(last)
         ).total_seconds() < self.heartbeat_interval_seconds:
@@ -436,3 +606,22 @@ class ExternalAlertingService:
                 .order_by(table.c.attempted_at, table.c.id)
             ).fetchall()
         return [dict(row._mapping) for row in rows]
+
+
+def build_external_alerting_service(
+    engine: Engine, *, device_id: str
+) -> ExternalAlertingService:
+    """Construct the required production publisher for an enabled runtime."""
+
+    alert_url = os.getenv("EXTERNAL_ALERT_WEBHOOK_URL", "").strip()
+    heartbeat_url = os.getenv("EXTERNAL_HEARTBEAT_WEBHOOK_URL", "").strip()
+    if not alert_url or not heartbeat_url:
+        raise ValueError(
+            "Enabled Buy Board runtime requires both external alert and heartbeat URLs"
+        )
+    provider = WebhookAlertDeliveryProvider(
+        alert_url=alert_url,
+        heartbeat_url=heartbeat_url,
+        bearer_token=os.getenv("EXTERNAL_ALERT_WEBHOOK_TOKEN", "").strip(),
+    )
+    return ExternalAlertingService(engine, provider, device_id=device_id)

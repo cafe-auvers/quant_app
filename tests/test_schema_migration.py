@@ -13,6 +13,8 @@ from src.core.order_state import BrokerOrder, OrderIntent, OrderSide, OrderStatu
 from src.core.trade_card_state import TradeCardState
 from src.services.capital_reservation_repository import fetch_reservation
 from src.services.execution_order_repository import fetch_execution_order
+from src.core.execution_mode import ExecutionLease
+from src.services.execution_lease_protocol import FakeExecutionLeaseProtocol
 from src.services.order_ledger import save_orders
 from src.services.runtime_device_state_repository import (
     require_compatible_runtime_schema,
@@ -20,6 +22,7 @@ from src.services.runtime_device_state_repository import (
 )
 from src.services.schema_migration import (
     MigrationEntriesBlockedError,
+    MigrationCutoverOwnershipError,
     MigrationPhase,
     MigrationRollbackForbiddenError,
     SchemaMigrationManager,
@@ -47,6 +50,12 @@ def _manager(tmp_path, monkeypatch, **kwargs):
     monkeypatch.setattr(
         "src.services.schema_migration.RESERVATIONS_FILE",
         tmp_path / "missing-reservations.json",
+    )
+    kwargs.setdefault(
+        "lease_protocol",
+        FakeExecutionLeaseProtocol(
+            current=ExecutionLease("pc-main", "token-8", 8)
+        ),
     )
     return SchemaMigrationManager(
         _engine(tmp_path),
@@ -127,6 +136,9 @@ def test_migration_converts_local_order_card_and_reservation_records(
         engine,
         backup_path=tmp_path / "migration-backup.json",
         legacy_paths=(order_path, card_path, reservation_path),
+        lease_protocol=FakeExecutionLeaseProtocol(
+            current=ExecutionLease("pc-main", "token-8", 8)
+        ),
     )
 
     _prepare(manager)
@@ -202,7 +214,9 @@ def test_rollback_allowed_before_any_post_migration_broker_mutation(
     )
     _prepare(manager)
 
-    manager.rollback_direct()
+    manager.rollback_direct(
+        device_id="pc-main", lease_token="token-8", lease_epoch=8
+    )
 
     assert legacy.read_text(encoding="utf-8") == "before"
     assert manager.state.phase == MigrationPhase.NOT_STARTED
@@ -216,7 +230,9 @@ def test_direct_restore_refused_after_a_post_migration_broker_mutation(
     manager.mark_post_migration_broker_mutation()
 
     with pytest.raises(MigrationRollbackForbiddenError, match="reconcile forward"):
-        manager.rollback_direct()
+        manager.rollback_direct(
+            device_id="pc-main", lease_token="token-8", lease_epoch=8
+        )
 
 
 def test_startup_refuses_schema_mismatch_with_another_live_device(tmp_path):
@@ -248,3 +264,59 @@ def test_stopped_device_on_an_old_schema_does_not_block_startup(tmp_path):
     )
 
     require_compatible_runtime_schema(engine, device_id="new-pc")
+
+
+def test_cutover_rechecks_live_lease_before_migration_mutation(tmp_path, monkeypatch):
+    protocol = FakeExecutionLeaseProtocol(
+        current=ExecutionLease("pc-main", "token-8", 8)
+    )
+
+    def supersede_after_backup(point):
+        if point == "after_backup":
+            protocol.grant(ExecutionLease("pc-other", "token-9", 9))
+
+    manager = _manager(
+        tmp_path,
+        monkeypatch,
+        lease_protocol=protocol,
+        fault_hook=supersede_after_backup,
+    )
+
+    with pytest.raises(MigrationCutoverOwnershipError):
+        _prepare(manager)
+
+
+def test_stale_lease_cannot_directly_restore_cutover_backup(tmp_path, monkeypatch):
+    protocol = FakeExecutionLeaseProtocol(
+        current=ExecutionLease("pc-main", "token-8", 8)
+    )
+    manager = _manager(tmp_path, monkeypatch, lease_protocol=protocol)
+    _prepare(manager)
+    protocol.grant(ExecutionLease("pc-main", "token-9", 9))
+
+    with pytest.raises(MigrationCutoverOwnershipError):
+        manager.rollback_direct(
+            device_id="pc-main", lease_token="token-8", lease_epoch=8
+        )
+
+
+def test_post_mutation_recovery_reconciles_fresh_snapshot_then_transforms(
+    tmp_path, monkeypatch
+):
+    manager = _manager(tmp_path, monkeypatch)
+    _prepare(manager)
+    manager.mark_post_migration_broker_mutation()
+    calls = []
+
+    state = manager.reconcile_forward_to_compatibility(
+        device_id="pc-main",
+        lease_token="token-8",
+        lease_epoch=8,
+        broker_snapshot_provider=lambda: calls.append("snapshot") or {"fresh": True},
+        full_reconciliation=lambda snapshot: calls.append("reconcile") or snapshot["fresh"],
+        compatibility_transform=lambda snapshot: calls.append("transform"),
+    )
+
+    assert calls == ["snapshot", "reconcile", "transform"]
+    assert state.phase == MigrationPhase.COMPATIBILITY_READY
+    assert state.reconciliation_complete is True

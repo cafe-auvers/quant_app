@@ -67,6 +67,7 @@ class CancelIntent:
     strategy_instance_id: str
     source: ExecutionSource
     emergency: bool = False
+    protective_entry_completion: bool = False
     symbol: str = ""
     broker_order_id: str = ""
     quantity: int = 0
@@ -80,6 +81,11 @@ class CancelIntent:
         object.__setattr__(self, "account_no", str(self.account_no or ""))
         object.__setattr__(self, "strategy_instance_id", str(self.strategy_instance_id or ""))
         object.__setattr__(self, "emergency", bool(self.emergency))
+        object.__setattr__(
+            self,
+            "protective_entry_completion",
+            bool(self.protective_entry_completion),
+        )
         object.__setattr__(self, "symbol", str(self.symbol or "").upper())
         object.__setattr__(self, "broker_order_id", str(self.broker_order_id or ""))
         object.__setattr__(self, "quantity", max(0, int(self.quantity or 0)))
@@ -100,6 +106,7 @@ class CancelIntent:
             self.strategy_instance_id,
             self.source,
             self.emergency,
+            self.protective_entry_completion,
             self.symbol,
             self.broker_order_id,
             self.quantity,
@@ -114,6 +121,7 @@ class CancelIntent:
             other.strategy_instance_id,
             other.source,
             other.emergency,
+            other.protective_entry_completion,
             other.symbol,
             other.broker_order_id,
             other.quantity,
@@ -132,6 +140,7 @@ class CancelIntent:
                 self.strategy_instance_id,
                 self.source,
                 self.emergency,
+                self.protective_entry_completion,
                 self.symbol,
                 self.broker_order_id,
                 self.quantity,
@@ -203,6 +212,7 @@ class CancelExecutionRequest:
     source: ExecutionSource = ExecutionSource.SYSTEM
     strategy_instance_id: str = ""
     emergency: bool = False
+    protective_entry_completion: bool = False
     symbol: str = ""
     broker_order_id: str = ""
     quantity: int = 0
@@ -216,6 +226,11 @@ class CancelExecutionRequest:
         object.__setattr__(self, "account_no", str(self.account_no or ""))
         object.__setattr__(self, "strategy_instance_id", str(self.strategy_instance_id or ""))
         object.__setattr__(self, "emergency", bool(self.emergency))
+        object.__setattr__(
+            self,
+            "protective_entry_completion",
+            bool(self.protective_entry_completion),
+        )
         object.__setattr__(self, "symbol", str(self.symbol or "").upper())
         object.__setattr__(self, "broker_order_id", str(self.broker_order_id or ""))
         object.__setattr__(self, "quantity", max(0, int(self.quantity or 0)))
