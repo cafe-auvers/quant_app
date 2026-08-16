@@ -106,7 +106,9 @@ class ExecutionCommand:
     lease_token: str = ""
     target_broker_order_id: str = ""
     requested_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    status: str = "REQUESTED"  # REQUESTED -> ACKNOWLEDGED | FAILED (B4b's post-call persist)
+    # PRE_BROKER_ABORTED is a definitive local outcome: the command was
+    # journaled, but a final mutable gate failed before any broker call.
+    status: str = "REQUESTED"  # -> ACKNOWLEDGED | FAILED | AMBIGUOUS | PRE_BROKER_ABORTED
     redacted_response: Dict[str, Any] = field(default_factory=dict)
     response_hash: str = ""
     command_id: Optional[int] = None

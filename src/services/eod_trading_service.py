@@ -143,6 +143,14 @@ class EodTradingService:
         card.entry_orb_low = None
         card.entry_orb_window = None
         card.entry_trigger = None
+        card.entry_attempt_group_id = ""
+        card.entry_attempt_count = 0
+        card.entry_client_order_id = ""
+        card.entry_pending_attempt_number = 0
+        card.entry_submission_unresolved = False
+        card.entry_cancel_in_flight = False
+        card.entry_cancel_reason = ""
+        card.entry_cancel_command_id = ""
         self._entry_attempt_manager.reset_symbol(card.environment, card.account_no, card.symbol)
         if card.capital_reservation_id:
             capital_allocator.release_reservation(
@@ -225,6 +233,10 @@ class EodTradingService:
         card.entry_cancel_in_flight = False
         card.entry_cancel_reason = ""
         card.entry_cancel_command_id = ""
+        card.entry_attempt_group_id = ""
+        card.entry_client_order_id = ""
+        card.entry_pending_attempt_number = 0
+        card.entry_submission_unresolved = False
         card.capital_reservation_id = ""
 
         if refreshed.filled_quantity > 0:

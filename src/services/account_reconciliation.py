@@ -730,16 +730,22 @@ def _card_tracks_order(
     )
 
 
-def _clear_entry_card_tracking(card: TradeCardState) -> None:
+def _clear_entry_card_tracking(
+    card: TradeCardState, *, retire_attempt_group: bool = False
+) -> None:
     card.entry_client_order_id = ""
     card.entry_cancel_command_id = ""
     card.entry_cancel_in_flight = False
     card.entry_cancel_reason = ""
     card.entry_pending_attempt_number = 0
     card.entry_submission_unresolved = False
+    if retire_attempt_group:
+        card.entry_attempt_group_id = ""
 
 
-def _clear_exit_card_tracking(card: TradeCardState) -> None:
+def _clear_exit_card_tracking(
+    card: TradeCardState, *, retire_attempt_group: bool = False
+) -> None:
     card.exit_client_order_id = ""
     card.exit_cancel_command_id = ""
     card.exit_cancel_in_flight = False
@@ -747,6 +753,8 @@ def _clear_exit_card_tracking(card: TradeCardState) -> None:
     card.exit_pending_attempt_number = 0
     card.exit_submission_unresolved = False
     card.reserved_sell_quantity = 0
+    if retire_attempt_group:
+        card.exit_attempt_group_id = ""
 
 
 def _operational_category(
@@ -935,10 +943,16 @@ def _project_exact_order_to_card(
             else:
                 card.stop_quantity = quantity
             if terminal:
-                if card.entry_cancel_reason != "TTL_REPRICE":
+                retry_remainder = (
+                    card.entry_cancel_reason == "TTL_REPRICE"
+                    and card.entry_remaining_target_quantity > 0
+                )
+                if not retry_remainder:
                     card.entry_remaining_target_quantity = 0
                     card.position_runtime_status = PositionRuntimeStatus.OPEN
-                _clear_entry_card_tracking(card)
+                _clear_entry_card_tracking(
+                    card, retire_attempt_group=not retry_remainder
+                )
         elif terminal:
             if card.broker_quantity > 0:
                 card.board_status = BoardStatus.OPEN_POSITION
@@ -947,7 +961,7 @@ def _project_exact_order_to_card(
                 card.board_status = BoardStatus.BUYLIST
             card.entry_runtime_status = None
             card.entry_remaining_target_quantity = 0
-            _clear_entry_card_tracking(card)
+            _clear_entry_card_tracking(card, retire_attempt_group=True)
         elif open_at_broker:
             card.board_status = BoardStatus.ENTRY_PENDING
             card.entry_runtime_status = EntryRuntimeStatus.ORDER_PENDING
@@ -978,7 +992,7 @@ def _project_exact_order_to_card(
             return
         remaining = holding.quantity if holding is not None else 0
         card.pending_partial_sell_quantity = 0
-        _clear_exit_card_tracking(card)
+        _clear_exit_card_tracking(card, retire_attempt_group=True)
         if remaining <= 0:
             card.broker_quantity = 0
             card.orderable_quantity = 0
@@ -1033,7 +1047,7 @@ def _project_exact_order_to_card(
             )
             return
         remaining = holding.quantity if holding is not None else 0
-        _clear_exit_card_tracking(card)
+        _clear_exit_card_tracking(card, retire_attempt_group=remaining <= 0)
         card.sell_all_at_market_open = False
         card.broker_quantity = remaining
         card.orderable_quantity = (
@@ -1444,6 +1458,7 @@ def reduce_account_reconciliation(
                 ):
                     card.board_status = BoardStatus.BUYLIST
                     card.entry_runtime_status = None
+                    _clear_entry_card_tracking(card, retire_attempt_group=True)
 
     # C3 fallback: every generation must include complete evidence for the
     # specific execution policy (regular versus broker-reserved MOO).

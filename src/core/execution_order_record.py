@@ -98,6 +98,10 @@ _ALLOWED_STATUS_TRANSITIONS: Dict[ExecutionOrderStatus, FrozenSet[ExecutionOrder
             ExecutionOrderStatus.ACKNOWLEDGED,
             ExecutionOrderStatus.REJECTED,
             ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE,
+            # The final mutable authorization/fence check can fail after
+            # SUBMITTING is committed but before the broker boundary is
+            # entered.  That outcome is known-local, not ambiguous.
+            ExecutionOrderStatus.CANCELLED_LOCALLY,
         }
     ),
     ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE: frozenset(
@@ -147,6 +151,9 @@ _ALLOWED_STATUS_TRANSITIONS: Dict[ExecutionOrderStatus, FrozenSet[ExecutionOrder
             # previously had a valid outcome in this table.
             ExecutionOrderStatus.WORKING,
             ExecutionOrderStatus.EXPIRED,
+            # A final pre-broker gate can fail after CANCEL_PENDING is
+            # journaled. Restore the exact pre-cancel live status.
+            ExecutionOrderStatus.ACKNOWLEDGED,
         }
     ),
 }
@@ -217,11 +224,12 @@ class AdoptedOrderPermission(str, Enum):
     REPLACE = "REPLACE"
 
 
-# Reaching either of these means a broker call was actually made and its
-# outcome isn't known yet -- per the "expected combinations" table,
-# broker_identity_status should read AMBIGUOUS by the time an
-# origin=APPLICATION record gets here, with no new evidence required to
-# know that much.
+# Reaching either of these means the broker boundary may have been entered
+# and its outcome is not yet known. SUBMITTING is committed immediately
+# before the final mutable gates; a gate failure atomically transitions it
+# to CANCELLED_LOCALLY and restores NOT_ASSIGNED before returning control.
+# Until either that abort or a broker result is persisted, AMBIGUOUS is the
+# conservative identity classification.
 _STATUSES_IMPLYING_AMBIGUOUS_IDENTITY: FrozenSet[ExecutionOrderStatus] = frozenset(
     {ExecutionOrderStatus.SUBMITTING, ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE}
 )
@@ -374,6 +382,17 @@ def apply_status_transition(
         and record.broker_identity_status == BrokerIdentityStatus.AMBIGUOUS
     ):
         record.broker_identity_status = BrokerIdentityStatus.NO_BROKER_ORDER_CONFIRMED
+
+    if (
+        target == ExecutionOrderStatus.CANCELLED_LOCALLY
+        and record.status == ExecutionOrderStatus.SUBMITTING
+    ):
+        # SUBMITTING normally means the broker boundary was entered, but a
+        # last-moment authorization/fence failure proves it was not. Retire
+        # the local attempt without leaving an ambiguous broker identity.
+        record.broker_order_id = ""
+        record.broker_identity_status = BrokerIdentityStatus.NOT_ASSIGNED
+        record.submission_started_at = None
 
     now = utc_now_iso()
     if target == ExecutionOrderStatus.SUBMITTING:

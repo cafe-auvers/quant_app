@@ -14,7 +14,7 @@ the identical SQLAlchemy ``Table`` + ``metadata.create_all`` pattern
 ``capital_allocator.py`` treats this as optional: every function there
 accepts ``engine: Optional[Engine] = None``. When an engine is supplied, the
 database becomes the authoritative source for the availability check and
-every reservation write mirrors here in addition to the local JSON ledger
+every reservation write commits here before updating the local JSON mirror
 (kept as the offline/recovery fallback, per section 23's "JSON files may
 remain for migration, backup, and recovery"). When no engine is supplied
 (the default, and every existing test), behavior is unchanged from before
@@ -28,11 +28,11 @@ execution gateway's atomic pre-submission transaction ("insert
 that (a) takes an already-open ``Connection`` so it can be composed with
 ``execution_command_repository.insert_command``/
 ``execution_order_repository.insert_execution_order`` into one commit, and
-(b) raises on failure rather than the existing ``save_reservation``'s
-best-effort log-and-continue -- a reservation that silently failed to write
-would leave the "atomic" transaction not actually atomic. ``save_reservation``
-itself is unchanged and still used by the pre-existing ``capital_allocator.py``
-mirror path.
+(b) raises on failure rather than ``save_reservation``'s compatibility
+best-effort log-and-continue behavior -- a reservation that silently failed
+to write would leave the "atomic" transaction not actually atomic. The
+allocator uses ``save_reservation_strict`` so CAS conflicts repair the local
+mirror from the authoritative row instead of persisting stale state.
 """
 from __future__ import annotations
 
@@ -220,53 +220,43 @@ def fetch_reservation(
     return _row_to_reservation(row) if row is not None else None
 
 
+def save_reservation_strict(
+    engine: Engine, reservation: CapitalReservation
+) -> CapitalReservation:
+    """Authoritative insert-or-CAS-update used before a local mirror write.
+
+    Unlike :func:`save_reservation`, conflicts and database failures are
+    propagated. This prevents a caller from assuming its stale mutation
+    succeeded and then making that stale object authoritative in JSON.
+    """
+    table = _ensure_table(engine)
+    with engine.begin() as conn:
+        existing = conn.execute(
+            select(table.c.reservation_id).where(
+                table.c.reservation_id == reservation.reservation_id
+            )
+        ).first()
+        if existing is None:
+            insert_reservation(conn, reservation)
+        else:
+            update_reservation(
+                conn,
+                reservation,
+                expected_version=reservation.version,
+            )
+    return reservation
+
+
 def save_reservation(engine: Optional[Engine], reservation: CapitalReservation) -> None:
-    """Insert-or-update (upsert) by ``reservation_id``. Best-effort: a
-    database write failure is logged, not raised -- the local JSON ledger
-    remains the record of truth for *this* process even if the database
-    mirror is temporarily unreachable.
+    """Backward-compatible best-effort wrapper around the strict API.
+
+    Safety-critical allocator paths use :func:`save_reservation_strict`
+    and write their local mirror only after its CAS succeeds.
     """
     if engine is None:
         return
     try:
-        table = _ensure_table(engine)
-        with engine.begin() as conn:
-            existing = conn.execute(
-                select(table.c.reservation_id).where(
-                    table.c.reservation_id == reservation.reservation_id
-                )
-            ).first()
-            values = dict(
-                environment=reservation.environment,
-                account_no=reservation.account_no,
-                symbol=reservation.symbol,
-                attempt_group_id=reservation.attempt_group_id,
-                requested_notional=reservation.requested_notional,
-                remaining_reserved_notional=reservation.remaining_reserved_notional,
-                status=reservation.status.value,
-                version=reservation.version,
-                created_at=reservation.created_at,
-                released_at=reservation.released_at,
-                absence_count=reservation.absence_count,
-                last_absence_snapshot_id=(
-                    reservation.last_absence_snapshot_id or None
-                ),
-                last_absence_observed_at=reservation.last_absence_observed_at,
-                last_absence_session_date=reservation.last_absence_session_date,
-                updated_at=_server_now(engine),
-            )
-            if existing is None:
-                conn.execute(
-                    table.insert().values(reservation_id=reservation.reservation_id, **values)
-                )
-            else:
-                # Best-effort callers still get the same non-raising API,
-                # but they may never overwrite a newer cross-device value.
-                update_reservation(
-                    conn,
-                    reservation,
-                    expected_version=reservation.version,
-                )
+        save_reservation_strict(engine, reservation)
     except (SQLAlchemyError, CapitalReservationVersionConflictError) as exc:
         logger.warning("capital_reservation_repository: save_reservation failed: %s", exc)
 
@@ -436,6 +426,6 @@ def reconcile_stale_reservations(
         if reservation.symbol in open_symbols:
             continue
         reservation.release()
-        save_reservation(engine, reservation)
+        save_reservation_strict(engine, reservation)
         released.append(reservation)
     return released

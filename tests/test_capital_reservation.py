@@ -291,6 +291,61 @@ def test_consume_and_release_mirror_to_database(tmp_path):
     assert db_active == []  # released -- no longer active
 
 
+def test_allocator_conflict_repairs_local_mirror_from_authoritative_database(tmp_path):
+    engine = _sqlite_engine(tmp_path)
+    path = tmp_path / "reservations.json"
+    reservation = allocator.reserve_capital_for_entry(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        attempt_group_id="g1",
+        requested_notional=1000.0,
+        buying_power_provider=lambda: 1000.0,
+        path=path,
+        engine=engine,
+    )
+    assert reservation is not None
+
+    # Another device consumes only 100 while this process still has v1.
+    newer = capital_reservation_repository.fetch_reservation(
+        engine, reservation.reservation_id
+    )
+    assert newer is not None
+    newer.consume(100.0)
+    capital_reservation_repository.save_reservation_strict(engine, newer)
+    assert newer.version == 2
+
+    # The stale local mutation must lose its CAS and must not be mirrored.
+    with pytest.raises(
+        capital_reservation_repository.CapitalReservationVersionConflictError
+    ):
+        allocator.consume_reservation(
+            reservation.reservation_id,
+            600.0,
+            path=path,
+            engine=engine,
+        )
+
+    mirrored = allocator.load_reservations(path)[0]
+    assert mirrored.version == 2
+    assert mirrored.status == CapitalReservationStatus.PARTIALLY_CONSUMED
+    assert mirrored.remaining_reserved_notional == pytest.approx(900.0)
+
+    # The repaired/authoritative 900 reservation leaves only 100; a stale
+    # local value of 400 would have incorrectly authorized this entry.
+    denied = allocator.reserve_capital_for_entry(
+        environment="PROD",
+        account_no="1",
+        symbol="NVDA",
+        attempt_group_id="g2",
+        requested_notional=200.0,
+        buying_power_provider=lambda: 1000.0,
+        path=path,
+        engine=engine,
+    )
+    assert denied is None
+
+
 def test_engine_none_never_touches_database(tmp_path):
     """Default behavior (engine=None) must be identical to before this
     module existed -- purely local JSON, no database calls at all."""

@@ -9,11 +9,21 @@ from sqlalchemy.pool import NullPool
 
 from fakes.fake_execution_broker import FakeExecutionBroker
 from src.core import execution_config
+from src.core.account_broker_snapshot import AccountBrokerSnapshot, SnapshotCompleteness
 from src.core.execution_mode import ExecutionLease
-from src.core.execution_order_record import ExecutionOrderStatus
+from src.core.execution_order_record import (
+    BrokerIdentityStatus,
+    ExecutionOrderRecord,
+    ExecutionOrderStatus,
+)
 from src.core.execution_ownership import ExecutionOwner, ExecutionOwnership
 from src.core.execution_result import UnifiedExecutionStatus
-from src.core.order_state import OrderSide
+from src.core.order_state import (
+    BrokerOrderStatusSnapshot,
+    OrderIntent,
+    OrderSide,
+    OrderStatus,
+)
 from src.core.trade_card_state import BoardStatus, EntryRuntimeStatus, TradeCardState
 from src.services import buyboard_runtime, capital_reservation_repository
 from src.services import execution_command_gateway as gateway_module
@@ -25,6 +35,10 @@ from src.services.execution_ownership_repository import assign_ownership
 from src.services.mutation_budget_protocol import AllowAllMutationBudget
 from src.services.realtime_market_data import QuoteSnapshot, RestPollingMarketDataService
 from src.services import trading_engine as trading_engine_module
+from src.services.account_reconciliation import (
+    AccountLocalState,
+    reduce_account_reconciliation,
+)
 
 
 LEASE = ExecutionLease(device_id="device-1", lease_token="lease-1", lease_epoch=7)
@@ -133,6 +147,88 @@ def _submit_guarded_entry(runtime, broker, market_data, card) -> None:
     market_data.poll_once()
     runtime.trading_engine.run_heartbeat([card])
     assert card.board_status == BoardStatus.ENTRY_PENDING
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_closed_cycle_retires_attempt_group_before_next_cycle_and_old_history_is_ignored(
+    tmp_path, monkeypatch
+):
+    runtime, broker, gateway, engine, market_data = _make_runtime(
+        tmp_path, monkeypatch
+    )
+    cycle_one_group = "CYCLE-1"
+    cycle_one_client_id = "CYCLE-1-ENTRY"
+    card = _persist_owned_card(
+        engine,
+        _card(
+            board_status=BoardStatus.OPEN_POSITION,
+            entry_attempt_group_id=cycle_one_group,
+            entry_client_order_id=cycle_one_client_id,
+            exit_attempt_group_id="CYCLE-1-EXIT",
+            broker_quantity=0,
+            orderable_quantity=0,
+        ),
+    )
+
+    runtime.position_manager.confirm_flat(card)
+    assert card.entry_attempt_group_id == ""
+    assert card.exit_attempt_group_id == ""
+
+    card.board_status = BoardStatus.BUYLIST
+    card.board_status = BoardStatus.BUY_TODAY
+    runtime.trading_engine._prepare_entry_attempt(card)
+    cycle_two_group = card.entry_attempt_group_id
+    assert cycle_two_group
+    assert cycle_two_group != cycle_one_group
+    assert card.entry_client_order_id != cycle_one_client_id
+
+    historical_order = ExecutionOrderRecord(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        intent=OrderIntent.ENTRY,
+        client_order_id=cycle_one_client_id,
+        broker_order_id="B-CYCLE-1",
+        attempt_group_id=cycle_one_group,
+        submitted_quantity=100,
+        remaining_quantity=100,
+        status=ExecutionOrderStatus.WORKING,
+        broker_identity_status=BrokerIdentityStatus.EXACT,
+    )
+    historical_fill = BrokerOrderStatusSnapshot(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        broker_order_id="B-CYCLE-1",
+        side=OrderSide.BUY,
+        status=OrderStatus.FILLED,
+        quantity_requested=100,
+        filled_quantity=100,
+        remaining_quantity=0,
+        avg_fill_price=99.0,
+    )
+    snapshot = AccountBrokerSnapshot(
+        environment="PROD",
+        account_no="1",
+        completeness=SnapshotCompleteness(
+            holdings_complete=True,
+            open_orders_complete=True,
+            history_complete=True,
+            reserved_orders_complete=True,
+            account_balance_complete=True,
+        ),
+        orders=(historical_fill,),
+        observed_at=datetime.now(timezone.utc),
+    )
+
+    plan = reduce_account_reconciliation(
+        snapshot,
+        AccountLocalState(cards=(card,), execution_orders=(historical_order,)),
+    )
+
+    assert plan.order_updates[0].status == ExecutionOrderStatus.FILLED
+    assert plan.card_updates == ()
 
 
 @pytest.mark.usefixtures("trading_enabled")

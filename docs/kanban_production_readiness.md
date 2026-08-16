@@ -134,7 +134,7 @@ PR's behavior composes correctly, plus the Gate 1 run in full.
 | 1 | Freeze requirements and invariants (this document) | DONE — revision 3.1 signed off |
 | 2 | Durable order ownership and command ledger | PR1 IMPLEMENTED, not activated — merged to `master` (`5b50e1d`): schemas, all three state machines, durable repositories, command ledger. Excludes A4a's KIS-specific correlation-key adapter (stays gated on Workstream 0). |
 | 3 | One guarded execution gateway | PR2 IMPLEMENTED, not activated — `ExecutionCommandGateway` (`src/services/execution_command_gateway.py`): dual-mode, with genuinely separate call shapes per mode (`submit_order`/`cancel_order` for `LEGACY_COMPATIBILITY`; `submit_guarded`/`cancel_guarded`/`replace_guarded` taking explicit request models with caller-generated stable command identities for `GUARDED_ENGINE`). Full A1-A11/B1-B4 sequence, one authoritative atomic capital reservation with an in-transaction availability check, a real lease-epoch gate, H1 ownership enforcement, a mutation-budget seam for Workstream 10, and fail-closed guarded runtime composition. Runtime-level tests cover restart-restored caller identity, normalized results, full-context tracked cancellation, Partial Sell/Sell All, one-reservation entry, and unresolved post-broker persistence without retry. |
-| 4 | Account-level reconciliation engine | PR3 IMPLEMENTED, not activated — one immutable `AccountBrokerSnapshot` per account/pass, per-source `SnapshotCompleteness`, a pure `ReconciliationPlan` reducer, durable two-generation order/reservation absence evidence, lifecycle-linked behavioral C4 projection, execution-boundary and last-broker-boundary fencing for active unowned orders, guarded execution of reducer commands, safe external SELL exposure handling, atomic account-plan persistence with reservation CAS, failure-invalidated action readiness, and one startup/periodic runtime pass replacing the three ordered EOD sweeps. KIS submission-time mapping and production threshold calibration remain gated on Workstream 0; without verified broker submission time, A4a stays manual and unmatched broker orders remain separate `DiscoveredExternalOrder`s. |
+| 4 | Account-level reconciliation engine | PR3 IMPLEMENTED, not activated — one immutable `AccountBrokerSnapshot` per account/pass, per-source `SnapshotCompleteness`, a pure `ReconciliationPlan` reducer, durable two-generation order/reservation absence evidence, lifecycle-linked behavioral C4 projection with terminal attempt-group retirement, execution-boundary and last-broker-boundary fencing for active unowned orders with definitive pre-broker aborts, guarded execution of reducer commands, safe external SELL exposure handling, atomic account-plan persistence plus strict allocator reservation CAS, failure-invalidated action readiness, and one startup/periodic runtime pass replacing the three ordered EOD sweeps. KIS submission-time mapping and production threshold calibration remain gated on Workstream 0; without verified broker submission time, A4a stays manual and unmatched broker orders remain separate `DiscoveredExternalOrder`s. |
 | 5 | Production KIS real-time market data | NOT STARTED |
 | 6 | Runtime readiness and device handoff | NOT STARTED |
 | 7 | Complete test program | NOT STARTED — matrix fully specified; distributed across PR1-7, capstone in PR8 |
@@ -242,13 +242,13 @@ created either via A1's own submission flow or via explicit adoption of a
 
   class BrokerIdentityStatus(str, Enum):
       NOT_ASSIGNED = "NOT_ASSIGNED"      # no broker call made yet (PREPARED)
-      AMBIGUOUS = "AMBIGUOUS"            # broker call made, outcome unknown (SUBMITTING/UNKNOWN_SUBMISSION_STATE)
+      AMBIGUOUS = "AMBIGUOUS"            # broker boundary may have been entered; outcome unknown (SUBMITTING/UNKNOWN_SUBMISSION_STATE)
       EXACT = "EXACT"                    # broker_order_id confirmed (ACKNOWLEDGED and beyond, or a completed adoption)
       NO_BROKER_ORDER_CONFIRMED = "NO_BROKER_ORDER_CONFIRMED"  # (revision 3.2) confirmed no broker order exists -- REJECTED/NOT_ACCEPTED_CONFIRMED reached from AMBIGUOUS, not EXACT
   ```
 
   *(Revision 3.2 addition: `NO_BROKER_ORDER_CONFIRMED`.)* `AMBIGUOUS` means
-  "a broker call was made, outcome unknown" -- once that outcome is
+  "the broker boundary may have been entered, outcome unknown" -- once that outcome is
   confirmed negative (an explicit `REJECTED` response, or A4a's inferred
   `NOT_ACCEPTED_CONFIRMED`) with no `broker_order_id` ever having been
   assigned, `AMBIGUOUS` is stale and wrong: there is no longer anything
@@ -266,6 +266,7 @@ created either via A1's own submission flow or via explicit adoption of a
   | `ExecutionOrderStatus` | `OrderOrigin` | `BrokerIdentityStatus` |
   |---|---|---|
   | `PREPARED` | `APPLICATION` | `NOT_ASSIGNED` |
+  | `CANCELLED_LOCALLY` (including a final-gate abort after the `SUBMITTING` commit) | `APPLICATION` | `NOT_ASSIGNED` |
   | `SUBMITTING` / `UNKNOWN_SUBMISSION_STATE` | `APPLICATION` | `AMBIGUOUS` |
   | `ACKNOWLEDGED` and beyond (except as below) | `APPLICATION` | `EXACT` -- **required**, not merely typical: a transition into `ACKNOWLEDGED` without a confirmed `broker_order_id` (either already `EXACT`, or supplied in that same transition) must raise, not persist an inconsistent record |
   | `REJECTED` / `NOT_ACCEPTED_CONFIRMED` reached while identity was still `AMBIGUOUS` | `APPLICATION` | `NO_BROKER_ORDER_CONFIRMED` *(revision 3.2)* |
@@ -306,6 +307,7 @@ belongs to `ExecutionOrderRecord` specifically. See
 | `SUBMITTING` | `ACKNOWLEDGED` | Broker responded, accepted, `broker_order_id` known |
 | `SUBMITTING` | `REJECTED` | Broker responded, explicitly rejected the submission |
 | `SUBMITTING` | `UNKNOWN_SUBMISSION_STATE` | Timeout, crash, or network loss before a response was durably persisted (see the SUBMITTING-commit rule below) |
+| `SUBMITTING` | `CANCELLED_LOCALLY` | A mutable ownership/lease/external-order fence fails at the final check after the journal commit but before the broker boundary; command becomes `PRE_BROKER_ABORTED` and the reservation is released atomically, so this is definitive local non-acceptance, never ambiguity |
 | `UNKNOWN_SUBMISSION_STATE` | `ACKNOWLEDGED` | A4a resolves: broker confirms the order exists, exact identity established |
 | `UNKNOWN_SUBMISSION_STATE` | `REJECTED` | The broker/exchange returns **explicit rejection evidence** for this exact submission — a real rejection response, never an inference |
 | `UNKNOWN_SUBMISSION_STATE` | `NOT_ACCEPTED_CONFIRMED` | *(revision 3.1)* A4a resolves **by inference**: exact correlation-key lookup plus complete broker-history evidence confirms no broker order was ever created for this submission — distinct from `REJECTED`'s explicit-evidence bar; see the corrected A4a below |
@@ -319,6 +321,7 @@ belongs to `ExecutionOrderRecord` specifically. See
 | `PARTIALLY_FILLED` | `CANCEL_PENDING` | A cancel command was submitted for the remainder |
 | `CANCEL_PENDING` | `CANCELLED` | Broker confirms the cancel |
 | `CANCEL_PENDING` | `FILLED` / `PARTIALLY_FILLED` | A fill raced the cancel — must be handled explicitly, never assumed impossible |
+| `CANCEL_PENDING` | prior `ACKNOWLEDGED` / `WORKING` / `PARTIALLY_FILLED` state | A mutable ownership/lease/external-order fence fails at the final check before the cancel reaches the broker; restore the exact pre-cancel state and retire the caller-owned cancel ID as `PRE_BROKER_ABORTED` |
 | `CANCEL_PENDING` | `WORKING` | *(revision 3.2)* The broker explicitly rejects the cancel request itself (e.g. the order had already progressed past the point a cancel could apply) — the order is simply still working, unchanged |
 | `CANCEL_PENDING` | `EXPIRED` | *(revision 3.2)* Time-in-force expiry races the cancel request — same "must be handled explicitly" rule as a racing fill |
 
@@ -453,6 +456,10 @@ calculate final quantity, price, exchange, order type (post risk-revalidation)
       (revision 3 fix: PREPARED-committed-but-SUBMITTING-write-failed must
       never fall through to calling the broker anyway -- that would reopen
       the exact ambiguous gap INV-1 exists to close)
+  → re-read mutable ownership, lease, and active-external-order fences
+      immediately before the broker boundary
+        gate failure → atomically persist command=PRE_BROKER_ABORTED,
+                       order=CANCELLED_LOCALLY, release reservation
   → execute the KIS request
   → on a response:
         success  → persist status=ACKNOWLEDGED + broker_order_id
@@ -468,8 +475,9 @@ Recovery semantics after a restart, made explicit:
   broker call was never authorized — safe to move directly to
   `CANCELLED_LOCALLY` or resume using the same command identity (A5's
   idempotency key covers a resumed attempt).
-- **`SUBMITTING` after restart**: broker acceptance is genuinely unknown.
-  Never blindly resubmit — this is A4a's exact trigger.
+- **`SUBMITTING` after restart**: broker acceptance is genuinely unknown
+  unless the final-gate abort transaction already converted it to
+  `CANCELLED_LOCALLY`. Never blindly resubmit — this is A4a's exact trigger.
 
 | Requirement | Owning module | Persisted state | Broker action | Failure behavior | Recovery behavior | Tests | Activation criterion |
 |---|---|---|---|---|---|---|---|
@@ -1123,6 +1131,15 @@ and stays `false` in unattended/automatic form until Gate 5 passes.
   invalidates cached action readiness; active external fences are re-read at
   the final submit/cancel boundary; and capital reservations now carry a
   migrated optimistic version used by gateway and account-plan CAS writes.
+- 2026-08-16 (PR3 final residual hardening): A final mutable-gate failure
+  now performs an explicit pre-broker abort: submit retires the command and
+  order locally while releasing capital, and cancel restores its exact
+  pre-cancel state and retires the failed caller-owned cancel ID. Entry and
+  exit attempt groups are retired when their objective/trade cycle ends, so
+  historical exact orders cannot correlate to a later cycle. The allocator
+  now uses a strict database CAS before updating JSON; on conflict it reloads
+  and mirrors the winning authoritative reservation before failing closed.
+  Local validation: `python -m compileall -q src tests` and `1608 passed`.
 - 2026-08-15: Initial draft, branch created from `109c2c4` ("kanban fix 8").
 - 2026-08-15 (revision 2): Incorporated first architecture review. Added
   Workstream 0, INV-20, rewrote A4 (single version), atomic pre-submission

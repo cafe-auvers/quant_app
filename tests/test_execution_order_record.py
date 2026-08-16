@@ -141,6 +141,7 @@ def test_every_encoded_valid_transition_is_accepted(frm, to):
         (ExecutionOrderStatus.SUBMITTING, ExecutionOrderStatus.ACKNOWLEDGED),
         (ExecutionOrderStatus.SUBMITTING, ExecutionOrderStatus.REJECTED),
         (ExecutionOrderStatus.SUBMITTING, ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE),
+        (ExecutionOrderStatus.SUBMITTING, ExecutionOrderStatus.CANCELLED_LOCALLY),
         (ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE, ExecutionOrderStatus.ACKNOWLEDGED),
         (ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE, ExecutionOrderStatus.REJECTED),
         (ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE, ExecutionOrderStatus.NOT_ACCEPTED_CONFIRMED),
@@ -161,6 +162,7 @@ def test_every_encoded_valid_transition_is_accepted(frm, to):
         (ExecutionOrderStatus.CANCEL_PENDING, ExecutionOrderStatus.FILLED),
         (ExecutionOrderStatus.CANCEL_PENDING, ExecutionOrderStatus.PARTIALLY_FILLED),
         (ExecutionOrderStatus.CANCEL_PENDING, ExecutionOrderStatus.WORKING),  # revision 3.2
+        (ExecutionOrderStatus.CANCEL_PENDING, ExecutionOrderStatus.ACKNOWLEDGED),
         (ExecutionOrderStatus.CANCEL_PENDING, ExecutionOrderStatus.EXPIRED),  # revision 3.2
     ],
 )
@@ -177,7 +179,7 @@ def test_every_documented_transition_table_row_matches_the_written_contract(frm,
     [
         (ExecutionOrderStatus.PREPARED, ExecutionOrderStatus.ACKNOWLEDGED),
         (ExecutionOrderStatus.SUBMITTING, ExecutionOrderStatus.FILLED),
-        (ExecutionOrderStatus.SUBMITTING, ExecutionOrderStatus.CANCELLED_LOCALLY),
+        (ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE, ExecutionOrderStatus.CANCELLED_LOCALLY),
         (ExecutionOrderStatus.WORKING, ExecutionOrderStatus.ACKNOWLEDGED),
         (ExecutionOrderStatus.CANCEL_PENDING, ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE),
         (ExecutionOrderStatus.FILLED, ExecutionOrderStatus.CANCELLED),
@@ -201,6 +203,18 @@ def test_apply_status_transition_mutates_the_record_on_success():
     rec = _record()
     apply_status_transition(rec, ExecutionOrderStatus.SUBMITTING)
     assert rec.status == ExecutionOrderStatus.SUBMITTING
+
+
+def test_pre_broker_submit_abort_retires_ambiguous_identity_locally():
+    rec = _record()
+    apply_status_transition(rec, ExecutionOrderStatus.SUBMITTING)
+
+    apply_status_transition(rec, ExecutionOrderStatus.CANCELLED_LOCALLY)
+
+    assert rec.status == ExecutionOrderStatus.CANCELLED_LOCALLY
+    assert rec.broker_identity_status == BrokerIdentityStatus.NOT_ASSIGNED
+    assert rec.broker_order_id == ""
+    assert rec.submission_started_at is None
 
 
 def test_apply_status_transition_raises_and_does_not_mutate_on_an_invalid_transition():

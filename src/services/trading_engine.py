@@ -725,6 +725,8 @@ class TradingEngine:
             card.entry_pending_attempt_number = 0
             card.entry_submission_unresolved = False
             card.next_retry_at = None
+            if card.entry_remaining_target_quantity <= 0:
+                card.entry_attempt_group_id = ""
             return True
 
         if action == AttemptDeadlineAction.CONFIRMED_CANCELLED_WITH_FILL:
@@ -747,6 +749,8 @@ class TradingEngine:
             card.entry_pending_attempt_number = 0
             card.entry_submission_unresolved = False
             card.next_retry_at = None
+            if not retry_remainder:
+                card.entry_attempt_group_id = ""
             if not card.exit_all_required:
                 card.position_runtime_status = (
                     PositionRuntimeStatus.ENTRY_COMPLETING
@@ -771,6 +775,7 @@ class TradingEngine:
                 # trying to complete it.
                 if not retry_remainder:
                     card.entry_remaining_target_quantity = 0
+                    card.entry_attempt_group_id = ""
                 card.entry_runtime_status = None
                 card.entry_block_reason = ""
                 if not card.exit_all_required:
@@ -784,6 +789,7 @@ class TradingEngine:
                 card.board_status = BoardStatus.BUYLIST
                 card.entry_runtime_status = None
                 card.entry_block_reason = ""
+                card.entry_attempt_group_id = ""
             else:
                 card.board_status = BoardStatus.BUY_TODAY
                 card.entry_runtime_status = EntryRuntimeStatus.RETRY_COOLDOWN
@@ -799,6 +805,7 @@ class TradingEngine:
             card.entry_submission_unresolved = False
             if already_has_position:
                 card.entry_remaining_target_quantity = 0
+                card.entry_attempt_group_id = ""
                 if not card.exit_all_required:
                     card.position_runtime_status = PositionRuntimeStatus.OPEN
                 card.entry_runtime_status = None
@@ -1048,6 +1055,7 @@ class TradingEngine:
                 card.exit_client_order_id = ""
                 card.exit_pending_attempt_number = 0
                 card.exit_submission_unresolved = False
+                card.exit_attempt_group_id = ""
                 card.next_exit_retry_at = None
                 card.last_exit_error = ""
                 changed.append(card)
