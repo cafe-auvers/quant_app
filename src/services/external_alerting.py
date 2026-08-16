@@ -479,10 +479,11 @@ class ExternalAlertingService:
                     "version": int(row.version) + 1,
                 }
                 if row.status == AlertIncidentStatus.ACKNOWLEDGED.value:
+                    # Delivery attempt numbers are lifetime-monotonic for an
+                    # incident because historical rows remain durable under
+                    # UNIQUE (incident_id, attempt_number).
                     values.update(
                         status=AlertIncidentStatus.OPEN.value,
-                        delivery_attempt_count=0,
-                        escalation_level=0,
                         next_attempt_at=now,
                         acknowledged_at=None,
                         acknowledged_by="",

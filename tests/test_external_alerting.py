@@ -107,6 +107,91 @@ def test_alert_deduplication_and_acknowledgement_are_incident_scoped(tmp_path):
     assert service.process_due() == 0
 
 
+def test_acknowledged_incident_recurrence_uses_next_lifetime_attempt(tmp_path):
+    provider = FakeProvider()
+    service, _ = _service(tmp_path, provider=provider)
+    incident = service.raise_alert(
+        CriticalAlertType.DATABASE_UNAVAILABLE,
+        "recurring-db",
+        "database unavailable",
+    )
+    assert service.process_due() == 1
+    assert service.acknowledge(incident.incident_id, acknowledged_by="operator")
+
+    reopened = service.raise_alert(
+        CriticalAlertType.DATABASE_UNAVAILABLE,
+        "recurring-db",
+        "database unavailable again",
+    )
+    assert reopened.delivery_attempt_count == 1
+    assert service.process_due() == 1
+
+    attempts = service.delivery_attempts(incident.incident_id)
+    assert [attempt["attempt_number"] for attempt in attempts] == [1, 2]
+    assert [attempt["status"] for attempt in attempts] == [
+        "DELIVERED",
+        "DELIVERED",
+    ]
+    assert len(provider.deliveries) == 2
+
+
+def test_acknowledged_incident_preserves_all_prior_attempt_history(tmp_path):
+    provider = FakeProvider()
+    provider.delivery_failures = 2
+    service, now = _service(
+        tmp_path,
+        provider=provider,
+        escalation_every_attempts=2,
+    )
+    incident = service.raise_alert(
+        CriticalAlertType.EXECUTION_LEASE_LOST,
+        "lease-main",
+        "execution lease lost",
+    )
+    assert service.process_due() == 1
+    now[0] += timedelta(seconds=1)
+    assert service.process_due() == 1
+    now[0] += timedelta(seconds=2)
+    assert service.process_due() == 1
+    prior_attempts = service.delivery_attempts(incident.incident_id)
+    assert [attempt["attempt_number"] for attempt in prior_attempts] == [1, 2, 3]
+
+    assert service.acknowledge(incident.incident_id, acknowledged_by="operator")
+    reopened = service.raise_alert(
+        CriticalAlertType.EXECUTION_LEASE_LOST,
+        "lease-main",
+        "execution lease lost again",
+    )
+    assert reopened.delivery_attempt_count == 3
+    assert reopened.escalation_level == 1
+    assert service.process_due() == 1
+
+    attempts = service.delivery_attempts(incident.incident_id)
+    assert [attempt["attempt_number"] for attempt in attempts] == [1, 2, 3, 4]
+    assert attempts[:3] == prior_attempts
+    assert attempts[-1]["status"] == "DELIVERED"
+
+
+def test_acknowledged_recurrence_retains_incident_id_and_counts_occurrence(tmp_path):
+    service, _ = _service(tmp_path)
+    first = service.raise_alert(
+        CriticalAlertType.STALE_CRITICAL_SYMBOL,
+        "MSFT",
+        "symbol is stale",
+    )
+    assert service.acknowledge(first.incident_id, acknowledged_by="operator")
+
+    recurrence = service.raise_alert(
+        CriticalAlertType.STALE_CRITICAL_SYMBOL,
+        "MSFT",
+        "symbol is stale again",
+    )
+
+    assert recurrence.incident_id == first.incident_id
+    assert recurrence.occurrence_count == 2
+    assert recurrence.status == AlertIncidentStatus.OPEN
+
+
 def test_heartbeat_is_published_on_the_expected_cadence(tmp_path):
     provider = FakeProvider()
     service, now = _service(tmp_path, provider=provider)
