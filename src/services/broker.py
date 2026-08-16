@@ -178,6 +178,11 @@ class ReadOnlyBroker:
 class KisBroker:
     """``Broker`` implementation backed by the real KIS overseas order API."""
 
+    # The gateway supplies priority context around a high-level operation,
+    # but this adapter acquires no scheduler turn itself.  Each underlying
+    # KIS HTTP request does that independently in ``src.api``.
+    schedules_at_request_boundary = True
+
     def submit_order(
         self,
         *,
@@ -221,6 +226,18 @@ class KisBroker:
 
     def is_ambiguous_submission_error(self, error: BaseException) -> bool:
         return kis_order.is_ambiguous_order_submission_error(error)
+
+    @staticmethod
+    def is_confirmed_pre_acceptance_rejection(error: BaseException) -> bool:
+        """Classify only KIS's typed, explicit rate-limit refusal as retryable.
+
+        Network errors and generic API failures may have crossed the mutation
+        boundary and therefore remain ambiguous/non-retryable.
+        """
+
+        from src.api.kis_account_snapshot_dual import KisRateLimitError
+
+        return isinstance(error, KisRateLimitError)
 
     def cancel_order(
         self,

@@ -12,6 +12,7 @@ from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
+    Integer,
     MetaData,
     String,
     func,
@@ -23,6 +24,9 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.engine import Engine
 
 from src.core.runtime_readiness import RuntimeDeviceState
+from src.core.schema_version import CURRENT_EXECUTION_SCHEMA_VERSION
+from src.services.state_sync import get_main_device
+from src.services.runtime_status import get_runtime_process_status
 
 _ensured_engines: "weakref.WeakSet[Engine]" = weakref.WeakSet()
 _ensure_lock = threading.Lock()
@@ -39,6 +43,7 @@ class RuntimeDeviceRecord:
     confirmed_by_lease_epoch: int
     confirmed_at: Optional[datetime]
     updated_at: datetime
+    schema_version: int
 
 
 def _table(metadata: MetaData):
@@ -50,6 +55,12 @@ def _table(metadata: MetaData):
         Column("device_id", String(64), primary_key=True),
         Column("hostname", String(255), nullable=False, server_default=""),
         Column("state", String(32), nullable=False),
+        Column(
+            "schema_version",
+            Integer,
+            nullable=False,
+            server_default=str(CURRENT_EXECUTION_SCHEMA_VERSION),
+        ),
         Column("handoff_confirmed", Boolean, nullable=False, server_default="0"),
         Column("readiness_generation", BigInteger, nullable=False, server_default="0"),
         Column("confirmed_generation", BigInteger, nullable=False, server_default="0"),
@@ -78,6 +89,9 @@ def ensure_runtime_device_state_table(engine: Engine):
                 "confirmed_generation": "BIGINT NOT NULL DEFAULT 0",
                 "confirmed_by_lease_epoch": "BIGINT NOT NULL DEFAULT 0",
                 "confirmed_at": "DATETIME NULL",
+                # Existing rows predate version publication and must remain
+                # explicitly unknown (0), never be relabelled as compatible.
+                "schema_version": "INTEGER NOT NULL DEFAULT 0",
             }
             with engine.begin() as conn:
                 for name, definition in additions.items():
@@ -117,6 +131,7 @@ def _record(row) -> RuntimeDeviceRecord:
         confirmed_by_lease_epoch=int(row.confirmed_by_lease_epoch or 0),
         confirmed_at=confirmed_at,
         updated_at=observed.astimezone(timezone.utc),
+        schema_version=int(row.schema_version or 0),
     )
 
 
@@ -127,6 +142,7 @@ def save_runtime_device_state(
     hostname: str,
     state: RuntimeDeviceState,
     handoff_confirmed: bool = False,
+    schema_version: int = CURRENT_EXECUTION_SCHEMA_VERSION,
 ) -> RuntimeDeviceRecord:
     """Upsert one device's readiness state.
 
@@ -175,6 +191,7 @@ def save_runtime_device_state(
         values = {
             "hostname": str(hostname or ""),
             "state": state.value,
+            "schema_version": int(schema_version),
             "handoff_confirmed": confirmed,
             "readiness_generation": generation,
             "confirmed_generation": confirmed_generation,
@@ -286,6 +303,83 @@ def get_runtime_device_state(
             select(table).where(table.c.device_id == str(device_id or ""))
         ).first()
     return _record(row) if row is not None else None
+
+
+def require_compatible_runtime_schema(
+    engine: Engine,
+    *,
+    device_id: str,
+    schema_version: int = CURRENT_EXECUTION_SCHEMA_VERSION,
+    lease_engine: Optional[Engine] = None,
+    max_age_seconds: float = 60.0,
+    now: Optional[datetime] = None,
+) -> None:
+    """Refuse startup while any genuinely live runtime is incompatible.
+
+    Runtime-state rows are historical observations, not execution authority.
+    A crashed device can leave ``ACTIVE`` behind indefinitely; once a fenced
+    failover grants the lease to another device, that abandoned row must no
+    longer block startup.  Fresh non-owner standbys still share canonical
+    state, though, and therefore must participate in mixed-version exclusion.
+    """
+
+    table = ensure_runtime_device_state_table(engine)
+    ownership = get_main_device(lease_engine or engine)
+    if not ownership.success:
+        raise RuntimeError(
+            "Runtime schema compatibility could not verify the current "
+            f"execution lease: {ownership.error}"
+        )
+    current_owner = ownership.main_device
+    live_states = {
+        RuntimeDeviceState.STARTING.value,
+        RuntimeDeviceState.STANDBY.value,
+        RuntimeDeviceState.STANDBY_READY.value,
+        RuntimeDeviceState.ACTIVE.value,
+        RuntimeDeviceState.SHUTTING_DOWN.value,
+    }
+    with engine.connect() as conn:
+        conflicting_rows = conn.execute(
+            select(table).where(
+                table.c.device_id != str(device_id or ""),
+                table.c.state.in_(live_states),
+                table.c.schema_version != int(schema_version),
+            )
+        ).fetchall()
+        server_now = conn.execute(select(_server_now(engine))).scalar()
+    reference = now or server_now or datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    else:
+        reference = reference.astimezone(timezone.utc)
+    for row in conflicting_rows:
+        conflicting = _record(row)
+        age = (reference - conflicting.updated_at).total_seconds()
+        row_is_fresh = 0.0 <= age <= float(max_age_seconds)
+        is_current_owner = bool(
+            current_owner is not None
+            and conflicting.device_id == current_owner.device_id
+        )
+        owner_process_is_fresh = False
+        if is_current_owner and not row_is_fresh:
+            owner_process_is_fresh = get_runtime_process_status(
+                lease_engine or engine,
+                conflicting.hostname,
+                max_age_seconds=max(0, int(max_age_seconds)),
+            ).active
+        if not row_is_fresh and not owner_process_is_fresh:
+            continue
+        authority = (
+            "current lease holder"
+            if is_current_owner
+            else "fresh running peer"
+        )
+        raise RuntimeError(
+            "Runtime schema mismatch: device "
+            f"{conflicting.device_id} is a {authority} in "
+            f"{conflicting.state.value} on schema {conflicting.schema_version}, "
+            f"while this runtime requires {schema_version}"
+        )
 
 
 def find_standby_successor(

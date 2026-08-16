@@ -119,7 +119,7 @@ from src.core.execution_request import (
     CancelIntent,
     derive_execution_client_order_id,
 )
-from src.core.execution_order_record import ExecutionOrderStatus
+from src.core.execution_order_record import ExecutionOrderRecord, ExecutionOrderStatus
 from src.core.execution_result import broker_order_from_execution_record
 from src.core.order_state import (
     BrokerOrder,
@@ -291,20 +291,21 @@ def _reconcile_order(order: BrokerOrder, *, broker: Broker) -> BrokerOrder:
     return refreshed if refreshed is not None else order
 
 
-def _cancel_order(intent: CancelIntent, *, broker: Broker) -> None:
+def _cancel_order(intent: CancelIntent, *, broker: Broker) -> Any:
     # Workstream 9 (PR2 third pass, finding 1): route through the shared
     # workflow service, not order_reconciliation directly -- request_cancel
     # is the one entry point both legacy and Kanban use (INV-21). In
     # LEGACY_COMPATIBILITY delegates to cancel_and_reconcile_order through
     # the gateway adapter; GUARDED_ENGINE consumes the full CancelIntent.
     try:
-        request_cancel_intent(intent, gateway=broker)
+        return request_cancel_intent(intent, gateway=broker)
     except ValueError as exc:
         # Already terminal / already cancelled / not found -- the caller
         # (entry_attempt_manager/position_manager) only ever calls this on
         # an order it believes is still open; a stale belief is not a bug
         # here, just logged so it's visible.
         logger.info("Cancel request for %s was a no-op: %s", intent.client_order_id, exc)
+        return None
 
 
 
@@ -571,6 +572,26 @@ def build_buyboard_runtime(
     guarded_lease = execution_lease if isinstance(execution_lease, ExecutionLease) else None
     legacy_lease = execution_lease if isinstance(execution_lease, LeaseHandle) else None
     resolved_equity_provider = account_equity_provider or buying_power_provider
+    guarded_record_cache: Dict[str, ExecutionOrderRecord] = {}
+
+    def cache_recent_guarded_record(client_order_id: str) -> None:
+        if not guarded_mode or not client_order_id:
+            return
+        assert isinstance(resolved_broker, ExecutionCommandGateway)
+        record = resolved_broker.cached_execution_record(client_order_id)
+        if record is not None:
+            guarded_record_cache[record.client_order_id] = record
+
+    def cancel_runtime_order(intent: CancelIntent) -> Any:
+        try:
+            result = _cancel_order(intent, broker=resolved_broker)
+            if isinstance(result, ExecutionOrderRecord):
+                guarded_record_cache[result.client_order_id] = result
+            return result
+        finally:
+            # Ambiguous cancellations raise, so a success-only cache update
+            # loses precisely the record the outage path must keep fenced.
+            cache_recent_guarded_record(intent.client_order_id)
 
     def persist_execution_identity(card: TradeCardState) -> None:
         if guarded_mode:
@@ -646,6 +667,34 @@ def build_buyboard_runtime(
             cancel_command_id = f"{client_order_id}:CANCEL:{uuid4().hex}"
             setattr(card, field_name, cancel_command_id)
             persist_execution_identity(card)
+        record = guarded_record_cache.get(client_order_id)
+        if guarded_mode and isinstance(resolved_broker, ExecutionCommandGateway):
+            # The emergency cache is newer than the last canonical snapshot
+            # after an offline cancel and must win over a stale WORKING row.
+            record = resolved_broker.cached_emergency_record(client_order_id) or record
+            if record is None and resolved_broker.canonical_database_writable:
+                record = fetch_execution_order(
+                    resolved_broker.database_engine, client_order_id
+                )
+                if record is not None:
+                    guarded_record_cache[client_order_id] = record
+        protective_entry_completion = bool(
+            str(scope).upper() == "ENTRY"
+            and record is not None
+            and record.side == OrderSide.BUY
+            and record.intent == OrderIntent.ENTRY
+            and record.client_order_id == card.entry_client_order_id
+            and int(card.broker_quantity or 0) > 0
+            and (
+                card.exit_all_required
+                or card.board_status == BoardStatus.SELL_ALL
+            )
+        )
+        emergency_cancel = bool(
+            str(scope).upper() == "EXIT"
+            and record is not None
+            and record.side == OrderSide.SELL
+        ) or protective_entry_completion
         return CancelIntent(
             client_order_id=client_order_id,
             cancel_command_id=cancel_command_id,
@@ -654,6 +703,17 @@ def build_buyboard_runtime(
             lease=guarded_lease,
             strategy_instance_id=strategy_instance_id,
             source=ExecutionSource.KANBAN_BOARD,
+            emergency=emergency_cancel,
+            protective_entry_completion=protective_entry_completion,
+            symbol=record.symbol if emergency_cancel else "",
+            broker_order_id=record.broker_order_id if emergency_cancel else "",
+            quantity=(
+                record.remaining_quantity or record.submitted_quantity
+                if emergency_cancel
+                else 0
+            ),
+            side=record.side.value if emergency_cancel else "",
+            exchange=record.exchange or "NASD" if emergency_cancel else "NASD",
         )
 
     def submit_order(**kwargs):
@@ -733,19 +793,22 @@ def build_buyboard_runtime(
         # and Kanban use (INV-21). It normalizes the two persistence models
         # into one workflow result while preserving this function's risk
         # revalidation and gate sequence.
-        return request_submit(
-            source=ExecutionSource.KANBAN_BOARD,
-            gateway=resolved_broker,
-            strategy_instance_id=strategy_instance_id,
-            lease=guarded_lease,
-            pre_trade_risk_decision=decision,
-            strategy_id=RISK_STRATEGY_ID,
-            plan_id=plan_id,
-            execution_authority=execution_authority,
-            execution_lease=legacy_lease,
-            lease_engine=lease_engine,
-            **submit_kwargs,
-        )
+        try:
+            return request_submit(
+                source=ExecutionSource.KANBAN_BOARD,
+                gateway=resolved_broker,
+                strategy_instance_id=strategy_instance_id,
+                lease=guarded_lease,
+                pre_trade_risk_decision=decision,
+                strategy_id=RISK_STRATEGY_ID,
+                plan_id=plan_id,
+                execution_authority=execution_authority,
+                execution_lease=legacy_lease,
+                lease_engine=lease_engine,
+                **submit_kwargs,
+            )
+        finally:
+            cache_recent_guarded_record(submit_kwargs.get("client_order_id", ""))
 
     authoritative_reservation_engine = (
         resolved_broker.database_engine
@@ -788,12 +851,49 @@ def build_buyboard_runtime(
         assert isinstance(resolved_broker, ExecutionCommandGateway)
         engine = resolved_broker.database_engine
         assert engine is not None
-        for record in list_execution_orders_for_card(
-            engine,
-            environment=card.environment,
-            account_no=card.account_no,
-            symbol=card.symbol,
-        ):
+        if resolved_broker.canonical_database_writable:
+            records = list_execution_orders_for_card(
+                engine,
+                environment=card.environment,
+                account_no=card.account_no,
+                symbol=card.symbol,
+            )
+            guarded_record_cache.update(
+                {record.client_order_id: record for record in records}
+            )
+            for record in records:
+                resolved_broker.remember_canonical_execution_record(record)
+        else:
+            records = [
+                record
+                for record in guarded_record_cache.values()
+                if (
+                    record.environment == card.environment
+                    and record.account_no == card.account_no
+                    and record.symbol == card.symbol
+                )
+            ]
+            for tracked_client_order_id in (
+                card.entry_client_order_id,
+                card.exit_client_order_id,
+            ):
+                if not tracked_client_order_id:
+                    continue
+                recent_record = resolved_broker.cached_execution_record(
+                    tracked_client_order_id
+                )
+                if recent_record is not None:
+                    guarded_record_cache[tracked_client_order_id] = recent_record
+                    records = [
+                        recent_record,
+                        *[
+                            record
+                            for record in records
+                            if record.client_order_id
+                            != recent_record.client_order_id
+                        ],
+                    ]
+        for record in records:
             if record.status not in guarded_open_statuses or record.side != side:
                 continue
             if intent is not None and record.intent != intent:
@@ -807,7 +907,18 @@ def build_buyboard_runtime(
         assert isinstance(resolved_broker, ExecutionCommandGateway)
         engine = resolved_broker.database_engine
         assert engine is not None
-        record = fetch_execution_order(engine, order.client_order_id)
+        if resolved_broker.canonical_database_writable:
+            record = fetch_execution_order(engine, order.client_order_id)
+            if record is not None:
+                guarded_record_cache[order.client_order_id] = record
+                resolved_broker.remember_canonical_execution_record(record)
+        else:
+            record = (
+                resolved_broker.cached_emergency_record(order.client_order_id)
+                or guarded_record_cache.get(order.client_order_id)
+            )
+            if record is not None:
+                guarded_record_cache[order.client_order_id] = record
         return broker_order_from_execution_record(record) if record is not None else order
 
     entry_deadline_lookup = EntryDeadlineLookup(
@@ -881,24 +992,28 @@ def build_buyboard_runtime(
         # Workstream 9 (PR2 third pass, finding 1): route through the
         # shared workflow service -- see submit_order's identical comment
         # above for the shared guarded/compatibility contract.
-        return request_submit(
-            source=ExecutionSource.KANBAN_BOARD,
-            gateway=resolved_broker,
-            strategy_instance_id=strategy_instance_id,
-            lease=guarded_lease,
-            side=OrderSide.SELL,
-            intent=intent,
-            limit_price=limit_price,
-            exchange=exchange,
-            plan_id=f"{submit_kwargs.get('environment', '')}:{symbol}:SELL:{reason}",
-            execution_authority=execution_authority,
-            execution_lease=legacy_lease,
-            lease_engine=lease_engine,
-            **submit_kwargs,
-        )
+        try:
+            return request_submit(
+                source=ExecutionSource.KANBAN_BOARD,
+                gateway=resolved_broker,
+                strategy_instance_id=strategy_instance_id,
+                lease=guarded_lease,
+                emergency=reason in {"sell_all", "sell_all_retry", "stop_loss"},
+                side=OrderSide.SELL,
+                intent=intent,
+                limit_price=limit_price,
+                exchange=exchange,
+                plan_id=f"{submit_kwargs.get('environment', '')}:{symbol}:SELL:{reason}",
+                execution_authority=execution_authority,
+                execution_lease=legacy_lease,
+                lease_engine=lease_engine,
+                **submit_kwargs,
+            )
+        finally:
+            cache_recent_guarded_record(submit_kwargs.get("client_order_id", ""))
 
     position_callbacks = PositionActionCallbacks(
-        cancel_order=lambda intent: _cancel_order(intent, broker=resolved_broker),
+        cancel_order=cancel_runtime_order,
         submit_sell_order=submit_sell_order,
         refresh_orderable_quantity=lambda environment, account_no, symbol: _refresh_orderable_quantity(
             environment, account_no, symbol, broker=resolved_broker
@@ -945,7 +1060,7 @@ def build_buyboard_runtime(
             card, side=OrderSide.BUY, intent=OrderIntent.ENTRY
         ),
         reconcile_order=reconcile_runtime_order,
-        cancel_order=lambda intent: _cancel_order(intent, broker=resolved_broker),
+        cancel_order=cancel_runtime_order,
         cancel_intent_factory=cancel_intent_factory,
         persist_cancel_state=persist_execution_identity,
     )

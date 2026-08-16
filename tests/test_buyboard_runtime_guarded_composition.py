@@ -18,13 +18,16 @@ from src.core.discovered_external_order import (
     ExternalOrderDisposition,
     new_discovered_external_order,
 )
-from src.core.execution_mode import ExecutionLease
+from src.core.execution_mode import ExecutionLease, ExecutionSource
 from src.core.execution_order_record import (
     BrokerIdentityStatus,
     ExecutionOrderRecord,
     ExecutionOrderStatus,
 )
-from src.core.execution_request import derive_execution_client_order_id
+from src.core.execution_request import (
+    SubmitExecutionRequest,
+    derive_execution_client_order_id,
+)
 from src.core.execution_ownership import ExecutionOwner, ExecutionOwnership
 from src.core.execution_result import UnifiedExecutionStatus
 from src.core.order_state import (
@@ -46,6 +49,7 @@ from src.services.execution_command_gateway import ExecutionCommandGateway
 from src.services.execution_lease_protocol import FakeExecutionLeaseProtocol
 from src.services.execution_order_repository import fetch_execution_order
 from src.services.execution_ownership_repository import assign_ownership
+from src.services.emergency_journal import EmergencyJournal, EmergencyLeaseAllowance
 from src.services.mutation_budget_protocol import AllowAllMutationBudget
 from src.services.discovered_external_order_repository import (
     record_discovered_external_order,
@@ -91,7 +95,16 @@ def _enable_guarded(monkeypatch) -> None:
     monkeypatch.setattr(buyboard_runtime, "_eod_window_reached", lambda: False)
 
 
-def _make_runtime(tmp_path, monkeypatch, *, broker=None, buying_power=100_000.0):
+def _make_runtime(
+    tmp_path,
+    monkeypatch,
+    *,
+    broker=None,
+    buying_power=100_000.0,
+    database_writable_provider=None,
+    emergency_journal=None,
+    emergency_lease_allowance=None,
+):
     _enable_guarded(monkeypatch)
     engine = create_engine(
         f"sqlite:///{tmp_path / 'composition.db'}", future=True, poolclass=NullPool
@@ -104,6 +117,9 @@ def _make_runtime(tmp_path, monkeypatch, *, broker=None, buying_power=100_000.0)
         lease_protocol=FakeExecutionLeaseProtocol(current=LEASE),
         mutation_budget=AllowAllMutationBudget(),
         buying_power_provider=lambda environment, account_no: buying_power,
+        database_writable_provider=database_writable_provider,
+        emergency_journal=emergency_journal,
+        emergency_lease_allowance=emergency_lease_allowance,
     )
 
     def lookup(environment, account_no, symbol):
@@ -580,6 +596,154 @@ def test_tracked_cancel_carries_full_context_to_cancel_guarded(tmp_path, monkeyp
     assert fetch_execution_order(engine, card.entry_client_order_id).status == (
         ExecutionOrderStatus.CANCELLED
     )
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_runtime_outage_cancels_completion_buy_then_submits_one_sell(
+    tmp_path, monkeypatch
+):
+    class PositionBroker(FakeExecutionBroker):
+        def get_positions(self, **_kwargs):
+            return {
+                "overseas": {
+                    "holdings": [
+                        {
+                            "symbol": "AAPL",
+                            "quantity": 4,
+                            "orderable_quantity": 4,
+                            "average_price": 100.0,
+                        }
+                    ]
+                }
+            }
+
+    writable = [True]
+    broker = PositionBroker()
+    runtime, broker, gateway, engine, market_data = _make_runtime(
+        tmp_path,
+        monkeypatch,
+        broker=broker,
+        database_writable_provider=lambda: writable[0],
+        emergency_journal=EmergencyJournal(tmp_path / "emergency.jsonl"),
+        emergency_lease_allowance=EmergencyLeaseAllowance(max_seconds=30),
+    )
+    card = _persist_owned_card(
+        engine,
+        _card(
+            board_status=BoardStatus.OPEN_POSITION,
+            entry_runtime_status=EntryRuntimeStatus.SESSION_COMPLETE,
+            position_runtime_status=PositionRuntimeStatus.OPEN,
+            broker_quantity=4,
+            orderable_quantity=4,
+            entry_remaining_target_quantity=2,
+            entry_attempt_group_id="entry-group",
+            entry_attempt_count=1,
+            entry_pending_attempt_number=1,
+            entry_client_order_id="COMPLETION-BUY-1",
+        ),
+    )
+    broker.queue_acceptance(broker_order_id="BR-COMPLETION-BUY")
+    gateway.submit_guarded(
+        SubmitExecutionRequest(
+            client_order_id="COMPLETION-BUY-1",
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            intent=OrderIntent.ENTRY,
+            quantity=2,
+            limit_price=100.0,
+            attempt_group_id="entry-group",
+            attempt_number=1,
+            lease=LEASE,
+            source=ExecutionSource.KANBAN_BOARD,
+            strategy_instance_id=STRATEGY_ID,
+        )
+    )
+    assert runtime.trading_engine._entry_deadline_lookup.find_open_entry_order(card)
+    market_data.subscribe([card.symbol])
+    market_data.poll_once()
+
+    writable[0] = False
+    broker.queue_cancel_confirmed()
+    runtime.trading_engine._initiate_sell_all(card)
+
+    assert len(broker.cancel_calls) == 1
+    assert broker.cancel_calls[0]["side"] == "BUY"
+    assert card.board_status == BoardStatus.SELL_ALL
+
+    broker.queue_acceptance(broker_order_id="BR-EMERGENCY-SELL")
+    runtime.trading_engine.run_heartbeat([card])
+
+    assert len(broker.submit_calls) == 2, (
+        card.last_exit_error,
+        card.entry_cancel_in_flight,
+        card.entry_client_order_id,
+        card.exit_client_order_id,
+        card.next_exit_retry_at,
+    )
+    assert broker.submit_calls[-1]["side"] == OrderSide.SELL
+    assert card.exit_client_order_id
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_immediate_outage_after_canonical_sell_ack_does_not_submit_again(
+    tmp_path, monkeypatch
+):
+    class PositionBroker(FakeExecutionBroker):
+        def get_positions(self, **_kwargs):
+            return {
+                "overseas": {
+                    "holdings": [
+                        {
+                            "symbol": "AAPL",
+                            "quantity": 4,
+                            "orderable_quantity": 4,
+                            "average_price": 100.0,
+                        }
+                    ]
+                }
+            }
+
+    writable = [True]
+    runtime, broker, gateway, engine, market_data = _make_runtime(
+        tmp_path,
+        monkeypatch,
+        broker=PositionBroker(),
+        database_writable_provider=lambda: writable[0],
+        emergency_journal=EmergencyJournal(tmp_path / "emergency.jsonl"),
+        emergency_lease_allowance=EmergencyLeaseAllowance(max_seconds=30),
+    )
+    card = _persist_owned_card(
+        engine,
+        _card(
+            board_status=BoardStatus.SELL_ALL,
+            entry_runtime_status=EntryRuntimeStatus.SESSION_COMPLETE,
+            position_runtime_status=PositionRuntimeStatus.LIQUIDATING,
+            broker_quantity=4,
+            orderable_quantity=4,
+            exit_all_required=True,
+        ),
+    )
+    market_data.subscribe([card.symbol])
+    market_data.poll_once()
+    broker.queue_acceptance(broker_order_id="BR-CANONICAL-SELL")
+
+    runtime.trading_engine.run_heartbeat([card])
+
+    assert len(broker.submit_calls) == 1
+    canonical_client_order_id = card.exit_client_order_id
+    assert canonical_client_order_id
+    assert gateway.cached_execution_record(canonical_client_order_id) is not None
+
+    # The DB disappears before any normal order lookup/reconciliation.  The
+    # just-ACKed command must remain an active fence for every outage tick.
+    writable[0] = False
+    runtime.trading_engine.run_heartbeat([card])
+    runtime.trading_engine.run_heartbeat([card])
+
+    assert len(broker.submit_calls) == 1
+    assert card.exit_client_order_id == canonical_client_order_id
 
 
 @pytest.mark.usefixtures("trading_enabled")

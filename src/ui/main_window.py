@@ -1790,12 +1790,16 @@ class MainWindow(
                 return
 
             from src.ui.buyboard.runtime_worker import BuyboardRuntimeWorker
+            from src.services.external_alerting import build_external_alerting_service
 
             lease_kwargs = self._current_execution_lease_kwargs()
             if role.is_main and lease_kwargs.get("execution_authority") is None:
                 return  # not actually main by the time we got here -- do not start
 
             queue_manager = self.__dict__.get("execution_queue_manager")
+            external_alerting = build_external_alerting_service(
+                self.pc_db_engine, device_id=role.device_id
+            )
 
             # Review finding P0-1: this must be the real, per-account,
             # staleness-aware KIS buying power the legacy dashboard's own
@@ -1824,6 +1828,7 @@ class MainWindow(
                 standby_only=standby_only,
                 device_id=role.device_id,
                 hostname=role.hostname,
+                external_alerting=external_alerting,
                 **lease_kwargs,
             )
             new_worker.board_changed.connect(self.refresh_buyboard)

@@ -261,6 +261,25 @@ def test_missing_critical_market_data_channel_is_critical():
     assert "AAPL" in check.detail
 
 
+def test_request_scheduler_metrics_are_exposed_in_health():
+    metrics = SimpleNamespace(
+        queued_requests=2,
+        budget_rejections=1,
+        uncertain_entry_rejections=1,
+        read_retries=3,
+        confirmed_mutation_retries=1,
+        known_mutation_budget_buckets=0,
+        uncertain_mutation_budget_buckets=1,
+    )
+
+    check = health._request_scheduler_check(metrics)
+
+    assert check.level == health.HealthLevel.WARNING
+    assert "queue=2" in check.detail
+    assert "uncertain_entry_blocks=1" in check.detail
+    assert "WS0 mutation budgets are unverified" in check.summary
+
+
 def _journal_status(**overrides):
     values = {
         "path": SimpleNamespace(),

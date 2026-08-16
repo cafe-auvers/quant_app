@@ -51,6 +51,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 import requests
 
@@ -61,6 +62,12 @@ except ModuleNotFoundError:  # Keep direct script execution usable.
     if str(repository_root) not in sys.path:
         sys.path.insert(0, str(repository_root))
     from src.utils.config import DEFAULT_KIS_TOKEN_CACHE, ENV_FILE, resolve_repo_path
+
+from src.services.kis_request_boundary import (
+    execute_kis_request,
+    has_kis_request_scheduler,
+)
+from src.services.kis_request_scheduler import RequestKind, RequestPriority
 
 try:
     from dotenv import load_dotenv
@@ -659,24 +666,48 @@ class KisAccountClient:
         This does not change behavior for any successful or API-level-error
         response; it only protects against momentary connectivity blips.
         """
-        last_exc: Optional[Exception] = None
-        for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
-            try:
-                return self.session.request(method, url, **kwargs)
-            except (
-                requests.exceptions.Timeout,
-                requests.exceptions.ConnectionError,
-            ) as exc:
-                last_exc = exc
-                if attempt >= MAX_RATE_LIMIT_RETRIES:
-                    break
-                time.sleep(
-                    RATE_LIMIT_BACKOFF_SECONDS[
-                        min(attempt, len(RATE_LIMIT_BACKOFF_SECONDS) - 1)
-                    ]
-                )
-
-        raise KisApiError(f"Network error calling KIS {url}: {last_exc}") from last_exc
+        network_errors = (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+        )
+        endpoint = urlsplit(url).path or str(url)
+        account_no = f"{self.config.cano}-{self.config.account_product_code}"
+        if not has_kis_request_scheduler():
+            last_exc: Optional[Exception] = None
+            for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+                try:
+                    return self.session.request(method, url, **kwargs)
+                except network_errors as exc:
+                    last_exc = exc
+                    if attempt >= MAX_RATE_LIMIT_RETRIES:
+                        break
+                    time.sleep(
+                        RATE_LIMIT_BACKOFF_SECONDS[
+                            min(attempt, len(RATE_LIMIT_BACKOFF_SECONDS) - 1)
+                        ]
+                    )
+            raise KisApiError(
+                f"Network error calling KIS {url}: {last_exc}"
+            ) from last_exc
+        try:
+            return execute_kis_request(
+                lambda: self.session.request(method, url, **kwargs),
+                account_no=account_no,
+                endpoint=endpoint,
+                retry_if=lambda exc: isinstance(exc, network_errors),
+                # Token issuance is a read-side prerequisite even when it is
+                # triggered from inside a mutation context.
+                force_kind=(
+                    RequestKind.READ if endpoint == TOKEN_ENDPOINT else None
+                ),
+                force_priority=(
+                    RequestPriority.LEASE_OR_HANDOFF
+                    if endpoint == TOKEN_ENDPOINT
+                    else None
+                ),
+            )
+        except network_errors as exc:
+            raise KisApiError(f"Network error calling KIS {url}: {exc}") from exc
 
     @staticmethod
     def _parse_response(

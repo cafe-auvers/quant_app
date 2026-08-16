@@ -64,6 +64,13 @@ logger = logging.getLogger(__name__)
 _ensured_engines: "weakref.WeakSet[Engine]" = weakref.WeakSet()
 _ensure_lock = threading.Lock()
 
+
+def invalidate_capital_reservations_table_cache(engine: Engine) -> None:
+    """Forget an ensure result after migration rollback drops the table."""
+
+    with _ensure_lock:
+        _ensured_engines.discard(engine)
+
 _ACTIVE_STATUS_VALUES = [
     CapitalReservationStatus.RESERVED.value,
     CapitalReservationStatus.PARTIALLY_CONSUMED.value,

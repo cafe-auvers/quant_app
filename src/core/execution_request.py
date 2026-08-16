@@ -66,6 +66,13 @@ class CancelIntent:
     lease: Optional[ExecutionLease]
     strategy_instance_id: str
     source: ExecutionSource
+    emergency: bool = False
+    protective_entry_completion: bool = False
+    symbol: str = ""
+    broker_order_id: str = ""
+    quantity: int = 0
+    side: str = ""
+    exchange: str = "NASD"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "client_order_id", str(self.client_order_id or "").strip())
@@ -73,6 +80,17 @@ class CancelIntent:
         object.__setattr__(self, "environment", str(self.environment or "").upper())
         object.__setattr__(self, "account_no", str(self.account_no or ""))
         object.__setattr__(self, "strategy_instance_id", str(self.strategy_instance_id or ""))
+        object.__setattr__(self, "emergency", bool(self.emergency))
+        object.__setattr__(
+            self,
+            "protective_entry_completion",
+            bool(self.protective_entry_completion),
+        )
+        object.__setattr__(self, "symbol", str(self.symbol or "").upper())
+        object.__setattr__(self, "broker_order_id", str(self.broker_order_id or ""))
+        object.__setattr__(self, "quantity", max(0, int(self.quantity or 0)))
+        object.__setattr__(self, "side", str(self.side or "").upper())
+        object.__setattr__(self, "exchange", str(self.exchange or "NASD").upper())
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, str):
@@ -87,6 +105,13 @@ class CancelIntent:
             self.lease,
             self.strategy_instance_id,
             self.source,
+            self.emergency,
+            self.protective_entry_completion,
+            self.symbol,
+            self.broker_order_id,
+            self.quantity,
+            self.side,
+            self.exchange,
         ) == (
             other.client_order_id,
             other.cancel_command_id,
@@ -95,6 +120,13 @@ class CancelIntent:
             other.lease,
             other.strategy_instance_id,
             other.source,
+            other.emergency,
+            other.protective_entry_completion,
+            other.symbol,
+            other.broker_order_id,
+            other.quantity,
+            other.side,
+            other.exchange,
         )
 
     def __hash__(self) -> int:
@@ -107,6 +139,13 @@ class CancelIntent:
                 self.lease,
                 self.strategy_instance_id,
                 self.source,
+                self.emergency,
+                self.protective_entry_completion,
+                self.symbol,
+                self.broker_order_id,
+                self.quantity,
+                self.side,
+                self.exchange,
             )
         )
 
@@ -140,6 +179,7 @@ class SubmitExecutionRequest:
     # so one Kanban strategy instance can never act on a symbol assigned to
     # a different one (review finding 3, third pass).
     strategy_instance_id: str = ""
+    emergency: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "client_order_id", str(self.client_order_id or "").strip())
@@ -147,6 +187,7 @@ class SubmitExecutionRequest:
         object.__setattr__(self, "account_no", str(self.account_no or ""))
         object.__setattr__(self, "symbol", str(self.symbol or "").upper())
         object.__setattr__(self, "strategy_instance_id", str(self.strategy_instance_id or ""))
+        object.__setattr__(self, "emergency", bool(self.emergency))
 
 
 @dataclass(frozen=True)
@@ -170,6 +211,13 @@ class CancelExecutionRequest:
     lease: Optional[ExecutionLease] = None
     source: ExecutionSource = ExecutionSource.SYSTEM
     strategy_instance_id: str = ""
+    emergency: bool = False
+    protective_entry_completion: bool = False
+    symbol: str = ""
+    broker_order_id: str = ""
+    quantity: int = 0
+    side: str = ""
+    exchange: str = "NASD"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "client_order_id", str(self.client_order_id or "").strip())
@@ -177,6 +225,17 @@ class CancelExecutionRequest:
         object.__setattr__(self, "environment", str(self.environment or "").upper())
         object.__setattr__(self, "account_no", str(self.account_no or ""))
         object.__setattr__(self, "strategy_instance_id", str(self.strategy_instance_id or ""))
+        object.__setattr__(self, "emergency", bool(self.emergency))
+        object.__setattr__(
+            self,
+            "protective_entry_completion",
+            bool(self.protective_entry_completion),
+        )
+        object.__setattr__(self, "symbol", str(self.symbol or "").upper())
+        object.__setattr__(self, "broker_order_id", str(self.broker_order_id or ""))
+        object.__setattr__(self, "quantity", max(0, int(self.quantity or 0)))
+        object.__setattr__(self, "side", str(self.side or "").upper())
+        object.__setattr__(self, "exchange", str(self.exchange or "NASD").upper())
 
 
 @dataclass(frozen=True)
