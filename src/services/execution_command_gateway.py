@@ -112,7 +112,11 @@ from src.services.discovered_external_order_repository import (
     require_no_active_unowned_external_order,
 )
 from src.services.mutation_budget_protocol import CommandType, MutationBudgetProtocol
-from src.services.kis_request_scheduler import RequestPriority
+from src.services.kis_request_boundary import (
+    install_process_kis_request_scheduler,
+    kis_request_scope,
+)
+from src.services.kis_request_scheduler import RequestKind, RequestPriority
 from src.services.emergency_journal import (
     EmergencyJournal,
     EmergencyJournalError,
@@ -394,6 +398,8 @@ class ExecutionCommandGateway:
         # tests/callers. Production composition supplies the real Workstream
         # 10 scheduler through ``request_scheduler``.
         self._mutation_budget = request_scheduler or mutation_budget
+        if request_scheduler is not None:
+            install_process_kis_request_scheduler(request_scheduler)
         self._buying_power_provider = buying_power_provider
         self._mode_override = mode_override
         self._ownership = ownership_registry or _OwnershipRegistry()
@@ -909,6 +915,14 @@ class ExecutionCommandGateway:
         priority: RequestPriority,
     ) -> Any:
         scheduler = self._mutation_budget
+        if getattr(self._real_broker, "schedules_at_request_boundary", False):
+            with kis_request_scope(
+                scheduler=scheduler,
+                account_no=account_no,
+                kind=RequestKind.READ,
+                priority=priority,
+            ):
+                return operation()
         execute = getattr(scheduler, "execute_read", None)
         if not callable(execute):
             return operation()
@@ -930,15 +944,29 @@ class ExecutionCommandGateway:
         is_new_entry: bool,
     ) -> Any:
         scheduler = self._require_mutation_budget()
-        execute = getattr(scheduler, "execute_mutation", None)
-        if not callable(execute):
-            return operation()
-
         classifier = getattr(
             self._real_broker,
             "is_confirmed_pre_acceptance_rejection",
             None,
         )
+        if getattr(self._real_broker, "schedules_at_request_boundary", False):
+            with kis_request_scope(
+                scheduler=scheduler,
+                account_no=account_no,
+                kind=RequestKind.MUTATION,
+                priority=priority,
+                command_type=command_type,
+                endpoint=endpoint,
+                is_new_entry=is_new_entry,
+                mutation_classifier=(
+                    classifier if callable(classifier) else None
+                ),
+            ):
+                return operation()
+        execute = getattr(scheduler, "execute_mutation", None)
+        if not callable(execute):
+            return operation()
+
         return execute(
             operation,
             command_type=command_type,

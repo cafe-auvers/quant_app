@@ -121,11 +121,12 @@ class LocalAlertSpool:
             for entry in entries
             if entry.get("event_type") == "ALERT_RECONCILED"
         }
-        latest_attempts = {
-            str(entry.get("pending_event_id") or ""): entry
-            for entry in entries
-            if entry.get("event_type") == "ALERT_DELIVERY_ATTEMPT"
-        }
+        attempts_by_pending: Dict[str, List[Dict[str, Any]]] = {}
+        for entry in entries:
+            if entry.get("event_type") != "ALERT_DELIVERY_ATTEMPT":
+                continue
+            pending_event_id = str(entry.get("pending_event_id") or "")
+            attempts_by_pending.setdefault(pending_event_id, []).append(entry)
         pending = []
         for entry in entries:
             if (
@@ -134,9 +135,10 @@ class LocalAlertSpool:
             ):
                 continue
             item = dict(entry)
-            attempt = latest_attempts.get(str(entry.get("event_id") or ""))
-            if attempt is not None:
-                item["delivery_attempt"] = dict(attempt)
+            attempts = attempts_by_pending.get(str(entry.get("event_id") or ""), [])
+            if attempts:
+                item["delivery_attempts"] = [dict(attempt) for attempt in attempts]
+                item["delivery_attempt"] = dict(attempts[-1])
             pending.append(item)
         return pending
 
@@ -411,7 +413,10 @@ class ExternalAlertingService:
             "device_id": self.device_id,
             "requires_acknowledgement": True,
             "offline_spool": pending is not None,
+            "attempt_number": 1,
+            "escalation_level": 0,
         }
+        attempted_at = _as_utc(self._clock())
         try:
             delivery_id = str(self.provider.deliver(payload) or "")
             status, error = "DELIVERED", ""
@@ -426,6 +431,12 @@ class ExternalAlertingService:
                         "status": status,
                         "provider_delivery_id": delivery_id,
                         "error": error,
+                        "attempt_number": 1,
+                        "escalation_level": 0,
+                        "attempted_at": attempted_at.isoformat(),
+                        "next_attempt_at": self._offline_next_attempt_at(
+                            attempted_at, attempt_number=1, status=status
+                        ).isoformat(),
                     },
                 )
             except Exception:
@@ -440,22 +451,37 @@ class ExternalAlertingService:
                 f"spool={spool_error}; provider={error}"
             )
 
-    def _record_spooled_delivery_attempt(
-        self, incident: AlertIncident, attempt: Dict[str, Any]
-    ) -> bool:
-        """Fold an already-attempted offline delivery into canonical state."""
-
-        now = _as_utc(self._clock())
-        attempt_number = incident.delivery_attempt_count + 1
-        escalation_level = min(
-            self.max_escalation_level,
-            (attempt_number - 1) // self.escalation_every_attempts,
-        )
-        status = str(attempt.get("status") or "FAILED").upper()
+    def _offline_next_attempt_at(
+        self, now: datetime, *, attempt_number: int, status: str
+    ) -> datetime:
         delay = (
             self.acknowledgement_timeout_seconds
-            if status == "DELIVERED"
+            if str(status).upper() == "DELIVERED"
             else self.retry_base_seconds * (2 ** min(attempt_number - 1, 6))
+        )
+        return _as_utc(now) + timedelta(seconds=delay)
+
+    @staticmethod
+    def _spool_datetime(value: Any, *, fallback: datetime) -> datetime:
+        if not value:
+            return _as_utc(fallback)
+        try:
+            return _as_utc(datetime.fromisoformat(str(value)))
+        except (TypeError, ValueError):
+            return _as_utc(fallback)
+
+    def _record_spooled_delivery_attempts(
+        self, incident: AlertIncident, attempts: List[Dict[str, Any]]
+    ) -> bool:
+        """Fold the complete offline retry history into canonical state."""
+
+        if not attempts:
+            return True
+        now = _as_utc(self._clock())
+        final_attempt_count = incident.delivery_attempt_count + len(attempts)
+        final_escalation = int(attempts[-1].get("escalation_level") or 0)
+        final_next_attempt_at = self._spool_datetime(
+            attempts[-1].get("next_attempt_at"), fallback=now
         )
         incident_table = _incident_table(MetaData())
         attempt_table = _attempt_table(MetaData())
@@ -468,46 +494,109 @@ class ExternalAlertingService:
                     incident_table.c.status == AlertIncidentStatus.OPEN.value,
                 )
                 .values(
-                    delivery_attempt_count=attempt_number,
-                    escalation_level=escalation_level,
-                    next_attempt_at=_db_datetime(now + timedelta(seconds=delay)),
+                    delivery_attempt_count=final_attempt_count,
+                    escalation_level=final_escalation,
+                    next_attempt_at=_db_datetime(final_next_attempt_at),
                     updated_at=_db_datetime(now),
                     version=incident.version + 1,
                 )
             )
             if updated.rowcount != 1:
                 return False
-            conn.execute(
-                attempt_table.insert().values(
-                    incident_id=incident.incident_id,
-                    attempt_number=attempt_number,
-                    escalation_level=escalation_level,
-                    attempted_at=_db_datetime(now),
-                    status=status,
-                    provider_delivery_id=str(
-                        attempt.get("provider_delivery_id") or ""
-                    ),
-                    error=str(attempt.get("error") or ""),
+            for offset, attempt in enumerate(attempts, start=1):
+                conn.execute(
+                    attempt_table.insert().values(
+                        incident_id=incident.incident_id,
+                        attempt_number=incident.delivery_attempt_count + offset,
+                        escalation_level=int(
+                            attempt.get("escalation_level") or 0
+                        ),
+                        attempted_at=_db_datetime(
+                            self._spool_datetime(
+                                attempt.get("attempted_at"), fallback=now
+                            )
+                        ),
+                        status=str(attempt.get("status") or "FAILED").upper(),
+                        provider_delivery_id=str(
+                            attempt.get("provider_delivery_id") or ""
+                        ),
+                        error=str(attempt.get("error") or ""),
+                    )
                 )
-            )
         return True
 
+    def _retry_spooled_alert_if_due(self, pending: Dict[str, Any]) -> int:
+        attempts = list(pending.get("delivery_attempts") or [])
+        latest = attempts[-1] if attempts else None
+        now = _as_utc(self._clock())
+        if latest is not None:
+            next_attempt_at = self._spool_datetime(
+                latest.get("next_attempt_at"), fallback=now
+            )
+            if now < next_attempt_at:
+                return 0
+        attempt_number = max(
+            len(attempts) + 1,
+            int(latest.get("attempt_number") or 0) + 1 if latest else 1,
+        )
+        escalation_level = min(
+            self.max_escalation_level,
+            (attempt_number - 1) // self.escalation_every_attempts,
+        )
+        payload = {
+            "incident_id": f"offline-{pending['event_id']}",
+            "alert_type": pending["alert_type"],
+            "dedupe_key": pending["dedupe_key"],
+            "message": pending["message"],
+            "device_id": self.device_id,
+            "requires_acknowledgement": True,
+            "offline_spool": True,
+            "attempt_number": attempt_number,
+            "escalation_level": escalation_level,
+        }
+        try:
+            provider_delivery_id = str(self.provider.deliver(payload) or "")
+            status, error = "DELIVERED", ""
+        except Exception as exc:
+            provider_delivery_id, status, error = "", "FAILED", str(exc)
+        self.local_spool.append(
+            "ALERT_DELIVERY_ATTEMPT",
+            {
+                "pending_event_id": pending["event_id"],
+                "status": status,
+                "provider_delivery_id": provider_delivery_id,
+                "error": error,
+                "attempt_number": attempt_number,
+                "escalation_level": escalation_level,
+                "attempted_at": now.isoformat(),
+                "next_attempt_at": self._offline_next_attempt_at(
+                    now, attempt_number=attempt_number, status=status
+                ).isoformat(),
+            },
+        )
+        return 1
+
     def _drain_local_spool(self) -> int:
-        drained = 0
+        processed = 0
         for pending in self.local_spool.pending_alerts():
-            incident = self.raise_alert(
-                pending["alert_type"], pending["dedupe_key"], pending["message"]
-            )
-            delivery_attempt = pending.get("delivery_attempt")
-            if delivery_attempt is not None and not self._record_spooled_delivery_attempt(
-                incident, delivery_attempt
-            ):
+            try:
+                incident = self.raise_alert(
+                    pending["alert_type"], pending["dedupe_key"], pending["message"]
+                )
+                attempts = list(pending.get("delivery_attempts") or [])
+                if not self._record_spooled_delivery_attempts(incident, attempts):
+                    continue
+                self.local_spool.append(
+                    "ALERT_RECONCILED", {"pending_event_id": pending["event_id"]}
+                )
+                processed += 1
+            except Exception:
+                # Canonical persistence may remain unavailable for hours.
+                # Retry directly from the fsynced local state during that
+                # entire window instead of waiting for database recovery.
+                processed += self._retry_spooled_alert_if_due(pending)
                 continue
-            self.local_spool.append(
-                "ALERT_RECONCILED", {"pending_event_id": pending["event_id"]}
-            )
-            drained += 1
-        return drained
+        return processed
 
     def due_incidents(self) -> List[AlertIncident]:
         now = _db_datetime(self._clock())
@@ -524,9 +613,12 @@ class ExternalAlertingService:
         return [_row_to_incident(row) for row in rows]
 
     def process_due(self) -> int:
-        self._drain_local_spool()
-        processed = 0
-        for incident in self.due_incidents():
+        processed = self._drain_local_spool()
+        try:
+            due_incidents = self.due_incidents()
+        except Exception:
+            return processed
+        for incident in due_incidents:
             now = _as_utc(self._clock())
             attempt_number = incident.delivery_attempt_count + 1
             escalation_level = min(

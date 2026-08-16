@@ -192,6 +192,66 @@ def test_spool_failure_does_not_suppress_direct_critical_alert_delivery(tmp_path
     assert provider.deliveries[0]["alert_type"] == "DATABASE_UNAVAILABLE"
 
 
+def test_failed_offline_alert_retries_and_escalates_before_database_recovers(
+    tmp_path,
+):
+    provider = FakeProvider()
+    provider.delivery_failures = 2
+    service, now = _service(
+        tmp_path,
+        provider=provider,
+        escalation_every_attempts=2,
+    )
+    healthy_engine = service.engine
+
+    class UnavailableEngine:
+        def begin(self):
+            raise RuntimeError("canonical DB unavailable")
+
+    service.engine = UnavailableEngine()
+    service.sink(
+        CriticalAlertType.DATABASE_UNAVAILABLE.value,
+        "sustained-outage",
+        "database remains unavailable",
+    )
+    assert len(provider.deliveries) == 1
+
+    now[0] += timedelta(seconds=1)
+    assert service.process_due() == 1
+    assert len(provider.deliveries) == 2
+
+    now[0] += timedelta(seconds=2)
+    assert service.process_due() == 1
+    assert len(provider.deliveries) == 3
+    assert provider.deliveries[-1]["escalation_level"] == 1
+    offline_attempts = service.local_spool.pending_alerts()[0][
+        "delivery_attempts"
+    ]
+    assert [attempt["status"] for attempt in offline_attempts] == [
+        "FAILED",
+        "FAILED",
+        "DELIVERED",
+    ]
+
+    service.engine = healthy_engine
+    service.process_due()
+
+    assert service.local_spool.pending_alerts() == []
+    assert len(provider.deliveries) == 3
+    incident = service.raise_alert(
+        CriticalAlertType.DATABASE_UNAVAILABLE,
+        "sustained-outage",
+        "database remains unavailable",
+    )
+    canonical_attempts = service.delivery_attempts(incident.incident_id)
+    assert [attempt["status"] for attempt in canonical_attempts] == [
+        "FAILED",
+        "FAILED",
+        "DELIVERED",
+    ]
+    assert canonical_attempts[-1]["escalation_level"] == 1
+
+
 def test_enabled_runtime_composition_requires_real_external_provider_urls(
     tmp_path, monkeypatch
 ):

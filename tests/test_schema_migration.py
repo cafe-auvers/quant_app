@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
-from sqlalchemy import MetaData, Table, create_engine, inspect, select
+from sqlalchemy import MetaData, Table, create_engine, inspect, select, text
 
 from src.core.runtime_readiness import RuntimeDeviceState
 from src.core.schema_version import CURRENT_EXECUTION_SCHEMA_VERSION
@@ -21,7 +21,12 @@ from src.services.runtime_device_state_repository import (
     require_compatible_runtime_schema,
     save_runtime_device_state,
 )
-from src.services.state_sync import LocalDeviceRole, claim_main_device
+from src.services import runtime_status
+from src.services.state_sync import (
+    LocalDeviceRole,
+    claim_main_device,
+    claim_main_device_if_stale,
+)
 from src.services.schema_migration import (
     MigrationEntriesBlockedError,
     MigrationCutoverOwnershipError,
@@ -306,8 +311,20 @@ def test_startup_refuses_schema_mismatch_with_another_live_device(tmp_path):
         state=RuntimeDeviceState.ACTIVE,
         schema_version=CURRENT_EXECUTION_SCHEMA_VERSION - 1,
     )
+    runtime_status.record_runtime_heartbeat(engine, hostname="old", pid=1)
+    stale_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
+        minutes=5
+    )
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE runtime_device_state SET updated_at = :stale_at "
+                "WHERE device_id = 'old-pc'"
+            ),
+            {"stale_at": stale_at},
+        )
 
-    with pytest.raises(RuntimeError, match="schema mismatch"):
+    with pytest.raises(RuntimeError, match="current lease holder"):
         require_compatible_runtime_schema(
             engine,
             device_id="new-pc",
@@ -315,29 +332,110 @@ def test_startup_refuses_schema_mismatch_with_another_live_device(tmp_path):
         )
 
 
-def test_stale_old_schema_active_row_does_not_block_new_lease_holder(tmp_path):
+def test_fresh_old_schema_standby_blocks_current_main_runtime(tmp_path):
     engine = _engine(tmp_path)
-    old_claim = claim_main_device(
-        engine, LocalDeviceRole(device_id="old-pc", hostname="old", is_main=True)
+    main_claim = claim_main_device(
+        engine, LocalDeviceRole(device_id="main-pc", hostname="main", is_main=True)
     )
-    assert old_claim.success
+    assert main_claim.success
     save_runtime_device_state(
         engine,
-        device_id="old-pc",
-        hostname="old",
+        device_id="main-pc",
+        hostname="main",
         state=RuntimeDeviceState.ACTIVE,
+        schema_version=CURRENT_EXECUTION_SCHEMA_VERSION,
+    )
+    save_runtime_device_state(
+        engine,
+        device_id="old-standby",
+        hostname="standby",
+        state=RuntimeDeviceState.STANDBY_READY,
         schema_version=CURRENT_EXECUTION_SCHEMA_VERSION - 1,
     )
-    new_claim = claim_main_device(
-        engine, LocalDeviceRole(device_id="new-pc", hostname="new", is_main=True)
+
+    with pytest.raises(RuntimeError, match="fresh running peer"):
+        require_compatible_runtime_schema(engine, device_id="main-pc")
+
+
+def test_stale_old_schema_standby_does_not_block_current_main_runtime(tmp_path):
+    engine = _engine(tmp_path)
+    main_claim = claim_main_device(
+        engine, LocalDeviceRole(device_id="main-pc", hostname="main", is_main=True)
     )
-    assert new_claim.success
+    assert main_claim.success
+    save_runtime_device_state(
+        engine,
+        device_id="old-standby",
+        hostname="standby",
+        state=RuntimeDeviceState.STANDBY_READY,
+        schema_version=CURRENT_EXECUTION_SCHEMA_VERSION - 1,
+    )
 
     require_compatible_runtime_schema(
         engine,
-        device_id="new-pc",
+        device_id="main-pc",
+        now=datetime.now(timezone.utc) + timedelta(seconds=61),
+    )
+
+
+def test_stale_old_schema_owner_allows_real_generation_fenced_handoff(tmp_path):
+    engine = _engine(tmp_path)
+    old_role = LocalDeviceRole(device_id="old-pc", hostname="OLD", is_main=True)
+    new_role = LocalDeviceRole(device_id="new-pc", hostname="NEW", is_main=False)
+    old_claim = claim_main_device(engine, old_role)
+    assert old_claim.success
+    save_runtime_device_state(
+        engine,
+        device_id=old_role.device_id,
+        hostname=old_role.hostname,
+        state=RuntimeDeviceState.ACTIVE,
+        schema_version=CURRENT_EXECUTION_SCHEMA_VERSION - 1,
+    )
+    runtime_status.record_runtime_heartbeat(
+        engine, hostname=old_role.hostname, pid=1
+    )
+    stale_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
+        minutes=5
+    )
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE runtime_device_state SET updated_at = :stale_at "
+                "WHERE device_id = :device_id"
+            ),
+            {"stale_at": stale_at, "device_id": old_role.device_id},
+        )
+        conn.execute(
+            text(
+                "UPDATE app_runtime_status SET heartbeat_at = :stale_at "
+                "WHERE hostname = :hostname AND process_name = 'main.py'"
+            ),
+            {"stale_at": stale_at, "hostname": old_role.hostname.lower()},
+        )
+    standby = save_runtime_device_state(
+        engine,
+        device_id=new_role.device_id,
+        hostname=new_role.hostname,
+        state=RuntimeDeviceState.STANDBY_READY,
         schema_version=CURRENT_EXECUTION_SCHEMA_VERSION,
     )
+
+    # Startup is allowed far enough to publish readiness because the old
+    # mismatched owner is genuinely stale; authority has not been bypassed.
+    require_compatible_runtime_schema(engine, device_id=new_role.device_id)
+    takeover = claim_main_device_if_stale(
+        engine,
+        new_role,
+        expected_owner_device_id=old_role.device_id,
+        heartbeat_cutoff_seconds=60,
+        expected_standby_generation=standby.readiness_generation,
+        standby_max_age_seconds=60,
+    )
+
+    assert takeover.success
+    assert takeover.main_device.device_id == new_role.device_id
+    assert takeover.main_device.lease_epoch > old_claim.main_device.lease_epoch
+    require_compatible_runtime_schema(engine, device_id=new_role.device_id)
 
 
 def test_stopped_device_on_an_old_schema_does_not_block_startup(tmp_path):

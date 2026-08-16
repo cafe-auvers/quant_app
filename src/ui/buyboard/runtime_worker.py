@@ -66,6 +66,7 @@ from src.services.execution_order_repository import fetch_execution_order
 from src.services.execution_authority import ExecutionAuthority, LeaseExpiredError, LeaseHandle
 from src.services.execution_lease_protocol import DefaultExecutionLeaseProtocol
 from src.services.kis_request_scheduler import KisRequestScheduler
+from src.services.kis_request_boundary import install_process_kis_request_scheduler
 from src.services.external_alerting import (
     CriticalAlertType,
     ExternalAlertingService,
@@ -154,6 +155,7 @@ class BuyboardRuntimeWorker(QThread):
         self._account_equity_provider = account_equity_provider
         self._broker = broker
         self.request_scheduler = request_scheduler or KisRequestScheduler()
+        install_process_kis_request_scheduler(self.request_scheduler)
         self._market_data = market_data
         self._execution_authority = execution_authority
         self._execution_lease = execution_lease

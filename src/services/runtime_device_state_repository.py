@@ -26,6 +26,7 @@ from sqlalchemy.engine import Engine
 from src.core.runtime_readiness import RuntimeDeviceState
 from src.core.schema_version import CURRENT_EXECUTION_SCHEMA_VERSION
 from src.services.state_sync import get_main_device
+from src.services.runtime_status import get_runtime_process_status
 
 _ensured_engines: "weakref.WeakSet[Engine]" = weakref.WeakSet()
 _ensure_lock = threading.Lock()
@@ -310,14 +311,16 @@ def require_compatible_runtime_schema(
     device_id: str,
     schema_version: int = CURRENT_EXECUTION_SCHEMA_VERSION,
     lease_engine: Optional[Engine] = None,
+    max_age_seconds: float = 60.0,
+    now: Optional[datetime] = None,
 ) -> None:
-    """Refuse startup when the authoritative lease holder is incompatible.
+    """Refuse startup while any genuinely live runtime is incompatible.
 
     Runtime-state rows are historical observations, not execution authority.
     A crashed device can leave ``ACTIVE`` behind indefinitely; once a fenced
     failover grants the lease to another device, that abandoned row must no
-    longer block startup.  Conversely, an old-schema device that still owns
-    the live lease remains a hard conflict even if another row looks newer.
+    longer block startup.  Fresh non-owner standbys still share canonical
+    state, though, and therefore must participate in mixed-version exclusion.
     """
 
     table = ensure_runtime_device_state_table(engine)
@@ -328,8 +331,6 @@ def require_compatible_runtime_schema(
             f"execution lease: {ownership.error}"
         )
     current_owner = ownership.main_device
-    if current_owner is None or current_owner.device_id == str(device_id or ""):
-        return
     live_states = {
         RuntimeDeviceState.STARTING.value,
         RuntimeDeviceState.STANDBY.value,
@@ -338,18 +339,46 @@ def require_compatible_runtime_schema(
         RuntimeDeviceState.SHUTTING_DOWN.value,
     }
     with engine.connect() as conn:
-        conflicting = conn.execute(
-            select(table.c.device_id, table.c.schema_version, table.c.state).where(
-                table.c.device_id == current_owner.device_id,
+        conflicting_rows = conn.execute(
+            select(table).where(
+                table.c.device_id != str(device_id or ""),
                 table.c.state.in_(live_states),
                 table.c.schema_version != int(schema_version),
             )
-        ).first()
-    if conflicting is not None:
+        ).fetchall()
+        server_now = conn.execute(select(_server_now(engine))).scalar()
+    reference = now or server_now or datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    else:
+        reference = reference.astimezone(timezone.utc)
+    for row in conflicting_rows:
+        conflicting = _record(row)
+        age = (reference - conflicting.updated_at).total_seconds()
+        row_is_fresh = 0.0 <= age <= float(max_age_seconds)
+        is_current_owner = bool(
+            current_owner is not None
+            and conflicting.device_id == current_owner.device_id
+        )
+        owner_process_is_fresh = False
+        if is_current_owner and not row_is_fresh:
+            owner_process_is_fresh = get_runtime_process_status(
+                lease_engine or engine,
+                conflicting.hostname,
+                max_age_seconds=max(0, int(max_age_seconds)),
+            ).active
+        if not row_is_fresh and not owner_process_is_fresh:
+            continue
+        authority = (
+            "current lease holder"
+            if is_current_owner
+            else "fresh running peer"
+        )
         raise RuntimeError(
             "Runtime schema mismatch: device "
-            f"{conflicting.device_id} is {conflicting.state} on schema "
-            f"{conflicting.schema_version}, while this runtime requires {schema_version}"
+            f"{conflicting.device_id} is a {authority} in "
+            f"{conflicting.state.value} on schema {conflicting.schema_version}, "
+            f"while this runtime requires {schema_version}"
         )
 
 

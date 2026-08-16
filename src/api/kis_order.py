@@ -25,9 +25,13 @@ from .kis_account_snapshot_dual import (
     KisAccountClient,
     KisEnvironment,
     KisInvalidAccountError,
+    KisRateLimitError,
     KisTokenError,
     load_config,
 )
+from src.services.kis_request_boundary import execute_kis_request
+from src.services.kis_request_scheduler import RequestKind, RequestPriority
+from src.services.mutation_budget_protocol import CommandType
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +47,42 @@ OVERSEAS_ORDER_INQUIRY_ENDPOINT = "/uapi/overseas-stock/v1/trading/inquire-ccnl"
 OVERSEAS_OPEN_ORDER_INQUIRY_ENDPOINT = "/uapi/overseas-stock/v1/trading/inquire-nccs"
 OVERSEAS_ORDER_CANCEL_ENDPOINT = "/uapi/overseas-stock/v1/trading/order-rvsecncl"
 AMBIGUOUS_ORDER_HTTP_STATUS_CODES = {502, 503, 504}
+
+
+def _scheduled_post_json(
+    client: KisAccountClient,
+    *,
+    url: str,
+    endpoint: str,
+    logical_endpoint: str,
+    account_no: str,
+    headers: Dict[str, str],
+    body: Dict[str, str],
+    priority: RequestPriority,
+    command_type: CommandType,
+    is_new_entry: bool = False,
+) -> Dict[str, Any]:
+    """Execute one KIS mutation request under the shared scheduler."""
+
+    def operation() -> Dict[str, Any]:
+        response = client.session.post(
+            url,
+            headers=headers,
+            json=body,
+            timeout=15,
+        )
+        return client._parse_response(response, endpoint=endpoint)
+
+    return execute_kis_request(
+        operation,
+        account_no=account_no,
+        endpoint=logical_endpoint,
+        default_kind=RequestKind.MUTATION,
+        default_priority=priority,
+        default_command_type=command_type,
+        default_is_new_entry=is_new_entry,
+        mutation_classifier=lambda exc: isinstance(exc, KisRateLimitError),
+    )
 
 _AMBIGUOUS_ORDER_ERROR_FRAGMENTS = (
     "timeout",
@@ -775,13 +815,17 @@ def cancel_overseas_order(
     url = f"{config.base_url}{OVERSEAS_ORDER_CANCEL_ENDPOINT}"
 
     def _post_cancel() -> Dict[str, Any]:
-        response = client.session.post(
-            url,
+        return _scheduled_post_json(
+            client,
+            url=url,
+            endpoint=OVERSEAS_ORDER_CANCEL_ENDPOINT,
+            logical_endpoint="cancel_order",
+            account_no=account_no,
             headers=client._headers(tr_id=tr_id),
-            json=body,
-            timeout=15,
+            body=body,
+            priority=RequestPriority.EXIT_CANCEL_OR_RECONCILIATION,
+            command_type=CommandType.CANCEL,
         )
-        return client._parse_response(response, endpoint=OVERSEAS_ORDER_CANCEL_ENDPOINT)
 
     try:
         result = _post_cancel()
@@ -901,13 +945,22 @@ def place_overseas_order(
 
     def _post_order() -> Dict[str, Any]:
         trading_state.require_trading_enabled(environment, symbol)
-        response = client.session.post(
-            url,
+        return _scheduled_post_json(
+            client,
+            url=url,
+            endpoint=OVERSEAS_ORDER_ENDPOINT,
+            logical_endpoint="submit_order",
+            account_no=str(account_no or ""),
             headers=client._headers(tr_id=tr_id),
-            json=body,
-            timeout=15,
+            body=body,
+            priority=(
+                RequestPriority.NEW_ENTRY
+                if side.lower() == "buy"
+                else RequestPriority.EMERGENCY_EXIT
+            ),
+            command_type=CommandType.SUBMIT,
+            is_new_entry=side.lower() == "buy",
         )
-        return client._parse_response(response, endpoint=OVERSEAS_ORDER_ENDPOINT)
 
     try:
         result = _post_order()
@@ -972,14 +1025,16 @@ def place_overseas_reserved_market_on_open_sell(
 
     def _post_reserved_order() -> Dict[str, Any]:
         trading_state.require_trading_enabled(environment, symbol)
-        response = client.session.post(
-            url,
+        return _scheduled_post_json(
+            client,
+            url=url,
+            endpoint=OVERSEAS_RESERVED_ORDER_ENDPOINT,
+            logical_endpoint="submit_order",
+            account_no=str(account_no or ""),
             headers=client._headers(tr_id=tr_id),
-            json=body,
-            timeout=15,
-        )
-        return client._parse_response(
-            response, endpoint=OVERSEAS_RESERVED_ORDER_ENDPOINT
+            body=body,
+            priority=RequestPriority.EMERGENCY_EXIT,
+            command_type=CommandType.SUBMIT,
         )
 
     try:
@@ -1033,14 +1088,16 @@ def cancel_overseas_reserved_order(
     url = f"{config.base_url}{OVERSEAS_RESERVED_ORDER_CANCEL_ENDPOINT}"
 
     def _post_cancel() -> Dict[str, Any]:
-        response = client.session.post(
-            url,
+        return _scheduled_post_json(
+            client,
+            url=url,
+            endpoint=OVERSEAS_RESERVED_ORDER_CANCEL_ENDPOINT,
+            logical_endpoint="cancel_order",
+            account_no=account_no,
             headers=client._headers(tr_id=tr_id),
-            json=body,
-            timeout=15,
-        )
-        return client._parse_response(
-            response, endpoint=OVERSEAS_RESERVED_ORDER_CANCEL_ENDPOINT
+            body=body,
+            priority=RequestPriority.EXIT_CANCEL_OR_RECONCILIATION,
+            command_type=CommandType.CANCEL,
         )
 
     try:

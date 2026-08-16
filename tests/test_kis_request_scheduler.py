@@ -13,12 +13,19 @@ from src.services.kis_request_scheduler import (
     RequestKind,
     RequestPriority,
 )
+from src.services.kis_request_boundary import (
+    execute_kis_request,
+    kis_request_scope,
+)
 from src.services.mutation_budget_protocol import (
     CommandType,
     MutationBudgetExceededError,
 )
 from src.services.broker import KisBroker
+from src.services.execution_command_gateway import ExecutionCommandGateway
 from src.api.kis_account_snapshot_dual import KisApiError, KisRateLimitError
+from src.api import kis_order
+from src.core.order_state import OrderSide
 
 
 def _scheduler(**kwargs):
@@ -283,3 +290,194 @@ def test_real_kis_classifier_only_retries_typed_rate_limit_rejections():
     assert not KisBroker.is_confirmed_pre_acceptance_rejection(
         TimeoutError("network timeout")
     )
+
+
+def test_emergency_request_overtakes_multi_request_discovery_before_next_http_call(
+    monkeypatch,
+):
+    scheduler = _scheduler(max_read_attempts=1)
+    gateway = ExecutionCommandGateway(
+        real_broker=KisBroker(),
+        request_scheduler=scheduler,
+        mode_override=False,
+    )
+    first_request_started = threading.Event()
+    release_first_request = threading.Event()
+    order = []
+    request_number = [0]
+
+    monkeypatch.setattr(
+        "src.services.broker.get_env_value", lambda *_args, **_kwargs: "NASD"
+    )
+
+    def one_http_request(source):
+        request_number[0] += 1
+        number = request_number[0]
+
+        def network_call():
+            if number == 1:
+                first_request_started.set()
+                assert release_first_request.wait(2)
+            order.append(f"read-{number}-{source}")
+            return []
+
+        return execute_kis_request(
+            network_call,
+            account_no="acct",
+            endpoint="/uapi/orders",
+        )
+
+    monkeypatch.setattr(
+        kis_order,
+        "query_overseas_order",
+        lambda **_kwargs: one_http_request("regular"),
+    )
+    monkeypatch.setattr(
+        kis_order,
+        "query_overseas_reserved_order",
+        lambda **_kwargs: one_http_request("reserved"),
+    )
+
+    discovery = threading.Thread(
+        target=lambda: gateway.discover_orders(
+            environment="PROD", account_no="acct"
+        )
+    )
+    discovery.start()
+    assert first_request_started.wait(2)
+
+    def emergency_request():
+        with kis_request_scope(
+            scheduler=scheduler,
+            account_no="acct",
+            kind=RequestKind.MUTATION,
+            priority=RequestPriority.EMERGENCY_EXIT,
+            command_type=CommandType.SUBMIT,
+            endpoint="submit_order",
+        ):
+            execute_kis_request(
+                lambda: order.append("emergency-exit"),
+                account_no="acct",
+                endpoint="submit_order",
+                default_kind=RequestKind.MUTATION,
+                default_priority=RequestPriority.EMERGENCY_EXIT,
+            )
+
+    emergency = threading.Thread(target=emergency_request)
+    emergency.start()
+    deadline = time.time() + 2
+    while scheduler.metrics().queued_requests < 1 and time.time() < deadline:
+        time.sleep(0.005)
+    release_first_request.set()
+    discovery.join(2)
+    emergency.join(2)
+    assert not discovery.is_alive()
+    assert not emergency.is_alive()
+    assert order == ["read-1-regular", "emergency-exit", "read-2-reserved"]
+    assert scheduler.metrics().completed_reads == 2
+
+
+def test_legacy_entry_and_kanban_emergency_share_one_request_budget(
+    monkeypatch,
+):
+    scheduler = _scheduler(max_read_attempts=1)
+    scheduler.synchronize_budget(
+        kind=RequestKind.MUTATION,
+        account_no="acct",
+        endpoint="submit_order",
+        remaining=2,
+    )
+    guarded_broker = KisBroker()
+    guarded_gateway = ExecutionCommandGateway(
+        real_broker=guarded_broker,
+        request_scheduler=scheduler,
+        mode_override=True,
+    )
+    legacy_gateway = ExecutionCommandGateway(
+        real_broker=KisBroker(), mode_override=False
+    )
+    blocker_started = threading.Event()
+    release_blocker = threading.Event()
+    order = []
+    monkeypatch.setattr(
+        "src.services.broker.trading_state.require_trading_enabled",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def fake_place_overseas_order(**kwargs):
+        is_entry = str(kwargs["side"]).lower() == "buy"
+        label = "legacy-entry" if is_entry else "kanban-emergency"
+        return execute_kis_request(
+            lambda: order.append(label) or {"output": {"ODNO": label}},
+            account_no=str(kwargs["account_no"]),
+            endpoint="submit_order",
+            default_kind=RequestKind.MUTATION,
+            default_priority=(
+                RequestPriority.NEW_ENTRY
+                if is_entry
+                else RequestPriority.EMERGENCY_EXIT
+            ),
+            default_command_type=CommandType.SUBMIT,
+            default_is_new_entry=is_entry,
+            mutation_classifier=KisBroker.is_confirmed_pre_acceptance_rejection,
+        )
+
+    monkeypatch.setattr(kis_order, "place_overseas_order", fake_place_overseas_order)
+
+    blocker = threading.Thread(
+        target=lambda: scheduler.execute_read(
+            lambda: (
+                blocker_started.set(),
+                release_blocker.wait(2),
+                order.append("blocker"),
+            ),
+            account_no="acct",
+            endpoint="display",
+            priority=RequestPriority.DISPLAY_REFRESH,
+        )
+    )
+    blocker.start()
+    assert blocker_started.wait(2)
+
+    legacy = threading.Thread(
+        target=lambda: legacy_gateway.submit_order(
+            environment="PROD",
+            account_no="acct",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            quantity=1,
+            limit_price=100.0,
+        )
+    )
+    legacy.start()
+
+    emergency = threading.Thread(
+        target=lambda: guarded_gateway._execute_scheduled_mutation(
+            lambda: guarded_broker.submit_order(
+                environment="PROD",
+                account_no="acct",
+                symbol="AAPL",
+                side=OrderSide.SELL,
+                quantity=1,
+                limit_price=99.0,
+            ),
+            command_type=CommandType.SUBMIT,
+            account_no="acct",
+            endpoint="submit_order",
+            priority=RequestPriority.EMERGENCY_EXIT,
+            is_new_entry=False,
+        )
+    )
+    emergency.start()
+
+    deadline = time.time() + 2
+    while scheduler.metrics().queued_requests < 2 and time.time() < deadline:
+        time.sleep(0.005)
+    release_blocker.set()
+    for thread in (blocker, legacy, emergency):
+        thread.join(2)
+        assert not thread.is_alive()
+
+    assert order == ["blocker", "kanban-emergency", "legacy-entry"]
+    snapshot = scheduler.budget_snapshot()
+    assert snapshot["MUTATION:acct:submit_order"]["remaining"] == 0

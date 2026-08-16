@@ -178,6 +178,11 @@ class ReadOnlyBroker:
 class KisBroker:
     """``Broker`` implementation backed by the real KIS overseas order API."""
 
+    # The gateway supplies priority context around a high-level operation,
+    # but this adapter acquires no scheduler turn itself.  Each underlying
+    # KIS HTTP request does that independently in ``src.api``.
+    schedules_at_request_boundary = True
+
     def submit_order(
         self,
         *,
