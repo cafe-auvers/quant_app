@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 
 from src.services.external_alerting import (
     AlertIncidentStatus,
@@ -250,6 +250,162 @@ def test_failed_offline_alert_retries_and_escalates_before_database_recovers(
         "DELIVERED",
     ]
     assert canonical_attempts[-1]["escalation_level"] == 1
+
+
+def test_offline_spool_deduplicates_ten_identical_occurrences(tmp_path):
+    provider = FakeProvider()
+    service, _ = _service(tmp_path, provider=provider)
+
+    class UnavailableEngine:
+        def begin(self):
+            raise RuntimeError("canonical DB unavailable")
+
+    service.engine = UnavailableEngine()
+    for occurrence in range(10):
+        service.sink(
+            CriticalAlertType.DATABASE_UNAVAILABLE.value,
+            "same-outage",
+            f"database unavailable occurrence {occurrence + 1}",
+        )
+
+    pending = service.local_spool.pending_alerts()
+    assert len(pending) == 1
+    assert pending[0]["occurrence_count"] == 10
+    assert pending[0]["message"] == "database unavailable occurrence 10"
+    assert len(provider.deliveries) == 1
+
+
+def test_offline_spool_keeps_different_dedupe_keys_independent(tmp_path):
+    provider = FakeProvider()
+    service, _ = _service(tmp_path, provider=provider)
+
+    class UnavailableEngine:
+        def begin(self):
+            raise RuntimeError("canonical DB unavailable")
+
+    service.engine = UnavailableEngine()
+    service.sink(
+        CriticalAlertType.DATABASE_UNAVAILABLE.value,
+        "primary-db",
+        "primary database unavailable",
+    )
+    service.sink(
+        CriticalAlertType.DATABASE_UNAVAILABLE.value,
+        "replica-db",
+        "replica database unavailable",
+    )
+
+    pending = service.local_spool.pending_alerts()
+    assert len(pending) == 2
+    assert {item["dedupe_key"] for item in pending} == {
+        "primary-db",
+        "replica-db",
+    }
+    assert len(provider.deliveries) == 2
+
+
+def test_repeated_offline_occurrences_do_not_bypass_retry_schedule(tmp_path):
+    provider = FakeProvider()
+    provider.delivery_failures = 1
+    service, _ = _service(tmp_path, provider=provider)
+
+    class UnavailableEngine:
+        def begin(self):
+            raise RuntimeError("canonical DB unavailable")
+
+    service.engine = UnavailableEngine()
+    service.sink(
+        CriticalAlertType.DATABASE_UNAVAILABLE.value,
+        "retry-schedule",
+        "database unavailable",
+    )
+    for _ in range(9):
+        service.sink(
+            CriticalAlertType.DATABASE_UNAVAILABLE.value,
+            "retry-schedule",
+            "database still unavailable",
+        )
+
+    pending = service.local_spool.pending_alerts()
+    assert len(provider.deliveries) == 1
+    assert len(pending) == 1
+    assert pending[0]["occurrence_count"] == 10
+    assert len(pending[0]["delivery_attempts"]) == 1
+
+
+def test_offline_incident_retries_exactly_once_when_schedule_becomes_due(tmp_path):
+    provider = FakeProvider()
+    provider.delivery_failures = 1
+    service, now = _service(tmp_path, provider=provider)
+
+    class UnavailableEngine:
+        def begin(self):
+            raise RuntimeError("canonical DB unavailable")
+
+    service.engine = UnavailableEngine()
+    service.sink(
+        CriticalAlertType.DATABASE_UNAVAILABLE.value,
+        "due-retry",
+        "database unavailable",
+    )
+
+    now[0] += timedelta(seconds=1)
+    assert service.process_due() == 1
+    assert service.process_due() == 0
+    assert len(provider.deliveries) == 2
+    assert [
+        attempt["status"]
+        for attempt in service.local_spool.pending_alerts()[0][
+            "delivery_attempts"
+        ]
+    ] == ["FAILED", "DELIVERED"]
+
+
+def test_offline_recovery_folds_one_incident_with_occurrences_and_attempts(
+    tmp_path,
+):
+    provider = FakeProvider()
+    provider.delivery_failures = 1
+    service, now = _service(tmp_path, provider=provider)
+    healthy_engine = service.engine
+
+    class UnavailableEngine:
+        def begin(self):
+            raise RuntimeError("canonical DB unavailable")
+
+    service.engine = UnavailableEngine()
+    for occurrence in range(3):
+        service.sink(
+            CriticalAlertType.DATABASE_UNAVAILABLE.value,
+            "recover-deduped",
+            f"database unavailable occurrence {occurrence + 1}",
+        )
+    now[0] += timedelta(seconds=1)
+    assert service.process_due() == 1
+
+    service.engine = healthy_engine
+    assert service.process_due() == 1
+
+    assert service.local_spool.pending_alerts() == []
+    assert len(provider.deliveries) == 2
+    with healthy_engine.connect() as conn:
+        incident = conn.execute(
+            text(
+                "SELECT incident_id, occurrence_count, message "
+                "FROM external_alert_incidents "
+                "WHERE alert_type = :alert_type AND dedupe_key = :dedupe_key"
+            ),
+            {
+                "alert_type": CriticalAlertType.DATABASE_UNAVAILABLE.value,
+                "dedupe_key": "recover-deduped",
+            },
+        ).mappings().one()
+    assert incident["occurrence_count"] == 3
+    assert incident["message"] == "database unavailable occurrence 3"
+    assert [
+        attempt["status"]
+        for attempt in service.delivery_attempts(incident["incident_id"])
+    ] == ["FAILED", "DELIVERED"]
 
 
 def test_enabled_runtime_composition_requires_real_external_provider_urls(

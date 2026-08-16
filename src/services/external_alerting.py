@@ -84,7 +84,9 @@ class LocalAlertSpool:
         self.path = Path(path)
         self._lock = threading.RLock()
 
-    def append(self, event_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _append_locked(
+        self, event_type: str, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
         record = {
             "event_id": uuid4().hex,
             "event_type": str(event_type).upper(),
@@ -95,27 +97,34 @@ class LocalAlertSpool:
             "utf-8"
         )
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._lock:
-            descriptor = os.open(
-                self.path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600
-            )
-            try:
-                if os.write(descriptor, encoded) != len(encoded):
-                    raise OSError("Short external-alert spool append")
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
+        descriptor = os.open(
+            self.path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600
+        )
+        try:
+            if os.write(descriptor, encoded) != len(encoded):
+                raise OSError("Short external-alert spool append")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
         return record
 
-    def pending_alerts(self) -> List[Dict[str, Any]]:
+    def append(self, event_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        with self._lock:
+            return self._append_locked(event_type, payload)
+
+    def _read_entries_locked(self) -> List[Dict[str, Any]]:
         if not self.path.exists():
             return []
-        with self._lock:
-            entries = [
-                json.loads(line)
-                for line in self.path.read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
+        return [
+            json.loads(line)
+            for line in self.path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    @staticmethod
+    def _fold_pending_alerts(
+        entries: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
         reconciled = {
             str(entry.get("pending_event_id") or "")
             for entry in entries
@@ -127,6 +136,12 @@ class LocalAlertSpool:
                 continue
             pending_event_id = str(entry.get("pending_event_id") or "")
             attempts_by_pending.setdefault(pending_event_id, []).append(entry)
+        occurrences_by_pending: Dict[str, List[Dict[str, Any]]] = {}
+        for entry in entries:
+            if entry.get("event_type") != "ALERT_OCCURRENCE":
+                continue
+            pending_event_id = str(entry.get("pending_event_id") or "")
+            occurrences_by_pending.setdefault(pending_event_id, []).append(entry)
         pending = []
         for entry in entries:
             if (
@@ -135,12 +150,84 @@ class LocalAlertSpool:
             ):
                 continue
             item = dict(entry)
+            occurrences = occurrences_by_pending.get(
+                str(entry.get("event_id") or ""), []
+            )
+            item["occurrence_count"] = max(
+                1, int(item.get("occurrence_count") or 1)
+            ) + len(occurrences)
+            if occurrences:
+                latest_occurrence = occurrences[-1]
+                item["message"] = str(
+                    latest_occurrence.get("message") or item.get("message") or ""
+                )
             attempts = attempts_by_pending.get(str(entry.get("event_id") or ""), [])
             if attempts:
                 item["delivery_attempts"] = [dict(attempt) for attempt in attempts]
                 item["delivery_attempt"] = dict(attempts[-1])
             pending.append(item)
         return pending
+
+    def pending_alerts(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return self._fold_pending_alerts(self._read_entries_locked())
+
+    def record_alert_occurrence(
+        self,
+        *,
+        alert_type: str,
+        dedupe_key: str,
+        message: str,
+        database_error: str,
+    ) -> tuple[Dict[str, Any], bool]:
+        """Append one occurrence and return its correlated pending incident.
+
+        The read/correlate/append sequence is protected by the same lock as
+        every append, so concurrent callers in this process cannot create two
+        pending incidents for one canonical deduplication key.
+        """
+
+        normalized_type = str(alert_type or "").upper()
+        normalized_key = str(dedupe_key or "").strip()
+        with self._lock:
+            entries = self._read_entries_locked()
+            pending_alerts = self._fold_pending_alerts(entries)
+            existing = next(
+                (
+                    pending
+                    for pending in pending_alerts
+                    if pending.get("alert_type") == normalized_type
+                    and pending.get("dedupe_key") == normalized_key
+                ),
+                None,
+            )
+            if existing is not None:
+                self._append_locked(
+                    "ALERT_OCCURRENCE",
+                    {
+                        "pending_event_id": existing["event_id"],
+                        "message": str(message),
+                        "database_error": str(database_error),
+                    },
+                )
+                correlated = dict(existing)
+                correlated["occurrence_count"] = (
+                    int(existing.get("occurrence_count") or 1) + 1
+                )
+                correlated["message"] = str(message)
+                return correlated, False
+
+            created = self._append_locked(
+                "ALERT_PENDING",
+                {
+                    "alert_type": normalized_type,
+                    "dedupe_key": normalized_key,
+                    "message": str(message),
+                    "database_error": str(database_error),
+                    "occurrence_count": 1,
+                },
+            )
+            return created, True
 
 
 class CriticalAlertType(str, Enum):
@@ -317,10 +404,28 @@ class ExternalAlertingService:
         dedupe_key: str,
         message: str,
     ) -> AlertIncident:
+        return self._raise_alert_occurrences(
+            alert_type,
+            dedupe_key,
+            message,
+            occurrence_count=1,
+        )
+
+    def _raise_alert_occurrences(
+        self,
+        alert_type: CriticalAlertType | str,
+        dedupe_key: str,
+        message: str,
+        *,
+        occurrence_count: int,
+    ) -> AlertIncident:
         resolved_type = self._normalize_type(alert_type)
         key = str(dedupe_key or "").strip()
         if not key:
             raise ValueError("Critical alert requires a dedupe_key")
+        occurrences = int(occurrence_count)
+        if occurrences <= 0:
+            raise ValueError("Critical alert occurrence_count must be positive")
         now = _db_datetime(self._clock())
         table = _incident_table(MetaData())
         with self.engine.begin() as conn:
@@ -339,7 +444,7 @@ class ExternalAlertingService:
                         dedupe_key=key,
                         message=str(message),
                         status=AlertIncidentStatus.OPEN.value,
-                        occurrence_count=1,
+                        occurrence_count=occurrences,
                         delivery_attempt_count=0,
                         escalation_level=0,
                         created_at=now,
@@ -354,7 +459,7 @@ class ExternalAlertingService:
                 incident_id = row.incident_id
                 values = {
                     "message": str(message),
-                    "occurrence_count": int(row.occurrence_count) + 1,
+                    "occurrence_count": int(row.occurrence_count) + occurrences,
                     "updated_at": now,
                     "version": int(row.version) + 1,
                 }
@@ -381,34 +486,38 @@ class ExternalAlertingService:
         return _row_to_incident(current)
 
     def sink(self, alert_class: str, dedupe_key: str, message: str) -> None:
+        resolved_type = self._normalize_type(alert_class).value
+        key = str(dedupe_key or "").strip()
+        if not key:
+            raise ValueError("Critical alert requires a dedupe_key")
         try:
-            self.raise_alert(alert_class, dedupe_key, message)
+            self.raise_alert(resolved_type, key, message)
             return
         except Exception as exc:
             database_error = str(exc)
         pending = None
+        is_new_pending = False
         spool_error: Optional[Exception] = None
         try:
-            pending = self.local_spool.append(
-                "ALERT_PENDING",
-                {
-                    "alert_type": str(alert_class).upper(),
-                    "dedupe_key": str(dedupe_key),
-                    "message": str(message),
-                    "database_error": database_error,
-                },
+            pending, is_new_pending = self.local_spool.record_alert_occurrence(
+                alert_type=resolved_type,
+                dedupe_key=key,
+                message=str(message),
+                database_error=database_error,
             )
         except Exception as exc:
             # Local durability and external delivery are independent failure
             # domains.  A full disk must never suppress the network alert.
             spool_error = exc
+        if pending is not None and not is_new_pending:
+            return
         offline_event_id = (
             str(pending["event_id"]) if pending is not None else uuid4().hex
         )
         payload = {
             "incident_id": f"offline-{offline_event_id}",
-            "alert_type": str(alert_class).upper(),
-            "dedupe_key": str(dedupe_key),
+            "alert_type": resolved_type,
+            "dedupe_key": key,
             "message": str(message),
             "device_id": self.device_id,
             "requires_acknowledgement": True,
@@ -580,8 +689,13 @@ class ExternalAlertingService:
         processed = 0
         for pending in self.local_spool.pending_alerts():
             try:
-                incident = self.raise_alert(
-                    pending["alert_type"], pending["dedupe_key"], pending["message"]
+                incident = self._raise_alert_occurrences(
+                    pending["alert_type"],
+                    pending["dedupe_key"],
+                    pending["message"],
+                    occurrence_count=max(
+                        1, int(pending.get("occurrence_count") or 1)
+                    ),
                 )
                 attempts = list(pending.get("delivery_attempts") or [])
                 if not self._record_spooled_delivery_attempts(incident, attempts):
