@@ -365,6 +365,8 @@ class PositionManager:
         card.stop_quantity = 0
         card.exit_all_required = False
         card.sell_all_at_market_open = False
+        card.market_data_outage_started_at = None
+        card.market_data_outage_risk_tier = ""
         # A flat confirmation definitively ends this trade cycle. Retire
         # both correlation scopes so historical execution rows cannot
         # project onto a later Buylist/new-cycle card for the same symbol.

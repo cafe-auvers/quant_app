@@ -256,6 +256,13 @@ class TradeCardState:
     # Capital (section 22 correlation, not the reservation record itself)
     capital_reservation_id: str = ""
 
+    # Workstream 5 feed-outage state. The last trusted observation freezes
+    # price-based risk classification while this symbol's feed is absent.
+    market_data_last_trusted_price: Optional[float] = None
+    market_data_last_trusted_at: Optional[datetime] = None
+    market_data_outage_started_at: Optional[datetime] = None
+    market_data_outage_risk_tier: str = ""
+
     # Timestamps
     created_at: datetime = field(default_factory=_utc_now)
     updated_at: datetime = field(default_factory=_utc_now)
@@ -350,6 +357,22 @@ class TradeCardState:
         )
         self.exit_cancel_command_id = str(self.exit_cancel_command_id or "")
         self.capital_reservation_id = str(self.capital_reservation_id or "")
+        self.market_data_last_trusted_price = _finite_float(
+            self.market_data_last_trusted_price
+        )
+        self.market_data_last_trusted_at = (
+            _parse_timestamp(self.market_data_last_trusted_at)
+            if self.market_data_last_trusted_at
+            else None
+        )
+        self.market_data_outage_started_at = (
+            _parse_timestamp(self.market_data_outage_started_at)
+            if self.market_data_outage_started_at
+            else None
+        )
+        self.market_data_outage_risk_tier = str(
+            self.market_data_outage_risk_tier or ""
+        ).upper()
         self.created_at = _parse_timestamp(self.created_at)
         self.updated_at = _parse_timestamp(self.updated_at)
         self.warnings = list(self.warnings or [])
@@ -433,6 +456,18 @@ class TradeCardState:
             ),
             "exit_cancel_command_id": self.exit_cancel_command_id,
             "capital_reservation_id": self.capital_reservation_id,
+            "market_data_last_trusted_price": self.market_data_last_trusted_price,
+            "market_data_last_trusted_at": (
+                self.market_data_last_trusted_at.isoformat()
+                if self.market_data_last_trusted_at
+                else None
+            ),
+            "market_data_outage_started_at": (
+                self.market_data_outage_started_at.isoformat()
+                if self.market_data_outage_started_at
+                else None
+            ),
+            "market_data_outage_risk_tier": self.market_data_outage_risk_tier,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "warnings": self.warnings,
@@ -517,6 +552,12 @@ class TradeCardState:
             exit_cancel_requested_at=data.get("exit_cancel_requested_at"),
             exit_cancel_command_id=str(data.get("exit_cancel_command_id", "")),
             capital_reservation_id=str(data.get("capital_reservation_id", "")),
+            market_data_last_trusted_price=data.get("market_data_last_trusted_price"),
+            market_data_last_trusted_at=data.get("market_data_last_trusted_at"),
+            market_data_outage_started_at=data.get("market_data_outage_started_at"),
+            market_data_outage_risk_tier=str(
+                data.get("market_data_outage_risk_tier", "")
+            ),
             created_at=data.get("created_at") or _utc_now(),
             updated_at=data.get("updated_at") or _utc_now(),
             warnings=list(data.get("warnings", []) or []),

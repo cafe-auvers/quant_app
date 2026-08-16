@@ -11,6 +11,7 @@ MARKET_DATA_READY_TIME_KST = dt.time(7, 0)
 US_MARKET_ZONE = ZoneInfo("America/New_York")
 US_MARKET_OPEN_TIME = dt.time(9, 30)
 US_MARKET_CLOSE_TIME = dt.time(16, 0)
+US_MARKET_EARLY_CLOSE_TIME = dt.time(13, 0)
 
 
 def _nearest_weekday(day: dt.date) -> dt.date:
@@ -94,6 +95,25 @@ def _as_us_market_time(now: Optional[dt.datetime]) -> dt.datetime:
     return moment.astimezone(US_MARKET_ZONE)
 
 
+def nyse_regular_session_close_time(day: dt.date) -> dt.time:
+    """Return the regular-session close, including recurring early closes."""
+    thanksgiving = _nth_weekday(day.year, 11, 3, 4)
+    day_after_thanksgiving = thanksgiving + dt.timedelta(days=1)
+    christmas_eve = dt.date(day.year, 12, 24)
+    july_third = dt.date(day.year, 7, 3)
+    early_close = day == day_after_thanksgiving or (
+        day == christmas_eve and day.weekday() < 5
+    )
+    # July 3 is an early close only when it remains a trading day (rather
+    # than the observed full-day Independence Day closure).
+    early_close = early_close or (
+        day == july_third
+        and day.weekday() < 5
+        and day not in nyse_holidays(day.year)
+    )
+    return US_MARKET_EARLY_CLOSE_TIME if early_close else US_MARKET_CLOSE_TIME
+
+
 def is_regular_session_open(now: Optional[dt.datetime] = None) -> bool:
     """True during NYSE regular trading hours (9:30-16:00 America/New_York),
     Monday-Friday, excluding the holidays :func:`nyse_holidays` already
@@ -108,7 +128,9 @@ def is_regular_session_open(now: Optional[dt.datetime] = None) -> bool:
     moment = _as_us_market_time(now)
     if moment.weekday() >= 5 or moment.date() in nyse_holidays(moment.year):
         return False
-    return US_MARKET_OPEN_TIME <= moment.time() < US_MARKET_CLOSE_TIME
+    return US_MARKET_OPEN_TIME <= moment.time() < nyse_regular_session_close_time(
+        moment.date()
+    )
 
 
 def seconds_until_regular_session_close(now: Optional[dt.datetime] = None) -> float:
@@ -120,7 +142,13 @@ def seconds_until_regular_session_close(now: Optional[dt.datetime] = None) -> fl
     :func:`is_regular_session_open` when session-open-ness also matters.
     """
     moment = _as_us_market_time(now)
-    close_at = moment.replace(hour=16, minute=0, second=0, microsecond=0)
+    close_time = nyse_regular_session_close_time(moment.date())
+    close_at = moment.replace(
+        hour=close_time.hour,
+        minute=close_time.minute,
+        second=0,
+        microsecond=0,
+    )
     return (close_at - moment).total_seconds()
 
 
