@@ -408,6 +408,136 @@ def test_offline_recovery_folds_one_incident_with_occurrences_and_attempts(
     ] == ["FAILED", "DELIVERED"]
 
 
+def test_spool_import_crash_after_occurrence_rolls_back_before_restart(tmp_path):
+    provider = FakeProvider()
+    provider.delivery_failures = 1
+    service, now = _service(tmp_path, provider=provider)
+    healthy_engine = service.engine
+
+    class UnavailableEngine:
+        def begin(self):
+            raise RuntimeError("canonical DB unavailable")
+
+    service.engine = UnavailableEngine()
+    for occurrence in range(3):
+        service.sink(
+            CriticalAlertType.DATABASE_UNAVAILABLE.value,
+            "crash-mid-import",
+            f"database unavailable occurrence {occurrence + 1}",
+        )
+    now[0] += timedelta(seconds=1)
+    assert service.process_due() == 1
+    pending = service.local_spool.pending_alerts()[0]
+    service.engine = healthy_engine
+
+    def crash_after_occurrence(point):
+        if point == "after_occurrence":
+            raise RuntimeError("simulated process crash")
+
+    service._spool_import_fault_hook = crash_after_occurrence
+    with pytest.raises(RuntimeError, match="simulated process crash"):
+        service._import_spooled_incident(pending)
+
+    with healthy_engine.connect() as conn:
+        assert conn.execute(
+            text(
+                "SELECT COUNT(*) FROM external_alert_incidents "
+                "WHERE dedupe_key = 'crash-mid-import'"
+            )
+        ).scalar_one() == 0
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM external_alert_spool_imports")
+        ).scalar_one() == 0
+
+    restarted, _ = _service(tmp_path, provider=provider, now=now)
+    assert restarted.process_due() == 1
+    assert restarted.local_spool.pending_alerts() == []
+    with restarted.engine.connect() as conn:
+        incident = conn.execute(
+            text(
+                "SELECT incident_id, occurrence_count "
+                "FROM external_alert_incidents "
+                "WHERE dedupe_key = 'crash-mid-import'"
+            )
+        ).mappings().one()
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM external_alert_spool_imports")
+        ).scalar_one() == 1
+    assert incident["occurrence_count"] == 3
+    assert [
+        attempt["status"]
+        for attempt in restarted.delivery_attempts(incident["incident_id"])
+    ] == ["FAILED", "DELIVERED"]
+    assert len(provider.deliveries) == 2
+
+
+def test_spool_import_receipt_prevents_replay_after_commit_before_marker(tmp_path):
+    provider = FakeProvider()
+    provider.delivery_failures = 1
+    service, now = _service(tmp_path, provider=provider)
+    healthy_engine = service.engine
+
+    class UnavailableEngine:
+        def begin(self):
+            raise RuntimeError("canonical DB unavailable")
+
+    service.engine = UnavailableEngine()
+    for occurrence in range(3):
+        service.sink(
+            CriticalAlertType.DATABASE_UNAVAILABLE.value,
+            "crash-before-marker",
+            f"database unavailable occurrence {occurrence + 1}",
+        )
+    now[0] += timedelta(seconds=1)
+    assert service.process_due() == 1
+    pending = service.local_spool.pending_alerts()[0]
+    service.engine = healthy_engine
+
+    # The canonical transaction commits, then the process dies before it can
+    # append ALERT_RECONCILED to the local spool.
+    service._import_spooled_incident(pending)
+    assert len(service.local_spool.pending_alerts()) == 1
+    with healthy_engine.connect() as conn:
+        before = conn.execute(
+            text(
+                "SELECT incident_id, occurrence_count, delivery_attempt_count "
+                "FROM external_alert_incidents "
+                "WHERE dedupe_key = 'crash-before-marker'"
+            )
+        ).mappings().one()
+        receipt = conn.execute(
+            text(
+                "SELECT pending_event_id, incident_id "
+                "FROM external_alert_spool_imports"
+            )
+        ).mappings().one()
+    assert before["occurrence_count"] == 3
+    assert before["delivery_attempt_count"] == 2
+    assert receipt["pending_event_id"] == pending["event_id"]
+    assert receipt["incident_id"] == before["incident_id"]
+
+    restarted, _ = _service(tmp_path, provider=provider, now=now)
+    assert restarted.process_due() == 1
+    assert restarted.local_spool.pending_alerts() == []
+    with restarted.engine.connect() as conn:
+        after = conn.execute(
+            text(
+                "SELECT incident_id, occurrence_count, delivery_attempt_count "
+                "FROM external_alert_incidents "
+                "WHERE dedupe_key = 'crash-before-marker'"
+            )
+        ).mappings().one()
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM external_alert_spool_imports")
+        ).scalar_one() == 1
+    assert dict(after) == dict(before)
+    assert [
+        attempt["status"]
+        for attempt in restarted.delivery_attempts(after["incident_id"])
+    ] == ["FAILED", "DELIVERED"]
+    assert len(provider.deliveries) == 2
+
+
 def test_enabled_runtime_composition_requires_real_external_provider_urls(
     tmp_path, monkeypatch
 ):

@@ -308,6 +308,16 @@ def _attempt_table(metadata: MetaData) -> Table:
     )
 
 
+def _spool_import_table(metadata: MetaData) -> Table:
+    return Table(
+        "external_alert_spool_imports",
+        metadata,
+        Column("pending_event_id", String(64), primary_key=True),
+        Column("incident_id", String(64), nullable=False),
+        Column("imported_at", DateTime, nullable=False),
+    )
+
+
 def _heartbeat_table(metadata: MetaData) -> Table:
     return Table(
         "application_heartbeat_attempts",
@@ -325,6 +335,7 @@ def ensure_external_alert_tables(engine: Engine) -> None:
     metadata = MetaData()
     _incident_table(metadata)
     _attempt_table(metadata)
+    _spool_import_table(metadata)
     _heartbeat_table(metadata)
     metadata.create_all(engine)
 
@@ -372,6 +383,7 @@ class ExternalAlertingService:
         max_escalation_level: int = 3,
         heartbeat_interval_seconds: float = 30.0,
         local_spool: Optional[LocalAlertSpool] = None,
+        spool_import_fault_hook: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.engine = engine
         self.provider = provider
@@ -387,6 +399,9 @@ class ExternalAlertingService:
             0.001, float(heartbeat_interval_seconds)
         )
         self.local_spool = local_spool or LocalAlertSpool()
+        self._spool_import_fault_hook = spool_import_fault_hook or (
+            lambda _point: None
+        )
         self._last_heartbeat_attempt_at: Optional[datetime] = None
         ensure_external_alert_tables(engine)
 
@@ -579,60 +594,153 @@ class ExternalAlertingService:
         except (TypeError, ValueError):
             return _as_utc(fallback)
 
-    def _record_spooled_delivery_attempts(
-        self, incident: AlertIncident, attempts: List[Dict[str, Any]]
-    ) -> bool:
-        """Fold the complete offline retry history into canonical state."""
+    def _import_spooled_incident(self, pending: Dict[str, Any]) -> None:
+        """Atomically import one local incident and its durable receipt."""
 
-        if not attempts:
-            return True
+        pending_event_id = str(pending.get("event_id") or "").strip()
+        if not pending_event_id:
+            raise ValueError("Spool import requires a pending event ID")
+        resolved_type = self._normalize_type(pending.get("alert_type") or "")
+        dedupe_key = str(pending.get("dedupe_key") or "").strip()
+        if not dedupe_key:
+            raise ValueError("Spool import requires a dedupe key")
+        occurrence_count = max(1, int(pending.get("occurrence_count") or 1))
+        attempts = list(pending.get("delivery_attempts") or [])
         now = _as_utc(self._clock())
-        final_attempt_count = incident.delivery_attempt_count + len(attempts)
-        final_escalation = int(attempts[-1].get("escalation_level") or 0)
-        final_next_attempt_at = self._spool_datetime(
-            attempts[-1].get("next_attempt_at"), fallback=now
-        )
         incident_table = _incident_table(MetaData())
         attempt_table = _attempt_table(MetaData())
+        import_table = _spool_import_table(MetaData())
         with self.engine.begin() as conn:
-            updated = conn.execute(
-                incident_table.update()
-                .where(
-                    incident_table.c.incident_id == incident.incident_id,
-                    incident_table.c.version == incident.version,
-                    incident_table.c.status == AlertIncidentStatus.OPEN.value,
+            receipt = conn.execute(
+                select(import_table.c.incident_id).where(
+                    import_table.c.pending_event_id == pending_event_id
                 )
-                .values(
-                    delivery_attempt_count=final_attempt_count,
-                    escalation_level=final_escalation,
-                    next_attempt_at=_db_datetime(final_next_attempt_at),
-                    updated_at=_db_datetime(now),
-                    version=incident.version + 1,
+            ).first()
+            if receipt is not None:
+                return
+
+            row = conn.execute(
+                select(incident_table).where(
+                    incident_table.c.alert_type == resolved_type.value,
+                    incident_table.c.dedupe_key == dedupe_key,
                 )
-            )
-            if updated.rowcount != 1:
-                return False
-            for offset, attempt in enumerate(attempts, start=1):
+            ).first()
+            if row is None:
+                incident_id = uuid4().hex
+                starting_attempt_count = 0
+                incident_version = 1
                 conn.execute(
-                    attempt_table.insert().values(
-                        incident_id=incident.incident_id,
-                        attempt_number=incident.delivery_attempt_count + offset,
-                        escalation_level=int(
-                            attempt.get("escalation_level") or 0
-                        ),
-                        attempted_at=_db_datetime(
-                            self._spool_datetime(
-                                attempt.get("attempted_at"), fallback=now
-                            )
-                        ),
-                        status=str(attempt.get("status") or "FAILED").upper(),
-                        provider_delivery_id=str(
-                            attempt.get("provider_delivery_id") or ""
-                        ),
-                        error=str(attempt.get("error") or ""),
+                    incident_table.insert().values(
+                        incident_id=incident_id,
+                        alert_type=resolved_type.value,
+                        dedupe_key=dedupe_key,
+                        message=str(pending.get("message") or ""),
+                        status=AlertIncidentStatus.OPEN.value,
+                        occurrence_count=occurrence_count,
+                        delivery_attempt_count=0,
+                        escalation_level=0,
+                        created_at=_db_datetime(now),
+                        updated_at=_db_datetime(now),
+                        next_attempt_at=_db_datetime(now),
+                        acknowledged_at=None,
+                        acknowledged_by="",
+                        version=incident_version,
                     )
                 )
-        return True
+            else:
+                incident_id = str(row.incident_id)
+                starting_attempt_count = int(row.delivery_attempt_count)
+                incident_version = int(row.version) + 1
+                updated = conn.execute(
+                    incident_table.update()
+                    .where(
+                        incident_table.c.incident_id == incident_id,
+                        incident_table.c.version == row.version,
+                    )
+                    .values(
+                        message=str(pending.get("message") or ""),
+                        status=AlertIncidentStatus.OPEN.value,
+                        occurrence_count=(
+                            int(row.occurrence_count) + occurrence_count
+                        ),
+                        updated_at=_db_datetime(now),
+                        next_attempt_at=(
+                            _db_datetime(now)
+                            if row.status == AlertIncidentStatus.ACKNOWLEDGED.value
+                            else row.next_attempt_at
+                        ),
+                        acknowledged_at=None,
+                        acknowledged_by="",
+                        version=incident_version,
+                    )
+                )
+                if updated.rowcount != 1:
+                    raise RuntimeError(
+                        "Canonical alert changed during spool import"
+                    )
+
+            # Fault injection here proves that the occurrence upsert cannot
+            # commit independently of attempts and the durable receipt.
+            self._spool_import_fault_hook("after_occurrence")
+
+            if attempts:
+                final_attempt_count = starting_attempt_count + len(attempts)
+                final_escalation = int(
+                    attempts[-1].get("escalation_level") or 0
+                )
+                final_next_attempt_at = self._spool_datetime(
+                    attempts[-1].get("next_attempt_at"), fallback=now
+                )
+                updated = conn.execute(
+                    incident_table.update()
+                    .where(
+                        incident_table.c.incident_id == incident_id,
+                        incident_table.c.version == incident_version,
+                        incident_table.c.status
+                        == AlertIncidentStatus.OPEN.value,
+                    )
+                    .values(
+                        delivery_attempt_count=final_attempt_count,
+                        escalation_level=final_escalation,
+                        next_attempt_at=_db_datetime(final_next_attempt_at),
+                        updated_at=_db_datetime(now),
+                        version=incident_version + 1,
+                    )
+                )
+                if updated.rowcount != 1:
+                    raise RuntimeError(
+                        "Canonical alert changed while importing attempts"
+                    )
+                for offset, attempt in enumerate(attempts, start=1):
+                    conn.execute(
+                        attempt_table.insert().values(
+                            incident_id=incident_id,
+                            attempt_number=starting_attempt_count + offset,
+                            escalation_level=int(
+                                attempt.get("escalation_level") or 0
+                            ),
+                            attempted_at=_db_datetime(
+                                self._spool_datetime(
+                                    attempt.get("attempted_at"), fallback=now
+                                )
+                            ),
+                            status=str(
+                                attempt.get("status") or "FAILED"
+                            ).upper(),
+                            provider_delivery_id=str(
+                                attempt.get("provider_delivery_id") or ""
+                            ),
+                            error=str(attempt.get("error") or ""),
+                        )
+                    )
+
+            conn.execute(
+                import_table.insert().values(
+                    pending_event_id=pending_event_id,
+                    incident_id=incident_id,
+                    imported_at=_db_datetime(now),
+                )
+            )
 
     def _retry_spooled_alert_if_due(self, pending: Dict[str, Any]) -> int:
         attempts = list(pending.get("delivery_attempts") or [])
@@ -689,17 +797,7 @@ class ExternalAlertingService:
         processed = 0
         for pending in self.local_spool.pending_alerts():
             try:
-                incident = self._raise_alert_occurrences(
-                    pending["alert_type"],
-                    pending["dedupe_key"],
-                    pending["message"],
-                    occurrence_count=max(
-                        1, int(pending.get("occurrence_count") or 1)
-                    ),
-                )
-                attempts = list(pending.get("delivery_attempts") or [])
-                if not self._record_spooled_delivery_attempts(incident, attempts):
-                    continue
+                self._import_spooled_incident(pending)
                 self.local_spool.append(
                     "ALERT_RECONCILED", {"pending_event_id": pending["event_id"]}
                 )
