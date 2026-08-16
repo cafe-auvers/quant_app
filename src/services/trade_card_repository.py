@@ -163,6 +163,27 @@ def get_trade_card(
         return None
 
 
+def get_trade_card_in_transaction(
+    conn,
+    environment: str,
+    account_no: str,
+    symbol: str,
+    *,
+    for_update: bool = False,
+) -> Optional[TradeCardState]:
+    """Read a card under a caller-owned workflow transaction."""
+    table = _get_trade_cards_table(MetaData())
+    statement = select(table).where(
+        table.c.environment == str(environment or "").upper(),
+        table.c.account_no == str(account_no or ""),
+        table.c.symbol == str(symbol or "").upper(),
+    )
+    if for_update:
+        statement = statement.with_for_update()
+    row = conn.execute(statement).first()
+    return _row_to_card(row) if row is not None else None
+
+
 def list_trade_cards(
     engine: Optional[Engine],
     *,

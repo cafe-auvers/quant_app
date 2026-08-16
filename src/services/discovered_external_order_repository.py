@@ -449,6 +449,21 @@ def list_discovered_external_orders_for_account(
     return [_row_to_order(row) for row in rows]
 
 
+def list_discovered_external_orders(
+    engine: Engine, *, environment: Optional[str] = None
+) -> list[DiscoveredExternalOrder]:
+    """Return external-order audit rows, optionally for one environment."""
+    table = ensure_discovered_external_orders_table(engine)
+    statement = select(table)
+    if environment is not None:
+        statement = statement.where(
+            table.c.environment == str(environment or "").upper()
+        )
+    with engine.begin() as conn:
+        rows = conn.execute(statement.order_by(table.c.id.asc())).fetchall()
+    return [_row_to_order(row) for row in rows]
+
+
 # --- atomic adoption (revision 3.2) -------------------------------------
 
 

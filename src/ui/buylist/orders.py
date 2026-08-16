@@ -1247,11 +1247,12 @@ class BuylistOrdersMixin:
                 account_no=target.account_no,
                 quantity=target.remaining_quantity,
             )
-            from src.services.order_reconciliation import \
-                cancel_and_reconcile_order
+            from src.core.execution_mode import ExecutionSource
+            from src.services.execution_workflow_service import request_cancel
 
-            updated = cancel_and_reconcile_order(
-                client_order_id,
+            updated = request_cancel(
+                source=ExecutionSource.LEGACY_BUY_DASHBOARD,
+                client_order_id=client_order_id,
                 ownership_engine=self.__dict__.get("pc_db_engine"),
             )
         except Exception as exc:

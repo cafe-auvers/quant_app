@@ -96,6 +96,38 @@ def get_ownership(engine: Engine, *, environment: str, account_no: str, symbol: 
     return _row_to_ownership(row)
 
 
+def get_ownership_in_transaction(
+    conn: Connection,
+    *,
+    environment: str,
+    account_no: str,
+    symbol: str,
+    for_update: bool = False,
+) -> ExecutionOwnership:
+    """Read an ownership assignment in the caller's transaction.
+
+    Workflow intent persistence uses ``for_update=True`` so an ownership
+    transfer cannot race between the UI fence and the card CAS write.
+    """
+    table = _get_execution_ownership_table(MetaData())
+    environment = str(environment or "").upper()
+    account_no = str(account_no or "")
+    symbol = str(symbol or "").upper()
+    statement = select(table).where(
+        table.c.environment == environment,
+        table.c.account_no == account_no,
+        table.c.symbol == symbol,
+    )
+    if for_update:
+        statement = statement.with_for_update()
+    row = conn.execute(statement).first()
+    if row is None:
+        return ExecutionOwnership(
+            environment=environment, account_no=account_no, symbol=symbol
+        )
+    return _row_to_ownership(row)
+
+
 def assign_ownership(engine: Engine, ownership: ExecutionOwnership) -> ExecutionOwnership:
     """Explicit, audited ownership transfer (H1/E1's "an EXPLICIT
     ownership transfer back to LEGACY... never an implicit fallback").

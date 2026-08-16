@@ -155,7 +155,7 @@ PR's behavior composes correctly, plus the Gate 1 run in full.
 | 10 | Rate-limit and command-priority scheduling | PR6 DRAFT IMPLEMENTED, not activated — strict priorities, per-account/endpoint budgets initialized only from explicit WS0 evidence, and typed pre-acceptance retry classification. |
 | 11 | Database-outage behavior | PR6 DRAFT IMPLEMENTED, not activated — bounded last-verified emergency lease, versioned ownership proof, fsynced local journal, protective completion-BUY cancellation, card-correlation recovery, and mandatory post-recovery broker reconciliation. |
 | 12 | External-alert delivery | PR6 DRAFT IMPLEMENTED, not activated — durable incident retry/dedupe/ack/escalation, HTTPS provider wiring, DB-independent local alert spool/direct delivery, and external-watchdog heartbeat publication. |
-| 13 | Kanban feature parity and UI projection | NOT STARTED |
+| 13 | Kanban feature parity and UI projection | PR7 IMPLEMENTED on `agent/pr7-kanban-feature-parity`, not activated â€” typed domain-owned board requests now enter only through `ExecutionWorkflowService`; card/ownership/readiness revisions are fenced, UI state is rebuilt from reconciled card/order/external-order projections, legacy submit/cancel UI workers use the same workflow boundary, and unowned broker orders remain distinct until explicit audited adoption. All production activation flags and verified capacities remain closed. |
 
 ---
 
@@ -1087,6 +1087,23 @@ owned cards).
 | Pre-market Sell All | Durable next-session exit instruction (ties into D9's outside-regular-session pricing) |
 | EOD unfilled entry | Automatic return to `Buylist` |
 | Partial fill | Card remains tracked as a position plus the remaining working-order state (not silently treated as fully complete) |
+
+PR7 traceability is intentionally split between the new frontend-boundary
+suite and the already-merged execution/reconciliation suites. The board
+tests assert the command/intention boundary; the downstream tests assert
+that broker truth, not the gesture, completes the lifecycle:
+
+| WS13 scenario | Regression coverage |
+|---|---|
+| Buylist â†’ Buy Today, revision-aware activation | `test_buylist_to_buy_today_is_a_revision_aware_workflow_request` |
+| Entry pending/fill/cancel/EOD return | `test_entry_pending_card_moves_to_open_position_on_full_fill_at_deadline`, `test_entry_pending_zero_fill_cancels_releases_capital_and_returns_to_buylist` |
+| Ambiguous entry and duplicate UI actions | `test_ambiguous_entry_blocks_user_cancel_until_reconciliation`, `test_two_sell_all_gestures_record_one_intent_and_never_declare_flat` |
+| Partial Sell request/fill/reconciliation | `test_partial_sell_uses_broker_orderable_quantity_and_stays_pending`, `test_partial_sell_fill_moves_stop_to_breakeven_and_returns_to_open_position` |
+| Sell All BUY-conflict cancellation/retry/flat confirmation | `test_outage_sell_all_cancels_completion_buy_before_one_sell`, `test_sell_all_closes_once_broker_confirms_zero` |
+| ORB/breakeven/manual stop projection | `test_stop_changes_use_frozen_orb_then_breakeven_then_manual` |
+| Stale card/readiness/ownership protection | `test_stale_card_revision_cannot_overwrite_reconciled_truth`, `test_stale_readiness_generation_and_reconciliation_both_fail_closed`, `test_ownership_revision_change_after_render_is_rejected` |
+| External order visibility and explicit adoption | `test_external_order_is_distinct_fenced_and_only_explicitly_adopted`, `test_external_order_without_a_trade_card_still_projects_and_can_be_explicitly_adopted` |
+| Legacy/Kanban workflow parity | `test_legacy_and_kanban_destructive_paths_both_reference_shared_workflow`, guarded/legacy workflow integration suites |
 
 ---
 

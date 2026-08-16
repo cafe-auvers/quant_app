@@ -1,243 +1,130 @@
-"""Board-command handlers and the ``BuyboardMixin`` Qt controller.
+"""Thin Qt adapter for the shared execution workflow service.
 
-``buydashboard_to_kanban.md`` section 295: "Dragging must send commands to
-the backend. The UI must not directly mutate state or submit broker orders."
-
-:func:`apply_board_command` is the backend referred to there. It is a plain
-function with no Qt dependency (the ``BuyboardMixin`` methods at the bottom
-of this module are the only Qt-facing pieces), so it is directly unit
-testable. It only ever changes ``board_status`` and the small set of fields
-each command concerns -- it never talks to KIS. Phase 3/5's entry and
-position engines observe the resulting board_status/flags
-(``exit_all_required``, ``sell_all_at_market_open``,
-``pending_partial_sell_quantity``, ``stop_type``/``active_stop_price``) on
-their own heartbeat and are responsible for the actual order submission,
-exactly as section 296-304 describes for the account-level execution
-boundary.
+Kanban gestures are typed requests.  This module neither applies domain
+mutations nor talks to a repository/gateway; it submits the request and then
+rebuilds the board from a fresh authoritative projection.
 """
 from __future__ import annotations
 
-import logging
-from typing import Optional
-
-from sqlalchemy.engine import Engine
-
-from src.core.kanban_transitions import (
-    InvalidBoardTransitionError,
-    validate_board_transition,
+from src.core.board_workflow import (
+    AnyBoardCommand,
+    BoardActionContext,
+    BoardProjectionContext,
 )
-from src.core.trade_card_state import (
-    BoardStatus,
-    PositionRuntimeStatus,
-    TradeCardState,
-)
-from src.services import trade_card_repository as repo
-from src.services.position_manager import PositionManager, minimum_manual_stop_price
+from src.core.execution_config import is_buyboard_engine_enabled
+from src.core.runtime_readiness import RuntimeDeviceState
+from src.services import execution_workflow_service
+from src.services.execution_workflow_service import BoardCommandRejectedError
 from src.services.trade_card_repository import (
     TradeCardNotFoundError,
     TradeCardVersionConflictError,
 )
 
-from .drag_commands import (
-    ActivateForToday,
-    AnyBoardCommand,
-    CancelEntry,
-    CancelQueuedSellAll,
-    MoveToBuylist,
-    MoveToWatchlist,
-    ReorderCard,
-    RequestPartialSell,
-    RequestSellAll,
-    SetBreakevenStop,
-    SetManualStop,
-)
-
-logger = logging.getLogger(__name__)
+# Compatibility name used by existing extensions/tests.
+CommandRejectedError = BoardCommandRejectedError
 
 
-class CommandRejectedError(RuntimeError):
-    """A well-formed command that cannot be applied to the card's current
-    state (illegal Kanban transition, invalid quantity/price, etc.)."""
+def apply_board_command(engine, command: AnyBoardCommand, *, context=None):
+    """Compatibility wrapper around the one authoritative workflow entry."""
+    return execution_workflow_service.request_board_action(
+        engine, command, context=context
+    ).card
 
 
-# Commands whose only effect is a direct board_status move, keyed by type.
-# CancelEntry/SetBreakevenStop/SetManualStop/RequestPartialSell/
-# CancelQueuedSellAll have extra validation and are handled by their own
-# functions below.
-_SIMPLE_MOVE_TARGET_STATUS = {
-    MoveToWatchlist: BoardStatus.WATCHLIST,
-    MoveToBuylist: BoardStatus.BUYLIST,
-    ActivateForToday: BoardStatus.BUY_TODAY,
-    RequestSellAll: BoardStatus.SELL_ALL,
-}
+def _worker_for(main_window):
+    return main_window.__dict__.get("_buyboard_runtime_worker")
 
 
-def apply_board_command(
-    engine: Optional[Engine], command: AnyBoardCommand
-) -> TradeCardState:
-    """Validate and apply one command. Raises ``TradeCardNotFoundError``,
-    ``TradeCardVersionConflictError`` (stale command, spec section 317-319),
-    or ``CommandRejectedError`` (well-formed but illegal right now).
-    """
-    card = repo.get_trade_card(
-        engine, command.environment, command.account_no, command.symbol
-    )
-    if card is None:
-        raise TradeCardNotFoundError(
-            f"No trade card for {command.environment}:{command.account_no}:"
-            f"{command.symbol}"
-        )
-    if card.version != command.expected_card_version:
-        raise TradeCardVersionConflictError(
-            f"Command {command.command_id} expected version "
-            f"{command.expected_card_version}, stored version is {card.version}"
-        )
+def _projection_context(main_window) -> BoardProjectionContext:
+    worker = _worker_for(main_window)
+    global_restrictions = []
+    if not is_buyboard_engine_enabled():
+        global_restrictions.append("Execution engine disabled")
+    if worker is None:
+        global_restrictions.append("Runtime worker unavailable")
+        return BoardProjectionContext(global_restrictions=tuple(global_restrictions))
 
-    if isinstance(command, CancelEntry):
-        _apply_cancel_entry(card)
-    elif isinstance(command, RequestPartialSell):
-        _apply_partial_sell(card, command)
-    elif isinstance(command, SetBreakevenStop):
-        _apply_set_breakeven_stop(card)
-    elif isinstance(command, SetManualStop):
-        _apply_set_manual_stop(card, command)
-    elif isinstance(command, CancelQueuedSellAll):
-        _apply_cancel_queued_sell_all(card)
-    elif isinstance(command, ReorderCard):
-        card.kanban_priority = command.target_priority
-    else:
-        target_status = _SIMPLE_MOVE_TARGET_STATUS.get(type(command))
-        if target_status is None:
-            raise CommandRejectedError(
-                f"Unrecognized command type: {type(command).__name__}"
-            )
-        _apply_simple_move(card, target_status, command)
+    state = getattr(worker, "device_state", RuntimeDeviceState.STARTING)
+    if state != RuntimeDeviceState.ACTIVE:
+        global_restrictions.append(f"Device state is {state.value}")
+    if not bool(getattr(worker, "_database_writable", False)):
+        global_restrictions.append("Canonical database is not confirmed writable")
 
-    return repo.update_trade_card(
-        engine, card, expected_version=command.expected_card_version
+    errors = dict(getattr(worker, "startup_reconciliation_errors", {}) or {})
+    reconciled = set(getattr(worker, "startup_reconciled_accounts", set()) or set())
+    blocked = set(errors)
+    account_restrictions = []
+    for account, reason in errors.items():
+        account_restrictions.append((str(account), (str(reason),)))
+    # An unknown account is handled by action-time readiness.  Known accounts
+    # without positive startup evidence are included here when worker state
+    # exposes them through its cached cards.
+    for card in list(getattr(worker, "_cached_cards", ()) or ()):
+        if card.account_no and card.account_no not in reconciled:
+            blocked.add(card.account_no)
+
+    return BoardProjectionContext(
+        readiness_generation=int(getattr(worker, "readiness_generation", 0) or 0),
+        reconciliation_blocked_accounts=tuple(sorted(blocked)),
+        global_restrictions=tuple(global_restrictions),
+        account_restrictions=tuple(account_restrictions),
     )
 
 
-def _move(card: TradeCardState, target_status: BoardStatus) -> None:
+def _action_context(main_window, command: AnyBoardCommand) -> BoardActionContext:
+    worker = _worker_for(main_window)
+    if worker is None:
+        return BoardActionContext(
+            enforce_runtime_fences=True,
+            engine_enabled=is_buyboard_engine_enabled(),
+            action_ready=False,
+            device_active=False,
+            restriction_reasons=("Runtime worker unavailable",),
+        )
+
+    from src.core.board_workflow import ActivateForToday, CancelEntry
+
+    action = "PROTECTIVE_EXIT"
+    if isinstance(command, ActivateForToday):
+        action = "NEW_ENTRY"
+    elif isinstance(command, CancelEntry):
+        action = "KNOWN_CANCEL"
     try:
-        validate_board_transition(card.board_status, target_status)
-    except InvalidBoardTransitionError as exc:
-        raise CommandRejectedError(str(exc)) from exc
-    card.previous_board_status = card.board_status
-    card.board_status = target_status
-
-
-def _apply_simple_move(
-    card: TradeCardState, target_status: BoardStatus, command: AnyBoardCommand
-) -> None:
-    _move(card, target_status)
-    if isinstance(command, MoveToWatchlist):
-        card.watchlist_member = True
-    elif isinstance(command, MoveToBuylist):
-        card.buylist_member = True
-        # Leaving Buy Today/Entry Pending without a filled order clears any
-        # stale entry-runtime badge and block reason.
-        card.entry_runtime_status = None
-        card.entry_block_reason = ""
-        if not card.entry_client_order_id and card.broker_quantity <= 0:
-            card.entry_attempt_group_id = ""
-            card.entry_attempt_count = 0
-    elif isinstance(command, ActivateForToday):
-        card.buylist_member = True
-    elif isinstance(command, RequestSellAll):
-        card.exit_all_required = True
-
-
-def _apply_cancel_entry(card: TradeCardState) -> None:
-    if card.board_status == BoardStatus.BUY_TODAY:
-        # No order can exist yet for a BUY_TODAY card in this design --
-        # trading_engine moves a card straight from BUY_TODAY to
-        # ENTRY_PENDING in the same heartbeat pass it submits an order, so
-        # there is never a window where BUY_TODAY has a live order to
-        # orphan. Safe to move immediately.
-        _move(card, BoardStatus.BUYLIST)
-        card.entry_runtime_status = None
-        card.entry_block_reason = ""
-        card.entry_attempt_group_id = ""
-        card.entry_attempt_count = 0
-        card.entry_client_order_id = ""
-        card.entry_pending_attempt_number = 0
-        card.entry_submission_unresolved = False
-    elif card.board_status == BoardStatus.ENTRY_PENDING:
-        # An order may be working at the broker right now -- do not move
-        # the card (and thus do not let the user believe it's safely back
-        # in Buylist) until the engine has actually cancelled/reconciled
-        # it. src.services.trading_engine watches for this flag on its next
-        # heartbeat, cancels the order, and moves the card once the broker
-        # confirms zero/partial fill (mirrors the EOD zero-fill path).
-        card.entry_block_reason = "cancel_requested"
-    else:
-        raise CommandRejectedError(
-            f"Cannot cancel an entry from {card.board_status.value}"
-        )
-
-
-def _apply_partial_sell(card: TradeCardState, command: RequestPartialSell) -> None:
-    if card.board_status != BoardStatus.OPEN_POSITION:
-        raise CommandRejectedError(
-            "Partial sell can only be requested from Open Positions"
-        )
-    if command.quantity <= 0:
-        raise CommandRejectedError("Partial-sell quantity must be positive")
-    orderable = card.orderable_quantity or card.broker_quantity
-    if orderable <= 0:
-        raise CommandRejectedError("No orderable quantity to sell")
-    if command.quantity >= orderable:
-        # Spec section 576-579: a request at/above the full orderable size is
-        # a Sell All, not a partial sell.
-        _move(card, BoardStatus.SELL_ALL)
-        card.exit_all_required = True
-        card.pending_partial_sell_quantity = 0
-        return
-    _move(card, BoardStatus.PARTIAL_SELL)
-    card.pending_partial_sell_quantity = command.quantity
-
-
-def _apply_set_breakeven_stop(card: TradeCardState) -> None:
-    if card.position_runtime_status == PositionRuntimeStatus.NONE:
-        raise CommandRejectedError("No open position to set a stop on")
-    PositionManager().apply_breakeven_stop(card)
-
-
-def _apply_set_manual_stop(card: TradeCardState, command: SetManualStop) -> None:
-    if card.position_runtime_status == PositionRuntimeStatus.NONE:
-        raise CommandRejectedError("No open position to set a stop on")
-    minimum = minimum_manual_stop_price(card)
-    if command.price < minimum:
-        raise CommandRejectedError(
-            f"Manual stop {command.price} cannot widen risk below the minimum "
-            f"{minimum} -- the greater of breakeven and the current active stop "
-            f"(spec section 646-659)"
-        )
-    PositionManager().apply_manual_stop(card, command.price)
-    card.active_stop_price = command.price
-
-
-def _apply_cancel_queued_sell_all(card: TradeCardState) -> None:
-    if card.board_status != BoardStatus.SELL_ALL or not card.sell_all_at_market_open:
-        raise CommandRejectedError("No queued market-open Sell All to cancel")
-    _move(card, BoardStatus.OPEN_POSITION)
-    card.sell_all_at_market_open = False
-    card.exit_all_required = False
-
-
-# --- Qt controller mixin ----------------------------------------------------
-#
-# Deliberately thin: every handler below just builds a command and calls
-# apply_board_command, then repaints. All decision logic lives above, where
-# it can be unit tested without a QApplication.
+        ready = bool(worker.account_action_ready(command.account_no, command.symbol, action))
+    except Exception:
+        ready = False
+    errors = getattr(worker, "startup_reconciliation_errors", {}) or {}
+    reasons = []
+    if command.account_no in errors:
+        reasons.append(str(errors[command.account_no]))
+    if not ready:
+        reasons.append(f"{action.lower().replace('_', ' ')} readiness is incomplete")
+    regular_session_open = None
+    runtime = getattr(worker, "runtime", None)
+    trading_engine = getattr(runtime, "trading_engine", None)
+    market_open = getattr(trading_engine, "_market_is_open", None)
+    if callable(market_open):
+        try:
+            regular_session_open = bool(market_open())
+        except Exception:
+            regular_session_open = None
+    return BoardActionContext(
+        enforce_runtime_fences=True,
+        engine_enabled=is_buyboard_engine_enabled(),
+        readiness_generation=int(getattr(worker, "readiness_generation", 0) or 0),
+        reconciliation_in_progress=bool(
+            command.account_no
+            in set(getattr(worker, "reconciliation_accounts_in_progress", set()) or set())
+        ),
+        action_ready=ready,
+        device_active=getattr(worker, "device_state", None) == RuntimeDeviceState.ACTIVE,
+        regular_session_open=regular_session_open,
+        restriction_reasons=tuple(dict.fromkeys(reasons)),
+    )
 
 
 class BuyboardMixin:
-    """Composed onto MainWindow alongside BuylistMixin (see
-    ``src/ui/buyboard/__init__.py``). Builds the new "Buy Board" tab and
-    wires drag/drop and dialog actions to ``apply_board_command``.
-    """
+    """Build the board and route all gestures through the workflow service."""
 
     def _buyboard_engine(self):
         return self.__dict__.get("pc_db_engine")
@@ -249,25 +136,29 @@ class BuyboardMixin:
         self.refresh_buyboard()
 
     def refresh_buyboard(self) -> None:
-        """Reload every card from the repository and repaint all columns."""
         from .board import populate_buyboard_columns
 
-        cards = repo.list_trade_cards(self._buyboard_engine(), environment="PROD")
-        populate_buyboard_columns(self, cards)
+        projections = execution_workflow_service.list_board_projections(
+            self._buyboard_engine(),
+            environment="PROD",
+            context=_projection_context(self),
+        )
+        populate_buyboard_columns(self, projections)
 
     def _buyboard_dispatch_command(self, command: AnyBoardCommand) -> bool:
-        """Apply one command; show a message box and refresh on rejection,
-        otherwise refresh silently. Returns True on success."""
         from PyQt5.QtWidgets import QMessageBox
 
         try:
-            apply_board_command(self._buyboard_engine(), command)
+            execution_workflow_service.request_board_action(
+                self._buyboard_engine(),
+                command,
+                context=_action_context(self, command),
+            )
         except TradeCardVersionConflictError:
             QMessageBox.warning(
                 self,
                 "Buy Board",
-                "This card changed on another device since it was loaded. "
-                "Refreshing the board -- please retry.",
+                "This card changed since it was loaded. The board has been refreshed; please retry.",
             )
             self.refresh_buyboard()
             return False
@@ -275,8 +166,11 @@ class BuyboardMixin:
             QMessageBox.warning(self, "Buy Board", "This card no longer exists.")
             self.refresh_buyboard()
             return False
-        except CommandRejectedError as exc:
+        except BoardCommandRejectedError as exc:
             QMessageBox.warning(self, "Buy Board", str(exc))
+            # Repaint on every rejection: the drag widget never performs a
+            # local row move, and this guarantees the user sees current truth.
+            self.refresh_buyboard()
             return False
         self.refresh_buyboard()
         return True

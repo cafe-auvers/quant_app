@@ -255,6 +255,9 @@ class BuyboardRuntimeWorker(QThread):
         # False -- no automatic order execution should begin for an
         # unreconciled account.
         self.startup_reconciliation_errors: Dict[str, str] = {}
+        # Read-only UI fence: a gesture rendered before/during an account
+        # reconciliation must not enqueue an intent against moving truth.
+        self.reconciliation_accounts_in_progress: set[str] = set()
         # Positive confirmation set: account numbers that have actually
         # completed a successful reconciliation at least once (startup or
         # periodic). Review finding P0: "unknown accounts can be
@@ -800,6 +803,7 @@ class BuyboardRuntimeWorker(QThread):
         expected_accounts = self._distinct_account_numbers(cards)
         self.startup_reconciliation_errors = {}
         for account_no in expected_accounts:
+            self.reconciliation_accounts_in_progress.add(account_no)
             try:
                 account_cards = [card for card in cards if card.account_no == account_no]
                 result = run_account_reconciliation_pass(
@@ -827,6 +831,8 @@ class BuyboardRuntimeWorker(QThread):
                 )
                 self._invalidate_account_reconciliation(account_no, str(exc))
                 continue
+            finally:
+                self.reconciliation_accounts_in_progress.discard(account_no)
             for card in account_changed:
                 if id(card) not in changed_ids:
                     changed_ids.add(id(card))
@@ -1136,6 +1142,7 @@ class BuyboardRuntimeWorker(QThread):
                 continue
 
             if reconcile_due:
+                self.reconciliation_accounts_in_progress.add(account_no)
                 try:
                     result = run_account_reconciliation_pass(
                         broker=self.runtime.broker,
@@ -1155,6 +1162,8 @@ class BuyboardRuntimeWorker(QThread):
                         "periodic account reconciliation failed",
                     )
                     continue
+                finally:
+                    self.reconciliation_accounts_in_progress.discard(account_no)
                 self._latest_reconciliation_snapshots[account_no] = result.snapshot
                 changed.extend(result.plan.changed_cards)
                 if execute_commands and self._accepting_commands:

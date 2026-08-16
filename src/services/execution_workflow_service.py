@@ -26,6 +26,7 @@ received.
 """
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
@@ -36,7 +37,13 @@ from src.brokers.execution_broker_protocol import (
     BrokerSubmissionResult,
 )
 from src.core.execution_mode import ExecutionMode, ExecutionSource
-from src.core.execution_order_record import ExecutionOrderRecord
+from src.core.execution_order_record import (
+    BrokerIdentityStatus,
+    ExecutionOrderRecord,
+    ExecutionOrderStatus,
+    TERMINAL_EXECUTION_ORDER_STATUSES,
+)
+from src.core.execution_ownership import ExecutionOwner
 from src.core.execution_request import (
     CancelExecutionRequest,
     CancelIntent,
@@ -60,6 +67,18 @@ from src.services.order_execution_service import submit_guarded_overseas_order
 from src.services.order_reconciliation import cancel_and_reconcile_order
 
 
+class BoardCommandRejectedError(RuntimeError):
+    """A well-formed board request is unsafe or invalid for current truth."""
+
+
+class BoardRuntimeFenceError(BoardCommandRejectedError):
+    """Runtime/readiness changed after the board projection was rendered."""
+
+
+class BoardOwnershipMismatchError(BoardCommandRejectedError):
+    """The Kanban UI does not own the requested account/symbol lifecycle."""
+
+
 class _SourceBoundGatewayBroker:
     """Adapts an :class:`ExecutionCommandGateway` to the exact
     ``ExecutionBrokerProtocol`` shape ``submit_guarded_overseas_order``/
@@ -73,14 +92,31 @@ class _SourceBoundGatewayBroker:
         self._gateway = gateway
         self._source = source
 
+    @staticmethod
+    def _accepts_source(method: Any) -> bool:
+        """Decide before a mutation; never retry after an unsupported kwarg."""
+        try:
+            parameters = inspect.signature(method).parameters.values()
+        except (TypeError, ValueError):
+            return False
+        return any(
+            parameter.name == "source"
+            or parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+
     def submit_order(self, **kwargs: Any) -> BrokerSubmissionResult:
-        return self._gateway.submit_order(source=self._source, **kwargs)
+        if self._accepts_source(self._gateway.submit_order):
+            kwargs["source"] = self._source
+        return self._gateway.submit_order(**kwargs)
 
     def is_ambiguous_submission_error(self, error: BaseException) -> bool:
         return self._gateway.is_ambiguous_submission_error(error)
 
     def cancel_order(self, **kwargs: Any) -> BrokerOrderStatusSnapshot:
-        return self._gateway.cancel_order(source=self._source, **kwargs)
+        if self._accepts_source(self._gateway.cancel_order):
+            kwargs["source"] = self._source
+        return self._gateway.cancel_order(**kwargs)
 
     def get_order(self, **kwargs: Any) -> List[BrokerOrderStatusSnapshot]:
         return self._gateway.get_order(**kwargs)
@@ -104,6 +140,13 @@ def _resolved_mode(gateway_or_broker: Any) -> ExecutionMode:
     that doesn't expose a ``mode`` in the first place.
     """
     return getattr(gateway_or_broker, "mode", ExecutionMode.LEGACY_COMPATIBILITY)
+
+
+def _legacy_broker_with_source(
+    gateway_or_broker: Any, source: ExecutionSource
+) -> Any:
+    """Wrap every legacy broker while preserving its exact call signature."""
+    return _SourceBoundGatewayBroker(gateway_or_broker, source)
 
 
 def request_submit(
@@ -169,7 +212,7 @@ def request_submit(
     order = submit_guarded_overseas_order(
         environment=environment, account_no=account_no, symbol=symbol, side=side, intent=intent,
         quantity=quantity, limit_price=limit_price, exchange=exchange, execution_policy=execution_policy,
-        path=path, broker=_SourceBoundGatewayBroker(resolved_gateway, source),
+        path=path, broker=_legacy_broker_with_source(resolved_gateway, source),
         attempt_deadline_at=attempt_deadline_at, **legacy_kwargs,
     )
     return ExecutionSubmissionResult.from_broker_order(order)
@@ -228,7 +271,9 @@ def request_cancel(
         )
         return resolved_gateway.cancel_guarded(request)
     return cancel_and_reconcile_order(
-        client_order_id, path=path, broker=_SourceBoundGatewayBroker(resolved_gateway, source)
+        client_order_id,
+        path=path,
+        broker=_legacy_broker_with_source(resolved_gateway, source),
     )
 
 
@@ -293,3 +338,613 @@ def request_replace(
         strategy_instance_id=strategy_instance_id,
     )
     return resolved_gateway.replace_guarded(request)
+
+
+# -- Kanban workflow/projection boundary (Workstream 13 / INV-21) ---------
+
+
+def _load_board_types():
+    # Kept local so broker-only users of this module do not pay for board
+    # repository/table setup and to avoid widening the import surface of the
+    # legacy execution path above.
+    from src.core import board_workflow
+
+    return board_workflow
+
+
+def _move_board_card(card, target_status) -> None:
+    from src.core.kanban_transitions import (
+        InvalidBoardTransitionError,
+        validate_board_transition,
+    )
+
+    try:
+        validate_board_transition(card.board_status, target_status)
+    except InvalidBoardTransitionError as exc:
+        raise BoardCommandRejectedError(str(exc)) from exc
+    card.previous_board_status = card.board_status
+    card.board_status = target_status
+
+
+def _board_action_name(command, card) -> str:
+    types = _load_board_types()
+    if isinstance(command, types.ActivateForToday):
+        return "NEW_ENTRY"
+    if isinstance(command, types.CancelEntry) and card.entry_client_order_id:
+        return "KNOWN_CANCEL"
+    if isinstance(
+        command,
+        (
+            types.RequestPartialSell,
+            types.RequestSellAll,
+            types.CancelQueuedSellAll,
+            types.SetOrbStop,
+            types.SetBreakevenStop,
+            types.SetManualStop,
+        ),
+    ):
+        return "PROTECTIVE_EXIT"
+    return "PRESENTATION"
+
+
+def _is_execution_affecting(command, card) -> bool:
+    return _board_action_name(command, card) != "PRESENTATION"
+
+
+def _require_current_board_runtime(command, card, context) -> None:
+    if not context.enforce_runtime_fences:
+        return
+    if (
+        command.expected_readiness_generation
+        and command.expected_readiness_generation != context.readiness_generation
+    ):
+        raise BoardRuntimeFenceError(
+            "Engine readiness changed since this card was rendered; refresh before retrying"
+        )
+    if not _is_execution_affecting(command, card):
+        return
+    # A BUY_TODAY cancellation only withdraws monitoring and cannot touch a
+    # broker.  It remains available while the execution engine is disabled.
+    types = _load_board_types()
+    local_cancel = isinstance(command, types.CancelEntry) and not card.entry_client_order_id
+    if not context.engine_enabled and not local_cancel:
+        raise BoardRuntimeFenceError(
+            "The Buy Board execution engine is disabled; no order action was recorded"
+        )
+    if context.reconciliation_in_progress:
+        raise BoardRuntimeFenceError(
+            "Broker reconciliation is in progress for this account; refresh after it completes"
+        )
+    if not context.device_active:
+        raise BoardRuntimeFenceError(
+            "This device is not the active execution owner; the request was not recorded"
+        )
+    if not context.action_ready:
+        reason = "; ".join(context.restriction_reasons) or "runtime readiness is incomplete"
+        raise BoardRuntimeFenceError(f"Action blocked: {reason}")
+
+
+def _require_kanban_board_ownership(
+    engine, command, card, context, *, ownership=None
+):
+    """Recheck durable symbol ownership for every execution-affecting UI action."""
+    if not context.enforce_runtime_fences or not _is_execution_affecting(command, card):
+        return None
+    from src.services.execution_ownership_repository import get_ownership
+
+    if ownership is None:
+        try:
+            ownership = get_ownership(
+                engine,
+                environment=card.environment,
+                account_no=card.account_no,
+                symbol=card.symbol,
+            )
+        except Exception as exc:
+            raise BoardOwnershipMismatchError(
+                "Execution ownership could not be verified; Kanban fails closed"
+            ) from exc
+    if ownership.owner != ExecutionOwner.KANBAN:
+        raise BoardOwnershipMismatchError(
+            f"{card.symbol} is {ownership.owner.value}-owned; Kanban may observe but cannot mutate it"
+        )
+    if not ownership.strategy_instance_id:
+        raise BoardOwnershipMismatchError(
+            f"{card.symbol} has invalid KANBAN ownership without a strategy identity"
+        )
+    if (
+        command.expected_execution_owner
+        and command.expected_execution_owner != ownership.owner.value
+    ):
+        raise BoardOwnershipMismatchError(
+            "Execution ownership changed since this card was rendered"
+        )
+    if (
+        command.expected_ownership_version
+        and command.expected_ownership_version != ownership.version
+    ):
+        raise BoardOwnershipMismatchError(
+            "Execution ownership revision changed since this card was rendered"
+        )
+    if (
+        command.expected_strategy_instance_id
+        and command.expected_strategy_instance_id != ownership.strategy_instance_id
+    ):
+        raise BoardOwnershipMismatchError(
+            "Kanban strategy ownership changed since this card was rendered"
+        )
+    return ownership
+
+
+def _active_owned_orders(engine, card) -> List[ExecutionOrderRecord]:
+    from src.services.execution_order_repository import list_execution_orders_for_card
+
+    return [
+        order
+        for order in list_execution_orders_for_card(
+            engine,
+            environment=card.environment,
+            account_no=card.account_no,
+            symbol=card.symbol,
+        )
+        if order.status not in TERMINAL_EXECUTION_ORDER_STATUSES
+    ]
+
+
+def _active_external_orders(engine, card):
+    from src.core.discovered_external_order import ExternalOrderDisposition
+    from src.services.discovered_external_order_repository import (
+        list_discovered_external_orders_for_account,
+    )
+
+    terminal = {
+        ExecutionOrderStatus.FILLED,
+        ExecutionOrderStatus.CANCELLED,
+        ExecutionOrderStatus.EXPIRED,
+        ExecutionOrderStatus.REJECTED,
+    }
+    return [
+        order
+        for order in list_discovered_external_orders_for_account(
+            engine,
+            environment=card.environment,
+            account_no=card.account_no,
+        )
+        if order.symbol == card.symbol
+        and order.disposition == ExternalOrderDisposition.DISCOVERED_UNOWNED
+        and order.broker_status not in terminal
+    ]
+
+
+def _require_board_action_not_conflicted(engine, command, card) -> None:
+    types = _load_board_types()
+    presentation_only = isinstance(
+        command, (types.MoveToWatchlist, types.MoveToBuylist, types.ReorderCard)
+    )
+    if presentation_only:
+        return
+    if card.entry_submission_unresolved or card.exit_submission_unresolved:
+        raise BoardCommandRejectedError(
+            "An ambiguous order is awaiting reconciliation; no new board action is allowed"
+        )
+    if card.entry_cancel_in_flight or card.exit_cancel_in_flight:
+        raise BoardCommandRejectedError(
+            "A cancellation is already unresolved; wait for broker reconciliation"
+        )
+    if _active_external_orders(engine, card):
+        raise BoardCommandRejectedError(
+            "An unowned external broker order is active for this symbol; it must remain separate and be resolved or explicitly adopted"
+        )
+
+    active_orders = _active_owned_orders(engine, card)
+    ambiguous = [
+        order
+        for order in active_orders
+        if order.status == ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE
+        or order.broker_identity_status == BrokerIdentityStatus.AMBIGUOUS
+    ]
+    if ambiguous:
+        raise BoardCommandRejectedError(
+            "An owned order has ambiguous broker identity; reconcile it before another UI action"
+        )
+    if isinstance(command, types.CancelEntry) and card.entry_block_reason == "cancel_requested":
+        raise BoardCommandRejectedError("Entry cancellation is already pending")
+    if isinstance(command, types.RequestPartialSell) and any(
+        order.side == OrderSide.SELL for order in active_orders
+    ):
+        raise BoardCommandRejectedError("A sell order is already pending for this symbol")
+    if isinstance(command, types.RequestSellAll) and card.board_status.value == "SELL_ALL":
+        raise BoardCommandRejectedError("Sell All is already pending")
+
+
+def _apply_board_mutation(command, card, *, context=None) -> None:
+    from src.core.trade_card_state import BoardStatus, PositionRuntimeStatus, StopType
+    from src.services.position_manager import (
+        PositionManager,
+        compute_breakeven_stop_price,
+        minimum_manual_stop_price,
+    )
+
+    types = _load_board_types()
+    if isinstance(command, types.CancelEntry):
+        if card.board_status == BoardStatus.BUY_TODAY:
+            _move_board_card(card, BoardStatus.BUYLIST)
+            card.entry_runtime_status = None
+            card.entry_block_reason = ""
+            card.entry_attempt_group_id = ""
+            card.entry_attempt_count = 0
+            card.entry_client_order_id = ""
+            card.entry_pending_attempt_number = 0
+            card.entry_submission_unresolved = False
+        elif card.board_status == BoardStatus.ENTRY_PENDING:
+            card.entry_block_reason = "cancel_requested"
+        else:
+            raise BoardCommandRejectedError(
+                f"Cannot cancel an entry from {card.board_status.value}"
+            )
+        return
+
+    if isinstance(command, types.RequestPartialSell):
+        if card.board_status != BoardStatus.OPEN_POSITION:
+            raise BoardCommandRejectedError(
+                "Partial sell can only be requested from Open Positions"
+            )
+        if command.quantity <= 0:
+            raise BoardCommandRejectedError("Partial-sell quantity must be positive")
+        orderable = card.orderable_quantity or card.broker_quantity
+        if orderable <= 0:
+            raise BoardCommandRejectedError("No broker-confirmed orderable quantity to sell")
+        if command.quantity >= orderable:
+            _move_board_card(card, BoardStatus.SELL_ALL)
+            card.exit_all_required = True
+            card.pending_partial_sell_quantity = 0
+        else:
+            _move_board_card(card, BoardStatus.PARTIAL_SELL)
+            card.pending_partial_sell_quantity = command.quantity
+            card.position_runtime_status = PositionRuntimeStatus.PARTIAL_EXIT_PENDING
+        return
+
+    if isinstance(command, types.SetOrbStop):
+        if card.position_runtime_status == PositionRuntimeStatus.NONE:
+            raise BoardCommandRejectedError("No open position to set a stop on")
+        orb_low = float(card.entry_orb_low or 0.0)
+        if orb_low <= 0:
+            raise BoardCommandRejectedError("The frozen entry ORB low is unavailable")
+        if card.active_stop_price and orb_low < card.active_stop_price:
+            raise BoardCommandRejectedError(
+                "Changing back to the ORB low would widen current stop protection"
+            )
+        card.stop_type = StopType.ORB_LOW
+        card.active_stop_price = orb_low
+        card.stop_quantity = card.broker_quantity
+        return
+
+    if isinstance(command, types.SetBreakevenStop):
+        if card.position_runtime_status == PositionRuntimeStatus.NONE:
+            raise BoardCommandRejectedError("No open position to set a stop on")
+        breakeven = compute_breakeven_stop_price(card.average_entry_price)
+        if card.active_stop_price and breakeven < card.active_stop_price:
+            raise BoardCommandRejectedError(
+                "Changing to breakeven would widen current stop protection"
+            )
+        PositionManager().apply_breakeven_stop(card)
+        return
+
+    if isinstance(command, types.SetManualStop):
+        if card.position_runtime_status == PositionRuntimeStatus.NONE:
+            raise BoardCommandRejectedError("No open position to set a stop on")
+        minimum = minimum_manual_stop_price(card)
+        if command.price < minimum:
+            raise BoardCommandRejectedError(
+                f"Manual stop {command.price} cannot widen risk below the minimum {minimum}"
+            )
+        PositionManager().apply_manual_stop(card, command.price)
+        return
+
+    if isinstance(command, types.CancelQueuedSellAll):
+        if card.board_status != BoardStatus.SELL_ALL or not card.sell_all_at_market_open:
+            raise BoardCommandRejectedError("No queued market-open Sell All to cancel")
+        _move_board_card(card, BoardStatus.OPEN_POSITION)
+        card.sell_all_at_market_open = False
+        card.exit_all_required = False
+        card.position_runtime_status = PositionRuntimeStatus.OPEN
+        return
+
+    if isinstance(command, types.ReorderCard):
+        card.kanban_priority = command.target_priority
+        return
+
+    targets = {
+        types.MoveToWatchlist: BoardStatus.WATCHLIST,
+        types.MoveToBuylist: BoardStatus.BUYLIST,
+        types.ActivateForToday: BoardStatus.BUY_TODAY,
+        types.RequestSellAll: BoardStatus.SELL_ALL,
+    }
+    target = targets.get(type(command))
+    if target is None:
+        raise BoardCommandRejectedError(
+            f"Unrecognized board command type: {type(command).__name__}"
+        )
+    _move_board_card(card, target)
+    if isinstance(command, types.MoveToWatchlist):
+        card.watchlist_member = True
+    elif isinstance(command, types.MoveToBuylist):
+        card.buylist_member = True
+        card.entry_runtime_status = None
+        card.entry_block_reason = ""
+        if not card.entry_client_order_id and card.broker_quantity <= 0:
+            card.entry_attempt_group_id = ""
+            card.entry_attempt_count = 0
+    elif isinstance(command, types.ActivateForToday):
+        card.buylist_member = True
+    elif isinstance(command, types.RequestSellAll):
+        # This is durable liquidation intent only.  The engine cancels a
+        # conflicting BUY, refreshes quantity, submits, and reconciliation
+        # alone may eventually project CLOSED.
+        card.exit_all_required = True
+        card.position_runtime_status = PositionRuntimeStatus.LIQUIDATING
+        if context is not None and context.regular_session_open is False:
+            card.sell_all_at_market_open = True
+            card.position_runtime_status = PositionRuntimeStatus.QUEUED_FOR_OPEN
+
+
+def request_board_action(engine, command, *, context=None):
+    """Validate and persist one revision-aware Kanban workflow request.
+
+    No broker method is called here.  Broker-affecting commands persist an
+    intent consumed by the same trading engine/workflow gateway used by the
+    legacy dashboard; broker reconciliation remains the only source of fills,
+    quantities, and terminal card placement.
+    """
+    from src.core.board_workflow import (
+        AdoptExternalOrder,
+        BoardActionContext,
+        BoardWorkflowResult,
+    )
+    from src.services import trade_card_repository
+    from src.services.discovered_external_order_repository import (
+        adopt_external_order_in_db,
+        fetch_discovered_external_order,
+    )
+    from src.services.trade_card_repository import (
+        TradeCardNotFoundError,
+        TradeCardVersionConflictError,
+    )
+
+    resolved_context = context or BoardActionContext()
+    if isinstance(command, AdoptExternalOrder):
+        external = fetch_discovered_external_order(engine, command.external_order_id)
+        if external is None or (
+            external.environment,
+            external.account_no,
+            external.symbol,
+        ) != (command.environment, command.account_no, command.symbol):
+            raise BoardCommandRejectedError(
+                "The selected external order no longer belongs to this UI scope"
+            )
+        adoption_card = trade_card_repository.get_trade_card(
+            engine, command.environment, command.account_no, command.symbol
+        )
+        if command.expected_card_version:
+            if adoption_card is None:
+                raise TradeCardNotFoundError(
+                    f"No trade card for {command.environment}:{command.account_no}:{command.symbol}"
+                )
+            if adoption_card.version != command.expected_card_version:
+                raise TradeCardVersionConflictError(
+                    f"Command {command.command_id} expected version "
+                    f"{command.expected_card_version}, stored version is {adoption_card.version}"
+                )
+        record = adopt_external_order_in_db(
+            engine,
+            command.external_order_id,
+            adopted_by=command.adopted_by,
+        )
+        return BoardWorkflowResult(
+            card=adoption_card,
+            command_id=command.command_id,
+            adopted_execution_client_order_id=record.client_order_id,
+        )
+
+    card = trade_card_repository.get_trade_card(
+        engine, command.environment, command.account_no, command.symbol
+    )
+    if card is None:
+        raise TradeCardNotFoundError(
+            f"No trade card for {command.environment}:{command.account_no}:{command.symbol}"
+        )
+    if card.version != command.expected_card_version:
+        raise TradeCardVersionConflictError(
+            f"Command {command.command_id} expected version "
+            f"{command.expected_card_version}, stored version is {card.version}"
+        )
+
+    _require_current_board_runtime(command, card, resolved_context)
+
+    _require_board_action_not_conflicted(engine, command, card)
+    # The final ownership check and card CAS share one transaction.  On
+    # MySQL the locked rows prevent a same-symbol ownership transfer from
+    # slipping between authorization and intent persistence.
+    from src.services.execution_ownership_repository import (
+        ensure_execution_ownership_table,
+        get_ownership_in_transaction,
+    )
+
+    trade_card_repository.ensure_trade_cards_table(engine)
+    ensure_execution_ownership_table(engine)
+    with engine.begin() as conn:
+        current = trade_card_repository.get_trade_card_in_transaction(
+            conn,
+            command.environment,
+            command.account_no,
+            command.symbol,
+            for_update=True,
+        )
+        if current is None:
+            raise TradeCardNotFoundError(
+                f"No trade card for {command.environment}:{command.account_no}:{command.symbol}"
+            )
+        if current.version != command.expected_card_version:
+            raise TradeCardVersionConflictError(
+                f"Command {command.command_id} expected version "
+                f"{command.expected_card_version}, stored version is {current.version}"
+            )
+        _require_current_board_runtime(command, current, resolved_context)
+        ownership = get_ownership_in_transaction(
+            conn,
+            environment=current.environment,
+            account_no=current.account_no,
+            symbol=current.symbol,
+            for_update=True,
+        )
+        _require_kanban_board_ownership(
+            engine,
+            command,
+            current,
+            resolved_context,
+            ownership=ownership,
+        )
+        _apply_board_mutation(command, current, context=resolved_context)
+        updated = trade_card_repository.update_trade_card_in_transaction(
+            conn, current, expected_version=command.expected_card_version
+        )
+    trade_card_repository.sync_trade_card_local_snapshot(updated)
+    return BoardWorkflowResult(card=updated, command_id=command.command_id)
+
+
+def project_board_card(engine, card, *, context=None):
+    """Build one read-only projection from card, order, external, and owner truth."""
+    import copy
+
+    from src.core.board_workflow import BoardCardProjection, BoardProjectionContext
+    from src.services.execution_ownership_repository import get_ownership
+
+    projection_context = context or BoardProjectionContext()
+    ownership = get_ownership(
+        engine,
+        environment=card.environment,
+        account_no=card.account_no,
+        symbol=card.symbol,
+    )
+    all_orders = _active_owned_orders(engine, card)
+    orders = [
+        order
+        for order in all_orders
+        if order.client_order_id
+        in {card.entry_client_order_id, card.exit_client_order_id}
+        or (
+            order.attempt_group_id
+            and order.attempt_group_id
+            in {card.entry_attempt_group_id, card.exit_attempt_group_id}
+        )
+    ]
+    unlinked_orders = [order for order in all_orders if order not in orders]
+    external = _active_external_orders(engine, card)
+    ambiguous_count = sum(
+        order.status == ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE
+        or order.broker_identity_status == BrokerIdentityStatus.AMBIGUOUS
+        for order in orders
+    )
+    restrictions = [
+        *projection_context.global_restrictions,
+        *projection_context.restrictions_for(card.account_no),
+    ]
+    if ownership.owner != ExecutionOwner.KANBAN:
+        restrictions.append(f"Observation only: execution owner is {ownership.owner.value}")
+    if external:
+        restrictions.append("Active unowned broker order fences execution")
+    if unlinked_orders:
+        restrictions.append("Unlinked owned broker order requires separate review")
+    if card.entry_submission_unresolved or card.exit_submission_unresolved or ambiguous_count:
+        restrictions.append("Ambiguous order requires reconciliation")
+    if card.entry_cancel_in_flight or card.exit_cancel_in_flight:
+        restrictions.append("Cancellation confirmation pending")
+    reconciliation_blocked = projection_context.reconciliation_blocked_for(
+        card.account_no
+    )
+    if reconciliation_blocked:
+        restrictions.append("Account reconciliation incomplete or stale")
+    return BoardCardProjection(
+        # Never hand the UI the mutable aggregate instance held by a caller
+        # (notably the runtime worker cache). A projection rendered at N must
+        # stay at N even if reconciliation mutates its source object to N+1.
+        card=copy.deepcopy(card),
+        ownership_owner=ownership.owner.value,
+        ownership_version=ownership.version,
+        strategy_instance_id=ownership.strategy_instance_id,
+        readiness_generation=projection_context.readiness_generation,
+        reconciliation_blocked=reconciliation_blocked,
+        engine_restrictions=tuple(dict.fromkeys(restrictions)),
+        owned_order_statuses=tuple(order.status for order in orders),
+        working_order_count=len(orders),
+        ambiguous_order_count=int(ambiguous_count),
+        unlinked_owned_orders=tuple(copy.deepcopy(unlinked_orders)),
+        external_orders=tuple(copy.deepcopy(external)),
+    )
+
+
+def list_board_projections(engine, *, environment="PROD", context=None):
+    import copy
+
+    from src.core.board_workflow import BoardExternalOrderProjection, BoardProjectionContext
+    from src.core.discovered_external_order import ExternalOrderDisposition
+    from src.services import trade_card_repository
+    from src.services.discovered_external_order_repository import (
+        list_discovered_external_orders,
+    )
+
+    if engine is None:
+        return []
+    projection_context = context or BoardProjectionContext()
+    card_projections = [
+        project_board_card(engine, card, context=context)
+        for card in trade_card_repository.list_trade_cards(
+            engine, environment=environment
+        )
+    ]
+    attached_external_ids = {
+        external.external_order_id
+        for projection in card_projections
+        for external in projection.external_orders
+    }
+    terminal = {
+        ExecutionOrderStatus.FILLED,
+        ExecutionOrderStatus.CANCELLED,
+        ExecutionOrderStatus.EXPIRED,
+        ExecutionOrderStatus.REJECTED,
+    }
+    standalone = [
+        BoardExternalOrderProjection(
+            order=copy.deepcopy(order),
+            readiness_generation=projection_context.readiness_generation,
+            engine_restrictions=tuple(
+                dict.fromkeys(
+                    [
+                        *projection_context.global_restrictions,
+                        *projection_context.restrictions_for(order.account_no),
+                        "Unowned broker order: observation only",
+                    ]
+                )
+            ),
+        )
+        for order in list_discovered_external_orders(
+            engine, environment=environment
+        )
+        if order.external_order_id not in attached_external_ids
+        and order.disposition == ExternalOrderDisposition.DISCOVERED_UNOWNED
+        and order.broker_status not in terminal
+    ]
+    return [*card_projections, *standalone]
+
+
+def get_board_projection(
+    engine, *, environment: str, account_no: str, symbol: str, context=None
+):
+    from src.services import trade_card_repository
+
+    card = trade_card_repository.get_trade_card(
+        engine, environment, account_no, symbol
+    )
+    if card is None:
+        return None
+    return project_board_card(engine, card, context=context)
