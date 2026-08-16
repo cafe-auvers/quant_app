@@ -82,6 +82,7 @@ def _get_capital_reservations_table(metadata: MetaData) -> Table:
         Column("requested_notional", Float, nullable=False),
         Column("remaining_reserved_notional", Float, nullable=False),
         Column("status", String(24), nullable=False),
+        Column("version", Integer, nullable=False, server_default="1"),
         Column("created_at", DateTime, nullable=False),
         Column("released_at", DateTime, nullable=True),
         Column("absence_count", Integer, nullable=False, server_default="0"),
@@ -113,18 +114,19 @@ def _ensure_table(engine: Engine) -> Table:
         if engine in _ensured_engines:
             return table
         metadata.create_all(engine)
-        _ensure_absence_evidence_columns(engine)
+        _ensure_pr3_columns(engine)
         _ensured_engines.add(engine)
     return table
 
 
-def _ensure_absence_evidence_columns(engine: Engine) -> None:
-    """Add PR3 evidence fields to an existing PR2 reservation table."""
+def _ensure_pr3_columns(engine: Engine) -> None:
+    """Add PR3 evidence and optimistic-version fields to a PR2 table."""
     existing = {
         column["name"]
         for column in inspect(engine).get_columns("capital_reservations")
     }
     definitions = {
+        "version": "INTEGER NOT NULL DEFAULT 1",
         "absence_count": "INTEGER NOT NULL DEFAULT 0",
         "last_absence_snapshot_id": "VARCHAR(64) NULL",
         "last_absence_observed_at": "VARCHAR(64) NULL",
@@ -159,6 +161,7 @@ def _row_to_reservation(row) -> CapitalReservation:
         requested_notional=row.requested_notional,
         remaining_reserved_notional=row.remaining_reserved_notional,
         status=row.status,
+        version=row.version,
         created_at=row.created_at,
         released_at=row.released_at,
         absence_count=row.absence_count,
@@ -241,6 +244,7 @@ def save_reservation(engine: Optional[Engine], reservation: CapitalReservation) 
                 requested_notional=reservation.requested_notional,
                 remaining_reserved_notional=reservation.remaining_reserved_notional,
                 status=reservation.status.value,
+                version=reservation.version,
                 created_at=reservation.created_at,
                 released_at=reservation.released_at,
                 absence_count=reservation.absence_count,
@@ -256,12 +260,14 @@ def save_reservation(engine: Optional[Engine], reservation: CapitalReservation) 
                     table.insert().values(reservation_id=reservation.reservation_id, **values)
                 )
             else:
-                conn.execute(
-                    table.update()
-                    .where(table.c.reservation_id == reservation.reservation_id)
-                    .values(**values)
+                # Best-effort callers still get the same non-raising API,
+                # but they may never overwrite a newer cross-device value.
+                update_reservation(
+                    conn,
+                    reservation,
+                    expected_version=reservation.version,
                 )
-    except SQLAlchemyError as exc:
+    except (SQLAlchemyError, CapitalReservationVersionConflictError) as exc:
         logger.warning("capital_reservation_repository: save_reservation failed: %s", exc)
 
 
@@ -274,6 +280,10 @@ class DuplicateReservationError(RuntimeError):
 
 class InsufficientAvailableCapitalError(RuntimeError):
     """The authoritative transaction cannot reserve the requested notional."""
+
+
+class CapitalReservationVersionConflictError(RuntimeError):
+    """A reservation changed after the caller read its version."""
 
 
 # --- shared-transaction primitive (Workstream 3, PR2) -----------------------
@@ -306,6 +316,7 @@ def insert_reservation(conn: Connection, reservation: CapitalReservation) -> Cap
             requested_notional=reservation.requested_notional,
             remaining_reserved_notional=reservation.remaining_reserved_notional,
             status=reservation.status.value,
+            version=reservation.version,
             created_at=reservation.created_at,
             released_at=reservation.released_at,
             absence_count=reservation.absence_count,
@@ -349,7 +360,12 @@ def insert_reservation_if_available(
     return insert_reservation(conn, reservation)
 
 
-def update_reservation(conn: Connection, reservation: CapitalReservation) -> CapitalReservation:
+def update_reservation(
+    conn: Connection,
+    reservation: CapitalReservation,
+    *,
+    expected_version: int,
+) -> CapitalReservation:
     """Companion to :func:`insert_reservation` for the same caller-owned-
     transaction composability -- used by the gateway to release a
     reservation (on a clean rejection) inside the same transaction as the
@@ -357,13 +373,18 @@ def update_reservation(conn: Connection, reservation: CapitalReservation) -> Cap
     write after the fact. Same table-must-already-exist requirement as
     :func:`insert_reservation`."""
     table = _get_capital_reservations_table(MetaData())
+    next_version = int(expected_version) + 1
     result = conn.execute(
         table.update()
-        .where(table.c.reservation_id == reservation.reservation_id)
+        .where(
+            table.c.reservation_id == reservation.reservation_id,
+            table.c.version == int(expected_version),
+        )
         .values(
             requested_notional=reservation.requested_notional,
             remaining_reserved_notional=reservation.remaining_reserved_notional,
             status=reservation.status.value,
+            version=next_version,
             released_at=reservation.released_at,
             absence_count=reservation.absence_count,
             last_absence_snapshot_id=(
@@ -375,9 +396,20 @@ def update_reservation(conn: Connection, reservation: CapitalReservation) -> Cap
         )
     )
     if result.rowcount == 0:
-        raise RuntimeError(
-            f"CapitalReservation {reservation.reservation_id!r} not found for update"
+        stored = conn.execute(
+            select(table.c.version).where(
+                table.c.reservation_id == reservation.reservation_id
+            )
+        ).first()
+        if stored is None:
+            raise RuntimeError(
+                f"CapitalReservation {reservation.reservation_id!r} not found for update"
+            )
+        raise CapitalReservationVersionConflictError(
+            f"reservation_id={reservation.reservation_id!r} version conflict "
+            f"(expected {expected_version}, stored {stored.version})"
         )
+    reservation.version = next_version
     return reservation
 
 

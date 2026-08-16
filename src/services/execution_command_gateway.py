@@ -829,6 +829,13 @@ class ExecutionCommandGateway:
         # reach the broker.
         self._require_ownership(environment, account_no, symbol, request.source, request.strategy_instance_id)
         self._require_verified_lease(request.lease)
+        with engine.connect() as conn:
+            require_no_active_unowned_external_order(
+                conn,
+                environment=environment,
+                account_no=account_no,
+                symbol=symbol,
+            )
 
         # 9. only now call the broker.
         try:
@@ -860,7 +867,11 @@ class ExecutionCommandGateway:
                         # gives the reservation back; an ambiguous one does
                         # not (the order may yet turn out to exist).
                         reservation.release()
-                        update_reservation(conn, reservation)
+                        update_reservation(
+                            conn,
+                            reservation,
+                            expected_version=reservation.version,
+                        )
 
             self._persist_or_raise_ambiguous(
                 _persist_failure, context=f"submit {client_order_id!r} failure persistence"
@@ -950,6 +961,13 @@ class ExecutionCommandGateway:
             record.environment, record.account_no, record.symbol, request.source, request.strategy_instance_id
         )
         self._require_verified_lease(request.lease)
+        with engine.connect() as conn:
+            require_no_active_unowned_external_order(
+                conn,
+                environment=record.environment,
+                account_no=record.account_no,
+                symbol=record.symbol,
+            )
 
         quantity = record.remaining_quantity or record.submitted_quantity
         try:
@@ -1029,7 +1047,11 @@ class ExecutionCommandGateway:
                             reservation.consume(filled_notional)
                         if reservation.is_open():
                             reservation.release()
-                        update_reservation(conn, reservation)
+                        update_reservation(
+                            conn,
+                            reservation,
+                            expected_version=reservation.version,
+                        )
 
         self._persist_or_raise_ambiguous(
             _persist_cancel_success, context=f"cancel {request.client_order_id!r} success persistence",

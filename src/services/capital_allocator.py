@@ -178,9 +178,11 @@ def _mutate_reservation(
             if reservation.reservation_id != reservation_id:
                 continue
             mutation(reservation)
-            _save_unlocked(reservations, path)
             if engine is not None:
                 capital_reservation_repository.save_reservation(engine, reservation)
+            # The CAS write advances ``version`` on success, so mirror only
+            # after that authoritative update has finalized the object.
+            _save_unlocked(reservations, path)
             return reservation
         if engine is not None:
             reservation = capital_reservation_repository.fetch_reservation(

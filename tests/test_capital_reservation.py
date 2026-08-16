@@ -378,5 +378,6 @@ def test_existing_pr2_reservation_table_is_migrated_with_absence_evidence_column
         engine, environment="PROD", account_no="1"
     )[0]
     assert stored.reservation_id == "R-OLD"
+    assert stored.version == 1
     assert stored.absence_count == 0
     assert stored.last_absence_snapshot_id == ""

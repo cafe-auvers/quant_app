@@ -700,6 +700,36 @@ def _order_key(order: ExecutionOrderRecord) -> Tuple[str, str, str]:
     return (order.environment, order.account_no, order.symbol)
 
 
+def _card_tracks_order(
+    card: Optional[TradeCardState], order: ExecutionOrderRecord
+) -> bool:
+    """Return whether ``card`` durably links this exact lifecycle order.
+
+    Symbol/account equality only identifies the card row; it does not prove
+    that a historical order belongs to the card's current trade cycle.  The
+    caller must have retained either the exact client ID or the current
+    attempt-group correlation before broker history may project onto the
+    card.
+    """
+    if card is None:
+        return False
+    if order.side == OrderSide.BUY:
+        return bool(
+            card.entry_client_order_id == order.client_order_id
+            or (
+                order.attempt_group_id
+                and card.entry_attempt_group_id == order.attempt_group_id
+            )
+        )
+    return bool(
+        card.exit_client_order_id == order.client_order_id
+        or (
+            order.attempt_group_id
+            and card.exit_attempt_group_id == order.attempt_group_id
+        )
+    )
+
+
 def _clear_entry_card_tracking(card: TradeCardState) -> None:
     card.entry_client_order_id = ""
     card.entry_cancel_command_id = ""
@@ -1061,6 +1091,7 @@ def reduce_account_reconciliation(
         )
         if (
             card is not None
+            and _card_tracks_order(card, order)
             and category in (
                 ReconciliationCategory.ENTRY_BUY,
                 ReconciliationCategory.ENTRY_COMPLETION_BUY,
@@ -1102,11 +1133,12 @@ def reduce_account_reconciliation(
                 )
             )
         card = card_by_key.get(_order_key(exact))
+        linked_card = card if _card_tracks_order(card, exact) else None
         _project_exact_order_to_card(
             order=exact,
             broker_snapshot=broker_snapshot,
             account_snapshot=snapshot,
-            card=card,
+            card=linked_card,
             category=category_by_client_order_id[exact.client_order_id],
             position_manager=position_manager,
             alerts=alerts,
@@ -1234,6 +1266,13 @@ def reduce_account_reconciliation(
                 ).hex,
                 discovered_at=snapshot.observed_at.isoformat(),
             )
+            terminal_external = mapped_status in _TERMINAL_EXECUTION_STATUSES
+            if terminal_external:
+                validate_disposition_transition(
+                    external.disposition,
+                    ExternalOrderDisposition.DISMISSED_TERMINAL,
+                )
+                external.disposition = ExternalOrderDisposition.DISMISSED_TERMINAL
             external_orders.append(external)
             external_by_broker_id[broker_id] = external
             classifications.append(
@@ -1242,18 +1281,19 @@ def reduce_account_reconciliation(
                     external.external_order_id,
                 )
             )
-            alerts.append(
-                ReconciliationAlert(
-                    "DISCOVERED_UNOWNED_BROKER_ORDER",
-                    ReconciliationAlertSeverity.CRITICAL,
-                    (
-                        "Broker order is not claimed by any local record; all "
-                        "mutations for this account and symbol are fenced"
-                    ),
-                    broker_snapshot.symbol,
-                    broker_order_id=broker_id,
+            if not terminal_external:
+                alerts.append(
+                    ReconciliationAlert(
+                        "DISCOVERED_UNOWNED_BROKER_ORDER",
+                        ReconciliationAlertSeverity.CRITICAL,
+                        (
+                            "Broker order is not claimed by any local record; all "
+                            "mutations for this account and symbol are fenced"
+                        ),
+                        broker_snapshot.symbol,
+                        broker_order_id=broker_id,
+                    )
                 )
-            )
         else:
             existing_external.broker_status = mapped_status
             existing_external.filled_quantity = broker_snapshot.filled_quantity
@@ -1658,6 +1698,7 @@ def apply_reconciliation_plan(engine: Engine, plan: ReconciliationPlan) -> None:
         *plan.card_creates,
         *plan.card_updates,
         *plan.order_updates,
+        *plan.reservation_updates,
         *plan.external_order_creates,
         *plan.external_order_updates,
     ]
@@ -1678,7 +1719,11 @@ def apply_reconciliation_plan(engine: Engine, plan: ReconciliationPlan) -> None:
                     conn, order, expected_version=original_versions[id(order)]
                 )
             for reservation in plan.reservation_updates:
-                update_reservation(conn, reservation)
+                update_reservation(
+                    conn,
+                    reservation,
+                    expected_version=original_versions[id(reservation)],
+                )
             for external in plan.external_order_creates:
                 existing = get_discovered_external_order_by_broker_id(
                     conn,

@@ -562,6 +562,52 @@ def test_action_specific_readiness_keeps_protective_exit_available_when_unrelate
     assert worker._card_action_ready(entry_card) is False
 
 
+def test_due_reconciliation_failure_invalidates_cached_action_readiness(
+    tmp_path, monkeypatch
+):
+    import datetime as dt
+
+    import src.ui.buyboard.runtime_worker as worker_module
+
+    worker, _ = _worker(tmp_path, account_no="1")
+    worker.runtime = _build_test_runtime(
+        buying_power_provider=worker._buying_power_provider,
+        card_lookup=worker._card_lookup,
+        broker=worker._broker,
+        market_data=_dummy_market_data(),
+    )
+    worker._latest_reconciliation_snapshots["1"] = AccountBrokerSnapshot(
+        environment="PROD",
+        account_no="1",
+        holdings=(),
+        completeness=SnapshotCompleteness(
+            holdings_complete=True,
+            open_orders_complete=True,
+            history_complete=True,
+            reserved_orders_complete=True,
+            account_balance_complete=True,
+        ),
+    )
+    worker.startup_reconciled_accounts.add("1")
+    old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)
+    worker._account_reconciled_at["1"] = old
+    worker._account_balance_refreshed_at["1"] = old
+    assert worker.account_action_ready("1", "AAPL", "NEW_ENTRY") is True
+
+    def fail_reconciliation(**kwargs):
+        raise RuntimeError("current broker snapshot unavailable")
+
+    monkeypatch.setattr(
+        worker_module, "run_account_reconciliation_pass", fail_reconciliation
+    )
+    worker._refresh_account_state_if_due([])
+
+    assert "1" not in worker._latest_reconciliation_snapshots
+    assert worker.account_action_ready("1", "AAPL", "NEW_ENTRY") is False
+    assert worker.account_action_ready("1", "AAPL", "PROTECTIVE_EXIT") is False
+    assert "1" in worker.startup_reconciliation_errors
+
+
 def test_reconciliation_alert_incidents_are_account_scoped_and_rearm_after_resolution(
     tmp_path,
 ):

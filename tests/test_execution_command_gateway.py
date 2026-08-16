@@ -198,6 +198,28 @@ def test_explicit_adoption_removes_external_order_execution_fence(tmp_path):
     assert len(broker.submit_calls) == 1
 
 
+@pytest.mark.usefixtures("trading_enabled")
+def test_terminal_external_audit_row_does_not_fence_submission(tmp_path):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    record_discovered_external_order(
+        engine,
+        new_discovered_external_order(
+            environment="PROD",
+            account_no="12345678-01",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            broker_order_id="B-TERMINAL-EXTERNAL",
+            broker_status=ExecutionOrderStatus.CANCELLED,
+        ),
+    )
+    broker.queue_acceptance(broker_order_id="B-NEW")
+
+    result = gateway.submit_guarded(_submit_request())
+
+    assert result.broker_order_id == "B-NEW"
+    assert len(broker.submit_calls) == 1
+
+
 def test_legacy_compatibility_submit_is_a_transparent_passthrough():
     broker = FakeExecutionBroker()
     broker.queue_acceptance(broker_order_id="B-1")
@@ -720,6 +742,32 @@ def test_a_lease_epoch_advance_between_the_initial_check_and_the_broker_call_blo
     assert lease_protocol.calls == 2
 
 
+@pytest.mark.usefixtures("trading_enabled")
+def test_external_fence_inserted_after_submitting_commit_blocks_broker_submit(
+    tmp_path, monkeypatch
+):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    broker.queue_acceptance(broker_order_id="SHOULD-NOT-BE-USED")
+    real_require_lease = gateway._require_verified_lease
+    calls = {"n": 0}
+
+    def insert_fence_on_final_check(lease):
+        calls["n"] += 1
+        real_require_lease(lease)
+        if calls["n"] == 2:
+            _record_active_external_order(engine, broker_order_id="B-RACED-SUBMIT")
+
+    monkeypatch.setattr(
+        gateway, "_require_verified_lease", insert_fence_on_final_check
+    )
+
+    with pytest.raises(ActiveExternalOrderFenceError):
+        gateway.submit_guarded(_submit_request())
+
+    assert broker.submit_calls == []
+    assert fetch_execution_order(engine, "CID-1").status == ExecutionOrderStatus.SUBMITTING
+
+
 # --- cancellation -----------------------------------------------------------
 
 
@@ -778,6 +826,33 @@ def test_cancel_confirmed_reaches_cancelled(tmp_path):
     gateway.cancel_guarded(_cancel_request())
     record = fetch_execution_order(engine, "CID-1")
     assert record.status == ExecutionOrderStatus.CANCELLED
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_external_fence_inserted_after_cancel_pending_commit_blocks_broker_cancel(
+    tmp_path, monkeypatch
+):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    _submit_and_acknowledge(gateway, broker)
+    broker.queue_cancel_confirmed()
+    real_require_lease = gateway._require_verified_lease
+    calls = {"n": 0}
+
+    def insert_fence_on_final_check(lease):
+        calls["n"] += 1
+        real_require_lease(lease)
+        if calls["n"] == 2:
+            _record_active_external_order(engine, broker_order_id="B-RACED-CANCEL")
+
+    monkeypatch.setattr(
+        gateway, "_require_verified_lease", insert_fence_on_final_check
+    )
+
+    with pytest.raises(ActiveExternalOrderFenceError):
+        gateway.cancel_guarded(_cancel_request())
+
+    assert broker.cancel_calls == []
+    assert fetch_execution_order(engine, "CID-1").status == ExecutionOrderStatus.CANCEL_PENDING
 
 
 @pytest.mark.usefixtures("trading_enabled")

@@ -389,7 +389,7 @@ class BuyboardRuntimeWorker(QThread):
                 logger.exception(
                     "Startup reconciliation failed for account %s", account_no
                 )
-                self.startup_reconciliation_errors[account_no] = str(exc)
+                self._invalidate_account_reconciliation(account_no, str(exc))
                 continue
             for card in account_changed:
                 if id(card) not in changed_ids:
@@ -590,6 +590,10 @@ class BuyboardRuntimeWorker(QThread):
                         "Periodic account reconciliation failed for account %s",
                         account_no,
                     )
+                    self._invalidate_account_reconciliation(
+                        account_no,
+                        "periodic account reconciliation failed",
+                    )
                     continue
                 self._latest_reconciliation_snapshots[account_no] = result.snapshot
                 changed.extend(result.plan.changed_cards)
@@ -687,6 +691,18 @@ class BuyboardRuntimeWorker(QThread):
             and completeness.reserved_orders_complete
             and completeness.account_balance_complete
         )
+
+    def _invalidate_account_reconciliation(
+        self, account_no: str, reason: str
+    ) -> None:
+        """Fail closed after a due pass cannot produce current broker truth."""
+        self._latest_reconciliation_snapshots.pop(account_no, None)
+        self._account_reconciled_at.pop(account_no, None)
+        self.startup_reconciled_accounts.discard(account_no)
+        self.startup_reconciliation_errors[account_no] = str(
+            reason or "account reconciliation failed"
+        )
+        self.startup_reconciliation_complete = False
 
     def _card_action_ready(self, card: TradeCardState) -> bool:
         """Gate only the broker evidence needed by this card's next action."""

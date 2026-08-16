@@ -367,20 +367,32 @@ def require_no_active_unowned_external_order(
 ) -> None:
     """Execution-boundary fence; call inside the mutation transaction."""
     table = _get_discovered_external_orders_table(MetaData())
-    row = conn.execute(
-        select(table.c.external_order_id, table.c.broker_order_id).where(
+    terminal_statuses = {
+        ExecutionOrderStatus.FILLED,
+        ExecutionOrderStatus.CANCELLED,
+        ExecutionOrderStatus.EXPIRED,
+        ExecutionOrderStatus.REJECTED,
+    }
+    rows = conn.execute(
+        select(table).where(
             table.c.environment == str(environment or "").upper(),
             table.c.account_no == str(account_no or ""),
             table.c.symbol == str(symbol or "").upper(),
             table.c.disposition
             == ExternalOrderDisposition.DISCOVERED_UNOWNED.value,
         )
-    ).first()
-    if row is not None:
+    ).fetchall()
+    active = None
+    for row in rows:
+        candidate = _row_to_order(row)
+        if candidate.broker_status not in terminal_statuses:
+            active = candidate
+            break
+    if active is not None:
         raise ActiveExternalOrderFenceError(
             f"{environment}/{account_no}/{symbol} is fenced by active unowned "
-            f"broker_order_id={row.broker_order_id!r} "
-            f"(external_order_id={row.external_order_id!r}); wait for a terminal "
+            f"broker_order_id={active.broker_order_id!r} "
+            f"(external_order_id={active.external_order_id!r}); wait for a terminal "
             "broker observation or explicitly adopt the order"
         )
 

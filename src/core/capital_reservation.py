@@ -66,6 +66,7 @@ class CapitalReservation:
     requested_notional: float
     remaining_reserved_notional: float
     status: CapitalReservationStatus = CapitalReservationStatus.RESERVED
+    version: int = 1
     created_at: datetime = field(default_factory=_utc_now)
     released_at: Optional[datetime] = None
     absence_count: int = 0
@@ -85,6 +86,7 @@ class CapitalReservation:
         self.status = _enum_from_value(
             self.status, CapitalReservationStatus, CapitalReservationStatus.RESERVED
         )
+        self.version = max(1, int(self.version or 1))
         self.created_at = _parse_timestamp(self.created_at) or _utc_now()
         self.released_at = _parse_timestamp(self.released_at)
         self.absence_count = max(0, int(self.absence_count or 0))
@@ -155,6 +157,7 @@ class CapitalReservation:
             "requested_notional": self.requested_notional,
             "remaining_reserved_notional": self.remaining_reserved_notional,
             "status": self.status.value,
+            "version": self.version,
             "created_at": self.created_at.isoformat(),
             "released_at": self.released_at.isoformat() if self.released_at else None,
             "absence_count": self.absence_count,
@@ -176,6 +179,7 @@ class CapitalReservation:
                 data.get("remaining_reserved_notional", 0.0) or 0.0
             ),
             status=data.get("status", CapitalReservationStatus.RESERVED),
+            version=int(data.get("version", 1) or 1),
             created_at=data.get("created_at"),
             released_at=data.get("released_at"),
             absence_count=int(data.get("absence_count", 0) or 0),

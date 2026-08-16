@@ -134,7 +134,7 @@ PR's behavior composes correctly, plus the Gate 1 run in full.
 | 1 | Freeze requirements and invariants (this document) | DONE — revision 3.1 signed off |
 | 2 | Durable order ownership and command ledger | PR1 IMPLEMENTED, not activated — merged to `master` (`5b50e1d`): schemas, all three state machines, durable repositories, command ledger. Excludes A4a's KIS-specific correlation-key adapter (stays gated on Workstream 0). |
 | 3 | One guarded execution gateway | PR2 IMPLEMENTED, not activated — `ExecutionCommandGateway` (`src/services/execution_command_gateway.py`): dual-mode, with genuinely separate call shapes per mode (`submit_order`/`cancel_order` for `LEGACY_COMPATIBILITY`; `submit_guarded`/`cancel_guarded`/`replace_guarded` taking explicit request models with caller-generated stable command identities for `GUARDED_ENGINE`). Full A1-A11/B1-B4 sequence, one authoritative atomic capital reservation with an in-transaction availability check, a real lease-epoch gate, H1 ownership enforcement, a mutation-budget seam for Workstream 10, and fail-closed guarded runtime composition. Runtime-level tests cover restart-restored caller identity, normalized results, full-context tracked cancellation, Partial Sell/Sell All, one-reservation entry, and unresolved post-broker persistence without retry. |
-| 4 | Account-level reconciliation engine | PR3 IMPLEMENTED, not activated — one immutable `AccountBrokerSnapshot` per account/pass, per-source `SnapshotCompleteness`, a pure `ReconciliationPlan` reducer, durable two-generation order/reservation absence evidence, behavioral C4 projection, execution-boundary fencing for active unowned orders, guarded execution of reducer commands, safe external SELL exposure handling, atomic account-plan persistence, and one startup/periodic runtime pass replacing the three ordered EOD sweeps. KIS submission-time mapping and production threshold calibration remain gated on Workstream 0; without verified broker submission time, A4a stays manual and unmatched broker orders remain separate `DiscoveredExternalOrder`s. |
+| 4 | Account-level reconciliation engine | PR3 IMPLEMENTED, not activated — one immutable `AccountBrokerSnapshot` per account/pass, per-source `SnapshotCompleteness`, a pure `ReconciliationPlan` reducer, durable two-generation order/reservation absence evidence, lifecycle-linked behavioral C4 projection, execution-boundary and last-broker-boundary fencing for active unowned orders, guarded execution of reducer commands, safe external SELL exposure handling, atomic account-plan persistence with reservation CAS, failure-invalidated action readiness, and one startup/periodic runtime pass replacing the three ordered EOD sweeps. KIS submission-time mapping and production threshold calibration remain gated on Workstream 0; without verified broker submission time, A4a stays manual and unmatched broker orders remain separate `DiscoveredExternalOrder`s. |
 | 5 | Production KIS real-time market data | NOT STARTED |
 | 6 | Runtime readiness and device handoff | NOT STARTED |
 | 7 | Complete test program | NOT STARTED — matrix fully specified; distributed across PR1-7, capstone in PR8 |
@@ -1116,6 +1116,13 @@ and stays `false` in unattended/automatic form until Gate 5 passes.
   database transaction; and made critical alert incidents account-scoped and
   re-armable after resolution. Runtime/fake-broker tests now assert real submit
   and cancel calls, plus ambiguity suppressing all subsequent broker calls.
+- 2026-08-16 (PR3 residual hardening): First-sighting terminal external
+  history is persisted directly as audit-only instead of becoming a transient
+  execution fence; exact order history projects onto a card only through its
+  durable client-ID or current attempt-group link; a failed due reconciliation
+  invalidates cached action readiness; active external fences are re-read at
+  the final submit/cancel boundary; and capital reservations now carry a
+  migrated optimistic version used by gateway and account-plan CAS writes.
 - 2026-08-15: Initial draft, branch created from `109c2c4` ("kanban fix 8").
 - 2026-08-15 (revision 2): Incorporated first architecture review. Added
   Workstream 0, INV-20, rewrote A4 (single version), atomic pre-submission

@@ -91,6 +91,8 @@ def _card(symbol="AAPL", **overrides) -> TradeCardState:
         entry_trigger=100.0,
         entry_orb_low=95.0,
         selected_orb_window="5m",
+        entry_attempt_group_id="G-1",
+        exit_attempt_group_id="G-1",
     )
     values.update(overrides)
     return TradeCardState(**values)
@@ -111,6 +113,7 @@ def _order(**overrides) -> ExecutionOrderRecord:
         broker_identity_status=BrokerIdentityStatus.EXACT,
         remaining_quantity=10,
         capital_reservation_id="R-1",
+        attempt_group_id="G-1",
     )
     values.update(overrides)
     return ExecutionOrderRecord(**values)
@@ -510,6 +513,33 @@ def test_a4b_creates_a_discovered_external_order_not_an_execution_order_record()
     assert plan.commands == ()
 
 
+def test_first_sighting_of_terminal_external_history_is_audit_only():
+    historical = BrokerOrderStatusSnapshot(
+        environment="PROD",
+        account_no="1",
+        symbol="TSLA",
+        broker_order_id="B-HISTORICAL",
+        side=OrderSide.BUY,
+        status=OrderStatus.FILLED,
+        quantity_requested=2,
+        filled_quantity=2,
+    )
+
+    plan = reduce_account_reconciliation(
+        _snapshot(orders=(historical,)), AccountLocalState()
+    )
+
+    assert len(plan.external_order_creates) == 1
+    assert (
+        plan.external_order_creates[0].disposition
+        == ExternalOrderDisposition.DISMISSED_TERMINAL
+    )
+    assert not any(
+        alert.code == "DISCOVERED_UNOWNED_BROKER_ORDER"
+        for alert in plan.alerts
+    )
+
+
 def test_unrecognized_open_external_order_still_creates_a_durable_fence():
     external_snapshot = BrokerOrderStatusSnapshot(
         environment="PROD",
@@ -753,6 +783,40 @@ def test_exact_entry_cancellation_with_zero_fill_returns_card_to_buylist():
     )
     assert plan.card_updates[0].board_status == BoardStatus.BUYLIST
     assert plan.order_updates[0].status == ExecutionOrderStatus.CANCELLED
+
+
+def test_old_exact_terminal_order_does_not_project_onto_current_buylist_cycle():
+    current_card = _card(
+        board_status=BoardStatus.BUYLIST,
+        entry_attempt_group_id="CURRENT-CYCLE",
+        entry_client_order_id="",
+    )
+    historical_order = _order(
+        client_order_id="OLD-CLIENT-ID",
+        attempt_group_id="PRIOR-CYCLE",
+        capital_reservation_id="",
+    )
+    historical_fill = BrokerOrderStatusSnapshot(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        broker_order_id="B-1",
+        side=OrderSide.BUY,
+        status=OrderStatus.FILLED,
+        quantity_requested=10,
+        filled_quantity=10,
+        avg_fill_price=101.0,
+    )
+
+    plan = reduce_account_reconciliation(
+        _snapshot(orders=(historical_fill,)),
+        AccountLocalState(
+            cards=(current_card,), execution_orders=(historical_order,)
+        ),
+    )
+
+    assert plan.order_updates[0].status == ExecutionOrderStatus.FILLED
+    assert plan.card_updates == ()
 
 
 def test_exact_working_entry_remains_tracked_without_a_cancel_command():
@@ -1367,3 +1431,38 @@ def test_atomic_plan_application_rolls_back_earlier_writes_on_later_failure(
     stored = trade_card_repository.get_trade_card(engine, "PROD", "1", "AAPL")
     assert stored.board_status == BoardStatus.BUYLIST
     assert stored.version == 1
+
+
+def test_stale_reconciliation_plan_cannot_overwrite_newer_reservation_state(
+    tmp_path,
+):
+    from src.services import capital_reservation_repository as reservation_repo
+    from src.services.capital_reservation_repository import (
+        CapitalReservationVersionConflictError,
+    )
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'reservation-cas.db'}", future=True)
+    reservation = _reservation("R-CAS")
+    reservation_repo.save_reservation(engine, reservation)
+    stale = reservation_repo.fetch_reservation(engine, "R-CAS")
+    newer = reservation_repo.fetch_reservation(engine, "R-CAS")
+
+    newer.release()
+    with engine.begin() as conn:
+        reservation_repo.update_reservation(
+            conn, newer, expected_version=newer.version
+        )
+
+    stale.absence_count = 1
+    stale.last_absence_snapshot_id = "stale-snapshot"
+    plan = ReconciliationPlan(
+        snapshot_id="stale-plan", reservation_updates=(stale,)
+    )
+
+    with pytest.raises(CapitalReservationVersionConflictError):
+        apply_reconciliation_plan(engine, plan)
+
+    stored = reservation_repo.fetch_reservation(engine, "R-CAS")
+    assert stored.version == 2
+    assert stored.status.value == "RELEASED"
+    assert stored.absence_count == 0
