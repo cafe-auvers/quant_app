@@ -1,6 +1,6 @@
 # Kanban Production Readiness — Requirements & Invariants
 
-Status: **SIGNED OFF — Workstream 1 complete, revision 3.1**
+Status: **SIGNED OFF — Workstream 1 complete; revision 3.4 amendment recorded**
 Branch: PR1 merged to `master` (commit `5b50e1d`, PR #4). PR2 onward branch
 directly off `master` (revision 3.3 — see rule 3 / [PR structure](#pr-structure-revision-3)).
 The formerly-planned `feature/kanban-production-readiness` integration
@@ -58,6 +58,16 @@ feature flags remain the sole activation gate — landing a PR's code on
 `master` is explicitly not equivalent to activating it. See the revision
 3.3 change-log entry for the full detail.
 
+Revision 3.4 explicitly narrows the Workstream 0 WebSocket gate after PR4's
+blocking review. Capability-specific adapters may be implemented provisionally
+before live evidence only when they are inactive, clearly labelled
+non-authoritative, and impossible to activate with default configuration.
+Workstream 0 evidence still gates every production interpretation: enabling
+the transport, accepting a timestamp/sequence mapping as execution-grade, and
+setting non-zero capacity. The provisional adapter and its fixtures must be
+validated and adapted to the recorded evidence before WS0 sign-off. This is an
+explicit contract revision; it does not treat unverified behavior as fact.
+
 ## How to use this document
 
 This is the frozen contract every workstream in this branch implements
@@ -84,15 +94,17 @@ Rules while this program is open:
    even though the PRs land on `master` incrementally.
 4. `BUYBOARD_ENGINE_ENABLED` stays `false` in production for the entire
    duration of this program, regardless of how much of it is complete.
-5. **Workstream 0 gates specific capability-dependent code, not all of
-   Workstreams 2 and 5** (narrowed in revision 3.1 — see the "Workstream 0"
+5. **Workstream 0 gates production use and verified semantics of specific
+   capability-dependent code, not all implementation work in Workstreams 2
+   and 5** (narrowed in revisions 3.1 and 3.4 — see the "Workstream 0"
    section below for the precise split). Everything capability-independent in
    Workstream 2 (schemas, both transition tables, `DiscoveredExternalOrder`,
    `ExternalOrderDisposition`, the command repository, A4b's conservative
    default behavior) may proceed immediately, in parallel with Workstream 0.
-   Only A4a's KIS-specific correlation-key adapter and Workstream 5's
-   production WebSocket parsing/subscription/timestamp-mapping code are
-   gated on Workstream 0's evidence.
+   A4a's KIS-specific correlation-key adapter remains gated on evidence.
+   Workstream 5 may carry a provisional inactive WebSocket adapter, but it
+   cannot be enabled or treated as execution-grade until Workstream 0 records
+   and signs off the corresponding behavior.
 
 ## PR structure (revision 3)
 
@@ -135,7 +147,7 @@ PR's behavior composes correctly, plus the Gate 1 run in full.
 | 2 | Durable order ownership and command ledger | PR1 IMPLEMENTED, not activated — merged to `master` (`5b50e1d`): schemas, all three state machines, durable repositories, command ledger. Excludes A4a's KIS-specific correlation-key adapter (stays gated on Workstream 0). |
 | 3 | One guarded execution gateway | PR2 IMPLEMENTED, not activated — `ExecutionCommandGateway` (`src/services/execution_command_gateway.py`): dual-mode, with genuinely separate call shapes per mode (`submit_order`/`cancel_order` for `LEGACY_COMPATIBILITY`; `submit_guarded`/`cancel_guarded`/`replace_guarded` taking explicit request models with caller-generated stable command identities for `GUARDED_ENGINE`). Full A1-A11/B1-B4 sequence, one authoritative atomic capital reservation with an in-transaction availability check, a real lease-epoch gate, H1 ownership enforcement, a mutation-budget seam for Workstream 10, and fail-closed guarded runtime composition. Runtime-level tests cover restart-restored caller identity, normalized results, full-context tracked cancellation, Partial Sell/Sell All, one-reservation entry, and unresolved post-broker persistence without retry. |
 | 4 | Account-level reconciliation engine | PR3 IMPLEMENTED, not activated — one immutable `AccountBrokerSnapshot` per account/pass, per-source `SnapshotCompleteness`, a pure `ReconciliationPlan` reducer, durable two-generation order/reservation absence evidence, lifecycle-linked behavioral C4 projection with terminal attempt-group retirement, execution-boundary and last-broker-boundary fencing for active unowned orders with definitive pre-broker aborts, guarded execution of reducer commands, safe external SELL exposure handling, atomic account-plan persistence plus strict allocator reservation CAS, failure-invalidated action readiness, and one startup/periodic runtime pass replacing the three ordered EOD sweeps. KIS submission-time mapping and production threshold calibration remain gated on Workstream 0; without verified broker submission time, A4a stays manual and unmatched broker orders remain separate `DiscoveredExternalOrder`s. |
-| 5 | Production KIS real-time market data | NOT STARTED |
+| 5 | Production KIS real-time market data | PR4 DRAFT IMPLEMENTED, not activated — approval-key/transport lifecycle, ACK/NACK and encrypted-notice framing, exact-event freshness/dedup validation, per-symbol channel readiness, lossless stop-version accumulator, channel-specific capacity, health metrics, market-session semantics, bounded emergency pricing, and tiered persisted outage state are implemented behind `BUYBOARD_ENGINE_ENABLED=false`, `KIS_WS_ENABLED=false`, and `KIS_WS_PROTOCOL_VERIFIED=false`. Live parsing/subscription activation remains blocked until Workstream 0 fills `docs/kis_capability_matrix.md` with credentialed evidence; no vendor-sample assumption is recorded as verified. |
 | 6 | Runtime readiness and device handoff | NOT STARTED |
 | 7 | Complete test program | NOT STARTED — matrix fully specified; distributed across PR1-7, capstone in PR8 |
 | 8 | Migration and cutover | NOT STARTED |
@@ -164,11 +176,13 @@ entries for their rationale). Revision 3 adds:
 
 ## 0. KIS protocol capability verification (Workstream 0)
 
-Unchanged from revision 2 — see the capability matrix, required outputs, and
-gate below. Blocks only the capability-dependent portions of A4a, C1/C3,
-D1, D3, and D11 identified in the narrowed gate below — A4b's conservative
-default behavior is not blocked. Still requires live KIS credentials this
-environment doesn't have.
+Revision 3.4 amends the gate below: see the capability matrix and required
+outputs. It blocks A4a and capability-dependent C1/C3 implementation, and it
+blocks production activation/verified semantics for D1, D3, and D11. A
+provisional, inactive D1/D3/D11 adapter may be developed before evidence so
+the lifecycle can be reviewed and tested against fakes, but it is not a
+verified KIS contract. A4b's conservative default behavior is not blocked.
+Live sign-off still requires KIS credentials this environment doesn't have.
 
 | Capability | Required proof | Verification method | If unavailable, fallback |
 |---|---|---|---|
@@ -178,26 +192,36 @@ environment doesn't have.
 | Broker-order identity uniqueness scope | Whether a broker order ID is unique only within (environment, account, exchange, session/trading-date) or has a wider or narrower actual scope — i.e. whether IDs are ever reused across sessions/trading dates, and whether the same numeric ID can independently exist on two different exchanges for the same account | Inspect real order IDs across multiple sessions/trading dates and, where the account trades more than one exchange, across exchanges; ask whether KIS documents an explicit reuse/rollover policy | `broker_identity_key` (PR1, revision 3.2) is provisionally scoped to `environment:account_no:broker_order_id` only — narrower than a true `(environment, account, exchange, session_date, broker_order_id)` key. If IDs are confirmed to repeat across sessions/trading dates or independently across exchanges, the key must be widened before Workstream 0's gate lifts on any capability that depends on long-lived exact-identity uniqueness; until then this is a known, provisional gap, not a silently-assumed-safe one |
 | History latency | Time from submit/cancel to appearance in `inquire-ccnl`/`inquire-nccs` | Timed test submissions, repeated across a session | Reconciliation retry interval (Workstream 4) must exceed the measured worst-case latency with margin |
 | History completeness | Max date range, pagination behavior, exchange coverage, whether cancelled/rejected orders appear at all | Boundary-condition queries | `SnapshotCompleteness` (C1) requires every configured exchange/source to individually succeed |
-| WebSocket symbol key format | Exact subscription key format per exchange | Inspect the official sample's subscribe payloads + a live test subscribe | Blocks D1 implementation until confirmed |
+| WebSocket symbol key format | Exact subscription key format per exchange | Inspect the official sample's subscribe payloads + a live test subscribe | Provisional adapter stays disabled; blocks D1 production activation until confirmed |
 | WebSocket connection/subscription limits | Max symbols per connection; max connections per approval key/account | Attempt subscribing an increasing symbol count against sim/prod | Drives the subscription-capacity tiers in D11 |
 | Simulation environment differences | Which TR IDs, order types, and WS feeds are unsupported or behave differently in simulation | Attempt each capability in sim, record failures | Determines which Workstream 7 scenarios can run in Gate 1 (sim) vs. must wait for Gate 2/4 (prod) |
-| Quote timestamp fields | Exact field(s) carrying exchange event time vs. local receive time | Inspect real WS frames | Blocks D3's `broker_event_at` implementation until confirmed |
+| Quote timestamp fields | Exact field(s) carrying exchange event time vs. local receive time | Inspect real WS frames | Provisional mapping is non-authoritative; blocks execution-grade D3 activation until confirmed |
 | Sequence numbering | Whether any WS channel actually provides a monotonic sequence field, and its exact semantics | Inspect real WS frames across a session, including a forced reconnect | Determines whether D3's sequence-regression check is enabled at all for that channel (see revised D3 below) |
 | Execution notice encryption | Whether/how `H0GSCNI0`/`H0GSCNI9` payloads are encrypted; which fields survive decryption | Inspect the official sample's decrypt routine + a live test notice | Determines whether D2's "notification-only" use is even parseable; if not, D2 drops that input entirely |
 
 Required output: `docs/kis_capability_matrix.md` + `tests/fixtures/kis_protocol/`
 (redacted captured request/response and WS frame samples).
 
-**Gate (narrowed in revision 3.1):**
+**Gate (narrowed in revisions 3.1 and 3.4):**
 
 ```
 Gated on this matrix (do not write until evidenced):
   - A4a's exact-correlation-key broker adapter
   - exact broker-order recovery logic that depends on KIS's real behavior
   - latency/completeness-dependent reconciliation thresholds (C1/C3)
-  - D1's production WebSocket parsers and subscription client
-  - D3's broker-timestamp field mapping
-  - D11's capacity-tier configuration
+
+May be written provisionally before evidence, but MUST remain inactive and
+explicitly non-authoritative until every corresponding matrix row is signed:
+  - D1's WebSocket parsers and subscription client
+  - D3's broker-timestamp/sequence field mapping
+  - D11's capacity-tier machinery
+
+For those provisional D1/D3/D11 adapters, Workstream 0 evidence is required
+before any of the following is permitted:
+  - KIS_WS_PROTOCOL_VERIFIED=true or a live connection/subscription
+  - treating the provisional field mapping as execution-grade broker time
+  - configuring a non-zero production/simulation channel capacity
+  - claiming the adapter conforms to actual KIS behavior rather than fakes
 
 NOT gated -- may proceed immediately, in parallel with Workstream 0:
   - ExecutionOrderRecord / DiscoveredExternalOrder schemas
@@ -645,7 +669,7 @@ different numbers, not interchangeable.
 
 | Requirement | Owning module | Persisted state | Broker action | Failure behavior | Recovery behavior | Tests | Activation criterion |
 |---|---|---|---|---|---|---|---|
-| D1. `kis_websocket.py`/`kis_ws_auth.py` handle approval-key issuance/refresh, connect, subscribe/unsubscribe, ACK/NACK parsing, ping/pong, frame parsing, encrypted execution-notice decoding, reconnect with backoff+jitter, resubscription after reconnect. | `src/api/kis_websocket.py`, `src/api/kis_ws_auth.py` (new) | none | WS connect/subscribe (read-only; execution notices supplementary only — INV-4) | Malformed frame: logged, dropped, connection stays up. Auth failure: bounded retry then a critical alert. | Reconnect resubscribes every desired symbol from `SymbolFeedState`. | Workstream 7's WS protocol list. | Workstream 5, gated on Workstream 0 |
+| D1. `kis_websocket.py`/`kis_ws_auth.py` handle approval-key issuance/refresh, connect, subscribe/unsubscribe, ACK/NACK parsing, ping/pong, frame parsing, encrypted execution-notice decoding, reconnect with backoff+jitter, resubscription after reconnect. | `src/api/kis_websocket.py`, `src/api/kis_ws_auth.py` (new) | none | WS connect/subscribe (read-only; execution notices supplementary only — INV-4) | Malformed frame: logged, dropped, connection stays up. Auth failure: bounded retry then a critical alert. | Reconnect resubscribes every desired symbol from `SymbolFeedState`. | Workstream 7's WS protocol list. | Provisional inactive adapter allowed by revision 3.4; production activation gated on Workstream 0 |
 | D2. `kis_realtime_market_data.py` implements `RealtimeMarketDataService` over `HDFSCNT0`/`HDFSASP0`; `H0GSCNI0`/`H0GSCNI9` feed low-latency *notifications* only — broker reconciliation (Workstream 4) remains authoritative for fills. | `src/services/kis_realtime_market_data.py` (new) | none | n/a | A parse failure for one symbol never blocks another. | N/A | `test_execution_notice_never_substitutes_for_broker_reconciled_fill` | Workstream 5 |
 | D3. `QuoteSnapshot` carries `broker_event_at` separately from `received_at`; execution readiness requires broker age + receive age + queue delay all within budget. Deduplication is by **exact duplicate event identity** (same channel, same sequence/trade identifier, same broker timestamp, same payload) — a repeated *price* at a new, distinct trade is a normal, valid event and must never be rejected. Sequence-regression checks apply only to channels Workstream 0 confirms actually provide a real, documented sequence field. | `src/services/realtime_market_data.py` (extend) | n/a | n/a | Also rejects future broker timestamps, excessive clock skew, non-monotonic timestamps — `clock_health` feeds E1. | N/A | `test_repeated_price_at_a_distinct_trade_is_not_rejected_as_a_duplicate`, `test_exact_duplicate_event_identity_is_coalesced`, `test_sequence_check_is_only_enforced_for_channels_workstream_0_confirms_have_one`, `test_future_broker_timestamp_is_rejected` | Workstream 5 |
 | D4. `SymbolFeedState` tracks per-symbol subscription/freshness/error state; a symbol is execution-ready only when socket connected AND subscriptions acked AND latest event fresh AND no unresolved sequence/channel error. | `src/services/kis_realtime_market_data.py` | n/a | n/a | One symbol's failure never marks another ready. | Reconnect re-evaluates every symbol independently. | `test_one_healthy_symbol_does_not_mark_a_failing_symbol_ready` | Workstream 5 |
@@ -708,6 +732,15 @@ drop an extreme or a breach," from revision 2) and keeps stop-version
 awareness where it already belongs — the trading engine, which is the only
 component that changes stops in the first place.
 
+PR4 blocking-review correction: the detached `PendingMarketState` generation
+does not own acknowledgement lifetime. Each symbol bucket retains the exact
+`(card_key, stop_version)` breach identities (including simultaneous old/new
+versions) and their representative event until the engine acknowledges that
+exact pair successfully. Rotating or draining a generation never clears the
+bucket-level latch. The min and max are representative `QuoteSnapshot`s, not
+only scalar prices, so event time and exact identity survive coalescing and
+both downward stops and upward entry breakouts remain actionable.
+
 Tests: `test_a_breach_between_two_higher_prices_in_one_drain_window_is_never_lost`, `test_a_stop_price_change_forces_a_drain_against_the_old_version_first`, `test_a_trade_after_a_stop_change_is_evaluated_against_the_new_version_only`, `test_trade_arriving_exactly_during_stop_version_change_is_assigned_to_one_and_only_one_stop_version`, `test_latch_clears_only_on_explicit_engine_acknowledgement`.
 
 #### D9. Decision semantics (additions: emergency pricing)
@@ -718,7 +751,8 @@ since D10 can require liquidation exactly when no fresh bid is available:
 
 ```
 Regular session, fresh bid available:
-    marketable limit using the bid and a configured collar.
+    marketable limit using bid * (1 - configured collar); the raw bid alone
+    is not the configured-collar branch.
 
 Regular session, no fresh bid:
     use a verified KIS-supported emergency order type if one exists
@@ -766,6 +800,13 @@ Tier classification also now considers account-level risk, not only
 position-notional percentages: position risk as % of account equity,
 position concentration, distance to stop in R/ATR multiples, and the
 symbol's liquidity/spread tier.
+
+Every emergency Sell All origin uses the same conflict-resolution sequence:
+a working entry-completion BUY is assigned a tracked cancel identity and must
+reach broker-confirmed terminal reconciliation before actual orderable
+quantity is refreshed and any liquidation SELL is submitted. The retry stage
+independently rechecks this fence so a user, stop, or outage origin cannot
+bypass it.
 
 Tests (in addition to revision 2's): `test_frozen_tier_does_not_escalate_purely_from_elapsed_time_alone_without_a_configured_duration_ceiling`, `test_a_broader_market_signal_can_escalate_a_frozen_tier`, `test_a_recovered_price_for_the_symbol_itself_reclassifies_immediately`, `test_tier_classification_considers_account_level_risk_factors`.
 
@@ -1104,6 +1145,15 @@ and stays `false` in unattended/automatic form until Gate 5 passes.
 
 ## Change log
 
+- 2026-08-16 (revision 3.4, PR4 blocking review): Explicitly revised the
+  Workstream 0 WebSocket gate. D1/D3/D11 adapters may exist provisionally
+  before credentialed evidence only while disabled, labelled
+  non-authoritative, zero-capacity, and fail-closed. Workstream 0 sign-off
+  remains mandatory before live connection/subscription, execution-grade
+  timestamp/sequence interpretation, non-zero capacity, or any production
+  activation claim. A4a and capability-dependent C1/C3 remain implementation-
+  gated. This records the contract change instead of silently coding around
+  the signed revision 3.1 wording.
 - 2026-08-16 (PR3): Implemented Workstream 4's account-level reconciliation
   engine and runtime integration. Added deterministic account snapshots and
   plans, action-specific completeness, durable absence generations, all C4

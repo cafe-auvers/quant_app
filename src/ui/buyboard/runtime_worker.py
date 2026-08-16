@@ -57,6 +57,7 @@ from src.services.execution_command_gateway import (
 from src.services.execution_command_repository import DuplicateCommandError
 from src.services.execution_order_repository import fetch_execution_order
 from src.services.execution_authority import ExecutionAuthority, LeaseExpiredError, LeaseHandle
+from src.services.kis_realtime_market_data import StopRule, SubscriptionPriority
 from src.services.trade_card_orb_bridge import TradeCardOrbEvaluator
 
 logger = logging.getLogger(__name__)
@@ -212,6 +213,12 @@ class BuyboardRuntimeWorker(QThread):
         self._alerted_card_keys_by_warning: Dict[str, set] = {}
         self._active_reconciliation_incidents: set = set()
         self._reconciliation_incident_generations: Dict[tuple, int] = {}
+        # Workstream 5: runtime-only stop generations. A generation advances
+        # only when that card's stop definition changes, not on unrelated
+        # optimistic-version writes.
+        self._market_stop_signatures: Dict[str, tuple] = {}
+        self._market_stop_generations: Dict[str, int] = {}
+        self._market_stop_symbols: set[str] = set()
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -237,6 +244,10 @@ class BuyboardRuntimeWorker(QThread):
                 broker=self._broker,
                 persist_card_before_execution=self._persist_execution_identity,
             )
+            if execution_config.KIS_WS_ENABLED:
+                start_market_data = getattr(self.runtime.market_data, "start", None)
+                if callable(start_market_data):
+                    start_market_data()
             self._run_startup_reconciliation()
         except Exception as exc:  # noqa: BLE001 - must not crash the app
             logger.exception("BuyboardRuntimeWorker failed to start")
@@ -258,6 +269,11 @@ class BuyboardRuntimeWorker(QThread):
                 logger.exception("BuyboardRuntimeWorker heartbeat cycle failed")
                 self.error_occurred.emit("Buy Board engine heartbeat failed -- see logs for detail.")
             self.msleep(max(1, int(self._heartbeat_seconds * 1000)))
+
+        if self.runtime is not None and execution_config.KIS_WS_ENABLED:
+            stop_market_data = getattr(self.runtime.market_data, "stop", None)
+            if callable(stop_market_data):
+                stop_market_data()
 
     def _lease_still_current(self) -> bool:
         """Review finding P0-1: "Stop the worker immediately on lease
@@ -453,14 +469,31 @@ class BuyboardRuntimeWorker(QThread):
         # protective exit, while a new entry still requires its complete
         # holdings/open-order/buying-power evidence set.
         ready_cards = [card for card in cards if self._card_action_ready(card)]
+        observation_cards = [
+            card for card in cards if card.board_status in _QUOTE_SUBSCRIBED_STATUSES
+        ]
 
         _track(self._sync_orb_plans(ready_cards))
-        self._sync_quote_subscriptions(ready_cards)
+        # Observation readiness is intentionally broader than mutation
+        # readiness: a reconciliation failure may block a command but must
+        # never make the feed stop watching an existing position.
+        self._sync_quote_subscriptions(observation_cards)
+        self._sync_market_stop_rules(observation_cards)
 
         for quote in self.runtime.market_data.poll_once():
-            _track(self.runtime.trading_engine.evaluate_quote(ready_cards, quote))
+            _track(self.runtime.trading_engine.evaluate_quote(observation_cards, quote))
+            _track(self.runtime.trading_engine.evaluate_entry_quote(ready_cards, quote))
+            self._acknowledge_market_breaches(quote, observation_cards)
 
         _track(self.runtime.trading_engine.run_heartbeat(ready_cards))
+        # Stops can change inside the heartbeat (first-fill ORB stop,
+        # completion-to-breakeven). Rotate under the feed's shared lock and
+        # immediately evaluate any events detached from the old version.
+        if self._sync_market_stop_rules(observation_cards):
+            for quote in self.runtime.market_data.poll_once():
+                _track(self.runtime.trading_engine.evaluate_quote(observation_cards, quote))
+                _track(self.runtime.trading_engine.evaluate_entry_quote(ready_cards, quote))
+                self._acknowledge_market_breaches(quote, observation_cards)
         # The full card set, not just ready_cards: UNRECONCILED_BROKER_ORDER
         # can be set by _refresh_account_state_if_due's order reconciliation,
         # which (deliberately) still runs for every account, including ones
@@ -473,6 +506,7 @@ class BuyboardRuntimeWorker(QThread):
 
     _EXIT_CANCEL_STALLED_WARNING = "EXIT_CANCEL_STALLED"
     _UNRECONCILED_BROKER_ORDER_WARNING = "UNRECONCILED_BROKER_ORDER"
+    _TRADING_HALT_EXIT_WARNING = "TRADING_HALT_EXIT_PENDING"
 
     # (warning name, alert-message builder) -- every critical, card-level
     # warning that must reach the user outside the app's own log pane, not
@@ -498,6 +532,14 @@ class BuyboardRuntimeWorker(QThread):
                 f"({card.environment}:{card.account_no}) was discovered with "
                 f"nothing local tracking it -- it cannot yet be automatically "
                 f"cancelled, repriced, or reconciled. Manual review required."
+            ),
+        ),
+        (
+            _TRADING_HALT_EXIT_WARNING,
+            lambda card: (
+                f"CRITICAL: liquidation for {card.symbol} "
+                f"({card.environment}:{card.account_no}) is retained but "
+                "broker submission is paused by a verified trading halt."
             ),
         ),
     )
@@ -1004,6 +1046,46 @@ class BuyboardRuntimeWorker(QThread):
 
     def _sync_quote_subscriptions(self, cards: List[TradeCardState]) -> None:
         market_data = self.runtime.market_data
+        configure = getattr(market_data, "configure_desired_channels", None)
+        if callable(configure):
+            trade_priorities: Dict[str, int] = {}
+            quote_priorities: Dict[str, int] = {}
+            for card in cards:
+                symbol = card.symbol
+                if card.board_status in {BoardStatus.SELL_ALL, BoardStatus.PARTIAL_SELL} or card.exit_all_required:
+                    trade_priority = SubscriptionPriority.CRITICAL_EXIT
+                elif card.board_status == BoardStatus.OPEN_POSITION:
+                    trade_priority = SubscriptionPriority.OPEN_POSITION
+                elif card.board_status == BoardStatus.ENTRY_PENDING:
+                    trade_priority = SubscriptionPriority.ENTRY_PENDING
+                elif card.board_status == BoardStatus.BUY_TODAY:
+                    trade_priority = SubscriptionPriority.BUY_TODAY
+                else:
+                    trade_priority = SubscriptionPriority.DISPLAY_ONLY
+
+                if card.board_status in {
+                    BoardStatus.SELL_ALL,
+                    BoardStatus.PARTIAL_SELL,
+                    BoardStatus.OPEN_POSITION,
+                }:
+                    quote_priority = SubscriptionPriority.CRITICAL_EXIT
+                elif card.board_status == BoardStatus.ENTRY_PENDING:
+                    quote_priority = SubscriptionPriority.ENTRY_PENDING
+                elif card.board_status == BoardStatus.BUY_TODAY:
+                    quote_priority = SubscriptionPriority.BUY_TODAY
+                else:
+                    quote_priority = SubscriptionPriority.DISPLAY_ONLY
+                trade_priorities[symbol] = min(
+                    int(trade_priority), trade_priorities.get(symbol, 999)
+                )
+                quote_priorities[symbol] = min(
+                    int(quote_priority), quote_priorities.get(symbol, 999)
+                )
+            configure(
+                trade_priorities=trade_priorities,
+                quote_priorities=quote_priorities,
+            )
+            return
         subscribed = getattr(market_data, "subscribed_symbols", None)
         if not callable(subscribed):
             return  # backend does not expose its current subscription set
@@ -1015,6 +1097,64 @@ class BuyboardRuntimeWorker(QThread):
             market_data.subscribe(to_add)
         if to_remove:
             market_data.unsubscribe(to_remove)
+
+    def _sync_market_stop_rules(self, cards: List[TradeCardState]) -> bool:
+        replace_rules = getattr(self.runtime.market_data, "replace_stop_rules", None)
+        if not callable(replace_rules):
+            return False
+        by_symbol: Dict[str, List[StopRule]] = {}
+        active_keys: set[str] = set()
+        for card in cards:
+            if (
+                card.board_status not in {BoardStatus.OPEN_POSITION, BoardStatus.PARTIAL_SELL}
+                or card.active_stop_price is None
+                or card.active_stop_price <= 0
+            ):
+                continue
+            active_keys.add(card.card_key)
+            signature = (
+                card.stop_type.value if card.stop_type is not None else "",
+                float(card.active_stop_price),
+                int(card.stop_quantity),
+            )
+            if self._market_stop_signatures.get(card.card_key) != signature:
+                self._market_stop_signatures[card.card_key] = signature
+                self._market_stop_generations[card.card_key] = (
+                    self._market_stop_generations.get(card.card_key, 0) + 1
+                )
+            by_symbol.setdefault(card.symbol, []).append(
+                StopRule(
+                    card_key=card.card_key,
+                    price=float(card.active_stop_price),
+                    version=str(self._market_stop_generations[card.card_key]),
+                )
+            )
+        for card_key in set(self._market_stop_signatures) - active_keys:
+            self._market_stop_signatures.pop(card_key, None)
+
+        rotated = False
+        symbols = set(by_symbol) | self._market_stop_symbols
+        subscribed = getattr(self.runtime.market_data, "subscribed_symbols", lambda: [])
+        symbols.update(subscribed())
+        for symbol in symbols:
+            if replace_rules(symbol, by_symbol.get(symbol, [])) is not None:
+                rotated = True
+        self._market_stop_symbols = set(by_symbol)
+        return rotated
+
+    def _acknowledge_market_breaches(
+        self, quote, cards: List[TradeCardState]
+    ) -> None:
+        acknowledge = getattr(
+            self.runtime.market_data, "acknowledge_stop_breach", None
+        )
+        if not callable(acknowledge) or not quote.breached_stop_versions:
+            return
+        cards_by_key = {card.card_key: card for card in cards}
+        for card_key, version in quote.breached_stop_versions:
+            card = cards_by_key.get(card_key)
+            if card is not None and card.exit_all_required:
+                acknowledge(card.symbol, card_key, version)
 
     def _persist_changed(self, cards: List[TradeCardState]) -> None:
         for card in cards:

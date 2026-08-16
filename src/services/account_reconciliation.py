@@ -755,6 +755,20 @@ def _clear_exit_card_tracking(
     card.reserved_sell_quantity = 0
     if retire_attempt_group:
         card.exit_attempt_group_id = ""
+        card.exit_attempt_count = 0
+
+
+def _consume_exit_card_attempt(
+    card: TradeCardState, order: ExecutionOrderRecord
+) -> None:
+    """Recover the highest used exit identity from durable order truth."""
+    card.exit_attempt_count = max(
+        int(card.exit_attempt_count or 0),
+        int(card.exit_pending_attempt_number or 0),
+        int(order.attempt_number or 0),
+    )
+    if order.attempt_group_id:
+        card.exit_attempt_group_id = order.attempt_group_id
 
 
 def _operational_category(
@@ -898,6 +912,12 @@ def _project_exact_order_to_card(
         else None
     )
     operational = _operational_category(order, card, category)
+    if order.side == OrderSide.SELL:
+        # The order row is persisted before the broker call. It is therefore
+        # the authoritative restart-boundary proof that this logical attempt
+        # number was consumed, even if the process crashed before the normal
+        # end-of-heartbeat card persistence.
+        _consume_exit_card_attempt(card, order)
 
     if operational in (
         ReconciliationCategory.ENTRY_BUY,
@@ -974,6 +994,9 @@ def _project_exact_order_to_card(
             card.position_runtime_status = PositionRuntimeStatus.PARTIAL_EXIT_PENDING
             card.reserved_sell_quantity = max(0, broker_snapshot.remaining_quantity)
             card.exit_client_order_id = order.client_order_id
+            card.exit_pending_attempt_number = max(
+                card.exit_pending_attempt_number, order.attempt_number
+            )
             return
         if not terminal:
             return
@@ -1030,6 +1053,9 @@ def _project_exact_order_to_card(
             )
             card.reserved_sell_quantity = max(0, broker_snapshot.remaining_quantity)
             card.exit_client_order_id = order.client_order_id
+            card.exit_pending_attempt_number = max(
+                card.exit_pending_attempt_number, order.attempt_number
+            )
             return
         if not terminal:
             return

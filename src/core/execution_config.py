@@ -11,6 +11,12 @@ without a code change.
 from __future__ import annotations
 
 import os
+from enum import Enum
+
+
+class MarketDataOutageRiskTier(str, Enum):
+    HIGH = "HIGH"
+    LOW = "LOW"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -38,6 +44,11 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_text(name: str, default: str = "") -> str:
+    raw = os.environ.get(name)
+    return str(raw).strip() if raw is not None else default
 
 
 # --- Entry attempt lifetime and retry (section 393-399) ---------------------
@@ -95,6 +106,78 @@ FALLBACK_POSITION_PRICE_POLL_SECONDS = _env_int(
     "FALLBACK_POSITION_PRICE_POLL_SECONDS", 2
 )
 QUOTE_STALE_AFTER_SECONDS = _env_int("QUOTE_STALE_AFTER_SECONDS", 3)
+
+# --- Production KIS WebSocket market data (Workstream 5) -------------------
+# All activation switches fail closed.  In particular, KIS_WS_ENABLED is not
+# sufficient on its own: the live protocol matrix must have been completed
+# and explicitly acknowledged before the production transport may start.
+KIS_WS_ENABLED = _env_bool("KIS_WS_ENABLED", False)
+KIS_WS_PROTOCOL_VERIFIED = _env_bool("KIS_WS_PROTOCOL_VERIFIED", False)
+KIS_MARKET_DATA_MODE = _env_text("KIS_MARKET_DATA_MODE", "REST_DISPLAY_ONLY").upper()
+KIS_MARKET_DATA_FALLBACK_MODE = _env_text(
+    "KIS_MARKET_DATA_FALLBACK_MODE", "DISPLAY_ONLY"
+).upper()
+# Opening ranges continue to use execution-grade KIS minute bars. PR4 does
+# not silently switch ORB construction to local tick aggregation.
+ORB_FORMATION_SOURCE = _env_text("ORB_FORMATION_SOURCE", "KIS_MINUTE_BARS").upper()
+KIS_WS_APPROVAL_KEY_TTL_SECONDS = _env_int(
+    "KIS_WS_APPROVAL_KEY_TTL_SECONDS", 23 * 60 * 60
+)
+KIS_WS_AUTH_MAX_RETRIES = _env_int("KIS_WS_AUTH_MAX_RETRIES", 3)
+KIS_WS_RECONNECT_INITIAL_SECONDS = _env_float(
+    "KIS_WS_RECONNECT_INITIAL_SECONDS", 1.0
+)
+KIS_WS_RECONNECT_MAX_SECONDS = _env_float("KIS_WS_RECONNECT_MAX_SECONDS", 30.0)
+KIS_WS_RECONNECT_JITTER_SECONDS = _env_float(
+    "KIS_WS_RECONNECT_JITTER_SECONDS", 0.5
+)
+KIS_WS_SUBSCRIPTION_ACK_TIMEOUT_SECONDS = _env_float(
+    "KIS_WS_SUBSCRIPTION_ACK_TIMEOUT_SECONDS", 5.0
+)
+BROKER_EVENT_STALE_SECONDS = _env_float("BROKER_EVENT_STALE_SECONDS", 3.0)
+LOCAL_RECEIVE_STALE_SECONDS = _env_float("LOCAL_RECEIVE_STALE_SECONDS", 3.0)
+MAX_MARKET_DATA_QUEUE_DELAY_SECONDS = _env_float(
+    "MAX_MARKET_DATA_QUEUE_DELAY_SECONDS", 1.0
+)
+MAX_BROKER_CLOCK_SKEW_SECONDS = _env_float("MAX_BROKER_CLOCK_SKEW_SECONDS", 5.0)
+MAX_FUTURE_BROKER_EVENT_SECONDS = _env_float(
+    "MAX_FUTURE_BROKER_EVENT_SECONDS", 1.0
+)
+# Capacity remains zero until Workstream 0 records the measured KIS limits.
+# A guessed unlimited/default capacity would violate INV-20.
+KIS_WS_TRADE_CHANNEL_CAPACITY = _env_int("KIS_WS_TRADE_CHANNEL_CAPACITY", 0)
+KIS_WS_QUOTE_CHANNEL_CAPACITY = _env_int("KIS_WS_QUOTE_CHANNEL_CAPACITY", 0)
+KIS_WS_RAW_CAPTURE_ENABLED = _env_bool("KIS_WS_RAW_CAPTURE_ENABLED", False)
+
+# Existing-position outage policy.  Defaults are deliberately conservative
+# and remain inert while BUYBOARD_ENGINE_ENABLED is false.
+MARKET_DATA_OUTAGE_GRACE_SECONDS = _env_int(
+    "MARKET_DATA_OUTAGE_GRACE_SECONDS", 15
+)
+MARKET_DATA_OUTAGE_MAX_HOLD_SECONDS = _env_int(
+    "MARKET_DATA_OUTAGE_MAX_HOLD_SECONDS", 120
+)
+MARKET_DATA_OUTAGE_RISK_BUFFER_PCT = _env_float(
+    "MARKET_DATA_OUTAGE_RISK_BUFFER_PCT", 0.01
+)
+MARKET_DATA_OUTAGE_LOSS_THRESHOLD_PCT = _env_float(
+    "MARKET_DATA_OUTAGE_LOSS_THRESHOLD_PCT", 0.02
+)
+MARKET_DATA_OUTAGE_SUPERVISED_HOLD_ONLY = _env_bool(
+    "MARKET_DATA_OUTAGE_SUPERVISED_HOLD_ONLY", False
+)
+MARKET_DATA_OUTAGE_ACCOUNT_RISK_PCT = _env_float(
+    "MARKET_DATA_OUTAGE_ACCOUNT_RISK_PCT", 0.01
+)
+MARKET_DATA_OUTAGE_CONCENTRATION_PCT = _env_float(
+    "MARKET_DATA_OUTAGE_CONCENTRATION_PCT", 0.20
+)
+MARKET_DATA_OUTAGE_STOP_DISTANCE_ATR = _env_float(
+    "MARKET_DATA_OUTAGE_STOP_DISTANCE_ATR", 0.5
+)
+EMERGENCY_EXIT_MAX_REPRICE_ATTEMPTS = _env_int(
+    "EMERGENCY_EXIT_MAX_REPRICE_ATTEMPTS", 3
+)
 
 # --- End of day (section 505-511) -------------------------------------------
 EOD_ENTRY_CLEANUP_SECONDS_BEFORE_CLOSE = _env_int(

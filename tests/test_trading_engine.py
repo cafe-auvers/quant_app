@@ -18,7 +18,11 @@ from src.core.trade_card_state import (
 from src.services.entry_attempt_manager import EntryAttemptManager
 from src.services.position_manager import PositionActionCallbacks, PositionManager
 from src.services.realtime_market_data import QuoteSnapshot, RestPollingMarketDataService
-from src.services.trading_engine import EntryDeadlineLookup, TradingEngine
+from src.services.trading_engine import (
+    EntryDeadlineLookup,
+    TradingEngine,
+    classify_market_data_outage_risk,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -189,6 +193,106 @@ def test_fresh_quote_allows_entry_submission_and_moves_to_entry_pending(tmp_path
     assert changed == [card]
     assert card.board_status == BoardStatus.ENTRY_PENDING
     assert card.entry_runtime_status == EntryRuntimeStatus.ORDER_PENDING
+
+
+def _entry_event_engine(tmp_path, now, submitted):
+    def submit(**kwargs):
+        submitted.append(kwargs)
+        return BrokerOrder.create(
+            environment=kwargs["environment"],
+            account_no=kwargs["account_no"],
+            symbol=kwargs["symbol"],
+            side=OrderSide.BUY,
+            intent=OrderIntent.ENTRY,
+            quantity_requested=kwargs["quantity"],
+            limit_price=kwargs["limit_price"],
+            status=OrderStatus.ACCEPTED,
+        )
+
+    engine = _make_engine(tmp_path, submit_order=submit)
+    engine._clock = lambda: now
+    engine._market_data = RestPollingMarketDataService(
+        quote_fetcher=lambda symbol: QuoteSnapshot(
+            symbol=symbol,
+            last_price=101.0,
+            bid=100.9,
+            ask=101.1,
+            broker_event_at=now,
+            received_at=now,
+            processed_at=now,
+        ),
+        clock=lambda: now,
+    )
+    engine._market_data.subscribe(["AAPL"])
+    engine._market_data.poll_once()
+    return engine
+
+
+def test_stale_representative_maximum_cannot_trigger_entry_from_fresh_cache(tmp_path):
+    now = dt.datetime(2026, 8, 16, 14, 30, tzinfo=dt.timezone.utc)
+    submitted = []
+    engine = _entry_event_engine(tmp_path, now, submitted)
+    card = _buy_today_card(entry_trigger=104.0)
+    stale_maximum = QuoteSnapshot(
+        symbol="AAPL",
+        last_price=105.0,
+        bid=104.9,
+        ask=105.0,
+        broker_event_at=now - dt.timedelta(seconds=2),
+        received_at=now - dt.timedelta(seconds=2),
+        processed_at=now,
+    )
+
+    assert engine._market_data.entry_quote_ready("AAPL", now=now)
+    assert not stale_maximum.is_execution_fresh(now=now)
+    assert engine.evaluate_entry_quote([card], stale_maximum) == []
+    assert submitted == []
+    assert card.entry_runtime_status == EntryRuntimeStatus.EXECUTE_READY
+
+
+def test_stop_breach_replay_above_breakout_is_never_entry_eligible(tmp_path):
+    now = dt.datetime(2026, 8, 16, 14, 30, tzinfo=dt.timezone.utc)
+    submitted = []
+    engine = _entry_event_engine(tmp_path, now, submitted)
+    card = _buy_today_card(entry_trigger=104.0)
+    replay = QuoteSnapshot(
+        symbol="AAPL",
+        last_price=105.0,
+        bid=104.9,
+        ask=105.0,
+        broker_event_at=now,
+        received_at=now,
+        processed_at=now,
+        breached_stop_versions=(("old-card", "v1"),),
+        entry_trigger_eligible=False,
+    )
+
+    assert replay.is_execution_fresh(now=now)
+    assert engine.evaluate_entry_quote([card], replay) == []
+    assert submitted == []
+
+
+def test_fresh_representative_maximum_triggers_exactly_one_entry(tmp_path):
+    now = dt.datetime(2026, 8, 16, 14, 30, tzinfo=dt.timezone.utc)
+    submitted = []
+    engine = _entry_event_engine(tmp_path, now, submitted)
+    card = _buy_today_card(entry_trigger=104.0)
+    fresh_maximum = QuoteSnapshot(
+        symbol="AAPL",
+        last_price=105.0,
+        bid=104.9,
+        ask=105.0,
+        broker_event_at=now,
+        received_at=now,
+        processed_at=now,
+    )
+
+    engine.evaluate_entry_quote([card], fresh_maximum)
+    engine.evaluate_entry_quote([card], fresh_maximum)
+
+    assert len(submitted) == 1
+    assert submitted[0]["limit_price"] == 105.0
+    assert card.board_status == BoardStatus.ENTRY_PENDING
 
 
 def test_card_without_execute_ready_status_is_ignored(tmp_path):
@@ -1323,6 +1427,10 @@ def test_partial_sell_cancels_stuck_order_once_ttl_passes_and_applies_partial_fi
     card = _open_card(
         board_status=BoardStatus.PARTIAL_SELL, broker_quantity=300, orderable_quantity=300,
         stop_type=StopType.ORB_LOW, active_stop_price=95.0,
+        exit_attempt_group_id="partial-chain",
+        exit_attempt_count=1,
+        exit_client_order_id=tracker.order.client_order_id,
+        exit_pending_attempt_number=1,
     )
     card.pending_partial_sell_quantity = 100
 
@@ -1340,6 +1448,8 @@ def test_partial_sell_cancels_stuck_order_once_ttl_passes_and_applies_partial_fi
     assert card.board_status == BoardStatus.OPEN_POSITION
     assert card.broker_quantity == 270
     assert card.stop_type == StopType.BREAKEVEN  # a real (partial) fill happened
+    assert card.exit_attempt_group_id == ""
+    assert card.exit_attempt_count == 0
 
 
 def test_partial_sell_ttl_cancel_before_deadline_is_untouched(tmp_path):
@@ -1484,3 +1594,294 @@ def test_evaluate_quote_one_accounts_failure_does_not_block_the_other(tmp_path):
 
     assert healthy in changed
     assert healthy.exit_all_required is True
+
+
+# --- Workstream 5: tiered feed-outage policy ------------------------------
+
+
+def _seed_then_disconnect(engine, symbol="AAPL"):
+    engine._market_data.subscribe([symbol])
+    engine._market_data.poll_once()
+    engine._market_data._connected = False
+
+
+def test_high_tier_position_liquidates_after_short_grace_period(tmp_path, monkeypatch):
+    monkeypatch.setattr(execution_config, "MARKET_DATA_OUTAGE_GRACE_SECONDS", 5)
+    now = [dt.datetime.now(dt.timezone.utc)]
+    engine = _make_engine(tmp_path)
+    engine._clock = lambda: now[0]
+    card = _open_card(active_stop_price=99.5)
+    _seed_then_disconnect(engine)
+
+    engine.run_heartbeat([card])
+    assert card.market_data_outage_risk_tier == "HIGH"
+    assert not card.exit_all_required
+
+    now[0] += dt.timedelta(seconds=6)
+    engine.run_heartbeat([card])
+    assert card.exit_all_required
+    assert card.board_status == BoardStatus.SELL_ALL
+
+
+def test_low_tier_position_holds_until_hard_ceiling(tmp_path, monkeypatch):
+    monkeypatch.setattr(execution_config, "MARKET_DATA_OUTAGE_GRACE_SECONDS", 2)
+    monkeypatch.setattr(execution_config, "MARKET_DATA_OUTAGE_MAX_HOLD_SECONDS", 10)
+    now = [dt.datetime.now(dt.timezone.utc)]
+    engine = _make_engine(tmp_path)
+    engine._clock = lambda: now[0]
+    card = _open_card(active_stop_price=50.0)
+    _seed_then_disconnect(engine)
+
+    engine.run_heartbeat([card])
+    assert card.market_data_outage_risk_tier == "LOW"
+    now[0] += dt.timedelta(seconds=5)
+    engine.run_heartbeat([card])
+    assert not card.exit_all_required
+    now[0] += dt.timedelta(seconds=6)
+    engine.run_heartbeat([card])
+    assert card.exit_all_required
+
+
+def test_frozen_tier_does_not_escalate_from_time_without_duration_ceiling(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(execution_config, "MARKET_DATA_OUTAGE_MAX_HOLD_SECONDS", 0)
+    now = [dt.datetime.now(dt.timezone.utc)]
+    engine = _make_engine(tmp_path)
+    engine._clock = lambda: now[0]
+    card = _open_card(active_stop_price=50.0)
+    _seed_then_disconnect(engine)
+
+    engine.run_heartbeat([card])
+    assert card.market_data_outage_risk_tier == "LOW"
+    now[0] += dt.timedelta(days=7)
+    engine.run_heartbeat([card])
+
+    assert card.market_data_outage_risk_tier == "LOW"
+    assert not card.exit_all_required
+
+
+def test_broader_market_signal_escalates_frozen_low_tier(tmp_path):
+    signal = [False]
+    now = [dt.datetime.now(dt.timezone.utc)]
+    engine = _make_engine(tmp_path)
+    engine._clock = lambda: now[0]
+    engine._broader_market_risk_signal = lambda card: signal[0]
+    card = _open_card(active_stop_price=50.0)
+    _seed_then_disconnect(engine)
+
+    engine.run_heartbeat([card])
+    assert card.market_data_outage_risk_tier == "LOW"
+    signal[0] = True
+    engine.run_heartbeat([card])
+    assert card.market_data_outage_risk_tier == "HIGH"
+
+
+def test_recovered_trusted_symbol_price_reclassifies_immediately(tmp_path):
+    now = [dt.datetime.now(dt.timezone.utc)]
+    engine = _make_engine(tmp_path)
+    engine._clock = lambda: now[0]
+    card = _open_card(active_stop_price=50.0)
+    _seed_then_disconnect(engine)
+    engine.run_heartbeat([card])
+    assert card.market_data_outage_risk_tier == "LOW"
+
+    recovered = QuoteSnapshot(
+        symbol="AAPL",
+        last_price=51.0,
+        bid=50.9,
+        ask=51.1,
+        broker_event_at=now[0],
+        received_at=now[0],
+    )
+    engine._market_data._cache.update(recovered)
+    engine._market_data._connected = True
+    engine.run_heartbeat([card])
+
+    assert card.market_data_outage_started_at is None
+    assert card.market_data_last_trusted_price == 51.0
+    assert card.market_data_outage_risk_tier == "HIGH"
+
+
+def test_high_outage_outside_session_persists_next_session_sell_intent(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(execution_config, "MARKET_DATA_OUTAGE_GRACE_SECONDS", 1)
+    now = [dt.datetime.now(dt.timezone.utc)]
+    sells = []
+    engine = _make_engine(tmp_path)
+    engine._clock = lambda: now[0]
+    engine._market_is_open_fn = lambda: False
+    engine._position_callbacks.submit_sell_order = lambda **kwargs: sells.append(kwargs)
+    card = _open_card(active_stop_price=99.5)
+    _seed_then_disconnect(engine)
+
+    engine.run_heartbeat([card])
+    now[0] += dt.timedelta(seconds=2)
+    engine.run_heartbeat([card])
+
+    assert card.board_status == BoardStatus.SELL_ALL
+    assert card.sell_all_at_market_open is True
+    assert card.position_runtime_status == PositionRuntimeStatus.QUEUED_FOR_OPEN
+    assert sells == []
+
+
+def test_verified_trading_halt_retains_exit_intent_and_retries_when_resumed(
+    tmp_path,
+):
+    halted = [True]
+    sells = []
+    engine = _make_engine(tmp_path)
+    engine._trading_halt_lookup = lambda symbol: halted[0]
+    engine._position_callbacks = PositionActionCallbacks(
+        cancel_order=lambda intent: None,
+        submit_sell_order=lambda **kwargs: sells.append(kwargs),
+        refresh_orderable_quantity=lambda *args: 30,
+    )
+    card = _open_card(
+        board_status=BoardStatus.SELL_ALL,
+        position_runtime_status=PositionRuntimeStatus.LIQUIDATING,
+        exit_all_required=True,
+        broker_quantity=30,
+        orderable_quantity=30,
+    )
+
+    engine.run_heartbeat([card])
+    assert sells == []
+    assert card.exit_all_required
+    assert "TRADING_HALT_EXIT_PENDING" in card.warnings
+
+    halted[0] = False
+    engine.run_heartbeat([card])
+    assert len(sells) == 1
+    assert "TRADING_HALT_EXIT_PENDING" not in card.warnings
+
+
+def test_outage_sell_all_cancels_completion_buy_before_one_sell(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(execution_config, "MARKET_DATA_OUTAGE_GRACE_SECONDS", 1)
+    now = [dt.datetime.now(dt.timezone.utc)]
+    order = _pending_order(
+        status=OrderStatus.WORKING,
+        filled=0,
+        deadline_seconds_ago=-3600,
+    )
+    cancel_calls = []
+    sell_calls = []
+    confirm_cancel = [False]
+
+    def find_entry(card):
+        return order if order.is_open() else None
+
+    def reconcile_entry(current):
+        if confirm_cancel[0] and current.status == OrderStatus.CANCEL_REQUESTED:
+            current.status = OrderStatus.CANCELLED
+        return current
+
+    engine = _make_engine(
+        tmp_path,
+        find_order=find_entry,
+        reconcile_order=reconcile_entry,
+    )
+    engine._clock = lambda: now[0]
+
+    def cancel_entry(intent):
+        cancel_calls.append(intent.client_order_id)
+        order.status = OrderStatus.CANCEL_REQUESTED
+
+    engine._position_callbacks = PositionActionCallbacks(
+        cancel_order=cancel_entry,
+        submit_sell_order=lambda **kwargs: sell_calls.append(kwargs),
+        refresh_orderable_quantity=lambda *args: 30,
+    )
+    card = _open_card(
+        broker_quantity=30,
+        orderable_quantity=30,
+        target_position_quantity=100,
+        entry_remaining_target_quantity=70,
+        position_runtime_status=PositionRuntimeStatus.ENTRY_COMPLETING,
+        active_stop_price=99.5,
+        entry_client_order_id=order.client_order_id,
+        entry_attempt_group_id="completion-group",
+    )
+    _seed_then_disconnect(engine)
+
+    engine.run_heartbeat([card])
+    now[0] += dt.timedelta(seconds=2)
+    engine.run_heartbeat([card])
+
+    assert cancel_calls == [order.client_order_id]
+    assert card.entry_cancel_in_flight is True
+    assert card.board_status == BoardStatus.SELL_ALL
+    assert sell_calls == []
+
+    engine.run_heartbeat([card])
+    assert sell_calls == []
+
+    confirm_cancel[0] = True
+    engine.run_heartbeat([card])
+
+    assert card.entry_cancel_in_flight is False
+    assert len(sell_calls) == 1
+    assert sell_calls[0]["quantity"] == 30
+
+
+def test_tier_classification_considers_account_level_risk_factors(monkeypatch):
+    monkeypatch.setattr(execution_config, "MARKET_DATA_OUTAGE_CONCENTRATION_PCT", 0.20)
+    card = _open_card(
+        broker_quantity=300,
+        active_stop_price=50.0,
+        average_entry_price=100.0,
+    )
+    tier = classify_market_data_outage_risk(
+        card, trusted_price=100.0, account_equity=100_000.0
+    )
+    assert tier == execution_config.MarketDataOutageRiskTier.HIGH
+
+
+def test_rest_display_fallback_blocks_automatic_entries(tmp_path):
+    engine = _make_engine(tmp_path)
+    engine._market_data = RestPollingMarketDataService(
+        quote_fetcher=lambda symbol: QuoteSnapshot(symbol=symbol, last_price=101.0),
+        execution_grade=False,
+    )
+    engine._market_data.subscribe(["AAPL"])
+    engine._market_data.poll_once()
+    card = _buy_today_card()
+
+    engine.run_heartbeat([card])
+
+    assert card.entry_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE
+
+
+def test_outage_classification_never_guesses_from_average_entry(tmp_path):
+    engine = _make_engine(tmp_path)
+    engine._market_data._connected = False
+    card = _open_card(active_stop_price=None, average_entry_price=100.0)
+
+    engine.run_heartbeat([card])
+
+    assert card.market_data_last_trusted_price is None
+    assert card.market_data_outage_risk_tier == "HIGH"
+
+
+def test_supervised_hold_only_cannot_disable_unattended_ceiling(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        execution_config, "MARKET_DATA_OUTAGE_SUPERVISED_HOLD_ONLY", True
+    )
+    monkeypatch.setattr(execution_config, "MARKET_DATA_OUTAGE_MAX_HOLD_SECONDS", 1)
+    now = [dt.datetime.now(dt.timezone.utc)]
+    engine = _make_engine(tmp_path)
+    engine._clock = lambda: now[0]
+    engine._unattended_session = lambda: True
+    card = _open_card(active_stop_price=50.0)
+    _seed_then_disconnect(engine)
+    engine.run_heartbeat([card])
+    now[0] += dt.timedelta(seconds=2)
+
+    engine.run_heartbeat([card])
+
+    assert card.exit_all_required

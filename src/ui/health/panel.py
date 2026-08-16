@@ -408,6 +408,16 @@ class HealthPanelMixin:
                 dt.datetime.now(dt.timezone.utc) - last_reconcile
             ).total_seconds()
         handoff_worker = self.__dict__.get("handoff_reconciliation_worker")
+        market_data_metrics = None
+        buyboard_worker = self.__dict__.get("_buyboard_runtime_worker")
+        runtime = getattr(buyboard_worker, "runtime", None)
+        market_data = getattr(runtime, "market_data", None)
+        metrics_reader = getattr(market_data, "health_metrics", None)
+        if callable(metrics_reader):
+            try:
+                market_data_metrics = metrics_reader()
+            except Exception:
+                logger.exception("Failed to read KIS market-data health metrics")
         return HealthContext(
             db_source=str(self.__dict__.get("db_engine_source", "none")),
             db_initializing=bool(self.__dict__.get("db_initializing", False)),
@@ -446,6 +456,7 @@ class HealthPanelMixin:
             handoff_blocked_symbols=tuple(
                 self.__dict__.get("_last_handoff_blocked_symbols", ())
             ),
+            market_data_metrics=market_data_metrics,
         )
 
     def refresh_health_panel(self, *args) -> None:

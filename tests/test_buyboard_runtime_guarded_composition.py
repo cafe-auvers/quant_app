@@ -9,7 +9,11 @@ from sqlalchemy.pool import NullPool
 
 from fakes.fake_execution_broker import FakeExecutionBroker
 from src.core import execution_config
-from src.core.account_broker_snapshot import AccountBrokerSnapshot, SnapshotCompleteness
+from src.core.account_broker_snapshot import (
+    AccountBrokerSnapshot,
+    AccountHoldingSnapshot,
+    SnapshotCompleteness,
+)
 from src.core.discovered_external_order import (
     ExternalOrderDisposition,
     new_discovered_external_order,
@@ -20,6 +24,7 @@ from src.core.execution_order_record import (
     ExecutionOrderRecord,
     ExecutionOrderStatus,
 )
+from src.core.execution_request import derive_execution_client_order_id
 from src.core.execution_ownership import ExecutionOwner, ExecutionOwnership
 from src.core.execution_result import UnifiedExecutionStatus
 from src.core.order_state import (
@@ -28,7 +33,12 @@ from src.core.order_state import (
     OrderSide,
     OrderStatus,
 )
-from src.core.trade_card_state import BoardStatus, EntryRuntimeStatus, TradeCardState
+from src.core.trade_card_state import (
+    BoardStatus,
+    EntryRuntimeStatus,
+    PositionRuntimeStatus,
+    TradeCardState,
+)
 from src.services import buyboard_runtime, capital_reservation_repository
 from src.services import execution_command_gateway as gateway_module
 from src.services import trade_card_repository
@@ -248,6 +258,119 @@ def test_runtime_pre_broker_abort_retries_with_attempt_two_and_a_fresh_identity(
     assert second_order.attempt_number == 2
     assert card.entry_client_order_id == second_id
     assert card.entry_attempt_count == 2
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_terminal_sell_all_restart_consumes_attempt_before_guarded_retry(
+    tmp_path, monkeypatch
+):
+    runtime, broker, gateway, engine, market_data = _make_runtime(
+        tmp_path, monkeypatch
+    )
+    group_id = "G-SELL-ALL-RESTART"
+    first_id = derive_execution_client_order_id(
+        attempt_group_id=group_id,
+        attempt_number=1,
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        intent=OrderIntent.MANUAL_EXIT,
+    )
+    crashed_card = _persist_owned_card(
+        engine,
+        _card(
+            board_status=BoardStatus.SELL_ALL,
+            position_runtime_status=PositionRuntimeStatus.LIQUIDATING,
+            broker_quantity=10,
+            orderable_quantity=10,
+            exit_all_required=True,
+            exit_attempt_group_id=group_id,
+            exit_client_order_id=first_id,
+            exit_pending_attempt_number=1,
+            exit_attempt_count=0,
+        ),
+    )
+    first_order = ExecutionOrderRecord(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        side=OrderSide.SELL,
+        intent=OrderIntent.MANUAL_EXIT,
+        client_order_id=first_id,
+        broker_order_id="B-EXIT-1",
+        attempt_group_id=group_id,
+        attempt_number=1,
+        submitted_quantity=10,
+        remaining_quantity=10,
+        submitted_limit_price=99.0,
+        status=ExecutionOrderStatus.ACKNOWLEDGED,
+        broker_identity_status=BrokerIdentityStatus.EXACT,
+    )
+    terminal = BrokerOrderStatusSnapshot(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        broker_order_id="B-EXIT-1",
+        side=OrderSide.SELL,
+        status=OrderStatus.CANCELLED,
+        quantity_requested=10,
+        remaining_quantity=10,
+    )
+
+    plan = reduce_account_reconciliation(
+        AccountBrokerSnapshot(
+            environment="PROD",
+            account_no="1",
+            completeness=SnapshotCompleteness(
+                holdings_complete=True,
+                open_orders_complete=True,
+                history_complete=True,
+                reserved_orders_complete=True,
+                account_balance_complete=True,
+            ),
+            orders=(terminal,),
+            holdings=(
+                # Shares remain after the terminal attempt, so this is one
+                # continuing Sell All chain rather than a flat lifecycle.
+                AccountHoldingSnapshot(
+                    symbol="AAPL",
+                    quantity=10,
+                    average_price=100.0,
+                    sellable_quantity=10,
+                ),
+            ),
+            observed_at=datetime.now(timezone.utc),
+        ),
+        AccountLocalState(cards=(crashed_card,), execution_orders=(first_order,)),
+    )
+
+    recovered = plan.card_updates[0]
+    assert recovered.exit_attempt_group_id == group_id
+    assert recovered.exit_attempt_count == 1
+    assert recovered.exit_pending_attempt_number == 0
+    assert recovered.exit_client_order_id == ""
+    trade_card_repository.update_trade_card(
+        engine, recovered, expected_version=recovered.version
+    )
+
+    market_data.subscribe([recovered.symbol])
+    market_data.poll_once()
+    broker.queue_acceptance(broker_order_id="B-EXIT-2")
+    result = runtime.trading_engine._position_callbacks.submit_sell_order(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        quantity=10,
+        reason="sell_all_retry",
+        trade_card=recovered,
+    )
+
+    assert result.status == UnifiedExecutionStatus.ACKNOWLEDGED
+    assert recovered.exit_client_order_id != first_id
+    second_order = fetch_execution_order(engine, recovered.exit_client_order_id)
+    assert second_order.attempt_group_id == group_id
+    assert second_order.attempt_number == 2
+    assert len(broker.submit_calls) == 1
 
 
 @pytest.mark.usefixtures("trading_enabled")
@@ -635,6 +758,94 @@ def test_partial_sell_and_sell_all_reach_submit_guarded(tmp_path, monkeypatch):
         OrderSide.SELL,
         OrderSide.SELL,
     ]
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_guarded_sell_all_ttl_reprices_use_fresh_ids_and_consume_emergency_cap(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(execution_config, "EMERGENCY_EXIT_MAX_REPRICE_ATTEMPTS", 3)
+    runtime, broker, gateway, engine, market_data = _make_runtime(
+        tmp_path, monkeypatch
+    )
+    monkeypatch.setattr(
+        broker,
+        "get_positions",
+        lambda **kwargs: {
+            "overseas": {
+                "holdings": [
+                    {
+                        "symbol": "AAPL",
+                        "quantity": 10,
+                        "orderable_quantity": 10,
+                    }
+                ]
+            }
+        },
+    )
+    card = _persist_owned_card(
+        engine,
+        _card(
+            board_status=BoardStatus.SELL_ALL,
+            position_runtime_status=PositionRuntimeStatus.LIQUIDATING,
+            broker_quantity=10,
+            orderable_quantity=10,
+            exit_all_required=True,
+            market_data_last_trusted_price=100.0,
+        ),
+    )
+    market_data.subscribe([card.symbol])
+    market_data.poll_once()
+    # Force bounded last-trusted-price collars so every accepted reprice must
+    # consume the same persisted counter that limits emergency attempts.
+    market_data._connected = False
+    current_time = [datetime.now(timezone.utc)]
+    runtime.trading_engine._clock = lambda: current_time[0]
+
+    broker.queue_acceptance(broker_order_id="B-EXIT-1")
+    runtime.trading_engine.run_heartbeat([card])
+
+    first_id = card.exit_client_order_id
+    assert first_id
+    assert card.exit_attempt_count == 1
+    assert len(broker.submit_calls) == 1
+
+    submitted_ids = [first_id]
+    for attempt_number in (2, 3):
+        current_time[0] += timedelta(
+            seconds=execution_config.SELL_ALL_ATTEMPT_TTL_SECONDS + 1
+        )
+        broker.queue_cancel_confirmed()
+        broker.queue_acceptance(broker_order_id=f"B-EXIT-{attempt_number}")
+
+        runtime.trading_engine.run_heartbeat([card])
+
+        submitted_ids.append(card.exit_client_order_id)
+        assert card.exit_attempt_count == attempt_number
+        assert len(broker.submit_calls) == attempt_number
+
+    assert len(set(submitted_ids)) == 3
+    records = [fetch_execution_order(engine, client_id) for client_id in submitted_ids]
+    assert [record.attempt_number for record in records] == [1, 2, 3]
+    assert len({record.attempt_group_id for record in records}) == 1
+
+    # Cancelling attempt 3 leaves shares, but no fourth emergency submission
+    # may cross the broker boundary after the configured cap is consumed.
+    current_time[0] += timedelta(
+        seconds=execution_config.SELL_ALL_ATTEMPT_TTL_SECONDS + 1
+    )
+    broker.queue_cancel_confirmed()
+    runtime.trading_engine.run_heartbeat([card])
+
+    assert len(broker.submit_calls) == 3
+    assert card.exit_attempt_count == 3
+    assert card.exit_client_order_id == ""
+    assert "retry limit reached" in card.last_exit_error
+
+    current_time[0] = card.next_exit_retry_at + timedelta(milliseconds=1)
+    runtime.trading_engine.run_heartbeat([card])
+    assert len(broker.submit_calls) == 3
+    assert card.exit_attempt_count == 3
 
 
 @pytest.mark.usefixtures("trading_enabled")

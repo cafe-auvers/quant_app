@@ -208,6 +208,59 @@ def test_mysql_health_does_not_report_cached_state_as_current_success():
     assert "database offline" in failed.detail
 
 
+def test_market_data_health_metrics_are_projected_to_health_tab():
+    metrics = SimpleNamespace(
+        ws_connected=True,
+        trade_channels_desired=2,
+        trade_channels_acked=2,
+        quote_channels_desired=2,
+        quote_channels_acked=2,
+        critical_trade_channels_missing=(),
+        critical_quote_channels_missing=(),
+        stale_symbols=(),
+        receive_lag_p50_ms=1.0,
+        receive_lag_p95_ms=2.0,
+        receive_lag_p99_ms=3.0,
+        reconnect_count=1,
+        nack_count=0,
+        malformed_frame_count=0,
+        queue_depth=0,
+        dropped_event_count=4,
+    )
+
+    check = health._market_data_check(metrics)
+
+    assert check.level == health.HealthLevel.HEALTHY
+    assert "2/2" in check.detail
+    assert "exact duplicates" in check.detail
+
+
+def test_missing_critical_market_data_channel_is_critical():
+    metrics = SimpleNamespace(
+        ws_connected=True,
+        trade_channels_desired=1,
+        trade_channels_acked=0,
+        quote_channels_desired=1,
+        quote_channels_acked=1,
+        critical_trade_channels_missing=("AAPL",),
+        critical_quote_channels_missing=(),
+        stale_symbols=(),
+        receive_lag_p50_ms=0.0,
+        receive_lag_p95_ms=0.0,
+        receive_lag_p99_ms=0.0,
+        reconnect_count=0,
+        nack_count=1,
+        malformed_frame_count=0,
+        queue_depth=0,
+        dropped_event_count=0,
+    )
+
+    check = health._market_data_check(metrics)
+
+    assert check.level == health.HealthLevel.CRITICAL
+    assert "AAPL" in check.detail
+
+
 def _journal_status(**overrides):
     values = {
         "path": SimpleNamespace(),

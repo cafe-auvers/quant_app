@@ -60,7 +60,7 @@ What this module fully wires
   legacy Buy Dashboard's order submission already does.
 
 What production activation still needs to supply
---------------------------------------------------
+-------------------------------------------------
 - ``buying_power_provider``/``account_equity_provider``: wired as of review
   finding P0-1's fix -- ``src.ui.main_window._sync_buyboard_runtime_worker``
   now passes :func:`src.services.buying_power_cache.make_buying_power_provider`/
@@ -79,13 +79,12 @@ What production activation still needs to supply
   or reserve anything for an account -- the account's KIS balance should be
   loaded (Watchlist tab's "Use KIS Balance", or an equivalent periodic
   refresh) before relying on automatic entries for that account.
-- A real tick-level KIS quote for ``RealtimeMarketDataService`` (no such
-  endpoint is used anywhere in this codebase yet -- see
-  :mod:`src.services.realtime_market_data`'s module docstring). The
-  fallback wired in here (``_kis_only_quote_fetcher``) polls the latest
-  1-minute bar close, which is materially coarser than a real tick and is
-  not sufficient for detecting an intraminute stop-loss touch that
-  recovers before the bar closes.
+- Credentialed Workstream 0 sign-off for the KIS WebSocket symbol keys,
+  capacities, timestamp semantics, sequencing, and execution-notice shape.
+  PR4 contains the transport and runtime integration, but its live factory
+  refuses to start until that evidence is recorded and
+  ``KIS_WS_PROTOCOL_VERIFIED=true``. The REST minute-bar fallback is now
+  display/diagnostic only and cannot authorize automatic execution.
 - Running the assembled ``TradingEngine``/``RestPollingMarketDataService``
   on a background thread (mirroring the existing ``KisOrderWorker``/
   ``KisAccountWorker`` ``QThread`` pattern), not the UI thread -- every
@@ -153,6 +152,9 @@ from src.services.intraday_data_service import (
     fetch_execution_grade_intraday,
 )
 from src.services.intraday_provider import IntradayInterval, IntradayRequest
+from src.services.kis_realtime_market_data import (
+    build_kis_realtime_market_data_from_environment,
+)
 from src.services.position_manager import (
     BrokerHolding,
     PositionActionCallbacks,
@@ -200,21 +202,39 @@ def _entry_plan_id(card: TradeCardState) -> str:
     return f"{card.environment}:{card.symbol}:{card.selected_orb_window or 'unknown'}"
 
 
-def _marketable_sell_limit_price(quote: Optional[QuoteSnapshot]) -> Optional[float]:
-    """A marketable SELL limit: the live bid if one is cached (guaranteed
-    at/above what a market order would clear at this instant), else a small
-    discount off the last trade price -- mirrors the existing legacy Buy
+def _marketable_sell_limit_price(
+    quote: Optional[QuoteSnapshot],
+    *,
+    quote_is_execution_ready: bool = True,
+    last_trusted_price: Optional[float] = None,
+    emergency_reprice_attempt: int = 0,
+) -> Optional[float]:
+    """A bounded marketable SELL limit below a fresh bid, else a small
+    discount off the last trusted trade price -- mirrors the existing legacy Buy
     Dashboard's ``src.ui.buylist.constants.STOP_LOSS_SELL_LIMIT_DISCOUNT_PCT``
     approach (same number, re-declared as
     ``execution_config.SELL_MARKETABLE_DISCOUNT_PCT`` rather than importing
     across the services/ui boundary).
     """
-    if quote is None:
-        return None
-    if quote.bid:
-        return float(quote.bid)
-    if quote.last_price:
-        return float(quote.last_price) * (1.0 - execution_config.SELL_MARKETABLE_DISCOUNT_PCT)
+    if quote_is_execution_ready and quote is not None and quote.bid:
+        # The bid is the reference, while the configured collar provides a
+        # bounded chance of execution if the top of book moves before the
+        # limit reaches the broker.  This remains a limit order, never an
+        # unbounded market order.
+        return float(quote.bid) * (
+            1.0 - execution_config.SELL_MARKETABLE_DISCOUNT_PCT
+        )
+    reference = last_trusted_price
+    if reference is None and quote_is_execution_ready and quote is not None:
+        reference = quote.last_price
+    if reference:
+        # Bounded, controlled collar widening. The caller enforces the hard
+        # attempt cap; no unbounded market order is assumed safe.
+        discount = execution_config.SELL_MARKETABLE_DISCOUNT_PCT * max(
+            1, emergency_reprice_attempt + 1
+        )
+        discount = min(discount, 0.05)
+        return float(reference) * (1.0 - discount)
     return None
 
 
@@ -805,18 +825,37 @@ def build_buyboard_runtime(
         reason = submit_kwargs.pop("reason", "sell_all")
         intent = _SELL_REASON_TO_INTENT.get(reason, OrderIntent.MANUAL_EXIT)
         symbol = submit_kwargs["symbol"]
-        quote = resolved_market_data.latest_quote(symbol)
-        limit_price = _marketable_sell_limit_price(quote)
-        if limit_price is None:
-            raise ExecutionGradeDataUnavailableError(
-                f"No live quote available to price a marketable SELL for {symbol}"
-            )
-        exchange = submit_kwargs.pop("exchange", "NASD")
         card = supplied_card or card_lookup(
             submit_kwargs.get("environment", ""),
             submit_kwargs.get("account_no", ""),
             symbol,
         )
+        quote = resolved_market_data.latest_quote(symbol)
+        quote_ready = resolved_market_data.is_symbol_execution_ready(
+            symbol, require_trade=False, require_quote=True
+        )
+        emergency_attempt = int(card.exit_attempt_count if card is not None else 0)
+        if (
+            not quote_ready
+            and emergency_attempt
+            >= execution_config.EMERGENCY_EXIT_MAX_REPRICE_ATTEMPTS
+        ):
+            raise ExecutionGradeDataUnavailableError(
+                f"Emergency SELL collar retry limit reached for {symbol}; manual intervention required"
+            )
+        limit_price = _marketable_sell_limit_price(
+            quote,
+            quote_is_execution_ready=quote_ready,
+            last_trusted_price=(
+                card.market_data_last_trusted_price if card is not None else None
+            ),
+            emergency_reprice_attempt=emergency_attempt,
+        )
+        if limit_price is None:
+            raise ExecutionGradeDataUnavailableError(
+                f"No fresh bid or last trusted price is available to price a bounded SELL for {symbol}"
+            )
+        exchange = submit_kwargs.pop("exchange", "NASD")
         if guarded_mode:
             if card is None:
                 raise RuntimeError(
@@ -909,14 +948,21 @@ def build_buyboard_runtime(
 
     resolved_market_data = market_data
     if resolved_market_data is None:
-        # No KIS tick/WebSocket quote source exists anywhere in this
-        # codebase yet (see realtime_market_data.py's module docstring).
-        # This falls back to polling the latest execution-grade (KIS-only,
-        # never yfinance -- section 21) 1-minute bar close, which is
-        # functional but materially coarser than a real tick feed --
-        # replace with a real streaming source as soon as one exists by
-        # passing ``market_data=`` explicitly.
-        resolved_market_data = RestPollingMarketDataService(quote_fetcher=_kis_only_quote_fetcher)
+        if (
+            execution_config.KIS_MARKET_DATA_MODE == "WEBSOCKET"
+            and execution_config.KIS_WS_ENABLED
+        ):
+            resolved_market_data = build_kis_realtime_market_data_from_environment(
+                environment="PROD"
+            )
+        else:
+            resolved_market_data = RestPollingMarketDataService(
+                quote_fetcher=_kis_only_quote_fetcher,
+                # Minute-bar REST polling is display/diagnostic fallback
+                # only. It must never authorize an entry or impersonate
+                # tick-level stop protection.
+                execution_grade=False,
+            )
 
     trading_engine = TradingEngine(
         entry_attempt_manager=entry_attempt_manager,
@@ -933,6 +979,8 @@ def build_buyboard_runtime(
         market_is_open=is_regular_session_open,
         eod_window_reached=_eod_window_reached,
         prepare_entry_attempt=prepare_entry_attempt if guarded_mode else None,
+        account_equity_provider=account_equity_provider,
+        trading_halt_lookup=resolved_market_data.is_symbol_trading_halted,
     )
 
     return BuyboardRuntime(

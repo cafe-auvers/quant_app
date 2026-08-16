@@ -1,25 +1,10 @@
-"""Real-time market-data service. ``buydashboard_to_kanban.md`` section 19.
+"""Shared real-time market-data interface and REST diagnostic backend.
 
-No WebSocket/streaming client exists anywhere in this codebase today
-(confirmed by a repo-wide search before writing this module) -- the
-existing KIS integration is entirely REST/request-based
-(:mod:`src.services.kis_intraday_provider`), matching the 60-second
-``QTimer`` polling loop the legacy Buy Dashboard uses. ``RealtimeMarketDataService``
-is the interface every consumer (stop-loss checks, entry-trigger
-evaluation, the Kanban UI) is written against; ``RestPollingMarketDataService``
-is the transport that ships today. A future KIS WebSocket backend (once a
-streaming approval key is provisioned for this account -- KIS's overseas
-real-time quote feed requires one) can implement the same interface without
-touching any consumer.
-
-Wiring a *real* KIS quote fetcher (bid/ask/last) into
-``RestPollingMarketDataService`` is intentionally left to the caller
-(:mod:`src.services.trading_engine`, Phase 5): no live tick-level quote
-endpoint exists in :mod:`src.api` today, only historical/intraday bar
-fetches and order-status queries. Callers must use
-:func:`src.services.intraday_data_service.fetch_execution_grade_intraday`
-(never the display-fallback path) to build that fetcher, per section 21's
-KIS-only-for-execution rule.
+The production WebSocket implementation lives in
+:mod:`src.services.kis_realtime_market_data`. ``RestPollingMarketDataService``
+remains useful for display, diagnostics, and deterministic tests, but the
+production composition marks its minute-bar fallback non-execution-grade:
+it cannot authorize an entry or impersonate tick-level stop protection.
 """
 from __future__ import annotations
 
@@ -40,19 +25,92 @@ def _utc_now() -> datetime:
 
 @dataclass(frozen=True)
 class QuoteSnapshot:
-    """Section 756-764."""
+    """Execution-grade quote with broker and local timing kept separate.
+
+    ``broker_event_at`` is the timestamp carried by KIS. ``received_at`` is
+    when this process received the frame, and ``processed_at`` is when the
+    engine drained it from the accumulator.  Older polling callers omit the
+    two new fields; they intentionally fall back to ``received_at`` so this
+    additive change does not reinterpret existing PR1-PR3 test fixtures.
+    """
 
     symbol: str
     last_price: float
     bid: Optional[float] = None
     ask: Optional[float] = None
     received_at: datetime = field(default_factory=_utc_now)
+    broker_event_at: Optional[datetime] = None
+    processed_at: Optional[datetime] = None
     source: str = ""
+    channel: str = ""
     sequence: Optional[int] = None
+    trade_id: str = ""
+    payload_fingerprint: str = ""
+    # When a stop version changes, the accumulator is detached under the
+    # feed's symbol lock and later evaluated against the exact old per-card
+    # stop set.  This tuple carries those immutable overrides to the engine.
+    stop_price_overrides: tuple[tuple[str, float], ...] = ()
+    breached_stop_versions: tuple[tuple[str, str], ...] = ()
+    regular_session: bool = True
+    # Some events are replayed solely to guarantee delivery of a previously
+    # latched protective-stop breach.  They remain valid for exit evaluation,
+    # but must never authorize a new entry even when their timestamps still
+    # fall inside the execution freshness budgets.
+    entry_trigger_eligible: bool = True
+
+    def __post_init__(self) -> None:
+        broker_at = self.broker_event_at or self.received_at
+        processed_at = self.processed_at or self.received_at
+        for name, value in (
+            ("received_at", self.received_at),
+            ("broker_event_at", broker_at),
+            ("processed_at", processed_at),
+        ):
+            normalized = value
+            if normalized.tzinfo is None:
+                normalized = normalized.replace(tzinfo=timezone.utc)
+            object.__setattr__(self, name, normalized.astimezone(timezone.utc))
 
     def age_seconds(self, *, now: Optional[datetime] = None) -> float:
         reference = now or _utc_now()
         return (reference - self.received_at).total_seconds()
+
+    def broker_age_seconds(self, *, now: Optional[datetime] = None) -> float:
+        reference = now or _utc_now()
+        return (reference - self.broker_event_at).total_seconds()
+
+    def queue_delay_seconds(self) -> float:
+        return max(0.0, (self.processed_at - self.received_at).total_seconds())
+
+    def is_execution_fresh(
+        self,
+        *,
+        now: Optional[datetime] = None,
+        broker_max_age_seconds: Optional[float] = None,
+        receive_max_age_seconds: Optional[float] = None,
+        queue_max_delay_seconds: Optional[float] = None,
+    ) -> bool:
+        reference = now or _utc_now()
+        broker_budget = (
+            execution_config.BROKER_EVENT_STALE_SECONDS
+            if broker_max_age_seconds is None
+            else broker_max_age_seconds
+        )
+        receive_budget = (
+            execution_config.LOCAL_RECEIVE_STALE_SECONDS
+            if receive_max_age_seconds is None
+            else receive_max_age_seconds
+        )
+        queue_budget = (
+            execution_config.MAX_MARKET_DATA_QUEUE_DELAY_SECONDS
+            if queue_max_delay_seconds is None
+            else queue_max_delay_seconds
+        )
+        return (
+            0.0 <= self.broker_age_seconds(now=reference) <= broker_budget
+            and 0.0 <= self.age_seconds(now=reference) <= receive_budget
+            and self.queue_delay_seconds() <= queue_budget
+        )
 
     def is_stale(
         self, *, now: Optional[datetime] = None, max_age_seconds: Optional[float] = None
@@ -105,6 +163,42 @@ class RealtimeMarketDataService:
     def is_connected(self) -> bool:
         raise NotImplementedError
 
+    def is_symbol_execution_ready(
+        self,
+        symbol: str,
+        *,
+        require_trade: bool = True,
+        require_quote: bool = True,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        """Per-symbol readiness seam used by the execution engine.
+
+        Legacy/test backends inherit the conservative connection+freshness
+        implementation.  The KIS backend overrides it with channel ACK,
+        timestamp, queue-delay, and channel-error checks.
+        """
+        quote = self.latest_quote(symbol)
+        return self.is_connected() and quote is not None and quote.is_execution_fresh(now=now)
+
+    def poll_once(self) -> List[QuoteSnapshot]:
+        """Return events ready for engine evaluation in this heartbeat."""
+        return []
+
+    def entry_quote_ready(
+        self, symbol: str, *, now: Optional[datetime] = None
+    ) -> bool:
+        """Whether the backend has everything needed to price a new BUY."""
+        return self.is_symbol_execution_ready(symbol, now=now)
+
+    def is_symbol_trading_halted(self, symbol: str) -> bool:
+        """Whether a separately verified feed signal says execution is halted.
+
+        Backends that cannot prove halt state return False.  A broker-side
+        rejection still remains authoritative; this seam only lets a known
+        halt prevent futile emergency submissions while retaining intent.
+        """
+        return False
+
 
 class InMemoryQuoteCache:
     """Thread-safe last-quote-per-symbol cache any backend can share."""
@@ -143,6 +237,7 @@ class RestPollingMarketDataService(RealtimeMarketDataService):
         quote_fetcher: Callable[[str], QuoteSnapshot],
         poll_interval_seconds: Optional[float] = None,
         clock: Callable[[], datetime] = _utc_now,
+        execution_grade: bool = True,
     ) -> None:
         self._quote_fetcher = quote_fetcher
         self._poll_interval_seconds = (
@@ -151,6 +246,7 @@ class RestPollingMarketDataService(RealtimeMarketDataService):
             else execution_config.FALLBACK_POSITION_PRICE_POLL_SECONDS
         )
         self._clock = clock
+        self._execution_grade = bool(execution_grade)
         self._cache = InMemoryQuoteCache()
         self._symbols: set[str] = set()
         self._symbols_lock = threading.Lock()
@@ -184,6 +280,22 @@ class RestPollingMarketDataService(RealtimeMarketDataService):
 
     def is_connected(self) -> bool:
         return self._connected
+
+    def is_symbol_execution_ready(
+        self,
+        symbol: str,
+        *,
+        require_trade: bool = True,
+        require_quote: bool = True,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        quote = self.latest_quote(symbol)
+        return bool(
+            self._execution_grade
+            and self._connected
+            and quote is not None
+            and quote.is_execution_fresh(now=now or self._clock())
+        )
 
     def poll_once(self) -> List[QuoteSnapshot]:
         """Fetch every subscribed symbol once, synchronously."""

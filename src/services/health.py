@@ -71,6 +71,7 @@ class HealthContext:
     handoff_reconciliation_running: bool = False
     handoff_reconciliation_required: bool = False
     handoff_blocked_symbols: Sequence[str] = field(default_factory=tuple)
+    market_data_metrics: Any = None
 
 
 @dataclass(frozen=True)
@@ -283,6 +284,56 @@ def _mysql_check(context: HealthContext) -> HealthCheck:
         HealthLevel.WARNING,
         "No database source is available",
         "Database-backed scanning and cache freshness are degraded.",
+    )
+
+
+def _market_data_check(metrics: Any) -> HealthCheck:
+    """Project Workstream 5 metrics onto the existing Health tab."""
+    if metrics is None:
+        return HealthCheck(
+            "KIS market data",
+            HealthLevel.UNKNOWN,
+            "Real-time market-data service is not running",
+        )
+    missing_trade = tuple(metrics.critical_trade_channels_missing)
+    missing_quote = tuple(metrics.critical_quote_channels_missing)
+    stale = tuple(metrics.stale_symbols)
+    detail = (
+        f"trade ACK {metrics.trade_channels_acked}/{metrics.trade_channels_desired}; "
+        f"quote ACK {metrics.quote_channels_acked}/{metrics.quote_channels_desired}; "
+        f"receive lag p50/p95/p99 {metrics.receive_lag_p50_ms:.1f}/"
+        f"{metrics.receive_lag_p95_ms:.1f}/{metrics.receive_lag_p99_ms:.1f} ms; "
+        f"reconnects {metrics.reconnect_count}; NACKs {metrics.nack_count}; "
+        f"malformed {metrics.malformed_frame_count}; queue {metrics.queue_depth}; "
+        f"exact duplicates coalesced {metrics.dropped_event_count}."
+    )
+    if not metrics.ws_connected:
+        return HealthCheck(
+            "KIS market data",
+            HealthLevel.CRITICAL,
+            "KIS WebSocket is disconnected",
+            detail,
+        )
+    if missing_trade or missing_quote:
+        return HealthCheck(
+            "KIS market data",
+            HealthLevel.CRITICAL,
+            "Critical symbol subscriptions are missing",
+            f"trade={','.join(missing_trade) or 'none'}; "
+            f"quote={','.join(missing_quote) or 'none'}. {detail}",
+        )
+    if stale:
+        return HealthCheck(
+            "KIS market data",
+            HealthLevel.CRITICAL,
+            "One or more KIS symbols are stale",
+            f"stale={','.join(stale)}. {detail}",
+        )
+    return HealthCheck(
+        "KIS market data",
+        HealthLevel.HEALTHY,
+        "WebSocket and critical symbol channels are ready",
+        detail,
     )
 
 
@@ -551,21 +602,26 @@ def collect_health_snapshot(context: HealthContext) -> HealthSnapshot:
             "Journal health check failed",
             scrub_sensitive_text(exc),
         )
+    checks = [
+        token_check,
+        _kis_api_check(context, configured),
+        _mysql_check(context),
+        _mirror_check(context),
+        _reconciliation_check(context),
+        _main_device_handoff_check(context),
+        journal_check,
+    ]
+    if context.market_data_metrics is not None:
+        checks.append(_market_data_check(context.market_data_metrics))
+    checks.append(
+        HealthCheck(
+            "Application heartbeat",
+            HealthLevel.HEALTHY,
+            "UI event loop is responsive",
+            "This snapshot was produced by a background health probe.",
+        )
+    )
     return HealthSnapshot(
         checked_at=dt.datetime.now().astimezone().isoformat(timespec="seconds"),
-        checks=[
-            token_check,
-            _kis_api_check(context, configured),
-            _mysql_check(context),
-            _mirror_check(context),
-            _reconciliation_check(context),
-            _main_device_handoff_check(context),
-            journal_check,
-            HealthCheck(
-                "Application heartbeat",
-                HealthLevel.HEALTHY,
-                "UI event loop is responsive",
-                "This snapshot was produced by a background health probe.",
-            ),
-        ],
+        checks=checks,
     )
