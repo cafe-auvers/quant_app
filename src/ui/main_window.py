@@ -31,6 +31,7 @@ except ImportError:
 
 from src.core.order_state import (BrokerOrder, OrderIntent, OrderSide,
                                   OrderStatus)
+from src.core import execution_config
 from src.core.scanner import StockScanner
 from src.core.trade_reviewer import TradeReviewer
 from src.core.watchlist import BuylistManager, TradePlanManager, Watchlist
@@ -403,6 +404,7 @@ class MainWindow(
         # _current_execution_lease_kwargs so ExecutionAuthority can re-verify
         # it at the actual broker boundary.
         self._current_lease_token = ""
+        self._current_lease_epoch = 0
         self._last_successful_reconcile_at: Optional[dt.datetime] = None
 
         # Automatic cross-machine handoff (laptop <-> PC). Both env flags
@@ -1104,6 +1106,11 @@ class MainWindow(
                 is_main_device=False,
             )
         self._current_lease_token = result.lease_token if result.is_main_device else ""
+        self._current_lease_epoch = (
+            int(getattr(result, "lease_epoch", 0) or 0)
+            if result.is_main_device
+            else 0
+        )
         self._sync_buyboard_runtime_worker()
         if result.main_device_hostname:
             self._last_main_device_hostname = result.main_device_hostname
@@ -1487,7 +1494,9 @@ class MainWindow(
         return {
             "execution_authority": ExecutionAuthority(),
             "execution_lease": LeaseHandle(
-                device_id=role.device_id, lease_token=lease_token
+                device_id=role.device_id,
+                lease_token=lease_token,
+                lease_epoch=int(self.__dict__.get("_current_lease_epoch", 0) or 0),
             ),
             "lease_engine": self.__dict__.get("pc_db_engine"),
         }
@@ -1601,6 +1610,15 @@ class MainWindow(
         except RuntimeError:
             # The underlying Qt C++ object was already deleted.
             return False
+        readiness_check = getattr(worker, "engine_readiness", None)
+        if callable(readiness_check):
+            readiness = readiness_check(
+                account_no,
+                action=action,
+                symbol=symbol,
+            )
+            if not readiness.healthy:
+                return False
         if not getattr(worker, "startup_reconciliation_ran", False):
             return False
         errors = getattr(worker, "startup_reconciliation_errors", None) or {}
@@ -1661,22 +1679,32 @@ class MainWindow(
             should_run = (
                 is_buyboard_engine_enabled()
                 and role is not None
-                and role.is_main
-                and bool(self.__dict__.get("_current_lease_token"))
                 and self.__dict__.get("pc_db_engine") is not None
+                and (
+                    not role.is_main
+                    or bool(self.__dict__.get("_current_lease_token"))
+                )
             )
             if not should_run:
                 if worker is not None and worker.isRunning():
                     worker.request_stop()
                     worker.requestInterruption()
                 return
+            standby_only = not role.is_main
             if worker is not None and worker.isRunning():
-                return  # already running with the current lease/engine
+                if bool(getattr(worker, "_standby_only", False)) == standby_only:
+                    return  # already running in the correct role
+                # Role changed: stop the old read-only/active composition.
+                # The next state-sync tick starts a fresh worker with the new
+                # lease and performs the mandatory final reconciliation.
+                worker.request_stop()
+                worker.requestInterruption()
+                return
 
             from src.ui.buyboard.runtime_worker import BuyboardRuntimeWorker
 
             lease_kwargs = self._current_execution_lease_kwargs()
-            if lease_kwargs.get("execution_authority") is None:
+            if role.is_main and lease_kwargs.get("execution_authority") is None:
                 return  # not actually main by the time we got here -- do not start
 
             queue_manager = self.__dict__.get("execution_queue_manager")
@@ -1703,6 +1731,10 @@ class MainWindow(
                     if queue_manager is not None
                     else None
                 ),
+                strategy_instance_id=execution_config.KANBAN_STRATEGY_INSTANCE_ID,
+                standby_only=standby_only,
+                device_id=role.device_id,
+                hostname=role.hostname,
                 **lease_kwargs,
             )
             new_worker.board_changed.connect(self.refresh_buyboard)
@@ -1713,7 +1745,10 @@ class MainWindow(
             self._track_worker("_buyboard_runtime_worker", new_worker)
             self._buyboard_runtime_worker = new_worker
             new_worker.start()
-            self.append_log("Buy Board engine started (BUYBOARD_ENGINE_ENABLED=true, main device).")
+            self.append_log(
+                "Buy Board runtime started in "
+                f"{'standby/read-only' if standby_only else 'main-device activation'} mode."
+            )
         except Exception:
             logger.exception("Failed to sync the Buy Board runtime worker")
 
@@ -2342,6 +2377,9 @@ class MainWindow(
     ) -> bool:
         deadline = time.monotonic() + max(0, timeout_ms) / 1000
         for worker in running_workers:
+            request_stop = getattr(worker, "request_stop", None)
+            if callable(request_stop):
+                request_stop()
             worker.requestInterruption()
         for worker in running_workers:
             worker.quit()
@@ -2378,6 +2416,9 @@ class MainWindow(
         )
 
     def closeEvent(self, event) -> None:
+        if not self._authorize_execution_shutdown():
+            event.ignore()
+            return
         self._database_shutting_down = True
         self._database_transition_generation = (
             self.__dict__.get("_database_transition_generation", 0) + 1
@@ -2493,6 +2534,24 @@ class MainWindow(
             return False
         if not self.state_sync_role.is_main:
             return True
+        decision = self._execution_shutdown_lease_decision(
+            explicit_unprotected_acceptance=bool(
+                self.__dict__.get("_shutdown_unprotected_accepted", False)
+            )
+        )
+        if not decision.allowed:
+            self.append_log(f"Main-device ownership retained: {decision.reason}")
+            return False
+        runtime_worker = self.__dict__.get("_buyboard_runtime_worker")
+        if (
+            runtime_worker is not None
+            and not bool(getattr(runtime_worker, "shutdown_prepared", False))
+        ):
+            self.append_log(
+                "Main-device ownership retained: Buy Board journal/final "
+                "reconciliation/WebSocket shutdown sequence did not complete."
+            )
+            return False
         if not final_save_succeeded:
             self.append_log(
                 "Main-device ownership retained: final local state save failed; "
@@ -2528,10 +2587,133 @@ class MainWindow(
         )
         if not self.state_sync_role.is_main:
             self._current_lease_token = ""
+            self._current_lease_epoch = 0
             self._sync_buyboard_runtime_worker()
         if not released and release_error:
             self.append_log(f"Main-device release failed: {release_error}")
         return released
+
+    def _execution_shutdown_exposure(self):
+        """Read durable cards/orders and name everything still exposed."""
+
+        from src.core.execution_order_record import TERMINAL_EXECUTION_ORDER_STATUSES
+        from src.core.runtime_readiness import ShutdownExposure
+        from src.core.trade_card_state import BoardStatus
+        from src.services.execution_order_repository import (
+            list_execution_orders,
+        )
+        from src.services.trade_card_repository import list_trade_cards
+
+        engine = self.__dict__.get("pc_db_engine")
+        if engine is None or not self.__dict__.get("_pc_database_ready", False):
+            return ShutdownExposure()
+        try:
+            cards = list_trade_cards(engine, environment="PROD")
+            open_statuses = {
+                BoardStatus.OPEN_POSITION,
+                BoardStatus.PARTIAL_SELL,
+                BoardStatus.SELL_ALL,
+            }
+            positions = tuple(
+                f"{card.account_no}/{card.symbol}"
+                for card in cards
+                if card.board_status in open_statuses
+                or int(card.broker_quantity or 0) > 0
+                or int(card.orderable_quantity or 0) > 0
+            )
+            working = [
+                f"{order.account_no}/{order.symbol} order"
+                for order in list_execution_orders(engine, environment="PROD")
+                if order.status not in TERMINAL_EXECUTION_ORDER_STATUSES
+            ]
+            for order in find_open_orders(self.__dict__.get("order_ledger", []) or []):
+                working.append(
+                    f"{getattr(order, 'account_no', '')}/{order.symbol} legacy order"
+                )
+            return ShutdownExposure(
+                open_positions=tuple(positions),
+                working_orders=tuple(working),
+            )
+        except Exception as exc:
+            # Unknown exposure is never interpreted as flat.
+            logger.exception("Could not inspect execution exposure for shutdown")
+            from src.core.runtime_readiness import ShutdownExposure
+
+            return ShutdownExposure(
+                working_orders=(f"UNKNOWN EXPOSURE (inspection failed: {exc})",)
+            )
+
+    def _execution_shutdown_lease_decision(
+        self, *, explicit_unprotected_acceptance: bool = False
+    ):
+        from src.core.runtime_readiness import decide_shutdown_lease_release
+        from src.services.runtime_device_state_repository import (
+            confirm_standby_handoff,
+            find_confirmed_standby_successor,
+            find_standby_successor,
+        )
+
+        exposure = self._execution_shutdown_exposure()
+        successor = None
+        engine = self.__dict__.get("pc_db_engine")
+        role = self.__dict__.get("state_sync_role")
+        if engine is not None and role is not None:
+            try:
+                candidate = find_standby_successor(
+                    engine, excluding_device_id=role.device_id
+                )
+                if candidate is not None and not candidate.handoff_confirmed:
+                    # This write is the outgoing owner's side of the
+                    # handshake. The lease is released only after reading
+                    # the confirmed row back below.
+                    confirm_standby_handoff(
+                        engine, device_id=candidate.device_id
+                    )
+                successor = find_confirmed_standby_successor(
+                    engine, excluding_device_id=role.device_id
+                )
+            except Exception:
+                logger.exception("Could not verify a STANDBY_READY successor")
+        return decide_shutdown_lease_release(
+            exposure,
+            successor_standby_ready=successor is not None,
+            handoff_confirmed=bool(successor and successor.handoff_confirmed),
+            unattended=bool(self.__dict__.get("_auto_claim_main_enabled", False)),
+            explicit_unprotected_acceptance=explicit_unprotected_acceptance,
+        )
+
+    def _authorize_execution_shutdown(self) -> bool:
+        """Apply E4 before timers/workers are disturbed."""
+
+        role = self.__dict__.get("state_sync_role")
+        if role is None or not role.is_main:
+            return True
+        decision = self._execution_shutdown_lease_decision()
+        if decision.allowed:
+            return True
+        if self.__dict__.get("_auto_claim_main_enabled", False):
+            self.append_log(f"CRITICAL: {decision.reason}")
+            QMessageBox.critical(self, "Unattended shutdown refused", decision.reason)
+            return False
+        exposure = self._execution_shutdown_exposure()
+        names = "\n".join(f"- {item}" for item in exposure.labels)
+        answer = QMessageBox.critical(
+            self,
+            "Unprotected positions",
+            "No confirmed STANDBY_READY successor exists. Closing will leave "
+            "these positions/orders without application protection:\n\n"
+            f"{names}\n\nAccept this unprotected supervised shutdown?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        accepted = answer == QMessageBox.Yes
+        self._shutdown_unprotected_accepted = accepted
+        if accepted:
+            self.append_log(
+                "CRITICAL: user explicitly accepted supervised shutdown with "
+                f"unprotected exposure: {', '.join(exposure.labels)}"
+            )
+        return accepted
 
     def _track_worker(
         self,

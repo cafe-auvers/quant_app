@@ -11,6 +11,7 @@ the method under test.
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -21,6 +22,7 @@ from sqlalchemy.pool import NullPool
 
 from src.core.account_broker_snapshot import AccountBrokerSnapshot, SnapshotCompleteness
 from src.core.execution_mode import ExecutionLease
+from src.core.runtime_readiness import EngineReadiness, RuntimeDeviceState
 from src.core.execution_ownership import ExecutionOwner, ExecutionOwnership
 from src.core.execution_order_record import (
     BrokerIdentityStatus,
@@ -233,12 +235,167 @@ def _seed_card(engine, **overrides):
     return repo.create_trade_card(engine, TradeCardState(**fields))
 
 
+def _ready_runtime_state(**overrides):
+    values = dict(
+        lease_current=True,
+        startup_reconciliation_complete=True,
+        account_reconciliation_fresh=True,
+        websocket_connected=True,
+        critical_trade_subscriptions_acked=True,
+        critical_quote_subscriptions_acked=True,
+        critical_quotes_fresh=True,
+        accumulator_draining_within_budget=True,
+        database_writable=True,
+        device_active=True,
+    )
+    values.update(overrides)
+    return EngineReadiness(**values)
+
+
 # --- Construction does not build/start anything -----------------------------
 
 
 def test_construction_builds_nothing(tmp_path):
     worker, _ = _worker(tmp_path)
     assert worker.runtime is None
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "startup_reconciliation_complete",
+        "account_reconciliation_fresh",
+        "websocket_connected",
+        "critical_trade_subscriptions_acked",
+        "critical_quote_subscriptions_acked",
+        "critical_quotes_fresh",
+        "accumulator_draining_within_budget",
+        "database_writable",
+    ],
+)
+def test_startup_sequence_does_not_allow_entries_before_every_step_confirms(
+    tmp_path, monkeypatch, missing
+):
+    worker, _ = _worker(tmp_path)
+    worker._accepting_commands = False
+    worker.device_state = RuntimeDeviceState.STANDBY
+    monkeypatch.setattr(
+        worker,
+        "engine_readiness",
+        lambda **kwargs: _ready_runtime_state(**{missing: False}),
+    )
+    final_passes = []
+    monkeypatch.setattr(
+        worker,
+        "_run_startup_reconciliation",
+        lambda **kwargs: final_passes.append(kwargs),
+    )
+
+    worker._advance_startup_readiness()
+
+    assert worker._accepting_commands is False
+    assert worker.device_state == RuntimeDeviceState.STANDBY
+    assert final_passes == []
+
+
+def test_startup_promotes_standby_to_active_only_after_final_reconciliation(
+    tmp_path, monkeypatch
+):
+    worker, _ = _worker(tmp_path)
+    worker._accepting_commands = False
+    worker.device_state = RuntimeDeviceState.STANDBY
+    transitions = []
+    final_passes = []
+    monkeypatch.setattr(
+        worker, "engine_readiness", lambda **kwargs: _ready_runtime_state()
+    )
+    monkeypatch.setattr(worker, "_lease_still_current", lambda: True)
+    monkeypatch.setattr(
+        worker,
+        "_run_startup_reconciliation",
+        lambda **kwargs: final_passes.append(kwargs),
+    )
+
+    def record_state(state, **kwargs):
+        transitions.append(state)
+        worker.device_state = state
+
+    monkeypatch.setattr(worker, "_set_device_state", record_state)
+
+    worker._advance_startup_readiness()
+
+    assert transitions == [
+        RuntimeDeviceState.STANDBY_READY,
+        RuntimeDeviceState.ACTIVE,
+    ]
+    assert final_passes == [{"execute_commands": False}]
+    assert worker._accepting_commands is True
+
+
+def test_pull_only_successor_reaches_standby_ready_but_never_active(
+    tmp_path, monkeypatch
+):
+    worker, _ = _worker(tmp_path, standby_only=True, device_id="successor")
+    worker._accepting_commands = False
+    worker.device_state = RuntimeDeviceState.STANDBY
+    transitions = []
+    monkeypatch.setattr(
+        worker, "engine_readiness", lambda **kwargs: _ready_runtime_state()
+    )
+
+    def record_state(state, **kwargs):
+        transitions.append(state)
+        worker.device_state = state
+
+    monkeypatch.setattr(worker, "_set_device_state", record_state)
+
+    worker._advance_startup_readiness()
+
+    assert transitions == [RuntimeDeviceState.STANDBY_READY]
+    assert worker._accepting_commands is False
+    assert worker.device_state == RuntimeDeviceState.STANDBY_READY
+
+
+def test_runtime_shutdown_orders_journal_reconciliation_and_market_data_close(
+    tmp_path, monkeypatch
+):
+    worker, _ = _worker(tmp_path)
+    calls = []
+
+    class _MarketData:
+        def configure_desired_channels(self, **kwargs):
+            calls.append(("unsubscribe", kwargs))
+
+        def stop(self):
+            calls.append(("stop", None))
+
+    worker.runtime = SimpleNamespace(market_data=_MarketData())
+    worker._journal_flush = lambda: calls.append(("flush", None))
+    monkeypatch.setattr(
+        worker,
+        "_run_startup_reconciliation",
+        lambda **kwargs: calls.append(("reconcile", kwargs)),
+    )
+
+    def record_state(state, **kwargs):
+        worker.device_state = state
+        calls.append(("state", state))
+
+    monkeypatch.setattr(worker, "_set_device_state", record_state)
+
+    worker.request_stop()
+    worker._perform_shutdown_sequence()
+
+    assert worker._accepting_commands is False
+    assert calls == [
+        ("state", RuntimeDeviceState.SHUTTING_DOWN),
+        ("flush", None),
+        ("reconcile", {"execute_commands": False}),
+        ("unsubscribe", {"trade_priorities": {}, "quote_priorities": {}}),
+        ("stop", None),
+        ("state", RuntimeDeviceState.STOPPED),
+    ]
+    assert worker.shutdown_prepared is True
 
 
 # --- Startup reconciliation --------------------------------------------------

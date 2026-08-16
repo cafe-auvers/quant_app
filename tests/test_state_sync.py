@@ -551,6 +551,20 @@ def test_release_main_device_clears_ownership_row_when_owned_by_role(tmp_path):
     assert ss.get_main_device(engine).main_device is None
 
 
+def test_clean_release_and_reclaim_advances_lease_epoch(tmp_path):
+    engine = _make_engine(tmp_path)
+    laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    pc = ss.LocalDeviceRole("pc-id", "PC", False)
+    first = ss.claim_main_device(engine, laptop)
+    assert first.success
+    assert ss.release_main_device(engine, laptop).success
+
+    second = ss.claim_main_device_if_unclaimed(engine, pc)
+
+    assert second.success
+    assert second.main_device.lease_epoch > first.main_device.lease_epoch
+
+
 def test_release_main_device_is_noop_when_not_owner(tmp_path):
     engine = _make_engine(tmp_path)
     laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)

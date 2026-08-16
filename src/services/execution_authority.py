@@ -11,8 +11,8 @@ re-check at the broker boundary, both devices could end up believing they're
 authorized to trade the same account at once.
 
 ``ExecutionAuthority`` closes that gap: it re-reads the live ownership row
-and raises unless both the device_id *and* the lease_token the caller
-believes it holds still match. Wired into
+and raises unless the device ID, lease token, and (when supplied) lease epoch
+the caller believes it holds still match. Wired into
 ``order_execution_service.submit_guarded_overseas_order`` at the same two
 re-check boundaries already used for the trading kill switch and risk
 approval.
@@ -45,6 +45,7 @@ class LeaseHandle:
 
     device_id: str
     lease_token: str
+    lease_epoch: int = 0
 
 
 class ExecutionAuthority:
@@ -73,10 +74,18 @@ class ExecutionAuthority:
         payload = pulled.state.payload
         current_device_id = str(payload.get("device_id") or "").strip()
         current_lease_token = str(payload.get("lease_token") or "").strip()
+        current_lease_epoch = max(
+            int(payload.get("lease_epoch") or 0),
+            int(pulled.state.revision or 0),
+        )
         if (
             current_device_id != expected.device_id
             or not current_lease_token
             or current_lease_token != expected.lease_token
+            or (
+                int(expected.lease_epoch or 0) > 0
+                and current_lease_epoch != int(expected.lease_epoch)
+            )
         ):
             logger.warning(
                 "Main-device lease no longer current for device %s; refusing to submit.",

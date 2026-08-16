@@ -3,11 +3,15 @@ from types import SimpleNamespace
 
 import pandas as pd
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.pool import NullPool
 
 import src.ui.buylist.view as buylist_view_module
 from src.core.execution_queue import (ExecutionQueueStatus, OrbCandidateStatus,
                                       is_pre_entry_execution_queue_item,
                                       queue_key)
+from src.core.execution_ownership import ExecutionOwner, ExecutionOwnership
+from src.services.execution_ownership_repository import assign_ownership
 from src.core.watchlist import BuylistManager, Watchlist, WatchlistItem
 from src.ui.main_window import MainWindow
 
@@ -786,6 +790,43 @@ def test_auto_submit_execute_ready_stays_blocked_when_buyboard_engine_flag_on_bu
 
     assert submissions == []  # entries stay frozen on both engines
     assert any("CRITICAL" in message for message in logs)
+
+
+def test_legacy_fail_open_never_activates_for_a_kanban_owned_symbol(
+    monkeypatch, tmp_path
+):
+    window = _build_queue_window(monkeypatch, tmp_path)
+    monkeypatch.setenv("BUYBOARD_ENGINE_ENABLED", "true")
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'ownership.db'}",
+        future=True,
+        poolclass=NullPool,
+    )
+    assign_ownership(
+        engine,
+        ExecutionOwnership(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            owner=ExecutionOwner.KANBAN,
+            strategy_instance_id="buyboard-orb-v1",
+            assigned_by="test",
+        ),
+    )
+    window.pc_db_engine = engine
+    window._buyboard_engine_healthy = lambda *args, **kwargs: False
+    logs = []
+    window.append_log = logs.append
+
+    blocked = window._legacy_auto_execution_blocked(
+        "PROD",
+        "AAPL",
+        account_no="1",
+        is_protective_exit=True,
+    )
+
+    assert blocked is True
+    assert any("explicit audited ownership transfer" in message for message in logs)
 
 
 def test_buyboard_engine_healthy_true_for_a_recently_started_slow_cycle(tmp_path):

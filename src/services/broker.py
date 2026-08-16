@@ -146,6 +146,35 @@ class Broker(Protocol):
         ...
 
 
+class ReadOnlyBroker:
+    """Read-side broker facade for a pull-only standby runtime.
+
+    Even if a future caller accidentally invokes an execution callback while
+    the worker is in standby, this object has no mutation path to delegate.
+    """
+
+    def __init__(self, delegate: Broker) -> None:
+        self._delegate = delegate
+
+    def submit_order(self, **kwargs):
+        raise RuntimeError("standby runtime is read-only; broker submission is disabled")
+
+    def cancel_order(self, **kwargs):
+        raise RuntimeError("standby runtime is read-only; broker cancellation is disabled")
+
+    def is_ambiguous_submission_error(self, error: BaseException) -> bool:
+        return False
+
+    def get_order(self, **kwargs):
+        return self._delegate.get_order(**kwargs)
+
+    def discover_orders(self, **kwargs):
+        return self._delegate.discover_orders(**kwargs)
+
+    def get_positions(self, **kwargs):
+        return self._delegate.get_positions(**kwargs)
+
+
 class KisBroker:
     """``Broker`` implementation backed by the real KIS overseas order API."""
 
@@ -201,6 +230,8 @@ class KisBroker:
         is_reserved: bool = False,
         **kwargs: Any,
     ) -> BrokerOrderStatusSnapshot:
+        # Gateway-only ownership correlation; never part of the KIS payload.
+        kwargs.pop("ownership_symbol", None)
         if is_reserved:
             return kis_order.cancel_overseas_reserved_order(
                 environment=environment, account_no=account_no, **kwargs

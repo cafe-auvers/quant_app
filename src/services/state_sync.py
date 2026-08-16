@@ -108,6 +108,7 @@ class MainDevice:
     revision: int
     updated_at: datetime
     lease_token: str = ""
+    lease_epoch: int = 0
 
 
 @dataclass(frozen=True)
@@ -287,6 +288,12 @@ def _main_device_from_state(state: RemoteState) -> MainDevice:
     device_id = str(state.payload.get("device_id") or "").strip()
     hostname = str(state.payload.get("hostname") or "").strip()
     lease_token = str(state.payload.get("lease_token") or "").strip()
+    # Existing pre-Workstream-6 ownership rows have no explicit field. Their
+    # already-monotonic ownership revision is the safe migration baseline.
+    lease_epoch = max(
+        int(state.payload.get("lease_epoch") or 0),
+        int(state.revision or 0),
+    )
     if not device_id:
         raise ValueError("Main-device ownership row has no device_id")
     return MainDevice(
@@ -295,6 +302,7 @@ def _main_device_from_state(state: RemoteState) -> MainDevice:
         revision=state.revision,
         updated_at=state.updated_at,
         lease_token=lease_token,
+        lease_epoch=lease_epoch,
     )
 
 
@@ -304,6 +312,10 @@ def get_main_device(engine: Optional[Engine]) -> OwnershipResult:
         return OwnershipResult(True)
     if pulled.status != PULL_OK or pulled.state is None:
         return OwnershipResult(False, error=pulled.error or "Could not read main-device ownership.")
+    # A released lease is retained as a tombstone so its epoch cannot reset
+    # to 1 on the next clean claim.  To callers it is still simply unclaimed.
+    if not str(pulled.state.payload.get("device_id") or "").strip():
+        return OwnershipResult(True)
     try:
         return OwnershipResult(True, main_device=_main_device_from_state(pulled.state))
     except ValueError as exc:
@@ -323,19 +335,27 @@ def claim_main_device(
     """
     if engine is None:
         return OwnershipResult(False, error="State sync database is unavailable.")
-    payload_json = json.dumps(
-        {
-            "device_id": role.device_id,
-            "hostname": role.hostname,
-            "lease_token": str(uuid.uuid4()),
-        },
-        separators=(",", ":"),
-    )
     try:
         table = _ensure_state_sync_table(engine)
         with engine.begin() as conn:
             row = _select_row(conn, table, MAIN_DEVICE_KEY, for_update=True)
             revision = int(row.revision or 1) + 1 if row is not None else 1
+            prior_epoch = 0
+            if row is not None:
+                prior_payload = _decode_payload(row.payload, MAIN_DEVICE_KEY)
+                prior_epoch = max(
+                    int(prior_payload.get("lease_epoch") or 0),
+                    int(row.revision or 0),
+                )
+            payload_json = json.dumps(
+                {
+                    "device_id": role.device_id,
+                    "hostname": role.hostname,
+                    "lease_token": str(uuid.uuid4()),
+                    "lease_epoch": prior_epoch + 1,
+                },
+                separators=(",", ":"),
+            )
             values = {
                 "payload": payload_json,
                 "revision": revision,
@@ -425,6 +445,11 @@ def claim_main_device_if_stale(
                     "device_id": role.device_id,
                     "hostname": role.hostname,
                     "lease_token": str(uuid.uuid4()),
+                    "lease_epoch": max(
+                        current_owner.lease_epoch,
+                        int(row.revision or 0),
+                    )
+                    + 1,
                 },
                 separators=(",", ":"),
             )
@@ -471,29 +496,46 @@ def claim_main_device_if_unclaimed(
         table = _ensure_state_sync_table(engine)
         with engine.begin() as conn:
             row = _select_row(conn, table, MAIN_DEVICE_KEY, for_update=True)
-            if row is not None:
+            if row is not None and str(
+                _decode_payload(row.payload, MAIN_DEVICE_KEY).get("device_id") or ""
+            ).strip():
                 return OwnershipResult(
                     False,
                     error="Ownership was claimed by another device before this claim ran.",
                 )
+            prior_epoch = 0
+            prior_revision = 0
+            if row is not None:
+                prior_payload = _decode_payload(row.payload, MAIN_DEVICE_KEY)
+                prior_epoch = int(prior_payload.get("lease_epoch") or 0)
+                prior_revision = int(row.revision or 0)
             payload_json = json.dumps(
                 {
                     "device_id": role.device_id,
                     "hostname": role.hostname,
                     "lease_token": str(uuid.uuid4()),
+                    "lease_epoch": max(prior_epoch, prior_revision) + 1,
                 },
                 separators=(",", ":"),
             )
-            conn.execute(
-                table.insert().values(
-                    state_key=MAIN_DEVICE_KEY,
-                    payload=payload_json,
-                    revision=1,
-                    updated_at=_server_now(engine),
-                    updated_by_host=role.hostname,
-                    updated_by_device=role.device_id,
-                )
+            values = dict(
+                payload=payload_json,
+                revision=prior_revision + 1 if row is not None else 1,
+                updated_at=_server_now(engine),
+                updated_by_host=role.hostname,
+                updated_by_device=role.device_id,
             )
+            if row is None:
+                conn.execute(
+                    table.insert().values(state_key=MAIN_DEVICE_KEY, **values)
+                )
+            else:
+                conn.execute(
+                    table.update()
+                    .where(table.c.state_key == MAIN_DEVICE_KEY)
+                    .where(table.c.revision == prior_revision)
+                    .values(**values)
+                )
             written_row = _select_row(conn, table, MAIN_DEVICE_KEY)
         if written_row is None:
             return OwnershipResult(False, error="Unclaimed-row claim was not persisted.")
@@ -505,15 +547,12 @@ def claim_main_device_if_unclaimed(
 
 
 def release_main_device(engine: Optional[Engine], role: LocalDeviceRole) -> OwnershipResult:
-    """Delete the ownership row iff still held by ``role``; a no-op otherwise.
+    """Release ownership iff still held by ``role`` while retaining epoch history.
 
-    Deletion (not blanking the payload) is deliberate: ``get_main_device()``
-    already treats a missing row as a clean, well-tested "unclaimed" state
-    (``PULL_MISSING``) that ``reconcile_state_with_remote`` already knows how
-    to bootstrap from. Blanking the payload would instead make
-    ``_main_device_from_state`` raise, which ``get_main_device`` turns into a
-    fatal ownership-read error -- stalling reconciliation on *both* devices
-    until someone manually re-claims.
+    The blank-device payload is an intentional tombstone. ``get_main_device``
+    exposes it as unclaimed, while the next claimant can still mint an epoch
+    strictly greater than the released lease.  Deleting this row would allow
+    a clean handoff to reuse epoch 1 after every release.
     """
     if engine is None:
         return OwnershipResult(False, error="State sync database is unavailable.")
@@ -528,7 +567,27 @@ def release_main_device(engine: Optional[Engine], role: LocalDeviceRole) -> Owne
             if current_owner.device_id != role.device_id:
                 # Not ours to release -- ownership already moved on.
                 return OwnershipResult(True)
-            conn.execute(table.delete().where(table.c.state_key == MAIN_DEVICE_KEY))
+            tombstone = json.dumps(
+                {
+                    "device_id": "",
+                    "hostname": "",
+                    "lease_token": "",
+                    "lease_epoch": current_owner.lease_epoch,
+                },
+                separators=(",", ":"),
+            )
+            conn.execute(
+                table.update()
+                .where(table.c.state_key == MAIN_DEVICE_KEY)
+                .where(table.c.revision == current_state.revision)
+                .values(
+                    payload=tombstone,
+                    revision=current_state.revision + 1,
+                    updated_at=_server_now(engine),
+                    updated_by_host=role.hostname,
+                    updated_by_device=role.device_id,
+                )
+            )
         return OwnershipResult(True)
     except (SQLAlchemyError, ValueError, TypeError) as exc:
         logger.info("Could not release main-device ownership: %s", exc)

@@ -147,8 +147,8 @@ PR's behavior composes correctly, plus the Gate 1 run in full.
 | 2 | Durable order ownership and command ledger | PR1 IMPLEMENTED, not activated — merged to `master` (`5b50e1d`): schemas, all three state machines, durable repositories, command ledger. Excludes A4a's KIS-specific correlation-key adapter (stays gated on Workstream 0). |
 | 3 | One guarded execution gateway | PR2 IMPLEMENTED, not activated — `ExecutionCommandGateway` (`src/services/execution_command_gateway.py`): dual-mode, with genuinely separate call shapes per mode (`submit_order`/`cancel_order` for `LEGACY_COMPATIBILITY`; `submit_guarded`/`cancel_guarded`/`replace_guarded` taking explicit request models with caller-generated stable command identities for `GUARDED_ENGINE`). Full A1-A11/B1-B4 sequence, one authoritative atomic capital reservation with an in-transaction availability check, a real lease-epoch gate, H1 ownership enforcement, a mutation-budget seam for Workstream 10, and fail-closed guarded runtime composition. Runtime-level tests cover restart-restored caller identity, normalized results, full-context tracked cancellation, Partial Sell/Sell All, one-reservation entry, and unresolved post-broker persistence without retry. |
 | 4 | Account-level reconciliation engine | PR3 IMPLEMENTED, not activated — one immutable `AccountBrokerSnapshot` per account/pass, per-source `SnapshotCompleteness`, a pure `ReconciliationPlan` reducer, durable two-generation order/reservation absence evidence, lifecycle-linked behavioral C4 projection with terminal attempt-group retirement, execution-boundary and last-broker-boundary fencing for active unowned orders with definitive pre-broker aborts, guarded execution of reducer commands, safe external SELL exposure handling, atomic account-plan persistence plus strict allocator reservation CAS, failure-invalidated action readiness, and one startup/periodic runtime pass replacing the three ordered EOD sweeps. KIS submission-time mapping and production threshold calibration remain gated on Workstream 0; without verified broker submission time, A4a stays manual and unmatched broker orders remain separate `DiscoveredExternalOrder`s. |
-| 5 | Production KIS real-time market data | PR4 DRAFT IMPLEMENTED, not activated — approval-key/transport lifecycle, ACK/NACK and encrypted-notice framing, exact-event freshness/dedup validation, per-symbol channel readiness, lossless stop-version accumulator, channel-specific capacity, health metrics, market-session semantics, bounded emergency pricing, and tiered persisted outage state are implemented behind `BUYBOARD_ENGINE_ENABLED=false`, `KIS_WS_ENABLED=false`, and `KIS_WS_PROTOCOL_VERIFIED=false`. Live parsing/subscription activation remains blocked until Workstream 0 fills `docs/kis_capability_matrix.md` with credentialed evidence; no vendor-sample assumption is recorded as verified. |
-| 6 | Runtime readiness and device handoff | NOT STARTED |
+| 5 | Production KIS real-time market data | PR4 IMPLEMENTED and merged to `master` (`952179e`), not activated — approval-key/transport lifecycle, ACK/NACK and encrypted-notice framing, exact-event freshness/dedup validation, per-symbol channel readiness, lossless stop-version accumulator, channel-specific capacity, health metrics, market-session semantics, bounded emergency pricing, and tiered persisted outage state are implemented behind `BUYBOARD_ENGINE_ENABLED=false`, `KIS_WS_ENABLED=false`, and `KIS_WS_PROTOCOL_VERIFIED=false`. Live parsing/subscription activation remains blocked until Workstream 0 fills `docs/kis_capability_matrix.md` with credentialed evidence; no vendor-sample assumption is recorded as verified. |
+| 6 | Runtime readiness and device handoff | PR5 DRAFT IMPLEMENTED, not activated — durable epoch fencing across clean and stale handoff, strict E1 aggregate health, read-only successor standby with persisted `STANDBY_READY`/`ACTIVE` state, final-reconciliation activation, KANBAN-scoped legacy suppression, and exposure-aware ordered shutdown are implemented. All execution and WebSocket activation flags remain false. |
 | 7 | Complete test program | NOT STARTED — matrix fully specified; distributed across PR1-7, capstone in PR8 |
 | 8 | Migration and cutover | NOT STARTED |
 | 9 | Legacy/Kanban ownership isolation | PR2 IMPLEMENTED, not activated — `ExecutionWorkflowService` is the one workflow service both the legacy Buy Dashboard's submission/cancellation entry points and the Kanban runtime (`buyboard_runtime.py`) now default to; an architecture test enforces no direct KIS-mutation call site outside the gateway/adapter. H1's persisted, multi-strategy `execution_owner` table (`src/core/execution_ownership.py` + `execution_ownership_repository.py`) is built and enforced at the gateway (B2) in `GUARDED_ENGINE` mode — `MANUAL` rejects every application source, `KANBAN` accepts only `KANBAN_BOARD`, unassigned defaults `LEGACY` (H2) and rejects `KANBAN_BOARD`. In-process mutual exclusion per `(environment, account_no, symbol)` is enforced additionally, regardless of mode, as a same-process race guard distinct from H1's durable assignment. |
@@ -1145,6 +1145,25 @@ and stays `false` in unattended/automatic form until Gate 5 passes.
 
 ## Change log
 
+- 2026-08-16 (PR5): Implemented Workstream 6 runtime readiness and device
+  handoff from post-PR4 `master@952179e`. Main-device leases now persist a
+  monotonically advancing epoch across takeover and clean-release tombstones;
+  the real lease protocol verifies device, token, and epoch at the gateway.
+  Runtime health is the fail-closed conjunction of lease currency, startup and
+  fresh account reconciliation, WebSocket connection, both critical channel
+  ACK sets, fresh critical quotes, bounded accumulator drain, database
+  writability, and durable ACTIVE state. Pull-only devices run through a
+  physically read-only broker facade and heartbeat `STANDBY_READY`; the
+  outgoing owner confirms that fresh standby record before release. Startup
+  admits no mutations before standby prerequisites and a final reconciliation.
+  Shutdown blocks commands, flushes the durable journal boundary, performs a
+  final projection-only reconciliation, unsubscribes/closes market data, then
+  permits lease release only for no exposure, a confirmed ready successor, or
+  explicit supervised acceptance. Unattended shutdown with exposure and no
+  successor is refused. KANBAN-owned symbols never fail open to legacy.
+  `BUYBOARD_ENGINE_ENABLED=false`, `KIS_WS_ENABLED=false`, and
+  `KIS_WS_PROTOCOL_VERIFIED=false` remain unchanged. Local validation:
+  `python -m compileall -q src tests` and `1706 passed`.
 - 2026-08-16 (revision 3.4, PR4 blocking review): Explicitly revised the
   Workstream 0 WebSocket gate. D1/D3/D11 adapters may exist provisionally
   before credentialed evidence only while disabled, labelled
@@ -1441,10 +1460,10 @@ and stays `false` in unattended/automatic form until Gate 5 passes.
   **Guarded lease gate (was: `lease=None` silently meant "unfenced," and
   `lease_epoch` was accepted without being verified against anything).**
   `GUARDED_ENGINE` mode now requires an explicit lease and a lease
-  protocol that reports `epoch_verified=True`; `DefaultExecutionLeaseProtocol`
-  always reports `epoch_verified=False` (honest about not having a real
-  epoch authority yet -- Workstream 5/6's job), so it can never itself
-  satisfy a `GUARDED_ENGINE` call today. `LeaseNotVerifiedError` covers a
+  protocol that reports `epoch_verified=True`. At PR2 time,
+  `DefaultExecutionLeaseProtocol` reported `epoch_verified=False` because no
+  durable epoch authority existed; PR5 supersedes that limitation with the
+  epoch persisted in main-device ownership state. `LeaseNotVerifiedError` covers a
   missing lease, an unverifiable epoch, and a stale epoch uniformly.
 
   **H1 implemented, not deferred.** `src/core/execution_ownership.py` +
@@ -1560,9 +1579,9 @@ and stays `false` in unattended/automatic form until Gate 5 passes.
   never pass) -- fixed.** `build_buyboard_runtime` now refuses
   `GUARDED_ENGINE` activation outright (`RuntimeError` at composition
   time) whenever `BUYBOARD_ENGINE_ENABLED=true` and no explicit `broker=`
-  override is supplied -- `DefaultExecutionLeaseProtocol.epoch_verified`
-  is permanently `False` (Workstream 5/6 doesn't exist yet) and
-  `AllowAllMutationBudget` is a testing placeholder, so the previous
+  override is supplied. At PR2 time the default lease protocol could not
+  verify an epoch; PR5 now supplies that verification, while
+  `AllowAllMutationBudget` remains a testing placeholder until Workstream 10, so the previous
   composition would have "succeeded" at startup and failed only on the
   first real command. This has no production effect (the flag stays
   `false` for the whole program) but closes a real internal

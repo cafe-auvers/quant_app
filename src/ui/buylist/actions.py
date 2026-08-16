@@ -18,6 +18,19 @@ from .constants import (STOP_LOSS_REPRICE_MIN_DROP_PCT,
 
 
 class BuylistActionsMixin:
+    def _new_kis_order_cancel_worker(self, client_order_id: str):
+        try:
+            return KisOrderCancelWorker(
+                client_order_id,
+                ownership_engine=self.__dict__.get("pc_db_engine"),
+            )
+        except TypeError as exc:
+            # Compatibility for lightweight test/plugin worker doubles that
+            # predate the optional ownership-engine keyword.
+            if "ownership_engine" not in str(exc):
+                raise
+            return KisOrderCancelWorker(client_order_id)
+
     def _open_orders_for_buylist_item(self, item, env: str) -> List[BrokerOrder]:
         if item is None:
             return []
@@ -410,7 +423,9 @@ class BuylistActionsMixin:
         if reply != QMessageBox.Yes:
             return
 
-        self.broker_order_cancel_worker = KisOrderCancelWorker(order.client_order_id)
+        self.broker_order_cancel_worker = self._new_kis_order_cancel_worker(
+            order.client_order_id
+        )
         self.broker_order_cancel_worker.finished_cancel.connect(
             self._on_broker_order_cancel_finished
         )
@@ -556,7 +571,7 @@ class BuylistActionsMixin:
                 continue
 
             item._buy_replace_pending = True
-            self.broker_order_cancel_worker = KisOrderCancelWorker(
+            self.broker_order_cancel_worker = self._new_kis_order_cancel_worker(
                 order.client_order_id
             )
             self.broker_order_cancel_worker.finished_cancel.connect(
@@ -701,7 +716,9 @@ class BuylistActionsMixin:
             return
 
         item._stop_reprice_pending = True
-        self.broker_order_cancel_worker = KisOrderCancelWorker(order.client_order_id)
+        self.broker_order_cancel_worker = self._new_kis_order_cancel_worker(
+            order.client_order_id
+        )
         self.broker_order_cancel_worker.finished_cancel.connect(
             lambda updated, it=item, px=new_limit: self._on_stop_reprice_cancel_finished(
                 it, px, updated

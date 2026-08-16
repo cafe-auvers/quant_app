@@ -1250,7 +1250,10 @@ class BuylistOrdersMixin:
             from src.services.order_reconciliation import \
                 cancel_and_reconcile_order
 
-            updated = cancel_and_reconcile_order(client_order_id)
+            updated = cancel_and_reconcile_order(
+                client_order_id,
+                ownership_engine=self.__dict__.get("pc_db_engine"),
+            )
         except Exception as exc:
             self.append_log(
                 f"Cancel request failed for {target.symbol} order {client_order_id}: {exc}"

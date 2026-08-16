@@ -21,6 +21,12 @@ from src.services import state_sync as ss
 from src.services.app_state import StateReconcileResult
 from src.services.execution_authority import ExecutionAuthority, LeaseHandle
 from src.services.handoff_reconciliation import PostClaimReconciliationResult
+from src.core.runtime_readiness import RuntimeDeviceState
+from src.core.trade_card_state import BoardStatus, TradeCardState
+from src.services import trade_card_repository
+from src.services.runtime_device_state_repository import (
+    save_runtime_device_state,
+)
 from src.ui.main_window import MainWindow
 
 
@@ -655,3 +661,77 @@ def test_shutdown_retains_ownership_when_final_local_save_failed(
     assert released is False
     assert published == []
     assert ss.get_main_device(engine).main_device.device_id == "laptop-id"
+
+
+def test_unattended_shutdown_release_is_refused_with_open_position_and_no_successor(
+    monkeypatch, tmp_path
+):
+    engine = _make_engine(tmp_path)
+    role = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    assert ss.claim_main_device(engine, role).success
+    trade_card_repository.create_trade_card(
+        engine,
+        TradeCardState(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            board_status=BoardStatus.OPEN_POSITION,
+            broker_quantity=10,
+            orderable_quantity=10,
+        ),
+    )
+    window = _base_window(is_main=True, lease_token="tok-1", pc_engine=engine)
+    window.state_sync_role = role
+    window._auto_claim_main_enabled = True
+    published = []
+    monkeypatch.setattr(
+        main_window_module,
+        "publish_handoff_snapshot",
+        lambda *args, **kwargs: published.append(True) or True,
+    )
+
+    released = MainWindow._release_main_device_ownership_for_shutdown(window)
+
+    assert released is False
+    assert published == []
+    assert ss.get_main_device(engine).main_device.device_id == "laptop-id"
+
+
+def test_shutdown_release_proceeds_with_confirmed_standby_successor(
+    monkeypatch, tmp_path
+):
+    engine = _make_engine(tmp_path)
+    role = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    assert ss.claim_main_device(engine, role).success
+    trade_card_repository.create_trade_card(
+        engine,
+        TradeCardState(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            board_status=BoardStatus.OPEN_POSITION,
+            broker_quantity=10,
+            orderable_quantity=10,
+        ),
+    )
+    save_runtime_device_state(
+        engine,
+        device_id="pc-id",
+        hostname="PC",
+        state=RuntimeDeviceState.STANDBY_READY,
+    )
+    window = _base_window(is_main=True, lease_token="tok-1", pc_engine=engine)
+    window.state_sync_role = role
+    window._auto_claim_main_enabled = True
+    window.buylist_manager = SimpleNamespace(to_dict=lambda: {"items": []})
+    monkeypatch.setattr(main_window_module, "load_json", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        main_window_module,
+        "publish_handoff_snapshot",
+        lambda *args, **kwargs: True,
+    )
+
+    released = MainWindow._release_main_device_ownership_for_shutdown(window)
+
+    assert released is True
+    assert ss.get_main_device(engine).main_device is None

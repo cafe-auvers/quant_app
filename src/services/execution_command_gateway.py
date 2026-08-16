@@ -15,8 +15,9 @@ the old minimal Broker protocol"):
   gateway is a drop-in ``broker=`` for
   :func:`~src.services.order_execution_service.submit_guarded_overseas_order`
   and :func:`~src.services.order_reconciliation.cancel_and_reconcile_order`.
-  A transparent pass-through to the real broker -- no command journal, no
-  capital reservation, no ``ExecutionOrderRecord``.
+  No command journal, capital reservation, or ``ExecutionOrderRecord`` is
+  introduced; when a shared DB is supplied, the gateway still enforces H1
+  ownership immediately before delegating to the real broker.
 - ``GUARDED_ENGINE`` (``BUYBOARD_ENGINE_ENABLED=true`` -- implemented and
   tested here, never selected in production by this PR): ``submit_guarded``/
   ``cancel_guarded``/``replace_guarded`` take explicit request models
@@ -47,6 +48,7 @@ from __future__ import annotations
 import logging
 import math
 import threading
+import weakref
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -406,6 +408,10 @@ class ExecutionCommandGateway:
                     "GUARDED_ENGINE mode requires submit_guarded(request=SubmitExecutionRequest(...)) "
                     "-- see the module docstring"
                 )
+            if self._engine is not None:
+                self._require_ownership(
+                    environment, account_no, symbol, source
+                )
             return self._real_broker.submit_order(
                 environment=environment, account_no=account_no, symbol=symbol, side=side,
                 quantity=quantity, limit_price=limit_price, exchange=exchange,
@@ -432,7 +438,10 @@ class ExecutionCommandGateway:
         **kwargs: Any,
     ) -> BrokerOrderStatusSnapshot:
         source = _as_source(source)
-        symbol = str(kwargs.get("symbol") or "").upper()
+        ownership_symbol = str(
+            kwargs.pop("ownership_symbol", "") or kwargs.get("symbol") or ""
+        ).upper()
+        symbol = ownership_symbol
         key = _recovery_key(environment, account_no, symbol)
         with self._ownership.claim(key, source):
             if self.mode != ExecutionMode.LEGACY_COMPATIBILITY:
@@ -440,6 +449,10 @@ class ExecutionCommandGateway:
                     "cancel_order() is the LEGACY_COMPATIBILITY Broker-protocol method; "
                     "GUARDED_ENGINE mode requires cancel_guarded(request=CancelExecutionRequest(...)) "
                     "-- see the module docstring"
+                )
+            if self._engine is not None:
+                self._require_ownership(
+                    environment, account_no, ownership_symbol, source
                 )
             return self._real_broker.cancel_order(
                 environment=environment, account_no=account_no, is_reserved=is_reserved, **kwargs
@@ -1126,6 +1139,9 @@ class ExecutionCommandGateway:
 
 _default_gateway_lock = threading.Lock()
 _default_gateway: Optional[ExecutionCommandGateway] = None
+_legacy_gateways_by_engine: "weakref.WeakKeyDictionary[Engine, ExecutionCommandGateway]" = (
+    weakref.WeakKeyDictionary()
+)
 
 
 def get_default_execution_gateway() -> ExecutionCommandGateway:
@@ -1144,6 +1160,28 @@ def get_default_execution_gateway() -> ExecutionCommandGateway:
             if _default_gateway is None:
                 _default_gateway = ExecutionCommandGateway(real_broker=KisBroker())
     return _default_gateway
+
+
+def get_legacy_execution_gateway(engine: Engine) -> ExecutionCommandGateway:
+    """Compatibility gateway with durable H1 ownership enforcement.
+
+    UI/runtime callers that have the shared database must use this variant;
+    the engine-less singleton remains only for standalone/backward-compatible
+    callers that have no ownership database in scope.
+    """
+
+    if engine is None:
+        return get_default_execution_gateway()
+    with _default_gateway_lock:
+        gateway = _legacy_gateways_by_engine.get(engine)
+        if gateway is None:
+            gateway = ExecutionCommandGateway(
+                real_broker=KisBroker(),
+                engine=engine,
+                mode_override=False,
+            )
+            _legacy_gateways_by_engine[engine] = gateway
+        return gateway
 
 
 def build_guarded_execution_gateway(

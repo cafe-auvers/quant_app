@@ -875,6 +875,7 @@ class StateReconcileResult:
     # live order submission so ExecutionAuthority can re-verify it at the
     # actual broker boundary. Empty whenever this device isn't main.
     lease_token: str = ""
+    lease_epoch: int = 0
 
 
 def _demote_after_lost_ownership(
@@ -883,6 +884,7 @@ def _demote_after_lost_ownership(
 ) -> LocalDeviceRole:
     result.is_main_device = False
     result.lease_token = ""
+    result.lease_epoch = 0
     try:
         role = set_local_device_main(role, False)
     except Exception as exc:
@@ -956,6 +958,9 @@ def reconcile_state_with_remote(
         result.main_device_hostname = main_device.hostname if main_device else ""
         result.lease_token = (
             main_device.lease_token if is_main and main_device else ""
+        )
+        result.lease_epoch = (
+            main_device.lease_epoch if is_main and main_device else 0
         )
 
         # Once startup reconciliation has established the base revisions, the
@@ -1215,6 +1220,7 @@ def auto_claim_main_device_if_stale(
             is_main_device=True,
             main_device_hostname=role.hostname,
             lease_token=ownership.main_device.lease_token if ownership.main_device else "",
+            lease_epoch=ownership.main_device.lease_epoch if ownership.main_device else 0,
             local_role=LocalDeviceRole(role.device_id, role.hostname, True),
         )
     return reconcile_state_with_remote(engine, role, save_lock=save_lock)
