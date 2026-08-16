@@ -224,9 +224,11 @@ def test_stop_price_change_forces_drain_against_old_version_first():
     current = accumulator.drain("AAPL")
 
     assert detached.stop_rules == (old,)
-    assert detached.pending.breached_stop_versions == {old.card_key: "old"}
+    assert detached.pending.breached_stop_versions == {(old.card_key, "old")}
     assert current.stop_rules == (new,)
-    assert current.pending.breached_stop_versions == {}
+    # The v1 identity is bucket-level and remains visible across the v2
+    # accumulator generation until the engine acknowledges that exact pair.
+    assert current.pending.breached_stop_versions == {(old.card_key, "old")}
 
 
 def test_trade_during_stop_change_is_assigned_once():
@@ -256,6 +258,63 @@ def test_latch_clears_only_on_explicit_engine_acknowledgement():
     assert accumulator.drain("AAPL").pending.stop_breach_latched
     assert accumulator.acknowledge_breach("AAPL", "card", "v1")
     assert not accumulator.drain("AAPL").pending.stop_breach_latched
+
+
+def test_stop_rotation_preserves_old_breach_until_exact_acknowledgement():
+    accumulator = PendingMarketStateAccumulator(clock=lambda: NOW)
+    accumulator.replace_stop_rules("AAPL", [StopRule("card", 100, "v1")])
+    accumulator.publish_trade(_event(price=99, fingerprint="v1-breach"))
+
+    accumulator.replace_stop_rules("AAPL", [StopRule("card", 98, "v2")])
+    drained = accumulator.drain_all()
+
+    assert any(
+        ("card", "v1") in item.pending.breached_stop_versions
+        for item in drained
+    )
+    assert accumulator.acknowledge_breach("AAPL", "card", "v1")
+    assert not accumulator.drain("AAPL").pending.stop_breach_latched
+
+
+def test_two_stop_versions_can_remain_latched_and_acknowledge_independently():
+    accumulator = PendingMarketStateAccumulator(clock=lambda: NOW)
+    accumulator.replace_stop_rules("AAPL", [StopRule("card", 100, "v1")])
+    accumulator.publish_trade(_event(price=99, fingerprint="v1-breach"))
+    accumulator.replace_stop_rules("AAPL", [StopRule("card", 98, "v2")])
+    accumulator.publish_trade(
+        _event(price=97, seconds=1, fingerprint="v2-breach")
+    )
+
+    identities = {
+        identity
+        for item in accumulator.drain_all()
+        for identity in item.pending.breached_stop_versions
+    }
+    assert identities == {("card", "v1"), ("card", "v2")}
+
+    assert accumulator.acknowledge_breach("AAPL", "card", "v1")
+    assert accumulator.drain("AAPL").pending.breached_stop_versions == {
+        ("card", "v2")
+    }
+    assert accumulator.acknowledge_breach("AAPL", "card", "v2")
+    assert not accumulator.drain("AAPL").pending.stop_breach_latched
+
+
+def test_unacknowledged_breach_replay_never_regresses_latest_quote_cache():
+    service, _ = _service()
+    service.replace_stop_rules("AAPL", [StopRule("card", 100, "v1")])
+    service.ingest_trade(_event(price=99, fingerprint="breach"))
+    service.poll_once()
+
+    service.ingest_trade(_event(price=105, seconds=1, fingerprint="recovery"))
+    replay_window = service.poll_once()
+
+    assert any(
+        event.last_price == 99
+        and ("card", "v1") in event.breached_stop_versions
+        for event in replay_window
+    )
+    assert service.latest_quote("AAPL").last_price == 105
 
 
 def test_execution_notice_never_substitutes_for_broker_reconciled_fill():
@@ -352,3 +411,12 @@ def test_subscription_ack_timeout_blocks_only_that_symbol_and_alerts(monkeypatch
     )
     assert "ACK timeout" in service.symbol_state("AAPL").last_error
     assert alerts
+
+
+def test_verified_halt_state_is_exposed_without_inferring_it_from_staleness():
+    service, _ = _service()
+    assert not service.is_symbol_trading_halted("AAPL")
+    service.set_symbol_trading_halted("AAPL", True)
+    assert service.is_symbol_trading_halted("AAPL")
+    service.set_symbol_trading_halted("AAPL", False)
+    assert not service.is_symbol_trading_halted("AAPL")

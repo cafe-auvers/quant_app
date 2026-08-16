@@ -185,6 +185,15 @@ class RealtimeMarketDataService:
         """Whether the backend has everything needed to price a new BUY."""
         return self.is_symbol_execution_ready(symbol, now=now)
 
+    def is_symbol_trading_halted(self, symbol: str) -> bool:
+        """Whether a separately verified feed signal says execution is halted.
+
+        Backends that cannot prove halt state return False.  A broker-side
+        rejection still remains authoritative; this seam only lets a known
+        halt prevent futile emergency submissions while retaining intent.
+        """
+        return False
+
 
 class InMemoryQuoteCache:
     """Thread-safe last-quote-per-symbol cache any backend can share."""

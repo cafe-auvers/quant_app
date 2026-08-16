@@ -72,6 +72,7 @@ from src.services.entry_attempt_manager import (
 )
 from src.services.execution_command_gateway import (
     AmbiguousPostBrokerPersistenceError,
+    GuardedCancellationRejectedError,
     GuardedSubmissionAmbiguousError,
 )
 from src.services.execution_command_repository import DuplicateCommandError
@@ -103,6 +104,7 @@ _OUTCOME_TO_ENTRY_RUNTIME_STATUS = {
 _DATA_STALE_WARNING = "DATA_STALE"
 _OUTAGE_HIGH_WARNING = "MARKET_DATA_OUTAGE_HIGH"
 _OUTAGE_LOW_WARNING = "MARKET_DATA_OUTAGE_LOW"
+_TRADING_HALT_EXIT_WARNING = "TRADING_HALT_EXIT_PENDING"
 # Section 5's PARTIAL_EXIT_ATTEMPT_TTL_SECONDS / SELL_ALL_ATTEMPT_TTL_SECONDS /
 # EXIT_CANCEL_CONFIRMATION_TIMEOUT_SECONDS: surfaced on the card the same way
 # _DATA_STALE_WARNING already is, so a liquidation cancel that the broker
@@ -211,6 +213,7 @@ class TradingEngine:
             Callable[[TradeCardState, Optional[QuoteSnapshot]], str]
         ] = None,
         unattended_session: Optional[Callable[[], bool]] = None,
+        trading_halt_lookup: Optional[Callable[[str], bool]] = None,
         clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         self._entry_attempt_manager = entry_attempt_manager
@@ -239,6 +242,7 @@ class TradingEngine:
             lambda card, quote: ""
         )
         self._unattended_session = unattended_session or (lambda: True)
+        self._trading_halt_lookup = trading_halt_lookup or (lambda symbol: False)
         self._clock = clock
 
     @staticmethod
@@ -285,6 +289,30 @@ class TradingEngine:
                 )
         return changed
 
+    def evaluate_entry_quote(
+        self, cards: List[TradeCardState], quote: QuoteSnapshot
+    ) -> List[TradeCardState]:
+        """Consume one representative trade event for BUY_TODAY entries.
+
+        The market-data accumulator can coalesce a busy drain window, but it
+        emits the actual min/max trade snapshots.  Entry decisions must use
+        those event prices directly rather than consulting only the cache's
+        final trade, otherwise a 100 -> 105 -> 101 breakout path disappears.
+        Callers pass only mutation-ready cards; this method does not widen
+        reconciliation or ownership authorization.
+        """
+        if not self.is_enabled() or not quote.regular_session:
+            return []
+        symbol = quote.symbol.upper()
+        matching = [
+            card
+            for card in cards
+            if card.symbol == symbol and card.board_status == BoardStatus.BUY_TODAY
+        ]
+        if not matching:
+            return []
+        return self._evaluate_buy_today(matching, quote_overrides={symbol: quote})
+
     def _evaluate_quote_for_card(self, card: TradeCardState, quote: QuoteSnapshot) -> bool:
         was_exit_required = card.exit_all_required
         was_board_status = card.board_status
@@ -317,29 +345,7 @@ class TradingEngine:
                     ),
                 )
             else:
-                # Section 500-504: "stop hit while completing entry" --
-                # an ENTRY_COMPLETING card still has board_status
-                # OPEN_POSITION, so it reaches this branch too. Cancel any
-                # remaining BUY order for the target completion before
-                # selling the actual (already-filled) remainder.
-                working_buy = self._entry_deadline_lookup.find_open_entry_order(card)
-                if working_buy is not None:
-                    # Keep tracking this cancellation through to broker
-                    # confirmation (_entry_tracking_scope stays keyed on
-                    # entry_cancel_in_flight for exactly this case) so its
-                    # capital reservation is actually settled, and tag the
-                    # reason EXIT_ALL so the remainder is never retried once
-                    # the cancel confirms (review finding P0-6).
-                    card.entry_cancel_in_flight = True
-                    card.entry_cancel_reason = EntryCancelReason.EXIT_ALL.value
-                self._position_manager.start_sell_all(
-                    card,
-                    callbacks=self._position_callbacks,
-                    working_buy_client_order_id=(
-                        working_buy.client_order_id if working_buy is not None else None
-                    ),
-                )
-                card.entry_remaining_target_quantity = 0
+                self._initiate_sell_all(card)
 
         return (
             card.exit_all_required != was_exit_required
@@ -350,6 +356,63 @@ class TradingEngine:
     def _clear_stale_warning(self, card: TradeCardState) -> None:
         if _DATA_STALE_WARNING in card.warnings:
             card.warnings = [w for w in card.warnings if w != _DATA_STALE_WARNING]
+
+    def _entry_conflict_clear_for_liquidation(
+        self, card: TradeCardState
+    ) -> tuple[bool, bool]:
+        """Cancel and track any completion BUY before a liquidation SELL.
+
+        Returns ``(clear_to_sell, card_changed)``.  The in-flight marker is
+        deliberately a hard fence even if a transient lookup returns no
+        order; broker-confirmed terminal reconciliation owns clearing it.
+        """
+        changed = False
+        if card.entry_remaining_target_quantity:
+            card.entry_remaining_target_quantity = 0
+            changed = True
+        working_buy = self._entry_deadline_lookup.find_open_entry_order(card)
+        if working_buy is not None:
+            if not card.entry_cancel_in_flight:
+                card.entry_cancel_in_flight = True
+                card.entry_cancel_reason = EntryCancelReason.EXIT_ALL.value
+                changed = True
+                self._position_callbacks.request_cancel(
+                    card, working_buy.client_order_id, scope="ENTRY"
+                )
+            return False, changed
+        if card.entry_cancel_in_flight or card.entry_submission_unresolved:
+            return False, changed
+        return True, changed
+
+    def _initiate_sell_all(
+        self, card: TradeCardState, *, queue_for_market_open: bool = False
+    ) -> bool:
+        """One initiation path for stop, user, and feed-outage liquidation."""
+        before = (
+            card.board_status,
+            card.position_runtime_status,
+            card.exit_all_required,
+            card.sell_all_at_market_open,
+            card.entry_remaining_target_quantity,
+            card.entry_cancel_in_flight,
+            card.entry_cancel_reason,
+        )
+        self._position_manager.start_sell_all(
+            card, callbacks=self._position_callbacks
+        )
+        if queue_for_market_open:
+            self._position_manager.queue_sell_all_at_market_open(card)
+        self._entry_conflict_clear_for_liquidation(card)
+        after = (
+            card.board_status,
+            card.position_runtime_status,
+            card.exit_all_required,
+            card.sell_all_at_market_open,
+            card.entry_remaining_target_quantity,
+            card.entry_cancel_in_flight,
+            card.entry_cancel_reason,
+        )
+        return before != after
 
     # --- Heartbeat (section 789-799) -----------------------------------
 
@@ -459,7 +522,12 @@ class TradingEngine:
 
     # -- BUY_TODAY -> entry attempts -------------------------------------
 
-    def _evaluate_buy_today(self, cards: List[TradeCardState]) -> List[TradeCardState]:
+    def _evaluate_buy_today(
+        self,
+        cards: List[TradeCardState],
+        *,
+        quote_overrides: Optional[Dict[str, QuoteSnapshot]] = None,
+    ) -> List[TradeCardState]:
         triggers: List[EntryTrigger] = []
         trigger_cards: Dict[str, TradeCardState] = {}
         changed: List[TradeCardState] = []
@@ -482,7 +550,9 @@ class TradingEngine:
                 # entries" -- checked independently of quote staleness so a
                 # disconnect blocks entries immediately, not only once the
                 # last cached quote ages past QUOTE_STALE_AFTER_SECONDS.
-                quote = self._market_data.latest_quote(card.symbol)
+                quote = (quote_overrides or {}).get(card.symbol)
+                if quote is None:
+                    quote = self._market_data.latest_quote(card.symbol)
                 if not self._market_data.entry_quote_ready(card.symbol, now=now):
                     # Section 826, 839: a stale/missing execution-grade quote
                     # blocks the attempt outright -- never guess with the
@@ -1154,7 +1224,7 @@ class TradingEngine:
             if not self._market_is_open():
                 continue
             try:
-                self._position_manager.start_sell_all(card, callbacks=self._position_callbacks)
+                self._initiate_sell_all(card)
                 card.sell_all_at_market_open = False
                 changed.append(card)
             except Exception:
@@ -1281,8 +1351,29 @@ class TradingEngine:
             if card.exit_submission_unresolved:
                 continue
             try:
+                clear_to_sell, conflict_changed = (
+                    self._entry_conflict_clear_for_liquidation(card)
+                )
+                if conflict_changed and card not in changed:
+                    changed.append(card)
+                if not clear_to_sell:
+                    continue
                 if self._position_callbacks.find_open_sell_order(card) is not None:
                     continue  # already working, or its cancel hasn't confirmed yet
+                if self._trading_halt_lookup(card.symbol):
+                    if _TRADING_HALT_EXIT_WARNING not in card.warnings:
+                        card.warnings = [*card.warnings, _TRADING_HALT_EXIT_WARNING]
+                        if card not in changed:
+                            changed.append(card)
+                    continue
+                if _TRADING_HALT_EXIT_WARNING in card.warnings:
+                    card.warnings = [
+                        warning
+                        for warning in card.warnings
+                        if warning != _TRADING_HALT_EXIT_WARNING
+                    ]
+                    if card not in changed:
+                        changed.append(card)
                 remaining = self._position_callbacks.refresh_orderable_quantity(
                     card.environment, card.account_no, card.symbol
                 )
@@ -1326,6 +1417,16 @@ class TradingEngine:
                 card.next_exit_retry_at = None
                 card.last_exit_error = f"UNRESOLVED: {exc}"[:500]
                 changed.append(card)
+            except GuardedCancellationRejectedError as exc:
+                # request_cancel_with_lifecycle already retired the failed
+                # caller-owned ID and cleared the in-flight marker. This was
+                # not a SELL submission failure, so do not consume an exit
+                # attempt or impose a sell-retry backoff; the next heartbeat
+                # may make a fresh cancellation decision with a fresh ID.
+                card.next_exit_retry_at = None
+                card.last_exit_error = f"Entry cancel rejected: {exc}"[:500]
+                if card not in changed:
+                    changed.append(card)
             except Exception as exc:
                 logger.exception("_retry_incomplete_sell_alls failed for %s", card.symbol)
                 self._back_off_exit_retry(card, str(exc))
@@ -1407,7 +1508,6 @@ class TradingEngine:
                     and quote.last_price > 0
                     and (
                         card.market_data_outage_started_at is not None
-                        or card.market_data_outage_risk_tier
                         or _OUTAGE_HIGH_WARNING in card.warnings
                         or _OUTAGE_LOW_WARNING in card.warnings
                     )
@@ -1422,8 +1522,29 @@ class TradingEngine:
                     )
                     card.market_data_last_trusted_price = float(quote.last_price)
                     card.market_data_last_trusted_at = quote.broker_event_at
+                    try:
+                        recovered_equity = float(
+                            self._account_equity_provider(
+                                card.environment, card.account_no
+                            )
+                            or 0.0
+                        )
+                    except Exception:
+                        recovered_equity = 0.0
+                    recovered_tier = classify_market_data_outage_risk(
+                        card,
+                        trusted_price=float(quote.last_price),
+                        account_equity=recovered_equity,
+                        bid=quote.bid,
+                        ask=quote.ask,
+                        liquidity_tier=self._liquidity_tier_lookup(card, quote),
+                    )
                     card.market_data_outage_started_at = None
-                    card.market_data_outage_risk_tier = ""
+                    # Preserve the immediate classification of genuinely new
+                    # trusted symbol data.  It is the baseline if another
+                    # outage begins and makes LOW -> HIGH recovery observable
+                    # instead of erasing the state without evaluating it.
+                    card.market_data_outage_risk_tier = recovered_tier.value
                     card.warnings = [w for w in card.warnings if w not in outage_warnings]
                     after = (
                         card.market_data_last_trusted_price,
@@ -1518,11 +1639,11 @@ class TradingEngine:
                     and not card.exit_all_required
                 ):
                     if self._market_is_open():
-                        self._position_manager.start_sell_all(
-                            card, callbacks=self._position_callbacks
-                        )
+                        self._initiate_sell_all(card)
                     else:
-                        self._position_manager.queue_sell_all_at_market_open(card)
+                        self._initiate_sell_all(
+                            card, queue_for_market_open=True
+                        )
                     if card not in changed:
                         changed.append(card)
             except Exception:

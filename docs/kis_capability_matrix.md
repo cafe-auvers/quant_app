@@ -5,15 +5,18 @@ Status: **SKELETON — no rows verified yet**
 This is the required output of Workstream 0
 ([kanban_production_readiness.md](kanban_production_readiness.md)). Every
 row below must be filled in with evidence from the real KIS API (production
-read-only and/or simulation) before the corresponding gated workstream
-starts:
+read-only and/or simulation) before the corresponding capability is activated
+or treated as verified:
 
-- Workstream 2's A4a/A4b (durable order ownership) is gated on the
+- Workstream 2's A4a exact-correlation recovery is gated on the
   "External correlation key", "Correlation recovery", "Broker order ID",
   "History latency", and "History completeness" rows.
-- Workstream 5's D1 (WebSocket client) is gated on the "WebSocket symbol key
-  format", "WebSocket connection/subscription limits", "Quote timestamp
-  fields", "Sequence numbering", and "Execution notice encryption" rows.
+- Workstream 5's provisional D1/D3/D11 adapter may be implemented inactive
+  under requirements-contract revision 3.4. Live connection/subscription,
+  execution-grade timestamp/sequence interpretation, and non-zero capacity
+  remain gated on the "WebSocket symbol key format", "WebSocket
+  connection/subscription limits", "Quote timestamp fields", "Sequence
+  numbering", and "Execution notice encryption" rows.
 
 **This matrix cannot be filled in from this development environment** — it
 has no live KIS production or simulation credentials. It must be completed
@@ -229,7 +232,8 @@ live test notice.
 ## Sign-off
 
 This matrix is complete when every row above has a filled-in `Status: ✅
-Verified` and a recorded `Finding`. Until then, Workstream 2's A4a/A4b and
-Workstream 5's D1 remain blocked per
+Verified` and a recorded `Finding`. Until then, Workstream 2's A4a remains
+implementation-blocked, while Workstream 5's provisional D1/D3/D11 adapter
+remains activation-blocked and non-authoritative per
 [kanban_production_readiness.md](kanban_production_readiness.md)'s
 Workstream 0 gate.

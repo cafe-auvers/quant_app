@@ -1536,6 +1536,25 @@ def test_low_tier_position_holds_until_hard_ceiling(tmp_path, monkeypatch):
     assert card.exit_all_required
 
 
+def test_frozen_tier_does_not_escalate_from_time_without_duration_ceiling(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(execution_config, "MARKET_DATA_OUTAGE_MAX_HOLD_SECONDS", 0)
+    now = [dt.datetime.now(dt.timezone.utc)]
+    engine = _make_engine(tmp_path)
+    engine._clock = lambda: now[0]
+    card = _open_card(active_stop_price=50.0)
+    _seed_then_disconnect(engine)
+
+    engine.run_heartbeat([card])
+    assert card.market_data_outage_risk_tier == "LOW"
+    now[0] += dt.timedelta(days=7)
+    engine.run_heartbeat([card])
+
+    assert card.market_data_outage_risk_tier == "LOW"
+    assert not card.exit_all_required
+
+
 def test_broader_market_signal_escalates_frozen_low_tier(tmp_path):
     signal = [False]
     now = [dt.datetime.now(dt.timezone.utc)]
@@ -1550,6 +1569,156 @@ def test_broader_market_signal_escalates_frozen_low_tier(tmp_path):
     signal[0] = True
     engine.run_heartbeat([card])
     assert card.market_data_outage_risk_tier == "HIGH"
+
+
+def test_recovered_trusted_symbol_price_reclassifies_immediately(tmp_path):
+    now = [dt.datetime.now(dt.timezone.utc)]
+    engine = _make_engine(tmp_path)
+    engine._clock = lambda: now[0]
+    card = _open_card(active_stop_price=50.0)
+    _seed_then_disconnect(engine)
+    engine.run_heartbeat([card])
+    assert card.market_data_outage_risk_tier == "LOW"
+
+    recovered = QuoteSnapshot(
+        symbol="AAPL",
+        last_price=51.0,
+        bid=50.9,
+        ask=51.1,
+        broker_event_at=now[0],
+        received_at=now[0],
+    )
+    engine._market_data._cache.update(recovered)
+    engine._market_data._connected = True
+    engine.run_heartbeat([card])
+
+    assert card.market_data_outage_started_at is None
+    assert card.market_data_last_trusted_price == 51.0
+    assert card.market_data_outage_risk_tier == "HIGH"
+
+
+def test_high_outage_outside_session_persists_next_session_sell_intent(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(execution_config, "MARKET_DATA_OUTAGE_GRACE_SECONDS", 1)
+    now = [dt.datetime.now(dt.timezone.utc)]
+    sells = []
+    engine = _make_engine(tmp_path)
+    engine._clock = lambda: now[0]
+    engine._market_is_open_fn = lambda: False
+    engine._position_callbacks.submit_sell_order = lambda **kwargs: sells.append(kwargs)
+    card = _open_card(active_stop_price=99.5)
+    _seed_then_disconnect(engine)
+
+    engine.run_heartbeat([card])
+    now[0] += dt.timedelta(seconds=2)
+    engine.run_heartbeat([card])
+
+    assert card.board_status == BoardStatus.SELL_ALL
+    assert card.sell_all_at_market_open is True
+    assert card.position_runtime_status == PositionRuntimeStatus.QUEUED_FOR_OPEN
+    assert sells == []
+
+
+def test_verified_trading_halt_retains_exit_intent_and_retries_when_resumed(
+    tmp_path,
+):
+    halted = [True]
+    sells = []
+    engine = _make_engine(tmp_path)
+    engine._trading_halt_lookup = lambda symbol: halted[0]
+    engine._position_callbacks = PositionActionCallbacks(
+        cancel_order=lambda intent: None,
+        submit_sell_order=lambda **kwargs: sells.append(kwargs),
+        refresh_orderable_quantity=lambda *args: 30,
+    )
+    card = _open_card(
+        board_status=BoardStatus.SELL_ALL,
+        position_runtime_status=PositionRuntimeStatus.LIQUIDATING,
+        exit_all_required=True,
+        broker_quantity=30,
+        orderable_quantity=30,
+    )
+
+    engine.run_heartbeat([card])
+    assert sells == []
+    assert card.exit_all_required
+    assert "TRADING_HALT_EXIT_PENDING" in card.warnings
+
+    halted[0] = False
+    engine.run_heartbeat([card])
+    assert len(sells) == 1
+    assert "TRADING_HALT_EXIT_PENDING" not in card.warnings
+
+
+def test_outage_sell_all_cancels_completion_buy_before_one_sell(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(execution_config, "MARKET_DATA_OUTAGE_GRACE_SECONDS", 1)
+    now = [dt.datetime.now(dt.timezone.utc)]
+    order = _pending_order(
+        status=OrderStatus.WORKING,
+        filled=0,
+        deadline_seconds_ago=-3600,
+    )
+    cancel_calls = []
+    sell_calls = []
+    confirm_cancel = [False]
+
+    def find_entry(card):
+        return order if order.is_open() else None
+
+    def reconcile_entry(current):
+        if confirm_cancel[0] and current.status == OrderStatus.CANCEL_REQUESTED:
+            current.status = OrderStatus.CANCELLED
+        return current
+
+    engine = _make_engine(
+        tmp_path,
+        find_order=find_entry,
+        reconcile_order=reconcile_entry,
+    )
+    engine._clock = lambda: now[0]
+
+    def cancel_entry(intent):
+        cancel_calls.append(intent.client_order_id)
+        order.status = OrderStatus.CANCEL_REQUESTED
+
+    engine._position_callbacks = PositionActionCallbacks(
+        cancel_order=cancel_entry,
+        submit_sell_order=lambda **kwargs: sell_calls.append(kwargs),
+        refresh_orderable_quantity=lambda *args: 30,
+    )
+    card = _open_card(
+        broker_quantity=30,
+        orderable_quantity=30,
+        target_position_quantity=100,
+        entry_remaining_target_quantity=70,
+        position_runtime_status=PositionRuntimeStatus.ENTRY_COMPLETING,
+        active_stop_price=99.5,
+        entry_client_order_id=order.client_order_id,
+        entry_attempt_group_id="completion-group",
+    )
+    _seed_then_disconnect(engine)
+
+    engine.run_heartbeat([card])
+    now[0] += dt.timedelta(seconds=2)
+    engine.run_heartbeat([card])
+
+    assert cancel_calls == [order.client_order_id]
+    assert card.entry_cancel_in_flight is True
+    assert card.board_status == BoardStatus.SELL_ALL
+    assert sell_calls == []
+
+    engine.run_heartbeat([card])
+    assert sell_calls == []
+
+    confirm_cancel[0] = True
+    engine.run_heartbeat([card])
+
+    assert card.entry_cancel_in_flight is False
+    assert len(sell_calls) == 1
+    assert sell_calls[0]["quantity"] == 30
 
 
 def test_tier_classification_considers_account_level_risk_factors(monkeypatch):

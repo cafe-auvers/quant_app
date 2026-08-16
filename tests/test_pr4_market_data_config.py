@@ -60,3 +60,18 @@ def test_live_factory_requires_both_enable_and_protocol_verification(monkeypatch
         assert "Workstream 0" in str(exc)
     else:
         raise AssertionError("unverified KIS protocol must fail closed")
+
+
+def test_ws0_contract_explicitly_allows_only_inactive_provisional_adapters():
+    contract = (ROOT / "docs" / "kanban_production_readiness.md").read_text(
+        encoding="utf-8"
+    )
+    matrix = (ROOT / "docs" / "kis_capability_matrix.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "revision 3.4 amendment recorded" in contract
+    assert "May be written provisionally before evidence" in contract
+    assert "KIS_WS_PROTOCOL_VERIFIED=true or a live connection/subscription" in contract
+    assert "non-zero production/simulation channel capacity" in contract
+    assert "provisional D1/D3/D11 adapter may be implemented inactive" in matrix

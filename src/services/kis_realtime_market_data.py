@@ -98,6 +98,7 @@ class SymbolFeedState:
     quote_error: str = ""
     clock_health: ClockHealth = ClockHealth.HEALTHY
     reconnect_generation: int = 0
+    trading_halted: bool = False
 
 
 @dataclass(frozen=True)
@@ -111,6 +112,8 @@ class StopRule:
 class PendingMarketState:
     latest_trade: Optional[QuoteSnapshot] = None
     latest_quote: Optional[QuoteSnapshot] = None
+    minimum_trade: Optional[QuoteSnapshot] = None
+    maximum_trade: Optional[QuoteSnapshot] = None
     minimum_trade_price_since_drain: Optional[float] = None
     maximum_trade_price_since_drain: Optional[float] = None
     first_event_at: Optional[datetime] = None
@@ -118,7 +121,7 @@ class PendingMarketState:
     event_count: int = 0
     stop_breach_latched: bool = False
     breached_stop_version: Optional[str] = None
-    breached_stop_versions: Dict[str, str] = field(default_factory=dict)
+    breached_stop_versions: set[tuple[str, str]] = field(default_factory=set)
     channel_error: str = ""
 
     def add_trade(self, quote: QuoteSnapshot, stop_rules: Mapping[str, StopRule]) -> None:
@@ -127,22 +130,24 @@ class PendingMarketState:
         if not quote.regular_session:
             self._record_event(quote.received_at)
             return
-        self.minimum_trade_price_since_drain = (
-            price
-            if self.minimum_trade_price_since_drain is None
-            else min(self.minimum_trade_price_since_drain, price)
-        )
-        self.maximum_trade_price_since_drain = (
-            price
-            if self.maximum_trade_price_since_drain is None
-            else max(self.maximum_trade_price_since_drain, price)
-        )
+        if (
+            self.minimum_trade_price_since_drain is None
+            or price < self.minimum_trade_price_since_drain
+        ):
+            self.minimum_trade_price_since_drain = price
+            self.minimum_trade = quote
+        if (
+            self.maximum_trade_price_since_drain is None
+            or price > self.maximum_trade_price_since_drain
+        ):
+            self.maximum_trade_price_since_drain = price
+            self.maximum_trade = quote
         for card_key, rule in stop_rules.items():
             if price <= rule.price:
-                self.breached_stop_versions[card_key] = rule.version
+                self.breached_stop_versions.add((card_key, rule.version))
         self.stop_breach_latched = bool(self.breached_stop_versions)
         if self.breached_stop_versions:
-            self.breached_stop_version = next(iter(self.breached_stop_versions.values()))
+            self.breached_stop_version = next(iter(self.breached_stop_versions))[1]
         self._record_event(quote.received_at)
 
     def add_quote(self, quote: QuoteSnapshot) -> None:
@@ -161,6 +166,7 @@ class DetachedMarketState:
     pending: PendingMarketState
     stop_rules: tuple[StopRule, ...]
     detached_at: datetime
+    latch_replay: bool = False
 
 
 class PendingMarketStateAccumulator:
@@ -171,6 +177,12 @@ class PendingMarketStateAccumulator:
         lock: threading.RLock = field(default_factory=threading.RLock)
         pending: PendingMarketState = field(default_factory=PendingMarketState)
         stop_rules: Dict[str, StopRule] = field(default_factory=dict)
+        # A breach belongs to the symbol bucket, not to one accumulator
+        # generation.  Stop rotation may detach the generation that first
+        # observed it, but only an exact engine acknowledgement removes it.
+        pending_breaches: Dict[
+            tuple[str, str], tuple[QuoteSnapshot, StopRule]
+        ] = field(default_factory=dict)
 
     def __init__(self, *, clock: Callable[[], datetime] = _utc_now) -> None:
         self._clock = clock
@@ -187,7 +199,13 @@ class PendingMarketStateAccumulator:
     def publish_trade(self, quote: QuoteSnapshot) -> None:
         bucket = self._bucket(quote.symbol)
         with bucket.lock:
+            before = set(bucket.pending.breached_stop_versions)
             bucket.pending.add_trade(quote, bucket.stop_rules)
+            for identity in bucket.pending.breached_stop_versions - before:
+                card_key, version = identity
+                rule = bucket.stop_rules.get(card_key)
+                if rule is not None and rule.version == version:
+                    bucket.pending_breaches.setdefault(identity, (quote, rule))
 
     def publish_quote(self, quote: QuoteSnapshot) -> None:
         bucket = self._bucket(quote.symbol)
@@ -222,20 +240,22 @@ class PendingMarketStateAccumulator:
         symbol = str(symbol or "").upper()
         bucket = self._bucket(symbol)
         with bucket.lock:
+            bucket.pending.breached_stop_versions.update(bucket.pending_breaches)
+            bucket.pending.stop_breach_latched = bool(
+                bucket.pending.breached_stop_versions
+            )
+            bucket.pending.breached_stop_version = (
+                next(iter(bucket.pending.breached_stop_versions))[1]
+                if bucket.pending.breached_stop_versions
+                else None
+            )
             detached = DetachedMarketState(
                 symbol=symbol,
                 pending=bucket.pending,
                 stop_rules=tuple(bucket.stop_rules.values()),
                 detached_at=self._clock(),
             )
-            # Breach state crosses ordinary drain boundaries and is removed
-            # only by explicit acknowledgement.
-            carried = dict(bucket.pending.breached_stop_versions)
-            bucket.pending = PendingMarketState(
-                stop_breach_latched=bool(carried),
-                breached_stop_version=(next(iter(carried.values())) if carried else None),
-                breached_stop_versions=carried,
-            )
+            bucket.pending = PendingMarketState()
             return detached
 
     def drain_all(self) -> list[DetachedMarketState]:
@@ -245,21 +265,97 @@ class PendingMarketStateAccumulator:
         with self._buckets_lock:
             symbols = list(self._buckets)
         detached.extend(self.drain(symbol) for symbol in symbols)
+
+        represented: Dict[str, set[tuple[str, str]]] = {}
+        for item in detached:
+            bucket = self._bucket(item.symbol)
+            with bucket.lock:
+                outstanding = dict(bucket.pending_breaches)
+            item.pending.breached_stop_versions.intersection_update(outstanding)
+            item.pending.stop_breach_latched = bool(
+                item.pending.breached_stop_versions
+            )
+            item.pending.breached_stop_version = (
+                next(iter(item.pending.breached_stop_versions))[1]
+                if item.pending.breached_stop_versions
+                else None
+            )
+            representatives = {
+                quote
+                for quote in (
+                    item.pending.minimum_trade,
+                    item.pending.maximum_trade,
+                    item.pending.latest_trade,
+                )
+                if quote is not None
+            }
+            for identity in item.pending.breached_stop_versions:
+                breach_quote, _ = outstanding[identity]
+                if breach_quote in representatives:
+                    represented.setdefault(item.symbol, set()).add(identity)
+
+        # If evaluation failed or acknowledgement was skipped after an older
+        # generation was drained, replay the exact breaching event and stop
+        # version on the next poll.  This is a latch replay, not a broker or
+        # market-data duplicate: it stops only after acknowledge_breach().
+        for symbol in symbols:
+            bucket = self._bucket(symbol)
+            with bucket.lock:
+                outstanding = dict(bucket.pending_breaches)
+            for identity, (quote, rule) in outstanding.items():
+                if identity in represented.get(symbol, set()):
+                    continue
+                detached.append(
+                    DetachedMarketState(
+                        symbol=symbol,
+                        pending=PendingMarketState(
+                            latest_trade=quote,
+                            minimum_trade=quote,
+                            maximum_trade=quote,
+                            minimum_trade_price_since_drain=float(quote.last_price),
+                            maximum_trade_price_since_drain=float(quote.last_price),
+                            first_event_at=quote.received_at,
+                            last_event_at=quote.received_at,
+                            event_count=1,
+                            stop_breach_latched=True,
+                            breached_stop_version=identity[1],
+                            breached_stop_versions={identity},
+                        ),
+                        stop_rules=(rule,),
+                        detached_at=self._clock(),
+                        latch_replay=True,
+                    )
+                )
         return [item for item in detached if item.pending.event_count or item.pending.stop_breach_latched]
 
     def acknowledge_breach(self, symbol: str, card_key: str, version: str) -> bool:
         bucket = self._bucket(symbol)
+        identity = (card_key, version)
         with bucket.lock:
-            if bucket.pending.breached_stop_versions.get(card_key) != version:
+            if identity not in bucket.pending_breaches:
                 return False
-            del bucket.pending.breached_stop_versions[card_key]
+            del bucket.pending_breaches[identity]
+            bucket.pending.breached_stop_versions.discard(identity)
             bucket.pending.stop_breach_latched = bool(bucket.pending.breached_stop_versions)
             bucket.pending.breached_stop_version = (
-                next(iter(bucket.pending.breached_stop_versions.values()))
+                next(iter(bucket.pending.breached_stop_versions))[1]
                 if bucket.pending.breached_stop_versions
                 else None
             )
-            return True
+        with self._detached_lock:
+            for item in self._detached:
+                if item.symbol != str(symbol or "").upper():
+                    continue
+                item.pending.breached_stop_versions.discard(identity)
+                item.pending.stop_breach_latched = bool(
+                    item.pending.breached_stop_versions
+                )
+                item.pending.breached_stop_version = (
+                    next(iter(item.pending.breached_stop_versions))[1]
+                    if item.pending.breached_stop_versions
+                    else None
+                )
+        return True
 
     def queue_depth(self) -> int:
         with self._detached_lock:
@@ -519,6 +615,16 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
     def acknowledge_stop_breach(self, symbol: str, card_key: str, version: str) -> bool:
         return self._accumulator.acknowledge_breach(symbol, card_key, version)
 
+    def set_symbol_trading_halted(self, symbol: str, halted: bool) -> None:
+        """Apply a verified halt signal without guessing from quote absence."""
+        symbol = str(symbol or "").upper()
+        with self._state_lock:
+            state = self._states.setdefault(symbol, SymbolFeedState(symbol=symbol))
+            state.trading_halted = bool(halted)
+
+    def is_symbol_trading_halted(self, symbol: str) -> bool:
+        return self.symbol_state(symbol).trading_halted
+
     def poll_once(self) -> list[QuoteSnapshot]:
         """Drain coalesced states; no network polling occurs."""
         processed_at = self._clock()
@@ -526,22 +632,31 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         for detached in self._accumulator.drain_all():
             pending = detached.pending
             overrides = tuple((rule.card_key, rule.price) for rule in detached.stop_rules)
-            if pending.latest_trade is not None:
+            breach_identities = tuple(sorted(pending.breached_stop_versions))
+            representative_trades: list[QuoteSnapshot] = []
+            for representative in (pending.minimum_trade, pending.maximum_trade):
+                if representative is not None and representative not in representative_trades:
+                    representative_trades.append(representative)
+            if not representative_trades and pending.latest_trade is not None:
+                representative_trades.append(pending.latest_trade)
+            representative_trades.sort(
+                key=lambda item: (item.received_at, item.broker_event_at)
+            )
+            for representative in representative_trades:
                 trade = replace(
-                    pending.latest_trade,
-                    last_price=(
-                        pending.minimum_trade_price_since_drain
-                        if pending.minimum_trade_price_since_drain is not None
-                        else pending.latest_trade.last_price
-                    ),
+                    representative,
                     processed_at=processed_at,
                     stop_price_overrides=overrides,
-                    breached_stop_versions=tuple(
-                        pending.breached_stop_versions.items()
-                    ),
+                    breached_stop_versions=breach_identities,
                 )
                 ready.append(trade)
-            latest = pending.latest_quote or pending.latest_trade
+            # A replay is an engine-delivery guarantee for a previously
+            # unacknowledged breach, not a new market observation.  Never let
+            # its historical event regress the latest-quote cache or fire a
+            # normal quote callback.
+            latest = None if detached.latch_replay else (
+                pending.latest_quote or pending.latest_trade
+            )
             if latest is not None:
                 current = self._cache.get(detached.symbol)
                 combined = replace(

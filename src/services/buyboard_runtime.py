@@ -209,16 +209,21 @@ def _marketable_sell_limit_price(
     last_trusted_price: Optional[float] = None,
     emergency_reprice_attempt: int = 0,
 ) -> Optional[float]:
-    """A marketable SELL limit: the live bid if one is cached (guaranteed
-    at/above what a market order would clear at this instant), else a small
-    discount off the last trade price -- mirrors the existing legacy Buy
+    """A bounded marketable SELL limit below a fresh bid, else a small
+    discount off the last trusted trade price -- mirrors the existing legacy Buy
     Dashboard's ``src.ui.buylist.constants.STOP_LOSS_SELL_LIMIT_DISCOUNT_PCT``
     approach (same number, re-declared as
     ``execution_config.SELL_MARKETABLE_DISCOUNT_PCT`` rather than importing
     across the services/ui boundary).
     """
     if quote_is_execution_ready and quote is not None and quote.bid:
-        return float(quote.bid)
+        # The bid is the reference, while the configured collar provides a
+        # bounded chance of execution if the top of book moves before the
+        # limit reaches the broker.  This remains a limit order, never an
+        # unbounded market order.
+        return float(quote.bid) * (
+            1.0 - execution_config.SELL_MARKETABLE_DISCOUNT_PCT
+        )
     reference = last_trusted_price
     if reference is None and quote_is_execution_ready and quote is not None:
         reference = quote.last_price
@@ -975,6 +980,7 @@ def build_buyboard_runtime(
         eod_window_reached=_eod_window_reached,
         prepare_entry_attempt=prepare_entry_attempt if guarded_mode else None,
         account_equity_provider=account_equity_provider,
+        trading_halt_lookup=resolved_market_data.is_symbol_trading_halted,
     )
 
     return BuyboardRuntime(

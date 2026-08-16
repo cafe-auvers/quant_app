@@ -1,6 +1,8 @@
 """Tests for src.services.buyboard_runtime (the P0-8 composition root)."""
 from __future__ import annotations
 
+import datetime as dt
+
 import pandas as pd
 import pytest
 
@@ -13,7 +15,7 @@ from src.core.order_state import (
     OrderStatus,
 )
 from src.core.execution_result import UnifiedExecutionStatus
-from src.core.trade_card_state import BoardStatus, TradeCardState
+from src.core.trade_card_state import BoardStatus, EntryRuntimeStatus, TradeCardState
 from src.services import buyboard_runtime as runtime_module
 from src.services import execution_workflow_service as workflow_module
 from src.services.broker import BrokerSubmissionResult
@@ -238,6 +240,159 @@ def test_submit_callback_reaches_the_guarded_gateway_not_wrongmode(
     assert result.status == UnifiedExecutionStatus.ACKNOWLEDGED
     assert persisted and persisted[0]["entry_client_order_id"]
     assert len(fake_broker.submit_calls) == 1
+
+
+def test_guarded_runtime_consumes_upward_extreme_before_latest_trade(
+    tmp_path, trading_enabled, monkeypatch
+):
+    from sqlalchemy import create_engine
+    from sqlalchemy.pool import NullPool
+
+    from fakes.fake_execution_broker import FakeExecutionBroker
+    from src.api.kis_websocket import KisWsSystemFrame
+    from src.core.execution_mode import ExecutionLease
+    from src.core.execution_ownership import ExecutionOwner, ExecutionOwnership
+    from src.services.execution_command_gateway import ExecutionCommandGateway
+    from src.services.execution_lease_protocol import FakeExecutionLeaseProtocol
+    from src.services.execution_ownership_repository import assign_ownership
+    from src.services.kis_realtime_market_data import (
+        KisRealtimeMarketDataService,
+        QUOTE_TR_ID,
+        SubscriptionPriority,
+        TRADE_TR_ID,
+    )
+    from src.services.mutation_budget_protocol import AllowAllMutationBudget
+
+    class Transport:
+        def on_data(self, callback):
+            self.data_callback = callback
+
+        def on_ack(self, callback):
+            self.ack_callback = callback
+
+        def on_connection(self, callback):
+            self.connection_callback = callback
+
+        def subscribe(self, subscriptions):
+            return None
+
+        def unsubscribe(self, subscriptions):
+            return None
+
+        def is_connected(self):
+            return True
+
+        reconnect_count = 0
+        malformed_frame_count = 0
+
+    observed_at = dt.datetime.now(dt.timezone.utc)
+    transport = Transport()
+    market_data = KisRealtimeMarketDataService(
+        transport=transport,
+        symbol_key_resolver=lambda symbol, channel: f"D{symbol}",
+        trade_capacity=1,
+        quote_capacity=1,
+        clock=lambda: observed_at,
+    )
+    market_data._on_connection(True, "", 1)
+    market_data.configure_desired_channels(
+        trade_priorities={"AAPL": SubscriptionPriority.BUY_TODAY},
+        quote_priorities={"AAPL": SubscriptionPriority.BUY_TODAY},
+    )
+    for tr_id in (TRADE_TR_ID, QUOTE_TR_ID):
+        market_data._on_ack(
+            KisWsSystemFrame(
+                tr_id=tr_id,
+                tr_key="DAAPL",
+                accepted=True,
+                message="SUBSCRIBE SUCCESS",
+            )
+        )
+
+    database = create_engine(
+        f"sqlite:///{tmp_path / 'upward-extreme.db'}",
+        future=True,
+        poolclass=NullPool,
+    )
+    broker = FakeExecutionBroker()
+    broker.queue_acceptance(broker_order_id="B-UPWARD-EXTREME")
+    lease = ExecutionLease(device_id="dev-1", lease_token="tok-1", lease_epoch=1)
+    gateway = ExecutionCommandGateway(
+        real_broker=broker,
+        engine=database,
+        mode_override=True,
+        lease_protocol=FakeExecutionLeaseProtocol(current=lease),
+        mutation_budget=AllowAllMutationBudget(),
+        buying_power_provider=lambda *_: 100_000.0,
+    )
+    assign_ownership(
+        database,
+        ExecutionOwnership(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            owner=ExecutionOwner.KANBAN,
+            strategy_instance_id="orb",
+        ),
+    )
+    card = _card(
+        entry_trigger=104.0,
+        breakout_price=104.0,
+        planned_quantity=10,
+        entry_runtime_status=EntryRuntimeStatus.EXECUTE_READY,
+    )
+    monkeypatch.setattr(runtime_module.execution_config, "is_buyboard_engine_enabled", lambda: True)
+    monkeypatch.setattr(
+        "src.services.trading_engine.is_buyboard_engine_enabled", lambda: True
+    )
+    runtime = runtime_module.build_buyboard_runtime(
+        buying_power_provider=lambda *_: 100_000.0,
+        card_lookup=lambda *_: card,
+        capital_reservation_engine=database,
+        broker=gateway,
+        market_data=market_data,
+        strategy_instance_id="orb",
+        execution_lease=lease,
+        persist_card_before_execution=lambda current: None,
+    )
+    runtime.trading_engine._clock = lambda: observed_at
+    runtime.trading_engine._market_is_open_fn = lambda: True
+
+    assert market_data.ingest_quote(
+        QuoteSnapshot(
+            symbol="AAPL",
+            last_price=101.0,
+            bid=100.9,
+            ask=101.1,
+            broker_event_at=observed_at,
+            received_at=observed_at,
+            channel=QUOTE_TR_ID,
+            payload_fingerprint="quote",
+        )
+    )
+    for index, price in enumerate((100.0, 105.0, 101.0)):
+        event_at = observed_at + dt.timedelta(milliseconds=index)
+        assert market_data.ingest_trade(
+            QuoteSnapshot(
+                symbol="AAPL",
+                last_price=price,
+                broker_event_at=event_at,
+                received_at=event_at,
+                channel=TRADE_TR_ID,
+                trade_id=str(index),
+                payload_fingerprint=f"trade-{index}",
+            )
+        )
+
+    events = market_data.poll_once()
+    assert 105.0 in [event.last_price for event in events]
+    assert market_data.entry_quote_ready("AAPL", now=observed_at)
+    for event in events:
+        runtime.trading_engine.evaluate_entry_quote([card], event)
+
+    assert card.entry_runtime_status == EntryRuntimeStatus.ORDER_PENDING
+    assert [call["limit_price"] for call in broker.submit_calls] == [105.0]
+    assert card.board_status == BoardStatus.ENTRY_PENDING
 
 
 def test_submit_order_wrapper_supplies_a_fresh_risk_decision(monkeypatch):
@@ -524,9 +679,39 @@ def test_submit_sell_order_maps_partial_sell_reason_and_prices_from_live_bid(mon
     assert order.status == UnifiedExecutionStatus.ACKNOWLEDGED
     assert captured["side"] == OrderSide.SELL
     assert captured["intent"] == OrderIntent.PARTIAL_EXIT
-    assert captured["limit_price"] == pytest.approx(99.5)  # uses the live bid
+    assert captured["limit_price"] == pytest.approx(
+        99.5 * (1 - runtime_module.execution_config.SELL_MARKETABLE_DISCOUNT_PCT)
+    )  # uses the live bid with the configured bounded collar
     assert captured["quantity"] == 50
     assert "reason" not in captured  # never forwarded to submit_guarded_overseas_order
+
+
+def test_emergency_sell_without_fresh_bid_uses_bounded_reprice_collars():
+    reference = 100.0
+    assert runtime_module._marketable_sell_limit_price(
+        None,
+        quote_is_execution_ready=False,
+        last_trusted_price=reference,
+        emergency_reprice_attempt=0,
+    ) == pytest.approx(
+        reference
+        * (1 - runtime_module.execution_config.SELL_MARKETABLE_DISCOUNT_PCT)
+    )
+    assert runtime_module._marketable_sell_limit_price(
+        None,
+        quote_is_execution_ready=False,
+        last_trusted_price=reference,
+        emergency_reprice_attempt=2,
+    ) == pytest.approx(
+        reference
+        * (1 - 3 * runtime_module.execution_config.SELL_MARKETABLE_DISCOUNT_PCT)
+    )
+    assert runtime_module._marketable_sell_limit_price(
+        None,
+        quote_is_execution_ready=False,
+        last_trusted_price=reference,
+        emergency_reprice_attempt=100,
+    ) == pytest.approx(95.0)
 
 
 def test_submit_sell_order_maps_sell_all_reasons_to_manual_exit_and_discounts_last_price(monkeypatch):

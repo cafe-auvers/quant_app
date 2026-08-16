@@ -482,6 +482,7 @@ class BuyboardRuntimeWorker(QThread):
 
         for quote in self.runtime.market_data.poll_once():
             _track(self.runtime.trading_engine.evaluate_quote(observation_cards, quote))
+            _track(self.runtime.trading_engine.evaluate_entry_quote(ready_cards, quote))
             self._acknowledge_market_breaches(quote, observation_cards)
 
         _track(self.runtime.trading_engine.run_heartbeat(ready_cards))
@@ -491,6 +492,7 @@ class BuyboardRuntimeWorker(QThread):
         if self._sync_market_stop_rules(observation_cards):
             for quote in self.runtime.market_data.poll_once():
                 _track(self.runtime.trading_engine.evaluate_quote(observation_cards, quote))
+                _track(self.runtime.trading_engine.evaluate_entry_quote(ready_cards, quote))
                 self._acknowledge_market_breaches(quote, observation_cards)
         # The full card set, not just ready_cards: UNRECONCILED_BROKER_ORDER
         # can be set by _refresh_account_state_if_due's order reconciliation,
@@ -504,6 +506,7 @@ class BuyboardRuntimeWorker(QThread):
 
     _EXIT_CANCEL_STALLED_WARNING = "EXIT_CANCEL_STALLED"
     _UNRECONCILED_BROKER_ORDER_WARNING = "UNRECONCILED_BROKER_ORDER"
+    _TRADING_HALT_EXIT_WARNING = "TRADING_HALT_EXIT_PENDING"
 
     # (warning name, alert-message builder) -- every critical, card-level
     # warning that must reach the user outside the app's own log pane, not
@@ -529,6 +532,14 @@ class BuyboardRuntimeWorker(QThread):
                 f"({card.environment}:{card.account_no}) was discovered with "
                 f"nothing local tracking it -- it cannot yet be automatically "
                 f"cancelled, repriced, or reconciled. Manual review required."
+            ),
+        ),
+        (
+            _TRADING_HALT_EXIT_WARNING,
+            lambda card: (
+                f"CRITICAL: liquidation for {card.symbol} "
+                f"({card.environment}:{card.account_no}) is retained but "
+                "broker submission is paused by a verified trading halt."
             ),
         ),
     )
