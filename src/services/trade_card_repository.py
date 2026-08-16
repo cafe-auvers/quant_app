@@ -64,6 +64,13 @@ _ensured_engines: "weakref.WeakSet[Engine]" = weakref.WeakSet()
 _ensure_lock = threading.Lock()
 
 
+def invalidate_trade_cards_table_cache(engine: Engine) -> None:
+    """Forget an ensure result after migration rollback drops the table."""
+
+    with _ensure_lock:
+        _ensured_engines.discard(engine)
+
+
 class TradeCardVersionConflictError(RuntimeError):
     """A write's ``expected_version`` no longer matches the stored row.
 

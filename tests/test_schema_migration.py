@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import MetaData, Table, create_engine, inspect, select
 
 from src.core.runtime_readiness import RuntimeDeviceState
 from src.core.schema_version import CURRENT_EXECUTION_SCHEMA_VERSION
@@ -20,6 +21,7 @@ from src.services.runtime_device_state_repository import (
     require_compatible_runtime_schema,
     save_runtime_device_state,
 )
+from src.services.state_sync import LocalDeviceRole, claim_main_device
 from src.services.schema_migration import (
     MigrationEntriesBlockedError,
     MigrationCutoverOwnershipError,
@@ -28,6 +30,8 @@ from src.services.schema_migration import (
     SchemaMigrationManager,
 )
 from src.services.trade_card_repository import (
+    create_trade_card,
+    ensure_trade_cards_table,
     get_trade_card,
     save_local_trade_cards_snapshot,
 )
@@ -222,6 +226,60 @@ def test_rollback_allowed_before_any_post_migration_broker_mutation(
     assert manager.state.phase == MigrationPhase.NOT_STARTED
 
 
+def test_direct_rollback_restores_datetime_rows_exactly(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    ensure_trade_cards_table(engine)
+    create_trade_card(engine, TradeCardState("PROD", "1", "AAPL"))
+    table = Table("trade_cards", MetaData(), autoload_with=engine)
+    original_updated_at = datetime(2026, 1, 2, 3, 4, 5, 678901)
+    with engine.begin() as conn:
+        conn.execute(table.update().values(updated_at=original_updated_at))
+        original = dict(conn.execute(select(table)).one()._mapping)
+
+    manager = _manager(tmp_path, monkeypatch)
+    _prepare(manager)
+    migrated_table = Table("trade_cards", MetaData(), autoload_with=manager.engine)
+    with manager.engine.begin() as conn:
+        conn.execute(
+            migrated_table.update().values(
+                updated_at=datetime(2030, 6, 7, 8, 9, 10),
+                payload='{"mutated":true}',
+            )
+        )
+
+    manager.rollback_direct(
+        device_id="pc-main", lease_token="token-8", lease_epoch=8
+    )
+
+    restored_table = Table("trade_cards", MetaData(), autoload_with=manager.engine)
+    with manager.engine.connect() as conn:
+        restored = dict(conn.execute(select(restored_table)).one()._mapping)
+    assert restored == original
+    assert restored["updated_at"] == original_updated_at
+
+
+def test_direct_rollback_drops_tables_that_were_absent_before_migration(
+    tmp_path, monkeypatch
+):
+    manager = _manager(tmp_path, monkeypatch)
+    target_tables = set(manager._DATABASE_TABLES)
+    assert target_tables.isdisjoint(inspect(manager.engine).get_table_names())
+
+    _prepare(manager)
+    assert target_tables.issubset(inspect(manager.engine).get_table_names())
+
+    manager.rollback_direct(
+        device_id="pc-main", lease_token="token-8", lease_epoch=8
+    )
+
+    assert target_tables.isdisjoint(inspect(manager.engine).get_table_names())
+
+    # The repository-level ensure caches must also be invalidated so a later
+    # retry can recreate the tables on this same long-lived Engine.
+    _prepare(manager)
+    assert target_tables.issubset(inspect(manager.engine).get_table_names())
+
+
 def test_direct_restore_refused_after_a_post_migration_broker_mutation(
     tmp_path, monkeypatch
 ):
@@ -237,6 +295,10 @@ def test_direct_restore_refused_after_a_post_migration_broker_mutation(
 
 def test_startup_refuses_schema_mismatch_with_another_live_device(tmp_path):
     engine = _engine(tmp_path)
+    claimed = claim_main_device(
+        engine, LocalDeviceRole(device_id="old-pc", hostname="old", is_main=True)
+    )
+    assert claimed.success
     save_runtime_device_state(
         engine,
         device_id="old-pc",
@@ -251,6 +313,31 @@ def test_startup_refuses_schema_mismatch_with_another_live_device(tmp_path):
             device_id="new-pc",
             schema_version=CURRENT_EXECUTION_SCHEMA_VERSION,
         )
+
+
+def test_stale_old_schema_active_row_does_not_block_new_lease_holder(tmp_path):
+    engine = _engine(tmp_path)
+    old_claim = claim_main_device(
+        engine, LocalDeviceRole(device_id="old-pc", hostname="old", is_main=True)
+    )
+    assert old_claim.success
+    save_runtime_device_state(
+        engine,
+        device_id="old-pc",
+        hostname="old",
+        state=RuntimeDeviceState.ACTIVE,
+        schema_version=CURRENT_EXECUTION_SCHEMA_VERSION - 1,
+    )
+    new_claim = claim_main_device(
+        engine, LocalDeviceRole(device_id="new-pc", hostname="new", is_main=True)
+    )
+    assert new_claim.success
+
+    require_compatible_runtime_schema(
+        engine,
+        device_id="new-pc",
+        schema_version=CURRENT_EXECUTION_SCHEMA_VERSION,
+    )
 
 
 def test_stopped_device_on_an_old_schema_does_not_block_startup(tmp_path):

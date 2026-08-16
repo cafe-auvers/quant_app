@@ -72,6 +72,13 @@ _ensured_engines: "weakref.WeakSet[Engine]" = weakref.WeakSet()
 _ensure_lock = threading.Lock()
 
 
+def invalidate_execution_orders_table_cache(engine: Engine) -> None:
+    """Forget an ensure result after migration rollback drops the table."""
+
+    with _ensure_lock:
+        _ensured_engines.discard(engine)
+
+
 class DuplicateExecutionOrderError(RuntimeError):
     """A row for this ``client_order_id`` already exists (A1/A5's
     idempotency guarantee applied to the order record itself)."""

@@ -687,6 +687,66 @@ def test_runtime_outage_cancels_completion_buy_then_submits_one_sell(
 
 
 @pytest.mark.usefixtures("trading_enabled")
+def test_immediate_outage_after_canonical_sell_ack_does_not_submit_again(
+    tmp_path, monkeypatch
+):
+    class PositionBroker(FakeExecutionBroker):
+        def get_positions(self, **_kwargs):
+            return {
+                "overseas": {
+                    "holdings": [
+                        {
+                            "symbol": "AAPL",
+                            "quantity": 4,
+                            "orderable_quantity": 4,
+                            "average_price": 100.0,
+                        }
+                    ]
+                }
+            }
+
+    writable = [True]
+    runtime, broker, gateway, engine, market_data = _make_runtime(
+        tmp_path,
+        monkeypatch,
+        broker=PositionBroker(),
+        database_writable_provider=lambda: writable[0],
+        emergency_journal=EmergencyJournal(tmp_path / "emergency.jsonl"),
+        emergency_lease_allowance=EmergencyLeaseAllowance(max_seconds=30),
+    )
+    card = _persist_owned_card(
+        engine,
+        _card(
+            board_status=BoardStatus.SELL_ALL,
+            entry_runtime_status=EntryRuntimeStatus.SESSION_COMPLETE,
+            position_runtime_status=PositionRuntimeStatus.LIQUIDATING,
+            broker_quantity=4,
+            orderable_quantity=4,
+            exit_all_required=True,
+        ),
+    )
+    market_data.subscribe([card.symbol])
+    market_data.poll_once()
+    broker.queue_acceptance(broker_order_id="BR-CANONICAL-SELL")
+
+    runtime.trading_engine.run_heartbeat([card])
+
+    assert len(broker.submit_calls) == 1
+    canonical_client_order_id = card.exit_client_order_id
+    assert canonical_client_order_id
+    assert gateway.cached_execution_record(canonical_client_order_id) is not None
+
+    # The DB disappears before any normal order lookup/reconciliation.  The
+    # just-ACKed command must remain an active fence for every outage tick.
+    writable[0] = False
+    runtime.trading_engine.run_heartbeat([card])
+    runtime.trading_engine.run_heartbeat([card])
+
+    assert len(broker.submit_calls) == 1
+    assert card.exit_client_order_id == canonical_client_order_id
+
+
+@pytest.mark.usefixtures("trading_enabled")
 def test_entry_cancel_rejection_clears_id_and_next_heartbeat_uses_a_new_one(
     tmp_path, monkeypatch
 ):

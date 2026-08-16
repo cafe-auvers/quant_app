@@ -6,7 +6,8 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timezone
+from decimal import Decimal
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Optional
@@ -37,11 +38,13 @@ from src.core.schema_version import CURRENT_EXECUTION_SCHEMA_VERSION
 from src.services.capital_reservation_repository import (
     ensure_capital_reservations_table,
     fetch_reservation,
+    invalidate_capital_reservations_table_cache,
     save_reservation_strict,
 )
 from src.services.execution_order_repository import (
     ensure_execution_orders_table,
     fetch_execution_order,
+    invalidate_execution_orders_table_cache,
     record_execution_order,
 )
 from src.services.execution_lease_protocol import (
@@ -54,6 +57,7 @@ from src.services.trade_card_repository import (
     LOCAL_TRADE_CARDS_FILE,
     ensure_trade_cards_table,
     get_trade_card,
+    invalidate_trade_cards_table_cache,
     insert_trade_card,
     load_local_trade_cards_snapshot,
 )
@@ -61,6 +65,44 @@ from src.services.capital_allocator import RESERVATIONS_FILE, load_reservations
 from src.utils.config import DATA_DIR
 
 SCHEMA_MIGRATION_BACKUP_FILE = DATA_DIR / "execution_schema_migration_backup.json"
+_BACKUP_VALUE_TYPE_KEY = "__schema_migration_value_type__"
+
+
+def _encode_backup_value(value):
+    if isinstance(value, datetime):
+        return {_BACKUP_VALUE_TYPE_KEY: "datetime", "value": value.isoformat()}
+    if isinstance(value, date):
+        return {_BACKUP_VALUE_TYPE_KEY: "date", "value": value.isoformat()}
+    if isinstance(value, time):
+        return {_BACKUP_VALUE_TYPE_KEY: "time", "value": value.isoformat()}
+    if isinstance(value, Decimal):
+        return {_BACKUP_VALUE_TYPE_KEY: "decimal", "value": str(value)}
+    if isinstance(value, bytes):
+        return {
+            _BACKUP_VALUE_TYPE_KEY: "bytes",
+            "value": base64.b64encode(value).decode("ascii"),
+        }
+    return value
+
+
+def _decode_backup_value(value):
+    if not isinstance(value, dict) or _BACKUP_VALUE_TYPE_KEY not in value:
+        return value
+    value_type = value.get(_BACKUP_VALUE_TYPE_KEY)
+    encoded = value.get("value")
+    if value_type == "datetime":
+        return datetime.fromisoformat(str(encoded))
+    if value_type == "date":
+        return date.fromisoformat(str(encoded))
+    if value_type == "time":
+        return time.fromisoformat(str(encoded))
+    if value_type == "decimal":
+        return Decimal(str(encoded))
+    if value_type == "bytes":
+        return base64.b64decode(str(encoded))
+    raise MigrationBackupIntegrityError(
+        f"Unknown migration backup value type {value_type!r}"
+    )
 
 
 class MigrationPhase(str, Enum):
@@ -290,21 +332,28 @@ class SchemaMigrationManager:
         metadata = MetaData()
         for table_name in self._DATABASE_TABLES:
             if table_name not in existing_tables:
+                database[table_name] = {
+                    "existed": False,
+                    "column_types": {},
+                    "rows": [],
+                }
                 continue
             reflected = Table(table_name, metadata, autoload_with=self.engine)
             with self.engine.connect() as conn:
                 rows = conn.execute(select(reflected)).fetchall()
-            database[table_name] = [
-                {
-                    key: (
-                        value.isoformat()
-                        if isinstance(value, datetime)
-                        else value
-                    )
-                    for key, value in row._mapping.items()
-                }
-                for row in rows
-            ]
+            database[table_name] = {
+                "existed": True,
+                "column_types": {
+                    column.name: str(column.type) for column in reflected.columns
+                },
+                "rows": [
+                    {
+                        key: _encode_backup_value(value)
+                        for key, value in row._mapping.items()
+                    }
+                    for row in rows
+                ],
+            }
         files = {}
         for path in self.legacy_paths:
             if path.exists():
@@ -312,7 +361,7 @@ class SchemaMigrationManager:
                     path.read_bytes()
                 ).decode("ascii")
         return {
-            "artifact_version": 1,
+            "artifact_version": 2,
             "source_schema_version": int(source_version),
             "target_schema_version": self.target_version,
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -440,6 +489,16 @@ class SchemaMigrationManager:
         self._migrate_legacy_orders()
         if self._migration_callback is not None:
             self._migration_callback()
+
+    def _invalidate_dropped_table_cache(self, table_name: str) -> None:
+        invalidators = {
+            "execution_orders": invalidate_execution_orders_table_cache,
+            "trade_cards": invalidate_trade_cards_table_cache,
+            "capital_reservations": invalidate_capital_reservations_table_cache,
+        }
+        invalidator = invalidators.get(table_name)
+        if invalidator is not None:
+            invalidator(self.engine)
 
     def prepare_cutover(
         self,
@@ -628,19 +687,64 @@ class SchemaMigrationManager:
             lease_token=lease_token,
             lease_epoch=lease_epoch,
         )
-        metadata = MetaData()
         inspector = inspect(self.engine)
         existing = set(inspector.get_table_names())
+        database = payload.get("database", {})
+        artifact_version = int(payload.get("artifact_version") or 1)
         with self.engine.begin() as conn:
-            for table_name, rows in payload.get("database", {}).items():
-                if table_name not in existing:
+            for table_name in self._DATABASE_TABLES:
+                table_backup = database.get(table_name)
+                if table_backup is None:
+                    if artifact_version > 1:
+                        raise MigrationBackupIntegrityError(
+                            f"Migration backup omits table manifest for {table_name!r}"
+                        )
+                    # V1 omitted tables that did not exist before migration.
+                    existed_before = False
+                    rows = []
+                # Artifact v1 stored only rows from pre-existing tables.
+                elif isinstance(table_backup, list):
+                    existed_before = True
+                    rows = table_backup
+                else:
+                    existed_before = bool(table_backup.get("existed"))
+                    rows = table_backup.get("rows", [])
+                if not existed_before:
+                    if table_name in existing:
+                        reflected = Table(
+                            table_name, MetaData(), autoload_with=self.engine
+                        )
+                        reflected.drop(conn)
+                        existing.remove(table_name)
+                        self._invalidate_dropped_table_cache(table_name)
                     continue
+                if table_name not in existing:
+                    raise MigrationBackupIntegrityError(
+                        f"Cannot restore pre-existing table {table_name!r}: it is missing"
+                    )
                 reflected = Table(
-                    table_name, metadata, autoload_with=self.engine
+                    table_name, MetaData(), autoload_with=self.engine
                 )
                 conn.execute(reflected.delete())
                 if rows:
-                    conn.execute(reflected.insert(), rows)
+                    decoded_rows = [
+                        {
+                            key: _decode_backup_value(value)
+                            for key, value in row.items()
+                        }
+                        for row in rows
+                    ]
+                    # Backward compatibility for v1 artifacts, which emitted
+                    # bare ISO strings for DateTime columns.
+                    if artifact_version == 1:
+                        for row in decoded_rows:
+                            for column in reflected.columns:
+                                value = row.get(column.name)
+                                if isinstance(column.type, DateTime) and isinstance(
+                                    value, str
+                                ):
+                                    row[column.name] = datetime.fromisoformat(value)
+                    conn.execute(reflected.insert(), decoded_rows)
         for raw_path, encoded in payload.get("files", {}).items():
             path = Path(raw_path)
             path.parent.mkdir(parents=True, exist_ok=True)

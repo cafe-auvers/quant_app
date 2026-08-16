@@ -25,6 +25,7 @@ from sqlalchemy.engine import Engine
 
 from src.core.runtime_readiness import RuntimeDeviceState
 from src.core.schema_version import CURRENT_EXECUTION_SCHEMA_VERSION
+from src.services.state_sync import get_main_device
 
 _ensured_engines: "weakref.WeakSet[Engine]" = weakref.WeakSet()
 _ensure_lock = threading.Lock()
@@ -308,10 +309,27 @@ def require_compatible_runtime_schema(
     *,
     device_id: str,
     schema_version: int = CURRENT_EXECUTION_SCHEMA_VERSION,
+    lease_engine: Optional[Engine] = None,
 ) -> None:
-    """Refuse startup while another live runtime advertises another schema."""
+    """Refuse startup when the authoritative lease holder is incompatible.
+
+    Runtime-state rows are historical observations, not execution authority.
+    A crashed device can leave ``ACTIVE`` behind indefinitely; once a fenced
+    failover grants the lease to another device, that abandoned row must no
+    longer block startup.  Conversely, an old-schema device that still owns
+    the live lease remains a hard conflict even if another row looks newer.
+    """
 
     table = ensure_runtime_device_state_table(engine)
+    ownership = get_main_device(lease_engine or engine)
+    if not ownership.success:
+        raise RuntimeError(
+            "Runtime schema compatibility could not verify the current "
+            f"execution lease: {ownership.error}"
+        )
+    current_owner = ownership.main_device
+    if current_owner is None or current_owner.device_id == str(device_id or ""):
+        return
     live_states = {
         RuntimeDeviceState.STARTING.value,
         RuntimeDeviceState.STANDBY.value,
@@ -322,7 +340,7 @@ def require_compatible_runtime_schema(
     with engine.connect() as conn:
         conflicting = conn.execute(
             select(table.c.device_id, table.c.schema_version, table.c.state).where(
-                table.c.device_id != str(device_id or ""),
+                table.c.device_id == current_owner.device_id,
                 table.c.state.in_(live_states),
                 table.c.schema_version != int(schema_version),
             )

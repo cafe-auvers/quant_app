@@ -156,6 +156,40 @@ def test_database_outage_spools_and_directly_delivers_critical_alert(tmp_path):
     service.engine = healthy_engine
     service.process_due()
     assert service.local_spool.pending_alerts() == []
+    assert len(provider.deliveries) == 1
+    incident = service.raise_alert(
+        CriticalAlertType.DATABASE_UNAVAILABLE,
+        "prod-db",
+        "canonical database unavailable",
+    )
+    assert [row["status"] for row in service.delivery_attempts(incident.incident_id)] == [
+        "DELIVERED"
+    ]
+
+
+def test_spool_failure_does_not_suppress_direct_critical_alert_delivery(tmp_path):
+    provider = FakeProvider()
+    service, _ = _service(tmp_path, provider=provider)
+
+    class UnavailableEngine:
+        def begin(self):
+            raise RuntimeError("canonical DB unavailable")
+
+    class FailedSpool:
+        def append(self, *_args, **_kwargs):
+            raise OSError("local disk unavailable")
+
+    service.engine = UnavailableEngine()
+    service.local_spool = FailedSpool()
+
+    service.sink(
+        CriticalAlertType.DATABASE_UNAVAILABLE.value,
+        "journal-write-failed",
+        "emergency journal could not be written",
+    )
+
+    assert len(provider.deliveries) == 1
+    assert provider.deliveries[0]["alert_type"] == "DATABASE_UNAVAILABLE"
 
 
 def test_enabled_runtime_composition_requires_real_external_provider_urls(

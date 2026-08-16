@@ -411,6 +411,14 @@ class ExecutionCommandGateway:
         self._last_verified_lease: Optional[ExecutionLease] = None
         self._last_database_writable_state: Optional[bool] = None
         self._emergency_records: Dict[str, ExecutionOrderRecord] = {}
+        # Process-local continuity across the instant the canonical database
+        # becomes unavailable.  The same mutable record object is cached as
+        # soon as a canonical command identity is prepared, so later status
+        # transitions (ACKNOWLEDGED/WORKING/ambiguous cancel or submit) are
+        # visible to offline orchestration before the guarded call returns or
+        # raises.  This is only a conservative read-through cache; canonical
+        # persistence remains authoritative after recovery.
+        self._recent_execution_records: Dict[str, ExecutionOrderRecord] = {}
         self._cached_ownership_proofs: Dict[
             tuple[str, str, str], ExecutionOwnershipProof
         ] = {}
@@ -605,6 +613,31 @@ class ExecutionCommandGateway:
         self, client_order_id: str
     ) -> Optional[ExecutionOrderRecord]:
         return self._emergency_records.get(str(client_order_id or ""))
+
+    def cached_execution_record(
+        self, client_order_id: str
+    ) -> Optional[ExecutionOrderRecord]:
+        """Return the newest process-local canonical/emergency order view.
+
+        This deliberately remains available while the canonical database is
+        down.  It prevents a just-acknowledged destructive command from
+        disappearing merely because the outage began before the runtime's
+        next normal repository lookup.
+        """
+
+        key = str(client_order_id or "")
+        return self._emergency_records.get(key) or self._recent_execution_records.get(
+            key
+        )
+
+    def remember_canonical_execution_record(
+        self, record: ExecutionOrderRecord
+    ) -> None:
+        """Refresh the process cache from a newer canonical read."""
+
+        current = self._recent_execution_records.get(record.client_order_id)
+        if current is None or int(record.version) >= int(current.version):
+            self._recent_execution_records[record.client_order_id] = record
 
     def _mark_post_migration_broker_mutation(self) -> None:
         if self._schema_migration_manager is not None:
@@ -1504,7 +1537,6 @@ class ExecutionCommandGateway:
             capital_reservation_id=reservation.reservation_id,
             replaces_execution_order_id=request.replaces_execution_order_id,
         )
-
         # 5 + 6. one transaction: command + reservation + PREPARED record.
         ensure_execution_commands_table(engine)
         ensure_execution_orders_table(engine)
@@ -1527,6 +1559,10 @@ class ExecutionCommandGateway:
         apply_status_transition(record, ExecutionOrderStatus.SUBMITTING)
         with engine.begin() as conn:
             update_execution_order(conn, record, expected_version=record.version)
+        # Only a durably journaled command can fence the outage path.  Cache
+        # after SUBMITTING commits (and before the broker boundary), never for
+        # a prepare transaction that itself failed.
+        self._recent_execution_records[client_order_id] = record
 
         # Finding 7 (third pass): re-verify ownership and lease immediately
         # before the actual broker call, not only once, earlier, before the
@@ -1656,6 +1692,10 @@ class ExecutionCommandGateway:
         self, request: CancelExecutionRequest, *, record: ExecutionOrderRecord,
         permission_check: Callable[[ExecutionOrderRecord], bool],
     ) -> ExecutionOrderRecord:
+        # Cache before the first transition.  Every later mutation is applied
+        # to this same object, including ambiguous outcomes that raise instead
+        # of returning a record to the caller.
+        self._recent_execution_records[record.client_order_id] = record
         engine = self._require_engine()
         mutation_budget = self._require_mutation_budget()
 

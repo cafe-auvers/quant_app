@@ -121,12 +121,24 @@ class LocalAlertSpool:
             for entry in entries
             if entry.get("event_type") == "ALERT_RECONCILED"
         }
-        return [
-            entry
+        latest_attempts = {
+            str(entry.get("pending_event_id") or ""): entry
             for entry in entries
-            if entry.get("event_type") == "ALERT_PENDING"
-            and entry.get("event_id") not in reconciled
-        ]
+            if entry.get("event_type") == "ALERT_DELIVERY_ATTEMPT"
+        }
+        pending = []
+        for entry in entries:
+            if (
+                entry.get("event_type") != "ALERT_PENDING"
+                or entry.get("event_id") in reconciled
+            ):
+                continue
+            item = dict(entry)
+            attempt = latest_attempts.get(str(entry.get("event_id") or ""))
+            if attempt is not None:
+                item["delivery_attempt"] = dict(attempt)
+            pending.append(item)
+        return pending
 
 
 class CriticalAlertType(str, Enum):
@@ -370,46 +382,127 @@ class ExternalAlertingService:
         try:
             self.raise_alert(alert_class, dedupe_key, message)
             return
-        except Exception as db_error:
+        except Exception as exc:
+            database_error = str(exc)
+        pending = None
+        spool_error: Optional[Exception] = None
+        try:
             pending = self.local_spool.append(
                 "ALERT_PENDING",
                 {
                     "alert_type": str(alert_class).upper(),
                     "dedupe_key": str(dedupe_key),
                     "message": str(message),
-                    "database_error": str(db_error),
+                    "database_error": database_error,
                 },
             )
+        except Exception as exc:
+            # Local durability and external delivery are independent failure
+            # domains.  A full disk must never suppress the network alert.
+            spool_error = exc
+        offline_event_id = (
+            str(pending["event_id"]) if pending is not None else uuid4().hex
+        )
         payload = {
-            "incident_id": f"offline-{pending['event_id']}",
+            "incident_id": f"offline-{offline_event_id}",
             "alert_type": str(alert_class).upper(),
             "dedupe_key": str(dedupe_key),
             "message": str(message),
             "device_id": self.device_id,
             "requires_acknowledgement": True,
-            "offline_spool": True,
+            "offline_spool": pending is not None,
         }
         try:
             delivery_id = str(self.provider.deliver(payload) or "")
             status, error = "DELIVERED", ""
         except Exception as exc:
             delivery_id, status, error = "", "FAILED", str(exc)
-        self.local_spool.append(
-            "ALERT_DELIVERY_ATTEMPT",
-            {
-                "pending_event_id": pending["event_id"],
-                "status": status,
-                "provider_delivery_id": delivery_id,
-                "error": error,
-            },
+        if pending is not None:
+            try:
+                self.local_spool.append(
+                    "ALERT_DELIVERY_ATTEMPT",
+                    {
+                        "pending_event_id": pending["event_id"],
+                        "status": status,
+                        "provider_delivery_id": delivery_id,
+                        "error": error,
+                    },
+                )
+            except Exception:
+                # Delivery was still attempted.  The caller's critical-log
+                # fallback is useful only when neither independent channel
+                # retained or delivered the incident.
+                if status != "DELIVERED":
+                    raise
+        elif status != "DELIVERED":
+            raise RuntimeError(
+                "Critical alert could be neither spooled nor delivered: "
+                f"spool={spool_error}; provider={error}"
+            )
+
+    def _record_spooled_delivery_attempt(
+        self, incident: AlertIncident, attempt: Dict[str, Any]
+    ) -> bool:
+        """Fold an already-attempted offline delivery into canonical state."""
+
+        now = _as_utc(self._clock())
+        attempt_number = incident.delivery_attempt_count + 1
+        escalation_level = min(
+            self.max_escalation_level,
+            (attempt_number - 1) // self.escalation_every_attempts,
         )
+        status = str(attempt.get("status") or "FAILED").upper()
+        delay = (
+            self.acknowledgement_timeout_seconds
+            if status == "DELIVERED"
+            else self.retry_base_seconds * (2 ** min(attempt_number - 1, 6))
+        )
+        incident_table = _incident_table(MetaData())
+        attempt_table = _attempt_table(MetaData())
+        with self.engine.begin() as conn:
+            updated = conn.execute(
+                incident_table.update()
+                .where(
+                    incident_table.c.incident_id == incident.incident_id,
+                    incident_table.c.version == incident.version,
+                    incident_table.c.status == AlertIncidentStatus.OPEN.value,
+                )
+                .values(
+                    delivery_attempt_count=attempt_number,
+                    escalation_level=escalation_level,
+                    next_attempt_at=_db_datetime(now + timedelta(seconds=delay)),
+                    updated_at=_db_datetime(now),
+                    version=incident.version + 1,
+                )
+            )
+            if updated.rowcount != 1:
+                return False
+            conn.execute(
+                attempt_table.insert().values(
+                    incident_id=incident.incident_id,
+                    attempt_number=attempt_number,
+                    escalation_level=escalation_level,
+                    attempted_at=_db_datetime(now),
+                    status=status,
+                    provider_delivery_id=str(
+                        attempt.get("provider_delivery_id") or ""
+                    ),
+                    error=str(attempt.get("error") or ""),
+                )
+            )
+        return True
 
     def _drain_local_spool(self) -> int:
         drained = 0
         for pending in self.local_spool.pending_alerts():
-            self.raise_alert(
+            incident = self.raise_alert(
                 pending["alert_type"], pending["dedupe_key"], pending["message"]
             )
+            delivery_attempt = pending.get("delivery_attempt")
+            if delivery_attempt is not None and not self._record_spooled_delivery_attempt(
+                incident, delivery_attempt
+            ):
+                continue
             self.local_spool.append(
                 "ALERT_RECONCILED", {"pending_event_id": pending["event_id"]}
             )

@@ -378,7 +378,9 @@ class BuyboardRuntimeWorker(QThread):
         try:
             self._accepting_commands = False
             require_compatible_runtime_schema(
-                self._db_engine, device_id=self._device_id
+                self._db_engine,
+                device_id=self._device_id,
+                lease_engine=self._lease_engine or self._db_engine,
             )
             migration_manager = (
                 self._schema_migration_manager
