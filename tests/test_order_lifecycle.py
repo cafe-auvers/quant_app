@@ -31,6 +31,7 @@ from src.services.order_ledger import (OrderLedgerCorruptionError,
                                        load_order_ledger, load_orders,
                                        update_order)
 from src.services.order_reconciliation import reconcile_orders_with_snapshot
+from src.services.position_manager import compute_breakeven_stop_price
 from src.ui.main_window import MainWindow
 
 RISK_STRATEGY_ID = "TEST"
@@ -2185,13 +2186,13 @@ def test_buylist_move_to_breakeven_uses_avg_cost_and_never_lowers_stop(monkeypat
 
     MainWindow._buylist_move_to_breakeven_selected(window, "SIM")
 
-    assert item.stop_loss == 100.0
+    assert item.stop_loss == compute_breakeven_stop_price(100.0)
     assert saves == [True]
     assert questions
 
     MainWindow._buylist_move_to_breakeven_selected(window, "SIM")
 
-    assert item.stop_loss == 100.0
+    assert item.stop_loss == compute_breakeven_stop_price(100.0)
     assert infos
 
 
@@ -2218,7 +2219,7 @@ def test_buylist_move_to_breakeven_falls_back_to_entry_price(monkeypatch):
 
     MainWindow._buylist_move_to_breakeven_selected(window, "SIM")
 
-    assert item.stop_loss == 95.0
+    assert item.stop_loss == compute_breakeven_stop_price(95.0)
 
 
 def test_buylist_sell_all_selected_confirms_limit_order_and_submits_full_quantity(monkeypatch):

@@ -429,15 +429,33 @@ def test_partial_sell_uses_broker_orderable_quantity_and_stays_pending(tmp_path)
     assert result.card.orderable_quantity == 80
 
 
-def test_stop_changes_use_frozen_orb_then_breakeven_then_manual(tmp_path):
+def test_stop_changes_remain_pending_until_runtime_acknowledges_each_rule(tmp_path):
     engine = _engine(tmp_path)
     card = _seed(engine)
     first_projection = _projection(engine, card, readiness_generation=7)
     breakeven = workflow.request_board_action(
         engine, _command(SetBreakevenStop, first_projection), context=_ready()
     ).card
-    assert breakeven.stop_type == StopType.BREAKEVEN
-    assert breakeven.active_stop_price > breakeven.average_entry_price
+    assert breakeven.stop_type == StopType.ORB_LOW
+    assert breakeven.active_stop_price == 95.0
+    assert breakeven.pending_stop_type == StopType.BREAKEVEN
+    assert breakeven.pending_stop_price > breakeven.average_entry_price
+    assert breakeven.pending_stop_command_id
+
+    pending_projection = _projection(engine, breakeven, readiness_generation=7)
+    with pytest.raises(workflow.BoardCommandRejectedError):
+        workflow.request_board_action(
+            engine,
+            _command(
+                SetManualStop,
+                pending_projection,
+                price=breakeven.pending_stop_price + 1.0,
+            ),
+            context=_ready(),
+        )
+
+    assert breakeven.acknowledge_pending_stop_change()
+    card_repo.update_trade_card(engine, breakeven, expected_version=breakeven.version)
 
     second_projection = _projection(engine, breakeven, readiness_generation=7)
     manual_price = breakeven.active_stop_price + 2.0
@@ -446,8 +464,10 @@ def test_stop_changes_use_frozen_orb_then_breakeven_then_manual(tmp_path):
         _command(SetManualStop, second_projection, price=manual_price),
         context=_ready(),
     ).card
-    assert manual.stop_type == StopType.MANUAL_PRICE
-    assert manual.active_stop_price == manual_price
+    assert manual.stop_type == StopType.BREAKEVEN
+    assert manual.active_stop_price == breakeven.active_stop_price
+    assert manual.pending_stop_type == StopType.MANUAL_PRICE
+    assert manual.pending_stop_price == manual_price
     assert manual.broker_quantity == 100
 
 
@@ -770,8 +790,9 @@ def test_legacy_and_kanban_destructive_paths_both_reference_shared_workflow():
     kanban_runtime = (ROOT / "src/services/buyboard_runtime.py").read_text(
         encoding="utf-8"
     )
-    assert "execution_workflow_service import request_submit" in legacy_worker
+    assert "request_exit_submit" in legacy_worker
     assert "execution_workflow_service import request_cancel" in legacy_actions
     assert "src.services.execution_workflow_service import" in kanban_runtime
     assert "request_submit" in kanban_runtime
+    assert "request_exit_submit" in kanban_runtime
     assert "request_cancel_intent" in kanban_runtime

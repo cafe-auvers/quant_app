@@ -17,6 +17,7 @@ from typing import Callable, List, Optional
 from sqlalchemy.engine import Engine
 
 from src.core.execution_request import CancelIntent
+from src.core.entry_monitoring_command import build_entry_monitoring_command
 from src.core.order_state import (
     BrokerOrder,
     OrderStatus,
@@ -136,8 +137,15 @@ class EodTradingService:
             if order.attempt_number:
                 card.entry_attempt_count = order.attempt_number
             return True
+        monitoring_command = build_entry_monitoring_command(
+            environment=card.environment,
+            account_no=card.account_no,
+            symbol=card.symbol,
+            enabled=False,
+        )
         card.board_status = BoardStatus.BUYLIST
         card.entry_runtime_status = None
+        card.buylist_member = not monitoring_command.enabled
         card.entry_block_reason = ""
         card.entry_orb_high = None
         card.entry_orb_low = None

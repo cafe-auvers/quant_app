@@ -812,6 +812,7 @@ class ExecutionCommandGateway:
                     environment=original.environment,
                     account_no=original.account_no,
                     symbol=original.symbol,
+                    allowed_adopted_client_order_id=original.client_order_id,
                 )
                 insert_command(conn, replace_command)
 
@@ -1780,6 +1781,7 @@ class ExecutionCommandGateway:
                 environment=record.environment,
                 account_no=record.account_no,
                 symbol=record.symbol,
+                allowed_adopted_client_order_id=record.client_order_id,
             )
             insert_command(conn, command)
             apply_status_transition(record, ExecutionOrderStatus.CANCEL_PENDING)
@@ -1800,6 +1802,7 @@ class ExecutionCommandGateway:
                     environment=record.environment,
                     account_no=record.account_no,
                     symbol=record.symbol,
+                    allowed_adopted_client_order_id=record.client_order_id,
                 )
         except (
             ExecutionOwnershipMismatchError,

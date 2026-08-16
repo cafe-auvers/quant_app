@@ -8,6 +8,7 @@ from PyQt5.QtCore import QTimer
 from PyQt5.QtWidgets import QLabel, QPushButton
 
 from src.core.execution_config import is_buyboard_engine_enabled
+from src.core.entry_monitoring_command import build_entry_monitoring_command
 from src.core.execution_queue import (
     BROKER_UNCERTAIN_STATUSES,
     POSITION_HOLDING_STATUSES,
@@ -361,7 +362,17 @@ class BuylistMonitoringMixin:
             environment = str(getattr(item, "environment", "") or "PROD").upper()
 
             if is_queue:
-                item.orb_monitor_enabled = False
+                account_no = str(getattr(item, "kis_account_no", "") or "")
+                if account_no:
+                    monitoring_command = build_entry_monitoring_command(
+                        environment=environment,
+                        account_no=account_no,
+                        symbol=symbol,
+                        enabled=False,
+                    )
+                    item.orb_monitor_enabled = monitoring_command.enabled
+                else:
+                    item.orb_monitor_enabled = False
                 item._buy_order_pending = False
                 item._auto_order_block_notice_logged = False
                 item._orb_queue_required_notice_logged = False

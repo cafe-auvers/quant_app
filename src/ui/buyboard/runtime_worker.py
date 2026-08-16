@@ -936,15 +936,25 @@ class BuyboardRuntimeWorker(QThread):
         # readiness: a reconciliation failure may block a command but must
         # never make the feed stop watching an existing position.
         self._sync_quote_subscriptions(observation_cards)
-        self._sync_market_stop_rules(observation_cards)
+        self._sync_market_stop_rules(
+            observation_cards,
+            apply_pending_changes=bool(allow_mutations and canonical_available),
+        )
 
         quotes = self.runtime.market_data.poll_once()
         self.last_market_data_drain_at = datetime.now(timezone.utc)
         if allow_mutations:
             for quote in quotes:
                 _track(self.runtime.trading_engine.evaluate_quote(observation_cards, quote))
+                _track(
+                    self.runtime.trading_engine.evaluate_pending_stop_handoff(
+                        observation_cards, quote
+                    )
+                )
                 _track(self.runtime.trading_engine.evaluate_entry_quote(ready_cards, quote))
                 self._acknowledge_market_breaches(quote, observation_cards)
+
+            _track(self._acknowledge_pending_stop_changes(observation_cards))
 
             heartbeat_cards = ready_cards
             if not canonical_available:
@@ -962,13 +972,21 @@ class BuyboardRuntimeWorker(QThread):
         # Stops can change inside the heartbeat (first-fill ORB stop,
         # completion-to-breakeven). Rotate under the feed's shared lock and
         # immediately evaluate any events detached from the old version.
-        if allow_mutations and self._sync_market_stop_rules(observation_cards):
+        if allow_mutations and self._sync_market_stop_rules(
+            observation_cards, apply_pending_changes=True
+        ):
             rotated_quotes = self.runtime.market_data.poll_once()
             self.last_market_data_drain_at = datetime.now(timezone.utc)
             for quote in rotated_quotes:
                 _track(self.runtime.trading_engine.evaluate_quote(observation_cards, quote))
+                _track(
+                    self.runtime.trading_engine.evaluate_pending_stop_handoff(
+                        observation_cards, quote
+                    )
+                )
                 _track(self.runtime.trading_engine.evaluate_entry_quote(ready_cards, quote))
                 self._acknowledge_market_breaches(quote, observation_cards)
+            _track(self._acknowledge_pending_stop_changes(observation_cards))
         # The full card set, not just ready_cards: UNRECONCILED_BROKER_ORDER
         # can be set by _refresh_account_state_if_due's order reconciliation,
         # which (deliberately) still runs for every account, including ones
@@ -1776,24 +1794,36 @@ class BuyboardRuntimeWorker(QThread):
         if to_remove:
             market_data.unsubscribe(to_remove)
 
-    def _sync_market_stop_rules(self, cards: List[TradeCardState]) -> bool:
+    def _sync_market_stop_rules(
+        self,
+        cards: List[TradeCardState],
+        *,
+        apply_pending_changes: bool = False,
+    ) -> bool:
         replace_rules = getattr(self.runtime.market_data, "replace_stop_rules", None)
         if not callable(replace_rules):
             return False
         by_symbol: Dict[str, List[StopRule]] = {}
         active_keys: set[str] = set()
         for card in cards:
+            stop_type = card.stop_type
+            stop_price = card.active_stop_price
+            stop_quantity = card.stop_quantity
+            if apply_pending_changes and card.pending_stop_command_id:
+                stop_type = card.pending_stop_type
+                stop_price = card.pending_stop_price
+                stop_quantity = card.pending_stop_quantity
             if (
                 card.board_status not in {BoardStatus.OPEN_POSITION, BoardStatus.PARTIAL_SELL}
-                or card.active_stop_price is None
-                or card.active_stop_price <= 0
+                or stop_price is None
+                or stop_price <= 0
             ):
                 continue
             active_keys.add(card.card_key)
             signature = (
-                card.stop_type.value if card.stop_type is not None else "",
-                float(card.active_stop_price),
-                int(card.stop_quantity),
+                stop_type.value if stop_type is not None else "",
+                float(stop_price),
+                int(stop_quantity),
             )
             if self._market_stop_signatures.get(card.card_key) != signature:
                 self._market_stop_signatures[card.card_key] = signature
@@ -1803,7 +1833,7 @@ class BuyboardRuntimeWorker(QThread):
             by_symbol.setdefault(card.symbol, []).append(
                 StopRule(
                     card_key=card.card_key,
-                    price=float(card.active_stop_price),
+                    price=float(stop_price),
                     version=str(self._market_stop_generations[card.card_key]),
                 )
             )
@@ -1819,6 +1849,28 @@ class BuyboardRuntimeWorker(QThread):
                 rotated = True
         self._market_stop_symbols = set(by_symbol)
         return rotated
+
+    def _acknowledge_pending_stop_changes(
+        self, cards: List[TradeCardState]
+    ) -> List[TradeCardState]:
+        """Promote a pending stop only after its exact feed rule is live."""
+
+        changed: List[TradeCardState] = []
+        for card in cards:
+            if not card.pending_stop_command_id or card.pending_stop_price is None:
+                continue
+            signature = (
+                card.pending_stop_type.value
+                if card.pending_stop_type is not None
+                else "",
+                float(card.pending_stop_price),
+                int(card.pending_stop_quantity),
+            )
+            if self._market_stop_signatures.get(card.card_key) != signature:
+                continue
+            if card.acknowledge_pending_stop_change():
+                changed.append(card)
+        return changed
 
     def _acknowledge_market_breaches(
         self, quote, cards: List[TradeCardState]

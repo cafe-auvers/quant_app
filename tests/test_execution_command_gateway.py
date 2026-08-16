@@ -63,10 +63,16 @@ from src.services.execution_lease_protocol import (
     FakeExecutionLeaseProtocol,
 )
 from src.services import state_sync
-from src.services.execution_order_repository import _get_execution_orders_table, fetch_execution_order, record_execution_order
+from src.services.execution_order_repository import (
+    _get_execution_orders_table,
+    fetch_execution_order,
+    record_execution_order,
+    save_execution_order,
+)
 from src.services.execution_ownership_repository import assign_ownership
 from src.services.mutation_budget_protocol import AllowAllMutationBudget
 from src.services.discovered_external_order_repository import (
+    ActiveExecutionOrderAdoptionConflictError,
     ActiveExternalOrderFenceError,
     adopt_external_order_in_db,
     list_discovered_external_orders_for_account,
@@ -204,20 +210,50 @@ def test_active_unowned_external_order_fences_guarded_cancel_and_replace(tmp_pat
 
 
 @pytest.mark.usefixtures("trading_enabled")
-def test_explicit_adoption_removes_external_order_execution_fence(tmp_path):
+def test_active_adoption_retains_fence_until_terminal_reconciliation(tmp_path):
     gateway, broker, engine = _guarded_gateway(tmp_path)
     external = _record_active_external_order(engine)
-    adopt_external_order_in_db(
+    adopted = adopt_external_order_in_db(
         engine,
         external.external_order_id,
         adopted_by="operator",
     )
     broker.queue_acceptance(broker_order_id="B-NEW")
 
-    result = gateway.submit_guarded(_submit_request())
+    with pytest.raises(ActiveExternalOrderFenceError):
+        gateway.submit_guarded(_submit_request())
+
+    assert broker.submit_calls == []
+    adopted.status = ExecutionOrderStatus.CANCELLED
+    save_execution_order(engine, adopted, expected_version=adopted.version)
+    result = gateway.submit_guarded(_submit_request(client_order_id="CID-2"))
 
     assert result.broker_order_id == "B-NEW"
     assert len(broker.submit_calls) == 1
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_active_adopted_buy_fences_automatic_protective_sell(tmp_path):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    external = _record_active_external_order(engine)
+    adopt_external_order_in_db(
+        engine, external.external_order_id, adopted_by="operator"
+    )
+    broker.queue_acceptance(broker_order_id="SELL-MUST-NOT-REACH-BROKER")
+
+    with pytest.raises(ActiveExternalOrderFenceError):
+        gateway.submit_guarded(
+            _submit_request(
+                client_order_id="STOP-SELL-1",
+                side=OrderSide.SELL,
+                intent=OrderIntent.STOP_LOSS,
+                quantity=100,
+                limit_price=94.0,
+                emergency=True,
+            )
+        )
+
+    assert broker.submit_calls == []
 
 
 @pytest.mark.usefixtures("trading_enabled")
@@ -886,6 +922,51 @@ def test_external_fence_inserted_after_submitting_commit_blocks_broker_submit(
     assert fresh.status == ExecutionOrderStatus.ACKNOWLEDGED
     assert fresh.broker_order_id == "SHOULD-NOT-BE-USED"
     assert len(broker.submit_calls) == 1
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_adoption_racing_sell_all_cannot_pass_the_final_broker_fence(
+    tmp_path, monkeypatch
+):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    broker.queue_acceptance(broker_order_id="SELL-MUST-NOT-BE-USED")
+    real_require_lease = gateway._require_verified_lease
+    calls = {"n": 0}
+    adoption_conflicts = []
+
+    def adopt_on_final_check(lease):
+        calls["n"] += 1
+        real_require_lease(lease)
+        if calls["n"] == 2:
+            external = _record_active_external_order(
+                engine, broker_order_id="B-RACED-ADOPTION"
+            )
+            try:
+                adopt_external_order_in_db(
+                    engine, external.external_order_id, adopted_by="operator"
+                )
+            except ActiveExecutionOrderAdoptionConflictError as exc:
+                adoption_conflicts.append(str(exc))
+
+    monkeypatch.setattr(gateway, "_require_verified_lease", adopt_on_final_check)
+
+    with pytest.raises(GuardedSubmissionPreBrokerAbortedError):
+        gateway.submit_guarded(
+            _submit_request(
+                client_order_id="SELL-ALL-RACE",
+                side=OrderSide.SELL,
+                intent=OrderIntent.MANUAL_EXIT,
+                quantity=100,
+                limit_price=99.0,
+                emergency=True,
+            )
+        )
+
+    assert broker.submit_calls == []
+    assert adoption_conflicts
+    assert fetch_execution_order(engine, "SELL-ALL-RACE").status == (
+        ExecutionOrderStatus.CANCELLED_LOCALLY
+    )
 
 
 # --- cancellation -----------------------------------------------------------

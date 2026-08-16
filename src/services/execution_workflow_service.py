@@ -37,6 +37,9 @@ from src.brokers.execution_broker_protocol import (
     BrokerSubmissionResult,
 )
 from src.core.execution_mode import ExecutionMode, ExecutionSource
+from src.core.exit_execution_command import ExitExecutionCommand
+from src.core.entry_monitoring_command import build_entry_monitoring_command
+from src.core.stop_change_command import build_stop_change_command
 from src.core.execution_order_record import (
     BrokerIdentityStatus,
     ExecutionOrderRecord,
@@ -216,6 +219,44 @@ def request_submit(
         attempt_deadline_at=attempt_deadline_at, **legacy_kwargs,
     )
     return ExecutionSubmissionResult.from_broker_order(order)
+
+
+def request_exit_submit(
+    *,
+    source: ExecutionSource,
+    command: ExitExecutionCommand,
+    **kwargs: Any,
+) -> ExecutionSubmissionResult:
+    """Submit the exact frontend-neutral L3 exit command."""
+
+    passthrough = dict(kwargs)
+    for owned_field in (
+        "environment",
+        "account_no",
+        "symbol",
+        "side",
+        "intent",
+        "quantity",
+        "limit_price",
+        "exchange",
+        "execution_policy",
+        "emergency",
+    ):
+        passthrough.pop(owned_field, None)
+    return request_submit(
+        source=source,
+        environment=command.environment,
+        account_no=command.account_no,
+        symbol=command.symbol,
+        side=command.side,
+        intent=command.intent,
+        quantity=command.quantity,
+        limit_price=command.limit_price,
+        exchange=command.exchange,
+        execution_policy=command.execution_policy,
+        emergency=command.emergency,
+        **passthrough,
+    )
 
 
 def request_cancel(
@@ -566,6 +607,12 @@ def _require_board_action_not_conflicted(engine, command, card) -> None:
         raise BoardCommandRejectedError(
             "A cancellation is already unresolved; wait for broker reconciliation"
         )
+    if isinstance(
+        command, (types.SetOrbStop, types.SetBreakevenStop, types.SetManualStop)
+    ) and card.pending_stop_command_id:
+        raise BoardCommandRejectedError(
+            "A stop change is still synchronizing with live market data; wait for runtime acknowledgement"
+        )
     if _active_external_orders(engine, card):
         raise BoardCommandRejectedError(
             "An unowned external broker order is active for this symbol; it must remain separate and be resolved or explicitly adopted"
@@ -594,17 +641,43 @@ def _require_board_action_not_conflicted(engine, command, card) -> None:
         raise BoardCommandRejectedError("A sell order is already pending for this symbol")
     if isinstance(command, types.RequestSellAll) and card.board_status.value == "SELL_ALL":
         raise BoardCommandRejectedError("Sell All is already pending")
+    if isinstance(command, types.CancelQueuedSellAll) and (
+        card.exit_client_order_id
+        or any(order.side == OrderSide.SELL for order in active_orders)
+    ):
+        raise BoardCommandRejectedError(
+            "The market-open SELL has already reached the execution lifecycle; it cannot be withdrawn as a local queue gesture"
+        )
 
 
 def _apply_board_mutation(command, card, *, context=None) -> None:
     from src.core.trade_card_state import BoardStatus, PositionRuntimeStatus, StopType
     from src.services.position_manager import (
-        PositionManager,
         compute_breakeven_stop_price,
         minimum_manual_stop_price,
     )
 
     types = _load_board_types()
+
+    def request_stop_change(stop_type, price: float) -> None:
+        requested_at = command.requested_at
+        if requested_at.tzinfo is None:
+            from datetime import timezone
+
+            requested_at = requested_at.replace(tzinfo=timezone.utc)
+        stop_command = build_stop_change_command(
+            environment=card.environment,
+            account_no=card.account_no,
+            symbol=card.symbol,
+            stop_type=stop_type,
+            price=price,
+            quantity=card.broker_quantity,
+        )
+        card.pending_stop_type = stop_command.stop_type
+        card.pending_stop_price = stop_command.price
+        card.pending_stop_quantity = stop_command.quantity
+        card.pending_stop_command_id = command.command_id
+        card.pending_stop_requested_at = requested_at
     if isinstance(command, types.CancelEntry):
         if card.board_status == BoardStatus.BUY_TODAY and not card.entry_client_order_id:
             _move_board_card(card, BoardStatus.BUYLIST)
@@ -653,9 +726,7 @@ def _apply_board_mutation(command, card, *, context=None) -> None:
             raise BoardCommandRejectedError(
                 "Changing back to the ORB low would widen current stop protection"
             )
-        card.stop_type = StopType.ORB_LOW
-        card.active_stop_price = orb_low
-        card.stop_quantity = card.broker_quantity
+        request_stop_change(StopType.ORB_LOW, orb_low)
         return
 
     if isinstance(command, types.SetBreakevenStop):
@@ -666,7 +737,7 @@ def _apply_board_mutation(command, card, *, context=None) -> None:
             raise BoardCommandRejectedError(
                 "Changing to breakeven would widen current stop protection"
             )
-        PositionManager().apply_breakeven_stop(card)
+        request_stop_change(StopType.BREAKEVEN, breakeven)
         return
 
     if isinstance(command, types.SetManualStop):
@@ -677,7 +748,7 @@ def _apply_board_mutation(command, card, *, context=None) -> None:
             raise BoardCommandRejectedError(
                 f"Manual stop {command.price} cannot widen risk below the minimum {minimum}"
             )
-        PositionManager().apply_manual_stop(card, command.price)
+        request_stop_change(StopType.MANUAL_PRICE, command.price)
         return
 
     if isinstance(command, types.CancelQueuedSellAll):
@@ -715,7 +786,12 @@ def _apply_board_mutation(command, card, *, context=None) -> None:
             card.entry_attempt_group_id = ""
             card.entry_attempt_count = 0
     elif isinstance(command, types.ActivateForToday):
-        card.buylist_member = True
+        monitoring_command = build_entry_monitoring_command(
+            environment=card.environment,
+            account_no=card.account_no,
+            symbol=card.symbol,
+        )
+        card.buylist_member = monitoring_command.enabled
     elif isinstance(command, types.RequestSellAll):
         # This is durable liquidation intent only.  The engine cancels a
         # conflicting BUY, refreshes quantity, submits, and reconciliation

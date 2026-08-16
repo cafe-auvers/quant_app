@@ -674,6 +674,7 @@ def test_submit_sell_order_maps_partial_sell_reason_and_prices_from_live_bid(mon
         broker=broker,
         market_data=market_data,
     )
+    runtime.trading_engine._market_is_open_fn = lambda: True
 
     order = runtime.trading_engine._position_callbacks.submit_sell_order(
         environment="PROD", account_no="1", symbol="AAPL", quantity=50, reason="partial_sell",
@@ -738,6 +739,7 @@ def test_submit_sell_order_maps_sell_all_reasons_to_manual_exit_and_discounts_la
         broker=broker,
         market_data=market_data,
     )
+    runtime.trading_engine._market_is_open_fn = lambda: True
 
     for reason in ("sell_all", "sell_all_retry"):
         runtime.trading_engine._position_callbacks.submit_sell_order(
@@ -760,6 +762,7 @@ def test_submit_sell_order_raises_without_a_live_quote():
         broker=broker,
         market_data=market_data,
     )
+    runtime.trading_engine._market_is_open_fn = lambda: True
     with pytest.raises(runtime_module.ExecutionGradeDataUnavailableError):
         runtime.trading_engine._position_callbacks.submit_sell_order(
             environment="PROD", account_no="1", symbol="AAPL", quantity=10, reason="sell_all",

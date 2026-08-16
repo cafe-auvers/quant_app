@@ -467,13 +467,20 @@ def test_queued_sell_all_fires_once_market_is_open(tmp_path):
     assert len(submitted) == 1
 
 
-def test_queued_sell_all_does_not_fire_before_market_open(tmp_path):
+def test_queued_sell_all_submits_broker_held_instruction_before_market_open(tmp_path):
+    submitted = []
     engine = _make_engine(tmp_path)
     engine._market_is_open = lambda: False
+    engine._position_callbacks = PositionActionCallbacks(
+        cancel_order=lambda cid: None,
+        submit_sell_order=lambda **kw: submitted.append(kw),
+        refresh_orderable_quantity=lambda *a: 100,
+    )
     card = _open_card(board_status=BoardStatus.SELL_ALL, sell_all_at_market_open=True)
 
-    assert engine.run_heartbeat([card]) == []
-    assert card.sell_all_at_market_open is True
+    assert engine.run_heartbeat([card]) == [card]
+    assert card.sell_all_at_market_open is False
+    assert submitted[0]["reason"] == "sell_all"
 
 
 # --- User-initiated CancelEntry on a working order (spec section 298-304) --

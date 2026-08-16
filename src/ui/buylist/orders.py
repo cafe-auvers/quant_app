@@ -8,6 +8,10 @@ from PyQt5.QtCore import QThread, QTimer
 from PyQt5.QtWidgets import QMessageBox
 
 from src.api.kis_order import is_ambiguous_order_submission_error
+from src.core.exit_execution_command import (
+    build_exit_execution_command,
+    exit_execution_policy,
+)
 from src.core.order_state import (OPEN_ORDER_STATUSES, REGULAR_LIMIT_EXECUTION,
                                   RESERVED_MOO_EXECUTION, BrokerOrder,
                                   OrderIntent, OrderSide, OrderStatus)
@@ -269,11 +273,11 @@ class BuylistOrdersMixin:
         env: str,
         now: Optional[dt.datetime] = None,
     ) -> str:
-        if str(env or "").upper() == "PROD" and not self._us_regular_market_is_open(
-            now
-        ):
-            return RESERVED_MOO_EXECUTION
-        return REGULAR_LIMIT_EXECUTION
+        return exit_execution_policy(
+            environment=env,
+            intent=OrderIntent.MANUAL_EXIT,
+            regular_session_open=self._us_regular_market_is_open(now),
+        )
 
     def _submit_kis_buy_order(
         self,
@@ -588,11 +592,21 @@ class BuylistOrdersMixin:
                 item, "Order price must be a positive finite number."
             )
             return
+        exit_command = build_exit_execution_command(
+            environment=env,
+            account_no=account_no,
+            symbol=item.symbol,
+            intent=intent,
+            quantity=quantity,
+            regular_session_open=(execution_policy != RESERVED_MOO_EXECUTION),
+            limit_price=order_price,
+        )
         try:
             worker_kwargs = {
                 "account_no": account_no,
                 "intent": intent,
                 "buylist_symbol_key": f"{env}:{item.symbol}",
+                "exit_command": exit_command,
                 **self._current_execution_lease_kwargs(),
             }
             if execution_policy == RESERVED_MOO_EXECUTION:

@@ -14,6 +14,7 @@ from src.core.order_state import (
     OrderSide,
 )
 from src.core.execution_mode import ExecutionSource
+from src.core.exit_execution_command import ExitExecutionCommand
 from src.risk.pre_trade import PreTradeRiskDecision
 from src.services.broker import Broker, KisBroker
 from src.services.event_journal import record_event
@@ -54,6 +55,7 @@ class KisOrderWorker(QThread):
         execution_authority: Optional[ExecutionAuthority] = None,
         execution_lease: Optional[LeaseHandle] = None,
         lease_engine: Optional[Any] = None,
+        exit_command: Optional[ExitExecutionCommand] = None,
     ) -> None:
         super().__init__()
         self.environment = environment
@@ -81,26 +83,16 @@ class KisOrderWorker(QThread):
         self.execution_authority = execution_authority
         self.execution_lease = execution_lease
         self.lease_engine = lease_engine
+        self.exit_command = exit_command
 
     def run(self) -> None:
         try:
-            from src.services.execution_workflow_service import request_submit
+            from src.services.execution_workflow_service import (
+                request_exit_submit,
+                request_submit,
+            )
 
-            result = request_submit(
-                source=ExecutionSource.LEGACY_BUY_DASHBOARD,
-                environment=self.environment,
-                account_no=self.account_no or "",
-                symbol=self.symbol,
-                side=OrderSide(str(self.side).upper()),
-                intent=(
-                    self.intent
-                    if isinstance(self.intent, OrderIntent)
-                    else OrderIntent(str(self.intent).upper())
-                ),
-                quantity=self.quantity,
-                limit_price=self.price,
-                exchange=self.exchange,
-                execution_policy=self.execution_policy,
+            shared_kwargs = dict(
                 gateway=self.broker,
                 pre_trade_risk_decision=self.pre_trade_risk_decision,
                 strategy_id=self.strategy_id,
@@ -112,6 +104,30 @@ class KisOrderWorker(QThread):
                 execution_lease=self.execution_lease,
                 lease_engine=self.lease_engine,
             )
+            if self.exit_command is not None:
+                result = request_exit_submit(
+                    source=ExecutionSource.LEGACY_BUY_DASHBOARD,
+                    command=self.exit_command,
+                    **shared_kwargs,
+                )
+            else:
+                result = request_submit(
+                    source=ExecutionSource.LEGACY_BUY_DASHBOARD,
+                    environment=self.environment,
+                    account_no=self.account_no or "",
+                    symbol=self.symbol,
+                    side=OrderSide(str(self.side).upper()),
+                    intent=(
+                        self.intent
+                        if isinstance(self.intent, OrderIntent)
+                        else OrderIntent(str(self.intent).upper())
+                    ),
+                    quantity=self.quantity,
+                    limit_price=self.price,
+                    exchange=self.exchange,
+                    execution_policy=self.execution_policy,
+                    **shared_kwargs,
+                )
             order = result.legacy_broker_order
             if order is None:
                 raise RuntimeError(

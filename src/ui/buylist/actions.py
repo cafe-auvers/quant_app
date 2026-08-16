@@ -7,9 +7,13 @@ from PyQt5.QtWidgets import (QDialog, QDialogButtonBox, QLabel, QMessageBox,
                              QSlider, QSpinBox, QTableWidget, QVBoxLayout)
 
 from src.api.kis_order import format_overseas_order_price
+from src.core.entry_monitoring_command import build_entry_monitoring_command
 from src.core.order_state import (REGULAR_LIMIT_EXECUTION,
                                   RESERVED_MOO_EXECUTION, BrokerOrder,
                                   OrderIntent, OrderSide, OrderStatus)
+from src.core.stop_change_command import build_stop_change_command
+from src.core.trade_card_state import StopType
+from src.services.position_manager import compute_breakeven_stop_price
 from src.services.order_ledger import find_open_orders, load_order_ledger
 from src.ui.workers import KisOrderCancelWorker, KisOrderQueryWorker
 
@@ -851,8 +855,13 @@ class BuylistActionsMixin:
             if not account_no:
                 self._warn_order_account_unavailable(item, env)
                 return
-            item.kis_account_no = account_no
-            item.orb_monitor_enabled = True
+            monitoring_command = build_entry_monitoring_command(
+                environment=env,
+                account_no=account_no,
+                symbol=item.symbol,
+            )
+            item.kis_account_no = monitoring_command.account_no
+            item.orb_monitor_enabled = monitoring_command.enabled
             self._save_state()
             active_attr = f"_buylist_{env.lower()}_monitor_active"
             was_running = getattr(self, active_attr, False)
@@ -1056,7 +1065,8 @@ class BuylistActionsMixin:
                 self, "No position", f"{item.symbol} has no open bought position."
             )
             return
-        breakeven = item.avg_cost if item.avg_cost > 0 else item.entry_price
+        entry_basis = item.avg_cost if item.avg_cost > 0 else item.entry_price
+        breakeven = compute_breakeven_stop_price(entry_basis)
         if breakeven <= 0:
             QMessageBox.warning(
                 self, "No price", f"No avg cost or entry price set for {item.symbol}."
@@ -1078,7 +1088,15 @@ class BuylistActionsMixin:
         if reply != QMessageBox.Yes:
             return
         old_stop = item.stop_loss
-        item.stop_loss = breakeven
+        stop_command = build_stop_change_command(
+            environment=env,
+            account_no=str(getattr(item, "kis_account_no", "") or ""),
+            symbol=item.symbol,
+            stop_type=StopType.BREAKEVEN,
+            price=breakeven,
+            quantity=item.shares_held,
+        )
+        item.stop_loss = stop_command.price
         self._save_state()
         self.populate_buylist_dashboard()
         self.append_log(

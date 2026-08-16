@@ -64,7 +64,11 @@ from src.core.execution_order_record import (
     compute_broker_identity_key,
 )
 from src.core.order_state import OrderSide
-from src.services.execution_order_repository import insert_execution_order
+from src.services.execution_order_repository import (
+    find_active_execution_order_for_scope,
+    find_active_unlinked_adopted_order,
+    insert_execution_order,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +78,10 @@ _ensure_lock = threading.Lock()
 
 class DuplicateExternalOrderError(RuntimeError):
     """A row for this ``external_order_id`` already exists."""
+
+
+class ActiveExecutionOrderAdoptionConflictError(RuntimeError):
+    """Adoption raced an already-active local execution lifecycle."""
 
 
 class DuplicateBrokerOrderDiscoveryError(RuntimeError):
@@ -330,12 +338,13 @@ def update_discovered_external_order(
 
 
 def get_discovered_external_order(
-    conn: Connection, external_order_id: str
+    conn: Connection, external_order_id: str, *, for_update: bool = False
 ) -> Optional[DiscoveredExternalOrder]:
     table = _get_discovered_external_orders_table(MetaData())
-    row = conn.execute(
-        select(table).where(table.c.external_order_id == external_order_id)
-    ).first()
+    statement = select(table).where(table.c.external_order_id == external_order_id)
+    if for_update:
+        statement = statement.with_for_update()
+    row = conn.execute(statement).first()
     return _row_to_order(row) if row is not None else None
 
 
@@ -364,8 +373,16 @@ def require_no_active_unowned_external_order(
     environment: str,
     account_no: str,
     symbol: str,
+    allowed_adopted_client_order_id: str = "",
 ) -> None:
-    """Execution-boundary fence; call inside the mutation transaction."""
+    """Execution-boundary fence; call inside the mutation transaction.
+
+    Both a newly discovered order and an active adopted-but-unlinked order
+    are conflicts.  Adoption must never weaken this final broker boundary.
+    ``allowed_adopted_client_order_id`` is only for a mutation targeting
+    that exact adopted order; the gateway's separate permission and broker
+    identity checks remain authoritative for that operation.
+    """
     table = _get_discovered_external_orders_table(MetaData())
     terminal_statuses = {
         ExecutionOrderStatus.FILLED,
@@ -380,7 +397,7 @@ def require_no_active_unowned_external_order(
             table.c.symbol == str(symbol or "").upper(),
             table.c.disposition
             == ExternalOrderDisposition.DISCOVERED_UNOWNED.value,
-        )
+        ).with_for_update()
     ).fetchall()
     active = None
     for row in rows:
@@ -393,7 +410,22 @@ def require_no_active_unowned_external_order(
             f"{environment}/{account_no}/{symbol} is fenced by active unowned "
             f"broker_order_id={active.broker_order_id!r} "
             f"(external_order_id={active.external_order_id!r}); wait for a terminal "
-            "broker observation or explicitly adopt the order"
+            "broker observation or explicitly resolve the order"
+        )
+
+    adopted = find_active_unlinked_adopted_order(
+        conn,
+        environment=environment,
+        account_no=account_no,
+        symbol=symbol,
+        allowed_client_order_id=allowed_adopted_client_order_id,
+    )
+    if adopted is not None:
+        raise ActiveExternalOrderFenceError(
+            f"{environment}/{account_no}/{symbol} is fenced by active adopted "
+            f"client_order_id={adopted.client_order_id!r} "
+            f"(broker_order_id={adopted.broker_order_id!r}); wait for terminal "
+            "reconciliation or explicitly resolve/link that exact order"
         )
 
 
@@ -492,12 +524,27 @@ def adopt_external_order_in_db(
     ensure_execution_orders_table_lazy(engine)
 
     with engine.begin() as conn:
-        external_order = get_discovered_external_order(conn, external_order_id)
+        external_order = get_discovered_external_order(
+            conn, external_order_id, for_update=True
+        )
         if external_order is None:
             raise ExternalOrderNotFoundError(
                 f"No DiscoveredExternalOrder for external_order_id={external_order_id!r}"
             )
         expected_version = external_order.version
+
+        active_local = find_active_execution_order_for_scope(
+            conn,
+            environment=external_order.environment,
+            account_no=external_order.account_no,
+            symbol=external_order.symbol,
+        )
+        if active_local is not None:
+            raise ActiveExecutionOrderAdoptionConflictError(
+                f"Cannot adopt broker_order_id={external_order.broker_order_id!r}: "
+                f"active client_order_id={active_local.client_order_id!r} already "
+                "owns the symbol execution lifecycle"
+            )
 
         # The pure business-logic function: validates disposition, builds
         # the new ExecutionOrderRecord, and mutates external_order's own

@@ -1,6 +1,8 @@
 """Tests for src.core.trade_card_state.TradeCardState."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 
 from src.core.trade_card_state import (
@@ -55,6 +57,11 @@ def test_to_dict_from_dict_round_trip():
         stop_type=StopType.ORB_LOW,
         active_stop_price=188.0,
         stop_quantity=100,
+        pending_stop_type=StopType.MANUAL_PRICE,
+        pending_stop_price=189.0,
+        pending_stop_quantity=100,
+        pending_stop_command_id="STOP-1",
+        pending_stop_requested_at=datetime(2026, 8, 17, tzinfo=timezone.utc),
         exit_all_required=False,
         warnings=["migrated_from_buylist"],
     )
@@ -64,6 +71,8 @@ def test_to_dict_from_dict_round_trip():
     assert restored.previous_board_status == BoardStatus.ENTRY_PENDING
     assert restored.entry_runtime_status == EntryRuntimeStatus.EXECUTE_READY
     assert restored.stop_type == StopType.ORB_LOW
+    assert restored.pending_stop_type == StopType.MANUAL_PRICE
+    assert restored.pending_stop_command_id == "STOP-1"
 
 
 def test_non_finite_floats_are_dropped_to_none():

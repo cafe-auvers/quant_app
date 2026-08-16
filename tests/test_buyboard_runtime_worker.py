@@ -39,7 +39,13 @@ from src.core.order_state import (
     OrderSide,
     OrderStatus,
 )
-from src.core.trade_card_state import BoardStatus, EntryRuntimeStatus, TradeCardState
+from src.core.trade_card_state import (
+    BoardStatus,
+    EntryRuntimeStatus,
+    PositionRuntimeStatus,
+    StopType,
+    TradeCardState,
+)
 from src.services import buyboard_runtime as runtime_module
 from src.services import trade_card_repository as repo
 from src.services.account_reconciliation import (
@@ -306,6 +312,108 @@ def test_database_recovery_forces_full_projection_before_reopening_commands(
     assert calls == [False]
     assert worker._recovery_reconciliation_required is False
     assert worker._accepting_commands is True
+
+
+def test_tighter_pending_stop_catches_trade_detached_under_old_generation(
+    tmp_path, monkeypatch
+):
+    """95 -> 100 with a 98 trade in the handoff cannot lose protection."""
+
+    import src.services.trading_engine as trading_engine_module
+
+    monkeypatch.setattr(
+        trading_engine_module, "is_buyboard_engine_enabled", lambda: True
+    )
+    now = dt.datetime.now(dt.timezone.utc)
+
+    class _Transport:
+        def on_data(self, callback):
+            pass
+
+        def on_ack(self, callback):
+            pass
+
+        def on_connection(self, callback):
+            pass
+
+        def subscribe(self, subscriptions):
+            pass
+
+        def unsubscribe(self, subscriptions):
+            pass
+
+        def is_connected(self):
+            return True
+
+    service = KisRealtimeMarketDataService(
+        transport=_Transport(),
+        symbol_key_resolver=lambda symbol, channel: symbol,
+        trade_capacity=10,
+        quote_capacity=10,
+        clock=lambda: now,
+        regular_session_filter=lambda observed_at: True,
+    )
+    card = TradeCardState(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        board_status=BoardStatus.OPEN_POSITION,
+        position_runtime_status=PositionRuntimeStatus.OPEN,
+        broker_quantity=10,
+        orderable_quantity=10,
+        stop_type=StopType.ORB_LOW,
+        active_stop_price=95.0,
+        stop_quantity=10,
+        pending_stop_type=StopType.MANUAL_PRICE,
+        pending_stop_price=100.0,
+        pending_stop_quantity=10,
+        pending_stop_command_id="STOP-CHANGE-1",
+        pending_stop_requested_at=now,
+    )
+    runtime = _build_test_runtime(
+        buying_power_provider=lambda *_: 100_000.0,
+        card_lookup=lambda *_: card,
+        broker=_FakeBroker(),
+        market_data=service,
+    )
+    worker, _ = _worker(tmp_path)
+    worker.runtime = runtime
+
+    # Old 95 protection is live. The 98 event lands after the durable UI
+    # request but before the worker acquires the feed lock for the new 100.
+    worker._sync_market_stop_rules([card], apply_pending_changes=False)
+    observed = now + dt.timedelta(milliseconds=1)
+    assert service.ingest_trade(
+        QuoteSnapshot(
+            symbol="AAPL",
+            last_price=98.0,
+            broker_event_at=observed,
+            received_at=observed,
+            processed_at=observed,
+            channel="HDFSCNT0",
+            payload_fingerprint="during-stop-handoff",
+        )
+    )
+    assert worker._sync_market_stop_rules([card], apply_pending_changes=True)
+
+    initiations = []
+    real_initiate = runtime.trading_engine._initiate_sell_all
+
+    def record_initiation(current, **kwargs):
+        initiations.append(current.card_key)
+        return real_initiate(current, **kwargs)
+
+    monkeypatch.setattr(runtime.trading_engine, "_initiate_sell_all", record_initiation)
+    for quote in service.poll_once():
+        runtime.trading_engine.evaluate_quote([card], quote)
+        runtime.trading_engine.evaluate_pending_stop_handoff([card], quote)
+
+    assert worker._acknowledge_pending_stop_changes([card]) == [card]
+    assert card.board_status == BoardStatus.SELL_ALL
+    assert card.exit_all_required is True
+    assert card.active_stop_price == 100.0
+    assert card.pending_stop_command_id == ""
+    assert initiations == [card.card_key]
 
 
 @pytest.mark.parametrize(

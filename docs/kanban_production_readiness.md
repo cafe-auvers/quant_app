@@ -155,7 +155,7 @@ PR's behavior composes correctly, plus the Gate 1 run in full.
 | 10 | Rate-limit and command-priority scheduling | PR6 DRAFT IMPLEMENTED, not activated — strict priorities, per-account/endpoint budgets initialized only from explicit WS0 evidence, and typed pre-acceptance retry classification. |
 | 11 | Database-outage behavior | PR6 DRAFT IMPLEMENTED, not activated — bounded last-verified emergency lease, versioned ownership proof, fsynced local journal, protective completion-BUY cancellation, card-correlation recovery, and mandatory post-recovery broker reconciliation. |
 | 12 | External-alert delivery | PR6 DRAFT IMPLEMENTED, not activated — durable incident retry/dedupe/ack/escalation, HTTPS provider wiring, DB-independent local alert spool/direct delivery, and external-watchdog heartbeat publication. |
-| 13 | Kanban feature parity and UI projection | PR7 IMPLEMENTED on `agent/pr7-kanban-feature-parity`, not activated â€” typed domain-owned board requests now enter only through `ExecutionWorkflowService`; card/ownership/readiness revisions are fenced, UI state is rebuilt from reconciled card/order/external-order projections, legacy submit/cancel UI workers use the same workflow boundary, and unowned broker orders remain distinct until explicit audited adoption. All production activation flags and verified capacities remain closed. |
+| 13 | Kanban feature parity and UI projection | PR7 IMPLEMENTED on `agent/pr7-kanban-feature-parity`, not activated â€” typed domain-owned board requests now enter only through `ExecutionWorkflowService`; real legacy and Kanban entry-monitoring, stop-change, and exit paths construct the same frontend-neutral commands (including broker-held premarket `RESERVED_MOO` exits); stop changes remain pending until the runtime atomically installs the new feed rule and evaluates the detached generation; card/ownership/readiness revisions are fenced; and active adopted-but-unlinked broker orders remain a final gateway fence until terminal reconciliation. All production activation flags and verified capacities remain closed. |
 
 ---
 
@@ -569,6 +569,12 @@ prior database generation.
             USER_ADOPTED and is preserved as the audit trail of what was
             actually discovered, never rewritten to look application-
             originated -- see ExternalOrderDisposition above
+        adoption alone does NOT clear the final mutation fence: while that
+            USER_ADOPTED execution record is active and still unlinked, all
+            other submit/cancel/replace mutations for the symbol remain
+            fenced; only terminal reconciliation or an explicit proven link/
+            resolution may clear it (an authorized cancel/replace may target
+            that exact adopted order)
 ```
 
 ### Reconciliation classification precedence (revision 3.1)
@@ -697,6 +703,14 @@ accumulator (which reopens the original lossy-queue problem in a different
 shape), the engine forces an immediate drain-and-evaluation of the current
 `PendingMarketState` against the **old** stop version *before* the new stop
 takes effect.
+
+For a UI-originated change, `active_stop_price` therefore remains the old
+live rule while the card carries a durable `pending_stop_*` request. The
+runtime installs the pending rule under the feed lock, drains/evaluates the
+old generation, applies the requested tighter rule to any post-request event
+that landed immediately before the lock handoff, and only then promotes the
+pending fields to the active stop. The board renders this as `STOP CHANGE
+PENDING`; it never displays the requested price as active protection early.
 
 **Revision 3.1 correction:** "synchronously drain" is not itself sufficient
 without a real synchronization primitive shared between the market-data
@@ -1104,7 +1118,7 @@ that broker truth, not the gesture, completes the lifecycle:
 | Stale card/readiness/ownership protection | `test_stale_card_revision_cannot_overwrite_reconciled_truth`, `test_stale_readiness_generation_and_reconciliation_both_fail_closed`, `test_ownership_revision_change_after_render_is_rejected` |
 | Buy Today backward-move/cancellation lifecycle | `test_buy_today_with_persisted_entry_identity_requires_cancel_lifecycle` |
 | External order visibility, explicit adoption, and unlinked execution fence | `test_external_order_is_distinct_fenced_and_only_explicitly_adopted`, `test_active_unlinked_owned_order_fences_entry_affecting_board_actions`, `test_external_order_without_a_trade_card_still_projects_and_can_be_explicitly_adopted` |
-| Legacy/Kanban workflow parity | all eight explicit `test_l3_*` rows in `tests/test_ws13_legacy_kanban_parity.py`; guarded/legacy workflow integration suites |
+| Legacy/Kanban workflow parity | all eight explicit `test_l3_*` rows in `tests/test_ws13_legacy_kanban_parity.py`, driven through the real legacy handlers and Kanban runtime/reducer paths; guarded/legacy workflow integration suites |
 
 ---
 

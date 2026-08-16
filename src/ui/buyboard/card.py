@@ -123,6 +123,18 @@ class TradeCardWidget(QFrame):
             )
             stop_lbl.setStyleSheet("color: #b71c1c; font-size: 11px;")
             layout.addWidget(stop_lbl)
+        if card.pending_stop_command_id and card.pending_stop_price:
+            pending_type = (
+                card.pending_stop_type.value
+                if card.pending_stop_type is not None
+                else "UNKNOWN"
+            )
+            pending_stop = QLabel(
+                f"STOP CHANGE PENDING ({pending_type}): "
+                f"{_fmt_price(card.pending_stop_price)}"
+            )
+            pending_stop.setStyleSheet("color: #ef6c00; font-weight: bold;")
+            layout.addWidget(pending_stop)
 
         if card.broker_quantity or card.orderable_quantity:
             quantity = QLabel(
