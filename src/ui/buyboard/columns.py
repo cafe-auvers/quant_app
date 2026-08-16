@@ -10,7 +10,11 @@ from PyQt5.QtCore import QMimeData, Qt
 from PyQt5.QtGui import QDrag
 from PyQt5.QtWidgets import QAbstractItemView, QListWidget, QListWidgetItem, QMenu
 
-from src.core.board_workflow import BoardCardProjection, BoardExternalOrderProjection
+from src.core.board_workflow import (
+    BoardCardProjection,
+    BoardExecutionOrderProjection,
+    BoardExternalOrderProjection,
+)
 from src.core.trade_card_state import BoardStatus, TradeCardState
 
 from .card import (
@@ -148,7 +152,12 @@ class BoardColumnList(QListWidget):
 
     def set_cards(
         self,
-        cards: List[TradeCardState | BoardCardProjection | BoardExternalOrderProjection],
+        cards: List[
+            TradeCardState
+            | BoardCardProjection
+            | BoardExternalOrderProjection
+            | BoardExecutionOrderProjection
+        ],
         quote_lookup: Optional[Callable[[str], Optional[float]]] = None,
     ) -> None:
         """``quote_lookup``, when supplied, returns the live last price for
@@ -166,7 +175,11 @@ class BoardColumnList(QListWidget):
             return item.card if isinstance(item, BoardCardProjection) else item
 
         def priority(item):
-            return 0 if isinstance(item, BoardExternalOrderProjection) else state(item).kanban_priority
+            if isinstance(
+                item, (BoardExternalOrderProjection, BoardExecutionOrderProjection)
+            ):
+                return 0
+            return state(item).kanban_priority
 
         for card in sorted(cards, key=lambda c: -priority(c)):
             if isinstance(card, BoardExternalOrderProjection):
@@ -178,6 +191,13 @@ class BoardColumnList(QListWidget):
                 )
                 external_item.setSizeHint(external_widget.sizeHint())
                 self.setItemWidget(external_item, external_widget)
+                continue
+            if isinstance(card, BoardExecutionOrderProjection):
+                owned_item = QListWidgetItem(self)
+                owned_item.setFlags(Qt.ItemIsEnabled)
+                owned_widget = UnlinkedExecutionOrderWidget(card.order)
+                owned_item.setSizeHint(owned_widget.sizeHint())
+                self.setItemWidget(owned_item, owned_widget)
                 continue
             card_state = state(card)
             item = QListWidgetItem(self)

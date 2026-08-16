@@ -1079,14 +1079,14 @@ owned cards).
 
 | Legacy Buy Dashboard action | Kanban equivalent |
 |---|---|
-| Add to Buy Today | Drag `Buylist` → `Buy Today` |
-| Cancel a pending entry | Drag `Entry Pending` → `Buylist`, or an explicit Cancel control |
-| Partial sell | Drag `Open Position` → `Partial Sell` + quantity dialog |
-| Sell All | Drag `Open Position` → `Sell All` |
-| Change stop type | ORB-low / breakeven / manual-price control on the card |
-| Pre-market Sell All | Durable next-session exit instruction (ties into D9's outside-regular-session pricing) |
-| EOD unfilled entry | Automatic return to `Buylist` |
-| Partial fill | Card remains tracked as a position plus the remaining working-order state (not silently treated as fully complete) |
+| Add to Buy Today | Drag `Buylist` → `Buy Today` — `test_l3_add_to_buy_today_produces_the_same_entry_monitoring_command` |
+| Cancel a pending entry | Drag `Entry Pending` → `Buylist`, or an explicit Cancel control — `test_l3_pending_entry_cancel_produces_the_same_cancel_intent` |
+| Partial sell | Drag `Open Position` → `Partial Sell` + quantity dialog — `test_l3_partial_sell_produces_equal_submission_result_and_command` |
+| Sell All | Drag `Open Position` → `Sell All` — `test_l3_sell_all_produces_equal_submission_result_and_command` |
+| Change stop type | ORB-low / breakeven / manual-price control on the card — `test_l3_stop_change_produces_the_same_protective_domain_state` |
+| Pre-market Sell All | Durable next-session exit instruction (ties into D9's outside-regular-session pricing) — `test_l3_premarket_sell_all_produces_the_same_next_open_intent` |
+| EOD unfilled entry | Automatic return to `Buylist` — `test_l3_eod_unfilled_entry_produces_the_same_authoritative_transition` |
+| Partial fill | Card remains tracked as a position plus the remaining working-order state (not silently treated as fully complete) — `test_l3_partial_fill_produces_the_same_reconciled_position_and_order_tracking` |
 
 PR7 traceability is intentionally split between the new frontend-boundary
 suite and the already-merged execution/reconciliation suites. The board
@@ -1102,8 +1102,9 @@ that broker truth, not the gesture, completes the lifecycle:
 | Sell All BUY-conflict cancellation/retry/flat confirmation | `test_outage_sell_all_cancels_completion_buy_before_one_sell`, `test_sell_all_closes_once_broker_confirms_zero` |
 | ORB/breakeven/manual stop projection | `test_stop_changes_use_frozen_orb_then_breakeven_then_manual` |
 | Stale card/readiness/ownership protection | `test_stale_card_revision_cannot_overwrite_reconciled_truth`, `test_stale_readiness_generation_and_reconciliation_both_fail_closed`, `test_ownership_revision_change_after_render_is_rejected` |
-| External order visibility and explicit adoption | `test_external_order_is_distinct_fenced_and_only_explicitly_adopted`, `test_external_order_without_a_trade_card_still_projects_and_can_be_explicitly_adopted` |
-| Legacy/Kanban workflow parity | `test_legacy_and_kanban_destructive_paths_both_reference_shared_workflow`, guarded/legacy workflow integration suites |
+| Buy Today backward-move/cancellation lifecycle | `test_buy_today_with_persisted_entry_identity_requires_cancel_lifecycle` |
+| External order visibility, explicit adoption, and unlinked execution fence | `test_external_order_is_distinct_fenced_and_only_explicitly_adopted`, `test_active_unlinked_owned_order_fences_entry_affecting_board_actions`, `test_external_order_without_a_trade_card_still_projects_and_can_be_explicitly_adopted` |
+| Legacy/Kanban workflow parity | all eight explicit `test_l3_*` rows in `tests/test_ws13_legacy_kanban_parity.py`; guarded/legacy workflow integration suites |
 
 ---
 

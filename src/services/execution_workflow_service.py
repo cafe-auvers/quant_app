@@ -491,6 +491,20 @@ def _active_owned_orders(engine, card) -> List[ExecutionOrderRecord]:
     ]
 
 
+def _card_tracks_order(card, order: ExecutionOrderRecord) -> bool:
+    """Return whether durable card correlation owns this active order."""
+    if order.client_order_id and order.client_order_id in {
+        card.entry_client_order_id,
+        card.exit_client_order_id,
+    }:
+        return True
+    return bool(
+        order.attempt_group_id
+        and order.attempt_group_id
+        in {card.entry_attempt_group_id, card.exit_attempt_group_id}
+    )
+
+
 def _active_external_orders(engine, card):
     from src.core.discovered_external_order import ExternalOrderDisposition
     from src.services.discovered_external_order_repository import (
@@ -518,10 +532,31 @@ def _active_external_orders(engine, card):
 
 def _require_board_action_not_conflicted(engine, command, card) -> None:
     types = _load_board_types()
-    presentation_only = isinstance(
-        command, (types.MoveToWatchlist, types.MoveToBuylist, types.ReorderCard)
-    )
-    if presentation_only:
+    active_orders = _active_owned_orders(engine, card)
+
+    # BUY_TODAY -> BUYLIST is a harmless presentation change only while no
+    # entry identity has been consumed.  The runtime persists that identity
+    # before crossing the broker boundary, so allowing the drag afterward
+    # could hide a BUY that becomes WORKING a moment later.  Once any such
+    # evidence exists the caller must request CancelEntry and wait for
+    # terminal broker reconciliation to perform the actual return.
+    if isinstance(command, types.MoveToBuylist):
+        entry_lifecycle_active = card.board_status.value == "ENTRY_PENDING" or (
+            card.board_status.value == "BUY_TODAY"
+            and (
+                card.entry_client_order_id
+                or card.entry_submission_unresolved
+                or card.entry_cancel_in_flight
+                or any(order.side == OrderSide.BUY for order in active_orders)
+            )
+        )
+        if entry_lifecycle_active:
+            raise BoardCommandRejectedError(
+                "A BUY identity/order already exists; request entry cancellation and wait for broker-confirmed terminal reconciliation"
+            )
+        return
+
+    if isinstance(command, (types.MoveToWatchlist, types.ReorderCard)):
         return
     if card.entry_submission_unresolved or card.exit_submission_unresolved:
         raise BoardCommandRejectedError(
@@ -536,7 +571,6 @@ def _require_board_action_not_conflicted(engine, command, card) -> None:
             "An unowned external broker order is active for this symbol; it must remain separate and be resolved or explicitly adopted"
         )
 
-    active_orders = _active_owned_orders(engine, card)
     ambiguous = [
         order
         for order in active_orders
@@ -546,6 +580,11 @@ def _require_board_action_not_conflicted(engine, command, card) -> None:
     if ambiguous:
         raise BoardCommandRejectedError(
             "An owned order has ambiguous broker identity; reconcile it before another UI action"
+        )
+    unlinked = [order for order in active_orders if not _card_tracks_order(card, order)]
+    if unlinked:
+        raise BoardCommandRejectedError(
+            "An active unlinked owned broker order fences execution; explicitly link or resolve it before another execution action"
         )
     if isinstance(command, types.CancelEntry) and card.entry_block_reason == "cancel_requested":
         raise BoardCommandRejectedError("Entry cancellation is already pending")
@@ -567,7 +606,7 @@ def _apply_board_mutation(command, card, *, context=None) -> None:
 
     types = _load_board_types()
     if isinstance(command, types.CancelEntry):
-        if card.board_status == BoardStatus.BUY_TODAY:
+        if card.board_status == BoardStatus.BUY_TODAY and not card.entry_client_order_id:
             _move_board_card(card, BoardStatus.BUYLIST)
             card.entry_runtime_status = None
             card.entry_block_reason = ""
@@ -576,7 +615,7 @@ def _apply_board_mutation(command, card, *, context=None) -> None:
             card.entry_client_order_id = ""
             card.entry_pending_attempt_number = 0
             card.entry_submission_unresolved = False
-        elif card.board_status == BoardStatus.ENTRY_PENDING:
+        elif card.board_status in (BoardStatus.BUY_TODAY, BoardStatus.ENTRY_PENDING):
             card.entry_block_reason = "cancel_requested"
         else:
             raise BoardCommandRejectedError(
@@ -827,17 +866,7 @@ def project_board_card(engine, card, *, context=None):
         symbol=card.symbol,
     )
     all_orders = _active_owned_orders(engine, card)
-    orders = [
-        order
-        for order in all_orders
-        if order.client_order_id
-        in {card.entry_client_order_id, card.exit_client_order_id}
-        or (
-            order.attempt_group_id
-            and order.attempt_group_id
-            in {card.entry_attempt_group_id, card.exit_attempt_group_id}
-        )
-    ]
+    orders = [order for order in all_orders if _card_tracks_order(card, order)]
     unlinked_orders = [order for order in all_orders if order not in orders]
     external = _active_external_orders(engine, card)
     ambiguous_count = sum(
@@ -886,12 +915,17 @@ def project_board_card(engine, card, *, context=None):
 def list_board_projections(engine, *, environment="PROD", context=None):
     import copy
 
-    from src.core.board_workflow import BoardExternalOrderProjection, BoardProjectionContext
+    from src.core.board_workflow import (
+        BoardExecutionOrderProjection,
+        BoardExternalOrderProjection,
+        BoardProjectionContext,
+    )
     from src.core.discovered_external_order import ExternalOrderDisposition
     from src.services import trade_card_repository
     from src.services.discovered_external_order_repository import (
         list_discovered_external_orders,
     )
+    from src.services.execution_order_repository import list_execution_orders
 
     if engine is None:
         return []
@@ -902,6 +936,10 @@ def list_board_projections(engine, *, environment="PROD", context=None):
             engine, environment=environment
         )
     ]
+    card_scopes = {
+        (projection.card.environment, projection.card.account_no, projection.card.symbol)
+        for projection in card_projections
+    }
     attached_external_ids = {
         external.external_order_id
         for projection in card_projections
@@ -913,7 +951,7 @@ def list_board_projections(engine, *, environment="PROD", context=None):
         ExecutionOrderStatus.EXPIRED,
         ExecutionOrderStatus.REJECTED,
     }
-    standalone = [
+    standalone_external = [
         BoardExternalOrderProjection(
             order=copy.deepcopy(order),
             readiness_generation=projection_context.readiness_generation,
@@ -934,7 +972,25 @@ def list_board_projections(engine, *, environment="PROD", context=None):
         and order.disposition == ExternalOrderDisposition.DISCOVERED_UNOWNED
         and order.broker_status not in terminal
     ]
-    return [*card_projections, *standalone]
+    standalone_owned = [
+        BoardExecutionOrderProjection(
+            order=copy.deepcopy(order),
+            readiness_generation=projection_context.readiness_generation,
+            engine_restrictions=tuple(
+                dict.fromkeys(
+                    [
+                        *projection_context.global_restrictions,
+                        *projection_context.restrictions_for(order.account_no),
+                        "Unlinked owned broker order: observation only",
+                    ]
+                )
+            ),
+        )
+        for order in list_execution_orders(engine, environment=environment)
+        if order.status not in TERMINAL_EXECUTION_ORDER_STATUSES
+        and (order.environment, order.account_no, order.symbol) not in card_scopes
+    ]
+    return [*card_projections, *standalone_external, *standalone_owned]
 
 
 def get_board_projection(

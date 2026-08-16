@@ -24,7 +24,11 @@ from PyQt5.QtWidgets import (
 )
 
 from src.core.execution_config import is_buyboard_engine_enabled
-from src.core.board_workflow import BoardCardProjection, BoardExternalOrderProjection
+from src.core.board_workflow import (
+    BoardCardProjection,
+    BoardExecutionOrderProjection,
+    BoardExternalOrderProjection,
+)
 from src.core.trade_card_state import BoardStatus, TradeCardState
 from src.services import execution_workflow_service
 
@@ -140,7 +144,7 @@ def _quote_lookup_for(main_window) -> Optional[Callable[[str], Optional[float]]]
 
 
 def _state(value):
-    if isinstance(value, BoardExternalOrderProjection):
+    if isinstance(value, (BoardExternalOrderProjection, BoardExecutionOrderProjection)):
         return None
     return value.card if isinstance(value, BoardCardProjection) else value
 
@@ -232,9 +236,17 @@ def _handle_card_dropped(main_window, payload: dict, target_status: BoardStatus)
             **common
         )
     elif target_status == BoardStatus.BUYLIST:
-        command = MoveToBuylist(
-            **common
-        )
+        # A backward move is presentation-only until the entry runtime has
+        # consumed an identity.  From that point onward it is a cancellation
+        # request and broker reconciliation alone may return the card to the
+        # Buylist.
+        if card.board_status == BoardStatus.ENTRY_PENDING or (
+            card.board_status == BoardStatus.BUY_TODAY
+            and bool(card.entry_client_order_id)
+        ):
+            command = CancelEntry(**common)
+        else:
+            command = MoveToBuylist(**common)
     elif target_status == BoardStatus.BUY_TODAY:
         command = ActivateForToday(
             **common

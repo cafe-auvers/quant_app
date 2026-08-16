@@ -14,8 +14,10 @@ from src.core.board_workflow import (
     ActivateForToday,
     AdoptExternalOrder,
     BoardActionContext,
+    BoardExecutionOrderProjection,
     BoardProjectionContext,
     CancelEntry,
+    MoveToBuylist,
     RequestPartialSell,
     RequestSellAll,
     SetBreakevenStop,
@@ -32,7 +34,13 @@ from src.core.execution_order_record import (
     OrderOrigin,
 )
 from src.core.execution_ownership import ExecutionOwner, ExecutionOwnership
-from src.core.order_state import OrderIntent, OrderSide
+from src.core.order_state import (
+    BrokerOrderDiscoveryResult,
+    BrokerOrderStatusSnapshot,
+    OrderIntent,
+    OrderSide,
+    OrderStatus,
+)
 from src.core.trade_card_state import (
     BoardStatus,
     PositionRuntimeStatus,
@@ -41,6 +49,7 @@ from src.core.trade_card_state import (
 )
 from src.services import execution_workflow_service as workflow
 from src.services import trade_card_repository as card_repo
+from src.services.account_reconciliation import run_account_reconciliation_pass
 from src.services.discovered_external_order_repository import (
     fetch_discovered_external_order,
     record_discovered_external_order,
@@ -48,6 +57,7 @@ from src.services.discovered_external_order_repository import (
 from src.services.execution_order_repository import (
     fetch_execution_order,
     record_execution_order,
+    save_execution_order,
 )
 from src.services.execution_ownership_repository import assign_ownership
 from src.services.trade_card_repository import TradeCardVersionConflictError
@@ -309,6 +319,99 @@ def test_ambiguous_entry_blocks_user_cancel_until_reconciliation(tmp_path):
     assert current.board_status == BoardStatus.ENTRY_PENDING
 
 
+def test_buy_today_with_persisted_entry_identity_requires_cancel_lifecycle(tmp_path):
+    engine = _engine(tmp_path)
+    card = _seed(
+        engine,
+        board_status=BoardStatus.BUY_TODAY,
+        position_runtime_status=PositionRuntimeStatus.NONE,
+        broker_quantity=0,
+        orderable_quantity=0,
+        entry_client_order_id="CID-ENTRY-1",
+        entry_attempt_group_id="ENTRY-GROUP",
+        entry_pending_attempt_number=1,
+    )
+    order = record_execution_order(
+        engine,
+        ExecutionOrderRecord(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            intent=OrderIntent.ENTRY,
+            client_order_id="CID-ENTRY-1",
+            attempt_group_id="ENTRY-GROUP",
+            attempt_number=1,
+            status=ExecutionOrderStatus.WORKING,
+            broker_identity_status=BrokerIdentityStatus.EXACT,
+            broker_order_id="BROKER-ENTRY-1",
+            submitted_quantity=10,
+            remaining_quantity=10,
+        ),
+    )
+    projection = _projection(engine, card, readiness_generation=7)
+
+    with pytest.raises(workflow.BoardCommandRejectedError, match="request entry cancellation"):
+        workflow.request_board_action(
+            engine, _command(MoveToBuylist, projection), context=_ready()
+        )
+
+    cancellation = workflow.request_board_action(
+        engine, _command(CancelEntry, projection), context=_ready()
+    ).card
+    assert cancellation.board_status == BoardStatus.BUY_TODAY
+    assert cancellation.entry_client_order_id == "CID-ENTRY-1"
+    assert cancellation.entry_block_reason == "cancel_requested"
+
+    # A terminal broker status without lifecycle reconciliation still cannot
+    # move the card; the durable identity must be retired by reconciliation.
+    prior_version = order.version
+    order.status = ExecutionOrderStatus.CANCELLED
+    order.remaining_quantity = 0
+    save_execution_order(engine, order, expected_version=prior_version)
+    terminal_projection = _projection(engine, cancellation, readiness_generation=7)
+    with pytest.raises(workflow.BoardCommandRejectedError, match="request entry cancellation"):
+        workflow.request_board_action(
+            engine, _command(MoveToBuylist, terminal_projection), context=_ready()
+        )
+
+    class TerminalBroker:
+        def get_positions(self, **kwargs):
+            return {"overseas": {"holdings": []}}
+
+        def discover_orders(self, **kwargs):
+            return BrokerOrderDiscoveryResult(
+                snapshots=(
+                    BrokerOrderStatusSnapshot(
+                        environment="PROD",
+                        account_no="1",
+                        symbol="AAPL",
+                        broker_order_id="BROKER-ENTRY-1",
+                        side=OrderSide.BUY,
+                        status=OrderStatus.CANCELLED,
+                        quantity_requested=10,
+                        filled_quantity=0,
+                        remaining_quantity=0,
+                    ),
+                ),
+                open_orders_complete=True,
+                history_complete=True,
+                reserved_orders_complete=True,
+            )
+
+    run_account_reconciliation_pass(
+        broker=TerminalBroker(),
+        engine=engine,
+        environment="PROD",
+        account_no="1",
+        cards=(cancellation,),
+        account_balance_provider=lambda environment, account_no: 100_000.0,
+    )
+    reconciled = card_repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert reconciled.board_status == BoardStatus.BUYLIST
+    assert reconciled.entry_client_order_id == ""
+
+
 def test_partial_sell_uses_broker_orderable_quantity_and_stays_pending(tmp_path):
     engine = _engine(tmp_path)
     card = _seed(engine, broker_quantity=100, orderable_quantity=80)
@@ -409,7 +512,7 @@ def test_external_order_is_distinct_fenced_and_only_explicitly_adopted(tmp_path)
             environment="PROD",
             account_no="1",
             symbol="AAPL",
-            side=OrderSide.SELL,
+            side=OrderSide.BUY,
             broker_order_id="BROKER-EXT-1",
             quantity_requested=25,
             broker_status=ExecutionOrderStatus.WORKING,
@@ -450,6 +553,57 @@ def test_external_order_is_distinct_fenced_and_only_explicitly_adopted(tmp_path)
         record.client_order_id
     ]
 
+    with pytest.raises(workflow.BoardCommandRejectedError, match="unlinked owned"):
+        workflow.request_board_action(
+            engine, _command(RequestSellAll, after), context=_ready()
+        )
+
+
+@pytest.mark.parametrize(
+    "board_status,command_type,command_kwargs",
+    [
+        (BoardStatus.BUYLIST, ActivateForToday, {}),
+        (BoardStatus.BUY_TODAY, CancelEntry, {}),
+    ],
+)
+def test_active_unlinked_owned_order_fences_entry_affecting_board_actions(
+    tmp_path, board_status, command_type, command_kwargs
+):
+    engine = _engine(tmp_path)
+    card = _seed(
+        engine,
+        board_status=board_status,
+        position_runtime_status=PositionRuntimeStatus.NONE,
+        broker_quantity=0,
+        orderable_quantity=0,
+    )
+    record_execution_order(
+        engine,
+        ExecutionOrderRecord(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            intent=OrderIntent.UNKNOWN,
+            client_order_id="ADOPTED-UNLINKED",
+            status=ExecutionOrderStatus.WORKING,
+            broker_identity_status=BrokerIdentityStatus.EXACT,
+            broker_order_id="BROKER-UNLINKED",
+            submitted_quantity=5,
+            remaining_quantity=5,
+            origin=OrderOrigin.USER_ADOPTED,
+            adopted_from_external_order_id="EXTERNAL-UNLINKED",
+        ),
+    )
+    projection = _projection(engine, card, readiness_generation=7)
+
+    with pytest.raises(workflow.BoardCommandRejectedError, match="unlinked owned"):
+        workflow.request_board_action(
+            engine,
+            _command(command_type, projection, **command_kwargs),
+            context=_ready(),
+        )
+
 
 def test_discovered_external_order_renders_as_a_separate_non_draggable_row(tmp_path):
     from PyQt5.QtCore import QMimeData, Qt
@@ -488,8 +642,14 @@ def test_discovered_external_order_renders_as_a_separate_non_draggable_row(tmp_p
 
 
 def test_external_order_without_a_trade_card_still_projects_and_can_be_explicitly_adopted(tmp_path):
-    from src.core.board_workflow import BoardExternalOrderProjection
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtWidgets import QApplication
 
+    from src.core.board_workflow import BoardExternalOrderProjection
+    from src.ui.buyboard.card import UnlinkedExecutionOrderWidget
+    from src.ui.buyboard.columns import BoardColumnList
+
+    app = QApplication.instance() or QApplication([])
     engine = _engine(tmp_path)
     external = record_discovered_external_order(
         engine,
@@ -527,6 +687,28 @@ def test_external_order_without_a_trade_card_still_projects_and_can_be_explicitl
     assert fetch_execution_order(
         engine, result.adopted_execution_client_order_id
     ).origin == OrderOrigin.USER_ADOPTED
+
+    after_adoption = workflow.list_board_projections(
+        engine,
+        context=BoardProjectionContext(readiness_generation=4),
+    )
+    assert len(after_adoption) == 1
+    assert isinstance(after_adoption[0], BoardExecutionOrderProjection)
+    assert (
+        after_adoption[0].order.client_order_id
+        == result.adopted_execution_client_order_id
+    )
+    assert after_adoption[0].order.origin == OrderOrigin.USER_ADOPTED
+
+    column = BoardColumnList(
+        BoardStatus.WATCHLIST,
+        on_card_dropped=lambda payload, target: None,
+    )
+    column.set_cards(after_adoption)
+    assert column.count() == 1
+    assert isinstance(column.itemWidget(column.item(0)), UnlinkedExecutionOrderWidget)
+    assert not bool(column.item(0).flags() & Qt.ItemIsDragEnabled)
+    app.processEvents()
 
 
 def test_a_rejected_drag_command_never_moves_the_local_widget():

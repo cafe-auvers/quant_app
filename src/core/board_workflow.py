@@ -217,6 +217,20 @@ class BoardExternalOrderProjection:
 
 
 @dataclass(frozen=True)
+class BoardExecutionOrderProjection:
+    """Standalone active owned order when no trade card exists for its symbol.
+
+    Adoption must not fabricate a card or make the broker order disappear.
+    This projection keeps the durable execution record visible as a separate,
+    non-draggable audit row until it becomes terminal or is explicitly linked.
+    """
+
+    order: ExecutionOrderRecord
+    readiness_generation: int = 0
+    engine_restrictions: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class BoardProjectionContext:
     readiness_generation: int = 0
     reconciliation_blocked_accounts: Tuple[str, ...] = ()
