@@ -184,6 +184,12 @@ MARKET_DATA_OUTAGE_STOP_DISTANCE_ATR = _env_float(
 EMERGENCY_EXIT_MAX_REPRICE_ATTEMPTS = _env_int(
     "EMERGENCY_EXIT_MAX_REPRICE_ATTEMPTS", 3
 )
+# Separate from market-data outage timing by design (INV-24). This bounds
+# how long a lease last verified at the canonical database may authorize
+# emergency-only mutations while that database remains unreachable.
+EMERGENCY_LEASE_ALLOWANCE_SECONDS = _env_float(
+    "EMERGENCY_LEASE_ALLOWANCE_SECONDS", 30.0
+)
 
 # --- End of day (section 505-511) -------------------------------------------
 EOD_ENTRY_CLEANUP_SECONDS_BEFORE_CLOSE = _env_int(

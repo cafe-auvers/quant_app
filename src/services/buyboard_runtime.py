@@ -119,7 +119,7 @@ from src.core.execution_request import (
     CancelIntent,
     derive_execution_client_order_id,
 )
-from src.core.execution_order_record import ExecutionOrderStatus
+from src.core.execution_order_record import ExecutionOrderRecord, ExecutionOrderStatus
 from src.core.execution_result import broker_order_from_execution_record
 from src.core.order_state import (
     BrokerOrder,
@@ -571,6 +571,7 @@ def build_buyboard_runtime(
     guarded_lease = execution_lease if isinstance(execution_lease, ExecutionLease) else None
     legacy_lease = execution_lease if isinstance(execution_lease, LeaseHandle) else None
     resolved_equity_provider = account_equity_provider or buying_power_provider
+    guarded_record_cache: Dict[str, ExecutionOrderRecord] = {}
 
     def persist_execution_identity(card: TradeCardState) -> None:
         if guarded_mode:
@@ -646,6 +647,20 @@ def build_buyboard_runtime(
             cancel_command_id = f"{client_order_id}:CANCEL:{uuid4().hex}"
             setattr(card, field_name, cancel_command_id)
             persist_execution_identity(card)
+        record = guarded_record_cache.get(client_order_id)
+        if guarded_mode and isinstance(resolved_broker, ExecutionCommandGateway):
+            record = record or resolved_broker.cached_emergency_record(client_order_id)
+            if record is None and resolved_broker.canonical_database_writable:
+                record = fetch_execution_order(
+                    resolved_broker.database_engine, client_order_id
+                )
+                if record is not None:
+                    guarded_record_cache[client_order_id] = record
+        emergency_cancel = bool(
+            str(scope).upper() == "EXIT"
+            and record is not None
+            and record.side == OrderSide.SELL
+        )
         return CancelIntent(
             client_order_id=client_order_id,
             cancel_command_id=cancel_command_id,
@@ -654,6 +669,16 @@ def build_buyboard_runtime(
             lease=guarded_lease,
             strategy_instance_id=strategy_instance_id,
             source=ExecutionSource.KANBAN_BOARD,
+            emergency=emergency_cancel,
+            symbol=record.symbol if emergency_cancel else "",
+            broker_order_id=record.broker_order_id if emergency_cancel else "",
+            quantity=(
+                record.remaining_quantity or record.submitted_quantity
+                if emergency_cancel
+                else 0
+            ),
+            side=record.side.value if emergency_cancel else "",
+            exchange=record.exchange or "NASD" if emergency_cancel else "NASD",
         )
 
     def submit_order(**kwargs):
@@ -788,12 +813,41 @@ def build_buyboard_runtime(
         assert isinstance(resolved_broker, ExecutionCommandGateway)
         engine = resolved_broker.database_engine
         assert engine is not None
-        for record in list_execution_orders_for_card(
-            engine,
-            environment=card.environment,
-            account_no=card.account_no,
-            symbol=card.symbol,
-        ):
+        if resolved_broker.canonical_database_writable:
+            records = list_execution_orders_for_card(
+                engine,
+                environment=card.environment,
+                account_no=card.account_no,
+                symbol=card.symbol,
+            )
+            guarded_record_cache.update(
+                {record.client_order_id: record for record in records}
+            )
+        else:
+            records = [
+                record
+                for record in guarded_record_cache.values()
+                if (
+                    record.environment == card.environment
+                    and record.account_no == card.account_no
+                    and record.symbol == card.symbol
+                )
+            ]
+            if card.exit_client_order_id:
+                emergency_record = resolved_broker.cached_emergency_record(
+                    card.exit_client_order_id
+                )
+                if emergency_record is not None:
+                    records = [
+                        emergency_record,
+                        *[
+                            record
+                            for record in records
+                            if record.client_order_id
+                            != emergency_record.client_order_id
+                        ],
+                    ]
+        for record in records:
             if record.status not in guarded_open_statuses or record.side != side:
                 continue
             if intent is not None and record.intent != intent:
@@ -807,7 +861,15 @@ def build_buyboard_runtime(
         assert isinstance(resolved_broker, ExecutionCommandGateway)
         engine = resolved_broker.database_engine
         assert engine is not None
-        record = fetch_execution_order(engine, order.client_order_id)
+        if resolved_broker.canonical_database_writable:
+            record = fetch_execution_order(engine, order.client_order_id)
+            if record is not None:
+                guarded_record_cache[order.client_order_id] = record
+        else:
+            record = (
+                resolved_broker.cached_emergency_record(order.client_order_id)
+                or guarded_record_cache.get(order.client_order_id)
+            )
         return broker_order_from_execution_record(record) if record is not None else order
 
     entry_deadline_lookup = EntryDeadlineLookup(
@@ -886,6 +948,7 @@ def build_buyboard_runtime(
             gateway=resolved_broker,
             strategy_instance_id=strategy_instance_id,
             lease=guarded_lease,
+            emergency=reason in {"sell_all", "sell_all_retry", "stop_loss"},
             side=OrderSide.SELL,
             intent=intent,
             limit_price=limit_price,

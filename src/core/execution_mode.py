@@ -49,6 +49,13 @@ class ExecutionMode(str, Enum):
     GUARDED_ENGINE = "GUARDED_ENGINE"
 
 
+class ExecutionPersistenceMode(str, Enum):
+    """Where B4a's mandatory pre-broker command record is committed."""
+
+    CANONICAL_DATABASE = "CANONICAL_DATABASE"
+    LOCAL_EMERGENCY_JOURNAL = "LOCAL_EMERGENCY_JOURNAL"
+
+
 def resolve_execution_mode(override: Optional[bool] = None) -> ExecutionMode:
     """``override`` exists only for tests that need to force
     ``GUARDED_ENGINE`` without mutating process-wide environment state --

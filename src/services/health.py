@@ -72,6 +72,7 @@ class HealthContext:
     handoff_reconciliation_required: bool = False
     handoff_blocked_symbols: Sequence[str] = field(default_factory=tuple)
     market_data_metrics: Any = None
+    request_scheduler_metrics: Any = None
 
 
 @dataclass(frozen=True)
@@ -590,6 +591,42 @@ def _main_device_handoff_check(context: HealthContext) -> HealthCheck:
     )
 
 
+def _request_scheduler_check(metrics: Any) -> HealthCheck:
+    if metrics is None:
+        return HealthCheck(
+            "KIS request scheduler",
+            HealthLevel.UNKNOWN,
+            "Request scheduler is not running",
+        )
+    queued = int(getattr(metrics, "queued_requests", 0) or 0)
+    budget_rejections = int(getattr(metrics, "budget_rejections", 0) or 0)
+    uncertain_entries = int(
+        getattr(metrics, "uncertain_entry_rejections", 0) or 0
+    )
+    retries = int(getattr(metrics, "read_retries", 0) or 0)
+    mutation_retries = int(
+        getattr(metrics, "confirmed_mutation_retries", 0) or 0
+    )
+    detail = (
+        f"queue={queued}, budget_rejections={budget_rejections}, "
+        f"uncertain_entry_blocks={uncertain_entries}, read_retries={retries}, "
+        f"confirmed_mutation_retries={mutation_retries}."
+    )
+    if budget_rejections or uncertain_entries:
+        return HealthCheck(
+            "KIS request scheduler",
+            HealthLevel.WARNING,
+            "Requests are being held by rate-budget gates",
+            detail,
+        )
+    return HealthCheck(
+        "KIS request scheduler",
+        HealthLevel.HEALTHY,
+        "Request priorities and budgets are active",
+        detail,
+    )
+
+
 def collect_health_snapshot(context: HealthContext) -> HealthSnapshot:
     """Run read-only local probes and combine them with cached runtime state."""
     token_check, configured = inspect_kis_token()
@@ -613,6 +650,8 @@ def collect_health_snapshot(context: HealthContext) -> HealthSnapshot:
     ]
     if context.market_data_metrics is not None:
         checks.append(_market_data_check(context.market_data_metrics))
+    if context.request_scheduler_metrics is not None:
+        checks.append(_request_scheduler_check(context.request_scheduler_metrics))
     checks.append(
         HealthCheck(
             "Application heartbeat",

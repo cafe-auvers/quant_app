@@ -126,6 +126,7 @@ def request_submit(
     attempt_number: int = 1,
     attempt_deadline_at: Optional[str] = None,
     strategy_instance_id: str = "",
+    emergency: bool = False,
     **legacy_kwargs: Any,
 ) -> ExecutionSubmissionResult:
     """The single shared submission entry point (INV-21).
@@ -160,6 +161,7 @@ def request_submit(
             attempt_number=attempt_number, attempt_deadline_at=attempt_deadline_at,
             lease=lease, source=source,
             strategy_instance_id=strategy_instance_id,
+            emergency=emergency,
         )
         return ExecutionSubmissionResult.from_execution_order(
             resolved_gateway.submit_guarded(request)
@@ -184,6 +186,12 @@ def request_cancel(
     environment: str = "",
     account_no: str = "",
     strategy_instance_id: str = "",
+    emergency: bool = False,
+    symbol: str = "",
+    broker_order_id: str = "",
+    quantity: int = 0,
+    side: str = "",
+    exchange: str = "NASD",
     ownership_engine=None,
 ) -> Any:
     """The single shared cancellation entry point (INV-21).
@@ -212,6 +220,8 @@ def request_cancel(
             client_order_id=client_order_id, cancel_command_id=stable_cancel_id,
             environment=environment, account_no=account_no, lease=lease, source=source,
             strategy_instance_id=strategy_instance_id,
+            emergency=emergency, symbol=symbol, broker_order_id=broker_order_id,
+            quantity=quantity, side=side, exchange=exchange,
         )
         return resolved_gateway.cancel_guarded(request)
     return cancel_and_reconcile_order(
@@ -236,6 +246,12 @@ def request_cancel_intent(
         environment=intent.environment,
         account_no=intent.account_no,
         strategy_instance_id=intent.strategy_instance_id,
+        emergency=intent.emergency,
+        symbol=intent.symbol,
+        broker_order_id=intent.broker_order_id,
+        quantity=intent.quantity,
+        side=intent.side,
+        exchange=intent.exchange,
     )
 
 

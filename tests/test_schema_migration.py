@@ -1,0 +1,250 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from sqlalchemy import create_engine
+
+from src.core.runtime_readiness import RuntimeDeviceState
+from src.core.schema_version import CURRENT_EXECUTION_SCHEMA_VERSION
+from src.core.capital_reservation import CapitalReservation
+from src.core.order_recovery_state import OrderRecoveryState
+from src.core.order_state import BrokerOrder, OrderIntent, OrderSide, OrderStatus
+from src.core.trade_card_state import TradeCardState
+from src.services.capital_reservation_repository import fetch_reservation
+from src.services.execution_order_repository import fetch_execution_order
+from src.services.order_ledger import save_orders
+from src.services.runtime_device_state_repository import (
+    require_compatible_runtime_schema,
+    save_runtime_device_state,
+)
+from src.services.schema_migration import (
+    MigrationEntriesBlockedError,
+    MigrationPhase,
+    MigrationRollbackForbiddenError,
+    SchemaMigrationManager,
+)
+from src.services.trade_card_repository import (
+    get_trade_card,
+    save_local_trade_cards_snapshot,
+)
+from src.utils.storage import save_json
+
+
+def _engine(tmp_path):
+    return create_engine(f"sqlite:///{tmp_path / 'migration.db'}", future=True)
+
+
+def _manager(tmp_path, monkeypatch, **kwargs):
+    monkeypatch.setattr(
+        "src.services.schema_migration.ORDERS_FILE",
+        tmp_path / "missing-orders.json",
+    )
+    monkeypatch.setattr(
+        "src.services.schema_migration.LOCAL_TRADE_CARDS_FILE",
+        tmp_path / "missing-trade-cards.json",
+    )
+    monkeypatch.setattr(
+        "src.services.schema_migration.RESERVATIONS_FILE",
+        tmp_path / "missing-reservations.json",
+    )
+    return SchemaMigrationManager(
+        _engine(tmp_path),
+        backup_path=tmp_path / "migration-backup.json",
+        legacy_paths=kwargs.pop("legacy_paths", ()),
+        **kwargs,
+    )
+
+
+def _prepare(manager):
+    return manager.prepare_cutover(
+        device_id="pc-main", lease_token="token-8", lease_epoch=8
+    )
+
+
+def test_migration_is_idempotent(tmp_path, monkeypatch):
+    calls = []
+    manager = _manager(
+        tmp_path,
+        monkeypatch,
+        migration_callback=lambda: calls.append("migrate"),
+    )
+
+    first = _prepare(manager)
+    second = _prepare(manager)
+
+    assert first.phase == MigrationPhase.AWAITING_RECONCILIATION
+    assert second.phase == MigrationPhase.AWAITING_RECONCILIATION
+    assert calls == ["migrate"]
+    assert manager.mark_reconciliation_complete().phase == MigrationPhase.READY
+    assert _prepare(manager).phase == MigrationPhase.READY
+
+
+def test_migration_converts_local_order_card_and_reservation_records(
+    tmp_path, monkeypatch
+):
+    order_path = tmp_path / "orders.json"
+    card_path = tmp_path / "trade_cards.json"
+    reservation_path = tmp_path / "capital_reservations.json"
+    order = BrokerOrder(
+        client_order_id="legacy-order-1",
+        environment="PROD",
+        account_no="12345678-01",
+        symbol="AAPL",
+        side=OrderSide.SELL,
+        intent=OrderIntent.MANUAL_EXIT,
+        quantity_requested=3,
+        limit_price=99.0,
+        exchange="NASD",
+        status=OrderStatus.WORKING,
+        broker_order_id="BR-LEGACY",
+    )
+    card = TradeCardState(
+        environment="PROD", account_no="12345678-01", symbol="AAPL"
+    )
+    reservation = CapitalReservation.create(
+        environment="PROD",
+        account_no="12345678-01",
+        symbol="MSFT",
+        attempt_group_id="legacy-group",
+        requested_notional=1000,
+    )
+    save_orders([order], path=order_path)
+    save_local_trade_cards_snapshot([card], path=card_path)
+    save_json(
+        reservation_path,
+        {"reservations": [reservation.to_dict()]},
+    )
+    monkeypatch.setattr("src.services.schema_migration.ORDERS_FILE", order_path)
+    monkeypatch.setattr(
+        "src.services.schema_migration.LOCAL_TRADE_CARDS_FILE", card_path
+    )
+    monkeypatch.setattr(
+        "src.services.schema_migration.RESERVATIONS_FILE", reservation_path
+    )
+    engine = _engine(tmp_path)
+    manager = SchemaMigrationManager(
+        engine,
+        backup_path=tmp_path / "migration-backup.json",
+        legacy_paths=(order_path, card_path, reservation_path),
+    )
+
+    _prepare(manager)
+
+    migrated_order = fetch_execution_order(engine, order.client_order_id)
+    assert migrated_order is not None
+    assert (
+        migrated_order.recovery_state
+        == OrderRecoveryState.BROKER_IDENTITY_UNCERTAIN
+    )
+    assert get_trade_card(engine, "PROD", "12345678-01", "AAPL") is not None
+    assert fetch_reservation(engine, reservation.reservation_id) is not None
+
+
+def test_first_launch_after_migration_blocks_entries_until_reconciliation_completes(
+    tmp_path, monkeypatch
+):
+    manager = _manager(tmp_path, monkeypatch)
+    _prepare(manager)
+
+    with pytest.raises(MigrationEntriesBlockedError):
+        manager.require_entries_ready()
+
+    manager.mark_reconciliation_complete()
+    manager.require_entries_ready()
+
+
+def test_migration_crash_after_backup_resumes_without_replacing_backup(
+    tmp_path, monkeypatch
+):
+    def crash(point):
+        if point == "after_backup":
+            raise RuntimeError("crash before cutover")
+
+    manager = _manager(tmp_path, monkeypatch, fault_hook=crash)
+    with pytest.raises(RuntimeError, match="before cutover"):
+        _prepare(manager)
+    checksum = manager.state.backup_checksum
+    assert manager.state.phase == MigrationPhase.BACKED_UP
+
+    resumed = _manager(tmp_path, monkeypatch)
+    assert _prepare(resumed).phase == MigrationPhase.AWAITING_RECONCILIATION
+    assert resumed.state.backup_checksum == checksum
+
+
+def test_migration_crash_after_cutover_resumes_forward(
+    tmp_path, monkeypatch
+):
+    def crash(point):
+        if point == "after_cutover":
+            raise RuntimeError("crash after cutover")
+
+    manager = _manager(tmp_path, monkeypatch, fault_hook=crash)
+    with pytest.raises(RuntimeError, match="after cutover"):
+        _prepare(manager)
+    assert manager.state.phase == MigrationPhase.AWAITING_RECONCILIATION
+
+    resumed = _manager(tmp_path, monkeypatch)
+    assert _prepare(resumed).phase == MigrationPhase.AWAITING_RECONCILIATION
+    assert resumed.mark_reconciliation_complete().phase == MigrationPhase.READY
+
+
+def test_rollback_allowed_before_any_post_migration_broker_mutation(
+    tmp_path, monkeypatch
+):
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text("before", encoding="utf-8")
+    manager = _manager(
+        tmp_path,
+        monkeypatch,
+        legacy_paths=(legacy,),
+        migration_callback=lambda: legacy.write_text("after", encoding="utf-8"),
+    )
+    _prepare(manager)
+
+    manager.rollback_direct()
+
+    assert legacy.read_text(encoding="utf-8") == "before"
+    assert manager.state.phase == MigrationPhase.NOT_STARTED
+
+
+def test_direct_restore_refused_after_a_post_migration_broker_mutation(
+    tmp_path, monkeypatch
+):
+    manager = _manager(tmp_path, monkeypatch)
+    _prepare(manager)
+    manager.mark_post_migration_broker_mutation()
+
+    with pytest.raises(MigrationRollbackForbiddenError, match="reconcile forward"):
+        manager.rollback_direct()
+
+
+def test_startup_refuses_schema_mismatch_with_another_live_device(tmp_path):
+    engine = _engine(tmp_path)
+    save_runtime_device_state(
+        engine,
+        device_id="old-pc",
+        hostname="old",
+        state=RuntimeDeviceState.ACTIVE,
+        schema_version=CURRENT_EXECUTION_SCHEMA_VERSION - 1,
+    )
+
+    with pytest.raises(RuntimeError, match="schema mismatch"):
+        require_compatible_runtime_schema(
+            engine,
+            device_id="new-pc",
+            schema_version=CURRENT_EXECUTION_SCHEMA_VERSION,
+        )
+
+
+def test_stopped_device_on_an_old_schema_does_not_block_startup(tmp_path):
+    engine = _engine(tmp_path)
+    save_runtime_device_state(
+        engine,
+        device_id="old-pc",
+        hostname="old",
+        state=RuntimeDeviceState.STOPPED,
+        schema_version=CURRENT_EXECUTION_SCHEMA_VERSION - 1,
+    )
+
+    require_compatible_runtime_schema(engine, device_id="new-pc")

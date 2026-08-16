@@ -55,6 +55,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from sqlalchemy.engine import Engine
 
 from src.brokers.execution_broker_protocol import Broker, BrokerSubmissionResult, KisBroker
+from src.core import execution_config
 from src.core.capital_reservation import CapitalReservation
 from src.core.execution_mode import ExecutionLease, ExecutionMode, ExecutionSource, resolve_execution_mode
 from src.core.execution_order_record import (
@@ -76,6 +77,7 @@ from src.core.order_state import (
     RESERVED_MOO_EXECUTION,
     BrokerOrderDiscoveryResult,
     BrokerOrderStatusSnapshot,
+    OrderIntent,
     OrderSide,
     OrderStatus,
 )
@@ -110,6 +112,13 @@ from src.services.discovered_external_order_repository import (
     require_no_active_unowned_external_order,
 )
 from src.services.mutation_budget_protocol import CommandType, MutationBudgetProtocol
+from src.services.kis_request_scheduler import RequestPriority
+from src.services.emergency_journal import (
+    EmergencyJournal,
+    EmergencyJournalError,
+    EmergencyLeaseAllowance,
+    EmergencyLeaseAllowanceError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +130,18 @@ class GuardedExecutionError(RuntimeError):
     """Base for every ``GUARDED_ENGINE``-mode gateway rejection. Never
     raised in ``LEGACY_COMPATIBILITY`` mode -- that mode's exceptions are
     whatever the real broker itself raises, unchanged."""
+
+
+class CanonicalDatabaseUnavailableError(GuardedExecutionError):
+    """Canonical persistence is unavailable and the request must fail closed."""
+
+
+class EmergencyActionNotPermittedError(GuardedExecutionError):
+    """A database-outage request is not one of the narrowly allowed exits."""
+
+
+class EmergencyJournalUnavailableError(GuardedExecutionError):
+    """Mandatory local persistence failed before an emergency broker call."""
 
 
 class WrongGatewayModeError(GuardedExecutionError):
@@ -351,19 +372,45 @@ class ExecutionCommandGateway:
         engine: Optional[Engine] = None,
         lease_protocol: Optional[ExecutionLeaseProtocol] = None,
         mutation_budget: Optional[MutationBudgetProtocol] = None,
+        request_scheduler: Optional[MutationBudgetProtocol] = None,
         buying_power_provider: Optional[Callable[[str, str], float]] = None,
         mode_override: Optional[bool] = None,
         ownership_registry: Optional[_OwnershipRegistry] = None,
+        emergency_journal: Optional[EmergencyJournal] = None,
+        emergency_lease_allowance: Optional[EmergencyLeaseAllowance] = None,
+        database_writable_provider: Optional[Callable[[], bool]] = None,
+        handoff_pending_provider: Optional[Callable[[], bool]] = None,
+        critical_alert_sink: Optional[Callable[[str, str, str], None]] = None,
+        schema_migration_manager: Optional[Any] = None,
     ) -> None:
         self._real_broker: Broker = real_broker if real_broker is not None else KisBroker()
         self._engine = engine
         self._lease_protocol: ExecutionLeaseProtocol = lease_protocol or DefaultExecutionLeaseProtocol(
             engine=engine
         )
-        self._mutation_budget = mutation_budget
+        if mutation_budget is not None and request_scheduler is not None:
+            raise ValueError("Supply request_scheduler or mutation_budget, not both")
+        # ``mutation_budget`` remains a compatibility keyword for existing
+        # tests/callers. Production composition supplies the real Workstream
+        # 10 scheduler through ``request_scheduler``.
+        self._mutation_budget = request_scheduler or mutation_budget
         self._buying_power_provider = buying_power_provider
         self._mode_override = mode_override
         self._ownership = ownership_registry or _OwnershipRegistry()
+        self._emergency_journal = emergency_journal or EmergencyJournal()
+        self._emergency_lease_allowance = (
+            emergency_lease_allowance
+            or EmergencyLeaseAllowance(
+                max_seconds=execution_config.EMERGENCY_LEASE_ALLOWANCE_SECONDS
+            )
+        )
+        self._database_writable_provider = database_writable_provider
+        self._handoff_pending_provider = handoff_pending_provider or (lambda: False)
+        self._critical_alert_sink = critical_alert_sink
+        self._schema_migration_manager = schema_migration_manager
+        self._last_verified_lease: Optional[ExecutionLease] = None
+        self._last_database_writable_state: Optional[bool] = None
+        self._emergency_records: Dict[str, ExecutionOrderRecord] = {}
 
     @property
     def mode(self) -> ExecutionMode:
@@ -372,6 +419,10 @@ class ExecutionCommandGateway:
     @property
     def database_engine(self) -> Optional[Engine]:
         return self._engine
+
+    @property
+    def canonical_database_writable(self) -> bool:
+        return self._canonical_database_is_writable()
 
     def require_guarded_runtime_ready(self) -> None:
         """Fail during composition if any guarded production gate is absent."""
@@ -461,24 +512,119 @@ class ExecutionCommandGateway:
     # --- read-only passthroughs (never guarded -- not destructive) -------------
 
     def get_order(self, **kwargs: Any) -> List[BrokerOrderStatusSnapshot]:
-        return self._real_broker.get_order(**kwargs)
+        return self._execute_scheduled_read(
+            lambda: self._real_broker.get_order(**kwargs),
+            account_no=str(kwargs.get("account_no") or ""),
+            endpoint="get_order",
+            priority=RequestPriority.ACCOUNT_RECONCILIATION,
+        )
 
     def discover_orders(self, **kwargs: Any) -> BrokerOrderDiscoveryResult:
-        return self._real_broker.discover_orders(**kwargs)
+        return self._execute_scheduled_read(
+            lambda: self._real_broker.discover_orders(**kwargs),
+            account_no=str(kwargs.get("account_no") or ""),
+            endpoint="discover_orders",
+            priority=RequestPriority.ACCOUNT_RECONCILIATION,
+        )
 
     def get_positions(self, **kwargs: Any) -> Dict[str, Any]:
-        return self._real_broker.get_positions(**kwargs)
+        return self._execute_scheduled_read(
+            lambda: self._real_broker.get_positions(**kwargs),
+            account_no=str(kwargs.get("account_no") or ""),
+            endpoint="get_positions",
+            priority=RequestPriority.ACCOUNT_RECONCILIATION,
+        )
 
     # --- GUARDED_ENGINE only ----------------------------------------------------
+
+    def _canonical_database_is_writable(self) -> bool:
+        provider = self._database_writable_provider
+        if provider is None:
+            return True
+        try:
+            writable = bool(provider())
+        except Exception:
+            writable = False
+        if writable:
+            self._last_database_writable_state = True
+        elif self._last_database_writable_state is not False:
+            self.note_canonical_database_unavailable()
+        return writable
+
+    def note_canonical_database_unavailable(self) -> None:
+        """Start the monotonic outage allowance at outage detection time."""
+
+        if self._last_database_writable_state is False:
+            return
+        self._last_database_writable_state = False
+        self._emergency_lease_allowance.begin_outage(
+            self._last_verified_lease,
+            verified_current=self._last_verified_lease is not None,
+            handoff_pending=bool(self._handoff_pending_provider()),
+        )
+
+    def _emit_critical_alert(self, alert_class: str, dedupe_key: str, message: str) -> None:
+        sink = self._critical_alert_sink
+        if sink is None:
+            logger.critical("%s [%s]: %s", alert_class, dedupe_key, message)
+            return
+        try:
+            sink(alert_class, dedupe_key, message)
+        except Exception:
+            logger.exception("Critical alert sink failed for %s", alert_class)
+
+    def note_canonical_lease_verified(self, lease: Optional[ExecutionLease]) -> None:
+        """Cache an exact lease only after an authoritative healthy-DB check.
+
+        The runtime may call this after its periodic lease check. A database
+        outage can never create or extend this proof; a restart loses it.
+        """
+
+        if not self._canonical_database_is_writable():
+            raise CanonicalDatabaseUnavailableError(
+                "Cannot cache an execution lease while the canonical database is unavailable"
+            )
+        self._require_verified_lease(lease)
+
+    def reconcile_emergency_journal(self) -> int:
+        if not self._canonical_database_is_writable():
+            raise CanonicalDatabaseUnavailableError(
+                "Canonical database is unavailable during emergency-journal reconciliation"
+            )
+        count = self._emergency_journal.reconcile_into_canonical(self._require_engine())
+        self._emergency_lease_allowance.clear()
+        self._emergency_records.clear()
+        if self._schema_migration_manager is not None:
+            self._schema_migration_manager.reconcile_local_mutation_marker()
+        return count
+
+    def cached_emergency_record(
+        self, client_order_id: str
+    ) -> Optional[ExecutionOrderRecord]:
+        return self._emergency_records.get(str(client_order_id or ""))
+
+    def _mark_post_migration_broker_mutation(self) -> None:
+        if self._schema_migration_manager is not None:
+            self._schema_migration_manager.mark_post_migration_broker_mutation()
+
+    def _cross_broker_boundary(self, operation: Callable[[], Any]) -> Any:
+        self._mark_post_migration_broker_mutation()
+        return operation()
 
     def submit_guarded(self, request: SubmitExecutionRequest) -> ExecutionOrderRecord:
         self._require_guarded_mode()
         key = _recovery_key(request.environment, request.account_no, request.symbol)
         with self._ownership.claim(key, request.source):
+            if not self._canonical_database_is_writable():
+                return self._do_emergency_submit(request)
             return self._do_submit(request)
 
     def cancel_guarded(self, request: CancelExecutionRequest) -> ExecutionOrderRecord:
         self._require_guarded_mode()
+        if not self._canonical_database_is_writable():
+            key = _recovery_key(request.environment, request.account_no, request.symbol)
+            with self._ownership.claim(key, request.source):
+                return self._do_emergency_cancel(request)
         record = self._fetch_record(request.client_order_id)
         if record is None:
             raise OrderNotFoundForCancelError(
@@ -568,9 +714,40 @@ class ExecutionCommandGateway:
 
             # 4. preflight both the cancel and submit mutation budgets
             # before committing to either broker call.
-            mutation_budget.require_available(CommandType.REPLACE)
-            mutation_budget.require_available(CommandType.CANCEL)
-            mutation_budget.require_available(CommandType.SUBMIT)
+            replace_priority = self._priority_for_record(original)
+            self._require_budget_available(
+                mutation_budget,
+                CommandType.REPLACE,
+                account_no=original.account_no,
+                endpoint="replace_order",
+                priority=replace_priority,
+                is_new_entry=(
+                    original.side == OrderSide.BUY
+                    and original.intent == OrderIntent.ENTRY
+                ),
+                consume=False,
+            )
+            self._require_budget_available(
+                mutation_budget,
+                CommandType.CANCEL,
+                account_no=original.account_no,
+                endpoint="cancel_order",
+                priority=replace_priority,
+                is_new_entry=False,
+                consume=False,
+            )
+            self._require_budget_available(
+                mutation_budget,
+                CommandType.SUBMIT,
+                account_no=original.account_no,
+                endpoint="submit_order",
+                priority=replace_priority,
+                is_new_entry=(
+                    original.side == OrderSide.BUY
+                    and original.intent == OrderIntent.ENTRY
+                ),
+                consume=False,
+            )
 
             # 5. persist the durable parent replace command/intention --
             # before either broker call, so a crash between the cancel and
@@ -662,6 +839,98 @@ class ExecutionCommandGateway:
             )
         return self._mutation_budget
 
+    @staticmethod
+    def _require_budget_available(
+        budget: MutationBudgetProtocol,
+        command_type: CommandType,
+        *,
+        account_no: str,
+        endpoint: str,
+        priority: RequestPriority,
+        is_new_entry: bool,
+        consume: bool,
+    ) -> None:
+        if getattr(budget, "context_aware", False):
+            budget.require_available(
+                command_type,
+                account_no=account_no,
+                endpoint=endpoint,
+                priority=priority,
+                is_new_entry=is_new_entry,
+                consume=consume,
+            )
+            return
+        # Compatibility for narrow PR2 test doubles implementing the old
+        # one-argument seam. They are never used by production composition.
+        budget.require_available(command_type)
+
+    def _execute_scheduled_read(
+        self,
+        operation: Callable[[], Any],
+        *,
+        account_no: str,
+        endpoint: str,
+        priority: RequestPriority,
+    ) -> Any:
+        scheduler = self._mutation_budget
+        execute = getattr(scheduler, "execute_read", None)
+        if not callable(execute):
+            return operation()
+        return execute(
+            operation,
+            account_no=account_no,
+            endpoint=endpoint,
+            priority=priority,
+        )
+
+    def _execute_scheduled_mutation(
+        self,
+        operation: Callable[[], Any],
+        *,
+        command_type: CommandType,
+        account_no: str,
+        endpoint: str,
+        priority: RequestPriority,
+        is_new_entry: bool,
+    ) -> Any:
+        scheduler = self._require_mutation_budget()
+        execute = getattr(scheduler, "execute_mutation", None)
+        if not callable(execute):
+            return operation()
+
+        classifier = getattr(
+            self._real_broker,
+            "is_confirmed_pre_acceptance_rejection",
+            None,
+        )
+        return execute(
+            operation,
+            command_type=command_type,
+            account_no=account_no,
+            endpoint=endpoint,
+            priority=priority,
+            is_new_entry=is_new_entry,
+            is_confirmed_pre_acceptance_rejection=(
+                classifier if callable(classifier) else None
+            ),
+        )
+
+    @staticmethod
+    def _priority_for_submit(request: SubmitExecutionRequest) -> RequestPriority:
+        if request.side == OrderSide.BUY and request.intent == OrderIntent.ENTRY:
+            return RequestPriority.NEW_ENTRY
+        if request.intent in (OrderIntent.STOP_LOSS, OrderIntent.MANUAL_EXIT):
+            return RequestPriority.EMERGENCY_EXIT
+        return RequestPriority.EXIT_CANCEL_OR_RECONCILIATION
+
+    @staticmethod
+    def _priority_for_record(record: ExecutionOrderRecord) -> RequestPriority:
+        if record.side == OrderSide.BUY:
+            return RequestPriority.ENTRY_CANCEL
+        if record.intent in (OrderIntent.STOP_LOSS, OrderIntent.MANUAL_EXIT):
+            return RequestPriority.EMERGENCY_EXIT
+        return RequestPriority.EXIT_CANCEL_OR_RECONCILIATION
+
     def _require_buying_power_provider(self) -> Callable[[str, str], float]:
         if self._buying_power_provider is None:
             raise GuardedEngineRequiresBuyingPowerProviderError(
@@ -685,6 +954,8 @@ class ExecutionCommandGateway:
                 "authoritative source -- refusing to proceed in GUARDED_ENGINE mode "
                 "(see DefaultExecutionLeaseProtocol.epoch_verified)"
             )
+        if self._canonical_database_is_writable():
+            self._last_verified_lease = lease
 
     def _require_ownership(
         self, environment: str, account_no: str, symbol: str, source: ExecutionSource,
@@ -743,6 +1014,308 @@ class ExecutionCommandGateway:
 
     # --- internal: GUARDED_ENGINE sequences -------------------------------------
 
+    def _require_emergency_allowance(
+        self, lease: Optional[ExecutionLease]
+    ) -> ExecutionLease:
+        if bool(self._handoff_pending_provider()):
+            self._emergency_lease_allowance.clear()
+            raise EmergencyActionNotPermittedError(
+                "Emergency execution is forbidden while device handoff is pending"
+            )
+        if self._emergency_lease_allowance.snapshot is None:
+            error = EmergencyActionNotPermittedError(
+                "No exact lease was verified when the canonical database outage began"
+            )
+            self._emit_critical_alert(
+                "DATABASE_UNAVAILABLE",
+                f"emergency-lease:{getattr(lease, 'device_id', 'unknown')}",
+                str(error),
+            )
+            raise error
+        try:
+            self._emergency_lease_allowance.require_valid(lease)
+        except EmergencyLeaseAllowanceError as exc:
+            self._emit_critical_alert(
+                "DATABASE_UNAVAILABLE",
+                f"emergency-lease:{getattr(lease, 'device_id', 'unknown')}",
+                str(exc),
+            )
+            raise EmergencyActionNotPermittedError(str(exc)) from exc
+        assert lease is not None
+        return lease
+
+    def _append_emergency_outcome(
+        self,
+        *,
+        request_entry: Dict[str, Any],
+        idempotency_key: str,
+        status: str,
+        broker_response: Optional[Dict[str, Any]],
+    ) -> None:
+        try:
+            self._emergency_journal.append_outcome(
+                requested_sequence=int(request_entry["sequence"]),
+                idempotency_key=idempotency_key,
+                status=status,
+                broker_response=broker_response,
+            )
+        except Exception as exc:
+            self._emit_critical_alert(
+                "DATABASE_UNAVAILABLE",
+                idempotency_key,
+                "A broker mutation completed but its emergency outcome could not be fsynced: "
+                f"{exc}",
+            )
+            raise AmbiguousPostBrokerPersistenceError(
+                "Emergency broker mutation completed but the local outcome journal failed; "
+                "never retry automatically"
+            ) from exc
+
+    def _do_emergency_submit(
+        self, request: SubmitExecutionRequest
+    ) -> ExecutionOrderRecord:
+        if (
+            not request.emergency
+            or request.side != OrderSide.SELL
+            or request.intent not in (OrderIntent.STOP_LOSS, OrderIntent.MANUAL_EXIT)
+        ):
+            raise CanonicalDatabaseUnavailableError(
+                "Canonical database unavailable; ordinary and entry commands fail closed"
+            )
+        lease = self._require_emergency_allowance(request.lease)
+        trading_state.require_trading_enabled(request.environment, request.symbol)
+        quantity = int(request.quantity)
+        limit_price = float(request.limit_price)
+        if quantity <= 0 or not math.isfinite(limit_price) or limit_price <= 0:
+            raise ValueError("Emergency SELL requires positive quantity and finite limit price")
+        idempotency_key = f"SUBMIT:{request.client_order_id}"
+        try:
+            requested = self._emergency_journal.append_requested(
+                idempotency_key=idempotency_key,
+                command_type="submit",
+                environment=request.environment,
+                account_no=request.account_no,
+                symbol=request.symbol,
+                lease=lease,
+                source=request.source.value,
+                order_payload={
+                    "client_order_id": request.client_order_id,
+                    "side": request.side.value,
+                    "intent": request.intent.value,
+                    "quantity": quantity,
+                    "limit_price": limit_price,
+                    "exchange": request.exchange,
+                    "execution_policy": request.execution_policy,
+                    "attempt_group_id": request.attempt_group_id,
+                    "attempt_number": int(request.attempt_number),
+                },
+            )
+        except Exception as exc:
+            self._emit_critical_alert(
+                "DATABASE_UNAVAILABLE",
+                idempotency_key,
+                f"Emergency journal pre-write failed; broker was not called: {exc}",
+            )
+            raise EmergencyJournalUnavailableError(str(exc)) from exc
+
+        try:
+            submission = self._execute_scheduled_mutation(
+                lambda: self._cross_broker_boundary(
+                    lambda: self._real_broker.submit_order(
+                        environment=request.environment,
+                        account_no=request.account_no,
+                        symbol=request.symbol,
+                        side=request.side,
+                        quantity=quantity,
+                        limit_price=limit_price,
+                        exchange=request.exchange,
+                        execution_policy=request.execution_policy,
+                    )
+                ),
+                command_type=CommandType.SUBMIT,
+                account_no=request.account_no,
+                endpoint="submit_order",
+                priority=RequestPriority.EMERGENCY_EXIT,
+                is_new_entry=False,
+            )
+        except Exception as exc:
+            try:
+                ambiguous = self._real_broker.is_ambiguous_submission_error(exc)
+            except Exception:
+                ambiguous = True
+            self._append_emergency_outcome(
+                request_entry=requested,
+                idempotency_key=idempotency_key,
+                status="AMBIGUOUS" if ambiguous else "FAILED",
+                broker_response={"error": str(exc)},
+            )
+            if ambiguous:
+                raise GuardedSubmissionAmbiguousError(str(exc)) from exc
+            raise GuardedSubmissionRejectedError(str(exc)) from exc
+
+        self._append_emergency_outcome(
+            request_entry=requested,
+            idempotency_key=idempotency_key,
+            status="ACKNOWLEDGED",
+            broker_response={
+                **submission.raw_response,
+                "broker_order_id": submission.broker_order_id,
+            },
+        )
+        record = ExecutionOrderRecord(
+            environment=request.environment,
+            account_no=request.account_no,
+            symbol=request.symbol,
+            side=request.side,
+            intent=request.intent,
+            client_order_id=request.client_order_id,
+            attempt_group_id=request.attempt_group_id,
+            attempt_number=request.attempt_number,
+            attempt_deadline_at=request.attempt_deadline_at,
+            submitted_quantity=quantity,
+            submitted_limit_price=limit_price,
+            remaining_quantity=quantity,
+            exchange=request.exchange,
+            execution_policy=request.execution_policy,
+            owner_device_id=lease.device_id,
+            lease_token=lease.lease_token,
+            lease_epoch=lease.lease_epoch,
+        )
+        apply_status_transition(record, ExecutionOrderStatus.SUBMITTING)
+        apply_status_transition(
+            record,
+            ExecutionOrderStatus.ACKNOWLEDGED,
+            broker_order_id=submission.broker_order_id,
+        )
+        self._emit_critical_alert(
+            "EMERGENCY_LIQUIDATION_ATTEMPTED",
+            idempotency_key,
+            f"Emergency protective SELL was submitted for {request.symbol}",
+        )
+        self._emergency_records[record.client_order_id] = record
+        return record
+
+    def _do_emergency_cancel(
+        self, request: CancelExecutionRequest
+    ) -> ExecutionOrderRecord:
+        if (
+            not request.emergency
+            or request.side != OrderSide.SELL.value
+            or not request.symbol
+            or not request.broker_order_id
+            or request.quantity <= 0
+        ):
+            raise CanonicalDatabaseUnavailableError(
+                "Canonical database unavailable; only complete emergency SELL cancellation "
+                "requests may use the local journal"
+            )
+        lease = self._require_emergency_allowance(request.lease)
+        trading_state.require_trading_enabled(request.environment, request.symbol)
+        idempotency_key = f"CANCEL:{request.cancel_command_id}"
+        try:
+            requested = self._emergency_journal.append_requested(
+                idempotency_key=idempotency_key,
+                command_type="cancel",
+                environment=request.environment,
+                account_no=request.account_no,
+                symbol=request.symbol,
+                lease=lease,
+                source=request.source.value,
+                target_broker_order_id=request.broker_order_id,
+                order_payload={
+                    "client_order_id": request.client_order_id,
+                    "side": request.side,
+                    "quantity": request.quantity,
+                    "exchange": request.exchange,
+                },
+            )
+        except Exception as exc:
+            self._emit_critical_alert(
+                "DATABASE_UNAVAILABLE",
+                idempotency_key,
+                f"Emergency journal pre-write failed; broker was not called: {exc}",
+            )
+            raise EmergencyJournalUnavailableError(str(exc)) from exc
+        try:
+            snapshot = self._execute_scheduled_mutation(
+                lambda: self._cross_broker_boundary(
+                    lambda: self._real_broker.cancel_order(
+                        environment=request.environment,
+                        account_no=request.account_no,
+                        is_reserved=False,
+                        symbol=request.symbol,
+                        broker_order_id=request.broker_order_id,
+                        quantity=request.quantity,
+                        side=request.side,
+                        exchange=request.exchange,
+                    )
+                ),
+                command_type=CommandType.CANCEL,
+                account_no=request.account_no,
+                endpoint="cancel_order",
+                priority=RequestPriority.EMERGENCY_EXIT,
+                is_new_entry=False,
+            )
+        except Exception as exc:
+            classify = getattr(self._real_broker, "is_ambiguous_cancellation_error", None)
+            try:
+                ambiguous = classify(exc) if callable(classify) else True
+            except Exception:
+                ambiguous = True
+            self._append_emergency_outcome(
+                request_entry=requested,
+                idempotency_key=idempotency_key,
+                status="AMBIGUOUS" if ambiguous else "FAILED",
+                broker_response={"error": str(exc)},
+            )
+            if ambiguous:
+                raise GuardedCancellationAmbiguousError(str(exc)) from exc
+            raise GuardedCancellationRejectedError(str(exc)) from exc
+        self._append_emergency_outcome(
+            request_entry=requested,
+            idempotency_key=idempotency_key,
+            status="ACKNOWLEDGED",
+            broker_response={
+                **snapshot.raw_response,
+                "normalized_status": snapshot.status.value,
+                "filled_quantity": snapshot.filled_quantity,
+                "remaining_quantity": snapshot.remaining_quantity,
+                "average_fill_price": snapshot.avg_fill_price,
+            },
+        )
+        record = ExecutionOrderRecord(
+            environment=request.environment,
+            account_no=request.account_no,
+            symbol=request.symbol,
+            side=OrderSide.SELL,
+            intent=OrderIntent.MANUAL_EXIT,
+            client_order_id=request.client_order_id,
+            broker_order_id=request.broker_order_id,
+            submitted_quantity=request.quantity,
+            remaining_quantity=request.quantity,
+            exchange=request.exchange,
+            owner_device_id=lease.device_id,
+            lease_token=lease.lease_token,
+            lease_epoch=lease.lease_epoch,
+            broker_identity_status=BrokerIdentityStatus.EXACT,
+            status=ExecutionOrderStatus.ACKNOWLEDGED,
+        )
+        apply_status_transition(record, ExecutionOrderStatus.CANCEL_PENDING)
+        record.filled_quantity = max(0, snapshot.filled_quantity)
+        record.remaining_quantity = max(0, snapshot.remaining_quantity)
+        if snapshot.status == OrderStatus.CANCELLED:
+            apply_status_transition(record, ExecutionOrderStatus.CANCELLED)
+        elif snapshot.status == OrderStatus.FILLED:
+            record.filled_quantity = snapshot.filled_quantity or request.quantity
+            record.remaining_quantity = 0
+            apply_status_transition(record, ExecutionOrderStatus.FILLED)
+        elif snapshot.status == OrderStatus.PARTIALLY_FILLED:
+            apply_status_transition(record, ExecutionOrderStatus.PARTIALLY_FILLED)
+        else:
+            _transition_recovery_state(record, OrderRecoveryState.DISCOVERING)
+        self._emergency_records[record.client_order_id] = record
+        return record
+
     def _do_submit(self, request: SubmitExecutionRequest) -> ExecutionOrderRecord:
         engine = self._require_engine()
         mutation_budget = self._require_mutation_budget()
@@ -760,7 +1333,21 @@ class ExecutionCommandGateway:
         self._require_verified_lease(request.lease)
 
         # B2: mutation budget (Workstream 10 seam).
-        mutation_budget.require_available(CommandType.SUBMIT)
+        submit_priority = self._priority_for_submit(request)
+        is_new_entry = (
+            request.side == OrderSide.BUY and request.intent == OrderIntent.ENTRY
+        )
+        if is_new_entry and self._schema_migration_manager is not None:
+            self._schema_migration_manager.require_entries_ready()
+        self._require_budget_available(
+            mutation_budget,
+            CommandType.SUBMIT,
+            account_no=account_no,
+            endpoint="submit_order",
+            priority=submit_priority,
+            is_new_entry=is_new_entry,
+            consume=False,
+        )
 
         # 3. command intent, quantity, price.
         quantity = int(request.quantity)
@@ -893,10 +1480,24 @@ class ExecutionCommandGateway:
 
         # 9. only now call the broker.
         try:
-            submission = self._real_broker.submit_order(
-                environment=environment, account_no=account_no, symbol=symbol, side=request.side,
-                quantity=quantity, limit_price=limit_price, exchange=request.exchange,
-                execution_policy=request.execution_policy,
+            submission = self._execute_scheduled_mutation(
+                lambda: self._cross_broker_boundary(
+                    lambda: self._real_broker.submit_order(
+                        environment=environment,
+                        account_no=account_no,
+                        symbol=symbol,
+                        side=request.side,
+                        quantity=quantity,
+                        limit_price=limit_price,
+                        exchange=request.exchange,
+                        execution_policy=request.execution_policy,
+                    )
+                ),
+                command_type=CommandType.SUBMIT,
+                account_no=account_no,
+                endpoint="submit_order",
+                priority=submit_priority,
+                is_new_entry=is_new_entry,
             )
         except Exception as exc:
             error_message = str(exc)
@@ -971,7 +1572,16 @@ class ExecutionCommandGateway:
             record.environment, record.account_no, record.symbol, request.source, request.strategy_instance_id
         )
         self._require_verified_lease(request.lease)
-        mutation_budget.require_available(CommandType.CANCEL)
+        cancel_priority = self._priority_for_record(record)
+        self._require_budget_available(
+            mutation_budget,
+            CommandType.CANCEL,
+            account_no=record.account_no,
+            endpoint="cancel_order",
+            priority=cancel_priority,
+            is_new_entry=False,
+            consume=False,
+        )
 
         if not permission_check(record):
             raise CancelNotPermittedError(
@@ -1046,11 +1656,26 @@ class ExecutionCommandGateway:
 
         quantity = record.remaining_quantity or record.submitted_quantity
         try:
-            snapshot = self._real_broker.cancel_order(
-                environment=record.environment, account_no=record.account_no,
-                is_reserved=(record.execution_policy == RESERVED_MOO_EXECUTION),
-                symbol=record.symbol, broker_order_id=record.broker_order_id, quantity=quantity,
-                side=record.side.value, exchange=record.exchange or "NASD",
+            snapshot = self._execute_scheduled_mutation(
+                lambda: self._cross_broker_boundary(
+                    lambda: self._real_broker.cancel_order(
+                        environment=record.environment,
+                        account_no=record.account_no,
+                        is_reserved=(
+                            record.execution_policy == RESERVED_MOO_EXECUTION
+                        ),
+                        symbol=record.symbol,
+                        broker_order_id=record.broker_order_id,
+                        quantity=quantity,
+                        side=record.side.value,
+                        exchange=record.exchange or "NASD",
+                    )
+                ),
+                command_type=CommandType.CANCEL,
+                account_no=record.account_no,
+                endpoint="cancel_order",
+                priority=cancel_priority,
+                is_new_entry=False,
             )
         except Exception as exc:
             error_message = str(exc)
@@ -1188,9 +1813,16 @@ def build_guarded_execution_gateway(
     *,
     engine: Engine,
     lease_protocol: ExecutionLeaseProtocol,
-    mutation_budget: MutationBudgetProtocol,
+    request_scheduler: Optional[MutationBudgetProtocol] = None,
+    mutation_budget: Optional[MutationBudgetProtocol] = None,
     buying_power_provider: Callable[[str, str], float],
     real_broker: Optional[Broker] = None,
+    emergency_journal: Optional[EmergencyJournal] = None,
+    emergency_lease_allowance: Optional[EmergencyLeaseAllowance] = None,
+    database_writable_provider: Optional[Callable[[], bool]] = None,
+    handoff_pending_provider: Optional[Callable[[], bool]] = None,
+    critical_alert_sink: Optional[Callable[[str, str, str], None]] = None,
+    schema_migration_manager: Optional[Any] = None,
 ) -> ExecutionCommandGateway:
     """The explicit ``GUARDED_ENGINE``-capable composition root (finding
     10): every dependency ``GUARDED_ENGINE`` mode actually needs is
@@ -1203,14 +1835,29 @@ def build_guarded_execution_gateway(
         raise GuardedEngineRequiresDatabaseError("build_guarded_execution_gateway requires engine")
     if lease_protocol is None:
         raise LeaseNotVerifiedError("build_guarded_execution_gateway requires lease_protocol")
-    if mutation_budget is None:
-        raise GuardedEngineRequiresMutationBudgetError("build_guarded_execution_gateway requires mutation_budget")
+    if request_scheduler is not None and mutation_budget is not None:
+        raise GuardedEngineRequiresMutationBudgetError(
+            "build_guarded_execution_gateway accepts request_scheduler or mutation_budget, not both"
+        )
+    scheduler = request_scheduler or mutation_budget
+    if scheduler is None:
+        raise GuardedEngineRequiresMutationBudgetError(
+            "build_guarded_execution_gateway requires request_scheduler"
+        )
     if buying_power_provider is None:
         raise GuardedEngineRequiresBuyingPowerProviderError(
             "build_guarded_execution_gateway requires buying_power_provider"
         )
     return ExecutionCommandGateway(
         real_broker=real_broker if real_broker is not None else KisBroker(),
-        engine=engine, lease_protocol=lease_protocol, mutation_budget=mutation_budget,
+        engine=engine,
+        lease_protocol=lease_protocol,
+        request_scheduler=scheduler,
         buying_power_provider=buying_power_provider,
+        emergency_journal=emergency_journal,
+        emergency_lease_allowance=emergency_lease_allowance,
+        database_writable_provider=database_writable_provider,
+        handoff_pending_provider=handoff_pending_provider,
+        critical_alert_sink=critical_alert_sink,
+        schema_migration_manager=schema_migration_manager,
     )

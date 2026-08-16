@@ -418,6 +418,14 @@ class HealthPanelMixin:
                 market_data_metrics = metrics_reader()
             except Exception:
                 logger.exception("Failed to read KIS market-data health metrics")
+        request_scheduler_metrics = None
+        scheduler = getattr(buyboard_worker, "request_scheduler", None)
+        scheduler_metrics_reader = getattr(scheduler, "metrics", None)
+        if callable(scheduler_metrics_reader):
+            try:
+                request_scheduler_metrics = scheduler_metrics_reader()
+            except Exception:
+                logger.exception("Failed to read KIS request-scheduler metrics")
         return HealthContext(
             db_source=str(self.__dict__.get("db_engine_source", "none")),
             db_initializing=bool(self.__dict__.get("db_initializing", False)),
@@ -457,6 +465,7 @@ class HealthPanelMixin:
                 self.__dict__.get("_last_handoff_blocked_symbols", ())
             ),
             market_data_metrics=market_data_metrics,
+            request_scheduler_metrics=request_scheduler_metrics,
         )
 
     def refresh_health_panel(self, *args) -> None:
