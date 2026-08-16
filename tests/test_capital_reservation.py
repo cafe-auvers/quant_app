@@ -4,6 +4,7 @@ from __future__ import annotations
 import threading
 
 import pytest
+from sqlalchemy import create_engine, text
 
 from src.core.capital_reservation import (
     CapitalReservation,
@@ -216,7 +217,6 @@ def test_two_near_simultaneous_triggers_do_not_both_reserve_the_same_capital(tmp
 
 
 def _sqlite_engine(tmp_path):
-    from sqlalchemy import create_engine
     from sqlalchemy.pool import NullPool
 
     return create_engine(f"sqlite:///{tmp_path / 'capital.db'}", future=True, poolclass=NullPool)
@@ -333,3 +333,50 @@ def test_list_active_reservations_returns_empty_for_no_engine():
     assert capital_reservation_repository.list_active_reservations(
         None, environment="PROD", account_no="1"
     ) == []
+
+
+def test_existing_pr2_reservation_table_is_migrated_with_absence_evidence_columns(
+    tmp_path,
+):
+    engine = create_engine(f"sqlite:///{tmp_path / 'old-reservations.db'}", future=True)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE capital_reservations (
+                    reservation_id VARCHAR(64) PRIMARY KEY,
+                    environment VARCHAR(10) NOT NULL,
+                    account_no VARCHAR(32) NOT NULL,
+                    symbol VARCHAR(20) NOT NULL,
+                    attempt_group_id VARCHAR(64) NOT NULL,
+                    requested_notional FLOAT NOT NULL,
+                    remaining_reserved_notional FLOAT NOT NULL,
+                    status VARCHAR(24) NOT NULL,
+                    created_at DATETIME NOT NULL,
+                    released_at DATETIME NULL,
+                    updated_at DATETIME NOT NULL
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO capital_reservations (
+                    reservation_id, environment, account_no, symbol,
+                    attempt_group_id, requested_notional,
+                    remaining_reserved_notional, status, created_at, updated_at
+                ) VALUES (
+                    'R-OLD', 'PROD', '1', 'AAPL', 'G-OLD', 1000, 1000,
+                    'RESERVED', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+
+    stored = capital_reservation_repository.list_active_reservations(
+        engine, environment="PROD", account_no="1"
+    )[0]
+    assert stored.reservation_id == "R-OLD"
+    assert stored.absence_count == 0
+    assert stored.last_absence_snapshot_id == ""

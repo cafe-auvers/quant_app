@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import create_engine
@@ -32,14 +32,21 @@ from src.core.order_state import (
     OrderSide,
     OrderStatus,
 )
-from src.core.trade_card_state import BoardStatus, TradeCardState
+from src.core.trade_card_state import (
+    BoardStatus,
+    PositionRuntimeStatus,
+    StopType,
+    TradeCardState,
+)
 from src.services.account_reconciliation import (
     AccountLocalState,
+    ReconciliationPlan,
     ReconciliationCategory,
     ReconciliationCommandType,
     apply_reconciliation_plan,
     classify_execution_order,
     decide_emergency_sell,
+    fetch_account_broker_snapshot,
     reduce_account_reconciliation,
     run_account_reconciliation_pass,
 )
@@ -231,6 +238,44 @@ def test_emergency_sell_all_alerts_rather_than_guesses_when_neither_is_available
     assert decision.manual_intervention_required is True
 
 
+def test_ambiguous_cancel_preserves_cancel_pending_and_emits_no_new_command():
+    card = _card(
+        board_status=BoardStatus.SELL_ALL,
+        broker_quantity=10,
+        exit_all_required=True,
+        exit_cancel_in_flight=True,
+        exit_cancel_command_id="CANCEL-STABLE",
+    )
+    sell = _order(
+        side=OrderSide.SELL,
+        intent=OrderIntent.MANUAL_EXIT,
+        client_order_id="SELL-1",
+        status=ExecutionOrderStatus.CANCEL_PENDING,
+        recovery_state=OrderRecoveryState.DISCOVERING,
+        remaining_quantity=4,
+        capital_reservation_id="",
+    )
+    still_working = BrokerOrderStatusSnapshot(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        broker_order_id="B-1",
+        side=OrderSide.SELL,
+        status=OrderStatus.WORKING,
+        quantity_requested=4,
+        remaining_quantity=4,
+    )
+
+    plan = reduce_account_reconciliation(
+        _snapshot(orders=(still_working,), holdings=(_holding(),)),
+        AccountLocalState(cards=(card,), execution_orders=(sell,)),
+    )
+
+    assert plan.order_updates[0].status == ExecutionOrderStatus.CANCEL_PENDING
+    assert plan.order_updates[0].recovery_state == OrderRecoveryState.DISCOVERING
+    assert plan.commands == ()
+
+
 def test_reducer_is_a_pure_function_of_snapshot_and_local_state():
     order = _order()
     card = _card()
@@ -282,7 +327,12 @@ def test_reducer_generated_ids_and_timestamps_are_snapshot_deterministic():
     assert state == original
     assert first.external_order_creates[0].discovered_at == NOW.isoformat()
     assert first.card_creates[0].created_at == NOW
-    assert first.reservation_updates[0].released_at == NOW
+    assert first.reservation_updates[0].absence_count == 1
+    assert first.reservation_updates[0].released_at is None
+    assert any(
+        alert.code == "ORPHAN_CAPITAL_RESERVATION_REQUIRES_REVIEW"
+        for alert in first.alerts
+    )
 
 
 def test_first_complete_absence_does_not_resolve_terminal():
@@ -460,6 +510,39 @@ def test_a4b_creates_a_discovered_external_order_not_an_execution_order_record()
     assert plan.commands == ()
 
 
+def test_unrecognized_open_external_order_still_creates_a_durable_fence():
+    external_snapshot = BrokerOrderStatusSnapshot(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        broker_order_id="B-UNKNOWN-EXTERNAL",
+        side=OrderSide.SELL,
+        status=OrderStatus.UNKNOWN,
+        quantity_requested=4,
+    )
+    plan = reduce_account_reconciliation(
+        _snapshot(orders=(external_snapshot,), holdings=(_holding(),)),
+        AccountLocalState(
+            cards=(
+                _card(
+                    board_status=BoardStatus.SELL_ALL,
+                    broker_quantity=10,
+                    exit_all_required=True,
+                ),
+            )
+        ),
+    )
+    assert len(plan.external_order_creates) == 1
+    assert plan.external_order_creates[0].broker_status == (
+        ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE
+    )
+    assert plan.commands == ()
+    assert any(
+        alert.code == "UNRECOGNIZED_BROKER_ORDER_STATUS"
+        for alert in plan.alerts
+    )
+
+
 def test_concurrent_a4b_create_plan_is_idempotent_at_the_unique_broker_identity(tmp_path):
     broker_order = BrokerOrderStatusSnapshot(
         environment="PROD",
@@ -556,7 +639,42 @@ def test_manual_position_orphan_reservation_and_live_order_without_reservation_a
     assert ReconciliationCategory.MANUAL_BROKER_POSITION in categories
     assert ReconciliationCategory.ORPHAN_CAPITAL_RESERVATION in categories
     assert ReconciliationCategory.LIVE_ORDER_WITHOUT_RESERVATION in categories
-    assert plan.reservation_updates[0].is_open() is False
+    assert plan.reservation_updates[0].absence_count == 1
+    assert plan.reservation_updates[0].is_open() is True
+    assert any(
+        alert.code == "ORPHAN_CAPITAL_RESERVATION_REQUIRES_REVIEW"
+        for alert in plan.alerts
+    )
+
+
+def test_orphan_reservation_releases_only_after_two_complete_generations():
+    orphan = _reservation("R-ORPHAN", "MSFT")
+    orphan.absence_count = 1
+    orphan.last_absence_snapshot_id = "snapshot-1"
+    orphan.last_absence_observed_at = NOW.isoformat()
+    orphan.last_absence_session_date = NOW.date().isoformat()
+
+    plan = reduce_account_reconciliation(
+        _snapshot(
+            snapshot_id="snapshot-2",
+            observed_at=NOW + timedelta(seconds=61),
+        ),
+        AccountLocalState(capital_reservations=(orphan,)),
+    )
+
+    repaired = plan.reservation_updates[0]
+    assert repaired.absence_count == 2
+    assert repaired.status.value == "RELEASED"
+    assert repaired.released_at == NOW + timedelta(seconds=61)
+
+
+def test_orphan_reservation_does_not_advance_on_incomplete_broker_evidence():
+    orphan = _reservation("R-ORPHAN", "MSFT")
+    plan = reduce_account_reconciliation(
+        _snapshot(completeness=_completeness(history_complete=False)),
+        AccountLocalState(capital_reservations=(orphan,)),
+    )
+    assert plan.reservation_updates == ()
 
 
 def test_discovered_external_order_is_dismissed_only_after_terminal_broker_evidence():
@@ -857,3 +975,395 @@ def test_absence_generation_persists_across_account_passes(tmp_path):
     assert second.plan.order_updates[0].absence_count == 2
     stored = execution_order_repository.fetch_execution_order(engine, "C-1")
     assert stored.recovery_state == OrderRecoveryState.TERMINAL_RECONCILED
+
+
+def test_working_partial_entry_restores_remaining_target_and_completion_state():
+    broker_order = BrokerOrderStatusSnapshot(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        broker_order_id="B-1",
+        side=OrderSide.BUY,
+        status=OrderStatus.PARTIALLY_FILLED,
+        quantity_requested=10,
+        filled_quantity=3,
+        remaining_quantity=7,
+        avg_fill_price=101.0,
+    )
+    plan = reduce_account_reconciliation(
+        _snapshot(orders=(broker_order,), holdings=(_holding(3),)),
+        AccountLocalState(
+            cards=(_card(),),
+            execution_orders=(_order(),),
+            capital_reservations=(_reservation(),),
+        ),
+    )
+
+    card = plan.card_updates[0]
+    assert card.board_status == BoardStatus.OPEN_POSITION
+    assert card.entry_remaining_target_quantity == 7
+    assert card.position_runtime_status == PositionRuntimeStatus.ENTRY_COMPLETING
+    assert card.entry_runtime_status is not None
+    assert plan.reservation_updates[0].remaining_reserved_notional == pytest.approx(697.0)
+
+
+def test_filled_partial_exit_projects_breakeven_and_clears_pending_state():
+    card = _card(
+        board_status=BoardStatus.PARTIAL_SELL,
+        broker_quantity=10,
+        orderable_quantity=6,
+        average_entry_price=100.0,
+        pending_partial_sell_quantity=4,
+        exit_client_order_id="SELL-1",
+    )
+    order = _order(
+        side=OrderSide.SELL,
+        intent=OrderIntent.PARTIAL_EXIT,
+        client_order_id="SELL-1",
+        submitted_quantity=4,
+        remaining_quantity=4,
+        capital_reservation_id="",
+    )
+    broker_order = BrokerOrderStatusSnapshot(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        broker_order_id="B-1",
+        side=OrderSide.SELL,
+        status=OrderStatus.FILLED,
+        quantity_requested=4,
+        filled_quantity=4,
+        remaining_quantity=0,
+        avg_fill_price=110.0,
+    )
+
+    plan = reduce_account_reconciliation(
+        _snapshot(orders=(broker_order,), holdings=(_holding(6),)),
+        AccountLocalState(cards=(card,), execution_orders=(order,)),
+    )
+
+    updated = plan.card_updates[0]
+    assert updated.board_status == BoardStatus.OPEN_POSITION
+    assert updated.pending_partial_sell_quantity == 0
+    assert updated.exit_client_order_id == ""
+    assert updated.stop_type == StopType.BREAKEVEN
+    assert updated.stop_quantity == 6
+
+
+@pytest.mark.parametrize(
+    ("intent", "execution_policy", "expected_runtime", "queued"),
+    [
+        (OrderIntent.MANUAL_EXIT, "REGULAR_LIMIT", PositionRuntimeStatus.LIQUIDATING, False),
+        (OrderIntent.STOP_LOSS, "REGULAR_LIMIT", PositionRuntimeStatus.LIQUIDATING, False),
+        (OrderIntent.MANUAL_EXIT, RESERVED_MOO_EXECUTION, PositionRuntimeStatus.QUEUED_FOR_OPEN, True),
+    ],
+)
+def test_working_liquidation_categories_project_explicit_card_state(
+    intent, execution_policy, expected_runtime, queued
+):
+    card = _card(
+        board_status=BoardStatus.SELL_ALL,
+        broker_quantity=10,
+        exit_all_required=True,
+    )
+    order = _order(
+        side=OrderSide.SELL,
+        intent=intent,
+        client_order_id="SELL-ALL-1",
+        execution_policy=execution_policy,
+        capital_reservation_id="",
+    )
+    broker_order = BrokerOrderStatusSnapshot(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        broker_order_id="B-1",
+        side=OrderSide.SELL,
+        status=OrderStatus.WORKING,
+        quantity_requested=10,
+        remaining_quantity=10,
+    )
+
+    plan = reduce_account_reconciliation(
+        _snapshot(orders=(broker_order,), holdings=(_holding(),)),
+        AccountLocalState(cards=(card,), execution_orders=(order,)),
+    )
+
+    updated = plan.card_updates[0]
+    assert updated.position_runtime_status == expected_runtime
+    assert updated.sell_all_at_market_open is queued
+    assert updated.exit_client_order_id == "SELL-ALL-1"
+
+
+def test_terminal_sell_all_with_confirmed_zero_holding_closes_card():
+    card = _card(
+        board_status=BoardStatus.SELL_ALL,
+        broker_quantity=10,
+        exit_all_required=True,
+        exit_client_order_id="SELL-ALL-1",
+    )
+    order = _order(
+        side=OrderSide.SELL,
+        intent=OrderIntent.MANUAL_EXIT,
+        client_order_id="SELL-ALL-1",
+        capital_reservation_id="",
+    )
+    terminal = BrokerOrderStatusSnapshot(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        broker_order_id="B-1",
+        side=OrderSide.SELL,
+        status=OrderStatus.FILLED,
+        quantity_requested=10,
+        filled_quantity=10,
+    )
+
+    plan = reduce_account_reconciliation(
+        _snapshot(orders=(terminal,), holdings=()),
+        AccountLocalState(cards=(card,), execution_orders=(order,)),
+    )
+
+    assert plan.card_updates[0].board_status == BoardStatus.CLOSED
+    assert plan.card_updates[0].exit_all_required is False
+
+
+@pytest.mark.parametrize(
+    ("intent", "execution_policy", "alert_code"),
+    [
+        (OrderIntent.PARTIAL_EXIT, "REGULAR_LIMIT", "PARTIAL_EXIT_TERMINAL_WITHOUT_HOLDINGS"),
+        (OrderIntent.MANUAL_EXIT, "REGULAR_LIMIT", "LIQUIDATION_TERMINAL_WITHOUT_HOLDINGS"),
+        (OrderIntent.STOP_LOSS, "REGULAR_LIMIT", "LIQUIDATION_TERMINAL_WITHOUT_HOLDINGS"),
+        (OrderIntent.MANUAL_EXIT, RESERVED_MOO_EXECUTION, "LIQUIDATION_TERMINAL_WITHOUT_HOLDINGS"),
+    ],
+)
+def test_terminal_exit_categories_fail_closed_without_fresh_holdings(
+    intent, execution_policy, alert_code
+):
+    board_status = (
+        BoardStatus.PARTIAL_SELL
+        if intent == OrderIntent.PARTIAL_EXIT
+        else BoardStatus.SELL_ALL
+    )
+    card = _card(
+        board_status=board_status,
+        broker_quantity=10,
+        pending_partial_sell_quantity=(4 if board_status == BoardStatus.PARTIAL_SELL else 0),
+        exit_all_required=(board_status == BoardStatus.SELL_ALL),
+    )
+    order = _order(
+        side=OrderSide.SELL,
+        intent=intent,
+        execution_policy=execution_policy,
+        submitted_quantity=4,
+        remaining_quantity=4,
+        capital_reservation_id="",
+    )
+    terminal = BrokerOrderStatusSnapshot(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        broker_order_id="B-1",
+        side=OrderSide.SELL,
+        status=OrderStatus.FILLED,
+        quantity_requested=4,
+        filled_quantity=4,
+    )
+
+    plan = reduce_account_reconciliation(
+        _snapshot(
+            orders=(terminal,),
+            holdings=(),
+            completeness=_completeness(holdings_complete=False),
+        ),
+        AccountLocalState(cards=(card,), execution_orders=(order,)),
+    )
+
+    assert any(alert.code == alert_code for alert in plan.alerts)
+    assert plan.card_updates[0].exit_submission_unresolved is True
+
+
+@pytest.mark.parametrize(
+    ("side", "intent", "execution_policy"),
+    [
+        (OrderSide.BUY, OrderIntent.ENTRY, "REGULAR_LIMIT"),
+        (OrderSide.SELL, OrderIntent.PARTIAL_EXIT, "REGULAR_LIMIT"),
+        (OrderSide.SELL, OrderIntent.MANUAL_EXIT, "REGULAR_LIMIT"),
+        (OrderSide.SELL, OrderIntent.STOP_LOSS, "REGULAR_LIMIT"),
+        (OrderSide.SELL, OrderIntent.MANUAL_EXIT, RESERVED_MOO_EXECUTION),
+    ],
+)
+def test_every_terminal_c4_category_settles_its_linked_reservation(
+    side, intent, execution_policy
+):
+    reservation = CapitalReservation(
+        reservation_id="R-C4",
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        attempt_group_id="G-C4",
+        requested_notional=(1000.0 if side == OrderSide.BUY else 0.0),
+        remaining_reserved_notional=(1000.0 if side == OrderSide.BUY else 0.0),
+    )
+    order = _order(
+        side=side,
+        intent=intent,
+        execution_policy=execution_policy,
+        capital_reservation_id="R-C4",
+    )
+    terminal = BrokerOrderStatusSnapshot(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        broker_order_id="B-1",
+        side=side,
+        status=OrderStatus.CANCELLED,
+        quantity_requested=10,
+    )
+
+    plan = reduce_account_reconciliation(
+        _snapshot(orders=(terminal,)),
+        AccountLocalState(
+            execution_orders=(order,), capital_reservations=(reservation,)
+        ),
+    )
+
+    assert plan.reservation_updates[0].status.value == "RELEASED"
+    assert plan.reservation_updates[0].remaining_reserved_notional == 0
+
+
+def test_exact_terminal_disagreement_always_escalates():
+    local = _order(
+        status=ExecutionOrderStatus.FILLED,
+        filled_quantity=10,
+        remaining_quantity=0,
+        recovery_state=OrderRecoveryState.TERMINAL_RECONCILED,
+    )
+    contradictory = BrokerOrderStatusSnapshot(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        broker_order_id="B-1",
+        side=OrderSide.BUY,
+        status=OrderStatus.CANCELLED,
+        quantity_requested=10,
+    )
+
+    plan = reduce_account_reconciliation(
+        _snapshot(orders=(contradictory,), holdings=(_holding(),)),
+        AccountLocalState(cards=(_card(),), execution_orders=(local,)),
+    )
+
+    assert any(alert.code == "BROKER_STATUS_CONTRADICTION" for alert in plan.alerts)
+    assert plan.order_updates[0].recovery_state == OrderRecoveryState.MANUAL_INTERVENTION_REQUIRED
+
+
+def test_first_regular_absence_requires_complete_holdings_evidence():
+    plan = reduce_account_reconciliation(
+        _snapshot(
+            completeness=_completeness(holdings_complete=False),
+            holdings=(),
+        ),
+        AccountLocalState(execution_orders=(_order(),)),
+    )
+    assert plan.order_updates == ()
+
+
+def test_reserved_moo_absence_requires_reserved_order_completeness():
+    reserved = _order(
+        side=OrderSide.SELL,
+        intent=OrderIntent.MANUAL_EXIT,
+        execution_policy=RESERVED_MOO_EXECUTION,
+        capital_reservation_id="",
+    )
+    plan = reduce_account_reconciliation(
+        _snapshot(
+            completeness=_completeness(reserved_orders_complete=False),
+            holdings=(_holding(),),
+        ),
+        AccountLocalState(execution_orders=(reserved,)),
+    )
+    assert plan.order_updates == ()
+
+
+def test_snapshot_session_date_uses_us_market_calendar_not_utc_date():
+    class Broker:
+        def get_positions(self, **kwargs):
+            return {"overseas": {"holdings": []}}
+
+        def discover_orders(self, **kwargs):
+            return BrokerOrderDiscoveryResult(
+                open_orders_complete=True,
+                history_complete=True,
+                reserved_orders_complete=True,
+            )
+
+    snapshot = fetch_account_broker_snapshot(
+        broker=Broker(),
+        environment="PROD",
+        account_no="1",
+        account_balance_provider=lambda *_: 1000.0,
+        clock=lambda: datetime(2026, 8, 18, 1, 0, tzinfo=timezone.utc),
+    )
+    assert snapshot.session_date == date(2026, 8, 17)
+
+
+def test_external_working_sell_blocks_emergency_submission_even_with_sellable_quantity():
+    external_sell = BrokerOrderStatusSnapshot(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        broker_order_id="B-EXTERNAL-SELL",
+        side=OrderSide.SELL,
+        status=OrderStatus.WORKING,
+        quantity_requested=40,
+        remaining_quantity=40,
+    )
+    decision = decide_emergency_sell(
+        _snapshot(orders=(external_sell,), holdings=(_holding(100, sellable_quantity=60),)),
+        symbol="AAPL",
+        execution_orders=(),
+    )
+    assert decision.quantity == 0
+    assert decision.manual_intervention_required is True
+    assert "sellable quantity is 60" in decision.reason
+
+
+def test_atomic_plan_application_rolls_back_earlier_writes_on_later_failure(
+    tmp_path, monkeypatch
+):
+    from src.services import discovered_external_order_repository as external_repo
+    from src.services import trade_card_repository
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'atomic-plan.db'}", future=True)
+    original = trade_card_repository.create_trade_card(
+        engine,
+        _card(board_status=BoardStatus.BUYLIST),
+    )
+    updated = deepcopy(original)
+    updated.board_status = BoardStatus.BUY_TODAY
+    external = new_discovered_external_order(
+        environment="PROD",
+        account_no="1",
+        symbol="MSFT",
+        side=OrderSide.BUY,
+        broker_order_id="B-ATOMIC-FAIL",
+        broker_status=ExecutionOrderStatus.WORKING,
+    )
+    plan = ReconciliationPlan(
+        snapshot_id="atomic-plan",
+        card_updates=(updated,),
+        external_order_creates=(external,),
+    )
+
+    monkeypatch.setattr(
+        external_repo,
+        "insert_discovered_external_order",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("injected")),
+    )
+    with pytest.raises(RuntimeError, match="injected"):
+        apply_reconciliation_plan(engine, plan)
+
+    stored = trade_card_repository.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert stored.board_status == BoardStatus.BUYLIST
+    assert stored.version == 1

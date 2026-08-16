@@ -87,6 +87,10 @@ def validate_disposition_transition(
 BROKER_OBSERVABLE_STATUSES: FrozenSet[ExecutionOrderStatus] = frozenset(
     {
         ExecutionOrderStatus.ACKNOWLEDGED,
+        # Conservative normalization for an exact external broker ID whose
+        # broker-open status could not be mapped more precisely. It remains
+        # fenced and alert-only; this never grants application ownership.
+        ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE,
         ExecutionOrderStatus.WORKING,
         ExecutionOrderStatus.PARTIALLY_FILLED,
         ExecutionOrderStatus.FILLED,

@@ -34,7 +34,6 @@ import json
 import logging
 import threading
 import weakref
-from datetime import datetime
 from typing import Any, Dict, FrozenSet, Optional
 
 from sqlalchemy import (
@@ -103,6 +102,10 @@ class ImmutableFieldChangedError(RuntimeError):
     ``external_order_id`` (revision 3.2) -- these identify *which real
     broker order* this permanent audit record describes, and must never
     silently drift."""
+
+
+class ActiveExternalOrderFenceError(RuntimeError):
+    """A still-unowned broker order durably fences this account/symbol."""
 
 
 def _get_discovered_external_orders_table(metadata: MetaData) -> Table:
@@ -334,6 +337,52 @@ def get_discovered_external_order(
         select(table).where(table.c.external_order_id == external_order_id)
     ).first()
     return _row_to_order(row) if row is not None else None
+
+
+def get_discovered_external_order_by_broker_id(
+    conn: Connection,
+    *,
+    environment: str,
+    account_no: str,
+    broker_order_id: str,
+) -> Optional[DiscoveredExternalOrder]:
+    table = _get_discovered_external_orders_table(MetaData())
+    row = conn.execute(
+        select(table).where(
+            table.c.broker_identity_key
+            == compute_broker_identity_key(
+                environment, account_no, broker_order_id
+            )
+        )
+    ).first()
+    return _row_to_order(row) if row is not None else None
+
+
+def require_no_active_unowned_external_order(
+    conn: Connection,
+    *,
+    environment: str,
+    account_no: str,
+    symbol: str,
+) -> None:
+    """Execution-boundary fence; call inside the mutation transaction."""
+    table = _get_discovered_external_orders_table(MetaData())
+    row = conn.execute(
+        select(table.c.external_order_id, table.c.broker_order_id).where(
+            table.c.environment == str(environment or "").upper(),
+            table.c.account_no == str(account_no or ""),
+            table.c.symbol == str(symbol or "").upper(),
+            table.c.disposition
+            == ExternalOrderDisposition.DISCOVERED_UNOWNED.value,
+        )
+    ).first()
+    if row is not None:
+        raise ActiveExternalOrderFenceError(
+            f"{environment}/{account_no}/{symbol} is fenced by active unowned "
+            f"broker_order_id={row.broker_order_id!r} "
+            f"(external_order_id={row.external_order_id!r}); wait for a terminal "
+            "broker observation or explicitly adopt the order"
+        )
 
 
 # --- standalone convenience wrappers ------------------------------------

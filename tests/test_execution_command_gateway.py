@@ -55,6 +55,11 @@ from src.services.execution_lease_protocol import FakeExecutionLeaseProtocol
 from src.services.execution_order_repository import _get_execution_orders_table, fetch_execution_order, record_execution_order
 from src.services.execution_ownership_repository import assign_ownership
 from src.services.mutation_budget_protocol import AllowAllMutationBudget
+from src.services.discovered_external_order_repository import (
+    ActiveExternalOrderFenceError,
+    adopt_external_order_in_db,
+    record_discovered_external_order,
+)
 from fakes.fake_execution_broker import FakeExecutionBroker
 
 
@@ -101,12 +106,96 @@ def _submit_request(**overrides):
     return SubmitExecutionRequest(**fields)
 
 
+def _record_active_external_order(engine, *, broker_order_id="B-EXTERNAL"):
+    return record_discovered_external_order(
+        engine,
+        new_discovered_external_order(
+            environment="PROD",
+            account_no="12345678-01",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            broker_order_id=broker_order_id,
+            broker_status=ExecutionOrderStatus.WORKING,
+        ),
+    )
+
+
 # --- mode selection / API split (findings 2) ---------------------------
 
 
 def test_default_gateway_resolves_legacy_compatibility_mode():
     gateway = get_default_execution_gateway()
     assert gateway.mode == ExecutionMode.LEGACY_COMPATIBILITY
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_active_unowned_external_order_fences_guarded_submit(tmp_path):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    _record_active_external_order(engine)
+    broker.queue_acceptance(broker_order_id="SHOULD-NOT-BE-USED")
+
+    with pytest.raises(ActiveExternalOrderFenceError):
+        gateway.submit_guarded(_submit_request())
+
+    assert broker.submit_calls == []
+    assert get_command_by_idempotency_key(engine, "SUBMIT:CID-1") is None
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_active_unowned_external_order_fences_guarded_cancel_and_replace(tmp_path):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    broker.queue_acceptance(broker_order_id="B-OWNED")
+    owned = gateway.submit_guarded(_submit_request())
+    _record_active_external_order(engine)
+    _, lease = _lease()
+
+    broker.queue_cancel_confirmed()
+    with pytest.raises(ActiveExternalOrderFenceError):
+        gateway.cancel_guarded(
+            CancelExecutionRequest(
+                client_order_id=owned.client_order_id,
+                cancel_command_id="CANCEL-FENCED",
+                environment="PROD",
+                account_no="12345678-01",
+                lease=lease,
+                source=ExecutionSource.SYSTEM,
+            )
+        )
+    with pytest.raises(ActiveExternalOrderFenceError):
+        gateway.replace_guarded(
+            ReplaceExecutionRequest(
+                client_order_id=owned.client_order_id,
+                replace_command_id="REPLACE-FENCED",
+                new_client_order_id="CID-REPLACEMENT",
+                new_quantity=5,
+                new_limit_price=99.0,
+                environment="PROD",
+                account_no="12345678-01",
+                lease=lease,
+                source=ExecutionSource.SYSTEM,
+            )
+        )
+
+    assert broker.cancel_calls == []
+    assert get_command_by_idempotency_key(engine, "CANCEL:CANCEL-FENCED") is None
+    assert get_command_by_idempotency_key(engine, "REPLACE:REPLACE-FENCED") is None
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_explicit_adoption_removes_external_order_execution_fence(tmp_path):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    external = _record_active_external_order(engine)
+    adopt_external_order_in_db(
+        engine,
+        external.external_order_id,
+        adopted_by="operator",
+    )
+    broker.queue_acceptance(broker_order_id="B-NEW")
+
+    result = gateway.submit_guarded(_submit_request())
+
+    assert result.broker_order_id == "B-NEW"
+    assert len(broker.submit_calls) == 1
 
 
 def test_legacy_compatibility_submit_is_a_transparent_passthrough():

@@ -108,7 +108,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 from uuid import uuid4
 
@@ -126,17 +126,16 @@ from src.core.order_state import (
     BrokerOrder,
     OrderIntent,
     OrderSide,
-    OrderStatus,
     REGULAR_LIMIT_EXECUTION,
     is_open_status,
 )
 from src.core.trade_card_state import TradeCardState
 from src.risk.orb_position import calculate_orb_position_values, is_orb_position_plan_valid
 from src.risk.pre_trade import PreTradeRiskDecision
-from src.services import capital_allocator, capital_reservation_repository
+from src.services import capital_allocator
 from src.services import order_ledger
 from src.services import order_reconciliation
-from src.services.broker import Broker, KisBroker
+from src.services.broker import Broker
 from src.services.execution_command_gateway import (
     ExecutionCommandGateway,
     get_default_execution_gateway,
@@ -436,6 +435,8 @@ class BuyboardRuntime:
     broker: Broker
     card_lookup: Callable[[str, str, str], Optional[TradeCardState]]
     account_size_provider: Callable[[str, str], float]
+    reconciliation_cancel_order: Callable[[TradeCardState, str], Any]
+    reconciliation_emergency_sell: Callable[[TradeCardState, int], Any]
 
 
 def build_buyboard_runtime(
@@ -860,6 +861,35 @@ def build_buyboard_runtime(
         reconcile_sell_order=reconcile_runtime_order,
     )
 
+    def reconciliation_cancel_order(
+        card: TradeCardState, client_order_id: str
+    ) -> Any:
+        record = (
+            fetch_execution_order(resolved_broker.database_engine, client_order_id)
+            if guarded_mode and isinstance(resolved_broker, ExecutionCommandGateway)
+            else None
+        )
+        scope = "ENTRY" if record is not None and record.side == OrderSide.BUY else "EXIT"
+        return position_callbacks.request_cancel(
+            card, client_order_id, scope=scope
+        )
+
+    def reconciliation_emergency_sell(
+        card: TradeCardState, quantity: int
+    ) -> Any:
+        deadline = datetime.now(timezone.utc) + timedelta(
+            seconds=execution_config.SELL_ALL_ATTEMPT_TTL_SECONDS
+        )
+        return submit_sell_order(
+            environment=card.environment,
+            account_no=card.account_no,
+            symbol=card.symbol,
+            quantity=quantity,
+            reason="sell_all_retry",
+            attempt_deadline_at=deadline.isoformat(),
+            trade_card=card,
+        )
+
     eod_callbacks = EodActionCallbacks(
         find_open_entry_order=lambda card: find_runtime_order(
             card, side=OrderSide.BUY, intent=OrderIntent.ENTRY
@@ -914,4 +944,6 @@ def build_buyboard_runtime(
         broker=resolved_broker,
         card_lookup=card_lookup,
         account_size_provider=buying_power_provider,
+        reconciliation_cancel_order=reconciliation_cancel_order,
+        reconciliation_emergency_sell=reconciliation_emergency_sell,
     )

@@ -45,11 +45,14 @@ from sqlalchemy import (
     Column,
     DateTime,
     Float,
+    Integer,
     MetaData,
     String,
     Table,
     func,
+    inspect,
     select,
+    text,
 )
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import SQLAlchemyError
@@ -81,6 +84,10 @@ def _get_capital_reservations_table(metadata: MetaData) -> Table:
         Column("status", String(24), nullable=False),
         Column("created_at", DateTime, nullable=False),
         Column("released_at", DateTime, nullable=True),
+        Column("absence_count", Integer, nullable=False, server_default="0"),
+        Column("last_absence_snapshot_id", String(64), nullable=True),
+        Column("last_absence_observed_at", String(64), nullable=True),
+        Column("last_absence_session_date", String(16), nullable=True),
         Column("updated_at", DateTime, nullable=False),
     )
 
@@ -106,8 +113,34 @@ def _ensure_table(engine: Engine) -> Table:
         if engine in _ensured_engines:
             return table
         metadata.create_all(engine)
+        _ensure_absence_evidence_columns(engine)
         _ensured_engines.add(engine)
     return table
+
+
+def _ensure_absence_evidence_columns(engine: Engine) -> None:
+    """Add PR3 evidence fields to an existing PR2 reservation table."""
+    existing = {
+        column["name"]
+        for column in inspect(engine).get_columns("capital_reservations")
+    }
+    definitions = {
+        "absence_count": "INTEGER NOT NULL DEFAULT 0",
+        "last_absence_snapshot_id": "VARCHAR(64) NULL",
+        "last_absence_observed_at": "VARCHAR(64) NULL",
+        "last_absence_session_date": "VARCHAR(16) NULL",
+    }
+    missing = [name for name in definitions if name not in existing]
+    if not missing:
+        return
+    with engine.begin() as conn:
+        for name in missing:
+            conn.execute(
+                text(
+                    f"ALTER TABLE capital_reservations ADD COLUMN {name} "
+                    f"{definitions[name]}"
+                )
+            )
 
 
 def _server_now(engine: Engine):
@@ -128,6 +161,10 @@ def _row_to_reservation(row) -> CapitalReservation:
         status=row.status,
         created_at=row.created_at,
         released_at=row.released_at,
+        absence_count=row.absence_count,
+        last_absence_snapshot_id=row.last_absence_snapshot_id or "",
+        last_absence_observed_at=row.last_absence_observed_at,
+        last_absence_session_date=row.last_absence_session_date,
     )
 
 
@@ -206,6 +243,12 @@ def save_reservation(engine: Optional[Engine], reservation: CapitalReservation) 
                 status=reservation.status.value,
                 created_at=reservation.created_at,
                 released_at=reservation.released_at,
+                absence_count=reservation.absence_count,
+                last_absence_snapshot_id=(
+                    reservation.last_absence_snapshot_id or None
+                ),
+                last_absence_observed_at=reservation.last_absence_observed_at,
+                last_absence_session_date=reservation.last_absence_session_date,
                 updated_at=_server_now(engine),
             )
             if existing is None:
@@ -265,6 +308,12 @@ def insert_reservation(conn: Connection, reservation: CapitalReservation) -> Cap
             status=reservation.status.value,
             created_at=reservation.created_at,
             released_at=reservation.released_at,
+            absence_count=reservation.absence_count,
+            last_absence_snapshot_id=(
+                reservation.last_absence_snapshot_id or None
+            ),
+            last_absence_observed_at=reservation.last_absence_observed_at,
+            last_absence_session_date=reservation.last_absence_session_date,
             updated_at=_server_now(conn.engine),
         )
     )
@@ -316,6 +365,12 @@ def update_reservation(conn: Connection, reservation: CapitalReservation) -> Cap
             remaining_reserved_notional=reservation.remaining_reserved_notional,
             status=reservation.status.value,
             released_at=reservation.released_at,
+            absence_count=reservation.absence_count,
+            last_absence_snapshot_id=(
+                reservation.last_absence_snapshot_id or None
+            ),
+            last_absence_observed_at=reservation.last_absence_observed_at,
+            last_absence_session_date=reservation.last_absence_session_date,
             updated_at=_server_now(conn.engine),
         )
     )

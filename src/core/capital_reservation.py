@@ -68,6 +68,10 @@ class CapitalReservation:
     status: CapitalReservationStatus = CapitalReservationStatus.RESERVED
     created_at: datetime = field(default_factory=_utc_now)
     released_at: Optional[datetime] = None
+    absence_count: int = 0
+    last_absence_snapshot_id: str = ""
+    last_absence_observed_at: Optional[str] = None
+    last_absence_session_date: Optional[str] = None
 
     def __post_init__(self) -> None:
         self.environment = str(self.environment or "").upper()
@@ -83,6 +87,18 @@ class CapitalReservation:
         )
         self.created_at = _parse_timestamp(self.created_at) or _utc_now()
         self.released_at = _parse_timestamp(self.released_at)
+        self.absence_count = max(0, int(self.absence_count or 0))
+        self.last_absence_snapshot_id = str(self.last_absence_snapshot_id or "")
+        self.last_absence_observed_at = (
+            str(self.last_absence_observed_at)
+            if self.last_absence_observed_at
+            else None
+        )
+        self.last_absence_session_date = (
+            str(self.last_absence_session_date)
+            if self.last_absence_session_date
+            else None
+        )
 
     @classmethod
     def create(
@@ -141,6 +157,10 @@ class CapitalReservation:
             "status": self.status.value,
             "created_at": self.created_at.isoformat(),
             "released_at": self.released_at.isoformat() if self.released_at else None,
+            "absence_count": self.absence_count,
+            "last_absence_snapshot_id": self.last_absence_snapshot_id,
+            "last_absence_observed_at": self.last_absence_observed_at,
+            "last_absence_session_date": self.last_absence_session_date,
         }
 
     @classmethod
@@ -158,6 +178,12 @@ class CapitalReservation:
             status=data.get("status", CapitalReservationStatus.RESERVED),
             created_at=data.get("created_at"),
             released_at=data.get("released_at"),
+            absence_count=int(data.get("absence_count", 0) or 0),
+            last_absence_snapshot_id=str(
+                data.get("last_absence_snapshot_id", "") or ""
+            ),
+            last_absence_observed_at=data.get("last_absence_observed_at"),
+            last_absence_session_date=data.get("last_absence_session_date"),
         )
 
 

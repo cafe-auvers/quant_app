@@ -66,7 +66,7 @@ from src.core.execution_order_record import (
     is_cancellable,
     validate_consistency,
 )
-from src.core.execution_ownership import ExecutionOwner, owner_for_source
+from src.core.execution_ownership import ExecutionOwner
 from src.core.execution_request import CancelExecutionRequest, ReplaceExecutionRequest, SubmitExecutionRequest
 from src.core.order_recovery_state import OrderRecoveryState, validate_recovery_transition
 from src.core.order_state import (
@@ -102,6 +102,10 @@ from src.services.execution_order_repository import (
     update_execution_order,
 )
 from src.services.execution_ownership_repository import ensure_execution_ownership_table, get_ownership
+from src.services.discovered_external_order_repository import (
+    ensure_discovered_external_orders_table,
+    require_no_active_unowned_external_order,
+)
 from src.services.mutation_budget_protocol import CommandType, MutationBudgetProtocol
 
 logger = logging.getLogger(__name__)
@@ -556,7 +560,14 @@ class ExecutionCommandGateway:
                 target_broker_order_id=original.broker_order_id, source=request.source.value,
             )
             ensure_execution_commands_table(engine)
+            ensure_discovered_external_orders_table(engine)
             with engine.begin() as conn:
+                require_no_active_unowned_external_order(
+                    conn,
+                    environment=original.environment,
+                    account_no=original.account_no,
+                    symbol=original.symbol,
+                )
                 insert_command(conn, replace_command)
 
             # 6. cancel the original.
@@ -787,7 +798,14 @@ class ExecutionCommandGateway:
         ensure_execution_commands_table(engine)
         ensure_execution_orders_table(engine)
         ensure_capital_reservations_table(engine)
+        ensure_discovered_external_orders_table(engine)
         with engine.begin() as conn:
+            require_no_active_unowned_external_order(
+                conn,
+                environment=environment,
+                account_no=account_no,
+                symbol=symbol,
+            )
             insert_command(conn, command)
             insert_reservation_if_available(
                 conn, reservation, buying_power=buying_power
@@ -820,6 +838,7 @@ class ExecutionCommandGateway:
                 execution_policy=request.execution_policy,
             )
         except Exception as exc:
+            error_message = str(exc)
             try:
                 ambiguous = self._real_broker.is_ambiguous_submission_error(exc)
             except Exception:
@@ -834,7 +853,7 @@ class ExecutionCommandGateway:
                     update_execution_order(conn, record, expected_version=record.version)
                     update_command_response(
                         conn, idempotency_key, status="AMBIGUOUS" if ambiguous else "FAILED",
-                        broker_response={"error": str(exc)},
+                        broker_response={"error": error_message},
                     )
                     if not ambiguous:
                         # 11: never automatically retry -- a clean rejection
@@ -847,8 +866,8 @@ class ExecutionCommandGateway:
                 _persist_failure, context=f"submit {client_order_id!r} failure persistence"
             )
             if ambiguous:
-                raise GuardedSubmissionAmbiguousError(str(exc)) from exc
-            raise GuardedSubmissionRejectedError(str(exc)) from exc
+                raise GuardedSubmissionAmbiguousError(error_message) from exc
+            raise GuardedSubmissionRejectedError(error_message) from exc
 
         # 10. success -- ACKNOWLEDGED with exact identity.
         record.remaining_quantity = record.submitted_quantity
@@ -907,12 +926,19 @@ class ExecutionCommandGateway:
         )
 
         ensure_execution_commands_table(engine)
+        ensure_discovered_external_orders_table(engine)
         # Idempotency: insert_command raises DuplicateCommandError on a
         # replayed cancel_command_id, propagated unchanged -- a genuinely
         # new cancel decision must use a new cancel_command_id (finding 8),
         # which is the caller's (ExecutionWorkflowService's) job, not this
         # method's.
         with engine.begin() as conn:
+            require_no_active_unowned_external_order(
+                conn,
+                environment=record.environment,
+                account_no=record.account_no,
+                symbol=record.symbol,
+            )
             insert_command(conn, command)
             apply_status_transition(record, ExecutionOrderStatus.CANCEL_PENDING)
             update_execution_order(conn, record, expected_version=record.version)
@@ -934,6 +960,7 @@ class ExecutionCommandGateway:
                 side=record.side.value, exchange=record.exchange or "NASD",
             )
         except Exception as exc:
+            error_message = str(exc)
             classify = getattr(self._real_broker, "is_ambiguous_cancellation_error", None)
             try:
                 ambiguous = classify(exc) if callable(classify) else True
@@ -944,7 +971,7 @@ class ExecutionCommandGateway:
                 with engine.begin() as conn:
                     update_command_response(
                         conn, cancel_idempotency_key, status="AMBIGUOUS" if ambiguous else "FAILED",
-                        broker_response={"error": str(exc)},
+                        broker_response={"error": error_message},
                     )
                     if ambiguous:
                         _transition_recovery_state(record, OrderRecoveryState.DISCOVERING)
@@ -956,8 +983,8 @@ class ExecutionCommandGateway:
                 _persist_cancel_failure, context=f"cancel {request.client_order_id!r} failure persistence"
             )
             if ambiguous:
-                raise GuardedCancellationAmbiguousError(str(exc)) from exc
-            raise GuardedCancellationRejectedError(str(exc)) from exc
+                raise GuardedCancellationAmbiguousError(error_message) from exc
+            raise GuardedCancellationRejectedError(error_message) from exc
 
         record.filled_quantity = max(record.filled_quantity, snapshot.filled_quantity)
         if snapshot.avg_fill_price:

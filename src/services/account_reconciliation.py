@@ -8,8 +8,9 @@ pure function over that immutable snapshot and cloned local state.
 from __future__ import annotations
 
 import copy
+import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Callable, Iterable, Mapping, Optional, Sequence, Tuple
 from uuid import NAMESPACE_URL, uuid5
@@ -61,6 +62,9 @@ from src.core.trade_card_state import (
     TradeCardState,
 )
 from src.services.position_manager import PositionManager
+from src.utils.market_calendar import US_MARKET_ZONE, previous_nyse_trading_day
+
+logger = logging.getLogger(__name__)
 
 
 class ReconciliationCategory(str, Enum):
@@ -114,6 +118,7 @@ class ReconciliationAlert:
     message: str
     symbol: str = ""
     client_order_id: str = ""
+    broker_order_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -238,6 +243,12 @@ def _extract_account_holdings(position_snapshot: Optional[Mapping]) -> Tuple[Acc
     return tuple(holdings)
 
 
+def _us_market_session_date(observed_at: datetime) -> date:
+    """Return the session label in the exchange's calendar, never UTC's date."""
+    market_day = observed_at.astimezone(US_MARKET_ZONE).date()
+    return previous_nyse_trading_day(market_day)
+
+
 def fetch_account_broker_snapshot(
     *,
     broker,
@@ -311,7 +322,7 @@ def fetch_account_broker_snapshot(
         account_buying_power=balance,
         account_equity=equity,
         observed_at=observed_at,
-        session_date=observed_at.date(),
+        session_date=_us_market_session_date(observed_at),
         errors=tuple(errors) + tuple(discovery.errors),
         completeness=SnapshotCompleteness(
             holdings_complete=holdings_complete,
@@ -387,8 +398,77 @@ def decide_emergency_sell(
     if holding is None or holding.quantity <= 0:
         return EmergencySellDecision(reason="No broker holding remains")
 
+    unresolved_owned_sells = tuple(
+        order
+        for order in execution_orders
+        if order.symbol == str(symbol or "").upper()
+        and order.side == OrderSide.SELL
+        and order.status in _OPEN_EXECUTION_STATUSES
+        and order.origin in (OrderOrigin.APPLICATION, OrderOrigin.USER_ADOPTED)
+        and (
+            order.broker_identity_status != BrokerIdentityStatus.EXACT
+            or not order.broker_order_id
+        )
+    )
+    if unresolved_owned_sells:
+        return EmergencySellDecision(
+            manual_intervention_required=True,
+            reason=(
+                "An owned SELL submission has unresolved broker identity; never "
+                "submit another liquidation while its outcome is ambiguous"
+            ),
+        )
+
+    known_broker_ids = {
+        order.broker_order_id
+        for order in execution_orders
+        if order.broker_identity_status == BrokerIdentityStatus.EXACT
+        and order.broker_order_id
+    }
+    external_working_orders = tuple(
+        broker_order
+        for broker_order in snapshot.orders
+        if broker_order.symbol == str(symbol or "").upper()
+        and is_open_status(broker_order.status)
+        and broker_order.broker_order_id not in known_broker_ids
+    )
+    if external_working_orders:
+        has_external_sell = any(
+            order.side == OrderSide.SELL for order in external_working_orders
+        )
+        sellable_note = (
+            f" Broker sellable quantity is {holding.sellable_quantity}."
+            if holding.sellable_quantity is not None
+            else ""
+        )
+        return EmergencySellDecision(
+            manual_intervention_required=True,
+            reason=(
+                "An unowned working broker order fences this symbol; "
+                "automatic liquidation is fenced until it is terminal or adopted."
+                f"{sellable_note if has_external_sell else ''}"
+            ),
+        )
+
     known_sells = _known_owned_working_sells(execution_orders, symbol)
     if known_sells:
+        unresolved = next(
+            (
+                order
+                for order in known_sells
+                if order.status == ExecutionOrderStatus.CANCEL_PENDING
+                or order.recovery_state != OrderRecoveryState.NONE
+            ),
+            None,
+        )
+        if unresolved is not None:
+            return EmergencySellDecision(
+                manual_intervention_required=True,
+                reason=(
+                    "An owned SELL mutation is unresolved; preserve its command "
+                    "identity and do not issue another broker call"
+                ),
+            )
         # Prefer controlling the exact existing order instead of creating
         # competing sell exposure.  ``quantity`` still exposes the maximum
         # safe additional amount for diagnostics/tests.
@@ -462,7 +542,12 @@ def _apply_exact_order_snapshot(
     if target is None:
         _set_recovery_state(order, OrderRecoveryState.MANUAL_INTERVENTION_REQUIRED)
         return f"Broker returned unrecognized order status {snapshot.status.value}"
-    if target != order.status:
+    preserve_ambiguous_cancel = bool(
+        order.status == ExecutionOrderStatus.CANCEL_PENDING
+        and order.recovery_state == OrderRecoveryState.DISCOVERING
+        and target in _OPEN_EXECUTION_STATUSES
+    )
+    if target != order.status and not preserve_ambiguous_cancel:
         if target in allowed_status_transitions(order.status):
             apply_status_transition(order, target)
         elif (
@@ -476,7 +561,7 @@ def _apply_exact_order_snapshot(
             # intermediate state instead of assigning CANCELLED directly.
             apply_status_transition(order, ExecutionOrderStatus.CANCEL_PENDING)
             apply_status_transition(order, ExecutionOrderStatus.CANCELLED)
-        elif order.status not in _TERMINAL_EXECUTION_STATUSES:
+        else:
             _set_recovery_state(
                 order, OrderRecoveryState.MANUAL_INTERVENTION_REQUIRED
             )
@@ -484,7 +569,10 @@ def _apply_exact_order_snapshot(
                 f"Broker status {target.value} contradicts local transition from "
                 f"{order.status.value}"
             )
-    if order.recovery_state == OrderRecoveryState.DISCOVERING:
+    if (
+        order.recovery_state == OrderRecoveryState.DISCOVERING
+        and not preserve_ambiguous_cancel
+    ):
         _set_recovery_state(order, OrderRecoveryState.NONE)
     elif (
         target in _TERMINAL_EXECUTION_STATUSES
@@ -492,6 +580,21 @@ def _apply_exact_order_snapshot(
     ):
         _set_recovery_state(order, OrderRecoveryState.TERMINAL_RECONCILED)
     return None
+
+
+def _absence_evidence_complete(
+    order: ExecutionOrderRecord, snapshot: AccountBrokerSnapshot
+) -> bool:
+    """Every C3 generation must carry the evidence for that order type."""
+    completeness = snapshot.completeness
+    if order.execution_policy == RESERVED_MOO_EXECUTION:
+        return bool(
+            completeness.holdings_complete
+            and completeness.open_orders_complete
+            and completeness.history_complete
+            and completeness.reserved_orders_complete
+        )
+    return completeness.allows(ReconciliationAction.TERMINAL_ORDER_CONCLUSION)
 
 
 def _heuristic_candidate(
@@ -597,6 +700,325 @@ def _order_key(order: ExecutionOrderRecord) -> Tuple[str, str, str]:
     return (order.environment, order.account_no, order.symbol)
 
 
+def _clear_entry_card_tracking(card: TradeCardState) -> None:
+    card.entry_client_order_id = ""
+    card.entry_cancel_command_id = ""
+    card.entry_cancel_in_flight = False
+    card.entry_cancel_reason = ""
+    card.entry_pending_attempt_number = 0
+    card.entry_submission_unresolved = False
+
+
+def _clear_exit_card_tracking(card: TradeCardState) -> None:
+    card.exit_client_order_id = ""
+    card.exit_cancel_command_id = ""
+    card.exit_cancel_in_flight = False
+    card.exit_cancel_requested_at = None
+    card.exit_pending_attempt_number = 0
+    card.exit_submission_unresolved = False
+    card.reserved_sell_quantity = 0
+
+
+def _operational_category(
+    order: ExecutionOrderRecord,
+    card: Optional[TradeCardState],
+    classified: ReconciliationCategory,
+) -> ReconciliationCategory:
+    """Retain the order's behavioral branch after it becomes terminal."""
+    if classified != ReconciliationCategory.TERMINAL_ORDER:
+        return classified
+    if order.execution_policy == RESERVED_MOO_EXECUTION:
+        return ReconciliationCategory.RESERVED_MOO_SELL
+    if order.side == OrderSide.BUY and order.intent == OrderIntent.ENTRY:
+        if card is not None and (
+            card.broker_quantity > 0 or card.entry_remaining_target_quantity > 0
+        ):
+            return ReconciliationCategory.ENTRY_COMPLETION_BUY
+        return ReconciliationCategory.ENTRY_BUY
+    if order.side == OrderSide.SELL:
+        if order.intent == OrderIntent.STOP_LOSS:
+            return ReconciliationCategory.STOP_LOSS_SELL
+        if order.intent in (OrderIntent.PARTIAL_EXIT, OrderIntent.PARTIAL_TAKE_PROFIT):
+            return ReconciliationCategory.PARTIAL_SELL
+        return ReconciliationCategory.SELL_ALL
+    return classified
+
+
+def _settle_capital_reservation(
+    *,
+    order: ExecutionOrderRecord,
+    reservation: Optional[CapitalReservation],
+    observed_at: datetime,
+) -> None:
+    """Project cumulative fill/terminal evidence onto the linked reservation."""
+    if reservation is None or not reservation.is_open():
+        return
+    fill_price = order.average_fill_price or order.submitted_limit_price
+    consumed_notional = max(0.0, order.filled_quantity * fill_price)
+    if order.status in _TERMINAL_EXECUTION_STATUSES:
+        reservation.remaining_reserved_notional = 0.0
+        reservation.status = (
+            CapitalReservationStatus.CONSUMED
+            if reservation.requested_notional > 0
+            and consumed_notional >= reservation.requested_notional
+            else CapitalReservationStatus.RELEASED
+        )
+        reservation.released_at = observed_at
+        return
+    if order.side != OrderSide.BUY or order.intent != OrderIntent.ENTRY:
+        return
+    target_remaining = max(
+        0.0, reservation.requested_notional - consumed_notional
+    )
+    if target_remaining == reservation.remaining_reserved_notional:
+        return
+    reservation.remaining_reserved_notional = target_remaining
+    reservation.status = (
+        CapitalReservationStatus.CONSUMED
+        if target_remaining <= 0
+        else CapitalReservationStatus.PARTIALLY_CONSUMED
+    )
+
+
+def _clear_reservation_absence(reservation: CapitalReservation) -> None:
+    reservation.absence_count = 0
+    reservation.last_absence_snapshot_id = ""
+    reservation.last_absence_observed_at = None
+    reservation.last_absence_session_date = None
+
+
+def _record_orphan_reservation_absence(
+    reservation: CapitalReservation, snapshot: AccountBrokerSnapshot
+) -> str:
+    """Require two durable, complete account generations before release."""
+    completeness = snapshot.completeness
+    complete = bool(
+        completeness.holdings_complete
+        and completeness.open_orders_complete
+        and completeness.history_complete
+        and completeness.reserved_orders_complete
+    )
+    if not complete:
+        return "INCOMPLETE_EVIDENCE"
+    if snapshot.holding_for(reservation.symbol) is not None or any(
+        order.symbol == reservation.symbol for order in snapshot.orders
+    ):
+        if reservation.absence_count:
+            _clear_reservation_absence(reservation)
+        return "CONTRADICTORY_BROKER_EVIDENCE"
+    session = snapshot.session_date.isoformat()
+    if reservation.absence_count <= 0:
+        reservation.absence_count = 1
+        reservation.last_absence_snapshot_id = snapshot.snapshot_id
+        reservation.last_absence_observed_at = snapshot.observed_at.isoformat()
+        reservation.last_absence_session_date = session
+        return "FIRST_ABSENCE"
+    if reservation.last_absence_snapshot_id == snapshot.snapshot_id:
+        return "SAME_GENERATION"
+    if reservation.last_absence_session_date != session:
+        _clear_reservation_absence(reservation)
+        return "SESSION_CHANGED_RESET"
+    try:
+        first_at = datetime.fromisoformat(
+            str(reservation.last_absence_observed_at)
+        )
+    except (TypeError, ValueError):
+        _clear_reservation_absence(reservation)
+        return "INVALID_FIRST_OBSERVATION_RESET"
+    if (
+        snapshot.observed_at - first_at
+    ).total_seconds() < execution_config.MIN_ABSENCE_CONFIRMATION_INTERVAL_SECONDS:
+        return "TOO_SOON"
+    reservation.absence_count = 2
+    reservation.last_absence_snapshot_id = snapshot.snapshot_id
+    reservation.last_absence_observed_at = snapshot.observed_at.isoformat()
+    reservation.remaining_reserved_notional = 0.0
+    reservation.status = CapitalReservationStatus.RELEASED
+    reservation.released_at = snapshot.observed_at
+    return "RELEASED_AFTER_TWO_COMPLETE_GENERATIONS"
+
+
+def _project_exact_order_to_card(
+    *,
+    order: ExecutionOrderRecord,
+    broker_snapshot: BrokerOrderStatusSnapshot,
+    account_snapshot: AccountBrokerSnapshot,
+    card: Optional[TradeCardState],
+    category: ReconciliationCategory,
+    position_manager: PositionManager,
+    alerts: list[ReconciliationAlert],
+) -> None:
+    """C4's explicit card projection for each operational order category."""
+    if card is None:
+        return
+    target = _snapshot_status(broker_snapshot)
+    terminal = target in _TERMINAL_EXECUTION_STATUSES
+    open_at_broker = is_open_status(broker_snapshot.status)
+    holding = (
+        account_snapshot.holding_for(order.symbol)
+        if account_snapshot.completeness.holdings_complete
+        else None
+    )
+    operational = _operational_category(order, card, category)
+
+    if operational in (
+        ReconciliationCategory.ENTRY_BUY,
+        ReconciliationCategory.ENTRY_COMPLETION_BUY,
+    ):
+        if broker_snapshot.filled_quantity > 0:
+            quantity = (
+                holding.quantity
+                if holding is not None
+                else max(card.broker_quantity, broker_snapshot.filled_quantity)
+            )
+            card.board_status = BoardStatus.OPEN_POSITION
+            card.broker_quantity = quantity
+            card.orderable_quantity = (
+                holding.sellable_quantity
+                if holding is not None and holding.sellable_quantity is not None
+                else quantity
+            )
+            card.average_entry_price = (
+                holding.average_price
+                if holding is not None and holding.average_price
+                else broker_snapshot.avg_fill_price
+            )
+            remaining_target = max(0, card.target_position_quantity - quantity)
+            card.entry_remaining_target_quantity = remaining_target
+            card.position_runtime_status = (
+                PositionRuntimeStatus.ENTRY_COMPLETING
+                if open_at_broker and remaining_target > 0
+                else PositionRuntimeStatus.OPEN
+            )
+            card.entry_runtime_status = (
+                EntryRuntimeStatus.ORDER_PENDING if open_at_broker else None
+            )
+            card.entry_client_order_id = order.client_order_id if open_at_broker else ""
+            if card.stop_type is None and card.entry_orb_low:
+                position_manager.apply_first_fill_stop(
+                    card,
+                    entry_orb_low=card.entry_orb_low,
+                    entry_orb_window=(
+                        card.entry_orb_window or card.selected_orb_window or ""
+                    ),
+                )
+            else:
+                card.stop_quantity = quantity
+            if terminal:
+                if card.entry_cancel_reason != "TTL_REPRICE":
+                    card.entry_remaining_target_quantity = 0
+                    card.position_runtime_status = PositionRuntimeStatus.OPEN
+                _clear_entry_card_tracking(card)
+        elif terminal:
+            if card.broker_quantity > 0:
+                card.board_status = BoardStatus.OPEN_POSITION
+                card.position_runtime_status = PositionRuntimeStatus.OPEN
+            else:
+                card.board_status = BoardStatus.BUYLIST
+            card.entry_runtime_status = None
+            card.entry_remaining_target_quantity = 0
+            _clear_entry_card_tracking(card)
+        elif open_at_broker:
+            card.board_status = BoardStatus.ENTRY_PENDING
+            card.entry_runtime_status = EntryRuntimeStatus.ORDER_PENDING
+            card.entry_client_order_id = order.client_order_id
+        return
+
+    if operational == ReconciliationCategory.PARTIAL_SELL:
+        if open_at_broker:
+            card.board_status = BoardStatus.PARTIAL_SELL
+            card.position_runtime_status = PositionRuntimeStatus.PARTIAL_EXIT_PENDING
+            card.reserved_sell_quantity = max(0, broker_snapshot.remaining_quantity)
+            card.exit_client_order_id = order.client_order_id
+            return
+        if not terminal:
+            return
+        if not account_snapshot.completeness.holdings_complete:
+            card.exit_submission_unresolved = True
+            alerts.append(
+                ReconciliationAlert(
+                    "PARTIAL_EXIT_TERMINAL_WITHOUT_HOLDINGS",
+                    ReconciliationAlertSeverity.CRITICAL,
+                    "Terminal partial exit cannot be projected without fresh holdings",
+                    order.symbol,
+                    order.client_order_id,
+                    order.broker_order_id,
+                )
+            )
+            return
+        remaining = holding.quantity if holding is not None else 0
+        card.pending_partial_sell_quantity = 0
+        _clear_exit_card_tracking(card)
+        if remaining <= 0:
+            card.broker_quantity = 0
+            card.orderable_quantity = 0
+            position_manager.confirm_flat(card)
+        elif broker_snapshot.filled_quantity > 0:
+            position_manager.on_partial_exit_filled(
+                card, refreshed_broker_quantity=remaining
+            )
+        else:
+            card.broker_quantity = remaining
+            card.orderable_quantity = (
+                holding.sellable_quantity
+                if holding is not None and holding.sellable_quantity is not None
+                else remaining
+            )
+            card.board_status = BoardStatus.OPEN_POSITION
+            card.position_runtime_status = PositionRuntimeStatus.OPEN
+        return
+
+    if operational in (
+        ReconciliationCategory.SELL_ALL,
+        ReconciliationCategory.STOP_LOSS_SELL,
+        ReconciliationCategory.RESERVED_MOO_SELL,
+    ):
+        if open_at_broker:
+            card.board_status = BoardStatus.SELL_ALL
+            card.exit_all_required = True
+            card.sell_all_at_market_open = (
+                operational == ReconciliationCategory.RESERVED_MOO_SELL
+            )
+            card.position_runtime_status = (
+                PositionRuntimeStatus.QUEUED_FOR_OPEN
+                if card.sell_all_at_market_open
+                else PositionRuntimeStatus.LIQUIDATING
+            )
+            card.reserved_sell_quantity = max(0, broker_snapshot.remaining_quantity)
+            card.exit_client_order_id = order.client_order_id
+            return
+        if not terminal:
+            return
+        if not account_snapshot.completeness.holdings_complete:
+            card.exit_submission_unresolved = True
+            alerts.append(
+                ReconciliationAlert(
+                    "LIQUIDATION_TERMINAL_WITHOUT_HOLDINGS",
+                    ReconciliationAlertSeverity.CRITICAL,
+                    "Terminal liquidation cannot be projected without fresh holdings",
+                    order.symbol,
+                    order.client_order_id,
+                    order.broker_order_id,
+                )
+            )
+            return
+        remaining = holding.quantity if holding is not None else 0
+        _clear_exit_card_tracking(card)
+        card.sell_all_at_market_open = False
+        card.broker_quantity = remaining
+        card.orderable_quantity = (
+            holding.sellable_quantity
+            if holding is not None and holding.sellable_quantity is not None
+            else remaining
+        )
+        if remaining <= 0:
+            position_manager.confirm_flat(card)
+        else:
+            card.board_status = BoardStatus.SELL_ALL
+            card.exit_all_required = True
+            card.position_runtime_status = PositionRuntimeStatus.LIQUIDATING
+
+
 def reduce_account_reconciliation(
     snapshot: AccountBrokerSnapshot,
     local_state: AccountLocalState,
@@ -625,6 +1047,7 @@ def reduce_account_reconciliation(
     alerts = []
     commands = []
     classifications = []
+    category_by_client_order_id = {}
     consumed_broker_ids = set()
     position_manager = PositionManager()
 
@@ -632,6 +1055,7 @@ def reduce_account_reconciliation(
     for order in orders:
         card = card_by_key.get(_order_key(order))
         category = classify_execution_order(order, card)
+        category_by_client_order_id[order.client_order_id] = category
         classifications.append(
             ReconciliationClassification(category, order.client_order_id)
         )
@@ -674,43 +1098,24 @@ def reduce_account_reconciliation(
                     contradiction,
                     exact.symbol,
                     exact.client_order_id,
+                    exact.broker_order_id,
                 )
             )
         card = card_by_key.get(_order_key(exact))
-        if card is not None and exact.side == OrderSide.BUY:
-            holding = snapshot.holding_for(exact.symbol)
-            if broker_snapshot.filled_quantity > 0:
-                quantity = (
-                    holding.quantity if holding is not None else broker_snapshot.filled_quantity
-                )
-                card.board_status = BoardStatus.OPEN_POSITION
-                card.broker_quantity = quantity
-                card.orderable_quantity = (
-                    holding.sellable_quantity
-                    if holding is not None and holding.sellable_quantity is not None
-                    else quantity
-                )
-                card.average_entry_price = (
-                    holding.average_price
-                    if holding is not None and holding.average_price
-                    else broker_snapshot.avg_fill_price
-                )
-                card.position_runtime_status = PositionRuntimeStatus.OPEN
-                card.entry_runtime_status = None
-                if card.stop_type is None and card.entry_orb_low:
-                    position_manager.apply_first_fill_stop(
-                        card,
-                        entry_orb_low=card.entry_orb_low,
-                        entry_orb_window=card.entry_orb_window
-                        or card.selected_orb_window
-                        or "",
-                    )
-            elif _snapshot_status(broker_snapshot) in _TERMINAL_EXECUTION_STATUSES:
-                card.board_status = BoardStatus.BUYLIST
-                card.entry_runtime_status = None
-            elif is_open_status(broker_snapshot.status):
-                card.board_status = BoardStatus.ENTRY_PENDING
-                card.entry_runtime_status = EntryRuntimeStatus.ORDER_PENDING
+        _project_exact_order_to_card(
+            order=exact,
+            broker_snapshot=broker_snapshot,
+            account_snapshot=snapshot,
+            card=card,
+            category=category_by_client_order_id[exact.client_order_id],
+            position_manager=position_manager,
+            alerts=alerts,
+        )
+        _settle_capital_reservation(
+            order=exact,
+            reservation=reservation_by_id.get(exact.capital_reservation_id),
+            observed_at=snapshot.observed_at,
+        )
 
     # A4a conservative path.  A heuristic candidate consumes the broker
     # snapshot for classification only; it never grants ownership/exact ID.
@@ -800,9 +1205,14 @@ def reduce_account_reconciliation(
                     ReconciliationAlertSeverity.CRITICAL,
                     "Broker order status could not be normalized safely",
                     broker_snapshot.symbol,
+                    broker_order_id=broker_id,
                 )
             )
-            continue
+            # UNKNOWN/CREATED/SUBMITTING are broker-open states even when
+            # they cannot be projected onto the normal execution status
+            # table. Persist the A4b fence instead of merely alerting and
+            # then allowing the heartbeat to submit beside them.
+            mapped_status = ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE
         if existing_external is None:
             external = new_discovered_external_order(
                 environment=snapshot.environment,
@@ -836,8 +1246,12 @@ def reduce_account_reconciliation(
                 ReconciliationAlert(
                     "DISCOVERED_UNOWNED_BROKER_ORDER",
                     ReconciliationAlertSeverity.CRITICAL,
-                    "Broker order is not claimed by any local record; alert only",
+                    (
+                        "Broker order is not claimed by any local record; all "
+                        "mutations for this account and symbol are fenced"
+                    ),
                     broker_snapshot.symbol,
+                    broker_order_id=broker_id,
                 )
             )
         else:
@@ -853,6 +1267,47 @@ def reduce_account_reconciliation(
                     ExternalOrderDisposition.DISMISSED_TERMINAL,
                 )
                 existing_external.disposition = ExternalOrderDisposition.DISMISSED_TERMINAL
+            elif (
+                existing_external.disposition
+                == ExternalOrderDisposition.DISCOVERED_UNOWNED
+                and mapped_status in _OPEN_EXECUTION_STATUSES
+            ):
+                alerts.append(
+                    ReconciliationAlert(
+                        "DISCOVERED_UNOWNED_BROKER_ORDER",
+                        ReconciliationAlertSeverity.CRITICAL,
+                        (
+                            "Active unowned broker order continues to fence all "
+                            "mutations for this account and symbol"
+                        ),
+                        broker_snapshot.symbol,
+                        broker_order_id=broker_id,
+                    )
+                )
+
+    alerted_external_ids = {
+        alert.broker_order_id
+        for alert in alerts
+        if alert.code == "DISCOVERED_UNOWNED_BROKER_ORDER"
+    }
+    for external in external_orders:
+        if (
+            external.disposition == ExternalOrderDisposition.DISCOVERED_UNOWNED
+            and external.broker_status in _OPEN_EXECUTION_STATUSES
+            and external.broker_order_id not in alerted_external_ids
+        ):
+            alerts.append(
+                ReconciliationAlert(
+                    "DISCOVERED_UNOWNED_BROKER_ORDER",
+                    ReconciliationAlertSeverity.CRITICAL,
+                    (
+                        "Durable active unowned broker order continues to fence "
+                        "all mutations for this account and symbol"
+                    ),
+                    external.symbol,
+                    broker_order_id=external.broker_order_id,
+                )
+            )
 
     # Holdings reconciliation is independent from reserved/history failures.
     if snapshot.completeness.allows(ReconciliationAction.POSITION_QUANTITY_UPDATE):
@@ -950,51 +1405,74 @@ def reduce_account_reconciliation(
                     card.board_status = BoardStatus.BUYLIST
                     card.entry_runtime_status = None
 
-    # C3 fallback: only complete open+history absence can advance evidence.
-    if snapshot.completeness.allows(ReconciliationAction.TERMINAL_ORDER_CONCLUSION):
-        for order in orders:
-            if (
-                not order.broker_order_id
-                or order.status in _TERMINAL_EXECUTION_STATUSES
-                or order.broker_order_id in consumed_broker_ids
-            ):
-                continue
-            holding = snapshot.holding_for(order.symbol)
-            outcome = _record_absence(
-                order,
-                snapshot,
-                holding_quantity=holding.quantity if holding is not None else 0,
-            )
-            if outcome in (
-                "MANUAL_INTERVENTION_REQUIRED",
-                "CONTRADICTION_RESET",
-            ):
-                alerts.append(
-                    ReconciliationAlert(
-                        f"ORDER_ABSENCE_{outcome}",
-                        ReconciliationAlertSeverity.CRITICAL,
-                        "Broker absence could not be resolved automatically",
-                        order.symbol,
-                        order.client_order_id,
-                    )
+    # C3 fallback: every generation must include complete evidence for the
+    # specific execution policy (regular versus broker-reserved MOO).
+    for order in orders:
+        if (
+            not order.broker_order_id
+            or order.status in _TERMINAL_EXECUTION_STATUSES
+            or order.broker_order_id in consumed_broker_ids
+            or not _absence_evidence_complete(order, snapshot)
+        ):
+            continue
+        holding = snapshot.holding_for(order.symbol)
+        outcome = _record_absence(
+            order,
+            snapshot,
+            holding_quantity=holding.quantity if holding is not None else 0,
+        )
+        if outcome in (
+            "MANUAL_INTERVENTION_REQUIRED",
+            "CONTRADICTION_RESET",
+        ):
+            alerts.append(
+                ReconciliationAlert(
+                    f"ORDER_ABSENCE_{outcome}",
+                    ReconciliationAlertSeverity.CRITICAL,
+                    "Broker absence could not be resolved automatically",
+                    order.symbol,
+                    order.client_order_id,
+                    order.broker_order_id,
                 )
+            )
 
     # Capital mismatches are explicit categories, never silent repairs.
     live_orders = [order for order in orders if order.status in _OPEN_EXECUTION_STATUSES]
     referenced_reservations = {
         order.capital_reservation_id
-        for order in live_orders
+        for order in orders
         if order.capital_reservation_id
     }
+    for order in orders:
+        if order.status in _TERMINAL_EXECUTION_STATUSES:
+            _settle_capital_reservation(
+                order=order,
+                reservation=reservation_by_id.get(order.capital_reservation_id),
+                observed_at=snapshot.observed_at,
+            )
     for reservation in reservations:
         if reservation.is_open() and reservation.reservation_id not in referenced_reservations:
-            reservation.remaining_reserved_notional = 0.0
-            reservation.status = CapitalReservationStatus.RELEASED
-            reservation.released_at = snapshot.observed_at
             classifications.append(
                 ReconciliationClassification(
                     ReconciliationCategory.ORPHAN_CAPITAL_RESERVATION,
                     reservation.reservation_id,
+                )
+            )
+            outcome = _record_orphan_reservation_absence(reservation, snapshot)
+            alerts.append(
+                ReconciliationAlert(
+                    "ORPHAN_CAPITAL_RESERVATION_REQUIRES_REVIEW",
+                    (
+                        ReconciliationAlertSeverity.INFO
+                        if outcome == "RELEASED_AFTER_TWO_COMPLETE_GENERATIONS"
+                        else ReconciliationAlertSeverity.CRITICAL
+                    ),
+                    (
+                        "Orphan reservation evidence outcome: "
+                        f"{outcome}. Capital is released only after two complete, "
+                        "independent account generations in the same US session."
+                    ),
+                    reservation.symbol,
                 )
             )
     for order in live_orders:
@@ -1152,43 +1630,89 @@ def load_account_local_state(
 
 
 def apply_reconciliation_plan(engine: Engine, plan: ReconciliationPlan) -> None:
-    """Persist a previously-computed plan without re-running its decisions."""
+    """Atomically persist one account plan without re-running decisions."""
     from src.services import trade_card_repository
-    from src.services.capital_reservation_repository import save_reservation
-    from src.services.discovered_external_order_repository import (
-        DuplicateBrokerOrderDiscoveryError,
-        DuplicateExternalOrderError,
-        record_discovered_external_order,
-        save_discovered_external_order,
+    from src.services.capital_reservation_repository import (
+        ensure_capital_reservations_table,
+        update_reservation,
     )
-    from src.services.execution_order_repository import save_execution_order
+    from src.services.discovered_external_order_repository import (
+        ensure_discovered_external_orders_table,
+        get_discovered_external_order_by_broker_id,
+        insert_discovered_external_order,
+        update_discovered_external_order,
+    )
+    from src.services.execution_order_repository import (
+        ensure_execution_orders_table,
+        update_execution_order,
+    )
 
-    for card in plan.card_creates:
-        trade_card_repository.create_trade_card(engine, card)
-    for card in plan.card_updates:
-        expected_version = card.version
-        trade_card_repository.update_trade_card(
-            engine, card, expected_version=expected_version
-        )
-    for order in plan.order_updates:
-        expected_version = order.version
-        save_execution_order(engine, order, expected_version=expected_version)
-    for reservation in plan.reservation_updates:
-        save_reservation(engine, reservation)
-    for external in plan.external_order_creates:
+    # DDL/table discovery stays outside the account transaction so SQLite
+    # and MySQL never open an implicit second connection while it is active.
+    trade_card_repository.ensure_trade_cards_table(engine)
+    ensure_execution_orders_table(engine)
+    ensure_capital_reservations_table(engine)
+    ensure_discovered_external_orders_table(engine)
+
+    versioned = [
+        *plan.card_creates,
+        *plan.card_updates,
+        *plan.order_updates,
+        *plan.external_order_creates,
+        *plan.external_order_updates,
+    ]
+    original_versions = {id(item): item.version for item in versioned}
+    original_card_updated_at = {
+        id(card): card.updated_at for card in (*plan.card_creates, *plan.card_updates)
+    }
+    try:
+        with engine.begin() as conn:
+            for card in plan.card_creates:
+                trade_card_repository.insert_trade_card(conn, card)
+            for card in plan.card_updates:
+                trade_card_repository.update_trade_card_in_transaction(
+                    conn, card, expected_version=original_versions[id(card)]
+                )
+            for order in plan.order_updates:
+                update_execution_order(
+                    conn, order, expected_version=original_versions[id(order)]
+                )
+            for reservation in plan.reservation_updates:
+                update_reservation(conn, reservation)
+            for external in plan.external_order_creates:
+                existing = get_discovered_external_order_by_broker_id(
+                    conn,
+                    environment=external.environment,
+                    account_no=external.account_no,
+                    broker_order_id=external.broker_order_id,
+                )
+                if existing is None:
+                    insert_discovered_external_order(conn, external)
+            for external in plan.external_order_updates:
+                update_discovered_external_order(
+                    conn,
+                    external,
+                    expected_version=original_versions[id(external)],
+                )
+    except Exception:
+        # These are cloned plan values, but resetting their optimistic
+        # versions keeps a caller from accidentally replaying a rolled-back
+        # in-memory version after a transient database failure.
+        for item in versioned:
+            item.version = original_versions[id(item)]
+        for card in (*plan.card_creates, *plan.card_updates):
+            card.updated_at = original_card_updated_at[id(card)]
+        raise
+
+    # The database is authoritative. Refresh the local recovery snapshot
+    # only after the whole account transaction commits.
+    for card in plan.changed_cards:
         try:
-            record_discovered_external_order(engine, external)
-        except (DuplicateExternalOrderError, DuplicateBrokerOrderDiscoveryError):
-            # Another account pass persisted the same immutable broker
-            # identity after this plan was reduced.  The uniqueness
-            # constraints are the authority; repeating this create is an
-            # idempotent reconciliation outcome, not a failed account.
-            pass
-    for external in plan.external_order_updates:
-        expected_version = external.version
-        save_discovered_external_order(
-            engine, external, expected_version=expected_version
-        )
+            trade_card_repository.sync_trade_card_local_snapshot(card)
+        except Exception:
+            logger.exception(
+                "Failed to refresh local card snapshot after atomic account plan"
+            )
 
 
 def run_account_reconciliation_pass(

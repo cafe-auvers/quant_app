@@ -47,6 +47,7 @@ _ACTION_REQUIREMENTS = {
     ReconciliationAction.CANCEL_KNOWN_ORDER: ("open_orders_complete",),
     ReconciliationAction.POSITION_QUANTITY_UPDATE: ("holdings_complete",),
     ReconciliationAction.TERMINAL_ORDER_CONCLUSION: (
+        "holdings_complete",
         "open_orders_complete",
         "history_complete",
     ),

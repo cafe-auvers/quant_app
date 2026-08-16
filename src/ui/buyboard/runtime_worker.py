@@ -28,22 +28,34 @@ new engine activity on the next tick without requiring an app restart.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional, Tuple
 
 from PyQt5.QtCore import QThread, pyqtSignal
 from sqlalchemy.engine import Engine
 
 from src.core import execution_config
+from src.core.account_broker_snapshot import AccountBrokerSnapshot, ReconciliationAction
 from src.core.execution_config import is_buyboard_engine_enabled
+from src.core.execution_order_record import ExecutionOrderStatus
+from src.core.order_state import OrderSide
 from src.core.trade_card_state import BoardStatus, TradeCardState
 from src.services import buyboard_runtime as buyboard_runtime_module
 from src.services import trade_card_repository as repo
 from src.services.account_reconciliation import (
     AccountReconciliationResult,
     ReconciliationAlertSeverity,
+    ReconciliationCommandType,
     run_account_reconciliation_pass,
 )
+from src.services.execution_command_gateway import (
+    AmbiguousPostBrokerPersistenceError,
+    GuardedCancellationRejectedError,
+    GuardedSubmissionAmbiguousError,
+    GuardedSubmissionRejectedError,
+)
+from src.services.execution_command_repository import DuplicateCommandError
+from src.services.execution_order_repository import fetch_execution_order
 from src.services.execution_authority import ExecutionAuthority, LeaseExpiredError, LeaseHandle
 from src.services.trade_card_orb_bridge import TradeCardOrbEvaluator
 
@@ -147,6 +159,7 @@ class BuyboardRuntimeWorker(QThread):
         # once at startup).
         self._account_balance_refreshed_at: Dict[str, datetime] = {}
         self._account_reconciled_at: Dict[str, datetime] = {}
+        self._latest_reconciliation_snapshots: Dict[str, AccountBrokerSnapshot] = {}
         # Review: "legacy execution suppression depends only on the feature
         # flag" -- it did not verify the new engine was actually running,
         # holding its lease, and producing recent heartbeats, so a silently
@@ -197,7 +210,8 @@ class BuyboardRuntimeWorker(QThread):
         # warning name -> card_key set already alerted via self.alert for
         # that warning -- see _emit_stalled_liquidation_alerts.
         self._alerted_card_keys_by_warning: Dict[str, set] = {}
-        self._alerted_reconciliation_keys: set = set()
+        self._active_reconciliation_incidents: set = set()
+        self._reconciliation_incident_generations: Dict[tuple, int] = {}
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -361,7 +375,11 @@ class BuyboardRuntimeWorker(QThread):
                     cards=account_cards,
                     position_balance_extractor=self._extract_account_balance,
                 )
+                self._latest_reconciliation_snapshots[account_no] = result.snapshot
                 account_changed = list(result.plan.changed_cards)
+                account_changed.extend(
+                    self._execute_reconciliation_commands(result)
+                )
                 self._handle_reconciliation_result(result)
             except Exception as exc:
                 # Review finding P0: this account did NOT get reconciled --
@@ -429,26 +447,12 @@ class BuyboardRuntimeWorker(QThread):
                     changed_ids.add(id(card))
                     changed.append(card)
 
-        # The periodic refresh runs over *every* account regardless of
-        # readiness -- it is the recovery path for a failed one -- but
-        # everything after it (ORB sync, quote subscriptions, entry/exit
-        # evaluation) must not process a card whose account_no is still in
-        # startup_reconciliation_errors. Review finding P0: "the worker
-        # still enters its normal runtime loop after
-        # _run_startup_reconciliation() regardless of whether
-        # reconciliation completed successfully" -- Buy Board deciding
-        # entries or exits for an account it has never actually confirmed
-        # broker truth for (or whose latest refresh just failed) would be
-        # acting on a local view that might not match the broker at all.
-        # This is a global (per-worker), not per-card, health signal
-        # already -- the legacy monitor's own health check
-        # (main_window._buyboard_engine_healthy) already fails open for
-        # every account's protective exits whenever this dict is
-        # non-empty, so excluding these cards here does not leave them
-        # unprotected.
-        ready_cards = [
-            card for card in cards if card.account_no not in self.startup_reconciliation_errors
-        ]
+        # The periodic refresh runs over every account regardless of
+        # readiness. Later work is gated per card/action: an unrelated
+        # balance or reserved-history failure must not suppress a safe
+        # protective exit, while a new entry still requires its complete
+        # holdings/open-order/buying-power evidence set.
+        ready_cards = [card for card in cards if self._card_action_ready(card)]
 
         _track(self._sync_orb_plans(ready_cards))
         self._sync_quote_subscriptions(ready_cards)
@@ -587,7 +591,9 @@ class BuyboardRuntimeWorker(QThread):
                         account_no,
                     )
                     continue
+                self._latest_reconciliation_snapshots[account_no] = result.snapshot
                 changed.extend(result.plan.changed_cards)
+                changed.extend(self._execute_reconciliation_commands(result))
                 self._handle_reconciliation_result(result)
                 if result.snapshot.completeness.account_balance_complete:
                     self._record_reconciliation_balance(account_no, result)
@@ -682,9 +688,192 @@ class BuyboardRuntimeWorker(QThread):
             and completeness.account_balance_complete
         )
 
+    def _card_action_ready(self, card: TradeCardState) -> bool:
+        """Gate only the broker evidence needed by this card's next action."""
+        if card.board_status in (
+            BoardStatus.WATCHLIST,
+            BoardStatus.BUYLIST,
+            BoardStatus.BUY_TODAY,
+        ):
+            action = "NEW_ENTRY"
+        elif card.board_status == BoardStatus.ENTRY_PENDING:
+            action = "KNOWN_CANCEL"
+        elif card.board_status in (
+            BoardStatus.OPEN_POSITION,
+            BoardStatus.PARTIAL_SELL,
+            BoardStatus.SELL_ALL,
+        ):
+            action = "PROTECTIVE_EXIT"
+        else:
+            return True
+        return self.account_action_ready(card.account_no, card.symbol, action)
+
+    def account_action_ready(
+        self, account_no: str, symbol: str, action: str
+    ) -> bool:
+        """Public health seam used to prevent cross-engine dual execution."""
+        snapshot = self._latest_reconciliation_snapshots.get(account_no)
+        if snapshot is None:
+            return False
+        completeness = snapshot.completeness
+        normalized = str(action or "").upper()
+        if normalized == "NEW_ENTRY":
+            return completeness.allows(ReconciliationAction.NEW_ENTRY)
+        if normalized == "KNOWN_CANCEL":
+            return completeness.allows(ReconciliationAction.CANCEL_KNOWN_ORDER)
+        if normalized == "PROTECTIVE_EXIT":
+            if not completeness.holdings_complete:
+                return False
+            holding = snapshot.holding_for(symbol)
+            safe_sell_exposure = bool(
+                completeness.open_orders_complete
+                or (holding is not None and holding.sellable_quantity is not None)
+            )
+            return safe_sell_exposure
+        return False
+
+    def _execute_reconciliation_commands(
+        self, result: AccountReconciliationResult
+    ) -> List[TradeCardState]:
+        """Run reducer commands through the runtime's shared guarded workflow."""
+        assert self.runtime is not None
+        changed: List[TradeCardState] = []
+        terminal_statuses = {
+            ExecutionOrderStatus.FILLED,
+            ExecutionOrderStatus.CANCELLED,
+            ExecutionOrderStatus.REJECTED,
+            ExecutionOrderStatus.EXPIRED,
+            ExecutionOrderStatus.CANCELLED_LOCALLY,
+            ExecutionOrderStatus.NOT_ACCEPTED_CONFIRMED,
+        }
+
+        def persist(card: TradeCardState) -> None:
+            repo.update_trade_card(
+                self._db_engine, card, expected_version=card.version
+            )
+            changed.append(card)
+
+        for command in result.plan.commands:
+            card = repo.get_trade_card(
+                self._db_engine,
+                command.environment,
+                command.account_no,
+                command.symbol,
+            )
+            if card is None:
+                message = (
+                    f"Reconciliation command {command.command_type.value} has no "
+                    f"durable card for {command.environment}/{command.account_no}/"
+                    f"{command.symbol}"
+                )
+                logger.error(message)
+                self.alert.emit(f"CRITICAL: {message}")
+                continue
+
+            if command.command_type == ReconciliationCommandType.CANCEL_KNOWN_ORDER:
+                try:
+                    self.runtime.reconciliation_cancel_order(
+                        card, command.client_order_id
+                    )
+                except GuardedCancellationRejectedError as exc:
+                    # request_cancel_with_lifecycle already cleared and
+                    # persisted the failed caller-owned cancel identity.
+                    logger.warning(
+                        "Reconciliation cancel explicitly rejected for %s: %s",
+                        command.client_order_id,
+                        exc,
+                    )
+                    changed.append(card)
+                    continue
+                except Exception as exc:
+                    # The workflow persists command identity before reaching
+                    # the gateway. Keep it for safe replay/reconciliation.
+                    logger.exception(
+                        "Reconciliation cancel failed for %s",
+                        command.client_order_id,
+                    )
+                    self.alert.emit(
+                        f"CRITICAL: reconciliation cancel failed for "
+                        f"{command.symbol}: {exc}"
+                    )
+                    changed.append(card)
+                    continue
+
+                after = fetch_execution_order(
+                    self._db_engine, command.client_order_id
+                )
+                if after is not None and after.status in terminal_statuses:
+                    if after.side == OrderSide.BUY:
+                        card.entry_client_order_id = ""
+                        card.entry_cancel_command_id = ""
+                        card.entry_cancel_in_flight = False
+                        card.entry_cancel_reason = ""
+                        card.entry_pending_attempt_number = 0
+                    else:
+                        card.exit_client_order_id = ""
+                        card.exit_cancel_command_id = ""
+                        card.exit_cancel_in_flight = False
+                        card.exit_cancel_requested_at = None
+                        card.exit_pending_attempt_number = 0
+                        card.reserved_sell_quantity = 0
+                    persist(card)
+                else:
+                    # Ambiguous cancellation is swallowed by the lifecycle
+                    # helper after it persists the in-flight marker and ID.
+                    changed.append(card)
+                continue
+
+            if command.command_type == ReconciliationCommandType.EMERGENCY_SELL_ALL:
+                try:
+                    self.runtime.reconciliation_emergency_sell(
+                        card, command.quantity
+                    )
+                except (
+                    GuardedSubmissionAmbiguousError,
+                    AmbiguousPostBrokerPersistenceError,
+                    DuplicateCommandError,
+                ) as exc:
+                    card.exit_submission_unresolved = True
+                    card.next_exit_retry_at = None
+                    card.last_exit_error = f"UNRESOLVED: {exc}"[:500]
+                    persist(card)
+                    continue
+                except GuardedSubmissionRejectedError as exc:
+                    card.exit_attempt_count += 1
+                    card.exit_client_order_id = ""
+                    card.exit_pending_attempt_number = 0
+                    card.exit_submission_unresolved = False
+                    card.last_exit_error = str(exc)[:500]
+                    card.next_exit_retry_at = datetime.now(timezone.utc) + timedelta(
+                        seconds=execution_config.EXIT_RETRY_COOLDOWN_SECONDS
+                    )
+                    persist(card)
+                    continue
+                except Exception as exc:
+                    # A pre-broker fence (notably DISCOVERED_UNOWNED) keeps
+                    # the already-persisted stable ID. The gateway remains
+                    # the final authority and made no broker mutation.
+                    logger.exception(
+                        "Reconciliation emergency SELL failed for %s",
+                        command.symbol,
+                    )
+                    self.alert.emit(
+                        f"CRITICAL: reconciliation emergency SELL failed for "
+                        f"{command.symbol}: {exc}"
+                    )
+                    changed.append(card)
+                    continue
+                card.reserved_sell_quantity = command.quantity
+                card.exit_submission_unresolved = False
+                card.next_exit_retry_at = None
+                card.last_exit_error = ""
+                persist(card)
+        return changed
+
     def _handle_reconciliation_result(
         self, result: AccountReconciliationResult
     ) -> None:
+        current_incidents = set()
         for alert in result.plan.alerts:
             logger.warning(
                 "Account reconciliation %s for %s/%s/%s: %s",
@@ -696,14 +885,34 @@ class BuyboardRuntimeWorker(QThread):
             )
             if alert.severity != ReconciliationAlertSeverity.CRITICAL:
                 continue
-            key = (alert.code, alert.symbol, alert.client_order_id)
-            if key in self._alerted_reconciliation_keys:
+            base = (
+                result.snapshot.environment,
+                result.snapshot.account_no,
+                alert.code,
+                alert.symbol,
+                alert.broker_order_id or alert.client_order_id,
+            )
+            if base in current_incidents:
                 continue
-            self._alerted_reconciliation_keys.add(key)
+            current_incidents.add(base)
+            if base in self._active_reconciliation_incidents:
+                continue
+            generation = self._reconciliation_incident_generations.get(base, 0) + 1
+            self._reconciliation_incident_generations[base] = generation
             self.alert.emit(
                 f"CRITICAL: account reconciliation {alert.code} for "
-                f"{alert.symbol or result.snapshot.account_no}: {alert.message}"
+                f"{alert.symbol or result.snapshot.account_no} "
+                f"(incident {generation}): {alert.message}"
             )
+        account_prefix = (
+            result.snapshot.environment,
+            result.snapshot.account_no,
+        )
+        self._active_reconciliation_incidents = {
+            key
+            for key in self._active_reconciliation_incidents
+            if key[:2] != account_prefix
+        } | current_incidents
 
     @staticmethod
     def _extract_account_balance(snapshot: dict) -> Tuple[float, float]:
