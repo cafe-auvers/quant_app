@@ -148,6 +148,12 @@ MAX_FUTURE_BROKER_EVENT_SECONDS = _env_float(
 KIS_WS_TRADE_CHANNEL_CAPACITY = _env_int("KIS_WS_TRADE_CHANNEL_CAPACITY", 0)
 KIS_WS_QUOTE_CHANNEL_CAPACITY = _env_int("KIS_WS_QUOTE_CHANNEL_CAPACITY", 0)
 KIS_WS_RAW_CAPTURE_ENABLED = _env_bool("KIS_WS_RAW_CAPTURE_ENABLED", False)
+# Stable identity used only after a symbol is explicitly assigned to this
+# Kanban strategy in the durable ownership table.  It does not activate the
+# engine or transfer ownership by itself.
+KANBAN_STRATEGY_INSTANCE_ID = _env_text(
+    "KANBAN_STRATEGY_INSTANCE_ID", "buyboard-orb-v1"
+)
 
 # Existing-position outage policy.  Defaults are deliberately conservative
 # and remain inert while BUYBOARD_ENGINE_ENABLED is false.

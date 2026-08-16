@@ -268,16 +268,26 @@ class KisOrderCancelWorker(QThread):
     finished_cancel = pyqtSignal(object)
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, client_order_id: str, broker: Optional[Broker] = None) -> None:
+    def __init__(
+        self,
+        client_order_id: str,
+        broker: Optional[Broker] = None,
+        ownership_engine=None,
+    ) -> None:
         super().__init__()
         self.client_order_id = client_order_id
         self.broker = broker
+        self.ownership_engine = ownership_engine
 
     def run(self) -> None:
         try:
             from src.services.order_reconciliation import cancel_and_reconcile_order
 
-            order = cancel_and_reconcile_order(self.client_order_id, broker=self.broker)
+            order = cancel_and_reconcile_order(
+                self.client_order_id,
+                broker=self.broker,
+                ownership_engine=self.ownership_engine,
+            )
             self.finished_cancel.emit(order)
         except Exception as exc:
             self.error_occurred.emit(str(exc))

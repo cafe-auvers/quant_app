@@ -18,7 +18,10 @@ from src.core.order_state import (
 )
 from src.services.order_ledger import ORDERS_FILE, load_orders, mutate_order
 from src.services.broker import Broker, KisBroker
-from src.services.execution_command_gateway import get_default_execution_gateway
+from src.services.execution_command_gateway import (
+    get_default_execution_gateway,
+    get_legacy_execution_gateway,
+)
 
 
 def _to_float(value: Any) -> float:
@@ -407,6 +410,7 @@ def cancel_and_reconcile_order(
     *,
     path: Path = ORDERS_FILE,
     broker: Optional[Broker] = None,
+    ownership_engine=None,
 ) -> BrokerOrder:
     """Cancel one known broker-side open order and persist the local status."""
     # Workstream 9 (PR2): the default broker is the shared execution
@@ -414,7 +418,11 @@ def cancel_and_reconcile_order(
     # identical change and src.core.execution_mode's module docstring for
     # why this changes nothing about the actual cancel behavior while
     # BUYBOARD_ENGINE_ENABLED stays false.
-    broker = get_default_execution_gateway() if broker is None else broker
+    broker = (
+        get_legacy_execution_gateway(ownership_engine)
+        if broker is None and ownership_engine is not None
+        else (get_default_execution_gateway() if broker is None else broker)
+    )
 
     orders = load_orders(path)
     target: Optional[BrokerOrder] = None
@@ -452,6 +460,7 @@ def cancel_and_reconcile_order(
             is_reserved=True,
             broker_order_id=target.broker_order_id,
             reservation_date=reservation_date,
+            ownership_symbol=target.symbol,
         )
         snapshot.symbol = target.symbol
     else:

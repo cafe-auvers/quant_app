@@ -1,13 +1,13 @@
 """Execution-lease verification for the ``GUARDED_ENGINE`` execution path
 (Workstream 3, A6/B2).
 
-:class:`~src.services.execution_authority.ExecutionAuthority` already
-re-verifies a device's main-device lease at the real broker boundary --
-this module does not replace it, it extends it with the ``lease_epoch``
-dimension PR1's schemas added (``ExecutionCommand.lease_epoch``,
-``ExecutionOrderRecord.lease_epoch``) that ``ExecutionAuthority``'s
-existing :class:`~src.services.execution_authority.LeaseHandle`
-(``device_id``/``lease_token`` only) doesn't carry.
+:class:`~src.services.execution_authority.ExecutionAuthority` re-verifies a
+device's main-device lease at the real broker boundary. This protocol adapts
+the core ``ExecutionLease`` value to that authority and exposes whether epoch
+verification is genuinely available to the guarded gateway.
+
+Workstream 6 persists that epoch beside the main-device token, so the real
+protocol now verifies all three dimensions at each guarded boundary.
 
 This lease check only ever runs in ``GUARDED_ENGINE`` mode. Legacy
 (``LEGACY_COMPATIBILITY``) submissions already re-verify their own lease via
@@ -53,17 +53,9 @@ class ExecutionLeaseProtocol(Protocol):
 
 
 class DefaultExecutionLeaseProtocol:
-    """Delegates device/token verification to the existing, already-real
-    ``ExecutionAuthority``. ``lease_epoch`` is accepted but not yet verified
-    against anything live -- ``state_sync`` does not persist an epoch value
-    today (Workstream 6 / PR5's device-handoff work owns adding that), so
-    there is nothing authoritative to check it against yet. This is a known,
-    explicitly-logged gap, not a silent assumption that epoch checking is
-    real: see the class's own ``epoch_verified`` flag, which every
-    ``GUARDED_ENGINE`` test can assert on.
-    """
+    """Verify device, token, and epoch against durable main-device state."""
 
-    epoch_verified: bool = False
+    epoch_verified: bool = True
 
     def __init__(self, *, authority: Optional[ExecutionAuthority] = None, engine: Optional[Engine] = None) -> None:
         self._authority = authority or ExecutionAuthority()
@@ -72,7 +64,15 @@ class DefaultExecutionLeaseProtocol:
     def require_current(self, lease: Optional[ExecutionLease]) -> None:
         if lease is None:
             return
-        handle = LeaseHandle(device_id=lease.device_id, lease_token=lease.lease_token)
+        if int(lease.lease_epoch or 0) <= 0:
+            raise LeaseNotCurrentError(
+                "execution lease has no positive authoritative epoch"
+            )
+        handle = LeaseHandle(
+            device_id=lease.device_id,
+            lease_token=lease.lease_token,
+            lease_epoch=lease.lease_epoch,
+        )
         try:
             self._authority.require_current_lease(self._engine, handle)
         except LeaseExpiredError as exc:
@@ -81,15 +81,11 @@ class DefaultExecutionLeaseProtocol:
 
 class FakeExecutionLeaseProtocol:
     """In-memory lease authority for tests -- lets a test directly control
-    "what is the current lease" (including ``lease_epoch``, unlike
-    :class:`DefaultExecutionLeaseProtocol`) without a real ``state_sync``
+    "what is the current lease" (including ``lease_epoch``) without a real ``state_sync``
     database. This is the double PR2's own ``GUARDED_ENGINE`` tests use to
     exercise the strict epoch gate the doc calls for.
 
-    ``epoch_verified`` defaults to ``True`` -- this fake stands in for "the
-    future, real epoch-verifying authority" (Workstream 5/6), unlike
-    :class:`DefaultExecutionLeaseProtocol` (which is honest that it cannot
-    verify one yet). Set it to ``False`` on an instance to exercise the
+    ``epoch_verified`` defaults to ``True``. Set it to ``False`` on an instance to exercise the
     gateway's "epoch cannot be verified -- reject" path instead.
     """
 

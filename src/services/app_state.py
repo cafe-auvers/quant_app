@@ -875,6 +875,7 @@ class StateReconcileResult:
     # live order submission so ExecutionAuthority can re-verify it at the
     # actual broker boundary. Empty whenever this device isn't main.
     lease_token: str = ""
+    lease_epoch: int = 0
 
 
 def _demote_after_lost_ownership(
@@ -883,6 +884,7 @@ def _demote_after_lost_ownership(
 ) -> LocalDeviceRole:
     result.is_main_device = False
     result.lease_token = ""
+    result.lease_epoch = 0
     try:
         role = set_local_device_main(role, False)
     except Exception as exc:
@@ -920,6 +922,7 @@ def reconcile_state_with_remote(
     *,
     save_lock: threading.Lock | None = None,
     ownership_only_when_main: bool = False,
+    allow_unprepared_claim: bool = True,
 ) -> StateReconcileResult:
     """Reconcile local files using ownership, hashes, and conditional revisions."""
     result = StateReconcileResult(local_role=role)
@@ -937,7 +940,7 @@ def reconcile_state_with_remote(
             return result
 
         main_device = ownership.main_device
-        if main_device is None and role.is_main:
+        if main_device is None and role.is_main and allow_unprepared_claim:
             ownership = claim_main_device(engine, role)
             if not ownership.success:
                 result.errors.append(ownership.error or "Could not claim main-device ownership.")
@@ -956,6 +959,9 @@ def reconcile_state_with_remote(
         result.main_device_hostname = main_device.hostname if main_device else ""
         result.lease_token = (
             main_device.lease_token if is_main and main_device else ""
+        )
+        result.lease_epoch = (
+            main_device.lease_epoch if is_main and main_device else 0
         )
 
         # Once startup reconciliation has established the base revisions, the
@@ -1077,6 +1083,7 @@ def activate_device_as_main(
     role: LocalDeviceRole,
     *,
     save_lock: threading.Lock | None = None,
+    expected_standby_generation: int = 0,
 ) -> StateReconcileResult:
     """Explicitly transfer main-device ownership, then reconcile safely."""
     if engine is None:
@@ -1097,7 +1104,11 @@ def activate_device_as_main(
     if prepared.errors or prepared.conflict_keys:
         return prepared
 
-    ownership = claim_main_device(engine, role)
+    ownership = claim_main_device(
+        engine,
+        role,
+        expected_standby_generation=expected_standby_generation,
+    )
     if not ownership.success:
         return StateReconcileResult(
             errors=[ownership.error or "Could not activate this device as main."],
@@ -1161,6 +1172,7 @@ def auto_claim_main_device_if_stale(
     expected_owner_device_id: str,
     heartbeat_cutoff_seconds: int = DEFAULT_HEARTBEAT_MAX_AGE_SECONDS,
     save_lock: threading.Lock | None = None,
+    expected_standby_generation: int = 0,
 ) -> StateReconcileResult:
     """Automatic, fenced equivalent of ``activate_device_as_main``.
 
@@ -1199,9 +1211,14 @@ def auto_claim_main_device_if_stale(
             role,
             expected_owner_device_id=expected_owner_device_id,
             heartbeat_cutoff_seconds=heartbeat_cutoff_seconds,
+            expected_standby_generation=expected_standby_generation,
         )
     else:
-        ownership = claim_main_device_if_unclaimed(engine, role)
+        ownership = claim_main_device_if_unclaimed(
+            engine,
+            role,
+            expected_standby_generation=expected_standby_generation,
+        )
     if not ownership.success:
         return StateReconcileResult(
             errors=[ownership.error or "Could not auto-claim main-device ownership."],
@@ -1215,6 +1232,7 @@ def auto_claim_main_device_if_stale(
             is_main_device=True,
             main_device_hostname=role.hostname,
             lease_token=ownership.main_device.lease_token if ownership.main_device else "",
+            lease_epoch=ownership.main_device.lease_epoch if ownership.main_device else 0,
             local_role=LocalDeviceRole(role.device_id, role.hostname, True),
         )
     return reconcile_state_with_remote(engine, role, save_lock=save_lock)
@@ -1224,6 +1242,8 @@ def release_main_device_and_demote(
     engine,
     role: LocalDeviceRole,
     *,
+    expected_lease_token: str,
+    expected_lease_epoch: int,
     disable_remote_writer: Callable[[], None] | None = None,
 ) -> tuple[bool, LocalDeviceRole, str]:
     """Persist pull-only state, fence local writes, then release ownership.
@@ -1245,11 +1265,30 @@ def release_main_device_and_demote(
         try:
             disable_remote_writer()
         except Exception as exc:
+            try:
+                role = set_local_device_main(role, True)
+            except Exception as restore_exc:
+                return (
+                    False,
+                    role,
+                    f"Could not disable remote state writer: {exc}; local main-role "
+                    f"restore also failed: {restore_exc}",
+                )
             return False, role, f"Could not disable remote state writer: {exc}"
 
-    result = release_main_device(engine, owning_role)
+    result = release_main_device(
+        engine,
+        owning_role,
+        expected_lease_token=expected_lease_token,
+        expected_lease_epoch=expected_lease_epoch,
+    )
     if not result.success:
-        return False, role, result.error or "Could not release main-device ownership."
+        error = result.error or "Could not release main-device ownership."
+        try:
+            role = set_local_device_main(role, True)
+        except Exception as restore_exc:
+            error = f"{error}; local main-role restore also failed: {restore_exc}"
+        return False, role, error
     return True, role, ""
 
 

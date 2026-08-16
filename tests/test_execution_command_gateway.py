@@ -58,7 +58,11 @@ from src.services.execution_command_repository import (
     get_command_by_idempotency_key,
     insert_command,
 )
-from src.services.execution_lease_protocol import FakeExecutionLeaseProtocol
+from src.services.execution_lease_protocol import (
+    DefaultExecutionLeaseProtocol,
+    FakeExecutionLeaseProtocol,
+)
+from src.services import state_sync
 from src.services.execution_order_repository import _get_execution_orders_table, fetch_execution_order, record_execution_order
 from src.services.execution_ownership_repository import assign_ownership
 from src.services.mutation_budget_protocol import AllowAllMutationBudget
@@ -551,12 +555,7 @@ def test_an_unverified_epoch_is_rejected_even_with_a_matching_lease(tmp_path):
 
 
 @pytest.mark.usefixtures("trading_enabled")
-def test_default_lease_protocol_never_reports_epoch_verified(tmp_path):
-    """DefaultExecutionLeaseProtocol is honest that it cannot verify an
-    epoch yet -- using it in GUARDED_ENGINE mode always rejects, by
-    design, until Workstream 5/6 supplies a real implementation."""
-    from src.services.execution_lease_protocol import DefaultExecutionLeaseProtocol
-
+def test_default_lease_protocol_rejects_when_no_authoritative_lease_exists(tmp_path):
     engine = _make_engine(tmp_path)
     broker = FakeExecutionBroker()
     broker.queue_acceptance()
@@ -567,6 +566,90 @@ def test_default_lease_protocol_never_reports_epoch_verified(tmp_path):
     _, lease = _lease()
     with pytest.raises(LeaseNotVerifiedError):
         gateway.submit_guarded(_submit_request(lease=lease))
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_losing_device_cannot_submit_after_lease_loss(tmp_path):
+    engine = _make_engine(tmp_path)
+    first_role = state_sync.LocalDeviceRole("dev-1", "LAPTOP", True)
+    claimed = state_sync.claim_main_device(engine, first_role)
+    assert claimed.success
+    lease = ExecutionLease(
+        device_id=claimed.main_device.device_id,
+        lease_token=claimed.main_device.lease_token,
+        lease_epoch=claimed.main_device.lease_epoch,
+    )
+    broker = FakeExecutionBroker()
+    broker.queue_acceptance(broker_order_id="B-FIRST")
+    gateway = ExecutionCommandGateway(
+        real_broker=broker,
+        engine=engine,
+        mode_override=True,
+        lease_protocol=DefaultExecutionLeaseProtocol(engine=engine),
+        mutation_budget=AllowAllMutationBudget(),
+        buying_power_provider=lambda *_: 100_000.0,
+    )
+    first = gateway.submit_guarded(_submit_request(lease=lease))
+    assert first.broker_order_id == "B-FIRST"
+
+    second_role = state_sync.LocalDeviceRole("dev-2", "PC", True)
+    replacement = state_sync.claim_main_device(engine, second_role)
+    assert replacement.success
+    assert replacement.main_device.lease_epoch > lease.lease_epoch
+    broker.queue_acceptance(broker_order_id="B-MUST-NOT-HAPPEN")
+    with pytest.raises(LeaseNotVerifiedError):
+        gateway.submit_guarded(
+            _submit_request(client_order_id="CID-2", lease=lease)
+        )
+    assert len(broker.submit_calls) == 1
+
+
+def test_legacy_monitor_cannot_act_on_a_kanban_owned_symbol(tmp_path):
+    engine = _make_engine(tmp_path)
+    broker = FakeExecutionBroker()
+    gateway = ExecutionCommandGateway(
+        real_broker=broker,
+        engine=engine,
+        mode_override=False,
+    )
+    assign_ownership(
+        engine,
+        ExecutionOwnership(
+            environment="PROD",
+            account_no="12345678-01",
+            symbol="AAPL",
+            owner=ExecutionOwner.KANBAN,
+            strategy_instance_id="buyboard-orb-v1",
+            assigned_by="test",
+        ),
+    )
+    broker.queue_acceptance(broker_order_id="MUST-NOT-HAPPEN")
+
+    with pytest.raises(ExecutionOwnershipMismatchError):
+        gateway.submit_order(
+            environment="PROD",
+            account_no="12345678-01",
+            symbol="AAPL",
+            side=OrderSide.SELL,
+            quantity=1,
+            limit_price=99.0,
+            source=ExecutionSource.LEGACY_BUY_DASHBOARD,
+        )
+
+    broker.queue_cancel_confirmed()
+    with pytest.raises(ExecutionOwnershipMismatchError):
+        gateway.cancel_order(
+            environment="PROD",
+            account_no="12345678-01",
+            symbol="AAPL",
+            broker_order_id="B-1",
+            quantity=1,
+            side="SELL",
+            source=ExecutionSource.LEGACY_BUY_DASHBOARD,
+        )
+
+    assert broker.submit_calls == []
+    assert broker.cancel_calls == []
 
 
 @pytest.mark.usefixtures("trading_enabled")

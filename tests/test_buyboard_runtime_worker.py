@@ -10,7 +10,9 @@ the method under test.
 """
 from __future__ import annotations
 
+import datetime as dt
 import os
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -21,6 +23,7 @@ from sqlalchemy.pool import NullPool
 
 from src.core.account_broker_snapshot import AccountBrokerSnapshot, SnapshotCompleteness
 from src.core.execution_mode import ExecutionLease
+from src.core.runtime_readiness import EngineReadiness, RuntimeDeviceState
 from src.core.execution_ownership import ExecutionOwner, ExecutionOwnership
 from src.core.execution_order_record import (
     BrokerIdentityStatus,
@@ -51,6 +54,11 @@ from src.services.execution_lease_protocol import FakeExecutionLeaseProtocol
 from src.services.execution_order_repository import record_execution_order
 from src.services.execution_ownership_repository import assign_ownership
 from src.services.mutation_budget_protocol import AllowAllMutationBudget
+from src.services.runtime_device_state_repository import get_runtime_device_state
+from src.services.kis_realtime_market_data import (
+    KisRealtimeMarketDataService,
+    StopRule,
+)
 from src.services.realtime_market_data import QuoteSnapshot, RestPollingMarketDataService
 from src.ui.buyboard.runtime_worker import BuyboardRuntimeWorker
 from fakes.fake_execution_broker import FakeExecutionBroker
@@ -233,12 +241,317 @@ def _seed_card(engine, **overrides):
     return repo.create_trade_card(engine, TradeCardState(**fields))
 
 
+def _ready_runtime_state(**overrides):
+    values = dict(
+        lease_current=True,
+        startup_reconciliation_complete=True,
+        account_reconciliation_fresh=True,
+        websocket_connected=True,
+        critical_trade_subscriptions_acked=True,
+        critical_quote_subscriptions_acked=True,
+        critical_quotes_fresh=True,
+        accumulator_draining_within_budget=True,
+        database_writable=True,
+        device_active=True,
+    )
+    values.update(overrides)
+    return EngineReadiness(**values)
+
+
 # --- Construction does not build/start anything -----------------------------
 
 
 def test_construction_builds_nothing(tmp_path):
     worker, _ = _worker(tmp_path)
     assert worker.runtime is None
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "startup_reconciliation_complete",
+        "account_reconciliation_fresh",
+        "websocket_connected",
+        "critical_trade_subscriptions_acked",
+        "critical_quote_subscriptions_acked",
+        "critical_quotes_fresh",
+        "accumulator_draining_within_budget",
+        "database_writable",
+    ],
+)
+def test_startup_sequence_does_not_allow_entries_before_every_step_confirms(
+    tmp_path, monkeypatch, missing
+):
+    worker, _ = _worker(tmp_path)
+    worker._accepting_commands = False
+    worker.device_state = RuntimeDeviceState.STANDBY
+    monkeypatch.setattr(
+        worker,
+        "engine_readiness",
+        lambda **kwargs: _ready_runtime_state(**{missing: False}),
+    )
+    final_passes = []
+    monkeypatch.setattr(
+        worker,
+        "_run_startup_reconciliation",
+        lambda **kwargs: final_passes.append(kwargs),
+    )
+
+    worker._advance_startup_readiness()
+
+    assert worker._accepting_commands is False
+    assert worker.device_state == RuntimeDeviceState.STANDBY
+    assert final_passes == []
+
+
+def test_startup_promotes_standby_to_active_only_after_final_reconciliation(
+    tmp_path, monkeypatch
+):
+    worker, _ = _worker(tmp_path)
+    worker._accepting_commands = False
+    worker.device_state = RuntimeDeviceState.STANDBY
+    transitions = []
+    final_passes = []
+    monkeypatch.setattr(
+        worker, "engine_readiness", lambda **kwargs: _ready_runtime_state()
+    )
+    monkeypatch.setattr(worker, "_lease_still_current", lambda: True)
+    monkeypatch.setattr(
+        worker,
+        "_run_startup_reconciliation",
+        lambda **kwargs: final_passes.append(kwargs),
+    )
+
+    def record_state(state, **kwargs):
+        transitions.append(state)
+        worker.device_state = state
+
+    monkeypatch.setattr(worker, "_set_device_state", record_state)
+
+    worker._advance_startup_readiness()
+
+    assert transitions == [
+        RuntimeDeviceState.STANDBY_READY,
+        RuntimeDeviceState.ACTIVE,
+    ]
+    assert final_passes == [{"execute_commands": False}]
+    assert worker._accepting_commands is True
+
+
+def test_pull_only_successor_reaches_standby_ready_but_never_active(
+    tmp_path, monkeypatch
+):
+    worker, _ = _worker(tmp_path, standby_only=True, device_id="successor")
+    worker._accepting_commands = False
+    worker.device_state = RuntimeDeviceState.STANDBY
+    transitions = []
+    final_passes = []
+    monkeypatch.setattr(
+        worker, "engine_readiness", lambda **kwargs: _ready_runtime_state()
+    )
+
+    def record_state(state, **kwargs):
+        transitions.append(state)
+        worker.device_state = state
+
+    monkeypatch.setattr(worker, "_set_device_state", record_state)
+    monkeypatch.setattr(
+        worker,
+        "_run_startup_reconciliation",
+        lambda **kwargs: final_passes.append(kwargs),
+    )
+
+    worker._advance_startup_readiness()
+
+    assert transitions == [RuntimeDeviceState.STANDBY_READY]
+    assert final_passes == [{"execute_commands": False}]
+    assert worker._accepting_commands is False
+    assert worker.device_state == RuntimeDeviceState.STANDBY_READY
+
+
+def test_standby_readiness_loss_demotes_immediately(tmp_path, monkeypatch):
+    worker, engine = _worker(tmp_path, standby_only=True, device_id="successor")
+    worker._accepting_commands = False
+    worker._set_device_state(RuntimeDeviceState.STANDBY_READY)
+    monkeypatch.setattr(
+        worker,
+        "engine_readiness",
+        lambda **kwargs: _ready_runtime_state(websocket_connected=False),
+    )
+
+    worker._advance_startup_readiness()
+
+    record = get_runtime_device_state(engine, device_id="successor")
+    assert worker.device_state == RuntimeDeviceState.STANDBY
+    assert worker._accepting_commands is False
+    assert record.state == RuntimeDeviceState.STANDBY
+
+
+def test_active_persistence_failure_never_opens_the_command_gate(
+    tmp_path, monkeypatch
+):
+    worker, _ = _worker(tmp_path, device_id="candidate")
+    worker._accepting_commands = False
+    worker.device_state = RuntimeDeviceState.STANDBY
+    monkeypatch.setattr(
+        worker, "engine_readiness", lambda **kwargs: _ready_runtime_state()
+    )
+    monkeypatch.setattr(worker, "_lease_still_current", lambda: True)
+    monkeypatch.setattr(worker, "_run_startup_reconciliation", lambda **kwargs: None)
+
+    def persist_state(state, **kwargs):
+        if state == RuntimeDeviceState.ACTIVE:
+            raise RuntimeError("ACTIVE write failed")
+        worker.device_state = state
+
+    monkeypatch.setattr(worker, "_set_device_state", persist_state)
+
+    with pytest.raises(RuntimeError, match="ACTIVE write failed"):
+        worker._advance_startup_readiness()
+
+    assert worker.device_state == RuntimeDeviceState.STANDBY_READY
+    assert worker._accepting_commands is False
+
+
+def test_runtime_shutdown_orders_journal_reconciliation_and_market_data_close(
+    tmp_path, monkeypatch
+):
+    worker, _ = _worker(tmp_path)
+    calls = []
+
+    class _MarketData:
+        def configure_desired_channels(self, **kwargs):
+            calls.append(("unsubscribe", kwargs))
+
+        def stop(self):
+            calls.append(("stop", None))
+
+    worker.runtime = SimpleNamespace(market_data=_MarketData())
+    worker._journal_flush = lambda: calls.append(("flush", None))
+    monkeypatch.setattr(
+        worker,
+        "_run_startup_reconciliation",
+        lambda **kwargs: calls.append(("reconcile", kwargs)),
+    )
+
+    def record_state(state, **kwargs):
+        worker.device_state = state
+        calls.append(("state", state))
+
+    monkeypatch.setattr(worker, "_set_device_state", record_state)
+
+    worker.request_stop()
+    worker._perform_shutdown_sequence()
+
+    assert worker._accepting_commands is False
+    assert calls == [
+        ("state", RuntimeDeviceState.SHUTTING_DOWN),
+        ("flush", None),
+        ("reconcile", {"execute_commands": False}),
+        ("unsubscribe", {"trade_priorities": {}, "quote_priorities": {}}),
+        ("stop", None),
+        ("state", RuntimeDeviceState.STOPPED),
+    ]
+    assert worker.shutdown_prepared is True
+
+
+def test_standby_stop_breach_survives_promotion_and_initiates_sell_all_once(
+    tmp_path
+):
+    now = dt.datetime.now(dt.timezone.utc)
+
+    class _Transport:
+        def __init__(self):
+            self.stopped = False
+
+        def on_data(self, callback):
+            pass
+
+        def on_ack(self, callback):
+            pass
+
+        def on_connection(self, callback):
+            pass
+
+        def subscribe(self, subscriptions):
+            pass
+
+        def unsubscribe(self, subscriptions):
+            pass
+
+        def start(self):
+            self.stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+        def is_connected(self):
+            return True
+
+    service = KisRealtimeMarketDataService(
+        transport=_Transport(),
+        symbol_key_resolver=lambda symbol, channel: symbol,
+        trade_capacity=10,
+        quote_capacity=10,
+        clock=lambda: now,
+    )
+    card = TradeCardState(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        board_status=BoardStatus.OPEN_POSITION,
+        broker_quantity=10,
+        orderable_quantity=10,
+        active_stop_price=100.0,
+    )
+    service.replace_stop_rules(
+        "AAPL", [StopRule(card.card_key, 100.0, "1")]
+    )
+    for offset, price in enumerate((101.0, 99.0, 101.0)):
+        observed = now + dt.timedelta(seconds=offset)
+        assert service.ingest_trade(
+            QuoteSnapshot(
+                symbol="AAPL",
+                last_price=price,
+                broker_event_at=observed,
+                received_at=observed,
+                processed_at=observed,
+                channel="HDFSCNT0",
+                payload_fingerprint=str(offset),
+            )
+        )
+
+    # Standby observes/drains but cannot acknowledge the breach.
+    assert any(quote.breached_stop_versions for quote in service.poll_once())
+    standby, _ = _worker(tmp_path, standby_only=True)
+    standby.runtime = SimpleNamespace(market_data=service)
+    standby._close_market_data()
+    promoted_service = standby.runtime.market_data
+
+    sell_all_calls = []
+
+    class _TradingEngine:
+        def evaluate_quote(self, cards, quote):
+            if quote.breached_stop_versions:
+                sell_all_calls.append(quote.breached_stop_versions)
+                cards[0].exit_all_required = True
+                cards[0].board_status = BoardStatus.SELL_ALL
+                return cards
+            return []
+
+    active, _ = _worker(tmp_path)
+    active.runtime = SimpleNamespace(
+        market_data=promoted_service,
+        trading_engine=_TradingEngine(),
+    )
+    for quote in promoted_service.poll_once():
+        active.runtime.trading_engine.evaluate_quote([card], quote)
+        active._acknowledge_market_breaches(quote, [card])
+    for quote in promoted_service.poll_once():
+        active.runtime.trading_engine.evaluate_quote([card], quote)
+
+    assert card.board_status == BoardStatus.SELL_ALL
+    assert len(sell_all_calls) == 1
 
 
 # --- Startup reconciliation --------------------------------------------------

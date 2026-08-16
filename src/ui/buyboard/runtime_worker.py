@@ -28,15 +28,19 @@ new engine activity on the next tick without requiring an app restart.
 from __future__ import annotations
 
 import logging
+import platform
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional, Tuple
 
 from PyQt5.QtCore import QThread, pyqtSignal
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from src.core import execution_config
 from src.core.account_broker_snapshot import AccountBrokerSnapshot, ReconciliationAction
 from src.core.execution_config import is_buyboard_engine_enabled
+from src.core.execution_mode import ExecutionLease
+from src.core.runtime_readiness import EngineReadiness, RuntimeDeviceState
 from src.core.execution_order_record import ExecutionOrderStatus
 from src.core.order_state import OrderSide
 from src.core.trade_card_state import BoardStatus, TradeCardState
@@ -57,6 +61,7 @@ from src.services.execution_command_gateway import (
 from src.services.execution_command_repository import DuplicateCommandError
 from src.services.execution_order_repository import fetch_execution_order
 from src.services.execution_authority import ExecutionAuthority, LeaseExpiredError, LeaseHandle
+from src.services.runtime_device_state_repository import save_runtime_device_state
 from src.services.kis_realtime_market_data import StopRule, SubscriptionPriority
 from src.services.trade_card_orb_bridge import TradeCardOrbEvaluator
 
@@ -107,6 +112,7 @@ class BuyboardRuntimeWorker(QThread):
         buying_power_provider: Callable[[str, str], float],
         account_equity_provider: Optional[Callable[[str, str], float]] = None,
         broker=None,
+        market_data=None,
         execution_authority: Optional[ExecutionAuthority] = None,
         execution_lease: Optional[LeaseHandle] = None,
         lease_engine: Optional[Engine] = None,
@@ -114,6 +120,11 @@ class BuyboardRuntimeWorker(QThread):
         execution_queue_item_lookup: Optional[Callable[[str, str], object]] = None,
         heartbeat_seconds: Optional[float] = None,
         account_discovery: Optional[Callable[[], List[str]]] = None,
+        strategy_instance_id: str = "",
+        journal_flush: Optional[Callable[[], None]] = None,
+        standby_only: bool = False,
+        device_id: str = "",
+        hostname: str = "",
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -123,6 +134,7 @@ class BuyboardRuntimeWorker(QThread):
         self._buying_power_provider = buying_power_provider
         self._account_equity_provider = account_equity_provider
         self._broker = broker
+        self._market_data = market_data
         self._execution_authority = execution_authority
         self._execution_lease = execution_lease
         self._lease_engine = lease_engine
@@ -136,6 +148,13 @@ class BuyboardRuntimeWorker(QThread):
         # whatever KIS accounts happen to be configured in the developer's
         # own .env -- defaults to the real KIS-config-backed discovery.
         self._account_discovery = account_discovery or self._default_account_discovery
+        self._strategy_instance_id = str(strategy_instance_id or "")
+        self._journal_flush = journal_flush or self._flush_execution_journal
+        self._standby_only = bool(standby_only)
+        self._device_id = str(
+            device_id or getattr(execution_lease, "device_id", "") or ""
+        )
+        self._hostname = str(hostname or platform.node())
         # How this worker finds the legacy execution queue's already-computed
         # ORB candidate for a symbol (review finding P0-2) -- typically
         # ``lambda symbol, env: main_window.execution_queue_manager.get_item(symbol, env)``.
@@ -147,7 +166,18 @@ class BuyboardRuntimeWorker(QThread):
         )
         self._orb_evaluator = TradeCardOrbEvaluator()
         self._stop_requested = False
+        # Directly-driven workers in unit/diagnostic contexts retain the
+        # historical default. ``run`` closes this gate before startup and
+        # only reopens it at ACTIVE.
+        self._accepting_commands = True
+        self.shutdown_prepared = False
+        self.shutdown_errors: List[str] = []
         self.runtime: Optional[buyboard_runtime_module.BuyboardRuntime] = None
+        self.device_state = RuntimeDeviceState.STARTING
+        self.readiness_generation = 0
+        self._lease_current = False
+        self._database_writable = False
+        self.last_market_data_drain_at: Optional[datetime] = None
         # Per real account_no (never this worker's own possibly-blank
         # self._account_no -- review finding: this worker is intentionally
         # account-unscoped and processes every PROD account's cards).
@@ -227,53 +257,242 @@ class BuyboardRuntimeWorker(QThread):
         Does not join -- callers that need to block until the thread has
         actually exited should follow this with ``QThread.wait()``.
         """
+        # First close the mutation gate.  The loop may still be between
+        # cycles, but no later cycle can derive/submit another command.
+        self._accepting_commands = False
         self._stop_requested = True
+
+    def _set_device_state(
+        self,
+        state: RuntimeDeviceState,
+        *,
+        handoff_confirmed: bool = False,
+    ):
+        if not self._device_id:
+            self.device_state = state
+            return
+        record = save_runtime_device_state(
+            self._db_engine,
+            device_id=self._device_id,
+            hostname=self._hostname,
+            state=state,
+            handoff_confirmed=handoff_confirmed,
+        )
+        # Durable state is the authorization source. Local state changes only
+        # after that write succeeds, especially for ACTIVE.
+        self.device_state = state
+        self.readiness_generation = int(record.readiness_generation or 0)
+        return record
+
+    def _demote_standby_readiness(self) -> None:
+        """Close the local claim path immediately, then clear durable readiness."""
+
+        self._accepting_commands = False
+        self.device_state = RuntimeDeviceState.STANDBY
+        if not self._device_id:
+            return
+        save_runtime_device_state(
+            self._db_engine,
+            device_id=self._device_id,
+            hostname=self._hostname,
+            state=RuntimeDeviceState.STANDBY,
+        )
+
+    def _probe_database_writable(self) -> bool:
+        """Exercise a write statement without changing application data."""
+
+        try:
+            with self._db_engine.begin() as conn:
+                # This is a real write-path prepare/execute and therefore
+                # catches read-only connections; the false predicate keeps
+                # all rows untouched.
+                conn.execute(text("UPDATE trade_cards SET version = version WHERE 1 = 0"))
+            self._database_writable = True
+        except Exception:
+            logger.exception("Buyboard runtime database write probe failed")
+            self._database_writable = False
+        return self._database_writable
+
+    def _flush_execution_journal(self) -> None:
+        """Cross a final database transaction boundary.
+
+        Commands are written synchronously before broker calls, so there is
+        no in-memory queue to drain.  Completing this transaction proves all
+        earlier journal commits are visible before final reconciliation.
+        """
+
+        with self._db_engine.begin() as conn:
+            conn.execute(text("SELECT 1"))
+
+    def _execution_lease_value(self) -> Optional[ExecutionLease]:
+        lease = self._execution_lease
+        if lease is None:
+            return None
+        return ExecutionLease(
+            device_id=lease.device_id,
+            lease_token=lease.lease_token,
+            lease_epoch=int(getattr(lease, "lease_epoch", 0) or 0),
+        )
 
     def run(self) -> None:  # noqa: D401 - Qt override
         if not is_buyboard_engine_enabled():
             return
         try:
+            self._accepting_commands = False
+            self._set_device_state(RuntimeDeviceState.STARTING)
             self.runtime = buyboard_runtime_module.build_buyboard_runtime(
                 buying_power_provider=self._buying_power_provider,
                 card_lookup=self._card_lookup,
                 account_equity_provider=self._account_equity_provider,
                 capital_reservation_engine=self._capital_reservation_engine,
                 execution_authority=self._execution_authority,
-                execution_lease=self._execution_lease,
+                execution_lease=self._execution_lease_value(),
                 lease_engine=self._lease_engine,
                 broker=self._broker,
+                market_data=self._market_data,
+                strategy_instance_id=self._strategy_instance_id,
                 persist_card_before_execution=self._persist_execution_identity,
+                observation_only=self._standby_only,
             )
             if execution_config.KIS_WS_ENABLED:
                 start_market_data = getattr(self.runtime.market_data, "start", None)
                 if callable(start_market_data):
                     start_market_data()
-            self._run_startup_reconciliation()
+            # Startup reconciliation is projection-only.  Reducer commands
+            # remain journaled but cannot cross the broker boundary until the
+            # device reaches ACTIVE after the final pass.
+            self._run_startup_reconciliation(execute_commands=False)
+            self._probe_database_writable()
+            self._set_device_state(RuntimeDeviceState.STANDBY)
         except Exception as exc:  # noqa: BLE001 - must not crash the app
             logger.exception("BuyboardRuntimeWorker failed to start")
+            try:
+                self._close_market_data()
+            except Exception:
+                logger.exception("Could not close market data after startup failure")
+            try:
+                self._set_device_state(RuntimeDeviceState.FAILED)
+            except Exception:
+                logger.exception("Could not persist failed runtime state")
             self.error_occurred.emit(f"Buy Board engine failed to start: {exc}")
             return
 
-        while not self._stop_requested:
-            if not is_buyboard_engine_enabled():
-                logger.info("BuyboardRuntimeWorker stopping: engine flag turned off")
-                break
-            if not self._lease_still_current():
-                logger.info("BuyboardRuntimeWorker stopping: main-device lease no longer current")
-                break
-            self.last_cycle_started_at = datetime.now(timezone.utc)
-            try:
-                self._run_one_cycle()
-                self.last_heartbeat_at = datetime.now(timezone.utc)
-            except Exception:  # noqa: BLE001 - one bad cycle must not kill the loop
-                logger.exception("BuyboardRuntimeWorker heartbeat cycle failed")
-                self.error_occurred.emit("Buy Board engine heartbeat failed -- see logs for detail.")
-            self.msleep(max(1, int(self._heartbeat_seconds * 1000)))
+        try:
+            while not self._stop_requested:
+                if not is_buyboard_engine_enabled():
+                    logger.info("BuyboardRuntimeWorker stopping: engine flag turned off")
+                    break
+                self._lease_current = (
+                    False if self._standby_only else self._lease_still_current()
+                )
+                if not self._standby_only and not self._lease_current:
+                    self._accepting_commands = False
+                    logger.info("BuyboardRuntimeWorker stopping: main-device lease no longer current")
+                    break
+                self.last_cycle_started_at = datetime.now(timezone.utc)
+                try:
+                    allow_mutations = self.device_state == RuntimeDeviceState.ACTIVE
+                    self._run_one_cycle(allow_mutations=allow_mutations)
+                    self.last_heartbeat_at = datetime.now(timezone.utc)
+                    self._probe_database_writable()
+                    if not allow_mutations:
+                        self._advance_startup_readiness()
+                except Exception:  # noqa: BLE001 - one bad cycle must not kill the loop
+                    logger.exception("BuyboardRuntimeWorker heartbeat cycle failed")
+                    if self.device_state == RuntimeDeviceState.STANDBY_READY:
+                        try:
+                            self._demote_standby_readiness()
+                        except Exception:
+                            logger.exception(
+                                "Could not persist standby demotion after cycle failure"
+                            )
+                    self.error_occurred.emit("Buy Board engine heartbeat failed -- see logs for detail.")
+                self.msleep(max(1, int(self._heartbeat_seconds * 1000)))
+        finally:
+            self._accepting_commands = False
+            self._perform_shutdown_sequence()
 
-        if self.runtime is not None and execution_config.KIS_WS_ENABLED:
-            stop_market_data = getattr(self.runtime.market_data, "stop", None)
-            if callable(stop_market_data):
-                stop_market_data()
+    def _advance_startup_readiness(self) -> None:
+        readiness = self.engine_readiness(include_device_state=False)
+        if not readiness.standby_ready:
+            if self.device_state == RuntimeDeviceState.STANDBY_READY:
+                self._demote_standby_readiness()
+            return
+        if self._standby_only:
+            if self.device_state != RuntimeDeviceState.STANDBY_READY:
+                # A standby publishes readiness only after its own final
+                # projection-only broker reconciliation and a second complete
+                # dependency check.
+                self._run_startup_reconciliation(execute_commands=False)
+                readiness = self.engine_readiness(include_device_state=False)
+                if not readiness.standby_ready:
+                    self._demote_standby_readiness()
+                    return
+            # Subsequent writes are successor-owned heartbeats. They preserve
+            # this readiness generation and do not refresh confirmation time.
+            self._set_device_state(RuntimeDeviceState.STANDBY_READY)
+            return
+        # The lease was acquired against the prior standby generation. Perform
+        # the immediate activation reconciliation with the command gate shut.
+        self._run_startup_reconciliation(execute_commands=False)
+        self._lease_current = self._lease_still_current()
+        readiness = self.engine_readiness(include_device_state=False)
+        if not (self._lease_current and readiness.standby_ready):
+            if self.device_state == RuntimeDeviceState.STANDBY_READY:
+                self._demote_standby_readiness()
+            return
+        if self.device_state != RuntimeDeviceState.STANDBY_READY:
+            self._set_device_state(RuntimeDeviceState.STANDBY_READY)
+        # Persist ACTIVE before either local ACTIVE or the mutation gate can
+        # become observable. A failed write leaves both closed.
+        self._set_device_state(RuntimeDeviceState.ACTIVE)
+        self._accepting_commands = True
+
+    def _perform_shutdown_sequence(self) -> None:
+        """E4: gate commands, flush, reconcile, close feed, then stop."""
+
+        self.shutdown_errors = []
+        try:
+            self._set_device_state(RuntimeDeviceState.SHUTTING_DOWN)
+        except Exception as exc:
+            self.shutdown_errors.append(f"device-state: {exc}")
+        try:
+            self._journal_flush()
+        except Exception as exc:
+            self.shutdown_errors.append(f"journal flush: {exc}")
+        if self.runtime is not None:
+            try:
+                self._run_startup_reconciliation(execute_commands=False)
+            except Exception as exc:
+                self.shutdown_errors.append(f"final reconciliation: {exc}")
+            try:
+                self._close_market_data()
+            except Exception as exc:
+                self.shutdown_errors.append(f"market-data close: {exc}")
+        self.shutdown_prepared = not self.shutdown_errors
+        try:
+            self._set_device_state(
+                RuntimeDeviceState.STOPPED if self.shutdown_prepared else RuntimeDeviceState.FAILED
+            )
+        except Exception as exc:
+            self.shutdown_errors.append(f"final device-state: {exc}")
+            self.shutdown_prepared = False
+
+    def _close_market_data(self) -> None:
+        if self.runtime is None:
+            return
+        market_data = self.runtime.market_data
+        configure = getattr(market_data, "configure_desired_channels", None)
+        if callable(configure):
+            configure(trade_priorities={}, quote_priorities={})
+        else:
+            subscribed = getattr(market_data, "subscribed_symbols", lambda: [])
+            symbols = list(subscribed())
+            if symbols:
+                market_data.unsubscribe(symbols)
+        stop_market_data = getattr(market_data, "stop", None)
+        if callable(stop_market_data):
+            stop_market_data()
 
     def _lease_still_current(self) -> bool:
         """Review finding P0-1: "Stop the worker immediately on lease
@@ -355,7 +574,7 @@ class BuyboardRuntimeWorker(QThread):
             logger.exception("Failed to discover configured KIS account profiles")
             return []
 
-    def _run_startup_reconciliation(self) -> None:
+    def _run_startup_reconciliation(self, *, execute_commands: bool = True) -> None:
         """Restores retry bookkeeping (review finding P0-4's predecessor,
         section 1070-1075's "Run full startup reconciliation") and corrects
         every card's positions/orders against broker truth before the first
@@ -393,9 +612,10 @@ class BuyboardRuntimeWorker(QThread):
                 )
                 self._latest_reconciliation_snapshots[account_no] = result.snapshot
                 account_changed = list(result.plan.changed_cards)
-                account_changed.extend(
-                    self._execute_reconciliation_commands(result)
-                )
+                if execute_commands and self._accepting_commands:
+                    account_changed.extend(
+                        self._execute_reconciliation_commands(result)
+                    )
                 self._handle_reconciliation_result(result)
             except Exception as exc:
                 # Review finding P0: this account did NOT get reconciled --
@@ -440,13 +660,18 @@ class BuyboardRuntimeWorker(QThread):
 
     # -- per-cycle heartbeat --------------------------------------------------
 
-    def _run_one_cycle(self) -> None:
+    def _run_one_cycle(self, *, allow_mutations: bool = True) -> None:
         assert self.runtime is not None
         cards = repo.list_trade_cards(self._db_engine, environment=self._environment)
         if self._account_no:
             cards = [card for card in cards if card.account_no == self._account_no]
 
-        reconciliation_changed = bool(self._refresh_account_state_if_due(cards))
+        allow_mutations = bool(allow_mutations and self._accepting_commands)
+        reconciliation_changed = bool(
+            self._refresh_account_state_if_due(
+                cards, execute_commands=allow_mutations
+            )
+        )
         # Reconciliation persists cloned reducer outputs.  Reload before
         # the heartbeat so every later decision sees the just-committed
         # account truth and writes from the current optimistic version.
@@ -473,24 +698,30 @@ class BuyboardRuntimeWorker(QThread):
             card for card in cards if card.board_status in _QUOTE_SUBSCRIBED_STATUSES
         ]
 
-        _track(self._sync_orb_plans(ready_cards))
+        if allow_mutations:
+            _track(self._sync_orb_plans(ready_cards))
         # Observation readiness is intentionally broader than mutation
         # readiness: a reconciliation failure may block a command but must
         # never make the feed stop watching an existing position.
         self._sync_quote_subscriptions(observation_cards)
         self._sync_market_stop_rules(observation_cards)
 
-        for quote in self.runtime.market_data.poll_once():
-            _track(self.runtime.trading_engine.evaluate_quote(observation_cards, quote))
-            _track(self.runtime.trading_engine.evaluate_entry_quote(ready_cards, quote))
-            self._acknowledge_market_breaches(quote, observation_cards)
+        quotes = self.runtime.market_data.poll_once()
+        self.last_market_data_drain_at = datetime.now(timezone.utc)
+        if allow_mutations:
+            for quote in quotes:
+                _track(self.runtime.trading_engine.evaluate_quote(observation_cards, quote))
+                _track(self.runtime.trading_engine.evaluate_entry_quote(ready_cards, quote))
+                self._acknowledge_market_breaches(quote, observation_cards)
 
-        _track(self.runtime.trading_engine.run_heartbeat(ready_cards))
+            _track(self.runtime.trading_engine.run_heartbeat(ready_cards))
         # Stops can change inside the heartbeat (first-fill ORB stop,
         # completion-to-breakeven). Rotate under the feed's shared lock and
         # immediately evaluate any events detached from the old version.
-        if self._sync_market_stop_rules(observation_cards):
-            for quote in self.runtime.market_data.poll_once():
+        if allow_mutations and self._sync_market_stop_rules(observation_cards):
+            rotated_quotes = self.runtime.market_data.poll_once()
+            self.last_market_data_drain_at = datetime.now(timezone.utc)
+            for quote in rotated_quotes:
                 _track(self.runtime.trading_engine.evaluate_quote(observation_cards, quote))
                 _track(self.runtime.trading_engine.evaluate_entry_quote(ready_cards, quote))
                 self._acknowledge_market_breaches(quote, observation_cards)
@@ -569,7 +800,12 @@ class BuyboardRuntimeWorker(QThread):
     # -- periodic per-account KIS refresh (review: no cadence populated the --
     # -- buying-power cache or re-reconciled positions after startup) --------
 
-    def _refresh_account_state_if_due(self, cards: List[TradeCardState]) -> List[TradeCardState]:
+    def _refresh_account_state_if_due(
+        self,
+        cards: List[TradeCardState],
+        *,
+        execute_commands: bool = True,
+    ) -> List[TradeCardState]:
         """Refreshes each real account's KIS buying power
         (``ACTIVE_ACCOUNT_REFRESH_SECONDS``/``IDLE_ACCOUNT_REFRESH_SECONDS``
         -- previously-unused constants; nothing populated
@@ -639,7 +875,8 @@ class BuyboardRuntimeWorker(QThread):
                     continue
                 self._latest_reconciliation_snapshots[account_no] = result.snapshot
                 changed.extend(result.plan.changed_cards)
-                changed.extend(self._execute_reconciliation_commands(result))
+                if execute_commands and self._accepting_commands:
+                    changed.extend(self._execute_reconciliation_commands(result))
                 self._handle_reconciliation_result(result)
                 if result.snapshot.completeness.account_balance_complete:
                     self._record_reconciliation_balance(account_no, result)
@@ -789,6 +1026,124 @@ class BuyboardRuntimeWorker(QThread):
             )
             return safe_sell_exposure
         return False
+
+    def _account_reconciliation_is_fresh(
+        self,
+        account_no: Optional[str] = None,
+        *,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        reference = now or datetime.now(timezone.utc)
+        if account_no is not None:
+            observed = self._account_reconciled_at.get(str(account_no or ""))
+            age = self._age_seconds(observed, reference)
+            return bool(
+                account_no
+                and account_no in self.startup_reconciled_accounts
+                and account_no not in self.startup_reconciliation_errors
+                and age is not None
+                and 0.0 <= age <= execution_config.FULL_RECONCILIATION_SECONDS
+            )
+        if not self.startup_reconciliation_complete:
+            return False
+        return all(
+            (age := self._age_seconds(self._account_reconciled_at.get(item), reference))
+            is not None
+            and 0.0 <= age <= execution_config.FULL_RECONCILIATION_SECONDS
+            for item in self.startup_reconciled_accounts
+        )
+
+    def engine_readiness(
+        self,
+        account_no: Optional[str] = None,
+        *,
+        symbol: str = "",
+        action: str = "",
+        include_device_state: bool = True,
+        now: Optional[datetime] = None,
+    ) -> EngineReadiness:
+        """Return the complete E1 predicate as independently visible facts."""
+
+        reference = now or datetime.now(timezone.utc)
+        startup_complete = (
+            bool(
+                account_no
+                and account_no in self.startup_reconciled_accounts
+                and account_no not in self.startup_reconciliation_errors
+            )
+            if account_no is not None
+            else bool(
+                self.startup_reconciliation_ran
+                and self.startup_reconciliation_complete
+                and not self.startup_reconciliation_errors
+            )
+        )
+        account_fresh = self._account_reconciliation_is_fresh(
+            account_no, now=reference
+        )
+        if account_no is not None and action:
+            account_fresh = account_fresh and self.account_action_ready(
+                account_no, symbol, action
+            )
+
+        connected = False
+        trade_acked = False
+        quote_acked = False
+        quotes_fresh = False
+        queue_within_budget = False
+        market_data = self.runtime.market_data if self.runtime is not None else None
+        if market_data is not None:
+            health_metrics = getattr(market_data, "health_metrics", None)
+            if callable(health_metrics):
+                try:
+                    metrics = health_metrics(now=reference)
+                except TypeError as exc:
+                    if "unexpected keyword argument" not in str(exc):
+                        raise
+                    metrics = health_metrics()
+                connected = bool(metrics.ws_connected)
+                trade_acked = not bool(metrics.critical_trade_channels_missing)
+                quote_acked = not bool(metrics.critical_quote_channels_missing)
+                quotes_fresh = not bool(metrics.stale_symbols)
+            else:
+                connected = bool(market_data.is_connected())
+                symbols = [symbol] if symbol else list(
+                    getattr(market_data, "subscribed_symbols", lambda: [])()
+                )
+                symbol_ready = getattr(market_data, "is_symbol_execution_ready", None)
+                quotes_fresh = bool(
+                    callable(symbol_ready)
+                    and all(symbol_ready(item, now=reference) for item in symbols)
+                )
+                trade_acked = connected and quotes_fresh
+                quote_acked = connected and quotes_fresh
+
+            drain_age = self._age_seconds(self.last_market_data_drain_at, reference)
+            drain_budget = max(
+                float(execution_config.MAX_MARKET_DATA_QUEUE_DELAY_SECONDS),
+                float(self._heartbeat_seconds)
+                + float(execution_config.MAX_MARKET_DATA_QUEUE_DELAY_SECONDS),
+            )
+            queue_within_budget = bool(
+                drain_age is not None and 0.0 <= drain_age <= drain_budget
+            )
+
+        return EngineReadiness(
+            lease_current=bool(self._lease_current),
+            startup_reconciliation_complete=startup_complete,
+            account_reconciliation_fresh=account_fresh,
+            websocket_connected=connected,
+            critical_trade_subscriptions_acked=trade_acked,
+            critical_quote_subscriptions_acked=quote_acked,
+            critical_quotes_fresh=quotes_fresh,
+            accumulator_draining_within_budget=queue_within_budget,
+            database_writable=bool(self._database_writable),
+            device_active=(
+                self.device_state == RuntimeDeviceState.ACTIVE
+                if include_device_state
+                else True
+            ),
+        )
 
     def _execute_reconciliation_commands(
         self, result: AccountReconciliationResult

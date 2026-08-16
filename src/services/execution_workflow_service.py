@@ -53,6 +53,7 @@ from src.core.order_state import (
     generate_client_order_id,
 )
 from src.services.execution_command_gateway import ExecutionCommandGateway, get_default_execution_gateway
+from src.services.execution_command_gateway import get_legacy_execution_gateway
 from src.services.execution_lease_protocol import ExecutionLease
 from src.services.order_ledger import ORDERS_FILE
 from src.services.order_execution_service import submit_guarded_overseas_order
@@ -144,7 +145,12 @@ def request_submit(
     ``execution_authority``, ``execution_lease``, etc.), used only in
     ``LEGACY_COMPATIBILITY`` mode and passed through unchanged.
     """
-    resolved_gateway = gateway or get_default_execution_gateway()
+    ownership_engine = legacy_kwargs.get("lease_engine")
+    resolved_gateway = gateway or (
+        get_legacy_execution_gateway(ownership_engine)
+        if ownership_engine is not None
+        else get_default_execution_gateway()
+    )
     if _resolved_mode(resolved_gateway) == ExecutionMode.GUARDED_ENGINE:
         stable_id = client_order_id or generate_client_order_id(environment, account_no, symbol, side, intent)
         request = SubmitExecutionRequest(
@@ -178,6 +184,7 @@ def request_cancel(
     environment: str = "",
     account_no: str = "",
     strategy_instance_id: str = "",
+    ownership_engine=None,
 ) -> Any:
     """The single shared cancellation entry point (INV-21).
 
@@ -194,7 +201,11 @@ def request_cancel(
     finding 9's account/environment-match gate); ``LEGACY_COMPATIBILITY``
     mode does not need them (the local order ledger already knows).
     """
-    resolved_gateway = gateway or get_default_execution_gateway()
+    resolved_gateway = gateway or (
+        get_legacy_execution_gateway(ownership_engine)
+        if ownership_engine is not None
+        else get_default_execution_gateway()
+    )
     if _resolved_mode(resolved_gateway) == ExecutionMode.GUARDED_ENGINE:
         stable_cancel_id = cancel_command_id or f"{client_order_id}:{uuid4().hex[:12]}"
         request = CancelExecutionRequest(

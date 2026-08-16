@@ -12,6 +12,8 @@ from sqlalchemy.schema import CreateTable
 from src.services import app_state
 from src.services import runtime_status
 from src.services import state_sync as ss
+from src.core.runtime_readiness import RuntimeDeviceState
+from src.services.runtime_device_state_repository import save_runtime_device_state
 import src.ui.main_window as main_window_module
 from src.ui.main_window import MainWindow
 
@@ -39,6 +41,19 @@ def _make_engine(tmp_path):
         future=True,
         poolclass=NullPool,
     )
+
+
+def _lease_kwargs(ownership):
+    lease = ownership.main_device
+    assert lease is not None
+    return {
+        "expected_lease_token": lease.lease_token,
+        "expected_lease_epoch": lease.lease_epoch,
+    }
+
+
+def _current_lease_kwargs(engine):
+    return _lease_kwargs(ss.get_main_device(engine))
 
 
 def _use_machine(monkeypatch, root):
@@ -543,21 +558,71 @@ def test_main_device_button_reflects_exclusive_role():
 def test_release_main_device_clears_ownership_row_when_owned_by_role(tmp_path):
     engine = _make_engine(tmp_path)
     laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
-    assert ss.claim_main_device(engine, laptop).success
+    claimed = ss.claim_main_device(engine, laptop)
+    assert claimed.success
 
-    result = ss.release_main_device(engine, laptop)
+    result = ss.release_main_device(engine, laptop, **_lease_kwargs(claimed))
 
     assert result.success
     assert ss.get_main_device(engine).main_device is None
+
+
+def test_clean_release_and_reclaim_advances_lease_epoch(tmp_path):
+    engine = _make_engine(tmp_path)
+    laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    pc = ss.LocalDeviceRole("pc-id", "PC", False)
+    first = ss.claim_main_device(engine, laptop)
+    assert first.success
+    assert ss.release_main_device(engine, laptop, **_lease_kwargs(first)).success
+
+    second = ss.claim_main_device_if_unclaimed(engine, pc)
+
+    assert second.success
+    assert second.main_device.lease_epoch > first.main_device.lease_epoch
+
+
+def test_stale_same_device_lease_cannot_release_newer_lease(tmp_path):
+    engine = _make_engine(tmp_path)
+    pc = ss.LocalDeviceRole("pc-id", "PC", True)
+    first = ss.claim_main_device(engine, pc)
+    assert first.success
+    assert ss.release_main_device(engine, pc, **_lease_kwargs(first)).success
+    second = ss.claim_main_device_if_unclaimed(engine, pc)
+    assert second.success
+
+    stale_release = ss.release_main_device(engine, pc, **_lease_kwargs(first))
+
+    assert stale_release.success is False
+    current = ss.get_main_device(engine).main_device
+    assert current is not None
+    assert current.lease_token == second.main_device.lease_token
+    assert current.lease_epoch == second.main_device.lease_epoch
+
+
+def test_exact_lease_release_preserves_epoch_in_tombstone(tmp_path):
+    engine = _make_engine(tmp_path)
+    pc = ss.LocalDeviceRole("pc-id", "PC", True)
+    claimed = ss.claim_main_device(engine, pc)
+    assert claimed.success
+
+    released = ss.release_main_device(engine, pc, **_lease_kwargs(claimed))
+
+    assert released.success is True
+    assert ss.get_main_device(engine).main_device is None
+    tombstone = ss.pull_state(engine, ss.MAIN_DEVICE_KEY)
+    assert tombstone.status == ss.PULL_OK
+    assert tombstone.state.payload["device_id"] == ""
+    assert tombstone.state.payload["lease_epoch"] == claimed.main_device.lease_epoch
 
 
 def test_release_main_device_is_noop_when_not_owner(tmp_path):
     engine = _make_engine(tmp_path)
     laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
     pc = ss.LocalDeviceRole("pc-id", "PC", False)
-    assert ss.claim_main_device(engine, laptop).success
+    claimed = ss.claim_main_device(engine, laptop)
+    assert claimed.success
 
-    result = ss.release_main_device(engine, pc)
+    result = ss.release_main_device(engine, pc, **_lease_kwargs(claimed))
 
     assert result.success
     assert ss.get_main_device(engine).main_device.device_id == "laptop-id"
@@ -567,7 +632,12 @@ def test_release_main_device_noop_when_already_unclaimed(tmp_path):
     engine = _make_engine(tmp_path)
     laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
 
-    result = ss.release_main_device(engine, laptop)
+    result = ss.release_main_device(
+        engine,
+        laptop,
+        expected_lease_token="already-released",
+        expected_lease_epoch=1,
+    )
 
     assert result.success
     assert ss.get_main_device(engine).main_device is None
@@ -743,10 +813,11 @@ def test_full_handoff_release_then_pc_auto_claims_via_stale_primitive(
     laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
     app_state.reconcile_state_with_remote(engine, laptop)
     assert ss.get_main_device(engine).main_device.device_id == "laptop-id"
+    lease_kwargs = _current_lease_kwargs(engine)
 
     # Clean release, as MainWindow._release_main_device_ownership_for_shutdown does.
     released, demoted_role, error = app_state.release_main_device_and_demote(
-        engine, laptop
+        engine, laptop, **lease_kwargs
     )
     assert released
     assert not error
@@ -783,9 +854,10 @@ def test_released_laptop_does_not_self_reclaim_on_next_reconcile(monkeypatch, tm
     _save_local_state(laptop_paths, {"items": []})
     laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
     app_state.reconcile_state_with_remote(engine, laptop)
+    lease_kwargs = _current_lease_kwargs(engine)
 
     released, demoted_role, _error = app_state.release_main_device_and_demote(
-        engine, laptop
+        engine, laptop, **lease_kwargs
     )
     assert released
     assert demoted_role.is_main is False
@@ -806,9 +878,13 @@ def test_release_demotes_and_disables_writer_before_deleting_ownership(monkeypat
         calls.append("demote")
         return ss.LocalDeviceRole(current.device_id, current.hostname, is_main)
 
-    def fake_release(_engine, current):
+    def fake_release(_engine, current, **kwargs):
         calls.append("release")
         assert current.is_main is True
+        assert kwargs == {
+            "expected_lease_token": "tok-1",
+            "expected_lease_epoch": 10,
+        }
         return SimpleNamespace(success=True, error="")
 
     monkeypatch.setattr(app_state, "set_local_device_main", fake_demote)
@@ -817,6 +893,8 @@ def test_release_demotes_and_disables_writer_before_deleting_ownership(monkeypat
     released, demoted, error = app_state.release_main_device_and_demote(
         object(),
         role,
+        expected_lease_token="tok-1",
+        expected_lease_epoch=10,
         disable_remote_writer=lambda: calls.append("disable_writer"),
     )
 
@@ -841,13 +919,70 @@ def test_release_retains_ownership_when_local_demotion_fails(monkeypatch):
     )
 
     released, unchanged, error = app_state.release_main_device_and_demote(
-        object(), role
+        object(),
+        role,
+        expected_lease_token="tok-1",
+        expected_lease_epoch=10,
     )
 
     assert released is False
     assert unchanged == role
     assert "disk full" in error
     assert release_calls == []
+
+
+def test_claim_atomically_requires_the_exact_fresh_standby_generation(tmp_path):
+    engine = _make_engine(tmp_path)
+    laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    pc = ss.LocalDeviceRole("pc-id", "PC", False)
+    claimed = ss.claim_main_device(engine, laptop)
+    assert claimed.success
+    ready = save_runtime_device_state(
+        engine,
+        device_id=pc.device_id,
+        hostname=pc.hostname,
+        state=RuntimeDeviceState.STANDBY_READY,
+    )
+
+    save_runtime_device_state(
+        engine,
+        device_id=pc.device_id,
+        hostname=pc.hostname,
+        state=RuntimeDeviceState.STANDBY,
+    )
+    rejected = ss.claim_main_device(
+        engine,
+        pc,
+        expected_standby_generation=ready.readiness_generation,
+    )
+
+    assert rejected.success is False
+    assert "not STANDBY_READY" in rejected.error
+    assert ss.get_main_device(engine).main_device.device_id == laptop.device_id
+
+
+def test_clean_handoff_claim_uses_the_persisted_standby_generation(tmp_path):
+    engine = _make_engine(tmp_path)
+    laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    pc = ss.LocalDeviceRole("pc-id", "PC", False)
+    claimed = ss.claim_main_device(engine, laptop)
+    assert claimed.success
+    ready = save_runtime_device_state(
+        engine,
+        device_id=pc.device_id,
+        hostname=pc.hostname,
+        state=RuntimeDeviceState.STANDBY_READY,
+    )
+    assert ss.release_main_device(engine, laptop, **_lease_kwargs(claimed)).success
+
+    claimed = ss.claim_main_device_if_unclaimed(
+        engine,
+        pc,
+        expected_standby_generation=ready.readiness_generation,
+    )
+
+    assert claimed.success is True
+    assert claimed.main_device.device_id == pc.device_id
 
 
 def test_release_retains_ownership_when_writer_cannot_be_disabled(monkeypatch):
@@ -869,13 +1004,15 @@ def test_release_retains_ownership_when_writer_cannot_be_disabled(monkeypatch):
     released, demoted, error = app_state.release_main_device_and_demote(
         object(),
         role,
+        expected_lease_token="tok-1",
+        expected_lease_epoch=10,
         disable_remote_writer=lambda: (_ for _ in ()).throw(
             RuntimeError("writer still bound")
         ),
     )
 
     assert released is False
-    assert demoted.is_main is False
+    assert demoted.is_main is True
     assert "writer still bound" in error
     assert release_calls == []
 

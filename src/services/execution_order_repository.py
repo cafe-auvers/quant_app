@@ -538,3 +538,19 @@ def list_execution_orders_for_account(
             .order_by(table.c.id.asc())
         ).fetchall()
     return [_row_to_record(row) for row in rows]
+
+
+def list_execution_orders(
+    engine: Engine, *, environment: Optional[str] = None
+) -> List[ExecutionOrderRecord]:
+    """Return all durable orders, optionally scoped to one environment."""
+
+    table = ensure_execution_orders_table(engine)
+    statement = select(table)
+    if environment is not None:
+        statement = statement.where(
+            table.c.environment == str(environment or "").upper()
+        )
+    with engine.begin() as conn:
+        rows = conn.execute(statement.order_by(table.c.id.asc())).fetchall()
+    return [_row_to_record(row) for row in rows]

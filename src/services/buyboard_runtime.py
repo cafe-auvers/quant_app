@@ -134,7 +134,7 @@ from src.risk.pre_trade import PreTradeRiskDecision
 from src.services import capital_allocator
 from src.services import order_ledger
 from src.services import order_reconciliation
-from src.services.broker import Broker
+from src.services.broker import Broker, ReadOnlyBroker
 from src.services.execution_command_gateway import (
     ExecutionCommandGateway,
     get_default_execution_gateway,
@@ -472,6 +472,7 @@ def build_buyboard_runtime(
     market_data: Optional[RealtimeMarketDataService] = None,
     strategy_instance_id: str = "",
     persist_card_before_execution: Optional[Callable[[TradeCardState], None]] = None,
+    observation_only: bool = False,
 ) -> BuyboardRuntime:
     """Assembles every engine piece with real callback implementations.
 
@@ -506,6 +507,10 @@ def build_buyboard_runtime(
     into both :class:`~src.services.entry_attempt_manager.EntryAttemptManager`
     and :class:`~src.services.eod_trading_service.EodTradingService`, which
     previously accepted this parameter but never actually used it.
+
+    ``observation_only`` is reserved for the pull-only Workstream 6 standby
+    worker. It wraps the broker in :class:`ReadOnlyBroker`; no submit/cancel
+    call can be delegated even if higher-level code is invoked accidentally.
     """
     # Workstream 9 (PR2): the default broker is the shared execution
     # gateway, not a raw KisBroker -- this module's own broker calls
@@ -523,7 +528,7 @@ def build_buyboard_runtime(
     # strategy identity therefore fails at startup, before a callback can
     # reach the broker.
     engine_enabled = execution_config.is_buyboard_engine_enabled()
-    if engine_enabled:
+    if engine_enabled and not observation_only:
         if not isinstance(broker, ExecutionCommandGateway):
             raise RuntimeError(
                 "BUYBOARD_ENGINE_ENABLED=true accepts only an ExecutionCommandGateway "
@@ -547,6 +552,12 @@ def build_buyboard_runtime(
                 "BUYBOARD_ENGINE_ENABLED=true requires durable card persistence before execution"
             )
         resolved_broker = broker
+    elif observation_only:
+        # A pull-only device proves STANDBY_READY before lease transfer.
+        # This facade makes that reconciliation physically read-only even if
+        # a future caller accidentally reaches an execution callback.
+        observed_broker = broker if broker is not None else get_default_execution_gateway()
+        resolved_broker = ReadOnlyBroker(observed_broker)
     else:
         if isinstance(broker, ExecutionCommandGateway) and broker.mode != ExecutionMode.LEGACY_COMPATIBILITY:
             raise RuntimeError(

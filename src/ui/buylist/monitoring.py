@@ -56,6 +56,31 @@ class BuylistMonitoringMixin:
         """
         if not is_buyboard_engine_enabled():
             return False
+        # E1: an unhealthy Kanban engine never implicitly transfers a
+        # KANBAN-owned symbol back to legacy.  The durable gateway enforces
+        # this too; checking here prevents the legacy monitor from even
+        # attempting the forbidden mutation and produces the intended alert.
+        kanban_owned = False
+        ownership_known = False
+        ownership_engine = self.__dict__.get("pc_db_engine")
+        if ownership_engine is not None and account_no and symbol:
+            try:
+                from src.core.execution_ownership import ExecutionOwner
+                from src.services.execution_ownership_repository import get_ownership
+
+                ownership = get_ownership(
+                    ownership_engine,
+                    environment=env,
+                    account_no=account_no,
+                    symbol=symbol,
+                )
+                ownership_known = True
+                kanban_owned = ownership.owner == ExecutionOwner.KANBAN
+            except Exception:
+                # UNKNOWN is not LEGACY. The durable gateway is still the
+                # final boundary, but the monitor must not even attempt to
+                # fail open when ownership could not be proved.
+                ownership_known = False
         # Review finding P0: flag-only suppression is unsafe -- if the new
         # engine has stopped or failed while the flag stays on, this would
         # leave *both* engines dark with nothing protecting open positions.
@@ -92,15 +117,30 @@ class BuylistMonitoringMixin:
             logged = self.__dict__.setdefault("_buyboard_engine_unhealthy_notice_logged", set())
             if account_no not in logged:
                 logged.add(account_no)
-                message = (
-                    f"CRITICAL: BUYBOARD_ENGINE_ENABLED=true but the Buy Board "
-                    f"engine is not confirmed healthy for account {account_no or env} "
-                    "(not running, lease lost, startup reconciliation incomplete "
-                    "for this account, or no recent heartbeat) -- legacy "
-                    "stop-loss protection remains ACTIVE as a fail-safe, but new "
-                    "automatic entries stay BLOCKED on both engines until health "
-                    "is confirmed. Investigate the Buy Board engine immediately."
-                )
+                if not ownership_known:
+                    message = (
+                        f"CRITICAL: execution ownership is UNKNOWN for {symbol} "
+                        f"({account_no or env}). Legacy automatic entries and "
+                        "protective exits remain BLOCKED until durable LEGACY "
+                        "ownership is positively verified."
+                    )
+                elif kanban_owned:
+                    message = (
+                        f"CRITICAL: the Buy Board engine is unhealthy for KANBAN-owned "
+                        f"{symbol} ({account_no or env}). Legacy may observe but all "
+                        "legacy mutations remain BLOCKED; an explicit audited ownership "
+                        "transfer is required before legacy can protect this symbol."
+                    )
+                else:
+                    message = (
+                        f"CRITICAL: BUYBOARD_ENGINE_ENABLED=true but the Buy Board "
+                        f"engine is not confirmed healthy for account {account_no or env} "
+                        "(not running, lease lost, startup reconciliation incomplete "
+                        "for this account, or no recent heartbeat) -- legacy "
+                        "stop-loss protection remains ACTIVE as a fail-safe, but new "
+                        "automatic entries stay BLOCKED on both engines until health "
+                        "is confirmed. Investigate the Buy Board engine immediately."
+                    )
                 # Review: a log-only alert "does not protect unattended
                 # trading when the user is asleep / the app is minimized."
                 # notify falls back to append_log for any caller (test
@@ -114,6 +154,8 @@ class BuylistMonitoringMixin:
             # Fail open only for protective exits; a new entry must not
             # start on either engine while the authoritative one's state is
             # unknown.
+            if not ownership_known or kanban_owned:
+                return True
             return not is_protective_exit
         logged = self.__dict__.get("_buyboard_engine_unhealthy_notice_logged")
         if logged:

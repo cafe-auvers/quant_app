@@ -6,6 +6,8 @@ no retry/lifecycle logic. OrderExecutionService's own
 state-machine behavior (CREATED -> UNKNOWN_SUBMISSION_STATE -> ACCEPTED/
 REJECTED) is covered separately in test_order_lifecycle.py.
 """
+from types import SimpleNamespace
+
 import pytest
 
 from src.api import kis_account_snapshot_dual, kis_order
@@ -15,7 +17,7 @@ from src.core.order_state import (REGULAR_LIMIT_EXECUTION,
                                   OrderStatus)
 from src.risk.pre_trade import PreTradeRiskDecision
 from src.services import trading_state
-from src.services.broker import BrokerSubmissionResult, KisBroker
+from src.services.broker import BrokerSubmissionResult, KisBroker, ReadOnlyBroker
 from src.services.trading_state import TradingDisabledError
 
 
@@ -37,6 +39,28 @@ def test_real_broker_submission_is_disarmed_by_default(monkeypatch):
             quantity=1,
             limit_price=100.0,
         )
+
+
+def test_standby_read_only_broker_never_delegates_mutations():
+    calls = []
+    delegate = SimpleNamespace(
+        submit_order=lambda **kwargs: calls.append("submit"),
+        cancel_order=lambda **kwargs: calls.append("cancel"),
+        get_order=lambda **kwargs: ["order"],
+        discover_orders=lambda **kwargs: "orders",
+        get_positions=lambda **kwargs: {"positions": []},
+    )
+    broker = ReadOnlyBroker(delegate)
+
+    with pytest.raises(RuntimeError, match="read-only"):
+        broker.submit_order()
+    with pytest.raises(RuntimeError, match="read-only"):
+        broker.cancel_order()
+    assert broker.get_order(environment="PROD", account_no="1") == ["order"]
+    assert broker.get_positions(environment="PROD", account_no="1") == {
+        "positions": []
+    }
+    assert calls == []
 
 
 def test_low_level_kis_submission_is_disarmed_before_authentication(monkeypatch):
