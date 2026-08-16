@@ -25,6 +25,7 @@ from src.core.runtime_readiness import RuntimeDeviceState
 from src.core.trade_card_state import BoardStatus, TradeCardState
 from src.services import trade_card_repository
 from src.services.runtime_device_state_repository import (
+    confirm_standby_handoff,
     save_runtime_device_state,
 )
 from src.ui.main_window import MainWindow
@@ -83,7 +84,14 @@ def _make_engine(tmp_path):
     )
 
 
-def _base_window(*, is_main=False, lease_token="", pc_engine=None, db_ready=True):
+def _base_window(
+    *,
+    is_main=False,
+    lease_token="",
+    lease_epoch=None,
+    pc_engine=None,
+    db_ready=True,
+):
     window = MainWindow.__new__(MainWindow)
     window.pc_db_engine = pc_engine
     window._pc_database_ready = db_ready
@@ -91,7 +99,9 @@ def _base_window(*, is_main=False, lease_token="", pc_engine=None, db_ready=True
         "pc-id" if not is_main else "laptop-id", "TESTHOST", is_main
     )
     window._current_lease_token = lease_token
-    window._current_lease_epoch = 1 if lease_token else 0
+    window._current_lease_epoch = (
+        int(lease_epoch) if lease_epoch is not None else (1 if lease_token else 0)
+    )
     window._last_successful_reconcile_at = None
     window._auto_claim_main_enabled = False
     window._auto_arm_trading_on_handoff = False
@@ -109,6 +119,27 @@ def _base_window(*, is_main=False, lease_token="", pc_engine=None, db_ready=True
     window.append_log = logs.append
     window._logs = logs
     return window
+
+
+def _bind_claimed_lease(window, ownership):
+    lease = ownership.main_device
+    assert lease is not None
+    window._current_lease_token = lease.lease_token
+    window._current_lease_epoch = lease.lease_epoch
+
+
+def _create_open_position(engine):
+    trade_card_repository.create_trade_card(
+        engine,
+        TradeCardState(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            board_status=BoardStatus.OPEN_POSITION,
+            broker_quantity=10,
+            orderable_quantity=10,
+        ),
+    )
 
 
 # --- _current_execution_lease_kwargs --------------------------------------
@@ -627,9 +658,11 @@ def test_release_ownership_for_shutdown_is_noop_when_not_main(tmp_path):
 def test_release_ownership_for_shutdown_publishes_and_releases(monkeypatch, tmp_path):
     engine = _make_engine(tmp_path)
     role = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
-    assert ss.claim_main_device(engine, role).success
+    claimed = ss.claim_main_device(engine, role)
+    assert claimed.success
 
     window = _base_window(is_main=True, lease_token="tok-1", pc_engine=engine)
+    _bind_claimed_lease(window, claimed)
     window.state_sync_role = role
     window.buylist_manager = SimpleNamespace(to_dict=lambda: {"items": []})
     monkeypatch.setattr(main_window_module, "load_json", lambda *a, **k: {})
@@ -696,17 +729,7 @@ def test_unattended_shutdown_release_is_refused_with_open_position_and_no_succes
     engine = _make_engine(tmp_path)
     role = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
     assert ss.claim_main_device(engine, role).success
-    trade_card_repository.create_trade_card(
-        engine,
-        TradeCardState(
-            environment="PROD",
-            account_no="1",
-            symbol="AAPL",
-            board_status=BoardStatus.OPEN_POSITION,
-            broker_quantity=10,
-            orderable_quantity=10,
-        ),
-    )
+    _create_open_position(engine)
     window = _base_window(is_main=True, lease_token="tok-1", pc_engine=engine)
     window.state_sync_role = role
     window._auto_claim_main_enabled = True
@@ -729,18 +752,9 @@ def test_shutdown_release_proceeds_with_confirmed_standby_successor(
 ):
     engine = _make_engine(tmp_path)
     role = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
-    assert ss.claim_main_device(engine, role).success
-    trade_card_repository.create_trade_card(
-        engine,
-        TradeCardState(
-            environment="PROD",
-            account_no="1",
-            symbol="AAPL",
-            board_status=BoardStatus.OPEN_POSITION,
-            broker_quantity=10,
-            orderable_quantity=10,
-        ),
-    )
+    claimed = ss.claim_main_device(engine, role)
+    assert claimed.success
+    _create_open_position(engine)
     save_runtime_device_state(
         engine,
         device_id="pc-id",
@@ -748,6 +762,7 @@ def test_shutdown_release_proceeds_with_confirmed_standby_successor(
         state=RuntimeDeviceState.STANDBY_READY,
     )
     window = _base_window(is_main=True, lease_token="tok-1", pc_engine=engine)
+    _bind_claimed_lease(window, claimed)
     window.state_sync_role = role
     window._auto_claim_main_enabled = True
     window.buylist_manager = SimpleNamespace(to_dict=lambda: {"items": []})
@@ -762,6 +777,92 @@ def test_shutdown_release_proceeds_with_confirmed_standby_successor(
 
     assert released is True
     assert ss.get_main_device(engine).main_device is None
+
+
+def test_exposed_release_rejects_successor_confirmed_for_prior_lease(
+    monkeypatch, tmp_path
+):
+    engine = _make_engine(tmp_path)
+    role = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    first = ss.claim_main_device(engine, role)
+    assert first.success
+    assert ss.release_main_device(
+        engine,
+        role,
+        expected_lease_token=first.main_device.lease_token,
+        expected_lease_epoch=first.main_device.lease_epoch,
+    ).success
+    current = ss.claim_main_device_if_unclaimed(engine, role)
+    assert current.success
+    _create_open_position(engine)
+    ready = save_runtime_device_state(
+        engine,
+        device_id="pc-id",
+        hostname="PC",
+        state=RuntimeDeviceState.STANDBY_READY,
+    )
+    assert confirm_standby_handoff(
+        engine,
+        device_id="pc-id",
+        readiness_generation=ready.readiness_generation,
+        outgoing_lease_epoch=first.main_device.lease_epoch,
+    )
+    window = _base_window(is_main=True, lease_token="placeholder", pc_engine=engine)
+    _bind_claimed_lease(window, current)
+    window.state_sync_role = role
+    published = []
+    monkeypatch.setattr(
+        main_window_module,
+        "publish_handoff_snapshot",
+        lambda *args, **kwargs: published.append(True) or True,
+    )
+
+    released = MainWindow._release_main_device_ownership_for_shutdown(window)
+
+    assert released is False
+    assert published == []
+    assert ss.get_main_device(engine).main_device.lease_epoch == current.main_device.lease_epoch
+
+
+def test_exposed_release_with_unknown_current_epoch_fails_closed(
+    monkeypatch, tmp_path
+):
+    engine = _make_engine(tmp_path)
+    role = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    claimed = ss.claim_main_device(engine, role)
+    assert claimed.success
+    _create_open_position(engine)
+    ready = save_runtime_device_state(
+        engine,
+        device_id="pc-id",
+        hostname="PC",
+        state=RuntimeDeviceState.STANDBY_READY,
+    )
+    assert confirm_standby_handoff(
+        engine,
+        device_id="pc-id",
+        readiness_generation=ready.readiness_generation,
+        outgoing_lease_epoch=claimed.main_device.lease_epoch,
+    )
+    window = _base_window(
+        is_main=True,
+        lease_token=claimed.main_device.lease_token,
+        lease_epoch=0,
+        pc_engine=engine,
+    )
+    window.state_sync_role = role
+    published = []
+    monkeypatch.setattr(
+        main_window_module,
+        "publish_handoff_snapshot",
+        lambda *args, **kwargs: published.append(True) or True,
+    )
+
+    released = MainWindow._release_main_device_ownership_for_shutdown(window)
+
+    assert released is False
+    assert published == []
+    assert ss.get_main_device(engine).main_device.lease_token == claimed.main_device.lease_token
 
 
 def test_missing_database_is_explicitly_unknown_exposure():

@@ -1157,9 +1157,12 @@ and stays `false` in unattended/automatic form until Gate 5 passes.
   after final reconciliation, is demoted on any dependency loss, and is
   atomically rechecked during lease acquisition. The outgoing owner's separate
   confirmation neither refreshes the successor heartbeat nor survives a new
-  generation, and is tied to the outgoing lease epoch. `ACTIVE` is durably
-  persisted before the local command gate opens. Startup admits no mutations
-  before standby prerequisites and activation reconciliation.
+  generation, and is tied to the outgoing lease epoch. Clean release is fenced
+  by the exact device, token, and positive epoch, so a stale same-device process
+  cannot tombstone a successor lease and an unknown epoch cannot authorize an
+  exposed-position handoff. `ACTIVE` is durably persisted before the local
+  command gate opens. Startup admits no mutations before standby prerequisites
+  and activation reconciliation.
   Shutdown blocks commands, flushes the durable journal boundary, performs a
   final projection-only reconciliation, unsubscribes/closes market data, then
   permits lease release only for no exposure, a confirmed ready successor, or
@@ -1171,7 +1174,7 @@ and stays `false` in unattended/automatic form until Gate 5 passes.
   unknown symbols never fail open to legacy.
   `BUYBOARD_ENGINE_ENABLED=false`, `KIS_WS_ENABLED=false`, and
   `KIS_WS_PROTOCOL_VERIFIED=false` remain unchanged. Local validation:
-  `python -m compileall -q src tests` and `1717 passed`.
+  `python -m compileall -q src tests` and `1721 passed`.
 - 2026-08-16 (revision 3.4, PR4 blocking review): Explicitly revised the
   Workstream 0 WebSocket gate. D1/D3/D11 adapters may exist provisionally
   before credentialed evidence only while disabled, labelled

@@ -1242,6 +1242,8 @@ def release_main_device_and_demote(
     engine,
     role: LocalDeviceRole,
     *,
+    expected_lease_token: str,
+    expected_lease_epoch: int,
     disable_remote_writer: Callable[[], None] | None = None,
 ) -> tuple[bool, LocalDeviceRole, str]:
     """Persist pull-only state, fence local writes, then release ownership.
@@ -1274,7 +1276,12 @@ def release_main_device_and_demote(
                 )
             return False, role, f"Could not disable remote state writer: {exc}"
 
-    result = release_main_device(engine, owning_role)
+    result = release_main_device(
+        engine,
+        owning_role,
+        expected_lease_token=expected_lease_token,
+        expected_lease_epoch=expected_lease_epoch,
+    )
     if not result.success:
         error = result.error or "Could not release main-device ownership."
         try:

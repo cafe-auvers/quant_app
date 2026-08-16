@@ -59,7 +59,9 @@ def test_runtime_device_state_requires_explicit_fresh_handoff_confirmation(tmp_p
     )
     assert (
         find_confirmed_standby_successor(
-            engine, excluding_device_id="current"
+            engine,
+            excluding_device_id="current",
+            expected_outgoing_lease_epoch=7,
         )
         is None
     )
@@ -73,6 +75,11 @@ def test_runtime_device_state_requires_explicit_fresh_handoff_confirmation(tmp_p
     assert confirmed.updated_at == ready.updated_at
     assert confirmed.confirmed_generation == ready.readiness_generation
     assert confirmed.confirmed_by_lease_epoch == 7
+    assert find_confirmed_standby_successor(
+        engine,
+        excluding_device_id="current",
+        expected_outgoing_lease_epoch=0,
+    ) is None
     # The successor keeps heartbeating while the outgoing owner publishes
     # and releases; that heartbeat must not erase the confirmation.
     save_runtime_device_state(

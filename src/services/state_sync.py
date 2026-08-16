@@ -617,8 +617,14 @@ def claim_main_device_if_unclaimed(
         return OwnershipResult(False, error=str(exc))
 
 
-def release_main_device(engine: Optional[Engine], role: LocalDeviceRole) -> OwnershipResult:
-    """Release ownership iff still held by ``role`` while retaining epoch history.
+def release_main_device(
+    engine: Optional[Engine],
+    role: LocalDeviceRole,
+    *,
+    expected_lease_token: str,
+    expected_lease_epoch: int,
+) -> OwnershipResult:
+    """Release ownership iff the exact caller-held lease still owns the row.
 
     The blank-device payload is an intentional tombstone. ``get_main_device``
     exposes it as unclaimed, while the next claimant can still mint an epoch
@@ -628,6 +634,13 @@ def release_main_device(engine: Optional[Engine], role: LocalDeviceRole) -> Owne
     if engine is None:
         return OwnershipResult(False, error="State sync database is unavailable.")
     try:
+        expected_token = str(expected_lease_token or "").strip()
+        expected_epoch = int(expected_lease_epoch or 0)
+        if not expected_token or expected_epoch <= 0:
+            return OwnershipResult(
+                False,
+                error="An exact positive lease epoch and nonblank lease token are required.",
+            )
         table = _ensure_state_sync_table(engine)
         with engine.begin() as conn:
             row = _select_row(conn, table, MAIN_DEVICE_KEY, for_update=True)
@@ -638,6 +651,16 @@ def release_main_device(engine: Optional[Engine], role: LocalDeviceRole) -> Owne
             if current_owner.device_id != role.device_id:
                 # Not ours to release -- ownership already moved on.
                 return OwnershipResult(True)
+            if current_owner.lease_token != expected_token:
+                return OwnershipResult(
+                    False,
+                    error="Main-device lease token changed before release.",
+                )
+            if current_owner.lease_epoch != expected_epoch:
+                return OwnershipResult(
+                    False,
+                    error="Main-device lease epoch changed before release.",
+                )
             tombstone = json.dumps(
                 {
                     "device_id": "",
@@ -647,7 +670,7 @@ def release_main_device(engine: Optional[Engine], role: LocalDeviceRole) -> Owne
                 },
                 separators=(",", ":"),
             )
-            conn.execute(
+            result = conn.execute(
                 table.update()
                 .where(table.c.state_key == MAIN_DEVICE_KEY)
                 .where(table.c.revision == current_state.revision)
@@ -659,6 +682,11 @@ def release_main_device(engine: Optional[Engine], role: LocalDeviceRole) -> Owne
                     updated_by_device=role.device_id,
                 )
             )
+            if result.rowcount != 1:
+                return OwnershipResult(
+                    False,
+                    error="Main-device lease changed before release committed.",
+                )
         return OwnershipResult(True)
     except (SQLAlchemyError, ValueError, TypeError) as exc:
         logger.info("Could not release main-device ownership: %s", exc)

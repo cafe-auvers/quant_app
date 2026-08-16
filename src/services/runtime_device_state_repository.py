@@ -314,16 +314,14 @@ def find_standby_successor(
     for row in rows:
         record = _record(row)
         age = (reference - record.updated_at).total_seconds()
+        expected_epoch = int(expected_outgoing_lease_epoch or 0)
         confirmation_matches = bool(
             not require_confirmed
             or (
                 record.handoff_confirmed
                 and record.confirmed_generation == record.readiness_generation
-                and (
-                    int(expected_outgoing_lease_epoch or 0) <= 0
-                    or record.confirmed_by_lease_epoch
-                    == int(expected_outgoing_lease_epoch)
-                )
+                and expected_epoch > 0
+                and record.confirmed_by_lease_epoch == expected_epoch
             )
         )
         if 0.0 <= age <= float(max_age_seconds) and confirmation_matches:
@@ -337,7 +335,7 @@ def find_confirmed_standby_successor(
     excluding_device_id: str,
     max_age_seconds: float = 60.0,
     now: Optional[datetime] = None,
-    expected_outgoing_lease_epoch: int = 0,
+    expected_outgoing_lease_epoch: int,
 ) -> Optional[RuntimeDeviceRecord]:
     return find_standby_successor(
         engine,

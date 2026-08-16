@@ -2693,6 +2693,12 @@ class MainWindow(
         released, resulting_role, release_error = release_main_device_and_demote(
             self.pc_db_engine,
             owning_role,
+            expected_lease_token=str(
+                self.__dict__.get("_current_lease_token", "") or ""
+            ),
+            expected_lease_epoch=int(
+                self.__dict__.get("_current_lease_epoch", 0) or 0
+            ),
             disable_remote_writer=lambda: self._bind_remote_state_engine(
                 self.pc_db_engine, is_main_device=False
             ),
@@ -2856,18 +2862,12 @@ class MainWindow(
         outgoing_lease_epoch = int(
             self.__dict__.get("_current_lease_epoch", 0) or 0
         )
-        if engine is not None and role is not None:
+        if engine is not None and role is not None and outgoing_lease_epoch > 0:
             try:
                 candidate = find_standby_successor(
                     engine, excluding_device_id=role.device_id
                 )
-                if candidate is not None and not (
-                    candidate.handoff_confirmed
-                    and candidate.confirmed_generation
-                    == candidate.readiness_generation
-                    and candidate.confirmed_by_lease_epoch
-                    == outgoing_lease_epoch
-                ):
+                if candidate is not None and not candidate.handoff_confirmed:
                     # This write is the outgoing owner's side of the
                     # handshake. The lease is released only after reading
                     # the confirmed row back below.
