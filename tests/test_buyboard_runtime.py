@@ -371,7 +371,10 @@ def test_guarded_runtime_consumes_upward_extreme_before_latest_trade(
         )
     )
     for index, price in enumerate((100.0, 105.0, 101.0)):
-        event_at = observed_at + dt.timedelta(milliseconds=index)
+        # Distinct trade IDs/fingerprints establish event identity; keep all
+        # three observations on the engine's frozen clock so this remains a
+        # freshness test rather than introducing future-dated ticks.
+        event_at = observed_at
         assert market_data.ingest_trade(
             QuoteSnapshot(
                 symbol="AAPL",

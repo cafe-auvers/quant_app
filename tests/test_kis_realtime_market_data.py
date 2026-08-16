@@ -165,6 +165,32 @@ def test_recent_event_with_backed_up_queue_is_not_execution_fresh():
     )
 
 
+def test_stale_maximum_is_not_execution_fresh_when_latest_cache_is_fresh():
+    service, _ = _service()
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": SubscriptionPriority.BUY_TODAY},
+        quote_priorities={"AAPL": SubscriptionPriority.BUY_TODAY},
+    )
+    _ack(service, "AAPL", "HDFSCNT0")
+    _ack(service, "AAPL", "HDFSASP0")
+    assert service.ingest_quote(
+        _event(channel="HDFSASP0", fingerprint="fresh-quote")
+    )
+    assert service.ingest_trade(
+        _event(price=105, seconds=-2, fingerprint="stale-maximum")
+    )
+    assert service.ingest_trade(
+        _event(price=101, fingerprint="fresh-latest")
+    )
+
+    events = service.poll_once()
+    maximum = next(event for event in events if event.last_price == 105)
+
+    assert not maximum.is_execution_fresh(now=NOW)
+    assert service.entry_quote_ready("AAPL", now=NOW)
+    assert service.latest_quote("AAPL").last_price == 101
+
+
 def test_one_healthy_symbol_does_not_mark_a_failing_symbol_ready():
     service, _ = _service()
     service.configure_desired_channels(
@@ -309,11 +335,13 @@ def test_unacknowledged_breach_replay_never_regresses_latest_quote_cache():
     service.ingest_trade(_event(price=105, seconds=1, fingerprint="recovery"))
     replay_window = service.poll_once()
 
-    assert any(
-        event.last_price == 99
-        and ("card", "v1") in event.breached_stop_versions
+    replay = next(
+        event
         for event in replay_window
+        if event.last_price == 99
+        and ("card", "v1") in event.breached_stop_versions
     )
+    assert replay.entry_trigger_eligible is False
     assert service.latest_quote("AAPL").last_price == 105
 
 
@@ -375,6 +403,73 @@ def test_market_data_health_metrics_are_exposed_and_update():
     assert metrics.quote_channels_desired == 1
     assert metrics.critical_trade_channels_missing == ("AAPL",)
     assert metrics.critical_quote_channels_missing == ("AAPL",)
+
+
+def test_health_is_critical_when_quote_is_fresh_but_trade_never_arrived():
+    service, _ = _service()
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": SubscriptionPriority.BUY_TODAY},
+        quote_priorities={"AAPL": SubscriptionPriority.BUY_TODAY},
+    )
+    _ack(service, "AAPL", "HDFSCNT0")
+    _ack(service, "AAPL", "HDFSASP0")
+    assert service.ingest_quote(
+        _event(channel="HDFSASP0", fingerprint="fresh-quote")
+    )
+
+    metrics = service.health_metrics(now=NOW)
+
+    assert metrics.critical_trade_channels_missing == ()
+    assert metrics.critical_quote_channels_missing == ()
+    assert metrics.stale_symbols == ("AAPL",)
+
+
+def test_health_is_critical_when_trade_is_fresh_but_quote_is_stale():
+    service, _ = _service()
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": SubscriptionPriority.OPEN_POSITION},
+        quote_priorities={"AAPL": SubscriptionPriority.OPEN_POSITION},
+    )
+    _ack(service, "AAPL", "HDFSCNT0")
+    _ack(service, "AAPL", "HDFSASP0")
+    assert service.ingest_quote(
+        _event(
+            channel="HDFSASP0",
+            seconds=-4,
+            fingerprint="stale-quote",
+        )
+    )
+    assert service.ingest_trade(
+        _event(channel="HDFSCNT0", fingerprint="fresh-trade")
+    )
+
+    assert service.health_metrics(now=NOW).stale_symbols == ("AAPL",)
+
+
+def test_removed_stale_symbol_no_longer_contaminates_critical_health():
+    service, _ = _service()
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": SubscriptionPriority.OPEN_POSITION},
+        quote_priorities={"AAPL": SubscriptionPriority.OPEN_POSITION},
+    )
+    assert service.health_metrics(now=NOW).stale_symbols == ("AAPL",)
+
+    service.configure_desired_channels(trade_priorities={}, quote_priorities={})
+
+    metrics = service.health_metrics(now=NOW)
+    assert metrics.stale_symbols == ()
+    assert metrics.last_trade_event is None
+    assert metrics.last_quote_event is None
+
+
+def test_stale_display_only_symbol_does_not_contaminate_execution_health():
+    service, _ = _service()
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": SubscriptionPriority.DISPLAY_ONLY},
+        quote_priorities={"AAPL": SubscriptionPriority.DISPLAY_ONLY},
+    )
+
+    assert service.health_metrics(now=NOW).stale_symbols == ()
 
 
 def test_subscription_nack_blocks_symbol_and_alerts():

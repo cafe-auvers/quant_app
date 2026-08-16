@@ -195,6 +195,106 @@ def test_fresh_quote_allows_entry_submission_and_moves_to_entry_pending(tmp_path
     assert card.entry_runtime_status == EntryRuntimeStatus.ORDER_PENDING
 
 
+def _entry_event_engine(tmp_path, now, submitted):
+    def submit(**kwargs):
+        submitted.append(kwargs)
+        return BrokerOrder.create(
+            environment=kwargs["environment"],
+            account_no=kwargs["account_no"],
+            symbol=kwargs["symbol"],
+            side=OrderSide.BUY,
+            intent=OrderIntent.ENTRY,
+            quantity_requested=kwargs["quantity"],
+            limit_price=kwargs["limit_price"],
+            status=OrderStatus.ACCEPTED,
+        )
+
+    engine = _make_engine(tmp_path, submit_order=submit)
+    engine._clock = lambda: now
+    engine._market_data = RestPollingMarketDataService(
+        quote_fetcher=lambda symbol: QuoteSnapshot(
+            symbol=symbol,
+            last_price=101.0,
+            bid=100.9,
+            ask=101.1,
+            broker_event_at=now,
+            received_at=now,
+            processed_at=now,
+        ),
+        clock=lambda: now,
+    )
+    engine._market_data.subscribe(["AAPL"])
+    engine._market_data.poll_once()
+    return engine
+
+
+def test_stale_representative_maximum_cannot_trigger_entry_from_fresh_cache(tmp_path):
+    now = dt.datetime(2026, 8, 16, 14, 30, tzinfo=dt.timezone.utc)
+    submitted = []
+    engine = _entry_event_engine(tmp_path, now, submitted)
+    card = _buy_today_card(entry_trigger=104.0)
+    stale_maximum = QuoteSnapshot(
+        symbol="AAPL",
+        last_price=105.0,
+        bid=104.9,
+        ask=105.0,
+        broker_event_at=now - dt.timedelta(seconds=2),
+        received_at=now - dt.timedelta(seconds=2),
+        processed_at=now,
+    )
+
+    assert engine._market_data.entry_quote_ready("AAPL", now=now)
+    assert not stale_maximum.is_execution_fresh(now=now)
+    assert engine.evaluate_entry_quote([card], stale_maximum) == []
+    assert submitted == []
+    assert card.entry_runtime_status == EntryRuntimeStatus.EXECUTE_READY
+
+
+def test_stop_breach_replay_above_breakout_is_never_entry_eligible(tmp_path):
+    now = dt.datetime(2026, 8, 16, 14, 30, tzinfo=dt.timezone.utc)
+    submitted = []
+    engine = _entry_event_engine(tmp_path, now, submitted)
+    card = _buy_today_card(entry_trigger=104.0)
+    replay = QuoteSnapshot(
+        symbol="AAPL",
+        last_price=105.0,
+        bid=104.9,
+        ask=105.0,
+        broker_event_at=now,
+        received_at=now,
+        processed_at=now,
+        breached_stop_versions=(("old-card", "v1"),),
+        entry_trigger_eligible=False,
+    )
+
+    assert replay.is_execution_fresh(now=now)
+    assert engine.evaluate_entry_quote([card], replay) == []
+    assert submitted == []
+
+
+def test_fresh_representative_maximum_triggers_exactly_one_entry(tmp_path):
+    now = dt.datetime(2026, 8, 16, 14, 30, tzinfo=dt.timezone.utc)
+    submitted = []
+    engine = _entry_event_engine(tmp_path, now, submitted)
+    card = _buy_today_card(entry_trigger=104.0)
+    fresh_maximum = QuoteSnapshot(
+        symbol="AAPL",
+        last_price=105.0,
+        bid=104.9,
+        ask=105.0,
+        broker_event_at=now,
+        received_at=now,
+        processed_at=now,
+    )
+
+    engine.evaluate_entry_quote([card], fresh_maximum)
+    engine.evaluate_entry_quote([card], fresh_maximum)
+
+    assert len(submitted) == 1
+    assert submitted[0]["limit_price"] == 105.0
+    assert card.board_status == BoardStatus.ENTRY_PENDING
+
+
 def test_card_without_execute_ready_status_is_ignored(tmp_path):
     engine = _make_engine(tmp_path)
     engine._market_data.subscribe(["AAPL"])
@@ -1327,6 +1427,10 @@ def test_partial_sell_cancels_stuck_order_once_ttl_passes_and_applies_partial_fi
     card = _open_card(
         board_status=BoardStatus.PARTIAL_SELL, broker_quantity=300, orderable_quantity=300,
         stop_type=StopType.ORB_LOW, active_stop_price=95.0,
+        exit_attempt_group_id="partial-chain",
+        exit_attempt_count=1,
+        exit_client_order_id=tracker.order.client_order_id,
+        exit_pending_attempt_number=1,
     )
     card.pending_partial_sell_quantity = 100
 
@@ -1344,6 +1448,8 @@ def test_partial_sell_cancels_stuck_order_once_ttl_passes_and_applies_partial_fi
     assert card.board_status == BoardStatus.OPEN_POSITION
     assert card.broker_quantity == 270
     assert card.stop_type == StopType.BREAKEVEN  # a real (partial) fill happened
+    assert card.exit_attempt_group_id == ""
+    assert card.exit_attempt_count == 0
 
 
 def test_partial_sell_ttl_cancel_before_deadline_is_untouched(tmp_path):

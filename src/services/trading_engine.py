@@ -77,6 +77,7 @@ from src.services.execution_command_gateway import (
 )
 from src.services.execution_command_repository import DuplicateCommandError
 from src.services.eod_trading_service import EodTradingService
+from src.services.intraday_data_service import ExecutionGradeDataUnavailableError
 from src.services.position_manager import (
     BrokerHolding,
     PositionActionCallbacks,
@@ -301,7 +302,13 @@ class TradingEngine:
         Callers pass only mutation-ready cards; this method does not widen
         reconciliation or ownership authorization.
         """
-        if not self.is_enabled() or not quote.regular_session:
+        now = self._clock()
+        if (
+            not self.is_enabled()
+            or not quote.regular_session
+            or not quote.entry_trigger_eligible
+            or not quote.is_execution_fresh(now=now)
+        ):
             return []
         symbol = quote.symbol.upper()
         matching = [
@@ -1118,6 +1125,7 @@ class TradingEngine:
                     self._back_off_exit_retry(card, order.error_message or "Partial sell rejected")
                     changed.append(card)
                     continue
+                self._consume_exit_attempt(card)
                 # Review finding P1-3: broker_quantity/orderable_quantity
                 # stay broker-authoritative -- do not guess orderable_quantity
                 # here before the order is confirmed filled/rejected.
@@ -1146,7 +1154,7 @@ class TradingEngine:
         """Review finding P1-4: a rejected/erroring Sell All or Partial Sell
         submission must not be resubmitted on literally every 1-second
         heartbeat tick."""
-        card.exit_attempt_count += 1
+        self._consume_exit_attempt(card)
         card.exit_client_order_id = ""
         card.exit_pending_attempt_number = 0
         card.exit_submission_unresolved = False
@@ -1154,6 +1162,25 @@ class TradingEngine:
         card.next_exit_retry_at = self._clock() + timedelta(
             seconds=execution_config.EXIT_RETRY_COOLDOWN_SECONDS
         )
+
+    @staticmethod
+    def _consume_exit_attempt(card: TradeCardState) -> None:
+        """Record the highest logical exit attempt whose identity was used."""
+        attempt_number = card.exit_pending_attempt_number or (
+            card.exit_attempt_count + 1
+        )
+        card.exit_attempt_count = max(card.exit_attempt_count, attempt_number)
+
+    def _retire_terminal_exit_attempt(self, card: TradeCardState) -> bool:
+        """Retire one terminal order identity while preserving its chain."""
+        changed = self._clear_exit_cancel_tracking(card)
+        if card.exit_client_order_id or card.exit_pending_attempt_number:
+            self._consume_exit_attempt(card)
+            card.exit_client_order_id = ""
+            card.exit_pending_attempt_number = 0
+            card.exit_submission_unresolved = False
+            changed = True
+        return changed
 
     def _reconcile_partial_sell_fills(self, cards: List[TradeCardState]) -> List[TradeCardState]:
         """Once the PARTIAL_EXIT order resolves, apply the fill and move
@@ -1207,6 +1234,7 @@ class TradingEngine:
                 card.exit_pending_attempt_number = 0
                 card.exit_submission_unresolved = False
                 card.exit_attempt_group_id = ""
+                card.exit_attempt_count = 0
                 card.next_exit_retry_at = None
                 card.last_exit_error = ""
                 changed.append(card)
@@ -1301,7 +1329,7 @@ class TradingEngine:
             try:
                 order = self._position_callbacks.find_open_sell_order(card)
                 if order is None:
-                    if self._clear_exit_cancel_tracking(card):
+                    if self._retire_terminal_exit_attempt(card):
                         changed.append(card)
                     continue
                 refreshed = self._position_callbacks.reconcile_sell_order(order)
@@ -1319,10 +1347,7 @@ class TradingEngine:
                 )
                 card.broker_quantity = remaining
                 card.orderable_quantity = remaining
-                self._clear_exit_cancel_tracking(card)
-                card.exit_client_order_id = ""
-                card.exit_pending_attempt_number = 0
-                card.exit_submission_unresolved = False
+                self._retire_terminal_exit_attempt(card)
                 changed.append(card)
             except Exception:
                 logger.exception("_reconcile_sell_all_orders failed for %s", card.symbol)
@@ -1360,6 +1385,12 @@ class TradingEngine:
                     continue
                 if self._position_callbacks.find_open_sell_order(card) is not None:
                     continue  # already working, or its cancel hasn't confirmed yet
+                # A synchronous confirmed cancel can make the prior order
+                # disappear between the reconciliation and retry stages in
+                # this same heartbeat. Consume and retire that exact identity
+                # before the replacement is derived.
+                if self._retire_terminal_exit_attempt(card) and card not in changed:
+                    changed.append(card)
                 if self._trading_halt_lookup(card.symbol):
                     if _TRADING_HALT_EXIT_WARNING not in card.warnings:
                         card.warnings = [*card.warnings, _TRADING_HALT_EXIT_WARNING]
@@ -1405,6 +1436,7 @@ class TradingEngine:
                 if order is not None and order.status == UnifiedExecutionStatus.REJECTED:
                     self._back_off_exit_retry(card, order.error_message or "Sell All rejected")
                 else:
+                    self._consume_exit_attempt(card)
                     card.next_exit_retry_at = None
                     card.last_exit_error = ""
                 changed.append(card)
@@ -1425,6 +1457,20 @@ class TradingEngine:
                 # may make a fresh cancellation decision with a fresh ID.
                 card.next_exit_retry_at = None
                 card.last_exit_error = f"Entry cancel rejected: {exc}"[:500]
+                if card not in changed:
+                    changed.append(card)
+            except ExecutionGradeDataUnavailableError as exc:
+                # Pricing failed before prepare_exit_identity() and therefore
+                # consumed no logical attempt. Preserve the bounded reprice
+                # counter at its authoritative cap and retry only after the
+                # normal cooldown (or manual/feed recovery).
+                card.exit_client_order_id = ""
+                card.exit_pending_attempt_number = 0
+                card.exit_submission_unresolved = False
+                card.last_exit_error = str(exc)[:500]
+                card.next_exit_retry_at = self._clock() + timedelta(
+                    seconds=execution_config.EXIT_RETRY_COOLDOWN_SECONDS
+                )
                 if card not in changed:
                     changed.append(card)
             except Exception as exc:

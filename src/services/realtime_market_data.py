@@ -52,6 +52,11 @@ class QuoteSnapshot:
     stop_price_overrides: tuple[tuple[str, float], ...] = ()
     breached_stop_versions: tuple[tuple[str, str], ...] = ()
     regular_session: bool = True
+    # Some events are replayed solely to guarantee delivery of a previously
+    # latched protective-stop breach.  They remain valid for exit evaluation,
+    # but must never authorize a new entry even when their timestamps still
+    # fall inside the execution freshness budgets.
+    entry_trigger_eligible: bool = True
 
     def __post_init__(self) -> None:
         broker_at = self.broker_event_at or self.received_at

@@ -648,6 +648,10 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
                     processed_at=processed_at,
                     stop_price_overrides=overrides,
                     breached_stop_versions=breach_identities,
+                    entry_trigger_eligible=(
+                        representative.entry_trigger_eligible
+                        and not detached.latch_replay
+                    ),
                 )
                 ready.append(trade)
             # A replay is an engine-delivery guarantee for a previously
@@ -1004,11 +1008,6 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         self._expire_ack_timeouts(reference)
         with self._state_lock:
             states = [replace(state) for state in self._states.values()]
-        stale = []
-        for state in states:
-            last = state.last_trade_event_at or state.last_quote_event_at
-            if last is None or (reference - last).total_seconds() > execution_config.BROKER_EVENT_STALE_SECONDS:
-                stale.append(state.symbol)
         trade_critical = {
             symbol
             for symbol, priority in self._trade_priorities.items()
@@ -1020,15 +1019,65 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
             if priority < SubscriptionPriority.DISPLAY_ONLY
         }
         state_by_symbol = {state.symbol: state for state in states}
+
+        def channel_unavailable(symbol: str, channel: FeedChannel) -> bool:
+            state = state_by_symbol.get(symbol, SymbolFeedState(symbol))
+            if channel == FeedChannel.TRADE:
+                acked = state.trade_acked
+                rejected = state.trade_rejected_due_to_capacity
+                error = state.trade_error
+                broker_event_at = state.last_trade_event_at
+                received_at = state.last_trade_received_at
+            else:
+                acked = state.quote_acked
+                rejected = state.quote_rejected_due_to_capacity
+                error = state.quote_error
+                broker_event_at = state.last_quote_event_at
+                received_at = state.last_quote_received_at
+            if (
+                not acked
+                or rejected
+                or bool(error)
+                or state.clock_health != ClockHealth.HEALTHY
+                or broker_event_at is None
+                or received_at is None
+            ):
+                return True
+            broker_age = (reference - broker_event_at).total_seconds()
+            receive_age = (reference - received_at).total_seconds()
+            return not (
+                0.0 <= broker_age <= execution_config.BROKER_EVENT_STALE_SECONDS
+                and 0.0 <= receive_age <= execution_config.LOCAL_RECEIVE_STALE_SECONDS
+            )
+
+        stale = {
+            symbol
+            for symbol in trade_critical
+            if channel_unavailable(symbol, FeedChannel.TRADE)
+        } | {
+            symbol
+            for symbol in quote_critical
+            if channel_unavailable(symbol, FeedChannel.QUOTE)
+        }
+        trade_states = [
+            state_by_symbol[symbol]
+            for symbol in self._trade_priorities
+            if symbol in state_by_symbol
+        ]
+        quote_states = [
+            state_by_symbol[symbol]
+            for symbol in self._quote_priorities
+            if symbol in state_by_symbol
+        ]
         lags = list(self._receive_lags_ms)
         pending_depth = self._accumulator.queue_depth()
         return MarketDataHealthMetrics(
             ws_connected=self.is_connected(),
             approval_key_age_seconds=self._approval_key_age(),
             trade_channels_desired=len(self._trade_priorities),
-            trade_channels_acked=sum(state.trade_acked for state in states),
+            trade_channels_acked=sum(state.trade_acked for state in trade_states),
             quote_channels_desired=len(self._quote_priorities),
-            quote_channels_acked=sum(state.quote_acked for state in states),
+            quote_channels_acked=sum(state.quote_acked for state in quote_states),
             critical_trade_channels_missing=tuple(
                 sorted(
                     symbol
@@ -1045,11 +1094,19 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
             ),
             stale_symbols=tuple(sorted(stale)),
             last_trade_event=max(
-                (state.last_trade_event_at for state in states if state.last_trade_event_at),
+                (
+                    state.last_trade_event_at
+                    for state in trade_states
+                    if state.last_trade_event_at
+                ),
                 default=None,
             ),
             last_quote_event=max(
-                (state.last_quote_event_at for state in states if state.last_quote_event_at),
+                (
+                    state.last_quote_event_at
+                    for state in quote_states
+                    if state.last_quote_event_at
+                ),
                 default=None,
             ),
             receive_lag_p50_ms=_percentile(lags, 0.50),
