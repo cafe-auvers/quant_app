@@ -98,6 +98,10 @@ _ALLOWED_STATUS_TRANSITIONS: Dict[ExecutionOrderStatus, FrozenSet[ExecutionOrder
             ExecutionOrderStatus.ACKNOWLEDGED,
             ExecutionOrderStatus.REJECTED,
             ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE,
+            # The final mutable authorization/fence check can fail after
+            # SUBMITTING is committed but before the broker boundary is
+            # entered.  That outcome is known-local, not ambiguous.
+            ExecutionOrderStatus.CANCELLED_LOCALLY,
         }
     ),
     ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE: frozenset(
@@ -147,6 +151,9 @@ _ALLOWED_STATUS_TRANSITIONS: Dict[ExecutionOrderStatus, FrozenSet[ExecutionOrder
             # previously had a valid outcome in this table.
             ExecutionOrderStatus.WORKING,
             ExecutionOrderStatus.EXPIRED,
+            # A final pre-broker gate can fail after CANCEL_PENDING is
+            # journaled. Restore the exact pre-cancel live status.
+            ExecutionOrderStatus.ACKNOWLEDGED,
         }
     ),
 }
@@ -217,11 +224,12 @@ class AdoptedOrderPermission(str, Enum):
     REPLACE = "REPLACE"
 
 
-# Reaching either of these means a broker call was actually made and its
-# outcome isn't known yet -- per the "expected combinations" table,
-# broker_identity_status should read AMBIGUOUS by the time an
-# origin=APPLICATION record gets here, with no new evidence required to
-# know that much.
+# Reaching either of these means the broker boundary may have been entered
+# and its outcome is not yet known. SUBMITTING is committed immediately
+# before the final mutable gates; a gate failure atomically transitions it
+# to CANCELLED_LOCALLY and restores NOT_ASSIGNED before returning control.
+# Until either that abort or a broker result is persisted, AMBIGUOUS is the
+# conservative identity classification.
 _STATUSES_IMPLYING_AMBIGUOUS_IDENTITY: FrozenSet[ExecutionOrderStatus] = frozenset(
     {ExecutionOrderStatus.SUBMITTING, ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE}
 )
@@ -375,6 +383,17 @@ def apply_status_transition(
     ):
         record.broker_identity_status = BrokerIdentityStatus.NO_BROKER_ORDER_CONFIRMED
 
+    if (
+        target == ExecutionOrderStatus.CANCELLED_LOCALLY
+        and record.status == ExecutionOrderStatus.SUBMITTING
+    ):
+        # SUBMITTING normally means the broker boundary was entered, but a
+        # last-moment authorization/fence failure proves it was not. Retire
+        # the local attempt without leaving an ambiguous broker identity.
+        record.broker_order_id = ""
+        record.broker_identity_status = BrokerIdentityStatus.NOT_ASSIGNED
+        record.submission_started_at = None
+
     now = utc_now_iso()
     if target == ExecutionOrderStatus.SUBMITTING:
         record.submission_started_at = now
@@ -434,6 +453,17 @@ class ExecutionOrderRecord:
     last_broker_seen_at: Optional[str] = None
     last_reconciled_at: Optional[str] = None
 
+    # Workstream 4/C3: two independent, sufficiently-separated complete
+    # broker snapshots are required before an exact order's disappearance
+    # can resolve terminal.  These live on the order so the evidence
+    # survives restart and device handoff.
+    absence_count: int = 0
+    last_absence_snapshot_id: str = ""
+    last_absence_observed_at: Optional[str] = None
+    last_absence_session_date: Optional[str] = None
+    last_absence_broker_order_id: str = ""
+    last_absence_holding_quantity: Optional[int] = None
+
     origin: OrderOrigin = OrderOrigin.APPLICATION
     broker_identity_status: BrokerIdentityStatus = BrokerIdentityStatus.NOT_ASSIGNED
     recovery_state: OrderRecoveryState = OrderRecoveryState.NONE
@@ -479,6 +509,21 @@ class ExecutionOrderRecord:
         self.filled_quantity = int(self.filled_quantity or 0)
         self.remaining_quantity = int(self.remaining_quantity or 0)
         self.average_fill_price = float(self.average_fill_price or 0.0)
+        self.absence_count = max(0, int(self.absence_count or 0))
+        self.last_absence_snapshot_id = str(self.last_absence_snapshot_id or "")
+        self.last_absence_observed_at = (
+            str(self.last_absence_observed_at) if self.last_absence_observed_at else None
+        )
+        self.last_absence_session_date = (
+            str(self.last_absence_session_date) if self.last_absence_session_date else None
+        )
+        self.last_absence_broker_order_id = str(
+            self.last_absence_broker_order_id or ""
+        )
+        if self.last_absence_holding_quantity is not None:
+            self.last_absence_holding_quantity = max(
+                0, int(self.last_absence_holding_quantity or 0)
+            )
         self.origin = _strict_enum(self.origin, OrderOrigin)
         self.broker_identity_status = _strict_enum(self.broker_identity_status, BrokerIdentityStatus)
         self.recovery_state = _strict_enum(self.recovery_state, OrderRecoveryState)

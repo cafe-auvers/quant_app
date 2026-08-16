@@ -143,6 +143,10 @@ class BrokerOrderStatusSnapshot:
     avg_fill_price: float = 0.0
     limit_price: float = 0.0
     raw_response: Dict[str, Any] = field(default_factory=dict)
+    # Normalized broker-side submission time.  KIS mapping remains empty
+    # until Workstream 0 proves the real field; reconciliation must never
+    # substitute checked_at (query time) for this value.
+    submitted_at: str = ""
     checked_at: str = field(default_factory=utc_now_iso)
 
     def __post_init__(self) -> None:
@@ -160,6 +164,7 @@ class BrokerOrderStatusSnapshot:
         self.limit_price = float(self.limit_price or 0.0)
         if not isinstance(self.raw_response, dict):
             self.raw_response = {"raw": self.raw_response}
+        self.submitted_at = str(self.submitted_at or "")
         self.checked_at = str(self.checked_at or utc_now_iso())
 
     def to_dict(self) -> Dict[str, Any]:
@@ -177,6 +182,7 @@ class BrokerOrderStatusSnapshot:
             "avg_fill_price": self.avg_fill_price,
             "limit_price": self.limit_price,
             "raw_response": self.raw_response,
+            "submitted_at": self.submitted_at,
             "checked_at": self.checked_at,
         }
 
@@ -196,6 +202,7 @@ class BrokerOrderStatusSnapshot:
             avg_fill_price=float(data.get("avg_fill_price", 0.0) or 0.0),
             limit_price=float(data.get("limit_price", 0.0) or 0.0),
             raw_response=data.get("raw_response") if isinstance(data.get("raw_response"), dict) else {},
+            submitted_at=str(data.get("submitted_at") or ""),
             checked_at=str(data.get("checked_at") or utc_now_iso()),
         )
 

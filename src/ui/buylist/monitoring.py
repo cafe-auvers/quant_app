@@ -73,7 +73,21 @@ class BuylistMonitoringMixin:
         # check rather than failing safely." A blank/unresolved account
         # must fail its own (never-positively-confirmed) account-specific
         # check, not silently fall back to the coarser global one.
-        engine_healthy = health_check(account_no) if callable(health_check) else True
+        if callable(health_check):
+            try:
+                engine_healthy = health_check(
+                    account_no,
+                    action=("PROTECTIVE_EXIT" if is_protective_exit else "NEW_ENTRY"),
+                    symbol=symbol,
+                )
+            except TypeError as exc:
+                # Compatibility with lightweight test/dummy windows whose
+                # health seam predates action-specific reconciliation.
+                if "unexpected keyword argument" not in str(exc):
+                    raise
+                engine_healthy = health_check(account_no)
+        else:
+            engine_healthy = True
         if not engine_healthy:
             logged = self.__dict__.setdefault("_buyboard_engine_unhealthy_notice_logged", set())
             if account_no not in logged:

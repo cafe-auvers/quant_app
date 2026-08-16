@@ -49,7 +49,6 @@ from src.core.kanban_transitions import (
     migrate_legacy_status_to_board_status,
 )
 from src.core.trade_card_state import (
-    BoardStatus,
     PositionRuntimeStatus,
     StopType,
     TradeCardState,
@@ -108,6 +107,11 @@ def _ensure_trade_cards_table(engine: Engine) -> Table:
         metadata.create_all(engine)
         _ensured_engines.add(engine)
     return table
+
+
+def ensure_trade_cards_table(engine: Engine) -> Table:
+    """Public pre-transaction table setup for atomic account plans."""
+    return _ensure_trade_cards_table(engine)
 
 
 def _server_now(engine: Engine):
@@ -205,6 +209,87 @@ def _upsert_local_snapshot_card(
     save_local_trade_cards_snapshot(cards, path=resolved_path)
 
 
+def sync_trade_card_local_snapshot(
+    card: TradeCardState, *, path: Optional[Path] = None
+) -> None:
+    """Refresh the recovery snapshot after a caller-owned DB transaction."""
+    _upsert_local_snapshot_card(card, path=path)
+
+
+def insert_trade_card(conn, card: TradeCardState) -> TradeCardState:
+    """Insert one card using the caller's transaction."""
+    table = _get_trade_cards_table(MetaData())
+    import json as _json
+
+    payload = card.to_dict()
+    payload["version"] = 1
+    try:
+        conn.execute(
+            table.insert().values(
+                environment=card.environment,
+                account_no=card.account_no,
+                symbol=card.symbol,
+                board_status=card.board_status.value,
+                version=1,
+                payload=_json.dumps(payload, separators=(",", ":")),
+                updated_at=_server_now(conn.engine),
+            )
+        )
+    except IntegrityError as exc:
+        raise TradeCardVersionConflictError(
+            f"A trade card already exists for {card.card_key}"
+        ) from exc
+    card.version = 1
+    return card
+
+
+def update_trade_card_in_transaction(
+    conn,
+    card: TradeCardState,
+    *,
+    expected_version: int,
+) -> TradeCardState:
+    """Optimistically update one card using the caller's transaction."""
+    table = _get_trade_cards_table(MetaData())
+    next_version = int(expected_version) + 1
+    card.updated_at = datetime.now(timezone.utc)
+    import json as _json
+
+    payload = card.to_dict()
+    payload["version"] = next_version
+    result = conn.execute(
+        table.update()
+        .where(
+            table.c.environment == card.environment,
+            table.c.account_no == card.account_no,
+            table.c.symbol == card.symbol,
+            table.c.version == int(expected_version),
+        )
+        .values(
+            board_status=card.board_status.value,
+            version=next_version,
+            payload=_json.dumps(payload, separators=(",", ":")),
+            updated_at=_server_now(conn.engine),
+        )
+    )
+    if result.rowcount == 0:
+        existing = conn.execute(
+            select(table.c.version).where(
+                table.c.environment == card.environment,
+                table.c.account_no == card.account_no,
+                table.c.symbol == card.symbol,
+            )
+        ).first()
+        if existing is None:
+            raise TradeCardNotFoundError(f"No trade card exists for {card.card_key}")
+        raise TradeCardVersionConflictError(
+            f"Expected version {expected_version} for {card.card_key}, "
+            f"stored version is {existing.version}"
+        )
+    card.version = next_version
+    return card
+
+
 def create_trade_card(
     engine: Engine, card: TradeCardState, *, local_snapshot_path: Optional[Path] = None
 ) -> TradeCardState:
@@ -214,27 +299,9 @@ def create_trade_card(
     instead, so the one-card-per-symbol invariant can never be bypassed by
     accidentally inserting a second row.
     """
-    table = _ensure_trade_cards_table(engine)
-    card.version = 1
-    import json as _json
-
+    _ensure_trade_cards_table(engine)
     with engine.begin() as conn:
-        try:
-            conn.execute(
-                table.insert().values(
-                    environment=card.environment,
-                    account_no=card.account_no,
-                    symbol=card.symbol,
-                    board_status=card.board_status.value,
-                    version=1,
-                    payload=_json.dumps(card.to_dict(), separators=(",", ":")),
-                    updated_at=_server_now(engine),
-                )
-            )
-        except IntegrityError as exc:
-            raise TradeCardVersionConflictError(
-                f"A trade card already exists for {card.card_key}"
-            ) from exc
+        insert_trade_card(conn, card)
     _upsert_local_snapshot_card(card, path=local_snapshot_path)
     return card
 
@@ -251,38 +318,11 @@ def update_trade_card(
     optimistic-concurrency guard). On success the returned card's ``version``
     is bumped by one.
     """
-    table = _ensure_trade_cards_table(engine)
-    next_version = int(expected_version) + 1
-    card.version = next_version
-    card.updated_at = datetime.now(timezone.utc)
-    import json as _json
-
+    _ensure_trade_cards_table(engine)
     with engine.begin() as conn:
-        result = conn.execute(
-            table.update()
-            .where(
-                table.c.environment == card.environment,
-                table.c.account_no == card.account_no,
-                table.c.symbol == card.symbol,
-                table.c.version == int(expected_version),
-            )
-            .values(
-                board_status=card.board_status.value,
-                version=next_version,
-                payload=_json.dumps(card.to_dict(), separators=(",", ":")),
-                updated_at=_server_now(engine),
-            )
+        update_trade_card_in_transaction(
+            conn, card, expected_version=expected_version
         )
-        if result.rowcount == 0:
-            existing = get_trade_card(engine, card.environment, card.account_no, card.symbol)
-            if existing is None:
-                raise TradeCardNotFoundError(
-                    f"No trade card exists for {card.card_key}"
-                )
-            raise TradeCardVersionConflictError(
-                f"Expected version {expected_version} for {card.card_key}, "
-                f"stored version is {existing.version}"
-            )
     _upsert_local_snapshot_card(card, path=local_snapshot_path)
     return card
 

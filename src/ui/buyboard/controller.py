@@ -139,6 +139,9 @@ def _apply_simple_move(
         # stale entry-runtime badge and block reason.
         card.entry_runtime_status = None
         card.entry_block_reason = ""
+        if not card.entry_client_order_id and card.broker_quantity <= 0:
+            card.entry_attempt_group_id = ""
+            card.entry_attempt_count = 0
     elif isinstance(command, ActivateForToday):
         card.buylist_member = True
     elif isinstance(command, RequestSellAll):
@@ -155,6 +158,11 @@ def _apply_cancel_entry(card: TradeCardState) -> None:
         _move(card, BoardStatus.BUYLIST)
         card.entry_runtime_status = None
         card.entry_block_reason = ""
+        card.entry_attempt_group_id = ""
+        card.entry_attempt_count = 0
+        card.entry_client_order_id = ""
+        card.entry_pending_attempt_number = 0
+        card.entry_submission_unresolved = False
     elif card.board_status == BoardStatus.ENTRY_PENDING:
         # An order may be working at the broker right now -- do not move
         # the card (and thus do not let the user believe it's safely back

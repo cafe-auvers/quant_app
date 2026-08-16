@@ -38,10 +38,11 @@ class OrderRecoveryState(str, Enum):
     MANUAL_INTERVENTION_REQUIRED = "MANUAL_INTERVENTION_REQUIRED"
 
 
-# No further automatic transitions out of either of these (the
-# OrderRecoveryState transition table's final row).
+# MANUAL_INTERVENTION_REQUIRED has no outbound transition. A previously
+# TERMINAL_RECONCILED record may still escalate to manual intervention if a
+# later exact broker observation contradicts that conclusion.
 TERMINAL_RECOVERY_STATES: FrozenSet[OrderRecoveryState] = frozenset(
-    {OrderRecoveryState.TERMINAL_RECONCILED, OrderRecoveryState.MANUAL_INTERVENTION_REQUIRED}
+    {OrderRecoveryState.MANUAL_INTERVENTION_REQUIRED}
 )
 
 # The transition table's specific rows, excluding the "any -> MANUAL_

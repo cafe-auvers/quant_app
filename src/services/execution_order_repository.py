@@ -205,6 +205,12 @@ def _record_to_payload(record: ExecutionOrderRecord) -> Dict[str, Any]:
         "cancel_requested_at": record.cancel_requested_at,
         "last_broker_seen_at": record.last_broker_seen_at,
         "last_reconciled_at": record.last_reconciled_at,
+        "absence_count": record.absence_count,
+        "last_absence_snapshot_id": record.last_absence_snapshot_id,
+        "last_absence_observed_at": record.last_absence_observed_at,
+        "last_absence_session_date": record.last_absence_session_date,
+        "last_absence_broker_order_id": record.last_absence_broker_order_id,
+        "last_absence_holding_quantity": record.last_absence_holding_quantity,
         "origin": record.origin.value,
         "broker_identity_status": record.broker_identity_status.value,
         "recovery_state": record.recovery_state.value,
@@ -248,6 +254,16 @@ def _payload_to_record(payload: Dict[str, Any]) -> ExecutionOrderRecord:
         cancel_requested_at=payload.get("cancel_requested_at"),
         last_broker_seen_at=payload.get("last_broker_seen_at"),
         last_reconciled_at=payload.get("last_reconciled_at"),
+        absence_count=payload.get("absence_count", 0),
+        last_absence_snapshot_id=payload.get("last_absence_snapshot_id", ""),
+        last_absence_observed_at=payload.get("last_absence_observed_at"),
+        last_absence_session_date=payload.get("last_absence_session_date"),
+        last_absence_broker_order_id=payload.get(
+            "last_absence_broker_order_id", ""
+        ),
+        last_absence_holding_quantity=payload.get(
+            "last_absence_holding_quantity"
+        ),
         origin=OrderOrigin(payload["origin"]),
         broker_identity_status=BrokerIdentityStatus(payload["broker_identity_status"]),
         recovery_state=OrderRecoveryState(payload["recovery_state"]),
@@ -500,5 +516,25 @@ def list_execution_orders_for_card(
                 table.c.symbol == str(symbol or "").upper(),
             )
             .order_by(table.c.id.desc())
+        ).fetchall()
+    return [_row_to_record(row) for row in rows]
+
+
+def list_execution_orders_for_account(
+    engine: Engine,
+    *,
+    environment: str,
+    account_no: str,
+) -> List[ExecutionOrderRecord]:
+    """Return every durable order in one account for a single C1 pass."""
+    table = ensure_execution_orders_table(engine)
+    with engine.begin() as conn:
+        rows = conn.execute(
+            select(table)
+            .where(
+                table.c.environment == str(environment or "").upper(),
+                table.c.account_no == str(account_no or ""),
+            )
+            .order_by(table.c.id.asc())
         ).fetchall()
     return [_row_to_record(row) for row in rows]

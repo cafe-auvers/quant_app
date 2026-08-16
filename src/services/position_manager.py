@@ -365,6 +365,29 @@ class PositionManager:
         card.stop_quantity = 0
         card.exit_all_required = False
         card.sell_all_at_market_open = False
+        # A flat confirmation definitively ends this trade cycle. Retire
+        # both correlation scopes so historical execution rows cannot
+        # project onto a later Buylist/new-cycle card for the same symbol.
+        card.entry_attempt_group_id = ""
+        card.entry_attempt_count = 0
+        card.entry_client_order_id = ""
+        card.entry_pending_attempt_number = 0
+        card.entry_submission_unresolved = False
+        card.entry_cancel_in_flight = False
+        card.entry_cancel_reason = ""
+        card.entry_cancel_command_id = ""
+        card.entry_remaining_target_quantity = 0
+        card.exit_attempt_group_id = ""
+        card.exit_attempt_count = 0
+        card.exit_client_order_id = ""
+        card.exit_pending_attempt_number = 0
+        card.exit_submission_unresolved = False
+        card.exit_cancel_in_flight = False
+        card.exit_cancel_requested_at = None
+        card.exit_cancel_command_id = ""
+        card.reserved_sell_quantity = 0
+        card.next_exit_retry_at = None
+        card.last_exit_error = ""
         return card
 
     # --- Manual purchases outside the application (section 14) -----------

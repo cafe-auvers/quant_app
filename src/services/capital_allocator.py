@@ -133,10 +133,15 @@ def reserve_capital_for_entry(
                 db_active = capital_reservation_repository.list_active_reservations(
                     engine, environment=environment, account_no=account_no
                 )
-                known_ids = {reservation.reservation_id for reservation in active}
-                active = active + [
-                    reservation for reservation in db_active if reservation.reservation_id not in known_ids
-                ]
+                # The database is authoritative for duplicate IDs. A stale
+                # JSON copy must never shadow a newer cross-device value.
+                active_by_id = {
+                    reservation.reservation_id: reservation for reservation in active
+                }
+                active_by_id.update(
+                    {reservation.reservation_id: reservation for reservation in db_active}
+                )
+                active = list(active_by_id.values())
             buying_power = float(buying_power_provider() or 0.0)
             available = available_for_new_entries(buying_power, active)
             if available < requested_notional:
@@ -158,11 +163,23 @@ def reserve_capital_for_entry(
                 attempt_group_id=attempt_group_id,
                 requested_notional=requested_notional,
             )
+            if engine is not None:
+                capital_reservation_repository.save_reservation_strict(
+                    engine, reservation
+                )
             reservations.append(reservation)
             _save_unlocked(reservations, path)
-            if engine is not None:
-                capital_reservation_repository.save_reservation(engine, reservation)
             return reservation
+
+
+def _upsert_local_reservation(
+    reservations: List[CapitalReservation], reservation: CapitalReservation
+) -> None:
+    for index, current in enumerate(reservations):
+        if current.reservation_id == reservation.reservation_id:
+            reservations[index] = reservation
+            return
+    reservations.append(reservation)
 
 
 def _mutate_reservation(
@@ -174,22 +191,44 @@ def _mutate_reservation(
 ) -> Optional[CapitalReservation]:
     with exclusive_file_lock(path):
         reservations = _load_unlocked(path)
-        for reservation in reservations:
-            if reservation.reservation_id != reservation_id:
-                continue
-            mutation(reservation)
-            _save_unlocked(reservations, path)
-            if engine is not None:
-                capital_reservation_repository.save_reservation(engine, reservation)
-            return reservation
-        if engine is not None:
+        reservation = next(
+            (
+                item
+                for item in reservations
+                if item.reservation_id == reservation_id
+            ),
+            None,
+        )
+        if reservation is None and engine is not None:
             reservation = capital_reservation_repository.fetch_reservation(
                 engine, reservation_id
             )
-            if reservation is not None:
-                mutation(reservation)
-                capital_reservation_repository.save_reservation(engine, reservation)
-                return reservation
+        if reservation is None:
+            return None
+
+        mutation(reservation)
+        if engine is not None:
+            try:
+                capital_reservation_repository.save_reservation_strict(
+                    engine, reservation
+                )
+            except capital_reservation_repository.CapitalReservationVersionConflictError:
+                # Another writer won. Repair the local copy from the
+                # authoritative row before exposing the conflict, so the
+                # next availability calculation cannot reuse stale capital.
+                authoritative = capital_reservation_repository.fetch_reservation(
+                    engine, reservation_id
+                )
+                if authoritative is not None:
+                    _upsert_local_reservation(reservations, authoritative)
+                    _save_unlocked(reservations, path)
+                raise
+
+        # The strict CAS advances ``version`` on success. Mirror only the
+        # finalized authoritative object.
+        _upsert_local_reservation(reservations, reservation)
+        _save_unlocked(reservations, path)
+        return reservation
     return None
 
 

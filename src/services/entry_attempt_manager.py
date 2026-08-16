@@ -46,6 +46,7 @@ from src.services import capital_allocator
 from src.services.capital_reservation_repository import InsufficientAvailableCapitalError
 from src.services.execution_command_gateway import (
     AmbiguousPostBrokerPersistenceError,
+    GuardedSubmissionPreBrokerAbortedError,
     GuardedSubmissionAmbiguousError,
 )
 from src.services.execution_command_repository import DuplicateCommandError
@@ -439,6 +440,31 @@ class EntryAttemptManager:
                 reservation_id=reservation.reservation_id if reservation else "",
                 attempt_group_id=attempt_group_id,
                 attempt_count=state.attempt_count,
+                detail=str(exc),
+            )
+        except GuardedSubmissionPreBrokerAbortedError as exc:
+            # The command identity was durably consumed even though the
+            # final mutable gate prevented the broker call. Advance the
+            # logical attempt before returning a retryable rejection so
+            # deterministic identity generation cannot recreate the
+            # retired client_order_id after cooldown.
+            if reservation is not None:
+                capital_allocator.release_reservation(
+                    reservation.reservation_id,
+                    path=self._reservations_path,
+                    engine=self._capital_reservation_engine,
+                )
+            state.attempt_count = max(state.attempt_count, attempt_number)
+            state.cooldown_until = now + timedelta(
+                seconds=execution_config.ENTRY_RETRY_COOLDOWN_SECONDS
+            )
+            return AttemptResult(
+                trigger,
+                AttemptOutcome.REJECTED,
+                reservation_id=reservation.reservation_id if reservation else "",
+                attempt_group_id=attempt_group_id,
+                attempt_count=state.attempt_count,
+                retry_at=state.cooldown_until,
                 detail=str(exc),
             )
         except Exception as exc:  # noqa: BLE001 - surfaced via AttemptResult

@@ -87,6 +87,10 @@ def validate_disposition_transition(
 BROKER_OBSERVABLE_STATUSES: FrozenSet[ExecutionOrderStatus] = frozenset(
     {
         ExecutionOrderStatus.ACKNOWLEDGED,
+        # Conservative normalization for an exact external broker ID whose
+        # broker-open status could not be mapped more precisely. It remains
+        # fenced and alert-only; this never grants application ownership.
+        ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE,
         ExecutionOrderStatus.WORKING,
         ExecutionOrderStatus.PARTIALLY_FILLED,
         ExecutionOrderStatus.FILLED,
@@ -198,6 +202,8 @@ def new_discovered_external_order(
     limit_price: float = 0.0,
     broker_status: ExecutionOrderStatus = ExecutionOrderStatus.WORKING,
     raw_response: Optional[Dict[str, Any]] = None,
+    external_order_id: Optional[str] = None,
+    discovered_at: Optional[str] = None,
 ) -> DiscoveredExternalOrder:
     """Constructs a :class:`DiscoveredExternalOrder` from a raw broker
     response, redacting it before it ever reaches the dataclass or the
@@ -207,6 +213,11 @@ def new_discovered_external_order(
     """
     redacted = _redact_raw_response(raw_response or {}, account_no=account_no)
     response_hash = hash_redacted_payload(redacted)
+    identity_fields = {}
+    if external_order_id is not None:
+        identity_fields["external_order_id"] = str(external_order_id)
+    if discovered_at is not None:
+        identity_fields["discovered_at"] = str(discovered_at)
     order = DiscoveredExternalOrder(
         environment=environment,
         account_no=account_no,
@@ -218,6 +229,7 @@ def new_discovered_external_order(
         limit_price=limit_price,
         broker_status=broker_status,
         redacted_response=redacted,
+        **identity_fields,
     )
     order.response_hash = response_hash
     return order

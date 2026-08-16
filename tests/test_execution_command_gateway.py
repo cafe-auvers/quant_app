@@ -17,7 +17,11 @@ from sqlalchemy.pool import NullPool
 from src.core.execution_mode import ExecutionLease, ExecutionMode, ExecutionSource
 from src.core.execution_ownership import ExecutionOwner, ExecutionOwnership
 from src.core.execution_order_record import AdoptedOrderPermission, ExecutionOrderStatus
-from src.core.discovered_external_order import adopt_external_order, new_discovered_external_order
+from src.core.discovered_external_order import (
+    ExternalOrderDisposition,
+    adopt_external_order,
+    new_discovered_external_order,
+)
 from src.core.execution_request import CancelExecutionRequest, ReplaceExecutionRequest, SubmitExecutionRequest
 from src.core.order_recovery_state import OrderRecoveryState
 from src.core.order_state import OrderIntent, OrderSide, OrderStatus
@@ -29,10 +33,12 @@ from src.services.execution_command_gateway import (
     ExecutionCommandGateway,
     ExecutionOwnershipMismatchError,
     GuardedCancellationAmbiguousError,
+    GuardedCancellationPreBrokerAbortedError,
     GuardedCancellationRejectedError,
     GuardedEngineRequiresDatabaseError,
     GuardedEngineRequiresMutationBudgetError,
     GuardedSubmissionAmbiguousError,
+    GuardedSubmissionPreBrokerAbortedError,
     GuardedSubmissionRejectedError,
     LeaseNotVerifiedError,
     ReplaceNotSafeError,
@@ -42,6 +48,7 @@ from src.services.execution_command_gateway import (
 )
 from src.services.capital_reservation_repository import (
     ensure_capital_reservations_table,
+    fetch_reservation,
     list_active_reservations,
 )
 from src.services.execution_command_repository import (
@@ -55,6 +62,13 @@ from src.services.execution_lease_protocol import FakeExecutionLeaseProtocol
 from src.services.execution_order_repository import _get_execution_orders_table, fetch_execution_order, record_execution_order
 from src.services.execution_ownership_repository import assign_ownership
 from src.services.mutation_budget_protocol import AllowAllMutationBudget
+from src.services.discovered_external_order_repository import (
+    ActiveExternalOrderFenceError,
+    adopt_external_order_in_db,
+    list_discovered_external_orders_for_account,
+    record_discovered_external_order,
+    save_discovered_external_order,
+)
 from fakes.fake_execution_broker import FakeExecutionBroker
 
 
@@ -101,12 +115,127 @@ def _submit_request(**overrides):
     return SubmitExecutionRequest(**fields)
 
 
+def _record_active_external_order(engine, *, broker_order_id="B-EXTERNAL"):
+    return record_discovered_external_order(
+        engine,
+        new_discovered_external_order(
+            environment="PROD",
+            account_no="12345678-01",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            broker_order_id=broker_order_id,
+            broker_status=ExecutionOrderStatus.WORKING,
+        ),
+    )
+
+
+def _resolve_external_fence(engine, external_order):
+    expected_version = external_order.version
+    external_order.broker_status = ExecutionOrderStatus.CANCELLED
+    external_order.disposition = ExternalOrderDisposition.DISMISSED_TERMINAL
+    save_discovered_external_order(
+        engine, external_order, expected_version=expected_version
+    )
+
+
 # --- mode selection / API split (findings 2) ---------------------------
 
 
 def test_default_gateway_resolves_legacy_compatibility_mode():
     gateway = get_default_execution_gateway()
     assert gateway.mode == ExecutionMode.LEGACY_COMPATIBILITY
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_active_unowned_external_order_fences_guarded_submit(tmp_path):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    _record_active_external_order(engine)
+    broker.queue_acceptance(broker_order_id="SHOULD-NOT-BE-USED")
+
+    with pytest.raises(ActiveExternalOrderFenceError):
+        gateway.submit_guarded(_submit_request())
+
+    assert broker.submit_calls == []
+    assert get_command_by_idempotency_key(engine, "SUBMIT:CID-1") is None
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_active_unowned_external_order_fences_guarded_cancel_and_replace(tmp_path):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    broker.queue_acceptance(broker_order_id="B-OWNED")
+    owned = gateway.submit_guarded(_submit_request())
+    _record_active_external_order(engine)
+    _, lease = _lease()
+
+    broker.queue_cancel_confirmed()
+    with pytest.raises(ActiveExternalOrderFenceError):
+        gateway.cancel_guarded(
+            CancelExecutionRequest(
+                client_order_id=owned.client_order_id,
+                cancel_command_id="CANCEL-FENCED",
+                environment="PROD",
+                account_no="12345678-01",
+                lease=lease,
+                source=ExecutionSource.SYSTEM,
+            )
+        )
+    with pytest.raises(ActiveExternalOrderFenceError):
+        gateway.replace_guarded(
+            ReplaceExecutionRequest(
+                client_order_id=owned.client_order_id,
+                replace_command_id="REPLACE-FENCED",
+                new_client_order_id="CID-REPLACEMENT",
+                new_quantity=5,
+                new_limit_price=99.0,
+                environment="PROD",
+                account_no="12345678-01",
+                lease=lease,
+                source=ExecutionSource.SYSTEM,
+            )
+        )
+
+    assert broker.cancel_calls == []
+    assert get_command_by_idempotency_key(engine, "CANCEL:CANCEL-FENCED") is None
+    assert get_command_by_idempotency_key(engine, "REPLACE:REPLACE-FENCED") is None
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_explicit_adoption_removes_external_order_execution_fence(tmp_path):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    external = _record_active_external_order(engine)
+    adopt_external_order_in_db(
+        engine,
+        external.external_order_id,
+        adopted_by="operator",
+    )
+    broker.queue_acceptance(broker_order_id="B-NEW")
+
+    result = gateway.submit_guarded(_submit_request())
+
+    assert result.broker_order_id == "B-NEW"
+    assert len(broker.submit_calls) == 1
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_terminal_external_audit_row_does_not_fence_submission(tmp_path):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    record_discovered_external_order(
+        engine,
+        new_discovered_external_order(
+            environment="PROD",
+            account_no="12345678-01",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            broker_order_id="B-TERMINAL-EXTERNAL",
+            broker_status=ExecutionOrderStatus.CANCELLED,
+        ),
+    )
+    broker.queue_acceptance(broker_order_id="B-NEW")
+
+    result = gateway.submit_guarded(_submit_request())
+
+    assert result.broker_order_id == "B-NEW"
+    assert len(broker.submit_calls) == 1
 
 
 def test_legacy_compatibility_submit_is_a_transparent_passthrough():
@@ -599,7 +728,7 @@ def test_an_ownership_transfer_between_the_initial_check_and_the_broker_call_blo
 
     monkeypatch.setattr(gw_module, "get_ownership", _ownership_changes_after_first_check)
 
-    with pytest.raises(ExecutionOwnershipMismatchError):
+    with pytest.raises(GuardedSubmissionPreBrokerAbortedError):
         gateway.submit_guarded(_submit_request())
     assert broker.submit_calls == []  # the broker was never actually reached
     assert calls["n"] == 2  # both the initial check and the re-check ran
@@ -625,10 +754,55 @@ def test_a_lease_epoch_advance_between_the_initial_check_and_the_broker_call_blo
     gateway, broker, engine = _guarded_gateway(tmp_path, lease_protocol=lease_protocol)
     broker.queue_acceptance()
 
-    with pytest.raises(LeaseNotVerifiedError):
+    with pytest.raises(GuardedSubmissionPreBrokerAbortedError):
         gateway.submit_guarded(_submit_request())
     assert broker.submit_calls == []
     assert lease_protocol.calls == 2
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_external_fence_inserted_after_submitting_commit_blocks_broker_submit(
+    tmp_path, monkeypatch
+):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    broker.queue_acceptance(broker_order_id="SHOULD-NOT-BE-USED")
+    real_require_lease = gateway._require_verified_lease
+    calls = {"n": 0}
+
+    def insert_fence_on_final_check(lease):
+        calls["n"] += 1
+        real_require_lease(lease)
+        if calls["n"] == 2:
+            _record_active_external_order(engine, broker_order_id="B-RACED-SUBMIT")
+
+    monkeypatch.setattr(
+        gateway, "_require_verified_lease", insert_fence_on_final_check
+    )
+
+    with pytest.raises(GuardedSubmissionPreBrokerAbortedError):
+        gateway.submit_guarded(_submit_request())
+
+    assert broker.submit_calls == []
+    aborted = fetch_execution_order(engine, "CID-1")
+    assert aborted.status == ExecutionOrderStatus.CANCELLED_LOCALLY
+    assert aborted.broker_order_id == ""
+    assert get_command_by_idempotency_key(engine, "SUBMIT:CID-1").status == "PRE_BROKER_ABORTED"
+    reservation = fetch_reservation(engine, aborted.capital_reservation_id)
+    assert reservation is not None
+    assert not reservation.is_open()
+
+    external = next(
+        order
+        for order in list_discovered_external_orders_for_account(
+            engine, environment="PROD", account_no="12345678-01"
+        )
+        if order.broker_order_id == "B-RACED-SUBMIT"
+    )
+    _resolve_external_fence(engine, external)
+    fresh = gateway.submit_guarded(_submit_request(client_order_id="CID-2"))
+    assert fresh.status == ExecutionOrderStatus.ACKNOWLEDGED
+    assert fresh.broker_order_id == "SHOULD-NOT-BE-USED"
+    assert len(broker.submit_calls) == 1
 
 
 # --- cancellation -----------------------------------------------------------
@@ -689,6 +863,47 @@ def test_cancel_confirmed_reaches_cancelled(tmp_path):
     gateway.cancel_guarded(_cancel_request())
     record = fetch_execution_order(engine, "CID-1")
     assert record.status == ExecutionOrderStatus.CANCELLED
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_external_fence_inserted_after_cancel_pending_commit_blocks_broker_cancel(
+    tmp_path, monkeypatch
+):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    _submit_and_acknowledge(gateway, broker)
+    broker.queue_cancel_confirmed()
+    real_require_lease = gateway._require_verified_lease
+    calls = {"n": 0}
+
+    def insert_fence_on_final_check(lease):
+        calls["n"] += 1
+        real_require_lease(lease)
+        if calls["n"] == 2:
+            _record_active_external_order(engine, broker_order_id="B-RACED-CANCEL")
+
+    monkeypatch.setattr(
+        gateway, "_require_verified_lease", insert_fence_on_final_check
+    )
+
+    with pytest.raises(GuardedCancellationPreBrokerAbortedError):
+        gateway.cancel_guarded(_cancel_request())
+
+    assert broker.cancel_calls == []
+    assert fetch_execution_order(engine, "CID-1").status == ExecutionOrderStatus.ACKNOWLEDGED
+    assert get_command_by_idempotency_key(engine, "CANCEL:CANCEL-1").status == "PRE_BROKER_ABORTED"
+
+    external = next(
+        order
+        for order in list_discovered_external_orders_for_account(
+            engine, environment="PROD", account_no="12345678-01"
+        )
+        if order.broker_order_id == "B-RACED-CANCEL"
+    )
+    _resolve_external_fence(engine, external)
+    broker.queue_cancel_confirmed()
+    gateway.cancel_guarded(_cancel_request(cancel_command_id="CANCEL-2"))
+    assert fetch_execution_order(engine, "CID-1").status == ExecutionOrderStatus.CANCELLED
+    assert len(broker.cancel_calls) == 1
 
 
 @pytest.mark.usefixtures("trading_enabled")

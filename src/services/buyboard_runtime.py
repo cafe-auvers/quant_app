@@ -108,7 +108,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 from uuid import uuid4
 
@@ -124,21 +124,18 @@ from src.core.execution_order_record import ExecutionOrderStatus
 from src.core.execution_result import broker_order_from_execution_record
 from src.core.order_state import (
     BrokerOrder,
-    BrokerOrderDiscoveryResult,
-    BrokerOrderStatusSnapshot,
     OrderIntent,
     OrderSide,
-    OrderStatus,
     REGULAR_LIMIT_EXECUTION,
     is_open_status,
 )
 from src.core.trade_card_state import TradeCardState
 from src.risk.orb_position import calculate_orb_position_values, is_orb_position_plan_valid
 from src.risk.pre_trade import PreTradeRiskDecision
-from src.services import capital_allocator, capital_reservation_repository
+from src.services import capital_allocator
 from src.services import order_ledger
 from src.services import order_reconciliation
-from src.services.broker import Broker, KisBroker
+from src.services.broker import Broker
 from src.services.execution_command_gateway import (
     ExecutionCommandGateway,
     get_default_execution_gateway,
@@ -290,103 +287,6 @@ def _cancel_order(intent: CancelIntent, *, broker: Broker) -> None:
         logger.info("Cancel request for %s was a no-op: %s", intent.client_order_id, exc)
 
 
-def _discover_all_orders(card: TradeCardState, *, broker: Broker) -> BrokerOrderDiscoveryResult:
-    return broker.discover_orders(environment=card.environment, account_no=card.account_no)
-
-
-def _exchange_from_snapshot(snapshot: BrokerOrderStatusSnapshot) -> str:
-    """Best-effort KIS exchange-code recovery from a discovered snapshot's
-    raw response row -- see :func:`_cancel_discovered_order`. Returns ""
-    (never a guessed default) when it cannot be found, so the caller can
-    fail closed instead of silently targeting the wrong exchange.
-    """
-    row = snapshot.raw_response or {}
-    if not isinstance(row, dict):
-        return ""
-    for key in ("ovrs_excg_cd", "OVRS_EXCG_CD", "excg_cd", "EXCG_CD", "exchange"):
-        for candidate in (key, key.lower(), key.upper()):
-            value = row.get(candidate)
-            if value:
-                return str(value).strip().upper()
-    return ""
-
-
-def _cancel_discovered_order(
-    card: TradeCardState, snapshot: BrokerOrderStatusSnapshot, *, broker: Broker
-) -> None:
-    """Best-effort direct cancel of a discovered order's unfilled remainder
-    -- see :attr:`EodActionCallbacks.cancel_discovered_order`. Unlike
-    :func:`_cancel_order`, there is no local :class:`BrokerOrder` record to
-    look up or persist a reconciled result to (that is the entire point --
-    this only runs when local tracking has already been lost), so this
-    calls ``broker.cancel_order`` directly, keyed by the snapshot's own
-    ``broker_order_id``, and never raises.
-
-    Always uses the regular (non-reserved) cancel endpoint: discovery
-    folds regular and reserved-MOO snapshots into one list with no flag
-    marking which source an order came from, so the two genuinely
-    different broker cancel calls (regular needs
-    symbol/quantity/side/exchange; reserved needs only broker_order_id/
-    reservation_date) can't be told apart from a snapshot alone in
-    general. This is safe specifically here because reserved-MOO
-    execution is exclusively a sell-side mechanism in this codebase
-    (``KisBroker.submit_order`` only ever routes it to
-    ``place_overseas_reserved_market_on_open_sell``) and every candidate
-    reaching this function is a BUY entry order
-    (``_find_matching_broker_entry_snapshot`` filters on
-    ``side == OrderSide.BUY``), which is never submitted as reserved-MOO.
-
-    Exchange is not a structured field on a discovered snapshot, but KIS's
-    cancel endpoint requires one (``OVRS_EXCG_CD``) to route the request.
-    Review finding: a hardcoded "NASD" default here would silently
-    misroute (or simply fail) a cancel for a genuinely NYSE/AMEX order --
-    the broader discovery code explicitly queries multiple exchanges, so
-    this is not merely theoretical. Recovered from the snapshot's own raw
-    KIS response row (``snapshot.raw_response``) via
-    :func:`_exchange_from_snapshot` instead; if it cannot be determined,
-    this refuses to guess and no-ops, matching this module's fail-closed
-    pattern everywhere else automatic cancellation is involved.
-    """
-    broker_order_id = str(snapshot.broker_order_id or "").strip()
-    if not broker_order_id:
-        logger.warning(
-            "Cannot cancel discovered order for %s: snapshot has no broker_order_id", card.symbol
-        )
-        return
-    exchange = _exchange_from_snapshot(snapshot)
-    if not exchange:
-        logger.warning(
-            "Cannot cancel discovered order for %s: exchange could not be determined from "
-            "the discovered snapshot (broker_order_id=%s) -- refusing to guess",
-            card.symbol, broker_order_id,
-        )
-        return
-    remaining = snapshot.remaining_quantity or max(
-        0, snapshot.quantity_requested - snapshot.filled_quantity
-    )
-    if remaining <= 0:
-        remaining = snapshot.quantity_requested
-    if remaining <= 0:
-        logger.warning(
-            "Cannot cancel discovered order for %s: no remaining quantity to cancel", card.symbol
-        )
-        return
-    try:
-        broker.cancel_order(
-            environment=snapshot.environment,
-            account_no=snapshot.account_no,
-            is_reserved=False,
-            symbol=snapshot.symbol,
-            broker_order_id=broker_order_id,
-            quantity=remaining,
-            side=snapshot.side.value,
-            exchange=exchange,
-        )
-    except Exception:
-        logger.exception(
-            "Direct cancel of discovered order failed for %s (broker_order_id=%s)",
-            card.symbol, broker_order_id,
-        )
 
 
 def _kis_only_quote_fetcher(symbol: str) -> QuoteSnapshot:
@@ -535,6 +435,8 @@ class BuyboardRuntime:
     broker: Broker
     card_lookup: Callable[[str, str, str], Optional[TradeCardState]]
     account_size_provider: Callable[[str, str], float]
+    reconciliation_cancel_order: Callable[[TradeCardState, str], Any]
+    reconciliation_emergency_sell: Callable[[TradeCardState, int], Any]
 
 
 def build_buyboard_runtime(
@@ -959,6 +861,35 @@ def build_buyboard_runtime(
         reconcile_sell_order=reconcile_runtime_order,
     )
 
+    def reconciliation_cancel_order(
+        card: TradeCardState, client_order_id: str
+    ) -> Any:
+        record = (
+            fetch_execution_order(resolved_broker.database_engine, client_order_id)
+            if guarded_mode and isinstance(resolved_broker, ExecutionCommandGateway)
+            else None
+        )
+        scope = "ENTRY" if record is not None and record.side == OrderSide.BUY else "EXIT"
+        return position_callbacks.request_cancel(
+            card, client_order_id, scope=scope
+        )
+
+    def reconciliation_emergency_sell(
+        card: TradeCardState, quantity: int
+    ) -> Any:
+        deadline = datetime.now(timezone.utc) + timedelta(
+            seconds=execution_config.SELL_ALL_ATTEMPT_TTL_SECONDS
+        )
+        return submit_sell_order(
+            environment=card.environment,
+            account_no=card.account_no,
+            symbol=card.symbol,
+            quantity=quantity,
+            reason="sell_all_retry",
+            attempt_deadline_at=deadline.isoformat(),
+            trade_card=card,
+        )
+
     eod_callbacks = EodActionCallbacks(
         find_open_entry_order=lambda card: find_runtime_order(
             card, side=OrderSide.BUY, intent=OrderIntent.ENTRY
@@ -967,12 +898,6 @@ def build_buyboard_runtime(
         cancel_order=lambda intent: _cancel_order(intent, broker=resolved_broker),
         cancel_intent_factory=cancel_intent_factory,
         persist_cancel_state=persist_execution_identity,
-        discover_all_orders=lambda card: _discover_all_orders(card, broker=resolved_broker),
-        # Review finding P0: a historical filled order discovered from
-        # KIS's ~14-day order-history window must not resurrect a position
-        # the account no longer actually holds -- confirm against a fresh
-        # current-holdings lookup before trusting one.
-        get_current_holding=lambda card: _refresh_broker_position(card, broker=resolved_broker),
     )
     eod_service = EodTradingService(
         entry_attempt_manager=entry_attempt_manager,
@@ -1019,4 +944,6 @@ def build_buyboard_runtime(
         broker=resolved_broker,
         card_lookup=card_lookup,
         account_size_provider=buying_power_provider,
+        reconciliation_cancel_order=reconciliation_cancel_order,
+        reconciliation_emergency_sell=reconciliation_emergency_sell,
     )

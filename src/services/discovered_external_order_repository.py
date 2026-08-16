@@ -34,7 +34,6 @@ import json
 import logging
 import threading
 import weakref
-from datetime import datetime
 from typing import Any, Dict, FrozenSet, Optional
 
 from sqlalchemy import (
@@ -103,6 +102,10 @@ class ImmutableFieldChangedError(RuntimeError):
     ``external_order_id`` (revision 3.2) -- these identify *which real
     broker order* this permanent audit record describes, and must never
     silently drift."""
+
+
+class ActiveExternalOrderFenceError(RuntimeError):
+    """A still-unowned broker order durably fences this account/symbol."""
 
 
 def _get_discovered_external_orders_table(metadata: MetaData) -> Table:
@@ -336,6 +339,64 @@ def get_discovered_external_order(
     return _row_to_order(row) if row is not None else None
 
 
+def get_discovered_external_order_by_broker_id(
+    conn: Connection,
+    *,
+    environment: str,
+    account_no: str,
+    broker_order_id: str,
+) -> Optional[DiscoveredExternalOrder]:
+    table = _get_discovered_external_orders_table(MetaData())
+    row = conn.execute(
+        select(table).where(
+            table.c.broker_identity_key
+            == compute_broker_identity_key(
+                environment, account_no, broker_order_id
+            )
+        )
+    ).first()
+    return _row_to_order(row) if row is not None else None
+
+
+def require_no_active_unowned_external_order(
+    conn: Connection,
+    *,
+    environment: str,
+    account_no: str,
+    symbol: str,
+) -> None:
+    """Execution-boundary fence; call inside the mutation transaction."""
+    table = _get_discovered_external_orders_table(MetaData())
+    terminal_statuses = {
+        ExecutionOrderStatus.FILLED,
+        ExecutionOrderStatus.CANCELLED,
+        ExecutionOrderStatus.EXPIRED,
+        ExecutionOrderStatus.REJECTED,
+    }
+    rows = conn.execute(
+        select(table).where(
+            table.c.environment == str(environment or "").upper(),
+            table.c.account_no == str(account_no or ""),
+            table.c.symbol == str(symbol or "").upper(),
+            table.c.disposition
+            == ExternalOrderDisposition.DISCOVERED_UNOWNED.value,
+        )
+    ).fetchall()
+    active = None
+    for row in rows:
+        candidate = _row_to_order(row)
+        if candidate.broker_status not in terminal_statuses:
+            active = candidate
+            break
+    if active is not None:
+        raise ActiveExternalOrderFenceError(
+            f"{environment}/{account_no}/{symbol} is fenced by active unowned "
+            f"broker_order_id={active.broker_order_id!r} "
+            f"(external_order_id={active.external_order_id!r}); wait for a terminal "
+            "broker observation or explicitly adopt the order"
+        )
+
+
 # --- standalone convenience wrappers ------------------------------------
 
 
@@ -353,6 +414,39 @@ def fetch_discovered_external_order(
     ensure_discovered_external_orders_table(engine)
     with engine.begin() as conn:
         return get_discovered_external_order(conn, external_order_id)
+
+
+def save_discovered_external_order(
+    engine: Engine,
+    order: DiscoveredExternalOrder,
+    *,
+    expected_version: int,
+) -> DiscoveredExternalOrder:
+    ensure_discovered_external_orders_table(engine)
+    with engine.begin() as conn:
+        return update_discovered_external_order(
+            conn, order, expected_version=expected_version
+        )
+
+
+def list_discovered_external_orders_for_account(
+    engine: Engine,
+    *,
+    environment: str,
+    account_no: str,
+) -> list[DiscoveredExternalOrder]:
+    """Return the permanent A4b audit records for one account."""
+    table = ensure_discovered_external_orders_table(engine)
+    with engine.begin() as conn:
+        rows = conn.execute(
+            select(table)
+            .where(
+                table.c.environment == str(environment or "").upper(),
+                table.c.account_no == str(account_no or ""),
+            )
+            .order_by(table.c.id.asc())
+        ).fetchall()
+    return [_row_to_order(row) for row in rows]
 
 
 # --- atomic adoption (revision 3.2) -------------------------------------

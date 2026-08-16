@@ -591,6 +591,7 @@ def _healthy_buyboard_worker():
         startup_reconciliation_complete=True,
         startup_reconciliation_errors={},
         startup_reconciled_accounts={"1"},
+        account_action_ready=lambda account_no, symbol, action: True,
         last_heartbeat_at=dt.datetime.now(dt.timezone.utc),
     )
 
@@ -724,6 +725,7 @@ def test_one_accounts_startup_failure_does_not_reopen_legacy_exits_for_another_a
         startup_reconciliation_complete=False,  # account "2" failed
         startup_reconciliation_errors={"2": "simulated KIS outage"},
         startup_reconciled_accounts={"1"},
+        account_action_ready=lambda account_no, symbol, action: account_no == "1",
         last_heartbeat_at=dt.datetime.now(dt.timezone.utc),
     )
     logs = []
@@ -877,6 +879,30 @@ def test_buyboard_engine_healthy_is_account_scoped(tmp_path):
     assert window._buyboard_engine_healthy(account_no="1") is True
     assert window._buyboard_engine_healthy(account_no="2") is False
     assert window._buyboard_engine_healthy() is False  # global check still fails closed
+
+
+def test_buyboard_engine_health_uses_action_specific_reconciliation_readiness(tmp_path):
+    window = MainWindow.__new__(MainWindow)
+    now = dt.datetime.now(dt.timezone.utc)
+    window._buyboard_runtime_worker = SimpleNamespace(
+        isRunning=lambda: True,
+        startup_reconciliation_ran=True,
+        startup_reconciliation_complete=False,
+        startup_reconciliation_errors={"1": "balance and reserved history unavailable"},
+        startup_reconciled_accounts=set(),
+        account_action_ready=lambda account_no, symbol, action: (
+            account_no == "1" and symbol == "AAPL" and action == "PROTECTIVE_EXIT"
+        ),
+        last_cycle_started_at=now,
+        last_heartbeat_at=now,
+    )
+
+    assert window._buyboard_engine_healthy(
+        account_no="1", action="PROTECTIVE_EXIT", symbol="AAPL"
+    ) is True
+    assert window._buyboard_engine_healthy(
+        account_no="1", action="NEW_ENTRY", symbol="AAPL"
+    ) is False
 
 
 def test_buyboard_engine_healthy_false_for_an_account_never_positively_confirmed(tmp_path):

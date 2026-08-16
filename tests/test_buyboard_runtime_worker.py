@@ -19,20 +19,41 @@ from PyQt5.QtWidgets import QApplication
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
+from src.core.account_broker_snapshot import AccountBrokerSnapshot, SnapshotCompleteness
+from src.core.execution_mode import ExecutionLease
+from src.core.execution_ownership import ExecutionOwner, ExecutionOwnership
+from src.core.execution_order_record import (
+    BrokerIdentityStatus,
+    ExecutionOrderRecord,
+    ExecutionOrderStatus,
+)
 from src.core.execution_queue import ExecutionQueueItem, OrbCandidate, OrbCandidateStatus
 from src.core.order_state import (
     BrokerOrderDiscoveryResult,
     BrokerOrderStatusSnapshot,
+    OrderIntent,
     OrderSide,
     OrderStatus,
 )
 from src.core.trade_card_state import BoardStatus, EntryRuntimeStatus, TradeCardState
 from src.services import buyboard_runtime as runtime_module
 from src.services import trade_card_repository as repo
+from src.services.account_reconciliation import (
+    AccountReconciliationResult,
+    ReconciliationAlert,
+    ReconciliationAlertSeverity,
+    ReconciliationPlan,
+)
 from src.services.broker import BrokerSubmissionResult
 from src.services.execution_authority import ExecutionAuthority, LeaseExpiredError, LeaseHandle
+from src.services.execution_command_gateway import ExecutionCommandGateway
+from src.services.execution_lease_protocol import FakeExecutionLeaseProtocol
+from src.services.execution_order_repository import record_execution_order
+from src.services.execution_ownership_repository import assign_ownership
+from src.services.mutation_budget_protocol import AllowAllMutationBudget
 from src.services.realtime_market_data import QuoteSnapshot, RestPollingMarketDataService
 from src.ui.buyboard.runtime_worker import BuyboardRuntimeWorker
+from fakes.fake_execution_broker import FakeExecutionBroker
 
 
 def _dummy_market_data() -> RestPollingMarketDataService:
@@ -154,6 +175,58 @@ def _worker(
     return worker, engine
 
 
+def _guarded_reconciliation_worker(tmp_path, monkeypatch, real_broker):
+    from src.core import execution_config
+
+    monkeypatch.setattr(execution_config, "is_buyboard_engine_enabled", lambda: True)
+    engine = _db_engine(tmp_path)
+    lease = ExecutionLease(device_id="device-1", lease_token="token-1", lease_epoch=1)
+    lease_protocol = FakeExecutionLeaseProtocol(
+        current=lease, epoch_verified=True
+    )
+    gateway = ExecutionCommandGateway(
+        real_broker=real_broker,
+        engine=engine,
+        mode_override=True,
+        lease_protocol=lease_protocol,
+        mutation_budget=AllowAllMutationBudget(),
+        buying_power_provider=lambda *_: 100_000.0,
+    )
+    assign_ownership(
+        engine,
+        ExecutionOwnership(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            owner=ExecutionOwner.KANBAN,
+            strategy_instance_id="reconciliation-test",
+        ),
+    )
+    market_data = _dummy_market_data()
+    market_data.subscribe(["AAPL"])
+    market_data.poll_once()
+    worker = BuyboardRuntimeWorker(
+        db_engine=engine,
+        environment="PROD",
+        account_no="1",
+        buying_power_provider=lambda *_: 100_000.0,
+        broker=gateway,
+        execution_lease=lease,
+        account_discovery=lambda: [],
+    )
+    worker.runtime = runtime_module.build_buyboard_runtime(
+        buying_power_provider=worker._buying_power_provider,
+        card_lookup=worker._card_lookup,
+        capital_reservation_engine=engine,
+        execution_lease=lease,
+        broker=gateway,
+        market_data=market_data,
+        strategy_instance_id="reconciliation-test",
+        persist_card_before_execution=worker._persist_execution_identity,
+    )
+    return worker, engine, gateway
+
+
 def _seed_card(engine, **overrides):
     fields = dict(environment="PROD", account_no="1", symbol="AAPL")
     fields.update(overrides)
@@ -166,32 +239,6 @@ def _seed_card(engine, **overrides):
 def test_construction_builds_nothing(tmp_path):
     worker, _ = _worker(tmp_path)
     assert worker.runtime is None
-
-
-# --- Order callbacks (review finding P0-4) -----------------------------------
-
-
-def test_build_order_callbacks_wires_cancel_discovered_order_to_the_broker(tmp_path):
-    """Review finding P0-4: an untracked discovered order's cancel
-    callback must actually reach the real broker (keyed by the
-    snapshot's own broker_order_id), not silently no-op."""
-    from src.core.order_state import BrokerOrderStatusSnapshot, OrderSide, OrderStatus
-
-    broker = _FakeBroker()
-    callbacks = BuyboardRuntimeWorker._build_order_callbacks(broker)
-    card = TradeCardState(environment="PROD", account_no="1", symbol="AAPL")
-    snapshot = BrokerOrderStatusSnapshot(
-        environment="PROD", account_no="1", symbol="AAPL", side=OrderSide.BUY,
-        status=OrderStatus.WORKING, broker_order_id="B-99",
-        quantity_requested=25, filled_quantity=0, remaining_quantity=25,
-        raw_response={"ovrs_excg_cd": "NASD"},
-    )
-
-    callbacks.cancel_discovered_order(card, snapshot)
-
-    assert len(broker.cancel_calls) == 1
-    assert broker.cancel_calls[0]["broker_order_id"] == "B-99"
-    assert broker.cancel_calls[0]["quantity"] == 25
 
 
 # --- Startup reconciliation --------------------------------------------------
@@ -366,15 +413,8 @@ def test_startup_reconciliation_does_not_cross_account_boundaries(tmp_path):
 
 
 def test_startup_reconciliation_fully_resolves_a_buy_today_fill_in_one_pass(tmp_path):
-    """Review finding P0: "BUY_TODAY recovery still has startup and
-    two-pass gaps" -- reconcile_buy_today_orders must run *before* the
-    ENTRY_PENDING sweep within a single startup pass, so a BUY_TODAY card
-    transitioned to ENTRY_PENDING by discovery is immediately picked up
-    and fully resolved (fill applied, moved to OPEN_POSITION) in this
-    exact same call -- not left at ENTRY_PENDING/DATA_UNAVAILABLE for a
-    later cycle (up to FULL_RECONCILIATION_SECONDS away) to notice.
-    Startup previously did not call reconcile_buy_today_orders at all.
-    """
+    """The account reducer consumes holdings and orders together, so a
+    startup fill cannot be stranded behind a second ordered sweep/pass."""
     broker = _FakeBroker()
     broker.discover_result = BrokerOrderDiscoveryResult(
         open_orders_complete=True, history_complete=True, reserved_orders_complete=True,
@@ -487,6 +527,121 @@ def test_periodic_reconciliation_success_clears_startup_reconciliation_error(tmp
 
     assert "1" not in worker.startup_reconciliation_errors
     assert worker.startup_reconciliation_complete is True
+
+
+def test_action_specific_readiness_keeps_protective_exit_available_when_unrelated_sources_fail(
+    tmp_path,
+):
+    worker, _ = _worker(tmp_path)
+    worker._latest_reconciliation_snapshots["1"] = AccountBrokerSnapshot(
+        environment="PROD",
+        account_no="1",
+        completeness=SnapshotCompleteness(
+            holdings_complete=True,
+            open_orders_complete=True,
+            history_complete=False,
+            reserved_orders_complete=False,
+            account_balance_complete=False,
+        ),
+    )
+    exit_card = TradeCardState(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        board_status=BoardStatus.OPEN_POSITION,
+        broker_quantity=10,
+    )
+    entry_card = TradeCardState(
+        environment="PROD",
+        account_no="1",
+        symbol="MSFT",
+        board_status=BoardStatus.BUY_TODAY,
+    )
+
+    assert worker._card_action_ready(exit_card) is True
+    assert worker._card_action_ready(entry_card) is False
+
+
+def test_due_reconciliation_failure_invalidates_cached_action_readiness(
+    tmp_path, monkeypatch
+):
+    import datetime as dt
+
+    import src.ui.buyboard.runtime_worker as worker_module
+
+    worker, _ = _worker(tmp_path, account_no="1")
+    worker.runtime = _build_test_runtime(
+        buying_power_provider=worker._buying_power_provider,
+        card_lookup=worker._card_lookup,
+        broker=worker._broker,
+        market_data=_dummy_market_data(),
+    )
+    worker._latest_reconciliation_snapshots["1"] = AccountBrokerSnapshot(
+        environment="PROD",
+        account_no="1",
+        holdings=(),
+        completeness=SnapshotCompleteness(
+            holdings_complete=True,
+            open_orders_complete=True,
+            history_complete=True,
+            reserved_orders_complete=True,
+            account_balance_complete=True,
+        ),
+    )
+    worker.startup_reconciled_accounts.add("1")
+    old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)
+    worker._account_reconciled_at["1"] = old
+    worker._account_balance_refreshed_at["1"] = old
+    assert worker.account_action_ready("1", "AAPL", "NEW_ENTRY") is True
+
+    def fail_reconciliation(**kwargs):
+        raise RuntimeError("current broker snapshot unavailable")
+
+    monkeypatch.setattr(
+        worker_module, "run_account_reconciliation_pass", fail_reconciliation
+    )
+    worker._refresh_account_state_if_due([])
+
+    assert "1" not in worker._latest_reconciliation_snapshots
+    assert worker.account_action_ready("1", "AAPL", "NEW_ENTRY") is False
+    assert worker.account_action_ready("1", "AAPL", "PROTECTIVE_EXIT") is False
+    assert "1" in worker.startup_reconciliation_errors
+
+
+def test_reconciliation_alert_incidents_are_account_scoped_and_rearm_after_resolution(
+    tmp_path,
+):
+    worker, _ = _worker(tmp_path)
+    messages = []
+    worker.alert.connect(messages.append)
+
+    def result(account_no, alerts):
+        return AccountReconciliationResult(
+            snapshot=AccountBrokerSnapshot(
+                environment="PROD",
+                account_no=account_no,
+                completeness=SnapshotCompleteness(),
+                snapshot_id=f"snapshot-{account_no}",
+            ),
+            plan=ReconciliationPlan(
+                snapshot_id=f"snapshot-{account_no}", alerts=tuple(alerts)
+            ),
+        )
+
+    incident = ReconciliationAlert(
+        "DISCOVERED_UNOWNED_BROKER_ORDER",
+        ReconciliationAlertSeverity.CRITICAL,
+        "fenced",
+        symbol="AAPL",
+        broker_order_id="B-1",
+    )
+    worker._handle_reconciliation_result(result("1", (incident,)))
+    worker._handle_reconciliation_result(result("2", (incident,)))
+    worker._handle_reconciliation_result(result("1", ()))
+    worker._handle_reconciliation_result(result("1", (incident,)))
+
+    assert len(messages) == 3
+    assert "incident 2" in messages[-1]
 
 
 def test_startup_reconciliation_complete_when_every_account_succeeds(tmp_path):
@@ -910,6 +1065,252 @@ def test_sync_quote_subscriptions_adds_and_removes(tmp_path):
     subscribed = set(worker.runtime.market_data.subscribed_symbols())
     assert "AAPL" in subscribed
     assert "STALE" not in subscribed
+
+
+class _AccountExecutionBroker(FakeExecutionBroker):
+    def __init__(self):
+        super().__init__()
+        self.discovery = BrokerOrderDiscoveryResult(
+            open_orders_complete=True,
+            history_complete=True,
+            reserved_orders_complete=True,
+        )
+        self.positions = {
+            "overseas": {
+                "holdings": [
+                    {
+                        "symbol": "AAPL",
+                        "quantity": 10,
+                        "sellable_quantity": 10,
+                        "average_price": 100.0,
+                    }
+                ],
+                "summary_by_exchange": {
+                    "NASD": {"cash_balance_usd": 100_000.0}
+                },
+            }
+        }
+
+    def discover_orders(self, **kwargs):
+        return self.discovery
+
+    def get_positions(self, **kwargs):
+        return self.positions
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_external_buy_snapshot_fences_the_following_runtime_heartbeat(
+    tmp_path, monkeypatch
+):
+    broker = _AccountExecutionBroker()
+    broker.positions["overseas"]["holdings"] = []
+    broker.discovery = BrokerOrderDiscoveryResult(
+        open_orders_complete=True,
+        history_complete=True,
+        reserved_orders_complete=True,
+        snapshots=[
+            BrokerOrderStatusSnapshot(
+                environment="PROD",
+                account_no="1",
+                symbol="AAPL",
+                broker_order_id="B-EXTERNAL-BUY",
+                side=OrderSide.BUY,
+                status=OrderStatus.WORKING,
+                quantity_requested=10,
+                remaining_quantity=10,
+                limit_price=100.0,
+            )
+        ],
+    )
+    worker, engine, _ = _guarded_reconciliation_worker(
+        tmp_path, monkeypatch, broker
+    )
+    worker.runtime.trading_engine._market_is_open_fn = lambda: True
+    _seed_card(
+        engine,
+        board_status=BoardStatus.BUY_TODAY,
+        entry_runtime_status=EntryRuntimeStatus.EXECUTE_READY,
+        planned_quantity=10,
+        target_position_quantity=10,
+        entry_trigger=100.0,
+        breakout_price=100.0,
+        entry_orb_low=95.0,
+        selected_orb_window="5m",
+        risk_percent=0.01,
+    )
+
+    worker._run_startup_reconciliation()
+    worker._run_one_cycle()
+
+    assert broker.submit_calls == []
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_reconciliation_emergency_command_reaches_fake_broker(tmp_path, monkeypatch):
+    broker = _AccountExecutionBroker()
+    broker.queue_acceptance(broker_order_id="B-EMERGENCY")
+    worker, engine, _ = _guarded_reconciliation_worker(
+        tmp_path, monkeypatch, broker
+    )
+    _seed_card(
+        engine,
+        board_status=BoardStatus.SELL_ALL,
+        broker_quantity=10,
+        orderable_quantity=10,
+        exit_all_required=True,
+    )
+
+    worker._run_startup_reconciliation()
+
+    assert len(broker.submit_calls) == 1
+    assert broker.submit_calls[0]["side"] == OrderSide.SELL
+    assert broker.submit_calls[0]["quantity"] == 10
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_reconciliation_cancel_command_reaches_fake_broker(tmp_path, monkeypatch):
+    broker = _AccountExecutionBroker()
+    broker.discovery = BrokerOrderDiscoveryResult(
+        open_orders_complete=True,
+        history_complete=True,
+        reserved_orders_complete=True,
+        snapshots=[
+            BrokerOrderStatusSnapshot(
+                environment="PROD",
+                account_no="1",
+                symbol="AAPL",
+                broker_order_id="B-WORKING-SELL",
+                side=OrderSide.SELL,
+                status=OrderStatus.WORKING,
+                quantity_requested=4,
+                remaining_quantity=4,
+            )
+        ],
+    )
+    broker.queue_cancel_confirmed()
+    worker, engine, _ = _guarded_reconciliation_worker(
+        tmp_path, monkeypatch, broker
+    )
+    _seed_card(
+        engine,
+        board_status=BoardStatus.SELL_ALL,
+        broker_quantity=10,
+        orderable_quantity=6,
+        exit_all_required=True,
+        exit_client_order_id="SELL-1",
+    )
+    record_execution_order(
+        engine,
+        ExecutionOrderRecord(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            side=OrderSide.SELL,
+            intent=OrderIntent.MANUAL_EXIT,
+            client_order_id="SELL-1",
+            broker_order_id="B-WORKING-SELL",
+            submitted_quantity=4,
+            submitted_limit_price=100.0,
+            status=ExecutionOrderStatus.WORKING,
+            broker_identity_status=BrokerIdentityStatus.EXACT,
+            remaining_quantity=4,
+        ),
+    )
+
+    worker._run_startup_reconciliation()
+
+    assert len(broker.cancel_calls) == 1
+    assert broker.cancel_calls[0]["broker_order_id"] == "B-WORKING-SELL"
+    assert broker.submit_calls == []
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_ambiguous_reconciliation_cancel_is_not_called_twice(
+    tmp_path, monkeypatch
+):
+    broker = _AccountExecutionBroker()
+    broker.discovery = BrokerOrderDiscoveryResult(
+        open_orders_complete=True,
+        history_complete=True,
+        reserved_orders_complete=True,
+        snapshots=[
+            BrokerOrderStatusSnapshot(
+                environment="PROD",
+                account_no="1",
+                symbol="AAPL",
+                broker_order_id="B-WORKING-SELL",
+                side=OrderSide.SELL,
+                status=OrderStatus.WORKING,
+                quantity_requested=4,
+                remaining_quantity=4,
+            )
+        ],
+    )
+    broker.queue_cancel_timeout()
+    worker, engine, _ = _guarded_reconciliation_worker(
+        tmp_path, monkeypatch, broker
+    )
+    _seed_card(
+        engine,
+        board_status=BoardStatus.SELL_ALL,
+        broker_quantity=10,
+        orderable_quantity=6,
+        exit_all_required=True,
+        exit_client_order_id="SELL-1",
+    )
+    record_execution_order(
+        engine,
+        ExecutionOrderRecord(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            side=OrderSide.SELL,
+            intent=OrderIntent.MANUAL_EXIT,
+            client_order_id="SELL-1",
+            broker_order_id="B-WORKING-SELL",
+            submitted_quantity=4,
+            submitted_limit_price=100.0,
+            status=ExecutionOrderStatus.WORKING,
+            broker_identity_status=BrokerIdentityStatus.EXACT,
+            remaining_quantity=4,
+        ),
+    )
+
+    worker._run_startup_reconciliation()
+    first_card = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    stable_cancel_id = first_card.exit_cancel_command_id
+    worker._run_startup_reconciliation()
+
+    assert len(broker.cancel_calls) == 1
+    stored = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert stored.exit_cancel_command_id == stable_cancel_id
+    assert stored.exit_cancel_in_flight is True
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_ambiguous_reconciliation_submission_is_not_called_twice(
+    tmp_path, monkeypatch
+):
+    broker = _AccountExecutionBroker()
+    broker.queue_timeout()
+    worker, engine, _ = _guarded_reconciliation_worker(
+        tmp_path, monkeypatch, broker
+    )
+    _seed_card(
+        engine,
+        board_status=BoardStatus.SELL_ALL,
+        broker_quantity=10,
+        orderable_quantity=10,
+        exit_all_required=True,
+    )
+
+    worker._run_startup_reconciliation()
+    worker._run_startup_reconciliation()
+
+    assert len(broker.submit_calls) == 1
+    stored = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert stored.exit_client_order_id
+    assert stored.exit_submission_unresolved is True
 
 
 # --- Persistence isolation ----------------------------------------------------

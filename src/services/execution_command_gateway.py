@@ -66,7 +66,7 @@ from src.core.execution_order_record import (
     is_cancellable,
     validate_consistency,
 )
-from src.core.execution_ownership import ExecutionOwner, owner_for_source
+from src.core.execution_ownership import ExecutionOwner
 from src.core.execution_request import CancelExecutionRequest, ReplaceExecutionRequest, SubmitExecutionRequest
 from src.core.order_recovery_state import OrderRecoveryState, validate_recovery_transition
 from src.core.order_state import (
@@ -102,6 +102,11 @@ from src.services.execution_order_repository import (
     update_execution_order,
 )
 from src.services.execution_ownership_repository import ensure_execution_ownership_table, get_ownership
+from src.services.discovered_external_order_repository import (
+    ActiveExternalOrderFenceError,
+    ensure_discovered_external_orders_table,
+    require_no_active_unowned_external_order,
+)
 from src.services.mutation_budget_protocol import CommandType, MutationBudgetProtocol
 
 logger = logging.getLogger(__name__)
@@ -147,6 +152,12 @@ class GuardedSubmissionRejectedError(GuardedExecutionError):
     acceptance rejection) -- never treated as a reason to retry."""
 
 
+class GuardedSubmissionPreBrokerAbortedError(GuardedSubmissionRejectedError):
+    """A journaled submission was definitively aborted by a final mutable
+    gate before the broker was called. The caller may start a fresh attempt
+    after the gate is resolved; the retired command identity is not reused."""
+
+
 class GuardedSubmissionAmbiguousError(GuardedExecutionError):
     """Timeout, transport loss, or any other outcome the broker adapter
     cannot distinguish from "maybe accepted" -- INV-23: never retried
@@ -183,6 +194,12 @@ class CancelNotPermittedError(GuardedExecutionError):
 class GuardedCancellationRejectedError(GuardedExecutionError):
     """The broker explicitly refused the cancel request itself (the order
     had already progressed past the point a cancel could apply)."""
+
+
+class GuardedCancellationPreBrokerAbortedError(GuardedCancellationRejectedError):
+    """A journaled cancellation was definitively aborted by a final
+    mutable gate before the broker was called. Subclassing explicit
+    rejection applies the same caller-owned cancel-ID retirement rule."""
 
 
 class GuardedCancellationAmbiguousError(GuardedExecutionError):
@@ -556,7 +573,14 @@ class ExecutionCommandGateway:
                 target_broker_order_id=original.broker_order_id, source=request.source.value,
             )
             ensure_execution_commands_table(engine)
+            ensure_discovered_external_orders_table(engine)
             with engine.begin() as conn:
+                require_no_active_unowned_external_order(
+                    conn,
+                    environment=original.environment,
+                    account_no=original.account_no,
+                    symbol=original.symbol,
+                )
                 insert_command(conn, replace_command)
 
             # 6. cancel the original.
@@ -787,7 +811,14 @@ class ExecutionCommandGateway:
         ensure_execution_commands_table(engine)
         ensure_execution_orders_table(engine)
         ensure_capital_reservations_table(engine)
+        ensure_discovered_external_orders_table(engine)
         with engine.begin() as conn:
+            require_no_active_unowned_external_order(
+                conn,
+                environment=environment,
+                account_no=account_no,
+                symbol=symbol,
+            )
             insert_command(conn, command)
             insert_reservation_if_available(
                 conn, reservation, buying_power=buying_power
@@ -809,8 +840,43 @@ class ExecutionCommandGateway:
         # enhancement -- see the module's own follow-up notes); it still
         # closes the concrete race: a stale authorization can no longer
         # reach the broker.
-        self._require_ownership(environment, account_no, symbol, request.source, request.strategy_instance_id)
-        self._require_verified_lease(request.lease)
+        try:
+            self._require_ownership(
+                environment, account_no, symbol, request.source,
+                request.strategy_instance_id,
+            )
+            self._require_verified_lease(request.lease)
+            with engine.connect() as conn:
+                require_no_active_unowned_external_order(
+                    conn,
+                    environment=environment,
+                    account_no=account_no,
+                    symbol=symbol,
+                )
+        except (
+            ExecutionOwnershipMismatchError,
+            LeaseNotVerifiedError,
+            ActiveExternalOrderFenceError,
+        ) as gate_error:
+            # The broker boundary has definitely not been entered. Retire
+            # every A1 artifact atomically so a final-gate race cannot look
+            # like an ambiguous submission or keep capital reserved.
+            apply_status_transition(record, ExecutionOrderStatus.CANCELLED_LOCALLY)
+            reservation.release()
+            with engine.begin() as conn:
+                update_execution_order(conn, record, expected_version=record.version)
+                update_command_response(
+                    conn,
+                    idempotency_key,
+                    status="PRE_BROKER_ABORTED",
+                    broker_response={"error": str(gate_error)},
+                )
+                update_reservation(
+                    conn,
+                    reservation,
+                    expected_version=reservation.version,
+                )
+            raise GuardedSubmissionPreBrokerAbortedError(str(gate_error)) from gate_error
 
         # 9. only now call the broker.
         try:
@@ -820,6 +886,7 @@ class ExecutionCommandGateway:
                 execution_policy=request.execution_policy,
             )
         except Exception as exc:
+            error_message = str(exc)
             try:
                 ambiguous = self._real_broker.is_ambiguous_submission_error(exc)
             except Exception:
@@ -834,21 +901,25 @@ class ExecutionCommandGateway:
                     update_execution_order(conn, record, expected_version=record.version)
                     update_command_response(
                         conn, idempotency_key, status="AMBIGUOUS" if ambiguous else "FAILED",
-                        broker_response={"error": str(exc)},
+                        broker_response={"error": error_message},
                     )
                     if not ambiguous:
                         # 11: never automatically retry -- a clean rejection
                         # gives the reservation back; an ambiguous one does
                         # not (the order may yet turn out to exist).
                         reservation.release()
-                        update_reservation(conn, reservation)
+                        update_reservation(
+                            conn,
+                            reservation,
+                            expected_version=reservation.version,
+                        )
 
             self._persist_or_raise_ambiguous(
                 _persist_failure, context=f"submit {client_order_id!r} failure persistence"
             )
             if ambiguous:
-                raise GuardedSubmissionAmbiguousError(str(exc)) from exc
-            raise GuardedSubmissionRejectedError(str(exc)) from exc
+                raise GuardedSubmissionAmbiguousError(error_message) from exc
+            raise GuardedSubmissionRejectedError(error_message) from exc
 
         # 10. success -- ACKNOWLEDGED with exact identity.
         record.remaining_quantity = record.submitted_quantity
@@ -907,12 +978,20 @@ class ExecutionCommandGateway:
         )
 
         ensure_execution_commands_table(engine)
+        ensure_discovered_external_orders_table(engine)
         # Idempotency: insert_command raises DuplicateCommandError on a
         # replayed cancel_command_id, propagated unchanged -- a genuinely
         # new cancel decision must use a new cancel_command_id (finding 8),
         # which is the caller's (ExecutionWorkflowService's) job, not this
         # method's.
+        pre_cancel_status = record.status
         with engine.begin() as conn:
+            require_no_active_unowned_external_order(
+                conn,
+                environment=record.environment,
+                account_no=record.account_no,
+                symbol=record.symbol,
+            )
             insert_command(conn, command)
             apply_status_transition(record, ExecutionOrderStatus.CANCEL_PENDING)
             update_execution_order(conn, record, expected_version=record.version)
@@ -920,10 +999,37 @@ class ExecutionCommandGateway:
         # Finding 7 (third pass): re-verify ownership and lease immediately
         # before the actual broker call -- see _do_submit's identical
         # re-check for the full reasoning.
-        self._require_ownership(
-            record.environment, record.account_no, record.symbol, request.source, request.strategy_instance_id
-        )
-        self._require_verified_lease(request.lease)
+        try:
+            self._require_ownership(
+                record.environment, record.account_no, record.symbol,
+                request.source, request.strategy_instance_id,
+            )
+            self._require_verified_lease(request.lease)
+            with engine.connect() as conn:
+                require_no_active_unowned_external_order(
+                    conn,
+                    environment=record.environment,
+                    account_no=record.account_no,
+                    symbol=record.symbol,
+                )
+        except (
+            ExecutionOwnershipMismatchError,
+            LeaseNotVerifiedError,
+            ActiveExternalOrderFenceError,
+        ) as gate_error:
+            # No cancel reached the broker. Restore the exact live status
+            # captured before CANCEL_PENDING and retire this caller-owned
+            # command ID as a definitive local rejection.
+            apply_status_transition(record, pre_cancel_status)
+            with engine.begin() as conn:
+                update_execution_order(conn, record, expected_version=record.version)
+                update_command_response(
+                    conn,
+                    cancel_idempotency_key,
+                    status="PRE_BROKER_ABORTED",
+                    broker_response={"error": str(gate_error)},
+                )
+            raise GuardedCancellationPreBrokerAbortedError(str(gate_error)) from gate_error
 
         quantity = record.remaining_quantity or record.submitted_quantity
         try:
@@ -934,6 +1040,7 @@ class ExecutionCommandGateway:
                 side=record.side.value, exchange=record.exchange or "NASD",
             )
         except Exception as exc:
+            error_message = str(exc)
             classify = getattr(self._real_broker, "is_ambiguous_cancellation_error", None)
             try:
                 ambiguous = classify(exc) if callable(classify) else True
@@ -944,7 +1051,7 @@ class ExecutionCommandGateway:
                 with engine.begin() as conn:
                     update_command_response(
                         conn, cancel_idempotency_key, status="AMBIGUOUS" if ambiguous else "FAILED",
-                        broker_response={"error": str(exc)},
+                        broker_response={"error": error_message},
                     )
                     if ambiguous:
                         _transition_recovery_state(record, OrderRecoveryState.DISCOVERING)
@@ -956,8 +1063,8 @@ class ExecutionCommandGateway:
                 _persist_cancel_failure, context=f"cancel {request.client_order_id!r} failure persistence"
             )
             if ambiguous:
-                raise GuardedCancellationAmbiguousError(str(exc)) from exc
-            raise GuardedCancellationRejectedError(str(exc)) from exc
+                raise GuardedCancellationAmbiguousError(error_message) from exc
+            raise GuardedCancellationRejectedError(error_message) from exc
 
         record.filled_quantity = max(record.filled_quantity, snapshot.filled_quantity)
         if snapshot.avg_fill_price:
@@ -1002,7 +1109,11 @@ class ExecutionCommandGateway:
                             reservation.consume(filled_notional)
                         if reservation.is_open():
                             reservation.release()
-                        update_reservation(conn, reservation)
+                        update_reservation(
+                            conn,
+                            reservation,
+                            expected_version=reservation.version,
+                        )
 
         self._persist_or_raise_ambiguous(
             _persist_cancel_success, context=f"cancel {request.client_order_id!r} success persistence",
