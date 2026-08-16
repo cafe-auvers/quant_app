@@ -1140,6 +1140,13 @@ and stays `false` in unattended/automatic form until Gate 5 passes.
   now uses a strict database CAS before updating JSON; on conflict it reloads
   and mirrors the winning authoritative reservation before failing closed.
   Local validation: `python -m compileall -q src tests` and `1608 passed`.
+- 2026-08-16 (PR3 final runtime follow-up): A pre-broker-aborted entry now
+  advances the consumed logical attempt number before entering cooldown, so
+  deterministic retry identity moves from attempt 1 to attempt 2 instead of
+  replaying the retired command ID. EOD now retires an entry-completion group
+  when no live completion order remains, while preserving that correlation
+  when a real order still needs cancellation and terminal reconciliation.
+  Local validation: `python -m compileall -q src tests` and `1610 passed`.
 - 2026-08-15: Initial draft, branch created from `109c2c4` ("kanban fix 8").
 - 2026-08-15 (revision 2): Incorporated first architecture review. Added
   Workstream 0, INV-20, rewrote A4 (single version), atomic pre-submission

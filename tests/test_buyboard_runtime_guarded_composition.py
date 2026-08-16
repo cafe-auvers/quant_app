@@ -10,6 +10,10 @@ from sqlalchemy.pool import NullPool
 from fakes.fake_execution_broker import FakeExecutionBroker
 from src.core import execution_config
 from src.core.account_broker_snapshot import AccountBrokerSnapshot, SnapshotCompleteness
+from src.core.discovered_external_order import (
+    ExternalOrderDisposition,
+    new_discovered_external_order,
+)
 from src.core.execution_mode import ExecutionLease
 from src.core.execution_order_record import (
     BrokerIdentityStatus,
@@ -33,6 +37,10 @@ from src.services.execution_lease_protocol import FakeExecutionLeaseProtocol
 from src.services.execution_order_repository import fetch_execution_order
 from src.services.execution_ownership_repository import assign_ownership
 from src.services.mutation_budget_protocol import AllowAllMutationBudget
+from src.services.discovered_external_order_repository import (
+    record_discovered_external_order,
+    save_discovered_external_order,
+)
 from src.services.realtime_market_data import QuoteSnapshot, RestPollingMarketDataService
 from src.services import trading_engine as trading_engine_module
 from src.services.account_reconciliation import (
@@ -141,12 +149,105 @@ def _cancel_commands(engine):
         ).fetchall()
 
 
+def _submit_commands(engine):
+    with engine.connect() as conn:
+        return conn.execute(
+            text(
+                "SELECT idempotency_key, status FROM execution_commands "
+                "WHERE command_type = 'submit' ORDER BY id"
+            )
+        ).fetchall()
+
+
 def _submit_guarded_entry(runtime, broker, market_data, card) -> None:
     broker.queue_acceptance(broker_order_id=f"B-{card.symbol}-ENTRY")
     market_data.subscribe([card.symbol])
     market_data.poll_once()
     runtime.trading_engine.run_heartbeat([card])
     assert card.board_status == BoardStatus.ENTRY_PENDING
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_runtime_pre_broker_abort_retries_with_attempt_two_and_a_fresh_identity(
+    tmp_path, monkeypatch
+):
+    runtime, broker, gateway, engine, market_data = _make_runtime(
+        tmp_path, monkeypatch
+    )
+    card = _persist_owned_card(engine, _card())
+    raced_external = {}
+    lease_checks = {"count": 0}
+    real_require_lease = gateway._require_verified_lease
+
+    def insert_fence_at_final_gate(lease):
+        lease_checks["count"] += 1
+        real_require_lease(lease)
+        if lease_checks["count"] == 2:
+            external = new_discovered_external_order(
+                environment="PROD",
+                account_no="1",
+                symbol="AAPL",
+                side=OrderSide.BUY,
+                broker_order_id="B-RACED-ENTRY",
+                broker_status=ExecutionOrderStatus.WORKING,
+            )
+            raced_external["order"] = record_discovered_external_order(
+                engine, external
+            )
+
+    monkeypatch.setattr(
+        gateway, "_require_verified_lease", insert_fence_at_final_gate
+    )
+    broker.queue_acceptance(broker_order_id="B-ATTEMPT-2")
+    market_data.subscribe([card.symbol])
+    market_data.poll_once()
+
+    runtime.trading_engine.run_heartbeat([card])
+
+    first_commands = _submit_commands(engine)
+    assert broker.submit_calls == []
+    assert len(first_commands) == 1
+    assert first_commands[0].status == "PRE_BROKER_ABORTED"
+    first_id = first_commands[0].idempotency_key.removeprefix("SUBMIT:")
+    first_order = fetch_execution_order(engine, first_id)
+    assert first_order.status == ExecutionOrderStatus.CANCELLED_LOCALLY
+    assert first_order.attempt_number == 1
+    assert card.entry_client_order_id == ""
+    assert card.entry_attempt_count == 1
+    assert card.next_retry_at is not None
+
+    # Mirror the worker's normal changed-card persistence before the next
+    # heartbeat/restart boundary.
+    trade_card_repository.update_trade_card(
+        engine, card, expected_version=card.version
+    )
+
+    external = raced_external["order"]
+    expected_version = external.version
+    external.broker_status = ExecutionOrderStatus.CANCELLED
+    external.disposition = ExternalOrderDisposition.DISMISSED_TERMINAL
+    save_discovered_external_order(
+        engine, external, expected_version=expected_version
+    )
+
+    after_cooldown = card.next_retry_at + timedelta(milliseconds=1)
+    runtime.entry_attempt_manager._clock = lambda: after_cooldown
+    runtime.trading_engine._clock = lambda: after_cooldown
+    market_data.poll_once()
+
+    runtime.trading_engine.run_heartbeat([card])
+
+    commands = _submit_commands(engine)
+    assert len(commands) == 2
+    second_id = commands[1].idempotency_key.removeprefix("SUBMIT:")
+    assert second_id != first_id
+    assert commands[1].status == "ACKNOWLEDGED"
+    assert len(broker.submit_calls) == 1
+    second_order = fetch_execution_order(engine, second_id)
+    assert second_order.attempt_group_id == first_order.attempt_group_id
+    assert second_order.attempt_number == 2
+    assert card.entry_client_order_id == second_id
+    assert card.entry_attempt_count == 2
 
 
 @pytest.mark.usefixtures("trading_enabled")

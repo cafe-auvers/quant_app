@@ -283,6 +283,21 @@ class EodTradingService:
             if not card.entry_cancel_in_flight:
                 card.entry_cancel_in_flight = True
                 card.entry_cancel_reason = EntryCancelReason.EOD.value
+        else:
+            # No live completion order needs correlation any longer. EOD
+            # definitively ends this entry objective, so retire its durable
+            # attempt scope before old broker history can be projected onto
+            # the still-open position through the group fallback.
+            card.entry_attempt_group_id = ""
+            card.entry_attempt_count = 0
+            card.entry_client_order_id = ""
+            card.entry_pending_attempt_number = 0
+            card.entry_submission_unresolved = False
+            self._entry_attempt_manager.reset_symbol(
+                card.environment,
+                card.account_no,
+                card.symbol,
+            )
         card.entry_remaining_target_quantity = 0
         card.position_runtime_status = PositionRuntimeStatus.OPEN
         return True

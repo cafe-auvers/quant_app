@@ -1,8 +1,21 @@
 """Tests for src.services.eod_trading_service."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
+from src.core.account_broker_snapshot import (
+    AccountBrokerSnapshot,
+    AccountHoldingSnapshot,
+    SnapshotCompleteness,
+)
+from src.core.execution_order_record import (
+    BrokerIdentityStatus,
+    ExecutionOrderRecord,
+    ExecutionOrderStatus,
+)
 from src.core.order_state import (
     BrokerOrder,
+    BrokerOrderStatusSnapshot,
     OrderIntent,
     OrderSide,
     OrderStatus,
@@ -15,6 +28,10 @@ from src.core.trade_card_state import (
     TradeCardState,
 )
 from src.services import capital_allocator
+from src.services.account_reconciliation import (
+    AccountLocalState,
+    reduce_account_reconciliation,
+)
 from src.services.eod_trading_service import (
     EodActionCallbacks,
     EodTradingService,
@@ -225,6 +242,7 @@ def test_open_position_with_incomplete_target_cancels_remainder_and_keeps_positi
         broker_quantity=30,
         entry_remaining_target_quantity=70,
         position_runtime_status=PositionRuntimeStatus.ENTRY_COMPLETING,
+        entry_attempt_group_id="LIVE-COMPLETION",
     )
 
     changed = service.run_eod_cleanup([card])
@@ -234,6 +252,93 @@ def test_open_position_with_incomplete_target_cancels_remainder_and_keeps_positi
     assert card.broker_quantity == 30  # position preserved
     assert card.entry_remaining_target_quantity == 0
     assert card.position_runtime_status == PositionRuntimeStatus.OPEN
+    assert card.entry_attempt_group_id == "LIVE-COMPLETION"
+
+
+def test_eod_no_order_retires_completion_group_and_old_history_cannot_project(
+    tmp_path,
+):
+    service, cancelled, manager = _service(tmp_path)
+    retired_group = "ENTRY-COMPLETION-OLD"
+    manager.restore_symbol_state(
+        "PROD", "1", "AAPL", attempt_group_id=retired_group, attempt_count=3
+    )
+    card = _card(
+        board_status=BoardStatus.OPEN_POSITION,
+        broker_quantity=30,
+        orderable_quantity=30,
+        entry_remaining_target_quantity=70,
+        position_runtime_status=PositionRuntimeStatus.ENTRY_COMPLETING,
+        entry_attempt_group_id=retired_group,
+        entry_attempt_count=3,
+        entry_client_order_id="",
+    )
+
+    changed = service.run_eod_cleanup([card])
+
+    assert changed == [card]
+    assert cancelled == []
+    assert card.entry_remaining_target_quantity == 0
+    assert card.entry_attempt_group_id == ""
+    assert card.entry_attempt_count == 0
+    assert card.entry_client_order_id == ""
+    assert card.entry_pending_attempt_number == 0
+    assert card.entry_submission_unresolved is False
+    assert manager._state == {}
+
+    historical_order = ExecutionOrderRecord(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        intent=OrderIntent.ENTRY,
+        client_order_id="OLD-COMPLETION-CID",
+        broker_order_id="B-OLD-COMPLETION",
+        attempt_group_id=retired_group,
+        attempt_number=3,
+        submitted_quantity=10,
+        remaining_quantity=10,
+        status=ExecutionOrderStatus.WORKING,
+        broker_identity_status=BrokerIdentityStatus.EXACT,
+    )
+    historical_fill = BrokerOrderStatusSnapshot(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        broker_order_id="B-OLD-COMPLETION",
+        side=OrderSide.BUY,
+        status=OrderStatus.FILLED,
+        quantity_requested=10,
+        filled_quantity=10,
+        remaining_quantity=0,
+        avg_fill_price=101.0,
+    )
+    snapshot = AccountBrokerSnapshot(
+        environment="PROD",
+        account_no="1",
+        completeness=SnapshotCompleteness(
+            holdings_complete=True,
+            open_orders_complete=True,
+            history_complete=True,
+            reserved_orders_complete=True,
+            account_balance_complete=True,
+        ),
+        holdings=(
+            AccountHoldingSnapshot(
+                symbol="AAPL", quantity=30, sellable_quantity=30
+            ),
+        ),
+        orders=(historical_fill,),
+        observed_at=datetime.now(timezone.utc),
+    )
+
+    plan = reduce_account_reconciliation(
+        snapshot,
+        AccountLocalState(cards=(card,), execution_orders=(historical_order,)),
+    )
+
+    assert plan.order_updates[0].status == ExecutionOrderStatus.FILLED
+    assert plan.card_updates == ()
 
 
 def test_open_position_with_completed_target_is_untouched(tmp_path):
