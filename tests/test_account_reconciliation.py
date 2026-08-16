@@ -1079,6 +1079,9 @@ def test_filled_partial_exit_projects_breakeven_and_clears_pending_state():
         average_entry_price=100.0,
         pending_partial_sell_quantity=4,
         exit_client_order_id="SELL-1",
+        exit_attempt_group_id="G-PARTIAL",
+        exit_attempt_count=4,
+        exit_pending_attempt_number=4,
     )
     order = _order(
         side=OrderSide.SELL,
@@ -1087,6 +1090,8 @@ def test_filled_partial_exit_projects_breakeven_and_clears_pending_state():
         submitted_quantity=4,
         remaining_quantity=4,
         capital_reservation_id="",
+        attempt_group_id="G-PARTIAL",
+        attempt_number=4,
     )
     broker_order = BrokerOrderStatusSnapshot(
         environment="PROD",
@@ -1110,6 +1115,9 @@ def test_filled_partial_exit_projects_breakeven_and_clears_pending_state():
     assert updated.board_status == BoardStatus.OPEN_POSITION
     assert updated.pending_partial_sell_quantity == 0
     assert updated.exit_client_order_id == ""
+    assert updated.exit_attempt_group_id == ""
+    assert updated.exit_attempt_count == 0
+    assert updated.exit_pending_attempt_number == 0
     assert updated.stop_type == StopType.BREAKEVEN
     assert updated.stop_quantity == 6
 
@@ -1157,6 +1165,47 @@ def test_working_liquidation_categories_project_explicit_card_state(
     assert updated.position_runtime_status == expected_runtime
     assert updated.sell_all_at_market_open is queued
     assert updated.exit_client_order_id == "SELL-ALL-1"
+
+
+def test_working_sell_after_restart_restores_attempt_from_durable_order():
+    card = _card(
+        board_status=BoardStatus.SELL_ALL,
+        broker_quantity=10,
+        exit_all_required=True,
+        exit_attempt_group_id="G-EXIT",
+        exit_client_order_id="SELL-ALL-3",
+        exit_attempt_count=0,
+        exit_pending_attempt_number=0,
+    )
+    order = _order(
+        side=OrderSide.SELL,
+        intent=OrderIntent.MANUAL_EXIT,
+        client_order_id="SELL-ALL-3",
+        attempt_group_id="G-EXIT",
+        attempt_number=3,
+        capital_reservation_id="",
+    )
+    broker_order = BrokerOrderStatusSnapshot(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        broker_order_id="B-1",
+        side=OrderSide.SELL,
+        status=OrderStatus.WORKING,
+        quantity_requested=10,
+        remaining_quantity=10,
+    )
+
+    plan = reduce_account_reconciliation(
+        _snapshot(orders=(broker_order,), holdings=(_holding(),)),
+        AccountLocalState(cards=(card,), execution_orders=(order,)),
+    )
+
+    updated = plan.card_updates[0]
+    assert updated.exit_attempt_group_id == "G-EXIT"
+    assert updated.exit_attempt_count == 3
+    assert updated.exit_pending_attempt_number == 3
+    assert updated.exit_client_order_id == "SELL-ALL-3"
 
 
 def test_terminal_sell_all_with_confirmed_zero_holding_closes_card():
