@@ -91,6 +91,7 @@ def _base_window(*, is_main=False, lease_token="", pc_engine=None, db_ready=True
         "pc-id" if not is_main else "laptop-id", "TESTHOST", is_main
     )
     window._current_lease_token = lease_token
+    window._current_lease_epoch = 1 if lease_token else 0
     window._last_successful_reconcile_at = None
     window._auto_claim_main_enabled = False
     window._auto_arm_trading_on_handoff = False
@@ -145,7 +146,7 @@ def test_lease_kwargs_populated_when_main_with_token():
 
     assert isinstance(kwargs["execution_authority"], ExecutionAuthority)
     assert kwargs["execution_lease"] == LeaseHandle(
-        device_id="laptop-id", lease_token="tok-1"
+        device_id="laptop-id", lease_token="tok-1", lease_epoch=1
     )
     assert kwargs["lease_engine"] is engine
 
@@ -503,6 +504,32 @@ def test_auto_claim_not_triggered_when_should_claim_says_no(monkeypatch):
     assert started == []
 
 
+def test_auto_claim_waits_for_a_fresh_standby_generation(monkeypatch):
+    window = _sync_completed_window(auto_claim_enabled=True)
+    window._sync_buyboard_runtime_worker = lambda: None
+    window._runtime_standby_generation_for_claim = lambda: 0
+    monkeypatch.setattr(
+        main_window_module.execution_config,
+        "is_buyboard_engine_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        main_window_module,
+        "should_auto_claim_main",
+        lambda *a, **k: (True, "laptop-id", "stale heartbeat"),
+    )
+    started = []
+    window._start_state_sync = lambda **kwargs: started.append(kwargs)
+
+    MainWindow._on_state_sync_completed(
+        window,
+        StateReconcileResult(is_main_device=False, local_role=window.state_sync_role),
+        0,
+    )
+
+    assert started == []
+
+
 def test_successful_auto_claim_activation_begins_post_claim_handoff():
     window = _sync_completed_window(auto_claim_enabled=True)
     window.state_sync_role = ss.LocalDeviceRole("pc-id", "PC", False)
@@ -735,3 +762,52 @@ def test_shutdown_release_proceeds_with_confirmed_standby_successor(
 
     assert released is True
     assert ss.get_main_device(engine).main_device is None
+
+
+def test_missing_database_is_explicitly_unknown_exposure():
+    window = _base_window(is_main=True, lease_token="tok-1", db_ready=False)
+
+    exposure = MainWindow._execution_shutdown_exposure(window)
+
+    assert exposure.inspection_confirmed is False
+    assert exposure.is_clear is False
+    assert "UNKNOWN EXPOSURE" in exposure.labels[0]
+
+
+def test_failed_final_release_aborts_close_and_restores_protection(monkeypatch):
+    window = _base_window(is_main=True, lease_token="tok-1")
+    window._authorize_execution_shutdown = lambda: True
+    window._stop_workers_for_shutdown = lambda *args, **kwargs: True
+    window._flush_state_saves_for_shutdown = lambda **kwargs: SimpleNamespace(
+        success=True,
+        error="",
+    )
+    window._release_main_device_ownership_for_shutdown = lambda **kwargs: False
+    window._authorize_emergency_close_after_release_failure = lambda: False
+    restored = []
+    window._restore_protection_after_aborted_shutdown = (
+        lambda timer_states: restored.append(timer_states)
+    )
+    for name in (
+        "scanner_worker",
+        "watchlist_worker",
+        "single_ai_worker",
+        "kis_order_worker",
+        "intraday_fetch_worker",
+        "intraday_bulk_worker",
+        "kis_account_worker",
+        "kis_startup_worker",
+        "order_reconciliation_worker",
+        "fx_rate_worker",
+    ):
+        setattr(window, name, None)
+    ignored = []
+    event = SimpleNamespace(ignore=lambda: ignored.append(True))
+    monkeypatch.setattr(
+        main_window_module.QMessageBox, "critical", lambda *args, **kwargs: None
+    )
+
+    MainWindow.closeEvent(window, event)
+
+    assert ignored == [True]
+    assert len(restored) == 1

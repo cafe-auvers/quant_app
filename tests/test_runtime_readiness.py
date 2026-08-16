@@ -15,6 +15,7 @@ from src.core.runtime_readiness import (
 from src.services.runtime_device_state_repository import (
     confirm_standby_handoff,
     find_confirmed_standby_successor,
+    get_runtime_device_state,
     save_runtime_device_state,
 )
 
@@ -50,7 +51,7 @@ def test_runtime_device_state_requires_explicit_fresh_handoff_confirmation(tmp_p
         future=True,
         poolclass=NullPool,
     )
-    save_runtime_device_state(
+    ready = save_runtime_device_state(
         engine,
         device_id="successor",
         hostname="PC",
@@ -62,7 +63,16 @@ def test_runtime_device_state_requires_explicit_fresh_handoff_confirmation(tmp_p
         )
         is None
     )
-    assert confirm_standby_handoff(engine, device_id="successor") is True
+    assert confirm_standby_handoff(
+        engine,
+        device_id="successor",
+        readiness_generation=ready.readiness_generation,
+        outgoing_lease_epoch=7,
+    ) is True
+    confirmed = get_runtime_device_state(engine, device_id="successor")
+    assert confirmed.updated_at == ready.updated_at
+    assert confirmed.confirmed_generation == ready.readiness_generation
+    assert confirmed.confirmed_by_lease_epoch == 7
     # The successor keeps heartbeating while the outgoing owner publishes
     # and releases; that heartbeat must not erase the confirmation.
     save_runtime_device_state(
@@ -71,14 +81,73 @@ def test_runtime_device_state_requires_explicit_fresh_handoff_confirmation(tmp_p
         hostname="PC",
         state=RuntimeDeviceState.STANDBY_READY,
     )
+    assert find_confirmed_standby_successor(
+        engine,
+        excluding_device_id="current",
+        expected_outgoing_lease_epoch=8,
+    ) is None
     successor = find_confirmed_standby_successor(
         engine,
         excluding_device_id="current",
         now=dt.datetime.now(dt.timezone.utc),
+        expected_outgoing_lease_epoch=7,
     )
     assert successor is not None
     assert successor.state == RuntimeDeviceState.STANDBY_READY
     assert successor.handoff_confirmed is True
+
+
+def test_readiness_loss_demotes_and_recovery_mints_a_new_generation(tmp_path):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'runtime-generation.db'}",
+        future=True,
+        poolclass=NullPool,
+    )
+    first = save_runtime_device_state(
+        engine,
+        device_id="successor",
+        hostname="PC",
+        state=RuntimeDeviceState.STANDBY_READY,
+    )
+    assert confirm_standby_handoff(
+        engine,
+        device_id="successor",
+        readiness_generation=first.readiness_generation,
+        outgoing_lease_epoch=4,
+    )
+
+    demoted = save_runtime_device_state(
+        engine,
+        device_id="successor",
+        hostname="PC",
+        state=RuntimeDeviceState.STANDBY,
+    )
+    recovered = save_runtime_device_state(
+        engine,
+        device_id="successor",
+        hostname="PC",
+        state=RuntimeDeviceState.STANDBY_READY,
+    )
+
+    assert demoted.handoff_confirmed is False
+    assert recovered.readiness_generation == first.readiness_generation + 1
+    assert recovered.handoff_confirmed is False
+
+
+def test_unknown_exposure_is_never_treated_as_flat():
+    exposure = ShutdownExposure(
+        inspection_confirmed=False,
+        inspection_error="database unavailable",
+    )
+    decision = decide_shutdown_lease_release(
+        exposure,
+        successor_standby_ready=False,
+        handoff_confirmed=False,
+        unattended=True,
+    )
+    assert exposure.is_clear is False
+    assert "UNKNOWN EXPOSURE" in exposure.labels[0]
+    assert decision.allowed is False
 
 
 def test_shutdown_with_open_positions_and_no_successor_is_refused_in_unattended_mode():

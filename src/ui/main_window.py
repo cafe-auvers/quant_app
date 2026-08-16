@@ -261,6 +261,8 @@ class StateSyncWorker(QThread):
         generation: int = 0,
         auto_claim: bool = False,
         expected_owner_device_id: str = "",
+        expected_standby_generation: int = 0,
+        require_runtime_ready_claim: bool = False,
     ) -> None:
         super().__init__()
         self.engine = engine
@@ -276,6 +278,8 @@ class StateSyncWorker(QThread):
         # auto_claim_main_device_if_stale in src/services/app_state.py.
         self.auto_claim = auto_claim
         self.expected_owner_device_id = expected_owner_device_id
+        self.expected_standby_generation = int(expected_standby_generation or 0)
+        self.require_runtime_ready_claim = bool(require_runtime_ready_claim)
 
     def run(self) -> None:
         try:
@@ -285,12 +289,14 @@ class StateSyncWorker(QThread):
                     self.role,
                     expected_owner_device_id=self.expected_owner_device_id,
                     save_lock=self.save_lock,
+                    expected_standby_generation=self.expected_standby_generation,
                 )
             elif self.activate:
                 result = activate_device_as_main(
                     self.engine,
                     self.role,
                     save_lock=self.save_lock,
+                    expected_standby_generation=self.expected_standby_generation,
                 )
             else:
                 result = reconcile_state_with_remote(
@@ -298,6 +304,7 @@ class StateSyncWorker(QThread):
                     self.role,
                     save_lock=self.save_lock,
                     ownership_only_when_main=self.ownership_only_when_main,
+                    allow_unprepared_claim=not self.require_runtime_ready_claim,
                 )
         except Exception as exc:
             logger.exception("State sync worker failed")
@@ -1020,6 +1027,7 @@ class MainWindow(
         activate: bool = False,
         auto_claim: bool = False,
         expected_owner_device_id: str = "",
+        expected_standby_generation: int = 0,
     ) -> None:
         """Start one ownership/state reconciliation in a background worker."""
         if self.__dict__.get("_database_shutting_down", False):
@@ -1037,6 +1045,20 @@ class MainWindow(
                     "State sync busy",
                     "Wait for the current state synchronization to finish, then try again.",
                 )
+            return
+        from src.core.execution_config import is_buyboard_engine_enabled
+
+        runtime_claim_required = bool(is_buyboard_engine_enabled())
+        expected_standby_generation = int(expected_standby_generation or 0)
+        if (
+            runtime_claim_required
+            and (activate or auto_claim)
+            and expected_standby_generation <= 0
+        ):
+            self.append_log(
+                "Main-device claim deferred: this device has not published a "
+                "fresh STANDBY_READY generation after final reconciliation."
+            )
             return
         if activate or auto_claim:
             self._handoff_reconciliation_required = True
@@ -1058,6 +1080,8 @@ class MainWindow(
             generation=self.__dict__.get("_database_transition_generation", 0),
             auto_claim=auto_claim,
             expected_owner_device_id=expected_owner_device_id,
+            expected_standby_generation=expected_standby_generation,
+            require_runtime_ready_claim=runtime_claim_required,
         )
         self.state_sync_worker = worker
         self._state_sync_action = "activate" if (activate or auto_claim) else "reconcile"
@@ -1207,11 +1231,63 @@ class MainWindow(
                 other_hostname=result.main_device_hostname,
             )
             if should_claim:
-                self.append_log(f"Automatic handoff: claiming main device ({reason}).")
-                self._start_state_sync(
-                    auto_claim=True,
-                    expected_owner_device_id=expected_owner_device_id,
-                )
+                generation = self._runtime_standby_generation_for_claim()
+                runtime_claim_required = execution_config.is_buyboard_engine_enabled()
+                if not runtime_claim_required or generation > 0:
+                    self.append_log(
+                        f"Automatic handoff: claiming main device ({reason})"
+                        + (
+                            f" from STANDBY_READY generation {generation}."
+                            if runtime_claim_required
+                            else "."
+                        )
+                    )
+                    claim_kwargs = dict(
+                        auto_claim=True,
+                        expected_owner_device_id=expected_owner_device_id,
+                    )
+                    if runtime_claim_required:
+                        claim_kwargs["expected_standby_generation"] = generation
+                    self._start_state_sync(**claim_kwargs)
+
+    def _runtime_standby_generation_for_claim(self) -> int:
+        """Return this device's fresh durable readiness generation, or zero."""
+
+        from src.core.execution_config import is_buyboard_engine_enabled
+        from src.core.runtime_readiness import RuntimeDeviceState
+
+        if not is_buyboard_engine_enabled():
+            return 0
+        worker = self.__dict__.get("_buyboard_runtime_worker")
+        role = self.__dict__.get("state_sync_role")
+        engine = self.__dict__.get("pc_db_engine")
+        if worker is None or role is None or engine is None:
+            return 0
+        try:
+            if (
+                not worker.isRunning()
+                or not bool(getattr(worker, "_standby_only", False))
+                or getattr(worker, "device_state", None)
+                != RuntimeDeviceState.STANDBY_READY
+                or not worker.engine_readiness(
+                    include_device_state=False
+                ).standby_ready
+            ):
+                return 0
+            from src.services.runtime_device_state_repository import (
+                get_runtime_device_state,
+            )
+
+            record = get_runtime_device_state(engine, device_id=role.device_id)
+            if record is None or record.state != RuntimeDeviceState.STANDBY_READY:
+                return 0
+            age = (dt.datetime.now(dt.timezone.utc) - record.updated_at).total_seconds()
+            if age < 0.0 or age > 60.0:
+                return 0
+            return int(record.readiness_generation or 0)
+        except Exception:
+            logger.exception("Could not verify this device's STANDBY_READY generation")
+            return 0
 
     # --- Automatic cross-machine handoff: post-claim reconciliation --------
     # The safety-critical sequence that must run before a newly-main device
@@ -1431,6 +1507,16 @@ class MainWindow(
                 "Connect to the shared MySQL database before transferring main-device ownership.",
             )
             return
+        standby_generation = self._runtime_standby_generation_for_claim()
+        if execution_config.is_buyboard_engine_enabled() and standby_generation <= 0:
+            QMessageBox.warning(
+                self,
+                "Device not ready",
+                "This device must complete its read-only startup and final broker "
+                "reconciliation before it can become Main. Wait for "
+                "STANDBY_READY, then try again.",
+            )
+            return
         reply = QMessageBox.question(
             self,
             "Use This Device as Main",
@@ -1443,7 +1529,10 @@ class MainWindow(
             QMessageBox.No,
         )
         if reply == QMessageBox.Yes:
-            self._start_state_sync(activate=True)
+            self._start_state_sync(
+                activate=True,
+                expected_standby_generation=standby_generation,
+            )
 
     # Bounded age past which a cached "I am main" belief is no longer trusted
     # for order submission. Defense in depth against network partition: a
@@ -1680,23 +1769,22 @@ class MainWindow(
                 is_buyboard_engine_enabled()
                 and role is not None
                 and self.__dict__.get("pc_db_engine") is not None
-                and (
-                    not role.is_main
-                    or bool(self.__dict__.get("_current_lease_token"))
-                )
             )
             if not should_run:
                 if worker is not None and worker.isRunning():
                     worker.request_stop()
                     worker.requestInterruption()
                 return
-            standby_only = not role.is_main
+            standby_only = not (
+                role.is_main and bool(self.__dict__.get("_current_lease_token"))
+            )
             if worker is not None and worker.isRunning():
                 if bool(getattr(worker, "_standby_only", False)) == standby_only:
                     return  # already running in the correct role
-                # Role changed: stop the old read-only/active composition.
-                # The next state-sync tick starts a fresh worker with the new
-                # lease and performs the mandatory final reconciliation.
+                # Role changed: retain the same market-data service so an
+                # unacknowledged stop breach survives recomposition.
+                self._capture_buyboard_market_data_for_restart(worker)
+                self._buyboard_runtime_restart_requested = True
                 worker.request_stop()
                 worker.requestInterruption()
                 return
@@ -1732,6 +1820,7 @@ class MainWindow(
                     else None
                 ),
                 strategy_instance_id=execution_config.KANBAN_STRATEGY_INSTANCE_ID,
+                market_data=self.__dict__.get("_buyboard_market_data_handoff"),
                 standby_only=standby_only,
                 device_id=role.device_id,
                 hostname=role.hostname,
@@ -1745,12 +1834,20 @@ class MainWindow(
             self._track_worker("_buyboard_runtime_worker", new_worker)
             self._buyboard_runtime_worker = new_worker
             new_worker.start()
+            self.__dict__.pop("_buyboard_market_data_handoff", None)
+            self._buyboard_runtime_restart_requested = False
             self.append_log(
                 "Buy Board runtime started in "
                 f"{'standby/read-only' if standby_only else 'main-device activation'} mode."
             )
         except Exception:
             logger.exception("Failed to sync the Buy Board runtime worker")
+
+    def _capture_buyboard_market_data_for_restart(self, worker) -> None:
+        runtime = getattr(worker, "runtime", None)
+        market_data = getattr(runtime, "market_data", None)
+        if market_data is not None:
+            self._buyboard_market_data_handoff = market_data
 
     def _state_sync_allows_order_submission(self) -> bool:
         """Allow broker submissions only from the active, recently-confirmed main device."""
@@ -2442,29 +2539,32 @@ class MainWindow(
                 was_active = True
             timer_states.append((timer, was_active))
             timer.stop()
+        runtime_worker = self.__dict__.get("_buyboard_runtime_worker")
+        if runtime_worker is not None:
+            self._capture_buyboard_market_data_for_restart(runtime_worker)
         candidate_workers = [
-            getattr(self, "database_init_worker", None),
-            getattr(self, "database_recovery_worker", None),
-            getattr(self, "_local_mirror_sync_worker", None),
-            getattr(self, "state_sync_worker", None),
-            getattr(self, "_pc_status_worker", None),
-            self.scanner_worker,
-            self.watchlist_worker,
-            self.single_ai_worker,
-            self.kis_order_worker,
-            self.intraday_fetch_worker,
-            self.intraday_bulk_worker,
-            self.kis_account_worker,
-            self.kis_startup_worker,
-            self.order_reconciliation_worker,
-            self.fx_rate_worker,
-            getattr(self, "broker_order_query_worker", None),
-            getattr(self, "broker_order_cancel_worker", None),
-            getattr(self, "handoff_reconciliation_worker", None),
-            getattr(self, "_buyboard_runtime_worker", None),
-            *getattr(self, "_buylist_order_workers", []),
-            *getattr(self, "_buylist_aux_workers", []),
-            *list(getattr(self, "_tracked_workers", {})),
+            self.__dict__.get("database_init_worker"),
+            self.__dict__.get("database_recovery_worker"),
+            self.__dict__.get("_local_mirror_sync_worker"),
+            self.__dict__.get("state_sync_worker"),
+            self.__dict__.get("_pc_status_worker"),
+            self.__dict__.get("scanner_worker"),
+            self.__dict__.get("watchlist_worker"),
+            self.__dict__.get("single_ai_worker"),
+            self.__dict__.get("kis_order_worker"),
+            self.__dict__.get("intraday_fetch_worker"),
+            self.__dict__.get("intraday_bulk_worker"),
+            self.__dict__.get("kis_account_worker"),
+            self.__dict__.get("kis_startup_worker"),
+            self.__dict__.get("order_reconciliation_worker"),
+            self.__dict__.get("fx_rate_worker"),
+            self.__dict__.get("broker_order_query_worker"),
+            self.__dict__.get("broker_order_cancel_worker"),
+            self.__dict__.get("handoff_reconciliation_worker"),
+            self.__dict__.get("_buyboard_runtime_worker"),
+            *self.__dict__.get("_buylist_order_workers", []),
+            *self.__dict__.get("_buylist_aux_workers", []),
+            *list(self.__dict__.get("_tracked_workers", {})),
         ]
         seen_workers: set[int] = set()
         running_workers = []
@@ -2509,9 +2609,20 @@ class MainWindow(
                 f"Final local state save failed:\n\n{message}",
             )
 
-        self._release_main_device_ownership_for_shutdown(
+        released = self._release_main_device_ownership_for_shutdown(
             final_save_succeeded=save_result.success
         )
+        if not released and not self._authorize_emergency_close_after_release_failure():
+            self._restore_protection_after_aborted_shutdown(timer_states)
+            QMessageBox.critical(
+                self,
+                "Shutdown aborted",
+                "Main-device ownership could not be released safely. The dashboard "
+                "has stayed open and restarted its protection runtime. Resolve the "
+                "database/handoff failure before closing again.",
+            )
+            event.ignore()
+            return
 
         safe_mark_runtime_process_stopped(
             self.pc_db_engine
@@ -2530,10 +2641,10 @@ class MainWindow(
         device or when the shared database isn't ready -- most shutdowns
         never touch the network at all.
         """
-        if not getattr(self, "_pc_database_ready", False):
-            return False
         if not self.state_sync_role.is_main:
             return True
+        if not getattr(self, "_pc_database_ready", False):
+            return False
         decision = self._execution_shutdown_lease_decision(
             explicit_unprotected_acceptance=bool(
                 self.__dict__.get("_shutdown_unprotected_accepted", False)
@@ -2578,20 +2689,101 @@ class MainWindow(
             )
             return False
 
-        released, self.state_sync_role, release_error = release_main_device_and_demote(
+        owning_role = self.state_sync_role
+        released, resulting_role, release_error = release_main_device_and_demote(
             self.pc_db_engine,
-            self.state_sync_role,
+            owning_role,
             disable_remote_writer=lambda: self._bind_remote_state_engine(
                 self.pc_db_engine, is_main_device=False
             ),
         )
-        if not self.state_sync_role.is_main:
+        if released:
+            self.state_sync_role = resulting_role
             self._current_lease_token = ""
             self._current_lease_epoch = 0
-            self._sync_buyboard_runtime_worker()
-        if not released and release_error:
-            self.append_log(f"Main-device release failed: {release_error}")
+        else:
+            # The remote row is still owned by this device. Do not let a
+            # failed local demotion make the live process believe otherwise.
+            self.state_sync_role = owning_role
+            try:
+                self._bind_remote_state_engine(
+                    self.pc_db_engine, is_main_device=True
+                )
+            except Exception:
+                logger.exception("Could not restore remote writer after release failure")
+            if release_error:
+                self.append_log(f"Main-device release failed: {release_error}")
         return released
+
+    def _authorize_emergency_close_after_release_failure(self) -> bool:
+        """Require a second, explicit supervised override after release fails."""
+
+        if self.__dict__.get("_auto_claim_main_enabled", False):
+            self.append_log(
+                "CRITICAL: unattended shutdown aborted because final lease release failed."
+            )
+            return False
+        answer = QMessageBox.critical(
+            self,
+            "Main-device release failed",
+            "The application could not complete its final state publication, "
+            "runtime shutdown, or main-device lease release. Closing now may "
+            "leave positions unprotected and requires stale-heartbeat takeover.\n\n"
+            "Exit anyway under supervised emergency acceptance?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        accepted = answer == QMessageBox.Yes
+        if accepted:
+            self.append_log(
+                "CRITICAL: user explicitly accepted emergency shutdown after "
+                "main-device lease release failed."
+            )
+        return accepted
+
+    def _restore_protection_after_aborted_shutdown(self, timer_states) -> None:
+        """Re-open timers and the execution runtime after a refused close."""
+
+        self._database_shutting_down = False
+        self._database_transition_generation = (
+            self.__dict__.get("_database_transition_generation", 0) + 1
+        )
+        engine = self.__dict__.get("pc_db_engine")
+        role = self.__dict__.get("state_sync_role")
+        if engine is not None and role is not None:
+            try:
+                result = reconcile_state_with_remote(
+                    engine,
+                    role,
+                    save_lock=self._ensure_save_lock(),
+                    ownership_only_when_main=True,
+                    allow_unprepared_claim=not execution_config.is_buyboard_engine_enabled(),
+                )
+                if result.local_role is not None:
+                    self.state_sync_role = result.local_role
+                self._current_lease_token = (
+                    result.lease_token if result.is_main_device else ""
+                )
+                self._current_lease_epoch = (
+                    int(result.lease_epoch or 0) if result.is_main_device else 0
+                )
+                self._bind_remote_state_engine(
+                    engine, is_main_device=result.is_main_device
+                )
+            except Exception:
+                logger.exception("Could not restore ownership after aborted shutdown")
+        for timer, was_active in timer_states:
+            if was_active:
+                timer.start()
+        worker = self.__dict__.get("_buyboard_runtime_worker")
+        if worker is not None:
+            try:
+                if not worker.isRunning():
+                    self._buyboard_runtime_worker = None
+            except RuntimeError:
+                self._buyboard_runtime_worker = None
+        self._buyboard_runtime_restart_requested = False
+        self._sync_buyboard_runtime_worker()
 
     def _execution_shutdown_exposure(self):
         """Read durable cards/orders and name everything still exposed."""
@@ -2606,7 +2798,10 @@ class MainWindow(
 
         engine = self.__dict__.get("pc_db_engine")
         if engine is None or not self.__dict__.get("_pc_database_ready", False):
-            return ShutdownExposure()
+            return ShutdownExposure(
+                inspection_confirmed=False,
+                inspection_error="shared execution database unavailable",
+            )
         try:
             cards = list_trade_cards(engine, environment="PROD")
             open_statuses = {
@@ -2640,7 +2835,8 @@ class MainWindow(
             from src.core.runtime_readiness import ShutdownExposure
 
             return ShutdownExposure(
-                working_orders=(f"UNKNOWN EXPOSURE (inspection failed: {exc})",)
+                inspection_confirmed=False,
+                inspection_error=f"inspection failed: {exc}",
             )
 
     def _execution_shutdown_lease_decision(
@@ -2657,20 +2853,34 @@ class MainWindow(
         successor = None
         engine = self.__dict__.get("pc_db_engine")
         role = self.__dict__.get("state_sync_role")
+        outgoing_lease_epoch = int(
+            self.__dict__.get("_current_lease_epoch", 0) or 0
+        )
         if engine is not None and role is not None:
             try:
                 candidate = find_standby_successor(
                     engine, excluding_device_id=role.device_id
                 )
-                if candidate is not None and not candidate.handoff_confirmed:
+                if candidate is not None and not (
+                    candidate.handoff_confirmed
+                    and candidate.confirmed_generation
+                    == candidate.readiness_generation
+                    and candidate.confirmed_by_lease_epoch
+                    == outgoing_lease_epoch
+                ):
                     # This write is the outgoing owner's side of the
                     # handshake. The lease is released only after reading
                     # the confirmed row back below.
                     confirm_standby_handoff(
-                        engine, device_id=candidate.device_id
+                        engine,
+                        device_id=candidate.device_id,
+                        readiness_generation=candidate.readiness_generation,
+                        outgoing_lease_epoch=outgoing_lease_epoch,
                     )
                 successor = find_confirmed_standby_successor(
-                    engine, excluding_device_id=role.device_id
+                    engine,
+                    excluding_device_id=role.device_id,
+                    expected_outgoing_lease_epoch=outgoing_lease_epoch,
                 )
             except Exception:
                 logger.exception("Could not verify a STANDBY_READY successor")
@@ -2761,6 +2971,12 @@ class MainWindow(
             if worker in collection:
                 collection.remove(worker)
         self._clear_worker_reference(attribute_name, worker)
+        if (
+            attribute_name == "_buyboard_runtime_worker"
+            and self.__dict__.get("_buyboard_runtime_restart_requested", False)
+            and not self.__dict__.get("_database_shutting_down", False)
+        ):
+            QTimer.singleShot(0, self._sync_buyboard_runtime_worker)
 
     def _clear_worker_reference(self, attribute_name: str, worker: QThread) -> None:
         cleared = getattr(self, attribute_name, None) is worker

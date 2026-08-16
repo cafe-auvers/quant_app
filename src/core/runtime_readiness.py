@@ -88,14 +88,25 @@ class EngineReadiness:
 class ShutdownExposure:
     open_positions: Tuple[str, ...] = ()
     working_orders: Tuple[str, ...] = ()
+    inspection_confirmed: bool = True
+    inspection_error: str = ""
 
     @property
     def labels(self) -> Tuple[str, ...]:
-        return tuple(dict.fromkeys((*self.open_positions, *self.working_orders)))
+        labels = (*self.open_positions, *self.working_orders)
+        if not self.inspection_confirmed:
+            labels = (
+                *labels,
+                "UNKNOWN EXPOSURE"
+                + (f" ({self.inspection_error})" if self.inspection_error else ""),
+            )
+        return tuple(dict.fromkeys(labels))
 
     @property
     def is_clear(self) -> bool:
-        return not self.labels
+        return self.inspection_confirmed and not (
+            self.open_positions or self.working_orders
+        )
 
 
 @dataclass(frozen=True)
@@ -114,6 +125,22 @@ def decide_shutdown_lease_release(
 ) -> ShutdownLeaseDecision:
     """Apply E4 without UI side effects."""
 
+    if not exposure.inspection_confirmed:
+        names = ", ".join(exposure.labels)
+        if unattended:
+            return ShutdownLeaseDecision(
+                False,
+                f"unattended shutdown refused because exposure is unknown: {names}",
+            )
+        if explicit_unprotected_acceptance:
+            return ShutdownLeaseDecision(
+                True,
+                f"supervised user explicitly accepted unknown exposure: {names}",
+            )
+        return ShutdownLeaseDecision(
+            False,
+            f"explicit supervised acceptance is required because exposure is unknown: {names}",
+        )
     if exposure.is_clear:
         return ShutdownLeaseDecision(True, "no open positions or working orders")
     if successor_standby_ready and handoff_confirmed:

@@ -61,25 +61,26 @@ class BuylistMonitoringMixin:
         # this too; checking here prevents the legacy monitor from even
         # attempting the forbidden mutation and produces the intended alert.
         kanban_owned = False
+        ownership_known = False
         ownership_engine = self.__dict__.get("pc_db_engine")
         if ownership_engine is not None and account_no and symbol:
             try:
                 from src.core.execution_ownership import ExecutionOwner
                 from src.services.execution_ownership_repository import get_ownership
 
-                kanban_owned = (
-                    get_ownership(
-                        ownership_engine,
-                        environment=env,
-                        account_no=account_no,
-                        symbol=symbol,
-                    ).owner
-                    == ExecutionOwner.KANBAN
+                ownership = get_ownership(
+                    ownership_engine,
+                    environment=env,
+                    account_no=account_no,
+                    symbol=symbol,
                 )
+                ownership_known = True
+                kanban_owned = ownership.owner == ExecutionOwner.KANBAN
             except Exception:
-                # The gateway remains the final ownership boundary.  A
-                # failed advisory lookup must not fabricate a transfer.
-                kanban_owned = False
+                # UNKNOWN is not LEGACY. The durable gateway is still the
+                # final boundary, but the monitor must not even attempt to
+                # fail open when ownership could not be proved.
+                ownership_known = False
         # Review finding P0: flag-only suppression is unsafe -- if the new
         # engine has stopped or failed while the flag stays on, this would
         # leave *both* engines dark with nothing protecting open positions.
@@ -116,7 +117,14 @@ class BuylistMonitoringMixin:
             logged = self.__dict__.setdefault("_buyboard_engine_unhealthy_notice_logged", set())
             if account_no not in logged:
                 logged.add(account_no)
-                if kanban_owned:
+                if not ownership_known:
+                    message = (
+                        f"CRITICAL: execution ownership is UNKNOWN for {symbol} "
+                        f"({account_no or env}). Legacy automatic entries and "
+                        "protective exits remain BLOCKED until durable LEGACY "
+                        "ownership is positively verified."
+                    )
+                elif kanban_owned:
                     message = (
                         f"CRITICAL: the Buy Board engine is unhealthy for KANBAN-owned "
                         f"{symbol} ({account_no or env}). Legacy may observe but all "
@@ -146,7 +154,7 @@ class BuylistMonitoringMixin:
             # Fail open only for protective exits; a new entry must not
             # start on either engine while the authoritative one's state is
             # unknown.
-            if kanban_owned:
+            if not ownership_known or kanban_owned:
                 return True
             return not is_protective_exit
         logged = self.__dict__.get("_buyboard_engine_unhealthy_notice_logged")

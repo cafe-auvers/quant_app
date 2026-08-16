@@ -148,7 +148,7 @@ PR's behavior composes correctly, plus the Gate 1 run in full.
 | 3 | One guarded execution gateway | PR2 IMPLEMENTED, not activated — `ExecutionCommandGateway` (`src/services/execution_command_gateway.py`): dual-mode, with genuinely separate call shapes per mode (`submit_order`/`cancel_order` for `LEGACY_COMPATIBILITY`; `submit_guarded`/`cancel_guarded`/`replace_guarded` taking explicit request models with caller-generated stable command identities for `GUARDED_ENGINE`). Full A1-A11/B1-B4 sequence, one authoritative atomic capital reservation with an in-transaction availability check, a real lease-epoch gate, H1 ownership enforcement, a mutation-budget seam for Workstream 10, and fail-closed guarded runtime composition. Runtime-level tests cover restart-restored caller identity, normalized results, full-context tracked cancellation, Partial Sell/Sell All, one-reservation entry, and unresolved post-broker persistence without retry. |
 | 4 | Account-level reconciliation engine | PR3 IMPLEMENTED, not activated — one immutable `AccountBrokerSnapshot` per account/pass, per-source `SnapshotCompleteness`, a pure `ReconciliationPlan` reducer, durable two-generation order/reservation absence evidence, lifecycle-linked behavioral C4 projection with terminal attempt-group retirement, execution-boundary and last-broker-boundary fencing for active unowned orders with definitive pre-broker aborts, guarded execution of reducer commands, safe external SELL exposure handling, atomic account-plan persistence plus strict allocator reservation CAS, failure-invalidated action readiness, and one startup/periodic runtime pass replacing the three ordered EOD sweeps. KIS submission-time mapping and production threshold calibration remain gated on Workstream 0; without verified broker submission time, A4a stays manual and unmatched broker orders remain separate `DiscoveredExternalOrder`s. |
 | 5 | Production KIS real-time market data | PR4 IMPLEMENTED and merged to `master` (`952179e`), not activated — approval-key/transport lifecycle, ACK/NACK and encrypted-notice framing, exact-event freshness/dedup validation, per-symbol channel readiness, lossless stop-version accumulator, channel-specific capacity, health metrics, market-session semantics, bounded emergency pricing, and tiered persisted outage state are implemented behind `BUYBOARD_ENGINE_ENABLED=false`, `KIS_WS_ENABLED=false`, and `KIS_WS_PROTOCOL_VERIFIED=false`. Live parsing/subscription activation remains blocked until Workstream 0 fills `docs/kis_capability_matrix.md` with credentialed evidence; no vendor-sample assumption is recorded as verified. |
-| 6 | Runtime readiness and device handoff | PR5 DRAFT IMPLEMENTED, not activated — durable epoch fencing across clean and stale handoff, strict E1 aggregate health, read-only successor standby with persisted `STANDBY_READY`/`ACTIVE` state, final-reconciliation activation, KANBAN-scoped legacy suppression, and exposure-aware ordered shutdown are implemented. All execution and WebSocket activation flags remain false. |
+| 6 | Runtime readiness and device handoff | PR5 DRAFT IMPLEMENTED, not activated — durable epoch fencing across clean and stale handoff, generation-fenced `STANDBY_READY` takeover after final reconciliation, persist-before-open `ACTIVE`, strict E1 aggregate health, read-only successor standby, KANBAN/unknown-scoped legacy suppression, exposure-aware ordered shutdown with abort recovery, and stop-latch-preserving promotion are implemented. All execution and WebSocket activation flags remain false. |
 | 7 | Complete test program | NOT STARTED — matrix fully specified; distributed across PR1-7, capstone in PR8 |
 | 8 | Migration and cutover | NOT STARTED |
 | 9 | Legacy/Kanban ownership isolation | PR2 IMPLEMENTED, not activated — `ExecutionWorkflowService` is the one workflow service both the legacy Buy Dashboard's submission/cancellation entry points and the Kanban runtime (`buyboard_runtime.py`) now default to; an architecture test enforces no direct KIS-mutation call site outside the gateway/adapter. H1's persisted, multi-strategy `execution_owner` table (`src/core/execution_ownership.py` + `execution_ownership_repository.py`) is built and enforced at the gateway (B2) in `GUARDED_ENGINE` mode — `MANUAL` rejects every application source, `KANBAN` accepts only `KANBAN_BOARD`, unassigned defaults `LEGACY` (H2) and rejects `KANBAN_BOARD`. In-process mutual exclusion per `(environment, account_no, symbol)` is enforced additionally, regardless of mode, as a same-process race guard distinct from H1's durable assignment. |
@@ -1153,17 +1153,25 @@ and stays `false` in unattended/automatic form until Gate 5 passes.
   fresh account reconciliation, WebSocket connection, both critical channel
   ACK sets, fresh critical quotes, bounded accumulator drain, database
   writability, and durable ACTIVE state. Pull-only devices run through a
-  physically read-only broker facade and heartbeat `STANDBY_READY`; the
-  outgoing owner confirms that fresh standby record before release. Startup
-  admits no mutations before standby prerequisites and a final reconciliation.
+  physically read-only broker facade. A readiness generation is published only
+  after final reconciliation, is demoted on any dependency loss, and is
+  atomically rechecked during lease acquisition. The outgoing owner's separate
+  confirmation neither refreshes the successor heartbeat nor survives a new
+  generation, and is tied to the outgoing lease epoch. `ACTIVE` is durably
+  persisted before the local command gate opens. Startup admits no mutations
+  before standby prerequisites and activation reconciliation.
   Shutdown blocks commands, flushes the durable journal boundary, performs a
   final projection-only reconciliation, unsubscribes/closes market data, then
   permits lease release only for no exposure, a confirmed ready successor, or
   explicit supervised acceptance. Unattended shutdown with exposure and no
-  successor is refused. KANBAN-owned symbols never fail open to legacy.
+  successor is refused; unknown exposure and a failed final release abort close
+  and restore protection unless separately accepted as a supervised emergency.
+  The market-data accumulator is retained across standby promotion so an
+  unacknowledged stop breach cannot disappear. KANBAN-owned and ownership-
+  unknown symbols never fail open to legacy.
   `BUYBOARD_ENGINE_ENABLED=false`, `KIS_WS_ENABLED=false`, and
   `KIS_WS_PROTOCOL_VERIFIED=false` remain unchanged. Local validation:
-  `python -m compileall -q src tests` and `1706 passed`.
+  `python -m compileall -q src tests` and `1717 passed`.
 - 2026-08-16 (revision 3.4, PR4 blocking review): Explicitly revised the
   Workstream 0 WebSocket gate. D1/D3/D11 adapters may exist provisionally
   before credentialed evidence only while disabled, labelled

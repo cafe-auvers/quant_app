@@ -675,18 +675,30 @@ def test_auto_submit_execute_ready_is_suppressed_when_buyboard_engine_enabled(
 def test_stop_hit_auto_sell_stays_active_when_buyboard_engine_flag_on_but_unhealthy(
     monkeypatch, tmp_path
 ):
-    """Review finding P0: "legacy execution suppression depends only on
-    the feature flag" -- if the new engine has stopped/failed while the
-    flag stays on, the legacy monitor must fail OPEN (keep protecting)
-    rather than also going dark, and must raise a critical alert."""
+    """A positively proven LEGACY symbol may retain protective fail-open."""
     window = _build_queue_window(monkeypatch, tmp_path)
     monkeypatch.setenv("BUYBOARD_ENGINE_ENABLED", "true")
+    ownership_engine = create_engine(
+        f"sqlite:///{tmp_path / 'ownership.db'}", future=True, poolclass=NullPool
+    )
+    window.pc_db_engine = ownership_engine
+    assign_ownership(
+        ownership_engine,
+        ExecutionOwnership(
+            environment="PROD",
+            account_no="12345678",
+            symbol="AAPL",
+            owner=ExecutionOwner.LEGACY,
+            strategy_instance_id="legacy-monitor",
+        ),
+    )
     window._buyboard_runtime_worker = None  # never started / already stopped
     logs = []
     submissions = []
     item = SimpleNamespace(
         symbol="AAPL",
         environment="PROD",
+        kis_account_no="12345678",
         monitoring_status="BOUGHT",
         breakout_method="",
         stop_loss=98.0,
@@ -711,6 +723,34 @@ def test_stop_hit_auto_sell_stays_active_when_buyboard_engine_flag_on_but_unheal
     assert any(
         "Buy Board engine is not confirmed healthy" in message for message in logs
     )
+
+
+def test_unknown_ownership_blocks_legacy_protective_fail_open(
+    monkeypatch, tmp_path
+):
+    from src.services import execution_ownership_repository
+
+    window = _build_queue_window(monkeypatch, tmp_path)
+    monkeypatch.setenv("BUYBOARD_ENGINE_ENABLED", "true")
+    window.pc_db_engine = object()
+    window._buyboard_engine_healthy = lambda *args, **kwargs: False
+    logs = []
+    window.append_log = logs.append
+    monkeypatch.setattr(
+        execution_ownership_repository,
+        "get_ownership",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("DB read failed")),
+    )
+
+    blocked = window._legacy_auto_execution_blocked(
+        "PROD",
+        "AAPL",
+        account_no="12345678",
+        is_protective_exit=True,
+    )
+
+    assert blocked is True
+    assert any("ownership is UNKNOWN" in message for message in logs)
 
 
 def test_one_accounts_startup_failure_does_not_reopen_legacy_exits_for_another_account(

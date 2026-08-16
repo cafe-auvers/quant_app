@@ -10,6 +10,7 @@ the method under test.
 """
 from __future__ import annotations
 
+import datetime as dt
 import os
 from types import SimpleNamespace
 
@@ -53,6 +54,11 @@ from src.services.execution_lease_protocol import FakeExecutionLeaseProtocol
 from src.services.execution_order_repository import record_execution_order
 from src.services.execution_ownership_repository import assign_ownership
 from src.services.mutation_budget_protocol import AllowAllMutationBudget
+from src.services.runtime_device_state_repository import get_runtime_device_state
+from src.services.kis_realtime_market_data import (
+    KisRealtimeMarketDataService,
+    StopRule,
+)
 from src.services.realtime_market_data import QuoteSnapshot, RestPollingMarketDataService
 from src.ui.buyboard.runtime_worker import BuyboardRuntimeWorker
 from fakes.fake_execution_broker import FakeExecutionBroker
@@ -339,6 +345,7 @@ def test_pull_only_successor_reaches_standby_ready_but_never_active(
     worker._accepting_commands = False
     worker.device_state = RuntimeDeviceState.STANDBY
     transitions = []
+    final_passes = []
     monkeypatch.setattr(
         worker, "engine_readiness", lambda **kwargs: _ready_runtime_state()
     )
@@ -348,12 +355,62 @@ def test_pull_only_successor_reaches_standby_ready_but_never_active(
         worker.device_state = state
 
     monkeypatch.setattr(worker, "_set_device_state", record_state)
+    monkeypatch.setattr(
+        worker,
+        "_run_startup_reconciliation",
+        lambda **kwargs: final_passes.append(kwargs),
+    )
 
     worker._advance_startup_readiness()
 
     assert transitions == [RuntimeDeviceState.STANDBY_READY]
+    assert final_passes == [{"execute_commands": False}]
     assert worker._accepting_commands is False
     assert worker.device_state == RuntimeDeviceState.STANDBY_READY
+
+
+def test_standby_readiness_loss_demotes_immediately(tmp_path, monkeypatch):
+    worker, engine = _worker(tmp_path, standby_only=True, device_id="successor")
+    worker._accepting_commands = False
+    worker._set_device_state(RuntimeDeviceState.STANDBY_READY)
+    monkeypatch.setattr(
+        worker,
+        "engine_readiness",
+        lambda **kwargs: _ready_runtime_state(websocket_connected=False),
+    )
+
+    worker._advance_startup_readiness()
+
+    record = get_runtime_device_state(engine, device_id="successor")
+    assert worker.device_state == RuntimeDeviceState.STANDBY
+    assert worker._accepting_commands is False
+    assert record.state == RuntimeDeviceState.STANDBY
+
+
+def test_active_persistence_failure_never_opens_the_command_gate(
+    tmp_path, monkeypatch
+):
+    worker, _ = _worker(tmp_path, device_id="candidate")
+    worker._accepting_commands = False
+    worker.device_state = RuntimeDeviceState.STANDBY
+    monkeypatch.setattr(
+        worker, "engine_readiness", lambda **kwargs: _ready_runtime_state()
+    )
+    monkeypatch.setattr(worker, "_lease_still_current", lambda: True)
+    monkeypatch.setattr(worker, "_run_startup_reconciliation", lambda **kwargs: None)
+
+    def persist_state(state, **kwargs):
+        if state == RuntimeDeviceState.ACTIVE:
+            raise RuntimeError("ACTIVE write failed")
+        worker.device_state = state
+
+    monkeypatch.setattr(worker, "_set_device_state", persist_state)
+
+    with pytest.raises(RuntimeError, match="ACTIVE write failed"):
+        worker._advance_startup_readiness()
+
+    assert worker.device_state == RuntimeDeviceState.STANDBY_READY
+    assert worker._accepting_commands is False
 
 
 def test_runtime_shutdown_orders_journal_reconciliation_and_market_data_close(
@@ -396,6 +453,105 @@ def test_runtime_shutdown_orders_journal_reconciliation_and_market_data_close(
         ("state", RuntimeDeviceState.STOPPED),
     ]
     assert worker.shutdown_prepared is True
+
+
+def test_standby_stop_breach_survives_promotion_and_initiates_sell_all_once(
+    tmp_path
+):
+    now = dt.datetime.now(dt.timezone.utc)
+
+    class _Transport:
+        def __init__(self):
+            self.stopped = False
+
+        def on_data(self, callback):
+            pass
+
+        def on_ack(self, callback):
+            pass
+
+        def on_connection(self, callback):
+            pass
+
+        def subscribe(self, subscriptions):
+            pass
+
+        def unsubscribe(self, subscriptions):
+            pass
+
+        def start(self):
+            self.stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+        def is_connected(self):
+            return True
+
+    service = KisRealtimeMarketDataService(
+        transport=_Transport(),
+        symbol_key_resolver=lambda symbol, channel: symbol,
+        trade_capacity=10,
+        quote_capacity=10,
+        clock=lambda: now,
+    )
+    card = TradeCardState(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        board_status=BoardStatus.OPEN_POSITION,
+        broker_quantity=10,
+        orderable_quantity=10,
+        active_stop_price=100.0,
+    )
+    service.replace_stop_rules(
+        "AAPL", [StopRule(card.card_key, 100.0, "1")]
+    )
+    for offset, price in enumerate((101.0, 99.0, 101.0)):
+        observed = now + dt.timedelta(seconds=offset)
+        assert service.ingest_trade(
+            QuoteSnapshot(
+                symbol="AAPL",
+                last_price=price,
+                broker_event_at=observed,
+                received_at=observed,
+                processed_at=observed,
+                channel="HDFSCNT0",
+                payload_fingerprint=str(offset),
+            )
+        )
+
+    # Standby observes/drains but cannot acknowledge the breach.
+    assert any(quote.breached_stop_versions for quote in service.poll_once())
+    standby, _ = _worker(tmp_path, standby_only=True)
+    standby.runtime = SimpleNamespace(market_data=service)
+    standby._close_market_data()
+    promoted_service = standby.runtime.market_data
+
+    sell_all_calls = []
+
+    class _TradingEngine:
+        def evaluate_quote(self, cards, quote):
+            if quote.breached_stop_versions:
+                sell_all_calls.append(quote.breached_stop_versions)
+                cards[0].exit_all_required = True
+                cards[0].board_status = BoardStatus.SELL_ALL
+                return cards
+            return []
+
+    active, _ = _worker(tmp_path)
+    active.runtime = SimpleNamespace(
+        market_data=promoted_service,
+        trading_engine=_TradingEngine(),
+    )
+    for quote in promoted_service.poll_once():
+        active.runtime.trading_engine.evaluate_quote([card], quote)
+        active._acknowledge_market_breaches(quote, [card])
+    for quote in promoted_service.poll_once():
+        active.runtime.trading_engine.evaluate_quote([card], quote)
+
+    assert card.board_status == BoardStatus.SELL_ALL
+    assert len(sell_all_calls) == 1
 
 
 # --- Startup reconciliation --------------------------------------------------

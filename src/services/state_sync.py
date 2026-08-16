@@ -325,6 +325,9 @@ def get_main_device(engine: Optional[Engine]) -> OwnershipResult:
 def claim_main_device(
     engine: Optional[Engine],
     role: LocalDeviceRole,
+    *,
+    expected_standby_generation: int = 0,
+    standby_max_age_seconds: float = 60.0,
 ) -> OwnershipResult:
     """Atomically make ``role`` the sole remote writer.
 
@@ -336,9 +339,30 @@ def claim_main_device(
     if engine is None:
         return OwnershipResult(False, error="State sync database is unavailable.")
     try:
+        runtime_table = None
+        if int(expected_standby_generation or 0) > 0:
+            from src.services.runtime_device_state_repository import (
+                ensure_runtime_device_state_table,
+            )
+
+            runtime_table = ensure_runtime_device_state_table(engine)
         table = _ensure_state_sync_table(engine)
         with engine.begin() as conn:
             row = _select_row(conn, table, MAIN_DEVICE_KEY, for_update=True)
+            if runtime_table is not None:
+                from src.services.runtime_device_state_repository import (
+                    verify_standby_generation_for_claim,
+                )
+
+                ready, error = verify_standby_generation_for_claim(
+                    conn,
+                    runtime_table,
+                    device_id=role.device_id,
+                    readiness_generation=expected_standby_generation,
+                    max_age_seconds=standby_max_age_seconds,
+                )
+                if not ready:
+                    return OwnershipResult(False, error=error)
             revision = int(row.revision or 1) + 1 if row is not None else 1
             prior_epoch = 0
             if row is not None:
@@ -389,6 +413,8 @@ def claim_main_device_if_stale(
     *,
     expected_owner_device_id: str,
     heartbeat_cutoff_seconds: int = 60,
+    expected_standby_generation: int = 0,
+    standby_max_age_seconds: float = 60.0,
 ) -> OwnershipResult:
     """Atomically transfer ownership away from a confirmed-stale owner.
 
@@ -410,6 +436,13 @@ def claim_main_device_if_stale(
     if not expected_owner_device_id:
         return OwnershipResult(False, error="No expected owner device to verify against.")
     try:
+        runtime_table = None
+        if int(expected_standby_generation or 0) > 0:
+            from src.services.runtime_device_state_repository import (
+                ensure_runtime_device_state_table,
+            )
+
+            runtime_table = ensure_runtime_device_state_table(engine)
         table = _ensure_state_sync_table(engine)
         with engine.begin() as conn:
             row = _select_row(conn, table, MAIN_DEVICE_KEY, for_update=True)
@@ -439,6 +472,20 @@ def claim_main_device_if_stale(
                     False,
                     error="Previous owner's heartbeat is fresh again; not claiming.",
                 )
+            if runtime_table is not None:
+                from src.services.runtime_device_state_repository import (
+                    verify_standby_generation_for_claim,
+                )
+
+                ready, error = verify_standby_generation_for_claim(
+                    conn,
+                    runtime_table,
+                    device_id=role.device_id,
+                    readiness_generation=expected_standby_generation,
+                    max_age_seconds=standby_max_age_seconds,
+                )
+                if not ready:
+                    return OwnershipResult(False, error=error)
 
             payload_json = json.dumps(
                 {
@@ -479,6 +526,9 @@ def claim_main_device_if_stale(
 def claim_main_device_if_unclaimed(
     engine: Optional[Engine],
     role: LocalDeviceRole,
+    *,
+    expected_standby_generation: int = 0,
+    standby_max_age_seconds: float = 60.0,
 ) -> OwnershipResult:
     """Atomically claim ownership only if the row is still genuinely missing.
 
@@ -493,6 +543,13 @@ def claim_main_device_if_unclaimed(
     if engine is None:
         return OwnershipResult(False, error="State sync database is unavailable.")
     try:
+        runtime_table = None
+        if int(expected_standby_generation or 0) > 0:
+            from src.services.runtime_device_state_repository import (
+                ensure_runtime_device_state_table,
+            )
+
+            runtime_table = ensure_runtime_device_state_table(engine)
         table = _ensure_state_sync_table(engine)
         with engine.begin() as conn:
             row = _select_row(conn, table, MAIN_DEVICE_KEY, for_update=True)
@@ -503,6 +560,20 @@ def claim_main_device_if_unclaimed(
                     False,
                     error="Ownership was claimed by another device before this claim ran.",
                 )
+            if runtime_table is not None:
+                from src.services.runtime_device_state_repository import (
+                    verify_standby_generation_for_claim,
+                )
+
+                ready, error = verify_standby_generation_for_claim(
+                    conn,
+                    runtime_table,
+                    device_id=role.device_id,
+                    readiness_generation=expected_standby_generation,
+                    max_age_seconds=standby_max_age_seconds,
+                )
+                if not ready:
+                    return OwnershipResult(False, error=error)
             prior_epoch = 0
             prior_revision = 0
             if row is not None:

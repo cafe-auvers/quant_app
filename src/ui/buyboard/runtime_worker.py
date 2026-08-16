@@ -112,6 +112,7 @@ class BuyboardRuntimeWorker(QThread):
         buying_power_provider: Callable[[str, str], float],
         account_equity_provider: Optional[Callable[[str, str], float]] = None,
         broker=None,
+        market_data=None,
         execution_authority: Optional[ExecutionAuthority] = None,
         execution_lease: Optional[LeaseHandle] = None,
         lease_engine: Optional[Engine] = None,
@@ -133,6 +134,7 @@ class BuyboardRuntimeWorker(QThread):
         self._buying_power_provider = buying_power_provider
         self._account_equity_provider = account_equity_provider
         self._broker = broker
+        self._market_data = market_data
         self._execution_authority = execution_authority
         self._execution_lease = execution_lease
         self._lease_engine = lease_engine
@@ -172,6 +174,7 @@ class BuyboardRuntimeWorker(QThread):
         self.shutdown_errors: List[str] = []
         self.runtime: Optional[buyboard_runtime_module.BuyboardRuntime] = None
         self.device_state = RuntimeDeviceState.STARTING
+        self.readiness_generation = 0
         self._lease_current = False
         self._database_writable = False
         self.last_market_data_drain_at: Optional[datetime] = None
@@ -264,16 +267,35 @@ class BuyboardRuntimeWorker(QThread):
         state: RuntimeDeviceState,
         *,
         handoff_confirmed: bool = False,
-    ) -> None:
+    ):
+        if not self._device_id:
+            self.device_state = state
+            return
+        record = save_runtime_device_state(
+            self._db_engine,
+            device_id=self._device_id,
+            hostname=self._hostname,
+            state=state,
+            handoff_confirmed=handoff_confirmed,
+        )
+        # Durable state is the authorization source. Local state changes only
+        # after that write succeeds, especially for ACTIVE.
         self.device_state = state
+        self.readiness_generation = int(record.readiness_generation or 0)
+        return record
+
+    def _demote_standby_readiness(self) -> None:
+        """Close the local claim path immediately, then clear durable readiness."""
+
+        self._accepting_commands = False
+        self.device_state = RuntimeDeviceState.STANDBY
         if not self._device_id:
             return
         save_runtime_device_state(
             self._db_engine,
             device_id=self._device_id,
             hostname=self._hostname,
-            state=state,
-            handoff_confirmed=handoff_confirmed,
+            state=RuntimeDeviceState.STANDBY,
         )
 
     def _probe_database_writable(self) -> bool:
@@ -327,6 +349,7 @@ class BuyboardRuntimeWorker(QThread):
                 execution_lease=self._execution_lease_value(),
                 lease_engine=self._lease_engine,
                 broker=self._broker,
+                market_data=self._market_data,
                 strategy_instance_id=self._strategy_instance_id,
                 persist_card_before_execution=self._persist_execution_identity,
                 observation_only=self._standby_only,
@@ -376,6 +399,13 @@ class BuyboardRuntimeWorker(QThread):
                         self._advance_startup_readiness()
                 except Exception:  # noqa: BLE001 - one bad cycle must not kill the loop
                     logger.exception("BuyboardRuntimeWorker heartbeat cycle failed")
+                    if self.device_state == RuntimeDeviceState.STANDBY_READY:
+                        try:
+                            self._demote_standby_readiness()
+                        except Exception:
+                            logger.exception(
+                                "Could not persist standby demotion after cycle failure"
+                            )
                     self.error_occurred.emit("Buy Board engine heartbeat failed -- see logs for detail.")
                 self.msleep(max(1, int(self._heartbeat_seconds * 1000)))
         finally:
@@ -385,24 +415,38 @@ class BuyboardRuntimeWorker(QThread):
     def _advance_startup_readiness(self) -> None:
         readiness = self.engine_readiness(include_device_state=False)
         if not readiness.standby_ready:
+            if self.device_state == RuntimeDeviceState.STANDBY_READY:
+                self._demote_standby_readiness()
             return
         if self._standby_only:
-            # Also serves as the durable standby heartbeat. Repository
-            # semantics preserve an outgoing owner's handoff confirmation.
+            if self.device_state != RuntimeDeviceState.STANDBY_READY:
+                # A standby publishes readiness only after its own final
+                # projection-only broker reconciliation and a second complete
+                # dependency check.
+                self._run_startup_reconciliation(execute_commands=False)
+                readiness = self.engine_readiness(include_device_state=False)
+                if not readiness.standby_ready:
+                    self._demote_standby_readiness()
+                    return
+            # Subsequent writes are successor-owned heartbeats. They preserve
+            # this readiness generation and do not refresh confirmation time.
             self._set_device_state(RuntimeDeviceState.STANDBY_READY)
             return
-        if self.device_state != RuntimeDeviceState.STANDBY_READY:
-            self._set_device_state(RuntimeDeviceState.STANDBY_READY)
-        # The final pass occurs after every standby prerequisite confirms.
-        # Any failure leaves the device at STANDBY_READY and the next normal
-        # cycle retries; entries never see the ACTIVE mutation gate.
+        # The lease was acquired against the prior standby generation. Perform
+        # the immediate activation reconciliation with the command gate shut.
         self._run_startup_reconciliation(execute_commands=False)
         self._lease_current = self._lease_still_current()
         readiness = self.engine_readiness(include_device_state=False)
         if not (self._lease_current and readiness.standby_ready):
+            if self.device_state == RuntimeDeviceState.STANDBY_READY:
+                self._demote_standby_readiness()
             return
-        self._accepting_commands = True
+        if self.device_state != RuntimeDeviceState.STANDBY_READY:
+            self._set_device_state(RuntimeDeviceState.STANDBY_READY)
+        # Persist ACTIVE before either local ACTIVE or the mutation gate can
+        # become observable. A failed write leaves both closed.
         self._set_device_state(RuntimeDeviceState.ACTIVE)
+        self._accepting_commands = True
 
     def _perform_shutdown_sequence(self) -> None:
         """E4: gate commands, flush, reconcile, close feed, then stop."""

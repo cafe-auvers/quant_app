@@ -12,6 +12,8 @@ from sqlalchemy.schema import CreateTable
 from src.services import app_state
 from src.services import runtime_status
 from src.services import state_sync as ss
+from src.core.runtime_readiness import RuntimeDeviceState
+from src.services.runtime_device_state_repository import save_runtime_device_state
 import src.ui.main_window as main_window_module
 from src.ui.main_window import MainWindow
 
@@ -864,6 +866,58 @@ def test_release_retains_ownership_when_local_demotion_fails(monkeypatch):
     assert release_calls == []
 
 
+def test_claim_atomically_requires_the_exact_fresh_standby_generation(tmp_path):
+    engine = _make_engine(tmp_path)
+    laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    pc = ss.LocalDeviceRole("pc-id", "PC", False)
+    assert ss.claim_main_device(engine, laptop).success
+    ready = save_runtime_device_state(
+        engine,
+        device_id=pc.device_id,
+        hostname=pc.hostname,
+        state=RuntimeDeviceState.STANDBY_READY,
+    )
+
+    save_runtime_device_state(
+        engine,
+        device_id=pc.device_id,
+        hostname=pc.hostname,
+        state=RuntimeDeviceState.STANDBY,
+    )
+    rejected = ss.claim_main_device(
+        engine,
+        pc,
+        expected_standby_generation=ready.readiness_generation,
+    )
+
+    assert rejected.success is False
+    assert "not STANDBY_READY" in rejected.error
+    assert ss.get_main_device(engine).main_device.device_id == laptop.device_id
+
+
+def test_clean_handoff_claim_uses_the_persisted_standby_generation(tmp_path):
+    engine = _make_engine(tmp_path)
+    laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    pc = ss.LocalDeviceRole("pc-id", "PC", False)
+    assert ss.claim_main_device(engine, laptop).success
+    ready = save_runtime_device_state(
+        engine,
+        device_id=pc.device_id,
+        hostname=pc.hostname,
+        state=RuntimeDeviceState.STANDBY_READY,
+    )
+    assert ss.release_main_device(engine, laptop).success
+
+    claimed = ss.claim_main_device_if_unclaimed(
+        engine,
+        pc,
+        expected_standby_generation=ready.readiness_generation,
+    )
+
+    assert claimed.success is True
+    assert claimed.main_device.device_id == pc.device_id
+
+
 def test_release_retains_ownership_when_writer_cannot_be_disabled(monkeypatch):
     role = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
     release_calls = []
@@ -889,7 +943,7 @@ def test_release_retains_ownership_when_writer_cannot_be_disabled(monkeypatch):
     )
 
     assert released is False
-    assert demoted.is_main is False
+    assert demoted.is_main is True
     assert "writer still bound" in error
     assert release_calls == []
 
