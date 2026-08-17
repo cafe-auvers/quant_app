@@ -108,33 +108,30 @@ def test_init_mysql_uses_preprovisioned_database_with_bounded_timeouts(monkeypat
 
 
 def test_main_loads_repository_env_before_runtime_imports(monkeypatch):
-    """A normal ``python main.py`` launch must honor live flags in .env."""
+    """The early loader fills values before runtime modules snapshot config."""
 
-    monkeypatch.delenv("BUYBOARD_ENGINE_ENABLED", raising=False)
-    monkeypatch.delenv("KIS_LIVE_EXECUTION_MODE", raising=False)
+    key = "QUANT_TEST_EARLY_ENV_LOAD"
+    monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(
         config_module,
         "load_env_file",
-        lambda: {
-            "BUYBOARD_ENGINE_ENABLED": "true",
-            "KIS_LIVE_EXECUTION_MODE": "CONTROLLED_LIVE",
-        },
+        lambda: {key: "loaded-before-runtime-import"},
     )
 
     app_main._load_repository_environment()
 
-    assert app_main.os.environ["BUYBOARD_ENGINE_ENABLED"] == "true"
-    assert app_main.os.environ["KIS_LIVE_EXECUTION_MODE"] == "CONTROLLED_LIVE"
+    assert app_main.os.environ[key] == "loaded-before-runtime-import"
 
 
 def test_main_does_not_override_explicit_machine_environment(monkeypatch):
-    monkeypatch.setenv("BUYBOARD_ENGINE_ENABLED", "false")
+    key = "QUANT_TEST_EARLY_ENV_OVERRIDE"
+    monkeypatch.setenv(key, "machine-value")
     monkeypatch.setattr(
         config_module,
         "load_env_file",
-        lambda: {"BUYBOARD_ENGINE_ENABLED": "true"},
+        lambda: {key: "file-value"},
     )
 
     app_main._load_repository_environment()
 
-    assert app_main.os.environ["BUYBOARD_ENGINE_ENABLED"] == "false"
+    assert app_main.os.environ[key] == "machine-value"
