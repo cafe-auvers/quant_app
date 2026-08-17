@@ -1727,6 +1727,7 @@ def apply_reconciliation_plan(engine: Engine, plan: ReconciliationPlan) -> None:
         ensure_execution_orders_table,
         update_execution_order,
     )
+    from src.services.stop_change_coordinator import stop_change_coordinator_for
 
     # DDL/table discovery stays outside the account transaction so SQLite
     # and MySQL never open an implicit second connection while it is active.
@@ -1747,52 +1748,57 @@ def apply_reconciliation_plan(engine: Engine, plan: ReconciliationPlan) -> None:
     original_card_updated_at = {
         id(card): card.updated_at for card in (*plan.card_creates, *plan.card_updates)
     }
-    try:
-        with engine.begin() as conn:
-            for card in plan.card_creates:
-                trade_card_repository.insert_trade_card(conn, card)
-            for card in plan.card_updates:
-                trade_card_repository.update_trade_card_in_transaction(
-                    conn, card, expected_version=original_versions[id(card)]
-                )
-            for order in plan.order_updates:
-                update_execution_order(
-                    conn, order, expected_version=original_versions[id(order)]
-                )
-            for reservation in plan.reservation_updates:
-                update_reservation(
-                    conn,
-                    reservation,
-                    expected_version=original_versions[id(reservation)],
-                )
-            for external in plan.external_order_creates:
-                existing = get_discovered_external_order_by_broker_id(
-                    conn,
-                    environment=external.environment,
-                    account_no=external.account_no,
-                    broker_order_id=external.broker_order_id,
-                )
-                if existing is None:
-                    insert_discovered_external_order(conn, external)
-            for external in plan.external_order_updates:
-                update_discovered_external_order(
-                    conn,
-                    external,
-                    expected_version=original_versions[id(external)],
-                )
-    except Exception:
-        # These are cloned plan values, but resetting their optimistic
-        # versions keeps a caller from accidentally replaying a rolled-back
-        # in-memory version after a transient database failure.
-        for item in versioned:
-            item.version = original_versions[id(item)]
-        for card in (*plan.card_creates, *plan.card_updates):
-            card.updated_at = original_card_updated_at[id(card)]
-        raise
+    coordinator = stop_change_coordinator_for(engine)
+    changed_cards = tuple(plan.changed_cards)
+    with coordinator.lock_cards(card.card_key for card in changed_cards):
+        try:
+            with engine.begin() as conn:
+                for card in plan.card_creates:
+                    trade_card_repository.insert_trade_card(conn, card)
+                for card in plan.card_updates:
+                    trade_card_repository.update_trade_card_in_transaction(
+                        conn, card, expected_version=original_versions[id(card)]
+                    )
+                for order in plan.order_updates:
+                    update_execution_order(
+                        conn, order, expected_version=original_versions[id(order)]
+                    )
+                for reservation in plan.reservation_updates:
+                    update_reservation(
+                        conn,
+                        reservation,
+                        expected_version=original_versions[id(reservation)],
+                    )
+                for external in plan.external_order_creates:
+                    existing = get_discovered_external_order_by_broker_id(
+                        conn,
+                        environment=external.environment,
+                        account_no=external.account_no,
+                        broker_order_id=external.broker_order_id,
+                    )
+                    if existing is None:
+                        insert_discovered_external_order(conn, external)
+                for external in plan.external_order_updates:
+                    update_discovered_external_order(
+                        conn,
+                        external,
+                        expected_version=original_versions[id(external)],
+                    )
+        except Exception:
+            # These are cloned plan values, but resetting their optimistic
+            # versions keeps a caller from accidentally replaying a rolled-back
+            # in-memory version after a transient database failure.
+            for item in versioned:
+                item.version = original_versions[id(item)]
+            for card in (*plan.card_creates, *plan.card_updates):
+                card.updated_at = original_card_updated_at[id(card)]
+            raise
+        for card in changed_cards:
+            coordinator.reconcile_durable(card)
 
     # The database is authoritative. Refresh the local recovery snapshot
     # only after the whole account transaction commits.
-    for card in plan.changed_cards:
+    for card in changed_cards:
         try:
             trade_card_repository.sync_trade_card_local_snapshot(card)
         except Exception:

@@ -16,13 +16,14 @@ from typing import Dict, Iterable, Iterator, Optional
 
 from sqlalchemy.engine import Engine
 
-from src.core.trade_card_state import StopType, TradeCardState
+from src.core.trade_card_state import BoardStatus, StopType, TradeCardState
 
 
 @dataclass(frozen=True)
 class CoordinatedStopChange:
     card_key: str
     command_id: str
+    request_card_version: int
     stop_type: Optional[StopType]
     price: float
     quantity: int
@@ -37,6 +38,7 @@ class CoordinatedStopChange:
         return cls(
             card_key=card.card_key,
             command_id=card.pending_stop_command_id,
+            request_card_version=int(card.version),
             stop_type=card.pending_stop_type,
             price=float(card.pending_stop_price),
             quantity=int(card.pending_stop_quantity),
@@ -85,8 +87,9 @@ class StopChangeCoordinator:
 
     def record_durable(self, card: TradeCardState) -> None:
         change = CoordinatedStopChange.from_card(card)
-        with self._guard:
-            self._pending[change.card_key] = change
+        with self.lock_cards([change.card_key]):
+            with self._guard:
+                self._pending[change.card_key] = change
 
     def overlay_pending(self, cards: Iterable[TradeCardState]) -> None:
         """Overlay a just-committed request onto an older worker snapshot."""
@@ -97,7 +100,29 @@ class StopChangeCoordinator:
             change = pending.get(card.card_key)
             if change is None:
                 continue
+            if card.pending_stop_command_id == change.command_id:
+                change.apply_to(card)
+                continue
             if change.matches_active(card):
+                continue
+            # A local object may already have terminated the lifecycle but
+            # not persisted it yet. Never resurrect the request into an
+            # ineligible lifecycle; durable reconciliation below owns
+            # retiring it after the version advances.
+            if card.board_status not in {
+                BoardStatus.OPEN_POSITION,
+                BoardStatus.PARTIAL_SELL,
+            }:
+                continue
+            # A newer canonical state without this command proves another
+            # durable write superseded or terminated the request. The normal
+            # persistence paths reconcile eagerly; this is a defensive read
+            # path for a coordinator surviving an unusual caller.
+            if (
+                int(card.version) > change.request_card_version
+                and not card.pending_stop_command_id
+            ):
+                self.reconcile_durable(card)
                 continue
             if (
                 card.pending_stop_command_id
@@ -106,15 +131,39 @@ class StopChangeCoordinator:
                 continue
             change.apply_to(card)
 
-    def complete_if_durable(self, card: TradeCardState) -> bool:
-        """Forget a request only after its active state persisted successfully."""
+    def reconcile_durable(self, card: TradeCardState) -> bool:
+        """Reconcile one successful canonical card write with pending state.
 
-        with self._guard:
-            change = self._pending.get(card.card_key)
-            if change is None or not change.matches_active(card):
-                return False
-            self._pending.pop(card.card_key, None)
-            return True
+        The card lock serializes this decision with a concurrent UI stop
+        commit. A newer request can therefore never be removed by cleanup
+        associated with the prior trade cycle.
+        """
+
+        with self.lock_cards([card.card_key]):
+            with self._guard:
+                change = self._pending.get(card.card_key)
+                if change is None:
+                    return False
+                if card.pending_stop_command_id == change.command_id:
+                    return False
+                completed = change.matches_active(card)
+                superseded = (
+                    int(card.version) > change.request_card_version
+                    and not card.pending_stop_command_id
+                )
+                if not completed and not superseded:
+                    return False
+                # Recheck object identity under the guard: record_durable()
+                # may have installed a newer request while this caller was
+                # waiting for the card lock.
+                if self._pending.get(card.card_key) is not change:
+                    return False
+                self._pending.pop(card.card_key, None)
+                return True
+
+    # Compatibility for callers/tests from the first coordinator revision.
+    def complete_if_durable(self, card: TradeCardState) -> bool:
+        return self.reconcile_durable(card)
 
     def pending_for(self, card_key: str) -> Optional[CoordinatedStopChange]:
         with self._guard:

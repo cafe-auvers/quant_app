@@ -771,7 +771,17 @@ then acknowledges. A concurrent harmless card edit that defeats the worker's
 CAS therefore leaves the latch outstanding for replay against the next
 canonical snapshot.
 
-Tests: `test_a_breach_between_two_higher_prices_in_one_drain_window_is_never_lost`, `test_a_stop_price_change_forces_a_drain_against_the_old_version_first`, `test_a_trade_after_a_stop_change_is_evaluated_against_the_new_version_only`, `test_trade_arriving_exactly_during_stop_version_change_is_assigned_to_one_and_only_one_stop_version`, `test_latch_clears_only_on_explicit_engine_acknowledgement`, `test_ui_stop_commit_reaches_feed_when_worker_card_snapshot_is_stale`, `test_stop_breach_ack_waits_for_successful_card_cas`.
+Coordinator lifetime is also tied to the durable card version created by the
+stop request, not merely to `(environment, account, symbol)`. Ordinary card
+persistence and atomic account reconciliation both reconcile coordinator
+state under the same per-card lock. The exact pending command keeps the
+request alive; a durably active requested stop completes it; and any newer
+durable version with that command absent retires it as superseded or
+terminated. Consequently `confirm_flat()` cannot leave a prior trade's stop
+request available to overlay onto a later trade cycle for the same symbol,
+and cleanup for an old request cannot delete a newer racing request.
+
+Tests: `test_a_breach_between_two_higher_prices_in_one_drain_window_is_never_lost`, `test_a_stop_price_change_forces_a_drain_against_the_old_version_first`, `test_a_trade_after_a_stop_change_is_evaluated_against_the_new_version_only`, `test_trade_arriving_exactly_during_stop_version_change_is_assigned_to_one_and_only_one_stop_version`, `test_latch_clears_only_on_explicit_engine_acknowledgement`, `test_ui_stop_commit_reaches_feed_when_worker_card_snapshot_is_stale`, `test_stop_breach_ack_waits_for_successful_card_cas`, `test_flat_confirmation_retires_pending_stop_before_next_trade_cycle`, `test_account_reconciliation_flat_retires_pending_stop`, `test_new_stop_request_survives_race_with_old_request_retirement`.
 
 #### D9. Decision semantics (additions: emergency pricing)
 

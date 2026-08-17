@@ -1027,8 +1027,6 @@ class BuyboardRuntimeWorker(QThread):
         persisted: List[TradeCardState] = []
         if canonical_available:
             persisted = self._persist_changed(changed)
-        for card in persisted:
-            self._stop_change_coordinator.complete_if_durable(card)
         durable_breach_keys = durably_liquidating_card_keys | {
             card.card_key for card in persisted if card.exit_all_required
         }
@@ -1970,16 +1968,20 @@ class BuyboardRuntimeWorker(QThread):
         persisted: List[TradeCardState] = []
         for card in cards:
             try:
-                try:
-                    repo.update_trade_card(self._db_engine, card, expected_version=card.version)
-                except repo.TradeCardNotFoundError:
-                    # A newly *discovered* card -- e.g. a manually-purchased
-                    # broker position with no prior local card
-                    # (PositionManager.discover_manual_position, surfaced
-                    # via startup/full-account reconciliation) -- has never
-                    # been persisted. Create it instead of dropping it.
-                    repo.create_trade_card(self._db_engine, card)
-                persisted.append(card)
+                with self._stop_change_coordinator.lock_cards([card.card_key]):
+                    try:
+                        repo.update_trade_card(
+                            self._db_engine, card, expected_version=card.version
+                        )
+                    except repo.TradeCardNotFoundError:
+                        # A newly *discovered* card -- e.g. a manually-purchased
+                        # broker position with no prior local card
+                        # (PositionManager.discover_manual_position, surfaced
+                        # via startup/full-account reconciliation) -- has never
+                        # been persisted. Create it instead of dropping it.
+                        repo.create_trade_card(self._db_engine, card)
+                    self._stop_change_coordinator.reconcile_durable(card)
+                    persisted.append(card)
             except Exception:
                 # A stale version (another device changed this card
                 # concurrently) or a transient DB error must not stop the
