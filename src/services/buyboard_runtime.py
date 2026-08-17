@@ -115,6 +115,11 @@ from sqlalchemy.engine import Engine
 
 from src.core import execution_config
 from src.core.execution_mode import ExecutionLease, ExecutionMode, ExecutionSource
+from src.core.exit_execution_command import (
+    build_exit_execution_command,
+    exit_execution_policy,
+    marketable_exit_limit_price,
+)
 from src.core.execution_request import (
     CancelIntent,
     derive_execution_client_order_id,
@@ -139,7 +144,11 @@ from src.services.execution_command_gateway import (
     ExecutionCommandGateway,
     get_default_execution_gateway,
 )
-from src.services.execution_workflow_service import request_cancel_intent, request_submit
+from src.services.execution_workflow_service import (
+    request_cancel_intent,
+    request_exit_submit,
+    request_submit,
+)
 from src.services.execution_order_repository import (
     fetch_execution_order,
     list_execution_orders_for_card,
@@ -209,33 +218,15 @@ def _marketable_sell_limit_price(
     last_trusted_price: Optional[float] = None,
     emergency_reprice_attempt: int = 0,
 ) -> Optional[float]:
-    """A bounded marketable SELL limit below a fresh bid, else a small
-    discount off the last trusted trade price -- mirrors the existing legacy Buy
-    Dashboard's ``src.ui.buylist.constants.STOP_LOSS_SELL_LIMIT_DISCOUNT_PCT``
-    approach (same number, re-declared as
-    ``execution_config.SELL_MARKETABLE_DISCOUNT_PCT`` rather than importing
-    across the services/ui boundary).
-    """
-    if quote_is_execution_ready and quote is not None and quote.bid:
-        # The bid is the reference, while the configured collar provides a
-        # bounded chance of execution if the top of book moves before the
-        # limit reaches the broker.  This remains a limit order, never an
-        # unbounded market order.
-        return float(quote.bid) * (
-            1.0 - execution_config.SELL_MARKETABLE_DISCOUNT_PCT
-        )
-    reference = last_trusted_price
-    if reference is None and quote_is_execution_ready and quote is not None:
-        reference = quote.last_price
-    if reference:
-        # Bounded, controlled collar widening. The caller enforces the hard
-        # attempt cap; no unbounded market order is assumed safe.
-        discount = execution_config.SELL_MARKETABLE_DISCOUNT_PCT * max(
-            1, emergency_reprice_attempt + 1
-        )
-        discount = min(discount, 0.05)
-        return float(reference) * (1.0 - discount)
-    return None
+    """Compatibility wrapper around the shared frontend-neutral policy."""
+
+    return marketable_exit_limit_price(
+        bid_price=quote.bid if quote is not None else None,
+        last_price=quote.last_price if quote is not None else None,
+        last_trusted_price=last_trusted_price,
+        quote_is_execution_ready=quote_is_execution_ready,
+        emergency_reprice_attempt=emergency_reprice_attempt,
+    )
 
 
 def _eod_window_reached() -> bool:
@@ -952,32 +943,53 @@ def build_buyboard_runtime(
             submit_kwargs.get("account_no", ""),
             symbol,
         )
-        quote = resolved_market_data.latest_quote(symbol)
-        quote_ready = resolved_market_data.is_symbol_execution_ready(
-            symbol, require_trade=False, require_quote=True
-        )
-        emergency_attempt = int(card.exit_attempt_count if card is not None else 0)
-        if (
-            not quote_ready
-            and emergency_attempt
-            >= execution_config.EMERGENCY_EXIT_MAX_REPRICE_ATTEMPTS
-        ):
-            raise ExecutionGradeDataUnavailableError(
-                f"Emergency SELL collar retry limit reached for {symbol}; manual intervention required"
-            )
-        limit_price = _marketable_sell_limit_price(
-            quote,
-            quote_is_execution_ready=quote_ready,
-            last_trusted_price=(
-                card.market_data_last_trusted_price if card is not None else None
-            ),
-            emergency_reprice_attempt=emergency_attempt,
-        )
-        if limit_price is None:
-            raise ExecutionGradeDataUnavailableError(
-                f"No fresh bid or last trusted price is available to price a bounded SELL for {symbol}"
-            )
         exchange = submit_kwargs.pop("exchange", "NASD")
+        # Use the engine's exact session oracle so a board decision and the
+        # shared exit command cannot disagree at the same boundary.
+        regular_session_open = trading_engine._market_is_open()
+        execution_policy = exit_execution_policy(
+            environment=submit_kwargs.get("environment", ""),
+            intent=intent,
+            regular_session_open=regular_session_open,
+        )
+        if execution_policy == REGULAR_LIMIT_EXECUTION:
+            quote = resolved_market_data.latest_quote(symbol)
+            quote_ready = resolved_market_data.is_symbol_execution_ready(
+                symbol, require_trade=False, require_quote=True
+            )
+            emergency_attempt = int(card.exit_attempt_count if card is not None else 0)
+            if (
+                not quote_ready
+                and emergency_attempt
+                >= execution_config.EMERGENCY_EXIT_MAX_REPRICE_ATTEMPTS
+            ):
+                raise ExecutionGradeDataUnavailableError(
+                    f"Emergency SELL collar retry limit reached for {symbol}; manual intervention required"
+                )
+            limit_price = _marketable_sell_limit_price(
+                quote,
+                quote_is_execution_ready=quote_ready,
+                last_trusted_price=(
+                    card.market_data_last_trusted_price if card is not None else None
+                ),
+                emergency_reprice_attempt=emergency_attempt,
+            )
+            if limit_price is None:
+                raise ExecutionGradeDataUnavailableError(
+                    f"No fresh bid or last trusted price is available to price a bounded SELL for {symbol}"
+                )
+        else:
+            limit_price = 0.0
+        exit_command = build_exit_execution_command(
+            environment=submit_kwargs.get("environment", ""),
+            account_no=submit_kwargs.get("account_no", ""),
+            symbol=symbol,
+            intent=intent,
+            quantity=submit_kwargs.get("quantity", 0),
+            regular_session_open=regular_session_open,
+            limit_price=limit_price,
+            exchange=exchange,
+        )
         if guarded_mode:
             if card is None:
                 raise RuntimeError(
@@ -993,16 +1005,12 @@ def build_buyboard_runtime(
         # shared workflow service -- see submit_order's identical comment
         # above for the shared guarded/compatibility contract.
         try:
-            return request_submit(
+            return request_exit_submit(
                 source=ExecutionSource.KANBAN_BOARD,
+                command=exit_command,
                 gateway=resolved_broker,
                 strategy_instance_id=strategy_instance_id,
                 lease=guarded_lease,
-                emergency=reason in {"sell_all", "sell_all_retry", "stop_loss"},
-                side=OrderSide.SELL,
-                intent=intent,
-                limit_price=limit_price,
-                exchange=exchange,
                 plan_id=f"{submit_kwargs.get('environment', '')}:{symbol}:SELL:{reason}",
                 execution_authority=execution_authority,
                 execution_lease=legacy_lease,

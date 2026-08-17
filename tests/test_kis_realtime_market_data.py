@@ -259,7 +259,9 @@ def test_stop_price_change_forces_drain_against_old_version_first():
 
 def test_trade_during_stop_change_is_assigned_once():
     accumulator = PendingMarketStateAccumulator(clock=lambda: NOW)
-    accumulator.replace_stop_rules("AAPL", [StopRule("card", 100, "old")])
+    old = StopRule("card", 100, "old")
+    new = StopRule("card", 98, "new")
+    accumulator.replace_stop_rules("AAPL", [old])
     barrier = threading.Barrier(2)
 
     def publish():
@@ -269,11 +271,16 @@ def test_trade_during_stop_change_is_assigned_once():
     thread = threading.Thread(target=publish)
     thread.start()
     barrier.wait()
-    accumulator.replace_stop_rules("AAPL", [StopRule("card", 98, "new")])
+    accumulator.replace_stop_rules("AAPL", [new])
     thread.join()
 
     drained = accumulator.drain_all()
+    event_generations = [
+        item.stop_rules for item in drained if item.pending.event_count
+    ]
     assert sum(item.pending.event_count for item in drained) == 1
+    assert len(event_generations) == 1
+    assert event_generations[0] in {(old,), (new,)}
 
 
 def test_latch_clears_only_on_explicit_engine_acknowledgement():

@@ -10,9 +10,19 @@ from PyQt5.QtCore import QMimeData, Qt
 from PyQt5.QtGui import QDrag
 from PyQt5.QtWidgets import QAbstractItemView, QListWidget, QListWidgetItem, QMenu
 
+from src.core.board_workflow import (
+    BoardCardProjection,
+    BoardExecutionOrderProjection,
+    BoardExternalOrderProjection,
+)
 from src.core.trade_card_state import BoardStatus, TradeCardState
 
-from .card import TradeCardWidget, card_drag_payload
+from .card import (
+    ExternalOrderWidget,
+    TradeCardWidget,
+    UnlinkedExecutionOrderWidget,
+    card_drag_payload,
+)
 
 # Left-to-right column order exactly as the spec lists it (section 18-31).
 BOARD_COLUMN_ORDER: List[BoardStatus] = [
@@ -60,12 +70,14 @@ class BoardColumnList(QListWidget):
         board_status: BoardStatus,
         on_card_dropped: Callable[[dict, BoardStatus], None],
         on_card_context_menu: Optional[Callable[[dict, "object"], None]] = None,
+        on_external_order_adopt: Optional[Callable[[object], None]] = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self.board_status = board_status
         self._on_card_dropped = on_card_dropped
         self._on_card_context_menu = on_card_context_menu
+        self._on_external_order_adopt = on_external_order_adopt
         self.setDragDropMode(QAbstractItemView.DragDrop)
         self.setSelectionMode(QAbstractItemView.SingleSelection)
         self.setSpacing(6)
@@ -140,7 +152,12 @@ class BoardColumnList(QListWidget):
 
     def set_cards(
         self,
-        cards: List[TradeCardState],
+        cards: List[
+            TradeCardState
+            | BoardCardProjection
+            | BoardExternalOrderProjection
+            | BoardExecutionOrderProjection
+        ],
         quote_lookup: Optional[Callable[[str], Optional[float]]] = None,
     ) -> None:
         """``quote_lookup``, when supplied, returns the live last price for
@@ -154,10 +171,56 @@ class BoardColumnList(QListWidget):
         regardless.
         """
         self.clear()
-        for card in sorted(cards, key=lambda c: -c.kanban_priority):
+        def state(item):
+            return item.card if isinstance(item, BoardCardProjection) else item
+
+        def priority(item):
+            if isinstance(
+                item, (BoardExternalOrderProjection, BoardExecutionOrderProjection)
+            ):
+                return 0
+            return state(item).kanban_priority
+
+        for card in sorted(cards, key=lambda c: -priority(c)):
+            if isinstance(card, BoardExternalOrderProjection):
+                external_item = QListWidgetItem(self)
+                external_item.setFlags(Qt.ItemIsEnabled)
+                external_widget = ExternalOrderWidget(
+                    card.order,
+                    on_adopt=self._on_external_order_adopt,
+                )
+                external_item.setSizeHint(external_widget.sizeHint())
+                self.setItemWidget(external_item, external_widget)
+                continue
+            if isinstance(card, BoardExecutionOrderProjection):
+                owned_item = QListWidgetItem(self)
+                owned_item.setFlags(Qt.ItemIsEnabled)
+                owned_widget = UnlinkedExecutionOrderWidget(card.order)
+                owned_item.setSizeHint(owned_widget.sizeHint())
+                self.setItemWidget(owned_item, owned_widget)
+                continue
+            card_state = state(card)
             item = QListWidgetItem(self)
             item.setData(Qt.UserRole, card_drag_payload(card))
-            current_price = quote_lookup(card.symbol) if quote_lookup is not None else None
+            current_price = quote_lookup(card_state.symbol) if quote_lookup is not None else None
             widget = TradeCardWidget(card, current_price=current_price)
             item.setSizeHint(widget.sizeHint())
             self.setItemWidget(item, widget)
+            if isinstance(card, BoardCardProjection):
+                for owned_order in card.unlinked_owned_orders:
+                    owned_item = QListWidgetItem(self)
+                    owned_item.setFlags(Qt.ItemIsEnabled)
+                    owned_widget = UnlinkedExecutionOrderWidget(owned_order)
+                    owned_item.setSizeHint(owned_widget.sizeHint())
+                    self.setItemWidget(owned_item, owned_widget)
+                for external_order in card.external_orders:
+                    external_item = QListWidgetItem(self)
+                    # No card payload: an external order cannot be dragged as
+                    # though it were application-owned state.
+                    external_item.setFlags(Qt.ItemIsEnabled)
+                    external_widget = ExternalOrderWidget(
+                        external_order,
+                        on_adopt=self._on_external_order_adopt,
+                    )
+                    external_item.setSizeHint(external_widget.sizeHint())
+                    self.setItemWidget(external_item, external_widget)

@@ -386,6 +386,11 @@ class PositionManager:
         card.stop_type = None
         card.active_stop_price = None
         card.stop_quantity = 0
+        card.pending_stop_type = None
+        card.pending_stop_price = None
+        card.pending_stop_quantity = 0
+        card.pending_stop_command_id = ""
+        card.pending_stop_requested_at = None
         card.exit_all_required = False
         card.sell_all_at_market_open = False
         card.market_data_outage_started_at = None

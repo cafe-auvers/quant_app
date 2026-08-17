@@ -49,7 +49,7 @@ methods for the exact finding each one addresses):
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional
 
@@ -319,6 +319,53 @@ class TradingEngine:
         if not matching:
             return []
         return self._evaluate_buy_today(matching, quote_overrides={symbol: quote})
+
+    def evaluate_pending_stop_handoff(
+        self, cards: List[TradeCardState], quote: QuoteSnapshot
+    ) -> List[TradeCardState]:
+        """Evaluate the narrow request-to-feed-lock window safely.
+
+        A trade received after the durable UI request but just before the
+        feed lock installed the tighter rule is detached with the old stop.
+        It is evaluated against that old generation first, then against the
+        requested protection.  A trade received after installation already
+        carries the new override, so sticky liquidation makes this check a
+        no-op and the event can trigger at most once.
+        """
+
+        if not self.is_enabled() or not quote.regular_session:
+            return []
+        changed: List[TradeCardState] = []
+        for card in cards:
+            requested_at = card.pending_stop_requested_at
+            pending_price = float(card.pending_stop_price or 0.0)
+            if (
+                card.symbol != quote.symbol.upper()
+                or card.board_status not in _TICK_REACTIVE_POSITION_STATUSES
+                or not card.pending_stop_command_id
+                or requested_at is None
+                or quote.received_at < requested_at
+                or pending_price <= 0
+                or quote.last_price > pending_price
+                or card.exit_all_required
+            ):
+                continue
+            old_active = card.active_stop_price
+            without_card_override = replace(
+                quote,
+                stop_price_overrides=tuple(
+                    item
+                    for item in quote.stop_price_overrides
+                    if item[0] != card.card_key
+                ),
+            )
+            try:
+                card.active_stop_price = pending_price
+                if self._evaluate_quote_for_card(card, without_card_override):
+                    changed.append(card)
+            finally:
+                card.active_stop_price = old_active
+        return changed
 
     def _evaluate_quote_for_card(self, card: TradeCardState, quote: QuoteSnapshot) -> bool:
         was_exit_required = card.exit_all_required
@@ -1324,7 +1371,7 @@ class TradingEngine:
         changed: List[TradeCardState] = []
         now = self._clock()
         for card in cards:
-            if card.board_status != BoardStatus.SELL_ALL or card.sell_all_at_market_open:
+            if card.board_status != BoardStatus.SELL_ALL:
                 continue
             try:
                 order = self._position_callbacks.find_open_sell_order(card)
@@ -1369,7 +1416,7 @@ class TradingEngine:
         changed: List[TradeCardState] = []
         now = self._clock()
         for card in cards:
-            if card.board_status != BoardStatus.SELL_ALL or card.sell_all_at_market_open:
+            if card.board_status != BoardStatus.SELL_ALL:
                 continue
             if card.next_exit_retry_at is not None and now < card.next_exit_retry_at:
                 continue  # P1-4: back off after a rejected/errored submission
@@ -1419,7 +1466,8 @@ class TradingEngine:
                 # path (e.g. a stop hit while the market happens to be
                 # closed) must wait for the session, not fire a
                 # regular-hours order outside it.
-                if not self._market_is_open():
+                market_open = self._market_is_open()
+                if not market_open and not card.sell_all_at_market_open:
                     continue
                 card.broker_quantity = remaining
                 card.orderable_quantity = remaining
@@ -1429,7 +1477,11 @@ class TradingEngine:
                     account_no=card.account_no,
                     symbol=card.symbol,
                     quantity=remaining,
-                    reason="sell_all_retry",
+                    reason=(
+                        "sell_all"
+                        if card.sell_all_at_market_open
+                        else "sell_all_retry"
+                    ),
                     attempt_deadline_at=deadline.isoformat(),
                     trade_card=card,
                 )
@@ -1437,6 +1489,9 @@ class TradingEngine:
                     self._back_off_exit_retry(card, order.error_message or "Sell All rejected")
                 else:
                     self._consume_exit_attempt(card)
+                    if card.sell_all_at_market_open:
+                        card.sell_all_at_market_open = False
+                        card.position_runtime_status = PositionRuntimeStatus.LIQUIDATING
                     card.next_exit_retry_at = None
                     card.last_exit_error = ""
                 changed.append(card)

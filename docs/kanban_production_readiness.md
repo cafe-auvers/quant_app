@@ -155,7 +155,7 @@ PR's behavior composes correctly, plus the Gate 1 run in full.
 | 10 | Rate-limit and command-priority scheduling | PR6 DRAFT IMPLEMENTED, not activated — strict priorities, per-account/endpoint budgets initialized only from explicit WS0 evidence, and typed pre-acceptance retry classification. |
 | 11 | Database-outage behavior | PR6 DRAFT IMPLEMENTED, not activated — bounded last-verified emergency lease, versioned ownership proof, fsynced local journal, protective completion-BUY cancellation, card-correlation recovery, and mandatory post-recovery broker reconciliation. |
 | 12 | External-alert delivery | PR6 DRAFT IMPLEMENTED, not activated — durable incident retry/dedupe/ack/escalation, HTTPS provider wiring, DB-independent local alert spool/direct delivery, and external-watchdog heartbeat publication. |
-| 13 | Kanban feature parity and UI projection | NOT STARTED |
+| 13 | Kanban feature parity and UI projection | PR7 IMPLEMENTED on `agent/pr7-kanban-feature-parity`, not activated â€” typed domain-owned board requests now enter only through `ExecutionWorkflowService`; real legacy and Kanban entry-monitoring, stop-change, and exit paths construct the same frontend-neutral commands (including broker-held premarket `RESERVED_MOO` exits); stop changes remain pending until the runtime atomically installs the new feed rule and evaluates the detached generation; card/ownership/readiness revisions are fenced; and active adopted-but-unlinked broker orders remain a final gateway fence until terminal reconciliation. All production activation flags and verified capacities remain closed. |
 
 ---
 
@@ -569,6 +569,12 @@ prior database generation.
             USER_ADOPTED and is preserved as the audit trail of what was
             actually discovered, never rewritten to look application-
             originated -- see ExternalOrderDisposition above
+        adoption alone does NOT clear the final mutation fence: while that
+            USER_ADOPTED execution record is active and still unlinked, all
+            other submit/cancel/replace mutations for the symbol remain
+            fenced; only terminal reconciliation or an explicit proven link/
+            resolution may clear it (an authorized cancel/replace may target
+            that exact adopted order)
 ```
 
 ### Reconciliation classification precedence (revision 3.1)
@@ -698,6 +704,23 @@ shape), the engine forces an immediate drain-and-evaluation of the current
 `PendingMarketState` against the **old** stop version *before* the new stop
 takes effect.
 
+For a UI-originated change, `active_stop_price` therefore remains the old
+live rule while the card carries a durable `pending_stop_*` request. The
+runtime installs the pending rule under the feed lock, drains/evaluates the
+old generation, applies the requested tighter rule to any post-request event
+that landed immediately before the lock handoff, and only then promotes the
+pending fields to the active stop. The board renders this as `STOP CHANGE
+PENDING`; it never displays the requested price as active protection early.
+
+PR7 adds the UI-to-worker half of this boundary. A per-database
+`StopChangeCoordinator` holds the card lock across the workflow service's
+final CAS/commit and publication of the durable request. The runtime takes
+the same lock at its feed/evaluation boundary and overlays a just-committed
+request onto an older in-memory card. A handoff-only breach (for example,
+95 -> 100 while a trade at 98 was observed under the old rule) is promoted
+into the accumulator's normal exact breach latch, so a later card CAS
+conflict replays that event instead of losing it.
+
 **Revision 3.1 correction:** "synchronously drain" is not itself sufficient
 without a real synchronization primitive shared between the market-data
 feed thread (which publishes ticks into the accumulator) and the engine
@@ -741,7 +764,24 @@ bucket-level latch. The min and max are representative `QuoteSnapshot`s, not
 only scalar prices, so event time and exact identity survive coalescing and
 both downward stops and upward entry breakouts remain actionable.
 
-Tests: `test_a_breach_between_two_higher_prices_in_one_drain_window_is_never_lost`, `test_a_stop_price_change_forces_a_drain_against_the_old_version_first`, `test_a_trade_after_a_stop_change_is_evaluated_against_the_new_version_only`, `test_trade_arriving_exactly_during_stop_version_change_is_assigned_to_one_and_only_one_stop_version`, `test_latch_clears_only_on_explicit_engine_acknowledgement`.
+The worker does not acknowledge any exact breach identity merely because its
+local card says `exit_all_required`. It first persists that safety consequence
+successfully (or proves the card was already durably liquidating when loaded),
+then acknowledges. A concurrent harmless card edit that defeats the worker's
+CAS therefore leaves the latch outstanding for replay against the next
+canonical snapshot.
+
+Coordinator lifetime is also tied to the durable card version created by the
+stop request, not merely to `(environment, account, symbol)`. Ordinary card
+persistence and atomic account reconciliation both reconcile coordinator
+state under the same per-card lock. The exact pending command keeps the
+request alive; a durably active requested stop completes it; and any newer
+durable version with that command absent retires it as superseded or
+terminated. Consequently `confirm_flat()` cannot leave a prior trade's stop
+request available to overlay onto a later trade cycle for the same symbol,
+and cleanup for an old request cannot delete a newer racing request.
+
+Tests: `test_a_breach_between_two_higher_prices_in_one_drain_window_is_never_lost`, `test_a_stop_price_change_forces_a_drain_against_the_old_version_first`, `test_a_trade_after_a_stop_change_is_evaluated_against_the_new_version_only`, `test_trade_arriving_exactly_during_stop_version_change_is_assigned_to_one_and_only_one_stop_version`, `test_latch_clears_only_on_explicit_engine_acknowledgement`, `test_ui_stop_commit_reaches_feed_when_worker_card_snapshot_is_stale`, `test_stop_breach_ack_waits_for_successful_card_cas`, `test_flat_confirmation_retires_pending_stop_before_next_trade_cycle`, `test_account_reconciliation_flat_retires_pending_stop`, `test_new_stop_request_survives_race_with_old_request_retirement`.
 
 #### D9. Decision semantics (additions: emergency pricing)
 
@@ -1079,14 +1119,39 @@ owned cards).
 
 | Legacy Buy Dashboard action | Kanban equivalent |
 |---|---|
-| Add to Buy Today | Drag `Buylist` → `Buy Today` |
-| Cancel a pending entry | Drag `Entry Pending` → `Buylist`, or an explicit Cancel control |
-| Partial sell | Drag `Open Position` → `Partial Sell` + quantity dialog |
-| Sell All | Drag `Open Position` → `Sell All` |
-| Change stop type | ORB-low / breakeven / manual-price control on the card |
-| Pre-market Sell All | Durable next-session exit instruction (ties into D9's outside-regular-session pricing) |
-| EOD unfilled entry | Automatic return to `Buylist` |
-| Partial fill | Card remains tracked as a position plus the remaining working-order state (not silently treated as fully complete) |
+| Add to Buy Today | Drag `Buylist` → `Buy Today` — `test_l3_add_to_buy_today_produces_the_same_entry_monitoring_command` |
+| Cancel a pending entry | Drag `Entry Pending` → `Buylist`, or an explicit Cancel control — `test_l3_pending_entry_cancel_produces_the_same_cancel_intent` |
+| Partial sell | Drag `Open Position` → `Partial Sell` + quantity dialog — `test_l3_partial_sell_produces_equal_submission_result_and_command` |
+| Sell All | Drag `Open Position` → `Sell All` — `test_l3_sell_all_produces_equal_submission_result_and_command` |
+| Change stop type | ORB-low / breakeven / manual-price control on the card — `test_l3_stop_change_produces_the_same_protective_domain_state` |
+| Pre-market Sell All | Durable next-session exit instruction (ties into D9's outside-regular-session pricing) — `test_l3_premarket_sell_all_produces_the_same_next_open_intent` |
+| EOD unfilled entry | Automatic return to `Buylist` — `test_l3_eod_unfilled_entry_produces_the_same_authoritative_transition` |
+| Partial fill | Card remains tracked as a position plus the remaining working-order state (not silently treated as fully complete) — `test_l3_partial_fill_produces_the_same_reconciled_position_and_order_tracking` |
+
+For regular-session Partial Sell and Sell All, both real frontends now pass
+their normalized market observation into the same bounded SELL-pricing
+function before constructing `ExitExecutionCommand`. The parity tests invoke
+the actual legacy handler without injecting a precomputed Kanban price; equal
+market state therefore produces equal commands by implementation rather than
+test setup.
+
+PR7 traceability is intentionally split between the new frontend-boundary
+suite and the already-merged execution/reconciliation suites. The board
+tests assert the command/intention boundary; the downstream tests assert
+that broker truth, not the gesture, completes the lifecycle:
+
+| WS13 scenario | Regression coverage |
+|---|---|
+| Buylist â†’ Buy Today, revision-aware activation | `test_buylist_to_buy_today_is_a_revision_aware_workflow_request` |
+| Entry pending/fill/cancel/EOD return | `test_entry_pending_card_moves_to_open_position_on_full_fill_at_deadline`, `test_entry_pending_zero_fill_cancels_releases_capital_and_returns_to_buylist` |
+| Ambiguous entry and duplicate UI actions | `test_ambiguous_entry_blocks_user_cancel_until_reconciliation`, `test_two_sell_all_gestures_record_one_intent_and_never_declare_flat` |
+| Partial Sell request/fill/reconciliation | `test_partial_sell_uses_broker_orderable_quantity_and_stays_pending`, `test_partial_sell_fill_moves_stop_to_breakeven_and_returns_to_open_position` |
+| Sell All BUY-conflict cancellation/retry/flat confirmation | `test_outage_sell_all_cancels_completion_buy_before_one_sell`, `test_sell_all_closes_once_broker_confirms_zero` |
+| ORB/breakeven/manual stop projection | `test_stop_changes_use_frozen_orb_then_breakeven_then_manual` |
+| Stale card/readiness/ownership protection | `test_stale_card_revision_cannot_overwrite_reconciled_truth`, `test_stale_readiness_generation_and_reconciliation_both_fail_closed`, `test_ownership_revision_change_after_render_is_rejected` |
+| Buy Today backward-move/cancellation lifecycle | `test_buy_today_with_persisted_entry_identity_requires_cancel_lifecycle` |
+| External order visibility, explicit adoption, and unlinked execution fence | `test_external_order_is_distinct_fenced_and_only_explicitly_adopted`, `test_active_unlinked_owned_order_fences_entry_affecting_board_actions`, `test_external_order_without_a_trade_card_still_projects_and_can_be_explicitly_adopted` |
+| Legacy/Kanban workflow parity | all eight explicit `test_l3_*` rows in `tests/test_ws13_legacy_kanban_parity.py`, driven through the real legacy handlers and Kanban runtime/reducer paths; guarded/legacy workflow integration suites |
 
 ---
 

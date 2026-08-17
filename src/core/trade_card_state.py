@@ -218,6 +218,13 @@ class TradeCardState:
     stop_type: Optional[StopType] = None
     active_stop_price: Optional[float] = None
     stop_quantity: int = 0
+    # A UI stop request is not active protection until the runtime rotates
+    # the market-data accumulator under its per-symbol feed lock.
+    pending_stop_type: Optional[StopType] = None
+    pending_stop_price: Optional[float] = None
+    pending_stop_quantity: int = 0
+    pending_stop_command_id: str = ""
+    pending_stop_requested_at: Optional[datetime] = None
 
     # Exit state (sections 17-18)
     exit_all_required: bool = False
@@ -336,6 +343,18 @@ class TradeCardState:
             self.stop_type = _enum_from_value(self.stop_type, StopType, StopType.ORB_LOW)
         self.active_stop_price = _finite_float(self.active_stop_price)
         self.stop_quantity = int(self.stop_quantity or 0)
+        if self.pending_stop_type is not None:
+            self.pending_stop_type = _enum_from_value(
+                self.pending_stop_type, StopType, StopType.ORB_LOW
+            )
+        self.pending_stop_price = _finite_float(self.pending_stop_price)
+        self.pending_stop_quantity = int(self.pending_stop_quantity or 0)
+        self.pending_stop_command_id = str(self.pending_stop_command_id or "")
+        self.pending_stop_requested_at = (
+            _parse_timestamp(self.pending_stop_requested_at)
+            if self.pending_stop_requested_at
+            else None
+        )
         self.exit_all_required = bool(self.exit_all_required)
         self.sell_all_at_market_open = bool(self.sell_all_at_market_open)
         self.pending_partial_sell_quantity = int(self.pending_partial_sell_quantity or 0)
@@ -381,6 +400,21 @@ class TradeCardState:
     def card_key(self) -> str:
         """``(environment, account_no, symbol)`` as a single lookup key."""
         return f"{self.environment}:{self.account_no}:{self.symbol}"
+
+    def acknowledge_pending_stop_change(self) -> bool:
+        """Promote a D5 stop request after the feed rule is installed."""
+
+        if not self.pending_stop_command_id or self.pending_stop_price is None:
+            return False
+        self.stop_type = self.pending_stop_type
+        self.active_stop_price = self.pending_stop_price
+        self.stop_quantity = self.pending_stop_quantity
+        self.pending_stop_type = None
+        self.pending_stop_price = None
+        self.pending_stop_quantity = 0
+        self.pending_stop_command_id = ""
+        self.pending_stop_requested_at = None
+        return True
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -437,6 +471,19 @@ class TradeCardState:
             "stop_type": self.stop_type.value if self.stop_type is not None else None,
             "active_stop_price": self.active_stop_price,
             "stop_quantity": self.stop_quantity,
+            "pending_stop_type": (
+                self.pending_stop_type.value
+                if self.pending_stop_type is not None
+                else None
+            ),
+            "pending_stop_price": self.pending_stop_price,
+            "pending_stop_quantity": self.pending_stop_quantity,
+            "pending_stop_command_id": self.pending_stop_command_id,
+            "pending_stop_requested_at": (
+                self.pending_stop_requested_at.isoformat()
+                if self.pending_stop_requested_at
+                else None
+            ),
             "exit_all_required": self.exit_all_required,
             "sell_all_at_market_open": self.sell_all_at_market_open,
             "pending_partial_sell_quantity": self.pending_partial_sell_quantity,
@@ -531,6 +578,11 @@ class TradeCardState:
             stop_type=data.get("stop_type"),
             active_stop_price=data.get("active_stop_price"),
             stop_quantity=int(data.get("stop_quantity", 0) or 0),
+            pending_stop_type=data.get("pending_stop_type"),
+            pending_stop_price=data.get("pending_stop_price"),
+            pending_stop_quantity=int(data.get("pending_stop_quantity", 0) or 0),
+            pending_stop_command_id=str(data.get("pending_stop_command_id", "")),
+            pending_stop_requested_at=data.get("pending_stop_requested_at"),
             exit_all_required=bool(data.get("exit_all_required", False)),
             sell_all_at_market_open=bool(data.get("sell_all_at_market_open", False)),
             pending_partial_sell_quantity=int(

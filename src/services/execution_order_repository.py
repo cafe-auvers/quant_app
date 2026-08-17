@@ -60,6 +60,7 @@ from src.core.execution_order_record import (
     ExecutionOrderRecord,
     ExecutionOrderStatus,
     OrderOrigin,
+    TERMINAL_EXECUTION_ORDER_STATUSES,
     compute_broker_identity_key,
     validate_consistency,
 )
@@ -479,6 +480,67 @@ def update_execution_order(
 def get_execution_order(conn: Connection, client_order_id: str) -> Optional[ExecutionOrderRecord]:
     table = _get_execution_orders_table(MetaData())
     row = conn.execute(select(table).where(table.c.client_order_id == client_order_id)).first()
+    return _row_to_record(row) if row is not None else None
+
+
+def find_active_unlinked_adopted_order(
+    conn: Connection,
+    *,
+    environment: str,
+    account_no: str,
+    symbol: str,
+    allowed_client_order_id: str = "",
+) -> Optional[ExecutionOrderRecord]:
+    """Return an active adopted order that must still fence mutations.
+
+    Adoption establishes a durable local audit record; it does not prove
+    that an otherwise-unlinked broker order is safe to ignore.  The one
+    exception is a mutation whose target is that exact adopted order (for
+    example an explicitly permitted cancel).  Its normal permission and
+    identity gates still run before this repository fence is consulted.
+    """
+
+    table = _get_execution_orders_table(MetaData())
+    terminal = [status.value for status in TERMINAL_EXECUTION_ORDER_STATUSES]
+    statement = select(table).where(
+        table.c.environment == str(environment or "").upper(),
+        table.c.account_no == str(account_no or ""),
+        table.c.symbol == str(symbol or "").upper(),
+        table.c.origin == OrderOrigin.USER_ADOPTED.value,
+        table.c.status.not_in(terminal),
+    )
+    allowed = str(allowed_client_order_id or "").strip()
+    if allowed:
+        statement = statement.where(table.c.client_order_id != allowed)
+    row = conn.execute(
+        statement.order_by(table.c.id.asc()).limit(1).with_for_update()
+    ).first()
+    return _row_to_record(row) if row is not None else None
+
+
+def find_active_execution_order_for_scope(
+    conn: Connection,
+    *,
+    environment: str,
+    account_no: str,
+    symbol: str,
+) -> Optional[ExecutionOrderRecord]:
+    """Return any nonterminal execution lifecycle for one symbol scope."""
+
+    table = _get_execution_orders_table(MetaData())
+    terminal = [status.value for status in TERMINAL_EXECUTION_ORDER_STATUSES]
+    row = conn.execute(
+        select(table)
+        .where(
+            table.c.environment == str(environment or "").upper(),
+            table.c.account_no == str(account_no or ""),
+            table.c.symbol == str(symbol or "").upper(),
+            table.c.status.not_in(terminal),
+        )
+        .order_by(table.c.id.asc())
+        .limit(1)
+        .with_for_update()
+    ).first()
     return _row_to_record(row) if row is not None else None
 
 

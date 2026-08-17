@@ -1,7 +1,8 @@
 """Workflow-level execution results shared by legacy and guarded modes."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional
 from enum import Enum
 
 from src.core.execution_order_record import ExecutionOrderRecord, ExecutionOrderStatus
@@ -108,6 +109,13 @@ class ExecutionSubmissionResult:
     capital_reservation_id: str
     ambiguous: bool = False
     error_message: str = ""
+    # Compatibility payload for the legacy Qt worker.  The authoritative
+    # cross-frontend fields above remain normalized; this is deliberately
+    # excluded from equality so INV-21 parity assertions compare intent/
+    # outcome rather than UI-specific object shape.
+    legacy_broker_order: Optional[BrokerOrder] = field(
+        default=None, compare=False, repr=False
+    )
 
     @classmethod
     def from_broker_order(cls, order: BrokerOrder) -> "ExecutionSubmissionResult":
@@ -125,6 +133,7 @@ class ExecutionSubmissionResult:
                 OrderStatus.UNKNOWN,
             ),
             error_message=order.error_message,
+            legacy_broker_order=order,
         )
 
     @classmethod

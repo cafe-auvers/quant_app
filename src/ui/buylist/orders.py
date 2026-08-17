@@ -8,6 +8,11 @@ from PyQt5.QtCore import QThread, QTimer
 from PyQt5.QtWidgets import QMessageBox
 
 from src.api.kis_order import is_ambiguous_order_submission_error
+from src.core.exit_execution_command import (
+    build_exit_execution_command,
+    exit_execution_policy,
+    marketable_exit_limit_price,
+)
 from src.core.order_state import (OPEN_ORDER_STATUSES, REGULAR_LIMIT_EXECUTION,
                                   RESERVED_MOO_EXECUTION, BrokerOrder,
                                   OrderIntent, OrderSide, OrderStatus)
@@ -269,11 +274,11 @@ class BuylistOrdersMixin:
         env: str,
         now: Optional[dt.datetime] = None,
     ) -> str:
-        if str(env or "").upper() == "PROD" and not self._us_regular_market_is_open(
-            now
-        ):
-            return RESERVED_MOO_EXECUTION
-        return REGULAR_LIMIT_EXECUTION
+        return exit_execution_policy(
+            environment=env,
+            intent=OrderIntent.MANUAL_EXIT,
+            regular_session_open=self._us_regular_market_is_open(now),
+        )
 
     def _submit_kis_buy_order(
         self,
@@ -575,11 +580,14 @@ class BuylistOrdersMixin:
         if execution_policy == RESERVED_MOO_EXECUTION:
             order_price = 0.0
         else:
-            order_price = (
-                max(0.01, explicit_price)
-                if explicit_price is not None
-                else self._buylist_order_price(item)
-            )
+            if explicit_price is not None:
+                order_price = max(0.01, explicit_price)
+            else:
+                market_observation = self._buylist_order_price(item)
+                order_price = marketable_exit_limit_price(
+                    last_price=market_observation,
+                    quote_is_execution_ready=True,
+                )
         if (
             execution_policy != RESERVED_MOO_EXECUTION
             and (not math.isfinite(float(order_price)) or order_price <= 0)
@@ -588,11 +596,21 @@ class BuylistOrdersMixin:
                 item, "Order price must be a positive finite number."
             )
             return
+        exit_command = build_exit_execution_command(
+            environment=env,
+            account_no=account_no,
+            symbol=item.symbol,
+            intent=intent,
+            quantity=quantity,
+            regular_session_open=(execution_policy != RESERVED_MOO_EXECUTION),
+            limit_price=order_price,
+        )
         try:
             worker_kwargs = {
                 "account_no": account_no,
                 "intent": intent,
                 "buylist_symbol_key": f"{env}:{item.symbol}",
+                "exit_command": exit_command,
                 **self._current_execution_lease_kwargs(),
             }
             if execution_policy == RESERVED_MOO_EXECUTION:
@@ -1247,11 +1265,12 @@ class BuylistOrdersMixin:
                 account_no=target.account_no,
                 quantity=target.remaining_quantity,
             )
-            from src.services.order_reconciliation import \
-                cancel_and_reconcile_order
+            from src.core.execution_mode import ExecutionSource
+            from src.services.execution_workflow_service import request_cancel
 
-            updated = cancel_and_reconcile_order(
-                client_order_id,
+            updated = request_cancel(
+                source=ExecutionSource.LEGACY_BUY_DASHBOARD,
+                client_order_id=client_order_id,
                 ownership_engine=self.__dict__.get("pc_db_engine"),
             )
         except Exception as exc:

@@ -232,9 +232,12 @@ def test_set_breakeven_stop_records_intent(tmp_path):
         board_status=BoardStatus.OPEN_POSITION,
         position_runtime_status=PositionRuntimeStatus.OPEN,
         broker_quantity=100,
+        average_entry_price=100.0,
     )
     result = apply_board_command(engine, _cmd(SetBreakevenStop, card))
-    assert result.stop_type == StopType.BREAKEVEN
+    assert result.stop_type is None
+    assert result.pending_stop_type == StopType.BREAKEVEN
+    assert result.pending_stop_price > result.average_entry_price
 
 
 def test_manual_stop_cannot_widen_risk(tmp_path):
@@ -263,8 +266,10 @@ def test_manual_stop_can_tighten_risk(tmp_path):
         active_stop_price=95.0,
     )
     result = apply_board_command(engine, _cmd(SetManualStop, card, price=98.0))
-    assert result.stop_type == StopType.MANUAL_PRICE
-    assert result.active_stop_price == 98.0
+    assert result.stop_type == StopType.ORB_LOW
+    assert result.active_stop_price == 95.0
+    assert result.pending_stop_type == StopType.MANUAL_PRICE
+    assert result.pending_stop_price == 98.0
 
 
 # --- Cancel queued Sell All (spec section 302-304, 719-724) -----------------

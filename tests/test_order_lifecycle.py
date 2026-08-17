@@ -15,6 +15,7 @@ from src.api.kis_account_snapshot_dual import (KisAccountClient,
                                                KisEnvironment,
                                                KisRateLimitError,
                                                KisTokenError)
+from src.core import execution_config
 from src.core.order_state import (REGULAR_LIMIT_EXECUTION,
                                   RESERVED_MOO_EXECUTION, BrokerOrder,
                                   OrderIntent, OrderSide, OrderStatus,
@@ -31,6 +32,7 @@ from src.services.order_ledger import (OrderLedgerCorruptionError,
                                        load_order_ledger, load_orders,
                                        update_order)
 from src.services.order_reconciliation import reconcile_orders_with_snapshot
+from src.services.position_manager import compute_breakeven_stop_price
 from src.ui.main_window import MainWindow
 
 RISK_STRATEGY_ID = "TEST"
@@ -2185,13 +2187,13 @@ def test_buylist_move_to_breakeven_uses_avg_cost_and_never_lowers_stop(monkeypat
 
     MainWindow._buylist_move_to_breakeven_selected(window, "SIM")
 
-    assert item.stop_loss == 100.0
+    assert item.stop_loss == compute_breakeven_stop_price(100.0)
     assert saves == [True]
     assert questions
 
     MainWindow._buylist_move_to_breakeven_selected(window, "SIM")
 
-    assert item.stop_loss == 100.0
+    assert item.stop_loss == compute_breakeven_stop_price(100.0)
     assert infos
 
 
@@ -2218,7 +2220,7 @@ def test_buylist_move_to_breakeven_falls_back_to_entry_price(monkeypatch):
 
     MainWindow._buylist_move_to_breakeven_selected(window, "SIM")
 
-    assert item.stop_loss == 95.0
+    assert item.stop_loss == compute_breakeven_stop_price(95.0)
 
 
 def test_buylist_sell_all_selected_confirms_limit_order_and_submits_full_quantity(monkeypatch):
@@ -2345,7 +2347,9 @@ def test_submit_kis_sell_order_uses_environment_and_live_price_without_current_p
     assert worker.environment == "SIM"
     assert worker.symbol == "AAPL"
     assert worker.quantity == 10
-    assert worker.price == 88.5
+    assert worker.price == pytest.approx(
+        88.5 * (1.0 - execution_config.SELL_MARKETABLE_DISCOUNT_PCT)
+    )
     assert worker.side == "sell"
     assert worker.account_no == "12345678"
     assert worker.intent == OrderIntent.STOP_LOSS

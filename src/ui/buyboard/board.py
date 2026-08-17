@@ -1,12 +1,13 @@
 """Assembles the Buy Board tab: 8 columns + refresh bar.
 
 Widget assembly and the drag-drop -> command translation live here;
-``apply_board_command`` (validation + persistence) lives in
-:mod:`src.ui.buyboard.controller` and has no Qt dependency.
+Every gesture is submitted through :mod:`src.services.execution_workflow_service`;
+the widgets are rebuilt only from its authoritative projection.
 """
 from __future__ import annotations
 
 import logging
+import getpass
 from typing import Callable, Dict, List, Optional
 
 from PyQt5.QtWidgets import (
@@ -23,9 +24,16 @@ from PyQt5.QtWidgets import (
 )
 
 from src.core.execution_config import is_buyboard_engine_enabled
+from src.core.board_workflow import (
+    BoardCardProjection,
+    BoardExecutionOrderProjection,
+    BoardExternalOrderProjection,
+)
 from src.core.trade_card_state import BoardStatus, TradeCardState
+from src.services import execution_workflow_service
 
 from . import dialogs
+from .card import card_drag_payload
 from .columns import BOARD_COLUMN_ORDER, BOARD_COLUMN_TITLES, BoardColumnList
 from .drag_commands import (
     ActivateForToday,
@@ -38,6 +46,7 @@ from .drag_commands import (
     RequestSellAll,
     SetBreakevenStop,
     SetManualStop,
+    SetOrbStop,
 )
 
 logger = logging.getLogger(__name__)
@@ -100,6 +109,7 @@ def build_buyboard_widget(main_window) -> None:
             board_status,
             lambda payload, target, mw=main_window: _handle_card_dropped(mw, payload, target),
             lambda payload, global_pos, mw=main_window: _handle_card_context_menu(mw, payload, global_pos),
+            lambda order, mw=main_window: _handle_external_order_adopt(mw, order),
         )
         group_layout.addWidget(column_list)
         columns_layout.addWidget(group, 1)
@@ -133,13 +143,24 @@ def _quote_lookup_for(main_window) -> Optional[Callable[[str], Optional[float]]]
     return lookup
 
 
-def _sync_account_filter_options(main_window, cards: List[TradeCardState]) -> Optional[str]:
+def _state(value):
+    if isinstance(value, (BoardExternalOrderProjection, BoardExecutionOrderProjection)):
+        return None
+    return value.card if isinstance(value, BoardCardProjection) else value
+
+
+def _account_no(value) -> str:
+    state = _state(value)
+    return state.account_no if state is not None else value.order.account_no
+
+
+def _sync_account_filter_options(main_window, cards) -> Optional[str]:
     """Refreshes the account-filter combo's entries from the live card set
     and returns the currently selected account_no (``None`` = All Accounts)."""
     combo = getattr(main_window, "_buyboard_account_filter_combo", None)
     if combo is None:
         return None
-    accounts = sorted({card.account_no for card in cards if card.account_no})
+    accounts = sorted({_account_no(card) for card in cards if _account_no(card)})
     previous_selection = combo.currentData()
     combo.blockSignals(True)
     combo.clear()
@@ -152,15 +173,19 @@ def _sync_account_filter_options(main_window, cards: List[TradeCardState]) -> Op
     return combo.currentData()
 
 
-def populate_buyboard_columns(main_window, cards: List[TradeCardState]) -> None:
+def populate_buyboard_columns(main_window, cards) -> None:
     selected_account = _sync_account_filter_options(main_window, cards)
     if selected_account:
-        cards = [card for card in cards if card.account_no == selected_account]
+        cards = [card for card in cards if _account_no(card) == selected_account]
     grouped: Dict[BoardStatus, List[TradeCardState]] = {
         status: [] for status in BOARD_COLUMN_ORDER
     }
     for card in cards:
-        grouped.setdefault(card.board_status, []).append(card)
+        state = _state(card)
+        grouped.setdefault(
+            state.board_status if state is not None else BoardStatus.WATCHLIST,
+            [],
+        ).append(card)
     quote_lookup = _quote_lookup_for(main_window)
     for status, column_list in main_window.buyboard_columns.items():
         column_list.set_cards(grouped.get(status, []), quote_lookup)
@@ -189,52 +214,62 @@ def _handle_card_dropped(main_window, payload: dict, target_status: BoardStatus)
         )
         return
 
-    card = None
-    try:
-        from src.services import trade_card_repository as repo
-
-        card = repo.get_trade_card(main_window._buyboard_engine(), environment, account_no, symbol)
-    except Exception:  # pragma: no cover - defensive, repository already logs
-        logger.exception("Failed to look up dropped card %s", symbol)
-    if card is None:
+    projection = _lookup_projection(main_window, environment, account_no, symbol)
+    if projection is None:
         QMessageBox.warning(main_window, "Buy Board", f"Could not find a card for {symbol}.")
         main_window.refresh_buyboard()
         return
+    card = projection.card
+    if card.version != version:
+        QMessageBox.warning(
+            main_window,
+            "Buy Board",
+            "This card changed after the drag began. The board has been refreshed.",
+        )
+        main_window.refresh_buyboard()
+        return
+
+    common = _command_kwargs(payload)
 
     if target_status == BoardStatus.WATCHLIST:
         command = MoveToWatchlist(
-            environment=environment, account_no=account_no, symbol=symbol, expected_card_version=version
+            **common
         )
     elif target_status == BoardStatus.BUYLIST:
-        command = MoveToBuylist(
-            environment=environment, account_no=account_no, symbol=symbol, expected_card_version=version
-        )
+        # A backward move is presentation-only until the entry runtime has
+        # consumed an identity.  From that point onward it is a cancellation
+        # request and broker reconciliation alone may return the card to the
+        # Buylist.
+        if card.board_status == BoardStatus.ENTRY_PENDING or (
+            card.board_status == BoardStatus.BUY_TODAY
+            and bool(card.entry_client_order_id)
+        ):
+            command = CancelEntry(**common)
+        else:
+            command = MoveToBuylist(**common)
     elif target_status == BoardStatus.BUY_TODAY:
         command = ActivateForToday(
-            environment=environment, account_no=account_no, symbol=symbol, expected_card_version=version
+            **common
         )
     elif target_status == BoardStatus.OPEN_POSITION:
         # The only manual drag that legally targets Open Positions is
         # cancelling a still-queued (not yet market-hours) Sell All.
         command = CancelQueuedSellAll(
-            environment=environment, account_no=account_no, symbol=symbol, expected_card_version=version
+            **common
         )
     elif target_status == BoardStatus.PARTIAL_SELL:
         quantity = dialogs.prompt_partial_sell_quantity(main_window, card)
         if quantity is None:
             return
         command = RequestPartialSell(
-            environment=environment,
-            account_no=account_no,
-            symbol=symbol,
-            expected_card_version=version,
+            **common,
             quantity=quantity,
         )
     elif target_status == BoardStatus.SELL_ALL:
         if not dialogs.confirm_sell_all(main_window, card):
             return
         command = RequestSellAll(
-            environment=environment, account_no=account_no, symbol=symbol, expected_card_version=version
+            **common
         )
     else:
         QMessageBox.information(
@@ -250,11 +285,17 @@ def _handle_card_dropped(main_window, payload: dict, target_status: BoardStatus)
 
 
 def _column_cards_sorted(main_window, board_status: BoardStatus) -> List[TradeCardState]:
-    from src.services import trade_card_repository as repo
+    from .controller import _projection_context
 
-    all_cards = repo.list_trade_cards(main_window._buyboard_engine(), environment="PROD")
+    all_cards = execution_workflow_service.list_board_projections(
+        main_window._buyboard_engine(), environment="PROD", context=_projection_context(main_window)
+    )
     return sorted(
-        (c for c in all_cards if c.board_status == board_status),
+        (
+            _state(c)
+            for c in all_cards
+            if _state(c) is not None and _state(c).board_status == board_status
+        ),
         key=lambda c: -c.kanban_priority,
     )
 
@@ -308,14 +349,20 @@ def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
     symbol = str(payload.get("symbol", ""))
     version = int(payload.get("version", 0))
 
-    from src.services import trade_card_repository as repo
-
-    card = repo.get_trade_card(main_window._buyboard_engine(), environment, account_no, symbol)
-    if card is None:
+    projection = _lookup_projection(main_window, environment, account_no, symbol)
+    if projection is None:
         return
+    card = projection.card
+    if card.version != version:
+        QMessageBox.warning(
+            main_window, "Buy Board", "This card changed; the board has been refreshed."
+        )
+        main_window.refresh_buyboard()
+        return
+    common = _command_kwargs(payload)
 
     menu = QMenu(main_window)
-    cancel_entry_action = breakeven_action = manual_stop_action = None
+    cancel_entry_action = orb_action = breakeven_action = manual_stop_action = None
     if card.board_status in (BoardStatus.BUY_TODAY, BoardStatus.ENTRY_PENDING):
         # Section 989-990 / review finding P1-8: Entry Pending is a
         # system-only drop target (no drag can reach it, and none can
@@ -327,6 +374,7 @@ def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
         )
         menu.addSeparator()
     if card.board_status in (BoardStatus.OPEN_POSITION, BoardStatus.PARTIAL_SELL):
+        orb_action = menu.addAction("Use Frozen ORB-Low Stop")
         breakeven_action = menu.addAction("Move Stop to Breakeven")
         manual_stop_action = menu.addAction("Set Manual Stop…")
         menu.addSeparator()
@@ -344,9 +392,16 @@ def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
 
     if chosen is cancel_entry_action:
         command = CancelEntry(
-            environment=environment, account_no=account_no, symbol=symbol, expected_card_version=version
+            **common
         )
         main_window._buyboard_dispatch_command(command)
+    elif chosen is orb_action:
+        if not is_buyboard_engine_enabled():
+            QMessageBox.information(
+                main_window, "Buy Board", "The new execution engine is not enabled yet."
+            )
+            return
+        main_window._buyboard_dispatch_command(SetOrbStop(**common))
     elif chosen is breakeven_action:
         if not is_buyboard_engine_enabled():
             QMessageBox.information(
@@ -354,7 +409,7 @@ def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
             )
             return
         command = SetBreakevenStop(
-            environment=environment, account_no=account_no, symbol=symbol, expected_card_version=version
+            **common
         )
         main_window._buyboard_dispatch_command(command)
     elif chosen is manual_stop_action:
@@ -367,10 +422,7 @@ def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
         if price is None:
             return
         command = SetManualStop(
-            environment=environment,
-            account_no=account_no,
-            symbol=symbol,
-            expected_card_version=version,
+            **common,
             price=price,
         )
         main_window._buyboard_dispatch_command(command)
@@ -378,3 +430,72 @@ def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
         _renumber_column_after_swap(main_window, siblings, index, index - 1)
     elif chosen is move_down_action and index is not None and index < len(siblings) - 1:
         _renumber_column_after_swap(main_window, siblings, index, index + 1)
+
+
+def _command_kwargs(payload: dict) -> dict:
+    return {
+        "environment": str(payload.get("environment", "")),
+        "account_no": str(payload.get("account_no", "")),
+        "symbol": str(payload.get("symbol", "")),
+        "expected_card_version": int(payload.get("version", 0)),
+        "expected_readiness_generation": int(payload.get("readiness_generation", 0)),
+        "expected_ownership_version": int(payload.get("ownership_version", 0)),
+        "expected_execution_owner": str(payload.get("execution_owner", "")),
+        "expected_strategy_instance_id": str(payload.get("strategy_instance_id", "")),
+    }
+
+
+def _lookup_projection(main_window, environment: str, account_no: str, symbol: str):
+    from .controller import _projection_context
+
+    try:
+        return execution_workflow_service.get_board_projection(
+            main_window._buyboard_engine(),
+            environment=environment,
+            account_no=account_no,
+            symbol=symbol,
+            context=_projection_context(main_window),
+        )
+    except Exception:  # projection failure is fail-closed for UI actions
+        logger.exception("Failed to load authoritative board projection for %s", symbol)
+        return None
+
+
+def _handle_external_order_adopt(main_window, external_order) -> None:
+    """The sole Kanban path that can explicitly adopt an unowned order."""
+    from .drag_commands import AdoptExternalOrder
+
+    projection = _lookup_projection(
+        main_window,
+        external_order.environment,
+        external_order.account_no,
+        external_order.symbol,
+    )
+    answer = QMessageBox.question(
+        main_window,
+        "Adopt Unowned Broker Order",
+        f"Adopt broker order {external_order.broker_order_id} as an audited, "
+        "restricted external order? This does not silently link it to the card "
+        "or grant cancel/replace permission.",
+        QMessageBox.Yes | QMessageBox.No,
+        QMessageBox.No,
+    )
+    if answer != QMessageBox.Yes:
+        return
+    payload = (
+        card_drag_payload(projection)
+        if projection is not None
+        else {
+            "environment": external_order.environment,
+            "account_no": external_order.account_no,
+            "symbol": external_order.symbol,
+            "version": 0,
+        }
+    )
+    main_window._buyboard_dispatch_command(
+        AdoptExternalOrder(
+            **_command_kwargs(payload),
+            external_order_id=external_order.external_order_id,
+            adopted_by=getpass.getuser() or "unknown-operator",
+        )
+    )
