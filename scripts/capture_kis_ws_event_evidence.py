@@ -16,7 +16,7 @@ Example::
       --confirm-read-only ^
       --symbol AAPL ^
       --frames-per-channel 20 ^
-      --output C:\quant_evidence\aapl_ws_frames.json
+      --output C:\\quant_evidence\\aapl_ws_frames.json
 """
 from __future__ import annotations
 
@@ -66,14 +66,26 @@ def _iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat()
 
 
-def _git_head() -> str:
-    return subprocess.run(
+def _git_snapshot() -> str:
+    head = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=ROOT,
         check=True,
         capture_output=True,
         text=True,
     ).stdout.strip()
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if dirty:
+        raise RuntimeError(
+            "evidence capture requires a clean exact commit; commit or discard local changes first"
+        )
+    return head
 
 
 def _sha256(path: Path) -> str:
@@ -181,6 +193,7 @@ def capture(
     frames_per_channel: int,
     timeout_seconds: float,
 ) -> dict[str, Any]:
+    commit_sha = _git_snapshot()
     symbol = str(symbol or "").strip().upper()
     if not symbol:
         raise ValueError("symbol is required")
@@ -344,7 +357,7 @@ def capture(
             "evidence_kind": "KIS_WS_REGULAR_SESSION_PUBLIC_EVENT_CAPTURE",
             "qualification_only": True,
             "review_status": "UNREVIEWED",
-            "commit_sha": _git_head(),
+            "commit_sha": commit_sha,
             "environment": "PROD",
             "symbol": symbol,
             "tr_key": tr_key,

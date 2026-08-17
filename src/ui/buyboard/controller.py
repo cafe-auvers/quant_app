@@ -17,16 +17,10 @@ from src.core.board_workflow import (
     BoardProjectionContext,
 )
 from src.core.execution_config import (
-    KANBAN_STRATEGY_INSTANCE_ID,
     is_buyboard_engine_enabled,
 )
-from src.core.execution_ownership import ExecutionOwner, ExecutionOwnership
 from src.core.runtime_readiness import RuntimeDeviceState
 from src.services import execution_workflow_service
-from src.services.execution_ownership_repository import (
-    assign_ownership,
-    get_ownership,
-)
 from src.services.execution_workflow_service import BoardCommandRejectedError
 from src.services.trade_card_repository import (
     TradeCardNotFoundError,
@@ -144,71 +138,6 @@ def _action_context(main_window, command: AnyBoardCommand) -> BoardActionContext
         device_active=getattr(worker, "device_state", None) == RuntimeDeviceState.ACTIVE,
         regular_session_open=regular_session_open,
         restriction_reasons=tuple(dict.fromkeys(reasons)),
-    )
-
-
-def _claim_kanban_intent_ownership(engine, command):
-    """Treat an explicit execution-intent gesture as the ownership cutover.
-
-    H2 defaults an unassigned symbol to LEGACY.  That is correct before the
-    user chooses Kanban execution, but it made a freshly bootstrapped card
-    visible yet unusable.  An explicit Buy Today / exit / stop gesture may
-    transfer LEGACY to the configured Kanban strategy.  MANUAL and another
-    Kanban strategy remain protected and require separate administrative
-    transfer.
-    """
-
-    if engine is None:
-        raise BoardCommandRejectedError("Canonical database is unavailable")
-    target_strategy = str(KANBAN_STRATEGY_INSTANCE_ID or "").strip()
-    if not target_strategy:
-        raise BoardCommandRejectedError(
-            "KANBAN_STRATEGY_INSTANCE_ID is blank; Kanban cannot claim execution ownership"
-        )
-    ownership = get_ownership(
-        engine,
-        environment=command.environment,
-        account_no=command.account_no,
-        symbol=command.symbol,
-    )
-    if ownership.owner == ExecutionOwner.MANUAL:
-        raise BoardCommandRejectedError(
-            f"{command.symbol} is MANUAL-owned; explicit administrative transfer is required"
-        )
-    if (
-        ownership.owner == ExecutionOwner.KANBAN
-        and ownership.strategy_instance_id
-        and ownership.strategy_instance_id != target_strategy
-    ):
-        raise BoardCommandRejectedError(
-            f"{command.symbol} belongs to another Kanban strategy instance"
-        )
-    if (
-        ownership.owner == ExecutionOwner.KANBAN
-        and ownership.strategy_instance_id == target_strategy
-    ):
-        return ownership
-    return assign_ownership(
-        engine,
-        ExecutionOwnership(
-            environment=command.environment,
-            account_no=command.account_no,
-            symbol=command.symbol,
-            owner=ExecutionOwner.KANBAN,
-            strategy_instance_id=target_strategy,
-            assigned_by=f"kanban_intent:{command.command_id[:16]}",
-        ),
-    )
-
-
-def _with_current_kanban_ownership(command, ownership):
-    return replace(
-        command,
-        expected_execution_owner=ExecutionOwner.KANBAN.value,
-        expected_ownership_version=int(getattr(ownership, "version", 0) or 0),
-        expected_strategy_instance_id=str(
-            getattr(ownership, "strategy_instance_id", "") or ""
-        ),
     )
 
 
@@ -341,15 +270,12 @@ class BuyboardMixin:
                 # pre-market and from a pull-only laptop; the authoritative PC
                 # runtime later consumes them only after its complete readiness
                 # predicate and broker-boundary guards pass.
-                ownership = _claim_kanban_intent_ownership(
-                    self._buyboard_engine(), command
-                )
-                command = _with_current_kanban_ownership(command, ownership)
                 context = replace(context, enforce_runtime_fences=False)
             execution_workflow_service.request_board_action(
                 self._buyboard_engine(),
                 command,
                 context=context,
+                claim_kanban_ownership=isinstance(command, intent_only_types),
             )
         except TradeCardVersionConflictError:
             QMessageBox.warning(

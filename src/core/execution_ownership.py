@@ -48,7 +48,9 @@ class ExecutionOwnership:
     strategy_instance_id: str = ""
     assigned_by: str = ""
     assigned_at: Optional[str] = None
-    version: int = 1
+    # Zero represents H2's virtual LEGACY default when no durable row exists.
+    # Persisted assignments start at version 1.
+    version: int = 0
 
     def __post_init__(self) -> None:
         self.environment = str(self.environment or "").upper()
@@ -62,7 +64,9 @@ class ExecutionOwnership:
             raise ValueError("KANBAN ownership requires a non-blank strategy_instance_id")
         self.strategy_instance_id = str(self.strategy_instance_id or "")
         self.assigned_by = str(self.assigned_by or "")
-        self.version = int(self.version or 1)
+        self.version = int(self.version or 0)
+        if self.version < 0:
+            raise ValueError("ownership version cannot be negative")
 
 
 @dataclass(frozen=True)

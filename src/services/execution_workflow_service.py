@@ -804,18 +804,30 @@ def _apply_board_mutation(command, card, *, context=None) -> None:
             card.position_runtime_status = PositionRuntimeStatus.QUEUED_FOR_OPEN
 
 
-def request_board_action(engine, command, *, context=None):
+def request_board_action(
+    engine,
+    command,
+    *,
+    context=None,
+    claim_kanban_ownership: bool = False,
+):
     """Validate and persist one revision-aware Kanban workflow request.
 
     No broker method is called here.  Broker-affecting commands persist an
     intent consumed by the same trading engine/workflow gateway used by the
     legacy dashboard; broker reconciliation remains the only source of fills,
-    quantities, and terminal card placement.
+    quantities, and terminal card placement.  ``claim_kanban_ownership`` is
+    restricted to those durable-intent commands and commits the explicit H2
+    ownership cutover atomically with the card revision.
     """
     from src.core.board_workflow import (
         AdoptExternalOrder,
         BoardActionContext,
         BoardWorkflowResult,
+        ActivateForToday,
+        CancelQueuedSellAll,
+        RequestPartialSell,
+        RequestSellAll,
         SetBreakevenStop,
         SetManualStop,
         SetOrbStop,
@@ -831,6 +843,19 @@ def request_board_action(engine, command, *, context=None):
     )
 
     resolved_context = context or BoardActionContext()
+    intent_only_types = (
+        ActivateForToday,
+        RequestPartialSell,
+        RequestSellAll,
+        CancelQueuedSellAll,
+        SetOrbStop,
+        SetBreakevenStop,
+        SetManualStop,
+    )
+    if claim_kanban_ownership and not isinstance(command, intent_only_types):
+        raise BoardCommandRejectedError(
+            "Only durable Kanban execution intent may claim symbol ownership"
+        )
     if isinstance(command, AdoptExternalOrder):
         external = fetch_discovered_external_order(engine, command.external_order_id)
         if external is None or (
@@ -885,9 +910,12 @@ def request_board_action(engine, command, *, context=None):
     # MySQL the locked rows prevent a same-symbol ownership transfer from
     # slipping between authorization and intent persistence.
     from src.services.execution_ownership_repository import (
+        assign_ownership_in_transaction,
         ensure_execution_ownership_table,
         get_ownership_in_transaction,
     )
+    from src.core.execution_config import KANBAN_STRATEGY_INSTANCE_ID
+    from src.core.execution_ownership import ExecutionOwnership
 
     trade_card_repository.ensure_trade_cards_table(engine)
     ensure_execution_ownership_table(engine)
@@ -930,13 +958,57 @@ def request_board_action(engine, command, *, context=None):
                 symbol=current.symbol,
                 for_update=True,
             )
-            _require_kanban_board_ownership(
-                engine,
-                command,
-                current,
-                resolved_context,
-                ownership=ownership,
-            )
+            if claim_kanban_ownership:
+                target_strategy = str(KANBAN_STRATEGY_INSTANCE_ID or "").strip()
+                if not target_strategy:
+                    raise BoardCommandRejectedError(
+                        "KANBAN_STRATEGY_INSTANCE_ID is blank; Kanban cannot claim execution ownership"
+                    )
+                if command.expected_execution_owner and (
+                    command.expected_execution_owner != ownership.owner.value
+                ):
+                    raise BoardOwnershipMismatchError(
+                        "Execution ownership changed since this card was rendered"
+                    )
+                if (
+                    command.expected_execution_owner
+                    and command.expected_ownership_version != ownership.version
+                ):
+                    raise BoardOwnershipMismatchError(
+                        "Execution ownership revision changed since this card was rendered"
+                    )
+                if ownership.owner == ExecutionOwner.MANUAL:
+                    raise BoardOwnershipMismatchError(
+                        f"{command.symbol} is MANUAL-owned; explicit administrative transfer is required"
+                    )
+                if (
+                    ownership.owner == ExecutionOwner.KANBAN
+                    and ownership.strategy_instance_id != target_strategy
+                ):
+                    raise BoardOwnershipMismatchError(
+                        f"{command.symbol} belongs to another Kanban strategy instance"
+                    )
+                if ownership.owner == ExecutionOwner.LEGACY:
+                    ownership = assign_ownership_in_transaction(
+                        conn,
+                        ExecutionOwnership(
+                            environment=current.environment,
+                            account_no=current.account_no,
+                            symbol=current.symbol,
+                            owner=ExecutionOwner.KANBAN,
+                            strategy_instance_id=target_strategy,
+                            assigned_by=f"kanban_intent:{command.command_id[:16]}",
+                        ),
+                        expected_version=ownership.version,
+                    )
+            else:
+                _require_kanban_board_ownership(
+                    engine,
+                    command,
+                    current,
+                    resolved_context,
+                    ownership=ownership,
+                )
             _apply_board_mutation(command, current, context=resolved_context)
             updated = trade_card_repository.update_trade_card_in_transaction(
                 conn, current, expected_version=command.expected_card_version

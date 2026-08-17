@@ -18,10 +18,10 @@ from src.services.execution_ownership_repository import (
     assign_ownership,
     get_ownership,
 )
+from src.services import execution_workflow_service
 from src.ui.buyboard.controller import (
     BuyboardMixin,
     CommandRejectedError,
-    _claim_kanban_planning_ownership,
 )
 
 
@@ -109,7 +109,11 @@ def test_buy_today_drag_does_not_steal_manual_ownership(tmp_path):
     )
 
     with pytest.raises(CommandRejectedError, match="MANUAL-owned"):
-        _claim_kanban_planning_ownership(engine, _command(card))
+        execution_workflow_service.request_board_action(
+            engine,
+            _command(card),
+            claim_kanban_ownership=True,
+        )
 
     ownership = get_ownership(
         engine,
@@ -136,4 +140,63 @@ def test_buy_today_drag_does_not_steal_other_kanban_strategy(tmp_path):
     )
 
     with pytest.raises(CommandRejectedError, match="another Kanban strategy"):
-        _claim_kanban_planning_ownership(engine, _command(card))
+        execution_workflow_service.request_board_action(
+            engine,
+            _command(card),
+            claim_kanban_ownership=True,
+        )
+
+
+def test_failed_card_write_rolls_back_ownership_claim(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    card = _seed_buylist(engine)
+
+    def fail_update(*args, **kwargs):
+        raise RuntimeError("injected card persistence failure")
+
+    monkeypatch.setattr(card_repo, "update_trade_card_in_transaction", fail_update)
+
+    with pytest.raises(RuntimeError, match="injected card persistence failure"):
+        execution_workflow_service.request_board_action(
+            engine,
+            _command(card),
+            claim_kanban_ownership=True,
+        )
+
+    stored = card_repo.get_trade_card(
+        engine, "PROD", "12345678-01", "AAPL"
+    )
+    ownership = get_ownership(
+        engine,
+        environment="PROD",
+        account_no="12345678-01",
+        symbol="AAPL",
+    )
+    assert stored is not None
+    assert stored.board_status == BoardStatus.BUYLIST
+    assert ownership.owner == ExecutionOwner.LEGACY
+    assert ownership.version == 0
+
+
+def test_stale_card_rejection_does_not_claim_ownership(tmp_path):
+    engine = _engine(tmp_path)
+    stale = _seed_buylist(engine)
+    current = card_repo.get_trade_card(engine, "PROD", "12345678-01", "AAPL")
+    current.name = "newer canonical state"
+    card_repo.update_trade_card(engine, current, expected_version=current.version)
+
+    with pytest.raises(card_repo.TradeCardVersionConflictError):
+        execution_workflow_service.request_board_action(
+            engine,
+            _command(stale),
+            claim_kanban_ownership=True,
+        )
+
+    ownership = get_ownership(
+        engine,
+        environment="PROD",
+        account_no="12345678-01",
+        symbol="AAPL",
+    )
+    assert ownership.owner == ExecutionOwner.LEGACY
+    assert ownership.version == 0

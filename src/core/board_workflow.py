@@ -167,8 +167,10 @@ AnyBoardCommand = Union[
 class BoardActionContext:
     """Current runtime facts rechecked when a UI request is handled.
 
-    ``enforce_runtime_fences`` is false for offline migration/unit tooling.
-    The real Qt controller always enables it.
+    ``enforce_runtime_fences`` is false for offline migration/unit tooling and
+    for the narrow durable-intent path (Buy Today, exits, and stop requests).
+    Those gestures perform no broker I/O; the authoritative runtime still
+    enforces every readiness and lease fence before consuming them.
     """
 
     enforce_runtime_fences: bool = False
