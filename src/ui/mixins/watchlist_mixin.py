@@ -352,7 +352,12 @@ class WatchlistMixin:
 
         tab_layout.addWidget(self.watchlist_splitter)
         self.watchlist_widget.setLayout(tab_layout)
-        self.populate_watchlist_table()
+        # Keep window construction deterministic and offline-safe.  Live chart
+        # fallback performs network I/O per symbol and must not block the Qt
+        # event loop before the first window is shown.
+        self.populate_watchlist_table(
+            use_live_fallback=False, calculate_scores=False
+        )
 
     def _get_account_balance_for_env(self, env: str) -> float:
         """Get the active account balance for the given environment.
@@ -401,7 +406,7 @@ class WatchlistMixin:
 
         return 10000.0 if env == "PROD" else 100000.0
 
-    def _calculate_item_scores(self, item) -> dict:
+    def _calculate_item_scores(self, item, *, use_live_fallback: bool = True) -> dict:
         """Calculate live trade plan and deterministic scores for a watchlist item.
 
         Sizing logic is identical to the Trade Plan ORB panel:
@@ -437,7 +442,7 @@ class WatchlistMixin:
         history = self._load_chart_history_for_timeframe(
             symbol, timeframe="1D", use_live_fallback=False
         )
-        if history.empty:
+        if history.empty and use_live_fallback:
             history = self._load_chart_history_for_timeframe(
                 symbol, timeframe="1D", use_live_fallback=True
             )
@@ -822,8 +827,19 @@ class WatchlistMixin:
             self._dashboard_summary_dirty = False
             self.update_dashboard_summary()
 
-    def populate_watchlist_table(self) -> None:
+    def populate_watchlist_table(
+        self,
+        *,
+        use_live_fallback: bool = True,
+        calculate_scores: bool = True,
+    ) -> None:
         """Populate the watchlist scoreboard table."""
+        calculate_scores = calculate_scores and not self.__dict__.get(
+            "_window_initializing", False
+        )
+        use_live_fallback = use_live_fallback and not self.__dict__.get(
+            "_window_initializing", False
+        )
         self.watchlist_table.setRowCount(0)
 
         for item in self.watchlist.items:
@@ -831,20 +847,35 @@ class WatchlistMixin:
             row = self.watchlist_table.rowCount()
             self.watchlist_table.insertRow(row)
 
-            # Calculate live deterministic plan and scores directly!
-            try:
-                scores = self._calculate_item_scores(item)
-            except Exception as e:
+            if calculate_scores:
+                try:
+                    scores = self._calculate_item_scores(
+                        item, use_live_fallback=use_live_fallback
+                    )
+                except Exception as e:
+                    scores = {
+                        "symbol": symbol,
+                        "price": 0.0,
+                        "total_score": 0.0,
+                        "status": "ERROR",
+                        "stop_adr": 0.0,
+                        "risk_percent": 0.01,
+                        "position_percent": 0.0,
+                        "trade_plan": f"Error: {str(e)}",
+                        "env": "PROD",
+                    }
+            else:
                 scores = {
                     "symbol": symbol,
                     "price": 0.0,
                     "total_score": 0.0,
-                    "status": "ERROR",
-                    "stop_adr": 0.0,
+                    "status": "WATCHING",
+                    "stop_adr": None,
                     "risk_percent": 0.01,
                     "position_percent": 0.0,
-                    "trade_plan": f"Error: {str(e)}",
+                    "trade_plan": "Refresh required",
                     "env": "PROD",
+                    **dict(getattr(self, "watchlist_scores", {}).get(symbol, {})),
                 }
 
             # Extract scores from cached AI analysis (score_breakdown) if available
@@ -1063,7 +1094,12 @@ class WatchlistMixin:
         """Recalculate all watchlist scoreboard data when account size or risk % changes."""
         if not hasattr(self, "watchlist_table"):
             return
-        self.populate_watchlist_table()
+        # Account snapshot callbacks run on the GUI thread. Re-render the
+        # durable/cached projection immediately and leave database/network
+        # score recalculation to the explicit refresh workflow.
+        self.populate_watchlist_table(
+            use_live_fallback=False, calculate_scores=False
+        )
         # Also refresh the ORB panel for whichever symbol is currently selected
         selected = (
             self.watchlist_table.selectionModel().selectedRows()

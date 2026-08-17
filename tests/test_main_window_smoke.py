@@ -24,6 +24,10 @@ def test_main_window_constructs_and_closes_offscreen_without_external_io(monkeyp
     global _APP
     _APP = QApplication.instance() or QApplication([])
 
+    watchlist = Watchlist()
+    watchlist.add("STIM", "Neuronetics")
+    score_calls = []
+
     monkeypatch.setattr(controller_layout, "QWebEngineView", None)
     monkeypatch.setattr(health_panel_module, "QWebEngineView", None)
     monkeypatch.setattr(QTimer, "start", lambda *_args, **_kwargs: None)
@@ -39,7 +43,27 @@ def test_main_window_constructs_and_closes_offscreen_without_external_io(monkeyp
         "get_state_save_manager",
         lambda: _InMemoryStateSaveManager(),
     )
-    monkeypatch.setattr(main_window_module.MainWindow, "_load_watchlist", lambda _self: Watchlist())
+    monkeypatch.setattr(
+        main_window_module.MainWindow, "_load_watchlist", lambda _self: watchlist
+    )
+    monkeypatch.setattr(
+        main_window_module.MainWindow,
+        "_calculate_item_scores",
+        lambda _self, item, *, use_live_fallback=True: (
+            score_calls.append((item.symbol, use_live_fallback))
+            or {
+                "symbol": item.symbol,
+                "price": 0.0,
+                "total_score": 0.0,
+                "status": "WATCHING",
+                "stop_adr": None,
+                "risk_percent": 0.01,
+                "position_percent": 0.0,
+                "trade_plan": "Cached data unavailable",
+                "env": "PROD",
+            }
+        ),
+    )
     monkeypatch.setattr(main_window_module.MainWindow, "_load_buylist", lambda _self: BuylistManager())
     monkeypatch.setattr(
         main_window_module.MainWindow,
@@ -91,6 +115,7 @@ def test_main_window_constructs_and_closes_offscreen_without_external_io(monkeyp
     from src.ui.buyboard.columns import BOARD_COLUMN_ORDER
 
     assert set(window.buyboard_columns.keys()) == set(BOARD_COLUMN_ORDER)
+    assert score_calls == []
 
     assert window.close() is True
     assert window._database_shutting_down is True

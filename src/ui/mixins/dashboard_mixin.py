@@ -42,10 +42,6 @@ from src.core.scanner import ComparisonOperator, ScanRule, StockScanner
 from src.core.trade_reviewer import TradeReviewer, TradeSetup
 from src.core.watchlist import (BuylistItem, BuylistManager, TradePlan,
                                 TradePlanManager, Watchlist)
-from src.infrastructure.database.repositories.market_bars import \
-    get_latest_hourly_price_history_timestamp
-from src.infrastructure.database.repositories.market_watermarks import \
-    get_latest_price_history_date
 from src.risk.position_sizer import PositionSizer
 from src.services.app_state import (SCANNER_SETUPS_FILE, SETTINGS_FILE,
                                     load_buylist_state,
@@ -1323,7 +1319,12 @@ class DashboardMixin:
         is_manual = force
 
         if is_manual:
-            self._cached_market_data_status = None
+            self._cached_market_data_status = "Checking..."
+            refresh_market_status = getattr(
+                self, "_start_market_data_status_refresh", None
+            )
+            if callable(refresh_market_status):
+                refresh_market_status()
 
         symbols = [stock["symbol"] for stock in self.scanner_results]
         _db_source_labels = {"pc": "PC", "local_mirror": "local mirror"}
@@ -1363,30 +1364,7 @@ class DashboardMixin:
         if not self.db_enabled or self.db_engine is None:
             return "Unavailable"
 
-        if getattr(self, "_cached_market_data_status", None) is not None:
-            return self._cached_market_data_status
-
-        try:
-            latest_date = get_latest_price_history_date(self.db_engine)
-            if latest_date is None:
-                self._cached_market_data_status = "No cached data"
-                return self._cached_market_data_status
-
-            daily_status = self._format_market_data_status_from_date(latest_date)
-            latest_hourly = get_latest_hourly_price_history_timestamp(self.db_engine)
-            if latest_hourly is None:
-                self._cached_market_data_status = (
-                    f"Daily {daily_status}; 1H no cached data"
-                )
-                return self._cached_market_data_status
-
-            hourly_text = pd.Timestamp(latest_hourly).strftime("%Y-%m-%d %H:%M")
-            self._cached_market_data_status = (
-                f"Daily {daily_status}; 1H latest {hourly_text} UTC"
-            )
-            return self._cached_market_data_status
-        except Exception:
-            return "Unavailable"
+        return getattr(self, "_cached_market_data_status", None) or "Checking..."
 
     @staticmethod
     def _format_market_data_status_from_date(
