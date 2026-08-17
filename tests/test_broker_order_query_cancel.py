@@ -1,3 +1,4 @@
+from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
@@ -192,6 +193,8 @@ def test_kis_pagination_fails_closed_on_continuation_without_cursor():
 
 
 def test_kis_reserved_order_query_parses_broker_reservation_fill(monkeypatch):
+    captured_params = []
+
     class FakeClient:
         def __init__(self, config):
             self.config = config
@@ -202,6 +205,7 @@ def test_kis_reserved_order_query_parses_broker_reservation_fill(monkeypatch):
         def _get_with_headers(self, endpoint, tr_id, params, tr_cont=""):
             assert endpoint.endswith("/order-resv-list")
             assert tr_id == "TTTT3039R"
+            captured_params.append(dict(params))
             return {
                 "rt_cd": "0",
                 "output": [
@@ -235,6 +239,14 @@ def test_kis_reserved_order_query_parses_broker_reservation_fill(monkeypatch):
     assert snapshot.side == OrderSide.SELL
     assert snapshot.filled_quantity == 4
     assert snapshot.broker_order_id == "RSV-1"
+    start = datetime.strptime(captured_params[0]["INQR_STRT_DT"], "%Y%m%d")
+    end = datetime.strptime(captured_params[0]["INQR_END_DT"], "%Y%m%d")
+    assert (end - start).days == 6
+
+
+def test_kis_reserved_order_query_rejects_seven_day_span_before_request():
+    with pytest.raises(ValueError, match="shorter than 7 days"):
+        kis_order._reserved_order_dates("20260801", "20260808")
 
 
 def test_reconcile_unknown_submission_keeps_unknown_on_unknown_snapshot():

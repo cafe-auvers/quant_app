@@ -589,6 +589,16 @@ class BuyboardRuntimeWorker(QThread):
         # The lease was acquired against the prior standby generation. Perform
         # the immediate activation reconciliation with the command gate shut.
         self._run_startup_reconciliation(execute_commands=False)
+        # A real account reconciliation can outlast the strict accumulator
+        # drain budget.  Refresh observation state *after* that blocking pass
+        # while the mutation gate is still closed; otherwise an otherwise
+        # healthy successor can remain STANDBY forever because every final
+        # reconciliation makes the preceding drain stale before readiness is
+        # rechecked.  KIS stop breaches remain latched until the engine
+        # acknowledges them, so draining here cannot lose protective intent.
+        if self.runtime is not None:
+            self.runtime.market_data.poll_once()
+            self.last_market_data_drain_at = datetime.now(timezone.utc)
         self._lease_current = self._lease_still_current()
         readiness = self.engine_readiness(include_device_state=False)
         if not (self._lease_current and readiness.standby_ready):

@@ -322,6 +322,42 @@ def _default_order_dates(
     return start.replace("-", ""), end.replace("-", "")
 
 
+def _reserved_order_dates(
+    start_date: Optional[str], end_date: Optional[str]
+) -> tuple[str, str]:
+    """Return a KIS-valid reservation-ledger window.
+
+    ``order-resv-list`` rejects ranges of seven days or more (APBK1744),
+    unlike the normal overseas order-history endpoint.  Keep the discovery
+    default inside that broker constraint and reject an explicitly oversized
+    window before making a request.
+    """
+
+    today = datetime.now(timezone.utc).date()
+    normalized_end = str(end_date or today.strftime("%Y%m%d")).replace("-", "")
+    try:
+        parsed_end = datetime.strptime(normalized_end, "%Y%m%d").date()
+    except ValueError as exc:
+        raise ValueError("end_date must be YYYYMMDD") from exc
+
+    normalized_start = str(start_date or "").replace("-", "")
+    if normalized_start:
+        try:
+            parsed_start = datetime.strptime(normalized_start, "%Y%m%d").date()
+        except ValueError as exc:
+            raise ValueError("start_date must be YYYYMMDD") from exc
+    else:
+        parsed_start = parsed_end - timedelta(days=6)
+        normalized_start = parsed_start.strftime("%Y%m%d")
+
+    span_days = (parsed_end - parsed_start).days
+    if span_days < 0:
+        raise ValueError("start_date must be on or before end_date")
+    if span_days >= 7:
+        raise ValueError("reserved-order query range must be shorter than 7 days")
+    return normalized_start, normalized_end
+
+
 def _broker_order_id_from_row(row: Dict[str, Any]) -> str:
     return str(
         _row_value(
@@ -715,7 +751,7 @@ def query_overseas_reserved_order(
     symbol = str(symbol or "").strip().upper()
     broker_order_id = str(broker_order_id or "").strip()
     exchange = str(exchange or "NASD").strip().upper()
-    start, end = _default_order_dates(start_date, end_date)
+    start, end = _reserved_order_dates(start_date, end_date)
     params = {
         "CANO": config.cano,
         "ACNT_PRDT_CD": config.account_product_code,
