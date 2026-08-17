@@ -117,6 +117,148 @@ def test_kis_query_parses_filled_partial_working_and_cancelled_rows():
     assert cancelled.status == OrderStatus.CANCELLED
 
 
+def test_kis_history_normalizes_unpadded_order_number_to_submit_identity():
+    snapshot = kis_order.parse_broker_order_status_snapshot(
+        {
+            "pdno": "AAPL",
+            "odno": "1234",
+            "orgn_odno": "0",
+            "rvse_cncl_dvsn": "00",
+            "ft_ord_qty": "1",
+            "ft_ccld_qty": "0",
+            "nccs_qty": "1",
+        },
+        environment="PROD",
+        account_no="12345678-01",
+        source="history",
+    )
+
+    assert snapshot.broker_order_id == "0000001234"
+    assert snapshot.status == OrderStatus.WORKING
+
+
+def test_kis_cancel_history_projects_terminal_status_to_original_order_id():
+    snapshot = kis_order.parse_broker_order_status_snapshot(
+        {
+            "pdno": "AAPL",
+            "odno": "5678",
+            "orgn_odno": "1234",
+            "rvse_cncl_dvsn": "02",
+            "rvse_cncl_dvsn_name": "취소",
+            "ft_ord_qty": "1",
+            "ft_ccld_qty": "0",
+            "nccs_qty": "0",
+        },
+        environment="PROD",
+        account_no="12345678-01",
+        source="history",
+    )
+
+    assert snapshot.broker_order_id == "0000001234"
+    assert snapshot.status == OrderStatus.CANCELLED
+
+
+def test_kis_order_filter_matches_padded_submit_id_to_unpadded_history_id():
+    snapshot = BrokerOrderStatusSnapshot(
+        environment="PROD",
+        account_no="12345678-01",
+        symbol="AAPL",
+        broker_order_id="1234",
+        side=OrderSide.BUY,
+        status=OrderStatus.WORKING,
+    )
+
+    assert kis_order._matches_order_filter(
+        snapshot,
+        broker_order_id="0000001234",
+    )
+
+
+def test_kis_reservation_identity_is_not_regular_order_number_padded():
+    snapshot = kis_order.parse_broker_order_status_snapshot(
+        {
+            "pdno": "AAPL",
+            "ovrs_rsvn_odno": "1234",
+            "ft_ord_qty": "1",
+        },
+        environment="PROD",
+        account_no="12345678-01",
+        source="reservation",
+    )
+
+    assert snapshot.broker_order_id == "1234"
+
+
+def test_kis_query_correlates_cancel_history_with_padded_owned_order(monkeypatch):
+    class FakeClient:
+        def __init__(self, config):
+            self.config = config
+
+        def authenticate(self, force_refresh=False):
+            return "token"
+
+        def _get_with_headers(self, endpoint, tr_id, params, tr_cont=""):
+            if endpoint.endswith("/inquire-nccs"):
+                return {"rt_cd": "0", "output": []}, {}
+            return {
+                "rt_cd": "0",
+                "output": [
+                    {
+                        "pdno": "AAPL",
+                        "odno": "1234",
+                        "orgn_odno": "0",
+                        "sll_buy_dvsn_cd": "02",
+                        "rvse_cncl_dvsn": "00",
+                        "ft_ord_qty": "1",
+                        "ft_ccld_qty": "0",
+                        "nccs_qty": "0",
+                    },
+                    {
+                        "pdno": "AAPL",
+                        "odno": "5678",
+                        "orgn_odno": "1234",
+                        "sll_buy_dvsn_cd": "02",
+                        "rvse_cncl_dvsn": "02",
+                        "rvse_cncl_dvsn_name": "취소",
+                        "ft_ord_qty": "1",
+                        "ft_ccld_qty": "0",
+                        "nccs_qty": "0",
+                    },
+                ],
+            }, {}
+
+    fake_config = SimpleNamespace(
+        cano="12345678",
+        account_product_code="01",
+        base_url="https://kis.example",
+    )
+    monkeypatch.setattr(kis_order, "load_config", lambda *args, **kwargs: fake_config)
+    monkeypatch.setattr(kis_order, "KisAccountClient", FakeClient)
+
+    snapshots = kis_order.query_overseas_order(
+        environment="PROD",
+        account_no="12345678-01",
+        symbol="AAPL",
+        broker_order_id="0000001234",
+        side="BUY",
+    )
+
+    assert {snapshot.broker_order_id for snapshot in snapshots} == {"0000001234"}
+    assert {snapshot.status for snapshot in snapshots} == {
+        OrderStatus.UNKNOWN,
+        OrderStatus.CANCELLED,
+    }
+    order = _order(
+        environment="PROD",
+        account_no="12345678-01",
+        broker_order_id="0000001234",
+        quantity=1,
+    )
+    selected = _select_snapshot_for_order(order, snapshots)
+    assert selected is not None
+    assert selected.status == OrderStatus.CANCELLED
+
+
 def test_query_overseas_order_returns_unknown_not_found_without_credentials(monkeypatch):
     class FakeClient:
         def __init__(self, config):
