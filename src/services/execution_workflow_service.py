@@ -27,6 +27,7 @@ received.
 from __future__ import annotations
 
 import inspect
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
@@ -815,6 +816,9 @@ def request_board_action(engine, command, *, context=None):
         AdoptExternalOrder,
         BoardActionContext,
         BoardWorkflowResult,
+        SetBreakevenStop,
+        SetManualStop,
+        SetOrbStop,
     )
     from src.services import trade_card_repository
     from src.services.discovered_external_order_repository import (
@@ -887,42 +891,58 @@ def request_board_action(engine, command, *, context=None):
 
     trade_card_repository.ensure_trade_cards_table(engine)
     ensure_execution_ownership_table(engine)
-    with engine.begin() as conn:
-        current = trade_card_repository.get_trade_card_in_transaction(
-            conn,
-            command.environment,
-            command.account_no,
-            command.symbol,
-            for_update=True,
-        )
-        if current is None:
-            raise TradeCardNotFoundError(
-                f"No trade card for {command.environment}:{command.account_no}:{command.symbol}"
+    stop_change_coordinator = None
+    stop_change_scope = nullcontext()
+    if isinstance(command, (SetOrbStop, SetBreakevenStop, SetManualStop)):
+        from src.services.stop_change_coordinator import stop_change_coordinator_for
+
+        stop_change_coordinator = stop_change_coordinator_for(engine)
+        stop_change_scope = stop_change_coordinator.lock_cards([card.card_key])
+
+    # A stop request owns the same per-card coordinator lock from its final
+    # revision/ownership read through canonical commit and process-local
+    # publication.  The runtime's feed drain takes this lock too, so it can
+    # never evaluate an event after the commit while still being unaware of
+    # the newly durable request.
+    with stop_change_scope:
+        with engine.begin() as conn:
+            current = trade_card_repository.get_trade_card_in_transaction(
+                conn,
+                command.environment,
+                command.account_no,
+                command.symbol,
+                for_update=True,
             )
-        if current.version != command.expected_card_version:
-            raise TradeCardVersionConflictError(
-                f"Command {command.command_id} expected version "
-                f"{command.expected_card_version}, stored version is {current.version}"
+            if current is None:
+                raise TradeCardNotFoundError(
+                    f"No trade card for {command.environment}:{command.account_no}:{command.symbol}"
+                )
+            if current.version != command.expected_card_version:
+                raise TradeCardVersionConflictError(
+                    f"Command {command.command_id} expected version "
+                    f"{command.expected_card_version}, stored version is {current.version}"
+                )
+            _require_current_board_runtime(command, current, resolved_context)
+            ownership = get_ownership_in_transaction(
+                conn,
+                environment=current.environment,
+                account_no=current.account_no,
+                symbol=current.symbol,
+                for_update=True,
             )
-        _require_current_board_runtime(command, current, resolved_context)
-        ownership = get_ownership_in_transaction(
-            conn,
-            environment=current.environment,
-            account_no=current.account_no,
-            symbol=current.symbol,
-            for_update=True,
-        )
-        _require_kanban_board_ownership(
-            engine,
-            command,
-            current,
-            resolved_context,
-            ownership=ownership,
-        )
-        _apply_board_mutation(command, current, context=resolved_context)
-        updated = trade_card_repository.update_trade_card_in_transaction(
-            conn, current, expected_version=command.expected_card_version
-        )
+            _require_kanban_board_ownership(
+                engine,
+                command,
+                current,
+                resolved_context,
+                ownership=ownership,
+            )
+            _apply_board_mutation(command, current, context=resolved_context)
+            updated = trade_card_repository.update_trade_card_in_transaction(
+                conn, current, expected_version=command.expected_card_version
+            )
+        if stop_change_coordinator is not None:
+            stop_change_coordinator.record_durable(updated)
     trade_card_repository.sync_trade_card_local_snapshot(updated)
     return BoardWorkflowResult(card=updated, command_id=command.command_id)
 

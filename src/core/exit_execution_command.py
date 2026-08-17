@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+from src.core import execution_config
 from src.core.order_state import (
     REGULAR_LIMIT_EXECUTION,
     RESERVED_MOO_EXECUTION,
@@ -38,6 +39,45 @@ def exit_execution_policy(
     ):
         return RESERVED_MOO_EXECUTION
     return REGULAR_LIMIT_EXECUTION
+
+
+def marketable_exit_limit_price(
+    *,
+    bid_price: float | None = None,
+    last_price: float | None = None,
+    last_trusted_price: float | None = None,
+    quote_is_execution_ready: bool = True,
+    emergency_reprice_attempt: int = 0,
+) -> float | None:
+    """Derive the shared bounded SELL limit from normalized market state.
+
+    Frontends provide observations, never their own pricing policy.  A fresh
+    bid receives the normal collar.  When only a last/trusted observation is
+    available, retries may widen the collar up to the existing five-percent
+    hard bound.
+    """
+
+    def positive(value: float | None) -> float | None:
+        try:
+            result = float(value or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return result if math.isfinite(result) and result > 0 else None
+
+    bid = positive(bid_price) if quote_is_execution_ready else None
+    if bid is not None:
+        discount = execution_config.SELL_MARKETABLE_DISCOUNT_PCT
+        return max(0.01, bid * (1.0 - discount))
+
+    reference = positive(last_trusted_price)
+    if reference is None and quote_is_execution_ready:
+        reference = positive(last_price)
+    if reference is None:
+        return None
+    discount = execution_config.SELL_MARKETABLE_DISCOUNT_PCT * max(
+        1, int(emergency_reprice_attempt or 0) + 1
+    )
+    return max(0.01, reference * (1.0 - min(discount, 0.05)))
 
 
 @dataclass(frozen=True)

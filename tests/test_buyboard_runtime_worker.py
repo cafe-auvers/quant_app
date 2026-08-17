@@ -23,6 +23,7 @@ from sqlalchemy.pool import NullPool
 
 from src.core import execution_config
 from src.core.account_broker_snapshot import AccountBrokerSnapshot, SnapshotCompleteness
+from src.core.board_workflow import BoardActionContext, ReorderCard, SetManualStop
 from src.core.execution_mode import ExecutionLease
 from src.core.runtime_readiness import EngineReadiness, RuntimeDeviceState
 from src.core.execution_ownership import ExecutionOwner, ExecutionOwnership
@@ -47,6 +48,7 @@ from src.core.trade_card_state import (
     TradeCardState,
 )
 from src.services import buyboard_runtime as runtime_module
+from src.services import execution_workflow_service as workflow
 from src.services import trade_card_repository as repo
 from src.services.account_reconciliation import (
     AccountReconciliationResult,
@@ -416,6 +418,186 @@ def test_tighter_pending_stop_catches_trade_detached_under_old_generation(
     assert initiations == [card.card_key]
 
 
+def _stale_snapshot_stop_worker(tmp_path, monkeypatch, *, stop_price: float):
+    import src.services.trading_engine as trading_engine_module
+
+    monkeypatch.setattr(
+        trading_engine_module, "is_buyboard_engine_enabled", lambda: True
+    )
+    now = dt.datetime.now(dt.timezone.utc)
+
+    class _Transport:
+        def on_data(self, callback):
+            pass
+
+        def on_ack(self, callback):
+            pass
+
+        def on_connection(self, callback):
+            pass
+
+        def subscribe(self, subscriptions):
+            pass
+
+        def unsubscribe(self, subscriptions):
+            pass
+
+        def is_connected(self):
+            return True
+
+    service = KisRealtimeMarketDataService(
+        transport=_Transport(),
+        symbol_key_resolver=lambda symbol, channel: symbol,
+        trade_capacity=10,
+        quote_capacity=10,
+        clock=lambda: now,
+        regular_session_filter=lambda observed_at: True,
+    )
+    worker, engine = _worker(tmp_path)
+    card = _seed_card(
+        engine,
+        board_status=BoardStatus.OPEN_POSITION,
+        position_runtime_status=PositionRuntimeStatus.OPEN,
+        broker_quantity=10,
+        orderable_quantity=10,
+        stop_type=StopType.ORB_LOW,
+        active_stop_price=stop_price,
+        stop_quantity=10,
+    )
+    worker.runtime = _build_test_runtime(
+        buying_power_provider=worker._buying_power_provider,
+        card_lookup=worker._card_lookup,
+        broker=worker._broker,
+        market_data=service,
+    )
+    worker.runtime.trading_engine.run_heartbeat = lambda cards: []
+    monkeypatch.setattr(
+        worker, "_refresh_account_state_if_due", lambda *args, **kwargs: False
+    )
+    worker._sync_market_stop_rules([card], apply_pending_changes=False)
+    return worker, engine, service, now
+
+
+def test_ui_stop_commit_reaches_feed_when_worker_card_snapshot_is_stale(
+    tmp_path, monkeypatch
+):
+    """A v11 stop commit cannot be missed by a worker still holding v10."""
+
+    worker, engine, service, now = _stale_snapshot_stop_worker(
+        tmp_path, monkeypatch, stop_price=95.0
+    )
+    original_sync = worker._sync_quote_subscriptions
+    injected = False
+
+    def commit_stop_after_worker_load(cards):
+        nonlocal injected
+        original_sync(cards)
+        if injected:
+            return
+        injected = True
+        canonical = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+        workflow.request_board_action(
+            engine,
+            SetManualStop(
+                environment="PROD",
+                account_no="1",
+                symbol="AAPL",
+                expected_card_version=canonical.version,
+                price=100.0,
+                requested_at=now,
+            ),
+            context=BoardActionContext(),
+        )
+        observed = now + dt.timedelta(milliseconds=1)
+        assert service.ingest_trade(
+            QuoteSnapshot(
+                symbol="AAPL",
+                last_price=98.0,
+                broker_event_at=observed,
+                received_at=observed,
+                processed_at=observed,
+                channel="HDFSCNT0",
+                payload_fingerprint="stale-worker-stop-request",
+            )
+        )
+
+    monkeypatch.setattr(worker, "_sync_quote_subscriptions", commit_stop_after_worker_load)
+
+    worker._run_one_cycle()
+
+    after_conflict = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert after_conflict.pending_stop_command_id
+    assert after_conflict.exit_all_required is False
+    assert any(quote.breached_stop_versions for quote in service.poll_once())
+
+    worker._run_one_cycle()
+
+    durable = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert durable.active_stop_price == 100.0
+    assert durable.pending_stop_command_id == ""
+    assert durable.exit_all_required is True
+    assert durable.board_status == BoardStatus.SELL_ALL
+    assert not any(quote.breached_stop_versions for quote in service.poll_once())
+
+
+def test_stop_breach_ack_waits_for_successful_card_cas(tmp_path, monkeypatch):
+    worker, engine, service, now = _stale_snapshot_stop_worker(
+        tmp_path, monkeypatch, stop_price=100.0
+    )
+    original_sync = worker._sync_quote_subscriptions
+    injected = False
+
+    def reorder_and_breach_after_worker_load(cards):
+        nonlocal injected
+        original_sync(cards)
+        if injected:
+            return
+        injected = True
+        canonical = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+        workflow.request_board_action(
+            engine,
+            ReorderCard(
+                environment="PROD",
+                account_no="1",
+                symbol="AAPL",
+                expected_card_version=canonical.version,
+                target_priority=7,
+            ),
+            context=BoardActionContext(),
+        )
+        observed = now + dt.timedelta(milliseconds=1)
+        assert service.ingest_trade(
+            QuoteSnapshot(
+                symbol="AAPL",
+                last_price=99.0,
+                broker_event_at=observed,
+                received_at=observed,
+                processed_at=observed,
+                channel="HDFSCNT0",
+                payload_fingerprint="breach-before-stale-cas",
+            )
+        )
+
+    monkeypatch.setattr(
+        worker, "_sync_quote_subscriptions", reorder_and_breach_after_worker_load
+    )
+
+    worker._run_one_cycle()
+
+    after_conflict = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert after_conflict.kanban_priority == 7
+    assert after_conflict.exit_all_required is False
+    assert any(quote.breached_stop_versions for quote in service.poll_once())
+
+    worker._run_one_cycle()
+
+    durable = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert durable.kanban_priority == 7
+    assert durable.exit_all_required is True
+    assert durable.board_status == BoardStatus.SELL_ALL
+    assert not any(quote.breached_stop_versions for quote in service.poll_once())
+
+
 @pytest.mark.parametrize(
     "missing",
     [
@@ -696,7 +878,11 @@ def test_standby_stop_breach_survives_promotion_and_initiates_sell_all_once(
     )
     for quote in promoted_service.poll_once():
         active.runtime.trading_engine.evaluate_quote([card], quote)
-        active._acknowledge_market_breaches(quote, [card])
+        candidates = set()
+        active._collect_market_breach_ack_candidates(quote, [card], candidates)
+        active._acknowledge_market_breach_candidates(
+            candidates, {card.card_key}
+        )
     for quote in promoted_service.poll_once():
         active.runtime.trading_engine.evaluate_quote([card], quote)
 

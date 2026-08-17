@@ -212,6 +212,35 @@ class PendingMarketStateAccumulator:
         with bucket.lock:
             bucket.pending.add_quote(quote)
 
+    def latch_breach(
+        self,
+        symbol: str,
+        card_key: str,
+        version: str,
+        quote: QuoteSnapshot,
+        stop_price: float,
+    ) -> bool:
+        """Latch a breach discovered during a pending-stop handoff.
+
+        The event may have been observed under a looser old rule, so normal
+        ingestion could not classify it as a breach.  Once the runtime checks
+        it against the newly durable tighter rule, it receives the same exact
+        replay/ack lifecycle as an ingestion-time breach.
+        """
+
+        bucket = self._bucket(symbol)
+        identity = (str(card_key), str(version))
+        rule = StopRule(
+            card_key=str(card_key), price=float(stop_price), version=str(version)
+        )
+        with bucket.lock:
+            created = identity not in bucket.pending_breaches
+            bucket.pending_breaches.setdefault(identity, (quote, rule))
+            bucket.pending.breached_stop_versions.add(identity)
+            bucket.pending.stop_breach_latched = True
+            bucket.pending.breached_stop_version = identity[1]
+        return created
+
     def replace_stop_rules(
         self, symbol: str, rules: Iterable[StopRule]
     ) -> Optional[DetachedMarketState]:
@@ -614,6 +643,18 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
 
     def acknowledge_stop_breach(self, symbol: str, card_key: str, version: str) -> bool:
         return self._accumulator.acknowledge_breach(symbol, card_key, version)
+
+    def latch_stop_breach(
+        self,
+        symbol: str,
+        card_key: str,
+        version: str,
+        quote: QuoteSnapshot,
+        stop_price: float,
+    ) -> bool:
+        return self._accumulator.latch_breach(
+            symbol, card_key, version, quote, stop_price
+        )
 
     def set_symbol_trading_halted(self, symbol: str, halted: bool) -> None:
         """Apply a verified halt signal without guessing from quote absence."""

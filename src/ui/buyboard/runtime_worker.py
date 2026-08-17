@@ -80,6 +80,7 @@ from src.services.runtime_device_state_repository import (
     save_runtime_device_state,
 )
 from src.services.kis_realtime_market_data import StopRule, SubscriptionPriority
+from src.services.stop_change_coordinator import stop_change_coordinator_for
 from src.services.trade_card_orb_bridge import TradeCardOrbEvaluator
 
 logger = logging.getLogger(__name__)
@@ -157,6 +158,7 @@ class BuyboardRuntimeWorker(QThread):
         self.request_scheduler = request_scheduler or KisRequestScheduler()
         install_process_kis_request_scheduler(self.request_scheduler)
         self._market_data = market_data
+        self._stop_change_coordinator = stop_change_coordinator_for(db_engine)
         self._execution_authority = execution_authority
         self._execution_lease = execution_lease
         self._lease_engine = lease_engine
@@ -909,6 +911,7 @@ class BuyboardRuntimeWorker(QThread):
 
         changed_ids: set = set()
         changed: List[TradeCardState] = []
+        breach_ack_candidates: set[tuple[str, str, str]] = set()
 
         def _track(touched: List[TradeCardState]) -> None:
             for card in touched:
@@ -929,6 +932,10 @@ class BuyboardRuntimeWorker(QThread):
         observation_cards = [
             card for card in cards if card.board_status in _QUOTE_SUBSCRIBED_STATUSES
         ]
+        durably_liquidating_card_keys = {
+            card.card_key for card in observation_cards if card.exit_all_required
+        }
+        stop_card_keys = [card.card_key for card in observation_cards]
 
         if allow_mutations:
             _track(self._sync_orb_plans(ready_cards))
@@ -936,26 +943,38 @@ class BuyboardRuntimeWorker(QThread):
         # readiness: a reconciliation failure may block a command but must
         # never make the feed stop watching an existing position.
         self._sync_quote_subscriptions(observation_cards)
-        self._sync_market_stop_rules(
-            observation_cards,
-            apply_pending_changes=bool(allow_mutations and canonical_available),
-        )
+        with self._stop_change_coordinator.lock_cards(stop_card_keys):
+            # A stop can commit after this cycle loaded ``cards``. Overlay
+            # that exact durable request before rotating/draining so the
+            # stale object cannot consume a post-request event using only
+            # its old stop.
+            self._stop_change_coordinator.overlay_pending(observation_cards)
+            self._sync_market_stop_rules(
+                observation_cards,
+                apply_pending_changes=bool(allow_mutations and canonical_available),
+            )
 
-        quotes = self.runtime.market_data.poll_once()
-        self.last_market_data_drain_at = datetime.now(timezone.utc)
-        if allow_mutations:
-            for quote in quotes:
-                _track(self.runtime.trading_engine.evaluate_quote(observation_cards, quote))
-                _track(
-                    self.runtime.trading_engine.evaluate_pending_stop_handoff(
-                        observation_cards, quote
+            quotes = self.runtime.market_data.poll_once()
+            self.last_market_data_drain_at = datetime.now(timezone.utc)
+            if allow_mutations:
+                for quote in quotes:
+                    _track(self.runtime.trading_engine.evaluate_quote(observation_cards, quote))
+                    pending_handoff = (
+                        self.runtime.trading_engine.evaluate_pending_stop_handoff(
+                            observation_cards, quote
+                        )
                     )
-                )
-                _track(self.runtime.trading_engine.evaluate_entry_quote(ready_cards, quote))
-                self._acknowledge_market_breaches(quote, observation_cards)
+                    _track(pending_handoff)
+                    self._latch_pending_stop_breaches(
+                        quote, pending_handoff, breach_ack_candidates
+                    )
+                    _track(self.runtime.trading_engine.evaluate_entry_quote(ready_cards, quote))
+                    self._collect_market_breach_ack_candidates(
+                        quote, observation_cards, breach_ack_candidates
+                    )
+                _track(self._acknowledge_pending_stop_changes(observation_cards))
 
-            _track(self._acknowledge_pending_stop_changes(observation_cards))
-
+        if allow_mutations:
             heartbeat_cards = ready_cards
             if not canonical_available:
                 heartbeat_cards = [
@@ -972,29 +991,50 @@ class BuyboardRuntimeWorker(QThread):
         # Stops can change inside the heartbeat (first-fill ORB stop,
         # completion-to-breakeven). Rotate under the feed's shared lock and
         # immediately evaluate any events detached from the old version.
-        if allow_mutations and self._sync_market_stop_rules(
-            observation_cards, apply_pending_changes=True
-        ):
-            rotated_quotes = self.runtime.market_data.poll_once()
-            self.last_market_data_drain_at = datetime.now(timezone.utc)
-            for quote in rotated_quotes:
-                _track(self.runtime.trading_engine.evaluate_quote(observation_cards, quote))
-                _track(
-                    self.runtime.trading_engine.evaluate_pending_stop_handoff(
-                        observation_cards, quote
-                    )
-                )
-                _track(self.runtime.trading_engine.evaluate_entry_quote(ready_cards, quote))
-                self._acknowledge_market_breaches(quote, observation_cards)
-            _track(self._acknowledge_pending_stop_changes(observation_cards))
+        if allow_mutations:
+            with self._stop_change_coordinator.lock_cards(stop_card_keys):
+                # Catch a UI stop request that committed while heartbeat
+                # work was running, even though this cycle's card list is
+                # older than the request.
+                self._stop_change_coordinator.overlay_pending(observation_cards)
+                if self._sync_market_stop_rules(
+                    observation_cards, apply_pending_changes=True
+                ):
+                    rotated_quotes = self.runtime.market_data.poll_once()
+                    self.last_market_data_drain_at = datetime.now(timezone.utc)
+                    for quote in rotated_quotes:
+                        _track(self.runtime.trading_engine.evaluate_quote(observation_cards, quote))
+                        pending_handoff = (
+                            self.runtime.trading_engine.evaluate_pending_stop_handoff(
+                                observation_cards, quote
+                            )
+                        )
+                        _track(pending_handoff)
+                        self._latch_pending_stop_breaches(
+                            quote, pending_handoff, breach_ack_candidates
+                        )
+                        _track(self.runtime.trading_engine.evaluate_entry_quote(ready_cards, quote))
+                        self._collect_market_breach_ack_candidates(
+                            quote, observation_cards, breach_ack_candidates
+                        )
+                _track(self._acknowledge_pending_stop_changes(observation_cards))
         # The full card set, not just ready_cards: UNRECONCILED_BROKER_ORDER
         # can be set by _refresh_account_state_if_due's order reconciliation,
         # which (deliberately) still runs for every account, including ones
         # excluded from ready_cards.
         self._emit_stalled_liquidation_alerts(cards)
 
+        persisted: List[TradeCardState] = []
         if canonical_available:
-            self._persist_changed(changed)
+            persisted = self._persist_changed(changed)
+        for card in persisted:
+            self._stop_change_coordinator.complete_if_durable(card)
+        durable_breach_keys = durably_liquidating_card_keys | {
+            card.card_key for card in persisted if card.exit_all_required
+        }
+        self._acknowledge_market_breach_candidates(
+            breach_ack_candidates, durable_breach_keys
+        )
         if changed or reconciliation_changed:
             self.board_changed.emit()
 
@@ -1872,21 +1912,62 @@ class BuyboardRuntimeWorker(QThread):
                 changed.append(card)
         return changed
 
-    def _acknowledge_market_breaches(
-        self, quote, cards: List[TradeCardState]
+    def _latch_pending_stop_breaches(
+        self,
+        quote,
+        cards: List[TradeCardState],
+        candidates: set[tuple[str, str, str]],
     ) -> None:
-        acknowledge = getattr(
-            self.runtime.market_data, "acknowledge_stop_breach", None
-        )
-        if not callable(acknowledge) or not quote.breached_stop_versions:
+        latch = getattr(self.runtime.market_data, "latch_stop_breach", None)
+        if not callable(latch):
+            return
+        for card in cards:
+            if not card.exit_all_required or card.pending_stop_price is None:
+                continue
+            version = str(self._market_stop_generations.get(card.card_key, 0))
+            if version == "0":
+                continue
+            latch(
+                card.symbol,
+                card.card_key,
+                version,
+                quote,
+                float(card.pending_stop_price),
+            )
+            candidates.add((card.symbol, card.card_key, version))
+
+    @staticmethod
+    def _collect_market_breach_ack_candidates(
+        quote,
+        cards: List[TradeCardState],
+        candidates: set[tuple[str, str, str]],
+    ) -> None:
+        if not quote.breached_stop_versions:
             return
         cards_by_key = {card.card_key: card for card in cards}
         for card_key, version in quote.breached_stop_versions:
             card = cards_by_key.get(card_key)
             if card is not None and card.exit_all_required:
-                acknowledge(card.symbol, card_key, version)
+                candidates.add((card.symbol, card_key, version))
 
-    def _persist_changed(self, cards: List[TradeCardState]) -> None:
+    def _acknowledge_market_breach_candidates(
+        self,
+        candidates: set[tuple[str, str, str]],
+        durable_card_keys: set[str],
+    ) -> None:
+        acknowledge = getattr(
+            self.runtime.market_data, "acknowledge_stop_breach", None
+        )
+        if not callable(acknowledge):
+            return
+        for symbol, card_key, version in sorted(candidates):
+            if card_key in durable_card_keys:
+                acknowledge(symbol, card_key, version)
+
+    def _persist_changed(
+        self, cards: List[TradeCardState]
+    ) -> List[TradeCardState]:
+        persisted: List[TradeCardState] = []
         for card in cards:
             try:
                 try:
@@ -1898,6 +1979,7 @@ class BuyboardRuntimeWorker(QThread):
                     # via startup/full-account reconciliation) -- has never
                     # been persisted. Create it instead of dropping it.
                     repo.create_trade_card(self._db_engine, card)
+                persisted.append(card)
             except Exception:
                 # A stale version (another device changed this card
                 # concurrently) or a transient DB error must not stop the
@@ -1905,3 +1987,4 @@ class BuyboardRuntimeWorker(QThread):
                 # next cycle re-loads authoritative state and simply tries
                 # again.
                 logger.exception("BuyboardRuntimeWorker failed to persist %s", card.symbol)
+        return persisted

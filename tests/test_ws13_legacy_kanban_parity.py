@@ -113,7 +113,7 @@ def _capture_real_legacy_exit_command(
     quantity: int,
     reason: str,
     regular_session_open: bool,
-    order_price: float | None,
+    order_price: float | None = None,
 ):
     captured = []
 
@@ -141,17 +141,21 @@ def _capture_real_legacy_exit_command(
     window._current_execution_lease_kwargs = lambda: {}
     window.append_log = lambda message: None
     monkeypatch.setattr(legacy_orders_module, "KisOrderWorker", _Worker)
+    submit_kwargs = {}
+    if order_price is not None:
+        submit_kwargs["order_price"] = order_price
     window._submit_kis_sell_order(
         SimpleNamespace(
             symbol="AAPL",
             environment="PROD",
             kis_account_no="1",
+            current_price=100.0,
             _stop_order_pending=False,
             _exit_order_pending=False,
         ),
         quantity,
         reason,
-        order_price=order_price,
+        **submit_kwargs,
     )
     return captured[0]
 
@@ -322,15 +326,11 @@ def test_l3_partial_sell_produces_equal_submission_result_and_command(
         context=BoardActionContext(),
     ).card
 
-    expected_price = 100.0 * (
-        1 - runtime_module.execution_config.SELL_MARKETABLE_DISCOUNT_PCT
-    )
     legacy = _capture_real_legacy_exit_command(
         monkeypatch,
         quantity=requested.pending_partial_sell_quantity,
         reason="partial sell",
         regular_session_open=True,
-        order_price=expected_price,
     )
     kanban, result = _capture_real_kanban_exit_command(
         monkeypatch,
@@ -356,15 +356,11 @@ def test_l3_sell_all_produces_equal_submission_result_and_command(
         context=BoardActionContext(),
     ).card
 
-    expected_price = 100.0 * (
-        1 - runtime_module.execution_config.SELL_MARKETABLE_DISCOUNT_PCT
-    )
     legacy = _capture_real_legacy_exit_command(
         monkeypatch,
         quantity=requested.orderable_quantity,
         reason="manual sell all",
         regular_session_open=True,
-        order_price=expected_price,
     )
     kanban, result = _capture_real_kanban_exit_command(
         monkeypatch,

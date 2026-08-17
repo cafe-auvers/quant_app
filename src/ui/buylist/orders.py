@@ -11,6 +11,7 @@ from src.api.kis_order import is_ambiguous_order_submission_error
 from src.core.exit_execution_command import (
     build_exit_execution_command,
     exit_execution_policy,
+    marketable_exit_limit_price,
 )
 from src.core.order_state import (OPEN_ORDER_STATUSES, REGULAR_LIMIT_EXECUTION,
                                   RESERVED_MOO_EXECUTION, BrokerOrder,
@@ -579,11 +580,14 @@ class BuylistOrdersMixin:
         if execution_policy == RESERVED_MOO_EXECUTION:
             order_price = 0.0
         else:
-            order_price = (
-                max(0.01, explicit_price)
-                if explicit_price is not None
-                else self._buylist_order_price(item)
-            )
+            if explicit_price is not None:
+                order_price = max(0.01, explicit_price)
+            else:
+                market_observation = self._buylist_order_price(item)
+                order_price = marketable_exit_limit_price(
+                    last_price=market_observation,
+                    quote_is_execution_ready=True,
+                )
         if (
             execution_policy != RESERVED_MOO_EXECUTION
             and (not math.isfinite(float(order_price)) or order_price <= 0)

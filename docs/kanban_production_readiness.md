@@ -712,6 +712,15 @@ that landed immediately before the lock handoff, and only then promotes the
 pending fields to the active stop. The board renders this as `STOP CHANGE
 PENDING`; it never displays the requested price as active protection early.
 
+PR7 adds the UI-to-worker half of this boundary. A per-database
+`StopChangeCoordinator` holds the card lock across the workflow service's
+final CAS/commit and publication of the durable request. The runtime takes
+the same lock at its feed/evaluation boundary and overlays a just-committed
+request onto an older in-memory card. A handoff-only breach (for example,
+95 -> 100 while a trade at 98 was observed under the old rule) is promoted
+into the accumulator's normal exact breach latch, so a later card CAS
+conflict replays that event instead of losing it.
+
 **Revision 3.1 correction:** "synchronously drain" is not itself sufficient
 without a real synchronization primitive shared between the market-data
 feed thread (which publishes ticks into the accumulator) and the engine
@@ -755,7 +764,14 @@ bucket-level latch. The min and max are representative `QuoteSnapshot`s, not
 only scalar prices, so event time and exact identity survive coalescing and
 both downward stops and upward entry breakouts remain actionable.
 
-Tests: `test_a_breach_between_two_higher_prices_in_one_drain_window_is_never_lost`, `test_a_stop_price_change_forces_a_drain_against_the_old_version_first`, `test_a_trade_after_a_stop_change_is_evaluated_against_the_new_version_only`, `test_trade_arriving_exactly_during_stop_version_change_is_assigned_to_one_and_only_one_stop_version`, `test_latch_clears_only_on_explicit_engine_acknowledgement`.
+The worker does not acknowledge any exact breach identity merely because its
+local card says `exit_all_required`. It first persists that safety consequence
+successfully (or proves the card was already durably liquidating when loaded),
+then acknowledges. A concurrent harmless card edit that defeats the worker's
+CAS therefore leaves the latch outstanding for replay against the next
+canonical snapshot.
+
+Tests: `test_a_breach_between_two_higher_prices_in_one_drain_window_is_never_lost`, `test_a_stop_price_change_forces_a_drain_against_the_old_version_first`, `test_a_trade_after_a_stop_change_is_evaluated_against_the_new_version_only`, `test_trade_arriving_exactly_during_stop_version_change_is_assigned_to_one_and_only_one_stop_version`, `test_latch_clears_only_on_explicit_engine_acknowledgement`, `test_ui_stop_commit_reaches_feed_when_worker_card_snapshot_is_stale`, `test_stop_breach_ack_waits_for_successful_card_cas`.
 
 #### D9. Decision semantics (additions: emergency pricing)
 
@@ -1101,6 +1117,13 @@ owned cards).
 | Pre-market Sell All | Durable next-session exit instruction (ties into D9's outside-regular-session pricing) — `test_l3_premarket_sell_all_produces_the_same_next_open_intent` |
 | EOD unfilled entry | Automatic return to `Buylist` — `test_l3_eod_unfilled_entry_produces_the_same_authoritative_transition` |
 | Partial fill | Card remains tracked as a position plus the remaining working-order state (not silently treated as fully complete) — `test_l3_partial_fill_produces_the_same_reconciled_position_and_order_tracking` |
+
+For regular-session Partial Sell and Sell All, both real frontends now pass
+their normalized market observation into the same bounded SELL-pricing
+function before constructing `ExitExecutionCommand`. The parity tests invoke
+the actual legacy handler without injecting a precomputed Kanban price; equal
+market state therefore produces equal commands by implementation rather than
+test setup.
 
 PR7 traceability is intentionally split between the new frontend-boundary
 suite and the already-merged execution/reconciliation suites. The board

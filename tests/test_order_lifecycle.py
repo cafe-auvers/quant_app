@@ -15,6 +15,7 @@ from src.api.kis_account_snapshot_dual import (KisAccountClient,
                                                KisEnvironment,
                                                KisRateLimitError,
                                                KisTokenError)
+from src.core import execution_config
 from src.core.order_state import (REGULAR_LIMIT_EXECUTION,
                                   RESERVED_MOO_EXECUTION, BrokerOrder,
                                   OrderIntent, OrderSide, OrderStatus,
@@ -2346,7 +2347,9 @@ def test_submit_kis_sell_order_uses_environment_and_live_price_without_current_p
     assert worker.environment == "SIM"
     assert worker.symbol == "AAPL"
     assert worker.quantity == 10
-    assert worker.price == 88.5
+    assert worker.price == pytest.approx(
+        88.5 * (1.0 - execution_config.SELL_MARKETABLE_DISCOUNT_PCT)
+    )
     assert worker.side == "sell"
     assert worker.account_no == "12345678"
     assert worker.intent == OrderIntent.STOP_LOSS

@@ -118,6 +118,7 @@ from src.core.execution_mode import ExecutionLease, ExecutionMode, ExecutionSour
 from src.core.exit_execution_command import (
     build_exit_execution_command,
     exit_execution_policy,
+    marketable_exit_limit_price,
 )
 from src.core.execution_request import (
     CancelIntent,
@@ -217,33 +218,15 @@ def _marketable_sell_limit_price(
     last_trusted_price: Optional[float] = None,
     emergency_reprice_attempt: int = 0,
 ) -> Optional[float]:
-    """A bounded marketable SELL limit below a fresh bid, else a small
-    discount off the last trusted trade price -- mirrors the existing legacy Buy
-    Dashboard's ``src.ui.buylist.constants.STOP_LOSS_SELL_LIMIT_DISCOUNT_PCT``
-    approach (same number, re-declared as
-    ``execution_config.SELL_MARKETABLE_DISCOUNT_PCT`` rather than importing
-    across the services/ui boundary).
-    """
-    if quote_is_execution_ready and quote is not None and quote.bid:
-        # The bid is the reference, while the configured collar provides a
-        # bounded chance of execution if the top of book moves before the
-        # limit reaches the broker.  This remains a limit order, never an
-        # unbounded market order.
-        return float(quote.bid) * (
-            1.0 - execution_config.SELL_MARKETABLE_DISCOUNT_PCT
-        )
-    reference = last_trusted_price
-    if reference is None and quote_is_execution_ready and quote is not None:
-        reference = quote.last_price
-    if reference:
-        # Bounded, controlled collar widening. The caller enforces the hard
-        # attempt cap; no unbounded market order is assumed safe.
-        discount = execution_config.SELL_MARKETABLE_DISCOUNT_PCT * max(
-            1, emergency_reprice_attempt + 1
-        )
-        discount = min(discount, 0.05)
-        return float(reference) * (1.0 - discount)
-    return None
+    """Compatibility wrapper around the shared frontend-neutral policy."""
+
+    return marketable_exit_limit_price(
+        bid_price=quote.bid if quote is not None else None,
+        last_price=quote.last_price if quote is not None else None,
+        last_trusted_price=last_trusted_price,
+        quote_is_execution_ready=quote_is_execution_ready,
+        emergency_reprice_attempt=emergency_reprice_attempt,
+    )
 
 
 def _eod_window_reached() -> bool:
