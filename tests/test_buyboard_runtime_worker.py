@@ -852,6 +852,56 @@ def test_startup_promotes_standby_to_active_only_after_final_reconciliation(
     assert worker._accepting_commands is True
 
 
+def test_startup_refreshes_observation_after_slow_final_reconciliation(
+    tmp_path, monkeypatch
+):
+    worker, _ = _worker(tmp_path)
+    worker._accepting_commands = False
+    worker.device_state = RuntimeDeviceState.STANDBY
+    polls = []
+    readiness_calls = []
+
+    class _MarketData:
+        def poll_once(self):
+            polls.append(True)
+            return []
+
+    worker.runtime = SimpleNamespace(market_data=_MarketData())
+
+    def readiness(**kwargs):
+        readiness_calls.append(kwargs)
+        return _ready_runtime_state(
+            accumulator_draining_within_budget=(
+                len(readiness_calls) == 1 or bool(polls)
+            )
+        )
+
+    monkeypatch.setattr(worker, "engine_readiness", readiness)
+    monkeypatch.setattr(worker, "_lease_still_current", lambda: True)
+
+    def slow_final_reconciliation(**kwargs):
+        worker.last_market_data_drain_at = dt.datetime.now(
+            dt.timezone.utc
+        ) - dt.timedelta(minutes=1)
+
+    monkeypatch.setattr(
+        worker, "_run_startup_reconciliation", slow_final_reconciliation
+    )
+
+    def record_state(state, **kwargs):
+        worker.device_state = state
+
+    monkeypatch.setattr(worker, "_set_device_state", record_state)
+
+    worker._advance_startup_readiness()
+
+    assert polls == [True]
+    assert len(readiness_calls) == 2
+    assert worker.last_market_data_drain_at is not None
+    assert worker.device_state == RuntimeDeviceState.ACTIVE
+    assert worker._accepting_commands is True
+
+
 def test_pull_only_successor_reaches_standby_ready_but_never_active(
     tmp_path, monkeypatch
 ):
@@ -1797,6 +1847,7 @@ def test_one_cycle_persists_engine_changes(tmp_path, monkeypatch):
         buying_power_provider=worker._buying_power_provider,
         card_lookup=worker._card_lookup,
         broker=worker._broker,
+        market_data=_dummy_market_data(),
     )
     card = _seed_card(
         engine,
