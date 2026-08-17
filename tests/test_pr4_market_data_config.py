@@ -19,12 +19,18 @@ from src.services.kis_realtime_market_data import (
     build_kis_realtime_market_data_from_environment,
 )
 from src.core import execution_config
+from src.core.runtime_safety_audit import (
+    BROKER_MUTATION_AUDIT_SOURCE,
+    ENTRY_READINESS_AUDIT_SOURCE,
+    begin_runtime_safety_audit,
+)
 from gate2.reporting import (
     Gate2Evidence,
     LiveGate2Runner,
     _ProgressWatchdog,
     _SecretRedactingFormatter,
     build_report,
+    main as gate2_main,
 )
 from src.api.kis_websocket import KisWsProtocolOperation
 from gate2.capabilities import (
@@ -241,8 +247,11 @@ def _passing_gate2_evidence() -> Gate2Evidence:
         capability_manifest_sha256="d" * 64,
         capability_review={
             "status": "APPROVED",
+            "author": "bundle-author",
             "reviewer": "reviewer",
             "reviewed_at": "2026-08-17T00:00:00+00:00",
+            "method": "PROCEDURAL_DUAL_CONTROL",
+            "reference": "dual-control-log:gate2-review-1",
         },
         verified_capabilities=capabilities,
         runtime_confirmed_sequence_channels=[],
@@ -309,6 +318,8 @@ def _passing_gate2_evidence() -> Gate2Evidence:
         },
         silent_stale_probe={
             "connected_during_probe": True,
+            "entry_readiness_ready_before_probe": True,
+            "entry_readiness_ready_while_stale": False,
             "detected": True,
             "recovered": True,
             "detection_seconds": 2.1,
@@ -320,10 +331,21 @@ def _passing_gate2_evidence() -> Gate2Evidence:
         continuity_started_at=opened.isoformat(),
         continuity_start_delay_seconds=0.0,
         poll_interval_seconds=0.1,
+        safety_audit_initialized=True,
+        safety_audit_sources=[
+            BROKER_MUTATION_AUDIT_SOURCE,
+            ENTRY_READINESS_AUDIT_SOURCE,
+        ],
+        broker_mutation_count=0,
+        entry_readiness_check_count=1,
+        stale_entry_readiness_check_count=1,
+        stale_entry_readiness_rejection_count=1,
+        stale_entry_readiness_allow_count=0,
         log_scan_completed=True,
         log_capture_sha256="f" * 64,
         sensitive_value_count=4,
         approval_key_count=1,
+        redacted_evidence_sha256={"session-frames.json": "9" * 64},
     )
 
 
@@ -350,11 +372,42 @@ def test_gate2_report_fails_closed_for_activation_or_missing_reconnect_evidence(
     assert "critical_ack_recovery_seconds" in report["blockers"]
 
 
+def test_gate2_cli_requires_at_least_one_redacted_evidence_file():
+    with pytest.raises(SystemExit) as exc:
+        gate2_main(
+            [
+                "--confirm-read-only",
+                "--symbols",
+                "AAPL",
+                "--session-date",
+                "2026-08-17",
+                "--gate1-report",
+                "gate1.json",
+                "--capability-manifest",
+                "capabilities.json",
+                "--reconnect-after-seconds",
+                "60",
+                "--silent-stale-probe-after-seconds",
+                "120",
+                "--log-output",
+                "gate2.log",
+            ]
+        )
+
+    assert exc.value.code == 2
+
+
 def test_gate2_report_rejects_unmeasured_default_zero_metrics_and_runtime_mismatch():
     evidence = _passing_gate2_evidence()
     evidence.protocol_operations.clear()
     evidence.log_scan_completed = False
     evidence.receive_lag_ms["count"] = 0
+    evidence.safety_audit_initialized = False
+    evidence.broker_mutation_count = None
+    evidence.stale_entry_readiness_check_count = None
+    evidence.stale_entry_readiness_rejection_count = None
+    evidence.stale_entry_readiness_allow_count = None
+    evidence.redacted_evidence_sha256.clear()
     evidence.verified_capabilities[TRADE_SEQUENCE]["interpretation"] = "MONOTONIC"
     evidence.verified_capabilities[TRADE_SEQUENCE]["sequence_field"] = "EVOL"
 
@@ -366,6 +419,9 @@ def test_gate2_report_rejects_unmeasured_default_zero_metrics_and_runtime_mismat
     assert "receive_lag_p95_ms" in report["blockers"]
     assert "receive_lag_p99_ms" in report["blockers"]
     assert "sequence_semantics" in report["blockers"]
+    assert "broker_mutations" in report["blockers"]
+    assert "stale_entry_readiness_fence" in report["blockers"]
+    assert "redacted_evidence_bundle" in report["blockers"]
 
 
 class _Gate2AuditService:
@@ -385,7 +441,8 @@ def test_gate2_protocol_audit_detects_duplicate_subscribe_and_unexpected_disconn
     evidence.disconnects.clear()
     evidence.injected_disconnect_request_count = 0
     service = _Gate2AuditService()
-    runner = LiveGate2Runner(service, evidence)
+    safety_audit = begin_runtime_safety_audit()
+    runner = LiveGate2Runner(service, evidence, safety_audit)
     observed = dt.datetime(2026, 8, 17, 14, 0, tzinfo=dt.timezone.utc)
     operation = KisWsProtocolOperation(
         generation=1,
@@ -399,6 +456,7 @@ def test_gate2_protocol_audit_detects_duplicate_subscribe_and_unexpected_disconn
     service.operation_callback(operation)
     service.session_callback(False, "transport lost", 1, observed)
     runner.finalize()
+    safety_audit.close()
 
     assert evidence.duplicate_subscription_anomaly_count == 1
     assert evidence.disconnects[0]["classification"] == "UNEXPECTED"
@@ -502,8 +560,11 @@ def test_gate2_capability_manifest_requires_reviewed_matching_nonempty_evidence(
                 "environment": "PROD",
                 "review": {
                     "status": "APPROVED",
+                    "author": "bundle-author",
                     "reviewer": "independent-reviewer",
                     "reviewed_at": "2026-08-17T00:00:00Z",
+                    "method": "PROCEDURAL_DUAL_CONTROL",
+                    "reference": "dual-control-log:gate2-review-1",
                 },
                 "capabilities": entries,
             }
@@ -517,6 +578,14 @@ def test_gate2_capability_manifest_requires_reviewed_matching_nonempty_evidence(
 
     assert verified.confirmed_sequence_channels == ("HDFSCNT0",)
 
+    same_reviewer = json.loads(manifest_path.read_text(encoding="utf-8"))
+    same_reviewer["review"]["reviewer"] = same_reviewer["review"]["author"]
+    manifest_path.write_text(json.dumps(same_reviewer), encoding="utf-8")
+    with pytest.raises(ValueError, match="reviewer must differ"):
+        load_verified_capability_manifest(
+            manifest_path, expected_commit=commit, expected_environment="PROD"
+        )
+
     (tmp_path / "evidence-0.json").write_text("{}", encoding="utf-8")
     entries[0]["evidence_sha256"] = sha256_file(tmp_path / "evidence-0.json")
     manifest_path.write_text(
@@ -527,8 +596,11 @@ def test_gate2_capability_manifest_requires_reviewed_matching_nonempty_evidence(
                 "environment": "PROD",
                 "review": {
                     "status": "APPROVED",
+                    "author": "bundle-author",
                     "reviewer": "independent-reviewer",
                     "reviewed_at": "2026-08-17T00:00:00Z",
+                    "method": "PROCEDURAL_DUAL_CONTROL",
+                    "reference": "dual-control-log:gate2-review-1",
                 },
                 "capabilities": entries,
             }

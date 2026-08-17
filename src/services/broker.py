@@ -28,8 +28,16 @@ from src.core.order_state import (
     BrokerOrderStatusSnapshot,
     OrderSide,
 )
+from src.core.runtime_safety_audit import (
+    BROKER_MUTATION_AUDIT_SOURCE,
+    record_broker_mutation_attempt,
+    register_runtime_safety_audit_source,
+)
 from src.services import trading_state
 from src.utils.config import get_env_value
+
+
+register_runtime_safety_audit_source(BROKER_MUTATION_AUDIT_SOURCE)
 
 
 @dataclass(frozen=True)
@@ -195,6 +203,7 @@ class KisBroker:
         exchange: str = "NASD",
         execution_policy: str = REGULAR_LIMIT_EXECUTION,
     ) -> BrokerSubmissionResult:
+        record_broker_mutation_attempt()
         # Defense in depth: service callers are expected to check before
         # reserving an order, but the real broker boundary must not rely on
         # every present and future caller remembering to do so.
@@ -247,6 +256,7 @@ class KisBroker:
         is_reserved: bool = False,
         **kwargs: Any,
     ) -> BrokerOrderStatusSnapshot:
+        record_broker_mutation_attempt()
         # Gateway-only ownership correlation; never part of the KIS payload.
         kwargs.pop("ownership_symbol", None)
         if is_reserved:

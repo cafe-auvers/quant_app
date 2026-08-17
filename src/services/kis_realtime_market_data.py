@@ -28,6 +28,11 @@ from src.api.kis_websocket import (
 )
 from src.api.kis_ws_auth import KisWsApprovalKeyProvider
 from src.core import execution_config
+from src.core.runtime_safety_audit import (
+    ENTRY_READINESS_AUDIT_SOURCE,
+    record_entry_readiness,
+    register_runtime_safety_audit_source,
+)
 from src.services.realtime_market_data import (
     DisconnectCallback,
     InMemoryQuoteCache,
@@ -38,6 +43,8 @@ from src.services.realtime_market_data import (
 from src.utils.market_calendar import is_regular_session_open
 
 logger = logging.getLogger(__name__)
+
+register_runtime_safety_audit_source(ENTRY_READINESS_AUDIT_SOURCE)
 
 TRADE_TR_ID = "HDFSCNT0"
 QUOTE_TR_ID = "HDFSASP0"
@@ -1086,7 +1093,7 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         self, symbol: str, *, now: Optional[datetime] = None
     ) -> bool:
         quote = self.latest_quote(symbol)
-        return bool(
+        ready = bool(
             self.is_symbol_execution_ready(
                 symbol, require_trade=True, require_quote=True, now=now
             )
@@ -1095,6 +1102,8 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
             and quote.ask > 0
             and quote.last_price > 0
         )
+        record_entry_readiness(symbol=symbol, ready=ready)
+        return ready
 
     def _on_connection(self, connected: bool, reason: str, generation: int) -> None:
         was_connected = self._connected

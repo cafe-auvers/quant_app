@@ -25,6 +25,11 @@ SEQUENCE_INTERPRETATIONS = {"MONOTONIC", "NO_USABLE_SEQUENCE"}
 SEQUENCE_RESET_SEMANTICS = {"RESET_ON_RECONNECT", "CONTINUES_ACROSS_RECONNECT"}
 TIMESTAMP_INTERPRETATION = "EXCHANGE_EVENT_TIME_AMERICA_NEW_YORK"
 NOTICE_INTERPRETATION = "AES_CBC_ACK_KEY_IV_DECRYPTED_FIELD_MAP_VERIFIED"
+REVIEW_METHODS = {
+    "GITHUB_PR_REVIEW",
+    "SIGNED_ATTESTATION",
+    "PROCEDURAL_DUAL_CONTROL",
+}
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -42,8 +47,11 @@ class VerifiedCapabilityManifest:
     sha256: str
     commit_sha: str
     environment: str
+    review_author: str
     reviewer: str
     reviewed_at: str
+    review_method: str
+    review_reference: str
     capabilities: dict[str, dict[str, str]]
 
     @property
@@ -86,21 +94,31 @@ def _read_json_object(path: Path) -> dict:
     return value
 
 
-def _parse_review(payload: Mapping) -> tuple[str, str]:
+def _parse_review(payload: Mapping) -> tuple[str, str, str, str, str]:
     review = payload.get("review")
     if not isinstance(review, dict) or review.get("status") != "APPROVED":
         raise ValueError("capability manifest requires review.status=APPROVED")
+    author = str(review.get("author") or "").strip()
     reviewer = str(review.get("reviewer") or "").strip()
     reviewed_at = str(review.get("reviewed_at") or "").strip()
-    if not reviewer or not reviewed_at:
-        raise ValueError("capability manifest review requires reviewer and reviewed_at")
+    method = str(review.get("method") or "").strip().upper()
+    reference = str(review.get("reference") or "").strip()
+    if not author or not reviewer or not reviewed_at or not reference:
+        raise ValueError(
+            "capability manifest review requires author, reviewer, reviewed_at, "
+            "and reference"
+        )
+    if author.casefold() == reviewer.casefold():
+        raise ValueError("capability manifest reviewer must differ from its author")
+    if method not in REVIEW_METHODS:
+        raise ValueError("capability manifest review method is unsupported")
     try:
         parsed = datetime.fromisoformat(reviewed_at.replace("Z", "+00:00"))
     except ValueError as exc:
         raise ValueError("capability manifest reviewed_at must be ISO-8601") from exc
     if parsed.tzinfo is None:
         raise ValueError("capability manifest reviewed_at must include a timezone")
-    return reviewer, reviewed_at
+    return author, reviewer, reviewed_at, method, reference
 
 
 def _timezone_aware_iso8601(value: object, *, field_name: str) -> str:
@@ -138,7 +156,9 @@ def load_verified_capability_manifest(
     environment = str(payload.get("environment") or "").strip().upper()
     if environment != str(expected_environment).upper():
         raise ValueError("capability manifest environment does not match the soak")
-    reviewer, reviewed_at = _parse_review(payload)
+    author, reviewer, reviewed_at, review_method, review_reference = _parse_review(
+        payload
+    )
     entries = payload.get("capabilities")
     if not isinstance(entries, list):
         raise ValueError("capability manifest capabilities must be a list")
@@ -243,8 +263,11 @@ def load_verified_capability_manifest(
         sha256=sha256_file(path),
         commit_sha=commit_sha,
         environment=environment,
+        review_author=author,
         reviewer=reviewer,
         reviewed_at=reviewed_at,
+        review_method=review_method,
+        review_reference=review_reference,
         capabilities=capabilities,
     )
 

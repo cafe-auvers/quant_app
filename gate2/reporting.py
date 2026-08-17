@@ -16,6 +16,16 @@ from typing import Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from src.core import execution_config
+from src.core.runtime_safety_audit import (
+    BROKER_MUTATION_AUDIT_SOURCE,
+    ENTRY_READINESS_AUDIT_SOURCE,
+    GATE2_REQUIRED_AUDIT_SOURCES,
+    RuntimeSafetyAuditSession,
+    begin_runtime_safety_audit,
+)
+# Importing the sole real broker adapter registers its instrumented boundary.
+# Gate 2 never constructs it or any execution workflow.
+from src.services import broker as _broker_audit_boundary  # noqa: F401
 from src.services.kis_realtime_market_data import (
     FeedChannel,
     KisRealtimeMarketDataService,
@@ -150,8 +160,13 @@ class Gate2Evidence:
     continuity_started_at: str = ""
     continuity_start_delay_seconds: float = 0.0
     poll_interval_seconds: float = 0.0
-    stale_entry_attempt_count: int = 0
-    broker_mutation_count: int = 0
+    safety_audit_initialized: bool = False
+    safety_audit_sources: list[str] = field(default_factory=list)
+    broker_mutation_count: int | None = None
+    entry_readiness_check_count: int | None = None
+    stale_entry_readiness_check_count: int | None = None
+    stale_entry_readiness_rejection_count: int | None = None
+    stale_entry_readiness_allow_count: int | None = None
     unhandled_disconnect_count: int = 0
     secret_leak_count: int = 0
     log_scan_completed: bool = False
@@ -177,7 +192,17 @@ def _metric(
 
 
 def _review_snapshot_complete(review: Mapping[str, str]) -> bool:
-    if review.get("status") != "APPROVED" or not str(review.get("reviewer") or "").strip():
+    author = str(review.get("author") or "").strip()
+    reviewer = str(review.get("reviewer") or "").strip()
+    if (
+        review.get("status") != "APPROVED"
+        or not author
+        or not reviewer
+        or author.casefold() == reviewer.casefold()
+        or str(review.get("method") or "")
+        not in {"GITHUB_PR_REVIEW", "SIGNED_ATTESTATION", "PROCEDURAL_DUAL_CONTROL"}
+        or not str(review.get("reference") or "").strip()
+    ):
         return False
     try:
         reviewed_at = datetime.fromisoformat(
@@ -218,6 +243,9 @@ def build_report(evidence: Gate2Evidence) -> dict:
     capability_ok = capability_snapshot_complete(
         evidence.verified_capabilities, environment=evidence.environment
     )
+    audit_sources_ok = GATE2_REQUIRED_AUDIT_SOURCES <= set(
+        evidence.safety_audit_sources
+    )
     monotonic_capabilities = [
         evidence.verified_capabilities.get(item, {})
         for item in (TRADE_SEQUENCE, QUOTE_SEQUENCE)
@@ -240,6 +268,11 @@ def build_report(evidence: Gate2Evidence) -> dict:
     ) == expected_sequence_channels and (
         evidence.runtime_sequence_fields == expected_sequence_fields
         and evidence.runtime_sequence_reset_semantics == expected_sequence_resets
+    )
+    redacted_evidence_ok = bool(evidence.redacted_evidence_sha256) and all(
+        str(name or "").strip()
+        and SHA256_PATTERN.fullmatch(str(digest or ""))
+        for name, digest in evidence.redacted_evidence_sha256.items()
     )
     continuity_start = (
         datetime.fromisoformat(evidence.continuity_started_at)
@@ -323,16 +356,54 @@ def build_report(evidence: Gate2Evidence) -> dict:
             threshold="connected silent-channel stall detected and recovered in <=3s",
             passed=(
                 evidence.silent_stale_probe.get("connected_during_probe") is True
+                and evidence.silent_stale_probe.get(
+                    "entry_readiness_ready_before_probe"
+                )
+                is True
                 and evidence.silent_stale_probe.get("detected") is True
                 and evidence.silent_stale_probe.get("recovered") is True
                 and float(evidence.silent_stale_probe.get("detection_seconds", 99.0))
                 <= 3.0
             ),
         ),
-        "entry_attempts_while_stale": _metric(
-            value=evidence.stale_entry_attempt_count,
-            threshold="0",
-            passed=evidence.stale_entry_attempt_count == 0,
+        "stale_entry_readiness_fence": _metric(
+            value=(
+                evidence.stale_entry_readiness_allow_count
+                if evidence.stale_entry_readiness_allow_count is not None
+                else -1
+            ),
+            numerator=evidence.stale_entry_readiness_rejection_count,
+            denominator=evidence.stale_entry_readiness_check_count,
+            threshold=(
+                "initialized real entry-readiness audit; controlled stale "
+                "window rejected at least once and never allowed"
+            ),
+            passed=(
+                evidence.safety_audit_initialized
+                and audit_sources_ok
+                and ENTRY_READINESS_AUDIT_SOURCE in evidence.safety_audit_sources
+                and evidence.silent_stale_probe.get("detected") is True
+                and evidence.silent_stale_probe.get(
+                    "entry_readiness_ready_before_probe"
+                )
+                is True
+                and evidence.silent_stale_probe.get(
+                    "entry_readiness_ready_while_stale"
+                )
+                is False
+                and evidence.entry_readiness_check_count is not None
+                and evidence.stale_entry_readiness_check_count is not None
+                and evidence.stale_entry_readiness_rejection_count is not None
+                and evidence.stale_entry_readiness_allow_count is not None
+                and evidence.stale_entry_readiness_check_count > 0
+                and evidence.entry_readiness_check_count
+                >= evidence.stale_entry_readiness_check_count
+                and evidence.stale_entry_readiness_rejection_count > 0
+                and evidence.stale_entry_readiness_allow_count == 0
+                and evidence.stale_entry_readiness_check_count
+                == evidence.stale_entry_readiness_rejection_count
+                + evidence.stale_entry_readiness_allow_count
+            ),
         ),
         "duplicate_subscription_corruption": _metric(
             value=evidence.duplicate_subscription_anomaly_count,
@@ -418,9 +489,18 @@ def build_report(evidence: Gate2Evidence) -> dict:
             ),
         ),
         "broker_mutations": _metric(
-            value=evidence.broker_mutation_count,
-            threshold="0",
-            passed=evidence.broker_mutation_count == 0,
+            value=(
+                evidence.broker_mutation_count
+                if evidence.broker_mutation_count is not None
+                else -1
+            ),
+            threshold="initialized real KIS broker-boundary audit; 0 attempts",
+            passed=(
+                evidence.safety_audit_initialized
+                and audit_sources_ok
+                and BROKER_MUTATION_AUDIT_SOURCE in evidence.safety_audit_sources
+                and evidence.broker_mutation_count == 0
+            ),
         ),
         "runtime_activation_fence": _metric(
             value=int(activation_ok),
@@ -455,6 +535,11 @@ def build_report(evidence: Gate2Evidence) -> dict:
             value=int(EXECUTION_NOTICE in evidence.verified_capabilities),
             threshold="strict execution-notice capability verified",
             passed=capability_ok,
+        ),
+        "redacted_evidence_bundle": _metric(
+            value=len(evidence.redacted_evidence_sha256),
+            threshold="at least one named redacted raw-evidence file with SHA-256",
+            passed=redacted_evidence_ok,
         ),
     }
     blockers = sorted(
@@ -528,6 +613,21 @@ def build_report(evidence: Gate2Evidence) -> dict:
             "redaction_count": evidence.log_redaction_count,
             "leak_count": evidence.secret_leak_count,
         },
+        "runtime_safety_audit": {
+            "initialized": evidence.safety_audit_initialized,
+            "sources": sorted(evidence.safety_audit_sources),
+            "broker_mutation_attempt_count": evidence.broker_mutation_count,
+            "entry_readiness_check_count": evidence.entry_readiness_check_count,
+            "stale_entry_readiness_check_count": (
+                evidence.stale_entry_readiness_check_count
+            ),
+            "stale_entry_readiness_rejection_count": (
+                evidence.stale_entry_readiness_rejection_count
+            ),
+            "stale_entry_readiness_allow_count": (
+                evidence.stale_entry_readiness_allow_count
+            ),
+        },
         "runtime_confirmed_sequence_channels": sorted(
             evidence.runtime_confirmed_sequence_channels
         ),
@@ -586,9 +686,15 @@ def _synthetic_stop_test(service: KisRealtimeMarketDataService) -> dict[str, int
 class LiveGate2Runner:
     """Poll only the KIS market-data service and assemble qualification evidence."""
 
-    def __init__(self, service: KisRealtimeMarketDataService, evidence: Gate2Evidence):
+    def __init__(
+        self,
+        service: KisRealtimeMarketDataService,
+        evidence: Gate2Evidence,
+        safety_audit: RuntimeSafetyAuditSession,
+    ):
         self.service = service
         self.evidence = evidence
+        self.safety_audit = safety_audit
         self._expected_disconnects = 0
         self._operation_states: dict[tuple[int, str, str], str] = {}
         self._silent_probe_phase = ""
@@ -702,6 +808,8 @@ class LiveGate2Runner:
         connected = self.service.is_connected()
         if not connected or last_received is None or last_event is None:
             return
+        if not self.service.entry_quote_ready(symbol, now=now):
+            return
         self.service.set_qualification_channel_suppressed(symbol, channel, True)
         self._silent_probe_phase = "SUPPRESSED"
         self.evidence.silent_stale_probe = {
@@ -711,6 +819,7 @@ class LiveGate2Runner:
             "last_received_at": _iso(last_received),
             "last_broker_event_at": _iso(last_event),
             "connected_during_probe": connected,
+            "entry_readiness_ready_before_probe": True,
             "detected": False,
             "detection_seconds": None,
             "detected_at": None,
@@ -740,6 +849,13 @@ class LiveGate2Runner:
             probe["detection_seconds"] = detected_after
             probe["detected_at"] = _iso(now)
             self.evidence.stale_detection_seconds.append(detected_after)
+            self.safety_audit.begin_stale_entry_probe(symbol)
+            try:
+                probe["entry_readiness_ready_while_stale"] = bool(
+                    self.service.entry_quote_ready(symbol, now=now)
+                )
+            finally:
+                self.safety_audit.end_stale_entry_probe(symbol)
             self.service.set_qualification_channel_suppressed(symbol, channel, False)
             self._silent_probe_phase = "RECOVERING"
         elif self._silent_probe_phase == "RECOVERING" and symbol not in stale_symbols:
@@ -985,8 +1101,11 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
         capability_manifest_sha256=capability_manifest.sha256,
         capability_review={
             "status": "APPROVED",
+            "author": capability_manifest.review_author,
             "reviewer": capability_manifest.reviewer,
             "reviewed_at": capability_manifest.reviewed_at,
+            "method": capability_manifest.review_method,
+            "reference": capability_manifest.review_reference,
         },
         verified_capabilities=capability_manifest.capabilities,
         runtime_confirmed_sequence_channels=list(
@@ -1021,8 +1140,22 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
             "history boundary/latency and mutation rate-limit evidence",
         ],
     )
+    evidence_names: set[str] = set()
     for path in args.redacted_evidence:
         resolved = path.resolve()
+        try:
+            resolved.relative_to(root.resolve())
+        except ValueError:
+            pass
+        else:
+            raise RuntimeError("redacted raw evidence must remain outside the repository")
+        if not resolved.is_file() or resolved.stat().st_size <= 0:
+            raise RuntimeError(f"redacted raw evidence is missing or empty: {resolved}")
+        if resolved.name in evidence_names:
+            raise RuntimeError(
+                f"redacted raw evidence basenames must be unique: {resolved.name}"
+            )
+        evidence_names.add(resolved.name)
         evidence.redacted_evidence_sha256[resolved.name] = _sha256(resolved)
 
     log_path = args.log_output.resolve()
@@ -1087,7 +1220,8 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
     )
     priority = {symbol: int(SubscriptionPriority.CRITICAL_EXIT) for symbol in symbols}
     service.configure_desired_channels(trade_priorities=priority, quote_priorities=priority)
-    runner = LiveGate2Runner(service, evidence)
+    safety_audit = begin_runtime_safety_audit()
+    runner = LiveGate2Runner(service, evidence, safety_audit)
     reconnect_offsets = sorted(float(value) for value in args.reconnect_after_seconds)
     next_reconnect = 0
     stop_probe_complete = False
@@ -1154,6 +1288,24 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
         runner.finalize()
         watchdog.stop()
         service.stop()
+        safety_snapshot = safety_audit.close()
+        evidence.safety_audit_initialized = safety_snapshot.initialized
+        evidence.safety_audit_sources = list(safety_snapshot.registered_sources)
+        evidence.broker_mutation_count = (
+            safety_snapshot.broker_mutation_attempt_count
+        )
+        evidence.entry_readiness_check_count = (
+            safety_snapshot.entry_readiness_check_count
+        )
+        evidence.stale_entry_readiness_check_count = (
+            safety_snapshot.stale_entry_readiness_check_count
+        )
+        evidence.stale_entry_readiness_rejection_count = (
+            safety_snapshot.stale_entry_readiness_rejection_count
+        )
+        evidence.stale_entry_readiness_allow_count = (
+            safety_snapshot.stale_entry_readiness_allow_count
+        )
         root_logger.removeHandler(log_handler)
         root_logger.setLevel(previous_root_level)
         log_handler.flush()
@@ -1188,7 +1340,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--session-date", required=True, help="NYSE session date YYYY-MM-DD")
     parser.add_argument("--gate1-report", type=Path, required=True)
     parser.add_argument("--capability-manifest", type=Path, required=True)
-    parser.add_argument("--redacted-evidence", type=Path, action="append", default=[])
+    parser.add_argument(
+        "--redacted-evidence", type=Path, action="append", required=True
+    )
     parser.add_argument("--reconnect-after-seconds", type=float, action="append", required=True)
     parser.add_argument("--silent-stale-probe-after-seconds", type=float, required=True)
     parser.add_argument("--poll-seconds", type=float, default=0.1)

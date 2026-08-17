@@ -115,14 +115,14 @@ LOCAL_RECEIVE_STALE_SECONDS=2
 | Injected reconnects | 100% recover | injection/recovery pairs |
 | Critical ACK recovery | < 10 seconds | p50/p95/max recovery |
 | Critical stale detection | ≤ 3 seconds | per-symbol detection latency |
-| Entry attempts while stale | 0 | decision audit |
+| Stale entry-readiness fence | At least one rejection and zero allows during the controlled stale window | instrumented `entry_quote_ready()` boundary audit |
 | Duplicate-subscription corruption | 0 | actual generation/TR/key operations and duplicate-request probe |
 | Missed synthetic stop breaches | 0 | injected/latched/consumed IDs |
 | Queue/accumulator deadlocks | 0 | independent watchdog/cycle progress |
 | Receive lag p95 | < 1 second | broker-event to receive |
 | Receive lag p99 | < 2 seconds | broker-event to receive |
 | Secret/approval-key leakage | 0 | full captured-log scan including issued approval key |
-| Broker mutations | 0 | gateway/broker boundary audit |
+| Broker mutations | Initialized audit source and 0 attempts | sole real `KisBroker` mutation-boundary audit |
 
 ## Machine-readable evidence bundle
 
@@ -138,7 +138,8 @@ The generated Gate-2 report must contain:
 - reconnect injection timestamps and ACK-recovery durations;
 - parser/frame counts by TR ID and schema fingerprint;
 - session-wide sample counts plus p50/p95/p99/max receive and queue lag;
-- activation-default snapshot and `broker_mutations=0`;
+- activation-default snapshot plus initialized runtime-safety audit sources,
+  observed stale-readiness rejection, and `broker_mutations=0`;
 - captured-log digest/byte count, issued-approval-key scan result, and hashes
   of redacted raw evidence;
 - overall `PASSED` or `FAILED` with explicit blockers.
@@ -160,6 +161,7 @@ python scripts/run_gate2_soak.py `
   --session-date YYYY-MM-DD `
   --gate1-report artifacts/gate1_report.json `
   --capability-manifest C:\redacted\gate2_capabilities.json `
+  --redacted-evidence C:\redacted\regular-session-frames.json `
   --reconnect-after-seconds 3600 `
   --silent-stale-probe-after-seconds 5400 `
   --log-output C:\redacted\gate2_runtime.log `
@@ -177,8 +179,11 @@ each required capability:
   "environment": "PROD",
   "review": {
     "status": "APPROVED",
-    "reviewer": "<independent reviewer>",
-    "reviewed_at": "<timezone-aware ISO-8601>"
+    "author": "<bundle author identity>",
+    "reviewer": "<different reviewer identity>",
+    "reviewed_at": "<timezone-aware ISO-8601>",
+    "method": "PROCEDURAL_DUAL_CONTROL",
+    "reference": "<immutable approval record URL or attestation digest>"
   },
   "capabilities": [
     {
@@ -205,3 +210,13 @@ capability/environment/TR/interpretation fields. Empty files, digest
 mismatches, unreviewed manifests, CLI-only assertions, and commit mismatches
 fail before any live connection. Raw/unredacted captures remain outside the
 repository.
+
+The runner requires at least one separately named, nonempty
+`--redacted-evidence` file outside the repository and records its digest in
+the final report. The manifest also rejects equal author/reviewer strings and
+requires an approval method/reference. These fields are completeness checks,
+not cryptographic identity authentication: the operator must verify the
+reviewer's real identity and independence through the referenced GitHub
+review, signed attestation, or documented dual-control record. Until that
+external control exists, the bundle is not independently reviewed even if a
+locally supplied string passes schema validation.

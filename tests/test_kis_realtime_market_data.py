@@ -6,6 +6,10 @@ import threading
 import pytest
 
 from src.api.kis_websocket import KisWsDataFrame, KisWsSubscription, KisWsSystemFrame
+from src.core.runtime_safety_audit import (
+    ENTRY_READINESS_AUDIT_SOURCE,
+    begin_runtime_safety_audit,
+)
 from src.services.kis_realtime_market_data import (
     ClockHealth,
     FeedChannel,
@@ -212,6 +216,23 @@ def test_qualification_silent_channel_probe_uses_live_service_freshness(monkeypa
     assert service.health_metrics(now=NOW + dt.timedelta(seconds=2.1)).stale_symbols == (
         "AAPL",
     )
+    with begin_runtime_safety_audit(
+        required_sources={ENTRY_READINESS_AUDIT_SOURCE}
+    ) as audit:
+        audit.begin_stale_entry_probe("AAPL")
+        try:
+            assert not service.entry_quote_ready(
+                "AAPL", now=NOW + dt.timedelta(seconds=2.1)
+            )
+        finally:
+            audit.end_stale_entry_probe("AAPL")
+        snapshot = audit.snapshot()
+
+    assert snapshot.initialized
+    assert ENTRY_READINESS_AUDIT_SOURCE in snapshot.registered_sources
+    assert snapshot.stale_entry_readiness_check_count == 1
+    assert snapshot.stale_entry_readiness_rejection_count == 1
+    assert snapshot.stale_entry_readiness_allow_count == 0
 
     service.set_qualification_channel_suppressed("AAPL", FeedChannel.TRADE, False)
     assert service.ingest_trade(
