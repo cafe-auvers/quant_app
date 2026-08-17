@@ -21,6 +21,7 @@ from src.services.trade_card_repository import (
     TradeCardNotFoundError,
     TradeCardVersionConflictError,
 )
+from src.utils.config import get_env_value
 
 logger = logging.getLogger(__name__)
 
@@ -60,9 +61,6 @@ def _projection_context(main_window) -> BoardProjectionContext:
     account_restrictions = []
     for account, reason in errors.items():
         account_restrictions.append((str(account), (str(reason),)))
-    # An unknown account is handled by action-time readiness.  Known accounts
-    # without positive startup evidence are included here when worker state
-    # exposes them through its cached cards.
     for card in list(getattr(worker, "_cached_cards", ()) or ()):
         if card.account_no and card.account_no not in reconciled:
             blocked.add(card.account_no)
@@ -144,12 +142,12 @@ class BuyboardMixin:
         self.refresh_buyboard()
 
         # The window is intentionally rendered before the asynchronous PC-DB
-        # probe finishes.  The first refresh above can therefore be empty even
-        # though canonical state becomes available moments later.  Keep one
-        # lightweight projection timer so DB readiness, cross-device changes,
-        # legacy Watchlist/Buylist edits, and fresh cached KIS holdings become
-        # visible without a manual refresh/restart.  The runtime worker still
-        # emits immediate board_changed events for execution-state changes.
+        # probe finishes. The first refresh can therefore be empty even though
+        # canonical state becomes available moments later. Keep one lightweight
+        # projection timer so DB readiness, cross-device changes, legacy
+        # Watchlist/Buylist edits, and fresh cached KIS holdings become visible
+        # without a manual refresh/restart. Runtime execution changes still
+        # trigger immediate board_changed refreshes.
         timer = QTimer(self)
         timer.setInterval(self._BUYBOARD_PROJECTION_REFRESH_MS)
         timer.timeout.connect(self.refresh_buyboard)
@@ -160,8 +158,8 @@ class BuyboardMixin:
         """Create only missing cards from state the application already owns.
 
         This is deliberately a presentation/bootstrap bridge, not a second
-        trading engine.  Existing TradeCardState rows are never overwritten by
-        legacy list metadata.  Once the dedicated runtime worker is running,
+        trading engine. Existing TradeCardState rows are never overwritten by
+        legacy list metadata. Once the dedicated runtime worker is running,
         broker holdings are projected only by its normal reconciliation path.
         """
 
@@ -169,12 +167,18 @@ class BuyboardMixin:
         if engine is None:
             return
 
-        from src.api.kis_config import KIS_ACCOUNT_NO
         from src.services.trade_card_bootstrap import (
             bootstrap_trade_cards_from_current_state,
         )
 
-        default_account_no = str(KIS_ACCOUNT_NO or "").strip()
+        # Keep this UI adapter independent of src.api.*. The configured PROD
+        # account is ordinary application configuration and is already loaded
+        # by main.py before UI modules import.
+        default_account_no = str(
+            get_env_value("KIS_PROD_ACCOUNT_NO", "")
+            or get_env_value("KIS_ACCOUNT_NO", "")
+            or ""
+        ).strip()
         if not default_account_no:
             for item in list(
                 getattr(self.__dict__.get("buylist_manager"), "items", ()) or ()
@@ -222,7 +226,7 @@ class BuyboardMixin:
             self._bootstrap_buyboard_projection()
         except Exception:
             # A bootstrap defect must not make an existing canonical board
-            # unusable.  Render whatever the DB already has and surface the
+            # unusable. Render whatever the DB already has and surface the
             # exception in the normal application log for correction.
             logger.exception("Buy Board bootstrap refresh failed")
 
@@ -256,8 +260,6 @@ class BuyboardMixin:
             return False
         except BoardCommandRejectedError as exc:
             QMessageBox.warning(self, "Buy Board", str(exc))
-            # Repaint on every rejection: the drag widget never performs a
-            # local row move, and this guarantees the user sees current truth.
             self.refresh_buyboard()
             return False
         self.refresh_buyboard()
