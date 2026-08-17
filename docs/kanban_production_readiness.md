@@ -148,14 +148,14 @@ PR's behavior composes correctly, plus the Gate 1 run in full.
 | 3 | One guarded execution gateway | PR2 IMPLEMENTED, not activated — `ExecutionCommandGateway` (`src/services/execution_command_gateway.py`): dual-mode, with genuinely separate call shapes per mode (`submit_order`/`cancel_order` for `LEGACY_COMPATIBILITY`; `submit_guarded`/`cancel_guarded`/`replace_guarded` taking explicit request models with caller-generated stable command identities for `GUARDED_ENGINE`). Full A1-A11/B1-B4 sequence, one authoritative atomic capital reservation with an in-transaction availability check, a real lease-epoch gate, H1 ownership enforcement, a mutation-budget seam for Workstream 10, and fail-closed guarded runtime composition. Runtime-level tests cover restart-restored caller identity, normalized results, full-context tracked cancellation, Partial Sell/Sell All, one-reservation entry, and unresolved post-broker persistence without retry. |
 | 4 | Account-level reconciliation engine | PR3 IMPLEMENTED, not activated — one immutable `AccountBrokerSnapshot` per account/pass, per-source `SnapshotCompleteness`, a pure `ReconciliationPlan` reducer, durable two-generation order/reservation absence evidence, lifecycle-linked behavioral C4 projection with terminal attempt-group retirement, execution-boundary and last-broker-boundary fencing for active unowned orders with definitive pre-broker aborts, guarded execution of reducer commands, safe external SELL exposure handling, atomic account-plan persistence plus strict allocator reservation CAS, failure-invalidated action readiness, and one startup/periodic runtime pass replacing the three ordered EOD sweeps. KIS submission-time mapping and production threshold calibration remain gated on Workstream 0; without verified broker submission time, A4a stays manual and unmatched broker orders remain separate `DiscoveredExternalOrder`s. |
 | 5 | Production KIS real-time market data | PR4 IMPLEMENTED and merged to `master` (`952179e`), not activated — approval-key/transport lifecycle, ACK/NACK and encrypted-notice framing, exact-event freshness/dedup validation, per-symbol channel readiness, lossless stop-version accumulator, channel-specific capacity, health metrics, market-session semantics, bounded emergency pricing, and tiered persisted outage state are implemented behind `BUYBOARD_ENGINE_ENABLED=false`, `KIS_WS_ENABLED=false`, and `KIS_WS_PROTOCOL_VERIFIED=false`. Live parsing/subscription activation remains blocked until Workstream 0 fills `docs/kis_capability_matrix.md` with credentialed evidence; no vendor-sample assumption is recorded as verified. |
-| 6 | Runtime readiness and device handoff | PR5 DRAFT IMPLEMENTED, not activated — durable epoch fencing across clean and stale handoff, generation-fenced `STANDBY_READY` takeover after final reconciliation, persist-before-open `ACTIVE`, strict E1 aggregate health, read-only successor standby, KANBAN/unknown-scoped legacy suppression, exposure-aware ordered shutdown with abort recovery, and stop-latch-preserving promotion are implemented. All execution and WebSocket activation flags remain false. |
-| 7 | Complete test program | NOT STARTED — matrix fully specified; distributed across PR1-7, capstone in PR8 |
-| 8 | Migration and cutover | PR6 DRAFT IMPLEMENTED, not activated — exact-live-lease-fenced backup/cutover/direct rollback, crash-resumable migration, post-mutation rollback refusal, and forward-only broker reconciliation plus compatibility transform. |
+| 6 | Runtime readiness and device handoff | PR5 IMPLEMENTED and merged to `master` (`c5422b4`), not activated — durable epoch fencing across clean and stale handoff, generation-fenced `STANDBY_READY` takeover after final reconciliation, persist-before-open `ACTIVE`, strict E1 aggregate health, read-only successor standby, KANBAN/unknown-scoped legacy suppression, exposure-aware ordered shutdown with abort recovery, and stop-latch-preserving promotion are implemented. All execution and WebSocket activation flags remain false. |
+| 7 | Complete test program | PR8 DRAFT IMPLEMENTED on `agent/pr8-final-integration`, not activated — one deterministic manifest composes the prior F1/F2/F3/F4/L3 slices with PR8-only cross-workstream scenarios, frozen post-failure property checks, seeded state exploration, and a generated machine-readable Gate-1 report. |
+| 8 | Migration and cutover | PR6 IMPLEMENTED and merged to `master` (`77005ce`), not activated — exact-live-lease-fenced backup/cutover/direct rollback, crash-resumable migration, post-mutation rollback refusal, and forward-only broker reconciliation plus compatibility transform. |
 | 9 | Legacy/Kanban ownership isolation | PR2 IMPLEMENTED, not activated — `ExecutionWorkflowService` is the one workflow service both the legacy Buy Dashboard's submission/cancellation entry points and the Kanban runtime (`buyboard_runtime.py`) now default to; an architecture test enforces no direct KIS-mutation call site outside the gateway/adapter. H1's persisted, multi-strategy `execution_owner` table (`src/core/execution_ownership.py` + `execution_ownership_repository.py`) is built and enforced at the gateway (B2) in `GUARDED_ENGINE` mode — `MANUAL` rejects every application source, `KANBAN` accepts only `KANBAN_BOARD`, unassigned defaults `LEGACY` (H2) and rejects `KANBAN_BOARD`. In-process mutual exclusion per `(environment, account_no, symbol)` is enforced additionally, regardless of mode, as a same-process race guard distinct from H1's durable assignment. |
-| 10 | Rate-limit and command-priority scheduling | PR6 DRAFT IMPLEMENTED, not activated — strict priorities, per-account/endpoint budgets initialized only from explicit WS0 evidence, and typed pre-acceptance retry classification. |
-| 11 | Database-outage behavior | PR6 DRAFT IMPLEMENTED, not activated — bounded last-verified emergency lease, versioned ownership proof, fsynced local journal, protective completion-BUY cancellation, card-correlation recovery, and mandatory post-recovery broker reconciliation. |
-| 12 | External-alert delivery | PR6 DRAFT IMPLEMENTED, not activated — durable incident retry/dedupe/ack/escalation, HTTPS provider wiring, DB-independent local alert spool/direct delivery, and external-watchdog heartbeat publication. |
-| 13 | Kanban feature parity and UI projection | PR7 IMPLEMENTED on `agent/pr7-kanban-feature-parity`, not activated â€” typed domain-owned board requests now enter only through `ExecutionWorkflowService`; real legacy and Kanban entry-monitoring, stop-change, and exit paths construct the same frontend-neutral commands (including broker-held premarket `RESERVED_MOO` exits); stop changes remain pending until the runtime atomically installs the new feed rule and evaluates the detached generation; card/ownership/readiness revisions are fenced; and active adopted-but-unlinked broker orders remain a final gateway fence until terminal reconciliation. All production activation flags and verified capacities remain closed. |
+| 10 | Rate-limit and command-priority scheduling | PR6 IMPLEMENTED and merged to `master` (`77005ce`), not activated — strict priorities, per-account/endpoint budgets initialized only from explicit WS0 evidence, and typed pre-acceptance retry classification. |
+| 11 | Database-outage behavior | PR6 IMPLEMENTED and merged to `master` (`77005ce`), not activated — bounded last-verified emergency lease, versioned ownership proof, fsynced local journal, protective completion-BUY cancellation, card-correlation recovery, and mandatory post-recovery broker reconciliation. |
+| 12 | External-alert delivery | PR6 IMPLEMENTED and merged to `master` (`77005ce`), not activated — durable incident retry/dedupe/ack/escalation, HTTPS provider wiring, DB-independent local alert spool/direct delivery, and external-watchdog heartbeat publication. |
+| 13 | Kanban feature parity and UI projection | PR7 IMPLEMENTED and merged to `master` (`cda99b3`), not activated — typed domain-owned board requests now enter only through `ExecutionWorkflowService`; real legacy and Kanban entry-monitoring, stop-change, and exit paths construct the same frontend-neutral commands (including broker-held premarket `RESERVED_MOO` exits); stop changes remain pending until the runtime atomically installs the new feed rule and evaluates the detached generation; card/ownership/readiness revisions are fenced; and active adopted-but-unlinked broker orders remain a final gateway fence until terminal reconciliation. All production activation flags and verified capacities remain closed. |
 
 ---
 
@@ -951,6 +951,33 @@ tests, fault-injection tests, Kanban/legacy parity tests (Workstream 13).
 Each earlier PR (1-7) requires its own subset of these gates for that PR's
 own code before it can land on the integration branch — none of them skip
 CI, only the *scope* of what's required narrows to that PR's surface area.
+
+### PR8 Gate-1 certification harness
+
+`python scripts/run_gate1.py --output artifacts/gate1_report.json` launches
+one deterministic pytest process from the explicit manifest in
+`gate1/manifest.py`. The manifest composes architecture-boundary and both
+state-machine suites with F1 crash/fault injection, F2 WebSocket protocol,
+F3 multi-device handoff, seeded F4 model exploration, all eight L3
+legacy/Kanban parity rows, and the PR8-only cross-workstream scenarios.
+
+The PR8-only scenarios cover open-position lease handoff after final broker
+reconciliation, ambiguous submission across restart, database-outage
+emergency-journal recovery, stop-breach replay across handoff, external-order
+adoption/fencing before emergency exit, migration restart followed by broker
+reconciliation, and emergency liquidation under scheduler pressure. Each
+failure-boundary scenario is reduced to the frozen post-failure properties in
+`gate1/contract.py`; weakening a property to make a scenario pass is not an
+allowed fix.
+
+The generated JSON report records the exact checked-out commit SHA, model
+seed, scenario IDs/counts and groups, result, invariant violations, pytest
+exit code, and the complete activation-default snapshot. `artifacts/` is
+gitignored because the report contains per-run evidence; CI uploads it as the
+`gate1-report-<commit>` artifact after the normal Python 3.11/3.12 matrix is
+green. A passed report always states `production_activation_authorized=false`:
+Gate 1 is deterministic simulation evidence only and cannot lift Gate 2-5 or
+Workstream 0 prerequisites.
 
 ---
 
