@@ -1,6 +1,8 @@
 import pytest
 from sqlalchemy.engine import URL
 
+import main as app_main
+import src.utils.config as config_module
 import src.utils.db_loader as db_loader
 from src.infrastructure.database import engine as engine_module
 from src.infrastructure.database import schema as schema_module
@@ -103,3 +105,36 @@ def test_init_mysql_uses_preprovisioned_database_with_bounded_timeouts(monkeypat
     assert kwargs["pool_pre_ping"] is True
     assert kwargs["connect_args"]["connect_timeout"] == db_loader.MYSQL_CONNECT_TIMEOUT_SECONDS
     assert queries == ["SELECT 1"]
+
+
+def test_main_loads_repository_env_before_runtime_imports(monkeypatch):
+    """A normal ``python main.py`` launch must honor live flags in .env."""
+
+    monkeypatch.delenv("BUYBOARD_ENGINE_ENABLED", raising=False)
+    monkeypatch.delenv("KIS_LIVE_EXECUTION_MODE", raising=False)
+    monkeypatch.setattr(
+        config_module,
+        "load_env_file",
+        lambda: {
+            "BUYBOARD_ENGINE_ENABLED": "true",
+            "KIS_LIVE_EXECUTION_MODE": "CONTROLLED_LIVE",
+        },
+    )
+
+    app_main._load_repository_environment()
+
+    assert app_main.os.environ["BUYBOARD_ENGINE_ENABLED"] == "true"
+    assert app_main.os.environ["KIS_LIVE_EXECUTION_MODE"] == "CONTROLLED_LIVE"
+
+
+def test_main_does_not_override_explicit_machine_environment(monkeypatch):
+    monkeypatch.setenv("BUYBOARD_ENGINE_ENABLED", "false")
+    monkeypatch.setattr(
+        config_module,
+        "load_env_file",
+        lambda: {"BUYBOARD_ENGINE_ENABLED": "true"},
+    )
+
+    app_main._load_repository_environment()
+
+    assert app_main.os.environ["BUYBOARD_ENGINE_ENABLED"] == "false"
