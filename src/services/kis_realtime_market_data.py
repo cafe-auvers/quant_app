@@ -53,13 +53,15 @@ EXECUTION_NOTICE_TR_IDS = frozenset({"H0GSCNI0", "H0GSCNI9"})
 KIS_WS_VERIFIED_TOTAL_SUBSCRIPTION_LIMIT = 41
 
 TRADE_COLUMNS = (
-    "SYMB", "ZDIV", "TYMD", "XYMD", "XHMS", "KYMD", "KHMS", "OPEN",
-    "HIGH", "LOW", "LAST", "SIGN", "DIFF", "RATE", "PBID", "PASK",
-    "VBID", "VASK", "EVOL", "TVOL", "TAMT", "BIVL", "ASVL", "STRN", "MTYP",
+    "RSYM", "SYMB", "ZDIV", "TYMD", "XYMD", "XHMS", "KYMD", "KHMS",
+    "OPEN", "HIGH", "LOW", "LAST", "SIGN", "DIFF", "RATE", "PBID",
+    "PASK", "VBID", "VASK", "EVOL", "TVOL", "TAMT", "BIVL", "ASVL",
+    "STRN", "MTYP",
 )
 QUOTE_COLUMNS = (
-    "SYMB", "ZDIV", "XYMD", "XHMS", "KYMD", "KHMS", "BVOL", "AVOL",
-    "BDVL", "ADVL", "PBID1", "PASK1", "VBID1", "VASK1", "DBID1", "DASK1",
+    "RSYM", "SYMB", "ZDIV", "XYMD", "XHMS", "KYMD", "KHMS", "BVOL",
+    "AVOL", "BDVL", "ADVL", "PBID1", "PASK1", "VBID1", "VASK1",
+    "DBID1", "DASK1",
 )
 
 

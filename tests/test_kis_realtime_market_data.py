@@ -15,6 +15,7 @@ from src.services.kis_realtime_market_data import (
     FeedChannel,
     KisRealtimeMarketDataService,
     PendingMarketStateAccumulator,
+    QUOTE_COLUMNS,
     StopRule,
     SubscriptionPriority,
     TRADE_COLUMNS,
@@ -164,6 +165,75 @@ def test_protocol_metrics_count_frames_records_schema_and_parser_failures():
     assert dict(metrics.record_counts_by_tr_id) == {"HDFSCNT0": 1}
     assert len(dict(metrics.schema_fingerprints_by_tr_id)["HDFSCNT0"]) == 64
     assert metrics.parser_failure_count == 1
+
+
+def test_live_overseas_schemas_preserve_rsym_prefix_and_parse_prices():
+    assert len(TRADE_COLUMNS) == 26
+    assert TRADE_COLUMNS[:3] == ("RSYM", "SYMB", "ZDIV")
+    assert len(QUOTE_COLUMNS) == 17
+    assert QUOTE_COLUMNS[:3] == ("RSYM", "SYMB", "ZDIV")
+
+    service, _ = _service()
+    service.subscribe(["AAPL"])
+    service._event_time_parser = lambda *_args: NOW
+
+    trade = dict.fromkeys(TRADE_COLUMNS, "")
+    trade.update(
+        RSYM="DNASAAPL",
+        SYMB="AAPL",
+        ZDIV="4",
+        TYMD="20260817",
+        XYMD="20260817",
+        XHMS="103000",
+        KYMD="20260817",
+        KHMS="233000",
+        LAST="189.12",
+        PBID="189.10",
+        PASK="189.14",
+    )
+    service._on_data_frame(
+        KisWsDataFrame(
+            tr_id="HDFSCNT0",
+            record_count=1,
+            payload="^".join(trade[column] for column in TRADE_COLUMNS),
+            encrypted=False,
+            received_at=NOW,
+            payload_fingerprint="live-trade-schema",
+        )
+    )
+    service.poll_once()
+    parsed_trade = service.latest_quote("AAPL")
+    assert parsed_trade is not None
+    assert parsed_trade.last_price == pytest.approx(189.12)
+
+    quote = dict.fromkeys(QUOTE_COLUMNS, "")
+    quote.update(
+        RSYM="DNASAAPL",
+        SYMB="AAPL",
+        ZDIV="4",
+        XYMD="20260817",
+        XHMS="103001",
+        KYMD="20260817",
+        KHMS="233001",
+        PBID1="189.11",
+        PASK1="189.15",
+    )
+    service._on_data_frame(
+        KisWsDataFrame(
+            tr_id="HDFSASP0",
+            record_count=1,
+            payload="^".join(quote[column] for column in QUOTE_COLUMNS),
+            encrypted=False,
+            received_at=NOW,
+            payload_fingerprint="live-quote-schema",
+        )
+    )
+    service.poll_once()
+    parsed_quote = service.latest_quote("AAPL")
+    assert parsed_quote is not None
+    assert parsed_quote.last_price == pytest.approx(189.12)
+    assert parsed_quote.bid == pytest.approx(189.11)
+    assert parsed_quote.ask == pytest.approx(189.15)
 
 
 def test_protocol_latency_statistics_cover_more_than_the_old_rolling_window():
@@ -717,8 +787,8 @@ def test_one_symbol_parse_failure_does_not_block_next_record(monkeypatch):
     monkeypatch.setattr(service, "_ingest_trade_record", ingest)
     bad = [""] * len(TRADE_COLUMNS)
     good = [""] * len(TRADE_COLUMNS)
-    bad[0] = "BAD"
-    good[0] = "GOOD"
+    bad[TRADE_COLUMNS.index("SYMB")] = "BAD"
+    good[TRADE_COLUMNS.index("SYMB")] = "GOOD"
     service._on_data_frame(
         KisWsDataFrame(
             tr_id="HDFSCNT0",
