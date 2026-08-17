@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "evidence_kind": "credentialed_kis_websocket_aggregate_capacity",
+  "environment": "PROD",
+  "observed_at": "2026-08-17T03:11:04.710912+00:00",
+  "source_capture_sha256": "48c87b710f0e1cf7cb4dcad2f1234c5472d87f1f85a2ed02fa0e5556ac1fbc0c",
+  "broker_mutations": 0,
+  "session_count": 1,
+  "registration_mix": ["HDFSCNT0", "HDFSASP0"],
+  "requested_registrations": 42,
+  "accepted_registrations": 41,
+  "rejected_registrations": 1,
+  "first_rejection": {
+    "ordinal": 42,
+    "tr_id": "HDFSASP0",
+    "tr_key": "DNASBKNG",
+    "rt_cd": "1",
+    "msg_cd": "OPSP0008",
+    "msg1": "MAX SUBSCRIBE OVER"
+  }
+}

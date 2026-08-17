@@ -67,6 +67,7 @@ from src.services.execution_authority import ExecutionAuthority, LeaseExpiredErr
 from src.services.execution_lease_protocol import DefaultExecutionLeaseProtocol
 from src.services.kis_request_scheduler import KisRequestScheduler
 from src.services.kis_request_boundary import install_process_kis_request_scheduler
+from src.services.controlled_live_policy import require_controlled_live_configuration
 from src.services.external_alerting import (
     CriticalAlertType,
     ExternalAlertingService,
@@ -155,7 +156,14 @@ class BuyboardRuntimeWorker(QThread):
         self._buying_power_provider = buying_power_provider
         self._account_equity_provider = account_equity_provider
         self._broker = broker
-        self.request_scheduler = request_scheduler or KisRequestScheduler()
+        self.request_scheduler = request_scheduler or KisRequestScheduler(
+            max_confirmed_mutation_attempts=(
+                execution_config.KIS_MUTATION_MAX_CONFIRMED_ATTEMPTS
+            ),
+            min_mutation_spacing_seconds=(
+                execution_config.KIS_MUTATION_MIN_SPACING_SECONDS
+            ),
+        )
         install_process_kis_request_scheduler(self.request_scheduler)
         self._market_data = market_data
         self._stop_change_coordinator = stop_change_coordinator_for(db_engine)
@@ -410,6 +418,18 @@ class BuyboardRuntimeWorker(QThread):
                 )
             self._set_device_state(RuntimeDeviceState.STARTING)
             runtime_broker = self._broker
+            if (
+                not self._standby_only
+                and runtime_broker is None
+                and is_buyboard_engine_enabled()
+            ):
+                # The real production composition cannot start with a
+                # half-configured pilot. Injected test brokers remain under
+                # their explicit test policies.
+                require_controlled_live_configuration(
+                    environment=self._environment,
+                    scheduler=self.request_scheduler,
+                )
             if not self._standby_only and not isinstance(
                 runtime_broker, ExecutionCommandGateway
             ):

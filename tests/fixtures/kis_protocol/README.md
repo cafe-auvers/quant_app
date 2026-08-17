@@ -30,7 +30,12 @@ guessed from the official sample.
 
 ## Status
 
-Empty — nothing has been captured yet. This directory (and
-`docs/kis_capability_matrix.md`) are populated by Workstream 0, which
-requires live KIS production/simulation credentials this development
-environment does not have.
+Workstream 0 is in progress. The `ws0_20260817_*` files are derived from
+credentialed production/simulation captures and contain only redacted or
+shape-only evidence. They currently cover subscription ACKs, configured U.S.
+exchange key formats, the aggregate 41-registration production boundary, and
+production open/history query shapes. A controlled simulation order request
+also records the observed non-business-day rejection and proves that it left
+no matching open order. Accepted simulation mutations, real event frames, and
+execution notices are still missing; see
+`docs/kis_capability_matrix.md` for the authoritative row status.

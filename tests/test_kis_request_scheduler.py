@@ -114,6 +114,71 @@ def test_confirmed_pre_acceptance_rejection_is_the_only_mutation_retry():
     assert scheduler.metrics().confirmed_mutation_retries == 1
 
 
+def test_controlled_live_scheduler_disables_even_confirmed_mutation_retry():
+    scheduler = _scheduler(max_confirmed_mutation_attempts=1)
+    scheduler.synchronize_budget(
+        kind=RequestKind.MUTATION,
+        account_no="acct",
+        endpoint="submit_order",
+        remaining=5,
+    )
+    calls = []
+
+    with pytest.raises(ConfirmedPreAcceptanceRejection):
+        scheduler.execute_mutation(
+            lambda: calls.append(True)
+            or (_ for _ in ()).throw(
+                ConfirmedPreAcceptanceRejection("explicit refusal")
+            ),
+            command_type=CommandType.SUBMIT,
+            account_no="acct",
+            endpoint="submit_order",
+            priority=RequestPriority.NEW_ENTRY,
+            is_new_entry=True,
+        )
+
+    assert calls == [True]
+    assert scheduler.metrics().confirmed_mutation_retries == 0
+
+
+def test_process_wide_mutation_spacing_applies_across_endpoint_buckets():
+    now = [10.0]
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    scheduler = _scheduler(
+        max_confirmed_mutation_attempts=1,
+        min_mutation_spacing_seconds=0.2,
+        monotonic=lambda: now[0],
+        sleeper=sleep,
+    )
+    for endpoint in ("submit_order", "cancel_order"):
+        scheduler.synchronize_budget(
+            kind=RequestKind.MUTATION,
+            account_no="acct",
+            endpoint=endpoint,
+            remaining=5,
+        )
+    starts = []
+    for endpoint, command_type in (
+        ("submit_order", CommandType.SUBMIT),
+        ("cancel_order", CommandType.CANCEL),
+    ):
+        scheduler.execute_mutation(
+            lambda: starts.append(now[0]),
+            command_type=command_type,
+            account_no="acct",
+            endpoint=endpoint,
+            priority=RequestPriority.EMERGENCY_EXIT,
+        )
+
+    assert starts == pytest.approx([10.0, 10.2])
+    assert sleeps == pytest.approx([0.2])
+
+
 def test_exit_requests_are_never_starved_by_display_refresh_backlog():
     scheduler = _scheduler()
     first_started = threading.Event()

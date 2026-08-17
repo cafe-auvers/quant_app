@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "evidence_kind": "credentialed_kis_simulation_mutation_rejection",
+  "environment": "SIM",
+  "observed_at": "2026-08-17T03:19:57.618000+00:00",
+  "source_capture_sha256": "38a7decc9f5dc2f9ea551c028b44cde85223f16b8231ddabbf685ea68a43919c",
+  "safety": {
+    "exact_simulation_host_verified": true,
+    "production_endpoints_called": 0,
+    "application_activation_flags_changed": false,
+    "symbol": "AAPL",
+    "quantity": 1,
+    "limit_price": "0.01"
+  },
+  "correlation_token": "<CORRELATION_25b046e553_LEN12>",
+  "submit": {
+    "tr_id": "VTTT1002U",
+    "http_status": 200,
+    "elapsed_ms": 27.0,
+    "rt_cd": "1",
+    "msg_cd": "40100000",
+    "msg1": "모의투자 영업일이 아닙니다.",
+    "accepted": false,
+    "output_fields": [],
+    "broker_order_id_present": false,
+    "correlation_echoed": false
+  },
+  "cancel": null,
+  "open_order_check": {
+    "tr_id": "VTTS3018R",
+    "http_status": 200,
+    "rt_cd": "0",
+    "row_count": 0,
+    "matching_probe_order_count": 0
+  }
+}

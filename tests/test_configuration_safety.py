@@ -1,6 +1,8 @@
 import pytest
 from sqlalchemy.engine import URL
 
+import main as app_main
+import src.utils.config as config_module
 import src.utils.db_loader as db_loader
 from src.infrastructure.database import engine as engine_module
 from src.infrastructure.database import schema as schema_module
@@ -103,3 +105,33 @@ def test_init_mysql_uses_preprovisioned_database_with_bounded_timeouts(monkeypat
     assert kwargs["pool_pre_ping"] is True
     assert kwargs["connect_args"]["connect_timeout"] == db_loader.MYSQL_CONNECT_TIMEOUT_SECONDS
     assert queries == ["SELECT 1"]
+
+
+def test_main_loads_repository_env_before_runtime_imports(monkeypatch):
+    """The early loader fills values before runtime modules snapshot config."""
+
+    key = "QUANT_TEST_EARLY_ENV_LOAD"
+    monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(
+        config_module,
+        "load_env_file",
+        lambda: {key: "loaded-before-runtime-import"},
+    )
+
+    app_main._load_repository_environment()
+
+    assert app_main.os.environ[key] == "loaded-before-runtime-import"
+
+
+def test_main_does_not_override_explicit_machine_environment(monkeypatch):
+    key = "QUANT_TEST_EARLY_ENV_OVERRIDE"
+    monkeypatch.setenv(key, "machine-value")
+    monkeypatch.setattr(
+        config_module,
+        "load_env_file",
+        lambda: {key: "file-value"},
+    )
+
+    app_main._load_repository_environment()
+
+    assert app_main.os.environ[key] == "machine-value"

@@ -145,6 +145,12 @@ MAX_FUTURE_BROKER_EVENT_SECONDS = _env_float(
 )
 # Capacity remains zero until Workstream 0 records the measured KIS limits.
 # A guessed unlimited/default capacity would violate INV-20.
+KIS_WS_TOTAL_SUBSCRIPTION_CAPACITY = _env_int(
+    "KIS_WS_TOTAL_SUBSCRIPTION_CAPACITY", 0
+)
+# Deprecated as live KIS limits: credentialed WS0 evidence proved one
+# aggregate pool. These remain only for compatibility with older diagnostics;
+# production composition derives both candidate sets from TOTAL capacity.
 KIS_WS_TRADE_CHANNEL_CAPACITY = _env_int("KIS_WS_TRADE_CHANNEL_CAPACITY", 0)
 KIS_WS_QUOTE_CHANNEL_CAPACITY = _env_int("KIS_WS_QUOTE_CHANNEL_CAPACITY", 0)
 KIS_WS_RAW_CAPTURE_ENABLED = _env_bool("KIS_WS_RAW_CAPTURE_ENABLED", False)
@@ -208,6 +214,38 @@ KIS_REPLACE_MUTATION_CAPACITY = _env_int(
 )
 KIS_MUTATION_BUDGET_WINDOW_SECONDS = _env_float(
     "KIS_MUTATION_BUDGET_WINDOW_SECONDS", 1.0
+)
+# Process-wide spacing is an independent upper bound across endpoint buckets.
+# The controlled-live default is deliberately slower than the bucket totals;
+# a strategy cannot override it for a burst.
+KIS_MUTATION_MIN_SPACING_SECONDS = _env_float(
+    "KIS_MUTATION_MIN_SPACING_SECONDS", 0.2
+)
+# One means no scheduler-level retry, including a clean pre-acceptance rate
+# refusal. The workflow may make a later, freshly reconciled decision with a
+# new deterministic identity; the scheduler never loops during the pilot.
+KIS_MUTATION_MAX_CONFIRMED_ATTEMPTS = _env_int(
+    "KIS_MUTATION_MAX_CONFIRMED_ATTEMPTS", 1
+)
+
+# Supervised production envelope. DISABLED is an additional one-way fence on
+# the Kanban engine even when the administrative and in-session trading
+# switches are both armed. CONTROLLED_LIVE permits only explicitly listed BUY
+# symbols and caps each entry command's notional. Protective SELL/cancel paths
+# are not constrained by the entry cap. FULL_LIVE is a later explicit
+# operational promotion, not a code-path change.
+KIS_LIVE_EXECUTION_MODE = _env_text(
+    "KIS_LIVE_EXECUTION_MODE", "DISABLED"
+).upper()
+KIS_CONTROLLED_LIVE_SYMBOLS = tuple(
+    dict.fromkeys(
+        symbol.strip().upper()
+        for symbol in _env_text("KIS_CONTROLLED_LIVE_SYMBOLS", "").split(",")
+        if symbol.strip()
+    )
+)
+KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL = _env_float(
+    "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL", 0.0
 )
 
 # --- End of day (section 505-511) -------------------------------------------

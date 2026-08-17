@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "evidence_kind": "credentialed_kis_rest_query_shape",
+  "environment": "PROD",
+  "observed_at": "2026-08-17T03:08:29.607966+00:00",
+  "source_capture_sha256": "b9fdb6dd2a419f9bd36ba31233ff64bed10ba85d89ebf9dfde31572154c6f0fb",
+  "broker_mutations": 0,
+  "date_window_days": 30,
+  "surfaces": [
+    {"name": "inquire-nccs", "tr_id": "TTTS3018R", "exchanges": ["NASD", "NYSE", "AMEX"], "all_rt_cd_zero": true, "observed_row_counts": {"NASD": 0, "NYSE": 0, "AMEX": 0}},
+    {"name": "inquire-ccnl", "tr_id": "TTTS3035R", "exchanges": ["NASD", "NYSE", "AMEX"], "all_rt_cd_zero": true, "observed_row_counts": {"NASD": 3, "NYSE": 0, "AMEX": 0}}
+  ],
+  "observed_history_top_level_fields": ["ctx_area_fk200", "ctx_area_nk200", "msg1", "msg_cd", "output", "rt_cd"],
+  "observed_history_row_fields": ["ord_dt", "ord_gno_brno", "odno", "orgn_odno", "sll_buy_dvsn_cd", "sll_buy_dvsn_cd_name", "rvse_cncl_dvsn", "rvse_cncl_dvsn_name", "pdno", "prdt_name", "ft_ord_qty", "ft_ord_unpr3", "ft_ccld_qty", "ft_ccld_unpr3", "ft_ccld_amt3", "nccs_qty", "prcs_stat_name", "rjct_rson", "rjct_rson_name", "ord_tmd", "tr_mket_name", "tr_crcy_cd", "tr_natn", "ovrs_excg_cd", "tr_natn_name", "dmst_ord_dt", "thco_ord_tmd", "loan_type_cd", "loan_dt", "mdia_dvsn_name", "usa_amk_exts_rqst_yn", "splt_buy_attr_name"],
+  "redacted_identifiers": {"ord_gno_brno": "<REDACTED_LEN5>", "odno": "<REDACTED_LEN10>", "orgn_odno": ""},
+  "caller_correlation_field_observed": false,
+  "terminal_header_tr_cont": "D",
+  "cursor_fields_present": true
+}

@@ -287,6 +287,18 @@ def test_construction_builds_nothing(tmp_path):
     assert worker.runtime is None
 
 
+def test_default_worker_scheduler_uses_production_spacing_and_no_retry(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(execution_config, "KIS_MUTATION_MIN_SPACING_SECONDS", 0.25)
+    monkeypatch.setattr(execution_config, "KIS_MUTATION_MAX_CONFIRMED_ATTEMPTS", 1)
+
+    worker, _ = _worker(tmp_path)
+
+    assert worker.request_scheduler.min_mutation_spacing_seconds == 0.25
+    assert worker.request_scheduler.max_confirmed_mutation_attempts == 1
+
+
 def test_worker_activates_only_explicitly_verified_account_endpoint_budgets(
     tmp_path, monkeypatch
 ):

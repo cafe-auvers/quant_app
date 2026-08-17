@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "evidence_kind": "KIS_WS_PREMARKET_PUBLIC_EVENT_SCHEMA",
+  "review_status": "UNREVIEWED",
+  "environment": "PROD",
+  "observed_at": "2026-08-17T08:43:52.765548+00:00",
+  "tr_id": "HDFSCNT0",
+  "symbol": "AAPL",
+  "tr_key": "DNASAAPL",
+  "subscription_accepted": true,
+  "record_count": 2,
+  "observed_field_count": 52,
+  "fields_per_record": 26,
+  "vendor_schema_leading_fields": [
+    "RSYM",
+    "SYMB",
+    "ZDIV"
+  ],
+  "broker_mutations": 0,
+  "credentials_persisted": false,
+  "source_capture_sha256": "d2b09c290adcc94fa15c69f3cc731484c41aeb717cab3c0115a2b31d80646fad",
+  "finding": "The credentialed frame proved 26 fields per trade record. The current first-party KIS overseas WebSocket sample identifies the leading fields as RSYM, SYMB, and ZDIV. Timestamp and sequence semantics remain unverified."
+}

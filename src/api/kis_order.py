@@ -32,6 +32,7 @@ from .kis_account_snapshot_dual import (
 from src.services.kis_request_boundary import execute_kis_request
 from src.services.kis_request_scheduler import RequestKind, RequestPriority
 from src.services.mutation_budget_protocol import CommandType
+from src.services.controlled_live_policy import automatic_mutation_retry_permitted
 
 logger = logging.getLogger(__name__)
 
@@ -830,6 +831,8 @@ def cancel_overseas_order(
     try:
         result = _post_cancel()
     except KisTokenError:
+        if not automatic_mutation_retry_permitted(environment=env_key):
+            raise
         logger.info(
             "KIS cancel token expired for %s; refreshing token and retrying once.",
             env_key,
@@ -965,6 +968,8 @@ def place_overseas_order(
     try:
         result = _post_order()
     except KisTokenError:
+        if not automatic_mutation_retry_permitted(environment=environment):
+            raise
         logger.info(
             "KIS order token expired for %s; refreshing token and retrying once.",
             environment,
@@ -1040,6 +1045,8 @@ def place_overseas_reserved_market_on_open_sell(
     try:
         result = _post_reserved_order()
     except KisTokenError:
+        if not automatic_mutation_retry_permitted(environment=env_key):
+            raise
         logger.info(
             "KIS reserved-order token expired for %s; refreshing token and retrying once.",
             env_key,
@@ -1103,6 +1110,8 @@ def cancel_overseas_reserved_order(
     try:
         result = _post_cancel()
     except KisTokenError:
+        if not automatic_mutation_retry_permitted(environment=env_key):
+            raise
         client.authenticate(force_refresh=True)
         result = _post_cancel()
 

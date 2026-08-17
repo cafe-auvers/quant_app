@@ -68,6 +68,15 @@ class KisWsSystemFrame:
     encryption_iv: str = ""
 
 
+@dataclass(frozen=True)
+class KisWsProtocolOperation:
+    generation: int
+    action: str
+    tr_id: str
+    tr_key: str
+    sent_at: datetime
+
+
 def decode_aes_cbc_base64(*, key: str, iv: str, ciphertext: str) -> str:
     """Decode KIS's AES-CBC/Base64 execution-notice envelope."""
     try:
@@ -137,6 +146,7 @@ def parse_kis_ws_frame(raw: str, *, received_at: Optional[datetime] = None):
 DataCallback = Callable[[KisWsDataFrame], None]
 AckCallback = Callable[[KisWsSystemFrame], None]
 ConnectionCallback = Callable[[bool, str, int], None]
+OperationCallback = Callable[[KisWsProtocolOperation], None]
 CriticalCallback = Callable[[str], None]
 
 
@@ -170,6 +180,7 @@ class KisWebSocketClient:
         self._data_callbacks: list[DataCallback] = []
         self._ack_callbacks: list[AckCallback] = []
         self._connection_callbacks: list[ConnectionCallback] = []
+        self._operation_callbacks: list[OperationCallback] = []
         self._encryption: Dict[str, Tuple[str, str]] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._socket = None
@@ -188,6 +199,9 @@ class KisWebSocketClient:
 
     def on_connection(self, callback: ConnectionCallback) -> None:
         self._connection_callbacks.append(callback)
+
+    def on_operation(self, callback: OperationCallback) -> None:
+        self._operation_callbacks.append(callback)
 
     def is_connected(self) -> bool:
         return self._connected
@@ -214,6 +228,20 @@ class KisWebSocketClient:
                 if removed is not None:
                     removals.append(removed)
         self._schedule_messages(removals, tr_type="2")
+
+    def forget_subscriptions(
+        self, subscriptions: Iterable[KisWsSubscription]
+    ) -> None:
+        """Drop NACKed subscriptions from reconnect replay without UNSUB.
+
+        A rejected subscribe never became active at KIS, so sending an
+        unsubscribe would manufacture a second protocol operation. The
+        market-data coordinator calls this only after an explicit NACK.
+        """
+
+        with self._desired_lock:
+            for subscription in subscriptions:
+                self._desired.pop((subscription.tr_id, subscription.tr_key), None)
 
     def _schedule_messages(self, subscriptions, *, tr_type: str) -> None:
         if not subscriptions or not self._connected or self._loop is None:
@@ -254,6 +282,18 @@ class KisWebSocketClient:
                     subscription, tr_type=tr_type, approval_key=approval.value
                 )
             )
+            operation = KisWsProtocolOperation(
+                generation=self._reconnect_generation,
+                action="SUBSCRIBE" if tr_type == "1" else "UNSUBSCRIBE",
+                tr_id=subscription.tr_id,
+                tr_key=subscription.tr_key,
+                sent_at=self._clock(),
+            )
+            for callback in list(self._operation_callbacks):
+                try:
+                    callback(operation)
+                except Exception:
+                    logger.exception("KIS WebSocket operation callback failed")
             await asyncio.sleep(0.05)
 
     def start(self) -> None:
@@ -300,15 +340,23 @@ class KisWebSocketClient:
                     self._reconnect_generation += 1
                     if self._reconnect_generation > 1:
                         self.reconnect_count += 1
-                    self._notify_connection(True, "", self._reconnect_generation)
                     attempts = 0
                     # Desired, not merely previously ACKed, subscriptions are
                     # restored after every reconnect.
                     await self._send_subscriptions(
                         self.desired_subscriptions(), tr_type="1"
                     )
+                    # Observers see the new session only after every desired
+                    # subscription request has crossed the socket boundary.
+                    self._notify_connection(True, "", self._reconnect_generation)
                     async for raw in socket:
                         await self._handle_raw(raw)
+                    if not self._stop_event.is_set():
+                        self._notify_connection(
+                            False,
+                            "KIS WebSocket stream ended",
+                            self._reconnect_generation,
+                        )
             except KisWsAuthError as exc:
                 self._critical_alert(str(exc))
                 self._notify_connection(False, str(exc), self._reconnect_generation)

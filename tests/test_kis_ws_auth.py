@@ -63,6 +63,17 @@ def test_approval_key_is_cached_until_refresh_margin():
     assert session.calls[0][1]["json"]["grant_type"] == "client_credentials"
 
 
+def test_issued_approval_key_is_exposed_only_to_in_memory_audit_sink():
+    session = _Session([_Response({"approval_key": "APPROVAL"})])
+    observed = []
+    provider = _provider(session, sensitive_value_audit=observed.append)
+
+    provider.get()
+    provider.get()
+
+    assert observed == ["APPROVAL"]
+
+
 def test_unverified_protocol_blocks_before_network_call():
     session = _Session([_Response({"approval_key": "MUST_NOT_BE_USED"})])
     provider = KisWsApprovalKeyProvider(

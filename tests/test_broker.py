@@ -15,6 +15,10 @@ from src.core.order_state import (REGULAR_LIMIT_EXECUTION,
                                   RESERVED_MOO_EXECUTION,
                                   BrokerOrderStatusSnapshot, OrderSide,
                                   OrderStatus)
+from src.core.runtime_safety_audit import (
+    BROKER_MUTATION_AUDIT_SOURCE,
+    begin_runtime_safety_audit,
+)
 from src.risk.pre_trade import PreTradeRiskDecision
 from src.services import trading_state
 from src.services.broker import BrokerSubmissionResult, KisBroker, ReadOnlyBroker
@@ -30,15 +34,23 @@ def test_real_broker_submission_is_disarmed_by_default(monkeypatch):
         ),
     )
 
-    with pytest.raises(TradingDisabledError):
-        KisBroker().submit_order(
-            environment="SIM",
-            account_no="12345678",
-            symbol="AAPL",
-            side=OrderSide.BUY,
-            quantity=1,
-            limit_price=100.0,
-        )
+    with begin_runtime_safety_audit(
+        required_sources={BROKER_MUTATION_AUDIT_SOURCE}
+    ) as audit:
+        with pytest.raises(TradingDisabledError):
+            KisBroker().submit_order(
+                environment="SIM",
+                account_no="12345678",
+                symbol="AAPL",
+                side=OrderSide.BUY,
+                quantity=1,
+                limit_price=100.0,
+            )
+        snapshot = audit.snapshot()
+
+    assert snapshot.initialized
+    assert BROKER_MUTATION_AUDIT_SOURCE in snapshot.registered_sources
+    assert snapshot.broker_mutation_attempt_count == 1
 
 
 def test_standby_read_only_broker_never_delegates_mutations():
@@ -184,24 +196,29 @@ def test_cancel_order_regular_vs_reserved_routes_to_different_endpoints(monkeypa
     )
 
     broker = KisBroker()
-    regular_result = broker.cancel_order(
-        environment="PROD",
-        account_no="12345678-01",
-        symbol="AAPL",
-        broker_order_id="KIS-1",
-        quantity=1,
-        side="buy",
-    )
-    reserved_result = broker.cancel_order(
-        environment="PROD",
-        account_no="12345678-01",
-        is_reserved=True,
-        broker_order_id="RSV-1",
-        reservation_date="20260101",
-    )
+    with begin_runtime_safety_audit(
+        required_sources={BROKER_MUTATION_AUDIT_SOURCE}
+    ) as audit:
+        regular_result = broker.cancel_order(
+            environment="PROD",
+            account_no="12345678-01",
+            symbol="AAPL",
+            broker_order_id="KIS-1",
+            quantity=1,
+            side="buy",
+        )
+        reserved_result = broker.cancel_order(
+            environment="PROD",
+            account_no="12345678-01",
+            is_reserved=True,
+            broker_order_id="RSV-1",
+            reservation_date="20260101",
+        )
+        audit_snapshot = audit.snapshot()
 
     assert regular_result == "regular-result"
     assert reserved_result == "reserved-result"
+    assert audit_snapshot.broker_mutation_attempt_count == 2
     assert regular_calls == [
         {
             "environment": "PROD",

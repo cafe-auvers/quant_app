@@ -6,11 +6,16 @@ import threading
 import pytest
 
 from src.api.kis_websocket import KisWsDataFrame, KisWsSubscription, KisWsSystemFrame
+from src.core.runtime_safety_audit import (
+    ENTRY_READINESS_AUDIT_SOURCE,
+    begin_runtime_safety_audit,
+)
 from src.services.kis_realtime_market_data import (
     ClockHealth,
     FeedChannel,
     KisRealtimeMarketDataService,
     PendingMarketStateAccumulator,
+    QUOTE_COLUMNS,
     StopRule,
     SubscriptionPriority,
     TRADE_COLUMNS,
@@ -47,20 +52,36 @@ class _Transport:
     def unsubscribe(self, subscriptions):
         self.unsubscribed.extend(subscriptions)
 
+    def forget_subscriptions(self, subscriptions):
+        forgotten = set(subscriptions)
+        self.subscribed = [sub for sub in self.subscribed if sub not in forgotten]
+
     def is_connected(self):
         return self.connected
 
 
-def _service(*, sequences=(), trade_capacity=10, quote_capacity=10, alert=lambda message: None):
+def _service(
+    *,
+    sequences=(),
+    trade_capacity=10,
+    quote_capacity=10,
+    total_capacity=None,
+    execution_notice_subscription=None,
+    alert=lambda message: None,
+    qualification_mode=False,
+):
     transport = _Transport()
     service = KisRealtimeMarketDataService(
         transport=transport,
         symbol_key_resolver=lambda symbol, channel: f"D{symbol}",
         trade_capacity=trade_capacity,
         quote_capacity=quote_capacity,
+        total_capacity=total_capacity,
         confirmed_sequence_channels=sequences,
+        execution_notice_subscription=execution_notice_subscription,
         alert=alert,
         clock=lambda: NOW,
+        qualification_mode=qualification_mode,
     )
     service._on_connection(True, "", 1)
     return service, transport
@@ -120,6 +141,177 @@ def test_exact_duplicate_event_identity_is_coalesced():
     assert service.ingest_trade(event)
     assert not service.ingest_trade(event)
     assert service.dropped_event_count == 1
+    assert service.protocol_metrics_snapshot().duplicate_event_count == 1
+
+
+def test_protocol_metrics_count_frames_records_schema_and_parser_failures():
+    service, _ = _service()
+    values = [""] * len(TRADE_COLUMNS)
+    values[0] = "BAD"
+    service._on_data_frame(
+        KisWsDataFrame(
+            tr_id="HDFSCNT0",
+            record_count=1,
+            payload="^".join(values),
+            encrypted=False,
+            received_at=NOW,
+            payload_fingerprint="bad-frame",
+        )
+    )
+
+    metrics = service.protocol_metrics_snapshot()
+
+    assert dict(metrics.frame_counts_by_tr_id) == {"HDFSCNT0": 1}
+    assert dict(metrics.record_counts_by_tr_id) == {"HDFSCNT0": 1}
+    assert len(dict(metrics.schema_fingerprints_by_tr_id)["HDFSCNT0"]) == 64
+    assert metrics.parser_failure_count == 1
+
+
+def test_live_overseas_schemas_preserve_rsym_prefix_and_parse_prices():
+    assert len(TRADE_COLUMNS) == 26
+    assert TRADE_COLUMNS[:3] == ("RSYM", "SYMB", "ZDIV")
+    assert len(QUOTE_COLUMNS) == 71
+    assert QUOTE_COLUMNS[:3] == ("RSYM", "SYMB", "ZDIV")
+    assert QUOTE_COLUMNS[-6:] == (
+        "PBID10", "PASK10", "VBID10", "VASK10", "DBID10", "DASK10"
+    )
+
+    service, _ = _service()
+    service.subscribe(["AAPL"])
+    service._event_time_parser = lambda *_args: NOW
+
+    trade = dict.fromkeys(TRADE_COLUMNS, "")
+    trade.update(
+        RSYM="DNASAAPL",
+        SYMB="AAPL",
+        ZDIV="4",
+        TYMD="20260817",
+        XYMD="20260817",
+        XHMS="103000",
+        KYMD="20260817",
+        KHMS="233000",
+        LAST="189.12",
+        PBID="189.10",
+        PASK="189.14",
+    )
+    service._on_data_frame(
+        KisWsDataFrame(
+            tr_id="HDFSCNT0",
+            record_count=1,
+            payload="^".join(trade[column] for column in TRADE_COLUMNS),
+            encrypted=False,
+            received_at=NOW,
+            payload_fingerprint="live-trade-schema",
+        )
+    )
+    service.poll_once()
+    parsed_trade = service.latest_quote("AAPL")
+    assert parsed_trade is not None
+    assert parsed_trade.last_price == pytest.approx(189.12)
+
+    quote = dict.fromkeys(QUOTE_COLUMNS, "")
+    quote.update(
+        RSYM="DNASAAPL",
+        SYMB="AAPL",
+        ZDIV="4",
+        XYMD="20260817",
+        XHMS="103001",
+        KYMD="20260817",
+        KHMS="233001",
+        PBID1="189.11",
+        PASK1="189.15",
+    )
+    service._on_data_frame(
+        KisWsDataFrame(
+            tr_id="HDFSASP0",
+            record_count=1,
+            payload="^".join(quote[column] for column in QUOTE_COLUMNS),
+            encrypted=False,
+            received_at=NOW,
+            payload_fingerprint="live-quote-schema",
+        )
+    )
+    service.poll_once()
+    parsed_quote = service.latest_quote("AAPL")
+    assert parsed_quote is not None
+    assert parsed_quote.last_price == pytest.approx(189.12)
+    assert parsed_quote.bid == pytest.approx(189.11)
+    assert parsed_quote.ask == pytest.approx(189.15)
+
+
+def test_protocol_latency_statistics_cover_more_than_the_old_rolling_window():
+    service, _ = _service()
+    for index in range(3_000):
+        observed = NOW + dt.timedelta(microseconds=index)
+        received = observed + dt.timedelta(milliseconds=index % 500)
+        assert service.ingest_trade(
+            QuoteSnapshot(
+                symbol="AAPL",
+                last_price=100,
+                broker_event_at=observed,
+                received_at=received,
+                processed_at=received + dt.timedelta(milliseconds=index % 700),
+                channel="HDFSCNT0",
+                payload_fingerprint=f"event-{index}",
+            )
+        )
+
+    metrics = service.protocol_metrics_snapshot()
+
+    assert metrics.receive_lag_sample_count == 3_000
+    assert metrics.queue_lag_sample_count == 3_000
+    assert metrics.receive_lag_max_ms >= 499
+    assert metrics.queue_lag_max_ms >= 699
+
+
+def test_qualification_silent_channel_probe_uses_live_service_freshness(monkeypatch):
+    monkeypatch.setattr(
+        "src.services.kis_realtime_market_data.execution_config.BROKER_EVENT_STALE_SECONDS",
+        2.0,
+    )
+    monkeypatch.setattr(
+        "src.services.kis_realtime_market_data.execution_config.LOCAL_RECEIVE_STALE_SECONDS",
+        2.0,
+    )
+    service, _ = _service(qualification_mode=True)
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": SubscriptionPriority.OPEN_POSITION},
+        quote_priorities={},
+    )
+    _ack(service, "AAPL", "HDFSCNT0")
+    assert service.ingest_trade(_event(fingerprint="before-suppression"))
+
+    service.set_qualification_channel_suppressed("AAPL", FeedChannel.TRADE, True)
+    assert not service.ingest_trade(
+        _event(seconds=1, fingerprint="suppressed-live-event")
+    )
+    assert service.is_connected()
+    assert service.health_metrics(now=NOW + dt.timedelta(seconds=2.1)).stale_symbols == (
+        "AAPL",
+    )
+    with begin_runtime_safety_audit(
+        required_sources={ENTRY_READINESS_AUDIT_SOURCE}
+    ) as audit:
+        audit.begin_stale_entry_probe("AAPL")
+        try:
+            assert not service.entry_quote_ready(
+                "AAPL", now=NOW + dt.timedelta(seconds=2.1)
+            )
+        finally:
+            audit.end_stale_entry_probe("AAPL")
+        snapshot = audit.snapshot()
+
+    assert snapshot.initialized
+    assert ENTRY_READINESS_AUDIT_SOURCE in snapshot.registered_sources
+    assert snapshot.stale_entry_readiness_check_count == 1
+    assert snapshot.stale_entry_readiness_rejection_count == 1
+    assert snapshot.stale_entry_readiness_allow_count == 0
+
+    service.set_qualification_channel_suppressed("AAPL", FeedChannel.TRADE, False)
+    assert service.ingest_trade(
+        _event(seconds=2.1, fingerprint="after-suppression")
+    )
+    assert service.health_metrics(now=NOW + dt.timedelta(seconds=2.1)).stale_symbols == ()
 
 
 def test_sequence_check_is_only_enforced_for_confirmed_channels():
@@ -135,6 +327,31 @@ def test_sequence_check_is_only_enforced_for_confirmed_channels():
         _event(sequence=1, seconds=1, fingerprint="b")
     )
     assert confirmed.symbol_state("AAPL").clock_health == ClockHealth.SEQUENCE_REGRESSION
+
+
+def test_confirmed_sequence_channel_rejects_event_without_sequence():
+    confirmed, _ = _service(sequences={"HDFSCNT0"})
+
+    assert not confirmed.ingest_trade(_event(sequence=None, fingerprint="missing"))
+    assert confirmed.symbol_state("AAPL").clock_health == ClockHealth.SEQUENCE_MISSING
+
+
+def test_verified_sequence_reset_semantics_clear_only_resetting_channel():
+    service, _ = _service(sequences={"HDFSCNT0", "HDFSASP0"})
+    service._sequence_reset_by_channel = {
+        "HDFSCNT0": "RESET_ON_RECONNECT",
+        "HDFSASP0": "CONTINUES_ACROSS_RECONNECT",
+    }
+    assert service.ingest_trade(_event(sequence=10, fingerprint="trade"))
+    assert service.ingest_quote(
+        _event(channel="HDFSASP0", sequence=20, fingerprint="quote")
+    )
+
+    service._on_connection(False, "forced", 1)
+    service._on_connection(True, "", 2)
+
+    assert ("AAPL", FeedChannel.TRADE.value) not in service._last_sequence
+    assert service._last_sequence[("AAPL", FeedChannel.QUOTE.value)] == 20
 
 
 def test_future_broker_timestamp_is_rejected(monkeypatch):
@@ -224,6 +441,197 @@ def test_trade_channel_for_open_position_outranks_quote_channel_for_buy_today():
     selected = {(sub.tr_id, sub.symbol) for sub in transport.subscribed}
     assert ("HDFSCNT0", "OPEN") in selected
     assert ("HDFSASP0", "BUY") in selected
+
+
+def test_aggregate_session_capacity_pairs_highest_priority_channels():
+    service, transport = _service(
+        trade_capacity=10,
+        quote_capacity=10,
+        total_capacity=3,
+    )
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": 1, "MSFT": 2},
+        quote_priorities={"AAPL": 1, "MSFT": 2},
+    )
+
+    selected = {(sub.tr_id, sub.symbol) for sub in transport.subscribed}
+    assert selected == {
+        ("HDFSCNT0", "AAPL"),
+        ("HDFSASP0", "AAPL"),
+        ("HDFSCNT0", "MSFT"),
+    }
+    assert service.symbol_state("MSFT").quote_rejected_due_to_capacity
+
+
+def test_execution_notice_consumes_one_aggregate_kis_session_slot():
+    notice = KisWsSubscription("H0GSCNI0", "HTS_REDACTED")
+    service, transport = _service(
+        trade_capacity=10,
+        quote_capacity=10,
+        total_capacity=3,
+        execution_notice_subscription=notice,
+    )
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": 1, "MSFT": 2},
+        quote_priorities={"AAPL": 1, "MSFT": 2},
+    )
+
+    selected = {(sub.tr_id, sub.symbol) for sub in transport.subscribed}
+    assert ("H0GSCNI0", "") in selected
+    assert ("HDFSCNT0", "AAPL") in selected
+    assert ("HDFSASP0", "AAPL") in selected
+    assert len(selected) == 3
+    assert service.symbol_state("MSFT").trade_rejected_due_to_capacity
+    assert service.symbol_state("MSFT").quote_rejected_due_to_capacity
+
+
+def test_zero_aggregate_capacity_blocks_execution_notice_and_market_data():
+    notice = KisWsSubscription("H0GSCNI0", "HTS_REDACTED")
+    service, transport = _service(
+        trade_capacity=10,
+        quote_capacity=10,
+        total_capacity=0,
+        execution_notice_subscription=notice,
+    )
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": 1},
+        quote_priorities={"AAPL": 1},
+    )
+
+    assert transport.subscribed == []
+    state = service.symbol_state("AAPL")
+    assert state.trade_rejected_due_to_capacity
+    assert state.quote_rejected_due_to_capacity
+
+
+def test_capacity_above_credential_verified_kis_limit_is_rejected():
+    with pytest.raises(ValueError, match="credential-verified limit of 41"):
+        _service(
+            trade_capacity=41,
+            quote_capacity=41,
+            total_capacity=42,
+        )
+
+
+def test_pending_subscribe_consumes_capacity_and_ack_makes_it_active():
+    service, _ = _service(
+        trade_capacity=2,
+        quote_capacity=0,
+        total_capacity=1,
+    )
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": 1},
+        quote_priorities={},
+    )
+
+    pending = service.subscription_capacity_snapshot()
+    assert pending.pending_subscribe_count == 1
+    assert pending.active_count == 0
+    assert pending.occupied_count == 1
+    assert pending.available_count == 0
+
+    _ack(service, "AAPL", "HDFSCNT0")
+
+    active = service.subscription_capacity_snapshot()
+    assert active.pending_subscribe_count == 0
+    assert active.active_count == 1
+    assert active.occupied_count == 1
+
+
+def test_subscribe_nack_releases_slot_and_promotes_next_desired_key():
+    service, transport = _service(
+        trade_capacity=2,
+        quote_capacity=0,
+        total_capacity=1,
+    )
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": 1, "MSFT": 2},
+        quote_priorities={},
+    )
+    assert transport.subscribed[-1].symbol == "AAPL"
+
+    service._on_ack(
+        KisWsSystemFrame(
+            tr_id="HDFSCNT0",
+            tr_key="DAAPL",
+            accepted=False,
+            message="MAX SUBSCRIBE OVER",
+        )
+    )
+
+    assert transport.subscribed[-1].symbol == "MSFT"
+    snapshot = service.subscription_capacity_snapshot()
+    assert snapshot.pending_subscribe_count == 1
+    assert snapshot.occupied_count == 1
+    assert service.symbol_state("AAPL").trade_error == "MAX SUBSCRIBE OVER"
+    assert not service.symbol_state("MSFT").trade_rejected_due_to_capacity
+
+
+def test_unsubscribe_ack_releases_slot_before_replacement_subscribe():
+    service, transport = _service(
+        trade_capacity=2,
+        quote_capacity=0,
+        total_capacity=1,
+    )
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": 1},
+        quote_priorities={},
+    )
+    _ack(service, "AAPL", "HDFSCNT0")
+
+    service.configure_desired_channels(
+        trade_priorities={"MSFT": 1},
+        quote_priorities={},
+    )
+
+    waiting = service.subscription_capacity_snapshot()
+    assert waiting.pending_unsubscribe_count == 1
+    assert waiting.available_count == 0
+    assert transport.unsubscribed[-1].symbol == "AAPL"
+    assert all(sub.symbol != "MSFT" for sub in transport.subscribed)
+
+    service._on_ack(
+        KisWsSystemFrame(
+            tr_id="HDFSCNT0",
+            tr_key="DAAPL",
+            accepted=True,
+            is_unsubscribe=True,
+            message="UNSUBSCRIBE SUCCESS",
+        )
+    )
+
+    assert transport.subscribed[-1].symbol == "MSFT"
+    promoted = service.subscription_capacity_snapshot()
+    assert promoted.pending_unsubscribe_count == 0
+    assert promoted.pending_subscribe_count == 1
+    assert promoted.occupied_count == 1
+
+
+def test_reconnect_clears_session_ack_state_and_preserves_replay_intent():
+    service, _ = _service(
+        trade_capacity=1,
+        quote_capacity=0,
+        total_capacity=1,
+    )
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": 1},
+        quote_priorities={},
+    )
+    _ack(service, "AAPL", "HDFSCNT0")
+    assert service.subscription_capacity_snapshot().active_count == 1
+
+    service._on_connection(False, "forced", 1)
+    disconnected = service.subscription_capacity_snapshot()
+    assert disconnected.occupied_count == 0
+    assert disconnected.reconnect_replay_count == 1
+    assert not service.symbol_state("AAPL").trade_acked
+
+    service._on_connection(True, "", 2)
+    replayed = service.subscription_capacity_snapshot()
+    assert replayed.pending_subscribe_count == 1
+    assert replayed.active_count == 0
+    assert replayed.reconnect_replay_count == 1
+    assert service.symbol_state("AAPL").reconnect_generation == 2
 
 
 def test_breach_between_two_higher_prices_in_one_drain_window_is_never_lost():
@@ -382,8 +790,8 @@ def test_one_symbol_parse_failure_does_not_block_next_record(monkeypatch):
     monkeypatch.setattr(service, "_ingest_trade_record", ingest)
     bad = [""] * len(TRADE_COLUMNS)
     good = [""] * len(TRADE_COLUMNS)
-    bad[0] = "BAD"
-    good[0] = "GOOD"
+    bad[TRADE_COLUMNS.index("SYMB")] = "BAD"
+    good[TRADE_COLUMNS.index("SYMB")] = "GOOD"
     service._on_data_frame(
         KisWsDataFrame(
             tr_id="HDFSCNT0",

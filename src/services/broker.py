@@ -28,8 +28,20 @@ from src.core.order_state import (
     BrokerOrderStatusSnapshot,
     OrderSide,
 )
+from src.core.runtime_safety_audit import (
+    BROKER_MUTATION_AUDIT_SOURCE,
+    record_broker_mutation_attempt,
+    register_runtime_safety_audit_source,
+)
 from src.services import trading_state
+from src.services.controlled_live_policy import (
+    LiveExecutionEnvelopeError,
+    require_live_entry_allowed,
+)
 from src.utils.config import get_env_value
+
+
+register_runtime_safety_audit_source(BROKER_MUTATION_AUDIT_SOURCE)
 
 
 @dataclass(frozen=True)
@@ -195,10 +207,18 @@ class KisBroker:
         exchange: str = "NASD",
         execution_policy: str = REGULAR_LIMIT_EXECUTION,
     ) -> BrokerSubmissionResult:
+        record_broker_mutation_attempt()
         # Defense in depth: service callers are expected to check before
         # reserving an order, but the real broker boundary must not rely on
         # every present and future caller remembering to do so.
         trading_state.require_trading_enabled(environment, symbol)
+        require_live_entry_allowed(
+            environment=environment,
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            limit_price=limit_price,
+        )
         if execution_policy == RESERVED_MOO_EXECUTION:
             response = kis_order.place_overseas_reserved_market_on_open_sell(
                 environment=environment,
@@ -225,6 +245,8 @@ class KisBroker:
         )
 
     def is_ambiguous_submission_error(self, error: BaseException) -> bool:
+        if isinstance(error, LiveExecutionEnvelopeError):
+            return False
         return kis_order.is_ambiguous_order_submission_error(error)
 
     @staticmethod
@@ -247,6 +269,7 @@ class KisBroker:
         is_reserved: bool = False,
         **kwargs: Any,
     ) -> BrokerOrderStatusSnapshot:
+        record_broker_mutation_attempt()
         # Gateway-only ownership correlation; never part of the KIS payload.
         kwargs.pop("ownership_symbol", None)
         if is_reserved:

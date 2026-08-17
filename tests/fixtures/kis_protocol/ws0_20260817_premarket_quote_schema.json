@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "evidence_kind": "KIS_WS_PREMARKET_PUBLIC_QUOTE_SCHEMA",
+  "review_status": "UNREVIEWED",
+  "environment": "PROD",
+  "observed_at": "2026-08-17T08:58:09.026714+00:00",
+  "tr_id": "HDFSASP0",
+  "symbol": "AAPL",
+  "tr_key": "DNASAAPL",
+  "subscription_accepted": true,
+  "record_count": 1,
+  "observed_field_count": 71,
+  "fields_per_record": 71,
+  "header_field_count": 11,
+  "price_level_count": 10,
+  "fields_per_price_level": 6,
+  "broker_mutations": 0,
+  "credentials_persisted": false,
+  "source_capture_sha256": "5a9cb93f97f3c5e11ff19986a26822063ccd497462f7d81bc02bbc1cab5b390d",
+  "finding": "The credentialed frame proved 71 fields per quote record: the 11-field header followed by ten repeated six-field bid/ask price, size, and delta groups described by the current KIS 10-level quote service. Timestamp and sequence semantics remain unverified."
+}

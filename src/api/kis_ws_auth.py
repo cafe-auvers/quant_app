@@ -63,6 +63,7 @@ class KisWsApprovalKeyProvider:
         clock: Callable[[], datetime] = _utc_now,
         sleeper: Callable[[float], None] = time.sleep,
         critical_alert: Callable[[str], None] = lambda message: None,
+        sensitive_value_audit: Callable[[str], None] = lambda value: None,
     ) -> None:
         self._base_url = str(base_url or "").rstrip("/")
         self._app_key = str(app_key or "")
@@ -76,6 +77,7 @@ class KisWsApprovalKeyProvider:
         self._clock = clock
         self._sleeper = sleeper
         self._critical_alert = critical_alert
+        self._sensitive_value_audit = sensitive_value_audit
         self._cached: Optional[KisWsApprovalKey] = None
         self._lock = threading.Lock()
 
@@ -128,6 +130,7 @@ class KisWsApprovalKeyProvider:
                         issued_at=issued_at,
                         expires_at=issued_at + timedelta(seconds=self._ttl_seconds),
                     )
+                    self._sensitive_value_audit(value)
                     return self._cached
                 except Exception as exc:  # requests and malformed vendor replies
                     last_error = f"{type(exc).__name__}: {exc}"
