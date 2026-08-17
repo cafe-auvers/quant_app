@@ -170,8 +170,11 @@ def test_protocol_metrics_count_frames_records_schema_and_parser_failures():
 def test_live_overseas_schemas_preserve_rsym_prefix_and_parse_prices():
     assert len(TRADE_COLUMNS) == 26
     assert TRADE_COLUMNS[:3] == ("RSYM", "SYMB", "ZDIV")
-    assert len(QUOTE_COLUMNS) == 17
+    assert len(QUOTE_COLUMNS) == 71
     assert QUOTE_COLUMNS[:3] == ("RSYM", "SYMB", "ZDIV")
+    assert QUOTE_COLUMNS[-6:] == (
+        "PBID10", "PASK10", "VBID10", "VASK10", "DBID10", "DASK10"
+    )
 
     service, _ = _service()
     service.subscribe(["AAPL"])

@@ -58,10 +58,14 @@ TRADE_COLUMNS = (
     "PASK", "VBID", "VASK", "EVOL", "TVOL", "TAMT", "BIVL", "ASVL",
     "STRN", "MTYP",
 )
-QUOTE_COLUMNS = (
+_QUOTE_HEADER_COLUMNS = (
     "RSYM", "SYMB", "ZDIV", "XYMD", "XHMS", "KYMD", "KHMS", "BVOL",
-    "AVOL", "BDVL", "ADVL", "PBID1", "PASK1", "VBID1", "VASK1",
-    "DBID1", "DASK1",
+    "AVOL", "BDVL", "ADVL",
+)
+QUOTE_COLUMNS = _QUOTE_HEADER_COLUMNS + tuple(
+    f"{field}{level}"
+    for level in range(1, 11)
+    for field in ("PBID", "PASK", "VBID", "VASK", "DBID", "DASK")
 )
 
 

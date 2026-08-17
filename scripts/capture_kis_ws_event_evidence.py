@@ -1,4 +1,4 @@
-"""Capture regular-session KIS trade/quote frames for capability review.
+"""Capture public KIS trade/quote frames for capability review.
 
 This is a deliberately narrow qualification utility.  It issues a WebSocket
 approval key, subscribes to HDFSCNT0/HDFSASP0 for one already-verified symbol
@@ -354,7 +354,7 @@ def capture(
         counts = {tr_id: len(items) for tr_id, items in frames.items()}
         evidence = {
             "schema_version": 1,
-            "evidence_kind": "KIS_WS_REGULAR_SESSION_PUBLIC_EVENT_CAPTURE",
+            "evidence_kind": "KIS_WS_PUBLIC_EVENT_CAPTURE",
             "qualification_only": True,
             "review_status": "UNREVIEWED",
             "commit_sha": commit_sha,

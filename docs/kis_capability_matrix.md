@@ -31,6 +31,7 @@ mutation settings remain disabled:
 | WS0-E05 | Credentialed US exchange/daytime key ACK probe | PROD | 2026-08-17 03:11 UTC | `tests/fixtures/kis_protocol/ws0_20260817_subscription_acks.json` |
 | WS0-E06 | Controlled non-business-day order request | SIM | 2026-08-17 03:19 UTC | `tests/fixtures/kis_protocol/ws0_20260817_sim_mutation_rejection.json` |
 | WS0-E07 | Credentialed premarket trade-frame schema | PROD | 2026-08-17 08:43 UTC | `tests/fixtures/kis_protocol/ws0_20260817_premarket_trade_schema.json` |
+| WS0-E08 | Credentialed premarket quote-frame schema | PROD | 2026-08-17 08:58 UTC | `tests/fixtures/kis_protocol/ws0_20260817_premarket_quote_schema.json` |
 | WS0-O01 | Current KIS limits notice | Vendor | checked 2026-08-17 | [KIS API call-volume notice](https://apiportal.koreainvestment.com/community/10000000-0000-0011-0000-000000000001/post/d0d1a83f-6f8d-4437-9700-6d26702fd989) |
 | WS0-O02 | Official KIS sample implementation | Vendor | commit `b093e42ba32d1df5f5ddad7a71cb715cbc800832` | [KIS Open Trading API](https://github.com/koreainvestment/open-trading-api) |
 
@@ -195,7 +196,9 @@ history behavior remain open.
 with two records and 52 values. This proves 26 values per trade record. The
 current first-party KIS overseas WebSocket sample identifies the leading
 fields as `RSYM`, `SYMB`, and `ZDIV`; the parser now preserves that prefix.
-No `HDFSASP0` data frame was observed in this short capture.
+WS0-E08 then captured one credentialed `HDFSASP0` record containing 71 values:
+the 11-field header followed by ten six-field bid/ask level groups, consistent
+with KIS's current description of the U.S. feed as a real-time 10-level book.
 
 **Finding:** The trade-frame width is credential-verified, but Gate 2 cannot
 start until a regular-session capture confirms every field plus the date/time
