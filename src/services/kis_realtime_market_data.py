@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 TRADE_TR_ID = "HDFSCNT0"
 QUOTE_TR_ID = "HDFSASP0"
 EXECUTION_NOTICE_TR_IDS = frozenset({"H0GSCNI0", "H0GSCNI9"})
+KIS_WS_VERIFIED_TOTAL_SUBSCRIPTION_LIMIT = 41
 
 TRADE_COLUMNS = (
     "SYMB", "ZDIV", "TYMD", "XYMD", "XHMS", "KYMD", "KHMS", "OPEN",
@@ -442,6 +443,7 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         symbol_key_resolver: Callable[[str, FeedChannel], str],
         trade_capacity: int,
         quote_capacity: int,
+        total_capacity: Optional[int] = None,
         confirmed_sequence_channels: Iterable[str] = (),
         execution_notice_subscription: Optional[KisWsSubscription] = None,
         event_time_parser: Optional[
@@ -456,6 +458,22 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         self._symbol_key_resolver = symbol_key_resolver
         self._trade_capacity = max(0, int(trade_capacity))
         self._quote_capacity = max(0, int(quote_capacity))
+        # KIS enforces one aggregate session budget across every realtime TR,
+        # not an independent budget for each channel. ``None`` preserves the
+        # explicitly injected unit-test capacity; the live factory always
+        # supplies the fail-closed WS0 value.
+        self._total_capacity = (
+            self._trade_capacity
+            + self._quote_capacity
+            + (1 if execution_notice_subscription is not None else 0)
+            if total_capacity is None
+            else max(0, int(total_capacity))
+        )
+        if self._total_capacity > KIS_WS_VERIFIED_TOTAL_SUBSCRIPTION_LIMIT:
+            raise ValueError(
+                "KIS aggregate realtime capacity exceeds the credential-verified "
+                f"limit of {KIS_WS_VERIFIED_TOTAL_SUBSCRIPTION_LIMIT}"
+            )
         self._confirmed_sequence_channels = {
             str(channel).upper() for channel in confirmed_sequence_channels
         }
@@ -488,9 +506,13 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         self._transport.on_data(self._on_data_frame)
         self._transport.on_ack(self._on_ack)
         self._transport.on_connection(self._on_connection)
-        if self._execution_notice_subscription is not None:
+        if (
+            self._execution_notice_subscription is not None
+            and self._total_capacity > 0
+        ):
             # Supplementary notification channel only. It is intentionally
-            # outside trade/quote capacity and cannot update execution state.
+            # unable to update execution state, but it still consumes one of
+            # KIS's aggregate realtime-session slots.
             self._transport.subscribe([self._execution_notice_subscription])
 
     @staticmethod
@@ -587,8 +609,43 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         }
 
     def _rebalance_subscriptions(self) -> None:
-        selected_trade = self._selected(self._trade_priorities, self._trade_capacity)
-        selected_quote = self._selected(self._quote_priorities, self._quote_capacity)
+        channel_candidates = []
+        for symbol in self._selected(self._trade_priorities, self._trade_capacity):
+            channel_candidates.append(
+                (
+                    self._trade_priorities[symbol],
+                    symbol,
+                    0,
+                    FeedChannel.TRADE,
+                )
+            )
+        for symbol in self._selected(self._quote_priorities, self._quote_capacity):
+            channel_candidates.append(
+                (
+                    self._quote_priorities[symbol],
+                    symbol,
+                    1,
+                    FeedChannel.QUOTE,
+                )
+            )
+        notice_slots = (
+            1
+            if self._execution_notice_subscription is not None
+            and self._total_capacity > 0
+            else 0
+        )
+        data_slots = max(0, self._total_capacity - notice_slots)
+        selected_candidates = sorted(channel_candidates)[:data_slots]
+        selected_trade = {
+            symbol
+            for _, symbol, _, channel in selected_candidates
+            if channel == FeedChannel.TRADE
+        }
+        selected_quote = {
+            symbol
+            for _, symbol, _, channel in selected_candidates
+            if channel == FeedChannel.QUOTE
+        }
         desired_subscriptions: Dict[tuple[str, str], KisWsSubscription] = {}
         all_symbols = set(self._trade_priorities) | set(self._quote_priorities)
         with self._state_lock:
@@ -1233,6 +1290,7 @@ def build_kis_realtime_market_data_from_environment(
     return KisRealtimeMarketDataService(
         transport=transport,
         symbol_key_resolver=resolve_key,
+        total_capacity=execution_config.KIS_WS_TOTAL_SUBSCRIPTION_CAPACITY,
         trade_capacity=execution_config.KIS_WS_TRADE_CHANNEL_CAPACITY,
         quote_capacity=execution_config.KIS_WS_QUOTE_CHANNEL_CAPACITY,
         execution_notice_subscription=notice_subscription,

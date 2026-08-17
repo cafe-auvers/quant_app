@@ -51,14 +51,24 @@ class _Transport:
         return self.connected
 
 
-def _service(*, sequences=(), trade_capacity=10, quote_capacity=10, alert=lambda message: None):
+def _service(
+    *,
+    sequences=(),
+    trade_capacity=10,
+    quote_capacity=10,
+    total_capacity=None,
+    execution_notice_subscription=None,
+    alert=lambda message: None,
+):
     transport = _Transport()
     service = KisRealtimeMarketDataService(
         transport=transport,
         symbol_key_resolver=lambda symbol, channel: f"D{symbol}",
         trade_capacity=trade_capacity,
         quote_capacity=quote_capacity,
+        total_capacity=total_capacity,
         confirmed_sequence_channels=sequences,
+        execution_notice_subscription=execution_notice_subscription,
         alert=alert,
         clock=lambda: NOW,
     )
@@ -224,6 +234,76 @@ def test_trade_channel_for_open_position_outranks_quote_channel_for_buy_today():
     selected = {(sub.tr_id, sub.symbol) for sub in transport.subscribed}
     assert ("HDFSCNT0", "OPEN") in selected
     assert ("HDFSASP0", "BUY") in selected
+
+
+def test_aggregate_session_capacity_pairs_highest_priority_channels():
+    service, transport = _service(
+        trade_capacity=10,
+        quote_capacity=10,
+        total_capacity=3,
+    )
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": 1, "MSFT": 2},
+        quote_priorities={"AAPL": 1, "MSFT": 2},
+    )
+
+    selected = {(sub.tr_id, sub.symbol) for sub in transport.subscribed}
+    assert selected == {
+        ("HDFSCNT0", "AAPL"),
+        ("HDFSASP0", "AAPL"),
+        ("HDFSCNT0", "MSFT"),
+    }
+    assert service.symbol_state("MSFT").quote_rejected_due_to_capacity
+
+
+def test_execution_notice_consumes_one_aggregate_kis_session_slot():
+    notice = KisWsSubscription("H0GSCNI0", "HTS_REDACTED")
+    service, transport = _service(
+        trade_capacity=10,
+        quote_capacity=10,
+        total_capacity=3,
+        execution_notice_subscription=notice,
+    )
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": 1, "MSFT": 2},
+        quote_priorities={"AAPL": 1, "MSFT": 2},
+    )
+
+    selected = {(sub.tr_id, sub.symbol) for sub in transport.subscribed}
+    assert ("H0GSCNI0", "") in selected
+    assert ("HDFSCNT0", "AAPL") in selected
+    assert ("HDFSASP0", "AAPL") in selected
+    assert len(selected) == 3
+    assert service.symbol_state("MSFT").trade_rejected_due_to_capacity
+    assert service.symbol_state("MSFT").quote_rejected_due_to_capacity
+
+
+def test_zero_aggregate_capacity_blocks_execution_notice_and_market_data():
+    notice = KisWsSubscription("H0GSCNI0", "HTS_REDACTED")
+    service, transport = _service(
+        trade_capacity=10,
+        quote_capacity=10,
+        total_capacity=0,
+        execution_notice_subscription=notice,
+    )
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": 1},
+        quote_priorities={"AAPL": 1},
+    )
+
+    assert transport.subscribed == []
+    state = service.symbol_state("AAPL")
+    assert state.trade_rejected_due_to_capacity
+    assert state.quote_rejected_due_to_capacity
+
+
+def test_capacity_above_credential_verified_kis_limit_is_rejected():
+    with pytest.raises(ValueError, match="credential-verified limit of 41"):
+        _service(
+            trade_capacity=41,
+            quote_capacity=41,
+            total_capacity=42,
+        )
 
 
 def test_breach_between_two_higher_prices_in_one_drain_window_is_never_lost():

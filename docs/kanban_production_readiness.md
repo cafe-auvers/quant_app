@@ -1228,6 +1228,9 @@ Every row must have an explicit reducer branch and at least one fault-injection 
 
 ### Gate 2 — measurable acceptance criteria
 
+The operational preflight, evidence-bundle schema, and current blockers are
+tracked in [gate2_readiness_checklist.md](gate2_readiness_checklist.md).
+
 Unchanged from revision 2:
 
 | Metric | Requirement |

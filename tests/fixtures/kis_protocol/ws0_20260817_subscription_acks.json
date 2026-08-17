@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "evidence_kind": "credentialed_kis_websocket_subscription_ack",
+  "broker_mutations": 0,
+  "captures": [
+    {
+      "environment": "PROD",
+      "observed_at": "2026-08-17T03:07:19.303567+00:00",
+      "source_capture_sha256": "29cf2af8543beb33f73cce5a615382319e0186c541cb4e6d42f46fdf08aeaa6c",
+      "results": [
+        {"tr_id": "HDFSCNT0", "tr_key": "DNASAAPL", "encrypt": "N", "rt_cd": "0", "msg_cd": "OPSP0000", "msg1": "SUBSCRIBE SUCCESS", "output_iv_length": 16, "output_key_length": 32},
+        {"tr_id": "HDFSASP0", "tr_key": "DNASAAPL", "encrypt": "N", "rt_cd": "0", "msg_cd": "OPSP0000", "msg1": "SUBSCRIBE SUCCESS", "output_iv_length": 16, "output_key_length": 32}
+      ]
+    },
+    {
+      "environment": "SIM",
+      "observed_at": "2026-08-17T03:09:20.619143+00:00",
+      "source_capture_sha256": "f2ef2d4f078d3d624925d197c7f69f0dcf89d646fae62e545748241307f17c4b",
+      "results": [
+        {"tr_id": "HDFSCNT0", "tr_key": "DNASAAPL", "encrypt": "N", "rt_cd": "0", "msg_cd": "OPSP0000", "msg1": "SUBSCRIBE SUCCESS"},
+        {"tr_id": "HDFSASP0", "tr_key": "DNASAAPL", "encrypt": "N", "rt_cd": "0", "msg_cd": "OPSP0000", "msg1": "SUBSCRIBE SUCCESS"}
+      ]
+    },
+    {
+      "environment": "PROD",
+      "observed_at": "2026-08-17T03:11:36.651402+00:00",
+      "source_capture_sha256": "f042791e19e5302d63c767ebae25b1ab0abb2b54d0c9b2d490a18fc7fc6b509",
+      "results": [
+        {"label": "NASDAQ_REGULAR", "tr_id": "HDFSCNT0", "tr_key": "DNASAAPL", "msg_cd": "OPSP0000"},
+        {"label": "NASDAQ_REGULAR", "tr_id": "HDFSASP0", "tr_key": "DNASAAPL", "msg_cd": "OPSP0000"},
+        {"label": "NYSE_REGULAR", "tr_id": "HDFSCNT0", "tr_key": "DNYSIBM", "msg_cd": "OPSP0000"},
+        {"label": "NYSE_REGULAR", "tr_id": "HDFSASP0", "tr_key": "DNYSIBM", "msg_cd": "OPSP0000"},
+        {"label": "AMEX_REGULAR", "tr_id": "HDFSCNT0", "tr_key": "DAMSBTG", "msg_cd": "OPSP0000"},
+        {"label": "AMEX_REGULAR", "tr_id": "HDFSASP0", "tr_key": "DAMSBTG", "msg_cd": "OPSP0000"},
+        {"label": "NASDAQ_DAYTIME", "tr_id": "HDFSCNT0", "tr_key": "RBAQAAPL", "msg_cd": "OPSP0000"},
+        {"label": "NASDAQ_DAYTIME", "tr_id": "HDFSASP0", "tr_key": "RBAQAAPL", "msg_cd": "OPSP0000"}
+      ]
+    }
+  ]
+}

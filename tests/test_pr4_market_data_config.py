@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -31,6 +32,7 @@ def test_pr4_market_data_configuration_is_present_and_fail_closed():
         "BROKER_EVENT_STALE_SECONDS",
         "LOCAL_RECEIVE_STALE_SECONDS",
         "MAX_MARKET_DATA_QUEUE_DELAY_SECONDS",
+        "KIS_WS_TOTAL_SUBSCRIPTION_CAPACITY=0",
         "KIS_WS_RAW_CAPTURE_ENABLED=false",
         "BUYBOARD_ENGINE_ENABLED=false",
     ):
@@ -75,3 +77,55 @@ def test_ws0_contract_explicitly_allows_only_inactive_provisional_adapters():
     assert "KIS_WS_PROTOCOL_VERIFIED=true or a live connection/subscription" in contract
     assert "non-zero production/simulation channel capacity" in contract
     assert "provisional D1/D3/D11 adapter may be implemented inactive" in matrix
+
+
+def test_ws0_credentialed_capacity_evidence_matches_fail_closed_runtime_contract():
+    fixture_dir = ROOT / "tests" / "fixtures" / "kis_protocol"
+    capacity = json.loads(
+        (fixture_dir / "ws0_20260817_subscription_capacity.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    acknowledgements = json.loads(
+        (fixture_dir / "ws0_20260817_subscription_acks.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    simulated_rejection = json.loads(
+        (fixture_dir / "ws0_20260817_sim_mutation_rejection.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert capacity["broker_mutations"] == 0
+    assert capacity["accepted_registrations"] == 41
+    assert capacity["first_rejection"] == {
+        "ordinal": 42,
+        "tr_id": "HDFSASP0",
+        "tr_key": "DNASBKNG",
+        "rt_cd": "1",
+        "msg_cd": "OPSP0008",
+        "msg1": "MAX SUBSCRIBE OVER",
+    }
+    assert acknowledgements["broker_mutations"] == 0
+    assert simulated_rejection["submit"]["msg_cd"] == "40100000"
+    assert not simulated_rejection["submit"]["accepted"]
+    assert simulated_rejection["open_order_check"]["matching_probe_order_count"] == 0
+    assert simulated_rejection["safety"]["production_endpoints_called"] == 0
+    assert execution_config.KIS_WS_TOTAL_SUBSCRIPTION_CAPACITY == 0
+
+
+def test_ws0_committed_evidence_contains_no_credential_or_account_material():
+    fixture_dir = ROOT / "tests" / "fixtures" / "kis_protocol"
+    forbidden = (
+        "approval_key",
+        "access_token",
+        "appsecret",
+        "authorization",
+        "account_no",
+        "acnt_no",
+        "cano",
+    )
+    for path in sorted(fixture_dir.glob("ws0_*.json")):
+        text = path.read_text(encoding="utf-8").lower()
+        assert not any(token in text for token in forbidden), path.name

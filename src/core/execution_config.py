@@ -145,6 +145,9 @@ MAX_FUTURE_BROKER_EVENT_SECONDS = _env_float(
 )
 # Capacity remains zero until Workstream 0 records the measured KIS limits.
 # A guessed unlimited/default capacity would violate INV-20.
+KIS_WS_TOTAL_SUBSCRIPTION_CAPACITY = _env_int(
+    "KIS_WS_TOTAL_SUBSCRIPTION_CAPACITY", 0
+)
 KIS_WS_TRADE_CHANNEL_CAPACITY = _env_int("KIS_WS_TRADE_CHANNEL_CAPACITY", 0)
 KIS_WS_QUOTE_CHANNEL_CAPACITY = _env_int("KIS_WS_QUOTE_CHANNEL_CAPACITY", 0)
 KIS_WS_RAW_CAPTURE_ENABLED = _env_bool("KIS_WS_RAW_CAPTURE_ENABLED", False)
