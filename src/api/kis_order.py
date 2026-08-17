@@ -358,20 +358,58 @@ def _reserved_order_dates(
     return normalized_start, normalized_end
 
 
+def _normalize_kis_order_number(value: Any) -> str:
+    """Return KIS's stable representation for a regular order number.
+
+    Credentialed simulation evidence shows that an accepted overseas order
+    returns a ten-character, zero-padded ``ODNO``, while ``inquire-ccnl``
+    later reports the same numeric identity without those leading zeroes.
+    Keeping both representations as raw strings makes an owned order look
+    external after restart.  KIS regular order numbers are ten digits, so
+    normalize numeric values to that width while leaving non-numeric test or
+    reservation identities unchanged.
+    """
+
+    text = str(value or "").strip()
+    if not text or not text.isdigit() or set(text) == {"0"}:
+        return "" if text and set(text) == {"0"} else text
+    return text.zfill(10) if len(text) < 10 else text
+
+
 def _broker_order_id_from_row(row: Dict[str, Any]) -> str:
-    return str(
+    reserved_order_id = str(
+        _row_value(row, "ovrs_rsvn_odno", "OVRS_RSVN_ODNO") or ""
+    ).strip()
+    if reserved_order_id:
+        # Reservation identifiers have a separate broker namespace and are
+        # intentionally preserved exactly as returned.
+        return reserved_order_id
+
+    revision_cancel_code = str(
         _row_value(
             row,
-            "ovrs_rsvn_odno",
-            "OVRS_RSVN_ODNO",
-            "odno",
-            "ODNO",
-            "order_no",
-            "ord_no",
-            "KIS_ORDER_NO",
+            "rvse_cncl_dvsn",
+            "rvse_cncl_dvsn_cd",
+            "RVSE_CNCL_DVSN_CD",
         )
         or ""
+    ).strip()
+    current_order_id = _row_value(
+        row,
+        "odno",
+        "ODNO",
+        "order_no",
+        "ord_no",
+        "KIS_ORDER_NO",
     )
+    if revision_cancel_code == "02":
+        # KIS emits a new ODNO for the cancellation history row.  That row
+        # describes the terminal outcome of ORGN_ODNO; treating its own ODNO
+        # as an independent broker order creates a false external-order fence.
+        original_order_id = _row_value(row, "orgn_odno", "ORGN_ODNO")
+        if _normalize_kis_order_number(original_order_id):
+            current_order_id = original_order_id
+    return _normalize_kis_order_number(current_order_id)
 
 
 def _status_from_order_row(
@@ -407,6 +445,17 @@ def _status_from_order_row(
         )
     ).upper()
 
+    revision_cancel_code = str(
+        _row_value(
+            row,
+            "rvse_cncl_dvsn",
+            "rvse_cncl_dvsn_cd",
+            "RVSE_CNCL_DVSN_CD",
+        )
+        or ""
+    ).strip()
+    if revision_cancel_code == "02":
+        return OrderStatus.CANCELLED
     if str(_row_value(row, "cncl_yn") or "").strip().upper() == "Y":
         return OrderStatus.CANCELLED
     if str(_row_value(row, "nprc_rson_text") or "").strip():
@@ -506,7 +555,9 @@ def _matches_order_filter(
     broker_order_id: str = "",
     side: str = "",
 ) -> bool:
-    if broker_order_id and snapshot.broker_order_id != str(broker_order_id):
+    if broker_order_id and _normalize_kis_order_number(
+        snapshot.broker_order_id
+    ) != _normalize_kis_order_number(broker_order_id):
         return False
     if symbol and snapshot.symbol and snapshot.symbol != str(symbol).upper():
         return False
