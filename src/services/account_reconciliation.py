@@ -1219,6 +1219,14 @@ def reduce_account_reconciliation(
         if candidate.recovery_state == OrderRecoveryState.NONE:
             _set_recovery_state(candidate, OrderRecoveryState.DISCOVERING)
         _set_recovery_state(candidate, OrderRecoveryState.BROKER_IDENTITY_UNCERTAIN)
+        candidate.recovery_candidate_broker_order_ids = tuple(
+            dict.fromkeys(
+                (
+                    *candidate.recovery_candidate_broker_order_ids,
+                    broker_snapshot.broker_order_id,
+                )
+            )
+        )
         alerts.append(
             ReconciliationAlert(
                 "AMBIGUOUS_SUBMISSION_HEURISTIC_CANDIDATE",

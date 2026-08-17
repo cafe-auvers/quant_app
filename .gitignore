@@ -73,6 +73,7 @@ logs/
 .pytest_cache/
 .coverage
 htmlcov/
+/artifacts/
 
 # Application specific
 *.db
