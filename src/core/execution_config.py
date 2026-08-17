@@ -148,6 +148,9 @@ MAX_FUTURE_BROKER_EVENT_SECONDS = _env_float(
 KIS_WS_TOTAL_SUBSCRIPTION_CAPACITY = _env_int(
     "KIS_WS_TOTAL_SUBSCRIPTION_CAPACITY", 0
 )
+# Deprecated as live KIS limits: credentialed WS0 evidence proved one
+# aggregate pool. These remain only for compatibility with older diagnostics;
+# production composition derives both candidate sets from TOTAL capacity.
 KIS_WS_TRADE_CHANNEL_CAPACITY = _env_int("KIS_WS_TRADE_CHANNEL_CAPACITY", 0)
 KIS_WS_QUOTE_CHANNEL_CAPACITY = _env_int("KIS_WS_QUOTE_CHANNEL_CAPACITY", 0)
 KIS_WS_RAW_CAPTURE_ENABLED = _env_bool("KIS_WS_RAW_CAPTURE_ENABLED", False)

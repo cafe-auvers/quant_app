@@ -162,7 +162,8 @@ registrations across quotes, trades, expected executions, and notices.
 
 **Finding:** Capacity is **41 total registrations per app key/session**, not
 41 per TR/channel. An `H0GSCNI0`/`H0GSCNI9` notice consumes one of those slots.
-The application must enforce one aggregate budget before Gate 2.
+The live application enforces this as its sole broker-capacity budget; legacy
+trade/quote capacity settings are not applied as independent KIS limits.
 
 ## Simulation environment differences
 

@@ -63,6 +63,7 @@ def _service(
     total_capacity=None,
     execution_notice_subscription=None,
     alert=lambda message: None,
+    qualification_mode=False,
 ):
     transport = _Transport()
     service = KisRealtimeMarketDataService(
@@ -75,6 +76,7 @@ def _service(
         execution_notice_subscription=execution_notice_subscription,
         alert=alert,
         clock=lambda: NOW,
+        qualification_mode=qualification_mode,
     )
     service._on_connection(True, "", 1)
     return service, transport
@@ -160,6 +162,64 @@ def test_protocol_metrics_count_frames_records_schema_and_parser_failures():
     assert metrics.parser_failure_count == 1
 
 
+def test_protocol_latency_statistics_cover_more_than_the_old_rolling_window():
+    service, _ = _service()
+    for index in range(3_000):
+        observed = NOW + dt.timedelta(microseconds=index)
+        received = observed + dt.timedelta(milliseconds=index % 500)
+        assert service.ingest_trade(
+            QuoteSnapshot(
+                symbol="AAPL",
+                last_price=100,
+                broker_event_at=observed,
+                received_at=received,
+                processed_at=received + dt.timedelta(milliseconds=index % 700),
+                channel="HDFSCNT0",
+                payload_fingerprint=f"event-{index}",
+            )
+        )
+
+    metrics = service.protocol_metrics_snapshot()
+
+    assert metrics.receive_lag_sample_count == 3_000
+    assert metrics.queue_lag_sample_count == 3_000
+    assert metrics.receive_lag_max_ms >= 499
+    assert metrics.queue_lag_max_ms >= 699
+
+
+def test_qualification_silent_channel_probe_uses_live_service_freshness(monkeypatch):
+    monkeypatch.setattr(
+        "src.services.kis_realtime_market_data.execution_config.BROKER_EVENT_STALE_SECONDS",
+        2.0,
+    )
+    monkeypatch.setattr(
+        "src.services.kis_realtime_market_data.execution_config.LOCAL_RECEIVE_STALE_SECONDS",
+        2.0,
+    )
+    service, _ = _service(qualification_mode=True)
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": SubscriptionPriority.OPEN_POSITION},
+        quote_priorities={},
+    )
+    _ack(service, "AAPL", "HDFSCNT0")
+    assert service.ingest_trade(_event(fingerprint="before-suppression"))
+
+    service.set_qualification_channel_suppressed("AAPL", FeedChannel.TRADE, True)
+    assert not service.ingest_trade(
+        _event(seconds=1, fingerprint="suppressed-live-event")
+    )
+    assert service.is_connected()
+    assert service.health_metrics(now=NOW + dt.timedelta(seconds=2.1)).stale_symbols == (
+        "AAPL",
+    )
+
+    service.set_qualification_channel_suppressed("AAPL", FeedChannel.TRADE, False)
+    assert service.ingest_trade(
+        _event(seconds=2.1, fingerprint="after-suppression")
+    )
+    assert service.health_metrics(now=NOW + dt.timedelta(seconds=2.1)).stale_symbols == ()
+
+
 def test_sequence_check_is_only_enforced_for_confirmed_channels():
     unconfirmed, _ = _service()
     assert unconfirmed.ingest_trade(_event(sequence=2, fingerprint="a"))
@@ -173,6 +233,31 @@ def test_sequence_check_is_only_enforced_for_confirmed_channels():
         _event(sequence=1, seconds=1, fingerprint="b")
     )
     assert confirmed.symbol_state("AAPL").clock_health == ClockHealth.SEQUENCE_REGRESSION
+
+
+def test_confirmed_sequence_channel_rejects_event_without_sequence():
+    confirmed, _ = _service(sequences={"HDFSCNT0"})
+
+    assert not confirmed.ingest_trade(_event(sequence=None, fingerprint="missing"))
+    assert confirmed.symbol_state("AAPL").clock_health == ClockHealth.SEQUENCE_MISSING
+
+
+def test_verified_sequence_reset_semantics_clear_only_resetting_channel():
+    service, _ = _service(sequences={"HDFSCNT0", "HDFSASP0"})
+    service._sequence_reset_by_channel = {
+        "HDFSCNT0": "RESET_ON_RECONNECT",
+        "HDFSASP0": "CONTINUES_ACROSS_RECONNECT",
+    }
+    assert service.ingest_trade(_event(sequence=10, fingerprint="trade"))
+    assert service.ingest_quote(
+        _event(channel="HDFSASP0", sequence=20, fingerprint="quote")
+    )
+
+    service._on_connection(False, "forced", 1)
+    service._on_connection(True, "", 2)
+
+    assert ("AAPL", FeedChannel.TRADE.value) not in service._last_sequence
+    assert service._last_sequence[("AAPL", FeedChannel.QUOTE.value)] == 20
 
 
 def test_future_broker_timestamp_is_rejected(monkeypatch):

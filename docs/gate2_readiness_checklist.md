@@ -17,6 +17,8 @@ mutations, the Kanban runtime, shadow execution, or live trading.
   reconnect/reset semantics before enabling sequence rejection.
 - [ ] Configure a redacted HTS-ID test identity and verify
   `H0GSCNI0`/`H0GSCNI9` encryption and decrypted field mapping.
+- [ ] Assemble those reviewed findings into the strict capability manifest
+  described below. Each evidence digest and interpretation must validate.
 - [ ] Demonstrate a forced disconnect, deterministic desired-set replay, and
   100% critical re-ACK in less than 10 seconds.
 - [x] Enforce the credential-verified aggregate WebSocket limit of 41 total
@@ -65,12 +67,20 @@ KIS_MUTATION_BUDGET_VERIFIED=false
 KIS_SUBMIT_MUTATION_CAPACITY=0
 KIS_CANCEL_MUTATION_CAPACITY=0
 KIS_REPLACE_MUTATION_CAPACITY=0
+BROKER_EVENT_STALE_SECONDS=2
+LOCAL_RECEIVE_STALE_SECONDS=2
 ```
 
 - [ ] `KIS_WS_TOTAL_SUBSCRIPTION_CAPACITY=41` comes from WS0-E04.
+- [ ] The Gate-2-only freshness budgets plus reporter poll interval remain at
+  or below three seconds; the values above leave deterministic scheduling
+  margin without changing the application's fail-closed production defaults.
+- [ ] Legacy `KIS_WS_TRADE_CHANNEL_CAPACITY` and
+  `KIS_WS_QUOTE_CHANNEL_CAPACITY` values are not treated as broker limits.
+  Live composition uses the aggregate pool as its sole capacity authority.
 - [ ] Requested trade + quote + execution-notice registrations never exceed
-  the aggregate total. For the read-only soak, leave `KIS_WS_HTS_ID` empty
-  unless execution-notice verification is the explicit test objective.
+  the aggregate total. `KIS_WS_HTS_ID` is required because the current Gate-2
+  contract includes execution-notice encryption/mapping verification.
 - [ ] `KIS_WS_SYMBOL_KEYS_JSON` contains only WS0-verified keys.
 - [ ] The runtime startup log records `production_activation_authorized=false`.
 - [ ] No process with the same app key holds a second WebSocket session.
@@ -84,9 +94,11 @@ KIS_REPLACE_MUTATION_CAPACITY=0
   flow is established.
 - [ ] Confirm every desired critical subscription is re-ACKed after reconnect.
 - [ ] Exercise duplicate subscribe/unsubscribe requests without corrupting
-  desired or acknowledged state.
+  desired or acknowledged state; record every actual operation by connection
+  generation and reject duplicate protocol transitions.
 - [ ] Verify a stale critical symbol is declared stale within three seconds and
-  cannot produce an entry decision.
+  cannot produce an entry decision. This must use the connected silent-channel
+  suppression probe, independently of disconnect ACK invalidation.
 - [ ] Replay synthetic stop thresholds through the live accumulator without
   permitting any broker mutation.
 - [ ] Stop immediately if an activation flag changes, a mutation is attempted,
@@ -96,7 +108,7 @@ KIS_REPLACE_MUTATION_CAPACITY=0
 
 | Metric | Pass requirement | Evidence field |
 |---|---|---|
-| Continuous read-only soak | One full regular session | start/end/session calendar |
+| Continuous read-only soak | One full regular session with at least 95% of scheduled samples | start/end/session calendar and sample count |
 | Critical subscription ACK | 100% | requested/acked keys |
 | Silent parser failures | 0 | parser drop/error counts |
 | Unhandled disconnects | 0 | disconnect classifications |
@@ -104,12 +116,12 @@ KIS_REPLACE_MUTATION_CAPACITY=0
 | Critical ACK recovery | < 10 seconds | p50/p95/max recovery |
 | Critical stale detection | ≤ 3 seconds | per-symbol detection latency |
 | Entry attempts while stale | 0 | decision audit |
-| Duplicate-subscription corruption | 0 | desired/ACK set consistency |
+| Duplicate-subscription corruption | 0 | actual generation/TR/key operations and duplicate-request probe |
 | Missed synthetic stop breaches | 0 | injected/latched/consumed IDs |
-| Queue/accumulator deadlocks | 0 | watchdog/cycle progress |
+| Queue/accumulator deadlocks | 0 | independent watchdog/cycle progress |
 | Receive lag p95 | < 1 second | broker-event to receive |
 | Receive lag p99 | < 2 seconds | broker-event to receive |
-| Secret/approval-key leakage | 0 | redaction scan |
+| Secret/approval-key leakage | 0 | full captured-log scan including issued approval key |
 | Broker mutations | 0 | gateway/broker boundary audit |
 
 ## Machine-readable evidence bundle
@@ -120,13 +132,15 @@ The generated Gate-2 report must contain:
 - environment, symbols, TR IDs, verified subscription keys, and requested
   aggregate slots;
 - KIS capability-matrix revision/digest;
+- reviewed capability-manifest digest and normalized verified capabilities;
 - session calendar, UTC/KST/US-Eastern start and end times;
 - every metric above with numerator, denominator, threshold, and result;
 - reconnect injection timestamps and ACK-recovery durations;
 - parser/frame counts by TR ID and schema fingerprint;
-- p50/p95/p99/max event, receive, and queue lag;
+- session-wide sample counts plus p50/p95/p99/max receive and queue lag;
 - activation-default snapshot and `broker_mutations=0`;
-- redaction scan result and hashes of redacted raw evidence;
+- captured-log digest/byte count, issued-approval-key scan result, and hashes
+  of redacted raw evidence;
 - overall `PASSED` or `FAILED` with explicit blockers.
 
 Gate 2 passes only when every metric passes in one evidence bundle. A failed or
@@ -145,14 +159,49 @@ python scripts/run_gate2_soak.py `
   --symbols AAPL,MSFT `
   --session-date YYYY-MM-DD `
   --gate1-report artifacts/gate1_report.json `
-  --timestamp-evidence C:\redacted\timestamps.json `
-  --execution-notice-evidence C:\redacted\notice.json `
-  --trade-sequence-finding NO_USABLE_SEQUENCE `
-  --quote-sequence-finding NO_USABLE_SEQUENCE `
+  --capability-manifest C:\redacted\gate2_capabilities.json `
   --reconnect-after-seconds 3600 `
+  --silent-stale-probe-after-seconds 5400 `
+  --log-output C:\redacted\gate2_runtime.log `
   --output C:\redacted\gate2_report.json
 ```
 
-Use `MONOTONIC` instead only when credentialed evidence proves a usable
-monotonic sequence for that channel. Raw/unredacted captures remain outside
-the repository.
+The capability manifest has schema version 1, the exact soak commit and
+environment, an approved reviewer identity/time, and exactly one entry for
+each required capability:
+
+```json
+{
+  "schema_version": 1,
+  "commit_sha": "<exact 40-character soak commit>",
+  "environment": "PROD",
+  "review": {
+    "status": "APPROVED",
+    "reviewer": "<independent reviewer>",
+    "reviewed_at": "<timezone-aware ISO-8601>"
+  },
+  "capabilities": [
+    {
+      "capability_id": "HDFSCNT0_TIMESTAMP_SEMANTICS",
+      "status": "VERIFIED",
+      "environment": "PROD",
+      "tr_id": "HDFSCNT0",
+      "interpretation": "EXCHANGE_EVENT_TIME_AMERICA_NEW_YORK",
+      "evidence_file": "trade-timestamp.json",
+      "evidence_sha256": "<sha256>"
+    }
+  ]
+}
+```
+
+The bundle must also contain `HDFSASP0_TIMESTAMP_SEMANTICS`, both channel
+`*_SEQUENCE_SEMANTICS` entries, and `EXECUTION_NOTICE_ENCRYPTION`. A sequence
+interpretation is exactly `MONOTONIC` or `NO_USABLE_SEQUENCE`; `MONOTONIC`
+also requires the reviewed `sequence_field` and `reset_semantics` of either
+`RESET_ON_RECONNECT` or `CONTINUES_ACROSS_RECONNECT`; the live parser and
+reconnect lifecycle then use those exact values.
+Each referenced evidence file is a nonempty JSON observation with matching
+capability/environment/TR/interpretation fields. Empty files, digest
+mismatches, unreviewed manifests, CLI-only assertions, and commit mismatches
+fail before any live connection. Raw/unredacted captures remain outside the
+repository.

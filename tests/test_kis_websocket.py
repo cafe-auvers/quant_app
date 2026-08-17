@@ -151,6 +151,8 @@ def test_reconnect_resubscribes_every_desired_subscription():
     )
     subscription = KisWsSubscription("HDFSCNT0", "DNASAAPL", "AAPL", "TRADE")
     client.subscribe([subscription])
+    operations = []
+    client.on_operation(operations.append)
 
     asyncio.run(client.run_forever())
 
@@ -158,3 +160,7 @@ def test_reconnect_resubscribes_every_desired_subscription():
     assert sockets[0].sent[0]["body"]["input"]["tr_key"] == "DNASAAPL"
     assert sockets[1].sent[0]["body"]["input"]["tr_key"] == "DNASAAPL"
     assert client.reconnect_count == 1
+    assert [(item.generation, item.action) for item in operations] == [
+        (1, "SUBSCRIBE"),
+        (2, "SUBSCRIBE"),
+    ]

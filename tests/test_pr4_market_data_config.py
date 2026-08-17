@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 from pathlib import Path
+import threading
+import time
 from zoneinfo import ZoneInfo
+
+import pytest
 
 from src.utils.market_calendar import (
     is_regular_session_open,
@@ -14,7 +19,25 @@ from src.services.kis_realtime_market_data import (
     build_kis_realtime_market_data_from_environment,
 )
 from src.core import execution_config
-from gate2.reporting import Gate2Evidence, build_report
+from gate2.reporting import (
+    Gate2Evidence,
+    LiveGate2Runner,
+    _ProgressWatchdog,
+    _SecretRedactingFormatter,
+    build_report,
+)
+from src.api.kis_websocket import KisWsProtocolOperation
+from gate2.capabilities import (
+    EXECUTION_NOTICE,
+    NOTICE_INTERPRETATION,
+    QUOTE_SEQUENCE,
+    QUOTE_TIMESTAMP,
+    TIMESTAMP_INTERPRETATION,
+    TRADE_SEQUENCE,
+    TRADE_TIMESTAMP,
+    load_verified_capability_manifest,
+    sha256_file,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -63,6 +86,35 @@ def test_live_factory_requires_both_enable_and_protocol_verification(monkeypatch
         assert "Workstream 0" in str(exc)
     else:
         raise AssertionError("unverified KIS protocol must fail closed")
+
+
+def test_live_factory_uses_only_aggregate_pool_and_wires_verified_sequences(
+    monkeypatch,
+):
+    monkeypatch.setattr(execution_config, "KIS_WS_ENABLED", True)
+    monkeypatch.setattr(execution_config, "KIS_WS_PROTOCOL_VERIFIED", True)
+    monkeypatch.setattr(execution_config, "KIS_WS_TOTAL_SUBSCRIPTION_CAPACITY", 3)
+    monkeypatch.setattr(execution_config, "KIS_WS_TRADE_CHANNEL_CAPACITY", 0)
+    monkeypatch.setattr(execution_config, "KIS_WS_QUOTE_CHANNEL_CAPACITY", 0)
+    monkeypatch.setenv(
+        "KIS_WS_SYMBOL_KEYS_JSON",
+        json.dumps({"AAPL": "DNASAAPL", "MSFT": "DNASMSFT", "NVDA": "DNASNVDA"}),
+    )
+
+    service = build_kis_realtime_market_data_from_environment(
+        confirmed_sequence_channels=("HDFSCNT0",),
+        sequence_field_by_channel={"HDFSCNT0": "EVOL"},
+        sequence_reset_by_channel={"HDFSCNT0": "RESET_ON_RECONNECT"},
+    )
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": 0, "MSFT": 0, "NVDA": 0},
+        quote_priorities={},
+    )
+
+    snapshot = service.subscription_capacity_snapshot()
+    assert snapshot.reconnect_replay_count == 3
+    assert snapshot.total_capacity == 3
+    assert service._confirmed_sequence_channels == {"HDFSCNT0"}
 
 
 def test_ws0_contract_explicitly_allows_only_inactive_provisional_adapters():
@@ -140,10 +192,62 @@ def _passing_gate2_evidence() -> Gate2Evidence:
         "HDFSASP0:AAPL",
         "H0GSCNI0:EXECUTION_NOTICE",
     ]
+    capabilities = {
+        TRADE_TIMESTAMP: {
+            "capability_id": TRADE_TIMESTAMP,
+            "status": "VERIFIED",
+            "environment": "PROD",
+            "tr_id": "HDFSCNT0",
+            "interpretation": TIMESTAMP_INTERPRETATION,
+            "evidence_sha256": "1" * 64,
+        },
+        QUOTE_TIMESTAMP: {
+            "capability_id": QUOTE_TIMESTAMP,
+            "status": "VERIFIED",
+            "environment": "PROD",
+            "tr_id": "HDFSASP0",
+            "interpretation": TIMESTAMP_INTERPRETATION,
+            "evidence_sha256": "2" * 64,
+        },
+        TRADE_SEQUENCE: {
+            "capability_id": TRADE_SEQUENCE,
+            "status": "VERIFIED",
+            "environment": "PROD",
+            "tr_id": "HDFSCNT0",
+            "interpretation": "NO_USABLE_SEQUENCE",
+            "evidence_sha256": "3" * 64,
+        },
+        QUOTE_SEQUENCE: {
+            "capability_id": QUOTE_SEQUENCE,
+            "status": "VERIFIED",
+            "environment": "PROD",
+            "tr_id": "HDFSASP0",
+            "interpretation": "NO_USABLE_SEQUENCE",
+            "evidence_sha256": "4" * 64,
+        },
+        EXECUTION_NOTICE: {
+            "capability_id": EXECUTION_NOTICE,
+            "status": "VERIFIED",
+            "environment": "PROD",
+            "tr_id": "H0GSCNI0",
+            "interpretation": NOTICE_INTERPRETATION,
+            "evidence_sha256": "5" * 64,
+        },
+    }
     return Gate2Evidence(
         commit_sha="a" * 40,
         gate1_report_sha256="b" * 64,
         capability_matrix_sha256="c" * 64,
+        capability_manifest_sha256="d" * 64,
+        capability_review={
+            "status": "APPROVED",
+            "reviewer": "reviewer",
+            "reviewed_at": "2026-08-17T00:00:00+00:00",
+        },
+        verified_capabilities=capabilities,
+        runtime_confirmed_sequence_channels=[],
+        runtime_sequence_fields={},
+        runtime_sequence_reset_semantics={},
         environment="PROD",
         symbols=["AAPL"],
         tr_ids=["HDFSCNT0", "HDFSASP0", "H0GSCNI0"],
@@ -166,24 +270,60 @@ def _passing_gate2_evidence() -> Gate2Evidence:
         acked_subscriptions=subscriptions,
         max_aggregate_registration_usage=3,
         aggregate_registration_capacity=41,
-        connection_events=[
-            {"kind": "INJECTED_DISCONNECT", "at": opened.isoformat()}
+        connection_events=[{"kind": "DISCONNECT_REQUESTED", "at": opened.isoformat()}],
+        disconnects=[
+            {
+                "classification": "INJECTED",
+                "disconnect_at": opened.isoformat(),
+                "reconnected_at": (opened + dt.timedelta(seconds=1)).isoformat(),
+                "reacked_at": (opened + dt.timedelta(seconds=2)).isoformat(),
+                "recovery_seconds": 2.0,
+            }
         ],
+        injected_disconnect_request_count=1,
+        protocol_operations=[
+            {
+                "generation": 1,
+                "action": "SUBSCRIBE",
+                "tr_id": "HDFSCNT0",
+                "registration": "AAPL",
+                "transition_valid": True,
+            }
+        ],
+        duplicate_request_probe={
+            "requests_attempted": 4,
+            "unexpected_protocol_operations": 0,
+        },
         reconnect_recovery_seconds=[2.0],
         stale_detection_seconds=[0.2],
         frame_counts_by_tr_id={"HDFSCNT0": 100, "HDFSASP0": 100},
         record_counts_by_tr_id={"HDFSCNT0": 100, "HDFSASP0": 100},
         schema_fingerprints_by_tr_id={"HDFSCNT0": "d" * 64, "HDFSASP0": "e" * 64},
-        receive_lag_ms={"p50": 50.0, "p95": 100.0, "p99": 200.0, "max": 300.0},
-        queue_lag_ms={"p50": 1.0, "p95": 2.0, "p99": 3.0, "max": 4.0},
-        synthetic_stop_tests={"injected": 1, "latched": 1, "consumed": 1},
-        watchdog_cycles=10,
-        sequence_findings={
-            "HDFSCNT0": "NO_USABLE_SEQUENCE",
-            "HDFSASP0": "NO_USABLE_SEQUENCE",
+        receive_lag_ms={"count": 200, "p50": 50.0, "p95": 100.0, "p99": 200.0, "max": 300.0},
+        queue_lag_ms={"count": 200, "p50": 1.0, "p95": 2.0, "p99": 3.0, "max": 4.0},
+        synthetic_stop_tests={
+            "injected": 1,
+            "accepted_by_live_service": 1,
+            "latched": 1,
+            "consumed": 1,
         },
-        timestamp_evidence_sha256="f" * 64,
-        execution_notice_evidence_sha256="1" * 64,
+        silent_stale_probe={
+            "connected_during_probe": True,
+            "detected": True,
+            "recovered": True,
+            "detection_seconds": 2.1,
+        },
+        watchdog_cycles=10,
+        watchdog_max_gap_seconds=0.2,
+        watchdog_timeout_seconds=2.0,
+        continuity_sample_count=250_000,
+        continuity_started_at=opened.isoformat(),
+        continuity_start_delay_seconds=0.0,
+        poll_interval_seconds=0.1,
+        log_scan_completed=True,
+        log_capture_sha256="f" * 64,
+        sensitive_value_count=4,
+        approval_key_count=1,
     )
 
 
@@ -208,3 +348,194 @@ def test_gate2_report_fails_closed_for_activation_or_missing_reconnect_evidence(
     assert report["result"] == "FAILED"
     assert "runtime_activation_fence" in report["blockers"]
     assert "critical_ack_recovery_seconds" in report["blockers"]
+
+
+def test_gate2_report_rejects_unmeasured_default_zero_metrics_and_runtime_mismatch():
+    evidence = _passing_gate2_evidence()
+    evidence.protocol_operations.clear()
+    evidence.log_scan_completed = False
+    evidence.receive_lag_ms["count"] = 0
+    evidence.verified_capabilities[TRADE_SEQUENCE]["interpretation"] = "MONOTONIC"
+    evidence.verified_capabilities[TRADE_SEQUENCE]["sequence_field"] = "EVOL"
+
+    report = build_report(evidence)
+
+    assert report["result"] == "FAILED"
+    assert "duplicate_subscription_corruption" in report["blockers"]
+    assert "secret_leaks" in report["blockers"]
+    assert "receive_lag_p95_ms" in report["blockers"]
+    assert "receive_lag_p99_ms" in report["blockers"]
+    assert "sequence_semantics" in report["blockers"]
+
+
+class _Gate2AuditService:
+    def on_session(self, callback):
+        self.session_callback = callback
+
+    def on_protocol_operation(self, callback):
+        self.operation_callback = callback
+
+    def reconnect(self):
+        return None
+
+
+def test_gate2_protocol_audit_detects_duplicate_subscribe_and_unexpected_disconnect():
+    evidence = _passing_gate2_evidence()
+    evidence.protocol_operations.clear()
+    evidence.disconnects.clear()
+    evidence.injected_disconnect_request_count = 0
+    service = _Gate2AuditService()
+    runner = LiveGate2Runner(service, evidence)
+    observed = dt.datetime(2026, 8, 17, 14, 0, tzinfo=dt.timezone.utc)
+    operation = KisWsProtocolOperation(
+        generation=1,
+        action="SUBSCRIBE",
+        tr_id="HDFSCNT0",
+        tr_key="DNASAAPL",
+        sent_at=observed,
+    )
+
+    service.operation_callback(operation)
+    service.operation_callback(operation)
+    service.session_callback(False, "transport lost", 1, observed)
+    runner.finalize()
+
+    assert evidence.duplicate_subscription_anomaly_count == 1
+    assert evidence.disconnects[0]["classification"] == "UNEXPECTED"
+    assert evidence.unhandled_disconnect_count == 1
+
+
+def test_gate2_log_formatter_redacts_static_and_dynamically_issued_secrets():
+    values = {"STATIC-SECRET"}
+    lock = threading.Lock()
+    formatter = _SecretRedactingFormatter(
+        "%(message)s", sensitive_values=values, lock=lock
+    )
+    first = logging.LogRecord(
+        "gate2", logging.INFO, __file__, 1, "value=STATIC-SECRET", (), None
+    )
+    with lock:
+        values.add("DYNAMIC-APPROVAL")
+    second = logging.LogRecord(
+        "gate2", logging.INFO, __file__, 1, "key=DYNAMIC-APPROVAL", (), None
+    )
+
+    assert formatter.format(first) == "value=<redacted-secret>"
+    assert formatter.format(second) == "key=<redacted-secret>"
+    assert formatter.redaction_count == 2
+
+
+def test_gate2_progress_watchdog_produces_independent_measurement_cycles():
+    evidence = _passing_gate2_evidence()
+    evidence.watchdog_cycles = 0
+    evidence.watchdog_max_gap_seconds = 0.0
+    watchdog = _ProgressWatchdog(evidence, 0.5)
+
+    watchdog.start()
+    deadline = time.monotonic() + 1.0
+    while evidence.watchdog_cycles == 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    watchdog.stop()
+
+    assert evidence.watchdog_cycles > 0
+    assert 0 < evidence.watchdog_max_gap_seconds <= 0.5
+
+
+def test_gate2_capability_manifest_requires_reviewed_matching_nonempty_evidence(tmp_path):
+    commit = "a" * 40
+    entries = []
+    definitions = (
+        (TRADE_TIMESTAMP, "HDFSCNT0", TIMESTAMP_INTERPRETATION),
+        (QUOTE_TIMESTAMP, "HDFSASP0", TIMESTAMP_INTERPRETATION),
+        (TRADE_SEQUENCE, "HDFSCNT0", "MONOTONIC"),
+        (QUOTE_SEQUENCE, "HDFSASP0", "NO_USABLE_SEQUENCE"),
+        (EXECUTION_NOTICE, "H0GSCNI0", NOTICE_INTERPRETATION),
+    )
+    for index, (capability_id, tr_id, interpretation) in enumerate(definitions):
+        evidence_path = tmp_path / f"evidence-{index}.json"
+        evidence_path.write_text(
+            json.dumps(
+                {
+                    "capability_id": capability_id,
+                    "environment": "PROD",
+                    "tr_id": tr_id,
+                    "interpretation": interpretation,
+                    "observed_at": "2026-08-17T00:00:00Z",
+                    "observations": [{"frame_count": 10}],
+                    **(
+                        {
+                            "sequence_field": "EVOL",
+                            "reset_semantics": "RESET_ON_RECONNECT",
+                        }
+                        if capability_id == TRADE_SEQUENCE
+                        else {}
+                    ),
+                }
+            ),
+            encoding="utf-8",
+        )
+        entries.append(
+            {
+                "capability_id": capability_id,
+                "status": "VERIFIED",
+                "environment": "PROD",
+                "tr_id": tr_id,
+                "interpretation": interpretation,
+                "evidence_file": evidence_path.name,
+                "evidence_sha256": sha256_file(evidence_path),
+                **(
+                    {
+                        "sequence_field": "EVOL",
+                        "reset_semantics": "RESET_ON_RECONNECT",
+                    }
+                    if capability_id == TRADE_SEQUENCE
+                    else {}
+                ),
+            }
+        )
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "commit_sha": commit,
+                "environment": "PROD",
+                "review": {
+                    "status": "APPROVED",
+                    "reviewer": "independent-reviewer",
+                    "reviewed_at": "2026-08-17T00:00:00Z",
+                },
+                "capabilities": entries,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    verified = load_verified_capability_manifest(
+        manifest_path, expected_commit=commit, expected_environment="PROD"
+    )
+
+    assert verified.confirmed_sequence_channels == ("HDFSCNT0",)
+
+    (tmp_path / "evidence-0.json").write_text("{}", encoding="utf-8")
+    entries[0]["evidence_sha256"] = sha256_file(tmp_path / "evidence-0.json")
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "commit_sha": commit,
+                "environment": "PROD",
+                "review": {
+                    "status": "APPROVED",
+                    "reviewer": "independent-reviewer",
+                    "reviewed_at": "2026-08-17T00:00:00Z",
+                },
+                "capabilities": entries,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="lacks the required"):
+        load_verified_capability_manifest(
+            manifest_path, expected_commit=commit, expected_environment="PROD"
+        )

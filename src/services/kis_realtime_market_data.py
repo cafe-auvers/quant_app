@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 from src.api.kis_websocket import (
     KisWebSocketClient,
     KisWsDataFrame,
+    KisWsProtocolOperation,
     KisWsSubscription,
     KisWsSystemFrame,
 )
@@ -69,6 +70,7 @@ class ClockHealth(str, Enum):
     EXCESSIVE_SKEW = "EXCESSIVE_SKEW"
     NON_MONOTONIC = "NON_MONOTONIC"
     SEQUENCE_REGRESSION = "SEQUENCE_REGRESSION"
+    SEQUENCE_MISSING = "SEQUENCE_MISSING"
 
 
 class SubscriptionPriority(IntEnum):
@@ -449,6 +451,7 @@ class MarketDataProtocolMetrics:
     schema_fingerprints_by_tr_id: tuple[tuple[str, str], ...]
     parser_failure_count: int
     duplicate_event_count: int
+    receive_lag_sample_count: int
     receive_lag_p50_ms: float
     receive_lag_p95_ms: float
     receive_lag_p99_ms: float
@@ -457,18 +460,45 @@ class MarketDataProtocolMetrics:
     queue_lag_p95_ms: float
     queue_lag_p99_ms: float
     queue_lag_max_ms: float
+    queue_lag_sample_count: int
 
 
-def _percentile(values: Sequence[float], percentile: float) -> float:
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    index = (len(ordered) - 1) * percentile
-    lower = math.floor(index)
-    upper = math.ceil(index)
-    if lower == upper:
-        return ordered[lower]
-    return ordered[lower] + (ordered[upper] - ordered[lower]) * (index - lower)
+class _OnlineLatencyHistogram:
+    """Session-wide 1 ms histogram with bounded memory and exact maxima."""
+
+    def __init__(self, *, largest_bucket_ms: int = 10_000) -> None:
+        self._largest_bucket_ms = int(largest_bucket_ms)
+        self._buckets = [0] * (self._largest_bucket_ms + 2)
+        self._count = 0
+        self._maximum = 0.0
+        self._lock = threading.Lock()
+
+    def add(self, value_ms: float) -> None:
+        value = max(0.0, float(value_ms))
+        bucket = min(int(value), self._largest_bucket_ms + 1)
+        with self._lock:
+            self._buckets[bucket] += 1
+            self._count += 1
+            self._maximum = max(self._maximum, value)
+
+    def snapshot(self) -> tuple[int, float, float, float, float]:
+        with self._lock:
+            buckets = tuple(self._buckets)
+            count = self._count
+            maximum = self._maximum
+
+        def quantile(fraction: float) -> float:
+            if not count:
+                return 0.0
+            target = max(1, math.ceil(count * fraction))
+            seen = 0
+            for index, occurrences in enumerate(buckets):
+                seen += occurrences
+                if seen >= target:
+                    return maximum if index > self._largest_bucket_ms else float(index)
+            return maximum
+
+        return count, quantile(0.50), quantile(0.95), quantile(0.99), maximum
 
 
 class KisRealtimeMarketDataService(RealtimeMarketDataService):
@@ -483,6 +513,8 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         quote_capacity: int,
         total_capacity: Optional[int] = None,
         confirmed_sequence_channels: Iterable[str] = (),
+        sequence_field_by_channel: Optional[Mapping[str, str]] = None,
+        sequence_reset_by_channel: Optional[Mapping[str, str]] = None,
         execution_notice_subscription: Optional[KisWsSubscription] = None,
         event_time_parser: Optional[
             Callable[[str, str, str, datetime], datetime]
@@ -491,6 +523,7 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         approval_key_age: Callable[[], Optional[float]] = lambda: None,
         alert: Callable[[str], None] = lambda message: None,
         clock: Callable[[], datetime] = _utc_now,
+        qualification_mode: bool = False,
     ) -> None:
         self._transport = transport
         self._symbol_key_resolver = symbol_key_resolver
@@ -515,12 +548,22 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         self._confirmed_sequence_channels = {
             str(channel).upper() for channel in confirmed_sequence_channels
         }
+        self._sequence_field_by_channel = {
+            str(channel).upper(): str(field).upper()
+            for channel, field in (sequence_field_by_channel or {}).items()
+        }
+        self._sequence_reset_by_channel = {
+            str(channel).upper(): str(semantics).upper()
+            for channel, semantics in (sequence_reset_by_channel or {}).items()
+        }
         self._execution_notice_subscription = execution_notice_subscription
         self._event_time_parser = event_time_parser or self._parse_us_event_time
         self._regular_session_filter = regular_session_filter
         self._approval_key_age = approval_key_age
         self._alert = alert
         self._clock = clock
+        self._qualification_mode = bool(qualification_mode)
+        self._qualification_suppressed_channels: set[tuple[str, str]] = set()
         self._cache = InMemoryQuoteCache()
         self._states: Dict[str, SymbolFeedState] = {}
         self._state_lock = threading.RLock()
@@ -541,13 +584,16 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         self._session_callbacks: list[
             Callable[[bool, str, int, datetime], None]
         ] = []
+        self._operation_callbacks: list[
+            Callable[[KisWsProtocolOperation], None]
+        ] = []
         self._accumulator = PendingMarketStateAccumulator(clock=clock)
         self._last_timestamp: Dict[tuple[str, str], datetime] = {}
         self._last_sequence: Dict[tuple[str, str], int] = {}
         self._dedup_seen: set[tuple] = set()
         self._dedup_order: deque[tuple] = deque(maxlen=4096)
-        self._receive_lags_ms: deque[float] = deque(maxlen=2048)
-        self._queue_lags_ms: deque[float] = deque(maxlen=2048)
+        self._receive_lags_ms = _OnlineLatencyHistogram()
+        self._queue_lags_ms = _OnlineLatencyHistogram()
         self._frame_counts: Dict[str, int] = {}
         self._record_counts: Dict[str, int] = {}
         self._schema_fingerprints: Dict[str, str] = {}
@@ -560,6 +606,9 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         self._transport.on_data(self._on_data_frame)
         self._transport.on_ack(self._on_ack)
         self._transport.on_connection(self._on_connection)
+        on_operation = getattr(self._transport, "on_operation", None)
+        if callable(on_operation):
+            on_operation(self._on_protocol_operation)
         self._rebalance_subscriptions()
 
     @staticmethod
@@ -599,6 +648,18 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
     ) -> None:
         """Observe connection generations for read-only qualification evidence."""
         self._session_callbacks.append(callback)
+
+    def on_protocol_operation(
+        self, callback: Callable[[KisWsProtocolOperation], None]
+    ) -> None:
+        self._operation_callbacks.append(callback)
+
+    def _on_protocol_operation(self, operation: KisWsProtocolOperation) -> None:
+        for callback in list(self._operation_callbacks):
+            try:
+                callback(operation)
+            except Exception:
+                logger.exception("KIS WebSocket protocol audit callback failed")
 
     def on_execution_notice(self, callback: Callable[[str, tuple[str, ...]], None]) -> None:
         """Notification only; no callback is allowed to project a fill here."""
@@ -851,9 +912,13 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
 
     def protocol_metrics_snapshot(self) -> MarketDataProtocolMetrics:
         """Return immutable counters used by the standalone Gate-2 reporter."""
+        receive_count, receive_p50, receive_p95, receive_p99, receive_max = (
+            self._receive_lags_ms.snapshot()
+        )
+        queue_count, queue_p50, queue_p95, queue_p99, queue_max = (
+            self._queue_lags_ms.snapshot()
+        )
         with self._state_lock:
-            receive_lags = list(self._receive_lags_ms)
-            queue_lags = list(self._queue_lags_ms)
             return MarketDataProtocolMetrics(
                 frame_counts_by_tr_id=tuple(sorted(self._frame_counts.items())),
                 record_counts_by_tr_id=tuple(sorted(self._record_counts.items())),
@@ -862,14 +927,16 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
                 ),
                 parser_failure_count=self._parser_failure_count,
                 duplicate_event_count=self._duplicate_event_count,
-                receive_lag_p50_ms=_percentile(receive_lags, 0.50),
-                receive_lag_p95_ms=_percentile(receive_lags, 0.95),
-                receive_lag_p99_ms=_percentile(receive_lags, 0.99),
-                receive_lag_max_ms=max(receive_lags, default=0.0),
-                queue_lag_p50_ms=_percentile(queue_lags, 0.50),
-                queue_lag_p95_ms=_percentile(queue_lags, 0.95),
-                queue_lag_p99_ms=_percentile(queue_lags, 0.99),
-                queue_lag_max_ms=max(queue_lags, default=0.0),
+                receive_lag_sample_count=receive_count,
+                receive_lag_p50_ms=receive_p50,
+                receive_lag_p95_ms=receive_p95,
+                receive_lag_p99_ms=receive_p99,
+                receive_lag_max_ms=receive_max,
+                queue_lag_sample_count=queue_count,
+                queue_lag_p50_ms=queue_p50,
+                queue_lag_p95_ms=queue_p95,
+                queue_lag_p99_ms=queue_p99,
+                queue_lag_max_ms=queue_max,
             )
 
     def replace_stop_rules(self, symbol: str, rules: Iterable[StopRule]):
@@ -896,6 +963,19 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         with self._state_lock:
             state = self._states.setdefault(symbol, SymbolFeedState(symbol=symbol))
             state.trading_halted = bool(halted)
+
+    def set_qualification_channel_suppressed(
+        self, symbol: str, channel: FeedChannel, suppressed: bool
+    ) -> None:
+        """Suppress one live channel only for the explicit read-only soak probe."""
+        if not self._qualification_mode:
+            raise RuntimeError("channel suppression is restricted to qualification mode")
+        identity = (str(symbol or "").upper(), channel.value)
+        with self._state_lock:
+            if suppressed:
+                self._qualification_suppressed_channels.add(identity)
+            else:
+                self._qualification_suppressed_channels.discard(identity)
 
     def is_symbol_trading_halted(self, symbol: str) -> bool:
         return self.symbol_state(symbol).trading_halted
@@ -1037,6 +1117,21 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
                     state.quote_error = ""
                     state.clock_health = ClockHealth.HEALTHY
             if connected:
+                reset_channels = {
+                    (
+                        FeedChannel.TRADE.value
+                        if channel == TRADE_TR_ID
+                        else FeedChannel.QUOTE.value
+                    )
+                    for channel, semantics in self._sequence_reset_by_channel.items()
+                    if semantics == "RESET_ON_RECONNECT"
+                }
+                if reset_channels:
+                    self._last_sequence = {
+                        key: value
+                        for key, value in self._last_sequence.items()
+                        if key[1] not in reset_channels
+                    }
                 # KisWebSocketClient notifies only after replaying its durable
                 # desired set into this new socket session.
                 for key, sub in self._active_subscriptions.items():
@@ -1235,6 +1330,7 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
             processed_at=self._clock(),
             source="KIS_WS",
             channel=frame.tr_id,
+            sequence=self._sequence_from_record(frame.tr_id, record),
             payload_fingerprint=hashlib.sha256(
                 "^".join(record.values()).encode("utf-8")
             ).hexdigest(),
@@ -1258,11 +1354,24 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
             processed_at=self._clock(),
             source="KIS_WS",
             channel=frame.tr_id,
+            sequence=self._sequence_from_record(frame.tr_id, record),
             payload_fingerprint=hashlib.sha256(
                 "^".join(record.values()).encode("utf-8")
             ).hexdigest(),
         )
         self.ingest_quote(quote)
+
+    def _sequence_from_record(
+        self, tr_id: str, record: Mapping[str, str]
+    ) -> Optional[int]:
+        field = self._sequence_field_by_channel.get(str(tr_id).upper(), "")
+        if not field:
+            return None
+        value = str(record.get(field) or "").strip()
+        try:
+            return int(value) if value else None
+        except ValueError:
+            return None
 
     def ingest_trade(self, quote: QuoteSnapshot) -> bool:
         if not self._accept_event(quote, FeedChannel.TRADE):
@@ -1287,7 +1396,18 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
     def _accept_event(self, quote: QuoteSnapshot, channel: FeedChannel) -> bool:
         now = quote.received_at
         key = (quote.symbol.upper(), channel.value)
+        with self._state_lock:
+            if key in self._qualification_suppressed_channels:
+                self.dropped_event_count += 1
+                return False
         broker_at = quote.broker_event_at
+        if (
+            quote.channel.upper() in self._confirmed_sequence_channels
+            and quote.sequence is None
+        ):
+            return self._reject_event(
+                quote.symbol, channel, ClockHealth.SEQUENCE_MISSING
+            )
         future = (broker_at - now).total_seconds()
         skew = abs((now - broker_at).total_seconds())
         if future > execution_config.MAX_FUTURE_BROKER_EVENT_SECONDS:
@@ -1321,8 +1441,10 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         self._last_timestamp[key] = broker_at
         if quote.sequence is not None and quote.channel.upper() in self._confirmed_sequence_channels:
             self._last_sequence[key] = quote.sequence
-        self._receive_lags_ms.append(max(0.0, (now - broker_at).total_seconds() * 1000.0))
-        self._queue_lags_ms.append(quote.queue_delay_seconds() * 1000.0)
+        self._receive_lags_ms.add(
+            max(0.0, (now - broker_at).total_seconds() * 1000.0)
+        )
+        self._queue_lags_ms.add(quote.queue_delay_seconds() * 1000.0)
         return True
 
     def _reject_event(
@@ -1445,7 +1567,9 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
             for symbol in self._quote_priorities
             if symbol in state_by_symbol
         ]
-        lags = list(self._receive_lags_ms)
+        _, receive_p50, receive_p95, receive_p99, _ = (
+            self._receive_lags_ms.snapshot()
+        )
         pending_depth = self._accumulator.queue_depth()
         return MarketDataHealthMetrics(
             ws_connected=self.is_connected(),
@@ -1485,9 +1609,9 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
                 ),
                 default=None,
             ),
-            receive_lag_p50_ms=_percentile(lags, 0.50),
-            receive_lag_p95_ms=_percentile(lags, 0.95),
-            receive_lag_p99_ms=_percentile(lags, 0.99),
+            receive_lag_p50_ms=receive_p50,
+            receive_lag_p95_ms=receive_p95,
+            receive_lag_p99_ms=receive_p99,
             reconnect_count=self._transport.reconnect_count,
             nack_count=self.nack_count,
             malformed_frame_count=self._transport.malformed_frame_count,
@@ -1500,6 +1624,11 @@ def build_kis_realtime_market_data_from_environment(
     *,
     environment: str = "PROD",
     critical_alert: Callable[[str], None] = lambda message: None,
+    confirmed_sequence_channels: Iterable[str] = (),
+    sequence_field_by_channel: Optional[Mapping[str, str]] = None,
+    sequence_reset_by_channel: Optional[Mapping[str, str]] = None,
+    qualification_mode: bool = False,
+    sensitive_value_audit: Callable[[str], None] = lambda value: None,
 ) -> KisRealtimeMarketDataService:
     """Compose the live service without starting it.
 
@@ -1515,6 +1644,35 @@ def build_kis_realtime_market_data_from_environment(
         raise RuntimeError(
             "KIS_WS_PROTOCOL_VERIFIED is false; Workstream 0 capability evidence is required"
         )
+    confirmed_sequences = {
+        str(channel).upper() for channel in confirmed_sequence_channels
+    }
+    sequence_fields = {
+        str(channel).upper(): str(field).upper()
+        for channel, field in (sequence_field_by_channel or {}).items()
+    }
+    sequence_resets = {
+        str(channel).upper(): str(semantics).upper()
+        for channel, semantics in (sequence_reset_by_channel or {}).items()
+    }
+    if confirmed_sequences != set(sequence_fields):
+        raise ValueError(
+            "every verified monotonic channel requires one exact sequence field"
+        )
+    if confirmed_sequences != set(sequence_resets) or any(
+        semantics not in {"RESET_ON_RECONNECT", "CONTINUES_ACROSS_RECONNECT"}
+        for semantics in sequence_resets.values()
+    ):
+        raise ValueError(
+            "every verified monotonic channel requires exact reset semantics"
+        )
+    supported_fields = {
+        TRADE_TR_ID: set(TRADE_COLUMNS),
+        QUOTE_TR_ID: set(QUOTE_COLUMNS),
+    }
+    for channel, field in sequence_fields.items():
+        if field not in supported_fields.get(channel, set()):
+            raise ValueError(f"unsupported sequence field {channel}:{field}")
     prefix = f"KIS_{environment}"
     base_url = os.getenv(f"{prefix}_BASE_URL", "").strip()
     ws_url = os.getenv(f"{prefix}_WS_URL", "").strip()
@@ -1546,6 +1704,7 @@ def build_kis_realtime_market_data_from_environment(
         max_retries=execution_config.KIS_WS_AUTH_MAX_RETRIES,
         protocol_verified=execution_config.KIS_WS_PROTOCOL_VERIFIED,
         critical_alert=critical_alert,
+        sensitive_value_audit=sensitive_value_audit,
     )
     transport = KisWebSocketClient(
         url=ws_url,
@@ -1569,9 +1728,17 @@ def build_kis_realtime_market_data_from_environment(
         transport=transport,
         symbol_key_resolver=resolve_key,
         total_capacity=execution_config.KIS_WS_TOTAL_SUBSCRIPTION_CAPACITY,
-        trade_capacity=execution_config.KIS_WS_TRADE_CHANNEL_CAPACITY,
-        quote_capacity=execution_config.KIS_WS_QUOTE_CHANNEL_CAPACITY,
+        # Credentialed WS0 evidence proved one aggregate pool. The legacy
+        # per-channel values remain available only to directly constructed
+        # deterministic tests; live composition cannot preserve an old
+        # unverified channel ceiling or accidentally stay at zero.
+        trade_capacity=execution_config.KIS_WS_TOTAL_SUBSCRIPTION_CAPACITY,
+        quote_capacity=execution_config.KIS_WS_TOTAL_SUBSCRIPTION_CAPACITY,
+        confirmed_sequence_channels=confirmed_sequences,
+        sequence_field_by_channel=sequence_fields,
+        sequence_reset_by_channel=sequence_resets,
         execution_notice_subscription=notice_subscription,
         approval_key_age=approval_keys.approval_key_age_seconds,
         alert=critical_alert,
+        qualification_mode=qualification_mode,
     )
