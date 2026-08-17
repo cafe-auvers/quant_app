@@ -859,7 +859,7 @@ def test_gate1_rate_limit_pressure_prioritizes_real_emergency_liquidation(tmp_pa
 
     def first_display():
         first_started.set()
-        assert release_first.wait(2)
+        release_first.wait()
         order.append("display-0")
 
     def run(callable_):
@@ -902,15 +902,17 @@ def test_gate1_rate_limit_pressure_prioritizes_real_emergency_liquidation(tmp_pa
     )
     threads.append(emergency)
     emergency.start()
-    deadline = time.time() + 2
+    deadline = time.time() + 10
     while scheduler.metrics().queued_requests < 3 and time.time() < deadline:
         time.sleep(0.005)
+    queue_ready = scheduler.metrics().queued_requests >= 3
     release_first.set()
     for thread in threads:
         thread.join(2)
         assert not thread.is_alive()
 
     assert failures == []
+    assert queue_ready, "all competing requests must be queued before release"
     assert order[0:2] == ["display-0", "emergency-exit"]
     assert len(broker.submit_calls) == 1
     _assert_gate1(engine, broker)
