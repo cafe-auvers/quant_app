@@ -17,15 +17,26 @@ mutations, the Kanban runtime, shadow execution, or live trading.
   reconnect/reset semantics before enabling sequence rejection.
 - [ ] Configure a redacted HTS-ID test identity and verify
   `H0GSCNI0`/`H0GSCNI9` encryption and decrypted field mapping.
+- [ ] Demonstrate a forced disconnect, deterministic desired-set replay, and
+  100% critical re-ACK in less than 10 seconds.
+- [x] Enforce the credential-verified aggregate WebSocket limit of 41 total
+  registrations per app-key session, including pending subscribe,
+  pending-unsubscribe, active, and execution-notice slots. Explicit NACK and
+  unsubscribe ACK release a slot; reconnect clears session ACK state while
+  preserving desired replay intent.
+- [x] Implement a standalone Gate-2 runner/report path. The application engine
+  remains disabled and the runner composes only the market-data service.
+
+## Later execution qualification (does not block Gate 2)
+
 - [ ] Run controlled simulation submit/cancel/replace tests for
   `MGCO_APTM_ODNO`, immediate broker-order ID, recovery surfaces, history
   latency, and unambiguous pre-acceptance rate-limit errors.
 - [ ] Complete history boundary tests: oldest range, a real continuation page,
   and known cancelled/rejected orders.
-- [ ] Enforce the credential-verified aggregate WebSocket limit of 41 total
-  subscriptions, including an execution-notice slot, and rerun Gate 1.
-- [ ] Implement a standalone Gate-2 runner/report path. The application engine
-  must remain disabled during the soak.
+- [ ] Establish the broker-order-ID uniqueness domain across exchanges, dates,
+  sessions, accounts, and app keys before treating
+  `environment:account:broker_order_id` as globally sufficient.
 
 ## Exact preflight fence
 
@@ -33,7 +44,9 @@ mutations, the Kanban runtime, shadow execution, or live trading.
 - [ ] Full Gate-1 report is `PASSED` on that exact commit with zero skips,
   zero unclassified scenarios, and zero invariant violations.
 - [ ] Worktree and deployed package match that exact commit.
-- [ ] `docs/kis_capability_matrix.md` has no required unverified row.
+- [ ] Every Gate-2 WebSocket/read-only row in
+  `docs/kis_capability_matrix.md` is verified. Execution-only rows may remain
+  open, but must be listed as later-gate blockers in the evidence bundle.
 - [ ] Credential files and token caches are restricted to the deployment user.
 - [ ] Raw capture output is outside the repository until redaction is complete.
 - [ ] Application/database backup and log-retention locations have sufficient
@@ -120,3 +133,26 @@ Gate 2 passes only when every metric passes in one evidence bundle. A failed or
 partial session does not authorize Gate 3. After the run, restore
 `KIS_WS_ENABLED=false` and `KIS_WS_PROTOCOL_VERIFIED=false` until the evidence
 has received an explicit review decision.
+
+The runner never changes configuration or activation state. Once all
+WebSocket-specific WS0 rows are independently verified and a new exact-head
+Gate-1 report is available, invoke it from an operator-controlled environment:
+
+```powershell
+python scripts/run_gate2_soak.py `
+  --confirm-read-only `
+  --environment PROD `
+  --symbols AAPL,MSFT `
+  --session-date YYYY-MM-DD `
+  --gate1-report artifacts/gate1_report.json `
+  --timestamp-evidence C:\redacted\timestamps.json `
+  --execution-notice-evidence C:\redacted\notice.json `
+  --trade-sequence-finding NO_USABLE_SEQUENCE `
+  --quote-sequence-finding NO_USABLE_SEQUENCE `
+  --reconnect-after-seconds 3600 `
+  --output C:\redacted\gate2_report.json
+```
+
+Use `MONOTONIC` instead only when credentialed evidence proves a usable
+monotonic sequence for that channel. Raw/unredacted captures remain outside
+the repository.

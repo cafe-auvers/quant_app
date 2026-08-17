@@ -8,8 +8,10 @@ credentialed observation against the real API or a current first-party KIS
 statement, with any account data and credentials redacted.
 
 The provisional D1/D3/D11 adapter may be implemented inactive, but no row in
-this matrix authorizes application startup or broker execution. Until all
-required rows are verified:
+this matrix authorizes broker execution. Until the WebSocket/read-only subset
+is verified, the WebSocket flags and capacities remain disabled. Until full
+WS0 execution qualification and the later gates complete, all execution and
+mutation settings remain disabled:
 
 - `TRADING_ENABLED=false`
 - `BUYBOARD_ENGINE_ENABLED=false`
@@ -78,6 +80,24 @@ stable redacted token.
 
 **Finding:** `odno` is the observed historical broker-order identifier. Its
 immediate availability on submission remains unverified.
+
+## Broker order ID uniqueness scope
+
+**Required proof:** Whether `odno` is unique across account, app key,
+exchange, trade date, and reconnect/session boundaries, including reuse after
+the broker's history-retention window.
+
+**Status:** ⬜ Not verified — later execution qualification blocker
+
+**Evidence:** WS0-E03 observed ten-character `odno` values on one production
+account/history surface. That capture cannot establish a uniqueness domain.
+
+**Finding:** The current durable identity
+`environment:account:broker_order_id` remains provisional. Before Gate 4,
+controlled accepted orders must compare identifiers across exchanges, dates,
+sessions, account numbers, and app keys. This row does not block the read-only
+Gate-2 WebSocket soak because Gate 2 performs zero broker mutations and grants
+no cancellation authority.
 
 ## History latency
 
@@ -215,7 +235,15 @@ rate-limit rejection is unambiguously pre-acceptance.
 
 ## Sign-off
 
-WS0 is complete only when every required row above is verified, all raw
-captures have redacted fixtures, and the resulting adapter/configuration change
-has rerun the full Gate-1 certification on its exact commit. Current
-disposition: **WS0 incomplete; Gate 2 blocked; live execution unauthorized.**
+Full WS0 execution qualification is complete only when every required row
+above is verified, all raw captures have redacted fixtures, and the resulting
+adapter/configuration change has rerun Gate 1 on its exact commit. Gate 2 may
+start earlier only when the WebSocket/read-only subset is verified: event-time
+semantics, sequence availability/reset behavior, reconnect/resubscription,
+execution-notice encryption/mapping, aggregate session accounting, and the
+standalone soak reporter. Mutation correlation, broker-order uniqueness,
+history latency/completeness, and mutation rate-limit evidence remain required
+for later execution gates, but do not block a zero-mutation Gate-2 soak.
+
+Current disposition: **WS0 WebSocket subset incomplete; Gate 2 blocked; live
+execution unauthorized.**

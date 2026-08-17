@@ -79,6 +79,27 @@ class SubscriptionPriority(IntEnum):
     DISPLAY_ONLY = 4
 
 
+class SubscriptionSessionStatus(str, Enum):
+    PENDING_SUBSCRIBE = "PENDING_SUBSCRIBE"
+    ACTIVE = "ACTIVE"
+    PENDING_UNSUBSCRIBE = "PENDING_UNSUBSCRIBE"
+
+
+@dataclass(frozen=True)
+class SubscriptionCapacitySnapshot:
+    total_capacity: int
+    desired_count: int
+    reconnect_replay_count: int
+    pending_subscribe_count: int
+    active_count: int
+    pending_unsubscribe_count: int
+    occupied_count: int
+    available_count: int
+    max_occupied_count: int
+    execution_notice_desired: bool
+    execution_notice_acked: bool
+
+
 @dataclass
 class SymbolFeedState:
     symbol: str
@@ -421,6 +442,23 @@ class MarketDataHealthMetrics:
     dropped_event_count: int
 
 
+@dataclass(frozen=True)
+class MarketDataProtocolMetrics:
+    frame_counts_by_tr_id: tuple[tuple[str, int], ...]
+    record_counts_by_tr_id: tuple[tuple[str, int], ...]
+    schema_fingerprints_by_tr_id: tuple[tuple[str, str], ...]
+    parser_failure_count: int
+    duplicate_event_count: int
+    receive_lag_p50_ms: float
+    receive_lag_p95_ms: float
+    receive_lag_p99_ms: float
+    receive_lag_max_ms: float
+    queue_lag_p50_ms: float
+    queue_lag_p95_ms: float
+    queue_lag_p99_ms: float
+    queue_lag_max_ms: float
+
+
 def _percentile(values: Sequence[float], percentile: float) -> float:
     if not values:
         return 0.0
@@ -488,17 +526,33 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         self._state_lock = threading.RLock()
         self._trade_priorities: Dict[str, int] = {}
         self._quote_priorities: Dict[str, int] = {}
+        self._target_subscriptions: Dict[tuple[str, str], KisWsSubscription] = {}
+        # Subscriptions retained by the transport as deterministic reconnect
+        # intent. This is not the same thing as an ACKed KIS session slot.
         self._active_subscriptions: Dict[tuple[str, str], KisWsSubscription] = {}
+        self._session_subscriptions: Dict[tuple[str, str], KisWsSubscription] = {}
+        self._session_status: Dict[tuple[str, str], SubscriptionSessionStatus] = {}
+        self._session_nacked: set[tuple[str, str]] = set()
+        self._max_session_slots_used = 0
         self._symbol_by_key: Dict[tuple[str, str], str] = {}
         self._quote_callbacks: list[QuoteCallback] = []
         self._disconnect_callbacks: list[DisconnectCallback] = []
         self._notice_callbacks: list[Callable[[str, tuple[str, ...]], None]] = []
+        self._session_callbacks: list[
+            Callable[[bool, str, int, datetime], None]
+        ] = []
         self._accumulator = PendingMarketStateAccumulator(clock=clock)
         self._last_timestamp: Dict[tuple[str, str], datetime] = {}
         self._last_sequence: Dict[tuple[str, str], int] = {}
         self._dedup_seen: set[tuple] = set()
         self._dedup_order: deque[tuple] = deque(maxlen=4096)
         self._receive_lags_ms: deque[float] = deque(maxlen=2048)
+        self._queue_lags_ms: deque[float] = deque(maxlen=2048)
+        self._frame_counts: Dict[str, int] = {}
+        self._record_counts: Dict[str, int] = {}
+        self._schema_fingerprints: Dict[str, str] = {}
+        self._parser_failure_count = 0
+        self._duplicate_event_count = 0
         self._connected = False
         self._reconnect_generation = 0
         self.nack_count = 0
@@ -506,14 +560,7 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         self._transport.on_data(self._on_data_frame)
         self._transport.on_ack(self._on_ack)
         self._transport.on_connection(self._on_connection)
-        if (
-            self._execution_notice_subscription is not None
-            and self._total_capacity > 0
-        ):
-            # Supplementary notification channel only. It is intentionally
-            # unable to update execution state, but it still consumes one of
-            # KIS's aggregate realtime-session slots.
-            self._transport.subscribe([self._execution_notice_subscription])
+        self._rebalance_subscriptions()
 
     @staticmethod
     def _parse_us_event_time(
@@ -546,6 +593,12 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
 
     def on_disconnect(self, callback: DisconnectCallback) -> None:
         self._disconnect_callbacks.append(callback)
+
+    def on_session(
+        self, callback: Callable[[bool, str, int, datetime], None]
+    ) -> None:
+        """Observe connection generations for read-only qualification evidence."""
+        self._session_callbacks.append(callback)
 
     def on_execution_notice(self, callback: Callable[[str, tuple[str, ...]], None]) -> None:
         """Notification only; no callback is allowed to project a fill here."""
@@ -628,72 +681,196 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
                     FeedChannel.QUOTE,
                 )
             )
-        notice_slots = (
-            1
-            if self._execution_notice_subscription is not None
+        target_subscriptions: Dict[tuple[str, str], KisWsSubscription] = {}
+        if (
+            self._execution_notice_subscription is not None
             and self._total_capacity > 0
-            else 0
-        )
-        data_slots = max(0, self._total_capacity - notice_slots)
-        selected_candidates = sorted(channel_candidates)[:data_slots]
-        selected_trade = {
-            symbol
-            for _, symbol, _, channel in selected_candidates
-            if channel == FeedChannel.TRADE
-        }
-        selected_quote = {
-            symbol
-            for _, symbol, _, channel in selected_candidates
-            if channel == FeedChannel.QUOTE
-        }
-        desired_subscriptions: Dict[tuple[str, str], KisWsSubscription] = {}
+        ):
+            notice = self._execution_notice_subscription
+            target_subscriptions[(notice.tr_id, notice.tr_key)] = notice
+        for _, symbol, _, channel in sorted(channel_candidates):
+            tr_id = TRADE_TR_ID if channel == FeedChannel.TRADE else QUOTE_TR_ID
+            key = self._symbol_key_resolver(symbol, channel)
+            sub = KisWsSubscription(tr_id, key, symbol, channel.value)
+            target_subscriptions[(sub.tr_id, sub.tr_key)] = sub
+
         all_symbols = set(self._trade_priorities) | set(self._quote_priorities)
         with self._state_lock:
             for symbol in set(self._states) | all_symbols:
                 state = self._states.setdefault(symbol, SymbolFeedState(symbol=symbol))
                 state.trade_desired = symbol in self._trade_priorities
                 state.quote_desired = symbol in self._quote_priorities
-                state.trade_rejected_due_to_capacity = (
-                    state.trade_desired and symbol not in selected_trade
-                )
-                state.quote_rejected_due_to_capacity = (
-                    state.quote_desired and symbol not in selected_quote
-                )
-                if symbol in selected_trade:
-                    key = self._symbol_key_resolver(symbol, FeedChannel.TRADE)
-                    sub = KisWsSubscription(TRADE_TR_ID, key, symbol, FeedChannel.TRADE.value)
-                    desired_subscriptions[(sub.tr_id, sub.tr_key)] = sub
-                else:
-                    state.trade_acked = False
-                if symbol in selected_quote:
-                    key = self._symbol_key_resolver(symbol, FeedChannel.QUOTE)
-                    sub = KisWsSubscription(QUOTE_TR_ID, key, symbol, FeedChannel.QUOTE.value)
-                    desired_subscriptions[(sub.tr_id, sub.tr_key)] = sub
-                else:
-                    state.quote_acked = False
+            self._target_subscriptions = target_subscriptions
+            self._symbol_by_key = {
+                key: sub.symbol
+                for key, sub in target_subscriptions.items()
+                if sub.symbol
+            }
+            self._reconcile_subscription_target_locked()
+            self._refresh_capacity_rejections_locked()
+
+    def _reconcile_subscription_target_locked(self) -> None:
+        target_keys = set(self._target_subscriptions)
+        self._session_nacked.intersection_update(target_keys)
 
         removals = [
-            sub for key, sub in self._active_subscriptions.items() if key not in desired_subscriptions
+            (key, sub)
+            for key, sub in self._active_subscriptions.items()
+            if key not in target_keys
         ]
-        additions = [
-            sub for key, sub in desired_subscriptions.items() if key not in self._active_subscriptions
-        ]
-        if removals:
-            self._transport.unsubscribe(removals)
-        if additions:
-            self._transport.subscribe(additions)
-            requested_at = self._clock()
-            with self._state_lock:
-                for sub in additions:
-                    state = self._states[sub.symbol]
-                    if sub.tr_id == TRADE_TR_ID:
-                        state.trade_requested_at = requested_at
-                    else:
-                        state.quote_requested_at = requested_at
-        self._active_subscriptions = desired_subscriptions
-        self._symbol_by_key = {
-            (sub.tr_id, sub.tr_key): sub.symbol for sub in desired_subscriptions.values()
+        for key, sub in removals:
+            self._transport.unsubscribe([sub])
+            del self._active_subscriptions[key]
+            self._clear_channel_ack_locked(sub)
+            if self._connected and key in self._session_status:
+                self._session_subscriptions[key] = sub
+                self._session_status[key] = (
+                    SubscriptionSessionStatus.PENDING_UNSUBSCRIBE
+                )
+            else:
+                self._session_subscriptions.pop(key, None)
+                self._session_status.pop(key, None)
+
+        occupied = (
+            len(self._session_status)
+            if self._connected
+            else len(self._active_subscriptions)
+        )
+        for key, sub in self._target_subscriptions.items():
+            if key in self._active_subscriptions or key in self._session_status:
+                continue
+            if key in self._session_nacked or occupied >= self._total_capacity:
+                continue
+            self._transport.subscribe([sub])
+            self._active_subscriptions[key] = sub
+            occupied += 1
+            if self._connected:
+                self._session_subscriptions[key] = sub
+                self._session_status[key] = (
+                    SubscriptionSessionStatus.PENDING_SUBSCRIBE
+                )
+                self._mark_channel_requested_locked(sub)
+
+        self._max_session_slots_used = max(
+            self._max_session_slots_used,
+            len(self._session_status),
+        )
+
+    def _mark_channel_requested_locked(self, sub: KisWsSubscription) -> None:
+        if not sub.symbol:
+            return
+        state = self._states.setdefault(
+            sub.symbol, SymbolFeedState(symbol=sub.symbol)
+        )
+        requested_at = self._clock()
+        if sub.tr_id == TRADE_TR_ID:
+            state.trade_acked = False
+            state.trade_requested_at = requested_at
+        elif sub.tr_id == QUOTE_TR_ID:
+            state.quote_acked = False
+            state.quote_requested_at = requested_at
+
+    def _clear_channel_ack_locked(self, sub: KisWsSubscription) -> None:
+        if not sub.symbol:
+            return
+        state = self._states.setdefault(
+            sub.symbol, SymbolFeedState(symbol=sub.symbol)
+        )
+        if sub.tr_id == TRADE_TR_ID:
+            state.trade_acked = False
+            state.trade_requested_at = None
+        elif sub.tr_id == QUOTE_TR_ID:
+            state.quote_acked = False
+            state.quote_requested_at = None
+
+    def _refresh_capacity_rejections_locked(self) -> None:
+        selected_trade = {
+            sub.symbol
+            for sub in self._active_subscriptions.values()
+            if sub.tr_id == TRADE_TR_ID
         }
+        selected_quote = {
+            sub.symbol
+            for sub in self._active_subscriptions.values()
+            if sub.tr_id == QUOTE_TR_ID
+        }
+        for state in self._states.values():
+            state.trade_rejected_due_to_capacity = (
+                state.trade_desired and state.symbol not in selected_trade
+            )
+            state.quote_rejected_due_to_capacity = (
+                state.quote_desired and state.symbol not in selected_quote
+            )
+            if state.trade_rejected_due_to_capacity:
+                state.trade_acked = False
+            if state.quote_rejected_due_to_capacity:
+                state.quote_acked = False
+
+    def subscription_capacity_snapshot(self) -> SubscriptionCapacitySnapshot:
+        with self._state_lock:
+            pending_subscribe = sum(
+                status == SubscriptionSessionStatus.PENDING_SUBSCRIBE
+                for status in self._session_status.values()
+            )
+            active = sum(
+                status == SubscriptionSessionStatus.ACTIVE
+                for status in self._session_status.values()
+            )
+            pending_unsubscribe = sum(
+                status == SubscriptionSessionStatus.PENDING_UNSUBSCRIBE
+                for status in self._session_status.values()
+            )
+            occupied = len(self._session_status)
+            notice_key = (
+                (
+                    self._execution_notice_subscription.tr_id,
+                    self._execution_notice_subscription.tr_key,
+                )
+                if self._execution_notice_subscription is not None
+                else None
+            )
+            return SubscriptionCapacitySnapshot(
+                total_capacity=self._total_capacity,
+                desired_count=len(self._target_subscriptions),
+                reconnect_replay_count=len(self._active_subscriptions),
+                pending_subscribe_count=pending_subscribe,
+                active_count=active,
+                pending_unsubscribe_count=pending_unsubscribe,
+                occupied_count=occupied,
+                available_count=max(0, self._total_capacity - occupied),
+                max_occupied_count=self._max_session_slots_used,
+                execution_notice_desired=(
+                    notice_key is not None and notice_key in self._target_subscriptions
+                ),
+                execution_notice_acked=(
+                    notice_key is not None
+                    and self._session_status.get(notice_key)
+                    == SubscriptionSessionStatus.ACTIVE
+                ),
+            )
+
+    def protocol_metrics_snapshot(self) -> MarketDataProtocolMetrics:
+        """Return immutable counters used by the standalone Gate-2 reporter."""
+        with self._state_lock:
+            receive_lags = list(self._receive_lags_ms)
+            queue_lags = list(self._queue_lags_ms)
+            return MarketDataProtocolMetrics(
+                frame_counts_by_tr_id=tuple(sorted(self._frame_counts.items())),
+                record_counts_by_tr_id=tuple(sorted(self._record_counts.items())),
+                schema_fingerprints_by_tr_id=tuple(
+                    sorted(self._schema_fingerprints.items())
+                ),
+                parser_failure_count=self._parser_failure_count,
+                duplicate_event_count=self._duplicate_event_count,
+                receive_lag_p50_ms=_percentile(receive_lags, 0.50),
+                receive_lag_p95_ms=_percentile(receive_lags, 0.95),
+                receive_lag_p99_ms=_percentile(receive_lags, 0.99),
+                receive_lag_max_ms=max(receive_lags, default=0.0),
+                queue_lag_p50_ms=_percentile(queue_lags, 0.50),
+                queue_lag_p95_ms=_percentile(queue_lags, 0.95),
+                queue_lag_p99_ms=_percentile(queue_lags, 0.99),
+                queue_lag_max_ms=max(queue_lags, default=0.0),
+            )
 
     def replace_stop_rules(self, symbol: str, rules: Iterable[StopRule]):
         return self._accumulator.replace_stop_rules(symbol, rules)
@@ -844,11 +1021,14 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         self._connected = connected
         self._reconnect_generation = generation
         with self._state_lock:
+            self._session_subscriptions.clear()
+            self._session_status.clear()
+            self._session_nacked.clear()
             for state in self._states.values():
                 state.reconnect_generation = generation
+                state.trade_acked = False
+                state.quote_acked = False
                 if not connected:
-                    state.trade_acked = False
-                    state.quote_acked = False
                     state.trade_requested_at = None
                     state.quote_requested_at = None
                 elif generation:
@@ -856,46 +1036,138 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
                     state.trade_error = ""
                     state.quote_error = ""
                     state.clock_health = ClockHealth.HEALTHY
-                    if state.trade_desired and not state.trade_rejected_due_to_capacity:
-                        state.trade_requested_at = self._clock()
-                    if state.quote_desired and not state.quote_rejected_due_to_capacity:
-                        state.quote_requested_at = self._clock()
+            if connected:
+                # KisWebSocketClient notifies only after replaying its durable
+                # desired set into this new socket session.
+                for key, sub in self._active_subscriptions.items():
+                    self._session_subscriptions[key] = sub
+                    self._session_status[key] = (
+                        SubscriptionSessionStatus.PENDING_SUBSCRIBE
+                    )
+                    self._mark_channel_requested_locked(sub)
+                self._max_session_slots_used = max(
+                    self._max_session_slots_used,
+                    len(self._session_status),
+                )
+                self._reconcile_subscription_target_locked()
+            self._refresh_capacity_rejections_locked()
         if was_connected and not connected:
             for callback in list(self._disconnect_callbacks):
                 callback(reason or "KIS WebSocket disconnected")
+        observed_at = self._clock()
+        for callback in list(self._session_callbacks):
+            try:
+                callback(connected, reason, generation, observed_at)
+            except Exception:
+                logger.exception("KIS WebSocket session audit callback failed")
 
     def _on_ack(self, frame: KisWsSystemFrame) -> None:
-        symbol = self._symbol_by_key.get((frame.tr_id, frame.tr_key))
-        if not symbol:
-            return
-        channel = FeedChannel.TRADE if frame.tr_id == TRADE_TR_ID else FeedChannel.QUOTE
+        key = (frame.tr_id, frame.tr_key)
         with self._state_lock:
-            state = self._states[symbol]
-            accepted = frame.accepted and not frame.is_unsubscribe
-            if channel == FeedChannel.TRADE:
-                state.trade_acked = accepted
-                state.trade_requested_at = None
-                state.trade_error = "" if accepted else frame.message or "subscription NACK"
-            else:
-                state.quote_acked = accepted
-                state.quote_requested_at = None
-                state.quote_error = "" if accepted else frame.message or "subscription NACK"
-            if not accepted:
+            sub = self._session_subscriptions.get(key)
+            status = self._session_status.get(key)
+            if sub is None or status is None:
+                return
+
+            if frame.is_unsubscribe:
+                if frame.accepted:
+                    self._session_subscriptions.pop(key, None)
+                    self._session_status.pop(key, None)
+                    self._clear_channel_ack_locked(sub)
+                    self._reconcile_subscription_target_locked()
+                    self._refresh_capacity_rejections_locked()
+                    return
+                # A rejected unsubscribe did not release the KIS slot. Keep it
+                # occupied until a later exact ACK or a session reconnect.
+                self._session_status[key] = SubscriptionSessionStatus.ACTIVE
                 self.nack_count += 1
-                state.last_error = state.trade_error or state.quote_error
+                message = frame.message or "unsubscription NACK"
+                self._record_subscription_error_locked(sub, message)
                 self._alert(
-                    f"KIS {channel.value} subscription rejected for {symbol}: {state.last_error}"
+                    f"KIS unsubscription rejected for {sub.tr_id}:{sub.tr_key}: {message}"
                 )
-            elif not state.trade_error and not state.quote_error:
-                state.last_error = ""
+                self._refresh_capacity_rejections_locked()
+                return
+
+            if frame.accepted:
+                self._session_status[key] = SubscriptionSessionStatus.ACTIVE
+                self._record_subscription_ack_locked(sub)
+                return
+
+            # Explicit subscribe rejection releases tentative capacity and is
+            # removed from reconnect replay. A lower-priority desired item may
+            # consume the newly available slot, but this key is not retried in
+            # the same session.
+            self._session_subscriptions.pop(key, None)
+            self._session_status.pop(key, None)
+            self._active_subscriptions.pop(key, None)
+            self._session_nacked.add(key)
+            forget = getattr(self._transport, "forget_subscriptions", None)
+            if callable(forget):
+                forget([sub])
+            self._clear_channel_ack_locked(sub)
+            self.nack_count += 1
+            message = frame.message or "subscription NACK"
+            self._record_subscription_error_locked(sub, message)
+            self._alert(
+                f"KIS subscription rejected for {sub.tr_id}:{sub.tr_key}: {message}"
+            )
+            self._reconcile_subscription_target_locked()
+            self._refresh_capacity_rejections_locked()
+
+    def _record_subscription_ack_locked(self, sub: KisWsSubscription) -> None:
+        if not sub.symbol:
+            return
+        state = self._states[sub.symbol]
+        if sub.tr_id == TRADE_TR_ID:
+            state.trade_acked = True
+            state.trade_requested_at = None
+            state.trade_error = ""
+        elif sub.tr_id == QUOTE_TR_ID:
+            state.quote_acked = True
+            state.quote_requested_at = None
+            state.quote_error = ""
+        if not state.trade_error and not state.quote_error:
+            state.last_error = ""
+
+    def _record_subscription_error_locked(
+        self, sub: KisWsSubscription, message: str
+    ) -> None:
+        if not sub.symbol:
+            return
+        state = self._states[sub.symbol]
+        if sub.tr_id == TRADE_TR_ID:
+            state.trade_error = message
+            state.trade_requested_at = None
+        elif sub.tr_id == QUOTE_TR_ID:
+            state.quote_error = message
+            state.quote_requested_at = None
+        state.last_error = message
 
     def _on_data_frame(self, frame: KisWsDataFrame) -> None:
+        if frame.tr_id == TRADE_TR_ID:
+            schema = TRADE_COLUMNS
+        elif frame.tr_id == QUOTE_TR_ID:
+            schema = QUOTE_COLUMNS
+        else:
+            schema = (f"FIELD_COUNT:{len(frame.payload.split('^'))}",)
+        schema_fingerprint = hashlib.sha256(
+            "^".join(schema).encode("utf-8")
+        ).hexdigest()
+        with self._state_lock:
+            self._frame_counts[frame.tr_id] = self._frame_counts.get(frame.tr_id, 0) + 1
+            self._record_counts[frame.tr_id] = (
+                self._record_counts.get(frame.tr_id, 0) + frame.record_count
+            )
+            self._schema_fingerprints[frame.tr_id] = schema_fingerprint
         try:
             if frame.tr_id == TRADE_TR_ID:
                 for record in self._split_records(frame, TRADE_COLUMNS):
                     try:
                         self._ingest_trade_record(record, frame)
                     except Exception:
+                        with self._state_lock:
+                            self._parser_failure_count += 1
                         logger.exception(
                             "KIS trade record dropped without blocking later records"
                         )
@@ -904,6 +1176,8 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
                     try:
                         self._ingest_quote_record(record, frame)
                     except Exception:
+                        with self._state_lock:
+                            self._parser_failure_count += 1
                         logger.exception(
                             "KIS quote record dropped without blocking later records"
                         )
@@ -914,6 +1188,8 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
             else:
                 logger.debug("Ignoring unsupported KIS realtime TR ID %s", frame.tr_id)
         except Exception:
+            with self._state_lock:
+                self._parser_failure_count += 1
             # One channel/symbol parse failure must not poison dispatch of a
             # later frame for another symbol.
             logger.exception("KIS realtime frame parse failed for %s", frame.tr_id)
@@ -956,7 +1232,7 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
             ask=float(record["PASK"]) if record["PASK"] else None,
             broker_event_at=event_at,
             received_at=frame.received_at,
-            processed_at=frame.received_at,
+            processed_at=self._clock(),
             source="KIS_WS",
             channel=frame.tr_id,
             payload_fingerprint=hashlib.sha256(
@@ -979,7 +1255,7 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
             ask=float(record["PASK1"]) if record["PASK1"] else None,
             broker_event_at=event_at,
             received_at=frame.received_at,
-            processed_at=frame.received_at,
+            processed_at=self._clock(),
             source="KIS_WS",
             channel=frame.tr_id,
             payload_fingerprint=hashlib.sha256(
@@ -1036,6 +1312,7 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         )
         if identity in self._dedup_seen:
             self.dropped_event_count += 1
+            self._duplicate_event_count += 1
             return False
         if len(self._dedup_order) == self._dedup_order.maxlen:
             self._dedup_seen.discard(self._dedup_order[0])
@@ -1045,6 +1322,7 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         if quote.sequence is not None and quote.channel.upper() in self._confirmed_sequence_channels:
             self._last_sequence[key] = quote.sequence
         self._receive_lags_ms.append(max(0.0, (now - broker_at).total_seconds() * 1000.0))
+        self._queue_lags_ms.append(quote.queue_delay_seconds() * 1000.0)
         return True
 
     def _reject_event(

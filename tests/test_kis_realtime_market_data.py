@@ -47,6 +47,10 @@ class _Transport:
     def unsubscribe(self, subscriptions):
         self.unsubscribed.extend(subscriptions)
 
+    def forget_subscriptions(self, subscriptions):
+        forgotten = set(subscriptions)
+        self.subscribed = [sub for sub in self.subscribed if sub not in forgotten]
+
     def is_connected(self):
         return self.connected
 
@@ -130,6 +134,30 @@ def test_exact_duplicate_event_identity_is_coalesced():
     assert service.ingest_trade(event)
     assert not service.ingest_trade(event)
     assert service.dropped_event_count == 1
+    assert service.protocol_metrics_snapshot().duplicate_event_count == 1
+
+
+def test_protocol_metrics_count_frames_records_schema_and_parser_failures():
+    service, _ = _service()
+    values = [""] * len(TRADE_COLUMNS)
+    values[0] = "BAD"
+    service._on_data_frame(
+        KisWsDataFrame(
+            tr_id="HDFSCNT0",
+            record_count=1,
+            payload="^".join(values),
+            encrypted=False,
+            received_at=NOW,
+            payload_fingerprint="bad-frame",
+        )
+    )
+
+    metrics = service.protocol_metrics_snapshot()
+
+    assert dict(metrics.frame_counts_by_tr_id) == {"HDFSCNT0": 1}
+    assert dict(metrics.record_counts_by_tr_id) == {"HDFSCNT0": 1}
+    assert len(dict(metrics.schema_fingerprints_by_tr_id)["HDFSCNT0"]) == 64
+    assert metrics.parser_failure_count == 1
 
 
 def test_sequence_check_is_only_enforced_for_confirmed_channels():
@@ -304,6 +332,127 @@ def test_capacity_above_credential_verified_kis_limit_is_rejected():
             quote_capacity=41,
             total_capacity=42,
         )
+
+
+def test_pending_subscribe_consumes_capacity_and_ack_makes_it_active():
+    service, _ = _service(
+        trade_capacity=2,
+        quote_capacity=0,
+        total_capacity=1,
+    )
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": 1},
+        quote_priorities={},
+    )
+
+    pending = service.subscription_capacity_snapshot()
+    assert pending.pending_subscribe_count == 1
+    assert pending.active_count == 0
+    assert pending.occupied_count == 1
+    assert pending.available_count == 0
+
+    _ack(service, "AAPL", "HDFSCNT0")
+
+    active = service.subscription_capacity_snapshot()
+    assert active.pending_subscribe_count == 0
+    assert active.active_count == 1
+    assert active.occupied_count == 1
+
+
+def test_subscribe_nack_releases_slot_and_promotes_next_desired_key():
+    service, transport = _service(
+        trade_capacity=2,
+        quote_capacity=0,
+        total_capacity=1,
+    )
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": 1, "MSFT": 2},
+        quote_priorities={},
+    )
+    assert transport.subscribed[-1].symbol == "AAPL"
+
+    service._on_ack(
+        KisWsSystemFrame(
+            tr_id="HDFSCNT0",
+            tr_key="DAAPL",
+            accepted=False,
+            message="MAX SUBSCRIBE OVER",
+        )
+    )
+
+    assert transport.subscribed[-1].symbol == "MSFT"
+    snapshot = service.subscription_capacity_snapshot()
+    assert snapshot.pending_subscribe_count == 1
+    assert snapshot.occupied_count == 1
+    assert service.symbol_state("AAPL").trade_error == "MAX SUBSCRIBE OVER"
+    assert not service.symbol_state("MSFT").trade_rejected_due_to_capacity
+
+
+def test_unsubscribe_ack_releases_slot_before_replacement_subscribe():
+    service, transport = _service(
+        trade_capacity=2,
+        quote_capacity=0,
+        total_capacity=1,
+    )
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": 1},
+        quote_priorities={},
+    )
+    _ack(service, "AAPL", "HDFSCNT0")
+
+    service.configure_desired_channels(
+        trade_priorities={"MSFT": 1},
+        quote_priorities={},
+    )
+
+    waiting = service.subscription_capacity_snapshot()
+    assert waiting.pending_unsubscribe_count == 1
+    assert waiting.available_count == 0
+    assert transport.unsubscribed[-1].symbol == "AAPL"
+    assert all(sub.symbol != "MSFT" for sub in transport.subscribed)
+
+    service._on_ack(
+        KisWsSystemFrame(
+            tr_id="HDFSCNT0",
+            tr_key="DAAPL",
+            accepted=True,
+            is_unsubscribe=True,
+            message="UNSUBSCRIBE SUCCESS",
+        )
+    )
+
+    assert transport.subscribed[-1].symbol == "MSFT"
+    promoted = service.subscription_capacity_snapshot()
+    assert promoted.pending_unsubscribe_count == 0
+    assert promoted.pending_subscribe_count == 1
+    assert promoted.occupied_count == 1
+
+
+def test_reconnect_clears_session_ack_state_and_preserves_replay_intent():
+    service, _ = _service(
+        trade_capacity=1,
+        quote_capacity=0,
+        total_capacity=1,
+    )
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": 1},
+        quote_priorities={},
+    )
+    _ack(service, "AAPL", "HDFSCNT0")
+    assert service.subscription_capacity_snapshot().active_count == 1
+
+    service._on_connection(False, "forced", 1)
+    disconnected = service.subscription_capacity_snapshot()
+    assert disconnected.occupied_count == 0
+    assert disconnected.reconnect_replay_count == 1
+    assert not service.symbol_state("AAPL").trade_acked
+
+    service._on_connection(True, "", 2)
+    replayed = service.subscription_capacity_snapshot()
+    assert replayed.pending_subscribe_count == 1
+    assert replayed.active_count == 0
+    assert replayed.reconnect_replay_count == 1
+    assert service.symbol_state("AAPL").reconnect_generation == 2
 
 
 def test_breach_between_two_higher_prices_in_one_drain_window_is_never_lost():

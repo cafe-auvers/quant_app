@@ -215,6 +215,20 @@ class KisWebSocketClient:
                     removals.append(removed)
         self._schedule_messages(removals, tr_type="2")
 
+    def forget_subscriptions(
+        self, subscriptions: Iterable[KisWsSubscription]
+    ) -> None:
+        """Drop NACKed subscriptions from reconnect replay without UNSUB.
+
+        A rejected subscribe never became active at KIS, so sending an
+        unsubscribe would manufacture a second protocol operation. The
+        market-data coordinator calls this only after an explicit NACK.
+        """
+
+        with self._desired_lock:
+            for subscription in subscriptions:
+                self._desired.pop((subscription.tr_id, subscription.tr_key), None)
+
     def _schedule_messages(self, subscriptions, *, tr_type: str) -> None:
         if not subscriptions or not self._connected or self._loop is None:
             return
@@ -300,13 +314,15 @@ class KisWebSocketClient:
                     self._reconnect_generation += 1
                     if self._reconnect_generation > 1:
                         self.reconnect_count += 1
-                    self._notify_connection(True, "", self._reconnect_generation)
                     attempts = 0
                     # Desired, not merely previously ACKed, subscriptions are
                     # restored after every reconnect.
                     await self._send_subscriptions(
                         self.desired_subscriptions(), tr_type="1"
                     )
+                    # Observers see the new session only after every desired
+                    # subscription request has crossed the socket boundary.
+                    self._notify_connection(True, "", self._reconnect_generation)
                     async for raw in socket:
                         await self._handle_raw(raw)
             except KisWsAuthError as exc:

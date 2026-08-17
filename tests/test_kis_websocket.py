@@ -85,6 +85,16 @@ def test_desired_subscriptions_survive_while_disconnected():
     assert client.desired_subscriptions() == [subscription]
 
 
+def test_explicit_nack_forget_removes_reconnect_intent_without_unsubscribe():
+    client = KisWebSocketClient(url="ws://example", approval_keys=_Keys())
+    subscription = KisWsSubscription("HDFSCNT0", "DNASAAPL", "AAPL", "TRADE")
+    client.subscribe([subscription])
+
+    client.forget_subscriptions([subscription])
+
+    assert client.desired_subscriptions() == []
+
+
 def test_malformed_frame_is_dropped_without_changing_connected_state():
     client = KisWebSocketClient(url="ws://example", approval_keys=_Keys())
     client._connected = True
