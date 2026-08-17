@@ -1,11 +1,12 @@
 """Thin Qt adapter for the shared execution workflow service.
 
-Kanban gestures are typed requests.  This module neither applies domain
-mutations nor talks to a repository/gateway; it submits the request and then
-rebuilds the board from a fresh authoritative projection.
+Kanban gestures are typed requests.  This module never calls the broker or
+execution gateway directly; it submits durable workflow intent and rebuilds
+the board from authoritative state.
 """
 from __future__ import annotations
 
+from dataclasses import replace
 import logging
 
 from src.core.board_workflow import (
@@ -13,9 +14,17 @@ from src.core.board_workflow import (
     BoardActionContext,
     BoardProjectionContext,
 )
-from src.core.execution_config import is_buyboard_engine_enabled
+from src.core.execution_config import (
+    KANBAN_STRATEGY_INSTANCE_ID,
+    is_buyboard_engine_enabled,
+)
+from src.core.execution_ownership import ExecutionOwner, ExecutionOwnership
 from src.core.runtime_readiness import RuntimeDeviceState
 from src.services import execution_workflow_service
+from src.services.execution_ownership_repository import (
+    assign_ownership,
+    get_ownership,
+)
 from src.services.execution_workflow_service import BoardCommandRejectedError
 from src.services.trade_card_repository import (
     TradeCardNotFoundError,
@@ -125,6 +134,60 @@ def _action_context(main_window, command: AnyBoardCommand) -> BoardActionContext
     )
 
 
+def _claim_kanban_planning_ownership(engine, command) -> None:
+    """Make Buy Today an explicit pre-market ownership transfer.
+
+    Moving a Buylist card to Buy Today is a user planning decision, not a
+    broker mutation.  It may therefore be recorded before WebSocket/account
+    readiness is available.  The drag explicitly transfers an unowned/H2
+    LEGACY symbol to the configured Kanban strategy so the later guarded
+    execution path cannot fail merely because the card was bootstrapped from
+    the legacy lists.  MANUAL or a different Kanban strategy is never stolen.
+    """
+
+    if engine is None:
+        raise BoardCommandRejectedError("Canonical database is unavailable")
+    target_strategy = str(KANBAN_STRATEGY_INSTANCE_ID or "").strip()
+    if not target_strategy:
+        raise BoardCommandRejectedError(
+            "KANBAN_STRATEGY_INSTANCE_ID is blank; Buy Today cannot claim execution ownership"
+        )
+    ownership = get_ownership(
+        engine,
+        environment=command.environment,
+        account_no=command.account_no,
+        symbol=command.symbol,
+    )
+    if ownership.owner == ExecutionOwner.MANUAL:
+        raise BoardCommandRejectedError(
+            f"{command.symbol} is MANUAL-owned; explicit administrative transfer is required"
+        )
+    if (
+        ownership.owner == ExecutionOwner.KANBAN
+        and ownership.strategy_instance_id
+        and ownership.strategy_instance_id != target_strategy
+    ):
+        raise BoardCommandRejectedError(
+            f"{command.symbol} belongs to another Kanban strategy instance"
+        )
+    if (
+        ownership.owner == ExecutionOwner.KANBAN
+        and ownership.strategy_instance_id == target_strategy
+    ):
+        return
+    assign_ownership(
+        engine,
+        ExecutionOwnership(
+            environment=command.environment,
+            account_no=command.account_no,
+            symbol=command.symbol,
+            owner=ExecutionOwner.KANBAN,
+            strategy_instance_id=target_strategy,
+            assigned_by=f"buy_today:{command.command_id[:16]}",
+        ),
+    )
+
+
 class BuyboardMixin:
     """Build the board and route all gestures through the workflow service."""
 
@@ -171,9 +234,6 @@ class BuyboardMixin:
             bootstrap_trade_cards_from_current_state,
         )
 
-        # Keep this UI adapter independent of src.api.*. The configured PROD
-        # account is ordinary application configuration and is already loaded
-        # by main.py before UI modules import.
         default_account_no = str(
             get_env_value("KIS_PROD_ACCOUNT_NO", "")
             or get_env_value("KIS_ACCOUNT_NO", "")
@@ -225,9 +285,6 @@ class BuyboardMixin:
         try:
             self._bootstrap_buyboard_projection()
         except Exception:
-            # A bootstrap defect must not make an existing canonical board
-            # unusable. Render whatever the DB already has and surface the
-            # exception in the normal application log for correction.
             logger.exception("Buy Board bootstrap refresh failed")
 
         projections = execution_workflow_service.list_board_projections(
@@ -239,12 +296,20 @@ class BuyboardMixin:
 
     def _buyboard_dispatch_command(self, command: AnyBoardCommand) -> bool:
         from PyQt5.QtWidgets import QMessageBox
+        from src.core.board_workflow import ActivateForToday
 
         try:
+            context = _action_context(self, command)
+            if isinstance(command, ActivateForToday):
+                # Pre-market Buy Today is durable monitoring intent only. The
+                # later trading engine still requires ACTIVE/readiness before
+                # it can derive or submit any order.
+                _claim_kanban_planning_ownership(self._buyboard_engine(), command)
+                context = replace(context, enforce_runtime_fences=False)
             execution_workflow_service.request_board_action(
                 self._buyboard_engine(),
                 command,
-                context=_action_context(self, command),
+                context=context,
             )
         except TradeCardVersionConflictError:
             QMessageBox.warning(
