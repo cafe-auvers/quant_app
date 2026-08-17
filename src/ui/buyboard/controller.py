@@ -1,8 +1,10 @@
 """Thin Qt adapter for the shared execution workflow service.
 
-Kanban gestures are typed requests.  This module never calls the broker or
-execution gateway directly; it submits durable workflow intent and rebuilds
-the board from authoritative state.
+Kanban gestures are typed durable user intent.  The UI never calls a broker or
+execution gateway directly; the authoritative PC runtime consumes those intents
+later under its lease, reconciliation, market-data, kill-switch, and execution
+safety fences.  This distinction is intentional: a laptop must be able to plan
+Buy Today / exits / stops before market open or while it is pull-only.
 """
 from __future__ import annotations
 
@@ -31,6 +33,7 @@ from src.services.trade_card_repository import (
     TradeCardVersionConflictError,
 )
 from src.utils.config import get_env_value
+from src.utils.market_calendar import is_regular_session_open
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +85,13 @@ def _projection_context(main_window) -> BoardProjectionContext:
     )
 
 
+def _safe_regular_session_open() -> bool | None:
+    try:
+        return bool(is_regular_session_open())
+    except Exception:
+        return None
+
+
 def _action_context(main_window, command: AnyBoardCommand) -> BoardActionContext:
     worker = _worker_for(main_window)
     if worker is None:
@@ -90,6 +100,7 @@ def _action_context(main_window, command: AnyBoardCommand) -> BoardActionContext
             engine_enabled=is_buyboard_engine_enabled(),
             action_ready=False,
             device_active=False,
+            regular_session_open=_safe_regular_session_open(),
             restriction_reasons=("Runtime worker unavailable",),
         )
 
@@ -119,6 +130,8 @@ def _action_context(main_window, command: AnyBoardCommand) -> BoardActionContext
             regular_session_open = bool(market_open())
         except Exception:
             regular_session_open = None
+    if regular_session_open is None:
+        regular_session_open = _safe_regular_session_open()
     return BoardActionContext(
         enforce_runtime_fences=True,
         engine_enabled=is_buyboard_engine_enabled(),
@@ -134,15 +147,15 @@ def _action_context(main_window, command: AnyBoardCommand) -> BoardActionContext
     )
 
 
-def _claim_kanban_planning_ownership(engine, command) -> None:
-    """Make Buy Today an explicit pre-market ownership transfer.
+def _claim_kanban_intent_ownership(engine, command):
+    """Treat an explicit execution-intent gesture as the ownership cutover.
 
-    Moving a Buylist card to Buy Today is a user planning decision, not a
-    broker mutation.  It may therefore be recorded before WebSocket/account
-    readiness is available.  The drag explicitly transfers an unowned/H2
-    LEGACY symbol to the configured Kanban strategy so the later guarded
-    execution path cannot fail merely because the card was bootstrapped from
-    the legacy lists.  MANUAL or a different Kanban strategy is never stolen.
+    H2 defaults an unassigned symbol to LEGACY.  That is correct before the
+    user chooses Kanban execution, but it made a freshly bootstrapped card
+    visible yet unusable.  An explicit Buy Today / exit / stop gesture may
+    transfer LEGACY to the configured Kanban strategy.  MANUAL and another
+    Kanban strategy remain protected and require separate administrative
+    transfer.
     """
 
     if engine is None:
@@ -150,7 +163,7 @@ def _claim_kanban_planning_ownership(engine, command) -> None:
     target_strategy = str(KANBAN_STRATEGY_INSTANCE_ID or "").strip()
     if not target_strategy:
         raise BoardCommandRejectedError(
-            "KANBAN_STRATEGY_INSTANCE_ID is blank; Buy Today cannot claim execution ownership"
+            "KANBAN_STRATEGY_INSTANCE_ID is blank; Kanban cannot claim execution ownership"
         )
     ownership = get_ownership(
         engine,
@@ -174,8 +187,8 @@ def _claim_kanban_planning_ownership(engine, command) -> None:
         ownership.owner == ExecutionOwner.KANBAN
         and ownership.strategy_instance_id == target_strategy
     ):
-        return
-    assign_ownership(
+        return ownership
+    return assign_ownership(
         engine,
         ExecutionOwnership(
             environment=command.environment,
@@ -183,7 +196,18 @@ def _claim_kanban_planning_ownership(engine, command) -> None:
             symbol=command.symbol,
             owner=ExecutionOwner.KANBAN,
             strategy_instance_id=target_strategy,
-            assigned_by=f"buy_today:{command.command_id[:16]}",
+            assigned_by=f"kanban_intent:{command.command_id[:16]}",
+        ),
+    )
+
+
+def _with_current_kanban_ownership(command, ownership):
+    return replace(
+        command,
+        expected_execution_owner=ExecutionOwner.KANBAN.value,
+        expected_ownership_version=int(getattr(ownership, "version", 0) or 0),
+        expected_strategy_instance_id=str(
+            getattr(ownership, "strategy_instance_id", "") or ""
         ),
     )
 
@@ -218,13 +242,7 @@ class BuyboardMixin:
         self._buyboard_projection_timer = timer
 
     def _bootstrap_buyboard_projection(self) -> None:
-        """Create only missing cards from state the application already owns.
-
-        This is deliberately a presentation/bootstrap bridge, not a second
-        trading engine. Existing TradeCardState rows are never overwritten by
-        legacy list metadata. Once the dedicated runtime worker is running,
-        broker holdings are projected only by its normal reconciliation path.
-        """
+        """Create only missing cards from state the application already owns."""
 
         engine = self._buyboard_engine()
         if engine is None:
@@ -296,15 +314,37 @@ class BuyboardMixin:
 
     def _buyboard_dispatch_command(self, command: AnyBoardCommand) -> bool:
         from PyQt5.QtWidgets import QMessageBox
-        from src.core.board_workflow import ActivateForToday
+        from src.core.board_workflow import (
+            ActivateForToday,
+            CancelQueuedSellAll,
+            RequestPartialSell,
+            RequestSellAll,
+            SetBreakevenStop,
+            SetManualStop,
+            SetOrbStop,
+        )
+
+        intent_only_types = (
+            ActivateForToday,
+            RequestPartialSell,
+            RequestSellAll,
+            CancelQueuedSellAll,
+            SetOrbStop,
+            SetBreakevenStop,
+            SetManualStop,
+        )
 
         try:
             context = _action_context(self, command)
-            if isinstance(command, ActivateForToday):
-                # Pre-market Buy Today is durable monitoring intent only. The
-                # later trading engine still requires ACTIVE/readiness before
-                # it can derive or submit any order.
-                _claim_kanban_planning_ownership(self._buyboard_engine(), command)
+            if isinstance(command, intent_only_types):
+                # These gestures perform zero broker I/O here. They are valid
+                # pre-market and from a pull-only laptop; the authoritative PC
+                # runtime later consumes them only after its complete readiness
+                # predicate and broker-boundary guards pass.
+                ownership = _claim_kanban_intent_ownership(
+                    self._buyboard_engine(), command
+                )
+                command = _with_current_kanban_ownership(command, ownership)
                 context = replace(context, enforce_runtime_fences=False)
             execution_workflow_service.request_board_action(
                 self._buyboard_engine(),
