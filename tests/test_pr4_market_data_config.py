@@ -49,6 +49,79 @@ from gate2.capabilities import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _write_runtime_capability_manifest(
+    directory: Path, *, commit: str, include_execution_notice: bool = False
+) -> Path:
+    definitions = [
+        (TRADE_TIMESTAMP, "HDFSCNT0", TIMESTAMP_INTERPRETATION),
+        (QUOTE_TIMESTAMP, "HDFSASP0", TIMESTAMP_INTERPRETATION),
+        (TRADE_SEQUENCE, "HDFSCNT0", "MONOTONIC"),
+        (QUOTE_SEQUENCE, "HDFSASP0", "NO_USABLE_SEQUENCE"),
+    ]
+    if include_execution_notice:
+        definitions.append(
+            (EXECUTION_NOTICE, "H0GSCNI0", NOTICE_INTERPRETATION)
+        )
+    entries = []
+    for index, (capability_id, tr_id, interpretation) in enumerate(definitions):
+        sequence = (
+            {
+                "sequence_field": "EVOL",
+                "reset_semantics": "RESET_ON_RECONNECT",
+            }
+            if capability_id == TRADE_SEQUENCE
+            else {}
+        )
+        evidence_path = directory / f"runtime-evidence-{index}.json"
+        evidence_path.write_text(
+            json.dumps(
+                {
+                    "capability_id": capability_id,
+                    "environment": "PROD",
+                    "tr_id": tr_id,
+                    "interpretation": interpretation,
+                    "observed_at": "2026-08-17T00:00:00Z",
+                    "observations": [{"frame_count": 10}],
+                    **sequence,
+                }
+            ),
+            encoding="utf-8",
+        )
+        entries.append(
+            {
+                "capability_id": capability_id,
+                "status": "VERIFIED",
+                "environment": "PROD",
+                "tr_id": tr_id,
+                "interpretation": interpretation,
+                "evidence_file": evidence_path.name,
+                "evidence_sha256": sha256_file(evidence_path),
+                **sequence,
+            }
+        )
+    manifest_path = directory / "runtime-manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "commit_sha": commit,
+                "environment": "PROD",
+                "review": {
+                    "status": "APPROVED",
+                    "author": "bundle-author",
+                    "reviewer": "independent-reviewer",
+                    "reviewed_at": "2026-08-17T00:00:00Z",
+                    "method": "PROCEDURAL_DUAL_CONTROL",
+                    "reference": "dual-control-log:runtime-review-1",
+                },
+                "capabilities": entries,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return manifest_path
+
+
 def test_pr4_market_data_configuration_is_present_and_fail_closed():
     env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
     requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
@@ -57,6 +130,9 @@ def test_pr4_market_data_configuration_is_present_and_fail_closed():
         "KIS_SIM_WS_URL",
         "KIS_WS_ENABLED=false",
         "KIS_WS_PROTOCOL_VERIFIED=false",
+        "KIS_CAPABILITY_MANIFEST_PATH=",
+        "KIS_CAPABILITY_MANIFEST_SHA256=",
+        "KIS_RUNTIME_COMMIT_SHA=",
         "KIS_WS_HTS_ID",
         "KIS_MARKET_DATA_MODE=REST_DISPLAY_ONLY",
         "BROKER_EVENT_STALE_SECONDS",
@@ -64,6 +140,9 @@ def test_pr4_market_data_configuration_is_present_and_fail_closed():
         "MAX_MARKET_DATA_QUEUE_DELAY_SECONDS",
         "KIS_WS_TOTAL_SUBSCRIPTION_CAPACITY=0",
         "KIS_WS_RAW_CAPTURE_ENABLED=false",
+        "KIS_LIVE_EXECUTION_MODE=DISABLED",
+        "KIS_MUTATION_MIN_SPACING_SECONDS=0.2",
+        "KIS_MUTATION_MAX_CONFIRMED_ATTEMPTS=1",
         "BUYBOARD_ENGINE_ENABLED=false",
     ):
         assert name in env_example
@@ -111,6 +190,7 @@ def test_live_factory_uses_only_aggregate_pool_and_wires_verified_sequences(
         confirmed_sequence_channels=("HDFSCNT0",),
         sequence_field_by_channel={"HDFSCNT0": "EVOL"},
         sequence_reset_by_channel={"HDFSCNT0": "RESET_ON_RECONNECT"},
+        qualification_mode=True,
     )
     service.configure_desired_channels(
         trade_priorities={"AAPL": 0, "MSFT": 0, "NVDA": 0},
@@ -123,6 +203,54 @@ def test_live_factory_uses_only_aggregate_pool_and_wires_verified_sequences(
     assert service._confirmed_sequence_channels == {"HDFSCNT0"}
 
 
+def test_normal_live_factory_loads_exact_pinned_reviewed_capabilities(
+    tmp_path, monkeypatch
+):
+    commit = "a" * 40
+    manifest_path = _write_runtime_capability_manifest(tmp_path, commit=commit)
+    manifest_digest = sha256_file(manifest_path)
+    monkeypatch.setattr(execution_config, "KIS_WS_ENABLED", True)
+    monkeypatch.setattr(execution_config, "KIS_WS_PROTOCOL_VERIFIED", True)
+    monkeypatch.setattr(execution_config, "KIS_WS_TOTAL_SUBSCRIPTION_CAPACITY", 3)
+    monkeypatch.setenv("KIS_WS_HTS_ID", "reviewed-user")
+    monkeypatch.setenv("KIS_WS_SYMBOL_KEYS_JSON", '{"AAPL":"DNASAAPL"}')
+
+    service = build_kis_realtime_market_data_from_environment(
+        capability_manifest_path=manifest_path,
+        capability_manifest_sha256=manifest_digest,
+        runtime_commit_sha=commit,
+    )
+
+    assert service._confirmed_sequence_channels == {"HDFSCNT0"}
+    assert service._sequence_field_by_channel == {"HDFSCNT0": "EVOL"}
+    assert service.capability_manifest_sha256 == manifest_digest
+    assert service.capability_manifest_commit_sha == commit
+    assert service.subscription_capacity_snapshot().execution_notice_desired is False
+
+
+def test_normal_live_factory_rejects_drift_from_reviewed_manifest(
+    tmp_path, monkeypatch
+):
+    commit = "b" * 40
+    manifest_path = _write_runtime_capability_manifest(tmp_path, commit=commit)
+    monkeypatch.setattr(execution_config, "KIS_WS_ENABLED", True)
+    monkeypatch.setattr(execution_config, "KIS_WS_PROTOCOL_VERIFIED", True)
+
+    with pytest.raises(RuntimeError, match="digest mismatch"):
+        build_kis_realtime_market_data_from_environment(
+            capability_manifest_path=manifest_path,
+            capability_manifest_sha256="f" * 64,
+            runtime_commit_sha=commit,
+        )
+
+    with pytest.raises(ValueError, match="ad-hoc capability"):
+        build_kis_realtime_market_data_from_environment(
+            confirmed_sequence_channels=("HDFSCNT0",),
+            sequence_field_by_channel={"HDFSCNT0": "EVOL"},
+            sequence_reset_by_channel={"HDFSCNT0": "RESET_ON_RECONNECT"},
+        )
+
+
 def test_ws0_contract_explicitly_allows_only_inactive_provisional_adapters():
     contract = (ROOT / "docs" / "kanban_production_readiness.md").read_text(
         encoding="utf-8"
@@ -131,7 +259,7 @@ def test_ws0_contract_explicitly_allows_only_inactive_provisional_adapters():
         encoding="utf-8"
     )
 
-    assert "revision 3.4 amendment recorded" in contract
+    assert "revision 3.5 pilot amendment recorded" in contract
     assert "May be written provisionally before evidence" in contract
     assert "KIS_WS_PROTOCOL_VERIFIED=true or a live connection/subscription" in contract
     assert "non-zero production/simulation channel capacity" in contract
@@ -270,6 +398,9 @@ def _passing_gate2_evidence() -> Gate2Evidence:
             "KIS_SUBMIT_MUTATION_CAPACITY": 0,
             "KIS_CANCEL_MUTATION_CAPACITY": 0,
             "KIS_REPLACE_MUTATION_CAPACITY": 0,
+            "KIS_LIVE_EXECUTION_MODE": "DISABLED",
+            "KIS_CONTROLLED_LIVE_SYMBOLS": [],
+            "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL": 0.0,
         },
         session_open=opened,
         session_close=closed,

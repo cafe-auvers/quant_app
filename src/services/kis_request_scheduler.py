@@ -123,6 +123,7 @@ class KisRequestScheduler:
         uncertain_protective_reserve: int = 2,
         max_read_attempts: int = 3,
         max_confirmed_mutation_attempts: int = 2,
+        min_mutation_spacing_seconds: float = 0.0,
         backoff_seconds: float = 0.25,
         monotonic: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
@@ -138,6 +139,9 @@ class KisRequestScheduler:
         self._max_confirmed_mutation_attempts = max(
             1, int(max_confirmed_mutation_attempts)
         )
+        self._min_mutation_spacing_seconds = max(
+            0.0, float(min_mutation_spacing_seconds)
+        )
         self._backoff_seconds = max(0.0, float(backoff_seconds))
         self._monotonic = monotonic
         self._sleeper = sleeper
@@ -145,8 +149,17 @@ class KisRequestScheduler:
         self._queue: list[tuple[int, int, _Waiter]] = []
         self._sequence = 0
         self._active = False
+        self._last_mutation_started_at: Optional[float] = None
         self._buckets: Dict[tuple[RequestKind, str, str], _BudgetBucket] = {}
         self._metrics = SchedulerMetrics()
+
+    @property
+    def max_confirmed_mutation_attempts(self) -> int:
+        return self._max_confirmed_mutation_attempts
+
+    @property
+    def min_mutation_spacing_seconds(self) -> float:
+        return self._min_mutation_spacing_seconds
 
     @staticmethod
     def _key(
@@ -344,6 +357,28 @@ class KisRequestScheduler:
             self._refresh_queue_metrics_locked()
             self._condition.notify_all()
 
+    def _wait_for_mutation_spacing(self) -> None:
+        """Enforce one process-wide floor between actual mutation attempts."""
+
+        now = self._monotonic()
+        previous = self._last_mutation_started_at
+        delay = (
+            0.0
+            if previous is None
+            else max(0.0, previous + self._min_mutation_spacing_seconds - now)
+        )
+        if delay > 0:
+            self._sleeper(delay)
+        # A deterministic test sleeper need not advance its fake clock. Keep
+        # the logical start monotonic while a real sleeper records real time.
+        observed = self._monotonic()
+        self._last_mutation_started_at = max(
+            observed,
+            (previous + self._min_mutation_spacing_seconds)
+            if previous is not None
+            else observed,
+        )
+
     def _refresh_queue_metrics_locked(self) -> None:
         highest = self._queue[0][0] if self._queue else 0
         self._metrics = replace(
@@ -426,6 +461,7 @@ class KisRequestScheduler:
                     is_new_entry=is_new_entry,
                     consume=True,
                 )
+                self._wait_for_mutation_spacing()
                 result = operation()
             except Exception as exc:
                 confirmed = False

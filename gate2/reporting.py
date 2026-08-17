@@ -64,6 +64,9 @@ SAFE_RUNTIME_EXPECTATIONS = {
     "KIS_SUBMIT_MUTATION_CAPACITY": 0,
     "KIS_CANCEL_MUTATION_CAPACITY": 0,
     "KIS_REPLACE_MUTATION_CAPACITY": 0,
+    "KIS_LIVE_EXECUTION_MODE": "DISABLED",
+    "KIS_CONTROLLED_LIVE_SYMBOLS": [],
+    "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL": 0.0,
 }
 
 
@@ -85,7 +88,7 @@ def _git(root: Path, *args: str) -> str:
     ).stdout.strip()
 
 
-def runtime_activation_snapshot() -> dict[str, bool | int]:
+def runtime_activation_snapshot() -> dict[str, bool | int | float | str | list[str]]:
     """Read safety state without mutating any flag or composing an engine."""
     return {
         "TRADING_ENABLED": bool(is_trading_enabled()),
@@ -105,6 +108,15 @@ def runtime_activation_snapshot() -> dict[str, bool | int]:
         ),
         "KIS_REPLACE_MUTATION_CAPACITY": int(
             execution_config.KIS_REPLACE_MUTATION_CAPACITY
+        ),
+        "KIS_LIVE_EXECUTION_MODE": str(
+            execution_config.KIS_LIVE_EXECUTION_MODE
+        ),
+        "KIS_CONTROLLED_LIVE_SYMBOLS": list(
+            execution_config.KIS_CONTROLLED_LIVE_SYMBOLS
+        ),
+        "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL": float(
+            execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL
         ),
     }
 
@@ -1215,6 +1227,9 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
         confirmed_sequence_channels=capability_manifest.confirmed_sequence_channels,
         sequence_field_by_channel=capability_manifest.sequence_field_by_channel,
         sequence_reset_by_channel=capability_manifest.sequence_reset_by_channel,
+        execution_notice_verified=(
+            EXECUTION_NOTICE in capability_manifest.capabilities
+        ),
         qualification_mode=True,
         sensitive_value_audit=audit_approval_key,
     )

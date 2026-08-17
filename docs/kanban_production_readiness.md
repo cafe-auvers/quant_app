@@ -1,6 +1,6 @@
 # Kanban Production Readiness — Requirements & Invariants
 
-Status: **SIGNED OFF — Workstream 1 complete; revision 3.4 amendment recorded**
+Status: **SIGNED OFF — Workstream 1 complete; revision 3.5 pilot amendment recorded**
 Branch: PR1 merged to `master` (commit `5b50e1d`, PR #4). PR2 onward branch
 directly off `master` (revision 3.3 — see rule 3 / [PR structure](#pr-structure-revision-3)).
 The formerly-planned `feature/kanban-production-readiness` integration
@@ -67,6 +67,17 @@ the transport, accepting a timestamp/sequence mapping as execution-grade, and
 setting non-zero capacity. The provisional adapter and its fixtures must be
 validated and adapted to the recorded evidence before WS0 sign-off. This is an
 explicit contract revision; it does not treat unverified behavior as fact.
+
+Revision 3.5 records the post-Gate-1 supervised-pilot policy. A separately
+approved controlled-live pilot may exercise the final production runtime
+before the full-session Gate-2 certificate and supplementary execution-notice
+mapping are complete, but only after real trade/quote ACK, frame,
+timestamp/sequence, freshness, startup-reconciliation, buying-power, and
+lease evidence exists for the exact runtime. The pilot uses the same code as
+full live behind an additional symbol/notional envelope, process-wide
+mutation spacing, and zero automatic mutation retries. It does not pass Gate
+2, authorize unattended operation, or relax broker reconciliation as the
+execution authority. See `docs/controlled_live_pilot_runbook.md`.
 
 ## How to use this document
 
@@ -1250,13 +1261,24 @@ Unchanged from revision 2:
 | Receive-lag p99 | under 2 seconds |
 | Secret/approval-key leakage in logs | 0 |
 
-`BUYBOARD_ENGINE_ENABLED` stays `false` until Gate 2 has passed at minimum,
-and stays `false` in unattended/automatic form until Gate 5 passes.
+`BUYBOARD_ENGINE_ENABLED` stays `false` unless either Gate 2 has passed or an
+explicitly approved, continuously supervised revision-3.5 controlled-live
+pilot satisfies `controlled_live_pilot_runbook.md`. It stays `false` in
+unattended/automatic form until Gate 5 passes.
 
 ---
 
 ## Change log
 
+- 2026-08-17 (revision 3.5): After Gate 1 passed, separated the full-session
+  read-only Gate-2 certificate from a narrowly approved supervised pilot of
+  the final runtime. Production WebSocket composition now consumes an exact
+  commit/digest-pinned reviewed capability manifest; the pilot can omit the
+  supplementary execution-notice capability but not trade/quote timestamp or
+  sequence evidence. Added a fail-closed controlled-live BUY allowlist and
+  per-entry notional cap, process-wide mutation spacing, and a one-attempt
+  scheduler policy. Defaults remain disabled and this revision does not
+  authorize unattended execution.
 - 2026-08-16 (PR5): Implemented Workstream 6 runtime readiness and device
   handoff from post-PR4 `master@952179e`. Main-device leases now persist a
   monotonically advancing epoch across takeover and clean-release tombstones;

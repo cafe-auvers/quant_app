@@ -234,6 +234,21 @@ capacities at zero. A controlled simulation submit/cancel/replace sequence is
 still required to identify endpoint-specific behavior and prove that the
 rate-limit rejection is unambiguously pre-acceptance.
 
+## Production composition binding
+
+Normal production WebSocket composition does not accept ad-hoc sequence
+arguments. It requires `KIS_CAPABILITY_MANIFEST_PATH`, a pinned
+`KIS_CAPABILITY_MANIFEST_SHA256`, and the exact deployed
+`KIS_RUNTIME_COMMIT_SHA`, then uses the same strict validator as the Gate-2
+runner. The manifest's timestamp interpretations and sequence/reset fields
+must match their redacted evidence files before a socket can be constructed.
+
+For a separately approved supervised controlled-live pilot, the four
+trade/quote timestamp and sequence capabilities are required while the
+supplementary execution-notice capability may be absent. An absent notice is
+not subscribed. The full Gate-2 report continues to require all five
+capabilities. Neither manifest form arms trading.
+
 ## Sign-off
 
 Full WS0 execution qualification is complete only when every required row

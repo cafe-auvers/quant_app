@@ -7,6 +7,13 @@ Any later code change requires a new exact-head Gate-1 report before Gate 2.
 Gate 2 validates live market data only; it does not authorize broker
 mutations, the Kanban runtime, shadow execution, or live trading.
 
+A separately approved supervised controlled-live pilot has its own stricter
+risk envelope and does not make this checklist pass. See
+[`controlled_live_pilot_runbook.md`](controlled_live_pilot_runbook.md). Normal
+production WebSocket composition and this qualifier now share the same strict
+manifest validator; production additionally pins the manifest digest and exact
+runtime commit through `KIS_CAPABILITY_MANIFEST_*` / `KIS_RUNTIME_COMMIT_SHA`.
+
 ## WS0 blockers that must close first
 
 - [ ] Capture real regular-session `HDFSCNT0` and `HDFSASP0` frames for the
@@ -67,6 +74,9 @@ KIS_MUTATION_BUDGET_VERIFIED=false
 KIS_SUBMIT_MUTATION_CAPACITY=0
 KIS_CANCEL_MUTATION_CAPACITY=0
 KIS_REPLACE_MUTATION_CAPACITY=0
+KIS_LIVE_EXECUTION_MODE=DISABLED
+KIS_CONTROLLED_LIVE_SYMBOLS=
+KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL=0
 BROKER_EVENT_STALE_SECONDS=2
 LOCAL_RECEIVE_STALE_SECONDS=2
 ```
@@ -205,6 +215,10 @@ interpretation is exactly `MONOTONIC` or `NO_USABLE_SEQUENCE`; `MONOTONIC`
 also requires the reviewed `sequence_field` and `reset_semantics` of either
 `RESET_ON_RECONNECT` or `CONTINUES_ACROSS_RECONNECT`; the live parser and
 reconnect lifecycle then use those exact values.
+`EXECUTION_NOTICE_ENCRYPTION` remains mandatory for the full Gate-2 report.
+The separately controlled supervised-pilot composition may omit it; in that
+case the notice channel is not subscribed and REST reconciliation remains the
+only execution authority.
 Each referenced evidence file is a nonempty JSON observation with matching
 capability/environment/TR/interpretation fields. Empty files, digest
 mismatches, unreviewed manifests, CLI-only assertions, and commit mismatches

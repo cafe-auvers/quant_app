@@ -144,7 +144,11 @@ def _evidence_path(manifest_path: Path, value: str) -> Path:
 
 
 def load_verified_capability_manifest(
-    path: Path, *, expected_commit: str, expected_environment: str
+    path: Path,
+    *,
+    expected_commit: str,
+    expected_environment: str,
+    require_execution_notice: bool = True,
 ) -> VerifiedCapabilityManifest:
     path = path.resolve()
     payload = _read_json_object(path)
@@ -164,7 +168,10 @@ def load_verified_capability_manifest(
         raise ValueError("capability manifest capabilities must be a list")
 
     expected_notice_tr = "H0GSCNI0" if environment == "PROD" else "H0GSCNI9"
-    expected_tr_ids = {**REQUIRED_CAPABILITIES, EXECUTION_NOTICE: expected_notice_tr}
+    supported_tr_ids = {**REQUIRED_CAPABILITIES, EXECUTION_NOTICE: expected_notice_tr}
+    required_tr_ids = dict(REQUIRED_CAPABILITIES)
+    if require_execution_notice:
+        required_tr_ids[EXECUTION_NOTICE] = expected_notice_tr
     capabilities: dict[str, dict[str, str]] = {}
     for raw in entries:
         if not isinstance(raw, dict):
@@ -172,7 +179,7 @@ def load_verified_capability_manifest(
         capability_id = str(raw.get("capability_id") or "").strip()
         if capability_id in capabilities:
             raise ValueError(f"duplicate capability_id: {capability_id}")
-        if capability_id not in expected_tr_ids:
+        if capability_id not in supported_tr_ids:
             raise ValueError(f"unsupported capability_id: {capability_id}")
         status = str(raw.get("status") or "").strip().upper()
         item_environment = str(raw.get("environment") or "").strip().upper()
@@ -183,7 +190,7 @@ def load_verified_capability_manifest(
             raise ValueError(f"{capability_id} status must be VERIFIED")
         if item_environment != environment:
             raise ValueError(f"{capability_id} environment mismatch")
-        if tr_id != expected_tr_ids[capability_id]:
+        if tr_id != supported_tr_ids[capability_id]:
             raise ValueError(f"{capability_id} tr_id mismatch")
         if not SHA256_PATTERN.fullmatch(digest):
             raise ValueError(f"{capability_id} evidence_sha256 is invalid")
@@ -255,7 +262,7 @@ def load_verified_capability_manifest(
             capabilities[capability_id]["sequence_field"] = sequence_field
             capabilities[capability_id]["reset_semantics"] = reset_semantics
 
-    missing = sorted(set(expected_tr_ids) - set(capabilities))
+    missing = sorted(set(required_tr_ids) - set(capabilities))
     if missing:
         raise ValueError(f"capability manifest is missing: {', '.join(missing)}")
     return VerifiedCapabilityManifest(

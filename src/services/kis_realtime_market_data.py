@@ -16,6 +16,7 @@ from collections import deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum, IntEnum
+from pathlib import Path
 from typing import Callable, Dict, Iterable, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
@@ -1636,8 +1637,12 @@ def build_kis_realtime_market_data_from_environment(
     confirmed_sequence_channels: Iterable[str] = (),
     sequence_field_by_channel: Optional[Mapping[str, str]] = None,
     sequence_reset_by_channel: Optional[Mapping[str, str]] = None,
+    execution_notice_verified: bool = False,
     qualification_mode: bool = False,
     sensitive_value_audit: Callable[[str], None] = lambda value: None,
+    capability_manifest_path: Optional[Path] = None,
+    capability_manifest_sha256: str = "",
+    runtime_commit_sha: str = "",
 ) -> KisRealtimeMarketDataService:
     """Compose the live service without starting it.
 
@@ -1653,17 +1658,79 @@ def build_kis_realtime_market_data_from_environment(
         raise RuntimeError(
             "KIS_WS_PROTOCOL_VERIFIED is false; Workstream 0 capability evidence is required"
         )
-    confirmed_sequences = {
-        str(channel).upper() for channel in confirmed_sequence_channels
-    }
-    sequence_fields = {
-        str(channel).upper(): str(field).upper()
-        for channel, field in (sequence_field_by_channel or {}).items()
-    }
-    sequence_resets = {
-        str(channel).upper(): str(semantics).upper()
-        for channel, semantics in (sequence_reset_by_channel or {}).items()
-    }
+    manifest_sha256 = ""
+    manifest_commit_sha = ""
+    if qualification_mode:
+        confirmed_sequences = {
+            str(channel).upper() for channel in confirmed_sequence_channels
+        }
+        sequence_fields = {
+            str(channel).upper(): str(field).upper()
+            for channel, field in (sequence_field_by_channel or {}).items()
+        }
+        sequence_resets = {
+            str(channel).upper(): str(semantics).upper()
+            for channel, semantics in (sequence_reset_by_channel or {}).items()
+        }
+    else:
+        if (
+            tuple(confirmed_sequence_channels)
+            or sequence_field_by_channel
+            or sequence_reset_by_channel
+        ):
+            raise ValueError(
+                "normal KIS WebSocket composition cannot accept ad-hoc capability "
+                "interpretation; configure the reviewed capability manifest"
+            )
+        # Keep the certification loader at the composition boundary so the
+        # production service consumes the exact same validated interpretation
+        # as the read-only qualifier. A path alone is insufficient: both the
+        # runtime commit and the independently recorded manifest digest are
+        # required and compared before a socket can be opened.
+        from gate2.capabilities import (
+            EXECUTION_NOTICE,
+            SHA256_PATTERN,
+            load_verified_capability_manifest,
+        )
+
+        configured_path = capability_manifest_path or Path(
+            os.getenv("KIS_CAPABILITY_MANIFEST_PATH", "").strip()
+        )
+        expected_commit = str(
+            runtime_commit_sha
+            or os.getenv("KIS_RUNTIME_COMMIT_SHA", "")
+        ).strip().lower()
+        expected_digest = str(
+            capability_manifest_sha256
+            or os.getenv("KIS_CAPABILITY_MANIFEST_SHA256", "")
+        ).strip().lower()
+        if not str(configured_path) or str(configured_path) == ".":
+            raise RuntimeError("KIS_CAPABILITY_MANIFEST_PATH is required")
+        if len(expected_commit) != 40 or any(
+            char not in "0123456789abcdef" for char in expected_commit
+        ):
+            raise RuntimeError("KIS_RUNTIME_COMMIT_SHA must be an exact 40-character SHA")
+        if not SHA256_PATTERN.fullmatch(expected_digest):
+            raise RuntimeError(
+                "KIS_CAPABILITY_MANIFEST_SHA256 must pin the reviewed manifest"
+            )
+        manifest = load_verified_capability_manifest(
+            configured_path,
+            expected_commit=expected_commit,
+            expected_environment=environment,
+            # Execution notices are supplementary to authoritative REST
+            # reconciliation and are not required for supervised pilot
+            # composition. Full Gate 2 keeps the loader's strict default.
+            require_execution_notice=False,
+        )
+        if manifest.sha256 != expected_digest:
+            raise RuntimeError("reviewed KIS capability manifest digest mismatch")
+        confirmed_sequences = set(manifest.confirmed_sequence_channels)
+        sequence_fields = manifest.sequence_field_by_channel
+        sequence_resets = manifest.sequence_reset_by_channel
+        execution_notice_verified = EXECUTION_NOTICE in manifest.capabilities
+        manifest_sha256 = manifest.sha256
+        manifest_commit_sha = manifest.commit_sha
     if confirmed_sequences != set(sequence_fields):
         raise ValueError(
             "every verified monotonic channel requires one exact sequence field"
@@ -1730,10 +1797,10 @@ def build_kis_realtime_market_data_from_environment(
             hts_id,
             channel="EXECUTION_NOTICE",
         )
-        if hts_id
+        if hts_id and execution_notice_verified
         else None
     )
-    return KisRealtimeMarketDataService(
+    service = KisRealtimeMarketDataService(
         transport=transport,
         symbol_key_resolver=resolve_key,
         total_capacity=execution_config.KIS_WS_TOTAL_SUBSCRIPTION_CAPACITY,
@@ -1751,3 +1818,8 @@ def build_kis_realtime_market_data_from_environment(
         alert=critical_alert,
         qualification_mode=qualification_mode,
     )
+    # Read-only diagnostics: these prove which reviewed interpretation was
+    # used by ordinary production composition. They confer no activation.
+    service.capability_manifest_sha256 = manifest_sha256
+    service.capability_manifest_commit_sha = manifest_commit_sha
+    return service
