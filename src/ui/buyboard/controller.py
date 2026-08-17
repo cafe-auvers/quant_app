@@ -6,6 +6,8 @@ rebuilds the board from a fresh authoritative projection.
 """
 from __future__ import annotations
 
+import logging
+
 from src.core.board_workflow import (
     AnyBoardCommand,
     BoardActionContext,
@@ -19,6 +21,8 @@ from src.services.trade_card_repository import (
     TradeCardNotFoundError,
     TradeCardVersionConflictError,
 )
+
+logger = logging.getLogger(__name__)
 
 # Compatibility name used by existing extensions/tests.
 CommandRejectedError = BoardCommandRejectedError
@@ -126,17 +130,101 @@ def _action_context(main_window, command: AnyBoardCommand) -> BoardActionContext
 class BuyboardMixin:
     """Build the board and route all gestures through the workflow service."""
 
+    _BUYBOARD_PROJECTION_REFRESH_MS = 3000
+
     def _buyboard_engine(self):
         return self.__dict__.get("pc_db_engine")
 
     def _build_buyboard_tab(self) -> None:
+        from PyQt5.QtCore import QTimer
+
         from .board import build_buyboard_widget
 
         build_buyboard_widget(self)
         self.refresh_buyboard()
 
+        # The window is intentionally rendered before the asynchronous PC-DB
+        # probe finishes.  The first refresh above can therefore be empty even
+        # though canonical state becomes available moments later.  Keep one
+        # lightweight projection timer so DB readiness, cross-device changes,
+        # legacy Watchlist/Buylist edits, and fresh cached KIS holdings become
+        # visible without a manual refresh/restart.  The runtime worker still
+        # emits immediate board_changed events for execution-state changes.
+        timer = QTimer(self)
+        timer.setInterval(self._BUYBOARD_PROJECTION_REFRESH_MS)
+        timer.timeout.connect(self.refresh_buyboard)
+        timer.start()
+        self._buyboard_projection_timer = timer
+
+    def _bootstrap_buyboard_projection(self) -> None:
+        """Create only missing cards from state the application already owns.
+
+        This is deliberately a presentation/bootstrap bridge, not a second
+        trading engine.  Existing TradeCardState rows are never overwritten by
+        legacy list metadata.  Once the dedicated runtime worker is running,
+        broker holdings are projected only by its normal reconciliation path.
+        """
+
+        engine = self._buyboard_engine()
+        if engine is None:
+            return
+
+        from src.api.kis_config import KIS_ACCOUNT_NO
+        from src.services.trade_card_bootstrap import (
+            bootstrap_trade_cards_from_current_state,
+        )
+
+        default_account_no = str(KIS_ACCOUNT_NO or "").strip()
+        if not default_account_no:
+            for item in list(
+                getattr(self.__dict__.get("buylist_manager"), "items", ()) or ()
+            ):
+                account_no = str(getattr(item, "kis_account_no", "") or "").strip()
+                if account_no:
+                    default_account_no = account_no
+                    break
+
+        worker = _worker_for(self)
+        runtime_running = False
+        if worker is not None:
+            try:
+                runtime_running = bool(worker.isRunning())
+            except RuntimeError:
+                runtime_running = False
+
+        kwargs = {}
+        if not runtime_running:
+            kwargs = {
+                "account_snapshots": self.__dict__.get("kis_account_snapshots", {}),
+                "account_snapshot_fetched_at": self.__dict__.get(
+                    "kis_account_snapshot_fetched_at", {}
+                ),
+            }
+
+        result = bootstrap_trade_cards_from_current_state(
+            engine,
+            buylist_manager=self.__dict__.get("buylist_manager"),
+            watchlist=self.__dict__.get("watchlist"),
+            default_account_no=default_account_no,
+            **kwargs,
+        )
+        if result.changed:
+            logger.info(
+                "Buy Board bootstrap created=%d holding_updates=%d",
+                len(result.created_keys),
+                len(result.holding_updated_keys),
+            )
+
     def refresh_buyboard(self) -> None:
         from .board import populate_buyboard_columns
+
+        try:
+            self._bootstrap_buyboard_projection()
+        except Exception:
+            # A bootstrap defect must not make an existing canonical board
+            # unusable.  Render whatever the DB already has and surface the
+            # exception in the normal application log for correction.
+            logger.exception("Buy Board bootstrap refresh failed")
 
         projections = execution_workflow_service.list_board_projections(
             self._buyboard_engine(),
