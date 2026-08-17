@@ -128,6 +128,68 @@ def get_ownership_in_transaction(
     return _row_to_ownership(row)
 
 
+def assign_ownership_in_transaction(
+    conn: Connection,
+    ownership: ExecutionOwnership,
+    *,
+    expected_version: Optional[int] = None,
+) -> ExecutionOwnership:
+    """Assign ownership inside a caller-owned atomic workflow transaction.
+
+    This is used when a durable UI intent and the ownership transfer are one
+    semantic operation (for example Buylist -> Buy Today).  ``expected_version``
+    may be supplied when the caller rendered a concrete ownership revision;
+    the default H2 LEGACY state has version 0 and no row.
+    """
+
+    table = _get_execution_ownership_table(MetaData())
+    current_row = conn.execute(
+        select(table).where(
+            table.c.environment == ownership.environment,
+            table.c.account_no == ownership.account_no,
+            table.c.symbol == ownership.symbol,
+        ).with_for_update()
+    ).first()
+    current_version = int(current_row.version) if current_row is not None else 0
+    if expected_version is not None and int(expected_version) != current_version:
+        raise OwnershipVersionConflictError(
+            f"Expected ownership version {expected_version} for "
+            f"{ownership.environment}:{ownership.account_no}:{ownership.symbol}, "
+            f"stored version is {current_version}"
+        )
+
+    next_version = current_version + 1
+    values = dict(
+        owner=ownership.owner.value,
+        strategy_instance_id=ownership.strategy_instance_id,
+        assigned_by=ownership.assigned_by,
+        version=next_version,
+        updated_at=_server_now(conn.engine),
+    )
+    if current_row is None:
+        conn.execute(
+            table.insert().values(
+                environment=ownership.environment,
+                account_no=ownership.account_no,
+                symbol=ownership.symbol,
+                **values,
+            )
+        )
+    else:
+        conn.execute(
+            table.update().where(table.c.id == current_row.id).values(**values)
+        )
+    return ExecutionOwnership(
+        environment=ownership.environment,
+        account_no=ownership.account_no,
+        symbol=ownership.symbol,
+        owner=ownership.owner,
+        strategy_instance_id=ownership.strategy_instance_id,
+        assigned_by=ownership.assigned_by,
+        version=next_version,
+    )
+
+
 def assign_ownership(engine: Engine, ownership: ExecutionOwnership) -> ExecutionOwnership:
     """Explicit, audited ownership transfer (H1/E1's "an EXPLICIT
     ownership transfer back to LEGACY... never an implicit fallback").
@@ -135,29 +197,6 @@ def assign_ownership(engine: Engine, ownership: ExecutionOwnership) -> Execution
     concurrency-guarded on its own version since an ownership transfer is
     a rare, explicit, single-actor administrative action, not a
     high-contention write path like an order record."""
-    table = ensure_execution_ownership_table(engine)
+    ensure_execution_ownership_table(engine)
     with engine.begin() as conn:
-        existing = conn.execute(
-            select(table.c.id, table.c.version).where(
-                table.c.environment == ownership.environment, table.c.account_no == ownership.account_no,
-                table.c.symbol == ownership.symbol,
-            )
-        ).first()
-        values = dict(
-            owner=ownership.owner.value, strategy_instance_id=ownership.strategy_instance_id,
-            assigned_by=ownership.assigned_by, updated_at=_server_now(engine),
-        )
-        if existing is None:
-            conn.execute(
-                table.insert().values(
-                    environment=ownership.environment, account_no=ownership.account_no,
-                    symbol=ownership.symbol, version=1, **values,
-                )
-            )
-        else:
-            conn.execute(
-                table.update()
-                .where(table.c.id == existing.id)
-                .values(version=existing.version + 1, **values)
-            )
-    return ownership
+        return assign_ownership_in_transaction(conn, ownership)
