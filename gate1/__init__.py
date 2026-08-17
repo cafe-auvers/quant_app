@@ -7,6 +7,7 @@ from .contract import (
     Gate1SystemObservation,
     evaluate_post_failure_properties,
 )
+from .observation import MutationBoundaryEvidence, build_gate1_system_observation
 
 __all__ = [
     "ACTIVATION_DEFAULTS",
@@ -14,4 +15,6 @@ __all__ = [
     "BrokerMutationObservation",
     "Gate1SystemObservation",
     "evaluate_post_failure_properties",
+    "MutationBoundaryEvidence",
+    "build_gate1_system_observation",
 ]

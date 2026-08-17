@@ -149,7 +149,7 @@ PR's behavior composes correctly, plus the Gate 1 run in full.
 | 4 | Account-level reconciliation engine | PR3 IMPLEMENTED, not activated — one immutable `AccountBrokerSnapshot` per account/pass, per-source `SnapshotCompleteness`, a pure `ReconciliationPlan` reducer, durable two-generation order/reservation absence evidence, lifecycle-linked behavioral C4 projection with terminal attempt-group retirement, execution-boundary and last-broker-boundary fencing for active unowned orders with definitive pre-broker aborts, guarded execution of reducer commands, safe external SELL exposure handling, atomic account-plan persistence plus strict allocator reservation CAS, failure-invalidated action readiness, and one startup/periodic runtime pass replacing the three ordered EOD sweeps. KIS submission-time mapping and production threshold calibration remain gated on Workstream 0; without verified broker submission time, A4a stays manual and unmatched broker orders remain separate `DiscoveredExternalOrder`s. |
 | 5 | Production KIS real-time market data | PR4 IMPLEMENTED and merged to `master` (`952179e`), not activated — approval-key/transport lifecycle, ACK/NACK and encrypted-notice framing, exact-event freshness/dedup validation, per-symbol channel readiness, lossless stop-version accumulator, channel-specific capacity, health metrics, market-session semantics, bounded emergency pricing, and tiered persisted outage state are implemented behind `BUYBOARD_ENGINE_ENABLED=false`, `KIS_WS_ENABLED=false`, and `KIS_WS_PROTOCOL_VERIFIED=false`. Live parsing/subscription activation remains blocked until Workstream 0 fills `docs/kis_capability_matrix.md` with credentialed evidence; no vendor-sample assumption is recorded as verified. |
 | 6 | Runtime readiness and device handoff | PR5 IMPLEMENTED and merged to `master` (`c5422b4`), not activated — durable epoch fencing across clean and stale handoff, generation-fenced `STANDBY_READY` takeover after final reconciliation, persist-before-open `ACTIVE`, strict E1 aggregate health, read-only successor standby, KANBAN/unknown-scoped legacy suppression, exposure-aware ordered shutdown with abort recovery, and stop-latch-preserving promotion are implemented. All execution and WebSocket activation flags remain false. |
-| 7 | Complete test program | PR8 DRAFT IMPLEMENTED on `agent/pr8-final-integration`, not activated — one deterministic manifest composes the prior F1/F2/F3/F4/L3 slices with PR8-only cross-workstream scenarios, frozen post-failure property checks, seeded state exploration, and a generated machine-readable Gate-1 report. |
+| 7 | Complete test program | PR8 DRAFT IMPLEMENTED on `agent/pr8-final-integration`, not activated — one deterministic manifest composes the prior F1/F2/F3/F4/L3 slices with PR8-only cross-workstream scenarios, evidence-derived fail-closed post-failure checks, adversarial seeded real-SUT exploration, a frozen required-node inventory, and a generated machine-readable Gate-1 report. |
 | 8 | Migration and cutover | PR6 IMPLEMENTED and merged to `master` (`77005ce`), not activated — exact-live-lease-fenced backup/cutover/direct rollback, crash-resumable migration, post-mutation rollback refusal, and forward-only broker reconciliation plus compatibility transform. |
 | 9 | Legacy/Kanban ownership isolation | PR2 IMPLEMENTED, not activated — `ExecutionWorkflowService` is the one workflow service both the legacy Buy Dashboard's submission/cancellation entry points and the Kanban runtime (`buyboard_runtime.py`) now default to; an architecture test enforces no direct KIS-mutation call site outside the gateway/adapter. H1's persisted, multi-strategy `execution_owner` table (`src/core/execution_ownership.py` + `execution_ownership_repository.py`) is built and enforced at the gateway (B2) in `GUARDED_ENGINE` mode — `MANUAL` rejects every application source, `KANBAN` accepts only `KANBAN_BOARD`, unassigned defaults `LEGACY` (H2) and rejects `KANBAN_BOARD`. In-process mutual exclusion per `(environment, account_no, symbol)` is enforced additionally, regardless of mode, as a same-process race guard distinct from H1's durable assignment. |
 | 10 | Rate-limit and command-priority scheduling | PR6 IMPLEMENTED and merged to `master` (`77005ce`), not activated — strict priorities, per-account/endpoint budgets initialized only from explicit WS0 evidence, and typed pre-acceptance retry classification. |
@@ -961,18 +961,35 @@ state-machine suites with F1 crash/fault injection, F2 WebSocket protocol,
 F3 multi-device handoff, seeded F4 model exploration, all eight L3
 legacy/Kanban parity rows, and the PR8-only cross-workstream scenarios.
 
-The PR8-only scenarios cover open-position lease handoff after final broker
-reconciliation, ambiguous submission across restart, database-outage
+The PR8-only scenarios cover open-position lease handoff through the actual
+standby/final-reconciliation/claim/activation runtime orchestration,
+ambiguous submission across restart, database-outage
 emergency-journal recovery, stop-breach replay across handoff, external-order
 adoption/fencing before emergency exit, migration restart followed by broker
 reconciliation, and emergency liquidation under scheduler pressure. Each
 failure-boundary scenario is reduced to the frozen post-failure properties in
-`gate1/contract.py`; weakening a property to make a scenario pass is not an
-allowed fix.
+`gate1/contract.py`. `gate1/observation.py` derives mutation, ownership,
+lease, freshness, broker-order memory, holdings, and card-projection evidence
+from the broker boundary recorder plus canonical command/order/external-order
+and card repositories. Unknown evidence fails closed. Duplicate submission is
+checked by both client ID and logical attempt identity. Conservative A4a
+candidate broker IDs remain durable audit evidence without granting exact
+identity or cancel authority. Weakening a property to make a scenario pass is
+not an allowed fix.
+
+F4 chooses seeded adversarial actions and drives the real runtime, guarded
+gateway, command journal, lease authority, emergency journal, and account
+reducer. It deliberately attempts stale-data entry, stale-lease mutation,
+restart replay, unowned cancellation, partial-fill/local divergence, and
+database-outage recovery; the SUT must reject or converge rather than the
+model suppressing unsafe actions in advance.
 
 The generated JSON report records the exact checked-out commit SHA, model
-seed, scenario IDs/counts and groups, result, invariant violations, pytest
-exit code, and the complete activation-default snapshot. `artifacts/` is
+seed, scenario IDs/counts and groups, the frozen contract-critical node-ID
+inventory and group minimums, result, invariant violations, pytest exit code,
+and the complete activation-default snapshot. A skipped selected scenario,
+unclassified scenario, absent required node, or unmet group minimum makes the
+report fail even when pytest exits zero. `artifacts/` is
 gitignored because the report contains per-run evidence; CI uploads it as the
 `gate1-report-<commit>` artifact after the normal Python 3.11/3.12 matrix is
 green. A passed report always states `production_activation_authorized=false`:

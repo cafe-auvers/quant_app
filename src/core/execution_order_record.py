@@ -467,6 +467,12 @@ class ExecutionOrderRecord:
     origin: OrderOrigin = OrderOrigin.APPLICATION
     broker_identity_status: BrokerIdentityStatus = BrokerIdentityStatus.NOT_ASSIGNED
     recovery_state: OrderRecoveryState = OrderRecoveryState.NONE
+    # Broker IDs seen only as conservative A4a heuristic candidates.  These
+    # IDs are durable audit evidence, never ownership: broker_identity_status
+    # remains AMBIGUOUS and none of the cancellation predicates consult this
+    # collection.  Keeping the evidence on the record prevents a restart from
+    # silently forgetting the broker row that caused BROKER_IDENTITY_UNCERTAIN.
+    recovery_candidate_broker_order_ids: tuple[str, ...] = ()
 
     # (revision 3.2) The exact actions a USER_ADOPTED record's adoption
     # granted -- see AdoptedOrderPermission. Always empty for
@@ -527,6 +533,13 @@ class ExecutionOrderRecord:
         self.origin = _strict_enum(self.origin, OrderOrigin)
         self.broker_identity_status = _strict_enum(self.broker_identity_status, BrokerIdentityStatus)
         self.recovery_state = _strict_enum(self.recovery_state, OrderRecoveryState)
+        self.recovery_candidate_broker_order_ids = tuple(
+            dict.fromkeys(
+                str(broker_order_id or "").strip()
+                for broker_order_id in (self.recovery_candidate_broker_order_ids or ())
+                if str(broker_order_id or "").strip()
+            )
+        )
         self.adoption_permissions = frozenset(
             _strict_enum(perm, AdoptedOrderPermission) for perm in (self.adoption_permissions or ())
         )

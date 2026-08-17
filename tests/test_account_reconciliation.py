@@ -463,6 +463,9 @@ def test_a_broker_order_used_as_an_a4a_candidate_is_not_also_created_as_an_exter
     assert plan.external_order_creates == ()
     assert plan.order_updates[0].broker_identity_status == BrokerIdentityStatus.AMBIGUOUS
     assert plan.order_updates[0].recovery_state == OrderRecoveryState.BROKER_IDENTITY_UNCERTAIN
+    assert plan.order_updates[0].recovery_candidate_broker_order_ids == (
+        "B-CANDIDATE",
+    )
     assert plan.commands == ()
 
 

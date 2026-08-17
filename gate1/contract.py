@@ -9,7 +9,7 @@ six Workstream 7 properties.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Mapping, Sequence
+from typing import Mapping, Optional, Sequence
 
 
 ACTIVATION_DEFAULTS: Mapping[str, str] = {
@@ -42,10 +42,11 @@ class BrokerMutationObservation:
     action: str
     client_order_id: str = ""
     target_broker_order_id: str = ""
-    exact_order_owned: bool = True
+    logical_operation_id: tuple[str, int, str, str, str] = ()
+    exact_order_owned: Optional[bool] = None
     is_new_entry: bool = False
-    market_data_fresh: bool = True
-    lease_current: bool = True
+    market_data_fresh: Optional[bool] = None
+    lease_current: Optional[bool] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "action", str(self.action or "").strip().upper())
@@ -57,6 +58,19 @@ class BrokerMutationObservation:
             "target_broker_order_id",
             str(self.target_broker_order_id or "").strip(),
         )
+        if self.logical_operation_id:
+            group_id, attempt_number, side, intent, symbol = self.logical_operation_id
+            object.__setattr__(
+                self,
+                "logical_operation_id",
+                (
+                    str(group_id or "").strip(),
+                    int(attempt_number or 0),
+                    str(side or "").strip().upper(),
+                    str(intent or "").strip().upper(),
+                    str(symbol or "").strip().upper(),
+                ),
+            )
 
 
 @dataclass(frozen=True)
@@ -77,12 +91,17 @@ def evaluate_post_failure_properties(
 
     violations: list[dict[str, str]] = []
     submit_counts: dict[str, int] = {}
+    logical_submit_counts: dict[tuple[str, int, str, str, str], int] = {}
     for mutation in observation.mutations:
         if mutation.action == "SUBMIT":
             submit_counts[mutation.client_order_id] = (
                 submit_counts.get(mutation.client_order_id, 0) + 1
             )
-            if mutation.is_new_entry and not mutation.market_data_fresh:
+            if mutation.logical_operation_id:
+                logical_submit_counts[mutation.logical_operation_id] = (
+                    logical_submit_counts.get(mutation.logical_operation_id, 0) + 1
+                )
+            if mutation.is_new_entry and mutation.market_data_fresh is not True:
                 violations.append(
                     {
                         "property": "no_new_entry_from_stale_data",
@@ -92,7 +111,7 @@ def evaluate_post_failure_properties(
                         ),
                     }
                 )
-        if mutation.action == "CANCEL" and not mutation.exact_order_owned:
+        if mutation.action == "CANCEL" and mutation.exact_order_owned is not True:
             violations.append(
                 {
                     "property": "no_unowned_cancellation",
@@ -102,7 +121,10 @@ def evaluate_post_failure_properties(
                     ),
                 }
             )
-        if mutation.action in {"SUBMIT", "CANCEL", "REPLACE"} and not mutation.lease_current:
+        if (
+            mutation.action in {"SUBMIT", "CANCEL", "REPLACE"}
+            and mutation.lease_current is not True
+        ):
             violations.append(
                 {
                     "property": "no_destructive_action_after_lease_loss",
@@ -121,6 +143,18 @@ def evaluate_post_failure_properties(
                     "detail": (
                         f"client_order_id={client_order_id!r} reached the broker "
                         f"{count} times"
+                    ),
+                }
+            )
+
+    for logical_operation_id, count in sorted(logical_submit_counts.items()):
+        if count > 1:
+            violations.append(
+                {
+                    "property": "no_duplicate_order",
+                    "detail": (
+                        f"logical_operation_id={logical_operation_id!r} reached "
+                        f"the broker {count} times under one or more client IDs"
                     ),
                 }
             )

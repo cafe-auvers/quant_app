@@ -222,6 +222,9 @@ def _record_to_payload(record: ExecutionOrderRecord) -> Dict[str, Any]:
         "origin": record.origin.value,
         "broker_identity_status": record.broker_identity_status.value,
         "recovery_state": record.recovery_state.value,
+        "recovery_candidate_broker_order_ids": list(
+            record.recovery_candidate_broker_order_ids
+        ),
         "adoption_permissions": sorted(perm.value for perm in record.adoption_permissions),
         "replaces_execution_order_id": record.replaces_execution_order_id,
         "adopted_from_external_order_id": record.adopted_from_external_order_id,
@@ -275,6 +278,9 @@ def _payload_to_record(payload: Dict[str, Any]) -> ExecutionOrderRecord:
         origin=OrderOrigin(payload["origin"]),
         broker_identity_status=BrokerIdentityStatus(payload["broker_identity_status"]),
         recovery_state=OrderRecoveryState(payload["recovery_state"]),
+        recovery_candidate_broker_order_ids=tuple(
+            payload.get("recovery_candidate_broker_order_ids", ())
+        ),
         adoption_permissions=frozenset(
             AdoptedOrderPermission(p) for p in payload.get("adoption_permissions", [])
         ),

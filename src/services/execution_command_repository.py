@@ -359,6 +359,27 @@ def get_command_by_idempotency_key(engine: Engine, idempotency_key: str) -> Opti
         return get_command(conn, idempotency_key)
 
 
+def list_execution_commands_for_account(
+    engine: Engine,
+    *,
+    environment: str,
+    account_no: str,
+) -> list[ExecutionCommand]:
+    """Return the durable command audit stream for one account in order."""
+
+    table = ensure_execution_commands_table(engine)
+    with engine.begin() as conn:
+        rows = conn.execute(
+            select(table)
+            .where(
+                table.c.environment == str(environment or "").upper(),
+                table.c.account_no == str(account_no or ""),
+            )
+            .order_by(table.c.id.asc())
+        ).fetchall()
+    return [_row_to_command(row) for row in rows]
+
+
 def record_command_response(
     engine: Engine,
     idempotency_key: str,

@@ -14,7 +14,13 @@ from typing import Mapping, Sequence
 import xml.etree.ElementTree as ET
 
 from gate1.contract import ACTIVATION_DEFAULTS, REQUIRED_POST_FAILURE_PROPERTIES
-from gate1.manifest import DEFAULT_MODEL_SEED, SCENARIO_GROUPS, unique_selectors
+from gate1.manifest import (
+    DEFAULT_MODEL_SEED,
+    REQUIRED_GROUP_MINIMUMS,
+    REQUIRED_SCENARIO_IDS,
+    SCENARIO_GROUPS,
+    unique_selectors,
+)
 
 
 def load_env_defaults(path: Path) -> dict[str, str]:
@@ -82,7 +88,7 @@ def parse_junit(path: Path) -> tuple[list[dict[str, str]], list[dict[str, str]]]
                 "result": status,
             }
         )
-        if status in {"FAILED", "ERROR"}:
+        if status in {"FAILED", "ERROR", "SKIPPED"}:
             violations.append(
                 {
                     "property": "scenario_passed",
@@ -102,6 +108,8 @@ def build_report(
     scenarios: Sequence[Mapping[str, str]],
     test_violations: Sequence[Mapping[str, str]],
     pytest_exit_code: int,
+    required_scenario_ids: Sequence[str] = tuple(REQUIRED_SCENARIO_IDS),
+    required_group_minimums: Mapping[str, int] = REQUIRED_GROUP_MINIMUMS,
 ) -> dict:
     violations = [*activation_violations(activation), *test_violations]
     if pytest_exit_code != 0 and not test_violations:
@@ -116,6 +124,33 @@ def build_report(
     for scenario in scenarios:
         group = str(scenario.get("group") or "UNCLASSIFIED")
         counts[group] = counts.get(group, 0) + 1
+    if counts["UNCLASSIFIED"]:
+        violations.append(
+            {
+                "property": "gate1_manifest_complete",
+                "detail": f"{counts['UNCLASSIFIED']} selected scenario(s) were unclassified",
+            }
+        )
+    present_ids = {str(item.get("scenario_id") or "") for item in scenarios}
+    for scenario_id in sorted(set(required_scenario_ids) - present_ids):
+        violations.append(
+            {
+                "property": "gate1_manifest_complete",
+                "detail": f"required scenario is absent: {scenario_id}",
+            }
+        )
+    for group_id, minimum in sorted(required_group_minimums.items()):
+        actual = counts.get(group_id, 0)
+        if actual < int(minimum):
+            violations.append(
+                {
+                    "property": "gate1_manifest_complete",
+                    "detail": (
+                        f"{group_id} contains {actual} scenario(s); "
+                        f"minimum is {int(minimum)}"
+                    ),
+                }
+            )
     return {
         "schema_version": 1,
         "gate": "GATE_1_DETERMINISTIC_SIMULATION",
@@ -126,6 +161,8 @@ def build_report(
         "model_seeds": [int(model_seed)],
         "scenario_count": len(scenarios),
         "scenario_counts_by_group": counts,
+        "required_scenario_ids": sorted(set(required_scenario_ids)),
+        "required_group_minimums": dict(required_group_minimums),
         "scenarios": list(scenarios),
         "required_post_failure_properties": list(REQUIRED_POST_FAILURE_PROPERTIES),
         "invariant_violations": violations,

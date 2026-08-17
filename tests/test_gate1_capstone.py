@@ -7,20 +7,25 @@ production feature flag is used.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import os
 import threading
 import time
 
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 import pytest
+from PyQt5.QtCore import QCoreApplication
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
 from fakes.fake_execution_broker import FakeExecutionBroker
-from gate1.contract import (
-    BrokerMutationObservation,
-    Gate1SystemObservation,
-    evaluate_post_failure_properties,
+from gate1.contract import evaluate_post_failure_properties
+from gate1.observation import (
+    MutationBoundaryEvidence,
+    build_gate1_system_observation,
 )
 from src.core.discovered_external_order import new_discovered_external_order
+from src.core.board_workflow import BoardActionContext, RequestSellAll
 from src.core.execution_mode import ExecutionLease, ExecutionSource
 from src.core.execution_order_record import (
     AdoptedOrderPermission,
@@ -37,6 +42,7 @@ from src.core.order_state import (
     OrderStatus,
 )
 from src.core.runtime_readiness import RuntimeDeviceState
+from src.core import execution_config
 from src.core.trade_card_state import (
     BoardStatus,
     PositionRuntimeStatus,
@@ -44,6 +50,9 @@ from src.core.trade_card_state import (
     TradeCardState,
 )
 from src.services import state_sync
+from src.services import buyboard_runtime
+from src.services import execution_workflow_service as workflow
+from src.services import trading_engine as trading_engine_module
 from src.services import trade_card_repository as card_repo
 from src.services.account_reconciliation import run_account_reconciliation_pass
 from src.services.discovered_external_order_repository import (
@@ -63,20 +72,22 @@ from src.services.execution_lease_protocol import (
     DefaultExecutionLeaseProtocol,
     FakeExecutionLeaseProtocol,
 )
+from src.services.execution_authority import ExecutionAuthority, LeaseHandle
 from src.services.execution_order_repository import (
     fetch_execution_order,
-    list_execution_orders_for_account,
 )
 from src.services.execution_ownership_repository import assign_ownership
 from src.services.kis_realtime_market_data import PendingMarketStateAccumulator, StopRule
 from src.services.kis_request_scheduler import BudgetPolicy, KisRequestScheduler, RequestPriority
 from src.services.mutation_budget_protocol import AllowAllMutationBudget
 from src.services.realtime_market_data import QuoteSnapshot
+from src.services.realtime_market_data import RestPollingMarketDataService
 from src.services.runtime_device_state_repository import (
     confirm_standby_handoff,
-    save_runtime_device_state,
+    get_runtime_device_state,
 )
 from src.services.schema_migration import MigrationPhase, SchemaMigrationManager
+from src.ui.buyboard.runtime_worker import BuyboardRuntimeWorker
 
 
 ENVIRONMENT = "PROD"
@@ -92,8 +103,32 @@ class CapstoneBroker(FakeExecutionBroker):
         super().__init__()
         self.order_snapshots: list[BrokerOrderStatusSnapshot] = []
         self.holdings: dict[str, tuple[int, float, int]] = {}
+        self.submit_boundary_evidence: list[MutationBoundaryEvidence] = []
+        self.cancel_boundary_evidence: list[MutationBoundaryEvidence] = []
+        self.lease_snapshot_provider = lambda: None
+        self.market_data_fresh_provider = lambda _symbol: None
+        self.discovery_calls = 0
+
+    def _boundary_evidence(self, symbol: str) -> MutationBoundaryEvidence:
+        return MutationBoundaryEvidence(
+            lease=self.lease_snapshot_provider(),
+            market_data_fresh=self.market_data_fresh_provider(symbol),
+        )
+
+    def submit_order(self, **kwargs):
+        self.submit_boundary_evidence.append(
+            self._boundary_evidence(str(kwargs.get("symbol") or ""))
+        )
+        return super().submit_order(**kwargs)
+
+    def cancel_order(self, **kwargs):
+        self.cancel_boundary_evidence.append(
+            self._boundary_evidence(str(kwargs.get("symbol") or ""))
+        )
+        return super().cancel_order(**kwargs)
 
     def discover_orders(self, **_kwargs):
+        self.discovery_calls += 1
         return BrokerOrderDiscoveryResult(
             snapshots=list(self.order_snapshots),
             open_orders_complete=True,
@@ -154,8 +189,25 @@ def _gateway(
     mutation_budget=None,
     journal=None,
     writable_provider=None,
+    market_data=None,
 ):
     _assign_kanban(engine)
+    if isinstance(broker, CapstoneBroker):
+        if isinstance(lease_protocol, FakeExecutionLeaseProtocol):
+            broker.lease_snapshot_provider = lambda: lease_protocol.current
+        else:
+            def current_durable_lease():
+                owner = state_sync.get_main_device(engine)
+                if not owner.success or owner.main_device is None:
+                    return None
+                return _lease(owner.main_device)
+
+            broker.lease_snapshot_provider = current_durable_lease
+        broker.market_data_fresh_provider = (
+            (lambda symbol: market_data.is_symbol_execution_ready(symbol))
+            if market_data is not None
+            else (lambda _symbol: None)
+        )
     return ExecutionCommandGateway(
         real_broker=broker,
         engine=engine,
@@ -227,14 +279,27 @@ def _working_snapshot(
     )
 
 
-def _assert_gate1(observation: Gate1SystemObservation) -> None:
+def _assert_gate1(engine, broker) -> None:
+    observation = build_gate1_system_observation(
+        engine=engine,
+        broker=broker,
+        environment=ENVIRONMENT,
+        account_no=ACCOUNT,
+    )
     assert evaluate_post_failure_properties(observation) == ()
 
 
 @pytest.mark.usefixtures("trading_enabled")
 def test_gate1_open_position_handoff_reconciles_before_transfer_and_rejects_old_device(
-    tmp_path,
+    tmp_path, monkeypatch,
 ):
+    _qt_app = QCoreApplication.instance() or QCoreApplication([])
+    monkeypatch.setattr(execution_config, "is_buyboard_engine_enabled", lambda: True)
+    monkeypatch.setattr(
+        trading_engine_module, "is_buyboard_engine_enabled", lambda: True
+    )
+    monkeypatch.setattr(buyboard_runtime, "is_regular_session_open", lambda: True)
+    monkeypatch.setattr(buyboard_runtime, "_eod_window_reached", lambda: False)
     engine = _engine(tmp_path, "open-position-handoff.db")
     old_role = state_sync.LocalDeviceRole("pc-old", "pc-old", True)
     new_role = state_sync.LocalDeviceRole("pc-new", "pc-new", False)
@@ -242,56 +307,119 @@ def test_gate1_open_position_handoff_reconciles_before_transfer_and_rejects_old_
     assert old_claim.success and old_claim.main_device is not None
     old_lease = _lease(old_claim.main_device)
 
-    card = card_repo.create_trade_card(
+    open_card = card_repo.create_trade_card(
         engine,
         TradeCardState(
             environment=ENVIRONMENT,
             account_no=ACCOUNT,
             symbol=SYMBOL,
-            board_status=BoardStatus.SELL_ALL,
-            position_runtime_status=PositionRuntimeStatus.LIQUIDATING,
+            board_status=BoardStatus.OPEN_POSITION,
+            position_runtime_status=PositionRuntimeStatus.OPEN,
             broker_quantity=10,
             orderable_quantity=10,
             average_entry_price=100.0,
             stop_type=StopType.ORB_LOW,
             active_stop_price=95.0,
             stop_quantity=10,
-            exit_all_required=True,
-            exit_attempt_group_id="gate1-exit",
-            exit_client_order_id="HANDOFF-SELL-1",
-            exit_pending_attempt_number=1,
         ),
     )
+    requested = workflow.request_board_action(
+        engine,
+        RequestSellAll(
+            environment=ENVIRONMENT,
+            account_no=ACCOUNT,
+            symbol=SYMBOL,
+            expected_card_version=open_card.version,
+        ),
+        context=BoardActionContext(),
+    ).card
+    assert requested.board_status == BoardStatus.SELL_ALL
+    assert requested.exit_all_required is True
+
     broker = CapstoneBroker()
     broker.holdings[SYMBOL] = (10, 100.0, 10)
-    broker.queue_acceptance(broker_order_id="B-HANDOFF-SELL")
+    market_data = RestPollingMarketDataService(
+        quote_fetcher=lambda symbol: QuoteSnapshot(
+            symbol=symbol,
+            last_price=99.0,
+            bid=98.9,
+            ask=99.0,
+        )
+    )
+    market_data.subscribe([SYMBOL])
+    market_data.poll_once()
     old_gateway = _gateway(
         engine,
         broker,
         DefaultExecutionLeaseProtocol(engine=engine),
+        market_data=market_data,
     )
-    old_gateway.submit_guarded(_request(old_lease, "HANDOFF-SELL-1"))
+    old_runtime = buyboard_runtime.build_buyboard_runtime(
+        buying_power_provider=lambda *_: 100_000.0,
+        account_equity_provider=lambda *_: 100_000.0,
+        card_lookup=lambda environment, account_no, symbol: card_repo.get_trade_card(
+            engine, environment, account_no, symbol
+        ),
+        capital_reservation_engine=engine,
+        broker=old_gateway,
+        execution_lease=old_lease,
+        lease_engine=engine,
+        strategy_instance_id=STRATEGY,
+        persist_card_before_execution=lambda card: card_repo.update_trade_card(
+            engine, card, expected_version=card.version
+        ),
+        market_data=market_data,
+    )
+    broker.queue_acceptance(broker_order_id="B-HANDOFF-SELL")
+    changed = old_runtime.trading_engine.run_heartbeat([requested])
+    assert changed == [requested]
+    card_repo.update_trade_card(engine, requested, expected_version=requested.version)
+    assert requested.exit_client_order_id
+    assert len(broker.submit_calls) == 1
     broker.order_snapshots = [
-        _working_snapshot("HANDOFF-SELL-1", "B-HANDOFF-SELL")
+        _working_snapshot(requested.exit_client_order_id, "B-HANDOFF-SELL")
     ]
 
-    final_reconciliation = run_account_reconciliation_pass(
-        broker=broker,
-        engine=engine,
+    # The pull-only production worker performs its initial reconciliation,
+    # then _advance_startup_readiness performs the required final pass before
+    # it is allowed to publish STANDBY_READY.
+    standby = BuyboardRuntimeWorker(
+        db_engine=engine,
         environment=ENVIRONMENT,
         account_no=ACCOUNT,
-        cards=[card],
-        account_balance_provider=lambda *_: 100_000.0,
-    )
-    assert final_reconciliation.snapshot.completeness.holdings_complete
-    assert final_reconciliation.snapshot.completeness.open_orders_complete
-
-    ready = save_runtime_device_state(
-        engine,
+        buying_power_provider=lambda *_: 100_000.0,
+        broker=broker,
+        market_data=market_data,
+        account_discovery=lambda: [],
+        standby_only=True,
         device_id=new_role.device_id,
         hostname=new_role.hostname,
-        state=RuntimeDeviceState.STANDBY_READY,
     )
+    standby.runtime = buyboard_runtime.build_buyboard_runtime(
+        buying_power_provider=lambda *_: 100_000.0,
+        card_lookup=lambda environment, account_no, symbol: card_repo.get_trade_card(
+            engine, environment, account_no, symbol
+        ),
+        broker=broker,
+        market_data=market_data,
+        observation_only=True,
+    )
+    standby._database_probe_completed = True
+    standby._database_writable = True
+    standby._accepting_commands = False
+    standby.device_state = RuntimeDeviceState.STANDBY
+    standby.last_market_data_drain_at = datetime.now(timezone.utc)
+    standby._run_startup_reconciliation(execute_commands=False)
+    discovery_calls_before_final = broker.discovery_calls
+    standby._advance_startup_readiness()
+    assert broker.discovery_calls > discovery_calls_before_final
+    assert standby.device_state == RuntimeDeviceState.STANDBY_READY
+    assert standby._accepting_commands is False
+
+    ready = get_runtime_device_state(
+        engine, device_id=new_role.device_id
+    )
+    assert ready is not None and ready.state == RuntimeDeviceState.STANDBY_READY
     assert confirm_standby_handoff(
         engine,
         device_id=new_role.device_id,
@@ -310,46 +438,79 @@ def test_gate1_open_position_handoff_reconciles_before_transfer_and_rejects_old_
         expected_standby_generation=ready.readiness_generation,
     )
     assert new_claim.success and new_claim.main_device is not None
+    new_lease = _lease(new_claim.main_device)
+
+    # Promotion uses the same production runtime readiness method. It runs
+    # another final reconciliation with the command gate closed, rechecks the
+    # newly acquired lease, persists ACTIVE, and only then accepts commands.
+    successor_gateway = _gateway(
+        engine,
+        broker,
+        DefaultExecutionLeaseProtocol(engine=engine),
+        market_data=market_data,
+    )
+    successor_runtime = buyboard_runtime.build_buyboard_runtime(
+        buying_power_provider=lambda *_: 100_000.0,
+        account_equity_provider=lambda *_: 100_000.0,
+        card_lookup=lambda environment, account_no, symbol: card_repo.get_trade_card(
+            engine, environment, account_no, symbol
+        ),
+        capital_reservation_engine=engine,
+        broker=successor_gateway,
+        execution_lease=new_lease,
+        lease_engine=engine,
+        strategy_instance_id=STRATEGY,
+        persist_card_before_execution=lambda card: card_repo.update_trade_card(
+            engine, card, expected_version=card.version
+        ),
+        market_data=market_data,
+    )
+    successor = BuyboardRuntimeWorker(
+        db_engine=engine,
+        environment=ENVIRONMENT,
+        account_no=ACCOUNT,
+        buying_power_provider=lambda *_: 100_000.0,
+        broker=successor_gateway,
+        market_data=market_data,
+        execution_authority=ExecutionAuthority(),
+        execution_lease=LeaseHandle(
+            device_id=new_lease.device_id,
+            lease_token=new_lease.lease_token,
+            lease_epoch=new_lease.lease_epoch,
+        ),
+        lease_engine=engine,
+        account_discovery=lambda: [],
+        strategy_instance_id=STRATEGY,
+        device_id=new_role.device_id,
+        hostname=new_role.hostname,
+    )
+    successor.runtime = successor_runtime
+    successor.execution_gateway = successor_gateway
+    successor._database_probe_completed = True
+    successor._database_writable = True
+    successor._accepting_commands = False
+    successor.device_state = RuntimeDeviceState.STANDBY
+    successor.last_market_data_drain_at = datetime.now(timezone.utc)
+    successor._run_startup_reconciliation(execute_commands=False)
+    successor._lease_current = successor._lease_still_current()
+    discovery_calls_before_activation = broker.discovery_calls
+    successor._advance_startup_readiness()
+    assert broker.discovery_calls > discovery_calls_before_activation
+    assert successor.device_state == RuntimeDeviceState.ACTIVE
+    assert successor._accepting_commands is True
+    assert successor.engine_readiness(account_no=ACCOUNT).healthy
 
     with pytest.raises((LeaseNotVerifiedError, GuardedSubmissionPreBrokerAbortedError)):
         old_gateway.submit_guarded(_request(old_lease, "STALE-DEVICE-SELL"))
     assert len(broker.submit_calls) == 1
 
     continued = card_repo.get_trade_card(engine, ENVIRONMENT, ACCOUNT, SYMBOL)
-    run_account_reconciliation_pass(
-        broker=broker,
-        engine=engine,
-        environment=ENVIRONMENT,
-        account_no=ACCOUNT,
-        cards=[continued],
-        account_balance_provider=lambda *_: 100_000.0,
-    )
-    continued = card_repo.get_trade_card(engine, ENVIRONMENT, ACCOUNT, SYMBOL)
     assert continued.active_stop_price == 95.0
-    assert continued.exit_client_order_id == "HANDOFF-SELL-1"
+    assert continued.exit_client_order_id == requested.exit_client_order_id
     assert continued.broker_quantity == 10
+    assert continued.exit_all_required is True
 
-    _assert_gate1(
-        Gate1SystemObservation(
-            mutations=(
-                BrokerMutationObservation(
-                    action="SUBMIT",
-                    client_order_id="HANDOFF-SELL-1",
-                    lease_current=True,
-                ),
-            ),
-            broker_open_order_ids=frozenset({"B-HANDOFF-SELL"}),
-            remembered_broker_order_ids=frozenset(
-                order.broker_order_id
-                for order in list_execution_orders_for_account(
-                    engine, environment=ENVIRONMENT, account_no=ACCOUNT
-                )
-                if order.broker_order_id
-            ),
-            broker_holdings={SYMBOL: 10},
-            projected_card_quantities={SYMBOL: continued.broker_quantity},
-        )
-    )
+    _assert_gate1(engine, broker)
 
 
 @pytest.mark.usefixtures("trading_enabled")
@@ -358,7 +519,17 @@ def test_gate1_ambiguous_submission_restart_reconciles_without_resubmitting(tmp_
     lease = ExecutionLease("pc", "token", 1)
     protocol = FakeExecutionLeaseProtocol(current=lease)
     broker = CapstoneBroker()
-    gateway = _gateway(engine, broker, protocol)
+    market_data = RestPollingMarketDataService(
+        quote_fetcher=lambda symbol: QuoteSnapshot(
+            symbol=symbol,
+            last_price=99.0,
+            bid=98.9,
+            ask=99.0,
+        )
+    )
+    market_data.subscribe([SYMBOL])
+    market_data.poll_once()
+    gateway = _gateway(engine, broker, protocol, market_data=market_data)
     broker.queue_timeout()
 
     with pytest.raises(GuardedSubmissionAmbiguousError):
@@ -398,7 +569,7 @@ def test_gate1_ambiguous_submission_restart_reconciles_without_resubmitting(tmp_
     reconciled = fetch_execution_order(engine, "AMBIGUOUS-CID")
     assert reconciled.recovery_state == OrderRecoveryState.BROKER_IDENTITY_UNCERTAIN
 
-    restarted = _gateway(engine, broker, protocol)
+    restarted = _gateway(engine, broker, protocol, market_data=market_data)
     with pytest.raises(DuplicateCommandError):
         restarted.submit_guarded(
             _request(
@@ -410,21 +581,8 @@ def test_gate1_ambiguous_submission_restart_reconciles_without_resubmitting(tmp_
             )
         )
     assert len(broker.submit_calls) == 1
-    _assert_gate1(
-        Gate1SystemObservation(
-            mutations=(
-                BrokerMutationObservation(
-                    action="SUBMIT",
-                    client_order_id="AMBIGUOUS-CID",
-                    is_new_entry=True,
-                ),
-            ),
-            broker_open_order_ids=frozenset({"B-AMBIGUOUS"}),
-            # The complete reconciliation classified the broker row as the
-            # unresolved candidate for this durable ambiguous command.
-            remembered_broker_order_ids=frozenset({"B-AMBIGUOUS"}),
-        )
-    )
+    assert reconciled.recovery_candidate_broker_order_ids == ("B-AMBIGUOUS",)
+    _assert_gate1(engine, broker)
 
 
 @pytest.mark.usefixtures("trading_enabled")
@@ -508,17 +666,7 @@ def test_gate1_database_outage_open_exposure_replays_emergency_journal_on_restar
     assert recovered_card.broker_quantity == 7
     assert len(broker.submit_calls) == 1
 
-    _assert_gate1(
-        Gate1SystemObservation(
-            mutations=(
-                BrokerMutationObservation(action="SUBMIT", client_order_id="OUTAGE-SELL-1"),
-            ),
-            broker_open_order_ids=frozenset({"B-OUTAGE-SELL"}),
-            remembered_broker_order_ids=frozenset({recovered_order.broker_order_id}),
-            broker_holdings={SYMBOL: 7},
-            projected_card_quantities={SYMBOL: recovered_card.broker_quantity},
-        )
-    )
+    _assert_gate1(engine, broker)
 
 
 @pytest.mark.usefixtures("trading_enabled")
@@ -561,13 +709,7 @@ def test_gate1_stop_breach_survives_device_handoff_and_submits_once(tmp_path):
     assert not accumulator.drain(SYMBOL).pending.stop_breach_latched
     assert len(broker.submit_calls) == 1
 
-    _assert_gate1(
-        Gate1SystemObservation(
-            mutations=(
-                BrokerMutationObservation(action="SUBMIT", client_order_id="NEW-LEASE-STOP"),
-            )
-        )
-    )
+    _assert_gate1(engine, broker)
 
 
 @pytest.mark.usefixtures("trading_enabled")
@@ -618,21 +760,7 @@ def test_gate1_external_order_fence_requires_exact_adopted_cancel_before_emergen
     assert len(broker.cancel_calls) == 1
     assert len(broker.submit_calls) == 1
 
-    _assert_gate1(
-        Gate1SystemObservation(
-            mutations=(
-                BrokerMutationObservation(
-                    action="CANCEL",
-                    client_order_id=adopted.client_order_id,
-                    target_broker_order_id="B-EXTERNAL-BUY",
-                    exact_order_owned=True,
-                ),
-                BrokerMutationObservation(
-                    action="SUBMIT", client_order_id="UNFENCED-EMERGENCY-SELL"
-                ),
-            )
-        )
-    )
+    _assert_gate1(engine, broker)
 
 
 def test_gate1_migration_restart_runs_broker_reconciliation_before_entries_ready(
@@ -698,12 +826,7 @@ def test_gate1_migration_restart_runs_broker_reconciliation_before_entries_ready
     reconciled = card_repo.get_trade_card(engine, ENVIRONMENT, ACCOUNT, SYMBOL)
     assert reconciled.broker_quantity == 5
 
-    _assert_gate1(
-        Gate1SystemObservation(
-            broker_holdings={SYMBOL: 5},
-            projected_card_quantities={SYMBOL: reconciled.broker_quantity},
-        )
-    )
+    _assert_gate1(engine, broker)
 
 
 @pytest.mark.usefixtures("trading_enabled")
@@ -790,12 +913,4 @@ def test_gate1_rate_limit_pressure_prioritizes_real_emergency_liquidation(tmp_pa
     assert failures == []
     assert order[0:2] == ["display-0", "emergency-exit"]
     assert len(broker.submit_calls) == 1
-    _assert_gate1(
-        Gate1SystemObservation(
-            mutations=(
-                BrokerMutationObservation(
-                    action="SUBMIT", client_order_id="RATE-EMERGENCY-SELL"
-                ),
-            )
-        )
-    )
+    _assert_gate1(engine, broker)
