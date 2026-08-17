@@ -1,0 +1,141 @@
+from types import SimpleNamespace
+
+from src.core.board_workflow import BoardProjectionContext
+from src.ui.buyboard import board as buyboard_board
+from src.ui.buyboard import controller as buyboard_controller
+from src.ui.mixins.dashboard_mixin import DashboardMixin
+
+
+def test_market_data_status_formatting_never_queries_the_database():
+    window = SimpleNamespace(
+        db_enabled=True,
+        db_engine=object(),
+        _cached_market_data_status=None,
+    )
+
+    assert DashboardMixin._format_market_data_status(window) == "Checking..."
+
+
+def test_buyboard_projection_worker_uses_authoritative_services(monkeypatch):
+    from src.services import trade_card_bootstrap
+
+    calls = []
+    projections = [object()]
+    monkeypatch.setattr(
+        trade_card_bootstrap,
+        "bootstrap_trade_cards_from_current_state",
+        lambda engine, **kwargs: calls.append(("bootstrap", engine, kwargs)),
+    )
+    monkeypatch.setattr(
+        buyboard_controller.execution_workflow_service,
+        "list_board_projections",
+        lambda engine, **kwargs: (
+            calls.append(("projection", engine, kwargs)) or projections
+        ),
+    )
+    request = buyboard_controller.BuyboardProjectionRequest(
+        engine=object(),
+        context=BoardProjectionContext(),
+        buylist_manager=object(),
+        watchlist=object(),
+        default_account_no="account",
+        account_snapshots={},
+        account_snapshot_fetched_at={},
+        runtime_running=True,
+        generation=4,
+    )
+    completed = []
+    worker = buyboard_controller.BuyboardProjectionWorker(request)
+    worker.completed.connect(
+        lambda result, error, generation: completed.append(
+            (result, error, generation)
+        )
+    )
+
+    worker.run()
+
+    assert [call[0] for call in calls] == ["bootstrap", "projection"]
+    assert completed == [(projections, "", 4)]
+
+
+class _Signal:
+    def __init__(self):
+        self.callback = None
+
+    def connect(self, callback):
+        self.callback = callback
+
+
+class _ProjectionWorkerStub:
+    instances = []
+
+    def __init__(self, request):
+        self.request = request
+        self.completed = _Signal()
+        self.started = False
+        self.__class__.instances.append(self)
+
+    def isRunning(self):
+        return self.started
+
+    def start(self):
+        self.started = True
+
+
+class _ProjectionWindow:
+    def __init__(self, request):
+        self.request = request
+        self.tracked = []
+
+    def _buyboard_projection_request(self, generation):
+        return self.request
+
+    def _track_worker(self, name, worker):
+        self.tracked.append((name, worker))
+
+    def _on_buyboard_projection_completed(self, *_args):
+        return None
+
+
+def test_refresh_buyboard_starts_worker_without_running_db_read_on_gui_thread(
+    monkeypatch,
+):
+    _ProjectionWorkerStub.instances = []
+    request = object()
+    window = _ProjectionWindow(request)
+    populated = []
+    monkeypatch.setattr(
+        buyboard_controller, "BuyboardProjectionWorker", _ProjectionWorkerStub
+    )
+    monkeypatch.setattr(
+        buyboard_board,
+        "populate_buyboard_columns",
+        lambda _window, values: populated.append(values),
+    )
+    monkeypatch.setattr(
+        buyboard_controller.execution_workflow_service,
+        "list_board_projections",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("projection DB read ran on the GUI thread")
+        ),
+    )
+
+    buyboard_controller.BuyboardMixin.refresh_buyboard(window)
+
+    worker = _ProjectionWorkerStub.instances[0]
+    assert worker.request is request
+    assert worker.started is True
+    assert window.tracked == [("_buyboard_projection_worker", worker)]
+    assert populated == []
+
+
+def test_busy_buyboard_projection_is_coalesced_without_invalidating_its_result():
+    window = _ProjectionWindow(object())
+    running = _ProjectionWorkerStub(object())
+    running.started = True
+    window._buyboard_projection_worker = running
+    window._buyboard_projection_generation = 7
+
+    buyboard_controller.BuyboardMixin.refresh_buyboard(window)
+
+    assert window._buyboard_projection_generation == 7

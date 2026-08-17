@@ -8,8 +8,11 @@ Buy Today / exits / stops before market open or while it is pull-only.
 """
 from __future__ import annotations
 
-from dataclasses import replace
+import copy
+from dataclasses import dataclass, replace
 import logging
+
+from PyQt5.QtCore import QThread, pyqtSignal
 
 from src.core.board_workflow import (
     AnyBoardCommand,
@@ -33,6 +36,67 @@ logger = logging.getLogger(__name__)
 
 # Compatibility name used by existing extensions/tests.
 CommandRejectedError = BoardCommandRejectedError
+
+
+@dataclass(frozen=True)
+class BuyboardProjectionRequest:
+    """Immutable inputs copied on the GUI thread for a projection read."""
+
+    engine: object
+    context: BoardProjectionContext
+    buylist_manager: object
+    watchlist: object
+    default_account_no: str
+    account_snapshots: dict
+    account_snapshot_fetched_at: dict
+    runtime_running: bool
+    generation: int
+
+
+class BuyboardProjectionWorker(QThread):
+    """Build the canonical board projection without blocking Qt."""
+
+    completed = pyqtSignal(object, str, int)
+
+    def __init__(self, request: BuyboardProjectionRequest) -> None:
+        super().__init__()
+        self.request = request
+
+    def run(self) -> None:
+        request = self.request
+        try:
+            from src.services.trade_card_bootstrap import (
+                bootstrap_trade_cards_from_current_state,
+            )
+
+            kwargs = {}
+            if not request.runtime_running:
+                kwargs = {
+                    "account_snapshots": request.account_snapshots,
+                    "account_snapshot_fetched_at": (
+                        request.account_snapshot_fetched_at
+                    ),
+                }
+            try:
+                bootstrap_trade_cards_from_current_state(
+                    request.engine,
+                    buylist_manager=request.buylist_manager,
+                    watchlist=request.watchlist,
+                    default_account_no=request.default_account_no,
+                    **kwargs,
+                )
+            except Exception:
+                logger.exception("Buy Board bootstrap refresh failed")
+
+            projections = execution_workflow_service.list_board_projections(
+                request.engine,
+                environment="PROD",
+                context=request.context,
+            )
+            self.completed.emit(projections, "", request.generation)
+        except Exception as exc:
+            logger.exception("Buy Board projection refresh failed")
+            self.completed.emit([], str(exc), request.generation)
 
 
 def apply_board_command(engine, command: AnyBoardCommand, *, context=None):
@@ -170,6 +234,49 @@ class BuyboardMixin:
         timer.start()
         self._buyboard_projection_timer = timer
 
+    def _buyboard_projection_request(self, generation: int):
+        engine = self._buyboard_engine()
+        if engine is None:
+            return None
+
+        default_account_no = str(
+            get_env_value("KIS_PROD_ACCOUNT_NO", "")
+            or get_env_value("KIS_ACCOUNT_NO", "")
+            or ""
+        ).strip()
+        if not default_account_no:
+            for item in list(
+                getattr(self.__dict__.get("buylist_manager"), "items", ()) or ()
+            ):
+                account_no = str(getattr(item, "kis_account_no", "") or "").strip()
+                if account_no:
+                    default_account_no = account_no
+                    break
+
+        runtime_worker = _worker_for(self)
+        runtime_running = False
+        if runtime_worker is not None:
+            try:
+                runtime_running = bool(runtime_worker.isRunning())
+            except RuntimeError:
+                runtime_running = False
+
+        return BuyboardProjectionRequest(
+            engine=engine,
+            context=_projection_context(self),
+            buylist_manager=copy.deepcopy(self.__dict__.get("buylist_manager")),
+            watchlist=copy.deepcopy(self.__dict__.get("watchlist")),
+            default_account_no=default_account_no,
+            account_snapshots=copy.deepcopy(
+                self.__dict__.get("kis_account_snapshots", {})
+            ),
+            account_snapshot_fetched_at=copy.deepcopy(
+                self.__dict__.get("kis_account_snapshot_fetched_at", {})
+            ),
+            runtime_running=runtime_running,
+            generation=generation,
+        )
+
     def _bootstrap_buyboard_projection(self) -> None:
         """Create only missing cards from state the application already owns."""
 
@@ -229,16 +336,38 @@ class BuyboardMixin:
     def refresh_buyboard(self) -> None:
         from .board import populate_buyboard_columns
 
-        try:
-            self._bootstrap_buyboard_projection()
-        except Exception:
-            logger.exception("Buy Board bootstrap refresh failed")
+        worker = self.__dict__.get("_buyboard_projection_worker")
+        if worker is not None:
+            try:
+                if worker.isRunning():
+                    return
+            except RuntimeError:
+                pass
 
-        projections = execution_workflow_service.list_board_projections(
-            self._buyboard_engine(),
-            environment="PROD",
-            context=_projection_context(self),
-        )
+        generation = int(
+            self.__dict__.get("_buyboard_projection_generation", 0)
+        ) + 1
+        self._buyboard_projection_generation = generation
+        request = self._buyboard_projection_request(generation)
+        if request is None:
+            populate_buyboard_columns(self, [])
+            return
+
+        worker = BuyboardProjectionWorker(request)
+        self._buyboard_projection_worker = worker
+        worker.completed.connect(self._on_buyboard_projection_completed)
+        self._track_worker("_buyboard_projection_worker", worker)
+        worker.start()
+
+    def _on_buyboard_projection_completed(
+        self, projections, error: str, generation: int
+    ) -> None:
+        if generation != self.__dict__.get("_buyboard_projection_generation", 0):
+            return
+        if error:
+            return
+        from .board import populate_buyboard_columns
+
         populate_buyboard_columns(self, projections)
 
     def _buyboard_dispatch_command(self, command: AnyBoardCommand) -> bool:

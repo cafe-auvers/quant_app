@@ -145,6 +145,42 @@ class DatabaseInitWorker(QThread):
 
 
 @dataclass(frozen=True)
+class MarketDataStatusResult:
+    """Slow market-cache watermarks resolved outside the GUI thread."""
+
+    engine: object
+    latest_daily: object = None
+    latest_hourly: object = None
+    error: str = ""
+
+
+class MarketDataStatusWorker(QThread):
+    """Read market-cache watermarks without freezing the dashboard."""
+
+    completed = pyqtSignal(object)
+
+    def __init__(self, engine) -> None:
+        super().__init__()
+        self.engine = engine
+
+    def run(self) -> None:
+        try:
+            from src.infrastructure.database.repositories.market_bars import \
+                get_latest_hourly_price_history_timestamp
+            from src.infrastructure.database.repositories.market_watermarks import \
+                get_latest_price_history_date
+
+            result = MarketDataStatusResult(
+                engine=self.engine,
+                latest_daily=get_latest_price_history_date(self.engine),
+                latest_hourly=get_latest_hourly_price_history_timestamp(self.engine),
+            )
+        except Exception as exc:
+            result = MarketDataStatusResult(engine=self.engine, error=str(exc))
+        self.completed.emit(result)
+
+
+@dataclass(frozen=True)
 class DatabaseRecoveryOutcome:
     engine: object
     success: bool
@@ -345,6 +381,10 @@ class MainWindow(
         # code that touches real Qt widget APIs on `self` outside of a
         # normal event-driven callback should check this first.
         self._qt_base_initialized = True
+        # Widget construction must not initiate per-symbol network fallbacks.
+        # This marker is cleared only after every synchronous startup refresh
+        # has completed and the window is ready to enter the Qt event loop.
+        self._window_initializing = True
         # ``append_log`` is also passed to the plain Python thread used for
         # background state saves.  Always cross back through a Qt signal before
         # touching the QTextEdit so that every widget mutation runs on the GUI
@@ -450,6 +490,7 @@ class MainWindow(
         self.latest_intraday_sources: dict[tuple[str, str], str] = {}
         self.intraday_fetch_attempts: dict[str, dt.datetime] = {}
         self._cached_market_data_status = None
+        self.market_data_status_worker = None
         self.orb_trade_plan_column_data: dict[int, dict] = {}
         self.updating_orb_selection = False
         self.intraday_bulk_purpose = "watchlist"
@@ -557,6 +598,7 @@ class MainWindow(
         QTimer.singleShot(2500, lambda: self.refresh_usd_krw_rate(show_messages=False))
         QTimer.singleShot(4000, self.reconcile_open_orders)
         self._apply_shortcuts()
+        self._window_initializing = False
 
     def _init_controllers(self) -> None:
         """Initialize non-rendering workflow controllers."""
@@ -626,11 +668,58 @@ class MainWindow(
             self.append_log(
                 "MySQL cache is unavailable; scanner and cached intraday features remain disabled."
             )
+        self._start_market_data_status_refresh()
         self.update_dashboard_summary()
         # The startup resolver already performed the first PC database probe.
         # Start service polling only after that probe has completed so startup
         # never launches duplicate connection attempts in separate QThreads.
         self._poll_pc_status()
+
+    def _start_market_data_status_refresh(self) -> None:
+        """Refresh slow DB watermarks on a worker, never on the Qt thread."""
+        if not self.db_enabled or self.db_engine is None:
+            self._cached_market_data_status = None
+            return
+        if not self.__dict__.get("_qt_base_initialized", False):
+            # Lightweight unit-test doubles deliberately bypass QObject init.
+            return
+        worker = self.__dict__.get("market_data_status_worker")
+        if worker is not None and worker.isRunning():
+            return
+        self._cached_market_data_status = "Checking..."
+        worker = MarketDataStatusWorker(self.db_engine)
+        self.market_data_status_worker = worker
+        worker.completed.connect(self._on_market_data_status_completed)
+        self._track_worker("market_data_status_worker", worker)
+        worker.start()
+
+    @pyqtSlot(object)
+    def _on_market_data_status_completed(self, result: MarketDataStatusResult) -> None:
+        if (
+            self.__dict__.get("_database_shutting_down", False)
+            or result.engine is not self.__dict__.get("db_engine")
+        ):
+            return
+        if result.error:
+            self._cached_market_data_status = "Unavailable"
+        elif result.latest_daily is None:
+            self._cached_market_data_status = "No cached data"
+        else:
+            daily_status = self._format_market_data_status_from_date(
+                result.latest_daily
+            )
+            if result.latest_hourly is None:
+                self._cached_market_data_status = (
+                    f"Daily {daily_status}; 1H no cached data"
+                )
+            else:
+                hourly_text = pd.Timestamp(result.latest_hourly).strftime(
+                    "%Y-%m-%d %H:%M"
+                )
+                self._cached_market_data_status = (
+                    f"Daily {daily_status}; 1H latest {hourly_text} UTC"
+                )
+        self.update_dashboard_summary()
 
     def _sync_active_pc_to_local_mirror(self) -> None:
         """Periodically preserve the active PC database for sudden failover."""
