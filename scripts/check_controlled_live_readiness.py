@@ -95,6 +95,17 @@ def _configured(name: str) -> bool:
     return bool(str(os.getenv(name, "") or "").strip())
 
 
+def _missing_external_delivery_configuration() -> tuple[str, ...]:
+    return tuple(
+        name
+        for name in (
+            "EXTERNAL_ALERT_WEBHOOK_URL",
+            "EXTERNAL_HEARTBEAT_WEBHOOK_URL",
+        )
+        if not _configured(name)
+    )
+
+
 def main() -> int:
     result = Preflight()
 
@@ -236,17 +247,18 @@ def main() -> int:
 
     result.guarded("canonical MySQL connectivity", _check_mysql)
 
+    missing_delivery = _missing_external_delivery_configuration()
+    result.check(
+        "external alert and heartbeat delivery",
+        not missing_delivery,
+        "missing " + ", ".join(missing_delivery),
+    )
+
     if not _configured("KIS_WS_HTS_ID"):
         result.warn(
             "KIS_WS_HTS_ID is absent. This does not block the supervised pilot "
             "when execution-notice capability is omitted; REST reconciliation remains authoritative."
         )
-    if not _configured("EXTERNAL_ALERT_WEBHOOK_URL"):
-        result.warn(
-            "EXTERNAL_ALERT_WEBHOOK_URL is not configured. Keep the pilot supervised; "
-            "do not treat this run as unattended-launch approval."
-        )
-
     print("Controlled-live preflight")
     print(f"  git head: {head or '<unknown>'}")
     for name in result.passes:
