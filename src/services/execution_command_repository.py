@@ -164,7 +164,11 @@ def _get_execution_commands_table(metadata: MetaData) -> Table:
         Column("target_broker_order_id", String(64), nullable=False, server_default=""),
         Column("requested_at", DateTime, nullable=False),
         Column("status", String(24), nullable=False, server_default="REQUESTED"),
-        Column("redacted_response", Text(length=16_777_215), nullable=False, server_default="{}"),
+        # MySQL 5.7 and older MariaDB releases reject DEFAULT values on
+        # TEXT/BLOB columns (error 1101). Every insert path already writes
+        # the redacted JSON explicitly, so a server-side default is neither
+        # needed nor portable.
+        Column("redacted_response", Text(length=16_777_215), nullable=False),
         Column("response_hash", String(64), nullable=False, server_default=""),
         Column("version", BigInteger, nullable=False, server_default="1"),
         Column("source", String(32), nullable=False, server_default=""),

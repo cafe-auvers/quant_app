@@ -6,8 +6,10 @@ docs/kanban_production_readiness.md, Workstream 2, A5, revisions 3.1 and
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import MetaData, create_engine
+from sqlalchemy.dialects import mysql
 from sqlalchemy.pool import NullPool
+from sqlalchemy.schema import CreateTable
 
 from src.services import execution_command_repository as repo
 
@@ -37,6 +39,16 @@ def _command(**overrides) -> repo.ExecutionCommand:
     )
     fields.update(overrides)
     return repo.ExecutionCommand(**fields)
+
+
+def test_mysql_command_journal_text_column_has_no_server_default():
+    table = repo._get_execution_commands_table(MetaData())
+    ddl = str(CreateTable(table).compile(dialect=mysql.dialect()))
+    response_line = next(
+        line for line in ddl.splitlines() if "redacted_response" in line
+    )
+
+    assert "DEFAULT" not in response_line.upper()
 
 
 # --- Construction / validation ------------------------------------------
