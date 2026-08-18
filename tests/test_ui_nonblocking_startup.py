@@ -1,6 +1,14 @@
 from types import SimpleNamespace
+import threading
+import time
 
-from src.core.board_workflow import BoardProjectionContext
+from PyQt5.QtCore import QCoreApplication
+
+from src.core.board_workflow import (
+    BoardActionContext,
+    BoardProjectionContext,
+    MoveToBuylist,
+)
 from src.ui.buyboard import board as buyboard_board
 from src.ui.buyboard import controller as buyboard_controller
 from src.ui.mixins.dashboard_mixin import DashboardMixin
@@ -67,6 +75,10 @@ class _Signal:
     def connect(self, callback):
         self.callback = callback
 
+    def emit(self, *args):
+        if self.callback is not None:
+            self.callback(*args)
+
 
 class _ProjectionWorkerStub:
     instances = []
@@ -74,6 +86,7 @@ class _ProjectionWorkerStub:
     def __init__(self, request):
         self.request = request
         self.completed = _Signal()
+        self.finished = _Signal()
         self.started = False
         self.__class__.instances.append(self)
 
@@ -84,7 +97,7 @@ class _ProjectionWorkerStub:
         self.started = True
 
 
-class _ProjectionWindow:
+class _ProjectionWindow(buyboard_controller.BuyboardMixin):
     def __init__(self, request):
         self.request = request
         self.tracked = []
@@ -106,6 +119,29 @@ class _InteractiveProjectionWindow(buyboard_controller.BuyboardMixin):
 
     def refresh_buyboard(self):
         self.refresh_count += 1
+
+
+class _PendingColumn:
+    def __init__(self):
+        self.states = []
+
+    def set_pending_card_keys(self, keys):
+        self.states.append(set(keys))
+
+
+class _CommandWindow(buyboard_controller.BuyboardMixin):
+    def __init__(self):
+        self.pc_db_engine = object()
+        self.buyboard_columns = {"buylist": _PendingColumn()}
+        self.refresh_count = 0
+        self.results = []
+
+    def refresh_buyboard(self):
+        self.refresh_count += 1
+
+    def _on_buyboard_command_completed(self, result):
+        self.results.append(result)
+        super()._on_buyboard_command_completed(result)
 
 
 def test_refresh_buyboard_starts_worker_without_running_db_read_on_gui_thread(
@@ -150,6 +186,133 @@ def test_busy_buyboard_projection_is_coalesced_without_invalidating_its_result()
     buyboard_controller.BuyboardMixin.refresh_buyboard(window)
 
     assert window._buyboard_projection_generation == 7
+    assert window._buyboard_refresh_pending is True
+
+
+def test_twenty_busy_refreshes_start_exactly_one_trailing_projection(monkeypatch):
+    _ProjectionWorkerStub.instances = []
+    window = _ProjectionWindow(object())
+    monkeypatch.setattr(
+        buyboard_controller, "BuyboardProjectionWorker", _ProjectionWorkerStub
+    )
+
+    window.refresh_buyboard()
+    first = _ProjectionWorkerStub.instances[0]
+    for _ in range(20):
+        window.refresh_buyboard()
+
+    assert len(_ProjectionWorkerStub.instances) == 1
+    first.started = False
+    first.finished.emit()
+
+    assert len(_ProjectionWorkerStub.instances) == 2
+    assert _ProjectionWorkerStub.instances[1].started is True
+    assert not window.__dict__.get("_buyboard_refresh_pending", False)
+
+
+def test_board_command_with_500ms_database_latency_does_not_block_dispatch(
+    monkeypatch,
+):
+    app = QCoreApplication.instance() or QCoreApplication([])
+    window = _CommandWindow()
+    monkeypatch.setattr(
+        buyboard_controller,
+        "_action_context",
+        lambda *_args: BoardActionContext(),
+    )
+
+    def slow_request(*_args, **_kwargs):
+        time.sleep(0.5)
+
+    monkeypatch.setattr(
+        buyboard_controller.execution_workflow_service,
+        "request_board_action",
+        slow_request,
+    )
+    command = MoveToBuylist(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        expected_card_version=1,
+    )
+
+    started_at = time.perf_counter()
+    assert window._buyboard_dispatch_command(command) is True
+    dispatch_ms = (time.perf_counter() - started_at) * 1000.0
+
+    assert dispatch_ms < 50.0
+    assert window.buyboard_columns["buylist"].states[-1] == {"PROD:1:AAPL"}
+
+    deadline = time.monotonic() + 2.0
+    while not window.results and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.005)
+    app.processEvents()
+    worker = window._buyboard_command_worker
+    worker.request_stop()
+    assert worker.wait(1000)
+
+    assert len(window.results) == 1
+    assert window.results[0].succeeded is True
+    assert window.results[0].elapsed_ms >= 450.0
+    assert window.refresh_count == 1
+    assert window.buyboard_columns["buylist"].states[-1] == set()
+
+
+def test_board_commands_share_one_serial_worker(monkeypatch):
+    app = QCoreApplication.instance() or QCoreApplication([])
+    window = _CommandWindow()
+    first_started = threading.Event()
+    release_first = threading.Event()
+    calls = []
+    monkeypatch.setattr(
+        buyboard_controller,
+        "_action_context",
+        lambda *_args: BoardActionContext(),
+    )
+
+    def request(_engine, command, **_kwargs):
+        calls.append(command.symbol)
+        if command.symbol == "AAPL":
+            first_started.set()
+            assert release_first.wait(1.0)
+
+    monkeypatch.setattr(
+        buyboard_controller.execution_workflow_service,
+        "request_board_action",
+        request,
+    )
+    first = MoveToBuylist(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        expected_card_version=1,
+    )
+    second = MoveToBuylist(
+        environment="PROD",
+        account_no="1",
+        symbol="MSFT",
+        expected_card_version=1,
+    )
+
+    window._buyboard_dispatch_command(first)
+    worker = window._buyboard_command_worker
+    assert first_started.wait(1.0)
+    window._buyboard_dispatch_command(second)
+
+    assert window._buyboard_command_worker is worker
+    assert calls == ["AAPL"]
+    release_first.set()
+    deadline = time.monotonic() + 2.0
+    while len(window.results) < 2 and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.005)
+    app.processEvents()
+    worker.request_stop()
+    assert worker.wait(1000)
+
+    assert calls == ["AAPL", "MSFT"]
+    assert len(window.results) == 2
 
 
 def test_projection_rebuild_is_deferred_until_user_interaction_finishes(

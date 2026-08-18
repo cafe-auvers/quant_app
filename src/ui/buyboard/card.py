@@ -413,6 +413,13 @@ class TradeCardWidget(QFrame):
         self.card_key = card.card_key
         self.card_state = card
         self._projection = projection
+        self._pending = False
+        self._pending_label = QLabel("Saving\u2026")
+        self._pending_label.setStyleSheet(
+            "color: #1565c0; font-size: 11px; font-weight: bold;"
+        )
+        self._pending_label.hide()
+        layout.addWidget(self._pending_label)
         status_text = _card_status_text(card, projection)
         if status_text:
             status_label = QLabel(html.escape(status_text))
@@ -543,6 +550,15 @@ class TradeCardWidget(QFrame):
         """Backward-compatible alias for older callers/tests."""
 
         return self.update_live_metrics(card, current_price)
+
+    def set_pending(self, pending: bool) -> None:
+        """Toggle the per-card save indicator without rebuilding the widget."""
+
+        pending = bool(pending)
+        if pending == self._pending:
+            return
+        self._pending = pending
+        self._pending_label.setVisible(pending)
 
 
 def card_drag_payload(

@@ -169,6 +169,9 @@ class _FakeMainWindow(QWidget):
         # assert on the resulting priorities without re-implementing that
         # plumbing themselves.
         self._cards_by_symbol = {card.symbol: card for card in cards}
+        self._buyboard_current_projections = tuple(
+            BoardCardProjection(card=card) for card in cards
+        )
 
     def _buyboard_engine(self):
         return self._engine
@@ -300,7 +303,7 @@ def test_context_menu_offers_remove_from_today_for_buy_today_card(tmp_path, monk
     _ensure_app()
     engine = _make_engine(tmp_path)
     card = repo.create_trade_card(engine, _card(board_status=BoardStatus.BUY_TODAY))
-    window = _FakeMainWindow(engine)
+    window = _FakeMainWindow(engine, cards=[card])
 
     captured_menu = {}
 
@@ -325,7 +328,7 @@ def test_context_menu_offers_cancel_entry_for_entry_pending_card(tmp_path, monke
     _ensure_app()
     engine = _make_engine(tmp_path)
     card = repo.create_trade_card(engine, _card(board_status=BoardStatus.ENTRY_PENDING))
-    window = _FakeMainWindow(engine)
+    window = _FakeMainWindow(engine, cards=[card])
 
     monkeypatch.setattr(QMenu, "exec_", lambda self, pos: _find_action_by_text(self, "Cancel Entry"))
 
@@ -345,7 +348,7 @@ def test_context_menu_has_no_cancel_entry_action_for_open_position(tmp_path, mon
     card = repo.create_trade_card(
         engine, _card(board_status=BoardStatus.OPEN_POSITION, broker_quantity=10, average_entry_price=100.0)
     )
-    window = _FakeMainWindow(engine)
+    window = _FakeMainWindow(engine, cards=[card])
 
     captured_menu = {}
 
@@ -397,6 +400,29 @@ def test_dragging_partial_sell_to_open_dispatches_partial_withdrawal(tmp_path, m
 
     assert len(window.dispatched) == 1
     assert isinstance(window.dispatched[0], CancelPartialSell)
+
+
+def test_drop_uses_rendered_projection_without_database_read(monkeypatch):
+    card = _card(board_status=BoardStatus.BUYLIST, version=4)
+    projection = BoardCardProjection(card=card)
+    window = _FakeMainWindow(engine=object(), cards=[card])
+    window._buyboard_current_projections = (projection,)
+    monkeypatch.setattr(
+        board_module.execution_workflow_service,
+        "get_board_projection",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("drop handler queried the database")
+        ),
+    )
+
+    board_module._handle_card_dropped(
+        window,
+        card_drag_payload(projection),
+        BoardStatus.BUY_TODAY,
+    )
+
+    assert len(window.dispatched) == 1
+    assert window.dispatched[0].symbol == "AAPL"
 
 
 def test_dragging_sell_all_to_partial_sell_prompts_and_dispatches_reduction(
@@ -541,3 +567,24 @@ def test_equivalent_refresh_reuses_widget_and_updates_payload_and_quote():
     assert column.itemWidget(column.item(0)) is widget
     assert column.item(0).data(Qt.UserRole)["version"] == 8
     assert "+10.00%" in widget._info_label.text()
+
+
+def test_pending_card_shows_saving_state_and_disables_repeat_drag():
+    _ensure_app()
+    column = BoardColumnList(BoardStatus.BUYLIST, lambda *_args: None)
+    card = _card(board_status=BoardStatus.BUYLIST)
+    column.set_cards([card])
+    item = column.item(0)
+    widget = column.itemWidget(item)
+
+    column.set_pending_card_keys({card.card_key})
+
+    assert widget._pending is True
+    assert widget._pending_label.isHidden() is False
+    assert not bool(item.flags() & Qt.ItemIsDragEnabled)
+
+    column.set_pending_card_keys(set())
+
+    assert widget._pending is False
+    assert widget._pending_label.isHidden() is True
+    assert bool(item.flags() & Qt.ItemIsDragEnabled)
