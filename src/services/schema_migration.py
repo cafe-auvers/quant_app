@@ -519,6 +519,18 @@ class SchemaMigrationManager:
         state = self.state
         if state.target_version != self.target_version:
             raise MigrationError("Migration target version does not match this runtime")
+        if state.phase == MigrationPhase.READY:
+            if not state.reconciliation_complete:
+                raise MigrationError(
+                    "READY migration state is missing reconciliation confirmation"
+                )
+            # The exact lease recorded on a completed cutover is permanent
+            # audit evidence, not continuing ownership of the schema. A
+            # later Main-device lease has already been verified above and
+            # may use the fully reconciled schema without rewriting that
+            # historical identity. In-progress phases remain exact-lease
+            # fenced below.
+            return state
         if state.cutover_device_id and (
             state.cutover_device_id != device_id
             or state.cutover_lease_token != lease_token
@@ -527,8 +539,6 @@ class SchemaMigrationManager:
             raise MigrationCutoverOwnershipError(
                 "A different exact lease owns the in-progress migration cutover"
             )
-        if state.phase == MigrationPhase.READY:
-            return state
         if state.phase == MigrationPhase.NOT_STARTED:
             payload = self._build_backup_payload(source_version)
             checksum = self._write_backup(payload)
