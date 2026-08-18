@@ -175,6 +175,9 @@ class BoardColumnList(QListWidget):
             | BoardExecutionOrderProjection
         ],
         quote_lookup: Optional[Callable[[str], Optional[float]]] = None,
+        account_equity_lookup: Optional[
+            Callable[[str, str], Optional[float]]
+        ] = None,
     ) -> bool:
         """``quote_lookup``, when supplied, returns the live last price for
         a symbol (e.g. from a running ``RealtimeMarketDataService``) so
@@ -247,7 +250,19 @@ class BoardColumnList(QListWidget):
                         if quote_lookup is not None
                         else None
                     )
-                    widget.update_current_price(card_state, current_price)
+                    account_equity = (
+                        account_equity_lookup(
+                            card_state.environment,
+                            card_state.account_no,
+                        )
+                        if account_equity_lookup is not None
+                        else None
+                    )
+                    widget.update_live_metrics(
+                        card_state,
+                        current_price,
+                        account_equity,
+                    )
             return False
 
         self.clear()
@@ -277,7 +292,19 @@ class BoardColumnList(QListWidget):
                 if quote_lookup is not None
                 else None
             )
-            widget = TradeCardWidget(card, current_price=current_price)
+            account_equity = (
+                account_equity_lookup(
+                    card_state.environment,
+                    card_state.account_no,
+                )
+                if account_equity_lookup is not None
+                else None
+            )
+            widget = TradeCardWidget(
+                card,
+                current_price=current_price,
+                account_equity=account_equity,
+            )
             item.setSizeHint(widget.sizeHint())
             self.setItemWidget(item, widget)
             if isinstance(card, BoardCardProjection):
@@ -300,3 +327,31 @@ class BoardColumnList(QListWidget):
                     self.setItemWidget(external_item, external_widget)
         self._render_signature = signature
         return True
+
+    def refresh_live_metrics(
+        self,
+        quote_lookup: Optional[Callable[[str], Optional[float]]] = None,
+        account_equity_lookup: Optional[
+            Callable[[str, str], Optional[float]]
+        ] = None,
+    ) -> int:
+        """Repaint quote-derived card values without DB reads or row rebuilds."""
+
+        updated = 0
+        for index in range(self.count()):
+            item = self.item(index)
+            widget = self.itemWidget(item)
+            if not isinstance(widget, TradeCardWidget):
+                continue
+            card = widget.card_state
+            current_price = (
+                quote_lookup(card.symbol) if quote_lookup is not None else None
+            )
+            account_equity = (
+                account_equity_lookup(card.environment, card.account_no)
+                if account_equity_lookup is not None
+                else None
+            )
+            if widget.update_live_metrics(card, current_price, account_equity):
+                updated += 1
+        return updated

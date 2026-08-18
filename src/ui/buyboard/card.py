@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import json
+import math
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QFrame, QLabel, QPushButton, QVBoxLayout
@@ -31,6 +33,28 @@ _BOARD_STATUS_ACCENT = {
 
 def _fmt_price(value) -> str:
     return f"{value:,.2f}" if value else "--"
+
+
+def _fmt_money(value: float, *, signed: bool = False) -> str:
+    """Compact dollar formatting without throwing away meaningful cents."""
+
+    number = float(value or 0.0)
+    if abs(number) < 0.005:
+        number = 0.0
+    amount = f"{abs(number):,.2f}".rstrip("0").rstrip(".")
+    if number < 0:
+        return f"-${amount}"
+    if signed and number > 0:
+        return f"+${amount}"
+    return f"${amount}"
+
+
+def _positive_float(value) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number > 0 else None
 
 
 def _pnl_percent(card: TradeCardState, current_price: float) -> float:
@@ -95,48 +119,279 @@ def board_interaction_fingerprint(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _position_summary(card: TradeCardState, current_price: float | None) -> str:
-    if card.board_status == BoardStatus.OPEN_POSITION or card.broker_quantity:
-        if current_price:
-            pnl = _pnl_percent(card, current_price)
-            pnl_color = "#2e7d32" if pnl >= 0 else "#c62828"
-            pnl_html = f"  <span style='color:{pnl_color};'>{pnl:+.2f}%</span>"
-        else:
-            pnl_html = "  <span style='color:#888;'>P&amp;L: no live quote</span>"
-        return (
-            f"{card.broker_quantity} sh @ {_fmt_price(card.average_entry_price)}"
-            + pnl_html
+def _humanize(value: object) -> str:
+    raw = getattr(value, "value", value)
+    return str(raw or "").strip().replace("_", " ")
+
+
+def _card_status_text(
+    card: TradeCardState,
+    projection: BoardCardProjection | None = None,
+) -> str:
+    """Return a trader-facing lifecycle label, not raw runtime diagnostics."""
+
+    if card.board_status == BoardStatus.BUY_TODAY:
+        return _humanize(card.entry_runtime_status)
+    if card.board_status == BoardStatus.ENTRY_PENDING:
+        if card.entry_cancel_in_flight:
+            return "CANCELLING ENTRY"
+        return "ENTRY - ORDER PENDING" if (
+            card.entry_client_order_id
+            or (projection is not None and projection.working_order_count)
+        ) else "ENTRY PENDING"
+    if card.board_status == BoardStatus.OPEN_POSITION:
+        if card.position_runtime_status == PositionRuntimeStatus.ENTRY_COMPLETING:
+            return "ENTRY COMPLETING"
+        return ""
+    if card.board_status == BoardStatus.PARTIAL_SELL:
+        if card.exit_cancel_in_flight:
+            return "CANCELLING PARTIAL SELL"
+        return "PARTIAL SELL - ORDER PENDING" if (
+            card.exit_client_order_id
+            or (projection is not None and projection.working_order_count)
+        ) else "PARTIAL SELL"
+    if card.board_status == BoardStatus.SELL_ALL:
+        if card.sell_all_at_market_open or (
+            card.position_runtime_status == PositionRuntimeStatus.QUEUED_FOR_OPEN
+        ):
+            return "SELL ALL - QUEUED FOR OPEN"
+        if card.exit_cancel_in_flight:
+            return "SELL ALL - CANCELLING / REPRICING"
+        return "SELL ALL - ORDER PENDING" if (
+            card.exit_client_order_id
+            or (projection is not None and projection.working_order_count)
+        ) else "SELL ALL"
+    if card.board_status == BoardStatus.CLOSED:
+        return "CLOSED"
+    return ""
+
+
+def _entry_target_quantity(card: TradeCardState) -> int:
+    target = (
+        int(card.target_position_quantity or 0)
+        or int(card.planned_quantity or 0)
+        or (
+            int(card.broker_quantity or 0)
+            + int(card.entry_remaining_target_quantity or 0)
         )
-    if card.breakout_price:
-        return f"Breakout {_fmt_price(card.breakout_price)}"
-    return "&nbsp;"
+    )
+    return max(0, int(card.broker_quantity or 0), target)
+
+
+def _stop_pnl(
+    card: TradeCardState,
+    *,
+    quantity: int,
+    entry_price: float | None,
+    require_active_protection: bool,
+) -> float | None:
+    if quantity <= 0:
+        return None
+    entry = _positive_float(entry_price)
+    if require_active_protection:
+        stop = _positive_float(card.active_stop_price)
+        if stop is None or int(card.stop_quantity or 0) < quantity:
+            return None
+    else:
+        stop = _positive_float(card.entry_orb_low or card.active_stop_price)
+    if entry is None or stop is None:
+        return None
+    return (stop - entry) * quantity
+
+
+def _account_result(value: float, account_equity: float | None) -> str:
+    equity = _positive_float(account_equity)
+    percent = (
+        f"{value / equity * 100.0:+.2f}% acct" if equity is not None else "-- acct"
+    )
+    color = "#2e7d32" if value >= 0 else "#c62828"
+    return (
+        f"{percent}&nbsp;&nbsp;"
+        f"<span style='color:{color};'>{_fmt_money(value, signed=True)}</span>"
+    )
+
+
+def _pnl_result(card: TradeCardState, current_price: float | None) -> str:
+    current = _positive_float(current_price)
+    entry = _positive_float(card.average_entry_price)
+    quantity = max(0, int(card.broker_quantity or 0))
+    if current is None or entry is None or quantity <= 0:
+        return "--"
+    percent = _pnl_percent(card, current)
+    dollars = (current - entry) * quantity
+    color = "#2e7d32" if dollars >= 0 else "#c62828"
+    return (
+        f"<span style='color:{color};'>{percent:+.2f}%&nbsp;&nbsp;"
+        f"{_fmt_money(dollars, signed=True)}</span>"
+    )
+
+
+def _card_metric_rows(
+    card: TradeCardState,
+    current_price: float | None,
+    account_equity: float | None = None,
+) -> list[tuple[str, str]]:
+    """Build state-specific facts exclusively from authoritative card/cache data."""
+
+    status = card.board_status
+    if status in (BoardStatus.WATCHLIST, BoardStatus.BUYLIST):
+        return [("Breakout", f"${_fmt_price(card.breakout_price)}")]
+    if status == BoardStatus.CLOSED:
+        # Trade-cycle realized/final P&L is not yet a first-class durable
+        # field. Keep CLOSED honest and simple instead of deriving history
+        # from a now-flat card.
+        return []
+
+    rows: list[tuple[str, str]] = [("Current", f"${_fmt_price(current_price)}")]
+    if status in (BoardStatus.BUY_TODAY, BoardStatus.ENTRY_PENDING):
+        rows.append(("Breakout", f"${_fmt_price(card.breakout_price)}"))
+
+    if status == BoardStatus.BUY_TODAY:
+        current = _positive_float(current_price)
+        breakout = _positive_float(card.breakout_price)
+        distance = (
+            f"{(breakout / current - 1.0) * 100.0:+.2f}%"
+            if current is not None and breakout is not None
+            else "--"
+        )
+        planned = max(0, int(card.planned_quantity or 0))
+        rows.extend(
+            [
+                ("To Breakout", distance),
+                ("Planned", f"{planned:,} sh" if planned else "--"),
+            ]
+        )
+        planned_stop_pnl = _stop_pnl(
+            card,
+            quantity=planned,
+            entry_price=card.entry_trigger or card.breakout_price,
+            require_active_protection=False,
+        )
+        if planned_stop_pnl is not None:
+            rows.append(("Stop P&L", _account_result(planned_stop_pnl, account_equity)))
+        else:
+            risk_fraction = _positive_float(card.risk_percent)
+            equity = _positive_float(account_equity)
+            if risk_fraction is not None and equity is not None:
+                rows.append(
+                    (
+                        "Risk Budget",
+                        f"{risk_fraction * 100.0:.2f}% acct&nbsp;&nbsp;"
+                        f"{_fmt_money(equity * risk_fraction)}",
+                    )
+                )
+        return rows
+
+    if status == BoardStatus.ENTRY_PENDING:
+        filled = max(0, int(card.broker_quantity or 0))
+        target = _entry_target_quantity(card)
+        fill_progress = (
+            f"{filled:,} / {target:,} sh" if target else f"{filled:,} / -- sh"
+        )
+        rows.extend(
+            [
+                ("Filled", fill_progress),
+                ("Avg Fill", f"${_fmt_price(card.average_entry_price)}"),
+            ]
+        )
+        if filled:
+            stop_pnl = _stop_pnl(
+                card,
+                quantity=filled,
+                entry_price=card.average_entry_price,
+                require_active_protection=True,
+            )
+        else:
+            stop_pnl = _stop_pnl(
+                card,
+                quantity=target,
+                entry_price=card.entry_trigger or card.breakout_price,
+                require_active_protection=False,
+            )
+        if stop_pnl is not None:
+            rows.append(("Stop P&L", _account_result(stop_pnl, account_equity)))
+        return rows
+
+    rows.extend(
+        [
+            ("Avg Entry", f"${_fmt_price(card.average_entry_price)}"),
+            ("Position", f"{max(0, int(card.broker_quantity or 0)):,} sh"),
+        ]
+    )
+    if status == BoardStatus.PARTIAL_SELL:
+        selling = max(0, int(card.reserved_sell_quantity or 0)) or max(
+            0, int(card.pending_partial_sell_quantity or 0)
+        )
+        rows.append(("Selling", f"{selling:,} sh" if selling else "--"))
+    elif status == BoardStatus.SELL_ALL:
+        selling = max(0, int(card.reserved_sell_quantity or 0)) or max(
+            0,
+            int(card.orderable_quantity or 0),
+            int(card.broker_quantity or 0),
+        )
+        rows.append(("Selling All", f"{selling:,} sh" if selling else "--"))
+    rows.append(("P&L", _pnl_result(card, current_price)))
+    stop_pnl = _stop_pnl(
+        card,
+        quantity=max(0, int(card.broker_quantity or 0)),
+        entry_price=card.average_entry_price,
+        require_active_protection=True,
+    )
+    if stop_pnl is not None:
+        rows.append(("Stop P&L", _account_result(stop_pnl, account_equity)))
+    return rows
+
+
+def _metric_rows_html(rows: list[tuple[str, str]]) -> str:
+    if not rows:
+        return ""
+    body = "".join(
+        "<tr>"
+        f"<td style='color:#666; padding-right:10px;'>{html.escape(label)}</td>"
+        f"<td align='right'>{value}</td>"
+        "</tr>"
+        for label, value in rows
+    )
+    return f"<table cellspacing='0' cellpadding='1'>{body}</table>"
+
+
+def _visible_restrictions(projection: BoardCardProjection | None) -> tuple[str, ...]:
+    if projection is None:
+        return ()
+    return tuple(
+        reason
+        for reason in projection.engine_restrictions
+        if str(reason).strip().casefold() != "device state is standby"
+    )
+
+
+def _visible_warnings(card: TradeCardState) -> tuple[str, ...]:
+    return tuple(
+        warning
+        for warning in card.warnings
+        if str(warning).strip().casefold() != "migrated_from_buylist"
+    )
 
 
 class TradeCardWidget(QFrame):
-    """Read-only rendering of one card. All mutation happens through
-    ``src.ui.buyboard.controller.apply_board_command`` -- this widget never
-    touches ``TradeCardState`` itself.
-    """
+    """Read-only trader-facing projection of one authoritative card."""
 
-    def __init__(self, card: TradeCardState | BoardCardProjection, current_price: float | None = None, parent=None) -> None:
-        """``current_price`` is a live quote the caller looked up (e.g. from
-        :class:`~src.services.realtime_market_data.RealtimeMarketDataService`),
-        not derived from the card itself. Code review finding P1-7: the
-        original version computed P&L from ``entry_trigger`` (the ORB
-        trigger price, not a live quote), which is not just stale but not
-        even the right *kind* of number -- it silently showed a P&L that
-        had nothing to do with the market. Without a real quote, this shows
-        plain position/breakout facts and no P&L figure at all, rather than
-        a misleading one.
-        """
+    def __init__(
+        self,
+        card: TradeCardState | BoardCardProjection,
+        current_price: float | None = None,
+        account_equity: float | None = None,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         resolved_card, projection = _as_projection(card)
-        self._build(resolved_card, current_price, projection)
+        self._build(resolved_card, current_price, account_equity, projection)
 
     def _build(
         self,
         card: TradeCardState,
         current_price: float | None,
+        account_equity: float | None,
         projection: BoardCardProjection | None = None,
     ) -> None:
         accent = _BOARD_STATUS_ACCENT.get(card.board_status, "#607d8b")
@@ -149,84 +404,40 @@ class TradeCardWidget(QFrame):
         layout.setContentsMargins(8, 6, 8, 6)
         layout.setSpacing(2)
 
-        header = QLabel(f"<b>{card.symbol}</b>  <span style='color:#888;'>{card.name}</span>")
+        header = QLabel(
+            f"<b>{html.escape(card.symbol)}</b>  "
+            f"<span style='color:#888;'>{html.escape(card.name)}</span>"
+        )
         layout.addWidget(header)
 
-        # P1-10: the database's uniqueness scope is (environment, account_no,
-        # symbol), not symbol alone -- two accounts can legitimately hold the
-        # same symbol as two distinct cards. Without this, they'd render as
-        # visually identical cards with no way to tell them apart.
-        if card.account_no:
-            account_lbl = QLabel(f"Account {card.account_no}")
-            account_lbl.setStyleSheet("color: #888; font-size: 10px;")
-            layout.addWidget(account_lbl)
-
-        badge_text = card.entry_runtime_status.value if card.entry_runtime_status else ""
-        if card.position_runtime_status != PositionRuntimeStatus.NONE:
-            badge_text = (badge_text + " " if badge_text else "") + card.position_runtime_status.value
-        if badge_text:
-            badge = QLabel(badge_text)
-            badge.setStyleSheet("color: #555; font-size: 11px;")
-            layout.addWidget(badge)
-
         self.card_key = card.card_key
-        self._info_label = QLabel(_position_summary(card, current_price))
-        layout.addWidget(self._info_label)
+        self.card_state = card
+        self._projection = projection
+        status_text = _card_status_text(card, projection)
+        if status_text:
+            status_label = QLabel(html.escape(status_text))
+            status_label.setStyleSheet(
+                "color: #555; font-size: 11px; font-weight: bold;"
+            )
+            layout.addWidget(status_label)
 
-        if card.stop_type is not None and card.active_stop_price:
-            stop_lbl = QLabel(
-                f"Stop ({card.stop_type.value}): {_fmt_price(card.active_stop_price)}"
-            )
-            stop_lbl.setStyleSheet("color: #b71c1c; font-size: 11px;")
-            layout.addWidget(stop_lbl)
+        self._metrics_label = QLabel(
+            _metric_rows_html(_card_metric_rows(card, current_price, account_equity))
+        )
+        # Compatibility for extensions/tests that inspected the former
+        # single position-summary label directly.
+        self._info_label = self._metrics_label
+        layout.addWidget(self._metrics_label)
+
         if card.pending_stop_command_id and card.pending_stop_price:
-            pending_type = (
-                card.pending_stop_type.value
-                if card.pending_stop_type is not None
-                else "UNKNOWN"
-            )
             pending_stop = QLabel(
-                f"STOP CHANGE PENDING ({pending_type}): "
-                f"{_fmt_price(card.pending_stop_price)}"
+                f"STOP CHANGE PENDING - ${_fmt_price(card.pending_stop_price)}"
             )
             pending_stop.setStyleSheet("color: #ef6c00; font-weight: bold;")
             layout.addWidget(pending_stop)
 
-        if card.broker_quantity or card.orderable_quantity:
-            quantity = QLabel(
-                f"Held {card.broker_quantity} / Orderable {card.orderable_quantity}"
-            )
-            quantity.setStyleSheet("color: #555; font-size: 11px;")
-            layout.addWidget(quantity)
-
-        if card.pending_partial_sell_quantity:
-            pending = QLabel(
-                f"PARTIAL SELL REQUESTED: {card.pending_partial_sell_quantity}"
-            )
-            pending.setStyleSheet("color: #8e24aa; font-weight: bold;")
-            layout.addWidget(pending)
-        elif card.board_status == BoardStatus.PARTIAL_SELL and (
-            card.exit_client_order_id
-            or (projection is not None and projection.working_order_count)
-        ):
-            pending = QLabel("PARTIAL SELL WITHDRAWAL / CANCEL PENDING")
-            pending.setStyleSheet("color: #ef6c00; font-weight: bold;")
-            layout.addWidget(pending)
-        elif card.exit_all_required:
-            pending = QLabel("SELL ALL / PROTECTIVE EXIT PENDING")
-            pending.setStyleSheet("color: #c62828; font-weight: bold;")
-            layout.addWidget(pending)
-
-        if projection is not None and projection.working_order_count:
-            statuses = ", ".join(status.value for status in projection.owned_order_statuses)
-            order = QLabel(
-                f"Owned broker order(s): {projection.working_order_count} [{statuses}]"
-            )
-            order.setStyleSheet("color: #ef6c00; font-size: 11px;")
-            order.setWordWrap(True)
-            layout.addWidget(order)
         if projection is not None and projection.ambiguous_order_count:
-            ambiguous = QLabel("AMBIGUOUS ORDER — reconciliation required")
+            ambiguous = QLabel("AMBIGUOUS ORDER - RECONCILIATION REQUIRED")
             ambiguous.setStyleSheet(
                 "color: white; background-color: #b71c1c; font-weight: bold;"
             )
@@ -236,26 +447,67 @@ class TradeCardWidget(QFrame):
             recon = QLabel("RECONCILIATION BLOCKED / STALE")
             recon.setStyleSheet("color: #c62828; font-weight: bold;")
             layout.addWidget(recon)
-        if projection is not None and projection.engine_restrictions:
-            restriction = QLabel("Restricted: " + " / ".join(projection.engine_restrictions))
+        restrictions = _visible_restrictions(projection)
+        if restrictions:
+            restriction = QLabel("RESTRICTED: " + " / ".join(restrictions))
             restriction.setStyleSheet("color: #ad6704; font-size: 11px;")
             restriction.setWordWrap(True)
             layout.addWidget(restriction)
 
-        if card.exit_all_required:
+        if card.exit_all_required and card.board_status != BoardStatus.SELL_ALL:
             alert = QLabel("EXIT ALL REQUIRED")
-            alert.setStyleSheet("color: white; background-color: #c62828; font-weight: bold;")
+            alert.setStyleSheet(
+                "color: white; background-color: #c62828; font-weight: bold;"
+            )
             layout.addWidget(alert)
 
+        unprotected_shares = 0
+        if card.broker_quantity > 0 and (
+            not card.active_stop_price or card.stop_quantity < card.broker_quantity
+        ):
+            unprotected_shares = max(
+                0, card.broker_quantity - int(card.stop_quantity or 0)
+            )
+            protection = QLabel(
+                f"WARNING: {unprotected_shares:,} SH UNPROTECTED"
+            )
+            protection.setStyleSheet(
+                "color: white; background-color: #b71c1c; font-weight: bold;"
+            )
+            layout.addWidget(protection)
+        if card.broker_quantity > card.orderable_quantity:
+            unavailable = card.broker_quantity - max(0, int(card.orderable_quantity or 0))
+            orderable = QLabel(f"WARNING: {unavailable:,} SH NOT ORDERABLE")
+            orderable.setStyleSheet("color: #b71c1c; font-weight: bold;")
+            layout.addWidget(orderable)
+        if projection is not None and projection.external_orders:
+            external = QLabel("EXTERNAL BROKER ORDER DETECTED")
+            external.setStyleSheet(
+                "color: white; background-color: #b71c1c; font-weight: bold;"
+            )
+            layout.addWidget(external)
+
         if card.entry_block_reason:
-            block = QLabel(card.entry_block_reason)
+            block = QLabel(html.escape(_humanize(card.entry_block_reason)))
             block.setStyleSheet("color: #ef6c00; font-size: 11px;")
             block.setWordWrap(True)
             layout.addWidget(block)
 
-        if card.warnings:
-            warnings_lbl = QLabel(" / ".join(card.warnings))
-            warnings_lbl.setStyleSheet("color: #b71c1c; font-size: 11px; font-weight: bold;")
+        warnings = tuple(
+            warning
+            for warning in _visible_warnings(card)
+            if not (
+                unprotected_shares
+                and str(warning).strip().casefold() == "stop_required"
+            )
+        )
+        if warnings:
+            warnings_lbl = QLabel(
+                " / ".join(html.escape(_humanize(warning)) for warning in warnings)
+            )
+            warnings_lbl.setStyleSheet(
+                "color: #b71c1c; font-size: 11px; font-weight: bold;"
+            )
             warnings_lbl.setWordWrap(True)
             layout.addWidget(warnings_lbl)
 
@@ -264,15 +516,28 @@ class TradeCardWidget(QFrame):
         base.setHeight(max(base.height(), 78))
         return base
 
-    def update_current_price(
-        self, card: TradeCardState, current_price: float | None
+    def update_live_metrics(
+        self,
+        card: TradeCardState,
+        current_price: float | None,
+        account_equity: float | None = None,
     ) -> bool:
-        """Refresh quote-derived text without destroying/recreating the card."""
+        """Refresh quote/equity-derived text without rebuilding the card."""
 
         if card.card_key != self.card_key:
             return False
-        self._info_label.setText(_position_summary(card, current_price))
+        self.card_state = card
+        self._metrics_label.setText(
+            _metric_rows_html(_card_metric_rows(card, current_price, account_equity))
+        )
         return True
+
+    def update_current_price(
+        self, card: TradeCardState, current_price: float | None
+    ) -> bool:
+        """Backward-compatible alias for older callers/tests."""
+
+        return self.update_live_metrics(card, current_price)
 
 
 def card_drag_payload(card: TradeCardState | BoardCardProjection) -> dict:
