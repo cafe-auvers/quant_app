@@ -306,6 +306,10 @@ def test_live_metric_refresh_reuses_widget_and_never_rebuilds_column():
 
     assert column.itemWidget(item) is widget
     assert "+10.00%" in _widget_text(widget)
+    assert column.refresh_live_metrics(
+        quote_lookup=lambda _symbol: 110.0,
+        account_equity_lookup=lambda _environment, _account: 10_000.0,
+    ) == 0
 
 
 # --- P1-8: column rendering respects kanban_priority ------------------------

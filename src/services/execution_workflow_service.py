@@ -1151,7 +1151,13 @@ def project_board_card(engine, card, *, context=None):
     )
 
 
-def list_board_projections(engine, *, environment="PROD", context=None):
+def list_board_projections(
+    engine,
+    *,
+    environment="PROD",
+    context=None,
+    board_statuses=None,
+):
     import copy
 
     from src.core.board_workflow import (
@@ -1169,11 +1175,15 @@ def list_board_projections(engine, *, environment="PROD", context=None):
     if engine is None:
         return []
     projection_context = context or BoardProjectionContext()
+    cards = trade_card_repository.list_trade_cards(
+        engine, environment=environment
+    )
+    if board_statuses is not None:
+        visible_statuses = set(board_statuses)
+        cards = [card for card in cards if card.board_status in visible_statuses]
     card_projections = [
         project_board_card(engine, card, context=context)
-        for card in trade_card_repository.list_trade_cards(
-            engine, environment=environment
-        )
+        for card in cards
     ]
     card_scopes = {
         (projection.card.environment, projection.card.account_no, projection.card.symbol)

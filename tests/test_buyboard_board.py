@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import os
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -12,12 +13,15 @@ from PyQt5.QtWidgets import QApplication, QMenu, QMessageBox, QWidget
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
-from src.core.board_workflow import BoardCardProjection
+from src.core.board_workflow import BoardCardProjection, BoardExternalOrderProjection
+from src.core.discovered_external_order import new_discovered_external_order
+from src.core.execution_order_record import ExecutionOrderStatus
+from src.core.order_state import OrderSide
 from src.core.trade_card_state import BoardStatus, TradeCardState
 from src.services import trade_card_repository as repo
 from src.ui.buyboard import board as board_module
 from src.ui.buyboard.card import card_drag_payload
-from src.ui.buyboard.columns import BoardColumnList
+from src.ui.buyboard.columns import BOARD_COLUMN_ORDER, BoardColumnList
 from src.ui.buyboard.drag_commands import (
     CancelEntry,
     CancelPartialSell,
@@ -42,6 +46,108 @@ def _card(**overrides):
     fields = dict(environment="PROD", account_no="1", symbol="AAPL", kanban_priority=0)
     fields.update(overrides)
     return TradeCardState(**fields)
+
+
+def test_operator_board_hides_watchlist_and_closed_columns():
+    assert BOARD_COLUMN_ORDER == [
+        BoardStatus.BUYLIST,
+        BoardStatus.BUY_TODAY,
+        BoardStatus.ENTRY_PENDING,
+        BoardStatus.OPEN_POSITION,
+        BoardStatus.PARTIAL_SELL,
+        BoardStatus.SELL_ALL,
+    ]
+
+
+def test_hidden_lifecycle_cards_are_not_rendered_but_remain_in_projection_cache():
+    rendered = {status: [] for status in BOARD_COLUMN_ORDER}
+
+    class _Column:
+        def __init__(self, status):
+            self.status = status
+
+        def set_cards(self, values, _quote_lookup, _equity_lookup):
+            rendered[self.status] = list(values)
+
+    watchlist = _card(symbol="WATCH", board_status=BoardStatus.WATCHLIST)
+    buylist = _card(symbol="BUY", board_status=BoardStatus.BUYLIST)
+    closed = _card(symbol="DONE", board_status=BoardStatus.CLOSED)
+    window = SimpleNamespace(
+        buyboard_columns={status: _Column(status) for status in BOARD_COLUMN_ORDER}
+    )
+
+    board_module.populate_buyboard_columns(window, [watchlist, buylist, closed])
+
+    assert rendered[BoardStatus.BUYLIST] == [buylist]
+    assert all(
+        value not in values
+        for value in (watchlist, closed)
+        for values in rendered.values()
+    )
+    assert window._buyboard_current_projections == (watchlist, buylist, closed)
+
+
+def test_standalone_broker_warning_remains_visible_when_watchlist_is_hidden():
+    rendered = {status: [] for status in BOARD_COLUMN_ORDER}
+
+    class _Column:
+        def __init__(self, status):
+            self.status = status
+
+        def set_cards(self, values, _quote_lookup, _equity_lookup):
+            rendered[self.status] = list(values)
+
+    external = BoardExternalOrderProjection(
+        order=new_discovered_external_order(
+            environment="PROD",
+            account_no="1",
+            symbol="EXT",
+            side=OrderSide.SELL,
+            broker_order_id="BROKER-1",
+            quantity_requested=1,
+            broker_status=ExecutionOrderStatus.WORKING,
+        )
+    )
+    window = SimpleNamespace(
+        buyboard_columns={status: _Column(status) for status in BOARD_COLUMN_ORDER}
+    )
+
+    board_module.populate_buyboard_columns(window, [external])
+
+    assert rendered[BoardStatus.OPEN_POSITION] == [external]
+
+
+def test_projection_filter_skips_hidden_cards_before_per_card_queries(
+    tmp_path, monkeypatch
+):
+    engine = _make_engine(tmp_path)
+    repo.create_trade_card(
+        engine,
+        _card(symbol="WATCH", board_status=BoardStatus.WATCHLIST),
+    )
+    visible = repo.create_trade_card(
+        engine,
+        _card(symbol="BUY", board_status=BoardStatus.BUYLIST),
+    )
+    projected_symbols = []
+
+    def project(_engine, card, *, context=None):
+        projected_symbols.append(card.symbol)
+        return BoardCardProjection(card=card)
+
+    monkeypatch.setattr(
+        board_module.execution_workflow_service,
+        "project_board_card",
+        project,
+    )
+
+    projections = board_module.execution_workflow_service.list_board_projections(
+        engine,
+        board_statuses=BOARD_COLUMN_ORDER,
+    )
+
+    assert projected_symbols == [visible.symbol]
+    assert [projection.card.symbol for projection in projections] == [visible.symbol]
 
 
 class _FakeMainWindow(QWidget):
