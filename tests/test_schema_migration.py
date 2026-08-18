@@ -471,6 +471,53 @@ def test_cutover_rechecks_live_lease_before_migration_mutation(tmp_path, monkeyp
         _prepare(manager)
 
 
+def test_completed_migration_is_reusable_by_a_new_verified_main_lease(
+    tmp_path, monkeypatch
+):
+    original = ExecutionLease("pc-main", "token-8", 8)
+    successor = ExecutionLease("pc-main", "token-9", 9)
+    protocol = FakeExecutionLeaseProtocol(current=original)
+    manager = _manager(tmp_path, monkeypatch, lease_protocol=protocol)
+    awaiting = _prepare(manager)
+    assert awaiting.phase == MigrationPhase.AWAITING_RECONCILIATION
+    ready = manager.mark_reconciliation_complete()
+    assert ready.phase == MigrationPhase.READY
+
+    protocol.grant(successor)
+    recovered = manager.prepare_cutover(
+        device_id=successor.device_id,
+        lease_token=successor.lease_token,
+        lease_epoch=successor.lease_epoch,
+    )
+
+    assert recovered.phase == MigrationPhase.READY
+    assert recovered.reconciliation_complete is True
+    assert recovered.cutover_lease_token == original.lease_token
+    assert recovered.cutover_lease_epoch == original.lease_epoch
+
+
+def test_incomplete_migration_remains_fenced_to_its_exact_cutover_lease(
+    tmp_path, monkeypatch
+):
+    original = ExecutionLease("pc-main", "token-8", 8)
+    successor = ExecutionLease("pc-main", "token-9", 9)
+    protocol = FakeExecutionLeaseProtocol(current=original)
+    manager = _manager(tmp_path, monkeypatch, lease_protocol=protocol)
+    awaiting = _prepare(manager)
+    assert awaiting.phase == MigrationPhase.AWAITING_RECONCILIATION
+
+    protocol.grant(successor)
+    with pytest.raises(
+        MigrationCutoverOwnershipError,
+        match="different exact lease",
+    ):
+        manager.prepare_cutover(
+            device_id=successor.device_id,
+            lease_token=successor.lease_token,
+            lease_epoch=successor.lease_epoch,
+        )
+
+
 def test_stale_lease_cannot_directly_restore_cutover_backup(tmp_path, monkeypatch):
     protocol = FakeExecutionLeaseProtocol(
         current=ExecutionLease("pc-main", "token-8", 8)
