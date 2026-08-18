@@ -1,18 +1,23 @@
 """Tests for src.ui.buyboard.board (review findings P1-7, P1-8)."""
 from __future__ import annotations
 
+import copy
 import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PyQt5.QtWidgets import QApplication, QMenu, QWidget
+from PyQt5.QtCore import Qt
+from PyQt5.QtWidgets import QApplication, QMenu, QMessageBox, QWidget
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
+from src.core.board_workflow import BoardCardProjection
 from src.core.trade_card_state import BoardStatus, TradeCardState
 from src.services import trade_card_repository as repo
 from src.ui.buyboard import board as board_module
+from src.ui.buyboard.card import card_drag_payload
+from src.ui.buyboard.columns import BoardColumnList
 from src.ui.buyboard.drag_commands import CancelEntry, CancelPartialSell, ReorderCard
 
 _APP = None
@@ -46,6 +51,7 @@ class _FakeMainWindow(QWidget):
         super().__init__()
         self._engine = engine
         self.dispatched = []
+        self.refresh_count = 0
         # Applies a dispatched ReorderCard's target_priority directly onto
         # the matching card object, the same effect the real
         # apply_board_command -> repository round trip has -- so tests can
@@ -56,7 +62,10 @@ class _FakeMainWindow(QWidget):
     def _buyboard_engine(self):
         return self._engine
 
-    def _buyboard_dispatch_command(self, command):
+    def refresh_buyboard(self):
+        self.refresh_count += 1
+
+    def _buyboard_dispatch_command(self, command, **_kwargs):
         self.dispatched.append(command)
         from src.ui.buyboard.drag_commands import ReorderCard
 
@@ -136,6 +145,30 @@ def test_renumber_commands_carry_the_correct_card_version_for_optimistic_concurr
     assert by_symbol["AAA"].expected_card_version == 3
     assert by_symbol["BBB"].expected_card_version == 7
     assert all(isinstance(cmd, ReorderCard) for cmd in window.dispatched)
+
+
+def test_priority_menu_uses_rendered_projection_cache_without_another_db_read(
+    monkeypatch,
+):
+    high = _card(symbol="HIGH", board_status=BoardStatus.BUYLIST, kanban_priority=20)
+    low = _card(symbol="LOW", board_status=BoardStatus.BUYLIST, kanban_priority=10)
+    window = _FakeMainWindow(engine=None, cards=[high, low])
+    window._buyboard_current_projections = (
+        BoardCardProjection(card=high),
+        BoardCardProjection(card=low),
+    )
+    monkeypatch.setattr(
+        board_module.execution_workflow_service,
+        "list_board_projections",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("context-menu priority lookup hit the database")
+        ),
+    )
+
+    assert board_module._column_cards_sorted(window, BoardStatus.BUYLIST) == [
+        high,
+        low,
+    ]
 
 
 # --- P1-8: Cancel Entry / Remove from Today are exposed in the UI ----------
@@ -237,7 +270,7 @@ def test_dragging_partial_sell_to_open_dispatches_partial_withdrawal(tmp_path, m
     monkeypatch.setattr(
         board_module,
         "_lookup_projection",
-        lambda *args: type("Projection", (), {"card": card})(),
+        lambda *args: BoardCardProjection(card=card),
     )
 
     board_module._handle_card_dropped(
@@ -253,3 +286,108 @@ def test_dragging_partial_sell_to_open_dispatches_partial_withdrawal(tmp_path, m
 
     assert len(window.dispatched) == 1
     assert isinstance(window.dispatched[0], CancelPartialSell)
+
+
+def test_drag_tolerates_equivalent_revision_and_uses_current_fences(
+    tmp_path, monkeypatch
+):
+    engine = _make_engine(tmp_path)
+    rendered = repo.create_trade_card(
+        engine,
+        _card(
+            board_status=BoardStatus.PARTIAL_SELL,
+            broker_quantity=300,
+            orderable_quantity=300,
+            pending_partial_sell_quantity=100,
+        ),
+    )
+    payload = card_drag_payload(BoardCardProjection(card=copy.deepcopy(rendered)))
+    current = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    repo.update_trade_card(engine, current, expected_version=current.version)
+    assert current.version == rendered.version + 1
+
+    window = _FakeMainWindow(engine)
+    monkeypatch.setattr(
+        board_module,
+        "_lookup_projection",
+        lambda *args: BoardCardProjection(card=current),
+    )
+    warnings = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda *args, **kwargs: warnings.append((args, kwargs)),
+    )
+
+    board_module._handle_card_dropped(
+        window, payload, BoardStatus.OPEN_POSITION
+    )
+
+    assert warnings == []
+    assert len(window.dispatched) == 1
+    assert window.dispatched[0].expected_card_version == current.version
+
+
+def test_drag_still_rejects_a_real_lifecycle_change(tmp_path, monkeypatch):
+    engine = _make_engine(tmp_path)
+    rendered = repo.create_trade_card(
+        engine,
+        _card(
+            board_status=BoardStatus.PARTIAL_SELL,
+            broker_quantity=300,
+            orderable_quantity=300,
+            pending_partial_sell_quantity=100,
+        ),
+    )
+    payload = card_drag_payload(BoardCardProjection(card=copy.deepcopy(rendered)))
+    current = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    current.pending_partial_sell_quantity = 90
+    repo.update_trade_card(engine, current, expected_version=current.version)
+
+    window = _FakeMainWindow(engine)
+    monkeypatch.setattr(
+        board_module,
+        "_lookup_projection",
+        lambda *args: BoardCardProjection(card=current),
+    )
+    warnings = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda *args, **kwargs: warnings.append((args, kwargs)),
+    )
+
+    board_module._handle_card_dropped(
+        window, payload, BoardStatus.OPEN_POSITION
+    )
+
+    assert len(warnings) == 1
+    assert window.dispatched == []
+
+
+def test_equivalent_refresh_reuses_widget_and_updates_payload_and_quote():
+    _ensure_app()
+    column = BoardColumnList(BoardStatus.OPEN_POSITION, lambda *_args: None)
+    rendered = _card(
+        board_status=BoardStatus.OPEN_POSITION,
+        broker_quantity=10,
+        orderable_quantity=10,
+        average_entry_price=100.0,
+        version=7,
+    )
+
+    assert column.set_cards([rendered], lambda _symbol: 100.0) is True
+    item = column.item(0)
+    widget = column.itemWidget(item)
+    assert "+0.00%" in widget._info_label.text()
+
+    refreshed = copy.deepcopy(rendered)
+    refreshed.version = 8
+    refreshed.updated_at = refreshed.updated_at.replace(microsecond=1)
+    refreshed.market_data_last_trusted_price = 110.0
+    refreshed.market_data_last_trusted_at = refreshed.updated_at
+    assert column.set_cards([refreshed], lambda _symbol: 110.0) is False
+
+    assert column.itemWidget(column.item(0)) is widget
+    assert column.item(0).data(Qt.UserRole)["version"] == 8
+    assert "+10.00%" in widget._info_label.text()

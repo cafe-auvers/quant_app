@@ -22,7 +22,9 @@ from src.services import execution_workflow_service
 from src.ui.buyboard.controller import (
     BuyboardMixin,
     CommandRejectedError,
+    _projection_context,
 )
+from src.ui.buyboard.card import board_interaction_fingerprint
 
 
 @pytest.fixture(autouse=True)
@@ -91,6 +93,35 @@ def test_buy_today_can_be_planned_before_runtime_worker_exists(tmp_path):
     assert stored.board_status == BoardStatus.BUY_TODAY
     assert ownership.owner == ExecutionOwner.KANBAN
     assert ownership.strategy_instance_id == KANBAN_STRATEGY_INSTANCE_ID
+    assert window.refresh_count == 1
+
+
+def test_dispatch_retries_once_after_equivalent_storage_only_revision(tmp_path):
+    engine = _engine(tmp_path)
+    rendered = _seed_buylist(engine)
+    window = _Window(engine)
+    projection = execution_workflow_service.get_board_projection(
+        engine,
+        environment=rendered.environment,
+        account_no=rendered.account_no,
+        symbol=rendered.symbol,
+        context=_projection_context(window),
+    )
+    fingerprint = board_interaction_fingerprint(projection)
+
+    current = card_repo.get_trade_card(
+        engine, "PROD", "12345678-01", "AAPL"
+    )
+    card_repo.update_trade_card(engine, current, expected_version=current.version)
+
+    assert window._buyboard_dispatch_command(
+        _command(rendered), interaction_fingerprint=fingerprint
+    ) is True
+    stored = card_repo.get_trade_card(
+        engine, "PROD", "12345678-01", "AAPL"
+    )
+    assert stored.board_status == BoardStatus.BUY_TODAY
+    assert stored.version == 3
     assert window.refresh_count == 1
 
 

@@ -1,6 +1,9 @@
 """Draggable Kanban card widget for one TradeCardState."""
 from __future__ import annotations
 
+import hashlib
+import json
+
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QFrame, QLabel, QPushButton, QVBoxLayout
 
@@ -40,6 +43,73 @@ def _as_projection(value) -> tuple[TradeCardState, BoardCardProjection | None]:
     if isinstance(value, BoardCardProjection):
         return value.card, value
     return value, None
+
+
+def board_interaction_fingerprint(
+    value: TradeCardState | BoardCardProjection,
+) -> str:
+    """Hash actionable state, excluding storage and per-quote observations.
+
+    Reconciliation can confirm identical lifecycle facts under a new row
+    version, while each trusted quote can advance the audit-only last-price
+    fields. Neither makes a user's drag unsafe. Position/order/stop state,
+    outage warnings, ownership, and runtime fences remain in the hash.
+    """
+
+    card, projection = _as_projection(value)
+    card_state = dict(card.to_dict())
+    for observation_only_field in (
+        "version",
+        "updated_at",
+        "market_data_last_trusted_price",
+        "market_data_last_trusted_at",
+    ):
+        card_state.pop(observation_only_field, None)
+    payload = {"card": card_state}
+    if projection is not None:
+        payload["projection"] = {
+            "ownership_owner": projection.ownership_owner,
+            "ownership_version": projection.ownership_version,
+            "strategy_instance_id": projection.strategy_instance_id,
+            "readiness_generation": projection.readiness_generation,
+            "reconciliation_blocked": projection.reconciliation_blocked,
+            "engine_restrictions": projection.engine_restrictions,
+            "owned_order_statuses": tuple(
+                status.value for status in projection.owned_order_statuses
+            ),
+            "working_order_count": projection.working_order_count,
+            "ambiguous_order_count": projection.ambiguous_order_count,
+            "unlinked_owned_orders": tuple(
+                repr(order) for order in projection.unlinked_owned_orders
+            ),
+            "external_orders": tuple(
+                repr(order) for order in projection.external_orders
+            ),
+        }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _position_summary(card: TradeCardState, current_price: float | None) -> str:
+    if card.board_status == BoardStatus.OPEN_POSITION or card.broker_quantity:
+        if current_price:
+            pnl = _pnl_percent(card, current_price)
+            pnl_color = "#2e7d32" if pnl >= 0 else "#c62828"
+            pnl_html = f"  <span style='color:{pnl_color};'>{pnl:+.2f}%</span>"
+        else:
+            pnl_html = "  <span style='color:#888;'>P&amp;L: no live quote</span>"
+        return (
+            f"{card.broker_quantity} sh @ {_fmt_price(card.average_entry_price)}"
+            + pnl_html
+        )
+    if card.breakout_price:
+        return f"Breakout {_fmt_price(card.breakout_price)}"
+    return "&nbsp;"
 
 
 class TradeCardWidget(QFrame):
@@ -99,23 +169,9 @@ class TradeCardWidget(QFrame):
             badge.setStyleSheet("color: #555; font-size: 11px;")
             layout.addWidget(badge)
 
-        if card.board_status == BoardStatus.OPEN_POSITION or card.broker_quantity:
-            if current_price:
-                pnl = _pnl_percent(card, current_price)
-                pnl_color = "#2e7d32" if pnl >= 0 else "#c62828"
-                pnl_html = f"  <span style='color:{pnl_color};'>{pnl:+.2f}%</span>"
-            else:
-                # No live quote available -- show the position facts without
-                # inventing a P&L figure (P1-7).
-                pnl_html = "  <span style='color:#888;'>P&amp;L: no live quote</span>"
-            info = QLabel(
-                f"{card.broker_quantity} sh @ {_fmt_price(card.average_entry_price)}" + pnl_html
-            )
-        elif card.breakout_price:
-            info = QLabel(f"Breakout {_fmt_price(card.breakout_price)}")
-        else:
-            info = QLabel("&nbsp;")
-        layout.addWidget(info)
+        self.card_key = card.card_key
+        self._info_label = QLabel(_position_summary(card, current_price))
+        layout.addWidget(self._info_label)
 
         if card.stop_type is not None and card.active_stop_price:
             stop_lbl = QLabel(
@@ -208,6 +264,16 @@ class TradeCardWidget(QFrame):
         base.setHeight(max(base.height(), 78))
         return base
 
+    def update_current_price(
+        self, card: TradeCardState, current_price: float | None
+    ) -> bool:
+        """Refresh quote-derived text without destroying/recreating the card."""
+
+        if card.card_key != self.card_key:
+            return False
+        self._info_label.setText(_position_summary(card, current_price))
+        return True
+
 
 def card_drag_payload(card: TradeCardState | BoardCardProjection) -> dict:
     """The minimal identity+version payload carried by a drag/drop event."""
@@ -229,6 +295,7 @@ def card_drag_payload(card: TradeCardState | BoardCardProjection) -> dict:
         "strategy_instance_id": (
             projection.strategy_instance_id if projection is not None else ""
         ),
+        "state_fingerprint": board_interaction_fingerprint(card),
     }
 
 
