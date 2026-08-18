@@ -1,6 +1,6 @@
 # PyQt5 Trading Dashboard
 
-A desktop trading dashboard for US-market swing trading with scanner workflows, watchlist/ORB planning, chart review, KIS account visibility, and guarded KIS order submission.
+A desktop trading dashboard for US-market swing trading with scanner workflows, watchlist/ORB planning, a durable Kanban Buy Board, chart review, KIS account visibility, and guarded KIS order submission.
 
 ## Current Capabilities
 
@@ -13,6 +13,9 @@ A desktop trading dashboard for US-market swing trading with scanner workflows, 
 - A strategy-neutral `MarketSnapshot -> Strategy -> Signal` interface, with the existing ORB behavior as the first plugin.
 - An append-only, redacted trading event journal and a read-only Health tab for KIS, MySQL, mirror freshness, and reconciliation status.
 - Buy dashboard monitoring with partial-exit and EMA-close exit workflow support.
+- An eight-column Kanban Buy Board (`Watchlist` through `Closed`) backed by one durable trade-card aggregate per production account and symbol.
+- Typed, revision-fenced board commands: drag/drop records intent, while the background runtime and broker reconciliation own order effects and automatic lifecycle moves.
+- Guarded Kanban entry, partial-exit, sell-all, stop-management, ownership, failover/readiness, and external-order review paths. The engine remains fail-closed unless its production gates are explicitly satisfied.
 - Daily, hourly, TradingView, and intraday chart views with persisted drawings and breakout markers.
 - Shutdown-safe local JSON persistence with atomic writes, rolling `.bak` recovery, and save-status metadata.
 - Optional OpenAI-backed trade review with deterministic fallback analysis.
@@ -33,15 +36,17 @@ main.py                         Application entry point
 src/
   ui/
     main_window.py              MainWindow shell, state loading, menus, tabs, shared helpers
+    buyboard/                   Kanban columns/cards, typed command dispatch, projections, runtime worker
     dialogs.py                  Settings and scanner-filter dialogs
     controllers/                Testable workflow controllers for UI-owned workflows
     health/                     Production health panel and background probe
     mixins/                     Tab rendering, widget callbacks, and UI glue inherited by MainWindow
   api/                          KIS account, order, intraday, and daily-price adapters
-  core/                         Scanner, watchlist, scoring, order and execution queue models
+  core/                         Scanner, watchlist, trade-card/Kanban, order, and execution models
+  infrastructure/               Database schemas, repositories, refresh, and local-mirror support
   strategy/                     Strategy contracts and the built-in ORB plugin
   risk/                         Position sizing and final pre-trade approval
-  services/                     App-state, intraday, order ledger, execution, reconciliation
+  services/                     App-state, Kanban runtime, execution gateway, reconciliation, persistence
   utils/                        Storage, config, Yahoo data loading, MySQL cache helpers
 config/                         Non-secret configuration templates
 data/                           Local JSON state and ticker universe files
@@ -51,6 +56,8 @@ md_archive/                     Historical implementation notes and completed pl
 ```
 
 UI mixins keep PyQt tab construction, widget callbacks, table refreshes, and log/state-save side effects close to the widgets. `src/ui/controllers/` owns workflows that are easier to unit test outside the full `MainWindow`, including KIS account sync, scanner orchestration, watchlist ORB refreshes, chart data loading, and buylist execution queue refresh/submission coordination.
+
+The **Buy Board** is separate from the legacy Buy Dashboard. Its UI is a read-only projection of canonical trade-card, ownership, and order state. Board gestures are revision-aware requests; they never call KIS directly or mark an order filled. See [Kanban Logic and Architecture](docs/kanban_architecture.md) for the lifecycle, runtime flow, component boundaries, and safety gates.
 
 ## Setup
 
@@ -78,6 +85,8 @@ architecture and automation.
 
 Database and API credentials are local-only and belong in `.env` (gitignored, never commit it). See `.env.example` for the full list of variables to fill in, covering MySQL connection settings, KIS broker API credentials, and optional integration keys.
 
+After changing `.env`, regenerate the PC-specific copy with `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\sync_pc_env.ps1`. The script duplicates every variable into `.env.pc`, preserves every non-MySQL value exactly, and blanks all `MYSQL_*` values for manual entry on the PC. Both `.env` and `.env.pc` are gitignored; copy `.env.pc` to the PC checkout as `.env` after filling the MySQL values.
+
 Only enable KIS intraday after the endpoint, TR ID, request parameters, output field, and raw OHLCV field mappings have been verified.
 
 `QUANT_BACKUP_DIR` is optional -- see [docs/cloud_backup.md](docs/cloud_backup.md) for what it does and why (offsite backup of the gitignored `data/*.json` state files). Auto-detected if unset and a Google Drive for Desktop folder is present.
@@ -87,6 +96,9 @@ Only enable KIS intraday after the endpoint, TR ID, request parameters, output f
 - Keep `.env`, token caches, and local account state out of source control.
 - Keep the live monitor off until the production account snapshot, order review, and reconciliation paths are verified.
 - Treat successful KIS order submission as broker acceptance only.
+- Treat every Buy Board gesture as requested intent, not broker confirmation. `Entry Pending` and `Closed` are system-owned columns reached only from reconciled broker truth.
+- Keep `BUYBOARD_ENGINE_ENABLED=false` unless the execution lease, account reconciliation, database, KIS WebSocket protocol/capacity, mutation-budget, alerting, and live-execution fences described in `.env.example` have been deliberately configured and verified.
+- Preserve the one-owner rule for each `(environment, account_no, symbol)`: Kanban may execute only `KANBAN`-owned symbols for the configured `KANBAN_STRATEGY_INSTANCE_ID`; other cards remain observation-only.
 - Manual PROD partial/full sells placed outside the U.S. regular session use a
   broker-held KIS market-on-open reservation. This prioritizes exit execution
   over price protection and still depends on KIS accepting and forwarding the
@@ -100,6 +112,8 @@ Only enable KIS intraday after the endpoint, TR ID, request parameters, output f
 ## Documentation
 
 - `PROJECT_ARCHITECTURE.md` is the canonical architecture and maintenance map.
+- `docs/kanban_architecture.md` explains the Kanban state machine, command/runtime flow, persistence, safety boundaries, and component architecture.
+- `docs/kanban_production_readiness.md` records the detailed production invariants and rollout evidence requirements.
 - `rulebooks/` contains active trading rules used by review workflows.
 - `md_archive/` contains completed implementation notes and old planning documents that are not canonical.
 
