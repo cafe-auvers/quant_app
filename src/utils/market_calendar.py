@@ -133,6 +133,45 @@ def is_regular_session_open(now: Optional[dt.datetime] = None) -> bool:
     )
 
 
+def next_nyse_regular_session_open(
+    now: Optional[dt.datetime] = None,
+) -> dt.datetime:
+    """Return the next NYSE regular-session open in New York time.
+
+    If the session has not opened yet today, today's 09:30 is returned.
+    During or after today's session, the next eligible trading day is used.
+    This is an operator-facing ETA helper, not an exchange-order calendar;
+    exceptional one-off closures retain the same conservative limitation as
+    :func:`nyse_holidays`.
+    """
+
+    moment = _as_us_market_time(now)
+    candidate = moment.date()
+    for _ in range(370):
+        if (
+            candidate.weekday() < 5
+            and candidate not in nyse_holidays(candidate.year)
+        ):
+            opens_at = dt.datetime.combine(
+                candidate,
+                US_MARKET_OPEN_TIME,
+                tzinfo=US_MARKET_ZONE,
+            )
+            if moment < opens_at:
+                return opens_at
+        candidate += dt.timedelta(days=1)
+    raise RuntimeError("Could not resolve the next NYSE regular-session open")
+
+
+def seconds_until_nyse_regular_session_open(
+    now: Optional[dt.datetime] = None,
+) -> float:
+    """Seconds until :func:`next_nyse_regular_session_open`."""
+
+    moment = _as_us_market_time(now)
+    return max(0.0, (next_nyse_regular_session_open(moment) - moment).total_seconds())
+
+
 def seconds_until_regular_session_close(now: Optional[dt.datetime] = None) -> float:
     """Seconds from ``now`` until 16:00 America/New_York *today's date*.
 
