@@ -165,6 +165,57 @@ def test_pull_distinguishes_missing_from_database_error(tmp_path):
     assert unavailable.error
 
 
+def test_live_trading_control_is_shared_and_independent_of_main_owner(tmp_path):
+    engine = _make_engine(tmp_path)
+    laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", False)
+    pc = ss.LocalDeviceRole("pc-id", "PC", True)
+    assert ss.claim_main_device(engine, pc).success
+
+    missing = ss.get_live_trading_control(engine)
+    assert missing.success is True
+    assert missing.control is not None
+    assert missing.control.enabled is False
+    assert missing.control.revision == 0
+
+    enabled = ss.set_live_trading_control(engine, laptop, True)
+    assert enabled.success is True
+    assert enabled.control is not None
+    assert enabled.control.enabled is True
+    assert enabled.control.revision == 1
+    assert ss.get_main_device(engine).main_device.device_id == "pc-id"
+
+    observed_on_pc = ss.get_live_trading_control(engine)
+    assert observed_on_pc.control.enabled is True
+    disabled = ss.set_live_trading_control(engine, pc, False)
+    assert disabled.control.enabled is False
+    assert disabled.control.revision == 2
+    assert ss.get_live_trading_control(engine).control.enabled is False
+
+
+def test_live_trading_control_survives_restart_and_main_handoff(tmp_path):
+    engine = _make_engine(tmp_path)
+    laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    pc = ss.LocalDeviceRole("pc-id", "PC", False)
+
+    assert ss.set_live_trading_control(engine, laptop, True).success
+    assert ss.claim_main_device(engine, laptop).success
+    assert ss.claim_main_device(engine, pc).success
+
+    restarted_reader = ss.get_live_trading_control(engine)
+    assert restarted_reader.success is True
+    assert restarted_reader.control.enabled is True
+    assert restarted_reader.control.revision == 1
+    assert ss.get_main_device(engine).main_device.device_id == "pc-id"
+
+
+def test_live_trading_control_database_failure_is_not_treated_as_off(tmp_path):
+    result = ss.get_live_trading_control(None)
+
+    assert result.success is False
+    assert result.control is None
+    assert result.error
+
+
 def test_pull_only_pc_cannot_seed_or_overwrite_first_sync(monkeypatch, tmp_path):
     engine = _make_engine(tmp_path)
     pc_paths = _use_machine(monkeypatch, tmp_path / "pc")

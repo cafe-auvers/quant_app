@@ -53,8 +53,10 @@ BUYBOARD_ENGINE_ENABLED=true
 TRADING_ENABLED=true
 ```
 
-`TRADING_ENABLED=true` only permits the in-app session toggle. Trading still
-starts disarmed after every process launch. `CONTROLLED_LIVE` additionally
+`TRADING_ENABLED=true` permits this machine to honor the durable shared Live
+Trading control. The control is common to laptop and PC, survives process
+restarts and Main-device handoffs, and may be changed from either UI. Only the
+current Main device may execute. `CONTROLLED_LIVE` additionally
 blocks production BUYs outside the allowlist or above the per-entry cap.
 Protective SELLs are not blocked by the entry cap. The shared scheduler
 enforces process-wide spacing across endpoints and performs one mutation
@@ -78,25 +80,28 @@ that cannot yet exist.
 
 After that premarket transfer, the Main worker remains `STANDBY`, with its
 broker-command gate closed. It becomes `ACTIVE` only after an actual fresh
-regular-session quote makes the complete readiness predicate true. The Live
-Trading switch remains a separate session arm/disarm control; arming it does
+regular-session quote makes the complete readiness predicate true. The shared
+Live Trading switch remains a separate deployment-wide control; ON does
 not bypass worker readiness, lease, freshness, reconciliation, or gateway
 checks.
 
 ## Supervised sequence
 
-1. Start with the in-process trading switch off.
-2. Require `ACTIVE` runtime, current lease, writable database, completed and
+1. Verify the shared Live Trading control shows the same value on both devices.
+2. Require `ACTIVE` runtime on the current Main, a current lease, a writable
+   database, completed and
    fresh reconciliation, connected WebSocket, ACKed trade/quote channels,
    fresh quotes, healthy accumulator, fresh buying power, and operating
    external alerts.
-3. Manually arm the session switch only after every readiness item is green.
+3. Keep the shared control ON for continuous position protection. Use OFF as
+   the deployment-wide operator kill switch when execution must stop.
 4. Use normal strategy decisions; do not force an entry merely to exercise the
    broker.
 5. Compare every submit, partial fill, fill, cancel, Partial Sell, Sell All,
    position quantity, stop, and card projection against KIS truth.
-6. Disarm the session switch and prove another mutation cannot cross the
-   broker boundary.
+6. During qualification, turn the shared control OFF from the non-Main device
+   and prove the Main cannot cross another broker boundary; turn it back ON
+   only after both UIs reflect the durable revision.
 7. Stop on any ambiguity, stale feed, reconciliation mismatch, lease loss,
    alert failure, or duplicate identity. Reconcile forward; never retry an
    uncertain mutation.

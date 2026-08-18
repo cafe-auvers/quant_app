@@ -1223,7 +1223,11 @@ class ExecutionCommandGateway:
             source=request.source,
             strategy_instance_id=request.strategy_instance_id,
         )
-        trading_state.require_trading_enabled(request.environment, request.symbol)
+        with trading_state.allow_cached_emergency_authorization():
+            trading_state.require_trading_enabled(
+                request.environment,
+                request.symbol,
+            )
         quantity = int(request.quantity)
         limit_price = float(request.limit_price)
         if quantity <= 0 or not math.isfinite(limit_price) or limit_price <= 0:
@@ -1260,25 +1264,26 @@ class ExecutionCommandGateway:
             raise EmergencyJournalUnavailableError(str(exc)) from exc
 
         try:
-            submission = self._execute_scheduled_mutation(
-                lambda: self._cross_broker_boundary(
-                    lambda: self._real_broker.submit_order(
-                        environment=request.environment,
-                        account_no=request.account_no,
-                        symbol=request.symbol,
-                        side=request.side,
-                        quantity=quantity,
-                        limit_price=limit_price,
-                        exchange=request.exchange,
-                        execution_policy=request.execution_policy,
-                    )
-                ),
-                command_type=CommandType.SUBMIT,
-                account_no=request.account_no,
-                endpoint="submit_order",
-                priority=RequestPriority.EMERGENCY_EXIT,
-                is_new_entry=False,
-            )
+            with trading_state.allow_cached_emergency_authorization():
+                submission = self._execute_scheduled_mutation(
+                    lambda: self._cross_broker_boundary(
+                        lambda: self._real_broker.submit_order(
+                            environment=request.environment,
+                            account_no=request.account_no,
+                            symbol=request.symbol,
+                            side=request.side,
+                            quantity=quantity,
+                            limit_price=limit_price,
+                            exchange=request.exchange,
+                            execution_policy=request.execution_policy,
+                        )
+                    ),
+                    command_type=CommandType.SUBMIT,
+                    account_no=request.account_no,
+                    endpoint="submit_order",
+                    priority=RequestPriority.EMERGENCY_EXIT,
+                    is_new_entry=False,
+                )
         except Exception as exc:
             try:
                 ambiguous = self._real_broker.is_ambiguous_submission_error(exc)
@@ -1364,7 +1369,11 @@ class ExecutionCommandGateway:
             source=request.source,
             strategy_instance_id=request.strategy_instance_id,
         )
-        trading_state.require_trading_enabled(request.environment, request.symbol)
+        with trading_state.allow_cached_emergency_authorization():
+            trading_state.require_trading_enabled(
+                request.environment,
+                request.symbol,
+            )
         idempotency_key = f"CANCEL:{request.cancel_command_id}"
         try:
             requested = self._emergency_journal.append_requested(
@@ -1393,25 +1402,26 @@ class ExecutionCommandGateway:
             )
             raise EmergencyJournalUnavailableError(str(exc)) from exc
         try:
-            snapshot = self._execute_scheduled_mutation(
-                lambda: self._cross_broker_boundary(
-                    lambda: self._real_broker.cancel_order(
-                        environment=request.environment,
-                        account_no=request.account_no,
-                        is_reserved=False,
-                        symbol=request.symbol,
-                        broker_order_id=request.broker_order_id,
-                        quantity=request.quantity,
-                        side=request.side,
-                        exchange=request.exchange,
-                    )
-                ),
-                command_type=CommandType.CANCEL,
-                account_no=request.account_no,
-                endpoint="cancel_order",
-                priority=RequestPriority.EMERGENCY_EXIT,
-                is_new_entry=False,
-            )
+            with trading_state.allow_cached_emergency_authorization():
+                snapshot = self._execute_scheduled_mutation(
+                    lambda: self._cross_broker_boundary(
+                        lambda: self._real_broker.cancel_order(
+                            environment=request.environment,
+                            account_no=request.account_no,
+                            is_reserved=False,
+                            symbol=request.symbol,
+                            broker_order_id=request.broker_order_id,
+                            quantity=request.quantity,
+                            side=request.side,
+                            exchange=request.exchange,
+                        )
+                    ),
+                    command_type=CommandType.CANCEL,
+                    account_no=request.account_no,
+                    endpoint="cancel_order",
+                    priority=RequestPriority.EMERGENCY_EXIT,
+                    is_new_entry=False,
+                )
         except Exception as exc:
             classify = getattr(self._real_broker, "is_ambiguous_cancellation_error", None)
             try:

@@ -68,7 +68,12 @@ from src.services.order_ledger import (append_order, find_open_orders,
                                        update_order)
 from src.services.runtime_status import safe_mark_runtime_process_stopped
 from src.services.sleep_readiness import write_sleep_readiness_snapshot
-from src.services.state_sync import LocalDeviceRole, load_local_device_role
+from src.services.state_sync import (
+    LocalDeviceRole,
+    get_live_trading_control,
+    load_local_device_role,
+    set_live_trading_control,
+)
 from src.ui.buylist import BuylistMixin
 from src.ui.buyboard import BuyboardMixin
 from src.ui.charts.controller import ChartsControllerMixin
@@ -494,7 +499,37 @@ class StateSyncWorker(QThread):
                 errors=[f"State sync failed: {exc}"],
                 local_role=self.role,
             )
+        control_result = get_live_trading_control(self.engine)
+        if control_result.success and control_result.control is not None:
+            result.live_trading_enabled = control_result.control.enabled
+            result.live_trading_revision = control_result.control.revision
+        else:
+            result.live_trading_error = (
+                control_result.error
+                or "Could not read shared live-trading control."
+            )
         self.completed.emit(result, self.generation)
+
+
+class LiveTradingControlWorker(QThread):
+    """Persist one global kill-switch action without blocking the Qt thread."""
+
+    completed = pyqtSignal(object)
+
+    def __init__(self, engine, role: LocalDeviceRole, enabled: bool) -> None:
+        super().__init__()
+        self.engine = engine
+        self.role = role
+        self.enabled = bool(enabled)
+
+    def run(self) -> None:
+        self.completed.emit(
+            set_live_trading_control(
+                self.engine,
+                self.role,
+                self.enabled,
+            )
+        )
 
 
 class MainWindow(
@@ -588,6 +623,7 @@ class MainWindow(
         self._last_pc_main_app_active = None
         self.state_sync_role = load_local_device_role()
         self.state_sync_worker = None
+        self.live_trading_control_worker = None
         self._last_state_sync_notice = ""
         self._initial_state_sync_complete = False
         # Main-device lease fencing: the token this device believes it
@@ -599,6 +635,14 @@ class MainWindow(
         self._current_lease_token = ""
         self._current_lease_epoch = 0
         self._last_successful_reconcile_at: Optional[dt.datetime] = None
+        self._shared_live_trading_available = False
+        self._shared_live_trading_revision = 0
+        # Broker-boundary checks re-read canonical state. A database outage
+        # therefore blocks ordinary commands immediately even if the toolbar
+        # still displays the last confirmed state.
+        trading_state.set_authoritative_provider(
+            self._read_authoritative_live_trading_control
+        )
 
         # Automatic cross-machine handoff (laptop <-> PC). Both env flags
         # default OFF -- only the unattended device (the PC, per the deployed
@@ -610,9 +654,6 @@ class MainWindow(
         self._auto_claim_main_enabled = self._handoff_env_flag_true(
             "AUTO_CLAIM_MAIN_ON_HANDOFF"
         ) and self._expected_auto_claim_hostname_matches()
-        self._auto_arm_trading_on_handoff = self._handoff_env_flag_true(
-            "AUTO_ARM_TRADING_ON_HANDOFF"
-        )
         self.handoff_reconciliation_worker = None
         self._handoff_generation = 0
         self._state_sync_auto_claim = False
@@ -1298,9 +1339,6 @@ class MainWindow(
         if activate or auto_claim:
             self._handoff_reconciliation_required = True
             self._handoff_allow_auto_arm = bool(auto_claim)
-            trading_state.set_trading_enabled(False)
-            if self.__dict__.get("trading_enabled_button") is not None:
-                self._refresh_trading_enabled_widget()
         worker = StateSyncWorker(
             self.pc_db_engine,
             self.state_sync_role,
@@ -1341,6 +1379,35 @@ class MainWindow(
             return
         if not self.__dict__.get("_pc_database_ready", False):
             return
+        live_trading_error = str(
+            getattr(result, "live_trading_error", "") or ""
+        )
+        live_trading_enabled = getattr(result, "live_trading_enabled", None)
+        if not live_trading_error and live_trading_enabled is not None:
+            trading_state.set_trading_enabled(bool(live_trading_enabled))
+            self._shared_live_trading_available = True
+            self._shared_live_trading_revision = int(
+                getattr(result, "live_trading_revision", 0) or 0
+            )
+            live_notice = ""
+        else:
+            self._shared_live_trading_available = False
+            live_notice = live_trading_error or (
+                "Shared live-trading control did not return a value."
+            )
+        if live_notice != self.__dict__.get("_last_live_trading_notice", ""):
+            if live_notice:
+                self.append_log(
+                    "Live-trading control unavailable; ordinary broker "
+                    f"mutations fail closed: {live_notice}"
+                )
+            elif self.__dict__.get("_last_live_trading_notice", ""):
+                self.append_log(
+                    "Shared live-trading control is reachable again."
+                )
+        self._last_live_trading_notice = live_notice
+        if self.__dict__.get("trading_enabled_button") is not None:
+            self._refresh_trading_enabled_widget()
         previous_main = bool(self.state_sync_role.is_main)
         if result.local_role is not None:
             self.state_sync_role = result.local_role
@@ -1680,12 +1747,9 @@ class MainWindow(
         self._handoff_reconciliation_required = True
         self._handoff_allow_auto_arm = bool(allow_auto_arm)
 
-        # A takeover is an all-orders fence, not merely a per-item UI flag.
-        # This also protects manual "Use This Device as Main" activation if
-        # live trading happened to be enabled in this process beforehand.
-        trading_state.set_trading_enabled(False)
-        if self.__dict__.get("trading_enabled_button") is not None:
-            self._refresh_trading_enabled_widget()
+        # Main-device transfer never changes the deployment-wide kill switch.
+        # Lease, readiness, and handoff reconciliation remain independent
+        # all-orders fences until this device is actually safe to execute.
         if self.__dict__.get("_buylist_prod_monitor_active", False):
             self._toggle_buylist_monitor("PROD")
 
@@ -1743,12 +1807,10 @@ class MainWindow(
                 f"Automatic handoff: broker reconciliation clean for "
                 f"{len(outcome.reconciled_symbols)} symbol(s)."
             )
-            if self.__dict__.get("_handoff_allow_auto_arm", False):
-                self._auto_arm_trading_kill_switch()
-            else:
-                self.append_log(
-                    "Live trading remains disabled after manual main-device transfer."
-                )
+            self.append_log(
+                "Main-device transfer left the shared live-trading control "
+                f"{'ON' if trading_state.is_trading_enabled() else 'OFF'}."
+            )
             started = self._ensure_buylist_monitor_running("PROD")
             self.append_log(
                 "Automatic handoff complete: monitor "
@@ -1800,42 +1862,13 @@ class MainWindow(
         self.append_log(f"Automatic handoff: reconciliation worker failed: {message}")
 
     def _auto_arm_trading_kill_switch(self) -> None:
-        """Arm live trading after a clean automatic handoff -- gated, not automatic-by-default.
+        """Compatibility hook: handoff no longer owns the shared kill switch."""
 
-        Deliberately a narrower, separately-configured policy from
-        AUTO_CLAIM_MAIN_ON_HANDOFF: the kill switch otherwise starts
-        disabled on every launch and is only armed by an explicit in-process
-        UI click. Every condition below must hold, not just "we are main."
-        """
-        if not self._auto_arm_trading_on_handoff:
-            self.append_log(
-                "Live trading NOT auto-armed: AUTO_ARM_TRADING_ON_HANDOFF is not set."
-            )
-            return
-        if trading_state.is_trading_locked_disabled():
-            self.append_log(
-                "Live trading remains locked off by TRADING_ENABLED; "
-                "automatic handoff cannot arm it."
-            )
-            return
-        if not self.state_sync_role.is_main or not self._current_lease_token:
-            self.append_log("Live trading NOT auto-armed: lease is not currently held.")
-            return
-        if not self.__dict__.get("_pc_database_ready", False):
-            self.append_log("Live trading NOT auto-armed: shared database is not reachable.")
-            return
-        trading_state.set_trading_enabled(True)
-        button = getattr(self, "trading_enabled_button", None)
-        if button is not None:
-            button.blockSignals(True)
-            try:
-                button.setChecked(True)
-            finally:
-                button.blockSignals(False)
-        if hasattr(self, "_refresh_trading_enabled_widget"):
+        if self.__dict__.get("trading_enabled_button") is not None:
             self._refresh_trading_enabled_widget()
         self.append_log(
-            "Live trading auto-armed (automatic PC handoff, broker reconciliation clean)."
+            "Live trading is controlled by the shared deployment switch; "
+            "Main-device handoff did not change it."
         )
 
     def _update_main_device_button(self, *, main_hostname: str = "") -> None:
@@ -3597,40 +3630,89 @@ class MainWindow(
         self.market_status_timer.start()
         self.update_market_countdown_status()
 
+    def _read_authoritative_live_trading_control(self) -> bool:
+        """Read the canonical global switch for a broker-boundary decision."""
+
+        engine = self.__dict__.get("pc_db_engine")
+        if engine is None or not self.__dict__.get("_pc_database_ready", False):
+            raise RuntimeError("canonical shared database is unavailable")
+        result = get_live_trading_control(engine)
+        if not result.success or result.control is None:
+            raise RuntimeError(
+                result.error or "shared live-trading control is unavailable"
+            )
+        return bool(result.control.enabled)
+
     def _refresh_trading_enabled_widget(self) -> None:
-        """Sync the toolbar kill-switch button to the real trading_state."""
+        """Project the shared deployment kill switch into the toolbar."""
         button = getattr(self, "trading_enabled_button", None)
         if button is None:
             return
         locked = trading_state.is_trading_locked_disabled()
         enabled = trading_state.is_trading_enabled()
+        shared_configured = "pc_db_engine" in self.__dict__
+        shared_available = bool(
+            self.__dict__.get("_shared_live_trading_available", False)
+        )
+        update_worker = self.__dict__.get("live_trading_control_worker")
+        update_running = self._background_worker_running(update_worker)
         button.blockSignals(True)
         try:
             button.setChecked(enabled)
-            if locked:
+            if update_running:
+                button.setText("LIVE TRADING ● UPDATING SHARED CONTROL...")
+                button.setToolTip(
+                    "The deployment-wide control update is being committed."
+                )
+                button.setEnabled(False)
+                button.setStyleSheet(
+                    "QPushButton { background-color: #6b4f00; color: white; "
+                    "font-weight: bold; padding: 4px 10px; border-radius: 4px; }"
+                )
+            elif locked:
                 button.setText("LIVE TRADING ● LOCKED OFF")
                 button.setToolTip(
                     "TRADING_ENABLED is blank, false, or invalid in "
-                    ".env/environment; this forces live trading off and cannot "
-                    "be overridden from the UI."
+                    ".env/environment; this machine is administratively locked."
                 )
                 button.setEnabled(False)
                 button.setStyleSheet(
                     "QPushButton { background-color: #363a45; color: #787b86; "
                     "font-weight: bold; padding: 4px 10px; border-radius: 4px; }"
                 )
+            elif shared_configured and not shared_available:
+                button.setText(
+                    "LIVE TRADING ● ON (EMERGENCY ONLY)"
+                    if enabled
+                    else "LIVE TRADING ● CONTROL OFFLINE"
+                )
+                button.setToolTip(
+                    "The canonical shared control cannot be read. Ordinary "
+                    "orders fail closed. A last-confirmed ON state is usable "
+                    "only by the bounded emergency protective path."
+                )
+                button.setEnabled(False)
+                button.setStyleSheet(
+                    "QPushButton { background-color: #6b4f00; color: white; "
+                    "font-weight: bold; padding: 4px 10px; border-radius: 4px; }"
+                )
             elif enabled:
-                button.setText("LIVE TRADING ● ON")
-                button.setToolTip("Guarded order submission is armed. Click to disable.")
+                button.setText("LIVE TRADING ● ON (SHARED)")
+                button.setToolTip(
+                    "The deployment-wide broker gate is ON on both devices. "
+                    "Only the current Main device can execute. Click to turn "
+                    "it OFF everywhere."
+                )
                 button.setEnabled(True)
                 button.setStyleSheet(
                     "QPushButton { background-color: #f23645; color: white; "
                     "font-weight: bold; padding: 4px 10px; border-radius: 4px; }"
                 )
             else:
-                button.setText("LIVE TRADING ● DISABLED")
+                button.setText("LIVE TRADING ● DISABLED (SHARED)")
                 button.setToolTip(
-                    "Guarded order submission is blocked. Click to enable (confirmation required)."
+                    "Broker submission is blocked on both devices. Click to "
+                    "turn it ON everywhere (confirmation required)."
                 )
                 button.setEnabled(True)
                 button.setStyleSheet(
@@ -3641,32 +3723,72 @@ class MainWindow(
             button.blockSignals(False)
 
     def _on_trading_enabled_toggled(self, checked: bool) -> None:
-        """Handle a click on the toolbar live-trading kill switch.
-
-        Disabling is always immediate. Enabling requires an explicit
-        confirmation click-through so activating order submission is deliberate.
-        """
+        """Set the deployment-wide switch from either laptop or PC."""
         if checked:
             reply = QMessageBox.question(
                 self,
                 "Enable Live Trading",
-                "This allows guarded KIS order submission (PROD and SIM) for the "
-                "rest of this session. Enable live trading?",
+                "This turns guarded KIS order submission ON for the deployment. "
+                "Both computers will show ON, but only the current Main device "
+                "can execute. Continue?",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
             if reply != QMessageBox.Yes:
                 self._refresh_trading_enabled_widget()
                 return
-            trading_state.set_trading_enabled(True)
-        else:
-            trading_state.set_trading_enabled(False)
+        # Lightweight widget tests have no database. Real windows always use
+        # the shared row and never silently fall back to process-local state.
+        if "pc_db_engine" not in self.__dict__:
+            trading_state.set_trading_enabled(bool(checked))
+            self._refresh_trading_enabled_widget()
+            return
+
+        active_worker = self.__dict__.get("live_trading_control_worker")
+        if active_worker is not None and active_worker.isRunning():
+            self._refresh_trading_enabled_widget()
+            return
+        worker = LiveTradingControlWorker(
+            self.__dict__.get("pc_db_engine"),
+            self.state_sync_role,
+            bool(checked),
+        )
+        self.live_trading_control_worker = worker
+        worker.completed.connect(self._on_live_trading_control_updated)
+        self._track_worker("live_trading_control_worker", worker)
+        button = self.trading_enabled_button
+        button.setEnabled(False)
+        button.setText("LIVE TRADING ● UPDATING SHARED CONTROL...")
+        worker.start()
+
+    def _on_live_trading_control_updated(self, result) -> None:
+        """Apply a confirmed shared-control write to this process projection."""
+
+        if not result.success or result.control is None:
+            self._shared_live_trading_available = False
+            self._refresh_trading_enabled_widget()
+            QMessageBox.warning(
+                self,
+                "Live Trading Control Unavailable",
+                "The shared switch was not changed. Ordinary broker mutations "
+                "remain fail-closed.\n\n"
+                + (result.error or "Canonical database unavailable."),
+            )
+            return
+
+        trading_state.set_trading_enabled(result.control.enabled)
+        self._shared_live_trading_available = bool(
+            self.__dict__.get("pc_db_engine") is not None
+            and self.__dict__.get("_pc_database_ready", False)
+        )
+        self._shared_live_trading_revision = result.control.revision
 
         self._refresh_trading_enabled_widget()
         effective = trading_state.is_trading_enabled()
         self.append_log(
             f"Live trading {'ENABLED' if effective else 'DISABLED'} "
-            f"(guarded KIS order submission gate)."
+            f"for both devices by {self.state_sync_role.hostname} "
+            f"(shared revision {result.control.revision})."
         )
 
     def _build_status_log(self, parent_layout: QVBoxLayout) -> None:
@@ -3988,12 +4110,15 @@ class MainWindow(
             self._pc_probe_engine = current_pc_engine
         self._pc_database_ready = False
         self._pc_database_coordination_ready = False
+        self._shared_live_trading_available = False
         self._database_reconciliation_in_progress = False
         self.pc_db_engine = None
         self.db_engine = None
         self.db_engine_source = "none"
         self.db_enabled = False
         self._update_database_source_indicator()
+        if self.__dict__.get("trading_enabled_button") is not None:
+            self._refresh_trading_enabled_widget()
         self._database_transition_generation = (
             self.__dict__.get("_database_transition_generation", 0) + 1
         )

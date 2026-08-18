@@ -876,6 +876,11 @@ class StateReconcileResult:
     # actual broker boundary. Empty whenever this device isn't main.
     lease_token: str = ""
     lease_epoch: int = 0
+    # The deployment-wide kill switch is synchronized alongside ownership,
+    # but remains independent of it: either device may change the control.
+    live_trading_enabled: bool | None = None
+    live_trading_revision: int = 0
+    live_trading_error: str = ""
 
 
 def _demote_after_lost_ownership(

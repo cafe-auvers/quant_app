@@ -97,6 +97,51 @@ def test_env_value_unset_or_truthy_does_not_lock_or_auto_enable(monkeypatch):
     assert trading_state.is_trading_locked_disabled() is False
 
 
+def test_authoritative_shared_control_is_rechecked_at_every_boundary():
+    shared = [True]
+    trading_state.set_authoritative_provider(lambda: shared[0])
+
+    trading_state.require_trading_enabled("PROD", "STIM")
+    assert trading_state.is_trading_enabled() is True
+
+    shared[0] = False
+    with pytest.raises(trading_state.TradingDisabledError):
+        trading_state.require_trading_enabled("PROD", "STIM")
+    assert trading_state.is_trading_enabled() is False
+
+
+def test_authoritative_control_failure_blocks_ordinary_commands():
+    trading_state.set_trading_enabled(True)
+
+    def unavailable():
+        raise RuntimeError("database down")
+
+    trading_state.set_authoritative_provider(unavailable)
+
+    with pytest.raises(trading_state.TradingDisabledError) as exc_info:
+        trading_state.require_trading_enabled("PROD", "STIM")
+
+    assert "shared control unavailable" in str(exc_info.value)
+    # Preserve the last confirmed value exclusively for the bounded WS11
+    # emergency path; ordinary commands still raised above.
+    assert trading_state.is_trading_enabled() is True
+
+
+def test_last_confirmed_on_is_only_usable_in_emergency_outage_scope():
+    trading_state.set_trading_enabled(True)
+
+    def unavailable():
+        raise RuntimeError("database down")
+
+    trading_state.set_authoritative_provider(unavailable)
+
+    with trading_state.allow_cached_emergency_authorization():
+        trading_state.require_trading_enabled("PROD", "STIM")
+
+    with pytest.raises(trading_state.TradingDisabledError):
+        trading_state.require_trading_enabled("PROD", "STIM")
+
+
 def test_toolbar_toggle_requires_confirmation_to_enable(monkeypatch):
     from PyQt5.QtWidgets import QMessageBox
 
