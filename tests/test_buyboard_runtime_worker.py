@@ -933,6 +933,145 @@ def test_pull_only_successor_reaches_standby_ready_but_never_active(
     assert worker.device_state == RuntimeDeviceState.STANDBY_READY
 
 
+def test_pull_only_successor_is_handoff_ready_before_market_open_without_quotes(
+    tmp_path, monkeypatch
+):
+    worker, _ = _worker(
+        tmp_path,
+        standby_only=True,
+        device_id="successor",
+        regular_session_open=lambda: False,
+    )
+    worker._accepting_commands = False
+    worker.device_state = RuntimeDeviceState.STANDBY
+    transitions = []
+    final_passes = []
+    monkeypatch.setattr(
+        worker,
+        "engine_readiness",
+        lambda **kwargs: _ready_runtime_state(critical_quotes_fresh=False),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_run_startup_reconciliation",
+        lambda **kwargs: final_passes.append(kwargs),
+    )
+
+    def record_state(state, **kwargs):
+        transitions.append(state)
+        worker.device_state = state
+
+    monkeypatch.setattr(worker, "_set_device_state", record_state)
+
+    worker._advance_startup_readiness()
+
+    assert transitions == [RuntimeDeviceState.STANDBY_READY]
+    assert final_passes == [{"execute_commands": False}]
+    assert worker._accepting_commands is False
+
+
+def test_pull_only_successor_cannot_waive_stale_quotes_during_regular_session(
+    tmp_path, monkeypatch
+):
+    worker, _ = _worker(
+        tmp_path,
+        standby_only=True,
+        device_id="successor",
+        regular_session_open=lambda: True,
+    )
+    worker._accepting_commands = False
+    worker.device_state = RuntimeDeviceState.STANDBY
+    final_passes = []
+    monkeypatch.setattr(
+        worker,
+        "engine_readiness",
+        lambda **kwargs: _ready_runtime_state(critical_quotes_fresh=False),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_run_startup_reconciliation",
+        lambda **kwargs: final_passes.append(kwargs),
+    )
+
+    worker._advance_startup_readiness()
+
+    assert worker.device_state == RuntimeDeviceState.STANDBY
+    assert worker._accepting_commands is False
+    assert final_passes == []
+
+
+def test_premarket_handoff_does_not_waive_a_non_quote_dependency(
+    tmp_path, monkeypatch
+):
+    worker, _ = _worker(
+        tmp_path,
+        standby_only=True,
+        device_id="successor",
+        regular_session_open=lambda: False,
+    )
+    worker._accepting_commands = False
+    worker.device_state = RuntimeDeviceState.STANDBY
+    monkeypatch.setattr(
+        worker,
+        "engine_readiness",
+        lambda **kwargs: _ready_runtime_state(
+            critical_quotes_fresh=False,
+            account_reconciliation_fresh=False,
+        ),
+    )
+
+    worker._advance_startup_readiness()
+
+    assert worker.device_state == RuntimeDeviceState.STANDBY
+    assert worker._accepting_commands is False
+
+
+def test_main_lease_holder_waits_for_fresh_quote_before_active_execution(
+    tmp_path, monkeypatch
+):
+    quote_fresh = False
+    worker, _ = _worker(
+        tmp_path,
+        device_id="main-device",
+        regular_session_open=lambda: False,
+    )
+    worker._accepting_commands = False
+    worker.device_state = RuntimeDeviceState.STANDBY
+    monkeypatch.setattr(
+        worker,
+        "engine_readiness",
+        lambda **kwargs: _ready_runtime_state(critical_quotes_fresh=quote_fresh),
+    )
+    monkeypatch.setattr(worker, "_lease_still_current", lambda: True)
+    monkeypatch.setattr(worker, "_run_startup_reconciliation", lambda **kwargs: None)
+
+    worker._advance_startup_readiness()
+
+    assert worker.device_state == RuntimeDeviceState.STANDBY
+    assert worker._accepting_commands is False
+
+    quote_fresh = True
+    worker._advance_startup_readiness()
+
+    assert worker.device_state == RuntimeDeviceState.ACTIVE
+    assert worker._accepting_commands is True
+
+
+def test_handoff_session_lookup_failure_is_fail_closed(tmp_path):
+    def unavailable():
+        raise RuntimeError("calendar unavailable")
+
+    worker, _ = _worker(
+        tmp_path,
+        standby_only=True,
+        regular_session_open=unavailable,
+    )
+
+    assert worker.lease_handoff_ready(
+        _ready_runtime_state(critical_quotes_fresh=False)
+    ) is False
+
+
 def test_standby_readiness_loss_demotes_immediately(tmp_path, monkeypatch):
     worker, engine = _worker(tmp_path, standby_only=True, device_id="successor")
     worker._accepting_commands = False

@@ -58,6 +58,30 @@ def test_standby_readiness_exposes_the_same_gate_results_used_for_authorization(
     assert dict(readiness.standby_check_results)["critical_quotes_fresh"] is False
 
 
+def test_premarket_handoff_waives_only_fresh_quote_evidence():
+    values = dict(_READY)
+    values["lease_current"] = False
+    values["device_active"] = False
+    values["critical_quotes_fresh"] = False
+    readiness = EngineReadiness(**values)
+
+    assert readiness.premarket_handoff_ready is True
+    assert readiness.standby_ready is False
+    assert readiness.healthy is False
+
+
+@pytest.mark.parametrize(
+    "condition",
+    EngineReadiness.PREMARKET_HANDOFF_CHECK_FIELDS,
+)
+def test_premarket_handoff_keeps_every_non_quote_gate_fail_closed(condition):
+    values = dict(_READY)
+    values["critical_quotes_fresh"] = False
+    values[condition] = False
+
+    assert EngineReadiness(**values).premarket_handoff_ready is False
+
+
 def test_runtime_device_state_requires_explicit_fresh_handoff_confirmation(tmp_path):
     engine = create_engine(
         f"sqlite:///{tmp_path / 'runtime-state.db'}",

@@ -39,6 +39,35 @@ def test_closed_session_quote_wait_shows_exact_gate_and_market_open_eta():
     assert "Automatic PC claim is enabled" in display.tooltip
 
 
+def test_premarket_successor_shows_ready_for_main_transfer_without_quote():
+    display = _buyboard_readiness_display(
+        _readiness(critical_quotes_fresh=False),
+        device_state=RuntimeDeviceState.STANDBY_READY,
+        regular_session_open=False,
+        seconds_until_open=300,
+        auto_claim_enabled=True,
+    )
+
+    assert display.completed == 7
+    assert "STANDBY_READY for Main transfer" in display.label
+    assert "market opens in 00:05:00" in display.label
+    assert "execution waits" in display.label
+
+
+def test_premarket_main_shows_lease_held_while_execution_waits_for_quote():
+    display = _buyboard_readiness_display(
+        _readiness(critical_quotes_fresh=False),
+        device_state=RuntimeDeviceState.STANDBY,
+        regular_session_open=False,
+        seconds_until_open=120,
+        is_main_device=True,
+    )
+
+    assert "Main lease held" in display.label
+    assert "execution waits" in display.label
+    assert "market opens in 00:02:00" in display.label
+
+
 def test_live_reconciliation_uses_indeterminate_progress_without_fake_eta():
     display = _buyboard_readiness_display(
         _readiness(account_reconciliation_fresh=False),

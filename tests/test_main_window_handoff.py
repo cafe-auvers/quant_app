@@ -561,6 +561,53 @@ def test_auto_claim_waits_for_a_fresh_standby_generation(monkeypatch):
     assert started == []
 
 
+def test_premarket_quote_staleness_does_not_block_standby_generation_claim(
+    monkeypatch, tmp_path
+):
+    engine = _make_engine(tmp_path)
+    role = ss.LocalDeviceRole("pc-id", "PC", False)
+    record = save_runtime_device_state(
+        engine,
+        device_id=role.device_id,
+        hostname=role.hostname,
+        state=RuntimeDeviceState.STANDBY_READY,
+    )
+
+    class _Worker:
+        _standby_only = True
+        device_state = RuntimeDeviceState.STANDBY_READY
+
+        @staticmethod
+        def isRunning():
+            return True
+
+        @staticmethod
+        def engine_readiness(**kwargs):
+            return SimpleNamespace(
+                standby_ready=False,
+                premarket_handoff_ready=True,
+            )
+
+        @staticmethod
+        def lease_handoff_ready(readiness):
+            return readiness.premarket_handoff_ready
+
+    window = MainWindow.__new__(MainWindow)
+    window.pc_db_engine = engine
+    window.state_sync_role = role
+    window._buyboard_runtime_worker = _Worker()
+    monkeypatch.setattr(
+        main_window_module.execution_config,
+        "is_buyboard_engine_enabled",
+        lambda: True,
+    )
+
+    assert (
+        MainWindow._runtime_standby_generation_for_claim(window)
+        == record.readiness_generation
+    )
+
+
 def test_successful_auto_claim_activation_begins_post_claim_handoff():
     window = _sync_completed_window(auto_claim_enabled=True)
     window.state_sync_role = ss.LocalDeviceRole("pc-id", "PC", False)
