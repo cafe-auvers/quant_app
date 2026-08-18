@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import os
+import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
+from PyQt5.QtWidgets import QApplication
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
@@ -25,6 +27,9 @@ from src.ui.buyboard.controller import (
     _projection_context,
 )
 from src.ui.buyboard.card import board_interaction_fingerprint
+
+
+_APP = QApplication.instance() or QApplication([])
 
 
 @pytest.fixture(autouse=True)
@@ -49,6 +54,19 @@ class _Window(BuyboardMixin):
 
     def refresh_buyboard(self):
         self.refresh_count += 1
+
+
+def _wait_for_dispatched_command(window, timeout: float = 2.0):
+    deadline = time.monotonic() + timeout
+    while window.__dict__.get("_buyboard_pending_command_counts"):
+        _APP.processEvents()
+        if time.monotonic() >= deadline:
+            raise AssertionError("timed out waiting for background board command")
+        time.sleep(0.005)
+    _APP.processEvents()
+    worker = window._buyboard_command_worker
+    worker.request_stop()
+    assert worker.wait(1000)
 
 
 def _seed_buylist(engine):
@@ -79,6 +97,7 @@ def test_buy_today_can_be_planned_before_runtime_worker_exists(tmp_path):
     window = _Window(engine)
 
     assert window._buyboard_dispatch_command(_command(card)) is True
+    _wait_for_dispatched_command(window)
 
     stored = card_repo.get_trade_card(
         engine, "PROD", "12345678-01", "AAPL"
@@ -117,6 +136,7 @@ def test_dispatch_retries_once_after_equivalent_storage_only_revision(tmp_path):
     assert window._buyboard_dispatch_command(
         _command(rendered), interaction_fingerprint=fingerprint
     ) is True
+    _wait_for_dispatched_command(window)
     stored = card_repo.get_trade_card(
         engine, "PROD", "12345678-01", "AAPL"
     )

@@ -243,6 +243,15 @@ def populate_buyboard_columns(main_window, cards) -> None:
             quote_lookup,
             equity_lookup,
         )
+        pending_setter = getattr(column_list, "set_pending_card_keys", None)
+        if callable(pending_setter):
+            pending_setter(
+                set(
+                    main_window.__dict__.get(
+                        "_buyboard_pending_command_counts", {}
+                    )
+                )
+            )
     if hasattr(main_window, "_buyboard_engine_status_label"):
         enabled = is_buyboard_engine_enabled()
         main_window._buyboard_engine_status_label.setText(
@@ -530,19 +539,37 @@ def _payload_matches_projection(payload: dict, projection) -> bool:
 
 
 def _lookup_projection(main_window, environment: str, account_no: str, symbol: str):
-    from .controller import _projection_context
+    """Resolve a gesture against the exact projection already shown to the user.
 
-    try:
-        return execution_workflow_service.get_board_projection(
-            main_window._buyboard_engine(),
-            environment=environment,
-            account_no=account_no,
-            symbol=symbol,
-            context=_projection_context(main_window),
+    Canonical CAS, ownership, reconciliation, and fingerprint checks still run
+    in :class:`BoardCommandWorker`. Keeping this lookup in memory ensures a
+    drop or context-menu selection never starts a database read on Qt's thread.
+    """
+
+    expected = (
+        str(environment or "").upper(),
+        str(account_no or ""),
+        str(symbol or "").upper(),
+    )
+    for value in tuple(
+        getattr(main_window, "_buyboard_current_projections", ()) or ()
+    ):
+        state = _state(value)
+        if state is None:
+            continue
+        identity = (
+            str(state.environment or "").upper(),
+            str(state.account_no or ""),
+            str(state.symbol or "").upper(),
         )
-    except Exception:  # projection failure is fail-closed for UI actions
-        logger.exception("Failed to load authoritative board projection for %s", symbol)
-        return None
+        if identity != expected:
+            continue
+        return (
+            value
+            if isinstance(value, BoardCardProjection)
+            else BoardCardProjection(card=value)
+        )
+    return None
 
 
 def _handle_external_order_adopt(main_window, external_order) -> None:

@@ -11,6 +11,9 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, replace
 import logging
+from queue import Empty, Queue
+import time
+from typing import Optional
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
@@ -65,6 +68,7 @@ class BuyboardProjectionWorker(QThread):
         self.request = request
 
     def run(self) -> None:
+        started_at = time.perf_counter()
         request = self.request
         try:
             from .columns import BOARD_COLUMN_ORDER
@@ -101,6 +105,183 @@ class BuyboardProjectionWorker(QThread):
         except Exception as exc:
             logger.exception("Buy Board projection refresh failed")
             self.completed.emit([], str(exc), request.generation)
+        finally:
+            logger.debug(
+                "Buy Board projection generation=%d completed in %.1f ms",
+                request.generation,
+                (time.perf_counter() - started_at) * 1000.0,
+            )
+
+
+@dataclass(frozen=True)
+class BuyboardCommandRequest:
+    """Everything a board command needs after leaving the Qt thread."""
+
+    engine: object
+    command: AnyBoardCommand
+    action_context: BoardActionContext
+    projection_context: BoardProjectionContext
+    interaction_fingerprint: str = ""
+    enqueued_at: float = 0.0
+
+    @property
+    def card_key(self) -> str:
+        command = self.command
+        return f"{command.environment}:{command.account_no}:{command.symbol}"
+
+
+@dataclass(frozen=True)
+class BuyboardCommandResult:
+    """Thread-safe command outcome consumed by the Qt-thread completion slot."""
+
+    request: BuyboardCommandRequest
+    succeeded: bool
+    error_kind: str = ""
+    message: str = ""
+    elapsed_ms: float = 0.0
+    queue_wait_ms: float = 0.0
+
+
+class BoardCommandWorker(QThread):
+    """Execute all Kanban commands serially, away from the Qt event loop."""
+
+    completed = pyqtSignal(object)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._requests: Queue[Optional[BuyboardCommandRequest]] = Queue()
+
+    def enqueue(self, request: BuyboardCommandRequest) -> None:
+        self._requests.put(request)
+
+    def request_stop(self) -> None:
+        self._requests.put(None)
+
+    @staticmethod
+    def _execute(request: BuyboardCommandRequest) -> BuyboardCommandResult:
+        started_at = time.perf_counter()
+        queue_wait_ms = max(0.0, (started_at - request.enqueued_at) * 1000.0)
+        current_command = request.command
+        try:
+            for attempt in range(2):
+                try:
+                    execution_workflow_service.request_board_action(
+                        request.engine,
+                        current_command,
+                        context=request.action_context,
+                        claim_kanban_ownership=_claims_kanban_ownership(
+                            current_command
+                        ),
+                    )
+                    return BuyboardCommandResult(
+                        request=request,
+                        succeeded=True,
+                        elapsed_ms=(time.perf_counter() - started_at) * 1000.0,
+                        queue_wait_ms=queue_wait_ms,
+                    )
+                except TradeCardVersionConflictError:
+                    if attempt == 0 and request.interaction_fingerprint:
+                        try:
+                            projection = (
+                                execution_workflow_service.get_board_projection(
+                                    request.engine,
+                                    environment=current_command.environment,
+                                    account_no=current_command.account_no,
+                                    symbol=current_command.symbol,
+                                    context=request.projection_context,
+                                )
+                            )
+                        except Exception:
+                            projection = None
+                        if (
+                            projection is not None
+                            and board_interaction_fingerprint(projection)
+                            == request.interaction_fingerprint
+                        ):
+                            fresh = card_drag_payload(projection)
+                            current_command = replace(
+                                current_command,
+                                expected_card_version=fresh["version"],
+                                expected_readiness_generation=fresh[
+                                    "readiness_generation"
+                                ],
+                                expected_ownership_version=fresh[
+                                    "ownership_version"
+                                ],
+                                expected_execution_owner=fresh[
+                                    "execution_owner"
+                                ],
+                                expected_strategy_instance_id=fresh[
+                                    "strategy_instance_id"
+                                ],
+                            )
+                            continue
+                    return BuyboardCommandResult(
+                        request=request,
+                        succeeded=False,
+                        error_kind="version_conflict",
+                        message=(
+                            "This card changed since it was loaded. The board has "
+                            "been refreshed; please retry."
+                        ),
+                        elapsed_ms=(time.perf_counter() - started_at) * 1000.0,
+                        queue_wait_ms=queue_wait_ms,
+                    )
+                except TradeCardNotFoundError:
+                    return BuyboardCommandResult(
+                        request=request,
+                        succeeded=False,
+                        error_kind="not_found",
+                        message="This card no longer exists.",
+                        elapsed_ms=(time.perf_counter() - started_at) * 1000.0,
+                        queue_wait_ms=queue_wait_ms,
+                    )
+                except BoardCommandRejectedError as exc:
+                    return BuyboardCommandResult(
+                        request=request,
+                        succeeded=False,
+                        error_kind="rejected",
+                        message=str(exc),
+                        elapsed_ms=(time.perf_counter() - started_at) * 1000.0,
+                        queue_wait_ms=queue_wait_ms,
+                    )
+        except Exception as exc:
+            logger.exception(
+                "Buy Board command %s failed unexpectedly",
+                type(request.command).__name__,
+            )
+            return BuyboardCommandResult(
+                request=request,
+                succeeded=False,
+                error_kind="unexpected",
+                message=f"Could not save the board change: {exc}",
+                elapsed_ms=(time.perf_counter() - started_at) * 1000.0,
+                queue_wait_ms=queue_wait_ms,
+            )
+
+        raise AssertionError("unreachable command execution state")
+
+    def run(self) -> None:
+        while True:
+            try:
+                request = self._requests.get(timeout=0.1)
+            except Empty:
+                if self.isInterruptionRequested():
+                    break
+                continue
+            if request is None:
+                break
+            result = self._execute(request)
+            logger.info(
+                "Buy Board command=%s card=%s success=%s queue=%.1f ms "
+                "execution=%.1f ms",
+                type(request.command).__name__,
+                request.card_key,
+                result.succeeded,
+                result.queue_wait_ms,
+                result.elapsed_ms,
+            )
+            self.completed.emit(result)
 
 
 def apply_board_command(engine, command: AnyBoardCommand, *, context=None):
@@ -206,6 +387,33 @@ def _action_context(main_window, command: AnyBoardCommand) -> BoardActionContext
         device_active=getattr(worker, "device_state", None) == RuntimeDeviceState.ACTIVE,
         regular_session_open=regular_session_open,
         restriction_reasons=tuple(dict.fromkeys(reasons)),
+    )
+
+
+def _claims_kanban_ownership(command: AnyBoardCommand) -> bool:
+    from src.core.board_workflow import (
+        ActivateForToday,
+        CancelPartialSell,
+        CancelQueuedSellAll,
+        RequestPartialSell,
+        RequestSellAll,
+        SetBreakevenStop,
+        SetManualStop,
+        SetOrbStop,
+    )
+
+    return isinstance(
+        command,
+        (
+            ActivateForToday,
+            CancelPartialSell,
+            RequestPartialSell,
+            RequestSellAll,
+            CancelQueuedSellAll,
+            SetOrbStop,
+            SetBreakevenStop,
+            SetManualStop,
+        ),
     )
 
 
@@ -369,6 +577,7 @@ class BuyboardMixin:
         if worker is not None:
             try:
                 if worker.isRunning():
+                    self._buyboard_refresh_pending = True
                     return
             except RuntimeError:
                 pass
@@ -385,6 +594,7 @@ class BuyboardMixin:
         worker = BuyboardProjectionWorker(request)
         self._buyboard_projection_worker = worker
         worker.completed.connect(self._on_buyboard_projection_completed)
+        worker.finished.connect(self._on_buyboard_projection_worker_finished)
         self._track_worker("_buyboard_projection_worker", worker)
         worker.start()
 
@@ -400,7 +610,31 @@ class BuyboardMixin:
             return
         from .board import populate_buyboard_columns
 
+        started_at = time.perf_counter()
         populate_buyboard_columns(self, projections)
+        render_ms = (time.perf_counter() - started_at) * 1000.0
+        log = logger.warning if render_ms > 50.0 else logger.debug
+        log(
+            "Buy Board projection generation=%d rendered in %.1f ms%s",
+            generation,
+            render_ms,
+            " (event-loop target exceeded)" if render_ms > 50.0 else "",
+        )
+
+    def _on_buyboard_projection_worker_finished(self) -> None:
+        """Launch one coalesced refresh requested while a read was running."""
+
+        worker = self.__dict__.get("_buyboard_projection_worker")
+        if worker is not None:
+            try:
+                if not worker.isRunning():
+                    self._buyboard_projection_worker = None
+            except RuntimeError:
+                self._buyboard_projection_worker = None
+        if int(self.__dict__.get("_buyboard_interaction_depth", 0) or 0) > 0:
+            return
+        if bool(self.__dict__.pop("_buyboard_refresh_pending", False)):
+            self.refresh_buyboard()
 
     def _set_buyboard_interaction_active(self, active: bool) -> None:
         """Prevent a timer refresh from replacing widgets during a gesture."""
@@ -423,96 +657,66 @@ class BuyboardMixin:
         *,
         interaction_fingerprint: str = "",
     ) -> bool:
-        from PyQt5.QtWidgets import QMessageBox
-        from src.core.board_workflow import (
-            ActivateForToday,
-            CancelPartialSell,
-            CancelQueuedSellAll,
-            RequestPartialSell,
-            RequestSellAll,
-            SetBreakevenStop,
-            SetManualStop,
-            SetOrbStop,
+        engine = self._buyboard_engine()
+        if engine is None:
+            from PyQt5.QtWidgets import QMessageBox
+
+            QMessageBox.warning(self, "Buy Board", "The board database is unavailable.")
+            return False
+
+        action_context = _action_context(self, command)
+        if _claims_kanban_ownership(command):
+            # These gestures perform zero broker I/O here. They are valid
+            # pre-market and from a pull-only laptop; the authoritative PC
+            # runtime later consumes them only after its complete readiness
+            # predicate and broker-boundary guards pass.
+            action_context = replace(action_context, enforce_runtime_fences=False)
+        request = BuyboardCommandRequest(
+            engine=engine,
+            command=command,
+            action_context=action_context,
+            projection_context=_projection_context(self),
+            interaction_fingerprint=str(interaction_fingerprint or ""),
+            enqueued_at=time.perf_counter(),
         )
-
-        intent_only_types = (
-            ActivateForToday,
-            CancelPartialSell,
-            RequestPartialSell,
-            RequestSellAll,
-            CancelQueuedSellAll,
-            SetOrbStop,
-            SetBreakevenStop,
-            SetManualStop,
-        )
-
-        def request(current_command: AnyBoardCommand) -> None:
-            context = _action_context(self, current_command)
-            if isinstance(current_command, intent_only_types):
-                # These gestures perform zero broker I/O here. They are valid
-                # pre-market and from a pull-only laptop; the authoritative PC
-                # runtime later consumes them only after its complete readiness
-                # predicate and broker-boundary guards pass.
-                context = replace(context, enforce_runtime_fences=False)
-            execution_workflow_service.request_board_action(
-                self._buyboard_engine(),
-                current_command,
-                context=context,
-                claim_kanban_ownership=isinstance(
-                    current_command, intent_only_types
-                ),
-            )
-
-        current_command = command
-        for attempt in range(2):
+        worker = self.__dict__.get("_buyboard_command_worker")
+        create_worker = worker is None
+        if worker is not None:
             try:
-                request(current_command)
-                break
-            except TradeCardVersionConflictError:
-                if attempt == 0 and interaction_fingerprint:
-                    try:
-                        projection = execution_workflow_service.get_board_projection(
-                            self._buyboard_engine(),
-                            environment=current_command.environment,
-                            account_no=current_command.account_no,
-                            symbol=current_command.symbol,
-                            context=_projection_context(self),
-                        )
-                    except Exception:
-                        projection = None
-                    if (
-                        projection is not None
-                        and board_interaction_fingerprint(projection)
-                        == interaction_fingerprint
-                    ):
-                        fresh = card_drag_payload(projection)
-                        current_command = replace(
-                            current_command,
-                            expected_card_version=fresh["version"],
-                            expected_readiness_generation=fresh[
-                                "readiness_generation"
-                            ],
-                            expected_ownership_version=fresh["ownership_version"],
-                            expected_execution_owner=fresh["execution_owner"],
-                            expected_strategy_instance_id=fresh[
-                                "strategy_instance_id"
-                            ],
-                        )
-                        continue
-                QMessageBox.warning(
-                    self,
-                    "Buy Board",
-                    "This card changed since it was loaded. The board has been refreshed; please retry.",
-                )
-                self.refresh_buyboard()
-                return False
-            except TradeCardNotFoundError:
-                QMessageBox.warning(self, "Buy Board", "This card no longer exists.")
-                self.refresh_buyboard()
-                return False
-            except BoardCommandRejectedError as exc:
-                QMessageBox.warning(self, "Buy Board", str(exc))
-                self.refresh_buyboard()
-                return False
-        self.refresh_buyboard()
+                create_worker = bool(worker.isFinished())
+            except RuntimeError:
+                create_worker = True
+        if create_worker:
+            worker = BoardCommandWorker()
+            self._buyboard_command_worker = worker
+            worker.completed.connect(self._on_buyboard_command_completed)
+            track_worker = getattr(self, "_track_worker", None)
+            if callable(track_worker):
+                track_worker("_buyboard_command_worker", worker)
+        self._set_buyboard_card_pending(request.card_key, True)
+        worker.enqueue(request)
+        if create_worker:
+            worker.start()
         return True
+
+    def _set_buyboard_card_pending(self, card_key: str, pending: bool) -> None:
+        counts = self.__dict__.setdefault("_buyboard_pending_command_counts", {})
+        count = int(counts.get(card_key, 0) or 0)
+        count = count + 1 if pending else max(0, count - 1)
+        if count:
+            counts[card_key] = count
+        else:
+            counts.pop(card_key, None)
+        pending_keys = set(counts)
+        for column in getattr(self, "buyboard_columns", {}).values():
+            setter = getattr(column, "set_pending_card_keys", None)
+            if callable(setter):
+                setter(pending_keys)
+
+    def _on_buyboard_command_completed(self, result: BuyboardCommandResult) -> None:
+        from PyQt5.QtWidgets import QMessageBox
+
+        self._set_buyboard_card_pending(result.request.card_key, False)
+        if not result.succeeded:
+            QMessageBox.warning(self, "Buy Board", result.message)
+        self.refresh_buyboard()

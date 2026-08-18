@@ -84,6 +84,7 @@ class BoardColumnList(QListWidget):
         self._on_external_order_adopt = on_external_order_adopt
         self._on_interaction_active = on_interaction_active
         self._render_signature = None
+        self._pending_card_keys: set[str] = set()
         self.setDragDropMode(QAbstractItemView.DragDrop)
         self.setSelectionMode(QAbstractItemView.SingleSelection)
         self.setSpacing(6)
@@ -103,6 +104,8 @@ class BoardColumnList(QListWidget):
         payload = item.data(Qt.UserRole)
         if not payload:
             return
+        if self._payload_card_key(payload) in self._pending_card_keys:
+            return
         self._set_interaction_active(True)
         try:
             self._on_card_context_menu(payload, self.mapToGlobal(position))
@@ -120,6 +123,8 @@ class BoardColumnList(QListWidget):
             return
         payload = item.data(Qt.UserRole)
         if not payload:
+            return
+        if self._payload_card_key(payload) in self._pending_card_keys:
             return
         self._set_interaction_active(True)
         try:
@@ -316,6 +321,7 @@ class BoardColumnList(QListWidget):
                 current_price=current_price,
                 account_equity=account_equity,
             )
+            widget.set_pending(card_state.card_key in self._pending_card_keys)
             item.setSizeHint(widget.sizeHint())
             self.setItemWidget(item, widget)
             if isinstance(card, BoardCardProjection):
@@ -338,6 +344,34 @@ class BoardColumnList(QListWidget):
                     self.setItemWidget(external_item, external_widget)
         self._render_signature = signature
         return True
+
+    @staticmethod
+    def _payload_card_key(payload: dict) -> str:
+        return (
+            f"{str(payload.get('environment', '')).upper()}:"
+            f"{str(payload.get('account_no', ''))}:"
+            f"{str(payload.get('symbol', '')).upper()}"
+        )
+
+    def set_pending_card_keys(self, card_keys: set[str]) -> None:
+        """Show non-blocking save state and disable repeat gestures per card."""
+
+        self._pending_card_keys = {str(key) for key in card_keys}
+        for index in range(self.count()):
+            item = self.item(index)
+            payload = item.data(Qt.UserRole)
+            if not isinstance(payload, dict):
+                continue
+            pending = self._payload_card_key(payload) in self._pending_card_keys
+            flags = item.flags()
+            if pending:
+                item.setFlags(flags & ~Qt.ItemIsDragEnabled)
+            else:
+                item.setFlags(flags | Qt.ItemIsDragEnabled)
+            widget = self.itemWidget(item)
+            if isinstance(widget, TradeCardWidget):
+                widget.set_pending(pending)
+                item.setSizeHint(widget.sizeHint())
 
     def refresh_live_metrics(
         self,
