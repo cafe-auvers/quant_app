@@ -63,6 +63,11 @@ ALLOWED_BOARD_TRANSITIONS: Dict[BoardStatus, Set[BoardStatus]] = {
         BoardStatus.SELL_ALL,  # stop/user escalation while partial-selling
     },
     BoardStatus.SELL_ALL: {
+        # A user may reduce an unsubmitted/fully reconciled liquidation
+        # objective to a partial exit.  The workflow layer additionally
+        # rejects this edge while any SELL identity, reservation, working
+        # order, ambiguous submission, or cancellation is still live.
+        BoardStatus.PARTIAL_SELL,
         BoardStatus.CLOSED,  # only once broker confirms zero
         # CancelQueuedSellAll (section 302-304) cancels a premarket queued
         # sell-at-open instruction before it fires -- the card returns to

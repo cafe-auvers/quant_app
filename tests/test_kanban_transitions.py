@@ -61,6 +61,10 @@ def test_partial_sell_can_escalate_to_sell_all_on_stop_trigger():
     validate_board_transition(BoardStatus.PARTIAL_SELL, BoardStatus.SELL_ALL)
 
 
+def test_unsubmitted_sell_all_can_be_reduced_to_partial_sell():
+    validate_board_transition(BoardStatus.SELL_ALL, BoardStatus.PARTIAL_SELL)
+
+
 def test_closed_has_no_direct_outgoing_drag_transition():
     with pytest.raises(InvalidBoardTransitionError):
         validate_board_transition(BoardStatus.CLOSED, BoardStatus.BUYLIST)
