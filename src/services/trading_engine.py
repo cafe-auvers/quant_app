@@ -56,7 +56,7 @@ from typing import Callable, Dict, List, Optional
 from src.core import execution_config
 from src.core.execution_config import is_buyboard_engine_enabled
 from src.core.execution_result import UnifiedExecutionStatus
-from src.core.order_state import BrokerOrder, OrderStatus
+from src.core.order_state import BrokerOrder, OrderIntent, OrderStatus
 from src.core.trade_card_state import (
     BoardStatus,
     EntryRuntimeStatus,
@@ -1249,45 +1249,65 @@ class TradingEngine:
             try:
                 order = self._position_callbacks.find_open_sell_order(card)
                 if order is None:
+                    if card.pending_partial_sell_quantity <= 0:
+                        # A user withdrawal whose known order is now absent
+                        # has reached its terminal reconciliation boundary.
+                        # Refresh holdings before returning to Open so a
+                        # fill that raced the cancel is never hidden.
+                        remaining = self._position_callbacks.refresh_orderable_quantity(
+                            card.environment, card.account_no, card.symbol
+                        )
+                        self._complete_partial_exit(card, remaining)
+                        changed.append(card)
+                        continue
                     if self._clear_exit_cancel_tracking(card):
                         changed.append(card)
                     continue
                 refreshed = self._position_callbacks.reconcile_sell_order(order)
                 if refreshed.status.value not in ("FILLED", "CANCELLED", "REJECTED", "EXPIRED"):
-                    if self._escalate_exit_cancel_if_due(card, refreshed, now):
+                    if self._escalate_exit_cancel_if_due(
+                        card,
+                        refreshed,
+                        now,
+                        force=card.pending_partial_sell_quantity <= 0,
+                    ):
                         changed.append(card)
                     continue
-                self._clear_exit_cancel_tracking(card)
                 remaining = self._position_callbacks.refresh_orderable_quantity(
                     card.environment, card.account_no, card.symbol
                 )
-                # Review finding P1-2: a rejected or zero-fill-cancelled
-                # partial sale is not a completed partial exit -- only move
-                # the stop to breakeven when the broker-confirmed quantity
-                # actually decreased. Any decrease at all (even short of the
-                # full requested amount) is real and gets the breakeven
-                # treatment; anything else returns to Open Positions with
-                # the existing stop left untouched.
-                if remaining < card.broker_quantity:
-                    self._position_manager.on_partial_exit_filled(card, refreshed_broker_quantity=remaining)
-                else:
-                    card.broker_quantity = remaining
-                    card.orderable_quantity = remaining
-                    card.board_status = BoardStatus.OPEN_POSITION
-                    card.position_runtime_status = PositionRuntimeStatus.OPEN
-                card.pending_partial_sell_quantity = 0
-                card.reserved_sell_quantity = 0
-                card.exit_client_order_id = ""
-                card.exit_pending_attempt_number = 0
-                card.exit_submission_unresolved = False
-                card.exit_attempt_group_id = ""
-                card.exit_attempt_count = 0
-                card.next_exit_retry_at = None
-                card.last_exit_error = ""
+                self._complete_partial_exit(card, remaining)
                 changed.append(card)
             except Exception:
                 logger.exception("_reconcile_partial_sell_fills failed for %s", card.symbol)
         return changed
+
+    def _complete_partial_exit(
+        self, card: TradeCardState, remaining: int
+    ) -> None:
+        """Project terminal partial-exit truth and retire its correlation."""
+        self._clear_exit_cancel_tracking(card)
+        # A rejected or zero-fill cancellation leaves the existing stop
+        # untouched. Any broker-confirmed quantity decrease, including a
+        # fill racing a user cancel, receives breakeven protection.
+        if remaining < card.broker_quantity:
+            self._position_manager.on_partial_exit_filled(
+                card, refreshed_broker_quantity=remaining
+            )
+        else:
+            card.broker_quantity = remaining
+            card.orderable_quantity = remaining
+            card.board_status = BoardStatus.OPEN_POSITION
+            card.position_runtime_status = PositionRuntimeStatus.OPEN
+        card.pending_partial_sell_quantity = 0
+        card.reserved_sell_quantity = 0
+        card.exit_client_order_id = ""
+        card.exit_pending_attempt_number = 0
+        card.exit_submission_unresolved = False
+        card.exit_attempt_group_id = ""
+        card.exit_attempt_count = 0
+        card.next_exit_retry_at = None
+        card.last_exit_error = ""
 
     # -- Queued market-open Sell All (section 720-732) -------------------
 
@@ -1324,7 +1344,12 @@ class TradingEngine:
         return changed
 
     def _escalate_exit_cancel_if_due(
-        self, card: TradeCardState, order: BrokerOrder, now: datetime
+        self,
+        card: TradeCardState,
+        order: BrokerOrder,
+        now: datetime,
+        *,
+        force: bool = False,
     ) -> bool:
         """Called for a still-open (non-terminal) Partial Sell/Sell All
         order every heartbeat tick. Requests a cancel once its
@@ -1351,7 +1376,7 @@ class TradingEngine:
                         card.warnings = [*card.warnings, _EXIT_CANCEL_STALLED_WARNING]
                         return True
             return False
-        if not self._attempt_deadline_passed(order, now):
+        if not force and not self._attempt_deadline_passed(order, now):
             return False
         self._position_callbacks.request_cancel(card, order.client_order_id, scope="EXIT")
         card.exit_cancel_in_flight = True
@@ -1381,7 +1406,16 @@ class TradingEngine:
                     continue
                 refreshed = self._position_callbacks.reconcile_sell_order(order)
                 if refreshed.is_open():
-                    if self._escalate_exit_cancel_if_due(card, refreshed, now):
+                    # A Partial Sell upgraded by the user to Sell All must be
+                    # cancelled immediately, not left working until its TTL.
+                    # The replacement full liquidation is still submitted
+                    # only after terminal reconciliation proves it gone.
+                    if self._escalate_exit_cancel_if_due(
+                        card,
+                        refreshed,
+                        now,
+                        force=refreshed.intent == OrderIntent.PARTIAL_EXIT,
+                    ):
                         changed.append(card)
                     continue
                 # Terminal (filled/cancelled/rejected/expired) -- refresh the

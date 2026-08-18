@@ -56,8 +56,11 @@ ALLOWED_BOARD_TRANSITIONS: Dict[BoardStatus, Set[BoardStatus]] = {
         BoardStatus.SELL_ALL,
     },
     BoardStatus.PARTIAL_SELL: {
-        BoardStatus.OPEN_POSITION,  # reconciled, partial fills applied
-        BoardStatus.SELL_ALL,  # stop triggered while partial-selling
+        # CancelPartialSell may take this edge immediately only before a
+        # durable SELL lifecycle exists. Once submitted, broker-terminal
+        # reconciliation owns the same edge (including raced partial fills).
+        BoardStatus.OPEN_POSITION,
+        BoardStatus.SELL_ALL,  # stop/user escalation while partial-selling
     },
     BoardStatus.SELL_ALL: {
         BoardStatus.CLOSED,  # only once broker confirms zero

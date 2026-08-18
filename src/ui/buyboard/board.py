@@ -38,6 +38,7 @@ from .columns import BOARD_COLUMN_ORDER, BOARD_COLUMN_TITLES, BoardColumnList
 from .drag_commands import (
     ActivateForToday,
     CancelEntry,
+    CancelPartialSell,
     CancelQueuedSellAll,
     MoveToBuylist,
     MoveToWatchlist,
@@ -252,11 +253,13 @@ def _handle_card_dropped(main_window, payload: dict, target_status: BoardStatus)
             **common
         )
     elif target_status == BoardStatus.OPEN_POSITION:
-        # The only manual drag that legally targets Open Positions is
-        # cancelling a still-queued (not yet market-hours) Sell All.
-        command = CancelQueuedSellAll(
-            **common
-        )
+        if card.board_status == BoardStatus.PARTIAL_SELL:
+            # With no submitted SELL this is an immediate, local withdrawal.
+            # If a known SELL already exists, the runtime requests a broker
+            # cancel and reconciliation alone returns the card to Open.
+            command = CancelPartialSell(**common)
+        else:
+            command = CancelQueuedSellAll(**common)
     elif target_status == BoardStatus.PARTIAL_SELL:
         quantity = dialogs.prompt_partial_sell_quantity(main_window, card)
         if quantity is None:

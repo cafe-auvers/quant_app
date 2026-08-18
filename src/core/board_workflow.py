@@ -97,6 +97,17 @@ class RequestPartialSell(BoardCommand):
 
 
 @dataclass(frozen=True)
+class CancelPartialSell(BoardCommand):
+    """Withdraw a partial-exit objective or request cancellation of its order.
+
+    With no durable SELL lifecycle, the workflow returns the card to Open
+    Position immediately.  Once a known order exists, the card stays pending
+    until the runtime cancels it and broker reconciliation proves terminal
+    state.  Ambiguous orders remain non-withdrawable.
+    """
+
+
+@dataclass(frozen=True)
 class RequestSellAll(BoardCommand):
     pass
 
@@ -153,6 +164,7 @@ AnyBoardCommand = Union[
     ActivateForToday,
     CancelEntry,
     RequestPartialSell,
+    CancelPartialSell,
     RequestSellAll,
     CancelQueuedSellAll,
     SetOrbStop,
