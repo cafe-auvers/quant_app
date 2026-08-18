@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import src.ui.main_window as main_window_module
 from src.core.runtime_readiness import EngineReadiness, RuntimeDeviceState
-from src.ui.main_window import _buyboard_readiness_display
+from src.ui.main_window import MainWindow, _buyboard_readiness_display
 
 
 def _readiness(**overrides) -> EngineReadiness:
@@ -98,3 +101,58 @@ def test_active_projection_explains_that_live_trading_is_a_separate_gate():
     assert "Live Trading" in display.label
     assert "Current action guards" in display.tooltip
     assert "fresh regular-session quotes" in display.tooltip
+
+
+def test_active_runtime_stays_latched_while_legacy_handoff_is_running(monkeypatch):
+    monkeypatch.setattr(
+        main_window_module.execution_config,
+        "is_buyboard_engine_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(main_window_module, "is_regular_session_open", lambda: True)
+    runtime = SimpleNamespace(
+        isRunning=lambda: True,
+        device_state=RuntimeDeviceState.ACTIVE,
+        engine_readiness=lambda **_kwargs: _readiness(
+            lease_current=True,
+            device_active=True,
+            account_reconciliation_fresh=False,
+            critical_quotes_fresh=False,
+        ),
+        reconciliation_accounts_in_progress=set(),
+    )
+    window = MainWindow.__new__(MainWindow)
+    window._buyboard_runtime_worker = runtime
+    window.handoff_reconciliation_worker = SimpleNamespace(isRunning=lambda: True)
+    window.state_sync_worker = None
+    window.state_sync_role = SimpleNamespace(is_main=True)
+    window._auto_claim_main_enabled = True
+
+    display = MainWindow._current_buyboard_readiness_display(window)
+
+    assert display.completed == 8
+    assert display.total == 8
+    assert display.indeterminate is False
+    assert "readiness 8/8" in display.label
+    assert "ACTIVE" in display.label
+    assert "final broker reconciliation" not in display.label
+
+
+def test_standby_runtime_still_shows_running_handoff(monkeypatch):
+    monkeypatch.setattr(
+        main_window_module.execution_config,
+        "is_buyboard_engine_enabled",
+        lambda: True,
+    )
+    window = MainWindow.__new__(MainWindow)
+    window._buyboard_runtime_worker = SimpleNamespace(
+        isRunning=lambda: True,
+        device_state=RuntimeDeviceState.STANDBY,
+    )
+    window.handoff_reconciliation_worker = SimpleNamespace(isRunning=lambda: True)
+    window.state_sync_worker = None
+
+    display = MainWindow._current_buyboard_readiness_display(window)
+
+    assert display.indeterminate is True
+    assert "final broker reconciliation" in display.label
