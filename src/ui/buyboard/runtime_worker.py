@@ -43,7 +43,11 @@ from src.core.execution_mode import ExecutionLease, ExecutionSource
 from src.core.runtime_readiness import EngineReadiness, RuntimeDeviceState
 from src.core.execution_order_record import ExecutionOrderStatus
 from src.core.order_state import OrderSide
-from src.core.trade_card_state import BoardStatus, TradeCardState
+from src.core.trade_card_state import (
+    BoardStatus,
+    PositionRuntimeStatus,
+    TradeCardState,
+)
 from src.services import buyboard_runtime as buyboard_runtime_module
 from src.services import trade_card_repository as repo
 from src.services.account_reconciliation import (
@@ -1135,6 +1139,22 @@ class BuyboardRuntimeWorker(QThread):
     _DATA_STALE_WARNING = "DATA_STALE"
     _MARKET_DATA_OUTAGE_HIGH_WARNING = "MARKET_DATA_OUTAGE_HIGH"
     _MARKET_DATA_OUTAGE_LOW_WARNING = "MARKET_DATA_OUTAGE_LOW"
+    _POSITION_RISK_BOARD_STATUSES = {
+        BoardStatus.OPEN_POSITION,
+        BoardStatus.PARTIAL_SELL,
+        BoardStatus.SELL_ALL,
+    }
+    _POSITION_RISK_RUNTIME_STATUSES = set(PositionRuntimeStatus) - {
+        PositionRuntimeStatus.NONE,
+        PositionRuntimeStatus.CLOSED,
+    }
+    _POSITION_RISK_WARNINGS = {
+        _EXIT_CANCEL_STALLED_WARNING,
+        _TRADING_HALT_EXIT_WARNING,
+        _DATA_STALE_WARNING,
+        _MARKET_DATA_OUTAGE_HIGH_WARNING,
+        _MARKET_DATA_OUTAGE_LOW_WARNING,
+    }
 
     # (warning name, alert-message builder) -- every critical, card-level
     # warning that must reach the user outside the app's own log pane, not
@@ -1185,11 +1205,37 @@ class BuyboardRuntimeWorker(QThread):
             ),
         ),
     )
-    _RECOVERABLE_MARKET_DATA_ALERTS = (
+    _RECOVERABLE_CARD_ALERTS = (
+        (
+            _EXIT_CANCEL_STALLED_WARNING,
+            CriticalAlertType.CANCEL_CONFIRMATION_TIMEOUT,
+        ),
         (_DATA_STALE_WARNING, CriticalAlertType.STALE_CRITICAL_SYMBOL),
         (_MARKET_DATA_OUTAGE_HIGH_WARNING, CriticalAlertType.MARKET_DATA_OUTAGE),
         (_MARKET_DATA_OUTAGE_LOW_WARNING, CriticalAlertType.MARKET_DATA_OUTAGE),
     )
+
+    @classmethod
+    def _warning_is_actionable(
+        cls, card: TradeCardState, warning_name: str
+    ) -> bool:
+        """Ignore persisted position alarms after broker truth is flat.
+
+        A previous process can stop between confirming the final fill and
+        persisting removal of a warning.  On the next startup, the alert
+        bridge observes the old card before the engine's cleanup write.  A
+        warning string alone must not reopen a durable incident when the
+        card is already flat and closed.
+        """
+
+        if warning_name not in cls._POSITION_RISK_WARNINGS:
+            return True
+        return bool(
+            int(card.broker_quantity or 0) > 0
+            or int(card.orderable_quantity or 0) > 0
+            or card.board_status in cls._POSITION_RISK_BOARD_STATUSES
+            or card.position_runtime_status in cls._POSITION_RISK_RUNTIME_STATUSES
+        )
 
     def _emit_stalled_liquidation_alerts(self, cards: List[TradeCardState]) -> None:
         """Review: "a card warning/log condition... is insufficient when
@@ -1205,7 +1251,10 @@ class BuyboardRuntimeWorker(QThread):
         for warning_name, build_message in self._CRITICAL_CARD_WARNINGS:
             alerted = self._alerted_card_keys_by_warning.setdefault(warning_name, set())
             present_now = {
-                card.card_key for card in cards if warning_name in card.warnings
+                card.card_key
+                for card in cards
+                if warning_name in card.warnings
+                and self._warning_is_actionable(card, warning_name)
             }
             newly_present = present_now - alerted
             for card in cards:
@@ -1229,12 +1278,12 @@ class BuyboardRuntimeWorker(QThread):
                         message,
                     )
             self._alerted_card_keys_by_warning[warning_name] = present_now
-        self._resolve_cleared_market_data_alerts(cards)
+        self._resolve_cleared_recoverable_alerts(cards)
 
-    def _resolve_cleared_market_data_alerts(
+    def _resolve_cleared_recoverable_alerts(
         self, cards: List[TradeCardState]
     ) -> None:
-        """Stop retrying durable feed incidents after structural recovery.
+        """Stop retrying durable card incidents after their risk clears.
 
         The first observation also reconciles incidents left OPEN by an older
         process.  Later observations resolve only present-to-absent warning
@@ -1242,9 +1291,12 @@ class BuyboardRuntimeWorker(QThread):
         """
 
         card_keys = {card.card_key for card in cards}
-        for warning_name, alert_type in self._RECOVERABLE_MARKET_DATA_ALERTS:
+        for warning_name, alert_type in self._RECOVERABLE_CARD_ALERTS:
             present_now = {
-                card.card_key for card in cards if warning_name in card.warnings
+                card.card_key
+                for card in cards
+                if warning_name in card.warnings
+                and self._warning_is_actionable(card, warning_name)
             }
             previous = self._card_alert_presence_by_warning.get(warning_name)
             cleared = (
