@@ -65,6 +65,24 @@ workflow after reconciliation, never an inline retry.
 Missing, malformed, unreviewed, or mismatched values prevent the active
 runtime or WebSocket service from composing.
 
+### Premarket Main ownership is separate from execution readiness
+
+Outside the NYSE regular session, a read-only successor may publish
+`STANDBY_READY` and acquire the generation-fenced Main lease when the only
+missing execution dependency is a fresh regular-session quote. Startup and
+final broker reconciliation, account freshness, WebSocket connectivity,
+trade/quote subscription ACKs, accumulator health, and database writability
+are still required. This lets the deployment and device transfer finish
+before the opening bell without inventing or repeatedly requesting a quote
+that cannot yet exist.
+
+After that premarket transfer, the Main worker remains `STANDBY`, with its
+broker-command gate closed. It becomes `ACTIVE` only after an actual fresh
+regular-session quote makes the complete readiness predicate true. The Live
+Trading switch remains a separate session arm/disarm control; arming it does
+not bypass worker readiness, lease, freshness, reconciliation, or gateway
+checks.
+
 ## Supervised sequence
 
 1. Start with the in-process trading switch off.

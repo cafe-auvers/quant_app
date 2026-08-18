@@ -164,6 +164,7 @@ def _buyboard_readiness_display(
     regular_session_open: bool = False,
     seconds_until_open: Optional[float] = None,
     auto_claim_enabled: bool = False,
+    is_main_device: bool = False,
 ) -> BuyboardReadinessDisplay:
     """Project the authoritative readiness predicate into operator language."""
 
@@ -204,6 +205,27 @@ def _buyboard_readiness_display(
         reason = "waiting for KIS trade-subscription ACKs"
     elif not readiness.critical_quote_subscriptions_acked:
         reason = "waiting for KIS quote-subscription ACKs"
+    elif (
+        not regular_session_open
+        and not readiness.critical_quotes_fresh
+        and readiness.premarket_handoff_ready
+        and is_main_device
+    ):
+        reason = "Main lease held; execution waits for fresh regular-session quotes"
+        if seconds_until_open is not None:
+            reason += f"; market opens in {_format_readiness_eta(seconds_until_open)}"
+    elif (
+        not regular_session_open
+        and not readiness.critical_quotes_fresh
+        and readiness.premarket_handoff_ready
+        and device_state == RuntimeDeviceState.STANDBY_READY
+    ):
+        reason = (
+            "STANDBY_READY for Main transfer; execution waits for fresh "
+            "regular-session quotes"
+        )
+        if seconds_until_open is not None:
+            reason += f"; market opens in {_format_readiness_eta(seconds_until_open)}"
     elif not readiness.critical_quotes_fresh:
         if not regular_session_open and seconds_until_open is not None:
             reason = (
@@ -1464,7 +1486,7 @@ class MainWindow(
                     self._start_state_sync(**claim_kwargs)
 
     def _runtime_standby_generation_for_claim(self) -> int:
-        """Return this device's fresh durable readiness generation, or zero."""
+        """Return this device's fresh durable lease-handoff generation, or zero."""
 
         from src.core.execution_config import is_buyboard_engine_enabled
         from src.core.runtime_readiness import RuntimeDeviceState
@@ -1477,14 +1499,15 @@ class MainWindow(
         if worker is None or role is None or engine is None:
             return 0
         try:
+            readiness = worker.engine_readiness(include_device_state=False)
+            handoff_ready = getattr(worker, "lease_handoff_ready", None)
             if (
                 not worker.isRunning()
                 or not bool(getattr(worker, "_standby_only", False))
                 or getattr(worker, "device_state", None)
                 != RuntimeDeviceState.STANDBY_READY
-                or not worker.engine_readiness(
-                    include_device_state=False
-                ).standby_ready
+                or not callable(handoff_ready)
+                or not handoff_ready(readiness)
             ):
                 return 0
             from src.services.runtime_device_state_repository import (
@@ -1595,6 +1618,13 @@ class MainWindow(
                 seconds_until_open=until_open,
                 auto_claim_enabled=bool(
                     self.__dict__.get("_auto_claim_main_enabled", False)
+                ),
+                is_main_device=bool(
+                    getattr(
+                        self.__dict__.get("state_sync_role"),
+                        "is_main",
+                        False,
+                    )
                 ),
             )
         except Exception:
@@ -1865,7 +1895,9 @@ class MainWindow(
                 self,
                 "Device not ready",
                 "This device must complete its read-only startup and final broker "
-                "reconciliation before it can become Main. Wait for "
+                "reconciliation before it can become Main. Outside regular market "
+                "hours, a fresh quote is not required for ownership transfer; "
+                "execution will remain closed until one arrives. Wait for "
                 f"STANDBY_READY, then try again.{detail}",
             )
             return

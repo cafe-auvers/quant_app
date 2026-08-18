@@ -68,6 +68,7 @@ from src.services.execution_lease_protocol import DefaultExecutionLeaseProtocol
 from src.services.kis_request_scheduler import KisRequestScheduler
 from src.services.kis_request_boundary import install_process_kis_request_scheduler
 from src.services.controlled_live_policy import require_controlled_live_configuration
+from src.utils.market_calendar import is_regular_session_open
 from src.services.external_alerting import (
     CriticalAlertType,
     ExternalAlertingService,
@@ -147,6 +148,7 @@ class BuyboardRuntimeWorker(QThread):
         hostname: str = "",
         external_alerting: Optional[ExternalAlertingService] = None,
         schema_migration_manager: Optional[SchemaMigrationManager] = None,
+        regular_session_open: Optional[Callable[[], bool]] = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -189,6 +191,7 @@ class BuyboardRuntimeWorker(QThread):
         self._hostname = str(hostname or platform.node())
         self._external_alerting = external_alerting
         self._schema_migration_manager = schema_migration_manager
+        self._regular_session_open = regular_session_open or is_regular_session_open
         # How this worker finds the legacy execution queue's already-computed
         # ORB candidate for a symbol (review finding P0-2) -- typically
         # ``lambda symbol, env: main_window.execution_queue_manager.get_item(symbol, env)``.
@@ -568,7 +571,9 @@ class BuyboardRuntimeWorker(QThread):
 
     def _advance_startup_readiness(self) -> None:
         readiness = self.engine_readiness(include_device_state=False)
-        if not readiness.standby_ready:
+        handoff_ready = self.lease_handoff_ready(readiness)
+        required_ready = handoff_ready if self._standby_only else readiness.standby_ready
+        if not required_ready:
             if self.device_state == RuntimeDeviceState.STANDBY_READY:
                 self._demote_standby_readiness()
             return
@@ -578,8 +583,9 @@ class BuyboardRuntimeWorker(QThread):
                 # projection-only broker reconciliation and a second complete
                 # dependency check.
                 self._run_startup_reconciliation(execute_commands=False)
+                self._refresh_observation_after_final_reconciliation()
                 readiness = self.engine_readiness(include_device_state=False)
-                if not readiness.standby_ready:
+                if not self.lease_handoff_ready(readiness):
                     self._demote_standby_readiness()
                     return
             # Subsequent writes are successor-owned heartbeats. They preserve
@@ -596,9 +602,7 @@ class BuyboardRuntimeWorker(QThread):
         # reconciliation makes the preceding drain stale before readiness is
         # rechecked.  KIS stop breaches remain latched until the engine
         # acknowledges them, so draining here cannot lose protective intent.
-        if self.runtime is not None:
-            self.runtime.market_data.poll_once()
-            self.last_market_data_drain_at = datetime.now(timezone.utc)
+        self._refresh_observation_after_final_reconciliation()
         self._lease_current = self._lease_still_current()
         readiness = self.engine_readiness(include_device_state=False)
         if not (self._lease_current and readiness.standby_ready):
@@ -611,6 +615,35 @@ class BuyboardRuntimeWorker(QThread):
         # become observable. A failed write leaves both closed.
         self._set_device_state(RuntimeDeviceState.ACTIVE)
         self._accepting_commands = True
+
+    def lease_handoff_ready(
+        self, readiness: Optional[EngineReadiness] = None
+    ) -> bool:
+        """Return whether this read-only successor can own the Main lease.
+
+        During regular trading hours the full execution-grade readiness
+        predicate is mandatory.  Outside regular hours, only fresh quote
+        evidence is waived: broker reconciliation, subscription ACKs, queue
+        health, and canonical database access all remain fail-closed.
+        """
+
+        current = readiness or self.engine_readiness(include_device_state=False)
+        if current.standby_ready:
+            return True
+        try:
+            market_open = bool(self._regular_session_open())
+        except Exception:
+            logger.exception("Could not determine regular-session state for handoff")
+            return False
+        return not market_open and current.premarket_handoff_ready
+
+    def _refresh_observation_after_final_reconciliation(self) -> None:
+        """Refresh the local feed-drain timestamp after a blocking REST pass."""
+
+        if self.runtime is None:
+            return
+        self.runtime.market_data.poll_once()
+        self.last_market_data_drain_at = datetime.now(timezone.utc)
 
     def _perform_shutdown_sequence(self) -> None:
         """E4: gate commands, flush, reconcile, close feed, then stop."""

@@ -52,6 +52,15 @@ class EngineReadiness:
         "accumulator_draining_within_budget",
         "database_writable",
     )
+    PREMARKET_HANDOFF_CHECK_FIELDS: ClassVar[Tuple[str, ...]] = (
+        "startup_reconciliation_complete",
+        "account_reconciliation_fresh",
+        "websocket_connected",
+        "critical_trade_subscriptions_acked",
+        "critical_quote_subscriptions_acked",
+        "accumulator_draining_within_budget",
+        "database_writable",
+    )
 
     @property
     def standby_check_results(self) -> Tuple[Tuple[str, bool], ...]:
@@ -109,6 +118,22 @@ class EngineReadiness:
         """
 
         return all(passed for _, passed in self.standby_check_results)
+
+    @property
+    def premarket_handoff_ready(self) -> bool:
+        """Whether a read-only successor may safely acquire the Main lease.
+
+        A closed market cannot produce a fresh regular-session quote.  That
+        absence must continue to block ``ACTIVE`` execution, but it must not
+        prevent an otherwise reconciled successor from taking ownership in
+        advance of the opening bell.  The worker applies the session-hours
+        condition; this value type only exposes the quote-independent facts.
+        """
+
+        return all(
+            bool(getattr(self, field_name))
+            for field_name in self.PREMARKET_HANDOFF_CHECK_FIELDS
+        )
 
 
 @dataclass(frozen=True)
