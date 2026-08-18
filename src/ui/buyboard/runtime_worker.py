@@ -995,6 +995,17 @@ class BuyboardRuntimeWorker(QThread):
         observation_cards = [
             card for card in cards if card.board_status in _QUOTE_SUBSCRIBED_STATUSES
         ]
+        # Installing a durable stop request into the local market-data rule
+        # set is not a broker mutation.  The exact Main lease must be able to
+        # complete that handoff before the first regular-session quote makes
+        # the runtime ACTIVE; otherwise one premarket request remains pending
+        # indefinitely and fences every later stop edit.  A pull-only
+        # successor still cannot acknowledge canonical stop state.
+        allow_stop_change_ack = bool(
+            canonical_available
+            and not self._standby_only
+            and (allow_mutations or self._lease_current)
+        )
         durably_liquidating_card_keys = {
             card.card_key for card in observation_cards if card.exit_all_required
         }
@@ -1014,7 +1025,7 @@ class BuyboardRuntimeWorker(QThread):
             self._stop_change_coordinator.overlay_pending(observation_cards)
             self._sync_market_stop_rules(
                 observation_cards,
-                apply_pending_changes=bool(allow_mutations and canonical_available),
+                apply_pending_changes=allow_stop_change_ack,
             )
 
             quotes = self.runtime.market_data.poll_once()
@@ -1035,6 +1046,7 @@ class BuyboardRuntimeWorker(QThread):
                     self._collect_market_breach_ack_candidates(
                         quote, observation_cards, breach_ack_candidates
                     )
+            if allow_stop_change_ack:
                 _track(self._acknowledge_pending_stop_changes(observation_cards))
 
         if allow_mutations:

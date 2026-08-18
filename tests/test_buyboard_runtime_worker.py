@@ -564,6 +564,82 @@ def test_ui_stop_commit_reaches_feed_when_worker_card_snapshot_is_stale(
     assert not any(quote.breached_stop_versions for quote in service.poll_once())
 
 
+def test_main_standby_acknowledges_premarket_stop_without_broker_mutation(
+    tmp_path, monkeypatch
+):
+    worker, engine, _service, now = _stale_snapshot_stop_worker(
+        tmp_path, monkeypatch, stop_price=95.0
+    )
+    worker.device_state = RuntimeDeviceState.STANDBY
+    worker._accepting_commands = False
+    worker._lease_current = True
+    broker_calls = []
+    worker.runtime.broker.submit_order = lambda **kwargs: broker_calls.append(
+        ("submit", kwargs)
+    )
+    worker.runtime.broker.cancel_order = lambda **kwargs: broker_calls.append(
+        ("cancel", kwargs)
+    )
+
+    card = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    requested = workflow.request_board_action(
+        engine,
+        SetManualStop(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            expected_card_version=card.version,
+            price=100.0,
+            requested_at=now,
+        ),
+        context=BoardActionContext(),
+    ).card
+    assert requested.pending_stop_command_id
+
+    worker._run_one_cycle(allow_mutations=False)
+
+    durable = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert durable.active_stop_price == 100.0
+    assert durable.stop_type == StopType.MANUAL_PRICE
+    assert durable.pending_stop_command_id == ""
+    assert worker.device_state == RuntimeDeviceState.STANDBY
+    assert worker._accepting_commands is False
+    assert broker_calls == []
+
+
+def test_pull_only_standby_cannot_acknowledge_premarket_stop(
+    tmp_path, monkeypatch
+):
+    worker, engine, _service, now = _stale_snapshot_stop_worker(
+        tmp_path, monkeypatch, stop_price=95.0
+    )
+    worker._standby_only = True
+    worker.device_state = RuntimeDeviceState.STANDBY_READY
+    worker._accepting_commands = False
+    worker._lease_current = False
+
+    card = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    requested = workflow.request_board_action(
+        engine,
+        SetManualStop(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            expected_card_version=card.version,
+            price=100.0,
+            requested_at=now,
+        ),
+        context=BoardActionContext(),
+    ).card
+
+    worker._run_one_cycle(allow_mutations=False)
+
+    durable = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert durable.active_stop_price == 95.0
+    assert durable.pending_stop_command_id == requested.pending_stop_command_id
+    assert durable.pending_stop_price == 100.0
+
+
 def test_stop_breach_ack_waits_for_successful_card_cas(tmp_path, monkeypatch):
     worker, engine, service, now = _stale_snapshot_stop_worker(
         tmp_path, monkeypatch, stop_price=100.0
