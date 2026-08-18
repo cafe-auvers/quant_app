@@ -1637,30 +1637,41 @@ class MainWindow(
         if not execution_config.is_buyboard_engine_enabled():
             return None
 
-        state_sync_worker = self.__dict__.get("state_sync_worker")
-        if (
-            self.__dict__.get("_state_sync_action") == "activate"
-            and self._background_worker_running(state_sync_worker)
-        ):
-            return BuyboardReadinessDisplay(
-                8,
-                8,
-                "Buy Board activation — transferring the main-device lease (ETA unavailable)",
-                "The lease transaction is in progress and remains revision fenced.",
-                indeterminate=True,
-            )
-
-        handoff_worker = self.__dict__.get("handoff_reconciliation_worker")
-        if self._background_worker_running(handoff_worker):
-            return BuyboardReadinessDisplay(
-                8,
-                8,
-                "Buy Board activation — final broker reconciliation (ETA unavailable)",
-                "KIS account and order truth are being refreshed before execution can become ACTIVE.",
-                indeterminate=True,
-            )
-
         worker = self.__dict__.get("_buyboard_runtime_worker")
+        runtime_active = bool(
+            worker is not None
+            and self._background_worker_running(worker)
+            and getattr(worker, "device_state", RuntimeDeviceState.STARTING)
+            == RuntimeDeviceState.ACTIVE
+        )
+        # ACTIVE is a latched Buy Board state. A separate legacy Buylist
+        # handoff/reconciliation may continue in the background, but it does
+        # not revoke Buy Board activation and must not replace the stable 8/8
+        # projection with an indeterminate activation message.
+        if not runtime_active:
+            state_sync_worker = self.__dict__.get("state_sync_worker")
+            if (
+                self.__dict__.get("_state_sync_action") == "activate"
+                and self._background_worker_running(state_sync_worker)
+            ):
+                return BuyboardReadinessDisplay(
+                    8,
+                    8,
+                    "Buy Board activation — transferring the main-device lease (ETA unavailable)",
+                    "The lease transaction is in progress and remains revision fenced.",
+                    indeterminate=True,
+                )
+
+            handoff_worker = self.__dict__.get("handoff_reconciliation_worker")
+            if self._background_worker_running(handoff_worker):
+                return BuyboardReadinessDisplay(
+                    8,
+                    8,
+                    "Buy Board activation — final broker reconciliation (ETA unavailable)",
+                    "KIS account and order truth are being refreshed before execution can become ACTIVE.",
+                    indeterminate=True,
+                )
+
         if worker is None or not self._background_worker_running(worker):
             return BuyboardReadinessDisplay(
                 0,

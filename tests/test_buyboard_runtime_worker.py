@@ -2084,6 +2084,47 @@ def test_execution_stale_warning_is_local_and_recovery_resolves_incident(tmp_pat
     assert stale_resolutions[0][1].endswith(":STIM:DATA_STALE")
 
 
+def test_flat_closed_card_does_not_reopen_persisted_position_alerts(tmp_path):
+    worker, _ = _worker(tmp_path)
+    native_alerts = []
+    raised = []
+    resolutions = []
+
+    class Alerting:
+        def raise_alert(self, alert_type, dedupe_key, message):
+            raised.append((alert_type, dedupe_key, message))
+
+        def resolve_alert(self, alert_type, dedupe_key, *, resolved_by):
+            resolutions.append((alert_type, dedupe_key, resolved_by))
+            return True
+
+    worker._external_alerting = Alerting()
+    worker.alert.connect(native_alerts.append)
+    card = TradeCardState(
+        environment="PROD",
+        account_no="1",
+        symbol="STIM",
+        board_status=BoardStatus.CLOSED,
+        position_runtime_status=PositionRuntimeStatus.CLOSED,
+        broker_quantity=0,
+        orderable_quantity=0,
+        warnings=["MARKET_DATA_OUTAGE_LOW", "EXIT_CANCEL_STALLED"],
+    )
+
+    worker._emit_stalled_liquidation_alerts([card])
+
+    assert native_alerts == []
+    assert raised == []
+    assert (
+        CriticalAlertType.MARKET_DATA_OUTAGE,
+        "PROD:1:STIM:MARKET_DATA_OUTAGE_LOW",
+    ) in [(alert_type, dedupe_key) for alert_type, dedupe_key, _ in resolutions]
+    assert (
+        CriticalAlertType.CANCEL_CONFIRMATION_TIMEOUT,
+        "PROD:1:STIM:EXIT_CANCEL_STALLED",
+    ) in [(alert_type, dedupe_key) for alert_type, dedupe_key, _ in resolutions]
+
+
 def test_unreconciled_broker_order_warning_fires_alert_exactly_once(tmp_path):
     """Review finding P1: "UNRECONCILED_BROKER_ORDER should be a critical
     notification" -- not merely a card warning."""
