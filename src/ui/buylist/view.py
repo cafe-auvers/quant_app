@@ -773,6 +773,8 @@ class BuylistViewMixin:
             risk_percent=risk_percent,
             buffer_pct=buffer_pct,
             account_no=account_no,
+            trade_card_engine=self.__dict__.get("pc_db_engine"),
+            watchlist=self.__dict__.get("watchlist"),
             latest_intraday_session=self._latest_intraday_session,
             load_intraday_interval=lambda symbol, interval, window_days: self._load_cached_intraday_interval(
                 symbol,
@@ -800,6 +802,8 @@ class BuylistViewMixin:
                 self.update_dashboard_summary()
             self._save_buylist_state()
             self._save_execution_queue_state()
+            if result.canonical_changed_keys and hasattr(self, "refresh_buyboard"):
+                self.refresh_buyboard()
 
         if not show_log:
             return

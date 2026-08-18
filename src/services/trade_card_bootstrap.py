@@ -2,9 +2,10 @@
 
 The Kanban database is authoritative once a card exists.  This module only
 bridges the already-loaded legacy Watchlist/Buylist and fresh cached KIS
-holdings into *missing* trade-card rows so opening the Buy Board does not
-require a manual migration step.  It deliberately performs no network I/O and
-never rewrites an existing execution lifecycle from legacy list metadata.
+holdings into trade-card rows so opening the Buy Board does not require a
+manual migration step.  It deliberately performs no network I/O.  Legacy
+Buylist state may repair a passive WATCHLIST card to BUYLIST, but never
+rewrites a later execution lifecycle.
 
 Fresh cached holdings are allowed to update broker-derived position facts when
 the dedicated runtime worker is not running.  The runtime's normal account
@@ -15,13 +16,13 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from types import SimpleNamespace
 from typing import Mapping, Optional
 
 from sqlalchemy.engine import Engine
 
 from src.core.trade_card_state import BoardStatus, TradeCardState
 from src.services import trade_card_repository
+from src.services.buylist_membership_service import reconcile_buylist_item
 from src.services.position_manager import PositionManager, extract_overseas_holdings
 
 
@@ -30,12 +31,17 @@ class TradeCardBootstrapResult:
     """Summary of one idempotent bootstrap pass."""
 
     created_keys: tuple[str, ...] = ()
+    buylist_promoted_keys: tuple[str, ...] = ()
     holding_updated_keys: tuple[str, ...] = ()
     skipped_watchlist_symbols: tuple[str, ...] = ()
 
     @property
     def changed(self) -> bool:
-        return bool(self.created_keys or self.holding_updated_keys)
+        return bool(
+            self.created_keys
+            or self.buylist_promoted_keys
+            or self.holding_updated_keys
+        )
 
 
 def _normalized_account(value: object) -> str:
@@ -73,14 +79,15 @@ def bootstrap_trade_cards_from_current_state(
     max_snapshot_age_seconds: float = 120.0,
     now: Optional[datetime] = None,
 ) -> TradeCardBootstrapResult:
-    """Seed missing Watchlist/Buylist cards and project fresh cached holdings.
+    """Seed/reconcile Watchlist/Buylist cards and project cached holdings.
 
-    Legacy list state is *create-only*.  An existing TradeCardState may own a
-    working order, position, stop, or newer Kanban gesture, so legacy metadata
-    is never allowed to overwrite it.  Fresh cached KIS holdings may update
-    broker-derived position facts through :class:`PositionManager`, which
-    preserves active entry/exit intent exactly like normal runtime
-    reconciliation.
+    Legacy Buylist state may create a missing row and may perform the one safe
+    recovery transition ``WATCHLIST -> BUYLIST`` for a passive candidate.  An
+    existing later lifecycle may own an order, position, stop, or newer Kanban
+    gesture, so it is never moved backwards from legacy metadata.  Fresh
+    cached KIS holdings may update broker-derived position facts through
+    :class:`PositionManager`, which preserves active entry/exit intent exactly
+    like normal runtime reconciliation.
 
     ``account_snapshots`` is intentionally optional.  The UI passes it only
     while the dedicated Buy Board runtime is not running; once the runtime is
@@ -96,13 +103,14 @@ def bootstrap_trade_cards_from_current_state(
     )
     existing_by_key = {card.card_key: card for card in existing_cards}
     created_keys: list[str] = []
+    buylist_promoted_keys: list[str] = []
     holding_updated_keys: list[str] = []
     skipped_watchlist_symbols: list[str] = []
     fallback_account = _normalized_account(default_account_no)
 
-    # Reuse the established legacy->TradeCard mapping, but only consume its
-    # CREATE rows.  This keeps migration semantics in one place while making
-    # repeated UI bootstrap passes unable to clobber a newer Kanban state.
+    # Reuse the shared membership service used by direct Buylist additions.
+    # Its asymmetric rule allows only missing-row creation or the legal
+    # passive WATCHLIST -> BUYLIST promotion; later lifecycle state wins.
     cloned_buylist_items = []
     buylist_symbols: set[str] = set()
     for item in list(getattr(buylist_manager, "items", ()) or ()):
@@ -118,33 +126,29 @@ def bootstrap_trade_cards_from_current_state(
         if not account_no:
             continue
         clone = copy.copy(item)
+        clone.symbol = symbol
         clone.kis_account_no = account_no
         clone.environment = "PROD"
         cloned_buylist_items.append(clone)
 
-    if cloned_buylist_items:
-        report = trade_card_repository.build_trade_card_migration(
-            buylist_manager=SimpleNamespace(items=cloned_buylist_items),
+    for item in cloned_buylist_items:
+        key = f"PROD:{item.kis_account_no}:{item.symbol}"
+        sync = reconcile_buylist_item(
+            engine,
+            item,
             watchlist=watchlist,
-            existing_cards=existing_cards,
+            existing_card=existing_by_key.get(key),
+            existing_card_loaded=True,
         )
-        for row in report.creates:
-            try:
-                stored = trade_card_repository.create_trade_card(engine, row.card)
-            except trade_card_repository.TradeCardVersionConflictError:
-                # Another device/bootstrap pass won the insert race.  Reloading
-                # below is sufficient; never turn the race into an overwrite.
-                stored = trade_card_repository.get_trade_card(
-                    engine,
-                    row.card.environment,
-                    row.card.account_no,
-                    row.card.symbol,
-                )
-                if stored is None:
-                    continue
-            existing_by_key[stored.card_key] = stored
+        stored = sync.card
+        if stored is None:
+            continue
+        existing_by_key[stored.card_key] = stored
+        if sync.action == "created":
             existing_cards.append(stored)
             created_keys.append(stored.card_key)
+        elif sync.action == "promoted":
+            buylist_promoted_keys.append(stored.card_key)
 
     # WatchlistItem is account-agnostic in the legacy model.  The configured
     # production account gives a deterministic identity for presentation and
@@ -263,6 +267,7 @@ def bootstrap_trade_cards_from_current_state(
 
     return TradeCardBootstrapResult(
         created_keys=tuple(dict.fromkeys(created_keys)),
+        buylist_promoted_keys=tuple(dict.fromkeys(buylist_promoted_keys)),
         holding_updated_keys=tuple(dict.fromkeys(holding_updated_keys)),
         skipped_watchlist_symbols=tuple(dict.fromkeys(skipped_watchlist_symbols)),
     )

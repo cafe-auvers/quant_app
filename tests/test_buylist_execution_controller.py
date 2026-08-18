@@ -1,6 +1,11 @@
 from types import SimpleNamespace
 
 import src.ui.controllers.buylist_execution_controller as controller_module
+from sqlalchemy import create_engine
+from sqlalchemy.pool import NullPool
+
+from src.core.trade_card_state import BoardStatus, TradeCardState
+from src.services import trade_card_repository
 from src.ui.controllers.buylist_execution_controller import (
     BuylistExecutionController,
     ExecutionQueueRefreshRequest,
@@ -162,6 +167,52 @@ def test_successful_fake_queue_refresh_increments_refreshed_and_status_counts():
     assert result.refreshed == 1
     assert result.status_counts == {"EXECUTE_READY": 1}
     assert result.failures == []
+
+
+def test_queue_addition_writes_through_watchlist_card_to_canonical_buylist(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        trade_card_repository,
+        "LOCAL_TRADE_CARDS_FILE",
+        tmp_path / "trade_cards.json",
+    )
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'cards.db'}",
+        future=True,
+        poolclass=NullPool,
+    )
+    trade_card_repository.create_trade_card(
+        engine,
+        TradeCardState(
+            environment="PROD",
+            account_no="12345678",
+            symbol="AAPL",
+            board_status=BoardStatus.WATCHLIST,
+            watchlist_member=True,
+        ),
+    )
+    manager = FakeBuylistManager()
+    watch_item = _target()
+    controller = BuylistExecutionController(SimpleNamespace())
+
+    result = controller.refresh_execution_queue(
+        _request(
+            buylist_manager=manager,
+            trade_card_engine=engine,
+            watchlist=SimpleNamespace(items=[watch_item]),
+        )
+    )
+
+    stored = trade_card_repository.get_trade_card(
+        engine, "PROD", "12345678", "AAPL"
+    )
+    assert result.refreshed == 1
+    assert result.canonical_changed_keys == ["PROD:12345678:AAPL"]
+    assert manager.get("AAPL", "PROD") is not None
+    assert stored is not None
+    assert stored.board_status == BoardStatus.BUYLIST
+    assert stored.buylist_member is True
 
 
 def test_queue_pending_order_still_refreshes_candidates_for_replacement():

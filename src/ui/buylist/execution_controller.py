@@ -24,6 +24,8 @@ class ExecutionQueueRefreshRequest:
     risk_percent: float = 0.01
     buffer_pct: float = 0.001
     account_no: str = ""
+    trade_card_engine: Optional[Any] = None
+    watchlist: Optional[Any] = None
     window_days: int = 7
     latest_intraday_session: Callable[[Any], Any] = lambda frame: frame
     load_intraday_interval: Callable[[str, str, int], Any] = lambda _symbol, _interval, _window_days: None
@@ -46,6 +48,7 @@ class ExecutionQueueRefreshResult:
     failures: List[str] = field(default_factory=list)
     refreshed: int = 0
     target_count: int = 0
+    canonical_changed_keys: List[str] = field(default_factory=list)
 
     @property
     def scope(self) -> str:
@@ -123,13 +126,18 @@ class BuylistExecutionController(WindowController):
                     buffer_pct=request.buffer_pct,
                     duplicate_pending_order=duplicate_order,
                 )
-                self.apply_execution_queue_item_to_buylist(
+                sync = self.apply_execution_queue_item_to_buylist(
                     queue_item,
                     watch_item,
                     request.env,
                     request.buffer_pct,
                     buylist_manager=request.buylist_manager,
+                    trade_card_engine=request.trade_card_engine,
+                    default_account_no=request.account_no,
+                    watchlist=request.watchlist,
                 )
+                if sync is not None and sync.changed and sync.card_key:
+                    result.canonical_changed_keys.append(sync.card_key)
                 status_text = self._status_text(queue_item.status)
                 result.status_counts[status_text] = result.status_counts.get(status_text, 0) + 1
                 result.refreshed += 1
@@ -144,7 +152,10 @@ class BuylistExecutionController(WindowController):
         env: str,
         buffer_pct: float,
         buylist_manager: Optional[Any] = None,
-    ) -> None:
+        trade_card_engine: Optional[Any] = None,
+        default_account_no: str = "",
+        watchlist: Optional[Any] = None,
+    ) -> Any:
         symbol = str(queue_item.symbol or "").upper()
         if not symbol:
             return
@@ -229,8 +240,17 @@ class BuylistExecutionController(WindowController):
                 breakout_price=getattr(watch_item, "breakout_price", None),
                 breakout_method=f"execution_queue:{selected_window}" if selected_window else "execution_queue",
                 buffer_pct=effective_buffer_pct,
+                kis_account_no=str(default_account_no or "").strip(),
             )
-            manager.add(existing)
+            from src.services.buylist_membership_service import add_to_buylist
+
+            return add_to_buylist(
+                manager,
+                existing,
+                engine=trade_card_engine,
+                default_account_no=default_account_no,
+                watchlist=watchlist,
+            )
         else:
             existing.name = str(getattr(watch_item, "name", "") or existing.name or symbol)
             existing.status = status_text
@@ -260,6 +280,15 @@ class BuylistExecutionController(WindowController):
                 existing.trade_plan = trade_plan
             if use_selected_plan or not list(getattr(existing, "warnings", []) or []):
                 existing.warnings = warnings
+
+        from src.services.buylist_membership_service import reconcile_buylist_item
+
+        return reconcile_buylist_item(
+            trade_card_engine,
+            existing,
+            default_account_no=default_account_no,
+            watchlist=watchlist,
+        )
 
     def submit_selected_queue_order(self, env: str) -> None:
         submission_guard = getattr(
