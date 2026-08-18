@@ -1148,6 +1148,43 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
             return False
         return True
 
+    def is_symbol_feed_available(
+        self,
+        symbol: str,
+        *,
+        require_trade: bool = True,
+        require_quote: bool = True,
+    ) -> bool:
+        """Return structural KIS channel health without using event age.
+
+        KIS sends symbol data when market activity changes; an acknowledged
+        channel can therefore be healthy even when an illiquid symbol has not
+        produced a trade for several seconds.  Exact broker mutations still
+        call :meth:`is_symbol_execution_ready` and retain every timestamp and
+        queue-delay check.
+        """
+
+        reference = self._clock()
+        self._expire_ack_timeouts(reference)
+        state = self.symbol_state(symbol)
+        if not self.is_connected() or state.clock_health != ClockHealth.HEALTHY:
+            return False
+        if require_trade and (
+            not state.trade_acked
+            or state.trade_rejected_due_to_capacity
+            or bool(state.trade_error)
+            or bool(state.trade_configuration_error)
+        ):
+            return False
+        if require_quote and (
+            not state.quote_acked
+            or state.quote_rejected_due_to_capacity
+            or bool(state.quote_error)
+            or bool(state.quote_configuration_error)
+        ):
+            return False
+        return True
+
     def entry_quote_ready(
         self, symbol: str, *, now: Optional[datetime] = None
     ) -> bool:

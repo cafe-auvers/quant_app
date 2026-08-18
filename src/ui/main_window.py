@@ -180,7 +180,21 @@ def _buyboard_readiness_display(
     blocked_labels = tuple(_STANDBY_GATE_LABELS[item] for item in blockers)
 
     if device_state == RuntimeDeviceState.ACTIVE:
-        reason = "ACTIVE; broker mutations remain guarded by Live Trading"
+        tooltip_parts = [
+            "Startup readiness is latched while the worker remains ACTIVE.",
+            "Every broker mutation is revalidated for its account, symbol, and action.",
+        ]
+        if blocked_labels:
+            tooltip_parts.append(
+                "Current action guards: " + ", ".join(blocked_labels)
+            )
+        return BuyboardReadinessDisplay(
+            total,
+            total,
+            f"Buy Board readiness {total}/{total} — ACTIVE; "
+            "broker mutations remain guarded by Live Trading",
+            " | ".join(tooltip_parts),
+        )
     elif reconciliation_accounts:
         accounts = ", ".join(reconciliation_accounts)
         reason = f"final broker reconciliation for {accounts} (ETA unavailable)"

@@ -261,6 +261,34 @@ def test_missing_critical_market_data_channel_is_critical():
     assert "AAPL" in check.detail
 
 
+def test_quiet_symbol_is_warning_while_exact_order_gate_remains_closed():
+    metrics = SimpleNamespace(
+        ws_connected=True,
+        trade_channels_desired=1,
+        trade_channels_acked=1,
+        quote_channels_desired=1,
+        quote_channels_acked=1,
+        critical_trade_channels_missing=(),
+        critical_quote_channels_missing=(),
+        stale_symbols=("STIM",),
+        receive_lag_p50_ms=0.0,
+        receive_lag_p95_ms=0.0,
+        receive_lag_p99_ms=0.0,
+        reconnect_count=0,
+        nack_count=0,
+        malformed_frame_count=0,
+        queue_depth=0,
+        dropped_event_count=0,
+    )
+
+    check = health._market_data_check(metrics)
+
+    assert check.level == health.HealthLevel.WARNING
+    assert "STIM" in check.detail
+    assert "orders" in check.detail.lower()
+    assert "fail closed" in check.detail.lower()
+
+
 def test_request_scheduler_metrics_are_exposed_in_health():
     metrics = SimpleNamespace(
         queued_requests=2,

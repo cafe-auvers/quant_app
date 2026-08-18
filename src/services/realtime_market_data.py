@@ -180,6 +180,25 @@ class RealtimeMarketDataService:
         quote = self.latest_quote(symbol)
         return self.is_connected() and quote is not None and quote.is_execution_fresh(now=now)
 
+    def is_symbol_feed_available(
+        self,
+        symbol: str,
+        *,
+        require_trade: bool = True,
+        require_quote: bool = True,
+    ) -> bool:
+        """Whether monitoring infrastructure for ``symbol`` is available.
+
+        This is deliberately weaker than :meth:`is_symbol_execution_ready`.
+        Event-driven symbols can be quiet while their transport remains
+        connected, so event age belongs at the exact order gate rather than
+        being treated as proof of a feed outage.  Backends without explicit
+        subscription state retain the conservative connection-plus-first-
+        quote fallback; KIS overrides this with channel ACK/error checks.
+        """
+
+        return self.is_connected() and self.latest_quote(symbol) is not None
+
     def poll_once(self) -> List[QuoteSnapshot]:
         """Return events ready for engine evaluation in this heartbeat."""
         return []

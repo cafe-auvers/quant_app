@@ -69,6 +69,7 @@ from src.services.execution_command_gateway import ExecutionCommandGateway
 from src.services.execution_lease_protocol import FakeExecutionLeaseProtocol
 from src.services.execution_order_repository import record_execution_order
 from src.services.execution_ownership_repository import assign_ownership
+from src.services.external_alerting import CriticalAlertType
 from src.services.mutation_budget_protocol import AllowAllMutationBudget
 from src.services.position_manager import PositionManager
 from src.services.runtime_device_state_repository import get_runtime_device_state
@@ -855,6 +856,48 @@ def test_new_stop_request_survives_race_with_old_request_retirement():
     assert pending is not None
     assert pending.command_id == "NEW-STOP"
     assert pending.request_card_version == 4
+
+
+def test_action_readiness_uses_exact_symbol_not_another_quiet_symbol(tmp_path):
+    worker, _ = _worker(tmp_path)
+    observed_at = dt.datetime.now(dt.timezone.utc)
+
+    class MarketData:
+        @staticmethod
+        def health_metrics(*, now):
+            return SimpleNamespace(
+                ws_connected=True,
+                critical_trade_channels_missing=(),
+                critical_quote_channels_missing=(),
+                stale_symbols=("STIM",),
+            )
+
+        @staticmethod
+        def is_symbol_execution_ready(symbol, *, now):
+            return symbol == "AAPL"
+
+        @staticmethod
+        def is_symbol_feed_available(symbol):
+            return symbol == "AAPL"
+
+    worker.runtime = SimpleNamespace(market_data=MarketData())
+    worker.startup_reconciliation_ran = True
+    worker.startup_reconciliation_complete = True
+    worker._database_writable = True
+    worker.last_market_data_drain_at = observed_at
+    worker.device_state = RuntimeDeviceState.ACTIVE
+
+    global_readiness = worker.engine_readiness(now=observed_at)
+    action_readiness = worker.engine_readiness(
+        symbol="AAPL",
+        action="NEW_ENTRY",
+        now=observed_at,
+    )
+
+    assert global_readiness.critical_quotes_fresh is False
+    assert action_readiness.critical_trade_subscriptions_acked is True
+    assert action_readiness.critical_quote_subscriptions_acked is True
+    assert action_readiness.critical_quotes_fresh is True
 
 
 @pytest.mark.parametrize(
@@ -2004,6 +2047,41 @@ def test_no_stalled_warning_does_not_alert(tmp_path):
 
     worker._emit_stalled_liquidation_alerts([card])
     assert alerts == []
+
+
+def test_execution_stale_warning_is_local_and_recovery_resolves_incident(tmp_path):
+    worker, _ = _worker(tmp_path)
+    native_alerts = []
+    resolutions = []
+
+    class Alerting:
+        def resolve_alert(self, alert_type, dedupe_key, *, resolved_by):
+            resolutions.append((alert_type, dedupe_key, resolved_by))
+            return True
+
+    worker._external_alerting = Alerting()
+    worker.alert.connect(native_alerts.append)
+    card = TradeCardState(
+        environment="PROD",
+        account_no="1",
+        symbol="STIM",
+        board_status=BoardStatus.CLOSED,
+        warnings=["DATA_STALE"],
+    )
+
+    worker._emit_stalled_liquidation_alerts([card])
+    assert native_alerts == []
+
+    card.warnings = []
+    worker._emit_stalled_liquidation_alerts([card])
+
+    stale_resolutions = [
+        item
+        for item in resolutions
+        if item[0] == CriticalAlertType.STALE_CRITICAL_SYMBOL
+    ]
+    assert len(stale_resolutions) == 1
+    assert stale_resolutions[0][1].endswith(":STIM:DATA_STALE")
 
 
 def test_unreconciled_broker_order_warning_fires_alert_exactly_once(tmp_path):
