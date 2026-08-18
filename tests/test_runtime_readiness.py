@@ -45,6 +45,19 @@ def test_engine_health_requires_every_condition():
     assert EngineReadiness(**_READY).healthy is True
 
 
+def test_standby_readiness_exposes_the_same_gate_results_used_for_authorization():
+    values = dict(_READY)
+    values["lease_current"] = False
+    values["device_active"] = False
+    values["critical_quotes_fresh"] = False
+    readiness = EngineReadiness(**values)
+
+    assert readiness.standby_ready is False
+    assert readiness.standby_checks_completed == 7
+    assert readiness.standby_blockers == ("critical_quotes_fresh",)
+    assert dict(readiness.standby_check_results)["critical_quotes_fresh"] is False
+
+
 def test_runtime_device_state_requires_explicit_fresh_handoff_confirmation(tmp_path):
     engine = create_engine(
         f"sqlite:///{tmp_path / 'runtime-state.db'}",

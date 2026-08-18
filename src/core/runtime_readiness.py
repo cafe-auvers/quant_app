@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Tuple
+from typing import ClassVar, Tuple
 
 
 class RuntimeDeviceState(str, Enum):
@@ -42,6 +42,44 @@ class EngineReadiness:
     database_writable: bool
     device_active: bool
 
+    STANDBY_CHECK_FIELDS: ClassVar[Tuple[str, ...]] = (
+        "startup_reconciliation_complete",
+        "account_reconciliation_fresh",
+        "websocket_connected",
+        "critical_trade_subscriptions_acked",
+        "critical_quote_subscriptions_acked",
+        "critical_quotes_fresh",
+        "accumulator_draining_within_budget",
+        "database_writable",
+    )
+
+    @property
+    def standby_check_results(self) -> Tuple[Tuple[str, bool], ...]:
+        """Return each pre-activation gate as explicit observable state.
+
+        The UI uses this to project startup progress without inventing a
+        second readiness policy.  Authorization still comes exclusively from
+        :attr:`standby_ready`; this is only a read-only explanation of the
+        same predicate.
+        """
+
+        return tuple(
+            (field_name, bool(getattr(self, field_name)))
+            for field_name in self.STANDBY_CHECK_FIELDS
+        )
+
+    @property
+    def standby_blockers(self) -> Tuple[str, ...]:
+        return tuple(
+            field_name
+            for field_name, passed in self.standby_check_results
+            if not passed
+        )
+
+    @property
+    def standby_checks_completed(self) -> int:
+        return sum(passed for _, passed in self.standby_check_results)
+
     @property
     def healthy(self) -> bool:
         return all(
@@ -70,18 +108,7 @@ class EngineReadiness:
         ACTIVE later.
         """
 
-        return all(
-            (
-                self.startup_reconciliation_complete,
-                self.account_reconciliation_fresh,
-                self.websocket_connected,
-                self.critical_trade_subscriptions_acked,
-                self.critical_quote_subscriptions_acked,
-                self.critical_quotes_fresh,
-                self.accumulator_draining_within_budget,
-                self.database_writable,
-            )
-        )
+        return all(passed for _, passed in self.standby_check_results)
 
 
 @dataclass(frozen=True)

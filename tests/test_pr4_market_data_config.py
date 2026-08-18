@@ -12,7 +12,9 @@ import pytest
 
 from src.utils.market_calendar import (
     is_regular_session_open,
+    next_nyse_regular_session_open,
     nyse_regular_session_close_time,
+    seconds_until_nyse_regular_session_open,
     seconds_until_regular_session_close,
 )
 from src.services.kis_realtime_market_data import (
@@ -159,6 +161,16 @@ def test_early_close_is_used_for_market_session_decisions():
     assert is_regular_session_open(before)
     assert not is_regular_session_open(after)
     assert seconds_until_regular_session_close(before) == 60
+
+
+def test_next_regular_open_skips_weekends_and_holidays():
+    eastern = ZoneInfo("America/New_York")
+    friday_after_close = dt.datetime(2026, 7, 3, 16, 30, tzinfo=eastern)
+
+    next_open = next_nyse_regular_session_open(friday_after_close)
+
+    assert next_open == dt.datetime(2026, 7, 6, 9, 30, tzinfo=eastern)
+    assert seconds_until_nyse_regular_session_open(friday_after_close) == 65 * 60 * 60
 
 
 def test_live_factory_requires_both_enable_and_protocol_verification(monkeypatch):

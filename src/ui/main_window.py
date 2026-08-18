@@ -32,6 +32,7 @@ except ImportError:
 from src.core.order_state import (BrokerOrder, OrderIntent, OrderSide,
                                   OrderStatus)
 from src.core import execution_config
+from src.core.runtime_readiness import EngineReadiness, RuntimeDeviceState
 from src.core.scanner import StockScanner
 from src.core.trade_reviewer import TradeReviewer
 from src.core.watchlist import BuylistManager, TradePlanManager, Watchlist
@@ -91,7 +92,9 @@ from src.utils.config import DATA_DIR, ROOT_DIR, RULEBOOK_DIR, get_env_value
 from src.utils.data_loader import get_default_universe
 from src.utils.intraday_helpers import \
     extract_latest_opening_bar as _extract_latest_opening_bar
-from src.utils.market_calendar import expected_latest_market_data_date
+from src.utils.market_calendar import (expected_latest_market_data_date,
+                                       is_regular_session_open,
+                                       seconds_until_nyse_regular_session_open)
 from src.utils.storage import load_json
 
 __all__ = [
@@ -122,6 +125,127 @@ KIS_DAILY_CHART_FAILURE_COOLDOWN_SECONDS = 30 * 60
 WORKER_SHUTDOWN_TIMEOUT_MS = 30_000
 US_MARKET_OPEN_TIME = dt.time(9, 30)
 US_MARKET_CLOSE_TIME = dt.time(16, 0)
+
+_STANDBY_GATE_LABELS = {
+    "startup_reconciliation_complete": "initial broker reconciliation",
+    "account_reconciliation_fresh": "fresh broker account snapshot",
+    "websocket_connected": "KIS WebSocket connection",
+    "critical_trade_subscriptions_acked": "trade subscription acknowledgements",
+    "critical_quote_subscriptions_acked": "quote subscription acknowledgements",
+    "critical_quotes_fresh": "fresh regular-session quotes",
+    "accumulator_draining_within_budget": "market-data queue drain",
+    "database_writable": "canonical database write probe",
+}
+
+
+@dataclass(frozen=True)
+class BuyboardReadinessDisplay:
+    completed: int
+    total: int
+    label: str
+    tooltip: str
+    indeterminate: bool = False
+
+
+def _format_readiness_eta(seconds: float) -> str:
+    remaining = max(0, int(seconds))
+    days, remainder = divmod(remaining, 86_400)
+    hours, remainder = divmod(remainder, 3_600)
+    minutes, seconds = divmod(remainder, 60)
+    prefix = f"{days}d " if days else ""
+    return f"{prefix}{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _buyboard_readiness_display(
+    readiness: EngineReadiness,
+    *,
+    device_state: RuntimeDeviceState,
+    reconciliation_accounts: Tuple[str, ...] = (),
+    regular_session_open: bool = False,
+    seconds_until_open: Optional[float] = None,
+    auto_claim_enabled: bool = False,
+) -> BuyboardReadinessDisplay:
+    """Project the authoritative readiness predicate into operator language."""
+
+    checks = readiness.standby_check_results
+    completed = readiness.standby_checks_completed
+    total = len(checks)
+    blockers = readiness.standby_blockers
+    blocked_labels = tuple(_STANDBY_GATE_LABELS[item] for item in blockers)
+
+    if device_state == RuntimeDeviceState.ACTIVE:
+        reason = "ACTIVE; broker mutations remain guarded by Live Trading"
+    elif reconciliation_accounts:
+        accounts = ", ".join(reconciliation_accounts)
+        reason = f"final broker reconciliation for {accounts} (ETA unavailable)"
+        return BuyboardReadinessDisplay(
+            completed,
+            total,
+            f"Buy Board startup — {reason}",
+            "A live broker query is in progress. Its completion time depends on KIS response latency.",
+            indeterminate=True,
+        )
+    elif not readiness.startup_reconciliation_complete:
+        reason = "initial broker reconciliation (ETA unavailable)"
+        return BuyboardReadinessDisplay(
+            completed,
+            total,
+            f"Buy Board startup — {reason}",
+            "Startup cannot become ready until every configured account has been reconciled.",
+            indeterminate=True,
+        )
+    elif not readiness.database_writable:
+        reason = "waiting for canonical database write access"
+    elif not readiness.account_reconciliation_fresh:
+        reason = "waiting for a fresh broker account snapshot"
+    elif not readiness.websocket_connected:
+        reason = "connecting to the KIS WebSocket"
+    elif not readiness.critical_trade_subscriptions_acked:
+        reason = "waiting for KIS trade-subscription ACKs"
+    elif not readiness.critical_quote_subscriptions_acked:
+        reason = "waiting for KIS quote-subscription ACKs"
+    elif not readiness.critical_quotes_fresh:
+        if not regular_session_open and seconds_until_open is not None:
+            reason = (
+                "waiting for fresh regular-session quotes; market opens in "
+                f"{_format_readiness_eta(seconds_until_open)}"
+            )
+        else:
+            reason = "waiting for fresh execution-grade quotes"
+    elif not readiness.accumulator_draining_within_budget:
+        reason = "draining the market-data queue"
+    elif device_state == RuntimeDeviceState.STANDBY_READY:
+        reason = (
+            "STANDBY_READY; automatic PC claim is armed"
+            if auto_claim_enabled
+            else "STANDBY_READY; use this device as Main"
+        )
+    elif readiness.standby_ready:
+        reason = "publishing final readiness confirmation"
+    else:
+        reason = "checking execution dependencies"
+
+    passed_labels = tuple(
+        _STANDBY_GATE_LABELS[field_name]
+        for field_name, passed in checks
+        if passed
+    )
+    tooltip_parts = []
+    if passed_labels:
+        tooltip_parts.append("Passed: " + ", ".join(passed_labels))
+    if blocked_labels:
+        tooltip_parts.append("Waiting: " + ", ".join(blocked_labels))
+    tooltip_parts.append(
+        "Automatic PC claim is enabled."
+        if auto_claim_enabled
+        else "Automatic main-device claim is disabled."
+    )
+    return BuyboardReadinessDisplay(
+        completed,
+        total,
+        f"Buy Board readiness {completed}/{total} — {reason}",
+        " | ".join(tooltip_parts),
+    )
 
 
 class DatabaseInitWorker(QThread):
@@ -1378,6 +1502,139 @@ class MainWindow(
             logger.exception("Could not verify this device's STANDBY_READY generation")
             return 0
 
+    @staticmethod
+    def _background_worker_running(worker) -> bool:
+        if worker is None:
+            return False
+        try:
+            return bool(worker.isRunning())
+        except RuntimeError:
+            return False
+
+    def _foreground_progress_running(self) -> bool:
+        """Keep user-started work from being overwritten by readiness status."""
+
+        worker_names = (
+            "_local_mirror_sync_worker",
+            "scanner_worker",
+            "watchlist_worker",
+            "single_ai_worker",
+            "intraday_fetch_worker",
+            "intraday_bulk_worker",
+        )
+        return any(
+            self._background_worker_running(self.__dict__.get(name))
+            for name in worker_names
+        )
+
+    def _current_buyboard_readiness_display(
+        self,
+    ) -> Optional[BuyboardReadinessDisplay]:
+        if not execution_config.is_buyboard_engine_enabled():
+            return None
+
+        state_sync_worker = self.__dict__.get("state_sync_worker")
+        if (
+            self.__dict__.get("_state_sync_action") == "activate"
+            and self._background_worker_running(state_sync_worker)
+        ):
+            return BuyboardReadinessDisplay(
+                8,
+                8,
+                "Buy Board activation — transferring the main-device lease (ETA unavailable)",
+                "The lease transaction is in progress and remains revision fenced.",
+                indeterminate=True,
+            )
+
+        handoff_worker = self.__dict__.get("handoff_reconciliation_worker")
+        if self._background_worker_running(handoff_worker):
+            return BuyboardReadinessDisplay(
+                8,
+                8,
+                "Buy Board activation — final broker reconciliation (ETA unavailable)",
+                "KIS account and order truth are being refreshed before execution can become ACTIVE.",
+                indeterminate=True,
+            )
+
+        worker = self.__dict__.get("_buyboard_runtime_worker")
+        if worker is None or not self._background_worker_running(worker):
+            return BuyboardReadinessDisplay(
+                0,
+                8,
+                "Buy Board startup — runtime worker unavailable",
+                "The execution worker has not started; check canonical database and engine configuration.",
+                indeterminate=True,
+            )
+        try:
+            readiness = worker.engine_readiness(include_device_state=False)
+            market_open = is_regular_session_open()
+            until_open = (
+                None
+                if market_open
+                else seconds_until_nyse_regular_session_open()
+            )
+            return _buyboard_readiness_display(
+                readiness,
+                device_state=getattr(
+                    worker, "device_state", RuntimeDeviceState.STARTING
+                ),
+                reconciliation_accounts=tuple(
+                    sorted(
+                        str(item)
+                        for item in (
+                            getattr(
+                                worker,
+                                "reconciliation_accounts_in_progress",
+                                set(),
+                            )
+                            or set()
+                        )
+                    )
+                ),
+                regular_session_open=market_open,
+                seconds_until_open=until_open,
+                auto_claim_enabled=bool(
+                    self.__dict__.get("_auto_claim_main_enabled", False)
+                ),
+            )
+        except Exception:
+            logger.exception("Could not project Buy Board readiness progress")
+            return BuyboardReadinessDisplay(
+                0,
+                8,
+                "Buy Board readiness — status unavailable",
+                "The readiness explanation could not be calculated; execution remains fail closed.",
+            )
+
+    def _update_buyboard_readiness_progress(self) -> None:
+        progress_bar = self.__dict__.get("progress_bar")
+        progress_label = self.__dict__.get("progress_label")
+        if progress_bar is None or progress_label is None:
+            return
+        if self._foreground_progress_running():
+            return
+        display = self._current_buyboard_readiness_display()
+        if display is None:
+            if self.__dict__.pop("_buyboard_readiness_progress_active", False):
+                progress_bar.setRange(0, 100)
+                progress_bar.setValue(0)
+                progress_label.setText("Ready.")
+                progress_label.setToolTip("")
+            return
+        # Keep the shared bar on its normal 0-100 scale. Scanner/refresh
+        # workers assume that scale when they take foreground ownership, and
+        # a Qt busy range (0, 0) would otherwise make their later percentages
+        # invisible. Duration-unknown phases are identified explicitly in the
+        # label as "ETA unavailable" while the bar still shows how many of the
+        # overall readiness gates have passed.
+        progress_bar.setRange(0, 100)
+        progress_bar.setValue(
+            int((display.completed * 100) / max(1, display.total))
+        )
+        progress_label.setText(display.label)
+        progress_label.setToolTip(display.tooltip)
+        self._buyboard_readiness_progress_active = True
+
     # --- Automatic cross-machine handoff: post-claim reconciliation --------
     # The safety-critical sequence that must run before a newly-main device
     # may resume monitoring/live order submission. Manual activation uses the
@@ -1598,12 +1855,18 @@ class MainWindow(
             return
         standby_generation = self._runtime_standby_generation_for_claim()
         if execution_config.is_buyboard_engine_enabled() and standby_generation <= 0:
+            display = self._current_buyboard_readiness_display()
+            detail = (
+                f"\n\nCurrent status:\n{display.label}\n\n{display.tooltip}"
+                if display is not None
+                else ""
+            )
             QMessageBox.warning(
                 self,
                 "Device not ready",
                 "This device must complete its read-only startup and final broker "
                 "reconciliation before it can become Main. Wait for "
-                "STANDBY_READY, then try again.",
+                f"STANDBY_READY, then try again.{detail}",
             )
             return
         reply = QMessageBox.question(
@@ -2621,6 +2884,7 @@ class MainWindow(
             self.__dict__.get("pc_status_timer"),
             self.__dict__.get("local_mirror_sync_timer"),
             self.__dict__.get("market_status_timer"),
+            self.__dict__.get("buyboard_readiness_progress_timer"),
             self.__dict__.get("_refresh_poll_timer"),
         ]
         timer_states = []
@@ -3429,6 +3693,18 @@ class MainWindow(
         self.sleep_readiness_timer.setInterval(30_000)
         self.sleep_readiness_timer.timeout.connect(self._write_sleep_readiness_snapshot)
         self.sleep_readiness_timer.start()
+
+        # Read-only projection of the authoritative runtime readiness gates.
+        # This shares the existing progress bar, but yields to user-started
+        # scanner/refresh/mirror work so those task-specific percentages and
+        # ETAs remain visible while they run.
+        self.buyboard_readiness_progress_timer = QTimer(self)
+        self.buyboard_readiness_progress_timer.setInterval(1_000)
+        self.buyboard_readiness_progress_timer.timeout.connect(
+            self._update_buyboard_readiness_progress
+        )
+        self.buyboard_readiness_progress_timer.start()
+        self._update_buyboard_readiness_progress()
 
     def _write_sleep_readiness_snapshot(self) -> None:
         try:
