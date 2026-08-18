@@ -1,5 +1,8 @@
-"""The 8 Kanban columns (``buydashboard_to_kanban.md`` section 17-31) and the
-draggable ``QListWidget`` each one uses.
+"""The operator-facing Kanban columns and their draggable ``QListWidget``.
+
+Watchlist and Closed remain durable workflow states, but are intentionally not
+rendered on the execution board. Watchlist maintenance happens in TradingView
+and closed trades remain available through history/reporting views.
 """
 from __future__ import annotations
 
@@ -25,16 +28,15 @@ from .card import (
     card_drag_payload,
 )
 
-# Left-to-right column order exactly as the spec lists it (section 18-31).
+# Left-to-right operator workflow. Hidden lifecycle states remain valid
+# ``BoardStatus`` values and are not deleted from canonical storage.
 BOARD_COLUMN_ORDER: List[BoardStatus] = [
-    BoardStatus.WATCHLIST,
     BoardStatus.BUYLIST,
     BoardStatus.BUY_TODAY,
     BoardStatus.ENTRY_PENDING,
     BoardStatus.OPEN_POSITION,
     BoardStatus.PARTIAL_SELL,
     BoardStatus.SELL_ALL,
-    BoardStatus.CLOSED,
 ]
 
 BOARD_COLUMN_TITLES: Dict[BoardStatus, str] = {
@@ -202,18 +204,19 @@ class BoardColumnList(QListWidget):
 
         ordered = sorted(cards, key=lambda c: -priority(c))
 
-        def render_identity(item):
+        def prepare_render(item):
             if isinstance(item, BoardCardProjection):
-                return (
-                    "CARD",
-                    item.card.card_key,
-                    board_interaction_fingerprint(item),
+                fingerprint = board_interaction_fingerprint(item)
+                return item, fingerprint, (
+                    "CARD", item.card.card_key, fingerprint
                 )
             if isinstance(item, TradeCardState):
-                return ("CARD", item.card_key, board_interaction_fingerprint(item))
-            return (type(item).__name__, repr(item))
+                fingerprint = board_interaction_fingerprint(item)
+                return item, fingerprint, ("CARD", item.card_key, fingerprint)
+            return item, None, (type(item).__name__, repr(item))
 
-        signature = tuple(render_identity(item) for item in ordered)
+        prepared = tuple(prepare_render(item) for item in ordered)
+        signature = tuple(identity for _item, _fingerprint, identity in prepared)
         if signature == self._render_signature:
             existing = {}
             for index in range(self.count()):
@@ -227,7 +230,7 @@ class BoardColumnList(QListWidget):
                     str(payload.get("symbol", "")),
                 )
                 existing[key] = (item, self.itemWidget(item))
-            for value in ordered:
+            for value, fingerprint, _identity in prepared:
                 if isinstance(
                     value,
                     (BoardExternalOrderProjection, BoardExecutionOrderProjection),
@@ -243,7 +246,12 @@ class BoardColumnList(QListWidget):
                 if row is None:
                     continue
                 item, widget = row
-                item.setData(Qt.UserRole, card_drag_payload(value))
+                payload = card_drag_payload(
+                    value,
+                    state_fingerprint=fingerprint,
+                )
+                if item.data(Qt.UserRole) != payload:
+                    item.setData(Qt.UserRole, payload)
                 if isinstance(widget, TradeCardWidget):
                     current_price = (
                         quote_lookup(card_state.symbol)
@@ -266,7 +274,7 @@ class BoardColumnList(QListWidget):
             return False
 
         self.clear()
-        for card in ordered:
+        for card, fingerprint, _identity in prepared:
             if isinstance(card, BoardExternalOrderProjection):
                 external_item = QListWidgetItem(self)
                 external_item.setFlags(Qt.ItemIsEnabled)
@@ -286,7 +294,10 @@ class BoardColumnList(QListWidget):
                 continue
             card_state = state(card)
             item = QListWidgetItem(self)
-            item.setData(Qt.UserRole, card_drag_payload(card))
+            item.setData(
+                Qt.UserRole,
+                card_drag_payload(card, state_fingerprint=fingerprint),
+            )
             current_price = (
                 quote_lookup(card_state.symbol)
                 if quote_lookup is not None

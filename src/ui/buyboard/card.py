@@ -421,9 +421,10 @@ class TradeCardWidget(QFrame):
             )
             layout.addWidget(status_label)
 
-        self._metrics_label = QLabel(
-            _metric_rows_html(_card_metric_rows(card, current_price, account_equity))
+        self._metrics_html = _metric_rows_html(
+            _card_metric_rows(card, current_price, account_equity)
         )
+        self._metrics_label = QLabel(self._metrics_html)
         # Compatibility for extensions/tests that inspected the former
         # single position-summary label directly.
         self._info_label = self._metrics_label
@@ -527,9 +528,13 @@ class TradeCardWidget(QFrame):
         if card.card_key != self.card_key:
             return False
         self.card_state = card
-        self._metrics_label.setText(
-            _metric_rows_html(_card_metric_rows(card, current_price, account_equity))
+        metrics_html = _metric_rows_html(
+            _card_metric_rows(card, current_price, account_equity)
         )
+        if metrics_html == self._metrics_html:
+            return False
+        self._metrics_html = metrics_html
+        self._metrics_label.setText(metrics_html)
         return True
 
     def update_current_price(
@@ -540,7 +545,11 @@ class TradeCardWidget(QFrame):
         return self.update_live_metrics(card, current_price)
 
 
-def card_drag_payload(card: TradeCardState | BoardCardProjection) -> dict:
+def card_drag_payload(
+    card: TradeCardState | BoardCardProjection,
+    *,
+    state_fingerprint: str | None = None,
+) -> dict:
     """The minimal identity+version payload carried by a drag/drop event."""
     resolved, projection = _as_projection(card)
     return {
@@ -560,7 +569,11 @@ def card_drag_payload(card: TradeCardState | BoardCardProjection) -> dict:
         "strategy_instance_id": (
             projection.strategy_instance_id if projection is not None else ""
         ),
-        "state_fingerprint": board_interaction_fingerprint(card),
+        "state_fingerprint": (
+            state_fingerprint
+            if state_fingerprint is not None
+            else board_interaction_fingerprint(card)
+        ),
     }
 
 

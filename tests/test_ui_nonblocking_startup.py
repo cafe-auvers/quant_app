@@ -17,6 +17,7 @@ def test_market_data_status_formatting_never_queries_the_database():
 
 
 def test_buyboard_projection_worker_uses_authoritative_services(monkeypatch):
+    from src.ui.buyboard.columns import BOARD_COLUMN_ORDER
     from src.services import trade_card_bootstrap
 
     calls = []
@@ -55,6 +56,7 @@ def test_buyboard_projection_worker_uses_authoritative_services(monkeypatch):
     worker.run()
 
     assert [call[0] for call in calls] == ["bootstrap", "projection"]
+    assert calls[1][2]["board_statuses"] == BOARD_COLUMN_ORDER
     assert completed == [(projections, "", 4)]
 
 
@@ -212,3 +214,20 @@ def test_buyboard_live_metric_refresh_only_repaints_existing_widgets(monkeypatch
     assert buyboard_board.refresh_buyboard_live_metrics(window) == 1
     assert calls == [(123.45, 100_000.0)]
     assert buyboard_controller.BuyboardMixin._BUYBOARD_LIVE_METRIC_REFRESH_MS == 750
+
+
+def test_buyboard_live_metric_refresh_pauses_during_drag(monkeypatch):
+    calls = []
+    window = SimpleNamespace(_buyboard_interaction_depth=1)
+    monkeypatch.setattr(
+        buyboard_board,
+        "refresh_buyboard_live_metrics",
+        lambda _window: calls.append("refresh"),
+    )
+
+    buyboard_controller.BuyboardMixin._refresh_buyboard_live_metrics(window)
+    assert calls == []
+
+    window._buyboard_interaction_depth = 0
+    buyboard_controller.BuyboardMixin._refresh_buyboard_live_metrics(window)
+    assert calls == ["refresh"]

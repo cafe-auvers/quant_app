@@ -1,4 +1,4 @@
-"""Assembles the Buy Board tab: 8 columns + refresh bar.
+"""Assembles the operator-facing Buy Board columns and refresh bar.
 
 Widget assembly and the drag-drop -> command translation live here;
 Every gesture is submitted through :mod:`src.services.execution_workflow_service`;
@@ -212,18 +212,29 @@ def _sync_account_filter_options(main_window, cards) -> Optional[str]:
 def populate_buyboard_columns(main_window, cards) -> None:
     cards = list(cards)
     main_window._buyboard_current_projections = tuple(cards)
-    selected_account = _sync_account_filter_options(main_window, cards)
+    visible_statuses = set(BOARD_COLUMN_ORDER)
+    visible_cards = [
+        value
+        for value in cards
+        if _state(value) is None or _state(value).board_status in visible_statuses
+    ]
+    selected_account = _sync_account_filter_options(main_window, visible_cards)
     if selected_account:
-        cards = [card for card in cards if _account_no(card) == selected_account]
+        visible_cards = [
+            card for card in visible_cards if _account_no(card) == selected_account
+        ]
     grouped: Dict[BoardStatus, List[TradeCardState]] = {
         status: [] for status in BOARD_COLUMN_ORDER
     }
-    for card in cards:
+    for card in visible_cards:
         state = _state(card)
-        grouped.setdefault(
-            state.board_status if state is not None else BoardStatus.WATCHLIST,
-            [],
-        ).append(card)
+        # Standalone unowned/unlinked broker orders must remain visible even
+        # though Watchlist is hidden. Open Positions is the safety/exposure
+        # surface; these rows remain non-draggable observation-only widgets.
+        target_status = (
+            state.board_status if state is not None else BoardStatus.OPEN_POSITION
+        )
+        grouped[target_status].append(card)
     quote_lookup = _quote_lookup_for(main_window)
     equity_lookup = _account_equity_lookup_for(main_window)
     for status, column_list in main_window.buyboard_columns.items():

@@ -67,6 +67,7 @@ class BuyboardProjectionWorker(QThread):
     def run(self) -> None:
         request = self.request
         try:
+            from .columns import BOARD_COLUMN_ORDER
             from src.services.trade_card_bootstrap import (
                 bootstrap_trade_cards_from_current_state,
             )
@@ -94,6 +95,7 @@ class BuyboardProjectionWorker(QThread):
                 request.engine,
                 environment="PROD",
                 context=request.context,
+                board_statuses=BOARD_COLUMN_ORDER,
             )
             self.completed.emit(projections, "", request.generation)
         except Exception as exc:
@@ -248,6 +250,11 @@ class BuyboardMixin:
         self._buyboard_live_metric_timer = live_timer
 
     def _refresh_buyboard_live_metrics(self) -> None:
+        # Rewriting Qt labels while its native drag loop is active causes
+        # visible cursor/card hitching. The next 750 ms tick catches up after
+        # the gesture; execution truth and stale-card fences are unaffected.
+        if int(self.__dict__.get("_buyboard_interaction_depth", 0) or 0) > 0:
+            return
         from .board import refresh_buyboard_live_metrics
 
         refresh_buyboard_live_metrics(self)
