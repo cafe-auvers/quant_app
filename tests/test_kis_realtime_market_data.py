@@ -921,6 +921,23 @@ def test_health_is_critical_when_trade_is_fresh_but_quote_is_stale():
     assert service.health_metrics(now=NOW).stale_symbols == ("AAPL",)
 
 
+def test_quiet_acked_symbol_is_available_but_not_execution_ready():
+    service, _ = _service()
+    service.configure_desired_channels(
+        trade_priorities={"STIM": SubscriptionPriority.OPEN_POSITION},
+        quote_priorities={"STIM": SubscriptionPriority.OPEN_POSITION},
+    )
+    _ack(service, "STIM", "HDFSCNT0")
+    _ack(service, "STIM", "HDFSASP0")
+
+    assert service.is_symbol_feed_available("STIM")
+    assert not service.is_symbol_execution_ready("STIM", now=NOW)
+
+    service._on_connection(False, "socket closed", 1)
+
+    assert not service.is_symbol_feed_available("STIM")
+
+
 def test_removed_stale_symbol_no_longer_contaminates_critical_health():
     service, _ = _service()
     service.configure_desired_channels(

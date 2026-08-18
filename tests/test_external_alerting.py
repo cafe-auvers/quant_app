@@ -192,6 +192,32 @@ def test_acknowledged_recurrence_retains_incident_id_and_counts_occurrence(tmp_p
     assert recurrence.status == AlertIncidentStatus.OPEN
 
 
+def test_recovered_incident_stops_retrying_and_reopens_on_recurrence(tmp_path):
+    service, _ = _service(tmp_path)
+    first = service.raise_alert(
+        CriticalAlertType.MARKET_DATA_OUTAGE,
+        "PROD:1:STIM:MARKET_DATA_OUTAGE_LOW",
+        "market-data outage",
+    )
+
+    assert service.resolve_alert(
+        CriticalAlertType.MARKET_DATA_OUTAGE,
+        "PROD:1:STIM:MARKET_DATA_OUTAGE_LOW",
+        resolved_by="test-recovery",
+    )
+    assert service.due_incidents() == []
+
+    recurrence = service.raise_alert(
+        CriticalAlertType.MARKET_DATA_OUTAGE,
+        "PROD:1:STIM:MARKET_DATA_OUTAGE_LOW",
+        "market-data outage again",
+    )
+
+    assert recurrence.incident_id == first.incident_id
+    assert recurrence.status == AlertIncidentStatus.OPEN
+    assert recurrence.occurrence_count == 2
+
+
 def test_heartbeat_is_published_on_the_expected_cadence(tmp_path):
     provider = FakeProvider()
     service, now = _service(tmp_path, provider=provider)

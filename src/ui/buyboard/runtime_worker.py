@@ -287,6 +287,10 @@ class BuyboardRuntimeWorker(QThread):
         # warning name -> card_key set already alerted via self.alert for
         # that warning -- see _emit_stalled_liquidation_alerts.
         self._alerted_card_keys_by_warning: Dict[str, set] = {}
+        # warning name -> card keys present on the previous observation.
+        # Kept separately so a fresh worker can resolve durable incidents
+        # that recovered before this process started.
+        self._card_alert_presence_by_warning: Dict[str, set] = {}
         self._active_reconciliation_incidents: set = set()
         self._reconciliation_incident_generations: Dict[tuple, int] = {}
         # Workstream 5: runtime-only stop generations. A generation advances
@@ -1167,13 +1171,6 @@ class BuyboardRuntimeWorker(QThread):
             ),
         ),
         (
-            _DATA_STALE_WARNING,
-            lambda card: (
-                f"CRITICAL: execution-grade market data is stale for {card.symbol} "
-                f"({card.environment}:{card.account_no})."
-            ),
-        ),
-        (
             _MARKET_DATA_OUTAGE_HIGH_WARNING,
             lambda card: (
                 f"CRITICAL: high-risk market-data outage for {card.symbol} "
@@ -1187,6 +1184,11 @@ class BuyboardRuntimeWorker(QThread):
                 f"({card.environment}:{card.account_no})."
             ),
         ),
+    )
+    _RECOVERABLE_MARKET_DATA_ALERTS = (
+        (_DATA_STALE_WARNING, CriticalAlertType.STALE_CRITICAL_SYMBOL),
+        (_MARKET_DATA_OUTAGE_HIGH_WARNING, CriticalAlertType.MARKET_DATA_OUTAGE),
+        (_MARKET_DATA_OUTAGE_LOW_WARNING, CriticalAlertType.MARKET_DATA_OUTAGE),
     )
 
     def _emit_stalled_liquidation_alerts(self, cards: List[TradeCardState]) -> None:
@@ -1214,8 +1216,6 @@ class BuyboardRuntimeWorker(QThread):
                         alert_type = CriticalAlertType.CANCEL_CONFIRMATION_TIMEOUT
                     elif warning_name == self._UNRECONCILED_BROKER_ORDER_WARNING:
                         alert_type = CriticalAlertType.DISCOVERED_EXTERNAL_ORDER
-                    elif warning_name == self._DATA_STALE_WARNING:
-                        alert_type = CriticalAlertType.STALE_CRITICAL_SYMBOL
                     elif warning_name in {
                         self._MARKET_DATA_OUTAGE_HIGH_WARNING,
                         self._MARKET_DATA_OUTAGE_LOW_WARNING,
@@ -1229,6 +1229,35 @@ class BuyboardRuntimeWorker(QThread):
                         message,
                     )
             self._alerted_card_keys_by_warning[warning_name] = present_now
+        self._resolve_cleared_market_data_alerts(cards)
+
+    def _resolve_cleared_market_data_alerts(
+        self, cards: List[TradeCardState]
+    ) -> None:
+        """Stop retrying durable feed incidents after structural recovery.
+
+        The first observation also reconciles incidents left OPEN by an older
+        process.  Later observations resolve only present-to-absent warning
+        transitions, avoiding database work on every heartbeat.
+        """
+
+        card_keys = {card.card_key for card in cards}
+        for warning_name, alert_type in self._RECOVERABLE_MARKET_DATA_ALERTS:
+            present_now = {
+                card.card_key for card in cards if warning_name in card.warnings
+            }
+            previous = self._card_alert_presence_by_warning.get(warning_name)
+            cleared = (
+                card_keys - present_now
+                if previous is None
+                else previous - present_now
+            )
+            for card_key in cleared:
+                self._resolve_external_alert(
+                    alert_type,
+                    f"{card_key}:{warning_name}",
+                )
+            self._card_alert_presence_by_warning[warning_name] = present_now
 
     # -- periodic per-account KIS refresh (review: no cadence populated the --
     # -- buying-power cache or re-reconciled positions after startup) --------
@@ -1437,6 +1466,25 @@ class BuyboardRuntimeWorker(QThread):
         except Exception:
             logger.exception("Could not persist external alert %s", alert_type.value)
 
+    def _resolve_external_alert(
+        self,
+        alert_type: CriticalAlertType,
+        dedupe_key: str,
+    ) -> None:
+        if self._external_alerting is None:
+            return
+        resolve = getattr(self._external_alerting, "resolve_alert", None)
+        if not callable(resolve):
+            return
+        try:
+            resolve(
+                alert_type,
+                dedupe_key,
+                resolved_by=f"runtime-recovery:{self._device_id or 'unknown-device'}",
+            )
+        except Exception:
+            logger.exception("Could not resolve external alert %s", alert_type.value)
+
     def _card_action_ready(self, card: TradeCardState) -> bool:
         """Gate only the broker evidence needed by this card's next action."""
         if card.board_status in (
@@ -1581,6 +1629,29 @@ class BuyboardRuntimeWorker(QThread):
                 )
                 trade_acked = connected and quotes_fresh
                 quote_acked = connected and quotes_fresh
+
+            if symbol and action:
+                # An action for AAPL must not be blocked because an unrelated,
+                # quiet critical symbol such as STIM lacks a three-second
+                # event.  Revalidate the exact symbol here; the execution
+                # gateway performs the same fail-closed check at submission.
+                symbol_ready = getattr(
+                    market_data, "is_symbol_execution_ready", None
+                )
+                quotes_fresh = bool(
+                    callable(symbol_ready)
+                    and symbol_ready(str(symbol).upper(), now=reference)
+                )
+                feed_available = getattr(
+                    market_data, "is_symbol_feed_available", None
+                )
+                channel_ready = bool(
+                    feed_available(str(symbol).upper())
+                    if callable(feed_available)
+                    else quotes_fresh
+                )
+                trade_acked = connected and channel_ready
+                quote_acked = connected and channel_ready
 
             drain_age = self._age_seconds(self.last_market_data_drain_at, reference)
             drain_budget = max(

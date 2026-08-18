@@ -326,9 +326,11 @@ def _market_data_check(metrics: Any) -> HealthCheck:
     if stale:
         return HealthCheck(
             "KIS market data",
-            HealthLevel.CRITICAL,
-            "One or more KIS symbols are stale",
-            f"stale={','.join(stale)}. {detail}",
+            HealthLevel.WARNING,
+            "One or more symbols currently lack an execution-fresh event",
+            f"execution_stale={','.join(stale)}. Connection and subscription "
+            "ACKs are intact; exact orders for these symbols remain fail closed. "
+            f"{detail}",
         )
     return HealthCheck(
         "KIS market data",

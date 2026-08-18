@@ -246,6 +246,7 @@ class CriticalAlertType(str, Enum):
 class AlertIncidentStatus(str, Enum):
     OPEN = "OPEN"
     ACKNOWLEDGED = "ACKNOWLEDGED"
+    RESOLVED = "RESOLVED"
 
 
 class AlertDeliveryProvider(Protocol):
@@ -478,7 +479,7 @@ class ExternalAlertingService:
                     "updated_at": now,
                     "version": int(row.version) + 1,
                 }
-                if row.status == AlertIncidentStatus.ACKNOWLEDGED.value:
+                if row.status != AlertIncidentStatus.OPEN.value:
                     # Delivery attempt numbers are lifetime-monotonic for an
                     # incident because historical rows remain durable under
                     # UNIQUE (incident_id, attempt_number).
@@ -667,7 +668,7 @@ class ExternalAlertingService:
                         updated_at=_db_datetime(now),
                         next_attempt_at=(
                             _db_datetime(now)
-                            if row.status == AlertIncidentStatus.ACKNOWLEDGED.value
+                            if row.status != AlertIncidentStatus.OPEN.value
                             else row.next_attempt_at
                         ),
                         acknowledged_at=None,
@@ -914,6 +915,57 @@ class ExternalAlertingService:
                     status=AlertIncidentStatus.ACKNOWLEDGED.value,
                     acknowledged_at=now,
                     acknowledged_by=str(acknowledged_by or ""),
+                    updated_at=now,
+                    version=int(row.version) + 1,
+                )
+            )
+            return result.rowcount == 1
+
+    def resolve_alert(
+        self,
+        alert_type: CriticalAlertType | str,
+        dedupe_key: str,
+        *,
+        resolved_by: str = "system-recovery",
+    ) -> bool:
+        """Close an OPEN incident because its monitored condition recovered.
+
+        This is distinct from an operator acknowledgement.  A later
+        recurrence reopens the same durable incident and preserves its
+        lifetime delivery-attempt sequence.
+        """
+
+        resolved_type = self._normalize_type(alert_type)
+        key = str(dedupe_key or "").strip()
+        if not key:
+            raise ValueError("Critical alert resolution requires a dedupe_key")
+        now = _db_datetime(self._clock())
+        table = _incident_table(MetaData())
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                select(table).where(
+                    table.c.alert_type == resolved_type.value,
+                    table.c.dedupe_key == key,
+                )
+            ).first()
+            if row is None:
+                return False
+            if row.status in {
+                AlertIncidentStatus.ACKNOWLEDGED.value,
+                AlertIncidentStatus.RESOLVED.value,
+            }:
+                return True
+            result = conn.execute(
+                table.update()
+                .where(
+                    table.c.incident_id == row.incident_id,
+                    table.c.version == row.version,
+                    table.c.status == AlertIncidentStatus.OPEN.value,
+                )
+                .values(
+                    status=AlertIncidentStatus.RESOLVED.value,
+                    acknowledged_at=now,
+                    acknowledged_by=str(resolved_by or "system-recovery"),
                     updated_at=now,
                     version=int(row.version) + 1,
                 )

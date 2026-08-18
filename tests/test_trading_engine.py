@@ -958,6 +958,53 @@ def test_open_position_stale_flag_clears_once_fresh_quote_arrives(tmp_path):
     assert "DATA_STALE" not in card.warnings
 
 
+def test_quiet_connected_symbol_does_not_create_feed_outage(tmp_path):
+    now = dt.datetime.now(dt.timezone.utc)
+    engine = _make_engine(tmp_path)
+    engine._clock = lambda: now
+    engine._market_data._connected = True
+    engine._market_data._cache.update(
+        QuoteSnapshot(
+            symbol="AAPL",
+            last_price=100.0,
+            broker_event_at=now - dt.timedelta(seconds=10),
+            received_at=now - dt.timedelta(seconds=10),
+        )
+    )
+    card = _open_card()
+
+    engine.run_heartbeat([card])
+
+    assert "DATA_STALE" not in card.warnings
+    assert "MARKET_DATA_OUTAGE_LOW" not in card.warnings
+    assert "MARKET_DATA_OUTAGE_HIGH" not in card.warnings
+    assert card.market_data_outage_started_at is None
+
+
+def test_closed_card_clears_obsolete_market_data_incident(tmp_path):
+    engine = _make_engine(tmp_path)
+    card = _open_card(
+        board_status=BoardStatus.CLOSED,
+        position_runtime_status=PositionRuntimeStatus.CLOSED,
+        broker_quantity=0,
+        orderable_quantity=0,
+        warnings=[
+            "DATA_STALE",
+            "MARKET_DATA_OUTAGE_LOW",
+            "EXIT_CANCEL_STALLED",
+        ],
+        market_data_outage_started_at=dt.datetime.now(dt.timezone.utc),
+        market_data_outage_risk_tier="LOW",
+    )
+
+    changed = engine.run_heartbeat([card])
+
+    assert card in changed
+    assert card.warnings == ["EXIT_CANCEL_STALLED"]
+    assert card.market_data_outage_started_at is None
+    assert card.market_data_outage_risk_tier == ""
+
+
 # --- P1-14: EOD cleanup is actually invoked from the heartbeat -------------
 
 

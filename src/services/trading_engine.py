@@ -40,8 +40,9 @@ methods for the exact finding each one addresses):
 - P0-9: a retried/completion entry price is checked against the live quote
   so it stays marketable instead of only ever using the original ORB
   trigger price.
-- P1-6: an existing open position whose quote has gone stale/disconnected
-  is flagged immediately, independent of the new-entry staleness gate.
+- P1-6: an existing position whose feed disconnects or loses its structural
+  subscription health is flagged independently of the new-entry freshness
+  gate.
 - P1-14: the EOD cleanup service is actually invoked from the heartbeat
   (gated on an injectable "are we in the EOD window" hook) instead of
   existing only as a module nothing ever called.
@@ -410,6 +411,13 @@ class TradingEngine:
     def _clear_stale_warning(self, card: TradeCardState) -> None:
         if _DATA_STALE_WARNING in card.warnings:
             card.warnings = [w for w in card.warnings if w != _DATA_STALE_WARNING]
+
+    @staticmethod
+    def _clear_market_data_outage_warnings(card: TradeCardState) -> None:
+        outage_warnings = {_OUTAGE_HIGH_WARNING, _OUTAGE_LOW_WARNING}
+        card.warnings = [
+            warning for warning in card.warnings if warning not in outage_warnings
+        ]
 
     def _entry_conflict_clear_for_liquidation(
         self, card: TradeCardState
@@ -1606,48 +1614,87 @@ class TradingEngine:
         """
         return self._eod_window_reached_fn()
 
-    # -- Stale-quote protection for existing positions (review finding P1-6) --
+    # -- Structural feed protection for existing positions ------------------
 
     def _detect_stale_position_quotes(self, cards: List[TradeCardState]) -> List[TradeCardState]:
-        """New entries already refuse to fire on stale/missing data
-        (``_evaluate_buy_today``). An *existing* open position needs the
-        same visibility even though it doesn't block anything by itself --
-        the position stays protected by whatever the last good quote/REST
-        poll produced, but the card is flagged immediately so the failure
-        is visible rather than silent (section 826-833).
+        """Detect structural feed loss for an existing open position.
+
+        New entries and exact broker mutations still require execution-fresh
+        data.  This monitor intentionally uses connection/subscription/error
+        state instead of a per-symbol event-age threshold: event-driven,
+        illiquid symbols can be quiet without their feed being unavailable.
         """
         changed: List[TradeCardState] = []
         now = self._clock()
         for card in cards:
             if card.board_status not in _TICK_REACTIVE_POSITION_STATUSES:
+                position_exposure_remains = bool(
+                    card.broker_quantity > 0
+                    or card.position_runtime_status
+                    not in {PositionRuntimeStatus.NONE, PositionRuntimeStatus.CLOSED}
+                )
+                # Pending/liquidating lifecycle stages are owned by their
+                # dedicated reconciliation logic.  Preserve any incident
+                # already raised for a still-exposed card, but do not create a
+                # new one or erase it from this unrelated heartbeat stage.
+                if position_exposure_remains:
+                    continue
+                before = (
+                    card.market_data_outage_started_at,
+                    card.market_data_outage_risk_tier,
+                    tuple(card.warnings),
+                )
+                self._clear_stale_warning(card)
+                self._clear_market_data_outage_warnings(card)
+                card.market_data_outage_started_at = None
+                card.market_data_outage_risk_tier = ""
+                after = (
+                    card.market_data_outage_started_at,
+                    card.market_data_outage_risk_tier,
+                    tuple(card.warnings),
+                )
+                if before != after:
+                    changed.append(card)
                 continue
             try:
                 quote = self._market_data.latest_quote(card.symbol)
-                stale = not self._market_data.is_symbol_execution_ready(
-                    card.symbol,
-                    require_trade=True,
-                    require_quote=False,
-                    now=now,
+                feed_available = getattr(
+                    self._market_data, "is_symbol_feed_available", None
                 )
+                if callable(feed_available):
+                    structurally_ready = bool(
+                        feed_available(
+                            card.symbol,
+                            require_trade=True,
+                            require_quote=False,
+                        )
+                    )
+                else:
+                    structurally_ready = bool(
+                        self._market_data.is_symbol_execution_ready(
+                            card.symbol,
+                            require_trade=True,
+                            require_quote=False,
+                            now=now,
+                        )
+                    )
+                feed_unavailable = not structurally_ready
                 already_flagged = _DATA_STALE_WARNING in card.warnings
-                if stale and not already_flagged:
+                if feed_unavailable and not already_flagged:
                     card.warnings = [*card.warnings, _DATA_STALE_WARNING]
                     changed.append(card)
-                elif not stale and already_flagged:
+                elif not feed_unavailable and already_flagged:
                     self._clear_stale_warning(card)
                     changed.append(card)
 
                 if (
-                    not stale
-                    and quote is not None
-                    and quote.last_price > 0
+                    not feed_unavailable
                     and (
                         card.market_data_outage_started_at is not None
                         or _OUTAGE_HIGH_WARNING in card.warnings
                         or _OUTAGE_LOW_WARNING in card.warnings
                     )
                 ):
-                    outage_warnings = {_OUTAGE_HIGH_WARNING, _OUTAGE_LOW_WARNING}
                     before = (
                         card.market_data_last_trusted_price,
                         card.market_data_last_trusted_at,
@@ -1655,32 +1702,39 @@ class TradingEngine:
                         card.market_data_outage_risk_tier,
                         tuple(card.warnings),
                     )
-                    card.market_data_last_trusted_price = float(quote.last_price)
-                    card.market_data_last_trusted_at = quote.broker_event_at
-                    try:
-                        recovered_equity = float(
-                            self._account_equity_provider(
-                                card.environment, card.account_no
-                            )
-                            or 0.0
+                    execution_fresh = bool(
+                        quote is not None
+                        and quote.last_price > 0
+                        and self._market_data.is_symbol_execution_ready(
+                            card.symbol,
+                            require_trade=True,
+                            require_quote=False,
+                            now=now,
                         )
-                    except Exception:
-                        recovered_equity = 0.0
-                    recovered_tier = classify_market_data_outage_risk(
-                        card,
-                        trusted_price=float(quote.last_price),
-                        account_equity=recovered_equity,
-                        bid=quote.bid,
-                        ask=quote.ask,
-                        liquidity_tier=self._liquidity_tier_lookup(card, quote),
                     )
+                    if execution_fresh:
+                        card.market_data_last_trusted_price = float(quote.last_price)
+                        card.market_data_last_trusted_at = quote.broker_event_at
+                        try:
+                            recovered_equity = float(
+                                self._account_equity_provider(
+                                    card.environment, card.account_no
+                                )
+                                or 0.0
+                            )
+                        except Exception:
+                            recovered_equity = 0.0
+                        recovered_tier = classify_market_data_outage_risk(
+                            card,
+                            trusted_price=float(quote.last_price),
+                            account_equity=recovered_equity,
+                            bid=quote.bid,
+                            ask=quote.ask,
+                            liquidity_tier=self._liquidity_tier_lookup(card, quote),
+                        )
+                        card.market_data_outage_risk_tier = recovered_tier.value
                     card.market_data_outage_started_at = None
-                    # Preserve the immediate classification of genuinely new
-                    # trusted symbol data.  It is the baseline if another
-                    # outage begins and makes LOW -> HIGH recovery observable
-                    # instead of erasing the state without evaluating it.
-                    card.market_data_outage_risk_tier = recovered_tier.value
-                    card.warnings = [w for w in card.warnings if w not in outage_warnings]
+                    self._clear_market_data_outage_warnings(card)
                     after = (
                         card.market_data_last_trusted_price,
                         card.market_data_last_trusted_at,
@@ -1692,7 +1746,7 @@ class TradingEngine:
                         changed.append(card)
                     continue
 
-                if not stale:
+                if not feed_unavailable:
                     continue
                 if card.market_data_outage_started_at is None:
                     card.market_data_outage_started_at = now
