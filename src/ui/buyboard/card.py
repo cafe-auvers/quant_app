@@ -149,6 +149,13 @@ class TradeCardWidget(QFrame):
             )
             pending.setStyleSheet("color: #8e24aa; font-weight: bold;")
             layout.addWidget(pending)
+        elif card.board_status == BoardStatus.PARTIAL_SELL and (
+            card.exit_client_order_id
+            or (projection is not None and projection.working_order_count)
+        ):
+            pending = QLabel("PARTIAL SELL WITHDRAWAL / CANCEL PENDING")
+            pending.setStyleSheet("color: #ef6c00; font-weight: bold;")
+            layout.addWidget(pending)
         elif card.exit_all_required:
             pending = QLabel("SELL ALL / PROTECTIVE EXIT PENDING")
             pending.setStyleSheet("color: #c62828; font-weight: bold;")

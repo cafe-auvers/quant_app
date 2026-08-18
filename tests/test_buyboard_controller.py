@@ -29,6 +29,7 @@ from src.ui.buyboard.controller import CommandRejectedError, apply_board_command
 from src.ui.buyboard.drag_commands import (
     ActivateForToday,
     CancelEntry,
+    CancelPartialSell,
     CancelQueuedSellAll,
     MoveToBuylist,
     MoveToWatchlist,
@@ -213,6 +214,65 @@ def test_partial_sell_from_non_open_position_rejected(tmp_path):
     card = _seed(engine, board_status=BoardStatus.BUYLIST)
     with pytest.raises(CommandRejectedError):
         apply_board_command(engine, _cmd(RequestPartialSell, card, quantity=10))
+
+
+def test_unsubmitted_partial_sell_can_be_withdrawn_to_open_position(tmp_path):
+    engine = _make_engine(tmp_path)
+    card = _seed(
+        engine,
+        board_status=BoardStatus.PARTIAL_SELL,
+        position_runtime_status=PositionRuntimeStatus.PARTIAL_EXIT_PENDING,
+        broker_quantity=300,
+        orderable_quantity=300,
+        pending_partial_sell_quantity=100,
+    )
+
+    result = apply_board_command(engine, _cmd(CancelPartialSell, card))
+
+    assert result.board_status == BoardStatus.OPEN_POSITION
+    assert result.position_runtime_status == PositionRuntimeStatus.OPEN
+    assert result.pending_partial_sell_quantity == 0
+    assert result.broker_quantity == 300
+
+
+def test_partial_sell_with_durable_identity_waits_for_cancel_reconciliation(tmp_path):
+    engine = _make_engine(tmp_path)
+    card = _seed(
+        engine,
+        board_status=BoardStatus.PARTIAL_SELL,
+        position_runtime_status=PositionRuntimeStatus.PARTIAL_EXIT_PENDING,
+        broker_quantity=300,
+        orderable_quantity=300,
+        pending_partial_sell_quantity=100,
+        reserved_sell_quantity=100,
+        exit_attempt_group_id="G",
+        exit_client_order_id="CID-1",
+        exit_pending_attempt_number=1,
+    )
+
+    result = apply_board_command(engine, _cmd(CancelPartialSell, card))
+
+    assert result.board_status == BoardStatus.PARTIAL_SELL
+    assert result.pending_partial_sell_quantity == 0
+    assert result.exit_client_order_id == "CID-1"
+
+
+def test_partial_sell_can_be_replaced_by_sell_all_without_stale_quantity(tmp_path):
+    engine = _make_engine(tmp_path)
+    card = _seed(
+        engine,
+        board_status=BoardStatus.PARTIAL_SELL,
+        position_runtime_status=PositionRuntimeStatus.PARTIAL_EXIT_PENDING,
+        broker_quantity=300,
+        orderable_quantity=300,
+        pending_partial_sell_quantity=100,
+    )
+
+    result = apply_board_command(engine, _cmd(RequestSellAll, card))
+
+    assert result.board_status == BoardStatus.SELL_ALL
+    assert result.exit_all_required is True
+    assert result.pending_partial_sell_quantity == 0
 
 
 # --- Stops (spec section 605-659) -------------------------------------------

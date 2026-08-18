@@ -1477,6 +1477,106 @@ def test_partial_sell_ttl_cancel_before_deadline_is_untouched(tmp_path):
     assert engine.run_heartbeat([card]) == []
 
 
+def test_user_withdrawal_cancels_working_partial_before_ttl_then_returns_open(tmp_path):
+    working = _working_sell_order(
+        deadline_seconds_ago=-30, intent=OrderIntent.PARTIAL_EXIT
+    )
+    tracker = _StatefulOrderTracker(working)
+    engine = _make_engine(tmp_path)
+    engine._market_data.subscribe(["AAPL"])
+    engine._market_data.poll_once()
+    engine._position_callbacks = PositionActionCallbacks(
+        cancel_order=tracker.cancel_order,
+        submit_sell_order=lambda **kw: pytest.fail("withdrawal must not submit"),
+        refresh_orderable_quantity=lambda *a: 300,
+        find_open_sell_order=tracker.find,
+        reconcile_sell_order=tracker.reconcile,
+    )
+    card = _open_card(
+        board_status=BoardStatus.PARTIAL_SELL,
+        broker_quantity=300,
+        orderable_quantity=300,
+        exit_attempt_group_id="partial-chain",
+        exit_client_order_id=working.client_order_id,
+        exit_pending_attempt_number=1,
+        reserved_sell_quantity=100,
+    )
+    card.pending_partial_sell_quantity = 0  # durable user-withdrawal signal
+
+    first = engine.run_heartbeat([card])
+
+    assert first == [card]
+    assert tracker.cancel_calls == [working.client_order_id]
+    assert card.board_status == BoardStatus.PARTIAL_SELL
+    assert card.exit_cancel_in_flight is True
+
+    tracker.resolve(OrderStatus.CANCELLED, filled=0)
+    second = engine.run_heartbeat([card])
+
+    assert second == [card]
+    assert card.board_status == BoardStatus.OPEN_POSITION
+    assert card.broker_quantity == 300
+    assert card.exit_attempt_group_id == ""
+    assert card.exit_client_order_id == ""
+
+
+def test_sell_all_upgrade_cancels_working_partial_before_submitting_full_remainder(tmp_path):
+    working = _working_sell_order(
+        deadline_seconds_ago=-30, intent=OrderIntent.PARTIAL_EXIT
+    )
+    tracker = _StatefulOrderTracker(working)
+    submitted = []
+
+    def find_open(card):
+        return tracker.order if tracker.order.is_open() else None
+
+    def submit_sell(**kwargs):
+        submitted.append(kwargs)
+        return BrokerOrder.create(
+            environment=kwargs["environment"],
+            account_no=kwargs["account_no"],
+            symbol=kwargs["symbol"],
+            side=OrderSide.SELL,
+            intent=OrderIntent.MANUAL_EXIT,
+            quantity_requested=kwargs["quantity"],
+            limit_price=90.0,
+            status=OrderStatus.ACCEPTED,
+        )
+
+    engine = _make_engine(tmp_path)
+    engine._position_callbacks = PositionActionCallbacks(
+        cancel_order=tracker.cancel_order,
+        submit_sell_order=submit_sell,
+        refresh_orderable_quantity=lambda *a: 300,
+        find_open_sell_order=find_open,
+        reconcile_sell_order=tracker.reconcile,
+    )
+    card = _open_card(
+        board_status=BoardStatus.SELL_ALL,
+        broker_quantity=300,
+        orderable_quantity=300,
+        exit_all_required=True,
+        exit_attempt_group_id="partial-chain",
+        exit_client_order_id=working.client_order_id,
+        exit_pending_attempt_number=1,
+        reserved_sell_quantity=100,
+    )
+
+    first = engine.run_heartbeat([card])
+
+    assert first == [card]
+    assert tracker.cancel_calls == [working.client_order_id]
+    assert submitted == []
+
+    tracker.resolve(OrderStatus.CANCELLED, filled=0)
+    second = engine.run_heartbeat([card])
+
+    assert second == [card]
+    assert len(submitted) == 1
+    assert submitted[0]["quantity"] == 300
+    assert card.board_status == BoardStatus.SELL_ALL
+
+
 def test_exit_cancel_unconfirmed_past_timeout_flags_warning_without_resending_cancel(tmp_path):
     clock_time = dt.datetime(2026, 1, 5, 14, 30, tzinfo=dt.timezone.utc)
     tracker = _StatefulOrderTracker(_working_sell_order(now=clock_time))

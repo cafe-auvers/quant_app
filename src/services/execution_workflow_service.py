@@ -419,6 +419,7 @@ def _board_action_name(command, card) -> str:
         (
             types.RequestPartialSell,
             types.RequestSellAll,
+            types.CancelPartialSell,
             types.CancelQueuedSellAll,
             types.SetOrbStop,
             types.SetBreakevenStop,
@@ -572,7 +573,7 @@ def _active_external_orders(engine, card):
     ]
 
 
-def _require_board_action_not_conflicted(engine, command, card) -> None:
+def _require_board_action_not_conflicted(engine, command, card) -> List[ExecutionOrderRecord]:
     types = _load_board_types()
     active_orders = _active_owned_orders(engine, card)
 
@@ -596,10 +597,10 @@ def _require_board_action_not_conflicted(engine, command, card) -> None:
             raise BoardCommandRejectedError(
                 "A BUY identity/order already exists; request entry cancellation and wait for broker-confirmed terminal reconciliation"
             )
-        return
+        return active_orders
 
     if isinstance(command, (types.MoveToWatchlist, types.ReorderCard)):
-        return
+        return active_orders
     if card.entry_submission_unresolved or card.exit_submission_unresolved:
         raise BoardCommandRejectedError(
             "An ambiguous order is awaiting reconciliation; no new board action is allowed"
@@ -649,9 +650,10 @@ def _require_board_action_not_conflicted(engine, command, card) -> None:
         raise BoardCommandRejectedError(
             "The market-open SELL has already reached the execution lifecycle; it cannot be withdrawn as a local queue gesture"
         )
+    return active_orders
 
 
-def _apply_board_mutation(command, card, *, context=None) -> None:
+def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> None:
     from src.core.trade_card_state import BoardStatus, PositionRuntimeStatus, StopType
     from src.services.position_manager import (
         compute_breakeven_stop_price,
@@ -715,6 +717,37 @@ def _apply_board_mutation(command, card, *, context=None) -> None:
             _move_board_card(card, BoardStatus.PARTIAL_SELL)
             card.pending_partial_sell_quantity = command.quantity
             card.position_runtime_status = PositionRuntimeStatus.PARTIAL_EXIT_PENDING
+        return
+
+    if isinstance(command, types.CancelPartialSell):
+        if card.board_status != BoardStatus.PARTIAL_SELL:
+            raise BoardCommandRejectedError("No Partial Sell objective to withdraw")
+        active_sell = any(order.side == OrderSide.SELL for order in active_orders)
+        durable_exit_started = bool(
+            active_sell
+            or card.exit_client_order_id
+            or card.exit_pending_attempt_number
+            or card.reserved_sell_quantity
+        )
+        # Zero is the durable withdrawal signal consumed by the runtime.  A
+        # known working order must stay visibly pending until cancellation
+        # and broker reconciliation establish the remaining position.
+        card.pending_partial_sell_quantity = 0
+        card.next_exit_retry_at = None
+        card.last_exit_error = ""
+        if durable_exit_started:
+            return
+        _move_board_card(card, BoardStatus.OPEN_POSITION)
+        card.position_runtime_status = PositionRuntimeStatus.OPEN
+        card.reserved_sell_quantity = 0
+        card.exit_attempt_group_id = ""
+        card.exit_attempt_count = 0
+        card.exit_client_order_id = ""
+        card.exit_pending_attempt_number = 0
+        card.exit_submission_unresolved = False
+        card.exit_cancel_in_flight = False
+        card.exit_cancel_requested_at = None
+        card.exit_cancel_command_id = ""
         return
 
     if isinstance(command, types.SetOrbStop):
@@ -798,6 +831,7 @@ def _apply_board_mutation(command, card, *, context=None) -> None:
         # conflicting BUY, refreshes quantity, submits, and reconciliation
         # alone may eventually project CLOSED.
         card.exit_all_required = True
+        card.pending_partial_sell_quantity = 0
         card.position_runtime_status = PositionRuntimeStatus.LIQUIDATING
         if context is not None and context.regular_session_open is False:
             card.sell_all_at_market_open = True
@@ -825,6 +859,7 @@ def request_board_action(
         BoardActionContext,
         BoardWorkflowResult,
         ActivateForToday,
+        CancelPartialSell,
         CancelQueuedSellAll,
         RequestPartialSell,
         RequestSellAll,
@@ -845,6 +880,7 @@ def request_board_action(
     resolved_context = context or BoardActionContext()
     intent_only_types = (
         ActivateForToday,
+        CancelPartialSell,
         RequestPartialSell,
         RequestSellAll,
         CancelQueuedSellAll,
@@ -905,7 +941,7 @@ def request_board_action(
 
     _require_current_board_runtime(command, card, resolved_context)
 
-    _require_board_action_not_conflicted(engine, command, card)
+    active_orders = _require_board_action_not_conflicted(engine, command, card)
     # The final ownership check and card CAS share one transaction.  On
     # MySQL the locked rows prevent a same-symbol ownership transfer from
     # slipping between authorization and intent persistence.
@@ -1009,7 +1045,12 @@ def request_board_action(
                     resolved_context,
                     ownership=ownership,
                 )
-            _apply_board_mutation(command, current, context=resolved_context)
+            _apply_board_mutation(
+                command,
+                current,
+                context=resolved_context,
+                active_orders=active_orders,
+            )
             updated = trade_card_repository.update_trade_card_in_transaction(
                 conn, current, expected_version=command.expected_card_version
             )

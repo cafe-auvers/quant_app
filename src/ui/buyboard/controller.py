@@ -374,6 +374,7 @@ class BuyboardMixin:
         from PyQt5.QtWidgets import QMessageBox
         from src.core.board_workflow import (
             ActivateForToday,
+            CancelPartialSell,
             CancelQueuedSellAll,
             RequestPartialSell,
             RequestSellAll,
@@ -384,6 +385,7 @@ class BuyboardMixin:
 
         intent_only_types = (
             ActivateForToday,
+            CancelPartialSell,
             RequestPartialSell,
             RequestSellAll,
             CancelQueuedSellAll,

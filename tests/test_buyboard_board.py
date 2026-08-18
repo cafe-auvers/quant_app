@@ -13,7 +13,7 @@ from sqlalchemy.pool import NullPool
 from src.core.trade_card_state import BoardStatus, TradeCardState
 from src.services import trade_card_repository as repo
 from src.ui.buyboard import board as board_module
-from src.ui.buyboard.drag_commands import CancelEntry, ReorderCard
+from src.ui.buyboard.drag_commands import CancelEntry, CancelPartialSell, ReorderCard
 
 _APP = None
 
@@ -220,3 +220,36 @@ def test_context_menu_has_no_cancel_entry_action_for_open_position(tmp_path, mon
     assert _find_action_by_text(captured_menu["menu"], "Cancel Entry") is None
     assert _find_action_by_text(captured_menu["menu"], "Remove from Today") is None
     assert _find_action_by_text(captured_menu["menu"], "Move Stop to Breakeven") is not None
+
+
+def test_dragging_partial_sell_to_open_dispatches_partial_withdrawal(tmp_path, monkeypatch):
+    engine = _make_engine(tmp_path)
+    card = repo.create_trade_card(
+        engine,
+        _card(
+            board_status=BoardStatus.PARTIAL_SELL,
+            broker_quantity=300,
+            orderable_quantity=300,
+            pending_partial_sell_quantity=100,
+        ),
+    )
+    window = _FakeMainWindow(engine)
+    monkeypatch.setattr(
+        board_module,
+        "_lookup_projection",
+        lambda *args: type("Projection", (), {"card": card})(),
+    )
+
+    board_module._handle_card_dropped(
+        window,
+        {
+            "environment": card.environment,
+            "account_no": card.account_no,
+            "symbol": card.symbol,
+            "version": card.version,
+        },
+        BoardStatus.OPEN_POSITION,
+    )
+
+    assert len(window.dispatched) == 1
+    assert isinstance(window.dispatched[0], CancelPartialSell)

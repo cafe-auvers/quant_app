@@ -17,6 +17,7 @@ from src.core.board_workflow import (
     BoardExecutionOrderProjection,
     BoardProjectionContext,
     CancelEntry,
+    CancelPartialSell,
     MoveToBuylist,
     RequestPartialSell,
     RequestSellAll,
@@ -427,6 +428,80 @@ def test_partial_sell_uses_broker_orderable_quantity_and_stays_pending(tmp_path)
     assert result.card.pending_partial_sell_quantity == 30
     assert result.card.broker_quantity == 100
     assert result.card.orderable_quantity == 80
+
+
+@pytest.mark.parametrize("regular_session_open", [False, True])
+def test_unsubmitted_partial_sell_withdrawal_is_not_blocked_by_market_hours(
+    tmp_path, regular_session_open
+):
+    engine = _engine(tmp_path)
+    card = _seed(
+        engine,
+        board_status=BoardStatus.PARTIAL_SELL,
+        position_runtime_status=PositionRuntimeStatus.PARTIAL_EXIT_PENDING,
+        pending_partial_sell_quantity=30,
+    )
+    projection = _projection(engine, card, readiness_generation=7)
+
+    result = workflow.request_board_action(
+        engine,
+        _command(CancelPartialSell, projection),
+        context=BoardActionContext(
+            enforce_runtime_fences=False,
+            engine_enabled=False,
+            action_ready=False,
+            device_active=False,
+            regular_session_open=regular_session_open,
+        ),
+    ).card
+
+    assert result.board_status == BoardStatus.OPEN_POSITION
+    assert result.pending_partial_sell_quantity == 0
+    assert result.broker_quantity == 100
+
+
+def test_ambiguous_partial_sell_cannot_be_withdrawn_as_if_unsubmitted(tmp_path):
+    engine = _engine(tmp_path)
+    card = _seed(
+        engine,
+        board_status=BoardStatus.PARTIAL_SELL,
+        position_runtime_status=PositionRuntimeStatus.PARTIAL_EXIT_PENDING,
+        pending_partial_sell_quantity=30,
+        exit_client_order_id="CID-AMB",
+        exit_submission_unresolved=True,
+    )
+    projection = _projection(engine, card, readiness_generation=7)
+
+    with pytest.raises(workflow.BoardCommandRejectedError, match="ambiguous"):
+        workflow.request_board_action(
+            engine,
+            _command(CancelPartialSell, projection),
+            context=_ready(),
+        )
+
+    current = card_repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert current.board_status == BoardStatus.PARTIAL_SELL
+    assert current.pending_partial_sell_quantity == 30
+
+
+def test_stale_partial_sell_withdrawal_cannot_overwrite_newer_card(tmp_path):
+    engine = _engine(tmp_path)
+    card = _seed(
+        engine,
+        board_status=BoardStatus.PARTIAL_SELL,
+        position_runtime_status=PositionRuntimeStatus.PARTIAL_EXIT_PENDING,
+        pending_partial_sell_quantity=30,
+    )
+    stale = _projection(engine, card, readiness_generation=7)
+    card.orderable_quantity = 90
+    card_repo.update_trade_card(engine, card, expected_version=card.version)
+
+    with pytest.raises(TradeCardVersionConflictError):
+        workflow.request_board_action(
+            engine,
+            _command(CancelPartialSell, stale),
+            context=_ready(),
+        )
 
 
 def test_stop_changes_remain_pending_until_runtime_acknowledges_each_rule(tmp_path):
