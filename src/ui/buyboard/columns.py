@@ -21,6 +21,7 @@ from .card import (
     ExternalOrderWidget,
     TradeCardWidget,
     UnlinkedExecutionOrderWidget,
+    board_interaction_fingerprint,
     card_drag_payload,
 )
 
@@ -71,6 +72,7 @@ class BoardColumnList(QListWidget):
         on_card_dropped: Callable[[dict, BoardStatus], None],
         on_card_context_menu: Optional[Callable[[dict, "object"], None]] = None,
         on_external_order_adopt: Optional[Callable[[object], None]] = None,
+        on_interaction_active: Optional[Callable[[bool], None]] = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -78,6 +80,8 @@ class BoardColumnList(QListWidget):
         self._on_card_dropped = on_card_dropped
         self._on_card_context_menu = on_card_context_menu
         self._on_external_order_adopt = on_external_order_adopt
+        self._on_interaction_active = on_interaction_active
+        self._render_signature = None
         self.setDragDropMode(QAbstractItemView.DragDrop)
         self.setSelectionMode(QAbstractItemView.SingleSelection)
         self.setSpacing(6)
@@ -97,7 +101,15 @@ class BoardColumnList(QListWidget):
         payload = item.data(Qt.UserRole)
         if not payload:
             return
-        self._on_card_context_menu(payload, self.mapToGlobal(position))
+        self._set_interaction_active(True)
+        try:
+            self._on_card_context_menu(payload, self.mapToGlobal(position))
+        finally:
+            self._set_interaction_active(False)
+
+    def _set_interaction_active(self, active: bool) -> None:
+        if self._on_interaction_active is not None:
+            self._on_interaction_active(bool(active))
 
     # -- drag source ---------------------------------------------------
     def startDrag(self, supportedActions) -> None:  # noqa: N802 - Qt override
@@ -107,11 +119,15 @@ class BoardColumnList(QListWidget):
         payload = item.data(Qt.UserRole)
         if not payload:
             return
-        drag = QDrag(self)
-        mime = QMimeData()
-        mime.setData(_CARD_MIME_TYPE, json.dumps(payload).encode("utf-8"))
-        drag.setMimeData(mime)
-        drag.exec_(Qt.MoveAction)
+        self._set_interaction_active(True)
+        try:
+            drag = QDrag(self)
+            mime = QMimeData()
+            mime.setData(_CARD_MIME_TYPE, json.dumps(payload).encode("utf-8"))
+            drag.setMimeData(mime)
+            drag.exec_(Qt.MoveAction)
+        finally:
+            self._set_interaction_active(False)
 
     # -- drop target -----------------------------------------------------
     def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt override
@@ -159,7 +175,7 @@ class BoardColumnList(QListWidget):
             | BoardExecutionOrderProjection
         ],
         quote_lookup: Optional[Callable[[str], Optional[float]]] = None,
-    ) -> None:
+    ) -> bool:
         """``quote_lookup``, when supplied, returns the live last price for
         a symbol (e.g. from a running ``RealtimeMarketDataService``) so
         cards can show real P&L instead of none at all (section P1-7).
@@ -170,7 +186,7 @@ class BoardColumnList(QListWidget):
         the stored value but the column would render in the same order
         regardless.
         """
-        self.clear()
+
         def state(item):
             return item.card if isinstance(item, BoardCardProjection) else item
 
@@ -181,7 +197,61 @@ class BoardColumnList(QListWidget):
                 return 0
             return state(item).kanban_priority
 
-        for card in sorted(cards, key=lambda c: -priority(c)):
+        ordered = sorted(cards, key=lambda c: -priority(c))
+
+        def render_identity(item):
+            if isinstance(item, BoardCardProjection):
+                return (
+                    "CARD",
+                    item.card.card_key,
+                    board_interaction_fingerprint(item),
+                )
+            if isinstance(item, TradeCardState):
+                return ("CARD", item.card_key, board_interaction_fingerprint(item))
+            return (type(item).__name__, repr(item))
+
+        signature = tuple(render_identity(item) for item in ordered)
+        if signature == self._render_signature:
+            existing = {}
+            for index in range(self.count()):
+                item = self.item(index)
+                payload = item.data(Qt.UserRole)
+                if not isinstance(payload, dict):
+                    continue
+                key = (
+                    str(payload.get("environment", "")),
+                    str(payload.get("account_no", "")),
+                    str(payload.get("symbol", "")),
+                )
+                existing[key] = (item, self.itemWidget(item))
+            for value in ordered:
+                if isinstance(
+                    value,
+                    (BoardExternalOrderProjection, BoardExecutionOrderProjection),
+                ):
+                    continue
+                card_state = state(value)
+                key = (
+                    card_state.environment,
+                    card_state.account_no,
+                    card_state.symbol,
+                )
+                row = existing.get(key)
+                if row is None:
+                    continue
+                item, widget = row
+                item.setData(Qt.UserRole, card_drag_payload(value))
+                if isinstance(widget, TradeCardWidget):
+                    current_price = (
+                        quote_lookup(card_state.symbol)
+                        if quote_lookup is not None
+                        else None
+                    )
+                    widget.update_current_price(card_state, current_price)
+            return False
+
+        self.clear()
+        for card in ordered:
             if isinstance(card, BoardExternalOrderProjection):
                 external_item = QListWidgetItem(self)
                 external_item.setFlags(Qt.ItemIsEnabled)
@@ -202,7 +272,11 @@ class BoardColumnList(QListWidget):
             card_state = state(card)
             item = QListWidgetItem(self)
             item.setData(Qt.UserRole, card_drag_payload(card))
-            current_price = quote_lookup(card_state.symbol) if quote_lookup is not None else None
+            current_price = (
+                quote_lookup(card_state.symbol)
+                if quote_lookup is not None
+                else None
+            )
             widget = TradeCardWidget(card, current_price=current_price)
             item.setSizeHint(widget.sizeHint())
             self.setItemWidget(item, widget)
@@ -224,3 +298,5 @@ class BoardColumnList(QListWidget):
                     )
                     external_item.setSizeHint(external_widget.sizeHint())
                     self.setItemWidget(external_item, external_widget)
+        self._render_signature = signature
+        return True

@@ -97,6 +97,15 @@ class _ProjectionWindow:
         return None
 
 
+class _InteractiveProjectionWindow(buyboard_controller.BuyboardMixin):
+    def __init__(self):
+        self._buyboard_projection_generation = 3
+        self.refresh_count = 0
+
+    def refresh_buyboard(self):
+        self.refresh_count += 1
+
+
 def test_refresh_buyboard_starts_worker_without_running_db_read_on_gui_thread(
     monkeypatch,
 ):
@@ -139,3 +148,42 @@ def test_busy_buyboard_projection_is_coalesced_without_invalidating_its_result()
     buyboard_controller.BuyboardMixin.refresh_buyboard(window)
 
     assert window._buyboard_projection_generation == 7
+
+
+def test_projection_rebuild_is_deferred_until_user_interaction_finishes(
+    monkeypatch,
+):
+    window = _InteractiveProjectionWindow()
+    populated = []
+    monkeypatch.setattr(
+        buyboard_board,
+        "populate_buyboard_columns",
+        lambda _window, values: populated.append(values),
+    )
+
+    window._set_buyboard_interaction_active(True)
+    window._on_buyboard_projection_completed(["fresh"], "", 3)
+    assert populated == []
+
+    window._set_buyboard_interaction_active(False)
+    assert populated == [["fresh"]]
+
+
+def test_action_refresh_discards_projection_captured_before_interaction(
+    monkeypatch,
+):
+    window = _InteractiveProjectionWindow()
+    populated = []
+    monkeypatch.setattr(
+        buyboard_board,
+        "populate_buyboard_columns",
+        lambda _window, values: populated.append(values),
+    )
+
+    window._set_buyboard_interaction_active(True)
+    window._on_buyboard_projection_completed(["pre-action"], "", 3)
+    buyboard_controller.BuyboardMixin.refresh_buyboard(window)
+    window._set_buyboard_interaction_active(False)
+
+    assert populated == []
+    assert window.refresh_count == 1

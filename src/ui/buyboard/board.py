@@ -33,7 +33,7 @@ from src.core.trade_card_state import BoardStatus, TradeCardState
 from src.services import execution_workflow_service
 
 from . import dialogs
-from .card import card_drag_payload
+from .card import board_interaction_fingerprint, card_drag_payload
 from .columns import BOARD_COLUMN_ORDER, BOARD_COLUMN_TITLES, BoardColumnList
 from .drag_commands import (
     ActivateForToday,
@@ -111,6 +111,7 @@ def build_buyboard_widget(main_window) -> None:
             lambda payload, target, mw=main_window: _handle_card_dropped(mw, payload, target),
             lambda payload, global_pos, mw=main_window: _handle_card_context_menu(mw, payload, global_pos),
             lambda order, mw=main_window: _handle_external_order_adopt(mw, order),
+            lambda active, mw=main_window: mw._set_buyboard_interaction_active(active),
         )
         group_layout.addWidget(column_list)
         columns_layout.addWidget(group, 1)
@@ -162,6 +163,10 @@ def _sync_account_filter_options(main_window, cards) -> Optional[str]:
     if combo is None:
         return None
     accounts = sorted({_account_no(card) for card in cards if _account_no(card)})
+    desired_values = [None, *accounts]
+    current_values = [combo.itemData(index) for index in range(combo.count())]
+    if current_values == desired_values:
+        return combo.currentData()
     previous_selection = combo.currentData()
     combo.blockSignals(True)
     combo.clear()
@@ -175,6 +180,8 @@ def _sync_account_filter_options(main_window, cards) -> Optional[str]:
 
 
 def populate_buyboard_columns(main_window, cards) -> None:
+    cards = list(cards)
+    main_window._buyboard_current_projections = tuple(cards)
     selected_account = _sync_account_filter_options(main_window, cards)
     if selected_account:
         cards = [card for card in cards if _account_no(card) == selected_account]
@@ -204,7 +211,6 @@ def _handle_card_dropped(main_window, payload: dict, target_status: BoardStatus)
     environment = str(payload.get("environment", ""))
     account_no = str(payload.get("account_no", ""))
     symbol = str(payload.get("symbol", ""))
-    version = int(payload.get("version", 0))
 
     if target_status in _ENGINE_GATED_TARGET_COLUMNS and not is_buyboard_engine_enabled():
         QMessageBox.information(
@@ -221,7 +227,7 @@ def _handle_card_dropped(main_window, payload: dict, target_status: BoardStatus)
         main_window.refresh_buyboard()
         return
     card = projection.card
-    if card.version != version:
+    if not _payload_matches_projection(payload, projection):
         QMessageBox.warning(
             main_window,
             "Buy Board",
@@ -230,7 +236,9 @@ def _handle_card_dropped(main_window, payload: dict, target_status: BoardStatus)
         main_window.refresh_buyboard()
         return
 
-    common = _command_kwargs(payload)
+    current_payload = card_drag_payload(projection)
+    common = _command_kwargs(current_payload)
+    interaction_fingerprint = current_payload["state_fingerprint"]
 
     if target_status == BoardStatus.WATCHLIST:
         command = MoveToWatchlist(
@@ -284,15 +292,21 @@ def _handle_card_dropped(main_window, payload: dict, target_status: BoardStatus)
         )
         return
 
-    main_window._buyboard_dispatch_command(command)
+    main_window._buyboard_dispatch_command(
+        command, interaction_fingerprint=interaction_fingerprint
+    )
 
 
 def _column_cards_sorted(main_window, board_status: BoardStatus) -> List[TradeCardState]:
     from .controller import _projection_context
 
-    all_cards = execution_workflow_service.list_board_projections(
-        main_window._buyboard_engine(), environment="PROD", context=_projection_context(main_window)
-    )
+    all_cards = getattr(main_window, "_buyboard_current_projections", None)
+    if all_cards is None:
+        all_cards = execution_workflow_service.list_board_projections(
+            main_window._buyboard_engine(),
+            environment="PROD",
+            context=_projection_context(main_window),
+        )
     return sorted(
         (
             _state(c)
@@ -335,7 +349,10 @@ def _renumber_column_after_swap(
             expected_card_version=sibling.version,
             target_priority=target_priority,
         )
-        main_window._buyboard_dispatch_command(command)
+        main_window._buyboard_dispatch_command(
+            command,
+            interaction_fingerprint=board_interaction_fingerprint(sibling),
+        )
 
 
 def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
@@ -350,19 +367,20 @@ def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
     environment = str(payload.get("environment", ""))
     account_no = str(payload.get("account_no", ""))
     symbol = str(payload.get("symbol", ""))
-    version = int(payload.get("version", 0))
 
     projection = _lookup_projection(main_window, environment, account_no, symbol)
     if projection is None:
         return
     card = projection.card
-    if card.version != version:
+    if not _payload_matches_projection(payload, projection):
         QMessageBox.warning(
             main_window, "Buy Board", "This card changed; the board has been refreshed."
         )
         main_window.refresh_buyboard()
         return
-    common = _command_kwargs(payload)
+    current_payload = card_drag_payload(projection)
+    common = _command_kwargs(current_payload)
+    interaction_fingerprint = current_payload["state_fingerprint"]
 
     menu = QMenu(main_window)
     cancel_entry_action = orb_action = breakeven_action = manual_stop_action = None
@@ -397,14 +415,18 @@ def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
         command = CancelEntry(
             **common
         )
-        main_window._buyboard_dispatch_command(command)
+        main_window._buyboard_dispatch_command(
+            command, interaction_fingerprint=interaction_fingerprint
+        )
     elif chosen is orb_action:
         if not is_buyboard_engine_enabled():
             QMessageBox.information(
                 main_window, "Buy Board", "The new execution engine is not enabled yet."
             )
             return
-        main_window._buyboard_dispatch_command(SetOrbStop(**common))
+        main_window._buyboard_dispatch_command(
+            SetOrbStop(**common), interaction_fingerprint=interaction_fingerprint
+        )
     elif chosen is breakeven_action:
         if not is_buyboard_engine_enabled():
             QMessageBox.information(
@@ -414,7 +436,9 @@ def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
         command = SetBreakevenStop(
             **common
         )
-        main_window._buyboard_dispatch_command(command)
+        main_window._buyboard_dispatch_command(
+            command, interaction_fingerprint=interaction_fingerprint
+        )
     elif chosen is manual_stop_action:
         if not is_buyboard_engine_enabled():
             QMessageBox.information(
@@ -428,7 +452,9 @@ def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
             **common,
             price=price,
         )
-        main_window._buyboard_dispatch_command(command)
+        main_window._buyboard_dispatch_command(
+            command, interaction_fingerprint=interaction_fingerprint
+        )
     elif chosen is move_up_action and index is not None and index > 0:
         _renumber_column_after_swap(main_window, siblings, index, index - 1)
     elif chosen is move_down_action and index is not None and index < len(siblings) - 1:
@@ -446,6 +472,15 @@ def _command_kwargs(payload: dict) -> dict:
         "expected_execution_owner": str(payload.get("execution_owner", "")),
         "expected_strategy_instance_id": str(payload.get("strategy_instance_id", "")),
     }
+
+
+def _payload_matches_projection(payload: dict, projection) -> bool:
+    """Accept storage-only revision churn, never changed actionable state."""
+
+    rendered_fingerprint = str(payload.get("state_fingerprint", "") or "")
+    if rendered_fingerprint:
+        return rendered_fingerprint == board_interaction_fingerprint(projection)
+    return projection.card.version == int(payload.get("version", 0) or 0)
 
 
 def _lookup_projection(main_window, environment: str, account_no: str, symbol: str):
@@ -500,5 +535,10 @@ def _handle_external_order_adopt(main_window, external_order) -> None:
             **_command_kwargs(payload),
             external_order_id=external_order.external_order_id,
             adopted_by=getpass.getuser() or "unknown-operator",
-        )
+        ),
+        interaction_fingerprint=(
+            board_interaction_fingerprint(projection)
+            if projection is not None
+            else ""
+        ),
     )

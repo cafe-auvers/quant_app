@@ -32,6 +32,8 @@ from src.services.trade_card_repository import (
 from src.utils.config import get_env_value
 from src.utils.market_calendar import is_regular_session_open
 
+from .card import board_interaction_fingerprint, card_drag_payload
+
 logger = logging.getLogger(__name__)
 
 # Compatibility name used by existing extensions/tests.
@@ -336,6 +338,10 @@ class BuyboardMixin:
     def refresh_buyboard(self) -> None:
         from .board import populate_buyboard_columns
 
+        if int(self.__dict__.get("_buyboard_interaction_depth", 0) or 0) > 0:
+            self._buyboard_refresh_pending = True
+            return
+
         worker = self.__dict__.get("_buyboard_projection_worker")
         if worker is not None:
             try:
@@ -366,11 +372,34 @@ class BuyboardMixin:
             return
         if error:
             return
+        if int(self.__dict__.get("_buyboard_interaction_depth", 0) or 0) > 0:
+            self._buyboard_deferred_projection = (projections, error, generation)
+            return
         from .board import populate_buyboard_columns
 
         populate_buyboard_columns(self, projections)
 
-    def _buyboard_dispatch_command(self, command: AnyBoardCommand) -> bool:
+    def _set_buyboard_interaction_active(self, active: bool) -> None:
+        """Prevent a timer refresh from replacing widgets during a gesture."""
+
+        depth = int(self.__dict__.get("_buyboard_interaction_depth", 0) or 0)
+        depth = depth + 1 if active else max(0, depth - 1)
+        self._buyboard_interaction_depth = depth
+        if depth:
+            return
+        pending = bool(self.__dict__.pop("_buyboard_refresh_pending", False))
+        deferred = self.__dict__.pop("_buyboard_deferred_projection", None)
+        if pending:
+            self.refresh_buyboard()
+        elif deferred is not None:
+            self._on_buyboard_projection_completed(*deferred)
+
+    def _buyboard_dispatch_command(
+        self,
+        command: AnyBoardCommand,
+        *,
+        interaction_fingerprint: str = "",
+    ) -> bool:
         from PyQt5.QtWidgets import QMessageBox
         from src.core.board_workflow import (
             ActivateForToday,
@@ -394,9 +423,9 @@ class BuyboardMixin:
             SetManualStop,
         )
 
-        try:
-            context = _action_context(self, command)
-            if isinstance(command, intent_only_types):
+        def request(current_command: AnyBoardCommand) -> None:
+            context = _action_context(self, current_command)
+            if isinstance(current_command, intent_only_types):
                 # These gestures perform zero broker I/O here. They are valid
                 # pre-market and from a pull-only laptop; the authoritative PC
                 # runtime later consumes them only after its complete readiness
@@ -404,25 +433,63 @@ class BuyboardMixin:
                 context = replace(context, enforce_runtime_fences=False)
             execution_workflow_service.request_board_action(
                 self._buyboard_engine(),
-                command,
+                current_command,
                 context=context,
-                claim_kanban_ownership=isinstance(command, intent_only_types),
+                claim_kanban_ownership=isinstance(
+                    current_command, intent_only_types
+                ),
             )
-        except TradeCardVersionConflictError:
-            QMessageBox.warning(
-                self,
-                "Buy Board",
-                "This card changed since it was loaded. The board has been refreshed; please retry.",
-            )
-            self.refresh_buyboard()
-            return False
-        except TradeCardNotFoundError:
-            QMessageBox.warning(self, "Buy Board", "This card no longer exists.")
-            self.refresh_buyboard()
-            return False
-        except BoardCommandRejectedError as exc:
-            QMessageBox.warning(self, "Buy Board", str(exc))
-            self.refresh_buyboard()
-            return False
+
+        current_command = command
+        for attempt in range(2):
+            try:
+                request(current_command)
+                break
+            except TradeCardVersionConflictError:
+                if attempt == 0 and interaction_fingerprint:
+                    try:
+                        projection = execution_workflow_service.get_board_projection(
+                            self._buyboard_engine(),
+                            environment=current_command.environment,
+                            account_no=current_command.account_no,
+                            symbol=current_command.symbol,
+                            context=_projection_context(self),
+                        )
+                    except Exception:
+                        projection = None
+                    if (
+                        projection is not None
+                        and board_interaction_fingerprint(projection)
+                        == interaction_fingerprint
+                    ):
+                        fresh = card_drag_payload(projection)
+                        current_command = replace(
+                            current_command,
+                            expected_card_version=fresh["version"],
+                            expected_readiness_generation=fresh[
+                                "readiness_generation"
+                            ],
+                            expected_ownership_version=fresh["ownership_version"],
+                            expected_execution_owner=fresh["execution_owner"],
+                            expected_strategy_instance_id=fresh[
+                                "strategy_instance_id"
+                            ],
+                        )
+                        continue
+                QMessageBox.warning(
+                    self,
+                    "Buy Board",
+                    "This card changed since it was loaded. The board has been refreshed; please retry.",
+                )
+                self.refresh_buyboard()
+                return False
+            except TradeCardNotFoundError:
+                QMessageBox.warning(self, "Buy Board", "This card no longer exists.")
+                self.refresh_buyboard()
+                return False
+            except BoardCommandRejectedError as exc:
+                QMessageBox.warning(self, "Buy Board", str(exc))
+                self.refresh_buyboard()
+                return False
         self.refresh_buyboard()
         return True
