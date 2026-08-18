@@ -151,7 +151,9 @@ def _resolve_external_fence(engine, external_order):
 # --- mode selection / API split (findings 2) ---------------------------
 
 
-def test_default_gateway_resolves_legacy_compatibility_mode():
+def test_default_gateway_resolves_legacy_compatibility_mode(monkeypatch):
+    monkeypatch.setattr(gw_module, "_default_gateway", None)
+    monkeypatch.setenv("BUYBOARD_ENGINE_ENABLED", "true")
     gateway = get_default_execution_gateway()
     assert gateway.mode == ExecutionMode.LEGACY_COMPATIBILITY
 

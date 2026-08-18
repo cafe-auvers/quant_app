@@ -75,6 +75,7 @@ from src.services.runtime_device_state_repository import get_runtime_device_stat
 from src.services.kis_realtime_market_data import (
     KisRealtimeMarketDataService,
     StopRule,
+    SubscriptionPriority,
 )
 from src.services.realtime_market_data import QuoteSnapshot, RestPollingMarketDataService
 from src.services.stop_change_coordinator import (
@@ -2162,6 +2163,84 @@ def test_sync_quote_subscriptions_adds_and_removes(tmp_path):
     subscribed = set(worker.runtime.market_data.subscribed_symbols())
     assert "AAPL" in subscribed
     assert "STALE" not in subscribed
+
+
+def test_controlled_live_planning_cards_are_display_only_and_not_executable(
+    tmp_path, monkeypatch
+):
+    worker, _ = _worker(tmp_path)
+    configured = {}
+
+    class _MarketData:
+        def configure_desired_channels(self, **kwargs):
+            configured.update(kwargs)
+
+    worker.runtime = SimpleNamespace(market_data=_MarketData())
+    monkeypatch.setattr(
+        execution_config, "is_buyboard_engine_enabled", lambda: True
+    )
+    monkeypatch.setattr(execution_config, "KIS_LIVE_EXECUTION_MODE", "CONTROLLED_LIVE")
+    monkeypatch.setattr(execution_config, "KIS_CONTROLLED_LIVE_SYMBOLS", ("STIM",))
+    planning = TradeCardState(
+        environment="PROD",
+        account_no="1",
+        symbol="CDNA",
+        board_status=BoardStatus.BUY_TODAY,
+    )
+    position = TradeCardState(
+        environment="PROD",
+        account_no="1",
+        symbol="STIM",
+        board_status=BoardStatus.OPEN_POSITION,
+        broker_quantity=10,
+    )
+
+    worker._sync_quote_subscriptions([planning, position])
+
+    assert configured["trade_priorities"] == {
+        "CDNA": int(SubscriptionPriority.DISPLAY_ONLY),
+        "STIM": int(SubscriptionPriority.OPEN_POSITION),
+    }
+    assert configured["quote_priorities"] == {
+        "CDNA": int(SubscriptionPriority.DISPLAY_ONLY),
+        "STIM": int(SubscriptionPriority.CRITICAL_EXIT),
+    }
+    assert worker._card_in_execution_scope(planning) is False
+    assert worker._card_in_execution_scope(position) is True
+
+
+def test_controlled_live_allowlisted_buy_today_remains_execution_critical(
+    tmp_path, monkeypatch
+):
+    worker, _ = _worker(tmp_path)
+    configured = {}
+
+    class _MarketData:
+        def configure_desired_channels(self, **kwargs):
+            configured.update(kwargs)
+
+    worker.runtime = SimpleNamespace(market_data=_MarketData())
+    monkeypatch.setattr(
+        execution_config, "is_buyboard_engine_enabled", lambda: True
+    )
+    monkeypatch.setattr(execution_config, "KIS_LIVE_EXECUTION_MODE", "CONTROLLED_LIVE")
+    monkeypatch.setattr(execution_config, "KIS_CONTROLLED_LIVE_SYMBOLS", ("STIM",))
+    candidate = TradeCardState(
+        environment="PROD",
+        account_no="1",
+        symbol="STIM",
+        board_status=BoardStatus.BUY_TODAY,
+    )
+
+    worker._sync_quote_subscriptions([candidate])
+
+    assert configured["trade_priorities"]["STIM"] == int(
+        SubscriptionPriority.BUY_TODAY
+    )
+    assert configured["quote_priorities"]["STIM"] == int(
+        SubscriptionPriority.BUY_TODAY
+    )
+    assert worker._card_in_execution_scope(candidate) is True
 
 
 class _AccountExecutionBroker(FakeExecutionBroker):

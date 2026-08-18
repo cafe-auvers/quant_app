@@ -120,7 +120,7 @@ def require_live_entry_allowed(
     if normalized_side != OrderSide.BUY or _mode() == FULL_LIVE:
         return
     normalized_symbol = str(symbol or "").strip().upper()
-    if normalized_symbol not in set(execution_config.KIS_CONTROLLED_LIVE_SYMBOLS):
+    if not live_entry_symbol_allowed(environment=environment, symbol=normalized_symbol):
         raise LiveExecutionEnvelopeError(
             f"CONTROLLED_LIVE refuses entry for unapproved symbol {normalized_symbol}"
         )
@@ -133,6 +133,28 @@ def require_live_entry_allowed(
         raise LiveExecutionEnvelopeError(
             "CONTROLLED_LIVE entry exceeds the configured maximum notional"
         )
+
+
+def live_entry_symbol_allowed(*, environment: str, symbol: str) -> bool:
+    """Return whether the current live envelope includes an entry symbol.
+
+    This is a scope helper, not an execution authorization.  Runtime callers
+    use it to keep planning-only cards out of quote/readiness and mutation
+    sets during a controlled pilot.  The final broker boundary still calls
+    :func:`require_live_entry_allowed` with quantity and price.
+    """
+
+    if str(environment or "").strip().upper() != "PROD":
+        return True
+    if not execution_config.is_buyboard_engine_enabled():
+        return True
+    if _mode() != CONTROLLED_LIVE:
+        return True
+    normalized_symbol = str(symbol or "").strip().upper()
+    return bool(
+        normalized_symbol
+        and normalized_symbol in set(execution_config.KIS_CONTROLLED_LIVE_SYMBOLS)
+    )
 
 
 def automatic_mutation_retry_permitted(*, environment: str) -> bool:
