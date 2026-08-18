@@ -30,7 +30,7 @@ from src.core.board_workflow import (
     BoardExternalOrderProjection,
 )
 from src.core.trade_card_state import BoardStatus, TradeCardState
-from src.services import execution_workflow_service
+from src.services import buying_power_cache, execution_workflow_service
 
 from . import dialogs
 from .card import board_interaction_fingerprint, card_drag_payload
@@ -139,10 +139,40 @@ def _quote_lookup_for(main_window) -> Optional[Callable[[str], Optional[float]]]
         return None
 
     def lookup(symbol: str) -> Optional[float]:
-        quote = market_data.latest_quote(symbol)
-        return quote.last_price if quote is not None else None
+        try:
+            quote = market_data.latest_quote(symbol)
+            return quote.last_price if quote is not None else None
+        except Exception:
+            # A UI repaint must never affect the market-data/runtime thread.
+            logger.debug("Buy Board quote lookup failed for %s", symbol, exc_info=True)
+            return None
 
     return lookup
+
+
+def _account_equity_lookup_for(
+    _main_window,
+) -> Callable[[str, str], Optional[float]]:
+    """Read the existing in-memory account snapshot; never query KIS/DB here."""
+
+    def lookup(environment: str, account_no: str) -> Optional[float]:
+        snapshot = buying_power_cache.get_snapshot(environment, account_no)
+        if snapshot is None or snapshot.total_equity_usd <= 0:
+            return None
+        return float(snapshot.total_equity_usd)
+
+    return lookup
+
+
+def refresh_buyboard_live_metrics(main_window) -> int:
+    """Refresh current-price metrics in-place, independently of DB projection."""
+
+    quote_lookup = _quote_lookup_for(main_window)
+    equity_lookup = _account_equity_lookup_for(main_window)
+    updated = 0
+    for column_list in getattr(main_window, "buyboard_columns", {}).values():
+        updated += column_list.refresh_live_metrics(quote_lookup, equity_lookup)
+    return updated
 
 
 def _state(value):
@@ -195,8 +225,13 @@ def populate_buyboard_columns(main_window, cards) -> None:
             [],
         ).append(card)
     quote_lookup = _quote_lookup_for(main_window)
+    equity_lookup = _account_equity_lookup_for(main_window)
     for status, column_list in main_window.buyboard_columns.items():
-        column_list.set_cards(grouped.get(status, []), quote_lookup)
+        column_list.set_cards(
+            grouped.get(status, []),
+            quote_lookup,
+            equity_lookup,
+        )
     if hasattr(main_window, "_buyboard_engine_status_label"):
         enabled = is_buyboard_engine_enabled()
         main_window._buyboard_engine_status_label.setText(

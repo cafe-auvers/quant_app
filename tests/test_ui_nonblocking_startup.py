@@ -187,3 +187,28 @@ def test_action_refresh_discards_projection_captured_before_interaction(
 
     assert populated == []
     assert window.refresh_count == 1
+
+
+def test_buyboard_live_metric_refresh_only_repaints_existing_widgets(monkeypatch):
+    calls = []
+
+    class _Column:
+        def refresh_live_metrics(self, quote_lookup, equity_lookup):
+            calls.append((quote_lookup("AAPL"), equity_lookup("PROD", "1")))
+            return 1
+
+    window = SimpleNamespace(buyboard_columns={"open": _Column()})
+    monkeypatch.setattr(
+        buyboard_board,
+        "_quote_lookup_for",
+        lambda _window: lambda _symbol: 123.45,
+    )
+    monkeypatch.setattr(
+        buyboard_board,
+        "_account_equity_lookup_for",
+        lambda _window: lambda _environment, _account: 100_000.0,
+    )
+
+    assert buyboard_board.refresh_buyboard_live_metrics(window) == 1
+    assert calls == [(123.45, 100_000.0)]
+    assert buyboard_controller.BuyboardMixin._BUYBOARD_LIVE_METRIC_REFRESH_MS == 750

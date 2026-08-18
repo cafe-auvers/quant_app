@@ -211,6 +211,7 @@ class BuyboardMixin:
     """Build the board and route all gestures through the workflow service."""
 
     _BUYBOARD_PROJECTION_REFRESH_MS = 3000
+    _BUYBOARD_LIVE_METRIC_REFRESH_MS = 750
 
     def _buyboard_engine(self):
         return self.__dict__.get("pc_db_engine")
@@ -235,6 +236,21 @@ class BuyboardMixin:
         timer.timeout.connect(self.refresh_buyboard)
         timer.start()
         self._buyboard_projection_timer = timer
+
+        # Quote-derived values are intentionally repainted on a faster,
+        # independent cadence. This timer performs no DB/network query and
+        # never destroys card widgets, so live Current/P&L/To Breakout values
+        # do not reintroduce the drag lag caused by projection rebuilds.
+        live_timer = QTimer(self)
+        live_timer.setInterval(self._BUYBOARD_LIVE_METRIC_REFRESH_MS)
+        live_timer.timeout.connect(self._refresh_buyboard_live_metrics)
+        live_timer.start()
+        self._buyboard_live_metric_timer = live_timer
+
+    def _refresh_buyboard_live_metrics(self) -> None:
+        from .board import refresh_buyboard_live_metrics
+
+        refresh_buyboard_live_metrics(self)
 
     def _buyboard_projection_request(self, generation: int):
         engine = self._buyboard_engine()
