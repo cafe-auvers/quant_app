@@ -134,6 +134,8 @@ class SymbolFeedState:
     last_error: str = ""
     trade_error: str = ""
     quote_error: str = ""
+    trade_configuration_error: str = ""
+    quote_configuration_error: str = ""
     clock_health: ClockHealth = ClockHealth.HEALTHY
     reconnect_generation: int = 0
     trading_halted: bool = False
@@ -583,6 +585,7 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         self._state_lock = threading.RLock()
         self._trade_priorities: Dict[str, int] = {}
         self._quote_priorities: Dict[str, int] = {}
+        self._subscription_resolution_errors: Dict[tuple[str, str], str] = {}
         self._target_subscriptions: Dict[tuple[str, str], KisWsSubscription] = {}
         # Subscriptions retained by the transport as deterministic reconnect
         # intent. This is not the same thing as an ACKed KIS session slot.
@@ -738,24 +741,30 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
 
     def _rebalance_subscriptions(self) -> None:
         channel_candidates = []
-        for symbol in self._selected(self._trade_priorities, self._trade_capacity):
-            channel_candidates.append(
-                (
-                    self._trade_priorities[symbol],
-                    symbol,
-                    0,
-                    FeedChannel.TRADE,
-                )
-            )
-        for symbol in self._selected(self._quote_priorities, self._quote_capacity):
-            channel_candidates.append(
-                (
-                    self._quote_priorities[symbol],
-                    symbol,
-                    1,
-                    FeedChannel.QUOTE,
-                )
-            )
+        resolution_errors: Dict[tuple[str, str], str] = {}
+        channel_inputs = (
+            (self._trade_priorities, self._trade_capacity, 0, FeedChannel.TRADE),
+            (self._quote_priorities, self._quote_capacity, 1, FeedChannel.QUOTE),
+        )
+        for priorities, capacity, channel_order, channel in channel_inputs:
+            resolved = []
+            for symbol, priority in sorted(
+                priorities.items(), key=lambda item: (item[1], item[0])
+            ):
+                try:
+                    key = str(self._symbol_key_resolver(symbol, channel) or "").strip()
+                    if not key:
+                        raise RuntimeError(
+                            f"No KIS WebSocket subscription key configured for {symbol}"
+                        )
+                    tr_id = TRADE_TR_ID if channel == FeedChannel.TRADE else QUOTE_TR_ID
+                    sub = KisWsSubscription(tr_id, key, symbol, channel.value)
+                except Exception as exc:  # one symbol must not starve every feed
+                    resolution_errors[(symbol, channel.value)] = str(exc) or type(exc).__name__
+                    continue
+                resolved.append((priority, symbol, channel_order, channel, sub))
+            channel_candidates.extend(resolved[: max(0, int(capacity))])
+
         target_subscriptions: Dict[tuple[str, str], KisWsSubscription] = {}
         if (
             self._execution_notice_subscription is not None
@@ -763,10 +772,7 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         ):
             notice = self._execution_notice_subscription
             target_subscriptions[(notice.tr_id, notice.tr_key)] = notice
-        for _, symbol, _, channel in sorted(channel_candidates):
-            tr_id = TRADE_TR_ID if channel == FeedChannel.TRADE else QUOTE_TR_ID
-            key = self._symbol_key_resolver(symbol, channel)
-            sub = KisWsSubscription(tr_id, key, symbol, channel.value)
+        for _, _, _, _, sub in sorted(channel_candidates):
             target_subscriptions[(sub.tr_id, sub.tr_key)] = sub
 
         all_symbols = set(self._trade_priorities) | set(self._quote_priorities)
@@ -775,6 +781,31 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
                 state = self._states.setdefault(symbol, SymbolFeedState(symbol=symbol))
                 state.trade_desired = symbol in self._trade_priorities
                 state.quote_desired = symbol in self._quote_priorities
+                previous_trade_error = state.trade_configuration_error
+                previous_quote_error = state.quote_configuration_error
+                state.trade_configuration_error = resolution_errors.get(
+                    (symbol, FeedChannel.TRADE.value), ""
+                )
+                state.quote_configuration_error = resolution_errors.get(
+                    (symbol, FeedChannel.QUOTE.value), ""
+                )
+                if state.trade_configuration_error:
+                    state.trade_acked = False
+                    state.trade_requested_at = None
+                if state.quote_configuration_error:
+                    state.quote_acked = False
+                    state.quote_requested_at = None
+                configuration_error = (
+                    state.quote_configuration_error
+                    or state.trade_configuration_error
+                )
+                if configuration_error:
+                    state.last_error = configuration_error
+                elif state.last_error in {
+                    previous_trade_error,
+                    previous_quote_error,
+                }:
+                    state.last_error = ""
             self._target_subscriptions = target_subscriptions
             self._symbol_by_key = {
                 key: sub.symbol
@@ -783,6 +814,23 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
             }
             self._reconcile_subscription_target_locked()
             self._refresh_capacity_rejections_locked()
+
+        previous_errors = self._subscription_resolution_errors
+        self._subscription_resolution_errors = resolution_errors
+        for key, message in sorted(resolution_errors.items()):
+            if previous_errors.get(key) != message:
+                logger.warning(
+                    "KIS WebSocket %s subscription unavailable for %s: %s",
+                    key[1],
+                    key[0],
+                    message,
+                )
+        for key in sorted(set(previous_errors) - set(resolution_errors)):
+            logger.info(
+                "KIS WebSocket %s subscription configuration recovered for %s",
+                key[1],
+                key[0],
+            )
 
     def _reconcile_subscription_target_locked(self) -> None:
         target_keys = set(self._target_subscriptions)
@@ -871,10 +919,14 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         }
         for state in self._states.values():
             state.trade_rejected_due_to_capacity = (
-                state.trade_desired and state.symbol not in selected_trade
+                state.trade_desired
+                and not state.trade_configuration_error
+                and state.symbol not in selected_trade
             )
             state.quote_rejected_due_to_capacity = (
-                state.quote_desired and state.symbol not in selected_quote
+                state.quote_desired
+                and not state.quote_configuration_error
+                and state.symbol not in selected_quote
             )
             if state.trade_rejected_due_to_capacity:
                 state.trade_acked = False
@@ -1540,18 +1592,21 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
                 acked = state.trade_acked
                 rejected = state.trade_rejected_due_to_capacity
                 error = state.trade_error
+                configuration_error = state.trade_configuration_error
                 broker_event_at = state.last_trade_event_at
                 received_at = state.last_trade_received_at
             else:
                 acked = state.quote_acked
                 rejected = state.quote_rejected_due_to_capacity
                 error = state.quote_error
+                configuration_error = state.quote_configuration_error
                 broker_event_at = state.last_quote_event_at
                 received_at = state.last_quote_received_at
             if (
                 not acked
                 or rejected
                 or bool(error)
+                or bool(configuration_error)
                 or state.clock_health != ClockHealth.HEALTHY
                 or broker_event_at is None
                 or received_at is None

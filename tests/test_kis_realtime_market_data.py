@@ -69,11 +69,14 @@ def _service(
     execution_notice_subscription=None,
     alert=lambda message: None,
     qualification_mode=False,
+    symbol_key_resolver=None,
 ):
     transport = _Transport()
     service = KisRealtimeMarketDataService(
         transport=transport,
-        symbol_key_resolver=lambda symbol, channel: f"D{symbol}",
+        symbol_key_resolver=(
+            symbol_key_resolver or (lambda symbol, channel: f"D{symbol}")
+        ),
         trade_capacity=trade_capacity,
         quote_capacity=quote_capacity,
         total_capacity=total_capacity,
@@ -124,6 +127,63 @@ def _ack(service, symbol, tr_id):
             message="SUBSCRIBE SUCCESS",
         )
     )
+
+
+def test_missing_display_symbol_key_does_not_block_mapped_critical_feed():
+    def resolve(symbol, _channel):
+        if symbol == "CDNA":
+            raise RuntimeError("No verified key for CDNA")
+        return f"D{symbol}"
+
+    service, transport = _service(symbol_key_resolver=resolve)
+
+    service.configure_desired_channels(
+        trade_priorities={
+            "STIM": SubscriptionPriority.OPEN_POSITION,
+            "CDNA": SubscriptionPriority.DISPLAY_ONLY,
+        },
+        quote_priorities={
+            "STIM": SubscriptionPriority.OPEN_POSITION,
+            "CDNA": SubscriptionPriority.DISPLAY_ONLY,
+        },
+    )
+    _ack(service, "STIM", "HDFSCNT0")
+    _ack(service, "STIM", "HDFSASP0")
+
+    assert {item.symbol for item in transport.subscribed} == {"STIM"}
+    state = service.symbol_state("CDNA")
+    assert state.trade_configuration_error == "No verified key for CDNA"
+    assert state.quote_configuration_error == "No verified key for CDNA"
+    metrics = service.health_metrics()
+    assert metrics.critical_trade_channels_missing == ()
+    assert metrics.critical_quote_channels_missing == ()
+
+
+def test_missing_critical_symbol_key_blocks_readiness_without_starving_other_feed():
+    def resolve(symbol, _channel):
+        if symbol == "CDNA":
+            raise RuntimeError("No verified key for CDNA")
+        return f"D{symbol}"
+
+    service, transport = _service(symbol_key_resolver=resolve)
+
+    service.configure_desired_channels(
+        trade_priorities={
+            "STIM": SubscriptionPriority.OPEN_POSITION,
+            "CDNA": SubscriptionPriority.OPEN_POSITION,
+        },
+        quote_priorities={
+            "STIM": SubscriptionPriority.OPEN_POSITION,
+            "CDNA": SubscriptionPriority.OPEN_POSITION,
+        },
+    )
+    _ack(service, "STIM", "HDFSCNT0")
+    _ack(service, "STIM", "HDFSASP0")
+
+    assert {item.symbol for item in transport.subscribed} == {"STIM"}
+    metrics = service.health_metrics()
+    assert metrics.critical_trade_channels_missing == ("CDNA",)
+    assert metrics.critical_quote_channels_missing == ("CDNA",)
 
 
 def test_repeated_price_at_a_distinct_trade_is_not_rejected_as_a_duplicate():

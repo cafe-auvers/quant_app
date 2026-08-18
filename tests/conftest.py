@@ -17,6 +17,14 @@ import pytest
 # and including a hard process-crashing access violation.
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+# Unit tests must start from the repository's fail-closed execution defaults,
+# regardless of a developer workstation's production .env. Tests that exercise
+# guarded execution opt in explicitly with a mode override or monkeypatch.
+# Set these before importing any application module because execution_config
+# snapshots the controlled-live mode at import time.
+os.environ["BUYBOARD_ENGINE_ENABLED"] = "false"
+os.environ["KIS_LIVE_EXECUTION_MODE"] = "DISABLED"
+
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:

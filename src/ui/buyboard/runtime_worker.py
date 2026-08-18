@@ -67,7 +67,10 @@ from src.services.execution_authority import ExecutionAuthority, LeaseExpiredErr
 from src.services.execution_lease_protocol import DefaultExecutionLeaseProtocol
 from src.services.kis_request_scheduler import KisRequestScheduler
 from src.services.kis_request_boundary import install_process_kis_request_scheduler
-from src.services.controlled_live_policy import require_controlled_live_configuration
+from src.services.controlled_live_policy import (
+    live_entry_symbol_allowed,
+    require_controlled_live_configuration,
+)
 from src.utils.market_calendar import is_regular_session_open
 from src.services.external_alerting import (
     CriticalAlertType,
@@ -992,6 +995,9 @@ class BuyboardRuntimeWorker(QThread):
             if canonical_available
             else []
         )
+        execution_ready_cards = [
+            card for card in ready_cards if self._card_in_execution_scope(card)
+        ]
         observation_cards = [
             card for card in cards if card.board_status in _QUOTE_SUBSCRIBED_STATUSES
         ]
@@ -1042,7 +1048,11 @@ class BuyboardRuntimeWorker(QThread):
                     self._latch_pending_stop_breaches(
                         quote, pending_handoff, breach_ack_candidates
                     )
-                    _track(self.runtime.trading_engine.evaluate_entry_quote(ready_cards, quote))
+                    _track(
+                        self.runtime.trading_engine.evaluate_entry_quote(
+                            execution_ready_cards, quote
+                        )
+                    )
                     self._collect_market_breach_ack_candidates(
                         quote, observation_cards, breach_ack_candidates
                     )
@@ -1050,7 +1060,7 @@ class BuyboardRuntimeWorker(QThread):
                 _track(self._acknowledge_pending_stop_changes(observation_cards))
 
         if allow_mutations:
-            heartbeat_cards = ready_cards
+            heartbeat_cards = execution_ready_cards
             if not canonical_available:
                 heartbeat_cards = [
                     card
@@ -1088,7 +1098,11 @@ class BuyboardRuntimeWorker(QThread):
                         self._latch_pending_stop_breaches(
                             quote, pending_handoff, breach_ack_candidates
                         )
-                        _track(self.runtime.trading_engine.evaluate_entry_quote(ready_cards, quote))
+                        _track(
+                            self.runtime.trading_engine.evaluate_entry_quote(
+                                execution_ready_cards, quote
+                            )
+                        )
                         self._collect_market_breach_ack_candidates(
                             quote, observation_cards, breach_ack_candidates
                         )
@@ -1442,6 +1456,16 @@ class BuyboardRuntimeWorker(QThread):
         else:
             return True
         return self.account_action_ready(card.account_no, card.symbol, action)
+
+    def _card_in_execution_scope(self, card: TradeCardState) -> bool:
+        """Keep planning-only controlled-live entries away from mutation paths."""
+
+        if card.board_status != BoardStatus.BUY_TODAY:
+            return True
+        return live_entry_symbol_allowed(
+            environment=card.environment,
+            symbol=card.symbol,
+        )
 
     def account_action_ready(
         self, account_no: str, symbol: str, action: str
@@ -1868,7 +1892,11 @@ class BuyboardRuntimeWorker(QThread):
                 elif card.board_status == BoardStatus.ENTRY_PENDING:
                     trade_priority = SubscriptionPriority.ENTRY_PENDING
                 elif card.board_status == BoardStatus.BUY_TODAY:
-                    trade_priority = SubscriptionPriority.BUY_TODAY
+                    trade_priority = (
+                        SubscriptionPriority.BUY_TODAY
+                        if self._card_in_execution_scope(card)
+                        else SubscriptionPriority.DISPLAY_ONLY
+                    )
                 else:
                     trade_priority = SubscriptionPriority.DISPLAY_ONLY
 
@@ -1881,7 +1909,11 @@ class BuyboardRuntimeWorker(QThread):
                 elif card.board_status == BoardStatus.ENTRY_PENDING:
                     quote_priority = SubscriptionPriority.ENTRY_PENDING
                 elif card.board_status == BoardStatus.BUY_TODAY:
-                    quote_priority = SubscriptionPriority.BUY_TODAY
+                    quote_priority = (
+                        SubscriptionPriority.BUY_TODAY
+                        if self._card_in_execution_scope(card)
+                        else SubscriptionPriority.DISPLAY_ONLY
+                    )
                 else:
                     quote_priority = SubscriptionPriority.DISPLAY_ONLY
                 trade_priorities[symbol] = min(

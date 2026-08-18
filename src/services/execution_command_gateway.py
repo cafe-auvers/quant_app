@@ -1962,7 +1962,10 @@ def get_default_execution_gateway() -> ExecutionCommandGateway:
     if _default_gateway is None:
         with _default_gateway_lock:
             if _default_gateway is None:
-                _default_gateway = ExecutionCommandGateway(real_broker=KisBroker())
+                _default_gateway = ExecutionCommandGateway(
+                    real_broker=KisBroker(),
+                    mode_override=False,
+                )
     return _default_gateway
 
 
