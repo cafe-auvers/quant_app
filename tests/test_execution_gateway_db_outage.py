@@ -21,6 +21,7 @@ from src.services.execution_lease_protocol import FakeExecutionLeaseProtocol
 from src.services.execution_order_repository import fetch_execution_order
 from src.services.execution_ownership_repository import assign_ownership
 from src.services import trade_card_repository
+from src.services import trading_state
 from src.services.mutation_budget_protocol import AllowAllMutationBudget
 
 
@@ -110,6 +111,38 @@ def test_emergency_journal_is_fsynced_before_outage_broker_mutation(tmp_path):
     assert proof["owner"] == "KANBAN"
     assert proof["strategy_instance_id"] == "strategy-1"
     assert proof["version"] == 1
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_database_outage_preserves_only_last_confirmed_on_for_emergency_sell(
+    tmp_path,
+):
+    gateway, broker, lease, _ = _gateway(tmp_path)
+    trading_state.set_authoritative_provider(
+        lambda: (_ for _ in ()).throw(RuntimeError("canonical DB down"))
+    )
+    broker.queue_acceptance(broker_order_id="BR-EMERGENCY")
+
+    result = gateway.submit_guarded(_request(lease))
+
+    assert result.broker_order_id == "BR-EMERGENCY"
+    assert len(broker.submit_calls) == 1
+    with pytest.raises(trading_state.TradingDisabledError):
+        trading_state.require_trading_enabled("PROD", "AAPL")
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_shared_off_blocks_emergency_sell_before_local_journal_or_broker(tmp_path):
+    journal = EmergencyJournal(tmp_path / "emergency.jsonl")
+    gateway, broker, lease, _ = _gateway(tmp_path, journal=journal)
+    trading_state.set_authoritative_provider(lambda: False)
+    broker.queue_acceptance(broker_order_id="MUST-NOT-BE-USED")
+
+    with pytest.raises(trading_state.TradingDisabledError):
+        gateway.submit_guarded(_request(lease))
+
+    assert broker.submit_calls == []
+    assert journal.load_entries() == []
 
 
 @pytest.mark.usefixtures("trading_enabled")

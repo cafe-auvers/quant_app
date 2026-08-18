@@ -227,57 +227,21 @@ def test_order_submission_blocked_until_handoff_reconciliation_is_clean():
     assert any("handoff" in message.lower() for message in window._logs)
 
 
-# --- _auto_arm_trading_kill_switch gate checklist --------------------------
+# --- shared live-trading control survives Main handoff ----------------------
 
 
-def test_auto_arm_skipped_when_flag_off():
-    window = _base_window(is_main=True, lease_token="tok-1")
-    window._auto_arm_trading_on_handoff = False
-
-    MainWindow._auto_arm_trading_kill_switch(window)
-
-    assert trading_state.is_trading_enabled() is False
-
-
-def test_auto_arm_skipped_when_trading_locked_by_env(monkeypatch):
-    window = _base_window(is_main=True, lease_token="tok-1")
-    window._auto_arm_trading_on_handoff = True
-    monkeypatch.setattr(trading_state, "is_trading_locked_disabled", lambda: True)
-
-    MainWindow._auto_arm_trading_kill_switch(window)
-
-    assert trading_state.is_trading_enabled() is False
-
-
-def test_auto_arm_skipped_when_not_main():
-    window = _base_window(is_main=False, lease_token="")
-    window._auto_arm_trading_on_handoff = True
-
-    MainWindow._auto_arm_trading_kill_switch(window)
-
-    assert trading_state.is_trading_enabled() is False
-
-
-def test_auto_arm_skipped_when_database_not_ready():
-    window = _base_window(is_main=True, lease_token="tok-1", db_ready=False)
-    window._auto_arm_trading_on_handoff = True
-
-    MainWindow._auto_arm_trading_kill_switch(window)
-
-    assert trading_state.is_trading_enabled() is False
-
-
-def test_auto_arm_succeeds_when_every_condition_holds():
+def test_legacy_auto_arm_hook_does_not_change_shared_control():
     window = _base_window(is_main=True, lease_token="tok-1", db_ready=True)
     window.state_sync_role = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
     window._auto_arm_trading_on_handoff = True
     window.trading_enabled_button = _ButtonStub()
+    trading_state.set_trading_enabled(True)
 
     MainWindow._auto_arm_trading_kill_switch(window)
 
     assert trading_state.is_trading_enabled() is True
     assert window.trading_enabled_button.checked is True
-    assert any("auto-armed" in message.lower() for message in window._logs)
+    assert any("shared deployment switch" in message.lower() for message in window._logs)
 
 
 # --- post-claim reconciliation gating (_on_post_claim_reconciliation_finished) --
@@ -315,7 +279,7 @@ def _handoff_window():
     return window
 
 
-def test_post_claim_success_starts_monitor_and_arms_trading():
+def test_post_claim_success_starts_monitor_without_changing_shared_control():
     window = _handoff_window()
     window._handoff_generation = 1
     outcome = PostClaimReconciliationResult(ok=True, reconciled_symbols=["AAPL"])
@@ -323,7 +287,7 @@ def test_post_claim_success_starts_monitor_and_arms_trading():
     MainWindow._on_post_claim_reconciliation_finished(window, outcome, 1)
 
     assert window._calls.monitor_started == ["PROD"]
-    assert window._calls.auto_armed == 1
+    assert window._calls.auto_armed == 0
     assert window._calls.save_buylist == 1
 
 
@@ -501,6 +465,38 @@ def test_auto_claim_not_triggered_when_disabled(monkeypatch):
 
     assert calls == []
     assert started == []
+
+
+def test_state_sync_projects_shared_live_trading_on_and_off():
+    window = _sync_completed_window(auto_claim_enabled=False)
+    window._start_state_sync = lambda **_kwargs: None
+
+    MainWindow._on_state_sync_completed(
+        window,
+        StateReconcileResult(
+            is_main_device=False,
+            local_role=window.state_sync_role,
+            live_trading_enabled=True,
+            live_trading_revision=7,
+        ),
+        0,
+    )
+    assert trading_state.is_trading_enabled() is True
+    assert window._shared_live_trading_available is True
+    assert window._shared_live_trading_revision == 7
+
+    MainWindow._on_state_sync_completed(
+        window,
+        StateReconcileResult(
+            is_main_device=False,
+            local_role=window.state_sync_role,
+            live_trading_enabled=False,
+            live_trading_revision=8,
+        ),
+        0,
+    )
+    assert trading_state.is_trading_enabled() is False
+    assert window._shared_live_trading_revision == 8
 
 
 def test_auto_claim_triggered_when_enabled_and_should_claim_says_yes(monkeypatch):

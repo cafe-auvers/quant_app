@@ -53,6 +53,7 @@ TRADE_PLANS_KEY = "trade_plans"
 # it against fresh intraday data before resuming auto-submission.
 EXECUTION_QUEUE_KEY = "execution_queue"
 MAIN_DEVICE_KEY = "__main_device__"
+LIVE_TRADING_CONTROL_KEY = "__live_trading_control__"
 
 SYNCED_STATE_KEYS = (WATCHLIST_KEY, BUYLIST_KEY, TRADE_PLANS_KEY, EXECUTION_QUEUE_KEY)
 LOCAL_DEVICE_ROLE_FILE = DATA_DIR / "device_role.json"
@@ -115,6 +116,24 @@ class MainDevice:
 class OwnershipResult:
     success: bool
     main_device: Optional[MainDevice] = None
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class LiveTradingControl:
+    """Shared operator kill-switch state, independent of Main ownership."""
+
+    enabled: bool
+    revision: int
+    updated_at: datetime
+    updated_by_host: str = ""
+    updated_by_device: str = ""
+
+
+@dataclass(frozen=True)
+class LiveTradingControlResult:
+    success: bool
+    control: Optional[LiveTradingControl] = None
     error: str = ""
 
 
@@ -282,6 +301,123 @@ def pull_state(engine: Optional[Engine], state_key: str) -> PullResult:
     except (SQLAlchemyError, ValueError, TypeError) as exc:
         logger.info("State sync pull failed for %s: %s", state_key, exc)
         return PullResult(PULL_ERROR, error=str(exc))
+
+
+def get_live_trading_control(
+    engine: Optional[Engine],
+) -> LiveTradingControlResult:
+    """Read the global live-trading control.
+
+    A missing row is a valid, disabled state. This lets existing databases
+    upgrade without accidentally authorizing execution; the first explicit
+    operator ON action creates the row.
+    """
+
+    pulled = pull_state(engine, LIVE_TRADING_CONTROL_KEY)
+    if pulled.status == PULL_MISSING:
+        return LiveTradingControlResult(
+            True,
+            LiveTradingControl(
+                enabled=False,
+                revision=0,
+                updated_at=datetime.min,
+            ),
+        )
+    if pulled.status != PULL_OK or pulled.state is None:
+        return LiveTradingControlResult(
+            False,
+            error=pulled.error or "Could not read shared live-trading control.",
+        )
+    enabled = pulled.state.payload.get("enabled")
+    if not isinstance(enabled, bool):
+        return LiveTradingControlResult(
+            False,
+            error="Shared live-trading control has an invalid enabled value.",
+        )
+    return LiveTradingControlResult(
+        True,
+        LiveTradingControl(
+            enabled=enabled,
+            revision=pulled.state.revision,
+            updated_at=pulled.state.updated_at,
+            updated_by_host=pulled.state.updated_by_host,
+            updated_by_device=pulled.state.updated_by_device,
+        ),
+    )
+
+
+def set_live_trading_control(
+    engine: Optional[Engine],
+    role: LocalDeviceRole,
+    enabled: bool,
+) -> LiveTradingControlResult:
+    """Atomically set the global kill switch from either registered device.
+
+    Main ownership intentionally is not required here. Main controls who may
+    execute; this row controls whether execution is armed for the deployment.
+    The row lock serializes simultaneous operator actions, so the last
+    committed action wins and every change advances the durable revision.
+    """
+
+    if engine is None:
+        return LiveTradingControlResult(
+            False,
+            error="Shared live-trading database is unavailable.",
+        )
+    try:
+        table = _ensure_state_sync_table(engine)
+        with engine.begin() as conn:
+            row = _select_row(
+                conn,
+                table,
+                LIVE_TRADING_CONTROL_KEY,
+                for_update=True,
+            )
+            revision = int(row.revision or 0) + 1 if row is not None else 1
+            values = {
+                "payload": json.dumps(
+                    {"enabled": bool(enabled)},
+                    separators=(",", ":"),
+                ),
+                "revision": revision,
+                "updated_at": _server_now(engine),
+                "updated_by_host": role.hostname,
+                "updated_by_device": role.device_id,
+            }
+            if row is None:
+                conn.execute(
+                    table.insert().values(
+                        state_key=LIVE_TRADING_CONTROL_KEY,
+                        **values,
+                    )
+                )
+            else:
+                conn.execute(
+                    table.update()
+                    .where(table.c.state_key == LIVE_TRADING_CONTROL_KEY)
+                    .where(table.c.revision == int(row.revision or 0))
+                    .values(**values)
+                )
+            written_row = _select_row(conn, table, LIVE_TRADING_CONTROL_KEY)
+        if written_row is None:
+            return LiveTradingControlResult(
+                False,
+                error="Shared live-trading control was not persisted.",
+            )
+        state = _remote_state_from_row(written_row, LIVE_TRADING_CONTROL_KEY)
+        return LiveTradingControlResult(
+            True,
+            LiveTradingControl(
+                enabled=bool(state.payload.get("enabled")),
+                revision=state.revision,
+                updated_at=state.updated_at,
+                updated_by_host=state.updated_by_host,
+                updated_by_device=state.updated_by_device,
+            ),
+        )
+    except (SQLAlchemyError, ValueError, TypeError) as exc:
+        logger.info("Could not update shared live-trading control: %s", exc)
+        return LiveTradingControlResult(False, error=str(exc))
 
 
 def _main_device_from_state(state: RemoteState) -> MainDevice:

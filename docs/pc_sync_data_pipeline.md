@@ -335,12 +335,9 @@ must not be committed.
 
 ## Automatic laptop↔PC trading handoff
 
-> **Status: implemented and unit-tested, but never run against
-> a real PC, real S3 sleep/wake cycle, or real KIS credentials.** Follow the
-> runbook below and the verification checklist before trusting this with a
-> live position. Leave `AUTO_ARM_TRADING_ON_HANDOFF` off for the first
-> several real cycles even after the wake/sleep mechanics are confirmed
-> working.
+> **Status:** generation-fenced handoff and premarket readiness are deployed.
+> Continue to use the verification checklist after hardware, network, KIS, or
+> database changes.
 
 ### What it does
 
@@ -398,11 +395,11 @@ either machine.
   local save, strict publication, local demotion, or writer fencing fails,
   ownership is retained; the next device must wait for the stale-heartbeat
   fenced takeover path rather than seeing a false clean handoff.
-- **Kill switch auto-arm is a separate, stricter gate**
-  (`_auto_arm_trading_kill_switch`) from the claim itself -- requires its
-  own `AUTO_ARM_TRADING_ON_HANDOFF` flag, a currently-held lease, a reachable
-  database, and a clean reconciliation pass. `TRADING_ENABLED`'s existing
-  environment hard-lock is untouched and always wins.
+- **Live Trading is a shared durable control, separate from Main ownership.**
+  Either laptop or PC can turn it ON or OFF, and both UIs pull the same
+  revision. Handoff never changes it. `TRADING_ENABLED` remains a local
+  administrative hard lock, while lease, reconciliation, freshness, and
+  runtime readiness still fence the sole Main executor.
 - **Health tab**: a new "Main-device handoff" check shows lease age,
   pull-only owner, reconciliation-in-progress, and any blocked symbols.
 
@@ -411,16 +408,14 @@ either machine.
 ```
 AUTO_CLAIM_MAIN_ON_HANDOFF=0
 EXPECTED_AUTO_CLAIM_HOSTNAME=<the PC's exact hostname>
-AUTO_ARM_TRADING_ON_HANDOFF=0
 ```
 
 `EXPECTED_AUTO_CLAIM_HOSTNAME` must match `platform.node()` exactly on the
 PC or auto-claim silently stays off -- cheap insurance against an
 accidentally copy-pasted `.env`. The laptop deliberately never auto-reclaims
 on startup; it stays pull-only until "Use This Device as Main" is clicked
-manually. Keep both automation flags at `0` until the physical S3/wake and
-post-resume MySQL/KIS checks below pass. Enable auto-claim first; leave
-auto-arm off through several supervised handoffs.
+manually. Keep auto-claim at `0` until the physical S3/wake and post-resume
+MySQL/KIS checks below pass.
 
 ### Wake/sleep model: S3 instead of full shutdown
 
@@ -482,11 +477,10 @@ the wake time itself is harmless idle time either way.
       resume -- this is the biggest unverified assumption in the whole
       feature).
 - [ ] Run the two-process dry run from the implementation plan (a throwaway
-      test engine + a **stub** broker, never real KIS credentials) end to
-      end before ever enabling `AUTO_ARM_TRADING_ON_HANDOFF` against a real
-      account.
-- [ ] Once software behavior is trusted, enable `AUTO_ARM_TRADING_ON_HANDOFF`
-      and watch the Health tab's "Main-device handoff" check closely for the
+      test engine + a **stub** broker, never real KIS credentials) end to end
+      before changing automatic handoff policy against a real account.
+- [ ] Verify the shared Live Trading revision is identical on both devices,
+      then watch the Health tab's "Main-device handoff" check closely for the
       first several real handoffs.
 
 ### Known residual risks (accepted, not solved by this design)

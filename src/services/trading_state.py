@@ -1,18 +1,16 @@
-"""Global live-trading kill switch.
+"""Process projection of the deployment-wide live-trading kill switch.
 
-``TRADING_ENABLED`` starts DISABLED on every process launch by design: this
-state is deliberately in-memory only, with no persistence to ``settings.json``
-or any other file, so a forgotten "left it on" from a previous session can
-never silently carry forward into the next one. The in-process toggle (driven
-by the UI) is the only way to turn it on.
-
-An explicit falsy, blank, or unrecognized ``TRADING_ENABLED`` value in the
-environment or ``.env`` is a one-way lock. Recognized truthy values merely
-permit the UI toggle; they never turn trading on by themselves. This lets a dev
-clone with inherited PROD credentials remain administratively disarmed while
-ensuring a configuration typo also fails closed.
+``TRADING_ENABLED`` remains a per-machine administrative hard lock. When the
+desktop app attaches an authoritative provider, the mutable ON/OFF state comes
+from the canonical shared database and survives restarts and Main-device
+handoffs. Test and standalone callers without a provider retain the small
+in-process API.
 """
 from __future__ import annotations
+
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Callable, Iterator, Optional
 
 from src.utils.config import get_env_value
 
@@ -20,16 +18,27 @@ _FALSY_ENV_VALUES = {"0", "false", "no", "off"}
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
 _trading_enabled = False
+_authoritative_provider: Optional[Callable[[], bool]] = None
+_emergency_cached_authorization = ContextVar(
+    "emergency_cached_trading_authorization",
+    default=False,
+)
 
 
 class TradingDisabledError(RuntimeError):
     """Raised when an order reaches a submission boundary while disarmed."""
 
-    def __init__(self, environment: str, symbol: str) -> None:
+    def __init__(
+        self,
+        environment: str,
+        symbol: str,
+        *,
+        reason: str = "kill switch off",
+    ) -> None:
         self.environment = str(environment or "").upper()
         self.symbol = str(symbol or "").upper()
         super().__init__(
-            f"Live trading is disabled (kill switch off); refused to submit "
+            f"Live trading is disabled ({reason}); refused to submit "
             f"{self.environment} order for {self.symbol}. Enable trading from "
             "the toolbar before submitting orders."
         )
@@ -73,13 +82,62 @@ def set_trading_enabled(enabled: bool) -> bool:
     return is_trading_enabled()
 
 
+def set_authoritative_provider(
+    provider: Optional[Callable[[], bool]],
+) -> None:
+    """Install the canonical shared-state reader used at broker boundaries."""
+
+    global _authoritative_provider
+    _authoritative_provider = provider
+
+
+@contextmanager
+def allow_cached_emergency_authorization() -> Iterator[None]:
+    """Permit last-confirmed ON only inside the bounded emergency path.
+
+    WS11 deliberately allows protective exits/cancels to use its fsynced local
+    journal during a canonical-DB outage. Ordinary commands still fail closed
+    if the shared kill switch cannot be re-read.
+    """
+
+    token = _emergency_cached_authorization.set(True)
+    try:
+        yield
+    finally:
+        _emergency_cached_authorization.reset(token)
+
+
 def require_trading_enabled(environment: str, symbol: str) -> None:
-    """Fail closed at an order-submission boundary."""
-    if not is_trading_enabled():
+    """Re-read shared state and fail closed at an order boundary."""
+
+    global _trading_enabled
+    if is_trading_locked_disabled():
+        _trading_enabled = False
+        raise TradingDisabledError(
+            environment=environment,
+            symbol=symbol,
+            reason="local administrative lock",
+        )
+    provider = _authoritative_provider
+    if provider is not None:
+        try:
+            _trading_enabled = bool(provider())
+        except Exception as exc:
+            if not (
+                _emergency_cached_authorization.get()
+                and _trading_enabled
+            ):
+                raise TradingDisabledError(
+                    environment=environment,
+                    symbol=symbol,
+                    reason="shared control unavailable",
+                ) from exc
+    if not _trading_enabled:
         raise TradingDisabledError(environment=environment, symbol=symbol)
 
 
 def reset_trading_state_for_tests() -> None:
     """Test-only helper: restore the disabled-by-default in-process state."""
-    global _trading_enabled
+    global _trading_enabled, _authoritative_provider
     _trading_enabled = False
+    _authoritative_provider = None
