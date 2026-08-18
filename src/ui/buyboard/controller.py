@@ -561,8 +561,10 @@ class BuyboardMixin:
         )
         if result.changed:
             logger.info(
-                "Buy Board bootstrap created=%d holding_updates=%d",
+                "Buy Board bootstrap created=%d buylist_promotions=%d "
+                "holding_updates=%d",
                 len(result.created_keys),
+                len(result.buylist_promoted_keys),
                 len(result.holding_updated_keys),
             )
 

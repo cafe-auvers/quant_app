@@ -3,15 +3,18 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
 from src.core.trade_card_state import BoardStatus, TradeCardState
 from src.core.watchlist import BuylistItem, BuylistManager, Watchlist
 from src.services import trade_card_repository
+from src.services.execution_workflow_service import list_board_projections
 from src.services.trade_card_bootstrap import (
     bootstrap_trade_cards_from_current_state,
 )
+from src.ui.buyboard.columns import BOARD_COLUMN_ORDER
 
 
 def _engine(tmp_path):
@@ -134,6 +137,217 @@ def test_bootstrap_never_overwrites_existing_kanban_lifecycle(tmp_path, monkeypa
     assert stored is not None
     assert stored.board_status == BoardStatus.BUY_TODAY
     assert stored.version == existing.version
+
+
+def test_bootstrap_promotes_passive_watchlist_card_to_buylist(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        trade_card_repository,
+        "LOCAL_TRADE_CARDS_FILE",
+        tmp_path / "trade_cards.json",
+    )
+    engine = _engine(tmp_path)
+    existing = trade_card_repository.create_trade_card(
+        engine,
+        TradeCardState(
+            environment="PROD",
+            account_no="12345678-01",
+            symbol="AAPL",
+            name="Apple",
+            board_status=BoardStatus.WATCHLIST,
+            watchlist_member=True,
+            buylist_member=False,
+        ),
+    )
+    manager = BuylistManager()
+    manager.add(_buylist_item("AAPL", account_no="12345678-01"))
+
+    first = bootstrap_trade_cards_from_current_state(
+        engine,
+        buylist_manager=manager,
+        watchlist=Watchlist(),
+        default_account_no="12345678-01",
+    )
+    promoted = trade_card_repository.get_trade_card(
+        engine, "PROD", "12345678-01", "AAPL"
+    )
+
+    assert first.buylist_promoted_keys == ("PROD:12345678-01:AAPL",)
+    assert promoted is not None
+    assert promoted.board_status == BoardStatus.BUYLIST
+    assert promoted.previous_board_status == BoardStatus.WATCHLIST
+    assert promoted.watchlist_member is True
+    assert promoted.buylist_member is True
+    assert promoted.version == existing.version + 1
+
+    # A restart or second device sees the canonical promotion and performs no
+    # further write/version bump.
+    second = bootstrap_trade_cards_from_current_state(
+        engine,
+        buylist_manager=manager,
+        watchlist=Watchlist(),
+        default_account_no="12345678-01",
+    )
+    refreshed = trade_card_repository.get_trade_card(
+        engine, "PROD", "12345678-01", "AAPL"
+    )
+    assert second.changed is False
+    assert refreshed is not None
+    assert refreshed.version == promoted.version
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        BoardStatus.BUY_TODAY,
+        BoardStatus.ENTRY_PENDING,
+        BoardStatus.OPEN_POSITION,
+        BoardStatus.PARTIAL_SELL,
+        BoardStatus.SELL_ALL,
+    ],
+)
+def test_bootstrap_never_moves_advanced_lifecycle_back_to_buylist(
+    tmp_path, monkeypatch, status
+):
+    monkeypatch.setattr(
+        trade_card_repository,
+        "LOCAL_TRADE_CARDS_FILE",
+        tmp_path / "trade_cards.json",
+    )
+    engine = _engine(tmp_path)
+    existing = trade_card_repository.create_trade_card(
+        engine,
+        TradeCardState(
+            environment="PROD",
+            account_no="12345678-01",
+            symbol="AAPL",
+            board_status=status,
+            buylist_member=True,
+        ),
+    )
+    manager = BuylistManager()
+    manager.add(_buylist_item("AAPL", account_no="12345678-01"))
+
+    result = bootstrap_trade_cards_from_current_state(
+        engine,
+        buylist_manager=manager,
+        watchlist=Watchlist(),
+        default_account_no="12345678-01",
+    )
+
+    stored = trade_card_repository.get_trade_card(
+        engine, "PROD", "12345678-01", "AAPL"
+    )
+    assert result.changed is False
+    assert stored is not None
+    assert stored.board_status == status
+    assert stored.version == existing.version
+
+
+def test_bootstrap_cas_conflict_preserves_concurrent_lifecycle_advance(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        trade_card_repository,
+        "LOCAL_TRADE_CARDS_FILE",
+        tmp_path / "trade_cards.json",
+    )
+    engine = _engine(tmp_path)
+    trade_card_repository.create_trade_card(
+        engine,
+        TradeCardState(
+            environment="PROD",
+            account_no="12345678-01",
+            symbol="AAPL",
+            board_status=BoardStatus.WATCHLIST,
+            watchlist_member=True,
+        ),
+    )
+    manager = BuylistManager()
+    manager.add(_buylist_item("AAPL", account_no="12345678-01"))
+    real_update = trade_card_repository.update_trade_card
+    raced = False
+
+    def update_after_concurrent_advance(
+        target_engine, card, *, expected_version, local_snapshot_path=None
+    ):
+        nonlocal raced
+        if not raced:
+            raced = True
+            concurrent = trade_card_repository.get_trade_card(
+                target_engine, "PROD", "12345678-01", "AAPL"
+            )
+            assert concurrent is not None
+            concurrent.board_status = BoardStatus.BUY_TODAY
+            real_update(
+                target_engine,
+                concurrent,
+                expected_version=concurrent.version,
+                local_snapshot_path=local_snapshot_path,
+            )
+        return real_update(
+            target_engine,
+            card,
+            expected_version=expected_version,
+            local_snapshot_path=local_snapshot_path,
+        )
+
+    monkeypatch.setattr(
+        trade_card_repository,
+        "update_trade_card",
+        update_after_concurrent_advance,
+    )
+
+    result = bootstrap_trade_cards_from_current_state(
+        engine,
+        buylist_manager=manager,
+        watchlist=Watchlist(),
+        default_account_no="12345678-01",
+    )
+
+    stored = trade_card_repository.get_trade_card(
+        engine, "PROD", "12345678-01", "AAPL"
+    )
+    assert result.changed is False
+    assert stored is not None
+    assert stored.board_status == BoardStatus.BUY_TODAY
+    assert stored.version == 2
+
+
+def test_promoted_buylist_card_survives_visible_board_filter(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        trade_card_repository,
+        "LOCAL_TRADE_CARDS_FILE",
+        tmp_path / "trade_cards.json",
+    )
+    engine = _engine(tmp_path)
+    trade_card_repository.create_trade_card(
+        engine,
+        TradeCardState(
+            environment="PROD",
+            account_no="12345678-01",
+            symbol="AAPL",
+            board_status=BoardStatus.WATCHLIST,
+            watchlist_member=True,
+        ),
+    )
+    manager = BuylistManager()
+    manager.add(_buylist_item("AAPL", account_no="12345678-01"))
+
+    bootstrap_trade_cards_from_current_state(
+        engine,
+        buylist_manager=manager,
+        watchlist=Watchlist(),
+        default_account_no="12345678-01",
+    )
+    projections = list_board_projections(
+        engine,
+        environment="PROD",
+        board_statuses=BOARD_COLUMN_ORDER,
+    )
+
+    assert [(row.card.symbol, row.card.board_status) for row in projections] == [
+        ("AAPL", BoardStatus.BUYLIST)
+    ]
 
 
 def test_fresh_cached_holding_is_visible_as_open_position(tmp_path, monkeypatch):
