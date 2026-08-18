@@ -39,6 +39,7 @@ wheels/
 .env
 .env.*
 .env.local
+.env.pc
 *.env
 !.env.example
 *.key

@@ -4,7 +4,7 @@ This document describes the current architecture of the PyQt5 trading dashboard 
 
 ## Product Scope
 
-Quant App is a desktop trading dashboard for US-market swing trading, scanner review, watchlist analysis, ORB planning, KIS account visibility, and guarded KIS order submission.
+Quant App is a desktop trading dashboard for US-market swing trading, scanner review, watchlist analysis, ORB planning, a durable Kanban Buy Board, KIS account visibility, and guarded KIS order submission.
 
 The application is not a headless service. `main.py` creates a `QApplication`, installs a small Qt warning filter, imports `src.ui.main_window.MainWindow`, and starts the PyQt event loop.
 
@@ -21,6 +21,11 @@ main.py
       -> initialize UI workflow controllers
       -> build tabs, sidebar, status log, and menus
       -> preload KIS profiles and account data
+      -> bootstrap only missing Kanban trade cards from loaded Watchlist,
+         Buylist, and fresh cached KIS holdings
+      -> render the Buy Board from canonical card/order/ownership projections
+      -> when explicitly enabled, start the BuyboardRuntimeWorker in active
+         or standby/read-only mode according to device role and execution lease
       -> run scanner/watchlist/chart workers through QThread
       -> reconcile any open broker orders from the local order ledger
       -> start cross-machine state sync and background PC-to-laptop
@@ -76,6 +81,9 @@ flowchart TB
         Analysis --> Buylist[Buy Dashboard / Buylist]
         ORBRisk --> Buylist
         Scanner -. optional add .-> Buylist
+        Watchlist --> Board[Kanban Buy Board projection]
+        Buylist -. create missing trade cards .-> Board
+        ORB --> Board
         Daily --> Charts[Daily, hourly, and TradingView charts]
         IntradayCache --> Charts
         Watchlist --> Charts
@@ -83,13 +91,21 @@ flowchart TB
 
     subgraph Execution[Guarded order lifecycle]
         direction TB
+        Board --> BoardCommand[Typed, revision-fenced board command]
+        BoardCommand --> BoardIntent[Validate ownership/conflicts and\npersist durable card intent]
+        BoardIntent --> KanbanRuntime[BuyboardRuntimeWorker\nreconciliation, quotes, heartbeat]
+        KanbanRuntime --> KanbanReady{Lease, account, feed, DB,\nand action readiness satisfied?}
+        KanbanReady -- No --> ObserveOnly[Remain observation-only / retain intent]
+        KanbanReady -- Yes --> Gateway[Shared execution command gateway]
+
         Buylist --> Queue[Execution queue refresh]
         Queue --> Ready{Status is\nEXECUTE_READY?}
         Ready -- No --> Monitor[Keep monitoring / refresh data]
         Monitor --> Queue
         Ready -- Yes --> Validate[Validate account, quantity, risk,\nand duplicate-open-order guard]
         Validate --> Reserve[Persist local intent and\nUNKNOWN_SUBMISSION_STATE]
-        Reserve --> KISOrder[KIS overseas order API]
+        Reserve --> Gateway
+        Gateway --> KISOrder[KIS overseas order API]
         KISOrder --> Result{Broker response}
         Result -- Rejected --> Rejected[Persist REJECTED\nand show UI result]
         Result -- Ambiguous --> Unknown[Keep UNKNOWN_SUBMISSION_STATE\nblock resubmission]
@@ -99,6 +115,8 @@ flowchart TB
         Reconcile --> Fill{Conservative fill\nevidence?}
         Fill -- No / ambiguous --> Working[Keep WORKING or pending]
         Fill -- Yes --> Position[Apply filled quantity to buylist\nshares, cost, and exit state]
+        Reconcile --> KanbanProjection[Apply broker truth to trade card\nand system-owned column]
+        KanbanProjection --> Board
     end
 
     subgraph Persistence[Durable local state]
@@ -106,8 +124,11 @@ flowchart TB
         StateStore[(data/*.json)]
         Backup[Atomic write + rolling .bak recovery]
         Metadata[state_metadata.json\nsave status]
+        KanbanStore[(Canonical SQL state\ntrade cards, ownership, commands, orders,\nreservations, device readiness)]
+        KanbanSnapshot[trade_cards.json\nrecovery snapshot]
         StateStore --> Backup
         StateStore --> Metadata
+        KanbanStore --> KanbanSnapshot
     end
 
     Watchlist --> StateStore
@@ -120,6 +141,8 @@ flowchart TB
     Working --> StateStore
     Position --> StateStore
     Charts --> StateStore
+    BoardIntent --> KanbanStore
+    KanbanRuntime <--> KanbanStore
 
     classDef safety fill:#fff3cd,stroke:#b7791f,color:#3d2b00;
     classDef critical fill:#fde2e1,stroke:#c53030,color:#4a0808;
@@ -132,6 +155,7 @@ Reading guide:
 - Solid arrows are the normal flow; dashed arrows are explicit fallbacks (KIS-to-yfinance intraday, and MySQL-to-local-mirror data).
 - MySQL improves freshness and speed and is optional for a single-machine setup: Yahoo/KIS sources and local state keep the desktop application usable without it. In the two-machine setup (see [Two-Machine Data Pipeline](#two-machine-data-pipeline-pc-sync) below) it is the one canonical database, and the local SQLite mirror is a disposable safety copy, not a peer.
 - The persistence area is shared by user edits, the execution queue, chart drawings, and every meaningful order-status transition.
+- The Buy Board is a projection, not a second broker client. Gestures persist typed intent; the runtime reaches KIS only through the shared execution gateway, and reconciliation is the only authority for fills, quantities, and broker-confirmed columns.
 
 ## System Architecture
 
@@ -145,13 +169,13 @@ flowchart LR
 
     subgraph Desktop[PyQt5 desktop application]
         direction TB
-        UI[MainWindow and tab mixins\nwidgets, tables, dialogs, charts]
+        UI[MainWindow and tab mixins\nwidgets, tables, Buy Board, dialogs, charts]
         Controllers[UI controllers\naccount, scanner, watchlist, chart, execution]
-        Workers[QThread workers\nnetwork, refresh, scanner, review,\norder submission/query/cancel, reconciliation,\nPC status polling]
-        Core[Core domain\nscanner, watchlist, scoring,\nexecution queue, order state]
+        Workers[QThread workers\nnetwork, refresh, scanner, review,\norder submission/query/cancel, reconciliation,\nKanban projection/runtime, PC status polling]
+        Core[Core domain\nscanner, watchlist, scoring, trade cards,\nboard commands/transitions, execution state]
         Strategy[Strategy contracts and plugins\nMarketSnapshot, PortfolioSnapshot, Signal,\nORBStrategy]
         Risk[Risk\nposition sizing]
-        Services[Services\napp state, intraday orchestration,\norder ledger, guarded execution, reconciliation,\ncross-machine state sync, PC remote control,\nruntime heartbeats, historical refresh control,\ncloud/env backup]
+        Services[Services\napp state, intraday orchestration,\ntrade-card/ownership/order repositories,\nKanban runtime, guarded execution, reconciliation,\ncross-machine state sync, PC remote control,\nruntime heartbeats, historical refresh control,\ncloud/env backup]
         Utils[Utilities\nconfig, storage, market calendar, logging,\nloaders, DB and local-mirror helpers]
 
         UI <--> Controllers
@@ -169,7 +193,7 @@ flowchart LR
 
     subgraph Local[This machine]
         direction TB
-        Json[(data/*.json\nstate, queue, order ledger, drawings)]
+        Json[(data/*.json\nstate, queue, legacy order ledger, drawings,\ntrade-card recovery snapshot)]
         Rulebooks[rulebooks/*.md]
         Env[.env\nlocal secrets and settings]
         Mirror[(data/local_mirror.db\noffline SQLite mirror)]
@@ -179,7 +203,7 @@ flowchart LR
 
     subgraph PC[Always-on PC, reached over LAN/Tailscale\noptional second machine]
         direction TB
-        MySQL[(MySQL: quant_app\ncanonical prices, indicators,\nscanner metrics, app-state sync,\nruntime heartbeats)]
+        MySQL[(MySQL: quant_app\ncanonical prices and indicators,\ntrade cards, execution ownership/commands/orders,\nreservations, reconciliation/readiness state)]
         Listener[pc_remote_control_listener.py\nremote status/shutdown]
     end
 
@@ -215,6 +239,48 @@ flowchart LR
 
 Peer-machine roles, the SQLite fallback/backup mechanics, and the always-on-PC automation scripts are described in full in [docs/pc_sync_data_pipeline.md](docs/pc_sync_data_pipeline.md); this diagram only shows how they attach to the desktop app's own layers. A single machine works the same way with the `PC` subgraph absent and MySQL either unset (Yahoo/KIS-only) or pointed at a local instance.
 
+## Kanban Buy Board Architecture
+
+The **Buy Board** is an additive workflow beside the legacy Buy Dashboard. It renders eight columns from `TradeCardState.board_status`:
+
+```text
+Watchlist <-> Buylist -> Buy Today -> Entry Pending -> Open Positions
+Open Positions -> Partial Sell -> Open Positions
+Open Positions / Partial Sell -> Sell All -> Closed
+```
+
+The visible column is only one axis of the aggregate. Entry runtime state, broker position/order state, stop state, capital reservation correlation, warnings, and optimistic `version` are stored independently. The database enforces one card for each `(environment, account_no, symbol)`; the current model accepts production cards only.
+
+The central boundary is `ExecutionWorkflowService`:
+
+```mermaid
+flowchart LR
+    Gesture[Drag, menu action, or reorder] --> Command[Typed BoardCommand\ncard + ownership + readiness revisions]
+    Command --> Workflow[ExecutionWorkflowService\nvalidate and persist intent]
+    Workflow --> DB[(Canonical SQL state)]
+    DB --> Projection[BoardCardProjection]
+    Projection --> UI[Eight-column PyQt Buy Board]
+    DB --> Runtime[BuyboardRuntimeWorker]
+    Runtime --> Engine[TradingEngine / position and EOD services]
+    Engine --> Gateway[ExecutionCommandGateway]
+    Gateway --> Broker[KIS broker adapter]
+    Broker --> Reconcile[Account/order reconciliation]
+    Reconcile --> DB
+```
+
+Important boundaries:
+
+- Drag/drop never calls the broker and never moves a card on screen optimistically. After a command succeeds or fails, the UI reloads an authoritative projection.
+- `ENTRY_PENDING` and `CLOSED` are system-only targets. Entry fills, partial fills, cancellations, sell fills, and flat positions are applied from reconciliation.
+- Durable intent commands can atomically claim a previously `LEGACY` symbol for the configured Kanban strategy. `MANUAL` ownership and ownership by another Kanban strategy fail closed.
+- Card version, ownership version/strategy, and runtime readiness generation fence stale actions across refreshes and devices.
+- Active ambiguous, cancelling, external, or unlinked orders block conflicting actions. External orders remain separately visible and require explicit audited adoption.
+- `BuyboardRuntimeWorker` runs off the Qt thread. It reconciles accounts, synchronizes ORB plans from the existing execution queue, manages execution-grade quote subscriptions and stop rules, evaluates entries/exits, persists changed cards, and emits board refreshes/critical alerts.
+- A runtime can mutate only after the device/lease, startup and fresh account reconciliation, canonical database, KIS WebSocket/subscriptions/quote freshness, and accumulator-drain checks pass. Standby devices construct a read-only broker facade.
+- All Kanban broker mutations use `ExecutionSource.KANBAN_BOARD` through `ExecutionCommandGateway`; no Kanban UI or domain module imports a KIS order endpoint.
+
+See [docs/kanban_architecture.md](docs/kanban_architecture.md) for the full state graph, command mappings, entry/exit flows, persistence model, module map, and operating gates. The exhaustive production invariants and rollout evidence remain in [docs/kanban_production_readiness.md](docs/kanban_production_readiness.md).
+
 ## Directory Layout
 
 ```text
@@ -222,17 +288,17 @@ quant_app/
   main.py                         Application entry point
   historical.py                   Standalone 1D/1H historical-data refresh process (not Qt)
   src/
-    ui/                           PyQt windows, UI controllers, workers, chart bridge, UI constants
-    core/                         Trading domain models and pure business logic
+    ui/                           PyQt windows, Buy Board, UI controllers, workers, chart bridge, UI constants
+    core/                         Trading domain models, Kanban commands/transitions, and pure business logic
     strategy/                     Strategy-neutral snapshots/signals and built-in strategy plugins
     infrastructure/              Database engines, schemas, refresh orchestration, mirrors, and repositories
     risk/                         Pre-trade risk/sizing checks (position sizing today)
-    services/                     App-state persistence, order lifecycle, PC sync, and backup services
+    services/                     App-state persistence, Kanban/execution lifecycle, PC sync, and backup services
     utils/                        Storage, configuration, market-data, market-calendar, logging, and DB/local-mirror helpers
     api/                          KIS API adapters and order/account helpers
   scripts/                        PC automation, setup, and one-off maintenance scripts (see docs/pc_sync_data_pipeline.md)
   data/                           Local JSON state, ticker universe files, SQLite mirror, and refresh status/logs
-  docs/                           Architecture-adjacent design docs (PC sync, cloud backup, historical refactor plan)
+  docs/                           Kanban, PC sync, cloud backup, runbooks, and design documentation
   rulebooks/                      Markdown trading rules used by review workflows
   tests/                          Pytest regression suite
   config/                         Non-secret configuration template
@@ -252,10 +318,12 @@ Current inheritance shape:
 ```text
 MainWindow(
   SidebarMixin,
+  HealthPanelMixin,
   DashboardMixin,
   ScannerMixin,
   WatchlistMixin,
   BuylistMixin,
+  BuyboardMixin,
   ChartsControllerMixin,
   ChartsRenderMixin,
   QMainWindow,
@@ -270,6 +338,7 @@ Supporting UI modules:
 | `src/ui/dialogs.py` | Settings dialog and scanner filter dialog |
 | `src/ui/controllers/` | Workflow controllers for account sync, scanner runs, watchlist ORB refreshes, chart data loading, and buylist execution queue actions |
 | `src/ui/buylist/` | Static buy-dashboard view, action, monitoring, and order mixins plus thin policy and execution-queue adapters |
+| `src/ui/buyboard/` | Eight Kanban columns and card widgets, drag/menu-to-command translation, asynchronous projections, dialogs, and the background execution runtime worker |
 | `src/ui/charts/` | Static chart controller/render composites, focused controller and renderer modules, deterministic render-option/interaction models, and chart-data service |
 | `src/ui/health/` | Separate Health tab, background read-only probe, status rendering, and redacted event-journal viewer |
 | `src/ui/mixins/sidebar_mixin.py` | Left sidebar source switching, selected-symbol routing, and sidebar actions |
@@ -305,6 +374,7 @@ Current tab construction in `_setup_tabs()`:
 | `scanner` | Scanner | `_build_scanner_tab()` |
 | `watchlist` | Watchlist | `_build_watchlist_tab()` |
 | `buylist` | Buy Dashboard | `_build_buylist_tab()` |
+| `buyboard` | Buy Board | `_build_buyboard_tab()` |
 | `charts` | Charts | `_build_charts_tab()` |
 | `tradingview` | TradingView Chart | `_build_tradingview_tab()` |
 | `health` | Health | `_build_health_tab()` |
@@ -314,7 +384,7 @@ Current tab construction in `_setup_tabs()`:
 
 ## Worker Layer
 
-Most workers live in `src/ui/workers.py`; KIS order submission/query/cancel and reconciliation workers live in `src/ui/order_workers.py`. Daily/hourly history refresh is no longer an in-process worker -- see [Historical Data Refresh](#historical-data-refresh).
+Most workers live in `src/ui/workers.py`; KIS order submission/query/cancel and reconciliation workers live in `src/ui/order_workers.py`. Kanban projection and runtime workers live in `src/ui/buyboard/`. Daily/hourly history refresh is no longer an in-process worker -- see [Historical Data Refresh](#historical-data-refresh).
 
 | Worker | Module | Purpose |
 |---|---|---|
@@ -332,6 +402,8 @@ Most workers live in `src/ui/workers.py`; KIS order submission/query/cancel and 
 | `KisOrderQueryWorker` | `order_workers.py` | Query and reconcile unresolved orders through an injectable `Broker` |
 | `KisOrderCancelWorker` | `order_workers.py` | Cancel a locally tracked order through an injectable `Broker` and reconcile the result |
 | `HealthProbeWorker` | `health/panel.py` | Run local read-only production checks and load recent redacted journal events without blocking Qt |
+| `BuyboardProjectionWorker` | `buyboard/controller.py` | Bootstrap missing cards and build read-only card/order/ownership projections without blocking Qt |
+| `BuyboardRuntimeWorker` | `buyboard/runtime_worker.py` | Run active or standby Kanban startup reconciliation, readiness/lease checks, account refresh, market-data drain, trading heartbeat, persistence, shutdown reconciliation, and alerts |
 
 ## Service Layer
 
@@ -347,6 +419,17 @@ Most workers live in `src/ui/workers.py`; KIS order submission/query/cancel and 
 | `src/services/broker.py` | `Broker` protocol (`submit_order`/`cancel_order`/`get_order`/`get_positions`/ambiguous-error classification), normalized `BrokerSubmissionResult`, and `KisBroker`; all KIS response-field parsing stays at this adapter boundary |
 | `src/services/order_execution_service.py` | Broker-neutral guarded order submission with durable idempotency before and after API calls; gated by `trading_state`, an entry-only `PreTradeRiskDecision`, and an injectable `Broker` (defaults to `KisBroker`) |
 | `src/services/order_reconciliation.py` | Conservative account-snapshot reconciliation plus injectable broker order query/cancel for accepted/working orders |
+| `src/services/execution_workflow_service.py` | Shared legacy/Kanban execution facade and sole board-command boundary; validates card/runtime/ownership revisions and conflicts, persists board intent, and routes destructive work through the execution gateway |
+| `src/services/buyboard_runtime.py` | Kanban composition root wiring the broker-neutral trading engine, entry/position/EOD services, market data, risk revalidation, capital reservations, lease, and shared gateway |
+| `src/services/trading_engine.py` | One-second Kanban decision pipeline for retry recovery, entries, order reconciliation, entry completion, partial/full exits, stale quotes, stops, and EOD cleanup |
+| `src/services/trade_card_repository.py` | Canonical SQL trade-card rows with unique account/symbol identity, optimistic versions, and an atomic `data/trade_cards.json` recovery snapshot |
+| `src/services/trade_card_bootstrap.py` | Create-only bridge from loaded legacy Watchlist/Buylist state into missing cards; may project fresh cached holdings before the runtime owns reconciliation |
+| `src/services/trade_card_orb_bridge.py` | Copies the existing execution queue's selected ORB candidate into pre-entry card fields without duplicating ORB calculations |
+| `src/services/execution_ownership_repository.py` | Durable `LEGACY`/`KANBAN`/`MANUAL` ownership assignment and optimistic ownership revision per account and symbol |
+| `src/services/entry_attempt_manager.py` | Per-symbol serialized entry attempts, durable attempt identity/cooldown, capital reservations, and deadline/cancel handling |
+| `src/services/position_manager.py` | Broker-position projection, first-fill protection, stop evaluation, partial/sell-all flows, and flat-position confirmation |
+| `src/services/stop_change_coordinator.py` | Per-card lock and pending-stop handoff so newly durable stops are installed in the live feed before becoming active |
+| `src/services/eod_trading_service.py` | End-of-day entry cancellation/reset, remaining-target completion policy, and unresolved-order protection |
 | `src/services/event_journal.py` | Append-only JSONL trading audit events with cross-thread/process locking, account/free-text/secret redaction, runtime write-error telemetry, 25 MB rotation with the newest 20 archives retained, and a best-effort execution adapter |
 | `src/services/health.py` | Framework-neutral read-only health model for KIS configuration/token metadata and response age, a current MySQL `SELECT 1`, journal storage/write health, local-mirror freshness, and unresolved-order reconciliation state |
 | `src/services/historical_refresh_control.py` | Launches, polls, and terminates the standalone `historical.py` subprocess; owns its status-file schema and PID liveness checks |
@@ -366,6 +449,11 @@ The service layer contains persistence and lifecycle logic that is not specific 
 | `src/core/watchlist.py` | `Watchlist`, `TradePlanManager`, `BuylistManager`, and persistence-ready dataclasses |
 | `src/core/orb.py` | Static compatibility surface for strategy-owned ORB range/entry helpers, plus legacy display signals and intraday resampling |
 | `src/core/execution_queue.py` | Dynamic execution workflow for the built-in ORB plugin: queue item/candidate state, risk planning, environment-symbol keys, duplicate-pending rejection, and display-state helpers |
+| `src/core/trade_card_state.py` | Authoritative Kanban aggregate: visible column, entry runtime, broker position/order correlation, stop/exit state, retries, warnings, timestamps, and version |
+| `src/core/kanban_transitions.py` | Pure legal user-transition graph, closed-card membership restore, legacy-state migration, and one-card-per-account/symbol invariant |
+| `src/core/board_workflow.py` | Frontend-neutral typed board commands, optimistic fences, action/projection contexts, and read-only projection result types |
+| `src/core/execution_ownership.py` | Durable execution owner and strategy-instance value types plus frontend-source-to-owner policy |
+| `src/core/execution_request.py` / `execution_order_record.py` | Guarded command/order identities and canonical execution lifecycle records used by the shared gateway |
 | `src/core/trade_reviewer.py` | Rulebook-backed trade setup review model |
 | `src/core/scoring.py` | Deterministic scoring, optional OpenAI review, fallback analysis, and HTML rendering |
 | `src/core/order_state.py` | Broker order lifecycle enums and `BrokerOrder` persistence model |
@@ -414,6 +502,7 @@ Local JSON state is read/written through `src/utils/storage.py` and service help
 | `data/watchlist.json` | User watchlist items |
 | `data/buylist.json` | Buy dashboard and monitoring items |
 | `data/execution_queue.json` | Dynamic ORB execution queue items, selected candidates, status, and warnings |
+| `data/trade_cards.json` | Atomic local recovery snapshot of canonical Kanban trade cards; not authoritative while the database is reachable |
 | `data/legacy_non_prod_buylist.json` | One-time archive of non-production buylist rows removed from actionable state |
 | `data/legacy_non_prod_execution_queue.json` | One-time archive of non-production execution queue rows removed from actionable state |
 | `data/trade_plans.json` | Saved trade plans |
@@ -422,6 +511,7 @@ Local JSON state is read/written through `src/utils/storage.py` and service help
 | `data/tab_options.json` | Tab visibility settings |
 | `data/orders.json` | Local broker-order ledger, created when the first order is recorded |
 | `data/event_journal.jsonl` | Append-only, gitignored trading lifecycle journal; timestamped archives preserve earlier events when the active file rotates |
+| `data/emergency_execution_journal.jsonl` | Local emergency-only guarded command evidence used by narrowly fenced protective actions during a bounded canonical-database outage |
 | `data/state_metadata.json` | Optional sidecar with last successful/failed app-state save time, last error, and files written |
 | `data/us_kis_tickers.csv` | Cached KIS-registered US stock universe used by scanner refreshes |
 | `data/sp500_tickers.csv` | Cached S&P 500 fallback universe |
@@ -434,6 +524,8 @@ Local JSON state is read/written through `src/utils/storage.py` and service help
 
 Critical local state files keep one rolling `.bak` backup beside the JSON file, including watchlist, buylist, trade plans, orders, and execution queue state. The app does not wrap existing JSON payloads in a schema envelope, so legacy loaders keep their current formats.
 
+Kanban's authoritative lifecycle is row-oriented SQL state, not the legacy whole-file collection model. The main tables cover trade cards, execution ownership, execution commands and order records, capital reservations, discovered external orders, account reconciliation, execution leases, runtime-device/readiness state, and related journal/recovery metadata. Trade-card writes use optimistic compare-and-swap on `version`; ownership and runtime readiness have independent revisions. `data/trade_cards.json` mirrors successful card writes only as a recovery/migration aid.
+
 The production-only migration archives legacy non-production buylist and execution queue rows before filtering them. Archived rows are never relabeled as `PROD` and cannot submit live orders. Historical non-production broker orders remain in `data/orders.json` for audit history but are excluded from startup reconciliation.
 
 ## Production Observability
@@ -443,6 +535,8 @@ The Health tab is registered immediately after TradingView Chart. Opening it sta
 Live execution emits correlated lifecycle records from `SIGNAL_CREATED`, `RISK_APPROVED`/`RISK_REJECTED`, and `ORDER_INTENT_CREATED` through durable reservation/submission/acceptance, reconciliation, confirmed fills, and position updates/closure. Strategy signal outcome and risk outcome remain separate events. Every record has a UTC timestamp and event ID; order, broker-order, signal/plan, symbol, strategy, price, and quantity fields make a trade reconstructable. Full account numbers are scrubbed from every field (including client order IDs), secret-like payload keys and string values are redacted, free-text reasons are scrubbed, and raw broker responses are never journaled. `record_event()` is best effort, and the guarded order service also isolates an injected recorder exception, so an unavailable journal cannot change an order outcome or provoke a retry. After `ORDER_SUBMISSION_STARTED` is durably written, the service performs one final kill-switch and short-lived risk-approval check immediately before calling the broker.
 
 `MainWindow.closeEvent()` requests interruption for active background workers, waits with one shared bounded shutdown budget, then attempts a final synchronous app-state save and waits briefly for pending background saves. Normal UI save calls still schedule background saves through `save_app_state()`, but those threads are tracked and non-daemon.
+
+The Kanban runtime adds durable execution/device heartbeats, per-card warnings, critical native notifications, and optional out-of-process alert/heartbeat delivery. Lease loss, unreconciled broker orders, stalled liquidation cancellation, trading halts, stale execution-grade data, and high/low market-data outage states are surfaced independently of the board refresh itself.
 
 ## Market Data Layer
 
@@ -584,7 +678,7 @@ Only enable KIS intraday after the endpoint, TR ID, request params, output field
 
 ## KIS Order Lifecycle
 
-KIS order handling is intentionally split into submission, local ledgering, and fill reconciliation.
+KIS order handling is intentionally split into submission, durable order state, and fill reconciliation. The flow below is the legacy Buy Dashboard's local-ledger path. The Kanban runtime uses the same broker boundary through `ExecutionCommandGateway`, but records guarded command/order state in canonical SQL and projects reconciliation into `TradeCardState`; see [Kanban Buy Board Architecture](#kanban-buy-board-architecture).
 
 ```text
 Buy/Sell UI action or EXECUTE_READY execution queue submit action
@@ -660,7 +754,9 @@ Watchlist symbol
   -> BuylistExecutionController.refresh_execution_queue()
   -> ExecutionQueueManager builds/updates queue items without changing core strategy rules
   -> ExecutionQueueRefreshResult drives logs, table refreshes, and state saving
-  -> optional guarded KIS order submission from EXECUTE_READY queue rows
+  -> legacy path: optional guarded KIS order submission from EXECUTE_READY queue rows
+  -> Kanban path: TradeCardOrbEvaluator copies the selected candidate into
+     pre-entry cards; the runtime consumes EXECUTE_READY only after readiness gates
 ```
 
 Account value comes from the selected KIS profile when a snapshot is available. Otherwise the UI falls back to manual/default account-size values. USD/KRW conversion is tracked in the UI and refreshed separately.
@@ -684,6 +780,11 @@ Runtime configuration is environment-driven:
 |---|---|---|
 | `MYSQL_*` | `src/utils/config.py`, `src/infrastructure/database/` | MySQL connection; optional for a single machine, canonical for the two-machine setup |
 | `TRADING_ENABLED` | `src/services/trading_state.py` | Administrative order-submission lock; false/blank/invalid locks off, true only permits the separately confirmed in-app session toggle |
+| `BUYBOARD_ENGINE_ENABLED`, `KANBAN_STRATEGY_INSTANCE_ID` | `src/core/execution_config.py`, Buy Board UI/runtime | Fail-closed Kanban cutover and stable strategy ownership identity; the flag does not bypass any other readiness or trading gate |
+| `KIS_LIVE_EXECUTION_MODE`, `KIS_CONTROLLED_LIVE_*` | Controlled-live policy and execution gateway | Additional disabled/controlled/full-live envelope; controlled live restricts allowed entry symbols and per-entry notional |
+| `KIS_WS_*`, `KIS_MARKET_DATA_*`, `ORB_FORMATION_SOURCE` | Kanban real-time market-data composition | Verified protocol/capability manifest, subscription keys/capacity, freshness, and execution-grade quote/ORB-source gates |
+| `KIS_MUTATION_*` | Shared request scheduler and guarded gateway | Verified submit/cancel/replace budgets, spacing, and retry policy; unknown/zero entry capacity fails closed |
+| `EXTERNAL_ALERT_*` | `src/services/external_alerting.py` | Out-of-process critical-alert and missing-heartbeat delivery for unattended Kanban operation |
 | `KIS_PROD_*` / `KIS_SIM_*` | KIS account/order modules | KIS production/simulation account snapshots and order workflows |
 | `KIS_INTRADAY_ENABLED`, `KIS_OVERSEAS_INTRADAY_*` | `src/api/kis_intraday.py` | Configuration-gated KIS intraday endpoint/field mapping |
 | `PC_REMOTE_CONTROL_HOST`, `PC_WAKE_URL`, `REMOTE_CONTROL_TOKEN` | `src/services/pc_remote_control.py` | Always-on PC remote status/shutdown over Tailscale (see [Two-Machine Data Pipeline](#two-machine-data-pipeline-pc-sync)) |
@@ -707,11 +808,15 @@ Coverage includes scanner rules, scoring, position sizing, strategy protocol/ORB
 Buylist execution controller coverage includes selected-symbol queueing, missing symbols, unavailable queue manager failures, duplicate pending/open-order propagation, callback failures, refreshed counts, and result status counts.
 Intraday provider coverage includes KIS disabled/configuration errors, yfinance fallback behavior, source-priority cache loading, ORB invariance across normalized provider data, 1m-to-5m resampling, and worker signal payload shape.
 Two-machine/backup coverage includes the local SQLite mirror (`test_local_mirror.py`), cross-machine state sync (`test_state_sync.py`), runtime heartbeats (`test_pc_runtime_status.py`), the standalone refresh subprocess (`test_historical_refresh_control.py`, `test_run_daily_refresh.py`), selective/derived refresh caching (`test_historical_selective_refresh.py`, `test_derived_refresh_cache.py`), hourly backfill policy (`test_hourly_backfill_policy.py`), broker order query/cancel (`test_broker_order_query_cancel.py`), and cloud/env backup (`test_cloud_backup.py`, `test_env_backup.py`).
+Kanban coverage includes pure transitions and card serialization, optimistic repository updates, create-only bootstrap, ORB projection, board/card/controller behavior, runtime composition and heartbeat stages, planning activation, entry attempts, stops, EOD cleanup, guarded gateway integration, legacy/Kanban workflow parity, ownership/readiness fencing, and exhaustive state-model exploration (`test_kanban_transitions.py`, `test_trade_card_*.py`, `test_buyboard_*.py`, `test_ws13_*.py`, and `test_gate1_model_state_exploration.py`).
 
 ## Production Safety Notes
 
 - Keep secrets out of source. `.env` and `.kis_token_cache*.json` are local runtime files.
 - Guarded order submission is gated behind the `TRADING_ENABLED` kill switch (`src/services/trading_state.py`, toolbar toggle top-right of the main window). It starts disabled on every launch with no persistence; enabling requires an explicit click-through confirmation in the UI. Blank, falsy, or malformed configured values lock it off, and truthy configuration only permits the UI toggle. The service checks before ledger creation, after reservation, and immediately before the broker call after synchronous journal I/O; `KisBroker` and the low-level KIS POST boundary also re-check defensively.
+- Kanban is independently fail-closed behind `BUYBOARD_ENGINE_ENABLED`, live-execution policy, verified KIS WebSocket/subscription capacity, verified mutation budgets, the active execution lease/device role, writable canonical state, fresh action-specific account reconciliation, and current market-data health. A rendered card or persisted intent does not imply that execution is ready.
+- Do not manually force cards into `ENTRY_PENDING` or `CLOSED`. Those columns reflect broker lifecycle evidence and are owned by reconciliation/system transitions.
+- Do not bypass `ExecutionWorkflowService` or `ExecutionCommandGateway` from Buy Board code. A durable `KANBAN` ownership assignment and matching `KANBAN_STRATEGY_INSTANCE_ID` are required for Kanban mutation; `LEGACY`/`MANUAL` ownership remains observation-only.
 - KIS PROD order paths require valid credentials. Keep monitoring off until account snapshots, order review, and reconciliation have been verified.
 - KIS intraday remains configuration-gated. Do not enable it until endpoint/TR ID/request params/raw field mappings are verified.
 - yfinance fallback remains available for intraday/ORB workflows when KIS intraday is disabled or unavailable.
