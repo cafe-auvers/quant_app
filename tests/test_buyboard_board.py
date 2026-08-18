@@ -18,7 +18,12 @@ from src.services import trade_card_repository as repo
 from src.ui.buyboard import board as board_module
 from src.ui.buyboard.card import card_drag_payload
 from src.ui.buyboard.columns import BoardColumnList
-from src.ui.buyboard.drag_commands import CancelEntry, CancelPartialSell, ReorderCard
+from src.ui.buyboard.drag_commands import (
+    CancelEntry,
+    CancelPartialSell,
+    ReorderCard,
+    RequestPartialSell,
+)
 
 _APP = None
 
@@ -286,6 +291,45 @@ def test_dragging_partial_sell_to_open_dispatches_partial_withdrawal(tmp_path, m
 
     assert len(window.dispatched) == 1
     assert isinstance(window.dispatched[0], CancelPartialSell)
+
+
+def test_dragging_sell_all_to_partial_sell_prompts_and_dispatches_reduction(
+    tmp_path, monkeypatch
+):
+    _ensure_app()
+    engine = _make_engine(tmp_path)
+    card = repo.create_trade_card(
+        engine,
+        _card(
+            board_status=BoardStatus.SELL_ALL,
+            broker_quantity=300,
+            orderable_quantity=300,
+            sell_all_at_market_open=True,
+            exit_all_required=True,
+        ),
+    )
+    window = _FakeMainWindow(engine)
+    monkeypatch.setattr(
+        board_module,
+        "_lookup_projection",
+        lambda *args: BoardCardProjection(card=card),
+    )
+    monkeypatch.setattr(
+        board_module.dialogs,
+        "prompt_partial_sell_quantity",
+        lambda *_args: 100,
+    )
+    monkeypatch.setattr(board_module, "is_buyboard_engine_enabled", lambda: True)
+
+    board_module._handle_card_dropped(
+        window,
+        card_drag_payload(BoardCardProjection(card=card)),
+        BoardStatus.PARTIAL_SELL,
+    )
+
+    assert len(window.dispatched) == 1
+    assert isinstance(window.dispatched[0], RequestPartialSell)
+    assert window.dispatched[0].quantity == 100
 
 
 def test_drag_tolerates_equivalent_revision_and_uses_current_fences(

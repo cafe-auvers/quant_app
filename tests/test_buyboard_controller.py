@@ -275,6 +275,62 @@ def test_partial_sell_can_be_replaced_by_sell_all_without_stale_quantity(tmp_pat
     assert result.pending_partial_sell_quantity == 0
 
 
+def test_unsubmitted_sell_all_can_be_reduced_directly_to_partial_sell(tmp_path):
+    engine = _make_engine(tmp_path)
+    card = _seed(
+        engine,
+        board_status=BoardStatus.SELL_ALL,
+        position_runtime_status=PositionRuntimeStatus.QUEUED_FOR_OPEN,
+        broker_quantity=300,
+        orderable_quantity=300,
+        sell_all_at_market_open=True,
+        exit_all_required=True,
+        exit_attempt_group_id="OLD-SELL-ALL",
+        exit_attempt_count=2,
+        next_exit_retry_at="2026-08-18T13:30:00+00:00",
+        last_exit_error="prior explicit rejection",
+    )
+
+    result = apply_board_command(engine, _cmd(RequestPartialSell, card, quantity=100))
+
+    assert result.board_status == BoardStatus.PARTIAL_SELL
+    assert result.position_runtime_status == PositionRuntimeStatus.PARTIAL_EXIT_PENDING
+    assert result.pending_partial_sell_quantity == 100
+    assert result.sell_all_at_market_open is False
+    assert result.exit_all_required is False
+    assert result.exit_attempt_group_id == ""
+    assert result.exit_attempt_count == 0
+    assert result.next_exit_retry_at is None
+    assert result.last_exit_error == ""
+
+
+@pytest.mark.parametrize(
+    "durable_field,durable_value",
+    [
+        ("exit_client_order_id", "SELL-CID-1"),
+        ("exit_pending_attempt_number", 1),
+        ("reserved_sell_quantity", 300),
+        ("exit_cancel_command_id", "CANCEL-1"),
+    ],
+)
+def test_sell_all_to_partial_rejects_a_durable_exit_lifecycle(
+    tmp_path, durable_field, durable_value
+):
+    engine = _make_engine(tmp_path)
+    card = _seed(
+        engine,
+        board_status=BoardStatus.SELL_ALL,
+        position_runtime_status=PositionRuntimeStatus.LIQUIDATING,
+        broker_quantity=300,
+        orderable_quantity=300,
+        exit_all_required=True,
+        **{durable_field: durable_value},
+    )
+
+    with pytest.raises(CommandRejectedError, match="durable execution lifecycle"):
+        apply_board_command(engine, _cmd(RequestPartialSell, card, quantity=100))
+
+
 # --- Stops (spec section 605-659) -------------------------------------------
 
 

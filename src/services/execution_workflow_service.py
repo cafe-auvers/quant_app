@@ -637,10 +637,21 @@ def _require_board_action_not_conflicted(engine, command, card) -> List[Executio
         )
     if isinstance(command, types.CancelEntry) and card.entry_block_reason == "cancel_requested":
         raise BoardCommandRejectedError("Entry cancellation is already pending")
-    if isinstance(command, types.RequestPartialSell) and any(
-        order.side == OrderSide.SELL for order in active_orders
-    ):
-        raise BoardCommandRejectedError("A sell order is already pending for this symbol")
+    if isinstance(command, types.RequestPartialSell):
+        if any(order.side == OrderSide.SELL for order in active_orders):
+            raise BoardCommandRejectedError(
+                "A sell order is already pending for this symbol"
+            )
+        if card.board_status.value == "SELL_ALL" and (
+            card.exit_client_order_id
+            or card.exit_pending_attempt_number
+            or card.reserved_sell_quantity
+            or card.exit_cancel_command_id
+        ):
+            raise BoardCommandRejectedError(
+                "Sell All has already reached the durable execution lifecycle; "
+                "wait for broker reconciliation before reducing the objective"
+            )
     if isinstance(command, types.RequestSellAll) and card.board_status.value == "SELL_ALL":
         raise BoardCommandRejectedError("Sell All is already pending")
     if isinstance(command, types.CancelQueuedSellAll) and (
@@ -700,9 +711,10 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         return
 
     if isinstance(command, types.RequestPartialSell):
-        if card.board_status != BoardStatus.OPEN_POSITION:
+        source_status = card.board_status
+        if source_status not in {BoardStatus.OPEN_POSITION, BoardStatus.SELL_ALL}:
             raise BoardCommandRejectedError(
-                "Partial sell can only be requested from Open Positions"
+                "Partial sell can only be requested from Open Positions or an unsubmitted Sell All"
             )
         if command.quantity <= 0:
             raise BoardCommandRejectedError("Partial-sell quantity must be positive")
@@ -710,10 +722,28 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         if orderable <= 0:
             raise BoardCommandRejectedError("No broker-confirmed orderable quantity to sell")
         if command.quantity >= orderable:
-            _move_board_card(card, BoardStatus.SELL_ALL)
+            if source_status != BoardStatus.SELL_ALL:
+                _move_board_card(card, BoardStatus.SELL_ALL)
             card.exit_all_required = True
             card.pending_partial_sell_quantity = 0
         else:
+            if source_status == BoardStatus.SELL_ALL:
+                # Retire the old liquidation objective before creating the
+                # independent partial-exit lifecycle.  The conflict checks
+                # above prove no working/ambiguous SELL can be orphaned.
+                card.sell_all_at_market_open = False
+                card.exit_all_required = False
+                card.reserved_sell_quantity = 0
+                card.next_exit_retry_at = None
+                card.exit_attempt_count = 0
+                card.exit_attempt_group_id = ""
+                card.exit_client_order_id = ""
+                card.exit_pending_attempt_number = 0
+                card.exit_submission_unresolved = False
+                card.last_exit_error = ""
+                card.exit_cancel_in_flight = False
+                card.exit_cancel_requested_at = None
+                card.exit_cancel_command_id = ""
             _move_board_card(card, BoardStatus.PARTIAL_SELL)
             card.pending_partial_sell_quantity = command.quantity
             card.position_runtime_status = PositionRuntimeStatus.PARTIAL_EXIT_PENDING
