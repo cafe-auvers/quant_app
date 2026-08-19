@@ -1591,9 +1591,10 @@ class TradingEngine:
     def _run_eod_cleanup_if_due(self, cards: List[TradeCardState]) -> List[TradeCardState]:
         """The EOD service (section 13) previously existed only as a module
         nothing ever called. Runs on every heartbeat tick once
-        ``_eod_window_reached`` says we're within
-        ``EOD_ENTRY_CLEANUP_SECONDS_BEFORE_CLOSE`` of the close -- safe to
-        call repeatedly since each stage inside it is itself idempotent
+        ``_eod_window_reached`` says the final safety window has begun. The
+        service receives the separate market-closed state so untouched Buy
+        Today cards cannot reset before the bell. Safe to call repeatedly
+        since each stage inside it is itself idempotent
         (a card that has already moved off BUY_TODAY/ENTRY_PENDING/an
         incomplete-target OPEN_POSITION simply no longer matches any of its
         conditions).
@@ -1602,15 +1603,17 @@ class TradingEngine:
             return []
         if not self._eod_window_reached():
             return []
-        return self._eod_service.run_eod_cleanup(cards)
+        return self._eod_service.run_eod_cleanup(
+            cards,
+            market_closed=not self._market_is_open(),
+        )
 
     def _eod_window_reached(self) -> bool:
         """Delegates to the injected ``eod_window_reached`` callable (review
-        finding P0-8) -- production wiring compares
-        ``src.utils.market_calendar.seconds_until_regular_session_close()``
-        against ``EOD_ENTRY_CLEANUP_SECONDS_BEFORE_CLOSE``. Defaults to
-        False so tests never trigger EOD cleanup unless they explicitly opt
-        in.
+        finding P0-8) -- production wiring opens the processing window shortly
+        before the holiday-aware regular-session close and leaves it open
+        afterward. Defaults to False so tests never trigger EOD cleanup unless
+        they explicitly opt in.
         """
         return self._eod_window_reached_fn()
 

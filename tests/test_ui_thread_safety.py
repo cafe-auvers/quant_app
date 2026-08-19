@@ -25,8 +25,8 @@ def test_windows_qt_rendering_defaults_are_safe_and_overridable(monkeypatch):
     monkeypatch.delenv("QTWEBENGINE_CHROMIUM_FLAGS", raising=False)
     main._configure_qt_rendering_environment("win32")
 
-    assert os.environ["QT_OPENGL"] == "software"
-    assert os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] == "--disable-gpu"
+    assert "QT_OPENGL" not in os.environ
+    assert "QTWEBENGINE_CHROMIUM_FLAGS" not in os.environ
 
     monkeypatch.setenv("QT_OPENGL", "desktop")
     monkeypatch.setenv("QTWEBENGINE_CHROMIUM_FLAGS", "--use-angle=gl")
@@ -36,35 +36,13 @@ def test_windows_qt_rendering_defaults_are_safe_and_overridable(monkeypatch):
     assert os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] == "--use-angle=gl"
 
 
-def test_windows_software_renderer_sets_qt_attribute_before_app(monkeypatch):
-    import main
-
-    calls = []
-
-    class FakeCoreApplication:
-        @staticmethod
-        def setAttribute(attribute, enabled):
-            calls.append((attribute, enabled))
-
-    class FakeQt:
-        AA_UseSoftwareOpenGL = object()
-
-    monkeypatch.setenv("QT_OPENGL", "software")
-    main._configure_qt_application_attributes(
-        FakeCoreApplication, FakeQt, platform="win32"
-    )
-    assert calls == [(FakeQt.AA_UseSoftwareOpenGL, True)]
-
-
-def test_qt_gl_fallback_noise_is_only_hidden_in_software_mode(monkeypatch):
+def test_known_qt_gl_fallback_noise_is_hidden_without_forcing_software(monkeypatch):
     import main
 
     message = "ARB::createContext: Unable to create a GL Context"
-    monkeypatch.setenv("QT_OPENGL", "software")
+    monkeypatch.delenv("QT_OPENGL", raising=False)
     assert main._should_suppress_qt_message(message) is True
-
-    monkeypatch.setenv("QT_OPENGL", "desktop")
-    assert main._should_suppress_qt_message(message) is False
+    assert main._should_suppress_qt_message("QWidget: invalid state") is False
 
 
 class _RecordingScrollBar:

@@ -211,25 +211,11 @@ def _capture_real_kanban_exit_command(
     return captured[0], result
 
 
-def test_l3_add_to_buy_today_produces_the_same_entry_monitoring_command(
+def test_l3_buylist_activate_routes_through_buy_today_kanban_command(
     tmp_path, monkeypatch
 ):
-    from src.core.entry_monitoring_command import build_entry_monitoring_command
+    from src.core.board_workflow import BoardCardProjection
 
-    captured = {}
-
-    def legacy_builder(**kwargs):
-        captured["legacy"] = build_entry_monitoring_command(**kwargs)
-        return captured["legacy"]
-
-    def kanban_builder(**kwargs):
-        captured["kanban"] = build_entry_monitoring_command(**kwargs)
-        return captured["kanban"]
-
-    monkeypatch.setattr(
-        legacy_actions_module, "build_entry_monitoring_command", legacy_builder
-    )
-    monkeypatch.setattr(workflow, "build_entry_monitoring_command", kanban_builder)
     monkeypatch.setattr(
         legacy_actions_module.QMessageBox,
         "information",
@@ -241,15 +227,6 @@ def test_l3_add_to_buy_today_produces_the_same_entry_monitoring_command(
         kis_account_no="",
         orb_monitor_enabled=False,
     )
-    legacy = BuylistActionsMixin()
-    legacy._buylist_selected_item = lambda environment: legacy_item
-    legacy._is_execution_queue_buylist_item = lambda item: True
-    legacy._selected_order_account_for_item = lambda item, environment: "1"
-    legacy._buylist_prod_monitor_active = True
-    legacy._save_state = lambda: None
-    legacy.populate_buylist_dashboard = lambda: None
-    legacy._buylist_activate_selected("PROD")
-
     kanban_engine = _engine(tmp_path, "kanban-activation.db")
     kanban_card = _persist_card(
         kanban_engine,
@@ -258,14 +235,27 @@ def test_l3_add_to_buy_today_produces_the_same_entry_monitoring_command(
         broker_quantity=0,
         orderable_quantity=0,
     )
+    dispatched = []
+    legacy = BuylistActionsMixin()
+    legacy._buylist_selected_item = lambda environment: legacy_item
+    legacy._is_execution_queue_buylist_item = lambda item: True
+    legacy._selected_order_account_for_item = lambda item, environment: "1"
+    legacy._buyboard_current_projections = (
+        BoardCardProjection(card=kanban_card),
+    )
+    legacy._buyboard_dispatch_command = lambda command, **kwargs: (
+        dispatched.append(command) or True
+    )
+    legacy.append_log = lambda message: None
 
-    kanban_command = _command(ActivateForToday, kanban_card)
+    legacy._buylist_activate_selected("PROD")
+
     kanban_result = workflow.request_board_action(
-        kanban_engine, kanban_command, context=BoardActionContext()
+        kanban_engine, dispatched[0], context=BoardActionContext()
     ).card
 
-    assert captured["legacy"] == captured["kanban"]
-    assert legacy_item.orb_monitor_enabled is True
+    assert isinstance(dispatched[0], ActivateForToday)
+    assert legacy_item.orb_monitor_enabled is False
     assert kanban_result.board_status == BoardStatus.BUY_TODAY
 
 

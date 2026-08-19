@@ -2091,7 +2091,11 @@ def test_buylist_activate_explicitly_retires_legacy_entry(monkeypatch):
     assert "No BUY order was submitted" in logs[0]
 
 
-def test_buylist_activation_persists_selected_account_for_safe_handoff(monkeypatch):
+def test_buylist_activation_dispatches_buy_today_kanban_command(monkeypatch):
+    from src.core.board_workflow import BoardCardProjection
+    from src.core.trade_card_state import BoardStatus, TradeCardState
+    from src.ui.buyboard.drag_commands import ActivateForToday
+
     item = SimpleNamespace(
         symbol="AAPL",
         monitoring_status="WAITING_BREAKOUT",
@@ -2105,17 +2109,31 @@ def test_buylist_activation_persists_selected_account_for_safe_handoff(monkeypat
     window._warn_order_account_unavailable = lambda *a: pytest.fail(
         "configured account should be accepted"
     )
-    window._buylist_prod_monitor_active = True
-    window._save_state = lambda: None
-    window.populate_buylist_dashboard = lambda: None
+    card = TradeCardState(
+        environment="PROD",
+        account_no="12345678-01",
+        symbol="AAPL",
+        board_status=BoardStatus.BUYLIST,
+    )
+    window._buyboard_current_projections = (BoardCardProjection(card=card),)
+    dispatched = []
+    window._buyboard_dispatch_command = lambda command, **kwargs: (
+        dispatched.append((command, kwargs)) or True
+    )
+    logs = []
+    window.append_log = logs.append
     monkeypatch.setattr(
         buylist_actions_module.QMessageBox, "information", lambda *a, **k: None
     )
 
     MainWindow._buylist_activate_selected(window, "PROD")
 
-    assert item.kis_account_no == "12345678-01"
-    assert item.orb_monitor_enabled is True
+    assert len(dispatched) == 1
+    assert isinstance(dispatched[0][0], ActivateForToday)
+    assert dispatched[0][0].account_no == "12345678-01"
+    assert item.kis_account_no == ""
+    assert item.orb_monitor_enabled is False
+    assert "Buy Today activation" in logs[0]
 
 
 def test_buylist_activation_blocks_when_no_account_can_be_persisted():

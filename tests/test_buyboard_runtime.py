@@ -810,6 +810,21 @@ def test_build_buyboard_runtime_wires_real_market_session_hooks():
     assert runtime.trading_engine._eod_window_reached_fn is runtime_module._eod_window_reached
 
 
+@pytest.mark.parametrize(
+    ("seconds_left", "expected"),
+    ((61.0, False), (60.0, True), (0.0, True), (-60.0, True)),
+)
+def test_eod_processing_window_stays_open_through_market_close(
+    monkeypatch, seconds_left, expected
+):
+    monkeypatch.setattr(
+        runtime_module,
+        "seconds_until_regular_session_close",
+        lambda: seconds_left,
+    )
+    assert runtime_module._eod_window_reached() is expected
+
+
 # --- P1-1: capital_reservation_engine is actually threaded through ----------
 
 
