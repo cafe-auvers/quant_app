@@ -934,6 +934,172 @@ def test_database_probe_logs_one_concise_warning_for_an_outage(
     assert all(record.exc_info is None for record in warnings)
 
 
+def test_market_data_queue_requires_more_than_two_late_checks_to_block(tmp_path):
+    worker, _ = _worker(tmp_path)
+
+    class MarketData:
+        @staticmethod
+        def health_metrics(*, now):
+            return SimpleNamespace(
+                ws_connected=True,
+                critical_trade_channels_missing=(),
+                critical_quote_channels_missing=(),
+                stale_symbols=(),
+            )
+
+    worker.runtime = SimpleNamespace(market_data=MarketData())
+    observed_at = dt.datetime(2026, 8, 19, 12, 0, tzinfo=dt.timezone.utc)
+
+    # Startup remains fail-closed until at least one real drain is observed.
+    assert (
+        worker.engine_readiness(now=observed_at).accumulator_draining_within_budget
+        is False
+    )
+
+    worker.last_market_data_drain_at = observed_at
+    assert (
+        worker.engine_readiness(now=observed_at).accumulator_draining_within_budget
+        is True
+    )
+
+    drain_budget = max(
+        float(execution_config.MAX_MARKET_DATA_QUEUE_DELAY_SECONDS),
+        float(worker._heartbeat_seconds)
+        + float(execution_config.MAX_MARKET_DATA_QUEUE_DELAY_SECONDS),
+    )
+    first_late_check = observed_at + dt.timedelta(seconds=drain_budget + 0.1)
+    assert (
+        worker.engine_readiness(
+            now=first_late_check
+        ).accumulator_draining_within_budget
+        is True
+    )
+    # Re-reading the same sample cannot manufacture a second failure.
+    assert (
+        worker.engine_readiness(
+            now=first_late_check
+        ).accumulator_draining_within_budget
+        is True
+    )
+
+    second_late_check = first_late_check + dt.timedelta(seconds=1)
+    assert (
+        worker.engine_readiness(
+            now=second_late_check
+        ).accumulator_draining_within_budget
+        is True
+    )
+    third_late_check = second_late_check + dt.timedelta(seconds=1)
+    assert (
+        worker.engine_readiness(
+            now=third_late_check
+        ).accumulator_draining_within_budget
+        is False
+    )
+
+    # A successful drain clears the streak; the next isolated miss is again
+    # tolerated instead of flickering the whole board readiness indicator.
+    worker.last_market_data_drain_at = third_late_check
+    assert (
+        worker.engine_readiness(
+            now=third_late_check
+        ).accumulator_draining_within_budget
+        is True
+    )
+    next_isolated_miss = third_late_check + dt.timedelta(
+        seconds=drain_budget + 0.1
+    )
+    assert (
+        worker.engine_readiness(
+            now=next_isolated_miss
+        ).accumulator_draining_within_budget
+        is True
+    )
+
+
+def test_market_data_queue_counts_distinct_worker_cycles_not_ui_polls(tmp_path):
+    worker, _ = _worker(tmp_path)
+
+    class MarketData:
+        @staticmethod
+        def health_metrics(*, now):
+            return SimpleNamespace(
+                ws_connected=True,
+                critical_trade_channels_missing=(),
+                critical_quote_channels_missing=(),
+                stale_symbols=(),
+            )
+
+    worker.runtime = SimpleNamespace(market_data=MarketData())
+    observed_at = dt.datetime(2026, 8, 19, 12, 0, tzinfo=dt.timezone.utc)
+    worker.last_cycle_started_at = observed_at
+    worker.last_market_data_drain_at = observed_at
+    assert worker.engine_readiness(
+        now=observed_at
+    ).accumulator_draining_within_budget
+
+    drain_budget = max(
+        float(execution_config.MAX_MARKET_DATA_QUEUE_DELAY_SECONDS),
+        float(worker._heartbeat_seconds)
+        + float(execution_config.MAX_MARKET_DATA_QUEUE_DELAY_SECONDS),
+    )
+    slow_cycle = observed_at + dt.timedelta(seconds=1)
+    worker.last_cycle_started_at = slow_cycle
+    first_late = observed_at + dt.timedelta(seconds=drain_budget + 1)
+
+    # Ten UI reads during one slow broker call are still one failed cycle.
+    for offset in range(10):
+        assert worker.engine_readiness(
+            now=first_late + dt.timedelta(seconds=offset)
+        ).accumulator_draining_within_budget
+    assert worker._market_data_queue_failure_streak == 1
+
+    worker.last_cycle_started_at = slow_cycle + dt.timedelta(seconds=1)
+    assert worker.engine_readiness(
+        now=first_late + dt.timedelta(seconds=10)
+    ).accumulator_draining_within_budget
+    worker.last_cycle_started_at = slow_cycle + dt.timedelta(seconds=2)
+    assert not worker.engine_readiness(
+        now=first_late + dt.timedelta(seconds=11)
+    ).accumulator_draining_within_budget
+
+
+def test_operator_reconciliation_waits_for_three_failed_routine_passes(tmp_path):
+    worker, _ = _worker(tmp_path)
+    account_no = "1"
+    worker._reconciliation_required_accounts.add(account_no)
+    worker._account_reconciliation_confirmed_accounts.add(account_no)
+    worker.reconciliation_accounts_in_progress.add(account_no)
+    worker.routine_reconciliation_accounts_in_progress.add(account_no)
+    strict = _ready_runtime_state(
+        startup_reconciliation_complete=False,
+        account_reconciliation_fresh=False,
+    )
+
+    displayed = worker.readiness_for_operator_display(strict)
+    assert displayed.startup_reconciliation_complete is True
+    assert displayed.account_reconciliation_fresh is True
+    assert worker.reconciliation_accounts_for_operator_display() == ()
+
+    worker.reconciliation_accounts_in_progress.clear()
+    worker.routine_reconciliation_accounts_in_progress.clear()
+    for expected_streak in (1, 2):
+        worker._record_account_reconciliation_failure(account_no)
+        displayed = worker.readiness_for_operator_display(strict)
+        assert displayed.startup_reconciliation_complete is True
+        assert displayed.account_reconciliation_fresh is True
+        assert worker._account_reconciliation_failure_streaks[account_no] == expected_streak
+
+    worker._record_account_reconciliation_failure(account_no)
+    displayed = worker.readiness_for_operator_display(strict)
+    assert displayed.startup_reconciliation_complete is False
+    assert displayed.account_reconciliation_fresh is False
+
+    worker.reconciliation_accounts_in_progress.add(account_no)
+    worker.routine_reconciliation_accounts_in_progress.add(account_no)
+    assert worker.reconciliation_accounts_for_operator_display() == (account_no,)
+
+
 @pytest.mark.parametrize(
     "missing",
     [

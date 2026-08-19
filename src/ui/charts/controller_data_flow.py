@@ -197,6 +197,8 @@ class ChartsDataFlowMixin:
             "show_growth_6m": bool(base_options.get("show_growth_6m", False)),
             "window_days": int(base_options.get("window_days", 7) or 7),
             "timeframe": timeframe,
+            "view_key": view_key,
+            "sync_crosshair": view_key in {"left", "right"},
         }
         options["max_history_bars"] = self._tradingview_max_history_bars(
             timeframe, options["window_days"]

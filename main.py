@@ -27,24 +27,15 @@ def _load_repository_environment() -> None:
 
 
 def _configure_qt_rendering_environment(platform: str | None = None) -> None:
-    """Use Qt's software renderer by default on Windows driver stacks."""
+    """Leave Windows rendering automatic unless the operator overrides it.
+
+    Qt and Chromium both have their own hardware-to-software fallback paths.
+    Forcing software rendering process-wide makes canvas-heavy QWebEngine
+    pages, including TradingView, noticeably sluggish.  Explicit environment
+    values still work for machines that genuinely require software mode.
+    """
     if (platform or sys.platform) != "win32":
         return
-    # These must be present before importing PyQt/QtWebEngine.  Explicit user
-    # values still win, which keeps hardware acceleration opt-in for machines
-    # with a current, stable graphics driver.
-    os.environ.setdefault("QT_OPENGL", "software")
-    os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu")
-
-
-def _configure_qt_application_attributes(
-    qcore_application, qt_namespace, platform: str | None = None
-) -> None:
-    """Select Qt's software OpenGL implementation before QApplication exists."""
-    if (platform or sys.platform) != "win32":
-        return
-    if os.environ.get("QT_OPENGL", "").strip().lower() == "software":
-        qcore_application.setAttribute(qt_namespace.AA_UseSoftwareOpenGL, True)
 
 
 # Load operational configuration before importing any application module that
@@ -64,17 +55,15 @@ def _should_suppress_qt_message(message: str) -> bool:
         or "Premature end of document" in message
     ):
         return True
-    if os.environ.get("QT_OPENGL", "").strip().lower() == "software":
-        return any(
-            fragment in message
-            for fragment in (
-                "ARB::createContext:",
-                "GDI::createContext:",
-                "Unable to create a GL Context",
-                "composeAndFlush: makeCurrent() failed",
-            )
+    return any(
+        fragment in message
+        for fragment in (
+            "ARB::createContext:",
+            "GDI::createContext:",
+            "Unable to create a GL Context",
+            "composeAndFlush: makeCurrent() failed",
         )
-    return False
+    )
 
 
 def _qt_message_handler(mode, context, message):
@@ -107,7 +96,7 @@ def _install_global_excepthook():
 
 def main():
     """Initialize and run the application."""
-    from PyQt5.QtCore import QCoreApplication, Qt, qInstallMessageHandler
+    from PyQt5.QtCore import qInstallMessageHandler
     from PyQt5.QtWidgets import QApplication
 
     configure_logging()
@@ -117,7 +106,6 @@ def main():
         logger.warning("Native Python fault tracing could not be enabled.")
     _install_global_excepthook()
     qInstallMessageHandler(_qt_message_handler)
-    _configure_qt_application_attributes(QCoreApplication, Qt)
     from src.ui.main_window import MainWindow
 
     app = QApplication(sys.argv)

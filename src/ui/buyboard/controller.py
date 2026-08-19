@@ -618,6 +618,13 @@ class BuyboardMixin:
 
         started_at = time.perf_counter()
         populate_buyboard_columns(self, projections)
+        for callback_name in (
+            "_update_tradingview_activate_btn",
+            "_update_intraday_activate_btn",
+        ):
+            callback = getattr(self, callback_name, None)
+            if callable(callback):
+                callback()
         render_ms = (time.perf_counter() - started_at) * 1000.0
         now = time.monotonic()
         last_warning_at = float(

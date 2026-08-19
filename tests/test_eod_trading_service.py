@@ -104,6 +104,20 @@ def test_buy_today_with_no_order_returns_to_buylist_and_clears_runtime_values(tm
     assert cancelled == []  # nothing to cancel -- no order exists
 
 
+def test_buy_today_with_no_order_does_not_reset_before_market_close(tmp_path):
+    service, _, _ = _service(tmp_path)
+    card = _card(
+        board_status=BoardStatus.BUY_TODAY,
+        entry_runtime_status=EntryRuntimeStatus.ARMED,
+    )
+
+    changed = service.run_eod_cleanup([card], market_closed=False)
+
+    assert changed == []
+    assert card.board_status == BoardStatus.BUY_TODAY
+    assert card.entry_runtime_status == EntryRuntimeStatus.ARMED
+
+
 def test_buy_today_with_a_working_order_moves_to_entry_pending_instead_of_staying_stranded(
     tmp_path,
 ):
@@ -122,7 +136,7 @@ def test_buy_today_with_a_working_order_moves_to_entry_pending_instead_of_stayin
     service, cancelled, _ = _service(tmp_path, find_order=lambda card: order)
     card = _card(board_status=BoardStatus.BUY_TODAY)
 
-    changed = service.run_eod_cleanup([card])
+    changed = service.run_eod_cleanup([card], market_closed=False)
     assert changed == [card]
     assert card.board_status == BoardStatus.ENTRY_PENDING
     assert card.entry_runtime_status == EntryRuntimeStatus.ORDER_PENDING
@@ -148,7 +162,7 @@ def test_entry_pending_zero_fill_cancels_releases_capital_and_returns_to_buylist
     service, cancelled, _ = _service(tmp_path, find_order=lambda card: order, reconcile_order=lambda o: o)
     card = _card(board_status=BoardStatus.ENTRY_PENDING)
 
-    changed = service.run_eod_cleanup([card])
+    changed = service.run_eod_cleanup([card], market_closed=False)
     assert changed == [card]
     assert cancelled == [order.client_order_id]
     assert card.board_status == BoardStatus.ENTRY_PENDING  # not moved yet
@@ -157,7 +171,7 @@ def test_entry_pending_zero_fill_cancels_releases_capital_and_returns_to_buylist
     assert stored.is_open()  # not released until the cancel is confirmed
 
     order.status = OrderStatus.CANCELLED  # broker confirms, asynchronously
-    changed = service.run_eod_cleanup([card])
+    changed = service.run_eod_cleanup([card], market_closed=False)
     assert changed == [card]
     assert card.board_status == BoardStatus.BUYLIST
     assert card.entry_cancel_in_flight is False

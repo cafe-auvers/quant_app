@@ -3,10 +3,11 @@
 
 Like :mod:`src.services.entry_attempt_manager`/:mod:`src.services.position_manager`,
 this is synchronous and takes explicit input/output: the caller (in
-production, :mod:`src.services.trading_engine`'s heartbeat, gated on
-``EOD_ENTRY_CLEANUP_SECONDS_BEFORE_CLOSE``) supplies the current cards and
-gets back the ones that changed, to persist via
-:mod:`src.services.trade_card_repository`.
+production, :mod:`src.services.trading_engine`'s heartbeat) supplies the
+current cards and gets back the ones that changed, to persist via
+:mod:`src.services.trade_card_repository`. Untouched BUY_TODAY cards are
+cleared only after the regular-session close; order reconciliation may begin
+in the configured final-minute safety window.
 """
 from __future__ import annotations
 
@@ -102,15 +103,22 @@ class EodTradingService:
         # cross-device-visibility reason EntryAttemptManager does.
         self._capital_reservation_engine = capital_reservation_engine
 
-    def run_eod_cleanup(self, cards: List[TradeCardState]) -> List[TradeCardState]:
+    def run_eod_cleanup(
+        self,
+        cards: List[TradeCardState],
+        *,
+        market_closed: bool = True,
+    ) -> List[TradeCardState]:
         """Section 13's table, applied to every card. The caller owns the
-        timing gate (``EOD_ENTRY_CLEANUP_SECONDS_BEFORE_CLOSE`` before
-        close) -- this method always processes whatever it's given.
+        timing gate and supplies whether the market has actually closed.
         """
         changed: List[TradeCardState] = []
         for card in cards:
             if card.board_status == BoardStatus.BUY_TODAY:
-                if self._reset_buy_today_with_no_order(card):
+                if self._reset_buy_today_with_no_order(
+                    card,
+                    allow_no_order_reset=market_closed,
+                ):
                     changed.append(card)
             elif card.board_status == BoardStatus.ENTRY_PENDING:
                 if self._resolve_entry_pending_at_eod(card):
@@ -122,7 +130,12 @@ class EodTradingService:
 
     # -- "Buy Today with no submitted order" (section 512-516) ----------
 
-    def _reset_buy_today_with_no_order(self, card: TradeCardState) -> bool:
+    def _reset_buy_today_with_no_order(
+        self,
+        card: TradeCardState,
+        *,
+        allow_no_order_reset: bool = True,
+    ) -> bool:
         order = self._callbacks.find_open_entry_order(card)
         if order is not None:
             # A durable local order is sufficient to restore the card's
@@ -137,6 +150,8 @@ class EodTradingService:
             if order.attempt_number:
                 card.entry_attempt_count = order.attempt_number
             return True
+        if not allow_no_order_reset:
+            return False
         monitoring_command = build_entry_monitoring_command(
             environment=card.environment,
             account_no=card.account_no,

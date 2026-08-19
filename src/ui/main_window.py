@@ -137,7 +137,7 @@ _STANDBY_GATE_LABELS = {
     "websocket_connected": "KIS WebSocket connection",
     "critical_trade_subscriptions_acked": "trade subscription acknowledgements",
     "critical_quote_subscriptions_acked": "quote subscription acknowledgements",
-    "accumulator_draining_within_budget": "market-data queue drain",
+    "accumulator_draining_within_budget": "sustained market-data queue delay",
     "database_writable": "canonical database write probe",
 }
 
@@ -248,7 +248,7 @@ def _buyboard_readiness_display(
     elif not readiness.critical_quote_subscriptions_acked:
         reason = "waiting for KIS quote-subscription ACKs"
     elif not readiness.accumulator_draining_within_budget:
-        reason = "draining the market-data queue"
+        reason = "market-data queue missed its drain budget three times"
     elif device_state == RuntimeDeviceState.STANDBY_READY:
         reason = (
             "STANDBY_READY; automatic PC claim is armed"
@@ -1686,6 +1686,11 @@ class MainWindow(
             )
         try:
             readiness = worker.engine_readiness(include_device_state=False)
+            display_readiness = getattr(
+                worker, "readiness_for_operator_display", None
+            )
+            if callable(display_readiness):
+                readiness = display_readiness(readiness)
             market_open = is_regular_session_open()
             until_open = (
                 None
@@ -1697,16 +1702,26 @@ class MainWindow(
                 device_state=getattr(
                     worker, "device_state", RuntimeDeviceState.STARTING
                 ),
-                reconciliation_accounts=tuple(
-                    sorted(
-                        str(item)
-                        for item in (
-                            getattr(
-                                worker,
-                                "reconciliation_accounts_in_progress",
-                                set(),
+                reconciliation_accounts=(
+                    worker.reconciliation_accounts_for_operator_display()
+                    if callable(
+                        getattr(
+                            worker,
+                            "reconciliation_accounts_for_operator_display",
+                            None,
+                        )
+                    )
+                    else tuple(
+                        sorted(
+                            str(item)
+                            for item in (
+                                getattr(
+                                    worker,
+                                    "reconciliation_accounts_in_progress",
+                                    set(),
+                                )
+                                or set()
                             )
-                            or set()
                         )
                     )
                 ),

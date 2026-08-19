@@ -284,13 +284,32 @@ class ChartLightweightRenderMixin:
                 });
                 volumeSeries.setData(volumes);
             """
-        # Default zoom on load, expressed in bar counts. Hourly bars run ~7/trading-day
-        # (regular session), so 840 hourly bars covers roughly the same 120-trading-day
-        # span that the flat 120-bar default covers for daily candles.
-        default_visible_bars = 840 if str(options.get("timeframe", "1D")).strip().upper() == "1H" else 120
+        # The daily default historically showed 81 candles plus 40 future slots.
+        # Count actual sessions for intraday data so split 1H starts on the same
+        # market date instead of guessing how many hourly bars make a session.
+        default_visible_sessions = 81
+        if uses_intraday_time:
+            session_labels = [
+                pd.Timestamp(timestamp).strftime("%Y-%m-%d")
+                for timestamp in chart_history.index
+            ]
+            recent_sessions = list(dict.fromkeys(session_labels))[
+                -default_visible_sessions:
+            ]
+            first_visible_session = recent_sessions[0] if recent_sessions else ""
+            default_visible_data_bars = sum(
+                label >= first_visible_session for label in session_labels
+            )
+        else:
+            default_visible_data_bars = min(
+                default_visible_sessions, len(chart_history)
+            )
         bridge_enabled = QWebEngineView is not None and QWebChannel is not None
         bridge_script = '<script src="qrc:///qtwebchannel/qwebchannel.js"></script>' if bridge_enabled else ""
         symbol_json = json.dumps((storage_symbol or symbol).strip().upper())
+        view_key_json = json.dumps(str(options.get("view_key", "single")))
+        sync_crosshair_json = json.dumps(bool(options.get("sync_crosshair", False)))
+        uses_intraday_time_json = json.dumps(uses_intraday_time)
         return f"""
         <!DOCTYPE html>
         <html>
@@ -431,8 +450,12 @@ class ChartLightweightRenderMixin:
                 const alignedTi65Background = alignIndicatorSeries(ti65Background);
                 const savedDrawings = {drawings_json};
                 const symbolName = {symbol_json};
+                const chartViewKey = {view_key_json};
+                const crosshairSyncEnabled = {sync_crosshair_json};
+                const usesIntradayTime = {uses_intraday_time_json};
                 const container = document.getElementById('chart');
                 const rsContainer = document.getElementById('rs-chart');
+                const pricePanel = document.getElementById('price-panel');
                 let chartBridge = null;
                 let drawingMode = false;
                 let eraseMode = false;
@@ -522,7 +545,10 @@ class ChartLightweightRenderMixin:
                         candleSeries.removePriceLine(targetLine);
                         targetLine = null;
                     }}
-                    if (price === null || price === undefined || !Number.isFinite(Number(price)) || Number(price) <= 0) return;
+                    if (price === null || price === undefined || !Number.isFinite(Number(price)) || Number(price) <= 0) {{
+                        targetPrice = null;
+                        return;
+                    }}
                     targetPrice = Number(price);
                     targetLine = candleSeries.createPriceLine({{
                         price: targetPrice,
@@ -748,6 +774,7 @@ class ChartLightweightRenderMixin:
                 let activeEdit = null;
                 let pointerPreview = null;
                 let selectedDrawingId = null;
+                let syncedCrosshair = null;
 
                 function resizeOverlay() {{
                     const rect = overlay.getBoundingClientRect();
@@ -810,6 +837,56 @@ class ChartLightweightRenderMixin:
                             overlayContext.restore();
                         }}
                     }}
+                    if (syncedCrosshair) {{
+                        overlayContext.save();
+                        overlayContext.strokeStyle = '#d1d5db';
+                        overlayContext.lineWidth = 1;
+                        overlayContext.setLineDash([4, 4]);
+                        overlayContext.globalAlpha = 0.75;
+                        overlayContext.beginPath();
+                        overlayContext.moveTo(syncedCrosshair.x, 0);
+                        overlayContext.lineTo(syncedCrosshair.x, rect.height);
+                        overlayContext.moveTo(0, syncedCrosshair.y);
+                        overlayContext.lineTo(rect.width, syncedCrosshair.y);
+                        overlayContext.stroke();
+                        overlayContext.restore();
+                    }}
+                }}
+
+                function incomingDrawingTime(value, prefer) {{
+                    if (!usesIntradayTime) return String(value || '').slice(0, 10);
+                    if (typeof value === 'number') return value;
+                    const text = String(value || '');
+                    const day = text.slice(0, 10);
+                    const dayMatches = candles
+                        .map(candle => candle.time)
+                        .filter(time => normalizeTimeForSave(time).slice(0, 10) === day);
+                    if (text.length <= 10 && dayMatches.length > 0) {{
+                        return prefer === 'last'
+                            ? dayMatches[dayMatches.length - 1]
+                            : dayMatches[0];
+                    }}
+                    const parsed = Date.parse(text.replace(' ', 'T') + (text.includes('Z') ? '' : 'Z'));
+                    if (Number.isFinite(parsed)) return Math.floor(parsed / 1000);
+                    return dayMatches.length > 0
+                        ? (prefer === 'last' ? dayMatches[dayMatches.length - 1] : dayMatches[0])
+                        : null;
+                }}
+
+                function normalizeIncomingDrawing(drawing) {{
+                    if (!drawing) return null;
+                    if (drawing.start && drawing.end) return drawing;
+                    const startTime = incomingDrawingTime(drawing.start_date, 'first');
+                    const endTime = incomingDrawingTime(drawing.end_date, 'last');
+                    if (startTime == null || endTime == null) return null;
+                    return {{
+                        id: String(drawing.id || ''),
+                        start: {{ time: startTime, value: Number(drawing.start_price) }},
+                        end: {{ time: endTime, value: Number(drawing.end_price) }},
+                        color: drawing.color || null,
+                        dash: drawing.dash || null,
+                        readonly: drawing.readonly || false
+                    }};
                 }}
 
                 function addDrawingLine(drawing, persist) {{
@@ -925,6 +1002,72 @@ class ChartLightweightRenderMixin:
                     if (!enabled) overlay.style.cursor = 'default';
                 }}
 
+                window.applySyncedTargetPrice = function(price) {{
+                    targetMode = false;
+                    renderTargetLine(price);
+                }};
+                window.upsertSyncedDrawing = function(drawing) {{
+                    const normalized = normalizeIncomingDrawing(drawing);
+                    if (normalized) addDrawingLine(normalized, false);
+                }};
+                window.removeSyncedDrawing = function(drawingId) {{
+                    if (!drawingSeries.has(String(drawingId))) return;
+                    drawingSeries.delete(String(drawingId));
+                    if (selectedDrawingId === String(drawingId)) selectedDrawingId = null;
+                    renderDrawings();
+                }};
+                window.showSyncedCrosshair = function(xRatio, yRatio) {{
+                    const rect = overlay.getBoundingClientRect();
+                    const x = Math.max(0, Math.min(rect.width, Number(xRatio) * rect.width));
+                    const y = Math.max(0, Math.min(rect.height, Number(yRatio) * rect.height));
+                    const time = chart.timeScale().coordinateToTime(x);
+                    const price = candleSeries.coordinateToPrice(y);
+                    if (time != null && price != null && Number.isFinite(Number(price))) {{
+                        syncedCrosshair = null;
+                        chart.setCrosshairPosition(Number(price), time, candleSeries);
+                    }} else {{
+                        chart.clearCrosshairPosition();
+                        syncedCrosshair = {{ x, y }};
+                        renderDrawings();
+                    }}
+                }};
+                window.clearSyncedCrosshair = function() {{
+                    syncedCrosshair = null;
+                    chart.clearCrosshairPosition();
+                    renderDrawings();
+                }};
+
+                let crosshairPublishFrame = null;
+                let pendingCrosshair = null;
+                function publishCrosshair(visible, event) {{
+                    if (!crosshairSyncEnabled) return;
+                    if (!visible) {{
+                        pendingCrosshair = null;
+                    }} else {{
+                        const rect = pricePanel.getBoundingClientRect();
+                        if (!rect.width || !rect.height) return;
+                        pendingCrosshair = {{
+                            x: Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)),
+                            y: Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height))
+                        }};
+                    }}
+                    if (crosshairPublishFrame !== null) return;
+                    crosshairPublishFrame = requestAnimationFrame(() => {{
+                        crosshairPublishFrame = null;
+                        if (!chartBridge || !chartBridge.syncChartCrosshair) return;
+                        const point = pendingCrosshair;
+                        chartBridge.syncChartCrosshair(
+                            symbolName,
+                            chartViewKey,
+                            point ? point.x : 0,
+                            point ? point.y : 0,
+                            Boolean(point)
+                        );
+                    }});
+                }}
+                pricePanel.addEventListener('mousemove', event => publishCrosshair(true, event));
+                pricePanel.addEventListener('mouseleave', event => publishCrosshair(false, event));
+
                 window.enableTargetMode = function() {{
                     targetMode = true;
                     drawingMode = false;
@@ -1002,10 +1145,10 @@ class ChartLightweightRenderMixin:
                 }};
                 window.resetFullView = function() {{
                     const futureBars = Math.min(40, futureWhitespace.length);
-                    const visibleBars = Math.min({default_visible_bars}, candles.length + futureBars);
+                    const visibleDataBars = Math.min({default_visible_data_bars}, candles.length);
                     const visibleTo = Math.max(0, candles.length - 1 + futureBars);
                     const range = {{
-                        from: Math.max(0, visibleTo - visibleBars),
+                        from: Math.max(0, candles.length - visibleDataBars),
                         to: visibleTo
                     }};
                     chart.timeScale().setVisibleLogicalRange(range);

@@ -74,6 +74,19 @@ def test_premarket_main_is_ready_with_per_symbol_quote_guards():
     assert "Market opens in 00:02:00" in display.tooltip
 
 
+def test_confirmed_queue_delay_uses_a_stable_actionable_message():
+    display = _buyboard_readiness_display(
+        _readiness(accumulator_draining_within_budget=False),
+        device_state=RuntimeDeviceState.STANDBY,
+        regular_session_open=True,
+    )
+
+    assert display.completed == 6
+    assert display.total == 7
+    assert "missed its drain budget three times" in display.label
+    assert "sustained market-data queue delay" in display.tooltip
+
+
 def test_live_reconciliation_uses_indeterminate_progress_without_fake_eta():
     display = _buyboard_readiness_display(
         _readiness(account_reconciliation_fresh=False),
@@ -137,6 +150,42 @@ def test_active_runtime_stays_latched_while_legacy_handoff_is_running(monkeypatc
     assert display.indeterminate is False
     assert "readiness 7/7" in display.label
     assert "ACTIVE" in display.label
+    assert "final broker reconciliation" not in display.label
+
+
+def test_routine_reconciliation_uses_debounced_operator_projection(monkeypatch):
+    monkeypatch.setattr(
+        main_window_module.execution_config,
+        "is_buyboard_engine_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(main_window_module, "is_regular_session_open", lambda: True)
+    strict = _readiness(
+        startup_reconciliation_complete=False,
+        account_reconciliation_fresh=False,
+    )
+    stable = _readiness()
+    runtime = SimpleNamespace(
+        isRunning=lambda: True,
+        device_state=RuntimeDeviceState.STANDBY_READY,
+        engine_readiness=lambda **_kwargs: strict,
+        readiness_for_operator_display=lambda readiness: stable,
+        reconciliation_accounts_for_operator_display=lambda: (),
+        reconciliation_accounts_in_progress={"12345678-01"},
+    )
+    window = MainWindow.__new__(MainWindow)
+    window._buyboard_runtime_worker = runtime
+    window.handoff_reconciliation_worker = None
+    window.state_sync_worker = None
+    window.state_sync_role = SimpleNamespace(is_main=False)
+    window._auto_claim_main_enabled = True
+
+    display = MainWindow._current_buyboard_readiness_display(window)
+
+    assert display.completed == 7
+    assert display.total == 7
+    assert display.indeterminate is False
+    assert "STANDBY_READY" in display.label
     assert "final broker reconciliation" not in display.label
 
 

@@ -7,12 +7,11 @@ from PyQt5.QtWidgets import (QDialog, QDialogButtonBox, QLabel, QMessageBox,
                              QSlider, QSpinBox, QTableWidget, QVBoxLayout)
 
 from src.api.kis_order import format_overseas_order_price
-from src.core.entry_monitoring_command import build_entry_monitoring_command
 from src.core.order_state import (REGULAR_LIMIT_EXECUTION,
                                   RESERVED_MOO_EXECUTION, BrokerOrder,
                                   OrderIntent, OrderSide, OrderStatus)
 from src.core.stop_change_command import build_stop_change_command
-from src.core.trade_card_state import StopType
+from src.core.trade_card_state import BoardStatus, StopType
 from src.services.position_manager import compute_breakeven_stop_price
 from src.services.order_ledger import find_open_orders, load_order_ledger
 from src.ui.workers import KisOrderCancelWorker, KisOrderQueryWorker
@@ -850,43 +849,55 @@ class BuylistActionsMixin:
             self.append_log(f"[Buylist/{env}] {message}")
             QMessageBox.warning(self, "Legacy entry retired", message)
             return
-        if self._is_execution_queue_buylist_item(item):
-            account_no = self._selected_order_account_for_item(item, env)
-            if not account_no:
-                self._warn_order_account_unavailable(item, env)
-                return
-            monitoring_command = build_entry_monitoring_command(
-                environment=env,
-                account_no=account_no,
-                symbol=item.symbol,
-            )
-            item.kis_account_no = monitoring_command.account_no
-            item.orb_monitor_enabled = monitoring_command.enabled
-            self._save_state()
-            active_attr = f"_buylist_{env.lower()}_monitor_active"
-            was_running = getattr(self, active_attr, False)
-            if not was_running:
-                self._toggle_buylist_monitor(env)
-            self.populate_buylist_dashboard()
-            status = str(getattr(item, "monitoring_status", "") or "")
-            started_note = (
-                "Monitor started." if not was_running else "Monitor already running."
-            )
-            if status == "EXECUTE_READY":
-                msg = (
-                    f"{item.symbol} activated — EXECUTE_READY.\n\n"
-                    f"{started_note} Will auto-submit the BUY on the next 60-second cycle.\n\n"
-                    "Use 'Submit Buy' to submit immediately."
-                )
-            else:
-                msg = (
-                    f"{item.symbol} activated (status: {status}).\n\n"
-                    f"{started_note} Checking every 60 seconds — will auto-submit the BUY "
-                    "when price crosses the ORB entry trigger.\n\n"
-                    "Use 'Review Order' to see the planned entry/stop/shares."
-                )
-            QMessageBox.information(self, "Activated", msg)
+        account_no = self._selected_order_account_for_item(item, env)
+        if not account_no:
+            self._warn_order_account_unavailable(item, env)
             return
+
+        from src.ui.buyboard.board import _command_kwargs, _lookup_projection
+        from src.ui.buyboard.card import card_drag_payload
+        from src.ui.buyboard.drag_commands import ActivateForToday
+
+        projection = _lookup_projection(self, env, account_no, item.symbol)
+        if projection is None:
+            self.refresh_buyboard()
+            QMessageBox.information(
+                self,
+                "Buy Board is refreshing",
+                f"{item.symbol}'s Buy Board card is still loading. Try Activate again in a moment.",
+            )
+            return
+        card = projection.card
+        if card.board_status in {BoardStatus.BUY_TODAY, BoardStatus.ENTRY_PENDING}:
+            QMessageBox.information(
+                self,
+                "Already active",
+                f"{item.symbol} is already in {card.board_status.value.replace('_', ' ').title()}.",
+            )
+            return
+        if card.board_status != BoardStatus.BUYLIST:
+            QMessageBox.warning(
+                self,
+                "Buy Board",
+                f"{item.symbol} cannot be activated from {card.board_status.value}.",
+            )
+            return
+
+        payload = card_drag_payload(projection)
+        command = ActivateForToday(**_command_kwargs(payload))
+        if not self._buyboard_dispatch_command(
+            command,
+            interaction_fingerprint=payload["state_fingerprint"],
+        ):
+            return
+        self.append_log(
+            f"[Buylist/{env}] Requested Buy Today activation for {item.symbol}."
+        )
+        QMessageBox.information(
+            self,
+            "Activated",
+            f"{item.symbol} is moving to Buy Today on the Buy Board.",
+        )
 
     def _buylist_deactivate_selected(self, env: str) -> None:
         item = self._buylist_selected_item(env)

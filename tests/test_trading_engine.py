@@ -1024,6 +1024,7 @@ def test_eod_cleanup_runs_when_wired_and_window_reached(tmp_path):
         reservations_path=tmp_path / "reservations.json",
     )
     engine._eod_window_reached = lambda: True
+    engine._market_is_open_fn = lambda: False
     card = _buy_today_card(entry_runtime_status=EntryRuntimeStatus.ARMED)
 
     changed = engine.run_heartbeat([card])

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import platform
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -127,6 +128,9 @@ class BuyboardRuntimeWorker(QThread):
     once and never mutated afterward.
     """
 
+    _QUEUE_DRAIN_FAILURE_CONFIRMATIONS = 3
+    _ACCOUNT_RECONCILIATION_FAILURE_CONFIRMATIONS = 3
+
     board_changed = pyqtSignal()
     alert = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
@@ -223,6 +227,11 @@ class BuyboardRuntimeWorker(QThread):
         self._lease_current = False
         self._database_writable = False
         self._database_probe_completed = False
+        self._market_data_queue_confirmed_healthy = False
+        self._market_data_queue_failure_streak = 0
+        self._market_data_queue_last_failure_cycle_started_at: Optional[
+            datetime
+        ] = None
         self.execution_gateway: Optional[ExecutionCommandGateway] = None
         self._cached_cards: List[TradeCardState] = []
         self.last_market_data_drain_at: Optional[datetime] = None
@@ -238,6 +247,17 @@ class BuyboardRuntimeWorker(QThread):
         # once at startup).
         self._account_balance_refreshed_at: Dict[str, datetime] = {}
         self._account_reconciled_at: Dict[str, datetime] = {}
+        # Operator readiness is intentionally steadier than the per-command
+        # safety gate.  A routine broker pass can outlast its 60-second
+        # freshness window, but merely being in progress is not a failure.
+        # Preserve proof that an account has reconciled successfully before,
+        # and only surface a board-wide blocker after three genuinely failed
+        # passes in a row.  Action readiness continues to use the strict
+        # timestamps/snapshots below and is never relaxed by this debounce.
+        self._reconciliation_required_accounts: set[str] = set()
+        self._account_reconciliation_confirmed_accounts: set[str] = set()
+        self._account_reconciliation_failure_streaks: Dict[str, int] = {}
+        self.routine_reconciliation_accounts_in_progress: set[str] = set()
         self._latest_reconciliation_snapshots: Dict[str, AccountBrokerSnapshot] = {}
         # Review: "legacy execution suppression depends only on the feature
         # flag" -- it did not verify the new engine was actually running,
@@ -881,6 +901,7 @@ class BuyboardRuntimeWorker(QThread):
         changed_ids: set = set()
         changed: List[TradeCardState] = []
         expected_accounts = self._distinct_account_numbers(cards)
+        self._reconciliation_required_accounts.update(expected_accounts)
         self.startup_reconciliation_errors = {}
         for account_no in expected_accounts:
             self.reconciliation_accounts_in_progress.add(account_no)
@@ -909,7 +930,11 @@ class BuyboardRuntimeWorker(QThread):
                 logger.exception(
                     "Startup reconciliation failed for account %s", account_no
                 )
-                self._invalidate_account_reconciliation(account_no, str(exc))
+                self._invalidate_account_reconciliation(
+                    account_no,
+                    str(exc),
+                    confirm_for_operator=True,
+                )
                 continue
             finally:
                 self.reconciliation_accounts_in_progress.discard(account_no)
@@ -925,9 +950,11 @@ class BuyboardRuntimeWorker(QThread):
                     "; ".join(result.snapshot.errors)
                     or "account broker snapshot was incomplete"
                 )
+                self._record_account_reconciliation_failure(
+                    account_no, confirm_for_operator=True
+                )
                 continue
-            self._account_reconciled_at[account_no] = now
-            self.startup_reconciled_accounts.add(account_no)
+            self._record_account_reconciliation_success(account_no, now)
 
         if changed:
             self.board_changed.emit()
@@ -1350,7 +1377,9 @@ class BuyboardRuntimeWorker(QThread):
         # card-account grouping) also covers every configured-but-cardless
         # account, with an empty account_cards list; reconcile_broker_positions
         # correctly treats every holding found there as newly discovered.
-        for account_no in self._distinct_account_numbers(cards):
+        account_numbers = self._distinct_account_numbers(cards)
+        self._reconciliation_required_accounts.update(account_numbers)
+        for account_no in account_numbers:
             account_cards = by_account.get(account_no, [])
             has_active_entry_candidate = any(
                 card.board_status in (BoardStatus.BUY_TODAY, BoardStatus.ENTRY_PENDING)
@@ -1373,6 +1402,7 @@ class BuyboardRuntimeWorker(QThread):
 
             if reconcile_due:
                 self.reconciliation_accounts_in_progress.add(account_no)
+                self.routine_reconciliation_accounts_in_progress.add(account_no)
                 try:
                     result = run_account_reconciliation_pass(
                         broker=self.runtime.broker,
@@ -1393,6 +1423,9 @@ class BuyboardRuntimeWorker(QThread):
                     )
                     continue
                 finally:
+                    self.routine_reconciliation_accounts_in_progress.discard(
+                        account_no
+                    )
                     self.reconciliation_accounts_in_progress.discard(account_no)
                 self._latest_reconciliation_snapshots[account_no] = result.snapshot
                 changed.extend(result.plan.changed_cards)
@@ -1403,18 +1436,18 @@ class BuyboardRuntimeWorker(QThread):
                     self._record_reconciliation_balance(account_no, result)
                     self._account_balance_refreshed_at[account_no] = now
                 if not self._reconciliation_snapshot_complete(result):
-                    self.startup_reconciliation_errors[account_no] = (
+                    reason = (
                         "; ".join(result.snapshot.errors)
                         or "account broker snapshot was incomplete"
                     )
+                    self._invalidate_account_reconciliation(account_no, reason)
                     continue
-                self._account_reconciled_at[account_no] = now
+                self._record_account_reconciliation_success(account_no, now)
                 # Review finding P0: "unknown accounts can be incorrectly
                 # considered healthy" -- a full position+order
                 # reconciliation just succeeded for this account (whether
                 # or not it had ever run before), so it now has positive
                 # confirmation too.
-                self.startup_reconciled_accounts.add(account_no)
                 # Review finding P0: "no periodic recovery path that
                 # removes an account from startup_reconciliation_errors...
                 # this can leave the application permanently reporting the
@@ -1493,9 +1526,16 @@ class BuyboardRuntimeWorker(QThread):
         )
 
     def _invalidate_account_reconciliation(
-        self, account_no: str, reason: str
+        self,
+        account_no: str,
+        reason: str,
+        *,
+        confirm_for_operator: bool = False,
     ) -> None:
         """Fail closed after a due pass cannot produce current broker truth."""
+        self._record_account_reconciliation_failure(
+            account_no, confirm_for_operator=confirm_for_operator
+        )
         self._latest_reconciliation_snapshots.pop(account_no, None)
         self._account_reconciled_at.pop(account_no, None)
         self.startup_reconciled_accounts.discard(account_no)
@@ -1508,6 +1548,32 @@ class BuyboardRuntimeWorker(QThread):
             f"{self._environment}:{account_no}",
             self.startup_reconciliation_errors[account_no],
         )
+
+    def _record_account_reconciliation_failure(
+        self, account_no: str, *, confirm_for_operator: bool = False
+    ) -> None:
+        account = str(account_no or "")
+        if not account:
+            return
+        streak = (
+            self._account_reconciliation_failure_streaks.get(account, 0) + 1
+        )
+        if confirm_for_operator:
+            streak = max(
+                streak, self._ACCOUNT_RECONCILIATION_FAILURE_CONFIRMATIONS
+            )
+        self._account_reconciliation_failure_streaks[account] = streak
+
+    def _record_account_reconciliation_success(
+        self, account_no: str, observed_at: datetime
+    ) -> None:
+        account = str(account_no or "")
+        if not account:
+            return
+        self._account_reconciled_at[account] = observed_at
+        self.startup_reconciled_accounts.add(account)
+        self._account_reconciliation_confirmed_accounts.add(account)
+        self._account_reconciliation_failure_streaks.pop(account, None)
 
     def _raise_external_alert(
         self,
@@ -1718,6 +1784,10 @@ class BuyboardRuntimeWorker(QThread):
             queue_within_budget = bool(
                 drain_age is not None and 0.0 <= drain_age <= drain_budget
             )
+            queue_within_budget = self._confirmed_queue_drain_readiness(
+                queue_within_budget,
+                checked_at=reference,
+            )
 
         return EngineReadiness(
             lease_current=bool(self._lease_current),
@@ -1734,6 +1804,98 @@ class BuyboardRuntimeWorker(QThread):
                 if include_device_state
                 else True
             ),
+        )
+
+    def _operator_reconciliation_debounce_active(self) -> bool:
+        """Whether a previously healthy routine pass is still unconfirmed.
+
+        This affects only the progress projection.  ``engine_readiness`` and
+        every command gateway continue using the strict broker timestamps and
+        completeness evidence.
+        """
+
+        required = set(self._reconciliation_required_accounts)
+        if not required or not required.issubset(
+            self._account_reconciliation_confirmed_accounts
+        ):
+            return False
+        if any(
+            self._account_reconciliation_failure_streaks.get(account, 0)
+            >= self._ACCOUNT_RECONCILIATION_FAILURE_CONFIRMATIONS
+            for account in required
+        ):
+            return False
+        retrying = any(
+            0
+            < self._account_reconciliation_failure_streaks.get(account, 0)
+            < self._ACCOUNT_RECONCILIATION_FAILURE_CONFIRMATIONS
+            for account in required
+        )
+        routine_in_progress = bool(
+            required & self.routine_reconciliation_accounts_in_progress
+        )
+        return retrying or routine_in_progress
+
+    def readiness_for_operator_display(
+        self, readiness: Optional[EngineReadiness] = None
+    ) -> EngineReadiness:
+        """Return a stable UI projection without relaxing execution safety."""
+
+        current = readiness or self.engine_readiness(include_device_state=False)
+        if not self._operator_reconciliation_debounce_active():
+            return current
+        return replace(
+            current,
+            startup_reconciliation_complete=True,
+            account_reconciliation_fresh=True,
+        )
+
+    def reconciliation_accounts_for_operator_display(self) -> Tuple[str, ...]:
+        """Hide successful routine refreshes until failures are confirmed."""
+
+        accounts = set(self.reconciliation_accounts_in_progress)
+        if self._operator_reconciliation_debounce_active():
+            accounts.difference_update(
+                self.routine_reconciliation_accounts_in_progress
+            )
+        return tuple(sorted(accounts))
+
+    def _confirmed_queue_drain_readiness(
+        self,
+        raw_within_budget: bool,
+        *,
+        checked_at: datetime,
+    ) -> bool:
+        """Debounce transient drain jitter without weakening startup safety.
+
+        Before the queue has ever drained successfully, readiness remains
+        fail-closed. After that initial proof, up to two consecutive late
+        heartbeat cycles are tolerated; readiness blocks only on the third
+        genuinely distinct failed cycle. Repeated UI reads during one slow
+        broker call cannot manufacture extra failures. Any healthy observation
+        resets the streak.
+        """
+
+        if raw_within_budget:
+            self._market_data_queue_confirmed_healthy = True
+            self._market_data_queue_failure_streak = 0
+            self._market_data_queue_last_failure_cycle_started_at = None
+            return True
+        if not self._market_data_queue_confirmed_healthy:
+            return False
+
+        # ``engine_readiness`` is polled by the UI more often than the worker
+        # can finish a KIS reconciliation. Count the worker cycle identity,
+        # not elapsed wall-clock reads of the same unchanged drain timestamp.
+        # Directly-driven tests/diagnostics have no cycle marker, so their
+        # explicit ``checked_at`` value remains the sample identity.
+        failure_cycle = self.last_cycle_started_at or checked_at
+        if failure_cycle != self._market_data_queue_last_failure_cycle_started_at:
+            self._market_data_queue_failure_streak += 1
+            self._market_data_queue_last_failure_cycle_started_at = failure_cycle
+        return (
+            self._market_data_queue_failure_streak
+            < self._QUEUE_DRAIN_FAILURE_CONFIRMATIONS
         )
 
     def _execute_reconciliation_commands(

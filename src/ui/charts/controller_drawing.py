@@ -7,7 +7,6 @@ import json
 from typing import Any, List
 from zoneinfo import ZoneInfo
 
-from PyQt5.QtCore import QTimer
 from PyQt5.QtWidgets import QMessageBox
 
 try:
@@ -236,7 +235,6 @@ class ChartsDrawingMixin:
             or self.tabs.currentWidget() is not self.tradingview_widget
         ):
             return
-        symbol = self._active_chart_symbol()
         active_views = self._active_chart_command_views()
         web_views = [
             view
@@ -255,24 +253,7 @@ class ChartsDrawingMixin:
         self._set_button_state(
             getattr(self, "tradingview_line_tool_button", None), f"Line Tool ({d_key})"
         )
-        if symbol:
-            QTimer.singleShot(
-                150,
-                lambda symbol=symbol: self._sync_tradingview_drawings_after_tool_close(
-                    symbol
-                ),
-            )
         self.append_log("TradingView line tool disabled.")
-
-    def _sync_tradingview_drawings_after_tool_close(self, symbol: str) -> None:
-        if (
-            not hasattr(self, "tabs")
-            or self.tabs.currentWidget() is not self.tradingview_widget
-        ):
-            return
-        active_symbol = self._active_chart_symbol()
-        if active_symbol and active_symbol == symbol.strip().upper():
-            self.load_tradingview_chart(force=True, skip_split_view=True)
 
     def enable_tradingview_line_tool_mode(self) -> None:
         if (
@@ -425,6 +406,91 @@ class ChartsDrawingMixin:
                     lambda result: None,
                 )
 
+    def _run_tradingview_split_javascript(
+        self, symbol: str, script: str, *, exclude_view: str = ""
+    ) -> None:
+        """Apply a lightweight state update to the visible 1D/1H pair."""
+        symbol = symbol.strip().upper()
+        if not symbol or QWebEngineView is None:
+            return
+        tabs = self.__dict__.get("tabs")
+        if (
+            tabs is None
+            or tabs.currentWidget() is not self.__dict__.get("tradingview_widget")
+        ):
+            return
+        symbol_combo = self.__dict__.get("tradingview_symbol_combo")
+        if (
+            symbol_combo is None
+            or symbol_combo.currentText().strip().upper() != symbol
+        ):
+            return
+        split_view = self.__dict__.get("tradingview_split_chart_view")
+        if split_view is None or not split_view.isVisible():
+            return
+
+        views = (
+            ("left", self.__dict__.get("tradingview_chart_view")),
+            ("right", split_view),
+        )
+        for view_key, view in views:
+            if view_key == exclude_view:
+                continue
+            if isinstance(view, QWebEngineView):
+                view.page().runJavaScript(script, lambda result: None)
+
+    def sync_tradingview_crosshair(
+        self,
+        symbol: str,
+        source_view: str,
+        x_ratio: float,
+        y_ratio: float,
+        visible: bool,
+    ) -> None:
+        """Mirror cursor position without coupling either chart's time range."""
+        source_view = str(source_view).strip().lower()
+        if source_view not in {"left", "right"}:
+            return
+        if visible:
+            try:
+                x_value = min(1.0, max(0.0, float(x_ratio)))
+                y_value = min(1.0, max(0.0, float(y_ratio)))
+            except (TypeError, ValueError):
+                return
+            script = (
+                "window.showSyncedCrosshair && "
+                f"window.showSyncedCrosshair({x_value!r}, {y_value!r});"
+            )
+        else:
+            script = "window.clearSyncedCrosshair && window.clearSyncedCrosshair();"
+        self._run_tradingview_split_javascript(
+            symbol, script, exclude_view=source_view
+        )
+
+    def _sync_tradingview_target_price(self, symbol: str, price: float | None) -> None:
+        price_json = "null" if price is None else json.dumps(float(price))
+        self._run_tradingview_split_javascript(
+            symbol,
+            "window.applySyncedTargetPrice && "
+            f"window.applySyncedTargetPrice({price_json});",
+        )
+
+    def _sync_tradingview_drawing(self, symbol: str, drawing: dict) -> None:
+        drawing_json = json.dumps(drawing, separators=(",", ":"))
+        self._run_tradingview_split_javascript(
+            symbol,
+            "window.upsertSyncedDrawing && "
+            f"window.upsertSyncedDrawing({drawing_json});",
+        )
+
+    def _remove_tradingview_drawing(self, symbol: str, drawing_id: str) -> None:
+        drawing_id_json = json.dumps(str(drawing_id))
+        self._run_tradingview_split_javascript(
+            symbol,
+            "window.removeSyncedDrawing && "
+            f"window.removeSyncedDrawing({drawing_id_json});",
+        )
+
     def set_chart_target_price(self, symbol: str, breakout_price: float) -> None:
         symbol = symbol.strip().upper()
         if not symbol or breakout_price <= 0:
@@ -435,6 +501,7 @@ class ChartsDrawingMixin:
             item = self.watchlist.add(symbol=symbol, name=symbol)
         item.breakout_price = round(float(breakout_price), 2)
         self.mark_watchlist_and_dashboard_dirty()
+        self._sync_tradingview_target_price(symbol, item.breakout_price)
         self._save_state()
         self._reset_chart_mode_buttons()
         self.refresh_other_chart_views_for_symbol(symbol)
@@ -480,6 +547,7 @@ class ChartsDrawingMixin:
 
         item.breakout_price = None
         self.mark_watchlist_and_dashboard_dirty()
+        self._sync_tradingview_target_price(symbol, None)
         self._save_state()
         self._reset_chart_mode_buttons()
         self.refresh_other_chart_views_for_symbol(symbol)
@@ -505,6 +573,7 @@ class ChartsDrawingMixin:
             return
 
         self.chart_drawings.setdefault(symbol, []).append(clean_drawing)
+        self._sync_tradingview_drawing(symbol, clean_drawing)
         self._save_state()
         if not self._is_active_tradingview_line_tool_symbol(symbol):
             self._reset_chart_mode_buttons()
@@ -534,6 +603,7 @@ class ChartsDrawingMixin:
             if str(existing.get("id")) == drawing_id:
                 drawings[index] = clean_drawing
                 self.chart_drawings[symbol] = drawings
+                self._sync_tradingview_drawing(symbol, clean_drawing)
                 self._save_state()
                 if not self._is_active_tradingview_line_tool_symbol(symbol):
                     self.refresh_other_chart_views_for_symbol(symbol)
@@ -553,6 +623,7 @@ class ChartsDrawingMixin:
             self.chart_drawings[symbol] = remaining
         else:
             self.chart_drawings.pop(symbol, None)
+        self._remove_tradingview_drawing(symbol, drawing_id)
         self._save_state()
         if not self._is_active_tradingview_line_tool_symbol(symbol):
             self._reset_chart_mode_buttons()

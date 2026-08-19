@@ -40,6 +40,19 @@ class ChartBridge(QObject):
     def clearChartDrawings(self, symbol: str) -> None:
         self.window.clear_chart_drawings(symbol)
 
+    @pyqtSlot(str, str, float, float, bool)
+    def syncChartCrosshair(
+        self,
+        symbol: str,
+        source_view: str,
+        x_ratio: float,
+        y_ratio: float,
+        visible: bool,
+    ) -> None:
+        self.window.sync_tradingview_crosshair(
+            symbol, source_view, x_ratio, y_ratio, visible
+        )
+
     @pyqtSlot(str, int, int)
     def updateChartWindow(self, symbol: str, visible_bars: int, visible_end: int) -> None:
         self.window.update_chart_window(symbol, visible_bars, visible_end)
