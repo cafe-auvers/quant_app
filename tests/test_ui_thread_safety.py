@@ -36,6 +36,37 @@ def test_windows_qt_rendering_defaults_are_safe_and_overridable(monkeypatch):
     assert os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] == "--use-angle=gl"
 
 
+def test_windows_software_renderer_sets_qt_attribute_before_app(monkeypatch):
+    import main
+
+    calls = []
+
+    class FakeCoreApplication:
+        @staticmethod
+        def setAttribute(attribute, enabled):
+            calls.append((attribute, enabled))
+
+    class FakeQt:
+        AA_UseSoftwareOpenGL = object()
+
+    monkeypatch.setenv("QT_OPENGL", "software")
+    main._configure_qt_application_attributes(
+        FakeCoreApplication, FakeQt, platform="win32"
+    )
+    assert calls == [(FakeQt.AA_UseSoftwareOpenGL, True)]
+
+
+def test_qt_gl_fallback_noise_is_only_hidden_in_software_mode(monkeypatch):
+    import main
+
+    message = "ARB::createContext: Unable to create a GL Context"
+    monkeypatch.setenv("QT_OPENGL", "software")
+    assert main._should_suppress_qt_message(message) is True
+
+    monkeypatch.setenv("QT_OPENGL", "desktop")
+    assert main._should_suppress_qt_message(message) is False
+
+
 class _RecordingScrollBar:
     def __init__(self):
         self.value = 0

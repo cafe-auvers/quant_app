@@ -11,6 +11,7 @@ the method under test.
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import os
 import threading
 from types import SimpleNamespace
@@ -905,6 +906,32 @@ def test_action_readiness_uses_exact_symbol_not_another_quiet_symbol(tmp_path):
     assert action_readiness.critical_quote_subscriptions_acked is True
     assert action_readiness.critical_quotes_fresh is True
     assert stale_symbol_readiness.critical_quotes_fresh is False
+
+
+def test_database_probe_logs_one_concise_warning_for_an_outage(
+    tmp_path, caplog
+):
+    worker, _ = _worker(tmp_path)
+
+    class UnavailableEngine:
+        @staticmethod
+        def begin():
+            raise RuntimeError("database timed out")
+
+    worker._db_engine = UnavailableEngine()
+    caplog.set_level(logging.DEBUG, logger="src.ui.buyboard.runtime_worker")
+
+    assert worker._probe_database_writable() is False
+    assert worker._probe_database_writable() is False
+
+    warnings = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+        and "database is unavailable" in record.message
+    ]
+    assert len(warnings) == 1
+    assert all(record.exc_info is None for record in warnings)
 
 
 @pytest.mark.parametrize(

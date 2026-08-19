@@ -1830,7 +1830,7 @@ def run_account_reconciliation_pass(
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     persist: bool = True,
 ) -> AccountReconciliationResult:
-    """Fetch once, reduce once, and optionally persist one account pass."""
+    """Fetch broker truth once and retry one local optimistic-write race."""
     snapshot = fetch_account_broker_snapshot(
         broker=broker,
         environment=environment,
@@ -1840,13 +1840,55 @@ def run_account_reconciliation_pass(
         position_snapshot=position_snapshot,
         clock=clock,
     )
-    local_state = load_account_local_state(
-        engine,
-        environment=environment,
-        account_no=account_no,
-        cards=cards,
+    attempt_cards = cards
+    for attempt in range(2):
+        local_state = load_account_local_state(
+            engine,
+            environment=environment,
+            account_no=account_no,
+            cards=attempt_cards,
+        )
+        plan = reduce_account_reconciliation(snapshot, local_state)
+        if not persist:
+            return AccountReconciliationResult(snapshot=snapshot, plan=plan)
+        try:
+            apply_reconciliation_plan(engine, plan)
+        except _reconciliation_version_conflict_types():
+            if attempt:
+                raise
+            from src.services import trade_card_repository
+
+            logger.info(
+                "Account %s local state changed during reconciliation; "
+                "reloading and retrying once",
+                account_no,
+            )
+            attempt_cards = trade_card_repository.list_trade_cards(
+                engine,
+                environment=environment,
+                account_no=account_no,
+            )
+            continue
+        return AccountReconciliationResult(snapshot=snapshot, plan=plan)
+    raise AssertionError("unreachable reconciliation retry state")
+
+
+def _reconciliation_version_conflict_types() -> tuple[type[RuntimeError], ...]:
+    """Import repository conflicts lazily to keep service dependencies acyclic."""
+    from src.services.capital_reservation_repository import (
+        CapitalReservationVersionConflictError,
     )
-    plan = reduce_account_reconciliation(snapshot, local_state)
-    if persist:
-        apply_reconciliation_plan(engine, plan)
-    return AccountReconciliationResult(snapshot=snapshot, plan=plan)
+    from src.services.discovered_external_order_repository import (
+        ExternalOrderVersionConflictError,
+    )
+    from src.services.execution_order_repository import (
+        ExecutionOrderVersionConflictError,
+    )
+    from src.services.trade_card_repository import TradeCardVersionConflictError
+
+    return (
+        TradeCardVersionConflictError,
+        ExecutionOrderVersionConflictError,
+        CapitalReservationVersionConflictError,
+        ExternalOrderVersionConflictError,
+    )

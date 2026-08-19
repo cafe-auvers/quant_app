@@ -2978,6 +2978,8 @@ class MainWindow(
             self.__dict__.get("local_mirror_sync_timer"),
             self.__dict__.get("market_status_timer"),
             self.__dict__.get("buyboard_readiness_progress_timer"),
+            self.__dict__.get("_buyboard_projection_timer"),
+            self.__dict__.get("_buyboard_live_metric_timer"),
             self.__dict__.get("_refresh_poll_timer"),
         ]
         timer_states = []

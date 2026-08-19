@@ -37,6 +37,16 @@ def _configure_qt_rendering_environment(platform: str | None = None) -> None:
     os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu")
 
 
+def _configure_qt_application_attributes(
+    qcore_application, qt_namespace, platform: str | None = None
+) -> None:
+    """Select Qt's software OpenGL implementation before QApplication exists."""
+    if (platform or sys.platform) != "win32":
+        return
+    if os.environ.get("QT_OPENGL", "").strip().lower() == "software":
+        qcore_application.setAttribute(qt_namespace.AA_UseSoftwareOpenGL, True)
+
+
 # Load operational configuration before importing any application module that
 # snapshots environment-backed settings at module import time.
 _load_repository_environment()
@@ -47,12 +57,29 @@ from src.utils.logging_config import configure_logging
 logger = logging.getLogger(__name__)
 
 
-def _qt_message_handler(mode, context, message):
-    """Suppress one known Qt MIME warning while preserving other Qt output."""
+def _should_suppress_qt_message(message: str) -> bool:
+    """Return whether a Qt diagnostic is an expected, handled fallback."""
     if (
         "QMimeDatabase: Error loading internal MIME data" in message
         or "Premature end of document" in message
     ):
+        return True
+    if os.environ.get("QT_OPENGL", "").strip().lower() == "software":
+        return any(
+            fragment in message
+            for fragment in (
+                "ARB::createContext:",
+                "GDI::createContext:",
+                "Unable to create a GL Context",
+                "composeAndFlush: makeCurrent() failed",
+            )
+        )
+    return False
+
+
+def _qt_message_handler(mode, context, message):
+    """Suppress handled Qt fallbacks while preserving actionable output."""
+    if _should_suppress_qt_message(message):
         return
     sys.stderr.write(f"{message}\n")
 
@@ -80,7 +107,7 @@ def _install_global_excepthook():
 
 def main():
     """Initialize and run the application."""
-    from PyQt5.QtCore import qInstallMessageHandler
+    from PyQt5.QtCore import QCoreApplication, Qt, qInstallMessageHandler
     from PyQt5.QtWidgets import QApplication
 
     configure_logging()
@@ -90,6 +117,7 @@ def main():
         logger.warning("Native Python fault tracing could not be enabled.")
     _install_global_excepthook()
     qInstallMessageHandler(_qt_message_handler)
+    _configure_qt_application_attributes(QCoreApplication, Qt)
     from src.ui.main_window import MainWindow
 
     app = QApplication(sys.argv)

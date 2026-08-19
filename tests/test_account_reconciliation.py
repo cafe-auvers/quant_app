@@ -50,6 +50,7 @@ from src.services.account_reconciliation import (
     reduce_account_reconciliation,
     run_account_reconciliation_pass,
 )
+from src.services import account_reconciliation as reconciliation_module
 
 
 NOW = datetime(2026, 8, 15, 14, 0, tzinfo=timezone.utc)
@@ -186,6 +187,54 @@ def test_one_snapshot_is_fetched_and_reused_across_every_card_in_an_account():
     assert broker.positions_calls == 1
     assert broker.discovery_calls == 1
     assert {card.symbol for card in result.plan.card_updates} == {"AAPL", "MSFT"}
+
+
+def test_account_pass_retries_one_local_version_race_without_refetching_broker(
+    monkeypatch,
+):
+    from src.services.execution_order_repository import (
+        ExecutionOrderVersionConflictError,
+    )
+
+    class Broker:
+        positions_calls = 0
+        discovery_calls = 0
+
+        def get_positions(self, **kwargs):
+            self.positions_calls += 1
+            return {"overseas": {"holdings": []}}
+
+        def discover_orders(self, **kwargs):
+            self.discovery_calls += 1
+            return BrokerOrderDiscoveryResult(
+                open_orders_complete=True,
+                history_complete=True,
+                reserved_orders_complete=True,
+            )
+
+    attempts = []
+
+    def flaky_apply(engine, plan):
+        attempts.append(plan)
+        if len(attempts) == 1:
+            raise ExecutionOrderVersionConflictError("injected race")
+
+    monkeypatch.setattr(reconciliation_module, "apply_reconciliation_plan", flaky_apply)
+    broker = Broker()
+    result = run_account_reconciliation_pass(
+        broker=broker,
+        engine=create_engine("sqlite://", future=True),
+        environment="PROD",
+        account_no="1",
+        cards=(),
+        account_balance_provider=lambda *_: 100_000,
+        clock=lambda: NOW,
+    )
+
+    assert len(attempts) == 2
+    assert broker.positions_calls == 1
+    assert broker.discovery_calls == 1
+    assert result.snapshot.snapshot_id
 
 
 def test_incomplete_reserved_orders_does_not_block_an_emergency_sell_all():

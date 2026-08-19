@@ -441,6 +441,11 @@ def update_execution_order(
             f"client_order_id={record.client_order_id!r}: environment/account_no/symbol "
             "must not change after creation"
         )
+    if int(current.version) != int(expected_version):
+        raise ExecutionOrderVersionConflictError(
+            f"client_order_id={record.client_order_id!r} version conflict "
+            f"(expected {expected_version}, stored {current.version})"
+        )
 
     _check_broker_identity_conflict(conn, record)
     next_version = int(expected_version) + 1
@@ -477,7 +482,7 @@ def update_execution_order(
     if result.rowcount == 0:
         raise ExecutionOrderVersionConflictError(
             f"client_order_id={record.client_order_id!r} version conflict "
-            f"(expected {expected_version}, stored {current.version})"
+            f"(row changed concurrently after version {expected_version} was read)"
         )
     record.version = next_version
     return record

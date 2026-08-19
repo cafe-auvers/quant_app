@@ -337,45 +337,46 @@ def _partition_fingerprints(
             if cancellation_callback is not None and cancellation_callback():
                 raise InterruptedError("Local mirror synchronization was cancelled.")
             result = streaming_conn.execute(stmt)
-            for row_index, row in enumerate(result):
-                if (
-                    row_index % 1000 == 0
-                    and cancellation_callback is not None
-                    and cancellation_callback()
-                ):
-                    result.close()
-                    raise InterruptedError(
-                        "Local mirror synchronization was cancelled."
+            try:
+                for row_index, row in enumerate(result):
+                    if (
+                        row_index % 1000 == 0
+                        and cancellation_callback is not None
+                        and cancellation_callback()
+                    ):
+                        raise InterruptedError(
+                            "Local mirror synchronization was cancelled."
+                        )
+                    values = list(row)
+                    raw_partition = tuple(
+                        values[value_indexes[name]] for name in spec.partition_columns
                     )
-                values = list(row)
-                raw_partition = tuple(
-                    values[value_indexes[name]] for name in spec.partition_columns
-                )
-                normalized_partition = tuple(
-                    (
-                        _normalized_watermark(value).isoformat(timespec="microseconds")
-                        if isinstance(value, (dt.datetime, pd.Timestamp))
-                        else value
+                    normalized_partition = tuple(
+                        (
+                            _normalized_watermark(value).isoformat(timespec="microseconds")
+                            if isinstance(value, (dt.datetime, pd.Timestamp))
+                            else value
+                        )
+                        for value in raw_partition
                     )
-                    for value in raw_partition
-                )
-                state = states.get(normalized_partition)
-                if state is None:
-                    state = (raw_partition, 0, hashlib.sha256())
-                raw_key, row_count, digest = state
-                # MySQL reflects BOOLEAN as TINYINT(1), whereas SQLite reflects
-                # it as Boolean.  Normalize known semantic boolean columns so the
-                # same row hashes identically across both dialects.
-                for index in boolean_indexes:
-                    if values[index] is not None:
-                        values[index] = bool(values[index])
-                payload = repr(tuple(values)).encode("utf-8")
-                digest.update(len(payload).to_bytes(4, "big"))
-                digest.update(payload)
-                states[normalized_partition] = (raw_key, row_count + 1, digest)
-                rows_processed += 1
-                if row_progress_callback is not None and rows_processed % 5000 == 0:
-                    row_progress_callback(rows_processed)
+                    state = states.get(normalized_partition)
+                    if state is None:
+                        state = (raw_partition, 0, hashlib.sha256())
+                    raw_key, row_count, digest = state
+                    # MySQL reflects BOOLEAN as TINYINT(1), whereas SQLite reflects
+                    # it as Boolean. Normalize semantic boolean columns for parity.
+                    for index in boolean_indexes:
+                        if values[index] is not None:
+                            values[index] = bool(values[index])
+                    payload = repr(tuple(values)).encode("utf-8")
+                    digest.update(len(payload).to_bytes(4, "big"))
+                    digest.update(payload)
+                    states[normalized_partition] = (raw_key, row_count + 1, digest)
+                    rows_processed += 1
+                    if row_progress_callback is not None and rows_processed % 5000 == 0:
+                        row_progress_callback(rows_processed)
+            finally:
+                result.close()
 
     if connection is not None:
         consume(connection)
@@ -666,34 +667,35 @@ def _copy_scoped_changed_rows_to_local(
             if symbol_chunk is not None:
                 stmt = stmt.where(pc_table.c.symbol.in_(symbol_chunk))
             result = streaming_conn.execute(stmt)
-            while True:
-                if cancellation_callback is not None and cancellation_callback():
-                    result.close()
-                    raise InterruptedError(
-                        "Local mirror synchronization was cancelled."
+            try:
+                while True:
+                    if cancellation_callback is not None and cancellation_callback():
+                        raise InterruptedError(
+                            "Local mirror synchronization was cancelled."
+                        )
+                    batch = result.fetchmany(1000)
+                    if not batch:
+                        break
+                    records = [
+                        {
+                            name: value
+                            for name, value in dict(row._mapping).items()
+                            if name in local_table.columns
+                        }
+                        for row in batch
+                    ]
+                    _execute_bulk_upsert(
+                        local_conn,
+                        local_table,
+                        records,
+                        spec.primary_key,
+                        local_engine.dialect.name,
                     )
-                batch = result.fetchmany(1000)
-                if not batch:
-                    break
-                records = [
-                    {
-                        name: value
-                        for name, value in dict(row._mapping).items()
-                        if name in local_table.columns
-                    }
-                    for row in batch
-                ]
-                _execute_bulk_upsert(
-                    local_conn,
-                    local_table,
-                    records,
-                    spec.primary_key,
-                    local_engine.dialect.name,
-                )
-                rows_written += len(records)
-                if row_progress_callback is not None:
-                    row_progress_callback(rows_written)
-            result.close()
+                    rows_written += len(records)
+                    if row_progress_callback is not None:
+                        row_progress_callback(rows_written)
+            finally:
+                result.close()
     if row_progress_callback is not None:
         row_progress_callback(rows_written)
     return rows_written
@@ -768,16 +770,20 @@ def _fetch_partition_rows(
     ] = {}
     ordered_names = tuple(sorted(table.columns.keys()))
     def consume(conn) -> None:
-        for row in conn.execution_options(stream_results=True).execute(stmt):
-            record = dict(row._mapping)
-            primary_key = _normalized_reconcile_key(
-                table, spec.primary_key, record
-            )
-            normalized_row = tuple(
-                _normalize_reconcile_value(table.c[name], record.get(name))
-                for name in ordered_names
-            )
-            rows[primary_key] = (record, normalized_row)
+        result = conn.execution_options(stream_results=True).execute(stmt)
+        try:
+            for row in result:
+                record = dict(row._mapping)
+                primary_key = _normalized_reconcile_key(
+                    table, spec.primary_key, record
+                )
+                normalized_row = tuple(
+                    _normalize_reconcile_value(table.c[name], record.get(name))
+                    for name in ordered_names
+                )
+                rows[primary_key] = (record, normalized_row)
+        finally:
+            result.close()
 
     if connection is not None:
         consume(connection)
@@ -1010,15 +1016,18 @@ def sync_mirror_table(
     with pc_engine.connect() as pc_conn:
         pc_conn = pc_conn.execution_options(stream_results=True)
         result = pc_conn.execute(stmt)
-        while True:
-            batch = result.fetchmany(fetch_size)
-            if not batch:
-                break
-            records = [dict(row._mapping) for row in batch]
-            with local_engine.begin() as local_conn:
-                rows_written += _execute_bulk_upsert(
-                    local_conn, local_table, records, pk_columns, "sqlite"
-                )
+        try:
+            while True:
+                batch = result.fetchmany(fetch_size)
+                if not batch:
+                    break
+                records = [dict(row._mapping) for row in batch]
+                with local_engine.begin() as local_conn:
+                    rows_written += _execute_bulk_upsert(
+                        local_conn, local_table, records, pk_columns, "sqlite"
+                    )
+        finally:
+            result.close()
     return rows_written
 
 

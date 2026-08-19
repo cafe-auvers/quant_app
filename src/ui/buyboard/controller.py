@@ -422,6 +422,8 @@ class BuyboardMixin:
 
     _BUYBOARD_PROJECTION_REFRESH_MS = 3000
     _BUYBOARD_LIVE_METRIC_REFRESH_MS = 750
+    _BUYBOARD_SLOW_RENDER_WARNING_MS = 1000.0
+    _BUYBOARD_SLOW_RENDER_WARNING_INTERVAL_SECONDS = 60.0
 
     def _buyboard_engine(self):
         return self.__dict__.get("pc_db_engine")
@@ -571,6 +573,8 @@ class BuyboardMixin:
     def refresh_buyboard(self) -> None:
         from .board import populate_buyboard_columns
 
+        if bool(self.__dict__.get("_database_shutting_down", False)):
+            return
         if int(self.__dict__.get("_buyboard_interaction_depth", 0) or 0) > 0:
             self._buyboard_refresh_pending = True
             return
@@ -615,13 +619,28 @@ class BuyboardMixin:
         started_at = time.perf_counter()
         populate_buyboard_columns(self, projections)
         render_ms = (time.perf_counter() - started_at) * 1000.0
-        log = logger.warning if render_ms > 50.0 else logger.debug
-        log(
-            "Buy Board projection generation=%d rendered in %.1f ms%s",
-            generation,
-            render_ms,
-            " (event-loop target exceeded)" if render_ms > 50.0 else "",
+        now = time.monotonic()
+        last_warning_at = float(
+            self.__dict__.get("_buyboard_last_slow_render_warning_at", 0.0) or 0.0
         )
+        warning_due = (
+            render_ms >= self._BUYBOARD_SLOW_RENDER_WARNING_MS
+            and now - last_warning_at
+            >= self._BUYBOARD_SLOW_RENDER_WARNING_INTERVAL_SECONDS
+        )
+        if warning_due:
+            self._buyboard_last_slow_render_warning_at = now
+            logger.warning(
+                "Buy Board projection generation=%d had a slow UI render (%.1f ms)",
+                generation,
+                render_ms,
+            )
+        else:
+            logger.debug(
+                "Buy Board projection generation=%d rendered in %.1f ms",
+                generation,
+                render_ms,
+            )
 
     def _on_buyboard_projection_worker_finished(self) -> None:
         """Launch one coalesced refresh requested while a read was running."""
