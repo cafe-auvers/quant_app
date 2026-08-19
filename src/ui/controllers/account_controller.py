@@ -184,6 +184,33 @@ class AccountController(WindowController):
 
             holding = holdings_by_key.get((environment, account_no, symbol))
             if holding is None:
+                account_was_fetched = account_no in snapshot_accounts_by_environment.get(
+                    environment, set()
+                )
+                old_shares = max(0, int(getattr(item, "shares_held", 0) or 0))
+                old_status = str(getattr(item, "monitoring_status", "") or "")
+                position_statuses = {
+                    "BOUGHT",
+                    "BUY_PARTIAL",
+                    "FILLED",
+                    "SELL_SUBMITTED",
+                    "PARTIAL_EXIT_SUBMITTED",
+                    "PARTIAL_EXIT_RESERVED",
+                    "SELL_RESERVED",
+                }
+                if (
+                    account_was_fetched
+                    and (old_shares > 0 or old_status.upper() in position_statuses)
+                ):
+                    item.shares_held = 0
+                    item.position_percent = 0.0
+                    item.monitoring_status = "SOLD"
+                    item._buy_order_pending = False
+                    changed += 1
+                    self.append_log(
+                        f"[Buylist/{environment}] KIS confirms {symbol} is flat in "
+                        f"account {account_no}; cleared stale {old_shares}-share position."
+                    )
                 continue
 
             account_quantity, average_price = holding

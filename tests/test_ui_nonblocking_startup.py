@@ -1,16 +1,32 @@
 from types import SimpleNamespace
+from datetime import datetime, timezone
 import threading
 import time
 
+import pandas as pd
 from PyQt5.QtCore import QCoreApplication
 
 from src.core.board_workflow import (
     BoardActionContext,
+    BoardCardProjection,
     BoardProjectionContext,
     MoveToBuylist,
 )
+from src.core.execution_queue import (
+    ExecutionQueueItem,
+    OrbCandidate,
+    OrbCandidateStatus,
+)
+from src.core.trade_card_state import (
+    BoardStatus,
+    EntryRuntimeStatus,
+    PositionRuntimeStatus,
+    TradeCardState,
+)
+from src.services import trade_card_repository as trade_card_repo
 from src.ui.buyboard import board as buyboard_board
 from src.ui.buyboard import controller as buyboard_controller
+from src.ui.charts.controller_data_flow import ChartsDataFlowMixin
 from src.ui.mixins.dashboard_mixin import DashboardMixin
 
 
@@ -174,6 +190,192 @@ def test_refresh_buyboard_starts_worker_without_running_db_read_on_gui_thread(
     assert worker.started is True
     assert window.tracked == [("_buyboard_projection_worker", worker)]
     assert populated == []
+
+
+def test_database_outage_renders_local_snapshot_read_only_instead_of_emptying_board(
+    monkeypatch, tmp_path
+):
+    snapshot_path = tmp_path / "trade_cards.json"
+    monkeypatch.setattr(
+        trade_card_repo, "LOCAL_TRADE_CARDS_FILE", snapshot_path
+    )
+    trade_card_repo.save_local_trade_cards_snapshot(
+        [
+            TradeCardState(
+                environment="PROD",
+                account_no="1",
+                symbol="MAX",
+                board_status=BoardStatus.BUY_TODAY,
+            )
+        ],
+        path=snapshot_path,
+    )
+    candidate = OrbCandidate(
+        symbol="MAX",
+        window="30m",
+        breakout_price=13.28,
+        current_price=13.46,
+        status=OrbCandidateStatus.WAITING_BREAKOUT,
+    )
+    queue_item = ExecutionQueueItem(
+        symbol="MAX",
+        breakout_price=13.28,
+        current_price=13.46,
+        candidates={"30m": candidate},
+        last_updated=datetime.now(timezone.utc),
+    )
+    window = _ProjectionWindow(None)
+    window._buyboard_configured_accounts = (("PROD", "1"),)
+    window.execution_queue_manager = SimpleNamespace(
+        get_item=lambda symbol, environment: queue_item
+    )
+    populated = []
+    monkeypatch.setattr(
+        buyboard_board,
+        "populate_buyboard_columns",
+        lambda _window, values: populated.append(tuple(values)),
+    )
+
+    buyboard_controller.BuyboardMixin.refresh_buyboard(window)
+
+    assert len(populated) == 1
+    assert len(populated[0]) == 1
+    projection = populated[0][0]
+    assert isinstance(projection, BoardCardProjection)
+    assert projection.card.symbol == "MAX"
+    assert projection.card.breakout_price == 13.28
+    assert projection.card.market_data_last_trusted_price == 13.46
+    assert projection.card.entry_runtime_status == EntryRuntimeStatus.WAITING_BREAKOUT
+    assert projection.reconciliation_blocked is True
+    assert "last local snapshot" in projection.engine_restrictions[0]
+    assert window._buyboard_recovery_snapshot_active is True
+
+
+def test_database_outage_retains_last_in_memory_board_before_using_disk_snapshot(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        trade_card_repo,
+        "LOCAL_TRADE_CARDS_FILE",
+        tmp_path / "missing-trade-cards.json",
+    )
+    card = TradeCardState(
+        environment="PROD",
+        account_no="1",
+        symbol="WEX",
+        board_status=BoardStatus.BUY_TODAY,
+        breakout_price=191.39,
+    )
+    window = _ProjectionWindow(None)
+    window._buyboard_configured_accounts = (("PROD", "1"),)
+    window._buyboard_current_projections = (BoardCardProjection(card=card),)
+    populated = []
+    monkeypatch.setattr(
+        buyboard_board,
+        "populate_buyboard_columns",
+        lambda _window, values: populated.append(tuple(values)),
+    )
+
+    buyboard_controller.BuyboardMixin.refresh_buyboard(window)
+
+    assert populated[0][0].card.symbol == "WEX"
+    assert populated[0][0].card.breakout_price == 191.39
+    assert populated[0][0].reconciliation_blocked is True
+
+
+def test_buy_today_orb_symbols_fall_back_to_local_snapshot(monkeypatch, tmp_path):
+    snapshot_path = tmp_path / "trade_cards.json"
+    monkeypatch.setattr(
+        trade_card_repo, "LOCAL_TRADE_CARDS_FILE", snapshot_path
+    )
+    trade_card_repo.save_local_trade_cards_snapshot(
+        [
+            TradeCardState(
+                environment="PROD",
+                account_no="1",
+                symbol="WEX",
+                board_status=BoardStatus.BUY_TODAY,
+            ),
+            TradeCardState(
+                environment="PROD",
+                account_no="1",
+                symbol="MAX",
+                board_status=BoardStatus.BUYLIST,
+            ),
+        ],
+        path=snapshot_path,
+    )
+    window = buyboard_controller.BuyboardMixin()
+    window._buyboard_current_projections = ()
+    window._buyboard_configured_accounts = (("PROD", "1"),)
+
+    assert window._buy_today_orb_symbols() == ["WEX"]
+
+
+def test_recovery_projection_uses_fresh_kis_snapshot_to_close_stale_position():
+    card = TradeCardState(
+        environment="PROD",
+        account_no="1",
+        symbol="STIM",
+        board_status=BoardStatus.OPEN_POSITION,
+        broker_quantity=401,
+        orderable_quantity=401,
+        position_runtime_status=PositionRuntimeStatus.OPEN,
+    )
+    window = buyboard_controller.BuyboardMixin()
+    window._buyboard_recovery_source_cards = (card,)
+    window._buyboard_configured_accounts = (("PROD", "1"),)
+    window.kis_account_snapshots = {
+        ("PROD", "1"): {
+            "domestic": {"holdings": []},
+            "overseas": {"holdings": []},
+        }
+    }
+    window.kis_account_snapshot_fetched_at = {
+        ("PROD", "1"): datetime.now(timezone.utc)
+    }
+
+    projection = window._buyboard_recovery_projections()[0]
+
+    assert projection.card.board_status == BoardStatus.CLOSED
+    assert projection.card.broker_quantity == 0
+    assert projection.card.position_runtime_status == PositionRuntimeStatus.CLOSED
+
+
+def test_recovery_projection_promotes_buy_today_when_kis_confirms_holding():
+    card = TradeCardState(
+        environment="PROD",
+        account_no="1",
+        symbol="WEX",
+        board_status=BoardStatus.BUY_TODAY,
+    )
+    window = buyboard_controller.BuyboardMixin()
+    window._buyboard_recovery_source_cards = (card,)
+    window._buyboard_configured_accounts = (("PROD", "1"),)
+    window.kis_account_snapshots = {
+        ("PROD", "1"): {
+            "overseas": {
+                "holdings": [
+                    {
+                        "symbol": "WEX",
+                        "quantity": 7,
+                        "orderable_quantity": 6,
+                        "average_price": 193.25,
+                    }
+                ]
+            }
+        }
+    }
+    window.kis_account_snapshot_fetched_at = {
+        ("PROD", "1"): datetime.now(timezone.utc)
+    }
+
+    projection = window._buyboard_recovery_projections()[0]
+
+    assert projection.card.board_status == BoardStatus.OPEN_POSITION
+    assert projection.card.broker_quantity == 7
+    assert projection.card.orderable_quantity == 6
+    assert projection.card.average_entry_price == 193.25
 
 
 def test_busy_buyboard_projection_is_coalesced_without_invalidating_its_result():
@@ -394,3 +596,116 @@ def test_buyboard_live_metric_refresh_pauses_during_drag(monkeypatch):
     window._buyboard_interaction_depth = 0
     buyboard_controller.BuyboardMixin._refresh_buyboard_live_metrics(window)
     assert calls == ["refresh"]
+
+
+def test_buyboard_orb_refresh_targets_only_buy_today_and_is_independent_of_readiness(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        buyboard_controller, "is_buyboard_engine_enabled", lambda: True
+    )
+    monkeypatch.setattr(
+        buyboard_controller, "is_regular_session_open", lambda: True
+    )
+    requests = []
+
+    class _Window:
+        _BUYBOARD_ORB_DATA_REFRESH_MS = 60_000
+        _buyboard_projection_values = (
+            buyboard_controller.BuyboardMixin._buyboard_projection_values
+        )
+        _buy_today_orb_symbols = (
+            buyboard_controller.BuyboardMixin._buy_today_orb_symbols
+        )
+        _buyboard_monitored_symbols = (
+            buyboard_controller.BuyboardMixin._buyboard_monitored_symbols
+        )
+
+        def __init__(self):
+            self._buyboard_current_projections = (
+                TradeCardState(
+                    environment="PROD",
+                    account_no="1",
+                    symbol="WEX",
+                    board_status=BoardStatus.BUY_TODAY,
+                ),
+                TradeCardState(
+                    environment="PROD",
+                    account_no="1",
+                    symbol="MAX",
+                    board_status=BoardStatus.BUYLIST,
+                ),
+                TradeCardState(
+                    environment="PROD",
+                    account_no="1",
+                    symbol="STIM",
+                    board_status=BoardStatus.OPEN_POSITION,
+                ),
+            )
+
+        def refresh_watchlist_intraday_cache(self, **kwargs):
+            requests.append(kwargs)
+
+    window = _Window()
+    buyboard_controller.BuyboardMixin._refresh_buyboard_orb_data(window)
+
+    assert requests == [
+        {
+            "show_messages": False,
+            "triggered_by_live": True,
+            "source": "Buy Today ORB",
+            "symbols": ["WEX", "STIM"],
+            "purpose": "buyboard_orb",
+        }
+    ]
+
+
+def test_buyboard_orb_completion_refreshes_only_successful_kis_symbols():
+    queue_refreshes = []
+
+    class _Control:
+        def setEnabled(self, _enabled):
+            pass
+
+        def setText(self, _text):
+            pass
+
+    window = SimpleNamespace(
+        intraday_bulk_purpose="buyboard_orb",
+        _buyboard_orb_refresh_symbols=("WEX", "MAX"),
+        refresh_intraday_button=_Control(),
+        progress_label=_Control(),
+        append_log=lambda _message: None,
+        latest_intraday_prices={},
+        _load_cached_intraday_interval=lambda symbol, interval, window_days: (
+            pd.DataFrame(
+                {"Close": [195.2]},
+                index=pd.to_datetime(["2026-08-19T19:59:00Z"]),
+            )
+            if symbol == "WEX"
+            else pd.DataFrame()
+        ),
+        _latest_intraday_session=lambda frame: frame,
+        refresh_execution_queue=lambda env, **kwargs: queue_refreshes.append(
+            (env, kwargs)
+        ),
+    )
+
+    ChartsDataFlowMixin._on_intraday_bulk_finished(
+        window,
+        updated=["WEX"],
+        failed=["MAX: KIS data unavailable"],
+    )
+
+    assert queue_refreshes == [
+        (
+            "PROD",
+            {
+                "show_log": False,
+                "symbols": ["WEX"],
+                "create_missing": False,
+            },
+        )
+    ]
+    assert window.intraday_bulk_purpose == "watchlist"
+    assert window.latest_intraday_prices == {"WEX": 195.2}

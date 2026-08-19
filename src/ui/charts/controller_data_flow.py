@@ -272,13 +272,19 @@ class ChartsDataFlowMixin:
         )
         buy_price: Optional[float] = None
         buy_stop_loss: Optional[float] = None
-        if buylist_item is not None:
-            raw_buy = (
-                buylist_item.avg_cost
-                if buylist_item.monitoring_status == "BOUGHT"
-                and buylist_item.avg_cost > 0
-                else buylist_item.entry_price
+        try:
+            owned_shares = (
+                max(0, int(getattr(buylist_item, "shares_held", 0) or 0))
+                if buylist_item is not None
+                else 0
             )
+        except (TypeError, ValueError):
+            owned_shares = 0
+        if buylist_item is not None and owned_shares > 0:
+            # Entry/stop fields also hold the ORB plan before a fill. Chart
+            # position lines must represent executions, so never fall back to
+            # the planned entry price when there is no broker-confirmed cost.
+            raw_buy = buylist_item.avg_cost
             buy_price = float(raw_buy) if raw_buy and float(raw_buy) > 0 else None
             raw_stop = buylist_item.stop_loss
             buy_stop_loss = (
@@ -663,8 +669,18 @@ class ChartsDataFlowMixin:
         show_messages: bool = True,
         triggered_by_live: bool = False,
         source: str = "",
+        symbols: Optional[List[str]] = None,
+        purpose: str = "watchlist",
     ) -> None:
-        symbols = [item.symbol for item in self.watchlist.items]
+        if symbols is None:
+            symbols = [item.symbol for item in self.watchlist.items]
+        symbols = list(
+            dict.fromkeys(
+                str(symbol or "").strip().upper()
+                for symbol in symbols
+                if str(symbol or "").strip()
+            )
+        )
         if not symbols:
             if show_messages:
                 QMessageBox.information(
@@ -704,7 +720,9 @@ class ChartsDataFlowMixin:
             return
 
         engine = self.db_engine
-        self.intraday_bulk_purpose = "watchlist"
+        self.intraday_bulk_purpose = str(purpose or "watchlist")
+        if self.intraday_bulk_purpose == "buyboard_orb":
+            self._buyboard_orb_refresh_symbols = tuple(symbols)
         if hasattr(self, "refresh_watchlist_orb_button"):
             self.refresh_watchlist_orb_button.setEnabled(False)
         self.refresh_intraday_button.setEnabled(False)
@@ -722,7 +740,9 @@ class ChartsDataFlowMixin:
             environment=profile.get("environment", "PROD"),
             account_no=profile.get("account_no", ""),
             exchange="NASD",
-            allow_fallback=True,
+            # A chart/watchlist may use a clearly labelled fallback. An
+            # executable Kanban ORB must be built from KIS data only.
+            allow_fallback=self.intraday_bulk_purpose != "buyboard_orb",
         )
         self.intraday_bulk_worker.progress.connect(self._on_intraday_bulk_progress)
         self.intraday_bulk_worker.provider_warning.connect(
@@ -736,7 +756,8 @@ class ChartsDataFlowMixin:
         self.progress_label.setText(f"Intraday {index}/{total}: {symbol}")
 
     def _on_intraday_bulk_finished(self, updated: list, failed: list) -> None:
-        if self.intraday_bulk_purpose == "scanner_orb":
+        purpose = str(getattr(self, "intraday_bulk_purpose", "watchlist") or "watchlist")
+        if purpose == "scanner_orb":
             self.intraday_bulk_purpose = "watchlist"
             self.append_log(
                 f"Scanner ORB phase intraday fetch complete: {len(updated)} updated, {len(failed)} failed."
@@ -762,16 +783,74 @@ class ChartsDataFlowMixin:
             self._refresh_orb_after_intraday_bulk = False
             self.refresh_all_watchlist_orb_statuses()
         if hasattr(self, "refresh_execution_queue"):
-            env = (
-                self.watchlist_env_combo.currentText()
-                if hasattr(self, "watchlist_env_combo")
-                else "PROD"
+            if purpose == "buyboard_orb":
+                env = "PROD"
+                requested_symbols = list(
+                    self.__dict__.pop("_buyboard_orb_refresh_symbols", ()) or ()
+                )
+                refreshed_symbols = {
+                    str(symbol or "").strip().upper() for symbol in updated
+                }
+                # Never stamp an old cached plan as freshly observed when its
+                # KIS fetch failed. Leaving that queue row untouched lets the
+                # ORB bridge surface DATA UNAVAILABLE instead of reusing it.
+                queue_symbols = [
+                    symbol
+                    for symbol in requested_symbols
+                    if symbol in refreshed_symbols
+                ]
+                # Position cards may not have an execution-queue row.  Cache
+                # their freshly fetched KIS close directly so Current/P&L and
+                # stop-distance display remain live in read-only recovery mode.
+                loader = getattr(self, "_load_cached_intraday_interval", None)
+                latest_prices = self.__dict__.setdefault(
+                    "latest_intraday_prices", {}
+                )
+                if callable(loader):
+                    for symbol in queue_symbols:
+                        current_price = 0.0
+                        for interval in ("1m", "5m"):
+                            try:
+                                frame = loader(symbol, interval, window_days=7)
+                                if frame is None or frame.empty or "Close" not in frame:
+                                    continue
+                                session_filter = getattr(
+                                    self, "_latest_intraday_session", None
+                                )
+                                if callable(session_filter):
+                                    frame = session_filter(frame)
+                                if frame is not None and not frame.empty:
+                                    current_price = float(
+                                        frame.sort_index()["Close"].dropna().iloc[-1]
+                                    )
+                            except Exception:
+                                continue
+                            if current_price > 0:
+                                break
+                        if current_price > 0:
+                            latest_prices[symbol] = current_price
+            else:
+                env = (
+                    self.watchlist_env_combo.currentText()
+                    if hasattr(self, "watchlist_env_combo")
+                    else "PROD"
+                )
+                queue_symbols = None
+            self.refresh_execution_queue(
+                env,
+                show_log=False,
+                symbols=queue_symbols,
+                create_missing=False,
             )
-            self.refresh_execution_queue(env, show_log=False)
             if hasattr(self, "_auto_replace_working_entry_queue_items"):
                 self._auto_replace_working_entry_queue_items(env)
             if hasattr(self, "_auto_submit_execute_ready_queue_items"):
                 self._auto_submit_execute_ready_queue_items(env)
+            if purpose == "buyboard_orb" and hasattr(
+                self, "_refresh_buyboard_live_metrics"
+            ):
+                self._refresh_buyboard_live_metrics()
+        self.intraday_bulk_purpose = "watchlist"
         if hasattr(self, "live_data_checkbox") and self.live_data_checkbox.isChecked():
             status = f"Live data: updated {len(updated)}, failed {len(failed)}"
             if not self._is_us_regular_market_open():

@@ -152,6 +152,23 @@ def test_buy_today_without_orb_shows_authoritative_risk_budget_only():
     assert "Stop P&L" not in rows
 
 
+def test_buy_today_metrics_fall_back_to_the_persisted_observed_price():
+    card = TradeCardState(
+        environment="PROD",
+        account_no="1",
+        symbol="NVDA",
+        board_status=BoardStatus.BUY_TODAY,
+        breakout_price=200.0,
+        market_data_last_trusted_price=198.0,
+    )
+
+    rows = dict(_card_metric_rows(card, None))
+
+    assert rows["Current"] == "$198.00"
+    assert rows["Breakout"] == "$200.00"
+    assert rows["To Breakout"] == "+1.01%"
+
+
 def test_buy_today_status_names_the_selected_orb_plan():
     card = TradeCardState(
         environment="PROD",

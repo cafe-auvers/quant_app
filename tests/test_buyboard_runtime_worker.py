@@ -1825,6 +1825,63 @@ def test_run_one_cycle_excludes_cards_from_accounts_with_startup_errors(tmp_path
     assert stored.entry_runtime_status == EntryRuntimeStatus.RETRY_COOLDOWN
 
 
+def test_run_one_cycle_refreshes_orb_observation_for_reconciliation_blocked_account(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(execution_config, "is_buyboard_engine_enabled", lambda: True)
+    import src.services.trading_engine as trading_engine_module
+
+    monkeypatch.setattr(
+        trading_engine_module, "is_buyboard_engine_enabled", lambda: True
+    )
+    candidate = OrbCandidate(
+        symbol="AAPL",
+        window="5m",
+        orb_low=95.0,
+        orb_high=101.0,
+        entry_trigger=101.5,
+        current_price=100.5,
+        shares=10,
+        status=OrbCandidateStatus.WAITING_BREAKOUT,
+    )
+    item = ExecutionQueueItem(
+        symbol="AAPL",
+        environment="PROD",
+        breakout_price=101.25,
+        current_price=100.5,
+        candidates={"5m": candidate},
+        selected_window="5m",
+    )
+    worker, engine = _worker(
+        tmp_path,
+        execution_queue_item_lookup=lambda symbol, env: item,
+    )
+    worker.runtime = _build_test_runtime(
+        buying_power_provider=worker._buying_power_provider,
+        card_lookup=worker._card_lookup,
+        broker=worker._broker,
+        market_data=_dummy_market_data(),
+    )
+    _seed_card(
+        engine,
+        board_status=BoardStatus.BUY_TODAY,
+        entry_runtime_status=EntryRuntimeStatus.ORB_FORMING,
+    )
+    worker.startup_reconciliation_errors = {"1": "simulated KIS outage"}
+    now = dt.datetime.now(dt.timezone.utc)
+    worker._account_balance_refreshed_at["1"] = now
+    worker._account_reconciled_at["1"] = now
+
+    worker._run_one_cycle()
+
+    stored = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert stored.entry_runtime_status == EntryRuntimeStatus.WAITING_BREAKOUT
+    assert stored.breakout_price == 101.25
+    assert stored.entry_trigger == 101.5
+    assert stored.planned_quantity == 10
+    assert stored.market_data_last_trusted_price == 100.5
+
+
 def test_periodic_reconciliation_success_clears_startup_reconciliation_error(tmp_path, monkeypatch):
     """Review finding P0: "no periodic recovery path that removes an
     account from startup_reconciliation_errors ... this can leave the
@@ -2376,13 +2433,15 @@ def test_one_cycle_persists_engine_changes(tmp_path, monkeypatch):
         broker=worker._broker,
         market_data=_dummy_market_data(),
     )
+    # Keep this retry-state test independent of the real NYSE clock. The
+    # production runtime performs its EOD cleanup after the closing bell.
+    worker.runtime.trading_engine._market_is_open_fn = lambda: True
+    worker.runtime.trading_engine._eod_window_reached_fn = lambda: False
     card = _seed_card(
         engine,
         board_status=BoardStatus.BUY_TODAY,
         entry_runtime_status=EntryRuntimeStatus.RETRY_COOLDOWN,
     )
-    import datetime as dt
-
     card.next_retry_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=1)  # already due
     repo.update_trade_card(engine, card, expected_version=card.version)
 
@@ -2445,6 +2504,22 @@ def test_sync_orb_plans_is_a_no_op_without_a_lookup_wired(tmp_path):
     worker, engine = _worker(tmp_path)
     card = _seed_card(engine, board_status=BoardStatus.BUY_TODAY)
     assert worker._sync_orb_plans([card]) == []
+
+
+def test_sync_orb_plans_arms_target_plan_without_intraday_lookup(tmp_path):
+    worker, engine = _worker(tmp_path)
+    card = _seed_card(
+        engine,
+        board_status=BoardStatus.BUY_TODAY,
+        breakout_price=100.0,
+        position_percent=20.0,
+        entry_runtime_status=EntryRuntimeStatus.ORB_FORMING,
+    )
+
+    changed = worker._sync_orb_plans([card])
+
+    assert changed == [card]
+    assert card.entry_runtime_status == EntryRuntimeStatus.EXECUTE_READY
 
 
 def test_sync_orb_plans_skips_positioned_cards(tmp_path):

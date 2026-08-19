@@ -167,6 +167,9 @@ class TradeCardState:
     selected_orb_window: Optional[str] = None
     buffer_pct: float = 0.001
     risk_percent: float = 1.0
+    # Allocation used by target-price entries when no ORB sizing result is
+    # available. This is persisted operational intent, not market history.
+    position_percent: float = 0.0
     planned_quantity: int = 0
     target_position_quantity: int = 0
 
@@ -303,6 +306,9 @@ class TradeCardState:
         )
         self.buffer_pct = float(_finite_float(self.buffer_pct, 0.001))
         self.risk_percent = float(_finite_float(self.risk_percent, 1.0))
+        self.position_percent = max(
+            0.0, float(_finite_float(self.position_percent, 0.0))
+        )
         self.planned_quantity = int(self.planned_quantity or 0)
         self.target_position_quantity = int(self.target_position_quantity or 0)
         self.entry_orb_window = (
@@ -441,6 +447,7 @@ class TradeCardState:
             "selected_orb_window": self.selected_orb_window,
             "buffer_pct": self.buffer_pct,
             "risk_percent": self.risk_percent,
+            "position_percent": self.position_percent,
             "planned_quantity": self.planned_quantity,
             "target_position_quantity": self.target_position_quantity,
             "entry_orb_window": self.entry_orb_window,
@@ -542,6 +549,7 @@ class TradeCardState:
             selected_orb_window=data.get("selected_orb_window"),
             buffer_pct=data.get("buffer_pct", 0.001),
             risk_percent=data.get("risk_percent", 1.0),
+            position_percent=data.get("position_percent", 0.0),
             planned_quantity=int(data.get("planned_quantity", 0) or 0),
             target_position_quantity=int(
                 data.get("target_position_quantity", 0) or 0

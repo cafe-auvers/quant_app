@@ -665,7 +665,12 @@ def _require_board_action_not_conflicted(engine, command, card) -> List[Executio
 
 
 def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> None:
-    from src.core.trade_card_state import BoardStatus, PositionRuntimeStatus, StopType
+    from src.core.trade_card_state import (
+        BoardStatus,
+        EntryRuntimeStatus,
+        PositionRuntimeStatus,
+        StopType,
+    )
     from src.services.position_manager import (
         compute_breakeven_stop_price,
         minimum_manual_stop_price,
@@ -856,6 +861,19 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
             symbol=card.symbol,
         )
         card.buylist_member = monitoring_command.enabled
+        if (
+            card.breakout_price
+            and (
+                int(card.planned_quantity or 0) > 0
+                or float(card.position_percent or 0.0) > 0
+            )
+        ):
+            # A durable target/allocation is a complete monitoring plan.
+            # ORB history can refine it later, but is not a prerequisite.
+            card.entry_runtime_status = EntryRuntimeStatus.EXECUTE_READY
+            card.entry_block_reason = ""
+        elif card.entry_runtime_status is None:
+            card.entry_runtime_status = EntryRuntimeStatus.ORB_FORMING
     elif isinstance(command, types.RequestSellAll):
         # This is durable liquidation intent only.  The engine cancels a
         # conflicting BUY, refreshes quantity, submits, and reconciliation

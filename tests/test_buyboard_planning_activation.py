@@ -14,7 +14,11 @@ from sqlalchemy.pool import NullPool
 from src.core.board_workflow import ActivateForToday
 from src.core.execution_config import KANBAN_STRATEGY_INSTANCE_ID
 from src.core.execution_ownership import ExecutionOwner, ExecutionOwnership
-from src.core.trade_card_state import BoardStatus, TradeCardState
+from src.core.trade_card_state import (
+    BoardStatus,
+    EntryRuntimeStatus,
+    TradeCardState,
+)
 from src.services import trade_card_repository as card_repo
 from src.services.execution_ownership_repository import (
     assign_ownership,
@@ -113,6 +117,33 @@ def test_buy_today_can_be_planned_before_runtime_worker_exists(tmp_path):
     assert ownership.owner == ExecutionOwner.KANBAN
     assert ownership.strategy_instance_id == KANBAN_STRATEGY_INSTANCE_ID
     assert window.refresh_count == 1
+
+
+def test_buy_today_target_allocation_is_armed_without_orb_history(tmp_path):
+    engine = _engine(tmp_path)
+    card = card_repo.create_trade_card(
+        engine,
+        TradeCardState(
+            environment="PROD",
+            account_no="12345678-01",
+            symbol="WEX",
+            board_status=BoardStatus.BUYLIST,
+            buylist_member=True,
+            breakout_price=160.0,
+            position_percent=20.0,
+        ),
+    )
+
+    result = execution_workflow_service.request_board_action(
+        engine,
+        _command(card),
+        claim_kanban_ownership=True,
+    )
+
+    assert result.card.board_status == BoardStatus.BUY_TODAY
+    assert result.card.entry_runtime_status == EntryRuntimeStatus.EXECUTE_READY
+    assert result.card.breakout_price == 160.0
+    assert result.card.position_percent == 20.0
 
 
 def test_dispatch_retries_once_after_equivalent_storage_only_revision(tmp_path):

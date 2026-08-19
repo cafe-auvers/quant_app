@@ -2,6 +2,8 @@ import datetime as dt
 import json
 from types import SimpleNamespace
 
+from sqlalchemy import create_engine
+
 from src.core.order_state import BrokerOrder, OrderIntent, OrderSide, OrderStatus
 from src.services import health
 from src.services.event_journal import EventJournalStatus
@@ -77,6 +79,24 @@ def test_unreadable_order_ledger_is_critical():
 
     assert check.level == health.HealthLevel.CRITICAL
     assert "unreadable" in check.summary.lower()
+
+
+def test_health_separates_kanban_store_from_offline_history_database(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'kanban.sqlite3'}")
+    context = health.HealthContext(
+        db_source="none",
+        operational_store_configured=True,
+        operational_store_engine=engine,
+    )
+
+    operational = health._operational_store_check(context)
+    historical = health._mysql_check(context)
+
+    assert operational.level == health.HealthLevel.HEALTHY
+    assert "execution state is available" in operational.summary
+    assert historical.level == health.HealthLevel.WARNING
+    assert "historical" in historical.summary.lower()
+    assert "Kanban execution is independent" in historical.detail
 
 
 def test_reconciliation_health_ignores_non_production_open_orders():

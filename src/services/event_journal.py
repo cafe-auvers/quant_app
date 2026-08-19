@@ -182,7 +182,20 @@ def _rotate_if_needed(path: Path, incoming_bytes: int) -> bool:
     if current_size + incoming_bytes <= MAX_JOURNAL_BYTES:
         return False
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S")
-    archive = path.with_name(f"{path.stem}.{stamp}-{time.time_ns()}{path.suffix}")
+    # Windows' wall-clock nanosecond value can repeat during rapid rotations.
+    # os.replace() would then silently overwrite the earlier audit archive.
+    # The journal lock serializes this loop, so incrementing the numeric suffix
+    # until it is unused preserves every archive without widening the filename
+    # format accepted by _archive_paths().
+    archive_sequence = time.time_ns()
+    archive = path.with_name(
+        f"{path.stem}.{stamp}-{archive_sequence}{path.suffix}"
+    )
+    while archive.exists():
+        archive_sequence += 1
+        archive = path.with_name(
+            f"{path.stem}.{stamp}-{archive_sequence}{path.suffix}"
+        )
     os.replace(path, archive)
     return True
 

@@ -114,6 +114,9 @@ def test_retention_never_prunes_archives_before_new_active_write_succeeds(
     monkeypatch, tmp_path
 ):
     path = tmp_path / "events.jsonl"
+    # Reproduce Windows' coarse wall-clock resolution deterministically: every
+    # rotation must still receive a distinct archive name.
+    monkeypatch.setattr(event_journal.time, "time_ns", lambda: 1234)
     monkeypatch.setattr(event_journal, "MAX_JOURNAL_BYTES", 1)
     monkeypatch.setattr(event_journal, "MAX_JOURNAL_ARCHIVES", 10)
     for event_type in ("FIRST", "SECOND", "THIRD"):

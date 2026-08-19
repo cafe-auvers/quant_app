@@ -65,7 +65,15 @@ def _buy_today_card(**overrides):
     return TradeCardState(**fields)
 
 
-def _make_engine(tmp_path, *, submit_order=None, buying_power=100_000.0, find_order=None, reconcile_order=None):
+def _make_engine(
+    tmp_path,
+    *,
+    submit_order=None,
+    buying_power=100_000.0,
+    account_equity=0.0,
+    find_order=None,
+    reconcile_order=None,
+):
     raw_submit = submit_order or (lambda **kw: BrokerOrder.create(
         environment=kw["environment"], account_no=kw["account_no"], symbol=kw["symbol"],
         side=OrderSide.BUY, intent=OrderIntent.ENTRY, quantity_requested=kw["quantity"],
@@ -103,6 +111,7 @@ def _make_engine(tmp_path, *, submit_order=None, buying_power=100_000.0, find_or
         market_data=market_data,
         position_callbacks=callbacks,
         entry_deadline_lookup=lookup,
+        account_equity_provider=lambda _environment, _account_no: account_equity,
     )
 
 
@@ -193,6 +202,46 @@ def test_fresh_quote_allows_entry_submission_and_moves_to_entry_pending(tmp_path
     assert changed == [card]
     assert card.board_status == BoardStatus.ENTRY_PENDING
     assert card.entry_runtime_status == EntryRuntimeStatus.ORDER_PENDING
+
+
+def test_target_allocation_sizes_entry_without_orb_or_history_data(tmp_path):
+    submitted = []
+
+    def submit(**kwargs):
+        submitted.append(kwargs)
+        return BrokerOrder.create(
+            environment=kwargs["environment"],
+            account_no=kwargs["account_no"],
+            symbol=kwargs["symbol"],
+            side=OrderSide.BUY,
+            intent=OrderIntent.ENTRY,
+            quantity_requested=kwargs["quantity"],
+            limit_price=kwargs["limit_price"],
+            status=OrderStatus.ACCEPTED,
+        )
+
+    engine = _make_engine(
+        tmp_path,
+        submit_order=submit,
+        account_equity=100_000.0,
+    )
+    engine._market_data.subscribe(["AAPL"])
+    engine._market_data.poll_once()
+    card = _buy_today_card(
+        planned_quantity=0,
+        target_position_quantity=0,
+        entry_trigger=None,
+        breakout_price=100.0,
+        position_percent=20.0,
+    )
+
+    engine.run_heartbeat([card])
+
+    assert len(submitted) == 1
+    assert submitted[0]["quantity"] == 200
+    assert card.planned_quantity == 200
+    assert card.target_position_quantity == 200
+    assert card.board_status == BoardStatus.ENTRY_PENDING
 
 
 def _entry_event_engine(tmp_path, now, submitted):

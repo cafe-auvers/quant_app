@@ -246,12 +246,18 @@ def _card_metric_rows(
         # from a now-flat card.
         return []
 
-    rows: list[tuple[str, str]] = [("Current", f"${_fmt_price(current_price)}")]
+    effective_current_price = (
+        _positive_float(current_price)
+        or _positive_float(card.market_data_last_trusted_price)
+    )
+    rows: list[tuple[str, str]] = [
+        ("Current", f"${_fmt_price(effective_current_price)}")
+    ]
     if status in (BoardStatus.BUY_TODAY, BoardStatus.ENTRY_PENDING):
         rows.append(("Breakout", f"${_fmt_price(card.breakout_price)}"))
 
     if status == BoardStatus.BUY_TODAY:
-        current = _positive_float(current_price)
+        current = effective_current_price
         breakout = _positive_float(card.breakout_price)
         distance = (
             f"{(breakout / current - 1.0) * 100.0:+.2f}%"
@@ -572,6 +578,13 @@ def card_drag_payload(
 ) -> dict:
     """The minimal identity+version payload carried by a drag/drop event."""
     resolved, projection = _as_projection(card)
+    recovery_snapshot = bool(
+        projection is not None
+        and any(
+            "last local snapshot" in str(reason).casefold()
+            for reason in projection.engine_restrictions
+        )
+    )
     return {
         "environment": resolved.environment,
         "account_no": resolved.account_no,
@@ -589,6 +602,7 @@ def card_drag_payload(
         "strategy_instance_id": (
             projection.strategy_instance_id if projection is not None else ""
         ),
+        "recovery_snapshot": recovery_snapshot,
         "state_fingerprint": (
             state_fingerprint
             if state_fingerprint is not None

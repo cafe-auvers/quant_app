@@ -31,7 +31,9 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from src.services import (
+    app_state,
     event_journal,
+    trade_card_repository,
     trading_state,
 )  # noqa: E402  (needs sys.path set up above)
 
@@ -47,6 +49,26 @@ def _isolate_event_journal(monkeypatch, tmp_path):
     )
     yield
     event_journal.reset_event_journal_runtime_status_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_trade_card_snapshot(monkeypatch, tmp_path):
+    """Never let SQLite-backed tests rewrite the operator's recovery board."""
+
+    monkeypatch.setenv(
+        "OPERATIONAL_DB_PATH",
+        str(tmp_path / "kanban_operational.sqlite3"),
+    )
+    monkeypatch.setattr(
+        trade_card_repository,
+        "LOCAL_TRADE_CARDS_FILE",
+        tmp_path / "trade_cards.json",
+    )
+    monkeypatch.setattr(
+        app_state,
+        "KANBAN_STATE_METADATA_FILE",
+        tmp_path / "kanban_state_metadata.json",
+    )
 
 
 @pytest.fixture(autouse=True)

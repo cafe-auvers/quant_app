@@ -87,6 +87,23 @@ def test_confirmed_queue_delay_uses_a_stable_actionable_message():
     assert "sustained market-data queue delay" in display.tooltip
 
 
+def test_multiple_readiness_failures_are_all_named_in_the_label():
+    display = _buyboard_readiness_display(
+        _readiness(
+            account_reconciliation_fresh=False,
+            database_writable=False,
+        ),
+        device_state=RuntimeDeviceState.STANDBY,
+        regular_session_open=True,
+    )
+
+    assert display.completed == 5
+    assert display.total == 7
+    assert "2 checks pending" in display.label
+    assert "fresh broker account snapshot" in display.label
+    assert "local Kanban operational state writable" in display.label
+
+
 def test_live_reconciliation_uses_indeterminate_progress_without_fake_eta():
     display = _buyboard_readiness_display(
         _readiness(account_reconciliation_fresh=False),
@@ -151,6 +168,34 @@ def test_active_runtime_stays_latched_while_legacy_handoff_is_running(monkeypatc
     assert "readiness 7/7" in display.label
     assert "ACTIVE" in display.label
     assert "final broker reconciliation" not in display.label
+
+
+def test_database_outage_reports_kis_recovery_instead_of_runtime_unavailable(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        main_window_module.execution_config,
+        "is_buyboard_engine_enabled",
+        lambda: True,
+    )
+    window = MainWindow.__new__(MainWindow)
+    window._buyboard_runtime_worker = None
+    window.state_sync_worker = None
+    window.handoff_reconciliation_worker = None
+    window.pc_db_engine = None
+    window._pc_database_ready = False
+    window.kis_account_snapshots = {("PROD", "1"): {"overseas": {"holdings": []}}}
+    window.kis_account_snapshot_fetched_at = {
+        ("PROD", "1"): object()
+    }
+
+    display = MainWindow._current_buyboard_readiness_display(window)
+
+    assert "KIS holdings/prices monitored" in display.label
+    assert "execution disabled" in display.label
+    assert "runtime worker unavailable" not in display.label
+    assert "Historical data is not an execution requirement" in display.tooltip
+    assert "local Kanban operational file itself could not be opened" in display.tooltip
 
 
 def test_routine_reconciliation_uses_debounced_operator_projection(monkeypatch):

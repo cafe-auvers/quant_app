@@ -2792,6 +2792,39 @@ def test_buylist_position_sync_converts_filled_queue_status_to_bought():
     assert save_calls == [True]
 
 
+def test_buylist_position_sync_clears_a_stale_position_when_kis_confirms_flat():
+    logs = []
+    save_calls = []
+    item = SimpleNamespace(
+        symbol="STIM",
+        environment="PROD",
+        kis_account_no="63187258-01",
+        monitoring_status="BOUGHT",
+        shares_held=401,
+        avg_cost=2.88,
+        position_percent=100.0,
+        _buy_order_pending=False,
+    )
+    window = MainWindow.__new__(MainWindow)
+    window.buylist_manager = SimpleNamespace(items=[item])
+    window.order_ledger = []
+    window.append_log = logs.append
+    window._save_state = lambda: save_calls.append(True)
+    window.populate_buylist_dashboard = lambda: None
+
+    changed = MainWindow.sync_buylist_positions_from_kis_snapshots(
+        window,
+        {("PROD", "63187258-01"): _snapshot("OTHER", 1, 10.0)},
+    )
+
+    assert changed == 1
+    assert item.shares_held == 0
+    assert item.position_percent == 0.0
+    assert item.monitoring_status == "SOLD"
+    assert save_calls == [True]
+    assert any("KIS confirms STIM is flat" in message for message in logs)
+
+
 def test_buylist_position_sync_uses_item_account_not_largest_same_symbol_holding():
     item = SimpleNamespace(
         symbol="MRVL",

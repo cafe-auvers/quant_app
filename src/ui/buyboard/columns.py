@@ -139,6 +139,8 @@ class BoardColumnList(QListWidget):
         payload = item.data(Qt.UserRole)
         if not payload:
             return
+        if bool(payload.get("recovery_snapshot", False)):
+            return
         if self._payload_card_key(payload) in self._pending_card_keys:
             return
         self._set_interaction_active(True)
@@ -339,6 +341,8 @@ class BoardColumnList(QListWidget):
             widget.set_pending(card_state.card_key in self._pending_card_keys)
             self._set_item_widget_size(item, widget)
             self.setItemWidget(item, widget)
+            if bool(item.data(Qt.UserRole).get("recovery_snapshot", False)):
+                item.setFlags(item.flags() & ~Qt.ItemIsDragEnabled)
             if isinstance(card, BoardCardProjection):
                 for owned_order in card.unlinked_owned_orders:
                     owned_item = QListWidgetItem(self)
@@ -379,7 +383,8 @@ class BoardColumnList(QListWidget):
                 continue
             pending = self._payload_card_key(payload) in self._pending_card_keys
             flags = item.flags()
-            if pending:
+            restricted = bool(payload.get("recovery_snapshot", False))
+            if pending or restricted:
                 item.setFlags(flags & ~Qt.ItemIsDragEnabled)
             else:
                 item.setFlags(flags | Qt.ItemIsDragEnabled)

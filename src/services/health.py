@@ -54,6 +54,8 @@ class HealthContext:
     pc_database_engine: Any = None
     mirror_engine: Any = None
     mirror_tickers: Optional[Sequence[str]] = None
+    operational_store_configured: bool = False
+    operational_store_engine: Any = None
     kis_snapshot_count: int = 0
     kis_request_running: bool = False
     kis_last_success_at: str = ""
@@ -263,28 +265,57 @@ def _mysql_check(context: HealthContext) -> HealthCheck:
         return HealthCheck(
             "MySQL",
             HealthLevel.HEALTHY,
-            "Primary database verified now",
-            "A read-only SELECT 1 probe succeeded.",
+            "Historical-data database verified now",
+            "A read-only SELECT 1 probe succeeded. This is not an execution gate.",
         )
     if context.pc_database_ready or context.db_source == "pc":
         return HealthCheck(
             "MySQL",
             HealthLevel.WARNING,
-            "Primary database was last known reachable",
-            "No engine was available for a current read-only probe.",
+            "Historical database was last known reachable",
+            "No engine was available for a current read-only probe; Kanban execution is independent.",
         )
     if context.db_source == "local_mirror":
         return HealthCheck(
             "MySQL",
             HealthLevel.WARNING,
-            "Primary database is unavailable",
-            "The dashboard is using the local read-only data mirror.",
+            "Historical database is unavailable",
+            "Charts/scans are using the local data mirror; Kanban execution is independent.",
         )
     return HealthCheck(
         "MySQL",
         HealthLevel.WARNING,
-        "No database source is available",
-        "Database-backed scanning and cache freshness are degraded.",
+        "No historical database source is available",
+        "Charts, database-backed scans, and cache freshness are degraded; Kanban execution is independent.",
+    )
+
+
+def _operational_store_check(context: HealthContext) -> Optional[HealthCheck]:
+    if not context.operational_store_configured:
+        return None
+    engine = context.operational_store_engine
+    if engine is None:
+        return HealthCheck(
+            "Kanban operational store",
+            HealthLevel.CRITICAL,
+            "Local operational store is unavailable",
+            "Cards, commands, orders, and the execution lease cannot be persisted.",
+        )
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+    except Exception as exc:
+        return HealthCheck(
+            "Kanban operational store",
+            HealthLevel.CRITICAL,
+            "Local operational write store probe failed",
+            scrub_sensitive_text(exc),
+        )
+    return HealthCheck(
+        "Kanban operational store",
+        HealthLevel.HEALTHY,
+        "Local execution state is available",
+        "Cards, commands, orders, lease, and live-trading control are independent of historical data.",
     )
 
 
@@ -686,6 +717,9 @@ def collect_health_snapshot(context: HealthContext) -> HealthSnapshot:
         _main_device_handoff_check(context),
         journal_check,
     ]
+    operational_check = _operational_store_check(context)
+    if operational_check is not None:
+        checks.insert(3, operational_check)
     if context.market_data_metrics is not None:
         checks.append(_market_data_check(context.market_data_metrics))
     if context.request_scheduler_metrics is not None:

@@ -1271,7 +1271,11 @@ class BuylistOrdersMixin:
             updated = request_cancel(
                 source=ExecutionSource.LEGACY_BUY_DASHBOARD,
                 client_order_id=client_order_id,
-                ownership_engine=self.__dict__.get("pc_db_engine"),
+                ownership_engine=(
+                    self._execution_state_engine()
+                    if callable(getattr(self, "_execution_state_engine", None))
+                    else self.__dict__.get("pc_db_engine")
+                ),
             )
         except Exception as exc:
             self.append_log(

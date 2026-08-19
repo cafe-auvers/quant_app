@@ -143,6 +143,35 @@ def bootstrap_trade_cards_from_current_state(
         stored = sync.card
         if stored is None:
             continue
+        legacy_position_percent = max(
+            0.0, float(getattr(item, "position_percent", 0.0) or 0.0)
+        )
+        if (
+            legacy_position_percent > 0
+            and float(stored.position_percent or 0.0) <= 0
+            and float(stored.breakout_price or 0.0) > 0
+            and stored.board_status
+            in {BoardStatus.WATCHLIST, BoardStatus.BUYLIST, BoardStatus.BUY_TODAY}
+            and int(stored.broker_quantity or 0) <= 0
+            and not stored.entry_client_order_id
+        ):
+            enriched = copy.deepcopy(stored)
+            enriched.position_percent = legacy_position_percent
+            try:
+                stored = trade_card_repository.update_trade_card(
+                    engine,
+                    enriched,
+                    expected_version=stored.version,
+                )
+            except (
+                trade_card_repository.TradeCardVersionConflictError,
+                trade_card_repository.TradeCardNotFoundError,
+            ):
+                stored = trade_card_repository.get_trade_card(
+                    engine, "PROD", item.kis_account_no, item.symbol
+                )
+                if stored is None:
+                    continue
         existing_by_key[stored.card_key] = stored
         if sync.action == "created":
             existing_cards.append(stored)
@@ -177,6 +206,7 @@ def bootstrap_trade_cards_from_current_state(
             breakout_price=getattr(item, "breakout_price", None),
             selected_orb_window=plan.get("window"),
             buffer_pct=float(plan.get("buffer_pct", 0.001) or 0.001),
+            position_percent=float(plan.get("capital_percent", 0.0) or 0.0),
             planned_quantity=int(plan.get("shares", 0) or 0),
             target_position_quantity=int(plan.get("shares", 0) or 0),
             entry_trigger=plan.get("entry_trigger"),
