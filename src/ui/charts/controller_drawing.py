@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import math
 from typing import Any, List
 from zoneinfo import ZoneInfo
 
@@ -443,23 +444,26 @@ class ChartsDrawingMixin:
         self,
         symbol: str,
         source_view: str,
-        x_ratio: float,
-        y_ratio: float,
+        chart_time: str,
+        price: float,
         visible: bool,
     ) -> None:
-        """Mirror cursor position without coupling either chart's time range."""
+        """Mirror actual cursor time/price without coupling either chart's range."""
         source_view = str(source_view).strip().lower()
         if source_view not in {"left", "right"}:
             return
         if visible:
             try:
-                x_value = min(1.0, max(0.0, float(x_ratio)))
-                y_value = min(1.0, max(0.0, float(y_ratio)))
+                price_value = float(price)
             except (TypeError, ValueError):
+                return
+            time_value = str(chart_time).strip()
+            if not time_value or not math.isfinite(price_value) or price_value <= 0:
                 return
             script = (
                 "window.showSyncedCrosshair && "
-                f"window.showSyncedCrosshair({x_value!r}, {y_value!r});"
+                f"window.showSyncedCrosshair({json.dumps(time_value)}, "
+                f"{price_value!r});"
             )
         else:
             script = "window.clearSyncedCrosshair && window.clearSyncedCrosshair();"

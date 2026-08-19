@@ -53,14 +53,17 @@ def _split_window(monkeypatch):
     return window
 
 
-def test_split_crosshair_routes_only_to_the_sibling_view(monkeypatch):
+def test_split_crosshair_routes_actual_time_and_price_to_the_sibling(monkeypatch):
     window = _split_window(monkeypatch)
 
-    window.sync_tradingview_crosshair("AAPL", "left", 0.25, 0.75, True)
+    window.sync_tradingview_crosshair(
+        "AAPL", "left", "2026-01-02 15:30:00", 200.0, True
+    )
 
     assert window.tradingview_chart_view.page().scripts == []
     assert window.tradingview_split_chart_view.page().scripts == [
-        "window.showSyncedCrosshair && window.showSyncedCrosshair(0.25, 0.75);"
+        'window.showSyncedCrosshair && window.showSyncedCrosshair('
+        '"2026-01-02 15:30:00", 200.0);'
     ]
 
 
@@ -116,6 +119,8 @@ def test_lightweight_split_html_supports_direct_state_and_crosshair_sync():
     assert "window.upsertSyncedDrawing" in chart_html
     assert "syncChartCrosshair" in chart_html
     assert "window.showSyncedCrosshair" in chart_html
+    assert "resolveSyncedTime" in chart_html
+    assert "normalizeTimeForSave(time)" in chart_html
     assert "chart.setCrosshairPosition" in chart_html
 
 

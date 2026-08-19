@@ -774,7 +774,6 @@ class ChartLightweightRenderMixin:
                 let activeEdit = null;
                 let pointerPreview = null;
                 let selectedDrawingId = null;
-                let syncedCrosshair = null;
 
                 function resizeOverlay() {{
                     const rect = overlay.getBoundingClientRect();
@@ -836,20 +835,6 @@ class ChartLightweightRenderMixin:
                             overlayContext.stroke();
                             overlayContext.restore();
                         }}
-                    }}
-                    if (syncedCrosshair) {{
-                        overlayContext.save();
-                        overlayContext.strokeStyle = '#d1d5db';
-                        overlayContext.lineWidth = 1;
-                        overlayContext.setLineDash([4, 4]);
-                        overlayContext.globalAlpha = 0.75;
-                        overlayContext.beginPath();
-                        overlayContext.moveTo(syncedCrosshair.x, 0);
-                        overlayContext.lineTo(syncedCrosshair.x, rect.height);
-                        overlayContext.moveTo(0, syncedCrosshair.y);
-                        overlayContext.lineTo(rect.width, syncedCrosshair.y);
-                        overlayContext.stroke();
-                        overlayContext.restore();
                     }}
                 }}
 
@@ -1016,25 +1001,48 @@ class ChartLightweightRenderMixin:
                     if (selectedDrawingId === String(drawingId)) selectedDrawingId = null;
                     renderDrawings();
                 }};
-                window.showSyncedCrosshair = function(xRatio, yRatio) {{
-                    const rect = overlay.getBoundingClientRect();
-                    const x = Math.max(0, Math.min(rect.width, Number(xRatio) * rect.width));
-                    const y = Math.max(0, Math.min(rect.height, Number(yRatio) * rect.height));
-                    const time = chart.timeScale().coordinateToTime(x);
-                    const price = candleSeries.coordinateToPrice(y);
-                    if (time != null && price != null && Number.isFinite(Number(price))) {{
-                        syncedCrosshair = null;
-                        chart.setCrosshairPosition(Number(price), time, candleSeries);
-                    }} else {{
-                        chart.clearCrosshairPosition();
-                        syncedCrosshair = {{ x, y }};
-                        renderDrawings();
+                function resolveSyncedTime(value) {{
+                    const text = String(value || '');
+                    const day = text.slice(0, 10);
+                    const allTimes = candles
+                        .concat(futureWhitespace)
+                        .map(point => point.time);
+                    const dayMatches = allTimes.filter(
+                        time => normalizeTimeForSave(time).slice(0, 10) === day
+                    );
+                    if (!usesIntradayTime) {{
+                        return dayMatches.length > 0 ? dayMatches[0] : null;
                     }}
+                    if (text.length > 10) {{
+                        const parsed = Date.parse(
+                            text.replace(' ', 'T') + (text.includes('Z') ? '' : 'Z')
+                        );
+                        if (Number.isFinite(parsed)) {{
+                            const exactTime = Math.floor(parsed / 1000);
+                            if (allTimes.some(time => Number(time) === exactTime)) {{
+                                return exactTime;
+                            }}
+                        }}
+                    }}
+                    return dayMatches.length > 0 ? dayMatches[0] : null;
+                }}
+                window.showSyncedCrosshair = function(chartTime, price) {{
+                    const resolvedTime = resolveSyncedTime(chartTime);
+                    const resolvedPrice = Number(price);
+                    if (
+                        resolvedTime == null
+                        || !Number.isFinite(resolvedPrice)
+                        || resolvedPrice <= 0
+                    ) {{
+                        chart.clearCrosshairPosition();
+                        return;
+                    }}
+                    chart.setCrosshairPosition(
+                        resolvedPrice, resolvedTime, candleSeries
+                    );
                 }};
                 window.clearSyncedCrosshair = function() {{
-                    syncedCrosshair = null;
                     chart.clearCrosshairPosition();
-                    renderDrawings();
                 }};
 
                 let crosshairPublishFrame = null;
@@ -1046,10 +1054,16 @@ class ChartLightweightRenderMixin:
                     }} else {{
                         const rect = pricePanel.getBoundingClientRect();
                         if (!rect.width || !rect.height) return;
-                        pendingCrosshair = {{
-                            x: Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)),
-                            y: Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height))
-                        }};
+                        const x = event.clientX - rect.left;
+                        const y = event.clientY - rect.top;
+                        const time = chart.timeScale().coordinateToTime(x);
+                        const price = candleSeries.coordinateToPrice(y);
+                        pendingCrosshair = (
+                            time != null
+                            && price != null
+                            && Number.isFinite(Number(price))
+                            && Number(price) > 0
+                        ) ? {{ time: normalizeTimeForSave(time), price: Number(price) }} : null;
                     }}
                     if (crosshairPublishFrame !== null) return;
                     crosshairPublishFrame = requestAnimationFrame(() => {{
@@ -1059,8 +1073,8 @@ class ChartLightweightRenderMixin:
                         chartBridge.syncChartCrosshair(
                             symbolName,
                             chartViewKey,
-                            point ? point.x : 0,
-                            point ? point.y : 0,
+                            point ? point.time : '',
+                            point ? point.price : 0,
                             Boolean(point)
                         );
                     }});

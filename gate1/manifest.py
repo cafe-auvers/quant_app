@@ -89,7 +89,7 @@ REQUIRED_SCENARIO_IDS: frozenset[str] = frozenset(
         "tests.test_gate1_capstone::test_gate1_migration_restart_runs_broker_reconciliation_before_entries_ready",
         "tests.test_gate1_capstone::test_gate1_rate_limit_pressure_prioritizes_real_emergency_liquidation",
         # The complete signed L3 parity matrix.
-        "tests.test_ws13_legacy_kanban_parity::test_l3_add_to_buy_today_produces_the_same_entry_monitoring_command",
+        "tests.test_ws13_legacy_kanban_parity::test_l3_buylist_activate_routes_through_buy_today_kanban_command",
         "tests.test_ws13_legacy_kanban_parity::test_l3_pending_entry_cancel_produces_the_same_cancel_intent",
         "tests.test_ws13_legacy_kanban_parity::test_l3_partial_sell_produces_equal_submission_result_and_command",
         "tests.test_ws13_legacy_kanban_parity::test_l3_sell_all_produces_equal_submission_result_and_command",
