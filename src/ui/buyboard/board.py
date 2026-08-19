@@ -172,17 +172,37 @@ def _quote_lookup_for(main_window) -> Optional[Callable[[str], Optional[float]]]
     worker = getattr(main_window, "_buyboard_runtime_worker", None)
     runtime = getattr(worker, "runtime", None)
     market_data = getattr(runtime, "market_data", None) if runtime is not None else None
-    if market_data is None:
+    intraday_prices = dict(
+        getattr(main_window, "latest_intraday_prices", {}) or {}
+    )
+    persisted_prices: Dict[str, float] = {}
+    for value in tuple(
+        getattr(main_window, "_buyboard_current_projections", ()) or ()
+    ):
+        card = _state(value)
+        if card is None:
+            continue
+        price = _positive_number(card.market_data_last_trusted_price)
+        if price is not None:
+            persisted_prices[card.symbol] = price
+    if market_data is None and not intraday_prices and not persisted_prices:
         return None
 
     def lookup(symbol: str) -> Optional[float]:
         try:
-            quote = market_data.latest_quote(symbol)
-            return quote.last_price if quote is not None else None
+            quote = market_data.latest_quote(symbol) if market_data is not None else None
+            live_price = _positive_number(
+                quote.last_price if quote is not None else None
+            )
+            if live_price is not None:
+                return live_price
         except Exception:
             # A UI repaint must never affect the market-data/runtime thread.
             logger.debug("Buy Board quote lookup failed for %s", symbol, exc_info=True)
-            return None
+        cached_price = _positive_number(intraday_prices.get(str(symbol).upper()))
+        if cached_price is not None:
+            return cached_price
+        return persisted_prices.get(str(symbol).upper())
 
     return lookup
 
@@ -472,12 +492,27 @@ def populate_buyboard_columns(main_window, cards) -> None:
             )
     if hasattr(main_window, "_buyboard_engine_status_label"):
         enabled = is_buyboard_engine_enabled()
-        main_window._buyboard_engine_status_label.setText(
-            "Engine: ENABLED" if enabled else "Engine: OFF (board is read-only for order actions)"
+        recovery_active = bool(
+            getattr(main_window, "_buyboard_recovery_snapshot_active", False)
         )
-        main_window._buyboard_engine_status_label.setStyleSheet(
-            "color: #2e7d32; font-weight: bold;" if enabled else "color: #888;"
-        )
+        if recovery_active:
+            main_window._buyboard_engine_status_label.setText(
+                "Board: LOCAL SNAPSHOT — Kanban store unavailable; read-only"
+            )
+            main_window._buyboard_engine_status_label.setStyleSheet(
+                "color: #ad6704; font-weight: bold;"
+            )
+        else:
+            main_window._buyboard_engine_status_label.setText(
+                "Engine: ENABLED"
+                if enabled
+                else "Engine: OFF (board is read-only for order actions)"
+            )
+            main_window._buyboard_engine_status_label.setStyleSheet(
+                "color: #2e7d32; font-weight: bold;"
+                if enabled
+                else "color: #888;"
+            )
 
 
 def _handle_card_dropped(main_window, payload: dict, target_status: BoardStatus) -> None:
@@ -498,6 +533,14 @@ def _handle_card_dropped(main_window, payload: dict, target_status: BoardStatus)
     if projection is None:
         QMessageBox.warning(main_window, "Buy Board", f"Could not find a card for {symbol}.")
         main_window.refresh_buyboard()
+        return
+    if _is_recovery_projection(projection):
+        QMessageBox.information(
+            main_window,
+            "Buy Board",
+            "This is a read-only recovery snapshot. Board changes resume after "
+            "the Kanban operational store is available.",
+        )
         return
     card = projection.card
     if not _payload_matches_projection(payload, projection):
@@ -747,6 +790,12 @@ def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
         )
         main_window.refresh_buyboard()
         return
+    if _is_recovery_projection(projection):
+        menu = QMenu(main_window)
+        chart_action = menu.addAction("Open TradingView Chart")
+        if menu.exec_(global_pos) is chart_action:
+            _open_card_in_tradingview(main_window, card.symbol)
+        return
     current_payload = card_drag_payload(projection)
     common = _command_kwargs(current_payload)
     interaction_fingerprint = current_payload["state_fingerprint"]
@@ -960,6 +1009,13 @@ def _lookup_projection(main_window, environment: str, account_no: str, symbol: s
             else BoardCardProjection(card=value)
         )
     return None
+
+
+def _is_recovery_projection(projection: BoardCardProjection) -> bool:
+    return any(
+        "last local snapshot" in str(reason).casefold()
+        for reason in projection.engine_restrictions
+    )
 
 
 def _handle_external_order_adopt(main_window, external_order) -> None:

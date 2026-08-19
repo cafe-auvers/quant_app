@@ -496,6 +496,9 @@ def build_trade_card_migration(
             selected_orb_window=plan.get("window"),
             buffer_pct=float(getattr(item, "buffer_pct", 0.001) or 0.001),
             risk_percent=float(getattr(item, "risk_percent", 1.0) or 1.0),
+            position_percent=float(
+                getattr(item, "position_percent", 0.0) or 0.0
+            ),
             planned_quantity=int(plan.get("shares", 0) or 0),
             target_position_quantity=shares_held or int(plan.get("shares", 0) or 0),
             entry_orb_window=plan.get("window"),

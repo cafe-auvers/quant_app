@@ -22,10 +22,16 @@ from .constants import (STOP_LOSS_REPRICE_MIN_DROP_PCT,
 
 class BuylistActionsMixin:
     def _new_kis_order_cancel_worker(self, client_order_id: str):
+        engine_resolver = getattr(self, "_execution_state_engine", None)
+        ownership_engine = (
+            engine_resolver()
+            if callable(engine_resolver)
+            else self.__dict__.get("pc_db_engine")
+        )
         try:
             return KisOrderCancelWorker(
                 client_order_id,
-                ownership_engine=self.__dict__.get("pc_db_engine"),
+                ownership_engine=ownership_engine,
             )
         except TypeError as exc:
             # Compatibility for lightweight test/plugin worker doubles that

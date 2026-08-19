@@ -114,6 +114,41 @@ def test_copied_role_file_resets_identity_and_main_flag(tmp_path, monkeypatch):
     assert role.is_main is False
 
 
+def test_local_operational_metadata_does_not_reuse_shared_db_revisions(
+    tmp_path, monkeypatch
+):
+    paths = _use_machine(monkeypatch, tmp_path / "laptop")
+    local_payload = {"name": "Local", "items": [{"symbol": "WEX"}]}
+    _save_local_state(paths, local_payload)
+    app_state.save_json(
+        paths["STATE_METADATA_FILE"],
+        {
+            "state_sync": {
+                app_state.WATCHLIST_KEY: {
+                    "revision": 99,
+                    "content_hash": "old-shared-database-hash",
+                    "updated_at": "",
+                }
+            }
+        },
+    )
+    engine = _make_engine(tmp_path)
+    role = ss.LocalDeviceRole("laptop-id", "LAPTOP", False)
+    local_metadata = tmp_path / "kanban_state_metadata.json"
+
+    result = app_state.activate_device_as_main(
+        engine,
+        role,
+        metadata_path=local_metadata,
+    )
+
+    assert result.errors == []
+    assert result.conflict_keys == set()
+    assert result.is_main_device is True
+    assert _remote(engine, app_state.WATCHLIST_KEY).payload == local_payload
+    assert local_metadata.exists()
+
+
 def test_main_device_claim_is_exclusive(tmp_path):
     engine = _make_engine(tmp_path)
     laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
@@ -601,6 +636,65 @@ def test_main_device_button_reflects_exclusive_role():
     window._update_main_device_button(main_hostname="PC")
     assert window.main_device_button.text == "Use This Device as Main"
     assert "PC" in window.main_device_button.tooltip
+
+    window.pc_db_engine = None
+    window._pc_database_ready = False
+    window._update_main_device_button(main_hostname="PC")
+    assert window.main_device_button.enabled is False
+    assert window.main_device_button.text == "Main unavailable: Kanban store offline"
+    assert "local Kanban operational store could not be opened" in (
+        window.main_device_button.tooltip
+    )
+
+    window.db_initializing = True
+    window._main_availability_probe_complete = False
+    window._update_main_device_button()
+    assert window.main_device_button.text == (
+        "Checking Main availability (up to 3s)..."
+    )
+
+    window._main_availability_probe_complete = True
+    window._main_availability_probe_database_ready = False
+    window._update_main_device_button()
+    assert window.main_device_button.text == "Main unavailable: Kanban store offline"
+
+
+def test_local_kanban_store_allows_main_activation_without_history_database():
+    class Button:
+        def __init__(self):
+            self.text = ""
+            self.enabled = None
+            self.tooltip = ""
+
+        def setEnabled(self, value):
+            self.enabled = value
+
+        def setText(self, value):
+            self.text = value
+
+        def setStyleSheet(self, _value):
+            pass
+
+        def setToolTip(self, value):
+            self.tooltip = value
+
+    operational_engine = object()
+    window = MainWindow.__new__(MainWindow)
+    window.main_device_button = Button()
+    window.operational_db_engine = operational_engine
+    window._operational_database_ready = True
+    window.pc_db_engine = None
+    window._pc_database_ready = False
+    window.db_initializing = False
+    window.state_sync_role = ss.LocalDeviceRole("laptop-id", "LAPTOP", False)
+
+    window._update_main_device_button()
+
+    assert window._execution_state_engine() is operational_engine
+    assert window._execution_state_ready() is True
+    assert window.main_device_button.enabled is True
+    assert window.main_device_button.text == "Use This Device as Main"
+    assert "local Kanban store" in window.main_device_button.tooltip
 
 
 # --- Fenced ownership primitives (automatic cross-machine handoff) --------

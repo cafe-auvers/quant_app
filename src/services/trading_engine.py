@@ -582,6 +582,34 @@ class TradingEngine:
                 candidates.append(quote.last_price)
         return max(candidates)
 
+    def _target_plan_quantity(
+        self, card: TradeCardState, *, entry_price: float
+    ) -> int:
+        """Size a persisted target allocation without using history bars."""
+
+        planned = max(0, int(card.planned_quantity or 0))
+        if planned > 0:
+            return planned
+        try:
+            position_percent = float(card.position_percent or 0.0)
+            account_equity = float(
+                self._account_equity_provider(card.environment, card.account_no)
+                or 0.0
+            )
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        if position_percent <= 0 or account_equity <= 0 or entry_price <= 0:
+            return 0
+        planned = int(
+            account_equity * (position_percent / 100.0) / entry_price
+        )
+        if planned > 0:
+            card.planned_quantity = planned
+            card.target_position_quantity = max(
+                int(card.target_position_quantity or 0), planned
+            )
+        return max(0, planned)
+
     # -- BUY_TODAY -> entry attempts -------------------------------------
 
     def _evaluate_buy_today(
@@ -627,8 +655,15 @@ class TradingEngine:
                 if entry_trigger and quote.last_price < entry_trigger:
                     continue
                 price = self._marketable_entry_price(card, quote)
-                if not price or card.planned_quantity <= 0:
+                if not price:
                     continue
+                planned_quantity = self._target_plan_quantity(
+                    card, entry_price=price
+                )
+                if planned_quantity <= 0:
+                    continue
+                if card not in changed:
+                    changed.append(card)
                 self._prepare_entry_attempt(card)
                 key = f"{card.environment}:{card.account_no}:{card.symbol}"
                 trigger_cards[key] = card
@@ -639,9 +674,9 @@ class TradingEngine:
                         symbol=card.symbol,
                         trigger_at=now,
                         kanban_priority=card.kanban_priority,
-                        quantity=card.planned_quantity,
+                        quantity=planned_quantity,
                         limit_price=price,
-                        notional=card.planned_quantity * price,
+                        notional=planned_quantity * price,
                         attempt_group_id=card.entry_attempt_group_id,
                         attempt_number=card.entry_pending_attempt_number,
                         client_order_id=card.entry_client_order_id,

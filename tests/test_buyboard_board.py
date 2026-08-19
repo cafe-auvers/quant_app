@@ -43,6 +43,29 @@ def _ensure_app():
     _APP = QApplication.instance() or QApplication([])
 
 
+def test_quote_lookup_falls_back_to_intraday_then_persisted_card_price():
+    card = TradeCardState(
+        environment="PROD",
+        account_no="1",
+        symbol="WEX",
+        board_status=BoardStatus.BUY_TODAY,
+        market_data_last_trusted_price=193.5,
+    )
+    window = SimpleNamespace(
+        latest_intraday_prices={"WEX": 194.25},
+        _buyboard_current_projections=(card,),
+    )
+
+    lookup = board_module._quote_lookup_for(window)
+    assert lookup is not None
+    assert lookup("WEX") == 194.25
+
+    window.latest_intraday_prices = {}
+    lookup = board_module._quote_lookup_for(window)
+    assert lookup is not None
+    assert lookup("WEX") == 193.5
+
+
 @pytest.fixture(autouse=True)
 def _isolate_local_trade_card_snapshot(monkeypatch, tmp_path):
     monkeypatch.setattr(repo, "LOCAL_TRADE_CARDS_FILE", tmp_path / "trade_cards.json")
@@ -602,6 +625,35 @@ def test_drop_uses_rendered_projection_without_database_read(monkeypatch):
 
     assert len(window.dispatched) == 1
     assert window.dispatched[0].symbol == "AAPL"
+
+
+def test_recovery_snapshot_rejects_board_mutation(monkeypatch):
+    card = _card(board_status=BoardStatus.BUYLIST)
+    projection = BoardCardProjection(
+        card=card,
+        reconciliation_blocked=True,
+        engine_restrictions=(
+            "Canonical database unavailable; showing the last local snapshot read-only",
+        ),
+    )
+    window = _FakeMainWindow(engine=None, cards=[card])
+    window._buyboard_current_projections = (projection,)
+    messages = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "information",
+        lambda *args, **kwargs: messages.append((args, kwargs)),
+    )
+
+    board_module._handle_card_dropped(
+        window,
+        card_drag_payload(projection),
+        BoardStatus.BUY_TODAY,
+    )
+
+    assert window.dispatched == []
+    assert messages
+    assert "read-only recovery snapshot" in messages[0][0][2]
 
 
 def test_dragging_sell_all_to_partial_sell_prompts_and_dispatches_reduction(

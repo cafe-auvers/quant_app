@@ -1,4 +1,5 @@
 import datetime as dt
+import threading
 from types import SimpleNamespace
 
 from sqlalchemy import create_engine, text
@@ -122,6 +123,33 @@ def test_pc_status_worker_silences_expected_mysql_probe_failures(monkeypatch):
     assert results[0].database_ready is False
 
 
+def test_pc_status_worker_probes_listener_and_database_concurrently(monkeypatch):
+    rendezvous = threading.Barrier(2)
+
+    def listener_probe():
+        rendezvous.wait(timeout=1.0)
+        return PcStatus.OFF
+
+    def database_probe(*, log_unavailable=True, ensure_schema=True):
+        rendezvous.wait(timeout=1.0)
+        return None
+
+    monkeypatch.setattr(
+        "src.services.pc_remote_control.check_pc_status", listener_probe
+    )
+    monkeypatch.setattr(
+        "src.infrastructure.database.engine.init_mysql_engine", database_probe
+    )
+    results = []
+    worker = PcRemoteStatusWorker()
+    worker.finished_status.connect(results.append)
+
+    worker.run()
+
+    assert results[0].listener_status == PcStatus.OFF
+    assert results[0].database_ready is False
+
+
 class _SignalStub:
     def __init__(self):
         self.callbacks = []
@@ -149,7 +177,7 @@ class _StatusWorkerStub:
         self.deleted = True
 
 
-def test_pc_status_poll_waits_for_database_initialization(monkeypatch):
+def test_pc_status_poll_does_not_wait_for_local_database_initialization(monkeypatch):
     import src.ui.main_window as main_window
 
     _StatusWorkerStub.instances = []
@@ -161,7 +189,8 @@ def test_pc_status_poll_waits_for_database_initialization(monkeypatch):
 
     window._poll_pc_status()
 
-    assert _StatusWorkerStub.instances == []
+    assert len(_StatusWorkerStub.instances) == 1
+    assert _StatusWorkerStub.instances[0].engine is None
 
 
 def test_pc_status_poll_retains_worker_until_finished(monkeypatch):
@@ -356,6 +385,38 @@ def test_runtime_pc_database_loss_switches_to_local_mirror_and_detaches_state_sy
     assert manager.engine_bindings == [(None, "laptop-id", False)]
     assert summary_updates == [True]
     assert any("switched automatically to the local data mirror" in line for line in logs)
+
+
+def test_history_database_loss_keeps_local_kanban_authority_and_state_sync(
+    monkeypatch,
+):
+    import src.infrastructure.database.mirror_engine as mirror_engine
+
+    pc_engine = object()
+    market_mirror = object()
+    operational_engine = object()
+    window, manager, _logs, _summary_updates = _runtime_transition_window(
+        pc_engine
+    )
+    window.operational_db_engine = operational_engine
+    window._operational_database_ready = True
+    window._shared_live_trading_available = True
+    monkeypatch.setattr(
+        mirror_engine,
+        "init_local_mirror_engine",
+        lambda: market_mirror,
+    )
+
+    window._on_pc_status_result(_offline_pc_status())
+
+    assert window.db_engine is market_mirror
+    assert window.db_engine_source == "local_mirror"
+    assert window.pc_db_engine is None
+    assert window._initial_state_sync_complete is True
+    assert window._shared_live_trading_available is True
+    assert manager.engine_bindings == [
+        (operational_engine, "laptop-id", True)
+    ]
 
 
 def test_repeated_runtime_offline_status_does_not_repeat_failover(monkeypatch):

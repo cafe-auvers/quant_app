@@ -62,6 +62,7 @@ CHART_DRAWINGS_FILE = DATA_DIR / "chart_drawings.json"
 TAB_OPTIONS_FILE = DATA_DIR / "tab_options.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 STATE_METADATA_FILE = DATA_DIR / "state_metadata.json"
+KANBAN_STATE_METADATA_FILE = DATA_DIR / "kanban_state_metadata.json"
 LEGACY_NON_PRODUCTION_BUYLIST_FILE = DATA_DIR / "legacy_non_prod_buylist.json"
 LEGACY_NON_PRODUCTION_EXECUTION_QUEUE_FILE = (
     DATA_DIR / "legacy_non_prod_execution_queue.json"
@@ -928,6 +929,7 @@ def reconcile_state_with_remote(
     save_lock: threading.Lock | None = None,
     ownership_only_when_main: bool = False,
     allow_unprepared_claim: bool = True,
+    metadata_path: Path | None = None,
 ) -> StateReconcileResult:
     """Reconcile local files using ownership, hashes, and conditional revisions."""
     result = StateReconcileResult(local_role=role)
@@ -976,7 +978,7 @@ def reconcile_state_with_remote(
         if is_main and ownership_only_when_main:
             return result
 
-        sync_entries = _read_sync_entries()
+        sync_entries = _read_sync_entries(metadata_path)
         metadata_updates: Dict[str, Dict[str, Any]] = {}
         key_to_file = _synced_key_to_file()
 
@@ -1076,7 +1078,7 @@ def reconcile_state_with_remote(
                         break
 
         if metadata_updates:
-            _update_sync_entries(metadata_updates)
+            _update_sync_entries(metadata_updates, metadata_path)
         return result
     finally:
         if lock is not None:
@@ -1089,6 +1091,7 @@ def activate_device_as_main(
     *,
     save_lock: threading.Lock | None = None,
     expected_standby_generation: int = 0,
+    metadata_path: Path | None = None,
 ) -> StateReconcileResult:
     """Explicitly transfer main-device ownership, then reconcile safely."""
     if engine is None:
@@ -1105,6 +1108,7 @@ def activate_device_as_main(
         engine,
         pull_only_role,
         save_lock=save_lock,
+        metadata_path=metadata_path,
     )
     if prepared.errors or prepared.conflict_keys:
         return prepared
@@ -1128,7 +1132,12 @@ def activate_device_as_main(
             main_device_hostname=role.hostname,
             local_role=LocalDeviceRole(role.device_id, role.hostname, True),
         )
-    return reconcile_state_with_remote(engine, role, save_lock=save_lock)
+    return reconcile_state_with_remote(
+        engine,
+        role,
+        save_lock=save_lock,
+        metadata_path=metadata_path,
+    )
 
 
 def should_auto_claim_main(
@@ -1178,6 +1187,7 @@ def auto_claim_main_device_if_stale(
     heartbeat_cutoff_seconds: int = DEFAULT_HEARTBEAT_MAX_AGE_SECONDS,
     save_lock: threading.Lock | None = None,
     expected_standby_generation: int = 0,
+    metadata_path: Path | None = None,
 ) -> StateReconcileResult:
     """Automatic, fenced equivalent of ``activate_device_as_main``.
 
@@ -1205,7 +1215,12 @@ def auto_claim_main_device_if_stale(
     # startup pull must never turn an automatic claim into a blind overwrite
     # of newer remote buylist/execution-queue state.
     pull_only_role = LocalDeviceRole(role.device_id, role.hostname, False)
-    prepared = reconcile_state_with_remote(engine, pull_only_role, save_lock=save_lock)
+    prepared = reconcile_state_with_remote(
+        engine,
+        pull_only_role,
+        save_lock=save_lock,
+        metadata_path=metadata_path,
+    )
     if prepared.errors or prepared.conflict_keys:
         return prepared
 
@@ -1240,7 +1255,12 @@ def auto_claim_main_device_if_stale(
             lease_epoch=ownership.main_device.lease_epoch if ownership.main_device else 0,
             local_role=LocalDeviceRole(role.device_id, role.hostname, True),
         )
-    return reconcile_state_with_remote(engine, role, save_lock=save_lock)
+    return reconcile_state_with_remote(
+        engine,
+        role,
+        save_lock=save_lock,
+        metadata_path=metadata_path,
+    )
 
 
 def release_main_device_and_demote(

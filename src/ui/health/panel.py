@@ -433,6 +433,12 @@ class HealthPanelMixin:
             pc_database_engine=pc_database_engine,
             mirror_engine=self.__dict__.get("_local_mirror_engine"),
             mirror_tickers=mirror_tickers,
+            operational_store_configured=(
+                "operational_db_engine" in self.__dict__
+            ),
+            operational_store_engine=self.__dict__.get(
+                "operational_db_engine"
+            ),
             kis_snapshot_count=len(self.__dict__.get("kis_account_snapshots", {})),
             kis_request_running=any(
                 worker is not None and worker.isRunning() for worker in kis_workers

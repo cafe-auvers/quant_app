@@ -25,6 +25,10 @@ competing ORB refresh cycle.
 """
 from __future__ import annotations
 
+from datetime import datetime, time, timedelta, timezone
+from typing import Callable
+from zoneinfo import ZoneInfo
+
 from src.core.execution_queue import ExecutionQueueItem, OrbCandidateStatus
 from src.core.trade_card_state import BoardStatus, EntryRuntimeStatus, TradeCardState
 
@@ -51,6 +55,112 @@ _CANDIDATE_STATUS_TO_ENTRY_RUNTIME_STATUS = {
 # WAITING_BREAKOUT, VALID, EXECUTE_READY) is a normal in-progress state, not
 # a block worth explaining.
 _BLOCKED_CANDIDATE_STATUSES = {OrbCandidateStatus.RISK_INVALID, OrbCandidateStatus.REJECTED}
+
+_US_MARKET_ZONE = ZoneInfo("America/New_York")
+_US_REGULAR_OPEN = time(9, 30)
+_US_REGULAR_CLOSE = time(16, 0)
+_ORB_WINDOW_MINUTES = {"1m": 1, "5m": 5, "30m": 30}
+
+
+def _positive_float(value) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _clear_entry_plan(
+    card: TradeCardState, *, clear_quantity: bool = True
+) -> None:
+    """Remove values that must never leak from an older ORB/session."""
+
+    card.entry_orb_high = None
+    card.entry_orb_low = None
+    card.entry_trigger = None
+    card.stop_adr = None
+    if clear_quantity:
+        card.planned_quantity = 0
+        card.target_position_quantity = 0
+
+
+def _target_plan_available(card: TradeCardState) -> bool:
+    return bool(
+        _positive_float(card.breakout_price) is not None
+        and (
+            int(card.planned_quantity or 0) > 0
+            or _positive_float(card.position_percent) is not None
+        )
+    )
+
+
+def _orb_window_elapsed(
+    execution_queue_item: ExecutionQueueItem,
+    candidate,
+    *,
+    now: datetime,
+) -> bool:
+    reference = now
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    market_now = reference.astimezone(_US_MARKET_ZONE)
+    window = str(
+        getattr(candidate, "window", "")
+        or execution_queue_item.selected_window
+        or ""
+    ).strip()
+    minutes = _ORB_WINDOW_MINUTES.get(window)
+    if minutes is None:
+        return False
+    session_open = datetime.combine(
+        market_now.date(), _US_REGULAR_OPEN, tzinfo=_US_MARKET_ZONE
+    )
+    return market_now >= session_open + timedelta(minutes=minutes)
+
+
+def _use_target_plan(card: TradeCardState) -> TradeCardState:
+    """Keep monitoring durable target/allocation intent without ORB history."""
+
+    _clear_entry_plan(card, clear_quantity=False)
+    card.selected_orb_window = None
+    card.entry_runtime_status = EntryRuntimeStatus.EXECUTE_READY
+    card.entry_block_reason = ""
+    return card
+
+
+def _stale_for_current_session(
+    execution_queue_item: ExecutionQueueItem,
+    *,
+    now: datetime,
+) -> bool:
+    """Return whether a pre-open queue snapshot has outlived every ORB window.
+
+    A queue row refreshed before 09:30 ET is a legitimate ``FORMING`` plan
+    before the open.  Once the longest configured ORB window has elapsed, the
+    same untouched row is missing current-session data, not still forming.
+    Keeping this distinction here prevents both a misleading board badge and
+    reuse of yesterday/pre-market entry values.
+    """
+
+    reference = now
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    market_now = reference.astimezone(_US_MARKET_ZONE)
+    session_open = datetime.combine(
+        market_now.date(), _US_REGULAR_OPEN, tzinfo=_US_MARKET_ZONE
+    )
+    windows = [
+        _ORB_WINDOW_MINUTES.get(str(window or "").strip(), 0)
+        for window in (execution_queue_item.candidates or {})
+    ]
+    longest_window = max(windows or _ORB_WINDOW_MINUTES.values())
+    if market_now < session_open + timedelta(minutes=longest_window):
+        return False
+
+    updated_at = execution_queue_item.last_updated
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    return updated_at.astimezone(_US_MARKET_ZONE) < session_open
 
 
 def _display_candidate(execution_queue_item: ExecutionQueueItem):
@@ -109,12 +219,22 @@ def _display_candidate(execution_queue_item: ExecutionQueueItem):
     return None
 
 
+def _regular_session_complete(*, now: datetime) -> bool:
+    reference = now
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    return reference.astimezone(_US_MARKET_ZONE).time() >= _US_REGULAR_CLOSE
+
+
 class TradeCardOrbEvaluator:
     """Copies the execution queue's already-computed candidate selection
     onto a card. Never recomputes ORB/breakout/risk numbers itself --
     :mod:`src.core.orb`/:mod:`src.core.execution_queue`'s existing
     calculation remains the single source of truth for those.
     """
+
+    def __init__(self, *, clock: Callable[[], datetime] | None = None) -> None:
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     def update_card(
         self,
@@ -128,11 +248,62 @@ class TradeCardOrbEvaluator:
 
         if execution_queue_item.name and not card.name:
             card.name = execution_queue_item.name
-        card.breakout_price = execution_queue_item.breakout_price
+        queue_breakout = _positive_float(execution_queue_item.breakout_price)
+        if queue_breakout is not None:
+            card.breakout_price = queue_breakout
+        observed_price = _positive_float(execution_queue_item.current_price)
+        if observed_price is not None:
+            card.market_data_last_trusted_price = observed_price
+            card.market_data_last_trusted_at = execution_queue_item.last_updated
+
+        now = self._clock()
+        if _stale_for_current_session(
+            execution_queue_item,
+            now=now,
+        ):
+            if _target_plan_available(card):
+                return _use_target_plan(card)
+            _clear_entry_plan(card)
+            card.entry_runtime_status = EntryRuntimeStatus.DATA_UNAVAILABLE
+            card.entry_block_reason = "Current-session ORB minute bars are unavailable"
+            card.selected_orb_window = execution_queue_item.selected_window
+            return card
 
         candidate = _display_candidate(execution_queue_item)
+        if (
+            card.board_status == BoardStatus.BUY_TODAY
+            and _regular_session_complete(now=now)
+            and (
+                candidate is None
+                or candidate.status == OrbCandidateStatus.FORMING
+            )
+        ):
+            _clear_entry_plan(card)
+            card.entry_runtime_status = EntryRuntimeStatus.SESSION_COMPLETE
+            card.entry_block_reason = "Regular session is complete"
+            card.selected_orb_window = (
+                candidate.window
+                if candidate is not None
+                else execution_queue_item.selected_window
+            )
+            return card
+        if (
+            card.board_status == BoardStatus.BUY_TODAY
+            and _target_plan_available(card)
+            and (
+                candidate is None
+                or candidate.status == OrbCandidateStatus.FORMING
+            )
+            and _orb_window_elapsed(
+                execution_queue_item,
+                candidate,
+                now=now,
+            )
+        ):
+            return _use_target_plan(card)
         if candidate is None:
             # No ORB window has produced even a displayable plan yet.
+            _clear_entry_plan(card)
             card.entry_runtime_status = EntryRuntimeStatus.ORB_FORMING
             card.entry_block_reason = ""
             card.selected_orb_window = None
@@ -147,9 +318,8 @@ class TradeCardOrbEvaluator:
         card.stop_adr = candidate.stop_adr
         if candidate.risk_percent:
             card.risk_percent = candidate.risk_percent
-        if candidate.shares:
-            card.planned_quantity = int(candidate.shares)
-            card.target_position_quantity = int(candidate.shares)
+        card.planned_quantity = max(0, int(candidate.shares or 0))
+        card.target_position_quantity = card.planned_quantity
 
         card.entry_runtime_status = _CANDIDATE_STATUS_TO_ENTRY_RUNTIME_STATUS.get(
             candidate.status, EntryRuntimeStatus.ORB_FORMING

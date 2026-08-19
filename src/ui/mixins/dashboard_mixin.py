@@ -316,6 +316,18 @@ class DashboardMixin:
         if hasattr(self, "trade_kis_account_combo"):
             self.populate_trade_account_combo()
 
+    def configured_kis_account_keys(self) -> set[tuple[str, str]]:
+        """Return configured broker accounts without exposing KIS APIs to boards."""
+
+        return {
+            (
+                str(profile.get("environment") or "PROD").upper(),
+                str(profile.get("account_no") or "").strip(),
+            )
+            for profile in discover_account_profiles()
+            if str(profile.get("account_no") or "").strip()
+        }
+
     def _setup_live_data_timer(self) -> None:
         self.live_data_timer = QTimer(self)
         self.live_data_timer.setInterval(LIVE_INTRADAY_REFRESH_INTERVAL_MS)
@@ -460,15 +472,24 @@ class DashboardMixin:
         self.kis_startup_worker.start()
 
     def _on_startup_kis_accounts_finished(self, snapshots: dict, errors: list) -> None:
+        fetched_at = dt.datetime.now(dt.timezone.utc)
         if snapshots:
-            self._kis_api_last_success_at = dt.datetime.now().astimezone().isoformat(
+            self._kis_api_last_success_at = fetched_at.astimezone().isoformat(
                 timespec="seconds"
             )
         self._kis_api_last_error = (
             self._format_kis_error_message(str(errors[0])) if errors else ""
         )
         self.kis_account_snapshots.update(snapshots)
+        fetched_map = self.__dict__.setdefault(
+            "kis_account_snapshot_fetched_at", {}
+        )
+        for key in snapshots:
+            fetched_map[key] = fetched_at
         self.sync_buylist_positions_from_kis_snapshots(snapshots)
+        refresh_buyboard = getattr(self, "refresh_buyboard", None)
+        if callable(refresh_buyboard):
+            refresh_buyboard()
         selected_profile = self._selected_dashboard_kis_profile()
         if selected_profile:
             selected_snapshot = self.kis_account_snapshots.get(

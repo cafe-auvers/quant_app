@@ -39,6 +39,9 @@ from src.core.watchlist import BuylistManager, TradePlanManager, Watchlist
 from src.infrastructure.database.mirror_engine import resolve_data_engine
 from src.infrastructure.database.mirror_freshness import (
     local_mirror_hourly_is_stale, local_mirror_is_stale)
+from src.infrastructure.database.operational_engine import (
+    init_local_operational_engine,
+)
 from src.services import trading_state
 from src.services.app_state import (EXECUTION_QUEUE_FILE, SETTINGS_FILE,
                                     SaveResult, StateReconcileResult,
@@ -138,7 +141,7 @@ _STANDBY_GATE_LABELS = {
     "critical_trade_subscriptions_acked": "trade subscription acknowledgements",
     "critical_quote_subscriptions_acked": "quote subscription acknowledgements",
     "accumulator_draining_within_budget": "sustained market-data queue delay",
-    "database_writable": "canonical database write probe",
+    "database_writable": "local Kanban operational state writable",
 }
 
 
@@ -237,8 +240,12 @@ def _buyboard_readiness_display(
             "Startup cannot become ready until every configured account has been reconciled.",
             indeterminate=True,
         )
+    elif len(blocked_labels) > 1:
+        reason = f"{len(blocked_labels)} checks pending: " + "; ".join(
+            blocked_labels
+        )
     elif not readiness.database_writable:
-        reason = "waiting for canonical database write access"
+        reason = "waiting for the local Kanban operational store"
     elif not readiness.account_reconciliation_fresh:
         reason = "waiting for a fresh broker account snapshot"
     elif not readiness.websocket_connected:
@@ -464,6 +471,7 @@ class StateSyncWorker(QThread):
         expected_owner_device_id: str = "",
         expected_standby_generation: int = 0,
         require_runtime_ready_claim: bool = False,
+        metadata_path=None,
     ) -> None:
         super().__init__()
         self.engine = engine
@@ -481,6 +489,7 @@ class StateSyncWorker(QThread):
         self.expected_owner_device_id = expected_owner_device_id
         self.expected_standby_generation = int(expected_standby_generation or 0)
         self.require_runtime_ready_claim = bool(require_runtime_ready_claim)
+        self.metadata_path = metadata_path
 
     def run(self) -> None:
         try:
@@ -491,6 +500,7 @@ class StateSyncWorker(QThread):
                     expected_owner_device_id=self.expected_owner_device_id,
                     save_lock=self.save_lock,
                     expected_standby_generation=self.expected_standby_generation,
+                    metadata_path=self.metadata_path,
                 )
             elif self.activate:
                 result = activate_device_as_main(
@@ -498,6 +508,7 @@ class StateSyncWorker(QThread):
                     self.role,
                     save_lock=self.save_lock,
                     expected_standby_generation=self.expected_standby_generation,
+                    metadata_path=self.metadata_path,
                 )
             else:
                 result = reconcile_state_with_remote(
@@ -506,6 +517,7 @@ class StateSyncWorker(QThread):
                     save_lock=self.save_lock,
                     ownership_only_when_main=self.ownership_only_when_main,
                     allow_unprepared_claim=not self.require_runtime_ready_claim,
+                    metadata_path=self.metadata_path,
                 )
         except Exception as exc:
             logger.exception("State sync worker failed")
@@ -626,6 +638,15 @@ class MainWindow(
         self._pc_database_ready = False
         self._pc_database_coordination_ready = False
         self._last_pc_database_probe_ready = False
+        self._main_availability_probe_complete = False
+        self._main_availability_probe_database_ready = False
+        # Execution state is deliberately independent of the optional
+        # daily/hourly/intraday market-data databases.  A small local SQLite
+        # store keeps Kanban cards, leases, commands, orders, and the trading
+        # control available even when every historical database is offline.
+        self.operational_db_engine = init_local_operational_engine()
+        self._operational_database_ready = self.operational_db_engine is not None
+        self._operational_state_generation = 0
         self._database_transition_generation = 0
         self._database_shutting_down = False
         self._database_reconciliation_in_progress = False
@@ -745,10 +766,15 @@ class MainWindow(
         self.kis_daily_chart_unavailable_key: str = ""
         self.kis_daily_chart_last_error: str = ""
         self.state_save_manager = get_state_save_manager()
+        self.state_save_manager.metadata_file = (
+            self._execution_state_metadata_path()
+        )
         self.state_save_manager.set_engine(
-            None,
+            self._execution_state_engine(),
             device_id=self.state_sync_role.device_id,
-            is_main_device=self.state_sync_role.is_main,
+            # A persisted local role is only a hint until this launch has
+            # re-read the durable lease and reconciled KIS state.
+            is_main_device=False,
         )
         self._init_controllers()
 
@@ -796,6 +822,7 @@ class MainWindow(
         self.update_dashboard_summary()
         self.on_tab_changed()
         QTimer.singleShot(0, self._start_optional_database_initialization)
+        QTimer.singleShot(250, self._start_state_sync)
         QTimer.singleShot(1500, self.preload_kis_accounts_on_startup)
         QTimer.singleShot(2500, lambda: self.refresh_usd_krw_rate(show_messages=False))
         QTimer.singleShot(4000, self.reconcile_open_orders)
@@ -810,6 +837,52 @@ class MainWindow(
         self.scanner_controller = ScannerController(self)
         self.chart_data_controller = ChartDataController(self)
         self.account_controller = AccountController(self)
+
+    def _execution_state_engine(self):
+        """Return Kanban's operational store, never the historical-data route."""
+
+        local_engine = self.__dict__.get("operational_db_engine")
+        if local_engine is not None:
+            return local_engine
+        return self.__dict__.get("pc_db_engine")
+
+    def _execution_state_ready(self) -> bool:
+        engine = self._execution_state_engine()
+        if engine is None:
+            return False
+        local_engine = self.__dict__.get("operational_db_engine")
+        if engine is local_engine:
+            return bool(self.__dict__.get("_operational_database_ready", True))
+        return bool(
+            self.__dict__.get("_pc_database_ready", engine is not None)
+        )
+
+    def _using_local_operational_authority(self) -> bool:
+        engine = self._execution_state_engine()
+        return bool(
+            engine is not None
+            and engine is self.__dict__.get("operational_db_engine")
+        )
+
+    def _execution_state_generation(self) -> int:
+        """Return a generation unaffected by historical-data route changes."""
+
+        return int(
+            self.__dict__.get(
+                "_operational_state_generation",
+                self.__dict__.get("_database_transition_generation", 0),
+            )
+            or 0
+        )
+
+    def _execution_state_metadata_path(self):
+        from src.services import app_state
+
+        return (
+            app_state.KANBAN_STATE_METADATA_FILE
+            if self._using_local_operational_authority()
+            else None
+        )
 
     def _start_optional_database_initialization(self) -> None:
         """Begin optional database setup after widgets have been rendered."""
@@ -849,9 +922,18 @@ class MainWindow(
         self.db_enabled = engine is not None
         self.db_initializing = False
         self._pc_database_ready = bool(source == "pc" and pc_engine is not None)
-        self._pc_database_coordination_ready = False
+        if not self._using_local_operational_authority():
+            self._pc_database_coordination_ready = False
         self._last_pc_database_probe_ready = self._pc_database_ready
-        self._bind_remote_state_engine(pc_engine, is_main_device=False)
+        self._main_availability_probe_complete = True
+        self._main_availability_probe_database_ready = self._pc_database_ready
+        self._bind_remote_state_engine(
+            self._execution_state_engine(),
+            is_main_device=bool(
+                self.state_sync_role.is_main
+                and self._using_local_operational_authority()
+            ),
+        )
         self._update_database_source_indicator()
 
         if source == "pc":
@@ -871,6 +953,7 @@ class MainWindow(
                 "MySQL cache is unavailable; scanner and cached intraday features remain disabled."
             )
         self._start_market_data_status_refresh()
+        self._update_main_device_button()
         self.update_dashboard_summary()
         # The startup resolver already performed the first PC database probe.
         # Start service polling only after that probe has completed so startup
@@ -991,7 +1074,7 @@ class MainWindow(
             pc_engine,
             local_engine,
             hourly_symbols=self._relevant_hourly_symbols(),
-            generation=self.__dict__.get("_database_transition_generation", 0),
+            generation=self._execution_state_generation(),
         )
         self._local_mirror_sync_worker = worker
         self._local_mirror_sync_log_completion = bool(log_completion)
@@ -1319,14 +1402,13 @@ class MainWindow(
         auto_claim: bool = False,
         expected_owner_device_id: str = "",
         expected_standby_generation: int = 0,
+        allow_local_bootstrap: bool = False,
     ) -> None:
-        """Start one ownership/state reconciliation in a background worker."""
+        """Reconcile Kanban state without consulting historical-data storage."""
         if self.__dict__.get("_database_shutting_down", False):
             return
-        pc_engine = self.__dict__.get("pc_db_engine")
-        if pc_engine is None or not self.__dict__.get(
-            "_pc_database_ready", pc_engine is not None
-        ):
+        execution_engine = self._execution_state_engine()
+        if execution_engine is None or not self._execution_state_ready():
             return
         worker = self.state_sync_worker
         if worker is not None and worker.isRunning():
@@ -1345,6 +1427,10 @@ class MainWindow(
             runtime_claim_required
             and (activate or auto_claim)
             and expected_standby_generation <= 0
+            and not (
+                allow_local_bootstrap
+                and self._using_local_operational_authority()
+            )
         ):
             self.append_log(
                 "Main-device claim deferred: this device has not published a "
@@ -1355,7 +1441,7 @@ class MainWindow(
             self._handoff_reconciliation_required = True
             self._handoff_allow_auto_arm = bool(auto_claim)
         worker = StateSyncWorker(
-            self.pc_db_engine,
+            execution_engine,
             self.state_sync_role,
             self._ensure_save_lock(),
             activate=activate or auto_claim,
@@ -1369,7 +1455,14 @@ class MainWindow(
             auto_claim=auto_claim,
             expected_owner_device_id=expected_owner_device_id,
             expected_standby_generation=expected_standby_generation,
-            require_runtime_ready_claim=runtime_claim_required,
+            require_runtime_ready_claim=(
+                runtime_claim_required
+                and not (
+                    allow_local_bootstrap
+                    and self._using_local_operational_authority()
+                )
+            ),
+            metadata_path=self._execution_state_metadata_path(),
         )
         self.state_sync_worker = worker
         self._state_sync_action = "activate" if (activate or auto_claim) else "reconcile"
@@ -1390,10 +1483,11 @@ class MainWindow(
     ) -> None:
         if self.__dict__.get("_database_shutting_down", False):
             return
-        if generation != self.__dict__.get("_database_transition_generation", 0):
+        if generation != self._execution_state_generation():
             return
-        if not self.__dict__.get("_pc_database_ready", False):
+        if not self._execution_state_ready():
             return
+        execution_engine = self._execution_state_engine()
         live_trading_error = str(
             getattr(result, "live_trading_error", "") or ""
         )
@@ -1437,13 +1531,13 @@ class MainWindow(
             self._pc_database_coordination_ready = True
             self._last_successful_reconcile_at = dt.datetime.now(dt.timezone.utc)
             self._bind_remote_state_engine(
-                self.pc_db_engine,
+                execution_engine,
                 is_main_device=result.is_main_device,
             )
         else:
             self._pc_database_coordination_ready = False
             self._bind_remote_state_engine(
-                self.pc_db_engine,
+                execution_engine,
                 is_main_device=False,
             )
         self._current_lease_token = result.lease_token if result.is_main_device else ""
@@ -1539,11 +1633,12 @@ class MainWindow(
         if (
             action != "activate"
             and self._auto_claim_main_enabled
+            and not self._using_local_operational_authority()
             and not result.is_main_device
             and not (self.state_sync_worker and self.state_sync_worker.isRunning())
         ):
             should_claim, expected_owner_device_id, reason = should_auto_claim_main(
-                self.pc_db_engine,
+                execution_engine,
                 self.state_sync_role,
                 other_hostname=result.main_device_hostname,
             )
@@ -1577,7 +1672,7 @@ class MainWindow(
             return 0
         worker = self.__dict__.get("_buyboard_runtime_worker")
         role = self.__dict__.get("state_sync_role")
-        engine = self.__dict__.get("pc_db_engine")
+        engine = self._execution_state_engine()
         if worker is None or role is None or engine is None:
             return 0
         try:
@@ -1677,11 +1772,30 @@ class MainWindow(
                 )
 
         if worker is None or not self._background_worker_running(worker):
+            if not self._execution_state_ready():
+                kis_ready = bool(
+                    self.__dict__.get("kis_account_snapshots", {})
+                    and self.__dict__.get("kis_account_snapshot_fetched_at", {})
+                )
+                return BuyboardReadinessDisplay(
+                    0,
+                    7,
+                    (
+                        "Buy Board recovery — KIS holdings/prices monitored; "
+                        "execution disabled (Kanban operational store unavailable)"
+                        if kis_ready
+                        else "Buy Board recovery — connecting to KIS; execution "
+                        "disabled (Kanban operational store unavailable)"
+                    ),
+                    "Historical data is not an execution requirement. The local "
+                    "Kanban operational file itself could not be opened, so cards, "
+                    "commands, orders, and the device lease cannot be persisted.",
+                )
             return BuyboardReadinessDisplay(
                 0,
                 8,
                 "Buy Board startup — runtime worker unavailable",
-                "The execution worker has not started; check canonical database and engine configuration.",
+                "The local Kanban store is available; the execution worker is still starting. Historical-data availability is not a gate.",
                 indeterminate=True,
             )
         try:
@@ -1881,15 +1995,16 @@ class MainWindow(
         execution_queue_payload = load_json(EXECUTION_QUEUE_FILE, {})
         try:
             published = publish_handoff_snapshot(
-                self.pc_db_engine,
+                self._execution_state_engine(),
                 self.state_sync_role,
                 self.buylist_manager.to_dict(),
                 execution_queue_payload,
+                metadata_path=self._execution_state_metadata_path(),
             )
         except Exception as exc:
             return False, str(exc)
         if not published:
-            return False, "shared MySQL did not confirm the handoff state"
+            return False, "Kanban operational store did not confirm the handoff state"
         return True, ""
 
     def _retry_post_claim_handoff_if_still_main(self) -> None:
@@ -1910,38 +2025,63 @@ class MainWindow(
         if self.__dict__.get("trading_enabled_button") is not None:
             self._refresh_trading_enabled_widget()
         self.append_log(
-            "Live trading is controlled by the shared deployment switch; "
+            "Live trading is controlled by the durable Kanban switch; "
             "Main-device handoff did not change it."
         )
 
     def _update_main_device_button(self, *, main_hostname: str = "") -> None:
-        button = getattr(self, "main_device_button", None)
+        button = self.__dict__.get("main_device_button")
         if button is None:
             return
         is_main = bool(self.state_sync_role.is_main)
-        button.setEnabled(
-            bool(
-                self.__dict__.get(
-                    "_pc_database_ready",
-                    self.__dict__.get("pc_db_engine") is not None,
-                )
+        database_ready = self._execution_state_ready()
+        local_authority = self._using_local_operational_authority()
+        database_initializing = bool(self.__dict__.get("db_initializing", False))
+        availability_probe_complete = bool(
+            self.__dict__.get(
+                "_main_availability_probe_complete",
+                not database_initializing,
             )
-            or bool(self.__dict__.get("db_initializing", False))
         )
-        if is_main:
-            button.setText("Main Device: ON")
+        probe_found_database = bool(
+            self.__dict__.get("_main_availability_probe_database_ready", False)
+        )
+        recovery_running = self.__dict__.get("database_recovery_worker") is not None
+        button.setEnabled(database_ready)
+        if is_main and database_ready:
+            button.setText(
+                "Main Device: ON (Local Kanban)"
+                if local_authority
+                else "Main Device: ON"
+            )
             button.setStyleSheet(
                 "background-color: #137333; color: white; font-weight: bold;"
             )
             button.setToolTip(
-                "This device is the only device allowed to push shared app state."
+                "This device owns Kanban execution. Historical daily/hourly/"
+                "intraday databases are not part of execution readiness."
+            )
+        elif not database_ready:
+            if not availability_probe_complete:
+                button.setText("Checking Main availability (up to 3s)...")
+            elif probe_found_database or recovery_running:
+                button.setText("Verifying Kanban store...")
+            else:
+                button.setText("Main unavailable: Kanban store offline")
+            button.setStyleSheet("")
+            button.setToolTip(
+                "The local Kanban operational store could not be opened. Historical "
+                "database availability does not affect this control."
             )
         else:
             button.setText("Use This Device as Main")
             button.setStyleSheet("")
             owner_text = main_hostname or "the other device"
             button.setToolTip(
-                f"This device is pull-only. Click to transfer main ownership from {owner_text}."
+                "This device is pull-only. Click to make its local Kanban store "
+                "authoritative; KIS reconciliation runs before execution."
+                if local_authority
+                else f"This device is pull-only. Click to transfer main ownership from {owner_text}."
             )
 
     def _on_main_device_button_clicked(self) -> None:
@@ -1952,15 +2092,23 @@ class MainWindow(
                 "This device is already the exclusive main device.",
             )
             return
-        if self.pc_db_engine is None:
+        execution_engine = self._execution_state_engine()
+        if execution_engine is None or not self._execution_state_ready():
             QMessageBox.warning(
                 self,
-                "State sync unavailable",
-                "Connect to the shared MySQL database before transferring main-device ownership.",
+                "Main-device transfer unavailable",
+                "The local Kanban operational store could not be opened. Historical "
+                "daily/hourly/intraday data is not required, but cards, commands, "
+                "orders, and the local execution lease must be persisted.",
             )
             return
+        local_authority = self._using_local_operational_authority()
         standby_generation = self._runtime_standby_generation_for_claim()
-        if execution_config.is_buyboard_engine_enabled() and standby_generation <= 0:
+        if (
+            execution_config.is_buyboard_engine_enabled()
+            and standby_generation <= 0
+            and not local_authority
+        ):
             display = self._current_buyboard_readiness_display()
             detail = (
                 f"\n\nCurrent status:\n{display.label}\n\n{display.tooltip}"
@@ -1980,10 +2128,15 @@ class MainWindow(
         reply = QMessageBox.question(
             self,
             "Use This Device as Main",
-            "Transfer main-device ownership to this device?\n\n"
-            "The other device will be lease-fenced and become pull-only. Remote "
-            "revisions are checked so stale state cannot overwrite newer data.\n\n"
-            "This device will query every assigned KIS account before monitoring "
+            "Make this device the Kanban execution authority?\n\n"
+            + (
+                "This uses the durable local Kanban store. Historical-data outages "
+                "will affect charts and scans only. Do not run another disconnected "
+                "execution instance for the same KIS account.\n\n"
+                if local_authority
+                else "The other device will be lease-fenced and become pull-only.\n\n"
+            )
+            + "This device will query every assigned KIS account before monitoring "
             "can resume. Live trading will remain disabled after the transfer.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
@@ -1992,11 +2145,12 @@ class MainWindow(
             self._start_state_sync(
                 activate=True,
                 expected_standby_generation=standby_generation,
+                allow_local_bootstrap=local_authority,
             )
 
     # Bounded age past which a cached "I am main" belief is no longer trusted
     # for order submission. Defense in depth against network partition: a
-    # device that loses its connection to MySQL while still believing it's
+    # device that loses its connection to its operational store while still believing it's
     # main can never learn it's been demoted (its own reconciles just start
     # failing), so this makes it stop trading on its own before it could
     # even hear about an ownership change -- independent of, and in addition
@@ -2047,7 +2201,7 @@ class MainWindow(
                 lease_token=lease_token,
                 lease_epoch=int(self.__dict__.get("_current_lease_epoch", 0) or 0),
             ),
-            "lease_engine": self.__dict__.get("pc_db_engine"),
+            "lease_engine": self._execution_state_engine(),
         }
 
     # Maximum age of BuyboardRuntimeWorker.last_cycle_started_at (the
@@ -2228,7 +2382,7 @@ class MainWindow(
             should_run = (
                 is_buyboard_engine_enabled()
                 and role is not None
-                and self.__dict__.get("pc_db_engine") is not None
+                and self._execution_state_ready()
             )
             if not should_run:
                 if worker is not None and worker.isRunning():
@@ -2257,8 +2411,9 @@ class MainWindow(
                 return  # not actually main by the time we got here -- do not start
 
             queue_manager = self.__dict__.get("execution_queue_manager")
+            execution_engine = self._execution_state_engine()
             external_alerting = build_external_alerting_service(
-                self.pc_db_engine, device_id=role.device_id
+                execution_engine, device_id=role.device_id
             )
 
             # Review finding P0-1: this must be the real, per-account,
@@ -2273,7 +2428,7 @@ class MainWindow(
             account_equity_provider = buying_power_cache.make_account_equity_provider()
 
             new_worker = BuyboardRuntimeWorker(
-                db_engine=self.pc_db_engine,
+                db_engine=execution_engine,
                 environment="PROD",
                 account_no="",  # unscoped -- processes every PROD account's cards
                 buying_power_provider=buying_power_provider,
@@ -2353,16 +2508,16 @@ class MainWindow(
             return True
         if coordination_stale:
             self.append_log(
-                "CRITICAL: shared-MySQL lease coordination is stale. All KIS "
+                "CRITICAL: Kanban lease coordination is stale. All KIS "
                 "orders, including protective exits, remain blocked to prevent "
                 "split-brain execution. Manage the position directly in KIS if needed."
             )
             QMessageBox.warning(
                 self,
                 "Trading safety lock",
-                "Shared-MySQL lease coordination is stale. All KIS submissions, "
+                "Kanban lease coordination is stale. All KIS submissions, "
                 "including protective exits, are blocked to prevent two devices "
-                "from trading at once.\n\nRestore MySQL coordination or manage any "
+                "from trading at once.\n\nRestore the Kanban operational store or manage any "
                 "live position directly in KIS.",
             )
             return False
@@ -2742,7 +2897,12 @@ class MainWindow(
         role = self.state_sync_role
         if is_main_device is None:
             is_main_device = bool(role.is_main)
-        self._state_save_manager().set_engine(
+        manager = self._state_save_manager()
+        # Keep base revisions isolated from the optional shared/history
+        # database. Reusing its metadata would make a new local store look as
+        # if its missing rows had been deleted remotely.
+        manager.metadata_file = self._execution_state_metadata_path()
+        manager.set_engine(
             engine,
             device_id=role.device_id,
             is_main_device=is_main_device,
@@ -2995,6 +3155,8 @@ class MainWindow(
             self.__dict__.get("buyboard_readiness_progress_timer"),
             self.__dict__.get("_buyboard_projection_timer"),
             self.__dict__.get("_buyboard_live_metric_timer"),
+            self.__dict__.get("_buyboard_orb_data_timer"),
+            self.__dict__.get("_buyboard_broker_truth_timer"),
             self.__dict__.get("_refresh_poll_timer"),
         ]
         timer_states = []
@@ -3093,8 +3255,8 @@ class MainWindow(
             return
 
         safe_mark_runtime_process_stopped(
-            self.pc_db_engine
-            if getattr(self, "_pc_database_ready", False)
+            self._execution_state_engine()
+            if self._execution_state_ready()
             else None
         )
         super().closeEvent(event)
@@ -3106,13 +3268,14 @@ class MainWindow(
 
         Extracted as its own method (rather than inlined in the already-long
         closeEvent) so it's independently testable. A no-op for a pull-only
-        device or when the shared database isn't ready -- most shutdowns
+        device or when the Kanban operational store isn't ready -- most shutdowns
         never touch the network at all.
         """
         if not self.state_sync_role.is_main:
             return True
-        if not getattr(self, "_pc_database_ready", False):
+        if not self._execution_state_ready():
             return False
+        execution_engine = self._execution_state_engine()
         decision = self._execution_shutdown_lease_decision(
             explicit_unprotected_acceptance=bool(
                 self.__dict__.get("_shutdown_unprotected_accepted", False)
@@ -3141,10 +3304,11 @@ class MainWindow(
         execution_queue_payload = load_json(EXECUTION_QUEUE_FILE, {})
         try:
             published = publish_handoff_snapshot(
-                self.pc_db_engine,
+                execution_engine,
                 self.state_sync_role,
                 self.buylist_manager.to_dict(),
                 execution_queue_payload,
+                metadata_path=self._execution_state_metadata_path(),
             )
         except Exception as exc:
             published = False
@@ -3152,14 +3316,14 @@ class MainWindow(
         if not published:
             self.append_log(
                 "Main-device ownership retained because the final handoff "
-                "snapshot was not confirmed remotely; the next device must "
+                "snapshot was not confirmed durably; the next device must "
                 "use stale-heartbeat takeover."
             )
             return False
 
         owning_role = self.state_sync_role
         released, resulting_role, release_error = release_main_device_and_demote(
-            self.pc_db_engine,
+            execution_engine,
             owning_role,
             expected_lease_token=str(
                 self.__dict__.get("_current_lease_token", "") or ""
@@ -3168,7 +3332,7 @@ class MainWindow(
                 self.__dict__.get("_current_lease_epoch", 0) or 0
             ),
             disable_remote_writer=lambda: self._bind_remote_state_engine(
-                self.pc_db_engine, is_main_device=False
+                execution_engine, is_main_device=False
             ),
         )
         if released:
@@ -3181,7 +3345,7 @@ class MainWindow(
             self.state_sync_role = owning_role
             try:
                 self._bind_remote_state_engine(
-                    self.pc_db_engine, is_main_device=True
+                    execution_engine, is_main_device=True
                 )
             except Exception:
                 logger.exception("Could not restore remote writer after release failure")
@@ -3222,7 +3386,7 @@ class MainWindow(
         self._database_transition_generation = (
             self.__dict__.get("_database_transition_generation", 0) + 1
         )
-        engine = self.__dict__.get("pc_db_engine")
+        engine = self._execution_state_engine()
         role = self.__dict__.get("state_sync_role")
         if engine is not None and role is not None:
             try:
@@ -3232,6 +3396,7 @@ class MainWindow(
                     save_lock=self._ensure_save_lock(),
                     ownership_only_when_main=True,
                     allow_unprepared_claim=not execution_config.is_buyboard_engine_enabled(),
+                    metadata_path=self._execution_state_metadata_path(),
                 )
                 if result.local_role is not None:
                     self.state_sync_role = result.local_role
@@ -3270,11 +3435,11 @@ class MainWindow(
         )
         from src.services.trade_card_repository import list_trade_cards
 
-        engine = self.__dict__.get("pc_db_engine")
-        if engine is None or not self.__dict__.get("_pc_database_ready", False):
+        engine = self._execution_state_engine()
+        if engine is None or not self._execution_state_ready():
             return ShutdownExposure(
                 inspection_confirmed=False,
-                inspection_error="shared execution database unavailable",
+                inspection_error="Kanban operational store unavailable",
             )
         try:
             cards = list_trade_cards(engine, environment="PROD")
@@ -3325,7 +3490,7 @@ class MainWindow(
 
         exposure = self._execution_shutdown_exposure()
         successor = None
-        engine = self.__dict__.get("pc_db_engine")
+        engine = self._execution_state_engine()
         role = self.__dict__.get("state_sync_role")
         outgoing_lease_epoch = int(
             self.__dict__.get("_current_lease_epoch", 0) or 0
@@ -3650,7 +3815,7 @@ class MainWindow(
         # and database I/O stay on a worker so the UI thread never blocks.
         self._pc_status_worker: Optional[PcRemoteStatusWorker] = None
         self.pc_status_timer = QTimer(self)
-        self.pc_status_timer.setInterval(15000)
+        self.pc_status_timer.setInterval(5000)
         self.pc_status_timer.timeout.connect(self._poll_pc_status)
         self.pc_status_timer.start()
         QTimer.singleShot(0, self._poll_pc_status)
@@ -3672,26 +3837,29 @@ class MainWindow(
         self.update_market_countdown_status()
 
     def _read_authoritative_live_trading_control(self) -> bool:
-        """Read the canonical global switch for a broker-boundary decision."""
+        """Read the durable Kanban switch for a broker-boundary decision."""
 
-        engine = self.__dict__.get("pc_db_engine")
-        if engine is None or not self.__dict__.get("_pc_database_ready", False):
-            raise RuntimeError("canonical shared database is unavailable")
+        engine = self._execution_state_engine()
+        if engine is None or not self._execution_state_ready():
+            raise RuntimeError("Kanban operational store is unavailable")
         result = get_live_trading_control(engine)
         if not result.success or result.control is None:
             raise RuntimeError(
-                result.error or "shared live-trading control is unavailable"
+                result.error or "Kanban live-trading control is unavailable"
             )
         return bool(result.control.enabled)
 
     def _refresh_trading_enabled_widget(self) -> None:
-        """Project the shared deployment kill switch into the toolbar."""
+        """Project the durable Kanban kill switch into the toolbar."""
         button = getattr(self, "trading_enabled_button", None)
         if button is None:
             return
         locked = trading_state.is_trading_locked_disabled()
         enabled = trading_state.is_trading_enabled()
-        shared_configured = "pc_db_engine" in self.__dict__
+        control_configured = bool(
+            "operational_db_engine" in self.__dict__
+            or "pc_db_engine" in self.__dict__
+        )
         shared_available = bool(
             self.__dict__.get("_shared_live_trading_available", False)
         )
@@ -3701,9 +3869,9 @@ class MainWindow(
         try:
             button.setChecked(enabled)
             if update_running:
-                button.setText("LIVE TRADING ● UPDATING SHARED CONTROL...")
+                button.setText("LIVE TRADING ● UPDATING KANBAN CONTROL...")
                 button.setToolTip(
-                    "The deployment-wide control update is being committed."
+                    "The Kanban operational control update is being committed."
                 )
                 button.setEnabled(False)
                 button.setStyleSheet(
@@ -3721,14 +3889,14 @@ class MainWindow(
                     "QPushButton { background-color: #363a45; color: #787b86; "
                     "font-weight: bold; padding: 4px 10px; border-radius: 4px; }"
                 )
-            elif shared_configured and not shared_available:
+            elif control_configured and not shared_available:
                 button.setText(
                     "LIVE TRADING ● ON (EMERGENCY ONLY)"
                     if enabled
                     else "LIVE TRADING ● CONTROL OFFLINE"
                 )
                 button.setToolTip(
-                    "The canonical shared control cannot be read. Ordinary "
+                    "The Kanban operational control cannot be read. Ordinary "
                     "orders fail closed. A last-confirmed ON state is usable "
                     "only by the bounded emergency protective path."
                 )
@@ -3738,11 +3906,11 @@ class MainWindow(
                     "font-weight: bold; padding: 4px 10px; border-radius: 4px; }"
                 )
             elif enabled:
-                button.setText("LIVE TRADING ● ON (SHARED)")
+                button.setText("LIVE TRADING ● ON (KANBAN)")
                 button.setToolTip(
-                    "The deployment-wide broker gate is ON on both devices. "
-                    "Only the current Main device can execute. Click to turn "
-                    "it OFF everywhere."
+                    "The durable broker gate is ON in this Kanban operational "
+                    "store. Only its current Main device can execute. Click to "
+                    "turn it OFF."
                 )
                 button.setEnabled(True)
                 button.setStyleSheet(
@@ -3750,10 +3918,10 @@ class MainWindow(
                     "font-weight: bold; padding: 4px 10px; border-radius: 4px; }"
                 )
             else:
-                button.setText("LIVE TRADING ● DISABLED (SHARED)")
+                button.setText("LIVE TRADING ● DISABLED (KANBAN)")
                 button.setToolTip(
-                    "Broker submission is blocked on both devices. Click to "
-                    "turn it ON everywhere (confirmation required)."
+                    "Broker submission is blocked. Click to turn it ON in the "
+                    "current Kanban operational store (confirmation required)."
                 )
                 button.setEnabled(True)
                 button.setStyleSheet(
@@ -3764,14 +3932,14 @@ class MainWindow(
             button.blockSignals(False)
 
     def _on_trading_enabled_toggled(self, checked: bool) -> None:
-        """Set the deployment-wide switch from either laptop or PC."""
+        """Set the broker gate in the current Kanban operational store."""
         if checked:
             reply = QMessageBox.question(
                 self,
                 "Enable Live Trading",
-                "This turns guarded KIS order submission ON for the deployment. "
-                "Both computers will show ON, but only the current Main device "
-                "can execute. Continue?",
+                "This turns guarded KIS order submission ON for this Kanban "
+                "operational store. Only its current Main device can execute. "
+                "Continue?",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
@@ -3779,8 +3947,11 @@ class MainWindow(
                 self._refresh_trading_enabled_widget()
                 return
         # Lightweight widget tests have no database. Real windows always use
-        # the shared row and never silently fall back to process-local state.
-        if "pc_db_engine" not in self.__dict__:
+        # the durable row and never silently fall back to process-local state.
+        if (
+            "operational_db_engine" not in self.__dict__
+            and "pc_db_engine" not in self.__dict__
+        ):
             trading_state.set_trading_enabled(bool(checked))
             self._refresh_trading_enabled_widget()
             return
@@ -3790,7 +3961,7 @@ class MainWindow(
             self._refresh_trading_enabled_widget()
             return
         worker = LiveTradingControlWorker(
-            self.__dict__.get("pc_db_engine"),
+            self._execution_state_engine(),
             self.state_sync_role,
             bool(checked),
         )
@@ -3799,7 +3970,7 @@ class MainWindow(
         self._track_worker("live_trading_control_worker", worker)
         button = self.trading_enabled_button
         button.setEnabled(False)
-        button.setText("LIVE TRADING ● UPDATING SHARED CONTROL...")
+        button.setText("LIVE TRADING ● UPDATING KANBAN CONTROL...")
         worker.start()
 
     def _on_live_trading_control_updated(self, result) -> None:
@@ -3811,16 +3982,16 @@ class MainWindow(
             QMessageBox.warning(
                 self,
                 "Live Trading Control Unavailable",
-                "The shared switch was not changed. Ordinary broker mutations "
+                "The Kanban switch was not changed. Ordinary broker mutations "
                 "remain fail-closed.\n\n"
-                + (result.error or "Canonical database unavailable."),
+                + (result.error or "Kanban operational store unavailable."),
             )
             return
 
         trading_state.set_trading_enabled(result.control.enabled)
         self._shared_live_trading_available = bool(
-            self.__dict__.get("pc_db_engine") is not None
-            and self.__dict__.get("_pc_database_ready", False)
+            self._execution_state_engine() is not None
+            and self._execution_state_ready()
         )
         self._shared_live_trading_revision = result.control.revision
 
@@ -3828,8 +3999,8 @@ class MainWindow(
         effective = trading_state.is_trading_enabled()
         self.append_log(
             f"Live trading {'ENABLED' if effective else 'DISABLED'} "
-            f"for both devices by {self.state_sync_role.hostname} "
-            f"(shared revision {result.control.revision})."
+            f"in the Kanban store by {self.state_sync_role.hostname} "
+            f"(revision {result.control.revision})."
         )
 
     def _build_status_log(self, parent_layout: QVBoxLayout) -> None:
@@ -4140,7 +4311,6 @@ class MainWindow(
             return
         was_pc_active = bool(
             self.__dict__.get("_pc_database_ready", False)
-            or self.__dict__.get("pc_db_engine") is not None
             or self.__dict__.get("db_engine_source", "none") == "pc"
         )
         if not was_pc_active:
@@ -4150,8 +4320,6 @@ class MainWindow(
         if self.__dict__.get("_pc_probe_engine") is None:
             self._pc_probe_engine = current_pc_engine
         self._pc_database_ready = False
-        self._pc_database_coordination_ready = False
-        self._shared_live_trading_available = False
         self._database_reconciliation_in_progress = False
         self.pc_db_engine = None
         self.db_engine = None
@@ -4163,11 +4331,24 @@ class MainWindow(
         self._database_transition_generation = (
             self.__dict__.get("_database_transition_generation", 0) + 1
         )
-        self._initial_state_sync_complete = False
-        try:
-            self._bind_remote_state_engine(None, is_main_device=False)
-        except Exception:
-            logger.exception("Could not detach remote state persistence during failover")
+        if self._using_local_operational_authority():
+            try:
+                self._bind_remote_state_engine(
+                    self._execution_state_engine(),
+                    is_main_device=bool(self.state_sync_role.is_main),
+                )
+            except Exception:
+                logger.exception("Could not retain local Kanban persistence")
+        else:
+            self._pc_database_coordination_ready = False
+            self._shared_live_trading_available = False
+            self._initial_state_sync_complete = False
+            try:
+                self._bind_remote_state_engine(None, is_main_device=False)
+            except Exception:
+                logger.exception(
+                    "Could not detach remote state persistence during failover"
+                )
 
         local_engine = self.__dict__.get("_local_mirror_engine")
         if local_engine is None:
@@ -4222,15 +4403,24 @@ class MainWindow(
         self.db_engine_source = "pc"
         self.db_enabled = True
         self._pc_database_ready = True
-        self._pc_database_coordination_ready = False
+        if not self._using_local_operational_authority():
+            self._pc_database_coordination_ready = False
         self._last_pc_database_probe_ready = True
-        self._initial_state_sync_complete = False
+        if not self._using_local_operational_authority():
+            self._initial_state_sync_complete = False
         self._cached_market_data_status = None
         self._update_database_source_indicator()
         try:
-            # Remote writes and order submission remain disabled until the
-            # current-generation reconciliation confirms device ownership.
-            self._bind_remote_state_engine(engine, is_main_device=False)
+            # Historical database recovery must never replace or demote the
+            # dedicated Kanban operational store.
+            execution_engine = self._execution_state_engine()
+            self._bind_remote_state_engine(
+                execution_engine,
+                is_main_device=bool(
+                    self.state_sync_role.is_main
+                    and self._using_local_operational_authority()
+                ),
+            )
         except Exception:
             logger.exception("Could not attach recovered remote state persistence")
 
@@ -4241,7 +4431,8 @@ class MainWindow(
         try:
             self._update_main_device_button()
             self.update_dashboard_summary()
-            self._start_state_sync()
+            if not self._using_local_operational_authority():
+                self._start_state_sync()
             self._start_background_local_mirror_sync(engine)
         except Exception:
             # This method runs from Qt signal handlers.  A secondary UI or
@@ -4325,8 +4516,6 @@ class MainWindow(
         """
         if self.__dict__.get("_database_shutting_down", False):
             return
-        if getattr(self, "db_initializing", False):
-            return
         if self.__dict__.get("database_recovery_worker") is not None:
             return
         if self._pc_status_worker is not None:
@@ -4358,6 +4547,8 @@ class MainWindow(
 
         listener_on = status.listener_status == PcStatus.ON
         db_ready = bool(status.database_ready)
+        self._main_availability_probe_complete = True
+        self._main_availability_probe_database_ready = db_ready
         previous_main_app_active = self.__dict__.get(
             "_last_pc_main_app_active"
         )
@@ -4420,6 +4611,11 @@ class MainWindow(
         label.setToolTip(tooltip)
         services_label.setToolTip(tooltip)
         self._update_database_source_indicator()
+        self._update_main_device_button()
+        status_timer = self.__dict__.get("pc_status_timer")
+        if status_timer is not None:
+            # Reconnect quickly during an outage, then back off once healthy.
+            status_timer.setInterval(15_000 if db_ready else 5_000)
         self._last_pc_main_app_active = status.main_app_active
         if (
             status.main_app_active is True

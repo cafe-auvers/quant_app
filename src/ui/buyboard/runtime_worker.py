@@ -46,6 +46,7 @@ from src.core.execution_order_record import ExecutionOrderStatus
 from src.core.order_state import OrderSide
 from src.core.trade_card_state import (
     BoardStatus,
+    EntryRuntimeStatus,
     PositionRuntimeStatus,
     TradeCardState,
 )
@@ -1057,7 +1058,11 @@ class BuyboardRuntimeWorker(QThread):
         stop_card_keys = [card.card_key for card in observation_cards]
 
         if allow_mutations:
-            _track(self._sync_orb_plans(ready_cards))
+            # ORB observation is not an account/broker mutation. Keep every
+            # pre-entry card's plan current even when reconciliation blocks
+            # that account from submitting an order. Execution below remains
+            # restricted to ``execution_ready_cards``.
+            _track(self._sync_orb_plans(cards))
         # Observation readiness is intentionally broader than mutation
         # readiness: a reconciliation failure may block a command but must
         # never make the feed stop watching an existing position.
@@ -2134,11 +2139,26 @@ class BuyboardRuntimeWorker(QThread):
         refresh cycle most recently computed rather than triggering a
         second, competing ORB recalculation.
         """
-        if self._execution_queue_item_lookup is None:
-            return []
         changed: List[TradeCardState] = []
         for card in cards:
             if card.board_status not in _ORB_SYNCED_STATUSES:
+                continue
+            target_plan_ready = bool(
+                card.board_status == BoardStatus.BUY_TODAY
+                and float(card.breakout_price or 0.0) > 0
+                and (
+                    int(card.planned_quantity or 0) > 0
+                    or float(card.position_percent or 0.0) > 0
+                )
+            )
+            if self._execution_queue_item_lookup is None:
+                if target_plan_ready and card.entry_runtime_status in {
+                    None,
+                    EntryRuntimeStatus.ORB_FORMING,
+                }:
+                    card.entry_runtime_status = EntryRuntimeStatus.EXECUTE_READY
+                    card.entry_block_reason = ""
+                    changed.append(card)
                 continue
             try:
                 item = self._execution_queue_item_lookup(card.symbol, card.environment)
@@ -2146,21 +2166,46 @@ class BuyboardRuntimeWorker(QThread):
                 logger.exception("execution_queue_item_lookup failed for %s", card.symbol)
                 continue
             if item is None:
+                if target_plan_ready and card.entry_runtime_status in {
+                    None,
+                    EntryRuntimeStatus.ORB_FORMING,
+                }:
+                    card.entry_runtime_status = EntryRuntimeStatus.EXECUTE_READY
+                    card.entry_block_reason = ""
+                    changed.append(card)
                 continue
             before = (
+                card.name,
+                card.breakout_price,
                 card.entry_runtime_status,
                 card.entry_trigger,
+                card.entry_orb_high,
+                card.entry_orb_low,
+                card.stop_adr,
+                card.risk_percent,
                 card.planned_quantity,
+                card.target_position_quantity,
                 card.entry_block_reason,
                 card.selected_orb_window,
+                card.market_data_last_trusted_price,
+                card.market_data_last_trusted_at,
             )
             self._orb_evaluator.update_card(card, item)
             after = (
+                card.name,
+                card.breakout_price,
                 card.entry_runtime_status,
                 card.entry_trigger,
+                card.entry_orb_high,
+                card.entry_orb_low,
+                card.stop_adr,
+                card.risk_percent,
                 card.planned_quantity,
+                card.target_position_quantity,
                 card.entry_block_reason,
                 card.selected_orb_window,
+                card.market_data_last_trusted_price,
+                card.market_data_last_trusted_at,
             )
             if before != after:
                 changed.append(card)

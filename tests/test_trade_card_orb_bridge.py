@@ -1,6 +1,8 @@
 """Tests for src.services.trade_card_orb_bridge (code review finding P0-2)."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from src.core.execution_queue import ExecutionQueueItem, OrbCandidate, OrbCandidateStatus
 from src.core.trade_card_state import BoardStatus, EntryRuntimeStatus, TradeCardState
 from src.services.trade_card_orb_bridge import TradeCardOrbEvaluator
@@ -64,7 +66,8 @@ def test_forming_candidate_status_maps_to_orb_forming():
     card = _card()
     item = _queue_item(_candidate(status=OrbCandidateStatus.FORMING, shares=0))
 
-    TradeCardOrbEvaluator().update_card(card, item)
+    now = datetime(2026, 8, 19, 14, 0, tzinfo=timezone.utc)  # 10:00 ET
+    TradeCardOrbEvaluator(clock=lambda: now).update_card(card, item)
     assert card.entry_runtime_status == EntryRuntimeStatus.ORB_FORMING
 
 
@@ -108,9 +111,117 @@ def test_no_selected_candidate_yet_leaves_card_forming():
     card = _card()
     item = _queue_item(None)
 
-    TradeCardOrbEvaluator().update_card(card, item)
+    now = datetime(2026, 8, 19, 14, 0, tzinfo=timezone.utc)  # 10:00 ET
+    TradeCardOrbEvaluator(clock=lambda: now).update_card(card, item)
     assert card.entry_runtime_status == EntryRuntimeStatus.ORB_FORMING
     assert card.entry_orb_low is None  # nothing to size an entry off of yet
+
+
+def test_expired_orb_snapshot_keeps_durable_target_plan_executable():
+    now = datetime(2026, 8, 19, 14, 1, tzinfo=timezone.utc)  # 10:01 ET
+    card = _card(
+        entry_trigger=99.0,
+        entry_orb_high=99.0,
+        entry_orb_low=95.0,
+        planned_quantity=25,
+        target_position_quantity=25,
+    )
+    forming = {
+        window: _candidate(
+            window=window,
+            orb_high=None,
+            orb_low=None,
+            entry_trigger=None,
+            breakout_trigger=None,
+            shares=0,
+            status=OrbCandidateStatus.FORMING,
+            valid=False,
+        )
+        for window in ("1m", "5m", "30m")
+    }
+    item = _queue_item(
+        None,
+        current_price=102.25,
+        candidates=forming,
+        selected_window="1m",
+        last_updated=datetime(2026, 8, 19, 12, 30, tzinfo=timezone.utc),
+    )
+
+    TradeCardOrbEvaluator(clock=lambda: now).update_card(card, item)
+
+    assert card.entry_runtime_status == EntryRuntimeStatus.EXECUTE_READY
+    assert card.entry_block_reason == ""
+    assert card.breakout_price == 101.5
+    assert card.market_data_last_trusted_price == 102.25
+    assert card.entry_trigger is None
+    assert card.entry_orb_high is None
+    assert card.entry_orb_low is None
+    assert card.planned_quantity == 25
+    assert card.target_position_quantity == 25
+
+
+def test_elapsed_forming_orb_falls_back_to_target_allocation_plan():
+    now = datetime(2026, 8, 19, 14, 0, tzinfo=timezone.utc)  # 10:00 ET
+    card = _card(position_percent=20.0)
+    item = _queue_item(
+        _candidate(
+            window="1m",
+            orb_high=None,
+            orb_low=None,
+            entry_trigger=None,
+            breakout_trigger=None,
+            shares=0,
+            status=OrbCandidateStatus.FORMING,
+            valid=False,
+        ),
+        selected_window="1m",
+        last_updated=now,
+    )
+
+    TradeCardOrbEvaluator(clock=lambda: now).update_card(card, item)
+
+    assert card.entry_runtime_status == EntryRuntimeStatus.EXECUTE_READY
+    assert card.breakout_price == 101.5
+    assert card.position_percent == 20.0
+    assert card.selected_orb_window is None
+
+
+def test_preopen_snapshot_remains_forming_before_the_session_starts():
+    now = datetime(2026, 8, 19, 13, 0, tzinfo=timezone.utc)  # 09:00 ET
+    item = _queue_item(
+        _candidate(
+            window="1m",
+            orb_high=None,
+            orb_low=None,
+            shares=0,
+            status=OrbCandidateStatus.FORMING,
+            valid=False,
+        ),
+        last_updated=datetime(2026, 8, 19, 12, 30, tzinfo=timezone.utc),
+    )
+    card = _card()
+
+    TradeCardOrbEvaluator(clock=lambda: now).update_card(card, item)
+
+    assert card.entry_runtime_status == EntryRuntimeStatus.ORB_FORMING
+
+
+def test_forming_plan_becomes_session_complete_after_market_close():
+    now = datetime(2026, 8, 19, 20, 5, tzinfo=timezone.utc)  # 16:05 ET
+    card = _card()
+    item = _queue_item(
+        _candidate(
+            status=OrbCandidateStatus.FORMING,
+            shares=0,
+        ),
+        last_updated=now,
+    )
+
+    TradeCardOrbEvaluator(clock=lambda: now).update_card(card, item)
+
+    assert card.entry_runtime_status == EntryRuntimeStatus.SESSION_COMPLETE
+    assert card.entry_block_reason == "Regular session is complete"
+    assert card.planned_quantity == 0
 
 
 def test_best_waiting_plan_is_visible_before_it_becomes_execute_ready():
@@ -167,7 +278,8 @@ def test_manual_forming_plan_keeps_its_window_visible():
         manual_window_lock=True,
     )
 
-    TradeCardOrbEvaluator().update_card(card, item)
+    now = datetime(2026, 8, 19, 14, 0, tzinfo=timezone.utc)  # 10:00 ET
+    TradeCardOrbEvaluator(clock=lambda: now).update_card(card, item)
 
     assert card.entry_runtime_status == EntryRuntimeStatus.ORB_FORMING
     assert card.selected_orb_window == "30m"

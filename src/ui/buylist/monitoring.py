@@ -63,7 +63,12 @@ class BuylistMonitoringMixin:
         # attempting the forbidden mutation and produces the intended alert.
         kanban_owned = False
         ownership_known = False
-        ownership_engine = self.__dict__.get("pc_db_engine")
+        engine_resolver = getattr(self, "_execution_state_engine", None)
+        ownership_engine = (
+            engine_resolver()
+            if callable(engine_resolver)
+            else self.__dict__.get("pc_db_engine")
+        )
         if ownership_engine is not None and account_no and symbol:
             try:
                 from src.core.execution_ownership import ExecutionOwner

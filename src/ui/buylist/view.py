@@ -773,7 +773,11 @@ class BuylistViewMixin:
             risk_percent=risk_percent,
             buffer_pct=buffer_pct,
             account_no=account_no,
-            trade_card_engine=self.__dict__.get("pc_db_engine"),
+            trade_card_engine=(
+                self._execution_state_engine()
+                if callable(getattr(self, "_execution_state_engine", None))
+                else self.__dict__.get("pc_db_engine")
+            ),
             watchlist=self.__dict__.get("watchlist"),
             latest_intraday_session=self._latest_intraday_session,
             load_intraday_interval=lambda symbol, interval, window_days: self._load_cached_intraday_interval(

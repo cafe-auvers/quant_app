@@ -241,7 +241,7 @@ def test_legacy_auto_arm_hook_does_not_change_shared_control():
 
     assert trading_state.is_trading_enabled() is True
     assert window.trading_enabled_button.checked is True
-    assert any("shared deployment switch" in message.lower() for message in window._logs)
+    assert any("durable kanban switch" in message.lower() for message in window._logs)
 
 
 # --- post-claim reconciliation gating (_on_post_claim_reconciliation_finished) --
@@ -441,6 +441,7 @@ def test_begin_post_claim_handoff_locks_in_flight_items_and_starts_worker(monkey
 
 def _sync_completed_window(*, auto_claim_enabled: bool):
     window = _base_window(is_main=False, lease_token="")
+    window.pc_db_engine = object()
     window.state_sync_role = ss.LocalDeviceRole("pc-id", "PC", False)
     window._auto_claim_main_enabled = auto_claim_enabled
     window._database_transition_generation = 0

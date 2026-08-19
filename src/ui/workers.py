@@ -1155,6 +1155,8 @@ class PcRemoteStatusWorker(QThread):
         self.engine = engine
 
     def run(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
         from sqlalchemy import text
 
         from src.infrastructure.database.engine import init_mysql_engine
@@ -1164,32 +1166,45 @@ class PcRemoteStatusWorker(QThread):
                                                  get_runtime_process_status,
                                                  record_runtime_heartbeat)
 
-        try:
-            listener_status = check_pc_status()
-        except Exception:
-            listener_status = PcStatus.UNKNOWN
-        db_ready = False
+        def probe_listener():
+            try:
+                return check_pc_status()
+            except Exception:
+                return PcStatus.UNKNOWN
+
+        def probe_database():
+            engine = self.engine
+            owns_engine = False
+            db_ready = False
+            try:
+                if engine is None:
+                    # This worker keeps probing while the PC is offline. Leave
+                    # the user-facing failure log to the startup attempt.
+                    engine = init_mysql_engine(
+                        log_unavailable=False,
+                        ensure_schema=False,
+                    )
+                    owns_engine = engine is not None
+                if engine is not None:
+                    with engine.connect() as conn:
+                        conn.execute(text("SELECT 1"))
+                    db_ready = True
+            except Exception:
+                db_ready = False
+            return db_ready, engine, owns_engine
+
+        # Both network paths use a three-second timeout. Running them in
+        # parallel gives the UI a definitive answer in roughly three seconds
+        # instead of making an offline user wait for two sequential timeouts.
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            listener_future = executor.submit(probe_listener)
+            database_future = executor.submit(probe_database)
+            listener_status = listener_future.result()
+            db_ready, engine, owns_engine = database_future.result()
+
         db_hostname = ""
         main_app_active = None
         main_app_last_seen_seconds = None
-        engine = self.engine
-        owns_engine = False
-        try:
-            if engine is None:
-                # This worker runs every 15 seconds while the PC is offline.
-                # Keep probing so the status indicator notices recovery, but
-                # leave the user-facing failure log to the startup attempt.
-                engine = init_mysql_engine(
-                    log_unavailable=False,
-                    ensure_schema=False,
-                )
-                owns_engine = engine is not None
-            if engine is not None:
-                with engine.connect() as conn:
-                    conn.execute(text("SELECT 1"))
-                db_ready = True
-        except Exception:
-            db_ready = False
 
         if db_ready and engine is not None:
             try:
