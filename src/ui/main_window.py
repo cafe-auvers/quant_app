@@ -1836,10 +1836,9 @@ class MainWindow(
                 "Main-device transfer left the shared live-trading control "
                 f"{'ON' if trading_state.is_trading_enabled() else 'OFF'}."
             )
-            started = self._ensure_buylist_monitor_running("PROD")
+            self._sync_buyboard_runtime_worker()
             self.append_log(
-                "Automatic handoff complete: monitor "
-                f"{'started' if started else 'already running'}"
+                "Automatic handoff complete: Buy Board execution ownership restored"
                 f"{', live trading armed' if trading_state.is_trading_enabled() else ' (live trading NOT armed)'}."
             )
         else:
@@ -3449,14 +3448,10 @@ class MainWindow(
         self._add_configured_tab("watchlist", self.watchlist_widget, "Watchlist")
         self._build_watchlist_tab()
 
-        self.buylist_widget = QWidget()
-        self._add_configured_tab("buylist", self.buylist_widget, "Buy Dashboard")
-        self._build_buylist_tab()
-
-        # New Kanban Buy Board (buydashboard_to_kanban.md). Additive: the
-        # Buy Dashboard tab above remains the live, authoritative trading
-        # surface until BUYBOARD_ENGINE_ENABLED is explicitly turned on (see
-        # src.core.execution_config.is_buyboard_engine_enabled).
+        # The Buy Board is the sole operator-facing execution surface. The
+        # persisted buylist/execution-queue models remain compatibility inputs
+        # for ORB calculation and state migration, but no legacy dashboard is
+        # constructed or exposed.
         self.buyboard_widget = QWidget()
         self._add_configured_tab("buyboard", self.buyboard_widget, "Buy Board")
         self._build_buyboard_tab()

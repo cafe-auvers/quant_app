@@ -131,7 +131,11 @@ def _card_status_text(
     """Return a trader-facing lifecycle label, not raw runtime diagnostics."""
 
     if card.board_status == BoardStatus.BUY_TODAY:
-        return _humanize(card.entry_runtime_status)
+        status = _humanize(card.entry_runtime_status)
+        window = str(card.selected_orb_window or "").strip()
+        if status and window:
+            return f"{status} - ORB {window}"
+        return status
     if card.board_status == BoardStatus.ENTRY_PENDING:
         if card.entry_cancel_in_flight:
             return "CANCELLING ENTRY"

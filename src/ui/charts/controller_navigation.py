@@ -404,19 +404,50 @@ class ChartsNavigationMixin:
         item = buylist_manager.get(symbol, env) if buylist_manager is not None else None
         in_queue = item is not None and self._is_execution_queue_buylist_item(item)
         if in_queue:
-            if item.monitoring_status in ("BOUGHT", "BUY_SUBMITTED", "BUY_PARTIAL"):
-                from PyQt5.QtWidgets import QMessageBox
+            from src.core.trade_card_state import BoardStatus
+            from src.ui.buyboard.board import _command_kwargs, _lookup_projection
+            from src.ui.buyboard.card import card_drag_payload
+            from src.ui.buyboard.drag_commands import CancelEntry, MoveToWatchlist
 
+            account_no = self._selected_order_account_for_item(item, env)
+            projection = _lookup_projection(self, env, account_no, symbol)
+            if projection is None:
+                self.refresh_buyboard()
+                QMessageBox.information(
+                    self,
+                    "Buy Board is refreshing",
+                    f"{symbol}'s Buy Board card is still loading. Try again in a moment.",
+                )
+                return
+            card = projection.card
+            if max(0, int(card.broker_quantity or 0)) > 0:
                 QMessageBox.warning(
                     self,
                     "Active position",
                     f"{symbol} has an active position and cannot be removed here.",
                 )
                 return
-            buylist_manager.remove(symbol, env)
-            self._save_state()
-            self.populate_buylist_dashboard()
-            self.append_log(f"[Chart] {symbol} removed from execution queue.")
+            payload = card_drag_payload(projection)
+            common = _command_kwargs(payload)
+            if card.board_status == BoardStatus.BUYLIST:
+                command = MoveToWatchlist(**common)
+            elif card.board_status in {
+                BoardStatus.BUY_TODAY,
+                BoardStatus.ENTRY_PENDING,
+            }:
+                command = CancelEntry(**common)
+            else:
+                QMessageBox.information(
+                    self,
+                    "Buy Board",
+                    f"{symbol} cannot be removed from its current board state.",
+                )
+                return
+            self._buyboard_dispatch_command(
+                command,
+                interaction_fingerprint=payload["state_fingerprint"],
+            )
+            self.append_log(f"[Chart] Requested Buy Board removal for {symbol}.")
         else:
             watch_item = (
                 self.watchlist.get(symbol) if hasattr(self, "watchlist") else None
@@ -453,18 +484,36 @@ class ChartsNavigationMixin:
             )
 
     def _is_symbol_monitor_active(self, symbol: str, env: str) -> bool:
+        from src.core.trade_card_state import BoardStatus
+
+        card = self._chart_buyboard_card(symbol, env)
+        return card is not None and card.board_status in {
+            BoardStatus.BUY_TODAY,
+            BoardStatus.ENTRY_PENDING,
+        }
+
+    def _chart_buyboard_card(self, symbol: str, env: str):
+        symbol = str(symbol or "").strip().upper()
+        env = str(env or "PROD").strip().upper()
+        if not symbol:
+            return None
         buylist_manager = getattr(self, "buylist_manager", None)
-        if buylist_manager is None or not symbol:
-            return False
-        item = buylist_manager.get(symbol, env)
-        if item is None:
-            return False
-        if self._is_execution_queue_buylist_item(item):
-            return bool(getattr(item, "orb_monitor_enabled", False))
-        return str(getattr(item, "monitoring_status", "")).upper() in (
-            "ACTIVE",
-            "BOUGHT",
-        )
+        item = buylist_manager.get(symbol, env) if buylist_manager is not None else None
+        account_no = str(getattr(item, "kis_account_no", "") or "")
+        for value in tuple(
+            getattr(self, "_buyboard_current_projections", ()) or ()
+        ):
+            card = getattr(value, "card", value)
+            if (
+                str(getattr(card, "environment", "")).upper() == env
+                and str(getattr(card, "symbol", "")).upper() == symbol
+                and (
+                    not account_no
+                    or str(getattr(card, "account_no", "")) == account_no
+                )
+            ):
+                return card
+        return None
 
     def _chart_activate_toggle(self, symbol: str, start_monitor: bool = False) -> None:
         if not symbol:
@@ -486,43 +535,55 @@ class ChartsNavigationMixin:
             )
             return
 
-        is_active = self._is_symbol_monitor_active(symbol, env)
-        if is_active:
-            if self._is_execution_queue_buylist_item(item):
-                item.orb_monitor_enabled = False
-            elif str(getattr(item, "monitoring_status", "")).upper() not in ("BOUGHT",):
-                item.monitoring_status = "WATCHING"
-                self._clear_buylist_auto_order_block(item)
-            self._save_state()
-            self.populate_buylist_dashboard()
-            self.append_log(f"[Chart] {symbol} monitoring deactivated.")
+        from src.core.trade_card_state import BoardStatus
+        from src.ui.buyboard.board import _command_kwargs, _lookup_projection
+        from src.ui.buyboard.card import card_drag_payload
+        from src.ui.buyboard.drag_commands import ActivateForToday, CancelEntry
+
+        account_no = self._selected_order_account_for_item(item, env)
+        if not account_no:
+            self._warn_order_account_unavailable(item, env)
+            return
+        projection = _lookup_projection(self, env, account_no, symbol)
+        if projection is None:
+            self.refresh_buyboard()
+            QMessageBox.information(
+                self,
+                "Buy Board is refreshing",
+                f"{symbol} is queued, but its Buy Board card is still loading. Try again in a moment.",
+            )
+            return
+
+        payload = card_drag_payload(projection)
+        common = _command_kwargs(payload)
+        card = projection.card
+        if card.board_status == BoardStatus.BUYLIST:
+            command = ActivateForToday(**common)
+            message = f"[Chart] Requested Buy Today activation for {symbol}."
+        elif card.board_status in {BoardStatus.BUY_TODAY, BoardStatus.ENTRY_PENDING}:
+            command = CancelEntry(**common)
+            message = f"[Chart] Requested entry cancellation/removal for {symbol}."
+        elif max(0, int(card.broker_quantity or 0)) > 0:
+            QMessageBox.information(
+                self,
+                "Position already open",
+                f"{symbol} is already managed as an open position on Buy Board.",
+            )
+            return
         else:
-            if str(getattr(item, "monitoring_status", "")).upper() == "BOUGHT":
-                QMessageBox.information(
-                    self, "Already bought", f"{symbol} is already in a BOUGHT position."
-                )
-                return
-            if self._is_execution_queue_buylist_item(item):
-                account_no = self._selected_order_account_for_item(item, env)
-                if not account_no:
-                    self._warn_order_account_unavailable(item, env)
-                    return
-                item.kis_account_no = account_no
-                item.orb_monitor_enabled = True
-                self._ensure_buylist_monitor_running(env)
-            else:
-                message = (
-                    f"{symbol} uses the retired legacy entry workflow. "
-                    "No BUY order was submitted. Add or refresh it as an "
-                    "execution-queue strategy before activating entry monitoring."
-                )
-                self.append_log(f"[Chart] {message}")
-                QMessageBox.warning(self, "Legacy entry retired", message)
-                return
-            self._save_state()
-            self.populate_buylist_dashboard()
-            self.append_log(f"[Chart] {symbol} monitoring activated.")
-            # Pre-load intraday data so the Intraday tab is ready
+            QMessageBox.information(
+                self,
+                "Buy Board",
+                f"{symbol} cannot be activated from its current board state.",
+            )
+            return
+
+        self._buyboard_dispatch_command(
+            command,
+            interaction_fingerprint=payload["state_fingerprint"],
+        )
+        self.append_log(message)
+        if card.board_status == BoardStatus.BUYLIST:
             self._set_intraday_symbol(symbol)
             self.prefetch_intraday_cache_for_symbol(symbol)
 
@@ -535,8 +596,14 @@ class ChartsNavigationMixin:
         buylist_manager = getattr(self, "buylist_manager", None)
         item = buylist_manager.get(symbol, env) if buylist_manager and symbol else None
         in_queue = item is not None
+        card = self._chart_buyboard_card(symbol, env)
         is_active = self._is_symbol_monitor_active(symbol, env)
         btn.setEnabled(in_queue)
+        if card is not None and max(0, int(card.broker_quantity or 0)) > 0:
+            btn.setText("Position Open")
+            btn.setEnabled(False)
+            btn.setStyleSheet("")
+            return
         if is_active:
             btn.setText("Deactivate (A)")
             btn.setStyleSheet(

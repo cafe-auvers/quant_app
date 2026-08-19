@@ -113,6 +113,66 @@ def test_no_selected_candidate_yet_leaves_card_forming():
     assert card.entry_orb_low is None  # nothing to size an entry off of yet
 
 
+def test_best_waiting_plan_is_visible_before_it_becomes_execute_ready():
+    card = _card()
+    one_minute = _candidate(
+        window="1m",
+        status=OrbCandidateStatus.WAITING_BREAKOUT,
+        valid=False,
+        score=10.0,
+    )
+    five_minute = _candidate(
+        window="5m",
+        status=OrbCandidateStatus.WAITING_BREAKOUT,
+        valid=False,
+        score=25.0,
+    )
+    thirty_minute = _candidate(
+        window="30m",
+        status=OrbCandidateStatus.FORMING,
+        valid=False,
+        score=0.0,
+        shares=0,
+    )
+    item = _queue_item(
+        None,
+        candidates={
+            "1m": one_minute,
+            "5m": five_minute,
+            "30m": thirty_minute,
+        },
+    )
+
+    TradeCardOrbEvaluator().update_card(card, item)
+
+    assert card.entry_runtime_status == EntryRuntimeStatus.WAITING_BREAKOUT
+    assert card.selected_orb_window == "5m"
+    assert card.entry_orb_low == five_minute.orb_low
+    assert card.planned_quantity == five_minute.shares
+
+
+def test_manual_forming_plan_keeps_its_window_visible():
+    card = _card()
+    forming = _candidate(
+        window="30m",
+        status=OrbCandidateStatus.FORMING,
+        valid=False,
+        shares=0,
+    )
+    item = _queue_item(
+        None,
+        candidates={"30m": forming},
+        selected_window="30m",
+        locked=True,
+        manual_window_lock=True,
+    )
+
+    TradeCardOrbEvaluator().update_card(card, item)
+
+    assert card.entry_runtime_status == EntryRuntimeStatus.ORB_FORMING
+    assert card.selected_orb_window == "30m"
+
+
 def test_does_not_overwrite_a_frozen_entry_plan_once_position_is_open():
     """Section 620: once a card has a real (frozen) position, the ORB
     bridge must be a complete no-op -- it must never recompute/overwrite

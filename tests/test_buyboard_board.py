@@ -15,11 +15,17 @@ from sqlalchemy.pool import NullPool
 
 from src.core.board_workflow import BoardCardProjection, BoardExternalOrderProjection
 from src.core.discovered_external_order import new_discovered_external_order
+from src.core.execution_queue import (
+    ExecutionQueueItem,
+    OrbCandidate,
+    OrbCandidateStatus,
+)
 from src.core.execution_order_record import ExecutionOrderStatus
 from src.core.order_state import OrderSide
 from src.core.trade_card_state import BoardStatus, TradeCardState
 from src.services import trade_card_repository as repo
 from src.ui.buyboard import board as board_module
+from src.ui.buyboard import dialogs as board_dialogs
 from src.ui.buyboard.card import card_drag_payload
 from src.ui.buyboard.columns import BOARD_COLUMN_ORDER, BoardColumnList
 from src.ui.buyboard.drag_commands import (
@@ -324,6 +330,66 @@ def test_context_menu_offers_remove_from_today_for_buy_today_card(tmp_path, monk
     assert isinstance(window.dispatched[0], CancelEntry)
 
 
+def test_buy_today_context_menu_refreshes_and_opens_orb_plans(tmp_path, monkeypatch):
+    _ensure_app()
+    engine = _make_engine(tmp_path)
+    card = repo.create_trade_card(engine, _card(board_status=BoardStatus.BUY_TODAY))
+    window = _FakeMainWindow(engine, cards=[card])
+    candidate = OrbCandidate(
+        symbol=card.symbol,
+        window="5m",
+        status=OrbCandidateStatus.WAITING_BREAKOUT,
+        score=12.0,
+    )
+    queue_item = ExecutionQueueItem(
+        symbol=card.symbol,
+        candidates={"5m": candidate},
+    )
+    window.execution_queue_manager = SimpleNamespace(
+        get_item=lambda symbol, environment: queue_item
+    )
+    refresh_calls = []
+    window.refresh_execution_queue = lambda *args, **kwargs: refresh_calls.append(
+        (args, kwargs)
+    ) or 1
+    shown = []
+    monkeypatch.setattr(
+        board_module.dialogs,
+        "show_orb_plan_dialog",
+        lambda parent, item, **kwargs: shown.append((parent, item, kwargs)),
+    )
+    monkeypatch.setattr(
+        QMenu,
+        "exec_",
+        lambda self, pos: _find_action_by_text(
+            self, "Refresh / Select ORB Plans..."
+        ),
+    )
+
+    board_module._handle_card_context_menu(
+        window,
+        card_drag_payload(BoardCardProjection(card=card)),
+        None,
+    )
+
+    assert refresh_calls == [
+        (("PROD",), {"symbols": ["AAPL"], "create_missing": False})
+    ]
+    assert shown and shown[0][1] is queue_item
+    assert window.dispatched == []
+
+
+def test_orb_dialog_marks_waiting_breakout_as_a_valid_plan():
+    candidate = OrbCandidate(
+        symbol="AAPL",
+        window="1m",
+        status=OrbCandidateStatus.WAITING_BREAKOUT,
+        valid=False,
+    )
+
+    assert board_dialogs._orb_plan_classification(candidate) == "VALID"
+
+
 def test_context_menu_offers_cancel_entry_for_entry_pending_card(tmp_path, monkeypatch):
     _ensure_app()
     engine = _make_engine(tmp_path)
@@ -366,7 +432,89 @@ def test_context_menu_has_no_cancel_entry_action_for_open_position(tmp_path, mon
 
     assert _find_action_by_text(captured_menu["menu"], "Cancel Entry") is None
     assert _find_action_by_text(captured_menu["menu"], "Remove from Today") is None
+    assert _find_action_by_text(captured_menu["menu"], "Partial Sell...") is not None
+    assert _find_action_by_text(captured_menu["menu"], "Sell All") is not None
     assert _find_action_by_text(captured_menu["menu"], "Move Stop to Breakeven") is not None
+    assert _find_action_by_text(captured_menu["menu"], "Open TradingView Chart") is not None
+
+
+def test_buylist_context_menu_exposes_activation_removal_and_chart(tmp_path, monkeypatch):
+    _ensure_app()
+    engine = _make_engine(tmp_path)
+    card = repo.create_trade_card(engine, _card(board_status=BoardStatus.BUYLIST))
+    window = _FakeMainWindow(engine, cards=[card])
+    captured_menu = {}
+
+    def fake_exec(menu, _pos):
+        captured_menu["menu"] = menu
+        return None
+
+    monkeypatch.setattr(QMenu, "exec_", fake_exec)
+
+    board_module._handle_card_context_menu(
+        window,
+        card_drag_payload(BoardCardProjection(card=card)),
+        None,
+    )
+
+    menu = captured_menu["menu"]
+    assert _find_action_by_text(menu, "Activate for Buy Today") is not None
+    assert _find_action_by_text(menu, "Move to Watchlist") is not None
+    assert _find_action_by_text(menu, "Open TradingView Chart") is not None
+
+
+def test_portfolio_summary_aggregates_positions_capital_and_live_pnl():
+    cards = [
+        _card(
+            symbol="AAA",
+            account_no="1",
+            board_status=BoardStatus.OPEN_POSITION,
+            broker_quantity=10,
+            average_entry_price=100.0,
+        ),
+        _card(
+            symbol="BBB",
+            account_no="2",
+            board_status=BoardStatus.PARTIAL_SELL,
+            broker_quantity=20,
+            average_entry_price=50.0,
+        ),
+        _card(
+            symbol="NO_POSITION",
+            account_no="1",
+            board_status=BoardStatus.BUY_TODAY,
+        ),
+    ]
+    quotes = {"AAA": 110.0, "BBB": 45.0}
+    equities = {("PROD", "1"): 10_000.0, ("PROD", "2"): 10_000.0}
+
+    summary = board_module.calculate_portfolio_summary(
+        cards,
+        quotes.get,
+        lambda environment, account_no: equities[(environment, account_no)],
+    )
+
+    assert summary.positions == 2
+    assert summary.capital_percent == pytest.approx(10.0)
+    assert summary.pnl_usd == pytest.approx(0.0)
+
+
+def test_portfolio_summary_does_not_claim_pnl_when_a_quote_is_missing():
+    card = _card(
+        board_status=BoardStatus.OPEN_POSITION,
+        broker_quantity=10,
+        average_entry_price=100.0,
+    )
+
+    summary = board_module.calculate_portfolio_summary(
+        [card],
+        lambda _symbol: None,
+        lambda _environment, _account_no: 10_000.0,
+    )
+
+    assert summary.positions == 1
+    assert summary.capital_percent == pytest.approx(10.0)
+    assert summary.pnl_usd is None
 
 
 def test_dragging_partial_sell_to_open_dispatches_partial_withdrawal(tmp_path, monkeypatch):
@@ -567,6 +715,25 @@ def test_equivalent_refresh_reuses_widget_and_updates_payload_and_quote():
     assert column.itemWidget(column.item(0)) is widget
     assert column.item(0).data(Qt.UserRole)["version"] == 8
     assert "+10.00%" in widget._info_label.text()
+
+
+def test_card_width_tracks_column_without_horizontal_scrolling():
+    _ensure_app()
+    column = BoardColumnList(BoardStatus.BUY_TODAY, lambda *_args: None)
+    column.resize(300, 500)
+    card = _card(
+        board_status=BoardStatus.BUY_TODAY,
+        name="A long company name that must stay inside the Kanban column",
+    )
+
+    column.set_cards([card])
+    column.show()
+    QApplication.processEvents()
+
+    item = column.item(0)
+    widget = column.itemWidget(item)
+    assert column.horizontalScrollBar().maximum() == 0
+    assert widget.width() <= column.viewport().width()
 
 
 def test_pending_card_shows_saving_state_and_disables_repeat_drag():

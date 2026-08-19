@@ -1829,8 +1829,10 @@ def test_tradingview_add_current_symbol_removes_regardless_of_sidebar_source():
     assert window.watchlist.get("MSFT") is None
 
 
-def test_tradingview_activate_retires_legacy_entry(monkeypatch):
-    import src.ui.charts.controller_navigation as chart_navigation_module
+def test_tradingview_activate_dispatches_buyboard_command_without_legacy_monitor():
+    from src.core.board_workflow import BoardCardProjection
+    from src.core.trade_card_state import BoardStatus, TradeCardState
+    from src.ui.buyboard.drag_commands import ActivateForToday
 
     class Combo:
         def __init__(self, text):
@@ -1860,39 +1862,32 @@ def test_tradingview_activate_retires_legacy_entry(monkeypatch):
     window.tradingview_symbol_combo = Combo("AAPL")
     window.watchlist_env_combo = Combo("PROD")
     window.buylist_manager = Manager(item)
-    window._buylist_prod_monitor_active = False
-    window._clear_buylist_auto_order_block = lambda _item: None
-    saves = []
-    window._save_state = lambda: saves.append(True)
-    window.populate_buylist_dashboard = lambda: None
+    window._selected_order_account_for_item = lambda _item, _env: "1"
+    card = TradeCardState(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        board_status=BoardStatus.BUYLIST,
+    )
+    window._buyboard_current_projections = (BoardCardProjection(card=card),)
     logs = []
     window.append_log = logs.append
     window._set_intraday_symbol = lambda _symbol: None
     window.prefetch_intraday_cache_for_symbol = lambda _symbol: None
     window._update_tradingview_activate_btn = lambda: None
-    toggled = []
-
-    def toggle_monitor(env):
-        toggled.append(env)
-        window._buylist_prod_monitor_active = True
-
-    window._toggle_buylist_monitor = toggle_monitor
-    warnings = []
-    monkeypatch.setattr(
-        chart_navigation_module.QMessageBox,
-        "warning",
-        lambda *args, **kwargs: warnings.append(args),
+    dispatched = []
+    window._buyboard_dispatch_command = lambda command, **kwargs: dispatched.append(
+        (command, kwargs)
     )
 
     window._tradingview_activate_toggle()
 
     assert item.monitoring_status == "WATCHING"
     assert not hasattr(item, "orb_monitor_enabled")
-    assert window._buylist_prod_monitor_active is False
-    assert toggled == []
-    assert saves == []
-    assert warnings
-    assert "No BUY order was submitted" in logs[0]
+    assert len(dispatched) == 1
+    assert isinstance(dispatched[0][0], ActivateForToday)
+    assert dispatched[0][0].symbol == "AAPL"
+    assert "Buy Today activation" in logs[0]
 
 
 def test_chart_html_includes_bounded_pan_zoom_state():

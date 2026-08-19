@@ -91,6 +91,7 @@ class BoardColumnList(QListWidget):
         self.setAcceptDrops(board_status not in SYSTEM_ONLY_TARGET_COLUMNS)
         self.setDragEnabled(True)
         self.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setStyleSheet("QListWidget { background: palette(alternate-base); }")
         if on_card_context_menu is not None:
             self.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -115,6 +116,20 @@ class BoardColumnList(QListWidget):
     def _set_interaction_active(self, active: bool) -> None:
         if self._on_interaction_active is not None:
             self._on_interaction_active(bool(active))
+
+    def _set_item_widget_size(self, item: QListWidgetItem, widget) -> None:
+        size = widget.sizeHint()
+        available_width = max(120, self.viewport().width() - 4)
+        size.setWidth(available_width)
+        item.setSizeHint(size)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().resizeEvent(event)
+        for index in range(self.count()):
+            item = self.item(index)
+            widget = self.itemWidget(item)
+            if widget is not None:
+                self._set_item_widget_size(item, widget)
 
     # -- drag source ---------------------------------------------------
     def startDrag(self, supportedActions) -> None:  # noqa: N802 - Qt override
@@ -287,14 +302,14 @@ class BoardColumnList(QListWidget):
                     card.order,
                     on_adopt=self._on_external_order_adopt,
                 )
-                external_item.setSizeHint(external_widget.sizeHint())
+                self._set_item_widget_size(external_item, external_widget)
                 self.setItemWidget(external_item, external_widget)
                 continue
             if isinstance(card, BoardExecutionOrderProjection):
                 owned_item = QListWidgetItem(self)
                 owned_item.setFlags(Qt.ItemIsEnabled)
                 owned_widget = UnlinkedExecutionOrderWidget(card.order)
-                owned_item.setSizeHint(owned_widget.sizeHint())
+                self._set_item_widget_size(owned_item, owned_widget)
                 self.setItemWidget(owned_item, owned_widget)
                 continue
             card_state = state(card)
@@ -322,14 +337,14 @@ class BoardColumnList(QListWidget):
                 account_equity=account_equity,
             )
             widget.set_pending(card_state.card_key in self._pending_card_keys)
-            item.setSizeHint(widget.sizeHint())
+            self._set_item_widget_size(item, widget)
             self.setItemWidget(item, widget)
             if isinstance(card, BoardCardProjection):
                 for owned_order in card.unlinked_owned_orders:
                     owned_item = QListWidgetItem(self)
                     owned_item.setFlags(Qt.ItemIsEnabled)
                     owned_widget = UnlinkedExecutionOrderWidget(owned_order)
-                    owned_item.setSizeHint(owned_widget.sizeHint())
+                    self._set_item_widget_size(owned_item, owned_widget)
                     self.setItemWidget(owned_item, owned_widget)
                 for external_order in card.external_orders:
                     external_item = QListWidgetItem(self)
@@ -340,7 +355,7 @@ class BoardColumnList(QListWidget):
                         external_order,
                         on_adopt=self._on_external_order_adopt,
                     )
-                    external_item.setSizeHint(external_widget.sizeHint())
+                    self._set_item_widget_size(external_item, external_widget)
                     self.setItemWidget(external_item, external_widget)
         self._render_signature = signature
         return True
@@ -371,7 +386,7 @@ class BoardColumnList(QListWidget):
             widget = self.itemWidget(item)
             if isinstance(widget, TradeCardWidget):
                 widget.set_pending(pending)
-                item.setSizeHint(widget.sizeHint())
+                self._set_item_widget_size(item, widget)
 
     def refresh_live_metrics(
         self,

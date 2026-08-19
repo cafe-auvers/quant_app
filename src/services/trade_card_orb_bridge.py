@@ -53,6 +53,62 @@ _CANDIDATE_STATUS_TO_ENTRY_RUNTIME_STATUS = {
 _BLOCKED_CANDIDATE_STATUSES = {OrbCandidateStatus.RISK_INVALID, OrbCandidateStatus.REJECTED}
 
 
+def _display_candidate(execution_queue_item: ExecutionQueueItem):
+    """Return the plan the card should explain while no trigger is ready.
+
+    The queue deliberately reserves ``selected_candidate`` for an ORB that
+    can execute immediately. Before the trigger, however, the board still
+    needs to show the operator which risk-valid ORB plan is waiting. A manual
+    selection always wins; automatic display otherwise prefers a completed,
+    risk-valid plan, then a still-forming plan, and only shows an invalid plan
+    after no viable/forming alternative remains.
+    """
+
+    selected = execution_queue_item.selected_candidate
+    if selected is not None:
+        return selected
+
+    candidates = dict(getattr(execution_queue_item, "candidates", {}) or {})
+    selected_window = str(
+        getattr(execution_queue_item, "selected_window", "") or ""
+    )
+    if selected_window and (
+        getattr(execution_queue_item, "manual_window_lock", False)
+        or getattr(execution_queue_item, "locked", False)
+    ):
+        manually_selected = candidates.get(selected_window)
+        if manually_selected is not None:
+            return manually_selected
+
+    waiting = [
+        candidate
+        for candidate in candidates.values()
+        if candidate.status
+        in {OrbCandidateStatus.WAITING_BREAKOUT, OrbCandidateStatus.VALID}
+    ]
+    if waiting:
+        return max(waiting, key=lambda candidate: float(candidate.score or 0.0))
+
+    forming = [
+        candidate
+        for candidate in candidates.values()
+        if candidate.status == OrbCandidateStatus.FORMING
+    ]
+    if forming:
+        order = {"1m": 0, "5m": 1, "30m": 2}
+        return min(forming, key=lambda candidate: order.get(candidate.window, 99))
+
+    invalid = [
+        candidate
+        for candidate in candidates.values()
+        if candidate.status
+        in {OrbCandidateStatus.RISK_INVALID, OrbCandidateStatus.REJECTED}
+    ]
+    if invalid:
+        return max(invalid, key=lambda candidate: float(candidate.score or 0.0))
+    return None
+
+
 class TradeCardOrbEvaluator:
     """Copies the execution queue's already-computed candidate selection
     onto a card. Never recomputes ORB/breakout/risk numbers itself --
@@ -74,13 +130,12 @@ class TradeCardOrbEvaluator:
             card.name = execution_queue_item.name
         card.breakout_price = execution_queue_item.breakout_price
 
-        candidate = execution_queue_item.selected_candidate
+        candidate = _display_candidate(execution_queue_item)
         if candidate is None:
-            # No ORB window has produced a usable candidate yet (e.g. still
-            # forming, or the whole symbol has no valid window today) --
-            # nothing to size an entry off of.
+            # No ORB window has produced even a displayable plan yet.
             card.entry_runtime_status = EntryRuntimeStatus.ORB_FORMING
             card.entry_block_reason = ""
+            card.selected_orb_window = None
             return card
 
         card.selected_orb_window = candidate.window or execution_queue_item.selected_window

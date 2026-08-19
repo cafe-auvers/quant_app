@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import logging
 import getpass
+import math
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
 from PyQt5.QtWidgets import (
@@ -62,6 +64,21 @@ _ENGINE_GATED_TARGET_COLUMNS = {
     BoardStatus.SELL_ALL,
 }
 
+_POSITION_LIMIT = 30
+_POSITION_BOARD_STATUSES = {
+    BoardStatus.ENTRY_PENDING,
+    BoardStatus.OPEN_POSITION,
+    BoardStatus.PARTIAL_SELL,
+    BoardStatus.SELL_ALL,
+}
+
+
+@dataclass(frozen=True)
+class BuyboardPortfolioSummary:
+    positions: int
+    capital_percent: Optional[float]
+    pnl_usd: Optional[float]
+
 
 def build_buyboard_widget(main_window) -> None:
     root_layout = QVBoxLayout(main_window.buyboard_widget)
@@ -70,6 +87,17 @@ def build_buyboard_widget(main_window) -> None:
     header = QHBoxLayout()
     title = QLabel("<b>Buy Board</b>")
     header.addWidget(title)
+    header.addSpacing(12)
+
+    positions_label = QLabel(f"Positions: 0 / {_POSITION_LIMIT}")
+    positions_label.setStyleSheet("font-weight: bold; color: #2e7d32;")
+    capital_label = QLabel("Capital: -")
+    pnl_label = QLabel("P&L: -")
+    header.addWidget(positions_label)
+    header.addSpacing(12)
+    header.addWidget(capital_label)
+    header.addSpacing(12)
+    header.addWidget(pnl_label)
     header.addStretch()
     engine_status = QLabel(
         "Engine: ENABLED" if is_buyboard_engine_enabled() else "Engine: OFF (board is read-only for order actions)"
@@ -91,7 +119,10 @@ def build_buyboard_widget(main_window) -> None:
     account_filter_combo.currentIndexChanged.connect(main_window.refresh_buyboard)
     header.addWidget(account_filter_combo)
 
-    refresh_btn = QPushButton("Refresh")
+    refresh_btn = QPushButton("Refresh Board")
+    refresh_btn.setToolTip(
+        "Refresh the board projection. Broker orders and positions are reconciled automatically by the engine."
+    )
     refresh_btn.clicked.connect(main_window.refresh_buyboard)
     header.addWidget(refresh_btn)
     root_layout.addLayout(header)
@@ -123,6 +154,9 @@ def build_buyboard_widget(main_window) -> None:
     main_window.buyboard_columns = lists
     main_window._buyboard_engine_status_label = engine_status
     main_window._buyboard_account_filter_combo = account_filter_combo
+    main_window._buyboard_positions_label = positions_label
+    main_window._buyboard_capital_label = capital_label
+    main_window._buyboard_pnl_label = pnl_label
 
 
 def _quote_lookup_for(main_window) -> Optional[Callable[[str], Optional[float]]]:
@@ -164,6 +198,146 @@ def _account_equity_lookup_for(
     return lookup
 
 
+def _positive_number(value) -> Optional[float]:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed > 0 else None
+
+
+def calculate_portfolio_summary(
+    values,
+    quote_lookup: Optional[Callable[[str], Optional[float]]],
+    equity_lookup: Callable[[str, str], Optional[float]],
+) -> BuyboardPortfolioSummary:
+    """Aggregate the visible, broker-confirmed positions on the board."""
+
+    cards = []
+    for value in values:
+        card = _state(value)
+        if card is None or card.board_status not in _POSITION_BOARD_STATUSES:
+            continue
+        if max(0, int(card.broker_quantity or 0)) <= 0:
+            continue
+        cards.append(card)
+
+    if not cards:
+        return BuyboardPortfolioSummary(0, 0.0, 0.0)
+
+    accounts = {
+        (card.environment, card.account_no)
+        for card in cards
+        if card.account_no
+    }
+    equities = [
+        _positive_number(equity_lookup(environment, account_no))
+        for environment, account_no in accounts
+    ]
+    total_equity = (
+        sum(value for value in equities if value is not None)
+        if equities and all(value is not None for value in equities)
+        else None
+    )
+
+    cost_basis = 0.0
+    pnl = 0.0
+    capital_complete = total_equity is not None
+    pnl_complete = quote_lookup is not None
+    for card in cards:
+        quantity = max(0, int(card.broker_quantity or 0))
+        average_entry = _positive_number(card.average_entry_price)
+        if average_entry is None:
+            capital_complete = False
+            pnl_complete = False
+            continue
+        cost_basis += average_entry * quantity
+        if quote_lookup is None:
+            continue
+        try:
+            current_price = _positive_number(quote_lookup(card.symbol))
+        except Exception:
+            current_price = None
+        if current_price is None:
+            pnl_complete = False
+            continue
+        pnl += (current_price - average_entry) * quantity
+
+    capital_percent = (
+        cost_basis / total_equity * 100.0
+        if capital_complete and total_equity is not None and total_equity > 0
+        else None
+    )
+    return BuyboardPortfolioSummary(
+        positions=len(cards),
+        capital_percent=capital_percent,
+        pnl_usd=pnl if pnl_complete else None,
+    )
+
+
+def _update_portfolio_summary(
+    main_window,
+    visible_cards,
+    quote_lookup: Optional[Callable[[str], Optional[float]]] = None,
+    equity_lookup: Optional[Callable[[str, str], Optional[float]]] = None,
+) -> BuyboardPortfolioSummary:
+    quote_lookup = quote_lookup if quote_lookup is not None else _quote_lookup_for(main_window)
+    equity_lookup = equity_lookup or _account_equity_lookup_for(main_window)
+    summary = calculate_portfolio_summary(
+        visible_cards,
+        quote_lookup,
+        equity_lookup,
+    )
+
+    positions_label = getattr(main_window, "_buyboard_positions_label", None)
+    if positions_label is not None:
+        positions_label.setText(
+            f"Positions: {summary.positions} / {_POSITION_LIMIT}"
+        )
+        positions_label.setStyleSheet(
+            "font-weight: bold; color: "
+            + ("#c62828;" if summary.positions >= _POSITION_LIMIT else "#2e7d32;")
+        )
+    capital_label = getattr(main_window, "_buyboard_capital_label", None)
+    if capital_label is not None:
+        capital_label.setText(
+            "Capital: -"
+            if summary.capital_percent is None
+            else f"Capital: {summary.capital_percent:.1f}%"
+        )
+    pnl_label = getattr(main_window, "_buyboard_pnl_label", None)
+    if pnl_label is not None:
+        if summary.pnl_usd is None:
+            pnl_label.setText("P&L: -")
+            pnl_label.setStyleSheet("")
+        else:
+            sign = "+" if summary.pnl_usd >= 0 else "-"
+            pnl_label.setText(f"P&L: {sign}${abs(summary.pnl_usd):,.0f}")
+            pnl_label.setStyleSheet(
+                "font-weight: bold; color: "
+                + ("#2e7d32;" if summary.pnl_usd >= 0 else "#c62828;")
+            )
+    return summary
+
+
+def _currently_visible_cards(main_window):
+    selected_account = None
+    combo = getattr(main_window, "_buyboard_account_filter_combo", None)
+    if combo is not None:
+        selected_account = combo.currentData()
+    visible = []
+    for value in tuple(
+        getattr(main_window, "_buyboard_current_projections", ()) or ()
+    ):
+        state = _state(value)
+        if state is not None and state.board_status not in set(BOARD_COLUMN_ORDER):
+            continue
+        if selected_account and _account_no(value) != selected_account:
+            continue
+        visible.append(value)
+    return visible
+
+
 def refresh_buyboard_live_metrics(main_window) -> int:
     """Refresh current-price metrics in-place, independently of DB projection."""
 
@@ -172,6 +346,12 @@ def refresh_buyboard_live_metrics(main_window) -> int:
     updated = 0
     for column_list in getattr(main_window, "buyboard_columns", {}).values():
         updated += column_list.refresh_live_metrics(quote_lookup, equity_lookup)
+    _update_portfolio_summary(
+        main_window,
+        _currently_visible_cards(main_window),
+        quote_lookup,
+        equity_lookup,
+    )
     return updated
 
 
@@ -237,6 +417,12 @@ def populate_buyboard_columns(main_window, cards) -> None:
         grouped[target_status].append(card)
     quote_lookup = _quote_lookup_for(main_window)
     equity_lookup = _account_equity_lookup_for(main_window)
+    _update_portfolio_summary(
+        main_window,
+        visible_cards,
+        quote_lookup,
+        equity_lookup,
+    )
     for status, column_list in main_window.buyboard_columns.items():
         column_list.set_cards(
             grouped.get(status, []),
@@ -271,8 +457,8 @@ def _handle_card_dropped(main_window, payload: dict, target_status: BoardStatus)
         QMessageBox.information(
             main_window,
             "Buy Board",
-            "The new execution engine is not enabled yet. Use the existing "
-            "Buy Dashboard tab to submit real orders until this is turned on.",
+            "Live order actions are unavailable because the Buy Board execution "
+            "engine is not enabled on this device.",
         )
         return
 
@@ -410,15 +596,111 @@ def _renumber_column_after_swap(
         )
 
 
+def _queue_item_for_card(main_window, card: TradeCardState):
+    manager = getattr(main_window, "execution_queue_manager", None)
+    getter = getattr(manager, "get_item", None)
+    if not callable(getter):
+        return None
+    return getter(card.symbol, card.environment)
+
+
+def _sync_orb_plan_change(main_window, card: TradeCardState) -> None:
+    refresher = getattr(main_window, "refresh_execution_queue", None)
+    if callable(refresher):
+        refresher(
+            card.environment,
+            show_log=False,
+            symbols=[card.symbol],
+            create_missing=False,
+        )
+    refresh_board = getattr(main_window, "refresh_buyboard", None)
+    if callable(refresh_board):
+        refresh_board()
+
+
+def _show_orb_plans(main_window, card: TradeCardState) -> None:
+    """Refresh and show the existing queue's ORB plans for one Today card."""
+
+    refresher = getattr(main_window, "refresh_execution_queue", None)
+    if callable(refresher):
+        refresher(
+            card.environment,
+            symbols=[card.symbol],
+            create_missing=False,
+        )
+    queue_item = _queue_item_for_card(main_window, card)
+    if queue_item is None:
+        QMessageBox.warning(
+            main_window,
+            "ORB Plans",
+            f"No execution-queue ORB plans were found for {card.symbol}.",
+        )
+        return
+
+    def lock_window(window: str) -> None:
+        candidate = (getattr(queue_item, "candidates", {}) or {}).get(window)
+        if candidate is None:
+            return
+        queue_item.locked = True
+        queue_item.manual_window_lock = True
+        queue_item.locked_reason = "Manual ORB window lock from Buy Board"
+        queue_item.selected_window = window
+        queue_item.selected_candidate = candidate
+        saver = getattr(main_window, "_save_execution_queue_state", None)
+        if callable(saver):
+            saver()
+        _sync_orb_plan_change(main_window, card)
+
+    def unlock_auto() -> None:
+        unlocker = getattr(
+            main_window, "_unlock_execution_queue_item_for_auto", None
+        )
+        if callable(unlocker):
+            unlocker(queue_item)
+        else:
+            from src.core.execution_queue import select_best_orb_candidate
+
+            queue_item.locked = False
+            queue_item.manual_window_lock = False
+            queue_item.locked_reason = None
+            selected = select_best_orb_candidate(
+                getattr(queue_item, "candidates", {}) or {},
+                getattr(queue_item, "selected_window", None),
+                False,
+            )
+            queue_item.selected_candidate = selected
+            queue_item.selected_window = selected.window if selected else None
+            saver = getattr(main_window, "_save_execution_queue_state", None)
+            if callable(saver):
+                saver()
+        _sync_orb_plan_change(main_window, card)
+
+    dialogs.show_orb_plan_dialog(
+        main_window,
+        queue_item,
+        lock_window=lock_window,
+        unlock_auto=unlock_auto,
+    )
+
+
+def _open_card_in_tradingview(main_window, symbol: str) -> None:
+    set_chart_symbol = getattr(main_window, "_set_chart_symbol", None)
+    if callable(set_chart_symbol):
+        set_chart_symbol(symbol)
+    set_tradingview_symbol = getattr(main_window, "_set_tradingview_symbol", None)
+    if callable(set_tradingview_symbol):
+        set_tradingview_symbol(symbol)
+    tabs = getattr(main_window, "tabs", None)
+    tradingview_widget = getattr(main_window, "tradingview_widget", None)
+    if tabs is not None and tradingview_widget is not None:
+        tabs.setCurrentWidget(tradingview_widget)
+    load_chart = getattr(main_window, "load_tradingview_chart", None)
+    if callable(load_chart):
+        load_chart(force=True)
+
+
 def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
-    """Right-click actions: cancelling a still-pending entry (review
-    finding P1-8), stop management (review finding P1-9), and
-    Kanban-priority reordering (review finding P1-8/P1-7). Commands for
-    all of these already existed (:mod:`src.ui.buyboard.drag_commands`,
-    :mod:`src.ui.buyboard.controller`) but nothing in the board UI ever
-    exposed a Cancel Entry action, and reordering could silently create
-    duplicate priorities.
-    """
+    """Expose every operator action on the authoritative Kanban card."""
     environment = str(payload.get("environment", ""))
     account_no = str(payload.get("account_no", ""))
     symbol = str(payload.get("symbol", ""))
@@ -438,54 +720,124 @@ def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
     interaction_fingerprint = current_payload["state_fingerprint"]
 
     menu = QMenu(main_window)
-    cancel_entry_action = orb_action = breakeven_action = manual_stop_action = None
-    if card.board_status in (BoardStatus.BUY_TODAY, BoardStatus.ENTRY_PENDING):
-        # Section 989-990 / review finding P1-8: Entry Pending is a
-        # system-only drop target (no drag can reach it, and none can
-        # leave it either), so a right-click action is the only way to
-        # ever cancel a working entry from the board -- without this the
-        # only escape was the legacy Buy Dashboard tab.
-        cancel_entry_action = menu.addAction(
-            "Remove from Today" if card.board_status == BoardStatus.BUY_TODAY else "Cancel Entry"
-        )
+    actions = {}
+    if card.board_status == BoardStatus.BUYLIST:
+        actions["activate"] = menu.addAction("Activate for Buy Today")
+        actions["remove"] = menu.addAction("Move to Watchlist")
         menu.addSeparator()
+    elif card.board_status == BoardStatus.BUY_TODAY:
+        actions["orb_plans"] = menu.addAction("Refresh / Select ORB Plans...")
+        actions["remove_today"] = menu.addAction("Remove from Today")
+        menu.addSeparator()
+    elif card.board_status == BoardStatus.ENTRY_PENDING:
+        actions["cancel_entry"] = menu.addAction("Cancel Entry")
+        menu.addSeparator()
+
+    if card.board_status == BoardStatus.OPEN_POSITION:
+        actions["partial_sell"] = menu.addAction("Partial Sell...")
+        actions["sell_all"] = menu.addAction("Sell All")
+        menu.addSeparator()
+    elif card.board_status == BoardStatus.PARTIAL_SELL:
+        actions["cancel_partial"] = menu.addAction("Cancel Partial Sell")
+        menu.addSeparator()
+    elif card.board_status == BoardStatus.SELL_ALL:
+        actions["cancel_sell_all"] = menu.addAction("Cancel Sell All")
+        menu.addSeparator()
+
     if card.board_status in (BoardStatus.OPEN_POSITION, BoardStatus.PARTIAL_SELL):
-        orb_action = menu.addAction("Use Frozen ORB-Low Stop")
-        breakeven_action = menu.addAction("Move Stop to Breakeven")
-        manual_stop_action = menu.addAction("Set Manual Stop…")
+        actions["orb_stop"] = menu.addAction("Use Frozen ORB-Low Stop")
+        actions["breakeven"] = menu.addAction("Move Stop to Breakeven")
+        actions["manual_stop"] = menu.addAction("Set Manual Stop...")
         menu.addSeparator()
+
+    actions["chart"] = menu.addAction("Open TradingView Chart")
+    menu.addSeparator()
 
     siblings = _column_cards_sorted(main_window, card.board_status)
     index = next((i for i, sibling in enumerate(siblings) if sibling.card_key == card.card_key), None)
-    move_up_action = menu.addAction("Move Up Priority")
-    move_up_action.setEnabled(index is not None and index > 0)
-    move_down_action = menu.addAction("Move Down Priority")
-    move_down_action.setEnabled(index is not None and index < len(siblings) - 1)
+    actions["move_up"] = menu.addAction("Move Up Priority")
+    actions["move_up"].setEnabled(index is not None and index > 0)
+    actions["move_down"] = menu.addAction("Move Down Priority")
+    actions["move_down"].setEnabled(
+        index is not None and index < len(siblings) - 1
+    )
 
     chosen = menu.exec_(global_pos)
     if chosen is None:
         return
 
-    if chosen is cancel_entry_action:
-        command = CancelEntry(
-            **common
-        )
+    if chosen is actions.get("activate"):
+        command = ActivateForToday(**common)
         main_window._buyboard_dispatch_command(
             command, interaction_fingerprint=interaction_fingerprint
         )
-    elif chosen is orb_action:
+    elif chosen is actions.get("remove"):
+        command = MoveToWatchlist(**common)
+        main_window._buyboard_dispatch_command(
+            command, interaction_fingerprint=interaction_fingerprint
+        )
+    elif chosen is actions.get("orb_plans"):
+        _show_orb_plans(main_window, card)
+    elif chosen in (
+        actions.get("remove_today"),
+        actions.get("cancel_entry"),
+    ):
+        command = CancelEntry(**common)
+        main_window._buyboard_dispatch_command(
+            command, interaction_fingerprint=interaction_fingerprint
+        )
+    elif chosen is actions.get("partial_sell"):
         if not is_buyboard_engine_enabled():
             QMessageBox.information(
-                main_window, "Buy Board", "The new execution engine is not enabled yet."
+                main_window,
+                "Buy Board",
+                "The Buy Board execution engine is not enabled.",
+            )
+            return
+        quantity = dialogs.prompt_partial_sell_quantity(main_window, card)
+        if quantity is None:
+            return
+        main_window._buyboard_dispatch_command(
+            RequestPartialSell(**common, quantity=quantity),
+            interaction_fingerprint=interaction_fingerprint,
+        )
+    elif chosen is actions.get("sell_all"):
+        if not is_buyboard_engine_enabled():
+            QMessageBox.information(
+                main_window,
+                "Buy Board",
+                "The Buy Board execution engine is not enabled.",
+            )
+            return
+        if not dialogs.confirm_sell_all(main_window, card):
+            return
+        main_window._buyboard_dispatch_command(
+            RequestSellAll(**common),
+            interaction_fingerprint=interaction_fingerprint,
+        )
+    elif chosen is actions.get("cancel_partial"):
+        main_window._buyboard_dispatch_command(
+            CancelPartialSell(**common),
+            interaction_fingerprint=interaction_fingerprint,
+        )
+    elif chosen is actions.get("cancel_sell_all"):
+        main_window._buyboard_dispatch_command(
+            CancelQueuedSellAll(**common),
+            interaction_fingerprint=interaction_fingerprint,
+        )
+    elif chosen is actions.get("orb_stop"):
+        if not is_buyboard_engine_enabled():
+            QMessageBox.information(
+                main_window, "Buy Board", "The Buy Board execution engine is not enabled."
             )
             return
         main_window._buyboard_dispatch_command(
             SetOrbStop(**common), interaction_fingerprint=interaction_fingerprint
         )
-    elif chosen is breakeven_action:
+    elif chosen is actions.get("breakeven"):
         if not is_buyboard_engine_enabled():
             QMessageBox.information(
-                main_window, "Buy Board", "The new execution engine is not enabled yet."
+                main_window, "Buy Board", "The Buy Board execution engine is not enabled."
             )
             return
         command = SetBreakevenStop(
@@ -494,10 +846,10 @@ def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
         main_window._buyboard_dispatch_command(
             command, interaction_fingerprint=interaction_fingerprint
         )
-    elif chosen is manual_stop_action:
+    elif chosen is actions.get("manual_stop"):
         if not is_buyboard_engine_enabled():
             QMessageBox.information(
-                main_window, "Buy Board", "The new execution engine is not enabled yet."
+                main_window, "Buy Board", "The Buy Board execution engine is not enabled."
             )
             return
         price = dialogs.prompt_manual_stop_price(main_window, card)
@@ -510,9 +862,15 @@ def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
         main_window._buyboard_dispatch_command(
             command, interaction_fingerprint=interaction_fingerprint
         )
-    elif chosen is move_up_action and index is not None and index > 0:
+    elif chosen is actions.get("chart"):
+        _open_card_in_tradingview(main_window, card.symbol)
+    elif chosen is actions.get("move_up") and index is not None and index > 0:
         _renumber_column_after_swap(main_window, siblings, index, index - 1)
-    elif chosen is move_down_action and index is not None and index < len(siblings) - 1:
+    elif (
+        chosen is actions.get("move_down")
+        and index is not None
+        and index < len(siblings) - 1
+    ):
         _renumber_column_after_swap(main_window, siblings, index, index + 1)
 
 

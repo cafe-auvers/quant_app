@@ -112,6 +112,8 @@ def test_main_window_constructs_and_closes_offscreen_without_external_io(monkeyp
     tradingview_index = tab_labels.index("TradingView Chart")
     assert tab_labels[tradingview_index + 1] == "Health"
     assert "Buy Board" in tab_labels
+    assert "Buy Dashboard" not in tab_labels
+    assert not hasattr(window, "buylist_widget")
     from src.ui.buyboard.columns import BOARD_COLUMN_ORDER
 
     assert set(window.buyboard_columns.keys()) == set(BOARD_COLUMN_ORDER)
