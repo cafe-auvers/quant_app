@@ -937,6 +937,21 @@ def test_failed_final_release_aborts_close_and_restores_protection(monkeypatch):
     window._restore_protection_after_aborted_shutdown = (
         lambda timer_states: restored.append(timer_states)
     )
+    class Timer:
+        def __init__(self):
+            self.stop_count = 0
+
+        @staticmethod
+        def isActive():
+            return True
+
+        def stop(self):
+            self.stop_count += 1
+
+    projection_timer = Timer()
+    live_metric_timer = Timer()
+    window._buyboard_projection_timer = projection_timer
+    window._buyboard_live_metric_timer = live_metric_timer
     for name in (
         "scanner_worker",
         "watchlist_worker",
@@ -960,3 +975,7 @@ def test_failed_final_release_aborts_close_and_restores_protection(monkeypatch):
 
     assert ignored == [True]
     assert len(restored) == 1
+    assert projection_timer.stop_count == 1
+    assert live_metric_timer.stop_count == 1
+    assert (projection_timer, True) in restored[0]
+    assert (live_metric_timer, True) in restored[0]

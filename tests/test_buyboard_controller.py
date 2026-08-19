@@ -7,6 +7,8 @@ PyQt5 at module scope is fine headlessly; nothing here instantiates a widget).
 from __future__ import annotations
 
 import os
+import logging
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -25,7 +27,13 @@ from src.services.trade_card_repository import (
     TradeCardNotFoundError,
     TradeCardVersionConflictError,
 )
-from src.ui.buyboard.controller import CommandRejectedError, apply_board_command
+from src.ui.buyboard import board as board_module
+from src.ui.buyboard import controller as controller_module
+from src.ui.buyboard.controller import (
+    BuyboardMixin,
+    CommandRejectedError,
+    apply_board_command,
+)
 from src.ui.buyboard.drag_commands import (
     ActivateForToday,
     CancelEntry,
@@ -71,6 +79,42 @@ def _cmd(cls, card, **kw):
         expected_card_version=card.version,
         **kw,
     )
+
+
+def test_refresh_buyboard_does_not_start_a_worker_during_shutdown():
+    window = SimpleNamespace(_database_shutting_down=True)
+    BuyboardMixin.refresh_buyboard(window)
+    assert window.__dict__ == {"_database_shutting_down": True}
+
+
+def test_projection_render_warnings_are_severe_and_rate_limited(
+    monkeypatch, caplog
+):
+    window = BuyboardMixin()
+    window._buyboard_projection_generation = 7
+    monkeypatch.setattr(board_module, "populate_buyboard_columns", lambda *_: None)
+
+    perf_values = iter((1.0, 1.2, 2.0, 3.2, 4.0, 5.2, 6.0, 7.2))
+    monotonic_values = iter((100.0, 120.0, 150.0, 181.0))
+    monkeypatch.setattr(
+        controller_module,
+        "time",
+        SimpleNamespace(
+            perf_counter=lambda: next(perf_values),
+            monotonic=lambda: next(monotonic_values),
+        ),
+    )
+    caplog.set_level(logging.WARNING, logger=controller_module.__name__)
+
+    BuyboardMixin._on_buyboard_projection_completed(window, (), "", 7)
+    BuyboardMixin._on_buyboard_projection_completed(window, (), "", 7)
+    BuyboardMixin._on_buyboard_projection_completed(window, (), "", 7)
+    BuyboardMixin._on_buyboard_projection_completed(window, (), "", 7)
+
+    warnings = [
+        record for record in caplog.records if "slow UI render" in record.message
+    ]
+    assert len(warnings) == 2
 
 
 def test_watchlist_to_buylist(tmp_path):

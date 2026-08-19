@@ -84,6 +84,7 @@ from src.services.schema_migration import (
     MigrationPhase,
     SchemaMigrationManager,
 )
+from src.utils.redaction import scrub_sensitive_text
 from src.services.runtime_device_state_repository import (
     require_compatible_runtime_schema,
     save_runtime_device_state,
@@ -373,8 +374,17 @@ class BuyboardRuntimeWorker(QThread):
                 # but broker truth may have advanced during the outage. No
                 # normal heartbeat is permitted until a complete fresh pass.
                 self._recovery_reconciliation_required = True
-        except Exception:
-            logger.exception("Buyboard runtime database write probe failed")
+        except Exception as exc:
+            if not had_prior_probe or was_writable:
+                logger.warning(
+                    "Buyboard runtime database is unavailable: %s",
+                    scrub_sensitive_text(exc, account_no=self._account_no),
+                )
+            else:
+                logger.debug(
+                    "Buyboard runtime database remains unavailable: %s",
+                    scrub_sensitive_text(exc, account_no=self._account_no),
+                )
             self._database_writable = False
             if self.execution_gateway is not None:
                 self.execution_gateway.note_canonical_database_unavailable()
