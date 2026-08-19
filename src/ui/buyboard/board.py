@@ -93,6 +93,9 @@ def build_buyboard_widget(main_window) -> None:
     positions_label.setStyleSheet("font-weight: bold; color: #2e7d32;")
     capital_label = QLabel("Capital: -")
     pnl_label = QLabel("P&L: -")
+    pnl_label.setToolTip(
+        "Current filtered Buy Board P&L (entire Buy Board P&L)."
+    )
     header.addWidget(positions_label)
     header.addSpacing(12)
     header.addWidget(capital_label)
@@ -278,13 +281,21 @@ def calculate_portfolio_summary(
 def _update_portfolio_summary(
     main_window,
     visible_cards,
+    all_cards=None,
     quote_lookup: Optional[Callable[[str], Optional[float]]] = None,
     equity_lookup: Optional[Callable[[str, str], Optional[float]]] = None,
 ) -> BuyboardPortfolioSummary:
     quote_lookup = quote_lookup if quote_lookup is not None else _quote_lookup_for(main_window)
     equity_lookup = equity_lookup or _account_equity_lookup_for(main_window)
+    visible_cards = list(visible_cards)
+    all_cards = visible_cards if all_cards is None else list(all_cards)
     summary = calculate_portfolio_summary(
         visible_cards,
+        quote_lookup,
+        equity_lookup,
+    )
+    entire_summary = calculate_portfolio_summary(
+        all_cards,
         quote_lookup,
         equity_lookup,
     )
@@ -307,12 +318,19 @@ def _update_portfolio_summary(
         )
     pnl_label = getattr(main_window, "_buyboard_pnl_label", None)
     if pnl_label is not None:
+        def format_pnl(value: Optional[float]) -> str:
+            if value is None:
+                return "-"
+            sign = "+" if value >= 0 else "-"
+            return f"{sign}${abs(value):,.0f}"
+
+        pnl_label.setText(
+            f"P&L: {format_pnl(summary.pnl_usd)} "
+            f"({format_pnl(entire_summary.pnl_usd)})"
+        )
         if summary.pnl_usd is None:
-            pnl_label.setText("P&L: -")
             pnl_label.setStyleSheet("")
         else:
-            sign = "+" if summary.pnl_usd >= 0 else "-"
-            pnl_label.setText(f"P&L: {sign}${abs(summary.pnl_usd):,.0f}")
             pnl_label.setStyleSheet(
                 "font-weight: bold; color: "
                 + ("#2e7d32;" if summary.pnl_usd >= 0 else "#c62828;")
@@ -338,6 +356,17 @@ def _currently_visible_cards(main_window):
     return visible
 
 
+def _all_current_board_cards(main_window):
+    visible_statuses = set(BOARD_COLUMN_ORDER)
+    return [
+        value
+        for value in tuple(
+            getattr(main_window, "_buyboard_current_projections", ()) or ()
+        )
+        if _state(value) is None or _state(value).board_status in visible_statuses
+    ]
+
+
 def refresh_buyboard_live_metrics(main_window) -> int:
     """Refresh current-price metrics in-place, independently of DB projection."""
 
@@ -349,6 +378,7 @@ def refresh_buyboard_live_metrics(main_window) -> int:
     _update_portfolio_summary(
         main_window,
         _currently_visible_cards(main_window),
+        _all_current_board_cards(main_window),
         quote_lookup,
         equity_lookup,
     )
@@ -398,6 +428,7 @@ def populate_buyboard_columns(main_window, cards) -> None:
         for value in cards
         if _state(value) is None or _state(value).board_status in visible_statuses
     ]
+    all_board_cards = list(visible_cards)
     selected_account = _sync_account_filter_options(main_window, visible_cards)
     if selected_account:
         visible_cards = [
@@ -420,6 +451,7 @@ def populate_buyboard_columns(main_window, cards) -> None:
     _update_portfolio_summary(
         main_window,
         visible_cards,
+        all_board_cards,
         quote_lookup,
         equity_lookup,
     )

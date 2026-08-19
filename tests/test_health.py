@@ -79,6 +79,58 @@ def test_unreadable_order_ledger_is_critical():
     assert "unreadable" in check.summary.lower()
 
 
+def test_reconciliation_health_ignores_non_production_open_orders():
+    simulation_order = BrokerOrder.create(
+        environment="SIM",
+        account_no="simulation",
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        intent=OrderIntent.ENTRY,
+        quantity_requested=5,
+        limit_price=100.0,
+        status=OrderStatus.UNKNOWN_SUBMISSION_STATE,
+    )
+
+    check = health._reconciliation_check(
+        health.HealthContext(orders=[simulation_order])
+    )
+
+    assert check.level == health.HealthLevel.HEALTHY
+    assert check.summary == "No unresolved production broker orders"
+    assert "Ignored 1 non-production open ledger order(s)." in check.detail
+
+
+def test_reconciliation_health_counts_only_production_open_orders():
+    production_order = BrokerOrder.create(
+        environment="PROD",
+        account_no="production",
+        symbol="NVDA",
+        side=OrderSide.BUY,
+        intent=OrderIntent.ENTRY,
+        quantity_requested=2,
+        limit_price=100.0,
+        status=OrderStatus.ACCEPTED,
+    )
+    simulation_order = BrokerOrder.create(
+        environment="SIM",
+        account_no="simulation",
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        intent=OrderIntent.ENTRY,
+        quantity_requested=5,
+        limit_price=100.0,
+        status=OrderStatus.UNKNOWN_SUBMISSION_STATE,
+    )
+
+    check = health._reconciliation_check(
+        health.HealthContext(orders=[production_order, simulation_order])
+    )
+
+    assert check.level == health.HealthLevel.WARNING
+    assert check.summary == "1 open order(s) await final state"
+    assert "Ignored 1 non-production open ledger order(s)." in check.detail
+
+
 def test_main_device_handoff_check_healthy_when_main():
     check = health._main_device_handoff_check(
         health.HealthContext(is_main_device=True, lease_age_seconds=12.0)

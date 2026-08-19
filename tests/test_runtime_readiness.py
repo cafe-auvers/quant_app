@@ -45,20 +45,21 @@ def test_engine_health_requires_every_condition():
     assert EngineReadiness(**_READY).healthy is True
 
 
-def test_standby_readiness_exposes_the_same_gate_results_used_for_authorization():
+def test_standby_readiness_keeps_global_quote_staleness_symbol_scoped():
     values = dict(_READY)
     values["lease_current"] = False
     values["device_active"] = False
     values["critical_quotes_fresh"] = False
     readiness = EngineReadiness(**values)
 
-    assert readiness.standby_ready is False
+    assert readiness.standby_ready is True
     assert readiness.standby_checks_completed == 7
-    assert readiness.standby_blockers == ("critical_quotes_fresh",)
-    assert dict(readiness.standby_check_results)["critical_quotes_fresh"] is False
+    assert readiness.standby_blockers == ()
+    assert "critical_quotes_fresh" not in dict(readiness.standby_check_results)
+    assert readiness.healthy is False
 
 
-def test_premarket_handoff_waives_only_fresh_quote_evidence():
+def test_quote_freshness_is_diagnostic_but_not_a_global_standby_gate():
     values = dict(_READY)
     values["lease_current"] = False
     values["device_active"] = False
@@ -66,7 +67,7 @@ def test_premarket_handoff_waives_only_fresh_quote_evidence():
     readiness = EngineReadiness(**values)
 
     assert readiness.premarket_handoff_ready is True
-    assert readiness.standby_ready is False
+    assert readiness.standby_ready is True
     assert readiness.healthy is False
 
 

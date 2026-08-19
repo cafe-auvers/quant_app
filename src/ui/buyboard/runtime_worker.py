@@ -632,21 +632,15 @@ class BuyboardRuntimeWorker(QThread):
     ) -> bool:
         """Return whether this read-only successor can own the Main lease.
 
-        During regular trading hours the full execution-grade readiness
-        predicate is mandatory.  Outside regular hours, only fresh quote
-        evidence is waived: broker reconciliation, subscription ACKs, queue
-        health, and canonical database access all remain fail-closed.
+        Stable global infrastructure is mandatory in every session.  Volatile
+        quote freshness is enforced for the exact symbol at each execution
+        boundary, so one quiet symbol cannot demote the entire successor.
+        Broker reconciliation, subscription ACKs, queue health, and canonical
+        database access all remain fail-closed.
         """
 
         current = readiness or self.engine_readiness(include_device_state=False)
-        if current.standby_ready:
-            return True
-        try:
-            market_open = bool(self._regular_session_open())
-        except Exception:
-            logger.exception("Could not determine regular-session state for handoff")
-            return False
-        return not market_open and current.premarket_handoff_ready
+        return current.standby_ready
 
     def _refresh_observation_after_final_reconciliation(self) -> None:
         """Refresh the local feed-drain timestamp after a blocking REST pass."""

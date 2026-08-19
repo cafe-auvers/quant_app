@@ -427,3 +427,123 @@ def test_ui_terminal_event_fires_for_matching_active_run_id():
     status = {"finished_at": "t1", "run_id": "run_a"}
 
     assert ScannerMixin._is_new_terminal_refresh_event(ui, hrc.MODE_1D, status) is True
+
+
+class _UiTextStub:
+    def __init__(self, text=""):
+        self.value = text
+        self.tooltip = ""
+
+    def setText(self, text):
+        self.value = text
+
+    def text(self):
+        return self.value
+
+    def setToolTip(self, text):
+        self.tooltip = text
+
+
+class _UiProgressStub:
+    def __init__(self):
+        self.minimum = 0
+        self.maximum = 100
+        self.value = 0
+
+    def setRange(self, minimum, maximum):
+        self.minimum = minimum
+        self.maximum = maximum
+
+    def setValue(self, value):
+        self.value = value
+
+
+class _UiButtonStub(_UiTextStub):
+    def setEnabled(self, enabled):
+        self.enabled = enabled
+
+
+def test_completed_refresh_is_not_repainted_after_terminal_event_was_seen(monkeypatch):
+    import src.ui.mixins.scanner_mixin as scanner_mixin
+
+    class Window(scanner_mixin.ScannerMixin):
+        def __init__(self):
+            self._refresh_last_finished_at = {hrc.MODE_1H: "finished"}
+            self._refresh_active_run_id = {}
+            self._refresh_last_log_count = {}
+            self.progress_label = _UiTextStub("Buy Board readiness")
+            self.progress_bar = _UiProgressStub()
+
+        def append_log(self, _message):
+            pass
+
+    monkeypatch.setattr(scanner_mixin, "is_refresh_running", lambda _mode: (False, {}))
+    window = Window()
+
+    window._apply_refresh_status_to_ui(
+        hrc.MODE_1H,
+        _UiButtonStub(),
+        "Update 1H Data",
+        False,
+        {
+            "status": "completed",
+            "finished_at": "finished",
+            "run_id": "run-1",
+            "result": {"updated_count": 5674},
+        },
+    )
+
+    assert window.progress_label.text() == "Buy Board readiness"
+
+
+def test_new_completed_refresh_clears_after_brief_success_display(monkeypatch):
+    import src.ui.mixins.scanner_mixin as scanner_mixin
+
+    callbacks = []
+
+    class Window(scanner_mixin.ScannerMixin):
+        def __init__(self):
+            self._refresh_last_finished_at = {}
+            self._refresh_active_run_id = {hrc.MODE_1H: "run-1"}
+            self._refresh_last_log_count = {}
+            self.progress_label = _UiTextStub("Running")
+            self.progress_bar = _UiProgressStub()
+            self.handled = []
+
+        def append_log(self, _message):
+            pass
+
+        def _handle_refresh_terminal_status(self, mode, status):
+            self.handled.append((mode, status))
+
+    monkeypatch.setattr(scanner_mixin, "is_refresh_running", lambda _mode: (False, {}))
+    monkeypatch.setattr(
+        scanner_mixin.QTimer,
+        "singleShot",
+        lambda delay, callback: callbacks.append((delay, callback)),
+    )
+    window = Window()
+    status = {
+        "status": "completed",
+        "finished_at": "finished",
+        "run_id": "run-1",
+        "result": {"updated_count": 5674},
+    }
+
+    window._apply_refresh_status_to_ui(
+        hrc.MODE_1H,
+        _UiButtonStub(),
+        "Update 1H Data",
+        False,
+        status,
+    )
+
+    assert window.progress_label.text() == "1H refresh: completed (5674 updated)."
+    assert window.progress_bar.value == 100
+    assert len(window.handled) == 1
+    assert callbacks[0][0] == scanner_mixin.REFRESH_SUCCESS_DISPLAY_MS
+
+    callbacks[0][1]()
+
+    assert window.progress_label.text() == "Ready."
+    assert window.progress_bar.value == 0

@@ -137,7 +137,6 @@ _STANDBY_GATE_LABELS = {
     "websocket_connected": "KIS WebSocket connection",
     "critical_trade_subscriptions_acked": "trade subscription acknowledgements",
     "critical_quote_subscriptions_acked": "quote subscription acknowledgements",
-    "critical_quotes_fresh": "fresh regular-session quotes",
     "accumulator_draining_within_budget": "market-data queue drain",
     "database_writable": "canonical database write probe",
 }
@@ -161,6 +160,23 @@ def _format_readiness_eta(seconds: float) -> str:
     return f"{prefix}{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
+def _per_symbol_quote_guard_detail(
+    readiness: EngineReadiness,
+    *,
+    regular_session_open: bool,
+    seconds_until_open: Optional[float],
+) -> str:
+    if readiness.critical_quotes_fresh:
+        return ""
+    detail = (
+        "Per-symbol execution guard: symbols without a fresh execution-grade "
+        "quote remain individually blocked; overall board readiness is unchanged."
+    )
+    if not regular_session_open and seconds_until_open is not None:
+        detail += f" Market opens in {_format_readiness_eta(seconds_until_open)}."
+    return detail
+
+
 def _buyboard_readiness_display(
     readiness: EngineReadiness,
     *,
@@ -178,6 +194,11 @@ def _buyboard_readiness_display(
     total = len(checks)
     blockers = readiness.standby_blockers
     blocked_labels = tuple(_STANDBY_GATE_LABELS[item] for item in blockers)
+    quote_guard_detail = _per_symbol_quote_guard_detail(
+        readiness,
+        regular_session_open=regular_session_open,
+        seconds_until_open=seconds_until_open,
+    )
 
     if device_state == RuntimeDeviceState.ACTIVE:
         tooltip_parts = [
@@ -188,6 +209,8 @@ def _buyboard_readiness_display(
             tooltip_parts.append(
                 "Current action guards: " + ", ".join(blocked_labels)
             )
+        if quote_guard_detail:
+            tooltip_parts.append(quote_guard_detail)
         return BuyboardReadinessDisplay(
             total,
             total,
@@ -224,35 +247,6 @@ def _buyboard_readiness_display(
         reason = "waiting for KIS trade-subscription ACKs"
     elif not readiness.critical_quote_subscriptions_acked:
         reason = "waiting for KIS quote-subscription ACKs"
-    elif (
-        not regular_session_open
-        and not readiness.critical_quotes_fresh
-        and readiness.premarket_handoff_ready
-        and is_main_device
-    ):
-        reason = "Main lease held; execution waits for fresh regular-session quotes"
-        if seconds_until_open is not None:
-            reason += f"; market opens in {_format_readiness_eta(seconds_until_open)}"
-    elif (
-        not regular_session_open
-        and not readiness.critical_quotes_fresh
-        and readiness.premarket_handoff_ready
-        and device_state == RuntimeDeviceState.STANDBY_READY
-    ):
-        reason = (
-            "STANDBY_READY for Main transfer; execution waits for fresh "
-            "regular-session quotes"
-        )
-        if seconds_until_open is not None:
-            reason += f"; market opens in {_format_readiness_eta(seconds_until_open)}"
-    elif not readiness.critical_quotes_fresh:
-        if not regular_session_open and seconds_until_open is not None:
-            reason = (
-                "waiting for fresh regular-session quotes; market opens in "
-                f"{_format_readiness_eta(seconds_until_open)}"
-            )
-        else:
-            reason = "waiting for fresh execution-grade quotes"
     elif not readiness.accumulator_draining_within_budget:
         reason = "draining the market-data queue"
     elif device_state == RuntimeDeviceState.STANDBY_READY:
@@ -262,7 +256,11 @@ def _buyboard_readiness_display(
             else "STANDBY_READY; use this device as Main"
         )
     elif readiness.standby_ready:
-        reason = "publishing final readiness confirmation"
+        reason = (
+            "Main lease held; per-symbol execution guards active"
+            if is_main_device
+            else "publishing final readiness confirmation"
+        )
     else:
         reason = "checking execution dependencies"
 
@@ -276,6 +274,8 @@ def _buyboard_readiness_display(
         tooltip_parts.append("Passed: " + ", ".join(passed_labels))
     if blocked_labels:
         tooltip_parts.append("Waiting: " + ", ".join(blocked_labels))
+    if quote_guard_detail:
+        tooltip_parts.append(quote_guard_detail)
     tooltip_parts.append(
         "Automatic PC claim is enabled."
         if auto_claim_enabled
@@ -721,6 +721,7 @@ class MainWindow(
         self._refresh_last_finished_at: Dict[str, Optional[str]] = {}
         self._refresh_last_log_count: Dict[str, int] = {}
         self._refresh_active_run_id: Dict[str, Optional[str]] = {}
+        self._refresh_completion_display_tokens: Dict[str, tuple] = {}
         self._pending_local_mirror_hourly_refresh = False
         self._run_scanners_after_local_mirror_refresh = False
         self.kis_account_worker = None
@@ -1618,6 +1619,9 @@ class MainWindow(
     def _foreground_progress_running(self) -> bool:
         """Keep user-started work from being overwritten by readiness status."""
 
+        if self.__dict__.get("_refresh_completion_display_tokens"):
+            return True
+
         worker_names = (
             "_local_mirror_sync_worker",
             "scanner_worker",
@@ -1646,7 +1650,7 @@ class MainWindow(
         )
         # ACTIVE is a latched Buy Board state. A separate legacy Buylist
         # handoff/reconciliation may continue in the background, but it does
-        # not revoke Buy Board activation and must not replace the stable 8/8
+        # not revoke Buy Board activation and must not replace the stable ready
         # projection with an indeterminate activation message.
         if not runtime_active:
             state_sync_worker = self.__dict__.get("state_sync_worker")

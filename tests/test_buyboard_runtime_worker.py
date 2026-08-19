@@ -893,11 +893,18 @@ def test_action_readiness_uses_exact_symbol_not_another_quiet_symbol(tmp_path):
         action="NEW_ENTRY",
         now=observed_at,
     )
+    stale_symbol_readiness = worker.engine_readiness(
+        symbol="STIM",
+        action="NEW_ENTRY",
+        now=observed_at,
+    )
 
     assert global_readiness.critical_quotes_fresh is False
+    assert global_readiness.standby_ready is True
     assert action_readiness.critical_trade_subscriptions_acked is True
     assert action_readiness.critical_quote_subscriptions_acked is True
     assert action_readiness.critical_quotes_fresh is True
+    assert stale_symbol_readiness.critical_quotes_fresh is False
 
 
 @pytest.mark.parametrize(
@@ -908,7 +915,6 @@ def test_action_readiness_uses_exact_symbol_not_another_quiet_symbol(tmp_path):
         "websocket_connected",
         "critical_trade_subscriptions_acked",
         "critical_quote_subscriptions_acked",
-        "critical_quotes_fresh",
         "accumulator_draining_within_budget",
         "database_writable",
     ],
@@ -1090,7 +1096,7 @@ def test_pull_only_successor_is_handoff_ready_before_market_open_without_quotes(
     assert worker._accepting_commands is False
 
 
-def test_pull_only_successor_cannot_waive_stale_quotes_during_regular_session(
+def test_pull_only_successor_keeps_stale_quotes_symbol_scoped_during_regular_session(
     tmp_path, monkeypatch
 ):
     worker, _ = _worker(
@@ -1115,9 +1121,9 @@ def test_pull_only_successor_cannot_waive_stale_quotes_during_regular_session(
 
     worker._advance_startup_readiness()
 
-    assert worker.device_state == RuntimeDeviceState.STANDBY
+    assert worker.device_state == RuntimeDeviceState.STANDBY_READY
     assert worker._accepting_commands is False
-    assert final_passes == []
+    assert final_passes == [{"execute_commands": False}]
 
 
 def test_premarket_handoff_does_not_waive_a_non_quote_dependency(
@@ -1146,10 +1152,9 @@ def test_premarket_handoff_does_not_waive_a_non_quote_dependency(
     assert worker._accepting_commands is False
 
 
-def test_main_lease_holder_waits_for_fresh_quote_before_active_execution(
+def test_main_lease_holder_activates_with_per_symbol_quote_guards(
     tmp_path, monkeypatch
 ):
-    quote_fresh = False
     worker, _ = _worker(
         tmp_path,
         device_id="main-device",
@@ -1160,24 +1165,18 @@ def test_main_lease_holder_waits_for_fresh_quote_before_active_execution(
     monkeypatch.setattr(
         worker,
         "engine_readiness",
-        lambda **kwargs: _ready_runtime_state(critical_quotes_fresh=quote_fresh),
+        lambda **kwargs: _ready_runtime_state(critical_quotes_fresh=False),
     )
     monkeypatch.setattr(worker, "_lease_still_current", lambda: True)
     monkeypatch.setattr(worker, "_run_startup_reconciliation", lambda **kwargs: None)
 
     worker._advance_startup_readiness()
 
-    assert worker.device_state == RuntimeDeviceState.STANDBY
-    assert worker._accepting_commands is False
-
-    quote_fresh = True
-    worker._advance_startup_readiness()
-
     assert worker.device_state == RuntimeDeviceState.ACTIVE
     assert worker._accepting_commands is True
 
 
-def test_handoff_session_lookup_failure_is_fail_closed(tmp_path):
+def test_handoff_does_not_need_session_lookup_when_stable_gates_are_ready(tmp_path):
     def unavailable():
         raise RuntimeError("calendar unavailable")
 
@@ -1189,7 +1188,7 @@ def test_handoff_session_lookup_failure_is_fail_closed(tmp_path):
 
     assert worker.lease_handoff_ready(
         _ready_runtime_state(critical_quotes_fresh=False)
-    ) is False
+    ) is True
 
 
 def test_standby_readiness_loss_demotes_immediately(tmp_path, monkeypatch):
