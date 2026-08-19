@@ -102,7 +102,6 @@ DEFAULT_TAB_OPTIONS = {
     "dashboard": True,
     "scanner": True,
     "watchlist": True,
-    "buylist": True,
     "buyboard": True,
     "charts": False,
     "tradingview": True,

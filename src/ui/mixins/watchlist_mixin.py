@@ -280,7 +280,7 @@ class WatchlistMixin:
         self.move_buylist_button.clicked.connect(self.move_selected_to_buylist)
         self.move_buylist_button.setShortcut("B")
         self.move_buylist_button.setToolTip(
-            "Move selected Watchlist symbol to the Buy Dashboard execution queue (shortcut: B)"
+            "Move selected Watchlist symbol to the Buy Board Buylist column (shortcut: B)"
         )
         button_layout.addWidget(self.move_buylist_button)
 
@@ -1457,23 +1457,11 @@ class WatchlistMixin:
         self._save_state()
 
         if added:
-            # Auto-start the monitor so ARMED items are watched immediately.
-            active_attr = f"_buylist_{env.lower()}_monitor_active"
-            monitor_started = False
-            if hasattr(self, "_toggle_buylist_monitor") and not getattr(
-                self, active_attr, False
-            ):
-                self._toggle_buylist_monitor(env)
-                monitor_started = True
-            monitor_note = (
-                "\n\nMonitor auto-started — will auto-buy when price hits the entry trigger."
-                if monitor_started
-                else "\n\nMonitor is running — will auto-buy when price hits the entry trigger."
-            )
             QMessageBox.information(
                 self,
-                "Added to Execution Queue",
-                f"'{symbol}' added to the {env} Buy Dashboard execution queue.{monitor_note}",
+                "Added to Buy Board",
+                f"'{symbol}' added to the Buy Board Buylist column.\n\n"
+                "Move it to Buy Today when you want the Buy Board engine to monitor and execute its ORB plan.",
             )
         else:
             QMessageBox.warning(

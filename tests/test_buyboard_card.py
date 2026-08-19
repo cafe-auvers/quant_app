@@ -16,7 +16,12 @@ from src.core.trade_card_state import (
     PositionRuntimeStatus,
     TradeCardState,
 )
-from src.ui.buyboard.card import TradeCardWidget, _card_metric_rows, _pnl_percent
+from src.ui.buyboard.card import (
+    TradeCardWidget,
+    _card_metric_rows,
+    _card_status_text,
+    _pnl_percent,
+)
 
 _APP = None
 
@@ -145,6 +150,19 @@ def test_buy_today_without_orb_shows_authoritative_risk_budget_only():
     assert rows["Planned"] == "--"
     assert rows["Risk Budget"] == "1.00% acct&nbsp;&nbsp;$1,000"
     assert "Stop P&L" not in rows
+
+
+def test_buy_today_status_names_the_selected_orb_plan():
+    card = TradeCardState(
+        environment="PROD",
+        account_no="1",
+        symbol="NVDA",
+        board_status=BoardStatus.BUY_TODAY,
+        entry_runtime_status=EntryRuntimeStatus.ORB_FORMING,
+        selected_orb_window="30m",
+    )
+
+    assert _card_status_text(card) == "ORB FORMING - ORB 30m"
 
 
 def test_entry_pending_card_prioritizes_cancel_and_fill_progress():

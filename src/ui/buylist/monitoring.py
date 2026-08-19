@@ -172,8 +172,7 @@ class BuylistMonitoringMixin:
                 "[Buylist] Legacy automatic order submission is suppressed "
                 "(BUYBOARD_ENGINE_ENABLED=true, Buy Board engine confirmed "
                 "healthy) -- the Buy Board engine now owns automatic "
-                "entry/exit execution. The Buy Dashboard remains available "
-                "for manual/emergency actions."
+                "entry/exit execution and all operator actions."
             )
         return True
 

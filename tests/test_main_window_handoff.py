@@ -255,6 +255,7 @@ def _handoff_window():
         save_buylist=0,
         populate_dashboard=0,
         monitor_started=[],
+        runtime_synced=0,
         auto_armed=0,
         retries=[],
     )
@@ -266,6 +267,9 @@ def _handoff_window():
     )
     window._ensure_buylist_monitor_running = lambda env: (
         calls.monitor_started.append(env) or True
+    )
+    window._sync_buyboard_runtime_worker = lambda: setattr(
+        calls, "runtime_synced", calls.runtime_synced + 1
     )
     window._auto_arm_trading_kill_switch = lambda: setattr(
         calls, "auto_armed", calls.auto_armed + 1
@@ -279,14 +283,15 @@ def _handoff_window():
     return window
 
 
-def test_post_claim_success_starts_monitor_without_changing_shared_control():
+def test_post_claim_success_restores_buyboard_without_starting_legacy_monitor():
     window = _handoff_window()
     window._handoff_generation = 1
     outcome = PostClaimReconciliationResult(ok=True, reconciled_symbols=["AAPL"])
 
     MainWindow._on_post_claim_reconciliation_finished(window, outcome, 1)
 
-    assert window._calls.monitor_started == ["PROD"]
+    assert window._calls.monitor_started == []
+    assert window._calls.runtime_synced == 1
     assert window._calls.auto_armed == 0
     assert window._calls.save_buylist == 1
 
