@@ -9,7 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QApplication, QMenu, QMessageBox, QWidget
+from PyQt5.QtWidgets import QApplication, QLabel, QMenu, QMessageBox, QWidget
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
@@ -515,6 +515,37 @@ def test_portfolio_summary_does_not_claim_pnl_when_a_quote_is_missing():
     assert summary.positions == 1
     assert summary.capital_percent == pytest.approx(10.0)
     assert summary.pnl_usd is None
+
+
+def test_portfolio_header_shows_filtered_and_entire_board_pnl():
+    _ensure_app()
+    selected_card = _card(
+        symbol="SELECTED",
+        account_no="1",
+        board_status=BoardStatus.OPEN_POSITION,
+        broker_quantity=10,
+        average_entry_price=100.0,
+    )
+    other_account_card = _card(
+        symbol="OTHER",
+        account_no="2",
+        board_status=BoardStatus.OPEN_POSITION,
+        broker_quantity=20,
+        average_entry_price=50.0,
+    )
+    window = SimpleNamespace(_buyboard_pnl_label=QLabel())
+    quotes = {"SELECTED": 110.0, "OTHER": 40.0}
+
+    summary = board_module._update_portfolio_summary(
+        window,
+        [selected_card],
+        [selected_card, other_account_card],
+        quotes.get,
+        lambda _environment, _account_no: 10_000.0,
+    )
+
+    assert summary.pnl_usd == pytest.approx(100.0)
+    assert window._buyboard_pnl_label.text() == "P&L: +$100 (-$100)"
 
 
 def test_dragging_partial_sell_to_open_dispatches_partial_withdrawal(tmp_path, monkeypatch):

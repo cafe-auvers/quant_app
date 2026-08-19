@@ -492,7 +492,27 @@ def _reconciliation_check(context: HealthContext) -> HealthCheck:
             "Local order ledger is unreadable",
             scrub_sensitive_text(context.order_ledger_error),
         )
-    open_orders = [order for order in context.orders if is_open_status(order.status)]
+    ledger_open_orders = [
+        order for order in context.orders if is_open_status(order.status)
+    ]
+    # The application's automatic reconciliation loop intentionally processes
+    # production orders only.  Keep Health on that same operational scope so
+    # old simulation fixtures cannot create a permanent production warning.
+    open_orders = [
+        order
+        for order in ledger_open_orders
+        if str(order.environment or "").strip().upper() == "PROD"
+    ]
+    ignored_non_production = len(ledger_open_orders) - len(open_orders)
+    ignored_detail = (
+        f"Ignored {ignored_non_production} non-production open ledger order(s)."
+        if ignored_non_production
+        else ""
+    )
+
+    def detail_with_scope(detail: str = "") -> str:
+        return " ".join(part for part in (detail, ignored_detail) if part)
+
     unknown_orders = [
         order
         for order in open_orders
@@ -503,6 +523,7 @@ def _reconciliation_check(context: HealthContext) -> HealthCheck:
             "Reconciliation",
             HealthLevel.UNKNOWN,
             f"Reconciling {len(open_orders)} open order(s)",
+            ignored_detail,
         )
     if context.reconciliation_last_error:
         return HealthCheck(
@@ -517,7 +538,7 @@ def _reconciliation_check(context: HealthContext) -> HealthCheck:
             "Reconciliation",
             HealthLevel.CRITICAL,
             f"{len(unknown_orders)} order(s) have unknown broker state",
-            f"Reconcile before retrying: {symbols}.",
+            detail_with_scope(f"Reconcile before retrying: {symbols}."),
         )
     if open_orders:
         detail = (
@@ -529,13 +550,13 @@ def _reconciliation_check(context: HealthContext) -> HealthCheck:
             "Reconciliation",
             HealthLevel.WARNING,
             f"{len(open_orders)} open order(s) await final state",
-            detail,
+            detail_with_scope(detail),
         )
     return HealthCheck(
         "Reconciliation",
         HealthLevel.HEALTHY,
-        "No unresolved local broker orders",
-        (
+        "No unresolved production broker orders",
+        detail_with_scope(
             f"Last success: {context.reconciliation_last_success_at}."
             if context.reconciliation_last_success_at
             else ""

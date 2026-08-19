@@ -48,7 +48,6 @@ class EngineReadiness:
         "websocket_connected",
         "critical_trade_subscriptions_acked",
         "critical_quote_subscriptions_acked",
-        "critical_quotes_fresh",
         "accumulator_draining_within_budget",
         "database_writable",
     )
@@ -114,7 +113,10 @@ class EngineReadiness:
         and ``ACTIVE`` are deliberately excluded: a successor can become
         STANDBY_READY while another device still owns the execution lease.
         The final reconciliation and lease acquisition/recheck promote it to
-        ACTIVE later.
+        ACTIVE later.  Global quote freshness is also excluded because it is
+        volatile and unnecessarily lets one quiet symbol demote the entire
+        board.  Every mutation still fails closed on fresh data for its exact
+        symbol at the execution boundary.
         """
 
         return all(passed for _, passed in self.standby_check_results)

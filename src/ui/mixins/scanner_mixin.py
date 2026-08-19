@@ -86,6 +86,7 @@ MARKET_DATA_READY_TIME_KST = dt.time(7, 0)
 LIVE_INTRADAY_REFRESH_INTERVAL_MS = 5 * 60 * 1000
 TRADINGVIEW_REFRESH_INTERVAL_SECONDS = 5 * 60
 KIS_DAILY_CHART_FAILURE_COOLDOWN_SECONDS = 30 * 60
+REFRESH_SUCCESS_DISPLAY_MS = 5_000
 US_MARKET_OPEN_TIME = dt.time(9, 30)
 US_MARKET_CLOSE_TIME = dt.time(16, 0)
 
@@ -1135,14 +1136,73 @@ class ScannerMixin:
 
         button.setText(label_prefix)
         button.setEnabled(True)
-        if status.get("status") in ("completed", "error", "terminated"):
-            # Always safe to show passively (no dialog, no repeated side effects) so a
-            # reopened main.py reflects the last known outcome without re-triggering it.
-            self.progress_label.setText(
-                self._refresh_terminal_summary_text(mode, status)
+        outcome = status.get("status")
+        if outcome not in ("completed", "error", "terminated"):
+            return
+
+        is_new_terminal_event = self._is_new_terminal_refresh_event(mode, status)
+        if outcome == "completed":
+            # A successful historical refresh is an event, not durable system
+            # state.  Show it once for a newly finished run, then release the
+            # shared progress area back to Buy Board readiness.  In particular,
+            # do not repaint a previous session's completed status every poll.
+            if not is_new_terminal_event:
+                return
+            self._handle_refresh_terminal_status(mode, status)
+            if any(is_refresh_running(candidate)[0] for candidate in (MODE_1D, MODE_1H)):
+                return
+            summary = self._refresh_terminal_summary_text(mode, status)
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(100)
+            self.progress_label.setText(summary)
+            token = (status.get("run_id"), status.get("finished_at"))
+            visible_tokens = self.__dict__.setdefault(
+                "_refresh_completion_display_tokens", {}
             )
-            if self._is_new_terminal_refresh_event(mode, status):
-                self._handle_refresh_terminal_status(mode, status)
+            visible_tokens[mode] = token
+            QTimer.singleShot(
+                REFRESH_SUCCESS_DISPLAY_MS,
+                lambda m=mode, t=token, text=summary: self._clear_refresh_success_if_current(
+                    m, t, text
+                ),
+            )
+            return
+
+        # Errors and user termination remain visible until another foreground
+        # task updates the status area; these outcomes may require attention.
+        self.progress_label.setText(self._refresh_terminal_summary_text(mode, status))
+        if is_new_terminal_event:
+            self._handle_refresh_terminal_status(mode, status)
+
+    def _clear_refresh_success_if_current(
+        self,
+        mode: str,
+        token: tuple,
+        expected_text: str,
+    ) -> None:
+        visible_tokens = self.__dict__.get(
+            "_refresh_completion_display_tokens", {}
+        )
+        if visible_tokens.get(mode) != token:
+            return
+        visible_tokens.pop(mode, None)
+        if visible_tokens:
+            return
+        progress_label = self.__dict__.get("progress_label")
+        progress_bar = self.__dict__.get("progress_bar")
+        if (
+            progress_label is None
+            or progress_bar is None
+            or progress_label.text() != expected_text
+        ):
+            return
+        progress_bar.setRange(0, 100)
+        progress_bar.setValue(0)
+        progress_label.setText("Ready.")
+        progress_label.setToolTip("")
+        readiness_update = getattr(self, "_update_buyboard_readiness_progress", None)
+        if callable(readiness_update):
+            readiness_update()
 
     def _is_new_terminal_refresh_event(self, mode: str, status: dict) -> bool:
         finished_at = status.get("finished_at")
