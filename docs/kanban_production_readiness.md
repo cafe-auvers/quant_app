@@ -1174,7 +1174,7 @@ owned cards).
 
 | Legacy Buy Dashboard action | Kanban equivalent |
 |---|---|
-| Add to Buy Today | Activate routes `Buylist` → `Buy Today` — `test_l3_buylist_activate_routes_through_buy_today_kanban_command` |
+| Add to Buy Today | Drag `Buylist` → `Buy Today` — `test_l3_add_to_buy_today_produces_the_same_entry_monitoring_command` |
 | Cancel a pending entry | Drag `Entry Pending` → `Buylist`, or an explicit Cancel control — `test_l3_pending_entry_cancel_produces_the_same_cancel_intent` |
 | Partial sell | Drag `Open Position` → `Partial Sell` + quantity dialog — `test_l3_partial_sell_produces_equal_submission_result_and_command` |
 | Sell All | Drag `Open Position` → `Sell All` — `test_l3_sell_all_produces_equal_submission_result_and_command` |

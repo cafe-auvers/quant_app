@@ -462,8 +462,7 @@ The board tab and projections can exist while execution is disabled. `BUYBOARD_E
 
 Production mutation additionally depends on, among other configuration and runtime evidence:
 
-- the per-machine administrative lock plus the durable deployment-wide Live
-  Trading control shared by laptop and PC;
+- the administrative/session trading switch;
 - `KIS_LIVE_EXECUTION_MODE` and controlled-live symbol/notional limits when applicable;
 - a nonblank `KANBAN_STRATEGY_INSTANCE_ID`;
 - verified KIS WebSocket protocol manifest, symbol keys, and measured subscription capacity;
