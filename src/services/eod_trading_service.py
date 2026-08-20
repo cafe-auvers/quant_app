@@ -13,12 +13,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from datetime import date
 from typing import Callable, List, Optional
 
 from sqlalchemy.engine import Engine
 
 from src.core.execution_request import CancelIntent
 from src.core.entry_monitoring_command import build_entry_monitoring_command
+from src.core.exit_policy import market_session_date
 from src.core.order_state import (
     BrokerOrder,
     OrderStatus,
@@ -115,6 +117,8 @@ class EodTradingService:
         changed: List[TradeCardState] = []
         for card in cards:
             if card.board_status == BoardStatus.BUY_TODAY:
+                # Always restore correlation to an already-durable order;
+                # only the no-order reset itself waits for the closing bell.
                 if self._reset_buy_today_with_no_order(
                     card,
                     allow_no_order_reset=market_closed,
@@ -126,6 +130,42 @@ class EodTradingService:
             elif card.board_status == BoardStatus.OPEN_POSITION:
                 if self._stop_incomplete_target_completion(card):
                     changed.append(card)
+        return changed
+
+    def expire_buy_today_cards(
+        self,
+        cards: List[TradeCardState],
+        *,
+        market_closed: bool = False,
+        current_session_date: Optional[date] = None,
+    ) -> List[TradeCardState]:
+        """Expire one-session entry intent without requiring entry readiness.
+
+        A Buy Today card is local durable intent, so returning an untouched
+        card to Buylist must not depend on account reconciliation, quotes, or
+        order-submission readiness.  ``session_date`` also catches an app that
+        was offline at the closing bell; the stale intent is retired on its
+        next startup instead of silently re-arming for another market day.
+        """
+
+        session_today = current_session_date or market_session_date()
+        changed: List[TradeCardState] = []
+        for card in cards:
+            if card.board_status != BoardStatus.BUY_TODAY:
+                continue
+            prior_session = bool(
+                card.session_date is not None and card.session_date < session_today
+            )
+            already_complete = (
+                card.entry_runtime_status == EntryRuntimeStatus.SESSION_COMPLETE
+            )
+            if not (market_closed or prior_session or already_complete):
+                continue
+            if self._reset_buy_today_with_no_order(
+                card,
+                allow_no_order_reset=True,
+            ):
+                changed.append(card)
         return changed
 
     # -- "Buy Today with no submitted order" (section 512-516) ----------
@@ -159,6 +199,7 @@ class EodTradingService:
             enabled=False,
         )
         card.board_status = BoardStatus.BUYLIST
+        card.session_date = None
         card.entry_runtime_status = None
         card.buylist_member = not monitoring_command.enabled
         card.entry_block_reason = ""
@@ -282,6 +323,7 @@ class EodTradingService:
 
         # Section 517-521: confirmed cancelled with zero fill.
         card.board_status = BoardStatus.BUYLIST
+        card.session_date = None
         card.entry_runtime_status = None
         return True
 

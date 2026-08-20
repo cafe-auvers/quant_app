@@ -1,7 +1,7 @@
 """Tests for src.services.eod_trading_service."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from src.core.account_broker_snapshot import (
     AccountBrokerSnapshot,
@@ -85,6 +85,7 @@ def test_buy_today_with_no_order_returns_to_buylist_and_clears_runtime_values(tm
     service, cancelled, manager = _service(tmp_path)
     card = _card(
         board_status=BoardStatus.BUY_TODAY,
+        session_date=date(2026, 8, 19),
         entry_runtime_status=EntryRuntimeStatus.ARMED,
         entry_orb_high=105.0,
         entry_orb_low=95.0,
@@ -96,6 +97,7 @@ def test_buy_today_with_no_order_returns_to_buylist_and_clears_runtime_values(tm
 
     assert changed == [card]
     assert card.board_status == BoardStatus.BUYLIST
+    assert card.session_date is None
     assert card.entry_runtime_status is None
     assert card.entry_orb_high is None
     assert card.entry_orb_low is None
@@ -116,6 +118,43 @@ def test_buy_today_with_no_order_does_not_reset_before_market_close(tmp_path):
     assert changed == []
     assert card.board_status == BoardStatus.BUY_TODAY
     assert card.entry_runtime_status == EntryRuntimeStatus.ARMED
+
+
+def test_buy_today_from_prior_session_expires_after_offline_restart(tmp_path):
+    service, _, _ = _service(tmp_path)
+    card = _card(
+        board_status=BoardStatus.BUY_TODAY,
+        session_date=date(2026, 8, 19),
+        entry_runtime_status=EntryRuntimeStatus.ARMED,
+    )
+
+    changed = service.expire_buy_today_cards(
+        [card],
+        market_closed=False,
+        current_session_date=date(2026, 8, 20),
+    )
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.BUYLIST
+    assert card.session_date is None
+
+
+def test_legacy_session_complete_card_expires_without_session_date(tmp_path):
+    service, _, _ = _service(tmp_path)
+    card = _card(
+        board_status=BoardStatus.BUY_TODAY,
+        session_date=None,
+        entry_runtime_status=EntryRuntimeStatus.SESSION_COMPLETE,
+    )
+
+    changed = service.expire_buy_today_cards(
+        [card],
+        market_closed=False,
+        current_session_date=date(2026, 8, 20),
+    )
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.BUYLIST
 
 
 def test_buy_today_with_a_working_order_moves_to_entry_pending_instead_of_staying_stranded(

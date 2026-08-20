@@ -108,11 +108,9 @@ _QUOTE_SUBSCRIBED_STATUSES = {
     BoardStatus.SELL_ALL,
 }
 
-# Cards whose ORB plan the bridge is allowed to touch -- mirrors
-# src.services.trade_card_orb_bridge's own pre-entry guard; checked again
-# here so this module doesn't even bother looking up an execution-queue
-# item for a card the bridge would ignore anyway.
-_ORB_SYNCED_STATUSES = {BoardStatus.WATCHLIST, BoardStatus.BUYLIST, BoardStatus.BUY_TODAY}
+# ORB is an active-session entry concern.  Watchlist and Buylist remain
+# planning-only and retain only their configured breakout target.
+_ORB_SYNCED_STATUSES = {BoardStatus.BUY_TODAY}
 
 
 class BuyboardRuntimeWorker(QThread):
@@ -1058,9 +1056,9 @@ class BuyboardRuntimeWorker(QThread):
         stop_card_keys = [card.card_key for card in observation_cards]
 
         if allow_mutations:
-            # ORB observation is not an account/broker mutation. Keep every
-            # pre-entry card's plan current even when reconciliation blocks
-            # that account from submitting an order. Execution below remains
+            # ORB observation is not an account/broker mutation. Keep each
+            # Buy Today plan current even when reconciliation blocks that
+            # account from submitting an order. Execution below remains
             # restricted to ``execution_ready_cards``.
             _track(self._sync_orb_plans(cards))
         # Observation readiness is intentionally broader than mutation
@@ -1117,6 +1115,16 @@ class BuyboardRuntimeWorker(QThread):
                     }
                 ]
             _track(self.runtime.trading_engine.run_heartbeat(heartbeat_cards))
+            if canonical_available:
+                # Buy Today is valid for one regular session only.  Expiry is
+                # a local board transition, not an entry submission, so run it
+                # across the full card set even when account readiness kept a
+                # card out of ``execution_ready_cards`` above.
+                _track(
+                    self.runtime.trading_engine.expire_buy_today_cards_if_due(
+                        cards
+                    )
+                )
         # Stops can change inside the heartbeat (first-fill ORB stop,
         # completion-to-breakeven). Rotate under the feed's shared lock and
         # immediately evaluate any events detached from the old version.

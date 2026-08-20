@@ -849,12 +849,19 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         card.watchlist_member = True
     elif isinstance(command, types.MoveToBuylist):
         card.buylist_member = True
+        card.session_date = None
         card.entry_runtime_status = None
         card.entry_block_reason = ""
         if not card.entry_client_order_id and card.broker_quantity <= 0:
             card.entry_attempt_group_id = ""
             card.entry_attempt_count = 0
     elif isinstance(command, types.ActivateForToday):
+        if context is not None and context.session_date is not None:
+            card.session_date = context.session_date
+        else:
+            from src.core.exit_policy import market_session_date
+
+            card.session_date = market_session_date()
         monitoring_command = build_entry_monitoring_command(
             environment=card.environment,
             account_no=card.account_no,
@@ -872,8 +879,12 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
             # ORB history can refine it later, but is not a prerequisite.
             card.entry_runtime_status = EntryRuntimeStatus.EXECUTE_READY
             card.entry_block_reason = ""
-        elif card.entry_runtime_status is None:
+        else:
+            # Planning columns do not own ORB runtime state.  Every activation
+            # starts a fresh current-session observation instead of carrying a
+            # stale Buylist diagnostic into Buy Today.
             card.entry_runtime_status = EntryRuntimeStatus.ORB_FORMING
+            card.entry_block_reason = ""
     elif isinstance(command, types.RequestSellAll):
         # This is durable liquidation intent only.  The engine cancels a
         # conflicting BUY, refreshes quantity, submits, and reconciliation
@@ -1113,6 +1124,7 @@ def project_board_card(engine, card, *, context=None):
     import copy
 
     from src.core.board_workflow import BoardCardProjection, BoardProjectionContext
+    from src.core.trade_card_state import BoardStatus
     from src.services.execution_ownership_repository import get_ownership
 
     projection_context = context or BoardProjectionContext()
@@ -1135,7 +1147,11 @@ def project_board_card(engine, card, *, context=None):
         *projection_context.global_restrictions,
         *projection_context.restrictions_for(card.account_no),
     ]
-    if ownership.owner != ExecutionOwner.KANBAN:
+    planning_only = card.board_status in {
+        BoardStatus.WATCHLIST,
+        BoardStatus.BUYLIST,
+    }
+    if not planning_only and ownership.owner != ExecutionOwner.KANBAN:
         restrictions.append(f"Observation only: execution owner is {ownership.owner.value}")
     if external:
         restrictions.append("Active unowned broker order fences execution")

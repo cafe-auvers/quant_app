@@ -8,7 +8,7 @@ never treats the gesture itself as authoritative state.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Optional, Tuple, Union
 from uuid import uuid4
 
@@ -192,6 +192,7 @@ class BoardActionContext:
     action_ready: bool = True
     device_active: bool = True
     regular_session_open: Optional[bool] = None
+    session_date: Optional[date] = None
     restriction_reasons: Tuple[str, ...] = ()
 
 

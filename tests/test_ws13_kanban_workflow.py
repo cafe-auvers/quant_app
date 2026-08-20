@@ -4,6 +4,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -44,6 +45,7 @@ from src.core.order_state import (
 )
 from src.core.trade_card_state import (
     BoardStatus,
+    EntryRuntimeStatus,
     PositionRuntimeStatus,
     StopType,
     TradeCardState,
@@ -186,14 +188,27 @@ def test_architecture_no_kanban_interaction_module_calls_broker_or_gateway_direc
 
 def test_buylist_to_buy_today_is_a_revision_aware_workflow_request(tmp_path):
     engine = _engine(tmp_path)
-    card = _seed(engine, board_status=BoardStatus.BUYLIST, position_runtime_status=PositionRuntimeStatus.NONE, broker_quantity=0, orderable_quantity=0)
+    card = _seed(
+        engine,
+        board_status=BoardStatus.BUYLIST,
+        position_runtime_status=PositionRuntimeStatus.NONE,
+        broker_quantity=0,
+        orderable_quantity=0,
+        entry_runtime_status=EntryRuntimeStatus.DATA_UNAVAILABLE,
+        entry_block_reason="Current-session ORB minute bars are unavailable",
+    )
     projection = _projection(engine, card, readiness_generation=7)
 
     result = workflow.request_board_action(
-        engine, _command(ActivateForToday, projection), context=_ready()
+        engine,
+        _command(ActivateForToday, projection),
+        context=_ready(session_date=date(2026, 8, 19)),
     )
 
     assert result.card.board_status == BoardStatus.BUY_TODAY
+    assert result.card.session_date == date(2026, 8, 19)
+    assert result.card.entry_runtime_status == EntryRuntimeStatus.ORB_FORMING
+    assert result.card.entry_block_reason == ""
     assert result.card.version == card.version + 1
 
 
@@ -596,6 +611,27 @@ def test_projection_exposes_working_ambiguous_and_runtime_safety_state(tmp_path)
     assert projection.reconciliation_blocked is True
     assert "Execution engine disabled" in projection.engine_restrictions
     assert any("Ambiguous order" in reason for reason in projection.engine_restrictions)
+
+
+def test_buylist_projection_does_not_label_legacy_ownership_as_a_restriction(tmp_path):
+    engine = _engine(tmp_path)
+    card = card_repo.create_trade_card(
+        engine,
+        TradeCardState(
+            environment="PROD",
+            account_no="1",
+            symbol="MAX",
+            board_status=BoardStatus.BUYLIST,
+            breakout_price=13.75,
+        ),
+    )
+
+    projection = _projection(engine, card)
+
+    assert projection.ownership_owner == ExecutionOwner.LEGACY.value
+    assert not any(
+        "Observation only" in reason for reason in projection.engine_restrictions
+    )
 
 
 def test_external_order_is_distinct_fenced_and_only_explicitly_adopted(tmp_path):
