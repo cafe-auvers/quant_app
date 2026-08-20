@@ -30,6 +30,7 @@ from src.core.execution_order_record import (
     BrokerIdentityStatus,
     ExecutionOrderRecord,
     ExecutionOrderStatus,
+    apply_status_transition,
 )
 from src.core.execution_mode import ExecutionLease
 from src.core.order_recovery_state import OrderRecoveryState
@@ -46,6 +47,7 @@ from src.services.execution_order_repository import (
     fetch_execution_order,
     invalidate_execution_orders_table_cache,
     record_execution_order,
+    save_execution_order,
 )
 from src.services.execution_lease_protocol import (
     DefaultExecutionLeaseProtocol,
@@ -416,7 +418,16 @@ class SchemaMigrationManager:
                 OrderStatus.EXPIRED,
             }
             has_exact_identity = bool(order.broker_order_id)
-            if not has_exact_identity:
+            if order.status == OrderStatus.REJECTED and not has_exact_identity:
+                # An explicit broker/API rejection is a confirmed terminal
+                # result.  Rejections normally have no broker order ID because
+                # KIS never accepted the order; treating that absence as an
+                # ambiguous submission resurrects a rejected legacy attempt as
+                # an active "unlinked owned order" on every board refresh.
+                status = ExecutionOrderStatus.REJECTED
+                identity = BrokerIdentityStatus.NO_BROKER_ORDER_CONFIRMED
+                broker_order_id = ""
+            elif not has_exact_identity:
                 status = ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE
                 identity = BrokerIdentityStatus.AMBIGUOUS
                 broker_order_id = ""
@@ -466,6 +477,46 @@ class SchemaMigrationManager:
                     capital_reservation_id=order.capital_reservation_id,
                 ),
             )
+
+    def repair_misclassified_legacy_rejections(self) -> int:
+        """Retire explicit legacy rejections imported as ambiguous orders.
+
+        Earlier migrations classified every order without a broker order ID
+        as ``UNKNOWN_SUBMISSION_STATE``.  That is incorrect for an explicit
+        ``REJECTED`` legacy result: no broker identity exists precisely because
+        the order was not accepted.  Match only migration-owned rows against
+        the still-durable legacy ledger so genuine ambiguous submissions are
+        never inferred away.
+        """
+
+        if not ORDERS_FILE.exists():
+            return 0
+        rejected_ids = {
+            order.client_order_id
+            for order in load_orders(ORDERS_FILE)
+            if order.status == OrderStatus.REJECTED and not order.broker_order_id
+        }
+        repaired = 0
+        for client_order_id in rejected_ids:
+            record = fetch_execution_order(self.engine, client_order_id)
+            if (
+                record is None
+                or record.owner_device_id != "migration"
+                or record.status != ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE
+                or record.broker_identity_status != BrokerIdentityStatus.AMBIGUOUS
+                or record.broker_order_id
+            ):
+                continue
+            expected_version = record.version
+            apply_status_transition(record, ExecutionOrderStatus.REJECTED)
+            record.recovery_state = OrderRecoveryState.NONE
+            save_execution_order(
+                self.engine,
+                record,
+                expected_version=expected_version,
+            )
+            repaired += 1
+        return repaired
 
     def _apply_migration(self) -> None:
         ensure_trade_cards_table(self.engine)
@@ -524,6 +575,7 @@ class SchemaMigrationManager:
                 raise MigrationError(
                     "READY migration state is missing reconciliation confirmation"
                 )
+            self.repair_misclassified_legacy_rejections()
             # The exact lease recorded on a completed cutover is permanent
             # audit evidence, not continuing ownership of the schema. A
             # later Main-device lease has already been verified above and
@@ -609,6 +661,8 @@ class SchemaMigrationManager:
 
     def require_entries_ready(self) -> None:
         state = self.state
+        if state.phase == MigrationPhase.READY:
+            self.repair_misclassified_legacy_rejections()
         if not (
             state.phase == MigrationPhase.READY
             and state.reconciliation_complete

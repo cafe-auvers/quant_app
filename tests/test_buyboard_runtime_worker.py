@@ -1802,6 +1802,8 @@ def test_run_one_cycle_excludes_cards_from_accounts_with_startup_errors(tmp_path
         broker=worker._broker,
         market_data=_dummy_market_data(),
     )
+    # This test isolates readiness recovery, not after-close expiration.
+    worker.runtime.trading_engine._eod_window_reached_fn = lambda: False
     card = _seed_card(
         engine,
         board_status=BoardStatus.BUY_TODAY,
@@ -1862,6 +1864,8 @@ def test_run_one_cycle_refreshes_orb_observation_for_reconciliation_blocked_acco
         broker=worker._broker,
         market_data=_dummy_market_data(),
     )
+    # This test isolates ORB projection, not after-close expiration.
+    worker.runtime.trading_engine._eod_window_reached_fn = lambda: False
     _seed_card(
         engine,
         board_status=BoardStatus.BUY_TODAY,
@@ -2455,6 +2459,41 @@ def test_one_cycle_persists_engine_changes(tmp_path, monkeypatch):
     assert emitted == [True]
 
 
+def test_one_cycle_expires_buy_today_even_when_entry_readiness_is_blocked(
+    tmp_path, monkeypatch
+):
+    from src.core import execution_config
+
+    monkeypatch.setattr(execution_config, "is_buyboard_engine_enabled", lambda: True)
+    import src.services.trading_engine as trading_engine_module
+
+    monkeypatch.setattr(
+        trading_engine_module, "is_buyboard_engine_enabled", lambda: True
+    )
+    worker, engine = _worker(tmp_path)
+    worker.runtime = _build_test_runtime(
+        buying_power_provider=worker._buying_power_provider,
+        card_lookup=worker._card_lookup,
+        broker=worker._broker,
+        market_data=_dummy_market_data(),
+    )
+    worker.runtime.trading_engine._market_is_open_fn = lambda: False
+    worker.runtime.trading_engine._eod_window_reached_fn = lambda: True
+    worker._refresh_account_state_if_due = lambda cards, **kwargs: []
+    worker._card_action_ready = lambda card: False
+    _seed_card(
+        engine,
+        board_status=BoardStatus.BUY_TODAY,
+        entry_runtime_status=EntryRuntimeStatus.SESSION_COMPLETE,
+    )
+
+    worker._run_one_cycle()
+
+    stored = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert stored.board_status == BoardStatus.BUYLIST
+    assert stored.entry_runtime_status is None
+
+
 def test_one_cycle_scoped_to_the_workers_account(tmp_path, monkeypatch):
     from src.core import execution_config
 
@@ -2528,6 +2567,21 @@ def test_sync_orb_plans_skips_positioned_cards(tmp_path):
     called = []
     worker._execution_queue_item_lookup = lambda symbol, env: called.append(symbol) or None
     worker._sync_orb_plans([card])
+    assert called == []
+
+
+def test_sync_orb_plans_skips_planning_only_cards(tmp_path):
+    worker, engine = _worker(tmp_path)
+    cards = [
+        _seed_card(engine, symbol="WEX", board_status=BoardStatus.WATCHLIST),
+        _seed_card(engine, symbol="MAX", board_status=BoardStatus.BUYLIST),
+    ]
+    called = []
+    worker._execution_queue_item_lookup = (
+        lambda symbol, env: called.append((symbol, env)) or None
+    )
+
+    assert worker._sync_orb_plans(cards) == []
     assert called == []
 
 

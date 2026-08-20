@@ -321,9 +321,10 @@ def test_falls_back_to_breakout_trigger_when_no_entry_trigger():
     assert card.entry_trigger == 102.2
 
 
-def test_watchlist_and_buylist_cards_are_also_updated():
+def test_watchlist_and_buylist_cards_ignore_orb_runtime_state():
     for status in (BoardStatus.WATCHLIST, BoardStatus.BUYLIST):
-        card = _card(board_status=status)
+        card = _card(board_status=status, breakout_price=99.0)
         item = _queue_item(_candidate())
         TradeCardOrbEvaluator().update_card(card, item)
-        assert card.entry_runtime_status == EntryRuntimeStatus.EXECUTE_READY
+        assert card.breakout_price == 99.0
+        assert card.entry_runtime_status is None

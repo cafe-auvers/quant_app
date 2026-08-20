@@ -9,11 +9,19 @@ from sqlalchemy import MetaData, Table, create_engine, inspect, select, text
 from src.core.runtime_readiness import RuntimeDeviceState
 from src.core.schema_version import CURRENT_EXECUTION_SCHEMA_VERSION
 from src.core.capital_reservation import CapitalReservation
+from src.core.execution_order_record import (
+    BrokerIdentityStatus,
+    ExecutionOrderRecord,
+    ExecutionOrderStatus,
+)
 from src.core.order_recovery_state import OrderRecoveryState
 from src.core.order_state import BrokerOrder, OrderIntent, OrderSide, OrderStatus
 from src.core.trade_card_state import TradeCardState
 from src.services.capital_reservation_repository import fetch_reservation
-from src.services.execution_order_repository import fetch_execution_order
+from src.services.execution_order_repository import (
+    fetch_execution_order,
+    record_execution_order,
+)
 from src.core.execution_mode import ExecutionLease
 from src.services.execution_lease_protocol import FakeExecutionLeaseProtocol
 from src.services.order_ledger import save_orders
@@ -160,6 +168,104 @@ def test_migration_converts_local_order_card_and_reservation_records(
     )
     assert get_trade_card(engine, "PROD", "12345678-01", "AAPL") is not None
     assert fetch_reservation(engine, reservation.reservation_id) is not None
+
+
+def test_migration_keeps_rejected_order_without_broker_id_terminal(
+    tmp_path, monkeypatch
+):
+    order_path = tmp_path / "orders.json"
+    rejected = BrokerOrder(
+        client_order_id="legacy-rejected",
+        environment="PROD",
+        account_no="12345678-01",
+        symbol="OMH",
+        side=OrderSide.BUY,
+        intent=OrderIntent.ENTRY,
+        quantity_requested=20,
+        limit_price=0.9,
+        exchange="NASD",
+        status=OrderStatus.REJECTED,
+        broker_order_id="",
+    )
+    save_orders([rejected], path=order_path)
+    monkeypatch.setattr("src.services.schema_migration.ORDERS_FILE", order_path)
+    engine = _engine(tmp_path)
+    manager = SchemaMigrationManager(
+        engine,
+        backup_path=tmp_path / "migration-backup.json",
+        legacy_paths=(order_path,),
+        lease_protocol=FakeExecutionLeaseProtocol(
+            current=ExecutionLease("pc-main", "token-8", 8)
+        ),
+    )
+
+    _prepare(manager)
+
+    migrated = fetch_execution_order(engine, rejected.client_order_id)
+    assert migrated.status == ExecutionOrderStatus.REJECTED
+    assert (
+        migrated.broker_identity_status
+        == BrokerIdentityStatus.NO_BROKER_ORDER_CONFIRMED
+    )
+    assert migrated.recovery_state == OrderRecoveryState.NONE
+
+
+def test_ready_migration_repairs_rejected_order_previously_marked_unknown(
+    tmp_path, monkeypatch
+):
+    order_path = tmp_path / "orders.json"
+    rejected = BrokerOrder(
+        client_order_id="legacy-rejected",
+        environment="PROD",
+        account_no="12345678-01",
+        symbol="OMH",
+        side=OrderSide.BUY,
+        intent=OrderIntent.ENTRY,
+        quantity_requested=20,
+        limit_price=0.9,
+        exchange="NASD",
+        status=OrderStatus.REJECTED,
+        broker_order_id="",
+    )
+    save_orders([rejected], path=order_path)
+    monkeypatch.setattr("src.services.schema_migration.ORDERS_FILE", order_path)
+    engine = _engine(tmp_path)
+    manager = SchemaMigrationManager(
+        engine,
+        backup_path=tmp_path / "migration-backup.json",
+        legacy_paths=(order_path,),
+        lease_protocol=FakeExecutionLeaseProtocol(
+            current=ExecutionLease("pc-main", "token-8", 8)
+        ),
+    )
+    record_execution_order(
+        engine,
+        ExecutionOrderRecord(
+            environment=rejected.environment,
+            account_no=rejected.account_no,
+            symbol=rejected.symbol,
+            side=rejected.side,
+            intent=rejected.intent,
+            client_order_id=rejected.client_order_id,
+            submitted_quantity=rejected.quantity_requested,
+            submitted_limit_price=rejected.limit_price,
+            owner_device_id="migration",
+            status=ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE,
+            broker_identity_status=BrokerIdentityStatus.AMBIGUOUS,
+            recovery_state=OrderRecoveryState.BROKER_IDENTITY_UNCERTAIN,
+        ),
+    )
+    _prepare(manager)
+    manager.mark_reconciliation_complete()
+
+    assert _prepare(manager).phase == MigrationPhase.READY
+    repaired = fetch_execution_order(engine, rejected.client_order_id)
+    assert repaired.status == ExecutionOrderStatus.REJECTED
+    assert (
+        repaired.broker_identity_status
+        == BrokerIdentityStatus.NO_BROKER_ORDER_CONFIRMED
+    )
+    assert repaired.recovery_state == OrderRecoveryState.NONE
 
 
 def test_first_launch_after_migration_blocks_entries_until_reconciliation_completes(

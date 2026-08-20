@@ -1035,6 +1035,7 @@ class TradingEngine:
                 return True
             if reason in (EntryCancelReason.USER_CANCEL.value, EntryCancelReason.EOD.value):
                 card.board_status = BoardStatus.BUYLIST
+                card.session_date = None
                 card.entry_runtime_status = None
                 card.entry_block_reason = ""
                 card.entry_attempt_group_id = ""
@@ -1641,6 +1642,27 @@ class TradingEngine:
         return self._eod_service.run_eod_cleanup(
             cards,
             market_closed=not self._market_is_open(),
+        )
+
+    def expire_buy_today_cards_if_due(
+        self, cards: List[TradeCardState]
+    ) -> List[TradeCardState]:
+        """Retire one-session Buy Today intent for the full board scope.
+
+        The worker deliberately passes only execution-ready cards to the main
+        heartbeat.  Session expiry is not an entry or broker mutation, so it
+        must receive every card instead of being suppressed by reconciliation
+        or quote-readiness failures.
+        """
+
+        if self._eod_service is None:
+            return []
+        market_closed_in_eod_window = bool(
+            self._eod_window_reached() and not self._market_is_open()
+        )
+        return self._eod_service.expire_buy_today_cards(
+            cards,
+            market_closed=market_closed_in_eod_window,
         )
 
     def _eod_window_reached(self) -> bool:

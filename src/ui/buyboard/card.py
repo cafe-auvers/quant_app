@@ -447,6 +447,12 @@ class TradeCardWidget(QFrame):
         self._info_label = self._metrics_label
         layout.addWidget(self._metrics_label)
 
+        # Watchlist and Buylist are planning-only columns.  Runtime ownership,
+        # reconciliation, order, ORB, stop, and warning details only become
+        # relevant after a card is activated for Buy Today.
+        if card.board_status in {BoardStatus.WATCHLIST, BoardStatus.BUYLIST}:
+            return
+
         if card.pending_stop_command_id and card.pending_stop_price:
             pending_stop = QLabel(
                 f"STOP CHANGE PENDING - ${_fmt_price(card.pending_stop_price)}"

@@ -27,6 +27,7 @@ from src.core.board_workflow import (
 from src.core.execution_config import (
     is_buyboard_engine_enabled,
 )
+from src.core.exit_policy import market_session_date
 from src.core.runtime_readiness import RuntimeDeviceState
 from src.core.trade_card_state import (
     BoardStatus,
@@ -354,6 +355,7 @@ def _action_context(main_window, command: AnyBoardCommand) -> BoardActionContext
             action_ready=False,
             device_active=False,
             regular_session_open=_safe_regular_session_open(),
+            session_date=market_session_date(),
             restriction_reasons=("Runtime worker unavailable",),
         )
 
@@ -396,6 +398,7 @@ def _action_context(main_window, command: AnyBoardCommand) -> BoardActionContext
         action_ready=ready,
         device_active=getattr(worker, "device_state", None) == RuntimeDeviceState.ACTIVE,
         regular_session_open=regular_session_open,
+        session_date=market_session_date(),
         restriction_reasons=tuple(dict.fromkeys(reasons)),
     )
 

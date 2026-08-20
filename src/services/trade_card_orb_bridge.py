@@ -32,13 +32,11 @@ from zoneinfo import ZoneInfo
 from src.core.execution_queue import ExecutionQueueItem, OrbCandidateStatus
 from src.core.trade_card_state import BoardStatus, EntryRuntimeStatus, TradeCardState
 
-# A card only has an entry *plan* to sync while it is still pre-position --
-# section 620 freezes entry_orb_low/entry_orb_window/entry_trigger/stop_adr
-# at first fill ("the position manager should not repeatedly recalculate
-# the historical entry ORB after the position has been opened"), and this
-# bridge must never overwrite that frozen record once a card has moved
-# past BUY_TODAY.
-_PRE_ENTRY_STATUSES = {BoardStatus.WATCHLIST, BoardStatus.BUYLIST, BoardStatus.BUY_TODAY}
+# ORB begins only when the trader activates a planning card for Buy Today.
+# Watchlist and Buylist retain their configured breakout target without
+# current-session ORB state.  Once a position opens, the entry ORB record is
+# frozen and this bridge must not overwrite it.
+_ORB_ACTIVE_STATUSES = {BoardStatus.BUY_TODAY}
 
 _CANDIDATE_STATUS_TO_ENTRY_RUNTIME_STATUS = {
     OrbCandidateStatus.NOT_AVAILABLE: EntryRuntimeStatus.ORB_FORMING,
@@ -241,9 +239,8 @@ class TradeCardOrbEvaluator:
         card: TradeCardState,
         execution_queue_item: ExecutionQueueItem,
     ) -> TradeCardState:
-        """Mutates and returns ``card``. A no-op once the card has moved
-        past BUY_TODAY (see ``_PRE_ENTRY_STATUSES``)."""
-        if card.board_status not in _PRE_ENTRY_STATUSES:
+        """Mutate a Buy Today card; all other lifecycle stages are no-ops."""
+        if card.board_status not in _ORB_ACTIVE_STATUSES:
             return card
 
         if execution_queue_item.name and not card.name:

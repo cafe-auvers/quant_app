@@ -111,6 +111,45 @@ def test_watchlist_card_hides_internal_noise_and_only_shows_breakout():
     assert "MANUAL" not in text
 
 
+def test_buylist_card_shows_only_name_and_breakout_not_execution_or_orb_state():
+    _ensure_app()
+    card = TradeCardState(
+        environment="PROD",
+        account_no="SECRET-ACCOUNT",
+        symbol="MAX",
+        name="MediaAlpha",
+        board_status=BoardStatus.BUYLIST,
+        breakout_price=13.75,
+        entry_runtime_status=EntryRuntimeStatus.DATA_UNAVAILABLE,
+        entry_block_reason="Current-session ORB minute bars are unavailable",
+        warnings=["DATA_STALE"],
+    )
+    projection = BoardCardProjection(
+        card=card,
+        reconciliation_blocked=True,
+        engine_restrictions=(
+            "Observation only: execution owner is LEGACY",
+            "Execution engine disabled",
+        ),
+        ambiguous_order_count=1,
+    )
+
+    text = _widget_text(TradeCardWidget(projection, current_price=13.5))
+
+    assert "MAX" in text
+    assert "MediaAlpha" in text
+    assert "Breakout" in text
+    assert "$13.75" in text
+    assert "Current" not in text
+    assert "RESTRICTED" not in text
+    assert "LEGACY" not in text
+    assert "ORB" not in text
+    assert "unavailable" not in text
+    assert "RECONCILIATION" not in text
+    assert "AMBIGUOUS" not in text
+    assert "DATA STALE" not in text
+
+
 def test_buy_today_card_shows_live_breakout_distance_and_planned_stop_result():
     card = TradeCardState(
         environment="PROD",
