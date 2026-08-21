@@ -54,9 +54,9 @@ The board renders six columns in this order:
 5. Partial Sell
 6. Sell All
 
-There is no Watchlist tab or Watchlist column. `WATCHLIST` remains a hidden,
-non-executable storage/migration value so older synchronized data can be read
-without a destructive schema conversion. `CLOSED` is also durable but hidden;
+There is no dedicated Watchlist tab or Watchlist board column. `WATCHLIST`
+remains a real, hidden, non-executable planning stage exposed through the stock
+sidebar, Scanner, and TradingView actions. `CLOSED` is also durable but hidden;
 closed trades belong to history/reporting rather than the live execution view.
 Neither hidden value receives live quote monitoring.
 
@@ -65,7 +65,7 @@ The implemented lifecycle is:
 ```mermaid
 stateDiagram-v2
     [*] --> WATCHLIST
-    WATCHLIST --> BUYLIST: queue/import compatibility
+    WATCHLIST --> BUYLIST: user moves candidate to Buylist
     BUYLIST --> BUY_TODAY: user activates for today
     BUY_TODAY --> BUYLIST: user removes before an order identity exists
     BUY_TODAY --> ENTRY_PENDING: runtime submits or finds unresolved BUY
@@ -138,7 +138,7 @@ There are three other “heartbeat-like” cadences that should not be confused 
 
 ```mermaid
 flowchart TB
-    W[WATCHLIST hidden<br/>migration compatibility only<br/>no live quote subscription]
+    W[WATCHLIST hidden from board<br/>passive sidebar planning<br/>no live quote subscription]
     B[BUYLIST<br/>persistent candidate state<br/>ORB plan may sync; no automatic entry]
     T[BUY_TODAY<br/>live quote subscribed<br/>ORB badge advances toward EXECUTE_READY]
     P[ENTRY_PENDING<br/>BUY reconciled every heartbeat<br/>no duplicate entry while unresolved]
@@ -172,7 +172,7 @@ flowchart TB
 
 | Column | How it is entered | What the heartbeat does | How it leaves | Lifetime / expiry behavior |
 |---|---|---|---|---|
-| `WATCHLIST` (hidden) | Legacy bootstrap/migration or explicit queue removal compatibility | Never subscribes the symbol for execution quotes and cannot place an order. | A new queue/import promotes it to Buylist. | No automatic expiry; retained only so old data remains readable. |
+| `WATCHLIST` (hidden from board) | User adds a Scanner, sidebar, or TradingView candidate; a passive Buylist card may also be moved back here | Appears in the lightweight Watchlist sidebar. It never subscribes the symbol for execution quotes and cannot place an order. | The user explicitly moves it to Buylist. | No automatic expiry; membership persists and synchronizes until promoted or removed. |
 | `BUYLIST` | User move, safe entry withdrawal, all-window ORB rejection, zero-fill user/EOD cancellation, migration | Does not subscribe the symbol for Buy Today execution and never attempts an entry. An automatic ORB rejection return displays a durable memo with each window's reason. | User activates it for today or explicitly removes it from the queue. | No automatic expiry. |
 | `BUY_TODAY` | `ActivateForToday`, or return from a rejected/TTL-cancelled zero-fill attempt | Subscribes live quotes, syncs an account-matched ORB candidate whose source bars identify the current New York session, recovers retry/capital/data states, and attempts a BUY only when `EXECUTE_READY`, the regular session is open, the quote is fresh and over the trigger, and all ownership/risk/capital/readiness gates pass. The same symbol cannot be active here in two accounts because the compatibility ORB queue is symbol-scoped. | Submission/duplicate/ambiguous result moves it to Entry Pending; a pre-identity user removal or EOD cleanup moves it to Buylist. If all 1m, 5m, and 30m plans are conclusively `REJECTED`/`RISK_INVALID`, a card with no BUY identity automatically returns to Buylist. | Today's authorization ends in the EOD window, **60 seconds before regular close by default**. With no durable order it resets to Buylist. If a durable order exists, it becomes Entry Pending instead of being discarded. |
 | `ENTRY_PENDING` | A submitted, duplicate, discovered, or ambiguous BUY identity | Reconciles the tracked entry every heartbeat. Any fill is immediately projected and protected; the engine never waits for the TTL before applying a fill. It blocks a second BUY while identity/status is unresolved. | Any fill moves the visible card to Open Position; confirmed zero-fill user/EOD cancel moves to Buylist; automatic TTL cancel or rejection returns a zero-fill card to Buy Today for cooldown/retry. | Entry attempt deadline is **15 seconds** by default. Deadline passage requests cancellation; it does **not** mark the order canceled. The card can remain pending without a maximum duration while broker identity or cancel confirmation is unresolved. |

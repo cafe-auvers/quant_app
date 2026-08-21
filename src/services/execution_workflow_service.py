@@ -487,6 +487,11 @@ def _require_breakout_plan_mutation_policy(command, card, context) -> None:
         raise BoardCommandRejectedError(
             f"Cannot change breakout planning from {card.board_status.value}"
         )
+    if card.board_status == BoardStatus.WATCHLIST and not card.watchlist_member:
+        raise BoardCommandRejectedError(
+            "This Watchlist candidate was removed; add it to Watchlist again "
+            "before changing its breakout target"
+        )
     if (
         card.board_status == BoardStatus.BUY_TODAY
         and context.regular_session_open is True
@@ -641,36 +646,48 @@ def _active_external_orders(engine, card):
 
 def _require_board_action_not_conflicted(engine, command, card) -> List[ExecutionOrderRecord]:
     types = _load_board_types()
+    from src.core.trade_card_state import (
+        BoardStatus,
+        has_durable_execution_evidence,
+    )
+
     active_orders = _active_owned_orders(engine, card)
 
-    if _is_breakout_plan_command(command):
-        from src.core.trade_card_state import PositionRuntimeStatus
+    def has_durable_entry_or_position_evidence() -> bool:
+        return bool(active_orders or has_durable_execution_evidence(card))
 
-        durable_entry_or_position = bool(
-            active_orders
-            or card.entry_client_order_id
-            or card.entry_pending_attempt_number
-            or card.entry_submission_unresolved
-            or card.entry_cancel_in_flight
-            or card.entry_cancel_reason
-            or card.entry_cancel_command_id
-            or card.entry_remaining_target_quantity
-            or card.capital_reservation_id
-            or card.broker_quantity
-            or card.orderable_quantity
-            or card.average_entry_price
-            or card.position_runtime_status != PositionRuntimeStatus.NONE
-            or card.exit_client_order_id
-            or card.exit_pending_attempt_number
-            or card.exit_submission_unresolved
-            or card.exit_cancel_in_flight
-            or card.reserved_sell_quantity
-            or card.pending_stop_command_id
-        )
-        if durable_entry_or_position:
+    if _is_breakout_plan_command(command):
+        if has_durable_entry_or_position_evidence():
             raise BoardCommandRejectedError(
                 "Breakout planning cannot change after entry, order, reservation, or position evidence exists"
             )
+
+    planning_stage_move = isinstance(command, types.MoveToWatchlist) or (
+        isinstance(command, types.MoveToBuylist)
+        and card.board_status == BoardStatus.WATCHLIST
+    )
+    if (
+        isinstance(command, types.MoveToBuylist)
+        and card.board_status == BoardStatus.WATCHLIST
+        and not card.watchlist_member
+    ):
+        raise BoardCommandRejectedError(
+            "This Watchlist candidate was removed; add it again before promotion"
+        )
+    if planning_stage_move and has_durable_entry_or_position_evidence():
+        raise BoardCommandRejectedError(
+            "Planning membership cannot change while order, reservation, or "
+            "position evidence exists"
+        )
+    if isinstance(command, types.MoveToWatchlist) and _active_external_orders(
+        engine, card
+    ):
+        # WATCHLIST is intentionally hidden from the execution board.  Moving
+        # a card there while an unowned broker order is attached would also
+        # hide that order's mandatory alert row from the operator.
+        raise BoardCommandRejectedError(
+            "Planning membership cannot hide an active unowned external broker order"
+        )
 
     # BUY_TODAY -> BUYLIST is a harmless presentation change only while no
     # entry identity has been consumed.  The runtime persists that identity
@@ -808,17 +825,18 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         had_canonical_target = bool(
             math.isfinite(previous_breakout) and previous_breakout > 0
         )
-        if card.board_status == BoardStatus.WATCHLIST:
-            _move_board_card(card, BoardStatus.BUYLIST)
         clear_executable_entry_plan()
         # The Buy Board header is a default for a genuinely new plan. A target
         # revision on an existing plan (especially BUY_TODAY) keeps its frozen
         # buffer across devices and executor handoff.
-        if card.board_status == BoardStatus.BUYLIST and not had_canonical_target:
+        if (
+            card.board_status in {BoardStatus.WATCHLIST, BoardStatus.BUYLIST}
+            and not had_canonical_target
+        ):
             card.buffer_pct = float(command.buffer_pct)
         card.breakout_price = float(command.price)
-        card.watchlist_member = False
-        card.buylist_member = True
+        card.watchlist_member = card.board_status == BoardStatus.WATCHLIST
+        card.buylist_member = card.board_status != BoardStatus.WATCHLIST
         card.buy_today_note = ""
         card.entry_runtime_status = (
             EntryRuntimeStatus.ORB_FORMING
@@ -828,12 +846,12 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         return
 
     if isinstance(command, types.ClearBreakoutPrice):
-        if card.board_status in {BoardStatus.WATCHLIST, BoardStatus.BUY_TODAY}:
+        if card.board_status == BoardStatus.BUY_TODAY:
             _move_board_card(card, BoardStatus.BUYLIST)
         clear_executable_entry_plan()
         card.breakout_price = None
-        card.watchlist_member = False
-        card.buylist_member = True
+        card.watchlist_member = card.board_status == BoardStatus.WATCHLIST
+        card.buylist_member = card.board_status != BoardStatus.WATCHLIST
         card.session_date = None
         card.buy_today_note = ""
         card.entry_runtime_status = None
@@ -1008,9 +1026,15 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         )
     _move_board_card(card, target)
     if isinstance(command, types.MoveToWatchlist):
+        clear_executable_entry_plan()
         card.watchlist_member = True
+        card.buylist_member = False
+        card.session_date = None
+        card.entry_runtime_status = None
         card.buy_today_note = ""
     elif isinstance(command, types.MoveToBuylist):
+        clear_executable_entry_plan()
+        card.watchlist_member = False
         card.buylist_member = True
         card.buy_today_note = ""
         card.session_date = None
@@ -1172,8 +1196,9 @@ def request_board_action(
                     environment=command.environment,
                     account_no=command.account_no,
                     symbol=command.symbol,
-                    board_status=BoardStatus.BUYLIST,
-                    buylist_member=True,
+                    board_status=BoardStatus.WATCHLIST,
+                    watchlist_member=True,
+                    buylist_member=False,
                 )
                 _apply_board_mutation(
                     command,
@@ -1432,6 +1457,7 @@ def list_board_projections(
     )
     from src.core.discovered_external_order import ExternalOrderDisposition
     from src.core.execution_ownership import ExecutionOwnership
+    from src.core.trade_card_state import BoardStatus
     from src.services import trade_card_repository
     from src.services.discovered_external_order_repository import (
         list_discovered_external_orders,
@@ -1500,13 +1526,23 @@ def list_board_projections(
                 external_orders=external_by_scope.get(scope, ()),
             )
         )
+    # Hidden lifecycle cards are still returned for lightweight mirror sync,
+    # but they must never claim attached orders for visibility purposes.  A
+    # pre-existing inconsistent WATCHLIST/CLOSED card with a live order must
+    # leave that order visible as a standalone warning row.
+    hidden_board_statuses = {BoardStatus.WATCHLIST, BoardStatus.CLOSED}
+    visible_card_projections = [
+        projection
+        for projection in card_projections
+        if projection.card.board_status not in hidden_board_statuses
+    ]
     card_scopes = {
         (projection.card.environment, projection.card.account_no, projection.card.symbol)
-        for projection in card_projections
+        for projection in visible_card_projections
     }
     attached_external_ids = {
         external.external_order_id
-        for projection in card_projections
+        for projection in visible_card_projections
         for external in projection.external_orders
     }
     standalone_external = [

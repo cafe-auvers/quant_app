@@ -630,3 +630,63 @@ class TradeCardState:
             updated_at=data.get("updated_at") or _utc_now(),
             warnings=list(data.get("warnings", []) or []),
         )
+
+
+def has_durable_execution_evidence(card: TradeCardState) -> bool:
+    """Return whether a planning card carries live/attempted execution state.
+
+    ORB selection and sizing geometry are deliberately excluded: they are
+    passive plan inputs that a safe planning-stage move may clear.  Broker,
+    order-attempt, cancellation, reservation, position, stop, and exit state
+    are durable evidence and must never be hidden by a Watchlist/Buylist move.
+    """
+
+    return bool(
+        card.next_retry_at is not None
+        or card.entry_attempt_group_id
+        or card.entry_attempt_count
+        or card.entry_client_order_id
+        or card.entry_pending_attempt_number
+        or card.entry_submission_unresolved
+        or card.entry_cancel_in_flight
+        or card.entry_cancel_reason
+        or card.entry_cancel_command_id
+        or card.position_runtime_status != PositionRuntimeStatus.NONE
+        or card.broker_quantity
+        or card.orderable_quantity
+        or card.average_entry_price
+        or card.entry_remaining_target_quantity
+        or card.stop_type is not None
+        or card.active_stop_price is not None
+        or card.stop_quantity
+        or card.pending_stop_type is not None
+        or card.pending_stop_price is not None
+        or card.pending_stop_quantity
+        or card.pending_stop_command_id
+        or card.pending_stop_requested_at is not None
+        or card.exit_all_required
+        or card.sell_all_at_market_open
+        or card.pending_partial_sell_quantity
+        or card.reserved_sell_quantity
+        or card.next_exit_retry_at is not None
+        or card.exit_attempt_count
+        or card.exit_attempt_group_id
+        or card.exit_client_order_id
+        or card.exit_pending_attempt_number
+        or card.exit_submission_unresolved
+        or card.last_exit_error
+        or card.exit_cancel_in_flight
+        or card.exit_cancel_requested_at is not None
+        or card.exit_cancel_command_id
+        or card.capital_reservation_id
+        or card.return_to_buylist_after_close
+    )
+
+
+def is_passive_planning_card(card: TradeCardState) -> bool:
+    """Return whether a card can safely change passive planning membership."""
+
+    return bool(
+        card.board_status in {BoardStatus.WATCHLIST, BoardStatus.BUYLIST}
+        and not has_durable_execution_evidence(card)
+    )

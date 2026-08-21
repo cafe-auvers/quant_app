@@ -504,6 +504,35 @@ def test_state_sync_projects_shared_live_trading_on_and_off():
     assert window._shared_live_trading_revision == 8
 
 
+def test_state_sync_watchlist_reload_refreshes_lightweight_sidebar():
+    window = _sync_completed_window(auto_claim_enabled=False)
+    window._start_state_sync = lambda **_kwargs: None
+    refreshed = []
+    new_watchlist = object()
+    window._load_watchlist = lambda: new_watchlist
+    window.refresh_buyboard = lambda: None
+    window.refresh_sidebar_sources = lambda **_kwargs: refreshed.append(True)
+    chart_symbols_refreshed = []
+    window.populate_tradingview_watchlist_symbols = (
+        lambda: chart_symbols_refreshed.append(True)
+    )
+    window.update_dashboard_summary = lambda: None
+
+    MainWindow._on_state_sync_completed(
+        window,
+        StateReconcileResult(
+            is_main_device=False,
+            local_role=window.state_sync_role,
+            updated_keys=("watchlist",),
+        ),
+        0,
+    )
+
+    assert window.watchlist is new_watchlist
+    assert refreshed == [True]
+    assert chart_symbols_refreshed == [True]
+
+
 def test_auto_claim_triggered_when_enabled_and_should_claim_says_yes(monkeypatch):
     window = _sync_completed_window(auto_claim_enabled=True)
     monkeypatch.setattr(

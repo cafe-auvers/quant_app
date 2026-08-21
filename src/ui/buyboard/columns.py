@@ -1,8 +1,9 @@
 """The operator-facing Kanban columns and their draggable ``QListWidget``.
 
 Watchlist and Closed remain durable workflow states, but are intentionally not
-rendered on the execution board. The Watchlist value is compatibility-only;
-closed trades remain available through history/reporting views.
+rendered on the execution board. Watchlist is a passive planning stage exposed
+through lightweight sidebar/actions; closed trades remain available through
+history/reporting views.
 """
 from __future__ import annotations
 

@@ -1,8 +1,33 @@
 # Buy Board ORB Planning
 
 The Buy Board is the only operator-facing ORB planning surface. The former
-Watchlist tab, its AI analysis, snapshots, bulk scoring table, and Watchlist
-navigation actions are not part of the active UI.
+Watchlist tab, its AI analysis, snapshots, bulk scoring table, and embedded ORB
+matrix are not part of the active UI. Watchlist membership itself remains a
+lightweight, passive planning workflow in the stock sidebar, Scanner, and
+TradingView.
+
+## Passive Watchlist workflow
+
+- In **Scanner**, select a result and click **Add selected to Watchlist**.
+- In **TradingView**, load a symbol and click **Add to Watchlist (W)**, or use
+  the `W` shortcut.
+- Choose **Watchlist** in the stock sidebar to review saved candidates. From
+  there, **Move to Buylist** performs the explicit passive-stage promotion;
+  **Remove from Watchlist** removes an unwanted candidate.
+- On a Watchlist chart, drawing or clearing a breakout target keeps the symbol
+  in Watchlist. **Move to Buylist (Q)** is the separate promotion action.
+- A Buylist card can be returned with **Move to Watchlist** from its Buy Board
+  context menu or the TradingView queue-stage control.
+
+Watchlist membership is persisted and included in the normal cross-device plan
+sync. It does not create an ORB candidate, subscribe to execution quotes, or
+place an order. Live ORB monitoring begins only after the symbol is explicitly
+published/activated in **Buy Today**.
+
+Add, move, and remove actions require the shared coordination database and an
+explicitly selected production account. If either is unavailable, the action
+leaves both the canonical card and local Watchlist/Buylist mirrors unchanged;
+there is no offline promotion that can later overwrite a newer device change.
 
 ## Buffer %
 
@@ -30,11 +55,13 @@ assumption that removing and re-activating it applied the new header value.
 Changing the header alone is not a planning mutation and is not handed to the
 executor.
 
-Drawing a target for a symbol that has no canonical breakout creates a genuinely
-new Buylist plan and snapshots the current header buffer. Revising a non-empty
-target retains that plan's existing buffer. An explicit chart **Clear** followed
-by drawing a new target creates a new passive plan; this is distinct from
-**Remove from Today**, which preserves the plan and its buffer.
+After a symbol is added to Watchlist, drawing its first target creates or
+updates the passive canonical Watchlist plan and snapshots the current header
+buffer. Drawing or revising a target on an existing Watchlist card keeps it in
+Watchlist. **Move to Buylist** is the explicit promotion step. Revising a
+non-empty target retains that plan's existing buffer. An explicit chart
+**Clear** clears the passive target without promoting it; this is distinct from
+**Remove from Today**, which preserves the published plan and its buffer.
 
 ## Buy Today context actions
 
@@ -92,11 +119,13 @@ unpublished local lock or unlock.
 
 ## Chart target changes
 
-TradingView's Set, Clear, Queue, and Activate controls use the same canonical
-Buy Board command path; they do not write to the retired Watchlist data or
-silently edit a local Buylist mirror. A newly drawn target creates a versioned
-Buylist card for the explicitly selected KIS account. Clearing a passive target
-leaves a non-executable Buylist card with no breakout level.
+TradingView's Set, Clear, Queue, and Activate controls use version-fenced
+canonical planning commands; they never rely on an unsynchronized local target
+as execution authority. **Add to Watchlist** persists membership; after that,
+a newly drawn target creates or updates a versioned passive Watchlist card for
+the explicitly selected KIS account, and **Queue / Move to Buylist** performs
+the separate promotion. Clearing a passive target leaves the Watchlist card
+non-executable with no breakout level.
 
 Every Set/Clear request requires verified Operator Control and a known market
 session. A published Buy Today target may be changed or cleared only before the
@@ -128,7 +157,7 @@ Execution Owner authority, Operator Control rules for manual commands, live-trad
 reconciliation, and every broker-boundary fence described in
 [Execution Owner and Operator Control](execution_operator_control.md).
 
-The hidden `WATCHLIST` lifecycle value and `watchlist.json` remain readable for
-non-destructive migration and cross-version state compatibility. They do not
-create a Watchlist tab, visible board column, live subscription, or alternate
-execution path.
+The hidden `WATCHLIST` lifecycle value and synchronized `watchlist.json` remain
+the user-managed passive candidate stage. Watchlist items are accessible in the
+sidebar and can be promoted to Buylist, but they do not create a dedicated tab,
+visible board column, live subscription, or alternate execution path.

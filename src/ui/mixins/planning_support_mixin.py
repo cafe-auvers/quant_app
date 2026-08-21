@@ -1,8 +1,8 @@
-"""Shared planning helpers that are independent of the retired Watchlist UI.
+"""Shared planning helpers independent of the removed dedicated Watchlist tab.
 
-The application still reads the persisted ``Watchlist`` model as a migration
-input for Buy Board cards.  This mixin intentionally contains no Watchlist
-widgets, actions, AI analysis, or table projection code.
+The persisted ``Watchlist`` remains a passive planning stage exposed through
+lightweight sidebar and symbol actions.  This mixin intentionally contains no
+Watchlist table, AI analysis, or table projection code.
 """
 
 from __future__ import annotations

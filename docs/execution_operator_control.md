@@ -66,9 +66,10 @@ itself; confirm the mode, symbol scope, and cap shown beside it.
 
 Pre-market publishing and live Buy Today activation are separate paths:
 
-- **Publish Today's Plan** atomically publishes the legacy migration snapshot,
-  buylist, trade plans, and execution queue. It is a pre-market bulk
-  synchronization step; there is no Watchlist tab.
+- **Publish Today's Plan** atomically publishes the Watchlist, buylist, trade
+  plans, and execution queue. It is a pre-market bulk synchronization step.
+  Watchlist candidates remain available through the lightweight stock sidebar;
+  there is no dedicated Watchlist tab.
 - During the regular session, **Activate for Buy Today** becomes an
   `ADD_BUY_TODAY` operator command. It does not use the full-plan publish
   button.

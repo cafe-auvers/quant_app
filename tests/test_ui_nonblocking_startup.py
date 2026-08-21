@@ -81,7 +81,10 @@ def test_buyboard_projection_worker_uses_authoritative_services(monkeypatch):
     worker.run()
 
     assert [call[0] for call in calls] == ["bootstrap", "projection"]
-    assert calls[1][2]["board_statuses"] == BOARD_COLUMN_ORDER
+    assert calls[1][2]["board_statuses"] == (
+        *BOARD_COLUMN_ORDER,
+        BoardStatus.WATCHLIST,
+    )
     assert completed == [(projections, "", 4)]
 
 

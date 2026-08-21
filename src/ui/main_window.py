@@ -105,6 +105,7 @@ from src.ui.mixins.chart_command_routing_mixin import ChartCommandRoutingMixin
 from src.ui.mixins.planning_support_mixin import PlanningSupportMixin
 from src.ui.mixins.scanner_mixin import ScannerMixin
 from src.ui.mixins.sidebar_mixin import SidebarMixin
+from src.ui.mixins.watchlist_actions_mixin import WatchlistActionsMixin
 from src.ui.order_workers import HandoffReconciliationWorker
 from src.ui.workers import PcRemoteStatusWorker
 from src.utils.config import DATA_DIR, ROOT_DIR, get_env_value
@@ -838,6 +839,7 @@ class MainWindow(
     HealthPanelMixin,
     DashboardMixin,
     ScannerMixin,
+    WatchlistActionsMixin,
     PlanningSupportMixin,
     BuylistMixin,
     ChartCommandRoutingMixin,
@@ -1995,6 +1997,18 @@ class MainWindow(
             # an explicit projection refresh.  Do it on the actual sync event
             # instead of paying for a full board rebuild every few seconds.
             self.refresh_buyboard()
+        if updated_keys.intersection({"watchlist", "buylist"}):
+            # The tab is retired, but Watchlist/Buylist remain lightweight
+            # sidebar sources and must immediately reflect pulled state.
+            refresh_planning = getattr(
+                self, "_update_watchlist_action_surfaces", None
+            )
+            if callable(refresh_planning):
+                refresh_planning()
+            else:
+                refresh_sidebar = getattr(self, "refresh_sidebar_sources", None)
+                if callable(refresh_sidebar):
+                    refresh_sidebar()
 
         notices = []
         if result.conflict_keys:
@@ -3930,6 +3944,7 @@ class MainWindow(
             "tradingview", self.tradingview_widget, "TradingView Chart"
         )
         self._build_tradingview_tab()
+        self._install_tradingview_watchlist_controls()
 
         self.health_widget = QWidget()
         self._add_configured_tab("health", self.health_widget, "Health")
@@ -4685,7 +4700,7 @@ class MainWindow(
         text = str(message)
         # A shared legacy intraday worker still carries old internal naming.
         # Keep those implementation labels out of the operator-facing log now
-        # that the Watchlist UI has been removed.
+        # that the former dedicated Watchlist tab has been removed.
         text = text.replace(
             "Intraday watchlist refresh requires",
             "Intraday refresh requires",
