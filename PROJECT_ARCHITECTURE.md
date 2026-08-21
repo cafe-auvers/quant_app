@@ -4,7 +4,7 @@ This document describes the current architecture of the PyQt5 trading dashboard 
 
 ## Product Scope
 
-Quant App is a desktop trading dashboard for US-market swing trading, scanner review, watchlist analysis, ORB planning, a durable Kanban Buy Board, KIS account visibility, and guarded KIS order submission.
+Quant App is a desktop trading dashboard for US-market swing trading, scanner review, Buy Board ORB planning, KIS account visibility, and guarded KIS order submission. There is no operator-facing Watchlist tab.
 
 The application is not a headless service. `main.py` creates a `QApplication`, installs a small Qt warning filter, imports `src.ui.main_window.MainWindow`, and starts the PyQt event loop.
 
@@ -21,12 +21,12 @@ main.py
       -> initialize UI workflow controllers
       -> build tabs, sidebar, status log, and menus
       -> preload KIS profiles and account data
-      -> bootstrap only missing Kanban trade cards from loaded Watchlist,
-         Buylist, and fresh cached KIS holdings
+      -> bootstrap only missing Kanban trade cards from legacy planning state,
+         Buylist compatibility state, and fresh cached KIS holdings
       -> render the Buy Board from canonical card/order/ownership projections
       -> when explicitly enabled, start the BuyboardRuntimeWorker in active
          or standby/read-only mode according to device role and execution lease
-      -> run scanner/watchlist/chart workers through QThread
+      -> run scanner, chart, account, and execution workers through QThread
       -> reconcile any open broker orders from the local order ledger
       -> start cross-machine state sync and background PC-to-laptop
          mirror top-up when MySQL is reachable
@@ -73,20 +73,17 @@ flowchart TB
         direction TB
         MySQL --> Scanner[Scanner rules and results]
         Daily --> Scanner
-        Scanner --> Watchlist[Watchlist]
-        Watchlist --> Analysis[Rulebook review and deterministic / optional AI score]
-        Watchlist --> ORB[ORBStrategy range and trigger signal]
+        Scanner --> Charts[Daily, hourly, and TradingView charts]
+        Charts --> Breakout[Persist daily breakout price]
+        Breakout --> ORB[ORBStrategy range and trigger signal]
         IntradayCache --> ORB
         ORB --> ORBRisk[ORB position sizing and risk validation]
-        Analysis --> Buylist[Buy Dashboard / Buylist]
-        ORBRisk --> Buylist
-        Scanner -. optional add .-> Buylist
-        Watchlist --> Board[Kanban Buy Board projection]
-        Buylist -. create missing trade cards .-> Board
+        ORBRisk --> Queue[Execution queue]
+        Queue --> Board[Kanban Buy Board projection]
+        LegacyPlanning[Legacy planning state] -. create only missing cards .-> Board
         ORB --> Board
-        Daily --> Charts[Daily, hourly, and TradingView charts]
+        Daily --> Charts
         IntradayCache --> Charts
-        Watchlist --> Charts
     end
 
     subgraph Execution[Guarded order lifecycle]
@@ -98,7 +95,6 @@ flowchart TB
         KanbanReady -- No --> ObserveOnly[Remain observation-only / retain intent]
         KanbanReady -- Yes --> Gateway[Shared execution command gateway]
 
-        Buylist --> Queue[Execution queue refresh]
         Queue --> Ready{Status is\nEXECUTE_READY?}
         Ready -- No --> Monitor[Keep monitoring / refresh data]
         Monitor --> Queue
@@ -131,8 +127,7 @@ flowchart TB
         KanbanStore --> KanbanSnapshot
     end
 
-    Watchlist --> StateStore
-    Buylist --> StateStore
+    LegacyPlanning --> StateStore
     Queue --> StateStore
     Reserve --> StateStore
     Rejected --> StateStore
@@ -241,13 +236,17 @@ Peer-machine roles, the SQLite fallback/backup mechanics, and the always-on-PC a
 
 ## Kanban Buy Board Architecture
 
-The **Buy Board** is an additive workflow beside the legacy Buy Dashboard. It renders eight columns from `TradeCardState.board_status`:
+The **Buy Board** is the operator planning and execution workflow. It renders six columns from `TradeCardState.board_status`:
 
 ```text
-Watchlist <-> Buylist -> Buy Today -> Entry Pending -> Open Positions
+Buylist -> Buy Today -> Entry Pending -> Open Positions
 Open Positions -> Partial Sell -> Open Positions
-Open Positions / Partial Sell -> Sell All -> Closed
+Open Positions / Partial Sell -> Sell All
 ```
+
+`WATCHLIST` and `CLOSED` remain hidden durable values for non-destructive
+migration and history compatibility. They are not tabs or board columns and do
+not receive execution subscriptions.
 
 The visible column is only one axis of the aggregate. Entry runtime state, broker position/order state, stop state, capital reservation correlation, warnings, and optimistic `version` are stored independently. The database enforces one card for each `(environment, account_no, symbol)`; the current model accepts production cards only.
 
@@ -259,7 +258,7 @@ flowchart LR
     Command --> Workflow[ExecutionWorkflowService\nvalidate and persist intent]
     Workflow --> DB[(Canonical SQL state)]
     DB --> Projection[BoardCardProjection]
-    Projection --> UI[Eight-column PyQt Buy Board]
+    Projection --> UI[Six-column PyQt Buy Board]
     DB --> Runtime[BuyboardRuntimeWorker]
     Runtime --> Engine[TradingEngine / position and EOD services]
     Engine --> Gateway[ExecutionCommandGateway]
@@ -271,7 +270,7 @@ flowchart LR
 Important boundaries:
 
 - Drag/drop never calls the broker and never moves a card on screen optimistically. After a command succeeds or fails, the UI reloads an authoritative projection.
-- `ENTRY_PENDING` and `CLOSED` are system-only targets. Entry fills, partial fills, cancellations, sell fills, and flat positions are applied from reconciliation.
+- `ENTRY_PENDING` is a visible system-only target and `CLOSED` is hidden. Entry fills, partial fills, cancellations, sell fills, and flat positions are applied from reconciliation.
 - Durable intent commands can atomically claim a previously `LEGACY` symbol for the configured Kanban strategy. `MANUAL` ownership and ownership by another Kanban strategy fail closed.
 - Card version, ownership version/strategy, and runtime readiness generation fence stale actions across refreshes and devices.
 - Active ambiguous, cancelling, external, or unlinked orders block conflicting actions. External orders remain separately visible and require explicit audited adoption.
@@ -311,7 +310,7 @@ Generated files such as `__pycache__/` and `.pytest_cache/` are not part of the 
 
 `src/ui/main_window.py` owns the `MainWindow` shell: application state, startup ordering, tab registration, menus, status/progress helpers, persistence entry points, and shared parsing/formatting helpers. Domain-heavy UI behavior is split into plain Python mixins inherited by `MainWindow`; the mixins do not inherit Qt classes and do not import `MainWindow`.
 
-Workflow orchestration that can be tested outside the full PyQt window lives in focused UI packages and `src/ui/controllers/`. Mixins keep widget construction, event parsing, table refreshes, logging, and state-save side effects close to the UI while delegating account, scanner, watchlist, chart-data, and buylist execution workflows to controllers.
+Workflow orchestration that can be tested outside the full PyQt window lives in focused UI packages and `src/ui/controllers/`. Mixins keep widget construction, event parsing, table refreshes, logging, and state-save side effects close to the UI while delegating account, scanner, chart-data, and execution workflows to controllers.
 
 Current inheritance shape:
 
@@ -336,15 +335,15 @@ Supporting UI modules:
 |---|---|
 | `src/ui/main_window.py` | Main shell, startup ordering, local state loading/saving, tab registration, menus, status log, shared helpers |
 | `src/ui/dialogs.py` | Settings dialog and scanner filter dialog |
-| `src/ui/controllers/` | Workflow controllers for account sync, scanner runs, watchlist ORB refreshes, chart data loading, and buylist execution queue actions |
-| `src/ui/buylist/` | Static buy-dashboard view, action, monitoring, and order mixins plus thin policy and execution-queue adapters |
-| `src/ui/buyboard/` | Eight Kanban columns and card widgets, drag/menu-to-command translation, asynchronous projections, dialogs, and the background execution runtime worker |
+| `src/ui/controllers/` | Workflow controllers for account sync, scanner runs, chart data loading, and execution-queue actions |
+| `src/ui/buylist/` | Headless compatibility, monitoring, order, and execution-queue adapters used by Buy Board/runtime paths; no Buy Dashboard tab is built |
+| `src/ui/buyboard/` | Six visible Kanban columns and card widgets, ORB planning dialogs, drag/menu-to-command translation, asynchronous projections, and the background execution runtime worker |
 | `src/ui/charts/` | Static chart controller/render composites, focused controller and renderer modules, deterministic render-option/interaction models, and chart-data service |
 | `src/ui/health/` | Separate Health tab, background read-only probe, status rendering, and redacted event-journal viewer |
 | `src/ui/mixins/sidebar_mixin.py` | Left sidebar source switching, selected-symbol routing, and sidebar actions |
 | `src/ui/mixins/dashboard_mixin.py` | Dashboard tab, KIS account snapshot UI, profile selection widgets, FX/account-size display, summary widgets |
 | `src/ui/mixins/scanner_mixin.py` | Scanner tab, scanner setup/rule UI, worker signal wiring, scanner result table actions |
-| `src/ui/mixins/watchlist_mixin.py` | Watchlist tab, breakout-price persistence, ORB planning UI, AI review UI, move-to-buylist flow |
+| `src/ui/mixins/watchlist_mixin.py` | Transitional compatibility helpers still shared by chart/cache/trade-plan code; `_build_watchlist_tab()` is not called and no Watchlist widgets are constructed |
 | `src/ui/mixins/buylist_mixin.py` | Compatibility import for `src/ui/buylist/`; existing imports and monkeypatch-based tests continue to work |
 | `src/ui/mixins/charts_render_mixin.py` | Compatibility import for `src/ui/charts/renderer.py` |
 | `src/ui/mixins/charts_controller_mixin.py` | Compatibility import for `src/ui/charts/controller.py` |
@@ -361,7 +360,6 @@ Controllers are ordinary Python objects that receive the `MainWindow` only as a 
 |---|---|
 | `AccountController` | KIS account snapshot/profile sync, FX/account-size application, and account refresh commands |
 | `ScannerController` | Scanner setup persistence, scanner worker orchestration, and result action coordination |
-| `WatchlistController` | Watchlist ORB status refreshes and watchlist-to-buylist workflow helpers |
 | `ChartDataController` | `src/ui/charts/data_service.py`; chart data loading and refresh coordination for daily, hourly, TradingView, and intraday views |
 | `BuylistController` | `src/ui/buylist/controller.py`; thin UI adapter that exposes the framework-neutral exit rules owned by `src/core/exit_policy.py` |
 | `BuylistExecutionController` | `src/ui/buylist/execution_controller.py`; execution queue refresh and guarded order-command coordination. `ExecutionQueueRefreshRequest` carries parsed UI inputs and callbacks, and `ExecutionQueueRefreshResult` returns missing symbols, failures, refreshed count, and status counts |
@@ -372,15 +370,18 @@ Current tab construction in `_setup_tabs()`:
 |---|---|---|
 | `dashboard` | Dashboard | `_build_dashboard_tab()` |
 | `scanner` | Scanner | `_build_scanner_tab()` |
-| `watchlist` | Watchlist | `_build_watchlist_tab()` |
-| `buylist` | Buy Dashboard | `_build_buylist_tab()` |
 | `buyboard` | Buy Board | `_build_buyboard_tab()` |
 | `charts` | Charts | `_build_charts_tab()` |
 | `tradingview` | TradingView Chart | `_build_tradingview_tab()` |
 | `health` | Health | `_build_health_tab()` |
-| `intraday_charts` | Intraday Charts | `_build_intraday_charts_tab()` |
 
-`data/tab_options.json` persists tab visibility. The legacy `_build_trade_plan_tab()` method still exists for compatibility and tests, but it is not currently added by `_setup_tabs()`.
+`data/tab_options.json` persists active tab visibility. The legacy
+`_build_trade_plan_tab()` method remains only as a compatibility target and is
+not called. `_setup_tabs()` still builds the Watchlist-backed intraday chart
+controls on an unregistered compatibility widget because active single-symbol
+fetch completion callbacks share those control handles. That widget is never
+added to the tab bar and cannot be restored by an old `tab_options.json`; remove
+its construction only together with those shared fetch/chart callbacks.
 
 ## Worker Layer
 
@@ -394,8 +395,6 @@ Most workers live in `src/ui/workers.py`; KIS order submission/query/cancel and 
 | `IntradayFetchWorker` | `workers.py` | Fetch one symbol's intraday bars |
 | `IntradayBulkFetchWorker` | `workers.py` | Fetch intraday bars for multiple symbols |
 | `ScannerWorker` | `workers.py` | Run scanner rules over loaded metrics |
-| `WatchlistAiWorker` | `workers.py` | Review watchlist items in batch |
-| `SingleStockAiWorker` | `workers.py` | Review one stock/setup |
 | `PcRemoteStatusWorker` | `workers.py` | Check database, remote-control listener, and remote `main.py` health independently |
 | `KisOrderWorker` | `order_workers.py` | Submit KIS overseas orders and emit broker acceptance/rejection state |
 | `OrderReconciliationWorker` | `order_workers.py` | Fetch position snapshots through an injected `Broker` and reconcile open orders against holdings deltas |
@@ -488,7 +487,7 @@ The live execution queue calls `ORBStrategy.evaluate()` and requires its generic
 | Module | Responsibility |
 |---|---|
 | `src/risk/position_sizer.py` | `PositionSizer` -- fixed-risk, fixed-percent, volatility-based, and Kelly position sizing calculations |
-| `src/risk/orb_position.py` | Shared ORB sizing metrics, 10%/30% capital-allocation limits, 15%/66% stop-to-ADR limits, validation warnings, and recommendation score used by the queue, worker, and watchlist UI |
+| `src/risk/orb_position.py` | Shared ORB sizing metrics, 10%/30% capital-allocation limits, 15%/66% stop-to-ADR limits, validation warnings, and recommendation score used by the queue, worker, and Buy Board ORB dialogs |
 | `src/risk/pre_trade.py` | Immutable, short-lived `PreTradeRiskDecision` bound to the complete entry-order fingerprint, final approval enforcement, and immediate ORB-candidate/plan revalidation |
 
 `PositionSizer` and the duplicated ORB position-plan checks now live under `src/risk/` with their existing formulas and thresholds. `src/core/position_sizer.py` is a compatibility import for older scripts; new code imports from `src.risk`. Immediately before an entry is submitted, the selected ORB candidate is revalidated into a `PreTradeRiskDecision`. Candidate symbol and plan fingerprint must match the requested order. The decision binds environment, account, symbol, side, intent, quantity, reference price, exchange, execution policy, strategy ID, and plan ID, and expires within 30 seconds. `submit_guarded_overseas_order()` verifies it before ledger reservation, after reservation, and once more after synchronous `ORDER_SUBMISSION_STARTED` journaling at the immediate broker boundary. Exit intents deliberately do not require entry-risk approval, so protective liquidation remains available. The duplicate-open-order guard remains in `src/services/order_ledger.py` (`reserve_order_if_no_matching_open`) rather than moving here, since it is inherently coupled to the order ledger's file I/O rather than being a standalone calculation.
@@ -499,7 +498,7 @@ Local JSON state is read/written through `src/utils/storage.py` and service help
 
 | File | Purpose |
 |---|---|
-| `data/watchlist.json` | User watchlist items |
+| `data/watchlist.json` | Legacy planning/migration compatibility state; there is no operator-facing Watchlist tab |
 | `data/buylist.json` | Buy dashboard and monitoring items |
 | `data/execution_queue.json` | Dynamic ORB execution queue items, selected candidates, status, and warnings |
 | `data/trade_cards.json` | Atomic local recovery snapshot of canonical Kanban trade cards; not authoritative while the database is reachable |
@@ -736,17 +735,16 @@ Ticker universe
   -> compute_stock_metrics / scanner_metrics cache
   -> StockScanner rules
   -> scanner results table
-  -> optional add to watchlist or buylist
+  -> select a symbol for chart review
 ```
 
 Scanner setups are persisted in `data/scanner_setups.json`. Rules use labels from `src/ui/filter_catalog.py`.
 
-## Watchlist, ORB, and Buylist Flow
+## Buy Board ORB Planning Flow
 
 ```text
-Watchlist symbol
+Chart symbol with a persisted breakout price
   -> latest daily/hourly/intraday history
-  -> deterministic score and optional AI review
   -> ORBStrategy receives one MarketSnapshot per 1m/5m/30m window
   -> common Signal or no actionable signal
   -> account/risk-aware position plan
@@ -759,11 +757,17 @@ Watchlist symbol
      pre-entry cards; the runtime consumes EXECUTE_READY only after readiness gates
 ```
 
+For operator behavior, Buffer % immutability, and the separate 24-case versus
+optimized dialogs, see [docs/orb_buyboard_planning.md](docs/orb_buyboard_planning.md).
+
 Account value comes from the selected KIS profile when a snapshot is available. Otherwise the UI falls back to manual/default account-size values. USD/KRW conversion is tracked in the UI and refreshed separately.
 
-## AI and Rulebooks
+## Rulebooks and legacy review libraries
 
-Rulebooks live under `rulebooks/` and are loaded by `TradeReviewer`. `src/core/scoring.py` can call OpenAI when `OPENAI_API_KEY` is present. If the key is missing or a request fails, deterministic fallback analysis keeps the UI workflow functional.
+Rulebooks live under `rulebooks/` and remain available to non-UI review code.
+The former Watchlist `Analyze with AI` controls and worker launch paths are not
+part of the active tab workflow. `src/core/scoring.py` remains a compatibility
+library for historical scripts and tests.
 
 Current rulebook files:
 
@@ -789,7 +793,7 @@ Runtime configuration is environment-driven:
 | `KIS_INTRADAY_ENABLED`, `KIS_OVERSEAS_INTRADAY_*` | `src/api/kis_intraday.py` | Configuration-gated KIS intraday endpoint/field mapping |
 | `PC_REMOTE_CONTROL_HOST`, `PC_WAKE_URL`, `REMOTE_CONTROL_TOKEN` | `src/services/pc_remote_control.py` | Always-on PC remote status/shutdown over Tailscale (see [Two-Machine Data Pipeline](#two-machine-data-pipeline-pc-sync)) |
 | `QUANT_BACKUP_DIR` | `src/services/cloud_backup.py`, `src/services/env_backup.py` | Optional offsite backup target folder (see [Cloud Backup](#cloud-backup)) |
-| `OPENAI_API_KEY` | `src/core/scoring.py` | Optional AI review |
+| `OPENAI_API_KEY` | `src/core/scoring.py` | Legacy/non-UI scoring integration |
 
 The `.env` file is local-only and ignored by git. See `.env.example` for the full list of variables with placeholder values. `config/template_config.py` remains a non-secret example configuration file for the legacy `kis_config.py` loader.
 

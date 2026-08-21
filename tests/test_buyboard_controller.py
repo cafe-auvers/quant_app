@@ -87,6 +87,44 @@ def test_refresh_buyboard_does_not_start_a_worker_during_shutdown():
     assert window.__dict__ == {"_database_shutting_down": True}
 
 
+def test_orb_minute_bar_refresh_fetches_only_buy_today_symbols(monkeypatch):
+    window = BuyboardMixin()
+    window._buyboard_current_projections = (
+        TradeCardState(
+            environment="PROD",
+            account_no="1",
+            symbol="today",
+            board_status=BoardStatus.BUY_TODAY,
+        ),
+        TradeCardState(
+            environment="PROD",
+            account_no="1",
+            symbol="pending",
+            board_status=BoardStatus.ENTRY_PENDING,
+        ),
+        TradeCardState(
+            environment="PROD",
+            account_no="1",
+            symbol="open",
+            board_status=BoardStatus.OPEN_POSITION,
+        ),
+    )
+    refreshes = []
+    window.refresh_watchlist_intraday_cache = (
+        lambda **kwargs: refreshes.append(kwargs)
+    )
+    monkeypatch.setattr(
+        controller_module, "is_buyboard_engine_enabled", lambda: True
+    )
+    monkeypatch.setattr(controller_module, "is_regular_session_open", lambda: True)
+
+    window._refresh_buyboard_orb_data()
+
+    assert len(refreshes) == 1
+    assert refreshes[0]["symbols"] == ["TODAY"]
+    assert refreshes[0]["purpose"] == "buyboard_orb"
+
+
 def test_projection_render_warnings_are_severe_and_rate_limited(
     monkeypatch, caplog
 ):

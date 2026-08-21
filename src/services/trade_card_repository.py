@@ -584,7 +584,11 @@ def build_trade_card_migration(
             return_to_buylist_after_close=False,
             breakout_price=item.breakout_price,
             selected_orb_window=plan.get("window"),
-            buffer_pct=float(getattr(item, "buffer_pct", 0.001) or 0.001),
+            buffer_pct=float(
+                0.001
+                if getattr(item, "buffer_pct", None) in (None, "")
+                else getattr(item, "buffer_pct")
+            ),
             risk_percent=float(getattr(item, "risk_percent", 1.0) or 1.0),
             position_percent=float(
                 getattr(item, "position_percent", 0.0) or 0.0

@@ -531,19 +531,19 @@ def test_storage_handles_missing_and_malformed_json(tmp_path: Path):
     assert len(list(tmp_path.glob("data.json.corrupt-*"))) == 1
 
 
-def test_tab_options_normalization_defaults_legacy_chart_tabs_hidden():
+def test_tab_options_normalization_excludes_retired_watchlist_chart_tab():
     options = MainWindow._normalize_tab_options({})
 
     assert options["tradingview"] is True
     assert options["charts"] is False
-    assert options["intraday_charts"] is False
+    assert "intraday_charts" not in options
 
 
 def test_tab_options_normalization_accepts_file_shape():
     options = MainWindow._normalize_tab_options({"tabs": {"charts": True, "intraday_charts": True}})
 
     assert options["charts"] is True
-    assert options["intraday_charts"] is True
+    assert "intraday_charts" not in options
     assert options["tradingview"] is True
 
 

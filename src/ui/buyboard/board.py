@@ -12,11 +12,13 @@ import math
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
+from PyQt5.QtGui import QDoubleValidator
 from PyQt5.QtWidgets import (
     QComboBox,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMenu,
     QMessageBox,
     QPushButton,
@@ -26,6 +28,7 @@ from PyQt5.QtWidgets import (
 )
 
 from src.core.execution_config import is_buyboard_engine_enabled
+from src.core.orb_combinations import build_orb_position_combinations
 from src.core.board_workflow import (
     BoardCardProjection,
     BoardExecutionOrderProjection,
@@ -33,6 +36,10 @@ from src.core.board_workflow import (
 )
 from src.core.trade_card_state import BoardStatus, TradeCardState
 from src.services import buying_power_cache, execution_workflow_service
+from src.services.trade_card_orb_bridge import (
+    orb_candidate_stale_for_current_session,
+)
+from src.utils.market_calendar import is_regular_session_open
 
 from . import dialogs
 from .card import board_interaction_fingerprint, card_drag_payload
@@ -71,6 +78,7 @@ _POSITION_BOARD_STATUSES = {
     BoardStatus.PARTIAL_SELL,
     BoardStatus.SELL_ALL,
 }
+_DEFAULT_ORB_BUFFER_PERCENT = 0.10
 
 
 @dataclass(frozen=True)
@@ -78,6 +86,33 @@ class BuyboardPortfolioSummary:
     positions: int
     capital_percent: Optional[float]
     pnl_usd: Optional[float]
+
+
+def _valid_orb_buffer_percent(value) -> Optional[float]:
+    try:
+        percent = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(percent) or percent < 0.0 or percent > 100.0:
+        return None
+    return percent
+
+
+def buyboard_orb_buffer_pct(main_window) -> float:
+    """Return the Buy Board header's percent value as a fraction."""
+
+    widget = main_window.__dict__.get("buyboard_orb_buffer_pct_input")
+    percent = _valid_orb_buffer_percent(
+        widget.text().strip() if widget is not None else None
+    )
+    if percent is None:
+        settings = main_window.__dict__.get("settings", {}) or {}
+        percent = _valid_orb_buffer_percent(
+            settings.get("orb_buffer_percent", _DEFAULT_ORB_BUFFER_PERCENT)
+        )
+    if percent is None:
+        percent = _DEFAULT_ORB_BUFFER_PERCENT
+    return percent / 100.0
 
 
 def build_buyboard_widget(main_window) -> None:
@@ -102,6 +137,32 @@ def build_buyboard_widget(main_window) -> None:
     header.addSpacing(12)
     header.addWidget(pnl_label)
     header.addStretch()
+
+    header.addWidget(QLabel("Buffer %:"))
+    buffer_input = QLineEdit()
+    configured_buffer = _valid_orb_buffer_percent(
+        (main_window.__dict__.get("settings", {}) or {}).get(
+            "orb_buffer_percent", _DEFAULT_ORB_BUFFER_PERCENT
+        )
+    )
+    buffer_input.setText(
+        f"{configured_buffer if configured_buffer is not None else _DEFAULT_ORB_BUFFER_PERCENT:g}"
+    )
+    buffer_validator = QDoubleValidator(0.0, 100.0, 4, buffer_input)
+    buffer_validator.setNotation(QDoubleValidator.StandardNotation)
+    buffer_input.setValidator(buffer_validator)
+    buffer_input.setMaximumWidth(55)
+    buffer_input.setToolTip(
+        "Buffer above the daily breakout used when a new symbol is first "
+        "queued. Existing Buylist, Buy Today, published, and locked plans "
+        "keep their saved buffer."
+    )
+    save_buffer = getattr(main_window, "_save_buyboard_orb_buffer_pct", None)
+    if callable(save_buffer):
+        buffer_input.editingFinished.connect(save_buffer)
+    header.addWidget(buffer_input)
+    header.addSpacing(10)
+
     engine_status = QLabel(
         "Engine: ENABLED" if is_buyboard_engine_enabled() else "Engine: OFF (board is read-only for order actions)"
     )
@@ -156,6 +217,7 @@ def build_buyboard_widget(main_window) -> None:
 
     main_window.buyboard_columns = lists
     main_window._buyboard_engine_status_label = engine_status
+    main_window.buyboard_orb_buffer_pct_input = buffer_input
     main_window._buyboard_account_filter_combo = account_filter_combo
     main_window._buyboard_positions_label = positions_label
     main_window._buyboard_capital_label = capital_label
@@ -673,10 +735,105 @@ def _renumber_column_after_swap(
 
 def _queue_item_for_card(main_window, card: TradeCardState):
     manager = getattr(main_window, "execution_queue_manager", None)
+    if manager is None:
+        ensure_manager = getattr(
+            main_window, "_ensure_execution_queue_manager", None
+        )
+        if callable(ensure_manager):
+            manager = ensure_manager()
     getter = getattr(manager, "get_item", None)
     if not callable(getter):
         return None
     return getter(card.symbol, card.environment)
+
+
+def _orb_plan_ambiguous_across_accounts(
+    main_window, card: TradeCardState
+) -> bool:
+    """Use the unfiltered board snapshot to detect a symbol/account clash."""
+
+    target_environment = str(card.environment or "").strip().upper()
+    target_symbol = str(card.symbol or "").strip().upper()
+    accounts: set[str] = set()
+    for projection in tuple(
+        getattr(main_window, "_buyboard_current_projections", ()) or ()
+    ):
+        state = getattr(projection, "card", projection)
+        status = getattr(state, "board_status", None)
+        if status != BoardStatus.BUY_TODAY:
+            continue
+        if (
+            str(getattr(state, "environment", "") or "").strip().upper()
+            != target_environment
+            or str(getattr(state, "symbol", "") or "").strip().upper()
+            != target_symbol
+        ):
+            continue
+        accounts.add(str(getattr(state, "account_no", "") or "").strip())
+    return len(accounts) > 1
+
+
+def _warn_if_orb_plan_ambiguous(main_window, card: TradeCardState) -> bool:
+    if not _orb_plan_ambiguous_across_accounts(main_window, card):
+        return False
+    QMessageBox.warning(
+        main_window,
+        "ORB Plans Unavailable",
+        f"{card.symbol} is active in Buy Today for multiple accounts. "
+        "The ORB queue is symbol-scoped, so its plan cannot be safely "
+        "assigned to one account. Remove the extra Buy Today card first.",
+    )
+    return True
+
+
+def _warn_if_orb_queue_account_mismatch(
+    main_window, card: TradeCardState, queue_item
+) -> bool:
+    queue_account = str(getattr(queue_item, "account_no", "") or "").strip()
+    card_account = str(card.account_no or "").strip()
+    if queue_account and card_account and queue_account == card_account:
+        return False
+    QMessageBox.warning(
+        main_window,
+        "ORB Plans Unavailable",
+        (
+            f"{card.symbol}'s current ORB queue snapshot has no account sizing "
+            "provenance. Refresh the account state and ORB plan before using it."
+            if not queue_account
+            else (
+                f"{card.symbol}'s Buy Today card has no account identity."
+                if not card_account
+                else (
+                    f"{card.symbol}'s current ORB queue snapshot was sized for a "
+                    "different account. Refresh the account state and ORB plan "
+                    "before using it."
+                )
+            )
+        ),
+    )
+    return True
+
+
+def _orb_plan_mutation_permission(main_window) -> tuple[bool, str]:
+    """Return cached, local authority for optimized-plan mutations."""
+
+    try:
+        if is_regular_session_open():
+            return (
+                False,
+                "Market is open. The published ORB selection is read-only until "
+                "the regular session closes.",
+            )
+    except Exception:
+        return False, "Market-session status is unavailable; ORB selection is read-only."
+    checker = getattr(main_window, "_has_cached_local_operator_control", None)
+    if not callable(checker) or not bool(checker()):
+        return (
+            False,
+            "This device does not hold the last locally verified Operator Control. "
+            "ORB selection is read-only.",
+        )
+    return True, ""
 
 
 def _sync_orb_plan_change(main_window, card: TradeCardState) -> None:
@@ -696,8 +853,12 @@ def _sync_orb_plan_change(main_window, card: TradeCardState) -> None:
 def _show_orb_plans(main_window, card: TradeCardState) -> None:
     """Refresh and show the existing queue's ORB plans for one Today card."""
 
+    if _warn_if_orb_plan_ambiguous(main_window, card):
+        return
+
+    can_mutate, read_only_reason = _orb_plan_mutation_permission(main_window)
     refresher = getattr(main_window, "refresh_execution_queue", None)
-    if callable(refresher):
+    if can_mutate and callable(refresher):
         refresher(
             card.environment,
             symbols=[card.symbol],
@@ -711,43 +872,85 @@ def _show_orb_plans(main_window, card: TradeCardState) -> None:
             f"No execution-queue ORB plans were found for {card.symbol}.",
         )
         return
+    if _warn_if_orb_queue_account_mismatch(main_window, card, queue_item):
+        return
+
+    def current_stale_windows() -> set[str]:
+        return {
+            str(window)
+            for window, candidate in dict(
+                getattr(queue_item, "candidates", {}) or {}
+            ).items()
+            if orb_candidate_stale_for_current_session(queue_item, candidate)
+        }
+
+    stale_windows = current_stale_windows()
+
+    def mutation_still_allowed() -> bool:
+        allowed, reason = _orb_plan_mutation_permission(main_window)
+        if allowed:
+            return True
+        QMessageBox.information(main_window, "ORB Plans Read-only", reason)
+        return False
 
     def lock_window(window: str) -> None:
+        if not mutation_still_allowed():
+            return
         candidate = (getattr(queue_item, "candidates", {}) or {}).get(window)
         if candidate is None:
             return
+        candidate_is_stale = orb_candidate_stale_for_current_session(
+            queue_item, candidate
+        )
         queue_item.locked = True
         queue_item.manual_window_lock = True
         queue_item.locked_reason = "Manual ORB window lock from Buy Board"
         queue_item.selected_window = window
-        queue_item.selected_candidate = candidate
+        # Premarket planning may lock the desired *window*, but yesterday's
+        # metrics never become the executable selected candidate.  The first
+        # current-session refresh will populate this manual window safely.
+        queue_item.selected_candidate = None if candidate_is_stale else candidate
         saver = getattr(main_window, "_save_execution_queue_state", None)
         if callable(saver):
             saver()
-        _sync_orb_plan_change(main_window, card)
+        if candidate_is_stale:
+            refresh_board = getattr(main_window, "refresh_buyboard", None)
+            if callable(refresh_board):
+                refresh_board()
+        else:
+            _sync_orb_plan_change(main_window, card)
 
     def unlock_auto() -> None:
-        unlocker = getattr(
-            main_window, "_unlock_execution_queue_item_for_auto", None
-        )
-        if callable(unlocker):
-            unlocker(queue_item)
-        else:
-            from src.core.execution_queue import select_best_orb_candidate
+        if not mutation_still_allowed():
+            return
+        from src.core.execution_queue import select_best_orb_candidate
 
-            queue_item.locked = False
-            queue_item.manual_window_lock = False
-            queue_item.locked_reason = None
-            selected = select_best_orb_candidate(
-                getattr(queue_item, "candidates", {}) or {},
-                getattr(queue_item, "selected_window", None),
-                False,
-            )
-            queue_item.selected_candidate = selected
-            queue_item.selected_window = selected.window if selected else None
-            saver = getattr(main_window, "_save_execution_queue_state", None)
-            if callable(saver):
-                saver()
+        clearer = getattr(
+            main_window, "_clear_persisted_watchlist_orb_selection", None
+        )
+        if callable(clearer):
+            clearer(queue_item.symbol)
+        queue_item.locked = False
+        queue_item.manual_window_lock = False
+        queue_item.locked_reason = None
+        stale_now = current_stale_windows()
+        eligible = {
+            window: candidate
+            for window, candidate in dict(
+                getattr(queue_item, "candidates", {}) or {}
+            ).items()
+            if str(window) not in stale_now
+        }
+        selected = select_best_orb_candidate(
+            eligible,
+            getattr(queue_item, "selected_window", None),
+            False,
+        )
+        queue_item.selected_candidate = selected
+        queue_item.selected_window = selected.window if selected else None
+        saver = getattr(main_window, "_save_execution_queue_state", None)
+        if callable(saver):
+            saver()
         _sync_orb_plan_change(main_window, card)
 
     dialogs.show_orb_plan_dialog(
@@ -755,6 +958,52 @@ def _show_orb_plans(main_window, card: TradeCardState) -> None:
         queue_item,
         lock_window=lock_window,
         unlock_auto=unlock_auto,
+        stale_windows=stale_windows,
+        read_only=not can_mutate,
+        read_only_reason=read_only_reason,
+    )
+
+
+def _show_orb_combinations(main_window, card: TradeCardState) -> None:
+    """Show all sizing alternatives from the current Buy Today queue item."""
+
+    if _warn_if_orb_plan_ambiguous(main_window, card):
+        return
+
+    queue_item = _queue_item_for_card(main_window, card)
+    if queue_item is None:
+        QMessageBox.warning(
+            main_window,
+            "ORB Combinations",
+            f"No execution-queue ORB plans were found for {card.symbol}.",
+        )
+        return
+    if _warn_if_orb_queue_account_mismatch(main_window, card, queue_item):
+        return
+    try:
+        buffer_pct = float(card.buffer_pct)
+    except (TypeError, ValueError, OverflowError):
+        buffer_pct = buyboard_orb_buffer_pct(main_window)
+    if not math.isfinite(buffer_pct) or buffer_pct < 0 or buffer_pct > 1:
+        buffer_pct = buyboard_orb_buffer_pct(main_window)
+    stale_windows = {
+        str(window)
+        for window, candidate in dict(
+            getattr(queue_item, "candidates", {}) or {}
+        ).items()
+        if orb_candidate_stale_for_current_session(queue_item, candidate)
+    }
+    combinations = build_orb_position_combinations(
+        queue_item,
+        account_equity=0.0,
+        buffer_pct=buffer_pct,
+        stale_windows=stale_windows,
+    )
+    dialogs.show_orb_combinations_dialog(
+        main_window,
+        queue_item,
+        combinations,
+        buffer_pct=buffer_pct,
     )
 
 
@@ -804,9 +1053,9 @@ def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
     actions = {}
     if card.board_status == BoardStatus.BUYLIST:
         actions["activate"] = menu.addAction("Activate for Buy Today")
-        actions["remove"] = menu.addAction("Move to Watchlist")
         menu.addSeparator()
     elif card.board_status == BoardStatus.BUY_TODAY:
+        actions["orb_combinations"] = menu.addAction("ORB Combinations...")
         actions["orb_plans"] = menu.addAction("Refresh / Select ORB Plans...")
         actions["remove_today"] = menu.addAction("Remove from Today")
         menu.addSeparator()
@@ -852,11 +1101,8 @@ def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
         main_window._buyboard_dispatch_command(
             command, interaction_fingerprint=interaction_fingerprint
         )
-    elif chosen is actions.get("remove"):
-        command = MoveToWatchlist(**common)
-        main_window._buyboard_dispatch_command(
-            command, interaction_fingerprint=interaction_fingerprint
-        )
+    elif chosen is actions.get("orb_combinations"):
+        _show_orb_combinations(main_window, card)
     elif chosen is actions.get("orb_plans"):
         _show_orb_plans(main_window, card)
     elif chosen in (

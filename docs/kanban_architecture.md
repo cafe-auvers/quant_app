@@ -43,26 +43,29 @@ The aggregate deliberately separates these concerns:
 
 `EntryRuntimeStatus` and `PositionRuntimeStatus` are badges/substates; they never choose a column.
 
-## Visible Lifecycle
+## Operator-facing and hidden lifecycle
 
-The board has eight columns in this order:
+The board renders six columns in this order:
 
-1. Watchlist
-2. Buylist
-3. Buy Today
-4. Entry Pending
-5. Open Positions
-6. Partial Sell
-7. Sell All
-8. Closed
+1. Buylist
+2. Buy Today
+3. Entry Pending
+4. Open Positions
+5. Partial Sell
+6. Sell All
+
+There is no Watchlist tab or Watchlist column. `WATCHLIST` remains a hidden,
+non-executable storage/migration value so older synchronized data can be read
+without a destructive schema conversion. `CLOSED` is also durable but hidden;
+closed trades belong to history/reporting rather than the live execution view.
+Neither hidden value receives live quote monitoring.
 
 The implemented lifecycle is:
 
 ```mermaid
 stateDiagram-v2
     [*] --> WATCHLIST
-    WATCHLIST --> BUYLIST: user adds to Buylist
-    BUYLIST --> WATCHLIST: user removes from Buylist
+    WATCHLIST --> BUYLIST: queue/import compatibility
     BUYLIST --> BUY_TODAY: user activates for today
     BUY_TODAY --> BUYLIST: user removes before an order identity exists
     BUY_TODAY --> ENTRY_PENDING: runtime submits or finds unresolved BUY
@@ -78,15 +81,22 @@ stateDiagram-v2
     CLOSED --> BUYLIST: policy helper for a future daily reset
 ```
 
-`ENTRY_PENDING` and `CLOSED` are system-only drop targets. A user cannot drag a card into them. A user also cannot drag a working entry back to Buylist; `CancelEntry` records a cancellation request and waits for terminal broker evidence.
+`ENTRY_PENDING` is a visible system-only drop target. `CLOSED` is reached only
+from broker-confirmed flat state and is not rendered. A user cannot drag a
+working entry back to Buylist; `CancelEntry` records a cancellation request and
+waits for terminal broker evidence.
 
 The graph in `src/core/kanban_transitions.py` protects user-facing transitions. Verified system actors such as reconciliation, `TradingEngine`, and `EodTradingService` may perform additional guarded transitions, including zero-fill cancellation back to Buylist.
 
 The `CLOSED -> BUYLIST` arrow is currently policy, not an active scheduled transition. `restore_closed_card_membership()` returns `BUYLIST` when `return_to_buylist_after_close` is set, but the current production runtime does not call that helper. Until a daily-reset caller is wired, a closed card remains in `CLOSED`.
 
-## Detailed Visible Lifecycle: Heartbeats, Deadlines, and Expiry
+## Detailed Lifecycle: Heartbeats, Deadlines, and Expiry
 
-This section describes the same eight columns operationally. Defaults below come from `src/core/execution_config.py` unless stated otherwise. Most timing values are loaded from environment variables when the process starts, so the running deployment may differ from the defaults shown here.
+This section describes the six visible columns plus the two hidden durable
+states operationally. Defaults below come from `src/core/execution_config.py`
+unless stated otherwise. Most timing values are loaded from environment
+variables when the process starts, so the running deployment may differ from
+the defaults shown here.
 
 ### What the heartbeat is
 
@@ -128,7 +138,7 @@ There are three other “heartbeat-like” cadences that should not be confused 
 
 ```mermaid
 flowchart TB
-    W[WATCHLIST<br/>persistent research state<br/>ORB plan may sync; no live quote subscription]
+    W[WATCHLIST hidden<br/>migration compatibility only<br/>no live quote subscription]
     B[BUYLIST<br/>persistent candidate state<br/>ORB plan may sync; no automatic entry]
     T[BUY_TODAY<br/>live quote subscribed<br/>ORB badge advances toward EXECUTE_READY]
     P[ENTRY_PENDING<br/>BUY reconciled every heartbeat<br/>no duplicate entry while unresolved]
@@ -138,7 +148,6 @@ flowchart TB
     C[CLOSED<br/>broker-confirmed zero quantity<br/>no live quote subscription]
 
     W -->|MoveToBuylist| B
-    B -->|MoveToWatchlist| W
     B -->|ActivateForToday| T
     T -->|remove before order identity| B
     T -->|ready + regular session + fresh quote + risk/capital pass| P
@@ -163,9 +172,9 @@ flowchart TB
 
 | Column | How it is entered | What the heartbeat does | How it leaves | Lifetime / expiry behavior |
 |---|---|---|---|---|
-| `WATCHLIST` | Bootstrap, migration, or `MoveToWatchlist` | May copy an already-computed ORB candidate into pre-entry fields. It does not subscribe the symbol for live execution quotes and cannot place an order. | User moves it to Buylist. | No automatic expiry. It persists until a command or authoritative reconciliation changes it. |
-| `BUYLIST` | User move, safe entry withdrawal, all-window ORB rejection, zero-fill user/EOD cancellation, migration | Does not subscribe the symbol for Buy Today execution and never attempts an entry. An automatic ORB rejection return displays a durable memo with each window's reason. | User moves it to Watchlist or activates it for today. | No automatic expiry. |
-| `BUY_TODAY` | `ActivateForToday`, or return from a rejected/TTL-cancelled zero-fill attempt | Subscribes live quotes, syncs the selected ORB candidate, recovers retry/capital/data states, and attempts a BUY only when `EXECUTE_READY`, the regular session is open, the quote is fresh and over the trigger, and all ownership/risk/capital/readiness gates pass. | Submission/duplicate/ambiguous result moves it to Entry Pending; a pre-identity user removal or EOD cleanup moves it to Buylist. If all 1m, 5m, and 30m plans are conclusively `REJECTED`/`RISK_INVALID`, a card with no BUY identity automatically returns to Buylist. | Today's authorization ends in the EOD window, **60 seconds before regular close by default**. With no durable order it resets to Buylist. If a durable order exists, it becomes Entry Pending instead of being discarded. |
+| `WATCHLIST` (hidden) | Legacy bootstrap/migration or explicit queue removal compatibility | Never subscribes the symbol for execution quotes and cannot place an order. | A new queue/import promotes it to Buylist. | No automatic expiry; retained only so old data remains readable. |
+| `BUYLIST` | User move, safe entry withdrawal, all-window ORB rejection, zero-fill user/EOD cancellation, migration | Does not subscribe the symbol for Buy Today execution and never attempts an entry. An automatic ORB rejection return displays a durable memo with each window's reason. | User activates it for today or explicitly removes it from the queue. | No automatic expiry. |
+| `BUY_TODAY` | `ActivateForToday`, or return from a rejected/TTL-cancelled zero-fill attempt | Subscribes live quotes, syncs an account-matched ORB candidate whose source bars identify the current New York session, recovers retry/capital/data states, and attempts a BUY only when `EXECUTE_READY`, the regular session is open, the quote is fresh and over the trigger, and all ownership/risk/capital/readiness gates pass. The same symbol cannot be active here in two accounts because the compatibility ORB queue is symbol-scoped. | Submission/duplicate/ambiguous result moves it to Entry Pending; a pre-identity user removal or EOD cleanup moves it to Buylist. If all 1m, 5m, and 30m plans are conclusively `REJECTED`/`RISK_INVALID`, a card with no BUY identity automatically returns to Buylist. | Today's authorization ends in the EOD window, **60 seconds before regular close by default**. With no durable order it resets to Buylist. If a durable order exists, it becomes Entry Pending instead of being discarded. |
 | `ENTRY_PENDING` | A submitted, duplicate, discovered, or ambiguous BUY identity | Reconciles the tracked entry every heartbeat. Any fill is immediately projected and protected; the engine never waits for the TTL before applying a fill. It blocks a second BUY while identity/status is unresolved. | Any fill moves the visible card to Open Position; confirmed zero-fill user/EOD cancel moves to Buylist; automatic TTL cancel or rejection returns a zero-fill card to Buy Today for cooldown/retry. | Entry attempt deadline is **15 seconds** by default. Deadline passage requests cancellation; it does **not** mark the order canceled. The card can remain pending without a maximum duration while broker identity or cancel confirmation is unresolved. |
 | `OPEN_POSITION` | Any confirmed entry fill or broker holding discovery | Keeps broker quantity/orderable quantity reconciled, evaluates the active stop on execution-grade regular-session events, flags stale/outage data, and may retry an incomplete entry target while safe. | User requests Partial Sell/Sell All; stop or outage policy initiates Sell All; broker reconciliation can update lifecycle facts. | No position expiry. At EOD the engine stops trying to complete any remaining entry target, but the existing position and protection remain open. |
 | `PARTIAL_SELL` | User requests a positive quantity below current orderable shares | Submits one partial SELL when no conflicting sell is working, reconciles it each heartbeat, and escalates to cancel after its attempt deadline. A stop cancels/supersedes the partial path before full liquidation. | Terminal reconciliation returns to Open Position with refreshed shares; stop/liquidation moves to Sell All. | Each partial-exit attempt has a **10-second** deadline. The deadline requests cancel; it does not assume completion. Rejected/error submissions wait **5 seconds** before retry. |
@@ -201,7 +210,7 @@ flowchart TB
 
 ### What “expiry” does and does not mean
 
-The implementation has no blanket “card expires after N seconds” rule. It does not use `board_status_updated_at` to time out a column. Watchlist, Buylist, Open Position, and Closed cards persist until a command or reconciled fact changes them.
+The implementation has no blanket “card expires after N seconds” rule. It does not use `board_status_updated_at` to time out a column. Hidden compatibility, Buylist, Open Position, and Closed cards persist until a command or reconciled fact changes them.
 
 Order-attempt deadlines are stored as `attempt_deadline_at`. Retry timing is stored separately in `next_retry_at` or `next_exit_retry_at`; cancellation tracking uses explicit in-flight flags and request timestamps. This separation survives restart and prevents a UI column timestamp from being mistaken for broker evidence.
 
@@ -220,13 +229,14 @@ An ambiguous submission, unknown broker identity, or unconfirmed cancellation ha
 
 | UI action | Typed command | Durable effect |
 |---|---|---|
-| Drop into Watchlist | `MoveToWatchlist` | Presentation/membership change |
 | Drop into Buylist | `MoveToBuylist` or `CancelEntry` | Move when safe; otherwise request cancellation |
 | Drop into Buy Today | `ActivateForToday` | Authorize today's entry monitoring |
 | Drop queued Sell All into Open Positions | `CancelQueuedSellAll` | Withdraw a local premarket sell-at-open intent before submission |
 | Drop into Partial Sell | `RequestPartialSell(quantity)` | Persist partial-exit intent; quantity at/above orderable shares becomes Sell All |
 | Drop into Sell All | `RequestSellAll` | Persist liquidation intent; premarket requests may queue for market open |
 | Context: Cancel Entry | `CancelEntry` | Remove local monitoring or request broker cancellation |
+| Buy Today context: `ORB Combinations...` | None (read-only) | Show all 24 risk/window cases without changing selection or execution state |
+| Buy Today context: `Refresh / Select ORB Plans...` | Premarket queue refresh/window lock, or no command in read-only mode | Review the three optimized candidates; only the verified Operator Control device may refresh or change selection before market open, and every device is read-only during the regular session |
 | Context: ORB/breakeven/manual stop | `SetOrbStop`, `SetBreakevenStop`, `SetManualStop` | Persist a pending stop change; it is not active yet |
 | Context: priority up/down | `ReorderCard` | Update `kanban_priority`; higher values render and compete first |
 | Explicit external-order action | `AdoptExternalOrder` | Audited restricted adoption; never implied by drag/drop |

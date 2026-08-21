@@ -58,6 +58,8 @@ class FakeQueueManager:
         self.duplicate_pending_order = None
         self.pending_environment = None
         self.build_environment = None
+        self.build_account_no = None
+        self.build_account_size = None
         self.build_calls = 0
 
     def has_pending_or_submitted_order(self, symbol, environment="PROD"):
@@ -68,6 +70,8 @@ class FakeQueueManager:
         self.build_calls += 1
         self.duplicate_pending_order = kwargs["duplicate_pending_order"]
         self.build_environment = kwargs["environment"]
+        self.build_account_no = kwargs["account_no"]
+        self.build_account_size = kwargs["account_size"]
         return _queue_item(item.symbol, self.status)
 
 
@@ -102,6 +106,7 @@ def _existing_buylist_item(**overrides):
         "breakout_price": 99.0,
         "breakout_method": "execution_queue:5m",
         "buffer_pct": 0.002,
+        "kis_account_no": "account-1",
         "shares_held": 0,
         "avg_cost": 0.0,
         "buy_date": None,
@@ -167,6 +172,65 @@ def test_successful_fake_queue_refresh_increments_refreshed_and_status_counts():
     assert result.refreshed == 1
     assert result.status_counts == {"EXECUTE_READY": 1}
     assert result.failures == []
+
+
+def test_queue_candidate_is_sized_for_the_symbols_canonical_account():
+    controller = BuylistExecutionController(SimpleNamespace())
+    manager = FakeQueueManager()
+
+    result = controller.refresh_execution_queue(
+        _request(
+            manager=manager,
+            account_no="selected-account",
+            account_size=10_000.0,
+            account_no_for_symbol=lambda symbol: "card-account",
+            account_size_for_account=lambda environment, account: (
+                250_000.0 if account == "card-account" else 0.0
+            ),
+        )
+    )
+
+    assert result.failures == []
+    assert manager.build_account_no == "card-account"
+    assert manager.build_account_size == 250_000.0
+
+
+def test_missing_canonical_account_equity_defers_without_rebuilding_queue():
+    controller = BuylistExecutionController(SimpleNamespace())
+    manager = FakeQueueManager()
+
+    result = controller.refresh_execution_queue(
+        _request(
+            manager=manager,
+            account_no="selected-account",
+            account_size=10_000.0,
+            account_no_for_symbol=lambda symbol: "card-account",
+            account_size_for_account=lambda environment, account: None,
+        )
+    )
+
+    assert result.refreshed == 0
+    assert result.failures == []
+    assert result.status_counts == {"ACCOUNT_EQUITY_UNAVAILABLE": 1}
+    assert manager.build_calls == 0
+
+
+def test_queue_refresh_repairs_compatibility_mirror_account():
+    controller = BuylistExecutionController(SimpleNamespace())
+    manager = FakeBuylistManager()
+    existing = _existing_buylist_item(kis_account_no="stale-account")
+    manager.items[(existing.symbol, existing.environment)] = existing
+
+    controller.apply_execution_queue_item_to_buylist(
+        _queue_item(),
+        _target(),
+        "PROD",
+        0.001,
+        buylist_manager=manager,
+        default_account_no="canonical-account",
+    )
+
+    assert existing.kis_account_no == "canonical-account"
 
 
 def test_queue_addition_writes_through_watchlist_card_to_canonical_buylist(

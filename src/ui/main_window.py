@@ -94,8 +94,7 @@ from src.ui.charts.controller import ChartsControllerMixin
 from src.ui.charts.renderer import ChartsRenderMixin
 from src.ui.controllers import (AccountController, BuylistController,
                                 BuylistExecutionController,
-                                ChartDataController, ScannerController,
-                                WatchlistController)
+                                ChartDataController, ScannerController)
 from src.ui.dialogs import (BackupEnvDialog, RestoreBackupDialog,
                             RestoreEnvDialog, SettingsDialog)
 from src.ui.filter_catalog import (DEFAULT_SCANNER_SETUPS, DEFAULT_SETTINGS,
@@ -106,7 +105,7 @@ from src.ui.mixins.scanner_mixin import ScannerMixin
 from src.ui.mixins.sidebar_mixin import SidebarMixin
 from src.ui.mixins.watchlist_mixin import WatchlistMixin
 from src.ui.order_workers import HandoffReconciliationWorker
-from src.ui.workers import PcRemoteStatusWorker, WatchlistAiWorker
+from src.ui.workers import PcRemoteStatusWorker
 from src.utils.config import DATA_DIR, ROOT_DIR, RULEBOOK_DIR, get_env_value
 from src.utils.data_loader import get_default_universe
 from src.utils.device_identity import detect_local_device_kind, runtime_device_kind
@@ -120,7 +119,6 @@ from src.utils.storage import load_json
 __all__ = [
     "MainWindow",
     "QTimer",
-    "WatchlistAiWorker",
     "_extract_latest_opening_bar",
     "append_order",
     "find_open_orders",
@@ -1021,8 +1019,6 @@ class MainWindow(
         self.running_scanner_setup_name: Optional[str] = None
         self.running_scanner_show_warnings = True
         self.scanner_worker = None
-        self.watchlist_worker = None
-        self.single_ai_worker = None
         self.kis_order_worker = None
         self._refresh_last_finished_at: Dict[str, Optional[str]] = {}
         self._refresh_last_log_count: Dict[str, int] = {}
@@ -1116,7 +1112,6 @@ class MainWindow(
 
     def _init_controllers(self) -> None:
         """Initialize non-rendering workflow controllers."""
-        self.watchlist_controller = WatchlistController(self)
         self.buylist_execution_controller = BuylistExecutionController(self)
         self.buylist_controller = BuylistController(self)
         self.scanner_controller = ScannerController(self)
@@ -1990,7 +1985,10 @@ class MainWindow(
             )
         if "watchlist" in updated_keys:
             self.watchlist = self._load_watchlist()
-            self.populate_watchlist_table()
+            # Keep legacy compatibility state synchronized without assuming
+            # the removed Watchlist tab/table exists.
+            if hasattr(self, "watchlist_table"):
+                self.populate_watchlist_table()
         if "buylist" in updated_keys:
             self.buylist_manager = self._load_buylist()
             self.populate_buylist_dashboard()
@@ -2135,8 +2133,6 @@ class MainWindow(
         worker_names = (
             "_local_mirror_sync_worker",
             "scanner_worker",
-            "watchlist_worker",
-            "single_ai_worker",
             "intraday_fetch_worker",
             "intraday_bulk_worker",
         )
@@ -3476,8 +3472,6 @@ class MainWindow(
             self.__dict__.get("state_sync_worker"),
             self.__dict__.get("_pc_status_worker"),
             self.__dict__.get("scanner_worker"),
-            self.__dict__.get("watchlist_worker"),
-            self.__dict__.get("single_ai_worker"),
             self.__dict__.get("kis_order_worker"),
             self.__dict__.get("intraday_fetch_worker"),
             self.__dict__.get("intraday_bulk_worker"),
@@ -3927,10 +3921,6 @@ class MainWindow(
         self._add_configured_tab("scanner", self.scanner_widget, "Scanner")
         self._build_scanner_tab()
 
-        self.watchlist_widget = QWidget()
-        self._add_configured_tab("watchlist", self.watchlist_widget, "Watchlist")
-        self._build_watchlist_tab()
-
         # The Buy Board is the sole operator-facing execution surface. The
         # persisted buylist/execution-queue models remain compatibility inputs
         # for ORB calculation and state migration, but no legacy dashboard is
@@ -3953,26 +3943,28 @@ class MainWindow(
             "tradingview", self.tradingview_widget, "TradingView Chart"
         )
         self._build_tradingview_tab()
+        # Legacy chart code may still construct these controls while local
+        # Watchlist data remains migration-compatible. They are no longer an
+        # operator-facing workflow.
+        watchlist_button = self.__dict__.get("tradingview_add_watchlist_button")
+        if watchlist_button is not None:
+            watchlist_button.setVisible(False)
+        watchlist_shortcut = self.__dict__.get("tradingview_watchlist_shortcut")
+        if watchlist_shortcut is not None:
+            watchlist_shortcut.setEnabled(False)
 
         self.health_widget = QWidget()
         self._add_configured_tab("health", self.health_widget, "Health")
         self._build_health_tab()
 
         self.intraday_charts_widget = QWidget()
-        self._add_configured_tab(
-            "intraday_charts", self.intraday_charts_widget, "Intraday Charts"
-        )
+        # This legacy view is built only as a compatibility target for shared
+        # chart helpers. It was Watchlist-backed and is no longer exposed as a
+        # tab, even if an older tab_options.json enabled it.
         self._build_intraday_charts_tab()
 
-        # Wire env combo â†’ watchlist refresh (Trade Plan tab removed)
-        self.watchlist_env_combo.currentIndexChanged.connect(
-            self.on_watchlist_env_changed
-        )
-        self.watchlist_env_combo.currentIndexChanged.connect(
-            self.populate_watchlist_table
-        )
-        # currentIndexChanged was emitted during addItems before the signal was connected,
-        # so populate_trade_account_combo was never called. Trigger it once explicitly now.
+        # Account selectors are built on Dashboard; populate the shared trade
+        # account alias once after all tabs finish constructing.
         self.populate_trade_account_combo()
 
     def _add_configured_tab(self, key: str, widget: QWidget, label: str) -> None:
@@ -4572,10 +4564,10 @@ class MainWindow(
             return
         revisions = result.revisions
         summary = (
-            f"watchlist r{revisions.get('watchlist', 0)}, "
-            f"buylist r{revisions.get('buylist', 0)}, "
-            f"trade plans r{revisions.get('trade_plans', 0)}, "
-            f"execution queue r{revisions.get('execution_queue', 0)}"
+            f"planning snapshot r{revisions.get('buylist', 0)}/"
+            f"{revisions.get('trade_plans', 0)}, "
+            f"execution queue r{revisions.get('execution_queue', 0)}, "
+            f"compatibility state r{revisions.get('watchlist', 0)}"
         )
         if result.execution_owner_heartbeat_fresh:
             owner = result.execution_owner_hostname or "Execution Owner"
@@ -4592,7 +4584,31 @@ class MainWindow(
             QMessageBox.warning(self, "Plan published; executor not verified", message)
         self._start_state_sync()
 
+    def _has_cached_local_operator_control(self) -> bool:
+        """Use only the last background-verified control row for plan edits."""
+
+        control = self.__dict__.get("_cached_operator_control")
+        role = self.__dict__.get("state_sync_role")
+        return bool(
+            control is not None
+            and role is not None
+            and not bool(getattr(control, "locked", True))
+            and str(getattr(control, "device_id", "") or "").strip()
+            == str(getattr(role, "device_id", "") or "").strip()
+            and str(getattr(role, "device_id", "") or "").strip()
+        )
+
     def _refresh_control_ownership_status(self, result: StateReconcileResult) -> None:
+        # ORB planning actions are synchronous UI gestures.  They must never
+        # issue a blocking ownership query on the UI thread, so retain the
+        # latest result from the background state-sync worker and fail closed
+        # whenever that result was unavailable.
+        self._cached_operator_control = (
+            result.operator_control
+            if not str(getattr(result, "operator_control_error", "") or "").strip()
+            else None
+        )
+        self._cached_operator_control_verified_at = result.last_verified_at
         label = self.__dict__.get("control_ownership_status")
         if label is None:
             return
@@ -4645,8 +4661,7 @@ class MainWindow(
             f"PC Executor Ready: {readiness['PC']} | "
             f"Laptop Executor Ready: {readiness['Laptop']} | "
             f"Live Trading: {live_text} | "
-            f"Revisions W/B/Q: {revisions.get('watchlist', 0)}/"
-            f"{revisions.get('buylist', 0)}/"
+            f"Plan/Queue Revisions: {revisions.get('buylist', 0)}/"
             f"{revisions.get('execution_queue', 0)} | Verified: {verified_text}"
             f" | Last Command: {command_text}"
         )
@@ -4688,7 +4703,15 @@ class MainWindow(
 
     def append_log(self, message: str) -> None:
         """Request an in-app log update from any thread."""
-        self.log_message_requested.emit(str(message))
+        text = str(message)
+        # A shared legacy intraday worker still carries old internal naming.
+        # Keep those implementation labels out of the operator-facing log now
+        # that the Watchlist UI has been removed.
+        text = text.replace(
+            "Intraday watchlist refresh requires",
+            "Intraday refresh requires",
+        ).replace("watchlist symbols", "planning symbols")
+        self.log_message_requested.emit(text)
 
     @pyqtSlot(str)
     def _append_log_on_ui_thread(self, message: str) -> None:
@@ -5470,17 +5493,11 @@ class MainWindow(
             self.tradingview_full_view_shortcut.setKey(
                 parse_key(shortcuts.get("full_view", "F"))
             )
-        if hasattr(self, "tradingview_watchlist_shortcut"):
-            self.tradingview_watchlist_shortcut.setKey(
-                parse_key(shortcuts.get("add_watchlist", "W"))
-            )
-
         # 4. Update Button Labels
         t_key = shortcuts.get("set_target", "T")
         d_key = shortcuts.get("draw_line", "D")
         e_key = shortcuts.get("erase_drawing", "E")
         f_key = shortcuts.get("full_view", "F")
-        w_key = shortcuts.get("add_watchlist", "W")
 
         if hasattr(self, "intraday_set_target_button"):
             self.intraday_set_target_button.setText(f"Set Breakout Price ({t_key})")
@@ -5515,13 +5532,6 @@ class MainWindow(
             self.tradingview_line_tool_button.setText(f"Line Tool ({d_key})")
         if hasattr(self, "tradingview_full_view_button"):
             self.tradingview_full_view_button.setText(f"Full View ({f_key})")
-        if hasattr(self, "tradingview_add_watchlist_button"):
-            cur_wl = self.tradingview_add_watchlist_button.text()
-            self.tradingview_add_watchlist_button.setText(
-                f"Remove from Watchlist ({w_key})"
-                if cur_wl.startswith("Remove")
-                else f"Add to Watchlist ({w_key})"
-            )
         if hasattr(
             self, "tradingview_queue_btn"
         ) and self.tradingview_queue_btn.text().startswith("Queue"):
@@ -5536,17 +5546,17 @@ class MainWindow(
         QMessageBox.information(
             self,
             "About",
-            "Stock Dashboard\n\nA PyQt5 trading dashboard prototype with scanner, watchlist, and trade planning.",
+            "Stock Dashboard\n\nA PyQt5 trading dashboard with scanner, Buy Board, chart review, and guarded execution.",
         )
 
     def save_local_data(self) -> None:
-        """Persist watchlist and trade plans on demand."""
+        """Persist local planning and chart state on demand."""
         self._save_state()
-        self.append_log("Saved local watchlist, trade plans, and scanner setups.")
+        self.append_log("Saved local planning, chart, and scanner state.")
         QMessageBox.information(
             self,
             "Saved",
-            "Local watchlist, trade plans, and scanner setups have been saved.",
+            "Local planning, chart, and scanner state has been saved.",
         )
 
     def show_restore_backup_dialog(self) -> None:

@@ -54,9 +54,8 @@ class SettingsDialog(QDialog):
             "draw_line": "Draw Line",
             "erase_drawing": "Erase Drawing",
             "full_view": "Full View / Reset",
-            "add_watchlist": "Add to Watchlist",
-            "prev_symbol": "Previous Watchlist Symbol",
-            "next_symbol": "Next Watchlist Symbol",
+            "prev_symbol": "Previous Symbol",
+            "next_symbol": "Next Symbol",
             "pan_left": "Pan Left",
             "pan_right": "Pan Right"
         }
@@ -166,7 +165,7 @@ class RestoreBackupDialog(QDialog):
         layout.addWidget(self.snapshot_combo)
 
         note = QLabel(
-            "Restores watchlist, buylist, trade plans, scanner setups, chart\n"
+            "Restores legacy planning data, buylist, trade plans, scanner setups, chart\n"
             "drawings, tab options, settings, and trading records. The chosen\n"
             "snapshot is validated and staged first. The app then closes, saves\n"
             "your current files into a timestamped preservation folder, applies\n"
@@ -245,7 +244,7 @@ class BackupEnvDialog(QDialog):
 
         layout.addWidget(QLabel(f"Backup destination: {self.backup_root}"))
         note = QLabel(
-            ".env holds real secrets (MySQL password, KIS keys, OpenAI key), "
+            ".env holds real secrets (database passwords and API keys), "
             "so it's encrypted before it ever leaves this machine -- unlike "
             "the JSON state files, it's never written in plaintext to Drive.\n\n"
             "The passphrase below is NOT stored anywhere -- not in .env, not "

@@ -637,6 +637,48 @@ def test_add_buy_today_rejects_duplicate_active_symbol(engine, roles):
     assert "already has an active" in outcome.error_message
 
 
+def test_add_buy_today_rejects_same_symbol_active_in_another_account(
+    engine, roles
+):
+    pc, laptop = roles
+    claim_main_device(engine, pc)
+    set_operator_control(engine, pc, laptop)
+    card_repo.create_trade_card(
+        engine,
+        TradeCardState(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            board_status=BoardStatus.BUY_TODAY,
+        ),
+    )
+    second = card_repo.create_trade_card(
+        engine,
+        TradeCardState(
+            environment="PROD",
+            account_no="2",
+            symbol="AAPL",
+            board_status=BoardStatus.BUYLIST,
+        ),
+    )
+    queued = enqueue_board_operator_command(
+        engine,
+        laptop,
+        ActivateForToday(
+            environment="PROD",
+            account_no="2",
+            symbol="AAPL",
+            expected_card_version=second.version,
+        ),
+    )
+
+    outcome = process_next_board_operator_command(engine, pc)
+
+    assert outcome.command_id == queued.command.command_id
+    assert outcome.status == OperatorCommandStatus.REJECTED
+    assert "another account" in outcome.error_message
+
+
 def test_add_buy_today_is_applied_by_the_execution_owner(engine, roles):
     pc, laptop = roles
     claim_main_device(engine, pc)

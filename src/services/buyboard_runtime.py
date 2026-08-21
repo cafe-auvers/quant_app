@@ -106,6 +106,7 @@ None of this is activated automatically: constructing a
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
@@ -359,6 +360,11 @@ def _revalidate_and_approve(
     """Section 149-164's "fresh risk approval bound to the exact order
     fingerprint" gate, using the card's own persisted ORB fields.
 
+    ``account_size`` is retained as the private helper's compatibility name,
+    but callers must supply fresh total account equity. Spendable cash is a
+    separate capital-availability input and must never be used as the ORB
+    capital-percentage denominator.
+
     This is a lighter-weight revalidation than the legacy path's
     :func:`src.risk.pre_trade.assess_orb_entry_candidate`, which needs the
     live :class:`~src.core.execution_queue.OrbCandidate` object --
@@ -371,6 +377,17 @@ def _revalidate_and_approve(
     """
     stop_price = card.entry_orb_low
     reasons = []
+    try:
+        # ``account_size`` is the risk-sizing base at this boundary: fresh
+        # total account equity, not usable cash/buying power.  Availability
+        # remains independently enforced by EntryAttemptManager's capital
+        # reservation or the guarded execution gateway.
+        account_equity = float(account_size)
+    except (TypeError, ValueError, OverflowError):
+        account_equity = 0.0
+    if not math.isfinite(account_equity) or account_equity <= 0:
+        account_equity = 0.0
+        reasons.append("Fresh positive account equity is required")
     if quantity <= 0:
         reasons.append("Non-positive quantity")
     if limit_price <= 0:
@@ -387,7 +404,11 @@ def _revalidate_and_approve(
     # bounds.
     sizing = {
         "shares": float(quantity),
-        "capital_percent": (quantity * limit_price / account_size * 100.0) if account_size > 0 else 0.0,
+        "capital_percent": (
+            quantity * limit_price / account_equity * 100.0
+            if account_equity > 0
+            else 0.0
+        ),
         "stop_loss_percent": (
             (limit_price - stop_price) / limit_price * 100.0
             if stop_price is not None and limit_price > 0
@@ -713,10 +734,17 @@ def build_buyboard_runtime(
         account_no = kwargs["account_no"]
         symbol = kwargs["symbol"]
         card = card_lookup(environment, account_no, symbol)
-        account_size = buying_power_provider(environment, account_no)
 
         quantity = kwargs["quantity"]
         limit_price = kwargs["limit_price"]
+        try:
+            account_equity = float(
+                resolved_equity_provider(environment, account_no)
+            )
+        except (TypeError, ValueError, OverflowError):
+            account_equity = 0.0
+        if not math.isfinite(account_equity) or account_equity <= 0:
+            account_equity = 0.0
         # card.risk_percent is a *fraction* (e.g. 0.01 for 1%), matching
         # calculate_orb_position_values' own validation
         # (risk_fraction <= 1.0) and how the legacy dashboard already
@@ -740,9 +768,8 @@ def build_buyboard_runtime(
             # calculate_orb_position_values the legacy dashboard's sizing
             # already uses, rather than trusting a share count computed
             # against a since-moved price.
-            equity = resolved_equity_provider(environment, account_no)
             sizing = calculate_orb_position_values(
-                account_size=equity,
+                account_size=account_equity,
                 risk_percent=card.risk_percent,
                 entry_price=limit_price,
                 stop_price=card.entry_orb_low,
@@ -758,7 +785,7 @@ def build_buyboard_runtime(
                 quantity=quantity,
                 limit_price=limit_price,
                 exchange=kwargs.get("exchange", "NASD"),
-                account_size=account_size,
+                account_size=account_equity,
             )
             if card is not None
             else None

@@ -23,7 +23,14 @@ class ExecutionQueueRefreshRequest:
     account_size: float = 100000.0
     risk_percent: float = 0.01
     buffer_pct: float = 0.001
+    buffer_pct_for_symbol: Callable[[str], Optional[float]] = (
+        lambda _symbol: None
+    )
     account_no: str = ""
+    account_no_for_symbol: Callable[[str], str] = lambda _symbol: ""
+    account_size_for_account: Callable[[str, str], Optional[float]] = (
+        lambda _environment, _account_no: None
+    )
     trade_card_engine: Optional[Any] = None
     watchlist: Optional[Any] = None
     window_days: int = 7
@@ -90,6 +97,57 @@ class BuylistExecutionController(WindowController):
             if not symbol:
                 continue
             try:
+                item_account_no = str(
+                    request.account_no_for_symbol(symbol)
+                    or getattr(watch_item, "kis_account_no", "")
+                    or request.account_no
+                    or ""
+                ).strip()
+                try:
+                    resolved_account_size = request.account_size_for_account(
+                        request.env,
+                        item_account_no,
+                    )
+                    item_account_size = (
+                        float(resolved_account_size)
+                        if resolved_account_size is not None
+                        else 0.0
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    item_account_size = 0.0
+                if not math.isfinite(item_account_size):
+                    item_account_size = 0.0
+                if (
+                    item_account_size <= 0
+                    and item_account_no == str(request.account_no or "").strip()
+                ):
+                    try:
+                        item_account_size = float(request.account_size or 0.0)
+                    except (TypeError, ValueError, OverflowError):
+                        item_account_size = 0.0
+                if not math.isfinite(item_account_size) or item_account_size <= 0:
+                    # Missing account truth is temporary, not an invalid ORB
+                    # structure. Preserve any last-good queue snapshot rather
+                    # than rebuilding every window as terminal RISK_INVALID;
+                    # otherwise the runtime can incorrectly return a valid
+                    # published Buy Today card to Buylist.
+                    transient_status = "ACCOUNT_EQUITY_UNAVAILABLE"
+                    result.status_counts[transient_status] = (
+                        result.status_counts.get(transient_status, 0) + 1
+                    )
+                    continue
+                try:
+                    item_buffer_pct = float(
+                        request.buffer_pct_for_symbol(symbol)
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    item_buffer_pct = float(request.buffer_pct)
+                if (
+                    not math.isfinite(item_buffer_pct)
+                    or item_buffer_pct < 0.0
+                    or item_buffer_pct > 1.0
+                ):
+                    item_buffer_pct = 0.001
                 one_minute = request.latest_intraday_session(
                     request.load_intraday_interval(symbol, "1m", request.window_days)
                 )
@@ -109,7 +167,7 @@ class BuylistExecutionController(WindowController):
                 )
                 broker_has_open_order = request.has_duplicate_open_order(
                     request.env,
-                    request.account_no,
+                    item_account_no,
                     symbol,
                     OrderSide.BUY,
                     OrderIntent.ENTRY,
@@ -119,21 +177,26 @@ class BuylistExecutionController(WindowController):
                     watch_item,
                     {"1m": one_minute, "5m": five_minute, "30m": five_minute},
                     current_price=current_price,
-                    account_size=request.account_size,
+                    account_size=item_account_size,
                     risk_percent=request.risk_percent,
                     environment=request.env,
+                    account_no=item_account_no,
                     adr_percent=request.adr_percent_for_symbol(symbol),
-                    buffer_pct=request.buffer_pct,
+                    buffer_pct=item_buffer_pct,
                     duplicate_pending_order=duplicate_order,
+                    # The UI request has already resolved the canonical,
+                    # per-symbol buffer. A stale legacy selected_orb_plan may
+                    # keep its risk/window lock but cannot override this value.
+                    force_buffer_pct=True,
                 )
                 sync = self.apply_execution_queue_item_to_buylist(
                     queue_item,
                     watch_item,
                     request.env,
-                    request.buffer_pct,
+                    item_buffer_pct,
                     buylist_manager=request.buylist_manager,
                     trade_card_engine=request.trade_card_engine,
-                    default_account_no=request.account_no,
+                    default_account_no=item_account_no,
                     watchlist=request.watchlist,
                 )
                 if sync is not None and sync.changed and sync.card_key:
@@ -191,20 +254,11 @@ class BuylistExecutionController(WindowController):
         selected_window = display.selected_window
         warnings = display.warnings
         score = float(getattr(candidate, "score", 0.0) or 0.0) if candidate else 0.0
+        # ``buffer_pct`` was resolved before candidate construction and is the
+        # one authoritative value for this refresh. Legacy Watchlist plan data
+        # may retain a selected window/risk, but cannot replace a published
+        # card's buffer after executor handoff.
         effective_buffer_pct = buffer_pct
-        saved_plan = getattr(watch_item, "selected_orb_plan", None)
-        if (
-            candidate is not None
-            and isinstance(saved_plan, dict)
-            and str(saved_plan.get("window", "") or "")
-            == str(getattr(candidate, "window", "") or "")
-        ):
-            try:
-                saved_buffer = float(saved_plan.get("buffer_pct"))
-            except (TypeError, ValueError):
-                saved_buffer = None
-            if saved_buffer is not None and math.isfinite(saved_buffer) and saved_buffer >= 0:
-                effective_buffer_pct = saved_buffer
         summary = (
             f"Execution queue {status_text}"
             + (f"; selected ORB {selected_window}" if selected_window else "")
@@ -261,6 +315,9 @@ class BuylistExecutionController(WindowController):
             existing.breakout_price = getattr(watch_item, "breakout_price", None)
             existing.breakout_method = f"execution_queue:{selected_window}" if selected_window else "execution_queue"
             existing.buffer_pct = effective_buffer_pct
+            resolved_account_no = str(default_account_no or "").strip()
+            if resolved_account_no:
+                existing.kis_account_no = resolved_account_no
             # A durable Watchlist plan is an explicit user choice, so refresh
             # its compatibility mirrors.  Legacy auto-selected queue rows keep
             # their existing values unless missing.

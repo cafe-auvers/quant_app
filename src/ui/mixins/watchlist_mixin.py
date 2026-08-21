@@ -71,7 +71,7 @@ from src.ui.workers import (FxRateWorker, IntradayBulkFetchWorker,
                             IntradayFetchWorker, KisAccountWorker,
                             KisOrderWorker, KisStartupAccountsWorker,
                             OrderReconciliationWorker, ScannerWorker,
-                            SingleStockAiWorker, WatchlistAiWorker)
+                            WatchlistAiWorker)
 from src.utils.config import DATA_DIR
 from src.utils.data_loader import (_extract_symbol_history,
                                    download_price_history,
@@ -2045,6 +2045,9 @@ class WatchlistMixin:
 
     def _watchlist_orb_buffer_pct(self) -> float:
         if not hasattr(self, "watchlist_buffer_pct_input"):
+            buyboard_buffer = getattr(self, "_buyboard_orb_buffer_pct", None)
+            if callable(buyboard_buffer):
+                return buyboard_buffer()
             return 0.001
         try:
             text = self.watchlist_buffer_pct_input.text().strip()

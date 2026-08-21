@@ -13,7 +13,7 @@ def test_refactored_ui_modules_importable():
     )
     from src.ui.filter_catalog import DEFAULT_SCANNER_SETUPS, DEFAULT_TAB_OPTIONS
     from src.ui.main_window import MainWindow, _extract_latest_opening_bar
-    from src.ui.workers import ScannerWorker, WatchlistAiWorker
+    from src.ui.workers import ScannerWorker
 
     assert AccountController is not None
     assert BuylistExecutionController is not None
@@ -24,7 +24,6 @@ def test_refactored_ui_modules_importable():
     assert WatchlistController is not None
     assert _extract_latest_opening_bar is not None
     assert ScannerWorker is not None
-    assert WatchlistAiWorker is not None
     assert set(DEFAULT_SCANNER_SETUPS) == {"Setup 1", "Setup 2"}
     assert DEFAULT_TAB_OPTIONS["tradingview"] is True
 

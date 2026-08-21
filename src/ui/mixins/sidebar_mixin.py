@@ -63,8 +63,7 @@ from src.ui.filter_catalog import (DEFAULT_SCANNER_SETUPS, DEFAULT_SETTINGS,
 from src.ui.workers import (FxRateWorker, IntradayBulkFetchWorker,
                             IntradayFetchWorker, KisAccountWorker,
                             KisOrderWorker, KisStartupAccountsWorker,
-                            OrderReconciliationWorker, ScannerWorker,
-                            SingleStockAiWorker, WatchlistAiWorker)
+                            OrderReconciliationWorker, ScannerWorker)
 from src.utils.data_loader import (_extract_symbol_history,
                                    download_price_history,
                                    get_default_universe)
@@ -115,14 +114,6 @@ class SidebarMixin:
         self.sidebar_selected_label.setWordWrap(True)
         sidebar_layout.addWidget(self.sidebar_selected_label)
 
-        add_button = QPushButton("Add to Watchlist")
-        add_button.clicked.connect(self.sidebar_add_selected_to_watchlist)
-        sidebar_layout.addWidget(add_button)
-
-        trade_button = QPushButton("Open ORB Plan")
-        trade_button.clicked.connect(self.sidebar_load_trade_plan)
-        sidebar_layout.addWidget(trade_button)
-
         chart_button = QPushButton("Show Chart")
         chart_button.clicked.connect(self.sidebar_show_chart)
         sidebar_layout.addWidget(chart_button)
@@ -132,7 +123,7 @@ class SidebarMixin:
         self.addDockWidget(Qt.LeftDockWidgetArea, self.stock_sidebar)
         self.refresh_sidebar_sources()
     def refresh_sidebar_sources(self, selected_source: Optional[dict] = None) -> None:
-        """Refresh sidebar source options for each scanner setup plus watchlist."""
+        """Refresh sidebar source options for scanner results and Buylist."""
         if not hasattr(self, "sidebar_source_combo"):
             return
 
@@ -141,7 +132,6 @@ class SidebarMixin:
         self.sidebar_source_combo.clear()
         for setup_name in sorted(self.scanner_setups.keys()):
             self.sidebar_source_combo.addItem(f"Scan: {setup_name}", {"type": "scan", "setup": setup_name})
-        self.sidebar_source_combo.addItem("Watchlist", {"type": "watchlist"})
         self.sidebar_source_combo.addItem("Buylist", {"type": "buylist"})
 
         selected_index = 0
@@ -169,14 +159,14 @@ class SidebarMixin:
             return
         self.stock_sidebar.setVisible(True)
         if self.tabs.currentWidget() is self.intraday_charts_widget:
-            self._set_sidebar_source_to_watchlist()
+            self._set_sidebar_source_to_buylist()
         self.apply_sidebar_selection_to_current_tab()
-    def _set_sidebar_source_to_watchlist(self) -> None:
+    def _set_sidebar_source_to_buylist(self) -> None:
         if not hasattr(self, "sidebar_source_combo"):
             return
         for index in range(self.sidebar_source_combo.count()):
             data = self.sidebar_source_combo.itemData(index) or {}
-            if data.get("type") == "watchlist":
+            if data.get("type") == "buylist":
                 if self.sidebar_source_combo.currentIndex() != index:
                     self.sidebar_source_combo.setCurrentIndex(index)
                 return
@@ -191,7 +181,7 @@ class SidebarMixin:
             return "?"
 
     def refresh_stock_sidebar(self, *args) -> None:
-        """Refresh sidebar stock list from scanner results or watchlist."""
+        """Refresh sidebar stock list from scanner results or Buylist."""
         if not hasattr(self, "sidebar_stock_list"):
             return
 
@@ -236,18 +226,6 @@ class SidebarMixin:
                     "ai_summary": buy_item.ai_summary,
                 })
                 self.sidebar_stock_list.addItem(item)
-        else:
-            for watch_item in self.watchlist.items:
-                label = f"{watch_item.symbol} ({self._format_sidebar_added_date(watch_item.added_date)})"
-                item = QListWidgetItem(label)
-                item.setData(Qt.UserRole, {
-                    "symbol": watch_item.symbol,
-                    "name": watch_item.name,
-                    "price": watch_item.entry_price,
-                    "source": "watchlist",
-                })
-                self.sidebar_stock_list.addItem(item)
-
         if current_symbol:
             for row in range(self.sidebar_stock_list.count()):
                 item = self.sidebar_stock_list.item(row)
@@ -307,10 +285,7 @@ class SidebarMixin:
         price = data.get("price")
         current_widget = self.tabs.currentWidget()
 
-        if current_widget is self.watchlist_widget:
-            self.watchlist_symbol_input.setText(symbol)
-            self.watchlist_name_input.setText(name)
-        elif hasattr(self, "trade_plan_widget") and current_widget is self.trade_plan_widget:
+        if hasattr(self, "trade_plan_widget") and current_widget is self.trade_plan_widget:
             self._seed_trade_plan_fields(symbol=symbol, price=price, name=name, overwrite=True)
         elif current_widget is self.charts_widget:
             self._set_chart_symbol(symbol)
@@ -325,41 +300,6 @@ class SidebarMixin:
         elif current_widget is self.scanner_widget:
             self.scanner_selection_label.setText(f"Selected symbol: {symbol}")
             self.update_scanner_preview_chart(symbol)
-    def sidebar_add_selected_to_watchlist(self) -> None:
-        """Add selected sidebar stock to the watchlist."""
-        data = self._get_sidebar_selected_data()
-        if not data:
-            QMessageBox.warning(self, "No selection", "Select a stock from the sidebar first.")
-            return
-
-        symbol = data.get("symbol", "")
-        self.watchlist.add(
-            symbol=symbol,
-            name=data.get("name", symbol),
-            entry_price=data.get("price"),
-        )
-        self.populate_watchlist_table()
-        self.update_dashboard_summary()
-        self._save_state()
-        self.sidebar_source_combo.setCurrentText("Watchlist")
-        self.refresh_stock_sidebar()
-        self.prefetch_intraday_cache_for_symbol(symbol)
-        self.append_log(f"Added/updated {symbol} in watchlist from sidebar.")
-    def sidebar_load_trade_plan(self) -> None:
-        """Load selected sidebar stock — Trade Plan tab removed, redirect to Watchlist + chart."""
-        data = self._get_sidebar_selected_data()
-        if not data:
-            QMessageBox.warning(self, "No selection", "Select a stock from the sidebar first.")
-            return
-
-        symbol = data.get("symbol", "")
-        price = data.get("price")
-        name = data.get("name", "")
-
-        self._set_chart_symbol(symbol)
-        self.refresh_watchlist_orb_panel(symbol)
-        if hasattr(self, "watchlist_widget"):
-            self.tabs.setCurrentWidget(self.watchlist_widget)
     def sidebar_show_chart(self, *args) -> None:
         """Show selected sidebar stock on the TradingView chart tab or Charts tab (if Buylist)."""
         data = self._get_sidebar_selected_data()

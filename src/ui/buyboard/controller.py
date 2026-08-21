@@ -573,6 +573,36 @@ class BuyboardMixin:
         self._buyboard_broker_truth_timer = broker_timer
         QTimer.singleShot(5_000, self._refresh_buyboard_broker_truth)
 
+    def _buyboard_orb_buffer_pct(self) -> float:
+        from .board import buyboard_orb_buffer_pct
+
+        return buyboard_orb_buffer_pct(self)
+
+    def _save_buyboard_orb_buffer_pct(self) -> None:
+        """Persist the planning default without rewriting published cards."""
+
+        from src.services.app_state import SETTINGS_FILE
+        from src.utils.storage import save_json
+
+        from .board import buyboard_orb_buffer_pct
+
+        fraction = buyboard_orb_buffer_pct(self)
+        percent = fraction * 100.0
+        widget = self.__dict__.get("buyboard_orb_buffer_pct_input")
+        if widget is not None:
+            widget.setText(f"{percent:g}")
+        settings = self.__dict__.setdefault("settings", {})
+        if settings.get("orb_buffer_percent") == percent:
+            return
+        settings["orb_buffer_percent"] = percent
+        save_json(SETTINGS_FILE, settings)
+        append_log = getattr(self, "append_log", None)
+        if callable(append_log):
+            append_log(
+                f"ORB planning buffer set to {percent:g}% for newly queued "
+                "symbols. Existing plans keep their saved buffer."
+            )
+
     def _buyboard_projection_values(self):
         values = tuple(
             self.__dict__.get("_buyboard_current_projections", ()) or ()
@@ -657,7 +687,11 @@ class BuyboardMixin:
                 return
         except Exception:
             return
-        symbols = self._buyboard_monitored_symbols()
+        # ORB minute bars are needed only until a Buy Today entry leaves the
+        # planning stage.  Positions and working orders use their separate
+        # live trade/quote subscriptions and must not keep consuming the
+        # comparatively expensive intraday-history refresh budget.
+        symbols = self._buy_today_orb_symbols()
         if not symbols:
             return
         worker = self.__dict__.get("intraday_bulk_worker")

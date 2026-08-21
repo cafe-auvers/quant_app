@@ -162,10 +162,225 @@ def test_intentional_selected_symbol_creates_one_buylist_queue_item(
         window.execution_queue_manager.items[queue_key("AAPL", "PROD")].selected_window
         == "1m"
     )
+    assert (
+        window.execution_queue_manager.items[queue_key("AAPL", "PROD")].account_no
+        == "12345678"
+    )
     result = window._last_execution_queue_refresh_result
     assert result.refreshed == 1
     assert result.missing_symbols == []
     assert result.status_counts == {"EXECUTE_READY": 1}
+
+
+def test_queue_refresh_uses_the_cards_account_not_the_selected_ui_account(
+    monkeypatch, tmp_path
+):
+    window = _build_queue_window(monkeypatch, tmp_path)
+    window.watchlist.get("AAPL").kis_account_no = "account-2"
+    monkeypatch.setattr(
+        buylist_view_module.buying_power_cache,
+        "get_snapshot",
+        lambda environment, account_no: (
+            SimpleNamespace(total_equity_usd=250_000.0)
+            if account_no == "account-2"
+            else None
+        ),
+    )
+
+    refreshed = MainWindow.refresh_execution_queue(
+        window,
+        "PROD",
+        show_log=False,
+        symbols=["AAPL"],
+        create_missing=True,
+    )
+
+    queue_item = window.execution_queue_manager.get_item("AAPL", "PROD")
+    assert refreshed == 1
+    assert queue_item.account_no == "account-2"
+    assert queue_item.candidates["1m"].shares > 0
+
+
+def test_existing_queue_preserves_buylist_mirror_account_after_ui_switch(
+    monkeypatch, tmp_path
+):
+    window = _build_queue_window(monkeypatch, tmp_path)
+    MainWindow.refresh_execution_queue(
+        window,
+        "PROD",
+        show_log=False,
+        symbols=["AAPL"],
+        create_missing=True,
+    )
+    queue_item = window.execution_queue_manager.get_item("AAPL", "PROD")
+    mirror = window.buylist_manager.get("AAPL", "PROD")
+    original_shares = queue_item.candidates["1m"].shares
+
+    window._first_account_no_for_environment = lambda _env: "other-account"
+    window._get_account_balance_for_env = lambda _env: 250_000.0
+    monkeypatch.setattr(
+        buylist_view_module.buying_power_cache,
+        "get_snapshot",
+        lambda environment, account_no: (
+            SimpleNamespace(total_equity_usd=100_000.0)
+            if account_no == "12345678"
+            else None
+        ),
+    )
+
+    refreshed = MainWindow.refresh_execution_queue(
+        window, "PROD", show_log=False
+    )
+
+    assert refreshed == 1
+    assert queue_item.account_no == "12345678"
+    assert mirror.kis_account_no == "12345678"
+    assert queue_item.candidates["1m"].shares == original_shares
+
+
+def test_active_canonical_account_reassigns_queue_and_repairs_mirror(
+    monkeypatch, tmp_path
+):
+    window = _build_queue_window(monkeypatch, tmp_path)
+    MainWindow.refresh_execution_queue(
+        window,
+        "PROD",
+        show_log=False,
+        symbols=["AAPL"],
+        create_missing=True,
+    )
+    queue_item = window.execution_queue_manager.get_item("AAPL", "PROD")
+    mirror = window.buylist_manager.get("AAPL", "PROD")
+    queue_item.locked = True
+    queue_item.manual_window_lock = True
+    queue_item.locked_reason = "Detached account-1 lock"
+    window._buyboard_current_projections = (
+        SimpleNamespace(
+            card=SimpleNamespace(
+                environment="PROD",
+                account_no="account-2",
+                symbol="AAPL",
+                board_status="BUY_TODAY",
+                buffer_pct=0.001,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        buylist_view_module.buying_power_cache,
+        "get_snapshot",
+        lambda environment, account_no: (
+            SimpleNamespace(total_equity_usd=250_000.0)
+            if account_no == "account-2"
+            else None
+        ),
+    )
+
+    refreshed = MainWindow.refresh_execution_queue(
+        window, "PROD", show_log=False
+    )
+
+    assert refreshed == 1
+    assert queue_item.account_no == "account-2"
+    assert mirror.kis_account_no == "account-2"
+    assert queue_item.locked is False
+    assert queue_item.manual_window_lock is False
+    assert queue_item.locked_reason is None
+
+
+def test_missing_canonical_equity_retains_last_good_published_queue(
+    monkeypatch, tmp_path
+):
+    window = _build_queue_window(monkeypatch, tmp_path)
+    MainWindow.refresh_execution_queue(
+        window,
+        "PROD",
+        show_log=False,
+        symbols=["AAPL"],
+        create_missing=True,
+    )
+    queue_item = window.execution_queue_manager.get_item("AAPL", "PROD")
+    before = queue_item.to_dict()
+    window._buyboard_current_projections = (
+        SimpleNamespace(
+            card=SimpleNamespace(
+                environment="PROD",
+                account_no="12345678",
+                symbol="AAPL",
+                board_status="BUY_TODAY",
+                buffer_pct=0.001,
+            )
+        ),
+    )
+    window._first_account_no_for_environment = lambda _env: "other-account"
+    window._get_account_balance_for_env = lambda _env: 250_000.0
+    monkeypatch.setattr(
+        buylist_view_module.buying_power_cache,
+        "get_snapshot",
+        lambda environment, account_no: None,
+    )
+
+    refreshed = MainWindow.refresh_execution_queue(
+        window, "PROD", show_log=False
+    )
+
+    assert refreshed == 0
+    assert window._last_execution_queue_refresh_result.failures == []
+    assert window._last_execution_queue_refresh_result.status_counts == {
+        "ACCOUNT_EQUITY_UNAVAILABLE": 1
+    }
+    assert queue_item.to_dict() == before
+    assert all(
+        candidate.status != OrbCandidateStatus.RISK_INVALID
+        for candidate in queue_item.candidates.values()
+    )
+
+
+def test_existing_queue_row_keeps_published_buffer_when_header_changes(
+    monkeypatch, tmp_path
+):
+    window = _build_queue_window(monkeypatch, tmp_path)
+    window._buyboard_orb_buffer_pct = lambda: 0.001
+    MainWindow.refresh_execution_queue(
+        window,
+        "PROD",
+        show_log=False,
+        symbols=["AAPL"],
+        create_missing=True,
+    )
+    queue_item = window.execution_queue_manager.get_item("AAPL", "PROD")
+    assert queue_item.candidates["1m"].breakout_trigger == pytest.approx(100.1)
+
+    window._buyboard_orb_buffer_pct = lambda: 0.02
+    buylist_item = window.buylist_manager.get("AAPL", "PROD")
+    # Simulate a pre-fix/local compatibility mirror already contaminated by
+    # another device's header. The canonical active card remains authoritative.
+    buylist_item.buffer_pct = 0.02
+    window.watchlist.get("AAPL").selected_orb_plan = {
+        "window": "1m",
+        "risk_percent": 0.005,
+        "buffer_pct": 0.02,
+    }
+    window._buyboard_current_projections = (
+        SimpleNamespace(
+            card=SimpleNamespace(
+                environment="PROD",
+                account_no="12345678",
+                symbol="AAPL",
+                board_status="BUY_TODAY",
+                buffer_pct=0.001,
+            )
+        ),
+    )
+    refreshed = MainWindow.refresh_execution_queue(
+        window, "PROD", show_log=False
+    )
+
+    queue_item = window.execution_queue_manager.get_item("AAPL", "PROD")
+    buylist_item = window.buylist_manager.get("AAPL", "PROD")
+    assert refreshed == 1
+    assert queue_item.candidates["1m"].breakout_trigger == pytest.approx(100.1)
+    assert queue_item.candidates["5m"].breakout_trigger == pytest.approx(100.1)
+    assert buylist_item.buffer_pct == pytest.approx(0.001)
 
 
 def test_saved_watchlist_orb_plan_is_reapplied_to_execution_queue(
@@ -548,6 +763,18 @@ def test_queue_order_review_uses_selected_candidate_values(monkeypatch, tmp_path
     assert "Limit price: $123.45" in review
     assert "Quantity: 7" in review
     assert "Limit price: $1.23" not in review
+
+
+def test_queue_order_review_missing_candidate_points_to_buy_today_plans():
+    review = MainWindow._format_execution_queue_order_review(
+        SimpleNamespace(),
+        "PROD",
+        SimpleNamespace(symbol="AAPL"),
+        SimpleNamespace(selected_candidate=None, candidates={}),
+    )
+
+    assert "Refresh the Buy Today ORB plans" in review
+    assert "watchlist" not in review.casefold()
 
 
 def test_legacy_active_row_is_blocked_once_before_auto_buy(monkeypatch, tmp_path):

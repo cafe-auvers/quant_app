@@ -872,23 +872,11 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
             symbol=card.symbol,
         )
         card.buylist_member = monitoring_command.enabled
-        if (
-            card.breakout_price
-            and (
-                int(card.planned_quantity or 0) > 0
-                or float(card.position_percent or 0.0) > 0
-            )
-        ):
-            # A durable target/allocation is a complete monitoring plan.
-            # ORB history can refine it later, but is not a prerequisite.
-            card.entry_runtime_status = EntryRuntimeStatus.EXECUTE_READY
-            card.entry_block_reason = ""
-        else:
-            # Planning columns do not own ORB runtime state.  Every activation
-            # starts a fresh current-session observation instead of carrying a
-            # stale Buylist diagnostic into Buy Today.
-            card.entry_runtime_status = EntryRuntimeStatus.ORB_FORMING
-            card.entry_block_reason = ""
+        # Planning columns do not own current-session ORB runtime state.
+        # Every activation starts a fresh observation; a target/allocation by
+        # itself must never bypass the 1m/5m/30m ORB requirement.
+        card.entry_runtime_status = EntryRuntimeStatus.ORB_FORMING
+        card.entry_block_reason = ""
     elif isinstance(command, types.RequestSellAll):
         # This is durable liquidation intent only.  The engine cancels a
         # conflicting BUY, refreshes quantity, submits, and reconciliation
@@ -1001,6 +989,25 @@ def request_board_action(
             f"Command {command.command_id} expected version "
             f"{command.expected_card_version}, stored version is {card.version}"
         )
+
+    if isinstance(command, ActivateForToday):
+        for other in trade_card_repository.list_trade_cards(
+            engine,
+            environment=command.environment,
+            raise_on_error=True,
+        ):
+            if (
+                str(other.symbol or "").strip().upper()
+                == str(command.symbol or "").strip().upper()
+                and str(other.account_no or "").strip()
+                != str(command.account_no or "").strip()
+                and other.board_status == BoardStatus.BUY_TODAY
+            ):
+                raise BoardCommandRejectedError(
+                    f"{command.symbol} is already active in Buy Today for "
+                    "another account. The ORB queue is symbol-scoped, so "
+                    "only one account can activate that symbol at a time."
+                )
 
     _require_current_board_runtime(command, card, resolved_context)
 

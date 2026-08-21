@@ -1,5 +1,6 @@
 """Buylist widgets, table rendering, and execution-queue persistence."""
 
+import math
 from typing import Any, List, Optional, Tuple
 
 from PyQt5.QtCore import Qt, QThread, QTimer
@@ -11,6 +12,7 @@ from PyQt5.QtWidgets import (QAbstractItemView, QDialog, QHBoxLayout,
 
 from src.services.app_state import (
     archive_non_production_execution_queue_state, quarantine_rejected_records)
+from src.services import buying_power_cache
 from src.utils.storage import load_json, save_json
 
 from .constants import EXECUTION_QUEUE_FILE
@@ -755,12 +757,150 @@ class BuylistViewMixin:
             )
             if risk_percent <= 0:
                 risk_percent = 0.01
-            buffer_pct = (
-                self._watchlist_orb_buffer_pct()
-                if hasattr(self, "_watchlist_orb_buffer_pct")
-                else 0.001
-            )
+            if hasattr(self, "_buyboard_orb_buffer_pct"):
+                buffer_pct = self._buyboard_orb_buffer_pct()
+            elif hasattr(self, "_watchlist_orb_buffer_pct"):
+                # Compatibility for lightweight callers during the UI
+                # migration; MainWindow always owns the Buy Board parser.
+                buffer_pct = self._watchlist_orb_buffer_pct()
             account_no = self._first_account_no_for_environment(env) or ""
+
+        published_buffers: dict[str, set[float]] = {}
+        active_accounts: dict[str, set[str]] = {}
+        canonical_accounts: dict[str, set[str]] = {}
+        for projection in tuple(
+            self.__dict__.get("_buyboard_current_projections", ()) or ()
+        ):
+            card = getattr(projection, "card", projection)
+            if str(getattr(card, "environment", "") or "").upper() != env:
+                continue
+            status = str(
+                getattr(getattr(card, "board_status", ""), "value", None)
+                or getattr(card, "board_status", "")
+            ).upper()
+            symbol = str(getattr(card, "symbol", "") or "").strip().upper()
+            card_account = str(
+                getattr(card, "account_no", "") or ""
+            ).strip()
+            if symbol and card_account and status not in {"", "WATCHLIST", "CLOSED"}:
+                canonical_accounts.setdefault(symbol, set()).add(card_account)
+            if symbol and card_account and status == "BUY_TODAY":
+                active_accounts.setdefault(symbol, set()).add(card_account)
+            if status in {"", "WATCHLIST", "BUYLIST", "CLOSED"}:
+                continue
+            try:
+                value = float(getattr(card, "buffer_pct", None))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if symbol and math.isfinite(value) and 0.0 <= value <= 1.0:
+                published_buffers.setdefault(symbol, set()).add(value)
+
+        target_accounts: dict[str, str] = {}
+        queue_accounts: dict[str, str] = {}
+        for item in target_items:
+            symbol = str(
+                getattr(item, "symbol", "") or ""
+            ).strip().upper()
+            if not symbol:
+                continue
+            mirror = self.buylist_manager.get(symbol, env)
+            mirror_account = str(
+                getattr(mirror, "kis_account_no", "") or ""
+            ).strip()
+            item_account = str(
+                getattr(item, "kis_account_no", "") or ""
+            ).strip()
+            target_accounts[symbol] = mirror_account or item_account
+            queue_item = (
+                manager.get_item(symbol, env)
+                if manager is not None
+                else None
+            )
+            queue_accounts[symbol] = str(
+                getattr(queue_item, "account_no", "") or ""
+            ).strip()
+
+        def account_no_for_symbol(symbol: str) -> str:
+            active = active_accounts.get(symbol, set())
+            if len(active) > 1:
+                raise ValueError(
+                    f"{symbol} is active in Buy Today for multiple accounts"
+                )
+            if active:
+                return next(iter(active))
+
+            canonical = canonical_accounts.get(symbol, set())
+            if len(canonical) == 1:
+                return next(iter(canonical))
+
+            mirror_account = target_accounts.get(symbol, "")
+            queue_account = queue_accounts.get(symbol, "")
+            if len(canonical) > 1:
+                for candidate_account in (mirror_account, queue_account):
+                    if candidate_account in canonical:
+                        return candidate_account
+                raise ValueError(
+                    f"{symbol} exists in Buylist for multiple accounts"
+                )
+            return mirror_account or queue_account or account_no
+
+        def account_size_for_account(
+            environment: str, resolved_account_no: str
+        ) -> Optional[float]:
+            snapshot = buying_power_cache.get_snapshot(
+                environment,
+                resolved_account_no,
+            )
+            if snapshot is not None and snapshot.total_equity_usd > 0:
+                return float(snapshot.total_equity_usd)
+            if resolved_account_no == account_no:
+                fallback = float(account_size or 0.0)
+                return fallback if fallback > 0 else None
+            return None
+
+        def persisted_buffer_for_symbol(symbol: str) -> Optional[float]:
+            """Freeze every existing queue row to its published buffer.
+
+            The header is a default for a newly queued plan. Periodic ORB
+            refreshes, executor handoff, and manual window locks must keep the
+            buffer already written to that symbol's Buylist/card state.
+            """
+
+            canonical = published_buffers.get(symbol, set())
+            if len(canonical) > 1:
+                raise ValueError(
+                    f"Conflicting published ORB buffers exist for {symbol}"
+                )
+            if canonical:
+                return next(iter(canonical))
+            existing = self.buylist_manager.get(symbol, env)
+            if existing is not None:
+                try:
+                    value = float(getattr(existing, "buffer_pct", None))
+                except (TypeError, ValueError, OverflowError):
+                    value = None
+                if (
+                    value is not None
+                    and math.isfinite(value)
+                    and 0.0 <= value <= 1.0
+                ):
+                    return value
+            watchlist = self.__dict__.get("watchlist")
+            getter = getattr(watchlist, "get", None)
+            watch_item = getter(symbol) if callable(getter) else None
+            saved_plan = getattr(watch_item, "selected_orb_plan", None)
+            if isinstance(saved_plan, dict):
+                try:
+                    value = float(saved_plan.get("buffer_pct"))
+                except (TypeError, ValueError, OverflowError):
+                    value = None
+                if (
+                    value is not None
+                    and math.isfinite(value)
+                    and 0.0 <= value <= 1.0
+                ):
+                    return value
+            return None
 
         return ExecutionQueueRefreshRequest(
             env=env,
@@ -772,7 +912,10 @@ class BuylistViewMixin:
             account_size=account_size,
             risk_percent=risk_percent,
             buffer_pct=buffer_pct,
+            buffer_pct_for_symbol=persisted_buffer_for_symbol,
             account_no=account_no,
+            account_no_for_symbol=account_no_for_symbol,
+            account_size_for_account=account_size_for_account,
             trade_card_engine=(
                 self._execution_state_engine()
                 if callable(getattr(self, "_execution_state_engine", None))
@@ -819,7 +962,7 @@ class BuylistViewMixin:
                 )
             else:
                 self.append_log(
-                    f"[Execution Queue/{result.env}] No selected watchlist symbols could be queued."
+                    f"[Execution Queue/{result.env}] No selected planning symbols could be queued."
                 )
             if result.missing_symbols:
                 self.append_log(
@@ -911,7 +1054,7 @@ class BuylistViewMixin:
         watch_item.selected_orb_plan = None
         self._save_state()
         self.append_log(
-            f"Cleared saved Watchlist ORB selection for {str(symbol).strip().upper()}; auto selection is enabled."
+            f"Cleared saved ORB-window selection for {str(symbol).strip().upper()}; auto selection is enabled."
         )
         return True
 
@@ -961,7 +1104,7 @@ class BuylistViewMixin:
         if candidate is None:
             return (
                 f"{item.symbol} has no ORB candidate computed yet.\n\n"
-                "Click 'Refresh Queue' on the watchlist to recalculate."
+                "Refresh the Buy Today ORB plans and try again."
             )
 
         account_no = self._first_account_no_for_environment(env) or "<not selected>"

@@ -119,7 +119,7 @@ def test_buy_today_can_be_planned_before_runtime_worker_exists(tmp_path):
     assert window.refresh_count == 1
 
 
-def test_buy_today_target_allocation_is_armed_without_orb_history(tmp_path):
+def test_buy_today_target_allocation_waits_for_current_session_orb(tmp_path):
     engine = _engine(tmp_path)
     card = card_repo.create_trade_card(
         engine,
@@ -141,7 +141,7 @@ def test_buy_today_target_allocation_is_armed_without_orb_history(tmp_path):
     )
 
     assert result.card.board_status == BoardStatus.BUY_TODAY
-    assert result.card.entry_runtime_status == EntryRuntimeStatus.EXECUTE_READY
+    assert result.card.entry_runtime_status == EntryRuntimeStatus.ORB_FORMING
     assert result.card.breakout_price == 160.0
     assert result.card.position_percent == 20.0
 

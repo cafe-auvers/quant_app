@@ -63,8 +63,7 @@ from src.ui.filter_catalog import (DEFAULT_SCANNER_SETUPS, DEFAULT_SETTINGS,
 from src.ui.workers import (FxRateWorker, IntradayBulkFetchWorker,
                             IntradayFetchWorker, KisAccountWorker,
                             KisOrderWorker, KisStartupAccountsWorker,
-                            OrderReconciliationWorker, ScannerWorker,
-                            SingleStockAiWorker, WatchlistAiWorker)
+                            OrderReconciliationWorker, ScannerWorker)
 from src.utils.data_loader import (_extract_symbol_history,
                                    download_price_history,
                                    get_default_universe)
@@ -109,6 +108,10 @@ class DashboardMixin:
             self.populate_kis_account_combo
         )
         self.kis_environment_combo.setVisible(False)
+        # Neutral PROD environment aliases formerly created by the removed
+        # Watchlist tab. Account, queue, and chart code share this one source.
+        self.trade_kis_environment_combo = self.kis_environment_combo
+        self.watchlist_env_combo = self.kis_environment_combo
         kis_form.addRow("Profile", QLabel("PROD — Live Trading"))
 
         self.kis_account_combo = QComboBox()
@@ -243,38 +246,14 @@ class DashboardMixin:
         self.refresh_hourly_button.setObjectName("refreshHourlyButton")
         self.refresh_hourly_button.clicked.connect(self.refresh_hourly_data_to_db)
         button_layout.addWidget(self.refresh_hourly_button)
-        self.refresh_intraday_button = QPushButton("Update Watchlist Intraday")
+        # The bulk-fetch completion path still uses this compatibility handle
+        # to disable/re-enable refreshes. It is deliberately not added to the
+        # Dashboard: Buy Today ORB data has its own focused one-minute refresh
+        # in BuyboardMixin, so the retired Watchlist-wide fetch cannot consume
+        # market-hours resources.
+        self.refresh_intraday_button = QPushButton("Refresh Buy Today ORB Data")
         self.refresh_intraday_button.setObjectName("refreshIntradayButton")
-        self.refresh_intraday_button.clicked.connect(
-            self.refresh_watchlist_intraday_cache
-        )
-        button_layout.addWidget(self.refresh_intraday_button)
         layout.addLayout(button_layout)
-
-        live_group = QGroupBox("Live Intraday Updates")
-        live_layout = QHBoxLayout()
-        self.live_data_checkbox = QCheckBox("Live Data Auto Refresh")
-        self.live_data_checkbox.toggled.connect(self._on_live_data_toggled)
-        live_layout.addWidget(self.live_data_checkbox)
-
-        self.live_refresh_minutes_spin = QSpinBox()
-        self.live_refresh_minutes_spin.setRange(1, 60)
-        self.live_refresh_minutes_spin.setValue(5)
-        self.live_refresh_minutes_spin.setSuffix(" min")
-        self.live_refresh_minutes_spin.valueChanged.connect(
-            self._on_live_refresh_interval_changed
-        )
-        live_layout.addWidget(QLabel("Every"))
-        live_layout.addWidget(self.live_refresh_minutes_spin)
-
-        self.live_data_source_label = QLabel(format_intraday_source_label("yfinance"))
-        self.live_data_source_label.setWordWrap(True)
-        live_layout.addWidget(self.live_data_source_label, stretch=1)
-
-        self.live_data_status_label = QLabel("Live data: off")
-        live_layout.addWidget(self.live_data_status_label)
-        live_group.setLayout(live_layout)
-        layout.addWidget(live_group)
 
         self.dashboard_widget.setLayout(layout)
         self.populate_kis_account_combo()
@@ -1372,7 +1351,6 @@ class DashboardMixin:
 
         text = (
             f"Scanner yielded {len(self.scanner_results)} candidates.\n"
-            f"Watchlist contains {len(self.watchlist.items)} symbols.\n"
             + ("\n".join(buylist_lines) + "\n" if buylist_lines else "")
             + f"Active trade plans: {len(self.trade_manager.get_active_plans())}.\n"
             f"MySQL cache: {db_status}.\n"
@@ -1414,105 +1392,6 @@ class DashboardMixin:
     def _previous_weekday(day: dt.date) -> dt.date:
         """Backward-compatible name for callers of the old dashboard helper."""
         return previous_nyse_trading_day(day)
-
-    def run_single_stock_ai_analysis(self) -> None:
-        """Run the new detailed single stock AI quantitative analysis."""
-        existing_worker = self.__dict__.get("single_ai_worker")
-        if existing_worker is not None and existing_worker.isRunning():
-            QMessageBox.information(
-                self,
-                "Analysis running",
-                "A single-stock AI analysis is already running. Wait for it to finish before starting another one.",
-            )
-            return
-        selected_rows = self.watchlist_table.selectionModel().selectedRows()
-        if not selected_rows:
-            QMessageBox.information(
-                self,
-                "No Selection",
-                "Please select a stock from the watchlist to analyze.",
-            )
-            return
-
-        row = selected_rows[0].row()
-        symbol_item = self.watchlist_table.item(row, 0)
-        if symbol_item is None:
-            return
-
-        symbol = symbol_item.text().strip().upper()
-
-        # Show sidebar and set loading state
-        self.ai_sidebar.setVisible(True)
-        self.ai_report_view.setHtml(
-            f"<h3>Analyzing {symbol}...</h3><p>Running detailed quantitative swing-trading assessment. Please wait...</p>"
-        )
-
-        # Create and start the worker thread for single stock analysis
-        self.single_ai_worker = SingleStockAiWorker(
-            symbol, self.watchlist.get(symbol), self.db_engine, self
-        )
-        self.single_ai_worker.finished_analysis.connect(
-            self.on_single_stock_ai_finished
-        )
-        self._track_worker("single_ai_worker", self.single_ai_worker)
-        self.single_ai_worker.start()
-
-    def on_single_stock_ai_finished(self, ai_res: dict) -> None:
-        """Called when single stock AI analysis worker thread finishes."""
-        if "error" in ai_res:
-            self.ai_report_view.setHtml(
-                f"<h3>Analysis Failed</h3><p>{ai_res['error']}</p>"
-            )
-            return
-
-        full_json = ai_res.get("full_json")
-        if not full_json:
-            self.ai_report_view.setHtml(
-                "<h3>Analysis Error</h3><p>Could not retrieve report data.</p>"
-            )
-            return
-
-        # Update the local watchlist dictionary and scores mapping
-        symbol = full_json.get("symbol", "").upper().strip()
-        item = self.watchlist.get(symbol)
-        if item:
-            item.ai_analysis = ai_res
-
-        # Update self.watchlist_scores so the table row matches
-        if not hasattr(self, "watchlist_scores"):
-            self.watchlist_scores = {}
-
-        # Map back to scoreboard structure expected by table formatter
-        self.watchlist_scores[symbol] = {
-            "price": full_json.get("risk_assessment", {}).get("entry_price", 0.0),
-            "total_score": full_json.get("total_score", 0),
-            "status": full_json.get("decision", "WATCHING"),
-            "rr": 0.0,
-            "stop_adr": full_json.get("risk_assessment", {}).get(
-                "stop_distance_pct", 0.0
-            ),
-            "risk_percent": full_json.get("risk_assessment", {}).get(
-                "account_risk_pct", 0.0
-            ),
-            "position_percent": full_json.get("risk_assessment", {}).get(
-                "position_size_pct", 0.0
-            ),
-            "env": (
-                self.watchlist_env_combo.currentText()
-                if hasattr(self, "watchlist_env_combo")
-                else "PROD"
-            ),
-        }
-
-        # Format the html report
-        from src.core.scoring import render_quant_analysis_html
-
-        html = render_quant_analysis_html(full_json)
-        self.ai_report_view.setHtml(html)
-
-        # Redraw table and save state on main GUI thread safely
-        self.populate_watchlist_table()
-        self._save_state()
 
     def _score_growth_rank(self, stock: dict) -> float:
         return stock.get("growth_rank", 0.0) / 100.0
