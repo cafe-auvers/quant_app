@@ -584,6 +584,30 @@ def test_legacy_active_row_is_blocked_once_before_auto_buy(monkeypatch, tmp_path
     assert "only EXECUTE_READY execution-queue" in matching_logs[0]
 
 
+def test_rejected_execution_queue_item_is_not_refreshed_by_legacy_monitor(
+    monkeypatch, tmp_path
+):
+    window = _build_queue_window(monkeypatch, tmp_path)
+    refreshes = []
+    item = SimpleNamespace(
+        symbol="AAPL",
+        environment="PROD",
+        monitoring_status=ExecutionQueueStatus.REJECTED.value,
+        breakout_method="execution_queue:5m",
+        orb_monitor_enabled=True,
+        _buy_order_pending=False,
+    )
+    window.buylist_manager = SimpleNamespace(items=[item])
+    window._restore_monitorable_buylist_error_positions = lambda *_args: None
+    window.refresh_watchlist_intraday_cache = (
+        lambda **kwargs: refreshes.append(kwargs)
+    )
+
+    MainWindow._run_buylist_monitor_cycle(window, "PROD")
+
+    assert refreshes == []
+
+
 def _healthy_buyboard_worker():
     """A fake BuyboardRuntimeWorker reporting confirmed health, for tests
     exercising legacy-suppression behavior once the new engine is

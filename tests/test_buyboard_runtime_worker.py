@@ -290,6 +290,34 @@ def test_construction_builds_nothing(tmp_path):
     assert worker.runtime is None
 
 
+def test_card_cache_downloads_payload_only_when_revision_changes(
+    tmp_path, monkeypatch
+):
+    worker, engine = _worker(tmp_path)
+    _seed_card(engine)
+    real_list = repo.list_trade_cards
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(True)
+        return real_list(*args, **kwargs)
+
+    monkeypatch.setattr(repo, "list_trade_cards", counted)
+
+    first = worker._load_cards_if_changed()
+    second = worker._load_cards_if_changed()
+    assert first is second
+    assert len(calls) == 1
+
+    card = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    card.name = "Changed elsewhere"
+    repo.update_trade_card(engine, card, expected_version=card.version)
+
+    third = worker._load_cards_if_changed()
+    assert third[0].name == "Changed elsewhere"
+    assert len(calls) == 2
+
+
 def test_default_worker_scheduler_uses_production_spacing_and_no_retry(
     tmp_path, monkeypatch
 ):
@@ -932,6 +960,33 @@ def test_database_probe_logs_one_concise_warning_for_an_outage(
     ]
     assert len(warnings) == 1
     assert all(record.exc_info is None for record in warnings)
+
+
+def test_database_outage_alert_uses_offline_spool_seam(tmp_path):
+    worker, _ = _worker(tmp_path)
+    calls = []
+
+    class Alerting:
+        @staticmethod
+        def sink(*_args, **_kwargs):
+            raise AssertionError("offline outage must not retry canonical storage")
+
+        @staticmethod
+        def sink_offline(*args, **kwargs):
+            calls.append((args, kwargs))
+
+    worker._external_alerting = Alerting()
+    worker._database_writable = False
+
+    worker._raise_external_alert(
+        CriticalAlertType.DATABASE_UNAVAILABLE,
+        "PROD:device-1",
+        "database offline",
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0][0] == CriticalAlertType.DATABASE_UNAVAILABLE
+    assert calls[0][1]["deliver_directly"] is False
 
 
 def test_market_data_queue_requires_more_than_two_late_checks_to_block(tmp_path):
@@ -2539,6 +2594,65 @@ def test_sync_orb_plans_applies_the_execution_queue_bridge(tmp_path):
     assert card.entry_trigger == 101.5
 
 
+def test_sync_orb_plans_does_not_mark_price_only_movement_for_db_write(tmp_path):
+    worker, engine = _worker(tmp_path)
+    card = _seed_card(engine, board_status=BoardStatus.BUY_TODAY)
+    candidate = OrbCandidate(
+        symbol="AAPL",
+        window="5m",
+        orb_low=95.0,
+        orb_high=101.0,
+        entry_trigger=101.5,
+        current_price=100.0,
+        shares=10,
+        status=OrbCandidateStatus.WAITING_BREAKOUT,
+    )
+    item = ExecutionQueueItem(
+        symbol="AAPL",
+        environment="PROD",
+        current_price=100.0,
+        candidates={"5m": candidate},
+        selected_window="5m",
+    )
+    worker._execution_queue_item_lookup = lambda *_args: item
+    assert worker._sync_orb_plans([card]) == [card]
+
+    item.current_price = 100.25
+    item.last_updated = dt.datetime.now(dt.timezone.utc)
+
+    assert worker._sync_orb_plans([card]) == []
+    assert card.market_data_last_trusted_price == 100.25
+
+
+def test_sync_orb_plans_returns_fully_rejected_card_to_buylist(tmp_path):
+    worker, engine = _worker(tmp_path)
+    card = _seed_card(
+        engine,
+        board_status=BoardStatus.BUY_TODAY,
+        planned_quantity=10,
+        target_position_quantity=10,
+    )
+    item = ExecutionQueueItem(symbol="AAPL", environment="PROD")
+    item.candidates = {
+        window: OrbCandidate(
+            symbol="AAPL",
+            window=window,
+            status=OrbCandidateStatus.REJECTED,
+            valid=False,
+            reason=f"{window} invalid",
+        )
+        for window in ("1m", "5m", "30m")
+    }
+    worker._execution_queue_item_lookup = lambda symbol, env: item
+
+    changed = worker._sync_orb_plans([card])
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.BUYLIST
+    assert card.planned_quantity == 0
+    assert "all ORB plans invalid" in card.buy_today_note
+
+
 def test_sync_orb_plans_is_a_no_op_without_a_lookup_wired(tmp_path):
     worker, engine = _worker(tmp_path)
     card = _seed_card(engine, board_status=BoardStatus.BUY_TODAY)
@@ -2681,6 +2795,55 @@ def test_controlled_live_allowlisted_buy_today_remains_execution_critical(
         SubscriptionPriority.BUY_TODAY
     )
     assert worker._card_in_execution_scope(candidate) is True
+
+
+def test_buy_today_subscription_priority_focuses_ready_and_armed_entries(
+    tmp_path, monkeypatch
+):
+    worker, _ = _worker(tmp_path)
+    configured = {}
+
+    class _MarketData:
+        def configure_desired_channels(self, **kwargs):
+            configured.update(kwargs)
+
+    worker.runtime = SimpleNamespace(market_data=_MarketData())
+    monkeypatch.setattr(
+        execution_config, "is_buyboard_engine_enabled", lambda: True
+    )
+    monkeypatch.setattr(execution_config, "KIS_LIVE_EXECUTION_MODE", "FULL_LIVE")
+    cards = [
+        TradeCardState(
+            environment="PROD",
+            account_no="1",
+            symbol="READY",
+            board_status=BoardStatus.BUY_TODAY,
+            entry_runtime_status=EntryRuntimeStatus.EXECUTE_READY,
+        ),
+        TradeCardState(
+            environment="PROD",
+            account_no="1",
+            symbol="ARMED",
+            board_status=BoardStatus.BUY_TODAY,
+            entry_runtime_status=EntryRuntimeStatus.WAITING_BREAKOUT,
+        ),
+        TradeCardState(
+            environment="PROD",
+            account_no="1",
+            symbol="FORMING",
+            board_status=BoardStatus.BUY_TODAY,
+            entry_runtime_status=EntryRuntimeStatus.ORB_FORMING,
+        ),
+    ]
+
+    worker._sync_quote_subscriptions(cards)
+
+    assert configured["trade_priorities"] == {
+        "READY": int(SubscriptionPriority.ENTRY_READY),
+        "ARMED": int(SubscriptionPriority.ENTRY_ARMED),
+        "FORMING": int(SubscriptionPriority.BUY_TODAY),
+    }
+    assert configured["quote_priorities"] == configured["trade_priorities"]
 
 
 class _AccountExecutionBroker(FakeExecutionBroker):

@@ -63,6 +63,7 @@ def test_to_dict_from_dict_round_trip():
         pending_stop_command_id="STOP-1",
         pending_stop_requested_at=datetime(2026, 8, 17, tzinfo=timezone.utc),
         exit_all_required=False,
+        buy_today_note="All ORB plans were invalid.",
         warnings=["migrated_from_buylist"],
     )
     restored = TradeCardState.from_dict(card.to_dict())
@@ -73,6 +74,7 @@ def test_to_dict_from_dict_round_trip():
     assert restored.stop_type == StopType.ORB_LOW
     assert restored.pending_stop_type == StopType.MANUAL_PRICE
     assert restored.pending_stop_command_id == "STOP-1"
+    assert restored.buy_today_note == "All ORB plans were invalid."
 
 
 def test_non_finite_floats_are_dropped_to_none():

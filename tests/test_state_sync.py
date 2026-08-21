@@ -282,6 +282,33 @@ def test_pull_only_pc_cannot_seed_or_overwrite_first_sync(monkeypatch, tmp_path)
     assert app_state.load_json(pc_paths["WATCHLIST_FILE"], {}) == current
 
 
+def test_unchanged_pull_only_sync_uses_revisions_without_payload_downloads(
+    monkeypatch, tmp_path
+):
+    engine = _make_engine(tmp_path)
+    laptop_paths = _use_machine(monkeypatch, tmp_path / "laptop")
+    _save_local_state(laptop_paths, {"items": [{"symbol": "AAPL"}]})
+    laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    assert not app_state.reconcile_state_with_remote(engine, laptop).errors
+
+    _use_machine(monkeypatch, tmp_path / "pc")
+    pc = ss.LocalDeviceRole("pc-id", "PC", False)
+    assert not app_state.reconcile_state_with_remote(engine, pc).errors
+
+    payload_reads = []
+    real_pull = app_state.pull_state
+
+    def counted_pull(*args, **kwargs):
+        payload_reads.append(True)
+        return real_pull(*args, **kwargs)
+
+    monkeypatch.setattr(app_state, "pull_state", counted_pull)
+    result = app_state.reconcile_state_with_remote(engine, pc)
+
+    assert not result.errors
+    assert payload_reads == []
+
+
 def test_activating_pc_deactivates_laptop_and_rejects_old_writer(
     monkeypatch, tmp_path
 ):
@@ -601,100 +628,6 @@ def test_pull_only_device_blocks_low_level_order_submission(monkeypatch):
     assert item._buy_order_pending is False
     assert warnings
     assert any("pull-only" in message.lower() for message in messages)
-
-
-def test_main_device_button_reflects_exclusive_role():
-    class Button:
-        def __init__(self):
-            self.text = ""
-            self.enabled = None
-            self.tooltip = ""
-
-        def setEnabled(self, value):
-            self.enabled = value
-
-        def setText(self, value):
-            self.text = value
-
-        def setStyleSheet(self, value):
-            pass
-
-        def setToolTip(self, value):
-            self.tooltip = value
-
-    window = MainWindow.__new__(MainWindow)
-    window.main_device_button = Button()
-    window.pc_db_engine = object()
-    window.db_initializing = False
-    window.state_sync_role = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
-
-    window._update_main_device_button()
-    assert window.main_device_button.text == "Main Device: ON"
-    assert window.main_device_button.enabled is True
-
-    window.state_sync_role = ss.LocalDeviceRole("laptop-id", "LAPTOP", False)
-    window._update_main_device_button(main_hostname="PC")
-    assert window.main_device_button.text == "Use This Device as Main"
-    assert "PC" in window.main_device_button.tooltip
-
-    window.pc_db_engine = None
-    window._pc_database_ready = False
-    window._update_main_device_button(main_hostname="PC")
-    assert window.main_device_button.enabled is False
-    assert window.main_device_button.text == "Main unavailable: Kanban store offline"
-    assert "local Kanban operational store could not be opened" in (
-        window.main_device_button.tooltip
-    )
-
-    window.db_initializing = True
-    window._main_availability_probe_complete = False
-    window._update_main_device_button()
-    assert window.main_device_button.text == (
-        "Checking Main availability (up to 3s)..."
-    )
-
-    window._main_availability_probe_complete = True
-    window._main_availability_probe_database_ready = False
-    window._update_main_device_button()
-    assert window.main_device_button.text == "Main unavailable: Kanban store offline"
-
-
-def test_local_kanban_store_allows_main_activation_without_history_database():
-    class Button:
-        def __init__(self):
-            self.text = ""
-            self.enabled = None
-            self.tooltip = ""
-
-        def setEnabled(self, value):
-            self.enabled = value
-
-        def setText(self, value):
-            self.text = value
-
-        def setStyleSheet(self, _value):
-            pass
-
-        def setToolTip(self, value):
-            self.tooltip = value
-
-    operational_engine = object()
-    window = MainWindow.__new__(MainWindow)
-    window.main_device_button = Button()
-    window.operational_db_engine = operational_engine
-    window._operational_database_ready = True
-    window.pc_db_engine = None
-    window._pc_database_ready = False
-    window.db_initializing = False
-    window.state_sync_role = ss.LocalDeviceRole("laptop-id", "LAPTOP", False)
-
-    window._update_main_device_button()
-
-    assert window._execution_state_engine() is operational_engine
-    assert window._execution_state_ready() is True
-    assert window.main_device_button.enabled is True
-    assert window.main_device_button.text == "Use This Device as Main"
-    assert "local Kanban store" in window.main_device_button.tooltip
 
 
 # --- Fenced ownership primitives (automatic cross-machine handoff) --------

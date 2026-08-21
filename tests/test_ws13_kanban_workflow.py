@@ -8,7 +8,7 @@ from datetime import date
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.pool import NullPool
 
 from src.core.board_workflow import (
@@ -114,6 +114,35 @@ def _seed(engine, **overrides):
 def _projection(engine, card, **context_overrides):
     context = BoardProjectionContext(**context_overrides)
     return workflow.project_board_card(engine, card, context=context)
+
+
+def test_board_projection_query_count_is_constant_not_per_card(tmp_path):
+    engine = _engine(tmp_path)
+    for index in range(12):
+        _seed(
+            engine,
+            symbol=f"SYM{index}",
+            board_status=BoardStatus.BUYLIST,
+            position_runtime_status=PositionRuntimeStatus.NONE,
+            broker_quantity=0,
+            orderable_quantity=0,
+        )
+    # Ensure all four projection tables before counting application reads.
+    workflow.get_board_projection_revision(engine)
+    statements = []
+
+    def capture(_conn, _cursor, statement, _parameters, _context, _many):
+        if statement.lstrip().upper().startswith("SELECT"):
+            statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        projections = workflow.list_board_projections(engine)
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+
+    assert len(projections) == 12
+    assert len(statements) == 4
 
 
 def _command(command_type, projection, **kwargs):

@@ -4,7 +4,11 @@ from types import SimpleNamespace
 
 import src.ui.main_window as main_window_module
 from src.core.runtime_readiness import EngineReadiness, RuntimeDeviceState
-from src.ui.main_window import MainWindow, _buyboard_readiness_display
+from src.ui.main_window import (
+    MainWindow,
+    _buyboard_readiness_display,
+    _live_execution_status_text,
+)
 
 
 def _readiness(**overrides) -> EngineReadiness:
@@ -22,6 +26,28 @@ def _readiness(**overrides) -> EngineReadiness:
     )
     values.update(overrides)
     return EngineReadiness(**values)
+
+
+def test_live_execution_status_names_the_controlled_scope(monkeypatch):
+    monkeypatch.setattr(
+        main_window_module.execution_config,
+        "KIS_LIVE_EXECUTION_MODE",
+        "CONTROLLED_LIVE",
+    )
+    monkeypatch.setattr(
+        main_window_module.execution_config,
+        "KIS_CONTROLLED_LIVE_SYMBOLS",
+        ("STIM",),
+    )
+    monkeypatch.setattr(
+        main_window_module.execution_config,
+        "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL",
+        0.01,
+    )
+
+    assert _live_execution_status_text(True) == (
+        "Enabled (CONTROLLED_LIVE: STIM, max $0.01/entry)"
+    )
 
 
 def test_closed_session_stale_quote_is_informational_and_symbol_scoped():

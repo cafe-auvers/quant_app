@@ -37,6 +37,10 @@ from src.core.scanner import StockScanner
 from src.core.trade_reviewer import TradeReviewer
 from src.core.watchlist import BuylistManager, TradePlanManager, Watchlist
 from src.infrastructure.database.mirror_engine import resolve_data_engine
+from src.infrastructure.database.coordination_engine import (
+    coordination_database_configured,
+    init_coordination_engine,
+)
 from src.infrastructure.database.mirror_freshness import (
     local_mirror_hourly_is_stale, local_mirror_is_stale)
 from src.infrastructure.database.operational_engine import (
@@ -54,6 +58,7 @@ from src.services.app_state import (EXECUTION_QUEUE_FILE, SETTINGS_FILE,
                                     load_trade_plans_state,
                                     load_watchlist_state,
                                     publish_handoff_snapshot,
+                                    publish_trading_plan,
                                     reconcile_state_with_remote,
                                     release_main_device_and_demote,
                                     save_app_state, should_auto_claim_main)
@@ -74,7 +79,10 @@ from src.services.sleep_readiness import write_sleep_readiness_snapshot
 from src.services.state_sync import (
     LocalDeviceRole,
     get_live_trading_control,
+    get_operator_control,
+    get_synced_state_revisions,
     load_local_device_role,
+    set_operator_control,
     set_live_trading_control,
 )
 from src.ui.buylist import BuylistMixin
@@ -98,6 +106,7 @@ from src.ui.order_workers import HandoffReconciliationWorker
 from src.ui.workers import PcRemoteStatusWorker, WatchlistAiWorker
 from src.utils.config import DATA_DIR, ROOT_DIR, RULEBOOK_DIR, get_env_value
 from src.utils.data_loader import get_default_universe
+from src.utils.device_identity import detect_local_device_kind, runtime_device_kind
 from src.utils.intraday_helpers import \
     extract_latest_opening_bar as _extract_latest_opening_bar
 from src.utils.market_calendar import (expected_latest_market_data_date,
@@ -161,6 +170,18 @@ def _format_readiness_eta(seconds: float) -> str:
     minutes, seconds = divmod(remainder, 60)
     prefix = f"{days}d " if days else ""
     return f"{prefix}{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _live_execution_status_text(enabled: bool) -> str:
+    """Describe both the shared switch and the configured broker envelope."""
+
+    switch = "Enabled" if bool(enabled) else "Disabled"
+    mode = str(execution_config.KIS_LIVE_EXECUTION_MODE or "DISABLED").upper()
+    if mode != "CONTROLLED_LIVE":
+        return f"{switch} ({mode})"
+    symbols = ",".join(execution_config.KIS_CONTROLLED_LIVE_SYMBOLS) or "none"
+    cap = float(execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL or 0.0)
+    return f"{switch} (CONTROLLED_LIVE: {symbols}, max ${cap:,.2f}/entry)"
 
 
 def _per_symbol_quote_guard_detail(
@@ -286,7 +307,7 @@ def _buyboard_readiness_display(
     tooltip_parts.append(
         "Automatic PC claim is enabled."
         if auto_claim_enabled
-        else "Automatic main-device claim is disabled."
+        else "Automatic execution-owner claim is disabled."
     )
     return BuyboardReadinessDisplay(
         completed,
@@ -314,6 +335,29 @@ class DatabaseInitWorker(QThread):
             # optional-db failures, but the UI must also remain usable if an
             # unexpected driver error escapes it.
             self.initialized.emit(None, "none", None, str(exc))
+
+
+class CoordinationDatabaseInitWorker(QThread):
+    """Connect/provision the tiny Internet coordination store off the UI thread."""
+
+    initialized = pyqtSignal(object, str)
+
+    def run(self) -> None:
+        if not coordination_database_configured():
+            self.initialized.emit(None, "")
+            return
+        try:
+            engine = init_coordination_engine(ensure_schema=True, raise_on_error=True)
+            self.initialized.emit(engine, "")
+        except Exception as exc:  # credentials/endpoints must never reach UI logs
+            logger.debug(
+                "Coordination database initialization failed: %s", type(exc).__name__
+            )
+            self.initialized.emit(
+                None,
+                "The configured shared coordination database could not be reached. "
+                "Verify its SQL endpoint, TLS CA, username, password, and Internet connection.",
+            )
 
 
 @dataclass(frozen=True)
@@ -534,6 +578,33 @@ class StateSyncWorker(QThread):
                 control_result.error
                 or "Could not read shared live-trading control."
             )
+        operator_result = get_operator_control(self.engine)
+        if operator_result.success:
+            result.operator_control = operator_result.control
+        else:
+            result.operator_control_error = (
+                operator_result.error
+                or "Could not read shared operator-control ownership."
+            )
+        if not result.state_revisions:
+            result.state_revisions = get_synced_state_revisions(self.engine)
+        try:
+            from src.services.runtime_device_state_repository import (
+                list_runtime_device_states,
+            )
+            from src.services.operator_commands import list_operator_commands
+
+            result.runtime_devices = list_runtime_device_states(self.engine)
+            result.operator_commands = list_operator_commands(
+                self.engine, limit=10
+            )
+        except Exception:
+            logger.debug(
+                "Could not read runtime device/command status", exc_info=True
+            )
+            result.runtime_devices = []
+            result.operator_commands = []
+        result.last_verified_at = dt.datetime.now(dt.timezone.utc)
         self.completed.emit(result, self.generation)
 
 
@@ -554,6 +625,113 @@ class LiveTradingControlWorker(QThread):
                 self.engine,
                 self.role,
                 self.enabled,
+            )
+        )
+
+
+@dataclass(frozen=True)
+class ControlOwnerUpdate:
+    control: str
+    success: bool
+    target_label: str
+    result: object = None
+    error: str = ""
+
+
+class ControlOwnerWorker(QThread):
+    """Switch either owner without blocking the Qt event loop."""
+
+    completed = pyqtSignal(object)
+
+    def __init__(
+        self,
+        engine,
+        initiated_by: LocalDeviceRole,
+        *,
+        control: str,
+        target: Optional[LocalDeviceRole],
+        target_label: str,
+    ) -> None:
+        super().__init__()
+        self.engine = engine
+        self.initiated_by = initiated_by
+        self.control = str(control)
+        self.target = target
+        self.target_label = str(target_label)
+
+    def run(self) -> None:
+        try:
+            if self.control == "operator":
+                result = set_operator_control(
+                    self.engine,
+                    self.initiated_by,
+                    self.target,
+                )
+                success = bool(result.success)
+                error = str(result.error or "")
+            else:
+                from src.services.control_ownership import switch_execution_owner
+
+                if self.target is None:
+                    raise ValueError("Execution Owner cannot be Locked")
+                result = switch_execution_owner(
+                    self.engine,
+                    initiated_by=self.initiated_by,
+                    target_device_id=self.target.device_id,
+                )
+                success = bool(result.success)
+                error = str(result.error or "")
+        except Exception as exc:
+            logger.exception("Control-owner switch failed")
+            result = None
+            success = False
+            error = str(exc)
+        self.completed.emit(
+            ControlOwnerUpdate(
+                control=self.control,
+                success=success,
+                target_label=self.target_label,
+                result=result,
+                error=error,
+            )
+        )
+
+
+class PlanPublishWorker(QThread):
+    """Publish a copied planning snapshot and verify its shared revisions."""
+
+    completed = pyqtSignal(object)
+
+    def __init__(
+        self,
+        engine,
+        role: LocalDeviceRole,
+        payloads: tuple,
+        execution_queue: Dict[str, Any],
+        *,
+        metadata_path,
+        market_is_open: bool,
+    ) -> None:
+        super().__init__()
+        self.engine = engine
+        self.role = role
+        self.payloads = payloads
+        self.execution_queue = dict(execution_queue)
+        self.metadata_path = metadata_path
+        self.market_is_open = bool(market_is_open)
+
+    def run(self) -> None:
+        watchlist, buylist, trade_plans = self.payloads[:3]
+        self.completed.emit(
+            publish_trading_plan(
+                self.engine,
+                self.role,
+                watchlist,
+                buylist,
+                trade_plans,
+                self.execution_queue,
+                market_is_open=self.market_is_open,
+                metadata_path=self.metadata_path,
             )
         )
 
@@ -628,13 +806,19 @@ class MainWindow(
         # after the event loop begins.
         self.db_engine = None
         self.pc_db_engine = None
+        self.coordination_db_engine = None
         self._pc_probe_engine = None
         self._local_mirror_engine = None
         self.db_engine_source = "none"
         self.db_enabled = False
         self.db_initializing = True
         self.database_init_worker = None
+        self.coordination_database_init_worker = None
         self.database_recovery_worker = None
+        self._coordination_database_configured = coordination_database_configured()
+        self._coordination_database_ready = False
+        self._coordination_transition_generation = 0
+        self._last_coordination_database_notice = ""
         self._pc_database_ready = False
         self._pc_database_coordination_ready = False
         self._last_pc_database_probe_ready = False
@@ -684,8 +868,8 @@ class MainWindow(
         # .env) should ever set AUTO_CLAIM_MAIN_ON_HANDOFF, and only after
         # EXPECTED_AUTO_CLAIM_HOSTNAME confirms this is that specific
         # machine, so a copied .env can't silently arm this elsewhere. The
-        # laptop deliberately never auto-reclaims on startup -- it stays
-        # pull-only until "Use This Device as Main" is clicked manually.
+        # laptop deliberately never auto-reclaims on startup. Execution
+        # ownership can still be transferred explicitly with the owner controls.
         self._auto_claim_main_enabled = self._handoff_env_flag_true(
             "AUTO_CLAIM_MAIN_ON_HANDOFF"
         ) and self._expected_auto_claim_hostname_matches()
@@ -839,12 +1023,48 @@ class MainWindow(
         self.account_controller = AccountController(self)
 
     def _execution_state_engine(self):
-        """Return Kanban's operational store, never the historical-data route."""
+        """Return the one shared Kanban coordination store.
 
-        local_engine = self.__dict__.get("operational_db_engine")
-        if local_engine is not None:
-            return local_engine
-        return self.__dict__.get("pc_db_engine")
+        A configured Internet coordination database is preferred. The PC
+        database remains an optional historical-data source and the legacy
+        coordination fallback when no dedicated store is configured.
+        Watchlist/Buylist/Buy Today membership and main-device ownership
+        must stay synced across the laptop and PC -- exactly one device may
+        ever be Main, and that is only knowable through the store they both
+        share (`state_sync.py`'s `__main_device__` row lives here). This is
+        independent of historical daily/hourly/intraday market data, which
+        is a separate optional cache -- a stale/unreachable *scanner* feed
+        must never block execution, but losing the *shared coordination*
+        channel must, or two disconnected devices can both believe they are
+        Main at once. The local Kanban SQLite store is therefore recovery
+        material only in a real application window. Loss of shared MySQL
+        makes execution coordination fail closed.
+
+        Lightweight unit-test windows created without a ``pc_db_engine``
+        attribute retain the historical local-engine seam.
+        """
+
+        if (
+            "pc_db_engine" not in self.__dict__
+            or (
+                not self.__dict__.get("_qt_base_initialized", False)
+                and self.__dict__.get("pc_db_engine") is None
+            )
+        ):
+            return self.__dict__.get("operational_db_engine")
+        if self.__dict__.get("_coordination_database_configured", False):
+            coordination_engine = self.__dict__.get("coordination_db_engine")
+            if coordination_engine is not None and self.__dict__.get(
+                "_coordination_database_ready", False
+            ):
+                return coordination_engine
+            return None
+        pc_engine = self.__dict__.get("pc_db_engine")
+        if pc_engine is not None and self.__dict__.get(
+            "_pc_database_ready", pc_engine is not None
+        ):
+            return pc_engine
+        return None
 
     def _execution_state_ready(self) -> bool:
         engine = self._execution_state_engine()
@@ -853,6 +1073,8 @@ class MainWindow(
         local_engine = self.__dict__.get("operational_db_engine")
         if engine is local_engine:
             return bool(self.__dict__.get("_operational_database_ready", True))
+        if engine is self.__dict__.get("coordination_db_engine"):
+            return bool(self.__dict__.get("_coordination_database_ready", False))
         return bool(
             self.__dict__.get("_pc_database_ready", engine is not None)
         )
@@ -865,15 +1087,15 @@ class MainWindow(
         )
 
     def _execution_state_generation(self) -> int:
-        """Return a generation unaffected by historical-data route changes."""
+        """Return the generation for the current coordination-store route."""
 
-        return int(
-            self.__dict__.get(
-                "_operational_state_generation",
-                self.__dict__.get("_database_transition_generation", 0),
-            )
-            or 0
-        )
+        if self._using_local_operational_authority():
+            key = "_operational_state_generation"
+        elif self.__dict__.get("_coordination_database_configured", False):
+            key = "_coordination_transition_generation"
+        else:
+            key = "_database_transition_generation"
+        return int(self.__dict__.get(key, 0) or 0)
 
     def _execution_state_metadata_path(self):
         from src.services import app_state
@@ -888,6 +1110,7 @@ class MainWindow(
         """Begin optional database setup after widgets have been rendered."""
         if self.__dict__.get("_database_shutting_down", False):
             return
+        self._start_coordination_database_initialization()
         if self.database_init_worker is not None and self.database_init_worker.isRunning():
             return
         worker = DatabaseInitWorker()
@@ -895,6 +1118,59 @@ class MainWindow(
         worker.initialized.connect(self._on_optional_database_initialized)
         self._track_worker("database_init_worker", worker)
         worker.start()
+
+    def _start_coordination_database_initialization(self) -> None:
+        if self.__dict__.get("_database_shutting_down", False):
+            return
+        if self.__dict__.get("_coordination_database_ready", False):
+            return
+        worker = self.__dict__.get("coordination_database_init_worker")
+        if worker is not None:
+            return
+        worker = CoordinationDatabaseInitWorker()
+        self.coordination_database_init_worker = worker
+        worker.initialized.connect(self._on_coordination_database_initialized)
+        self._track_worker("coordination_database_init_worker", worker)
+        worker.start()
+
+    def _on_coordination_database_initialized(self, engine, error: str = "") -> None:
+        if self.__dict__.get("_database_shutting_down", False):
+            if engine is not None:
+                engine.dispose()
+            return
+        configured = bool(
+            self.__dict__.get("_coordination_database_configured", False)
+        )
+        self.coordination_db_engine = engine
+        self._coordination_database_ready = bool(configured and engine is not None)
+        self._coordination_transition_generation = int(
+            self.__dict__.get("_coordination_transition_generation", 0) or 0
+        ) + 1
+        if not configured:
+            return
+        if engine is None:
+            self._pc_database_coordination_ready = False
+            self._shared_live_trading_available = False
+            self._initial_state_sync_complete = False
+            self._bind_remote_state_engine(None, is_main_device=False)
+            notice = error or "Shared coordination database is unavailable."
+            if notice != self.__dict__.get(
+                "_last_coordination_database_notice", ""
+            ):
+                self.append_log(notice)
+            self._last_coordination_database_notice = notice
+            return
+        self._bind_remote_state_engine(engine, is_main_device=False)
+        if self.__dict__.get("_last_coordination_database_notice"):
+            self.append_log("Shared online coordination database recovered.")
+        else:
+            self.append_log(
+                "Shared online coordination database connected. Execution ownership "
+                "is independent of whether the PC historical database is online."
+            )
+        self._last_coordination_database_notice = ""
+        self._start_state_sync()
+        self._sync_buyboard_runtime_worker()
 
     def _on_optional_database_initialized(
         self, engine, source: str = "none", pc_engine=None, error: str = ""
@@ -922,7 +1198,10 @@ class MainWindow(
         self.db_enabled = engine is not None
         self.db_initializing = False
         self._pc_database_ready = bool(source == "pc" and pc_engine is not None)
-        if not self._using_local_operational_authority():
+        if (
+            not self._using_local_operational_authority()
+            and not self.__dict__.get("_coordination_database_configured", False)
+        ):
             self._pc_database_coordination_ready = False
         self._last_pc_database_probe_ready = self._pc_database_ready
         self._main_availability_probe_complete = True
@@ -953,7 +1232,6 @@ class MainWindow(
                 "MySQL cache is unavailable; scanner and cached intraday features remain disabled."
             )
         self._start_market_data_status_refresh()
-        self._update_main_device_button()
         self.update_dashboard_summary()
         # The startup resolver already performed the first PC database probe.
         # Start service polling only after that probe has completed so startup
@@ -1433,7 +1711,7 @@ class MainWindow(
             )
         ):
             self.append_log(
-                "Main-device claim deferred: this device has not published a "
+                "Execution-owner claim deferred: this device has not published a "
                 "fresh STANDBY_READY generation after final reconciliation."
             )
             return
@@ -1451,7 +1729,7 @@ class MainWindow(
                 and self.state_sync_role.is_main
                 and self._initial_state_sync_complete
             ),
-            generation=self.__dict__.get("_database_transition_generation", 0),
+            generation=self._execution_state_generation(),
             auto_claim=auto_claim,
             expected_owner_device_id=expected_owner_device_id,
             expected_standby_generation=expected_standby_generation,
@@ -1469,9 +1747,6 @@ class MainWindow(
         self._state_sync_auto_claim = auto_claim
         worker.completed.connect(self._on_state_sync_completed)
         self._track_worker("state_sync_worker", worker)
-        if activate and hasattr(self, "main_device_button"):
-            self.main_device_button.setEnabled(False)
-            self.main_device_button.setText("Activating Main Device...")
         worker.start()
 
     def _sync_state_with_remote(self) -> None:
@@ -1549,9 +1824,7 @@ class MainWindow(
         self._sync_buyboard_runtime_worker()
         if result.main_device_hostname:
             self._last_main_device_hostname = result.main_device_hostname
-        self._update_main_device_button(
-            main_hostname=result.main_device_hostname,
-        )
+        self._refresh_control_ownership_status(result)
 
         action = getattr(self, "_state_sync_action", "reconcile")
         was_auto_claim = bool(self._state_sync_auto_claim)
@@ -1559,18 +1832,18 @@ class MainWindow(
         if action == "activate" and result.is_main_device:
             if was_auto_claim:
                 self.append_log(
-                    "Automatic handoff: claimed main-device ownership "
+                    "Automatic handoff: claimed execution ownership "
                     f"({result.main_device_hostname or platform.node()}); "
                     "reconciling against the broker before resuming monitoring."
                 )
             else:
                 self.append_log(
-                    "This device is now the exclusive main device; the other device is pull-only."
+                    "This device is now the Execution Owner; the other device is standby/read-only."
                 )
         elif previous_main and not result.is_main_device:
             owner = result.main_device_hostname or "another device"
             self.append_log(
-                f"Main-device ownership moved to {owner}; this device is now pull-only."
+                f"Execution ownership moved to {owner}; this device is now standby/read-only."
             )
 
         updated_keys = set(result.updated_keys)
@@ -1594,6 +1867,11 @@ class MainWindow(
             self.__dict__.pop("execution_queue_manager", None)
             if hasattr(self, "populate_buylist_dashboard"):
                 self.populate_buylist_dashboard()
+        if updated_keys.intersection({"watchlist", "buylist", "execution_queue"}):
+            # Planning state is normalized into canonical trade-card rows by
+            # an explicit projection refresh.  Do it on the actual sync event
+            # instead of paying for a full board rebuild every few seconds.
+            self.refresh_buyboard()
 
         notices = []
         if result.conflict_keys:
@@ -1647,7 +1925,7 @@ class MainWindow(
                 runtime_claim_required = execution_config.is_buyboard_engine_enabled()
                 if not runtime_claim_required or generation > 0:
                     self.append_log(
-                        f"Automatic handoff: claiming main device ({reason})"
+                        f"Automatic handoff: claiming Execution Owner ({reason})"
                         + (
                             f" from STANDBY_READY generation {generation}."
                             if runtime_claim_required
@@ -1756,7 +2034,7 @@ class MainWindow(
                 return BuyboardReadinessDisplay(
                     8,
                     8,
-                    "Buy Board activation — transferring the main-device lease (ETA unavailable)",
+                    "Buy Board activation — transferring the execution lease (ETA unavailable)",
                     "The lease transaction is in progress and remains revision fenced.",
                     indeterminate=True,
                 )
@@ -1966,7 +2244,7 @@ class MainWindow(
                 f"{len(outcome.reconciled_symbols)} symbol(s)."
             )
             self.append_log(
-                "Main-device transfer left the shared live-trading control "
+                "Execution-owner transfer left the shared live-trading control "
                 f"{'ON' if trading_state.is_trading_enabled() else 'OFF'}."
             )
             self._sync_buyboard_runtime_worker()
@@ -2026,127 +2304,8 @@ class MainWindow(
             self._refresh_trading_enabled_widget()
         self.append_log(
             "Live trading is controlled by the durable Kanban switch; "
-            "Main-device handoff did not change it."
+            "Execution-owner handoff did not change it."
         )
-
-    def _update_main_device_button(self, *, main_hostname: str = "") -> None:
-        button = self.__dict__.get("main_device_button")
-        if button is None:
-            return
-        is_main = bool(self.state_sync_role.is_main)
-        database_ready = self._execution_state_ready()
-        local_authority = self._using_local_operational_authority()
-        database_initializing = bool(self.__dict__.get("db_initializing", False))
-        availability_probe_complete = bool(
-            self.__dict__.get(
-                "_main_availability_probe_complete",
-                not database_initializing,
-            )
-        )
-        probe_found_database = bool(
-            self.__dict__.get("_main_availability_probe_database_ready", False)
-        )
-        recovery_running = self.__dict__.get("database_recovery_worker") is not None
-        button.setEnabled(database_ready)
-        if is_main and database_ready:
-            button.setText(
-                "Main Device: ON (Local Kanban)"
-                if local_authority
-                else "Main Device: ON"
-            )
-            button.setStyleSheet(
-                "background-color: #137333; color: white; font-weight: bold;"
-            )
-            button.setToolTip(
-                "This device owns Kanban execution. Historical daily/hourly/"
-                "intraday databases are not part of execution readiness."
-            )
-        elif not database_ready:
-            if not availability_probe_complete:
-                button.setText("Checking Main availability (up to 3s)...")
-            elif probe_found_database or recovery_running:
-                button.setText("Verifying Kanban store...")
-            else:
-                button.setText("Main unavailable: Kanban store offline")
-            button.setStyleSheet("")
-            button.setToolTip(
-                "The local Kanban operational store could not be opened. Historical "
-                "database availability does not affect this control."
-            )
-        else:
-            button.setText("Use This Device as Main")
-            button.setStyleSheet("")
-            owner_text = main_hostname or "the other device"
-            button.setToolTip(
-                "This device is pull-only. Click to make its local Kanban store "
-                "authoritative; KIS reconciliation runs before execution."
-                if local_authority
-                else f"This device is pull-only. Click to transfer main ownership from {owner_text}."
-            )
-
-    def _on_main_device_button_clicked(self) -> None:
-        if self.state_sync_role.is_main:
-            QMessageBox.information(
-                self,
-                "Main device",
-                "This device is already the exclusive main device.",
-            )
-            return
-        execution_engine = self._execution_state_engine()
-        if execution_engine is None or not self._execution_state_ready():
-            QMessageBox.warning(
-                self,
-                "Main-device transfer unavailable",
-                "The local Kanban operational store could not be opened. Historical "
-                "daily/hourly/intraday data is not required, but cards, commands, "
-                "orders, and the local execution lease must be persisted.",
-            )
-            return
-        local_authority = self._using_local_operational_authority()
-        standby_generation = self._runtime_standby_generation_for_claim()
-        if (
-            execution_config.is_buyboard_engine_enabled()
-            and standby_generation <= 0
-            and not local_authority
-        ):
-            display = self._current_buyboard_readiness_display()
-            detail = (
-                f"\n\nCurrent status:\n{display.label}\n\n{display.tooltip}"
-                if display is not None
-                else ""
-            )
-            QMessageBox.warning(
-                self,
-                "Device not ready",
-                "This device must complete its read-only startup and final broker "
-                "reconciliation before it can become Main. Outside regular market "
-                "hours, a fresh quote is not required for ownership transfer; "
-                "execution will remain closed until one arrives. Wait for "
-                f"STANDBY_READY, then try again.{detail}",
-            )
-            return
-        reply = QMessageBox.question(
-            self,
-            "Use This Device as Main",
-            "Make this device the Kanban execution authority?\n\n"
-            + (
-                "This uses the durable local Kanban store. Historical-data outages "
-                "will affect charts and scans only. Do not run another disconnected "
-                "execution instance for the same KIS account.\n\n"
-                if local_authority
-                else "The other device will be lease-fenced and become pull-only.\n\n"
-            )
-            + "This device will query every assigned KIS account before monitoring "
-            "can resume. Live trading will remain disabled after the transfer.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if reply == QMessageBox.Yes:
-            self._start_state_sync(
-                activate=True,
-                expected_standby_generation=standby_generation,
-                allow_local_bootstrap=local_authority,
-            )
 
     # Bounded age past which a cached "I am main" belief is no longer trusted
     # for order submission. Defense in depth against network partition: a
@@ -2458,7 +2617,7 @@ class MainWindow(
             self._buyboard_runtime_restart_requested = False
             self.append_log(
                 "Buy Board runtime started in "
-                f"{'standby/read-only' if standby_only else 'main-device activation'} mode."
+                f"{'standby/read-only' if standby_only else 'execution-owner activation'} mode."
             )
         except Exception:
             logger.exception("Failed to sync the Buy Board runtime worker")
@@ -2470,14 +2629,14 @@ class MainWindow(
             self._buyboard_market_data_handoff = market_data
 
     def _state_sync_allows_order_submission(self) -> bool:
-        """Allow broker submissions only from the active, recently-confirmed main device."""
+        """Allow broker submissions only from the recently-confirmed Execution Owner."""
         role = self.__dict__.get("state_sync_role")
         if role is None:
             # Lightweight test/dummy windows do not initialize sync state.
             return True
         if self.__dict__.get("_handoff_reconciliation_required", False):
             self.append_log(
-                "KIS order submission blocked: main-device handoff broker "
+                "KIS order submission blocked: execution-owner handoff broker "
                 "reconciliation has not completed cleanly."
             )
             return False
@@ -2526,9 +2685,9 @@ class MainWindow(
         )
         QMessageBox.warning(
             self,
-            "Pull-only device",
-            "Only the active main device may submit KIS orders. "
-            "Click 'Use This Device as Main' before trading from this device.",
+            "Standby device",
+            "Only the current Execution Owner may submit KIS orders. Select "
+            "this machine under Execution Owner after it reports Executor Ready.",
         )
         return False
 
@@ -3174,6 +3333,7 @@ class MainWindow(
             self._capture_buyboard_market_data_for_restart(runtime_worker)
         candidate_workers = [
             self.__dict__.get("database_init_worker"),
+            self.__dict__.get("coordination_database_init_worker"),
             self.__dict__.get("database_recovery_worker"),
             self.__dict__.get("_local_mirror_sync_worker"),
             self.__dict__.get("state_sync_worker"),
@@ -3247,7 +3407,7 @@ class MainWindow(
             QMessageBox.critical(
                 self,
                 "Shutdown aborted",
-                "Main-device ownership could not be released safely. The dashboard "
+                "Execution ownership could not be released safely. The dashboard "
                 "has stayed open and restarted its protection runtime. Resolve the "
                 "database/handoff failure before closing again.",
             )
@@ -3282,7 +3442,7 @@ class MainWindow(
             )
         )
         if not decision.allowed:
-            self.append_log(f"Main-device ownership retained: {decision.reason}")
+            self.append_log(f"Execution ownership retained: {decision.reason}")
             return False
         runtime_worker = self.__dict__.get("_buyboard_runtime_worker")
         if (
@@ -3290,13 +3450,13 @@ class MainWindow(
             and not bool(getattr(runtime_worker, "shutdown_prepared", False))
         ):
             self.append_log(
-                "Main-device ownership retained: Buy Board journal/final "
+                "Execution ownership retained: Buy Board journal/final "
                 "reconciliation/WebSocket shutdown sequence did not complete."
             )
             return False
         if not final_save_succeeded:
             self.append_log(
-                "Main-device ownership retained: final local state save failed; "
+                "Execution ownership retained: final local state save failed; "
                 "the next device must use stale-heartbeat takeover."
             )
             return False
@@ -3315,7 +3475,7 @@ class MainWindow(
             self.append_log(f"Handoff publication failed: {exc}")
         if not published:
             self.append_log(
-                "Main-device ownership retained because the final handoff "
+                "Execution ownership retained because the final handoff "
                 "snapshot was not confirmed durably; the next device must "
                 "use stale-heartbeat takeover."
             )
@@ -3350,7 +3510,7 @@ class MainWindow(
             except Exception:
                 logger.exception("Could not restore remote writer after release failure")
             if release_error:
-                self.append_log(f"Main-device release failed: {release_error}")
+                self.append_log(f"Execution-owner release failed: {release_error}")
         return released
 
     def _authorize_emergency_close_after_release_failure(self) -> bool:
@@ -3363,9 +3523,9 @@ class MainWindow(
             return False
         answer = QMessageBox.critical(
             self,
-            "Main-device release failed",
+            "Execution-owner release failed",
             "The application could not complete its final state publication, "
-            "runtime shutdown, or main-device lease release. Closing now may "
+            "runtime shutdown, or execution lease release. Closing now may "
             "leave positions unprotected and requires stale-heartbeat takeover.\n\n"
             "Exit anyway under supervised emergency acceptance?",
             QMessageBox.Yes | QMessageBox.No,
@@ -3375,7 +3535,7 @@ class MainWindow(
         if accepted:
             self.append_log(
                 "CRITICAL: user explicitly accepted emergency shutdown after "
-                "main-device lease release failed."
+                "execution lease release failed."
             )
         return accepted
 
@@ -3909,7 +4069,7 @@ class MainWindow(
                 button.setText("LIVE TRADING ● ON (KANBAN)")
                 button.setToolTip(
                     "The durable broker gate is ON in this Kanban operational "
-                    "store. Only its current Main device can execute. Click to "
+                    "store. Only its current Execution Owner can execute. Click to "
                     "turn it OFF."
                 )
                 button.setEnabled(True)
@@ -3938,7 +4098,7 @@ class MainWindow(
                 self,
                 "Enable Live Trading",
                 "This turns guarded KIS order submission ON for this Kanban "
-                "operational store. Only its current Main device can execute. "
+                "operational store. Only its current Execution Owner can execute. "
                 "Continue?",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
@@ -4006,7 +4166,7 @@ class MainWindow(
     def _build_status_log(self, parent_layout: QVBoxLayout) -> None:
         """Build the shared dashboard log and progress widgets."""
         status_widget = QWidget()
-        status_widget.setMaximumHeight(145)
+        status_widget.setMaximumHeight(225)
         status_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         status_layout = QVBoxLayout()
         status_layout.setContentsMargins(0, 0, 0, 0)
@@ -4019,15 +4179,51 @@ class MainWindow(
         self.progress_bar.setMaximumHeight(16)
         self.progress_label = QLabel("Ready.")
         self.progress_label.setMaximumHeight(22)
-        self.main_device_button = QPushButton()
-        self.main_device_button.setObjectName("mainDeviceButton")
-        self.main_device_button.setMaximumWidth(210)
-        self.main_device_button.clicked.connect(
-            self._on_main_device_button_clicked
-        )
         progress_layout.addWidget(self.progress_bar, 2)
         progress_layout.addWidget(self.progress_label, 3)
-        progress_layout.addWidget(self.main_device_button)
+
+        owner_layout = QHBoxLayout()
+        owner_layout.setSpacing(4)
+        owner_layout.addWidget(QLabel("Execution Owner:"))
+        self.execution_owner_pc_button = QPushButton("PC")
+        self.execution_owner_laptop_button = QPushButton("Laptop")
+        self.execution_owner_pc_button.clicked.connect(
+            lambda: self._on_control_owner_clicked("execution", "PC")
+        )
+        self.execution_owner_laptop_button.clicked.connect(
+            lambda: self._on_control_owner_clicked("execution", "Laptop")
+        )
+        owner_layout.addWidget(self.execution_owner_pc_button)
+        owner_layout.addWidget(self.execution_owner_laptop_button)
+        owner_layout.addSpacing(12)
+        owner_layout.addWidget(QLabel("Operator Control:"))
+        self.operator_control_pc_button = QPushButton("PC")
+        self.operator_control_laptop_button = QPushButton("Laptop")
+        self.operator_control_locked_button = QPushButton("Locked")
+        self.operator_control_pc_button.clicked.connect(
+            lambda: self._on_control_owner_clicked("operator", "PC")
+        )
+        self.operator_control_laptop_button.clicked.connect(
+            lambda: self._on_control_owner_clicked("operator", "Laptop")
+        )
+        self.operator_control_locked_button.clicked.connect(
+            lambda: self._on_control_owner_clicked("operator", "Locked")
+        )
+        owner_layout.addWidget(self.operator_control_pc_button)
+        owner_layout.addWidget(self.operator_control_laptop_button)
+        owner_layout.addWidget(self.operator_control_locked_button)
+        owner_layout.addSpacing(8)
+        self.publish_trading_plan_button = QPushButton("Publish Today's Plan")
+        self.publish_trading_plan_button.clicked.connect(
+            self._on_publish_trading_plan_clicked
+        )
+        owner_layout.addWidget(self.publish_trading_plan_button)
+        self.control_ownership_status = QLabel("Control owners: verifying shared state...")
+        self.control_ownership_status.setWordWrap(True)
+        self.control_ownership_status.setStyleSheet(
+            "font-size: 11px; color: #555; padding-left: 8px;"
+        )
+        owner_layout.addWidget(self.control_ownership_status, 1)
 
         self.log_output = QTextEdit()
         self.log_output.setReadOnly(True)
@@ -4035,19 +4231,22 @@ class MainWindow(
             "background-color: black; color: white; font-family: Consolas, monospace; font-size: 11px;"
         )
         self.log_output.setMinimumHeight(70)
-        self.log_output.setMaximumHeight(95)
+        self.log_output.setMaximumHeight(80)
         self.log_output.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         status_layout.addLayout(progress_layout)
+        status_layout.addLayout(owner_layout)
         status_layout.addWidget(self.log_output)
         status_widget.setLayout(status_layout)
         parent_layout.addWidget(status_widget)
-        self._update_main_device_button()
-
         # Pull-only devices stay current while both applications remain open,
         # and former main devices promptly notice an ownership transfer.
         self.state_sync_timer = QTimer(self)
-        self.state_sync_timer.setInterval(15_000)
+        # Shared planning/control display refresh. Actual operator commands,
+        # broker-boundary authority checks, and handoff button actions use
+        # their own immediate paths; unchanged JSON revisions need one cloud
+        # check per minute, not four per minute.
+        self.state_sync_timer.setInterval(60_000)
         self.state_sync_timer.timeout.connect(self._start_state_sync)
         self.state_sync_timer.start()
 
@@ -4071,6 +4270,315 @@ class MainWindow(
         )
         self.buyboard_readiness_progress_timer.start()
         self._update_buyboard_readiness_progress()
+
+    @staticmethod
+    def _control_device_kind(hostname: str, details=None) -> str:
+        return runtime_device_kind(hostname, details)
+
+    @staticmethod
+    def _control_runtime_identity_available(record) -> bool:
+        state = getattr(record, "state", "")
+        state_value = str(getattr(state, "value", state) or "").upper()
+        if state_value not in {
+            RuntimeDeviceState.STARTING.value,
+            RuntimeDeviceState.STANDBY.value,
+            RuntimeDeviceState.STANDBY_READY.value,
+            RuntimeDeviceState.ACTIVE.value,
+        }:
+            return False
+        updated_at = getattr(record, "updated_at", None)
+        if not isinstance(updated_at, dt.datetime):
+            return False
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=dt.timezone.utc)
+        age_seconds = (
+            dt.datetime.now(dt.timezone.utc) - updated_at.astimezone(dt.timezone.utc)
+        ).total_seconds()
+        return -5.0 <= age_seconds <= 120.0
+
+    def _control_identity_kind(
+        self, *, device_id: str = "", hostname: str = ""
+    ) -> str:
+        records = list(self.__dict__.get("_runtime_device_records", ()) or ())
+        exact = [
+            record
+            for record in records
+            if device_id and str(record.device_id) == str(device_id)
+        ]
+        candidates = exact or [
+            record
+            for record in records
+            if hostname
+            and str(record.hostname).strip().lower()
+            == str(hostname).strip().lower()
+        ]
+        if candidates:
+            record = max(candidates, key=lambda item: item.updated_at)
+            return self._control_device_kind(record.hostname, record.details)
+        role = self.__dict__.get("state_sync_role")
+        if role is not None and (
+            (device_id and str(role.device_id) == str(device_id))
+            or (
+                hostname
+                and str(role.hostname).strip().lower()
+                == str(hostname).strip().lower()
+            )
+        ):
+            return detect_local_device_kind(role.hostname)
+        return self._control_device_kind(hostname)
+
+    def _control_target_role(self, target_label: str) -> Optional[LocalDeviceRole]:
+        if target_label == "Locked":
+            return None
+        records = list(self.__dict__.get("_runtime_device_records", ()) or ())
+        candidates = [
+            record
+            for record in records
+            if self._control_runtime_identity_available(record)
+            if self._control_device_kind(record.hostname, record.details)
+            == target_label
+        ]
+        if candidates:
+            record = max(candidates, key=lambda item: item.updated_at)
+            return LocalDeviceRole(
+                device_id=record.device_id,
+                hostname=record.hostname,
+                is_main=False,
+            )
+        # A device-kind guess from this process's hardware is not a published
+        # target identity. In particular, battery-less CI/VM hosts classify a
+        # DESKTOP-named laptop role as PC. Ownership changes require a fresh
+        # runtime row with an explicit device_kind and eligible state; without
+        # that row the button must report the target unavailable.
+        return None
+
+    def _set_control_owner_buttons_enabled(self, enabled: bool) -> None:
+        for name in (
+            "execution_owner_pc_button",
+            "execution_owner_laptop_button",
+            "operator_control_pc_button",
+            "operator_control_laptop_button",
+            "operator_control_locked_button",
+        ):
+            button = self.__dict__.get(name)
+            if button is not None:
+                button.setEnabled(bool(enabled))
+
+    def _on_control_owner_clicked(self, control: str, target_label: str) -> None:
+        if not self._execution_state_ready():
+            QMessageBox.warning(
+                self,
+                "Shared control unavailable",
+                "The shared coordination database is unavailable. Ownership "
+                "cannot be changed, and execution remains fail-closed. If TiDB "
+                "is configured, verify its SQL endpoint, TLS, and Internet connection.",
+            )
+            return
+        target = self._control_target_role(target_label)
+        if target_label != "Locked" and target is None:
+            QMessageBox.information(
+                self,
+                "Device not available",
+                f"No {target_label} runtime is registered in shared coordination. "
+                f"Start or restart main.py on the {target_label}, then wait "
+                "for its Executor Ready status.",
+            )
+            return
+        worker = self.__dict__.get("control_owner_worker")
+        if worker is not None and worker.isRunning():
+            return
+        worker = ControlOwnerWorker(
+            self._execution_state_engine(),
+            self.state_sync_role,
+            control=control,
+            target=target,
+            target_label=target_label,
+        )
+        self.control_owner_worker = worker
+        worker.completed.connect(self._on_control_owner_updated)
+        self._track_worker("control_owner_worker", worker)
+        self._set_control_owner_buttons_enabled(False)
+        worker.start()
+
+    def _on_control_owner_updated(self, update: ControlOwnerUpdate) -> None:
+        self._set_control_owner_buttons_enabled(True)
+        if not update.success:
+            QMessageBox.warning(
+                self,
+                "Owner switch blocked",
+                update.error or "The shared owner did not change.",
+            )
+            self.append_log(update.error or "Control-owner switch was blocked.")
+            return
+        label = "Execution Owner" if update.control == "execution" else "Operator Control"
+        self.append_log(f"{label} changed to {update.target_label}.")
+        self._start_state_sync()
+
+    def _on_publish_trading_plan_clicked(self) -> None:
+        if is_regular_session_open():
+            QMessageBox.information(
+                self,
+                "Market-open planning lock",
+                "Market is open. Full plan publish is disabled. Use Live "
+                "Intervention commands instead.",
+            )
+            return
+        if not self._execution_state_ready():
+            QMessageBox.warning(
+                self,
+                "Publish unavailable",
+                "The shared coordination database is unavailable.",
+            )
+            return
+        worker = self.__dict__.get("plan_publish_worker")
+        if worker is not None and worker.isRunning():
+            return
+        queue_manager = self.__dict__.get("execution_queue_manager")
+        if queue_manager is not None:
+            self._save_execution_queue_state()
+        saved = self._save_state_now(timeout=5.0, supersede_pending=True)
+        if not saved.success:
+            QMessageBox.warning(
+                self,
+                "Publish paused",
+                saved.error or "The local planning files could not be saved.",
+            )
+            return
+        worker = PlanPublishWorker(
+            self._execution_state_engine(),
+            self.state_sync_role,
+            self._state_save_payload(),
+            load_json(EXECUTION_QUEUE_FILE, {}),
+            metadata_path=self._execution_state_metadata_path(),
+            market_is_open=False,
+        )
+        self.plan_publish_worker = worker
+        worker.completed.connect(self._on_trading_plan_published)
+        self._track_worker("plan_publish_worker", worker)
+        self.publish_trading_plan_button.setEnabled(False)
+        self.publish_trading_plan_button.setText("Publishing...")
+        worker.start()
+
+    def _on_trading_plan_published(self, result) -> None:
+        self.publish_trading_plan_button.setEnabled(True)
+        self.publish_trading_plan_button.setText("Publish Today's Plan")
+        if not result.success:
+            QMessageBox.warning(
+                self,
+                "Plan publish blocked",
+                result.error or "The shared planning snapshot did not verify.",
+            )
+            self.append_log(result.error or "Plan publish failed verification.")
+            return
+        revisions = result.revisions
+        summary = (
+            f"watchlist r{revisions.get('watchlist', 0)}, "
+            f"buylist r{revisions.get('buylist', 0)}, "
+            f"trade plans r{revisions.get('trade_plans', 0)}, "
+            f"execution queue r{revisions.get('execution_queue', 0)}"
+        )
+        if result.execution_owner_heartbeat_fresh:
+            owner = result.execution_owner_hostname or "Execution Owner"
+            message = f"{owner} has latest plan ({summary})."
+            self.append_log(message)
+            QMessageBox.information(self, "Plan published", message)
+        else:
+            owner = result.execution_owner_hostname or "Execution Owner"
+            message = (
+                f"The plan is verified in shared MySQL ({summary}), but {owner}'s "
+                "main.py heartbeat is not fresh. Confirm the executor before market open."
+            )
+            self.append_log(message)
+            QMessageBox.warning(self, "Plan published; executor not verified", message)
+        self._start_state_sync()
+
+    def _refresh_control_ownership_status(self, result: StateReconcileResult) -> None:
+        label = self.__dict__.get("control_ownership_status")
+        if label is None:
+            return
+        self._runtime_device_records = tuple(result.runtime_devices or ())
+        execution_host = result.main_device_hostname or "Unassigned"
+        execution_label = (
+            self._control_identity_kind(hostname=execution_host)
+            if execution_host != "Unassigned"
+            else execution_host
+        )
+        operator = result.operator_control
+        if operator is None or bool(getattr(operator, "locked", True)):
+            operator_label = "Locked"
+        else:
+            operator_label = self._control_identity_kind(
+                device_id=operator.device_id,
+                hostname=operator.hostname,
+            )
+        readiness = {"PC": "No", "Laptop": "No"}
+        readiness_reason = {}
+        newest_by_kind = {}
+        for record in self._runtime_device_records:
+            kind = self._control_device_kind(record.hostname, record.details)
+            current = newest_by_kind.get(kind)
+            if current is None or record.updated_at > current.updated_at:
+                newest_by_kind[kind] = record
+        for kind, record in newest_by_kind.items():
+            ready = bool(record.details.get("executor_ready", False))
+            readiness[kind] = "Yes" if ready else "No"
+            if not ready:
+                readiness_reason[kind] = str(
+                    record.details.get("executor_not_ready_reason") or record.state.value
+                )
+        revisions = dict(result.state_revisions or {})
+        verified = result.last_verified_at
+        if isinstance(verified, dt.datetime):
+            verified_text = verified.astimezone(KST_ZONE).strftime("%H:%M:%S KST")
+        else:
+            verified_text = "-"
+        live_text = _live_execution_status_text(result.live_trading_enabled)
+        commands = list(result.operator_commands or ())
+        if commands:
+            newest = commands[0]
+            command_text = f"{newest.command_type.value}:{newest.status.value}"
+        else:
+            command_text = "None"
+        text_value = (
+            f"Current Execution Owner: {execution_label} | "
+            f"Current Operator Control: {operator_label} | "
+            f"PC Executor Ready: {readiness['PC']} | "
+            f"Laptop Executor Ready: {readiness['Laptop']} | "
+            f"Live Trading: {live_text} | "
+            f"Revisions W/B/Q: {revisions.get('watchlist', 0)}/"
+            f"{revisions.get('buylist', 0)}/"
+            f"{revisions.get('execution_queue', 0)} | Verified: {verified_text}"
+            f" | Last Command: {command_text}"
+        )
+        label.setText(text_value)
+        reason_text = "\n".join(
+            f"{kind}: {reason}" for kind, reason in sorted(readiness_reason.items())
+        )
+        command_history = "\n".join(
+            f"{item.created_at.isoformat()} {item.command_type.value} "
+            f"{item.symbol} {item.status.value}"
+            for item in commands
+        )
+        tooltip_sections = [text_value, reason_text, command_history]
+        label.setToolTip("\n".join(item for item in tooltip_sections if item))
+
+        active_style = "background-color: #137333; color: white; font-weight: bold;"
+        inactive_style = ""
+        self.execution_owner_pc_button.setStyleSheet(
+            active_style if execution_label == "PC" else inactive_style
+        )
+        self.execution_owner_laptop_button.setStyleSheet(
+            active_style if execution_label == "Laptop" else inactive_style
+        )
+        self.operator_control_pc_button.setStyleSheet(
+            active_style if operator_label == "PC" else inactive_style
+        )
+        self.operator_control_laptop_button.setStyleSheet(
+            active_style if operator_label == "Laptop" else inactive_style
+        )
+        self.operator_control_locked_button.setStyleSheet(
+            active_style if operator_label == "Locked" else inactive_style
+        )
 
     def _write_sleep_readiness_snapshot(self) -> None:
         try:
@@ -4283,11 +4791,31 @@ class MainWindow(
             text_value = "DB: Local (Syncing...)" if reconciling else "DB: Local"
             dot_color = "#ffb300"
             text_color = "#9a6700"
+            online_coordination = self._execution_state_ready()
             tooltip = (
                 "Market-data reads remain on the laptop's local SQLite mirror "
-                "while PC/local market data is reconciled."
+                "while PC/local market data is reconciled. Shared online "
+                "coordination remains available for ownership and execution."
+                if online_coordination
+                else (
+                    "Market-data reads remain on the laptop's local SQLite mirror "
+                    "while PC/local market data is reconciled. The shared "
+                    "coordination database is offline, so new entries and operator "
+                    "commands remain closed."
+                )
                 if reconciling
-                else "Market-data reads are using the laptop's local SQLite mirror."
+                else (
+                    "Market-data reads are using the laptop's local SQLite "
+                    "mirror. Shared online coordination remains available for "
+                    "ownership and execution."
+                    if online_coordination
+                    else (
+                        "Market-data reads are using the laptop's local SQLite "
+                        "mirror. The shared coordination database is offline: new "
+                        "entries and operator commands are closed; an already-active "
+                        "runtime has only bounded emergency position protection."
+                    )
+                )
             )
         else:
             text_value = "DB: Offline"
@@ -4331,14 +4859,18 @@ class MainWindow(
         self._database_transition_generation = (
             self.__dict__.get("_database_transition_generation", 0) + 1
         )
-        if self._using_local_operational_authority():
+        execution_engine = self._execution_state_engine()
+        if execution_engine is not None:
             try:
                 self._bind_remote_state_engine(
-                    self._execution_state_engine(),
-                    is_main_device=bool(self.state_sync_role.is_main),
+                    execution_engine,
+                    is_main_device=bool(
+                        self.state_sync_role.is_main
+                        and self._using_local_operational_authority()
+                    ),
                 )
             except Exception:
-                logger.exception("Could not retain local Kanban persistence")
+                logger.exception("Could not retain shared Kanban persistence")
         else:
             self._pc_database_coordination_ready = False
             self._shared_live_trading_available = False
@@ -4363,9 +4895,16 @@ class MainWindow(
             self.db_engine = local_engine
             self.db_engine_source = "local_mirror"
             self.db_enabled = True
-            self.append_log(
-                "PC database went offline; switched automatically to the local data mirror."
-            )
+            if self._execution_state_ready():
+                self.append_log(
+                    "PC historical database went offline; switched to the local "
+                    "data mirror. Shared coordination and execution remain online."
+                )
+            else:
+                self.append_log(
+                    "PC database went offline; switched automatically to the local data mirror. "
+                    "Shared coordination and new entries are closed until it recovers."
+                )
         else:
             self.db_engine = None
             self.db_engine_source = "none"
@@ -4377,7 +4916,6 @@ class MainWindow(
 
         self._update_database_source_indicator()
         self._cached_market_data_status = None
-        self._update_main_device_button()
         self.update_dashboard_summary()
 
     def _activate_recovered_pc_database(self, engine) -> None:
@@ -4403,10 +4941,16 @@ class MainWindow(
         self.db_engine_source = "pc"
         self.db_enabled = True
         self._pc_database_ready = True
-        if not self._using_local_operational_authority():
+        if (
+            not self._using_local_operational_authority()
+            and not self.__dict__.get("_coordination_database_configured", False)
+        ):
             self._pc_database_coordination_ready = False
         self._last_pc_database_probe_ready = True
-        if not self._using_local_operational_authority():
+        if (
+            not self._using_local_operational_authority()
+            and not self.__dict__.get("_coordination_database_configured", False)
+        ):
             self._initial_state_sync_complete = False
         self._cached_market_data_status = None
         self._update_database_source_indicator()
@@ -4429,7 +4973,6 @@ class MainWindow(
                 "PC database is back online; switched automatically from the local mirror."
             )
         try:
-            self._update_main_device_button()
             self.update_dashboard_summary()
             if not self._using_local_operational_authority():
                 self._start_state_sync()
@@ -4516,6 +5059,8 @@ class MainWindow(
         """
         if self.__dict__.get("_database_shutting_down", False):
             return
+        if self.__dict__.get("_coordination_database_configured", False):
+            self._start_coordination_database_initialization()
         if self.__dict__.get("database_recovery_worker") is not None:
             return
         if self._pc_status_worker is not None:
@@ -4611,7 +5156,6 @@ class MainWindow(
         label.setToolTip(tooltip)
         services_label.setToolTip(tooltip)
         self._update_database_source_indicator()
-        self._update_main_device_button()
         status_timer = self.__dict__.get("pc_status_timer")
         if status_timer is not None:
             # Reconnect quickly during an outage, then back off once healthy.
@@ -4670,6 +5214,31 @@ class MainWindow(
         webbrowser.open(url)
 
     def _confirm_and_send_pc_shutdown(self) -> None:
+        from src.core.execution_config import is_buyboard_engine_enabled
+        from src.services import trading_state
+
+        try:
+            live_session = bool(is_regular_session_open())
+        except Exception:
+            # An unknown calendar state must not make a destructive power
+            # action look safer than it is while execution is armed.
+            live_session = True
+        if (
+            live_session
+            and is_buyboard_engine_enabled()
+            and trading_state.is_trading_enabled()
+            and self._execution_state_engine() is self.__dict__.get("pc_db_engine")
+        ):
+            QMessageBox.warning(
+                self,
+                "PC shutdown blocked during live trading",
+                "This PC hosts the one canonical trading database. Turning it "
+                "off now would stop new entries and operator commands, and an "
+                "already-active executor would retain only short, bounded "
+                "emergency protection.\n\nDisarm live trading or wait until the "
+                "regular session closes before shutting down the PC.",
+            )
+            return
         reply = QMessageBox.question(
             self,
             "Turn off PC",

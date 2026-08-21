@@ -368,10 +368,14 @@ def _metric_rows_html(rows: list[tuple[str, str]]) -> str:
 def _visible_restrictions(projection: BoardCardProjection | None) -> tuple[str, ...]:
     if projection is None:
         return ()
+    quiet_runtime_states = {
+        "device state is standby",
+        "device state is standby_ready",
+    }
     return tuple(
         reason
         for reason in projection.engine_restrictions
-        if str(reason).strip().casefold() != "device state is standby"
+        if str(reason).strip().casefold() not in quiet_runtime_states
     )
 
 
@@ -451,6 +455,12 @@ class TradeCardWidget(QFrame):
         # reconciliation, order, ORB, stop, and warning details only become
         # relevant after a card is activated for Buy Today.
         if card.board_status in {BoardStatus.WATCHLIST, BoardStatus.BUYLIST}:
+            if card.buy_today_note:
+                memo = QLabel(f"Memo: {card.buy_today_note}")
+                memo.setTextFormat(Qt.PlainText)
+                memo.setStyleSheet("color: #8a5a00; font-size: 11px;")
+                memo.setWordWrap(True)
+                layout.addWidget(memo)
             return
 
         if card.pending_stop_command_id and card.pending_stop_price:

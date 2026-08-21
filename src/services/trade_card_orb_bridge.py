@@ -29,7 +29,11 @@ from datetime import datetime, time, timedelta, timezone
 from typing import Callable
 from zoneinfo import ZoneInfo
 
-from src.core.execution_queue import ExecutionQueueItem, OrbCandidateStatus
+from src.core.execution_queue import (
+    SUPPORTED_ORB_WINDOWS,
+    ExecutionQueueItem,
+    OrbCandidateStatus,
+)
 from src.core.trade_card_state import BoardStatus, EntryRuntimeStatus, TradeCardState
 
 # ORB begins only when the trader activates a planning card for Buy Today.
@@ -224,6 +228,81 @@ def _regular_session_complete(*, now: datetime) -> bool:
     return reference.astimezone(_US_MARKET_ZONE).time() >= _US_REGULAR_CLOSE
 
 
+def all_supported_orb_plans_rejected(
+    execution_queue_item: ExecutionQueueItem,
+) -> bool:
+    """Return true only after every supported ORB window is terminal-invalid.
+
+    Missing, unavailable, or still-forming data is deliberately not a
+    rejection.  That keeps a transient 1m/5m/30m data gap from removing a
+    potentially valid Buy Today card.
+    """
+
+    candidates = dict(getattr(execution_queue_item, "candidates", {}) or {})
+    terminal_invalid = {
+        OrbCandidateStatus.RISK_INVALID,
+        OrbCandidateStatus.REJECTED,
+    }
+    return all(
+        window in candidates and candidates[window].status in terminal_invalid
+        for window in SUPPORTED_ORB_WINDOWS
+    )
+
+
+def _orb_rejection_note(execution_queue_item: ExecutionQueueItem) -> str:
+    candidates = dict(getattr(execution_queue_item, "candidates", {}) or {})
+    details = []
+    for window in SUPPORTED_ORB_WINDOWS:
+        candidate = candidates[window]
+        reason = str(getattr(candidate, "reason", "") or "invalid ORB plan").strip()
+        details.append(f"{window}: {reason}")
+    return "Buy Today rejected - all ORB plans invalid. " + "; ".join(details)
+
+
+def _can_return_rejected_card_to_buylist(card: TradeCardState) -> bool:
+    """Never hide a BUY whose durable lifecycle may already have started."""
+
+    return not bool(
+        card.entry_client_order_id
+        or card.entry_pending_attempt_number
+        or card.entry_submission_unresolved
+        or card.entry_cancel_in_flight
+        or card.entry_remaining_target_quantity
+        or card.broker_quantity
+    )
+
+
+def _return_rejected_card_to_buylist(
+    card: TradeCardState,
+    execution_queue_item: ExecutionQueueItem,
+    *,
+    now: datetime,
+) -> TradeCardState:
+    reference = now
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    card.previous_board_status = card.board_status
+    card.board_status = BoardStatus.BUYLIST
+    card.board_status_updated_at = reference.astimezone(timezone.utc)
+    card.session_date = None
+    card.buylist_member = True
+    card.buy_today_note = _orb_rejection_note(execution_queue_item)
+    _clear_entry_plan(card)
+    card.selected_orb_window = None
+    card.entry_runtime_status = None
+    card.entry_block_reason = ""
+    card.next_retry_at = None
+    card.entry_attempt_group_id = ""
+    card.entry_attempt_count = 0
+    card.entry_client_order_id = ""
+    card.entry_pending_attempt_number = 0
+    card.entry_submission_unresolved = False
+    card.entry_cancel_in_flight = False
+    card.entry_cancel_reason = ""
+    card.entry_cancel_command_id = ""
+    return card
+
+
 class TradeCardOrbEvaluator:
     """Copies the execution queue's already-computed candidate selection
     onto a card. Never recomputes ORB/breakout/risk numbers itself --
@@ -265,6 +344,15 @@ class TradeCardOrbEvaluator:
             card.entry_block_reason = "Current-session ORB minute bars are unavailable"
             card.selected_orb_window = execution_queue_item.selected_window
             return card
+
+        if all_supported_orb_plans_rejected(
+            execution_queue_item
+        ) and _can_return_rejected_card_to_buylist(card):
+            return _return_rejected_card_to_buylist(
+                card,
+                execution_queue_item,
+                now=now,
+            )
 
         candidate = _display_candidate(execution_queue_item)
         if (

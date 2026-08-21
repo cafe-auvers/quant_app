@@ -8,6 +8,7 @@ import json
 import pytest
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+import src.api.kis_websocket as kis_websocket_module
 
 from src.api.kis_websocket import (
     KisWebSocketClient,
@@ -75,6 +76,40 @@ class _Approval:
 class _Keys:
     def get(self, **kwargs):
         return _Approval()
+
+
+def test_windows_transport_uses_private_selector_loop(monkeypatch):
+    monkeypatch.setattr(kis_websocket_module.sys, "platform", "win32")
+
+    loop = kis_websocket_module._websocket_event_loop()
+    try:
+        assert isinstance(loop, asyncio.SelectorEventLoop)
+    finally:
+        loop.close()
+
+
+def test_thread_bootstrap_retries_before_creating_coroutine():
+    attempts = []
+
+    def loop_factory():
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise OSError(10014, "temporary socket-pair startup failure")
+        return asyncio.SelectorEventLoop()
+
+    client = KisWebSocketClient(
+        url="ws://example",
+        approval_keys=_Keys(),
+        event_loop_factory=loop_factory,
+    )
+
+    async def finish_immediately():
+        client._stop_event.set()
+
+    client.run_forever = finish_immediately
+    client._run_thread()
+
+    assert len(attempts) == 2
 
 
 def test_desired_subscriptions_survive_while_disconnected():

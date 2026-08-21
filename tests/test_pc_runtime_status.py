@@ -308,7 +308,6 @@ def _runtime_transition_window(pc_engine, *, local_engine=None):
     window.pc_status_button = _WidgetStub()
     window.database_source_dot = _WidgetStub()
     window.database_source_label = _WidgetStub()
-    window.main_device_button = _WidgetStub()
     window.db_engine = pc_engine
     window.pc_db_engine = pc_engine
     window._pc_probe_engine = pc_engine
@@ -1156,6 +1155,37 @@ def test_database_source_indicator_maps_pc_local_and_offline_colors():
 
         assert window.database_source_label.text == expected_text
         assert expected_color in window.database_source_dot.stylesheet
+
+
+def test_remote_pc_shutdown_is_blocked_while_live_trading_is_armed(
+    monkeypatch,
+):
+    window = MainWindow.__new__(MainWindow)
+    warnings = []
+    monkeypatch.setattr(
+        "src.ui.main_window.is_regular_session_open", lambda: True
+    )
+    monkeypatch.setattr(
+        "src.core.execution_config.is_buyboard_engine_enabled", lambda: True
+    )
+    monkeypatch.setattr(
+        "src.services.trading_state.is_trading_enabled", lambda: True
+    )
+    monkeypatch.setattr(
+        "src.ui.main_window.QMessageBox.warning",
+        lambda *args: warnings.append(args),
+    )
+    monkeypatch.setattr(
+        "src.ui.main_window.QMessageBox.question",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("shutdown confirmation must remain unreachable")
+        ),
+    )
+
+    window._confirm_and_send_pc_shutdown()
+
+    assert len(warnings) == 1
+    assert "canonical trading database" in warnings[0][2]
 
 
 def test_ui_keeps_pc_on_when_database_works_but_listener_is_off():

@@ -62,6 +62,12 @@ def _ensure_runtime_status_table(engine: Engine) -> Table:
     return table
 
 
+def ensure_runtime_status_table(engine: Engine) -> Table:
+    """Public provisioning hook for the shared coordination store."""
+
+    return _ensure_runtime_status_table(engine)
+
+
 def _server_now(engine: Engine):
     if engine.dialect.name == "mysql":
         return func.utc_timestamp(6)

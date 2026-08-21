@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import pytest
 from sqlalchemy import create_engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import NullPool
 
 from src.core.trade_card_state import BoardStatus, TradeCardState
@@ -58,6 +59,27 @@ def test_create_then_get_round_trips(tmp_path):
     assert fetched is not None
     assert fetched.symbol == "AAPL"
     assert fetched.version == 1
+
+
+def test_strict_reads_do_not_turn_database_outage_into_missing_cards(monkeypatch):
+    outage = OperationalError(
+        "SELECT trade_cards", {}, RuntimeError("canonical database offline")
+    )
+    monkeypatch.setattr(
+        repo,
+        "_ensure_trade_cards_table",
+        lambda _engine: (_ for _ in ()).throw(outage),
+    )
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+
+    assert repo.list_trade_cards(engine) == []
+    assert repo.get_trade_card(engine, "PROD", "1", "AAPL") is None
+    with pytest.raises(OperationalError):
+        repo.list_trade_cards(engine, raise_on_error=True)
+    with pytest.raises(OperationalError):
+        repo.get_trade_card(
+            engine, "PROD", "1", "AAPL", raise_on_error=True
+        )
 
 
 def test_create_duplicate_raises_version_conflict(tmp_path):
@@ -262,3 +284,30 @@ def test_migration_respects_watchlist_membership(tmp_path):
         engine, buylist_manager=manager, watchlist=watchlist, apply=False
     )
     assert report.creates[0].card.watchlist_member is True
+
+
+def test_collection_revision_changes_without_returning_payloads(tmp_path):
+    engine = _make_engine(tmp_path)
+    empty = repo.get_trade_card_collection_revision(engine, environment="PROD")
+    assert empty.row_count == 0
+
+    repo.create_trade_card(
+        engine,
+        _card(),
+        local_snapshot_path=tmp_path / "trade_cards.json",
+    )
+    created = repo.get_trade_card_collection_revision(engine, environment="PROD")
+    assert created.row_count == 1
+    assert created != empty
+
+    card = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    card.name = "Updated"
+    repo.update_trade_card(
+        engine,
+        card,
+        expected_version=card.version,
+        local_snapshot_path=tmp_path / "trade_cards.json",
+    )
+    updated = repo.get_trade_card_collection_revision(engine, environment="PROD")
+    assert updated.version_sum == created.version_sum + 1
+    assert updated != created

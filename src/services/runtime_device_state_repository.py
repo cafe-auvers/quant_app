@@ -1,11 +1,12 @@
 """Durable Workstream 6 device readiness used by cross-device handoff."""
 from __future__ import annotations
 
+import json
 import threading
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from sqlalchemy import (
     BigInteger,
@@ -15,6 +16,7 @@ from sqlalchemy import (
     Integer,
     MetaData,
     String,
+    Text,
     func,
     inspect,
     select,
@@ -44,6 +46,7 @@ class RuntimeDeviceRecord:
     confirmed_at: Optional[datetime]
     updated_at: datetime
     schema_version: int
+    details: Dict[str, Any] = field(default_factory=dict)
 
 
 def _table(metadata: MetaData):
@@ -68,6 +71,11 @@ def _table(metadata: MetaData):
             "confirmed_by_lease_epoch", BigInteger, nullable=False, server_default="0"
         ),
         Column("confirmed_at", DateTime, nullable=True),
+        # MySQL 5.7 and older MariaDB releases reject defaults on TEXT/BLOB
+        # columns (error 1101).  Save paths always publish this JSON
+        # explicitly, while readers already treat NULL/blank legacy values as
+        # an empty object.
+        Column("details_json", Text(length=16_777_215), nullable=True),
         Column("updated_at", DateTime, nullable=False),
     )
 
@@ -92,6 +100,10 @@ def ensure_runtime_device_state_table(engine: Engine):
                 # Existing rows predate version publication and must remain
                 # explicitly unknown (0), never be relabelled as compatible.
                 "schema_version": "INTEGER NOT NULL DEFAULT 0",
+                # Keep the compatibility migration nullable.  Adding a
+                # NOT NULL TEXT column to a populated table is not portable,
+                # and every subsequent upsert writes a concrete JSON object.
+                "details_json": "TEXT NULL",
             }
             with engine.begin() as conn:
                 for name, definition in additions.items():
@@ -121,6 +133,12 @@ def _record(row) -> RuntimeDeviceRecord:
         if confirmed_at.tzinfo is None:
             confirmed_at = confirmed_at.replace(tzinfo=timezone.utc)
         confirmed_at = confirmed_at.astimezone(timezone.utc)
+    try:
+        details = json.loads(getattr(row, "details_json", "{}") or "{}")
+    except (TypeError, ValueError):
+        details = {}
+    if not isinstance(details, dict):
+        details = {}
     return RuntimeDeviceRecord(
         device_id=row.device_id,
         hostname=row.hostname,
@@ -132,6 +150,7 @@ def _record(row) -> RuntimeDeviceRecord:
         confirmed_at=confirmed_at,
         updated_at=observed.astimezone(timezone.utc),
         schema_version=int(row.schema_version or 0),
+        details=details,
     )
 
 
@@ -143,6 +162,7 @@ def save_runtime_device_state(
     state: RuntimeDeviceState,
     handoff_confirmed: bool = False,
     schema_version: int = CURRENT_EXECUTION_SCHEMA_VERSION,
+    details: Optional[Dict[str, Any]] = None,
 ) -> RuntimeDeviceRecord:
     """Upsert one device's readiness state.
 
@@ -188,6 +208,14 @@ def save_runtime_device_state(
             confirmed_generation = generation if confirmed else 0
             confirmed_by_lease_epoch = 0
             confirmed_at = _server_now(engine) if confirmed else None
+        existing_details: Dict[str, Any] = {}
+        if existing is not None:
+            try:
+                decoded_details = json.loads(existing.details_json or "{}")
+                if isinstance(decoded_details, dict):
+                    existing_details = decoded_details
+            except (TypeError, ValueError):
+                existing_details = {}
         values = {
             "hostname": str(hostname or ""),
             "state": state.value,
@@ -197,6 +225,15 @@ def save_runtime_device_state(
             "confirmed_generation": confirmed_generation,
             "confirmed_by_lease_epoch": confirmed_by_lease_epoch,
             "confirmed_at": confirmed_at,
+            "details_json": json.dumps(
+                (
+                    dict(details)
+                    if details is not None
+                    else existing_details
+                ),
+                default=str,
+                separators=(",", ":"),
+            ),
             "updated_at": _server_now(engine),
         }
         if existing is None:
@@ -207,6 +244,52 @@ def save_runtime_device_state(
             )
         row = conn.execute(select(table).where(table.c.device_id == device_id)).first()
     return _record(row)
+
+
+def refresh_runtime_device_state(
+    engine: Engine,
+    *,
+    device_id: str,
+    hostname: str,
+    state: RuntimeDeviceState,
+    schema_version: int = CURRENT_EXECUTION_SCHEMA_VERSION,
+    details: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Refresh an unchanged readiness row with one UPDATE statement.
+
+    State transitions still use :func:`save_runtime_device_state` because
+    they must calculate/read back the handoff generation.  Normal ACTIVE or
+    STANDBY_READY heartbeats already know that generation and must not spend
+    three cloud requests selecting the same row before and after every touch.
+    A missing or concurrently changed row returns ``False`` so the caller can
+    fall back to the full transition path.
+    """
+
+    device_id = str(device_id or "").strip()
+    if not device_id:
+        raise ValueError("runtime device state requires device_id")
+    state = state if isinstance(state, RuntimeDeviceState) else RuntimeDeviceState(state)
+    table = ensure_runtime_device_state_table(engine)
+    values = {
+        "hostname": str(hostname or ""),
+        "schema_version": int(schema_version),
+        "details_json": json.dumps(
+            dict(details) if details is not None else {},
+            default=str,
+            separators=(",", ":"),
+        ),
+        "updated_at": _server_now(engine),
+    }
+    with engine.begin() as conn:
+        result = conn.execute(
+            table.update()
+            .where(
+                table.c.device_id == device_id,
+                table.c.state == state.value,
+            )
+            .values(**values)
+        )
+    return result.rowcount == 1
 
 
 def confirm_standby_handoff(
@@ -303,6 +386,15 @@ def get_runtime_device_state(
             select(table).where(table.c.device_id == str(device_id or ""))
         ).first()
     return _record(row) if row is not None else None
+
+
+def list_runtime_device_states(engine: Engine) -> list[RuntimeDeviceRecord]:
+    """Return the latest readiness publication for every known device."""
+
+    table = ensure_runtime_device_state_table(engine)
+    with engine.connect() as conn:
+        rows = conn.execute(select(table).order_by(table.c.hostname.asc())).fetchall()
+    return [_record(row) for row in rows]
 
 
 def require_compatible_runtime_schema(

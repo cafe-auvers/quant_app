@@ -107,6 +107,94 @@ def test_rejected_candidate_blocks_with_reason():
     assert card.entry_block_reason == "No valid ORB window"
 
 
+def test_all_three_terminal_invalid_orb_plans_return_card_to_buylist_with_note():
+    now = datetime(2026, 8, 19, 14, 5, tzinfo=timezone.utc)  # 10:05 ET
+    candidates = {
+        "1m": _candidate(
+            window="1m",
+            status=OrbCandidateStatus.REJECTED,
+            valid=False,
+            reason="ORB high did not clear breakout",
+        ),
+        "5m": _candidate(
+            window="5m",
+            status=OrbCandidateStatus.RISK_INVALID,
+            valid=False,
+            reason="stop is too wide",
+        ),
+        "30m": _candidate(
+            window="30m",
+            status=OrbCandidateStatus.REJECTED,
+            valid=False,
+            reason="ORB strategy rejected",
+        ),
+    }
+    card = _card(
+        entry_trigger=101.0,
+        entry_orb_high=101.0,
+        entry_orb_low=95.0,
+        planned_quantity=20,
+        target_position_quantity=20,
+    )
+    item = _queue_item(None, candidates=candidates, last_updated=now)
+
+    TradeCardOrbEvaluator(clock=lambda: now).update_card(card, item)
+
+    assert card.board_status == BoardStatus.BUYLIST
+    assert card.previous_board_status == BoardStatus.BUY_TODAY
+    assert card.entry_runtime_status is None
+    assert card.entry_trigger is None
+    assert card.planned_quantity == 0
+    assert card.session_date is None
+    assert card.buylist_member is True
+    assert "all ORB plans invalid" in card.buy_today_note
+    assert "1m: ORB high did not clear breakout" in card.buy_today_note
+    assert "5m: stop is too wide" in card.buy_today_note
+    assert "30m: ORB strategy rejected" in card.buy_today_note
+
+
+def test_forming_window_prevents_automatic_return_to_buylist():
+    now = datetime(2026, 8, 19, 14, 5, tzinfo=timezone.utc)  # 10:05 ET
+    candidates = {
+        "1m": _candidate(
+            window="1m", status=OrbCandidateStatus.REJECTED, valid=False
+        ),
+        "5m": _candidate(
+            window="5m", status=OrbCandidateStatus.RISK_INVALID, valid=False
+        ),
+        "30m": _candidate(
+            window="30m", status=OrbCandidateStatus.FORMING, valid=False
+        ),
+    }
+    card = _card()
+    item = _queue_item(None, candidates=candidates, last_updated=now)
+
+    TradeCardOrbEvaluator(clock=lambda: now).update_card(card, item)
+
+    assert card.board_status == BoardStatus.BUY_TODAY
+    assert card.buy_today_note == ""
+
+
+def test_terminal_orb_rejection_never_hides_an_existing_entry_identity():
+    now = datetime(2026, 8, 19, 14, 5, tzinfo=timezone.utc)  # 10:05 ET
+    candidates = {
+        window: _candidate(
+            window=window,
+            status=OrbCandidateStatus.REJECTED,
+            valid=False,
+            reason="invalid",
+        )
+        for window in ("1m", "5m", "30m")
+    }
+    card = _card(entry_client_order_id="known-buy-order")
+    item = _queue_item(None, candidates=candidates, last_updated=now)
+
+    TradeCardOrbEvaluator(clock=lambda: now).update_card(card, item)
+
+    assert card.board_status == BoardStatus.BUY_TODAY
+    assert card.entry_client_order_id == "known-buy-order"
+
+
 def test_no_selected_candidate_yet_leaves_card_forming():
     card = _card()
     item = _queue_item(None)

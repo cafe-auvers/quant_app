@@ -383,6 +383,7 @@ class ExternalAlertingService:
         escalation_every_attempts: int = 2,
         max_escalation_level: int = 3,
         heartbeat_interval_seconds: float = 30.0,
+        heartbeat_audit_interval_seconds: float = 300.0,
         local_spool: Optional[LocalAlertSpool] = None,
         spool_import_fault_hook: Optional[Callable[[str], None]] = None,
     ) -> None:
@@ -399,11 +400,18 @@ class ExternalAlertingService:
         self.heartbeat_interval_seconds = max(
             0.001, float(heartbeat_interval_seconds)
         )
+        self.heartbeat_audit_interval_seconds = max(
+            self.heartbeat_interval_seconds,
+            float(heartbeat_audit_interval_seconds),
+        )
         self.local_spool = local_spool or LocalAlertSpool()
         self._spool_import_fault_hook = spool_import_fault_hook or (
             lambda _point: None
         )
         self._last_heartbeat_attempt_at: Optional[datetime] = None
+        self._last_heartbeat_published_at: Optional[datetime] = None
+        self._last_heartbeat_audited_at: Optional[datetime] = None
+        self._last_heartbeat_audit_status = ""
         ensure_external_alert_tables(engine)
 
     @staticmethod
@@ -512,6 +520,51 @@ class ExternalAlertingService:
             return
         except Exception as exc:
             database_error = str(exc)
+        self._deliver_offline_incident(
+            resolved_type,
+            key,
+            str(message),
+            database_error=database_error,
+        )
+
+    def sink_offline(
+        self,
+        alert_class: str,
+        dedupe_key: str,
+        message: str,
+        *,
+        database_error: str = "Canonical database is unavailable",
+        deliver_directly: bool = True,
+    ) -> None:
+        """Spool/deliver an incident when the caller already proved DB loss.
+
+        Retrying the same unavailable database before writing the local spool
+        adds another connection timeout at the worst possible moment. This
+        seam preserves the same durable and external-delivery behavior while
+        skipping that known-futile retry.
+        """
+
+        resolved_type = self._normalize_type(alert_class).value
+        key = str(dedupe_key or "").strip()
+        if not key:
+            raise ValueError("Critical alert requires a dedupe_key")
+        self._deliver_offline_incident(
+            resolved_type,
+            key,
+            str(message),
+            database_error=str(database_error),
+            deliver_directly=bool(deliver_directly),
+        )
+
+    def _deliver_offline_incident(
+        self,
+        resolved_type: str,
+        key: str,
+        message: str,
+        *,
+        database_error: str,
+        deliver_directly: bool = True,
+    ) -> None:
         pending = None
         is_new_pending = False
         spool_error: Optional[Exception] = None
@@ -519,7 +572,7 @@ class ExternalAlertingService:
             pending, is_new_pending = self.local_spool.record_alert_occurrence(
                 alert_type=resolved_type,
                 dedupe_key=key,
-                message=str(message),
+                message=message,
                 database_error=database_error,
             )
         except Exception as exc:
@@ -528,6 +581,13 @@ class ExternalAlertingService:
             spool_error = exc
         if pending is not None and not is_new_pending:
             return
+        if not deliver_directly:
+            if pending is None:
+                raise RuntimeError(
+                    "Critical alert could not be written to the offline spool: "
+                    f"{spool_error}"
+                )
+            return
         offline_event_id = (
             str(pending["event_id"]) if pending is not None else uuid4().hex
         )
@@ -535,7 +595,7 @@ class ExternalAlertingService:
             "incident_id": f"offline-{offline_event_id}",
             "alert_type": resolved_type,
             "dedupe_key": key,
-            "message": str(message),
+            "message": message,
             "device_id": self.device_id,
             "requires_acknowledgement": True,
             "offline_spool": pending is not None,
@@ -986,38 +1046,61 @@ class ExternalAlertingService:
             provider_id = str(self.provider.publish_heartbeat(payload) or "")
             status = "PUBLISHED"
             succeeded = True
+            self._last_heartbeat_published_at = now
         except Exception as exc:
             status = "FAILED"
             error = str(exc)
             succeeded = False
-        table = _heartbeat_table(MetaData())
-        try:
-            with self.engine.begin() as conn:
-                conn.execute(
-                    table.insert().values(
-                        device_id=self.device_id,
-                        attempted_at=_db_datetime(now),
-                        status=status,
-                        provider_delivery_id=provider_id,
-                        error=error,
+        audit_due = bool(
+            not self._last_heartbeat_audit_status
+            or status != self._last_heartbeat_audit_status
+            or self._last_heartbeat_audited_at is None
+            or (now - _as_utc(self._last_heartbeat_audited_at)).total_seconds()
+            >= self.heartbeat_audit_interval_seconds
+        )
+        if audit_due:
+            table = _heartbeat_table(MetaData())
+            try:
+                with self.engine.begin() as conn:
+                    conn.execute(
+                        table.insert().values(
+                            device_id=self.device_id,
+                            attempted_at=_db_datetime(now),
+                            status=status,
+                            provider_delivery_id=provider_id,
+                            error=error,
+                        )
                     )
+            except Exception:
+                self.local_spool.append(
+                    "HEARTBEAT_ATTEMPT",
+                    {
+                        "device_id": self.device_id,
+                        "attempted_at": now.isoformat(),
+                        "status": status,
+                        "provider_delivery_id": provider_id,
+                        "error": error,
+                    },
                 )
-        except Exception:
-            self.local_spool.append(
-                "HEARTBEAT_ATTEMPT",
-                {
-                    "device_id": self.device_id,
-                    "attempted_at": now.isoformat(),
-                    "status": status,
-                    "provider_delivery_id": provider_id,
-                    "error": error,
-                },
-            )
+            self._last_heartbeat_audited_at = now
+            self._last_heartbeat_audit_status = status
         return succeeded
 
     def publish_heartbeat_if_due(self) -> bool:
         table = _heartbeat_table(MetaData())
         now = _as_utc(self._clock())
+        # A successful publication in this process suppresses the durable
+        # lookup until the interval expires. Failures remain immediately
+        # retryable (the runtime itself applies a separate poll cadence).
+        if self._last_heartbeat_published_at is not None and (
+            now - _as_utc(self._last_heartbeat_published_at)
+        ).total_seconds() < self.heartbeat_interval_seconds:
+            return False
+        if self._last_heartbeat_attempt_at is not None:
+            # This process already owns the cadence. The external endpoint is
+            # the heartbeat authority; re-reading its TiDB audit row before
+            # every publication only adds quota cost and no safety.
+            return self.publish_heartbeat()
         try:
             with self.engine.begin() as conn:
                 last = conn.execute(
@@ -1030,7 +1113,7 @@ class ExternalAlertingService:
                     .limit(1)
                 ).scalar_one_or_none()
         except Exception:
-            last = self._last_heartbeat_attempt_at
+            last = self._last_heartbeat_published_at
         if last is not None and (
             now - _as_utc(last)
         ).total_seconds() < self.heartbeat_interval_seconds:

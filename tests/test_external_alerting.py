@@ -231,6 +231,24 @@ def test_heartbeat_is_published_on_the_expected_cadence(tmp_path):
     assert service.watchdog_is_external is True
 
 
+def test_successful_heartbeat_audit_is_compacted_while_webhook_stays_frequent(
+    tmp_path,
+):
+    provider = FakeProvider()
+    service, now = _service(
+        tmp_path,
+        provider=provider,
+        heartbeat_audit_interval_seconds=60,
+    )
+
+    assert service.publish_heartbeat_if_due() is True
+    now[0] += timedelta(seconds=10)
+    assert service.publish_heartbeat_if_due() is True
+
+    assert len(provider.heartbeats) == 2
+    assert len(service.heartbeat_attempts()) == 1
+
+
 def test_heartbeat_publication_failure_is_durable_and_retried(tmp_path):
     provider = FakeProvider()
     provider.heartbeat_failures = 1
@@ -276,6 +294,45 @@ def test_database_outage_spools_and_directly_delivers_critical_alert(tmp_path):
     assert [row["status"] for row in service.delivery_attempts(incident.incident_id)] == [
         "DELIVERED"
     ]
+
+
+def test_known_offline_alert_skips_a_second_database_attempt(tmp_path, monkeypatch):
+    provider = FakeProvider()
+    service, _ = _service(tmp_path, provider=provider)
+    monkeypatch.setattr(
+        service,
+        "raise_alert",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("known outage must not retry the database")
+        ),
+    )
+
+    service.sink_offline(
+        CriticalAlertType.DATABASE_UNAVAILABLE,
+        "prod-db",
+        "canonical database unavailable",
+    )
+
+    assert len(provider.deliveries) == 1
+    assert provider.deliveries[0]["offline_spool"] is True
+    assert len(service.local_spool.pending_alerts()) == 1
+
+
+def test_execution_thread_can_spool_known_outage_without_waiting_on_delivery(
+    tmp_path,
+):
+    provider = FakeProvider()
+    service, _ = _service(tmp_path, provider=provider)
+
+    service.sink_offline(
+        CriticalAlertType.DATABASE_UNAVAILABLE,
+        "prod-db-fast-path",
+        "canonical database unavailable",
+        deliver_directly=False,
+    )
+
+    assert provider.deliveries == []
+    assert len(service.local_spool.pending_alerts()) == 1
 
 
 def test_spool_failure_does_not_suppress_direct_critical_alert_delivery(tmp_path):

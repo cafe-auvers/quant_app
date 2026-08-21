@@ -150,6 +150,27 @@ def test_buylist_card_shows_only_name_and_breakout_not_execution_or_orb_state():
     assert "DATA STALE" not in text
 
 
+def test_buylist_card_shows_buy_today_rejection_memo():
+    _ensure_app()
+    card = TradeCardState(
+        environment="PROD",
+        account_no="1",
+        symbol="WEX",
+        board_status=BoardStatus.BUYLIST,
+        breakout_price=192.72,
+        buy_today_note=(
+            "Buy Today rejected - all ORB plans invalid. "
+            "1m: stop is too wide; 5m: breakout not cleared; 30m: risk invalid"
+        ),
+    )
+
+    text = _widget_text(TradeCardWidget(card))
+
+    assert "Memo:" in text
+    assert "all ORB plans invalid" in text
+    assert "1m: stop is too wide" in text
+
+
 def test_buy_today_card_shows_live_breakout_distance_and_planned_stop_result():
     card = TradeCardState(
         environment="PROD",
@@ -350,6 +371,19 @@ def test_actionable_restrictions_remain_visible_while_standby_is_silent():
 
     assert "STANDBY" not in text
     assert "Canonical database is not confirmed writable" in text
+
+
+def test_standby_ready_is_not_presented_as_an_execution_error():
+    _ensure_app()
+    projection = BoardCardProjection(
+        card=_open_card(orderable_quantity=100),
+        engine_restrictions=("Device state is STANDBY_READY",),
+    )
+
+    text = _widget_text(TradeCardWidget(projection))
+
+    assert "RESTRICTED" not in text
+    assert "STANDBY_READY" not in text
 
 
 def test_live_metric_refresh_reuses_widget_and_never_rebuilds_column():

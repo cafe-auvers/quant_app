@@ -161,6 +161,11 @@ class TradeCardState:
     watchlist_member: bool = False
     buylist_member: bool = False
     return_to_buylist_after_close: bool = False
+    # Durable, trader-facing explanation for the most recent automatic
+    # Buy Today -> Buylist return.  This is deliberately separate from
+    # ``entry_block_reason``: planning cards hide live-runtime diagnostics,
+    # while this note must remain visible until the trader tries again.
+    buy_today_note: str = ""
 
     # Entry plan
     breakout_price: Optional[float] = None
@@ -300,6 +305,7 @@ class TradeCardState:
         self.watchlist_member = bool(self.watchlist_member)
         self.buylist_member = bool(self.buylist_member)
         self.return_to_buylist_after_close = bool(self.return_to_buylist_after_close)
+        self.buy_today_note = str(self.buy_today_note or "")
         self.breakout_price = _finite_float(self.breakout_price)
         self.selected_orb_window = (
             str(self.selected_orb_window).strip() if self.selected_orb_window else None
@@ -443,6 +449,7 @@ class TradeCardState:
             "watchlist_member": self.watchlist_member,
             "buylist_member": self.buylist_member,
             "return_to_buylist_after_close": self.return_to_buylist_after_close,
+            "buy_today_note": self.buy_today_note,
             "breakout_price": self.breakout_price,
             "selected_orb_window": self.selected_orb_window,
             "buffer_pct": self.buffer_pct,
@@ -545,6 +552,7 @@ class TradeCardState:
             return_to_buylist_after_close=bool(
                 data.get("return_to_buylist_after_close", False)
             ),
+            buy_today_note=str(data.get("buy_today_note", "")),
             breakout_price=data.get("breakout_price"),
             selected_orb_window=data.get("selected_orb_window"),
             buffer_pct=data.get("buffer_pct", 0.001),

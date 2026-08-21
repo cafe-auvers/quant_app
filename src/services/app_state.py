@@ -35,11 +35,14 @@ from src.services.state_sync import (
     TRADE_PLANS_KEY,
     WATCHLIST_KEY,
     LocalDeviceRole,
+    PlanPublishResult,
     claim_main_device,
     claim_main_device_if_stale,
     claim_main_device_if_unclaimed,
     get_main_device,
+    get_synced_state_revisions,
     pull_state,
+    publish_planning_snapshot,
     push_state,
     release_main_device,
     set_local_device_main,
@@ -882,6 +885,12 @@ class StateReconcileResult:
     live_trading_enabled: bool | None = None
     live_trading_revision: int = 0
     live_trading_error: str = ""
+    operator_control: Any = None
+    operator_control_error: str = ""
+    runtime_devices: list[Any] = field(default_factory=list)
+    operator_commands: list[Any] = field(default_factory=list)
+    state_revisions: Dict[str, int] = field(default_factory=dict)
+    last_verified_at: datetime | None = None
 
 
 def _demote_after_lost_ownership(
@@ -979,6 +988,8 @@ def reconcile_state_with_remote(
             return result
 
         sync_entries = _read_sync_entries(metadata_path)
+        remote_revisions = get_synced_state_revisions(engine)
+        result.state_revisions = dict(remote_revisions)
         metadata_updates: Dict[str, Dict[str, Any]] = {}
         key_to_file = _synced_key_to_file()
 
@@ -989,6 +1000,17 @@ def reconcile_state_with_remote(
             base_entry = sync_entries.get(state_key)
             has_base, base_revision, base_hash = _base_sync_values(base_entry)
             local_dirty = has_base and local_hash != base_hash
+
+            # The four planning payloads can be large. A single compact
+            # revision query proves an unchanged pull-only row needs no JSON
+            # transfer. Main-device local changes still follow the guarded
+            # push path below.
+            if (
+                not is_main
+                and has_base
+                and int(remote_revisions.get(state_key, 0) or 0) == base_revision
+            ):
+                continue
 
             pulled = pull_state(engine, state_key)
             if pulled.status == PULL_ERROR:
@@ -1191,10 +1213,10 @@ def auto_claim_main_device_if_stale(
 ) -> StateReconcileResult:
     """Automatic, fenced equivalent of ``activate_device_as_main``.
 
-    Used only for unattended handoff (``should_auto_claim_main`` said yes) --
-    the manual "Use This Device as Main" button keeps using
-    ``activate_device_as_main``/plain ``claim_main_device`` unchanged. The
-    claim itself goes through a fenced primitive that re-verifies the
+    Used only for unattended handoff (``should_auto_claim_main`` said yes).
+    Explicit transfers now use the Execution Owner controls and their
+    readiness-gated switch service. The automatic claim itself goes through
+    a fenced primitive that re-verifies the
     expected state atomically inside the same row lock, instead of trusting
     the caller's earlier observation:
 
@@ -1365,6 +1387,96 @@ def publish_handoff_snapshot(
     if updates:
         _update_sync_entries(updates, path)
     return True
+
+
+def publish_trading_plan(
+    engine,
+    role: LocalDeviceRole,
+    watchlist_dict: Dict[str, Any],
+    buylist_dict: Dict[str, Any],
+    trade_plans_dict: Dict[str, Any],
+    execution_queue_dict: Dict[str, Any],
+    *,
+    market_is_open: bool,
+    metadata_path: Path | None = None,
+) -> PlanPublishResult:
+    """Revision-safe pre-market full publish with immediate read-back proof."""
+
+    path = metadata_path or STATE_METADATA_FILE
+    sync_entries = _read_sync_entries(path)
+    payloads = {
+        WATCHLIST_KEY: watchlist_dict,
+        BUYLIST_KEY: buylist_dict,
+        TRADE_PLANS_KEY: trade_plans_dict,
+        EXECUTION_QUEUE_KEY: execution_queue_dict,
+    }
+    expected: Dict[str, int] = {}
+    for state_key in SYNCED_STATE_KEYS:
+        has_base, base_revision, _base_hash = _base_sync_values(
+            sync_entries.get(state_key)
+        )
+        if has_base:
+            expected[state_key] = base_revision
+            continue
+        pulled = pull_state(engine, state_key)
+        if pulled.status == PULL_ERROR:
+            return PlanPublishResult(
+                False,
+                error=(
+                    f"Could not establish the current {state_key} revision: "
+                    f"{pulled.error or 'unknown database error'}"
+                ),
+            )
+        expected[state_key] = (
+            int(pulled.state.revision) if pulled.status == PULL_OK and pulled.state else 0
+        )
+
+    published = publish_planning_snapshot(
+        engine,
+        role,
+        payloads,
+        expected_revisions=expected,
+        market_is_open=market_is_open,
+    )
+    if not published.success:
+        return published
+
+    updates: Dict[str, Dict[str, Any]] = {}
+    for state_key, payload in payloads.items():
+        pulled = pull_state(engine, state_key)
+        if pulled.status != PULL_OK or pulled.state is None:
+            return PlanPublishResult(
+                False,
+                revisions=published.revisions,
+                verified_at=published.verified_at,
+                execution_owner_hostname=published.execution_owner_hostname,
+                execution_owner_heartbeat_fresh=(
+                    published.execution_owner_heartbeat_fresh
+                ),
+                error=f"Published {state_key}, but its read-back verification failed.",
+            )
+        payload_hash = _state_payload_hash(payload)
+        if (
+            pulled.state.revision != published.revisions[state_key]
+            or _state_payload_hash(pulled.state.payload) != payload_hash
+        ):
+            return PlanPublishResult(
+                False,
+                revisions=published.revisions,
+                verified_at=published.verified_at,
+                execution_owner_hostname=published.execution_owner_hostname,
+                execution_owner_heartbeat_fresh=(
+                    published.execution_owner_heartbeat_fresh
+                ),
+                error=f"Published {state_key}, but revision/hash verification did not match.",
+            )
+        updates[state_key] = _sync_entry(
+            pulled.state.revision,
+            payload_hash,
+            pulled.state.updated_at,
+        )
+    _update_sync_entries(updates, path)
+    return published
 
 
 def save_app_state(

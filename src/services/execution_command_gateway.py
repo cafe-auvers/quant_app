@@ -1096,6 +1096,44 @@ class ExecutionCommandGateway:
             )
         return proof
 
+    def note_canonical_ownership_snapshot_verified(
+        self,
+        ownership: ExecutionOwnership,
+        *,
+        source: ExecutionSource,
+        strategy_instance_id: str,
+    ) -> ExecutionOwnershipProof:
+        """Cache one row from a single authoritative bulk ownership read.
+
+        This is equivalent to ``note_canonical_ownership_verified`` except the
+        caller already fetched all relevant rows in one canonical query.
+        Online broker mutations still perform their own exact boundary read.
+        """
+
+        if not self._canonical_database_is_writable():
+            raise CanonicalDatabaseUnavailableError(
+                "Cannot cache execution ownership while the canonical database is unavailable"
+            )
+        key = (
+            str(ownership.environment or "").upper(),
+            str(ownership.account_no or ""),
+            str(ownership.symbol or "").upper(),
+        )
+        self._cached_ownership_proofs.pop(key, None)
+        if (
+            ownership.owner != ExecutionOwner.KANBAN
+            or source != ExecutionSource.KANBAN_BOARD
+            or not strategy_instance_id
+            or strategy_instance_id != ownership.strategy_instance_id
+            or int(ownership.version or 0) <= 0
+        ):
+            raise ExecutionOwnershipMismatchError(
+                "Emergency Kanban execution requires exact KANBAN strategy ownership"
+            )
+        proof = ExecutionOwnershipProof.from_ownership(ownership)
+        self._cached_ownership_proofs[key] = proof
+        return proof
+
     def _require_cached_emergency_ownership(
         self,
         *,

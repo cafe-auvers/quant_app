@@ -17,6 +17,7 @@ import time
 from typing import Optional
 
 from PyQt5.QtCore import QThread, pyqtSignal
+from sqlalchemy.exc import SQLAlchemyError
 
 from src.core.board_workflow import (
     AnyBoardCommand,
@@ -65,6 +66,8 @@ class BuyboardProjectionRequest:
     account_snapshot_fetched_at: dict
     runtime_running: bool
     generation: int
+    revision_only: bool = False
+    expected_revision: object = None
 
 
 class BuyboardProjectionWorker(QThread):
@@ -75,6 +78,7 @@ class BuyboardProjectionWorker(QThread):
     def __init__(self, request: BuyboardProjectionRequest) -> None:
         super().__init__()
         self.request = request
+        self.resolved_revision = None
 
     def run(self) -> None:
         started_at = time.perf_counter()
@@ -84,6 +88,18 @@ class BuyboardProjectionWorker(QThread):
             from src.services.trade_card_bootstrap import (
                 bootstrap_trade_cards_from_current_state,
             )
+
+            if request.revision_only:
+                current_revision = (
+                    execution_workflow_service.get_board_projection_revision(
+                        request.engine, environment="PROD"
+                    ),
+                    request.context,
+                )
+                self.resolved_revision = current_revision
+                if current_revision == request.expected_revision:
+                    self.completed.emit(None, "", request.generation)
+                    return
 
             kwargs = {}
             if not request.runtime_running:
@@ -101,6 +117,11 @@ class BuyboardProjectionWorker(QThread):
                     default_account_no=request.default_account_no,
                     **kwargs,
                 )
+            except SQLAlchemyError:
+                logger.debug(
+                    "Buy Board bootstrap paused because the canonical "
+                    "database is unavailable"
+                )
             except Exception:
                 logger.exception("Buy Board bootstrap refresh failed")
 
@@ -110,7 +131,22 @@ class BuyboardProjectionWorker(QThread):
                 context=request.context,
                 board_statuses=BOARD_COLUMN_ORDER,
             )
+            if request.revision_only:
+                # Bootstrap may itself have normalized a newly synced
+                # Watchlist/Buylist item, so capture the post-projection token.
+                self.resolved_revision = (
+                    execution_workflow_service.get_board_projection_revision(
+                        request.engine, environment="PROD"
+                    ),
+                    request.context,
+                )
             self.completed.emit(projections, "", request.generation)
+        except SQLAlchemyError as exc:
+            logger.warning(
+                "Buy Board canonical database is unavailable; showing the "
+                "read-only recovery snapshot"
+            )
+            self.completed.emit([], str(exc), request.generation)
         except Exception as exc:
             logger.exception("Buy Board projection refresh failed")
             self.completed.emit([], str(exc), request.generation)
@@ -132,6 +168,8 @@ class BuyboardCommandRequest:
     projection_context: BoardProjectionContext
     interaction_fingerprint: str = ""
     enqueued_at: float = 0.0
+    route_via_operator_queue: bool = False
+    requester_role: object = None
 
     @property
     def card_key(self) -> str:
@@ -149,6 +187,7 @@ class BuyboardCommandResult:
     message: str = ""
     elapsed_ms: float = 0.0
     queue_wait_ms: float = 0.0
+    operator_command_queued: bool = False
 
 
 class BoardCommandWorker(QThread):
@@ -172,6 +211,28 @@ class BoardCommandWorker(QThread):
         queue_wait_ms = max(0.0, (started_at - request.enqueued_at) * 1000.0)
         current_command = request.command
         try:
+            if request.route_via_operator_queue:
+                from src.services.operator_command_service import (
+                    enqueue_board_operator_command,
+                )
+
+                inserted = enqueue_board_operator_command(
+                    request.engine,
+                    request.requester_role,
+                    current_command,
+                )
+                return BuyboardCommandResult(
+                    request=request,
+                    succeeded=True,
+                    operator_command_queued=True,
+                    message=(
+                        "Live command queued for the Execution Owner."
+                        if inserted.created
+                        else "This live command was already queued."
+                    ),
+                    elapsed_ms=(time.perf_counter() - started_at) * 1000.0,
+                    queue_wait_ms=queue_wait_ms,
+                )
             for attempt in range(2):
                 try:
                     execution_workflow_service.request_board_action(
@@ -255,6 +316,20 @@ class BoardCommandWorker(QThread):
                         queue_wait_ms=queue_wait_ms,
                     )
         except Exception as exc:
+            from src.services.operator_commands import (
+                OperatorCommandError,
+                OperatorControlNotOwnedError,
+            )
+
+            if isinstance(exc, (OperatorControlNotOwnedError, OperatorCommandError)):
+                return BuyboardCommandResult(
+                    request=request,
+                    succeeded=False,
+                    error_kind="operator_control",
+                    message=str(exc),
+                    elapsed_ms=(time.perf_counter() - started_at) * 1000.0,
+                    queue_wait_ms=queue_wait_ms,
+                )
             logger.exception(
                 "Buy Board command %s failed unexpectedly",
                 type(request.command).__name__,
@@ -433,7 +508,7 @@ def _claims_kanban_ownership(command: AnyBoardCommand) -> bool:
 class BuyboardMixin:
     """Build the board and route all gestures through the workflow service."""
 
-    _BUYBOARD_PROJECTION_REFRESH_MS = 3000
+    _BUYBOARD_PROJECTION_REFRESH_MS = 60_000
     _BUYBOARD_LIVE_METRIC_REFRESH_MS = 750
     _BUYBOARD_ORB_DATA_REFRESH_MS = 60_000
     _BUYBOARD_BROKER_TRUTH_REFRESH_MS = 30_000
@@ -465,7 +540,7 @@ class BuyboardMixin:
         # trigger immediate board_changed refreshes.
         timer = QTimer(self)
         timer.setInterval(self._BUYBOARD_PROJECTION_REFRESH_MS)
-        timer.timeout.connect(self.refresh_buyboard)
+        timer.timeout.connect(lambda: self.refresh_buyboard(revision_only=True))
         timer.start()
         self._buyboard_projection_timer = timer
 
@@ -939,7 +1014,9 @@ class BuyboardMixin:
 
         refresh_buyboard_live_metrics(self)
 
-    def _buyboard_projection_request(self, generation: int):
+    def _buyboard_projection_request(
+        self, generation: int, *, revision_only: bool = False
+    ):
         engine = self._buyboard_engine()
         if engine is None:
             return None
@@ -980,6 +1057,8 @@ class BuyboardMixin:
             ),
             runtime_running=runtime_running,
             generation=generation,
+            revision_only=bool(revision_only),
+            expected_revision=self.__dict__.get("_buyboard_projection_revision"),
         )
 
     def _bootstrap_buyboard_projection(self) -> None:
@@ -1040,7 +1119,7 @@ class BuyboardMixin:
                 len(result.holding_updated_keys),
             )
 
-    def refresh_buyboard(self) -> None:
+    def refresh_buyboard(self, *, revision_only: bool = False) -> None:
         from .board import populate_buyboard_columns
 
         if bool(self.__dict__.get("_database_shutting_down", False)):
@@ -1062,7 +1141,11 @@ class BuyboardMixin:
             self.__dict__.get("_buyboard_projection_generation", 0)
         ) + 1
         self._buyboard_projection_generation = generation
-        request = self._buyboard_projection_request(generation)
+        request = (
+            self._buyboard_projection_request(generation, revision_only=True)
+            if revision_only
+            else self._buyboard_projection_request(generation)
+        )
         if request is None:
             self._show_buyboard_recovery_snapshot()
             return
@@ -1084,6 +1167,12 @@ class BuyboardMixin:
                 self._buyboard_refresh_pending = True
                 return
             self._show_buyboard_recovery_snapshot()
+            return
+        worker = self.__dict__.get("_buyboard_projection_worker")
+        resolved_revision = getattr(worker, "resolved_revision", None)
+        if resolved_revision is not None:
+            self._buyboard_projection_revision = resolved_revision
+        if projections is None:
             return
         if int(self.__dict__.get("_buyboard_interaction_depth", 0) or 0) > 0:
             self._buyboard_deferred_projection = (projections, error, generation)
@@ -1171,6 +1260,26 @@ class BuyboardMixin:
             return False
 
         action_context = _action_context(self, command)
+        route_via_operator_queue = False
+        role = self.__dict__.get("state_sync_role")
+        if role is not None and is_regular_session_open():
+            from src.services.operator_command_service import (
+                operator_command_type_for_board_command,
+            )
+
+            if operator_command_type_for_board_command(command) is not None:
+                route_via_operator_queue = True
+            elif not bool(getattr(role, "is_main", False)):
+                from PyQt5.QtWidgets import QMessageBox
+
+                QMessageBox.information(
+                    self,
+                    "Market-open planning lock",
+                    "Market is open. A non-execution-owner device may submit "
+                    "Live Intervention commands only; canonical planning state "
+                    "cannot be rewritten.",
+                )
+                return False
         if _claims_kanban_ownership(command):
             # These gestures perform zero broker I/O here. They are valid
             # pre-market and from a pull-only laptop; the authoritative PC
@@ -1184,6 +1293,8 @@ class BuyboardMixin:
             projection_context=_projection_context(self),
             interaction_fingerprint=str(interaction_fingerprint or ""),
             enqueued_at=time.perf_counter(),
+            route_via_operator_queue=route_via_operator_queue,
+            requester_role=role,
         )
         worker = self.__dict__.get("_buyboard_command_worker")
         create_worker = worker is None
@@ -1225,4 +1336,10 @@ class BuyboardMixin:
         self._set_buyboard_card_pending(result.request.card_key, False)
         if not result.succeeded:
             QMessageBox.warning(self, "Buy Board", result.message)
+        elif result.operator_command_queued:
+            append_log = getattr(self, "append_log", None)
+            if callable(append_log):
+                append_log(
+                    f"{type(result.request.command).__name__}: {result.message}"
+                )
         self.refresh_buyboard()

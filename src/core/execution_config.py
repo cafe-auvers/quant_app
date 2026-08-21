@@ -87,6 +87,38 @@ SELL_MARKETABLE_DISCOUNT_PCT = _env_float("SELL_MARKETABLE_DISCOUNT_PCT", 0.005)
 
 # --- One-second engine cadence (section 771-806) -----------------------------
 ENGINE_HEARTBEAT_SECONDS = _env_int("ENGINE_HEARTBEAT_SECONDS", 1)
+# The market/ORB loop above stays at one second. These independent cadences
+# cap Internet coordination traffic without delaying broker-boundary fencing.
+COORDINATION_ACTIVE_CARD_POLL_SECONDS = max(
+    60.0, _env_float("COORDINATION_ACTIVE_CARD_POLL_SECONDS", 60.0)
+)
+COORDINATION_STANDBY_CARD_POLL_SECONDS = max(
+    60.0, _env_float("COORDINATION_STANDBY_CARD_POLL_SECONDS", 60.0)
+)
+COORDINATION_DATABASE_PROBE_SECONDS = max(
+    15.0, _env_float("COORDINATION_DATABASE_PROBE_SECONDS", 15.0)
+)
+COORDINATION_LEASE_POLL_SECONDS = max(
+    10.0, _env_float("COORDINATION_LEASE_POLL_SECONDS", 10.0)
+)
+COORDINATION_DEVICE_HEARTBEAT_SECONDS = max(
+    15.0, _env_float("COORDINATION_DEVICE_HEARTBEAT_SECONDS", 15.0)
+)
+COORDINATION_OWNERSHIP_PROOF_SECONDS = max(
+    10.0, _env_float("COORDINATION_OWNERSHIP_PROOF_SECONDS", 10.0)
+)
+COORDINATION_ALERT_POLL_SECONDS = max(
+    30.0, _env_float("COORDINATION_ALERT_POLL_SECONDS", 30.0)
+)
+# Operator commands are the only coordination reads kept at one second while
+# the US regular session is open.  Off hours, published-state changes are
+# event-driven locally and a minute is sufficient for cross-device pickup.
+COORDINATION_OPERATOR_COMMAND_POLL_SECONDS = max(
+    1.0, _env_float("COORDINATION_OPERATOR_COMMAND_POLL_SECONDS", 1.0)
+)
+COORDINATION_OFF_HOURS_POLL_SECONDS = max(
+    60.0, _env_float("COORDINATION_OFF_HOURS_POLL_SECONDS", 60.0)
+)
 PENDING_ORDER_RECONCILIATION_SECONDS = _env_int(
     "PENDING_ORDER_RECONCILIATION_SECONDS", 2
 )

@@ -66,7 +66,7 @@ The **Buy Board** is separate from the legacy Buy Dashboard. Its UI is a read-on
 3. Run the app: `python main.py`
 4. Run tests: `pytest -q`
 
-The app can run without MySQL. Database-backed scanning and cache freshness features require valid `MYSQL_*` settings.
+The app can run without MySQL. Database-backed scanning and cache freshness features require valid `MYSQL_*` settings. For PC-independent execution coordination, configure the separate TLS-only `COORD_DB_*` SQL connection described in [TiDB Cloud Coordination Store](docs/tidb_coordination_store.md); historical prices are never uploaded there.
 
 `requirements.txt` contains the intentionally supported direct dependency ranges.
 `requirements.lock` pins the full Python 3.11/3.12 dependency graph and package
@@ -80,6 +80,10 @@ If you're running this across two machines (a dev laptop + an always-on
 data-refresh PC, sharing one MySQL database over LAN/Tailscale), see
 [docs/pc_sync_data_pipeline.md](docs/pc_sync_data_pipeline.md) for the full
 architecture and automation.
+
+For live control, handoff, Buy Today publishing, and the distinction between
+**Execution Owner** and **Operator Control**, see
+[docs/execution_operator_control.md](docs/execution_operator_control.md).
 
 ## Configuration
 
