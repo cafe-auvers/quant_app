@@ -20,12 +20,21 @@ class ExecutionQueueRefreshRequest:
     target_items: Sequence[Any]
     missing_symbols: List[str] = field(default_factory=list)
     requested_symbols: Optional[List[str]] = None
-    account_size: float = 100000.0
+    # Retained in the request shape for compatibility with older callers.
+    # Execution sizing requires account_size_for_account's exact account
+    # equity and never falls back to this selected-account estimate.
+    account_size: float = 0.0
     risk_percent: float = 0.01
     buffer_pct: float = 0.001
+    buffer_pct_for_symbol: Callable[[str], Optional[float]] = (
+        lambda _symbol: None
+    )
     account_no: str = ""
+    account_no_for_symbol: Callable[[str], str] = lambda _symbol: ""
+    account_size_for_account: Callable[[str, str], Optional[float]] = (
+        lambda _environment, _account_no: None
+    )
     trade_card_engine: Optional[Any] = None
-    watchlist: Optional[Any] = None
     window_days: int = 7
     latest_intraday_session: Callable[[Any], Any] = lambda frame: frame
     load_intraday_interval: Callable[[str, str, int], Any] = lambda _symbol, _interval, _window_days: None
@@ -85,11 +94,54 @@ class BuylistExecutionController(WindowController):
             result.failures.append("Execution queue manager is unavailable.")
             return result
 
-        for watch_item in request.target_items:
-            symbol = str(getattr(watch_item, "symbol", "") or "").strip().upper()
+        for planning_item in request.target_items:
+            symbol = str(getattr(planning_item, "symbol", "") or "").strip().upper()
             if not symbol:
                 continue
             try:
+                item_account_no = str(
+                    request.account_no_for_symbol(symbol)
+                    or getattr(planning_item, "kis_account_no", "")
+                    or request.account_no
+                    or ""
+                ).strip()
+                try:
+                    resolved_account_size = request.account_size_for_account(
+                        request.env,
+                        item_account_no,
+                    )
+                    item_account_size = (
+                        float(resolved_account_size)
+                        if resolved_account_size is not None
+                        else 0.0
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    item_account_size = 0.0
+                if not math.isfinite(item_account_size):
+                    item_account_size = 0.0
+                if not math.isfinite(item_account_size) or item_account_size <= 0:
+                    # Missing account truth is temporary, not an invalid ORB
+                    # structure. Preserve any last-good queue snapshot rather
+                    # than rebuilding every window as terminal RISK_INVALID;
+                    # otherwise the runtime can incorrectly return a valid
+                    # published Buy Today card to Buylist.
+                    transient_status = "ACCOUNT_EQUITY_UNAVAILABLE"
+                    result.status_counts[transient_status] = (
+                        result.status_counts.get(transient_status, 0) + 1
+                    )
+                    continue
+                try:
+                    item_buffer_pct = float(
+                        request.buffer_pct_for_symbol(symbol)
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    item_buffer_pct = float(request.buffer_pct)
+                if (
+                    not math.isfinite(item_buffer_pct)
+                    or item_buffer_pct < 0.0
+                    or item_buffer_pct > 1.0
+                ):
+                    item_buffer_pct = 0.001
                 one_minute = request.latest_intraday_session(
                     request.load_intraday_interval(symbol, "1m", request.window_days)
                 )
@@ -109,32 +161,36 @@ class BuylistExecutionController(WindowController):
                 )
                 broker_has_open_order = request.has_duplicate_open_order(
                     request.env,
-                    request.account_no,
+                    item_account_no,
                     symbol,
                     OrderSide.BUY,
                     OrderIntent.ENTRY,
                 )
                 duplicate_order = bool(broker_has_open_order and not queue_has_working_order)
                 queue_item = request.manager.build_or_update_from_watchlist_item(
-                    watch_item,
+                    planning_item,
                     {"1m": one_minute, "5m": five_minute, "30m": five_minute},
                     current_price=current_price,
-                    account_size=request.account_size,
+                    account_size=item_account_size,
                     risk_percent=request.risk_percent,
                     environment=request.env,
+                    account_no=item_account_no,
                     adr_percent=request.adr_percent_for_symbol(symbol),
-                    buffer_pct=request.buffer_pct,
+                    buffer_pct=item_buffer_pct,
                     duplicate_pending_order=duplicate_order,
+                    # The UI request has already resolved the canonical,
+                    # per-symbol buffer. Legacy imported plan data may keep
+                    # its risk/window lock but cannot override this value.
+                    force_buffer_pct=True,
                 )
                 sync = self.apply_execution_queue_item_to_buylist(
                     queue_item,
-                    watch_item,
+                    planning_item,
                     request.env,
-                    request.buffer_pct,
+                    item_buffer_pct,
                     buylist_manager=request.buylist_manager,
                     trade_card_engine=request.trade_card_engine,
-                    default_account_no=request.account_no,
-                    watchlist=request.watchlist,
+                    default_account_no=item_account_no,
                 )
                 if sync is not None and sync.changed and sync.card_key:
                     result.canonical_changed_keys.append(sync.card_key)
@@ -148,13 +204,12 @@ class BuylistExecutionController(WindowController):
     def apply_execution_queue_item_to_buylist(
         self,
         queue_item,
-        watch_item,
+        planning_item,
         env: str,
         buffer_pct: float,
         buylist_manager: Optional[Any] = None,
         trade_card_engine: Optional[Any] = None,
         default_account_no: str = "",
-        watchlist: Optional[Any] = None,
     ) -> Any:
         symbol = str(queue_item.symbol or "").upper()
         if not symbol:
@@ -182,7 +237,7 @@ class BuylistExecutionController(WindowController):
 
         status_text = self._status_text(queue_item.status)
         candidate = queue_item.selected_candidate
-        display = build_queue_display_state(queue_item, existing or watch_item)
+        display = build_queue_display_state(queue_item, existing or planning_item)
         entry_price = display.entry_price
         stop_loss = display.stop_loss
         capital_percent = display.capital_percent
@@ -191,20 +246,11 @@ class BuylistExecutionController(WindowController):
         selected_window = display.selected_window
         warnings = display.warnings
         score = float(getattr(candidate, "score", 0.0) or 0.0) if candidate else 0.0
+        # ``buffer_pct`` was resolved before candidate construction and is the
+        # one authoritative value for this refresh. Legacy imported plan data
+        # may retain a selected window/risk, but cannot replace a published
+        # card's buffer after executor handoff.
         effective_buffer_pct = buffer_pct
-        saved_plan = getattr(watch_item, "selected_orb_plan", None)
-        if (
-            candidate is not None
-            and isinstance(saved_plan, dict)
-            and str(saved_plan.get("window", "") or "")
-            == str(getattr(candidate, "window", "") or "")
-        ):
-            try:
-                saved_buffer = float(saved_plan.get("buffer_pct"))
-            except (TypeError, ValueError):
-                saved_buffer = None
-            if saved_buffer is not None and math.isfinite(saved_buffer) and saved_buffer >= 0:
-                effective_buffer_pct = saved_buffer
         summary = (
             f"Execution queue {status_text}"
             + (f"; selected ORB {selected_window}" if selected_window else "")
@@ -216,7 +262,7 @@ class BuylistExecutionController(WindowController):
             # Compatibility mirrors: queue state remains authoritative for display/order flow.
             existing = BuylistItem(
                 symbol=symbol,
-                name=str(getattr(watch_item, "name", "") or symbol),
+                name=str(getattr(planning_item, "name", "") or symbol),
                 entry_price=entry_price,
                 target_price=0.0,
                 stop_loss=stop_loss,
@@ -232,12 +278,12 @@ class BuylistExecutionController(WindowController):
                 position_percent=capital_percent,
                 ai_summary=summary,
                 warnings=warnings,
-                notes=str(getattr(watch_item, "notes", "") or ""),
+                notes=str(getattr(planning_item, "notes", "") or ""),
                 risk_percent=risk_percent,
                 trade_plan=trade_plan,
                 monitoring_status=status_text,
                 environment=env,
-                breakout_price=getattr(watch_item, "breakout_price", None),
+                breakout_price=getattr(planning_item, "breakout_price", None),
                 breakout_method=f"execution_queue:{selected_window}" if selected_window else "execution_queue",
                 buffer_pct=effective_buffer_pct,
                 kis_account_no=str(default_account_no or "").strip(),
@@ -249,21 +295,29 @@ class BuylistExecutionController(WindowController):
                 existing,
                 engine=trade_card_engine,
                 default_account_no=default_account_no,
-                watchlist=watchlist,
             )
         else:
-            existing.name = str(getattr(watch_item, "name", "") or existing.name or symbol)
+            existing.name = str(
+                getattr(planning_item, "name", "") or existing.name or symbol
+            )
             existing.status = status_text
             existing.ai_summary = summary
-            existing.notes = str(getattr(watch_item, "notes", "") or existing.notes or "")
+            existing.notes = str(
+                getattr(planning_item, "notes", "") or existing.notes or ""
+            )
             existing.monitoring_status = status_text
             existing.environment = env
-            existing.breakout_price = getattr(watch_item, "breakout_price", None)
+            existing.breakout_price = getattr(
+                planning_item, "breakout_price", None
+            )
             existing.breakout_method = f"execution_queue:{selected_window}" if selected_window else "execution_queue"
             existing.buffer_pct = effective_buffer_pct
-            # A durable Watchlist plan is an explicit user choice, so refresh
-            # its compatibility mirrors.  Legacy auto-selected queue rows keep
-            # their existing values unless missing.
+            resolved_account_no = str(default_account_no or "").strip()
+            if resolved_account_no:
+                existing.kis_account_no = resolved_account_no
+            # A manual queue-window choice is explicit, so refresh its
+            # compatibility mirror. Auto-selected queue rows keep their
+            # existing values unless missing.
             use_selected_plan = bool(getattr(queue_item, "manual_window_lock", False))
             if use_selected_plan or float(getattr(existing, "entry_price", 0.0) or 0.0) <= 0:
                 existing.entry_price = entry_price
@@ -287,7 +341,6 @@ class BuylistExecutionController(WindowController):
             trade_card_engine,
             existing,
             default_account_no=default_account_no,
-            watchlist=watchlist,
         )
 
     def submit_selected_queue_order(self, env: str) -> None:

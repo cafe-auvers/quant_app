@@ -47,13 +47,6 @@ def test_numeric_parsers_reject_nonfinite_and_negative_values():
     for text in ("nan", "inf", "-inf", "-1"):
         assert MainWindow._parse_float(window, _TextInput(text), 2.5) == 2.5
 
-    window.watchlist_buffer_pct_input = _TextInput("-0.10")
-    assert MainWindow._watchlist_orb_buffer_pct(window) == pytest.approx(0.001)
-    window.watchlist_buffer_pct_input = _TextInput("nan")
-    assert MainWindow._watchlist_orb_buffer_pct(window) == pytest.approx(0.001)
-    window.watchlist_buffer_pct_input = _TextInput("inf")
-    assert MainWindow._watchlist_orb_buffer_pct(window) == pytest.approx(0.001)
-
 
 def test_dashboard_snapshot_callback_keeps_the_profile_that_started_request():
     stored_syncs = []

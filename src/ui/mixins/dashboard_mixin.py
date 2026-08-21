@@ -39,7 +39,6 @@ from src.core.orb import (calculate_orb_range, evaluate_orb_entry_signal,
 from src.core.order_state import (OPEN_ORDER_STATUSES, BrokerOrder,
                                   OrderIntent, OrderSide, OrderStatus)
 from src.core.scanner import ComparisonOperator, ScanRule, StockScanner
-from src.core.trade_reviewer import TradeReviewer, TradeSetup
 from src.core.watchlist import (BuylistItem, BuylistManager, TradePlan,
                                 TradePlanManager, Watchlist)
 from src.risk.position_sizer import PositionSizer
@@ -63,8 +62,7 @@ from src.ui.filter_catalog import (DEFAULT_SCANNER_SETUPS, DEFAULT_SETTINGS,
 from src.ui.workers import (FxRateWorker, IntradayBulkFetchWorker,
                             IntradayFetchWorker, KisAccountWorker,
                             KisOrderWorker, KisStartupAccountsWorker,
-                            OrderReconciliationWorker, ScannerWorker,
-                            SingleStockAiWorker, WatchlistAiWorker)
+                            OrderReconciliationWorker, ScannerWorker)
 from src.utils.data_loader import (_extract_symbol_history,
                                    download_price_history,
                                    get_default_universe)
@@ -80,11 +78,8 @@ REFERENCE_SYMBOL = "SPY"
 KST_ZONE = ZoneInfo("Asia/Seoul")
 US_MARKET_ZONE = ZoneInfo("America/New_York")
 MARKET_DATA_READY_TIME_KST = dt.time(7, 0)
-LIVE_INTRADAY_REFRESH_INTERVAL_MS = 5 * 60 * 1000
 TRADINGVIEW_REFRESH_INTERVAL_SECONDS = 5 * 60
 KIS_DAILY_CHART_FAILURE_COOLDOWN_SECONDS = 30 * 60
-US_MARKET_OPEN_TIME = dt.time(9, 30)
-US_MARKET_CLOSE_TIME = dt.time(16, 0)
 
 
 class DashboardMixin:
@@ -109,6 +104,10 @@ class DashboardMixin:
             self.populate_kis_account_combo
         )
         self.kis_environment_combo.setVisible(False)
+        # Neutral PROD aliases let account, queue, and chart code share this
+        # one Dashboard-owned environment source.
+        self.trade_kis_environment_combo = self.kis_environment_combo
+        self.watchlist_env_combo = self.kis_environment_combo
         kis_form.addRow("Profile", QLabel("PROD — Live Trading"))
 
         self.kis_account_combo = QComboBox()
@@ -116,11 +115,8 @@ class DashboardMixin:
             self.update_kis_account_status
         )
         kis_form.addRow("Account", self.kis_account_combo)
-        # This one account selector also drives trade sizing and order routing
-        # (Watchlist ORB panel, Buy Dashboard, real KIS order submission) — it
-        # used to be a second, independently-selectable combo on the Watchlist
-        # tab (trade_kis_account_combo). Aliasing removes the risk of viewing
-        # one account here while orders silently route to a different one.
+        # This one selector drives Buy Board sizing and KIS order routing.
+        # Aliasing prevents the displayed account and routed account drifting.
         self.trade_kis_account_combo = self.kis_account_combo
         self.kis_account_combo.currentIndexChanged.connect(
             self.apply_cached_trade_account_size
@@ -136,15 +132,14 @@ class DashboardMixin:
         kis_options_layout.addStretch()
         kis_form.addRow("Sections", kis_options_layout)
 
-        # Trade sizing inputs — used by the Watchlist ORB Position Plan panel
-        # and Buy Dashboard for share/capital-% math. Not shown in the UI:
+        # Trade sizing inputs used by Buy Board/scanner share and capital math.
+        # They are not shown separately in the UI:
         # the "Total (est.)" line in kis_account_summary_label already
         # displays this same USD figure and the USD/KRW rate together, and
         # both are auto-populated (account combo change / "Use KIS Balance" /
         # startup preload) — there's nothing to manually type here. The
-        # widgets still have to exist though: ~10 call sites across
-        # watchlist/buylist/scanner read account_size_input directly for
-        # real position sizing and order routing.
+        # widgets remain because planning reads the normalized value for
+        # position sizing and order routing.
         self.account_size_input = QLineEdit("100000")
         account_size_validator = QDoubleValidator(
             0.0, 1_000_000_000_000.0, 2, self.account_size_input
@@ -170,9 +165,6 @@ class DashboardMixin:
         kis_layout.addLayout(kis_form)
 
         self.account_size_input.textChanged.connect(self.on_account_size_text_changed)
-        self.account_size_input.textChanged.connect(
-            self.recalculate_watchlist_scoreboard_sizes
-        )
         self.usd_krw_rate_input.textChanged.connect(
             self.apply_cached_trade_account_size
         )
@@ -243,38 +235,14 @@ class DashboardMixin:
         self.refresh_hourly_button.setObjectName("refreshHourlyButton")
         self.refresh_hourly_button.clicked.connect(self.refresh_hourly_data_to_db)
         button_layout.addWidget(self.refresh_hourly_button)
-        self.refresh_intraday_button = QPushButton("Update Watchlist Intraday")
+        # The bulk-fetch completion path still uses this compatibility handle
+        # to disable/re-enable refreshes. It is deliberately not added to the
+        # Dashboard: Buy Today ORB data has its own focused one-minute refresh
+        # in BuyboardMixin, so the retired Watchlist-wide fetch cannot consume
+        # market-hours resources.
+        self.refresh_intraday_button = QPushButton("Refresh Buy Today ORB Data")
         self.refresh_intraday_button.setObjectName("refreshIntradayButton")
-        self.refresh_intraday_button.clicked.connect(
-            self.refresh_watchlist_intraday_cache
-        )
-        button_layout.addWidget(self.refresh_intraday_button)
         layout.addLayout(button_layout)
-
-        live_group = QGroupBox("Live Intraday Updates")
-        live_layout = QHBoxLayout()
-        self.live_data_checkbox = QCheckBox("Live Data Auto Refresh")
-        self.live_data_checkbox.toggled.connect(self._on_live_data_toggled)
-        live_layout.addWidget(self.live_data_checkbox)
-
-        self.live_refresh_minutes_spin = QSpinBox()
-        self.live_refresh_minutes_spin.setRange(1, 60)
-        self.live_refresh_minutes_spin.setValue(5)
-        self.live_refresh_minutes_spin.setSuffix(" min")
-        self.live_refresh_minutes_spin.valueChanged.connect(
-            self._on_live_refresh_interval_changed
-        )
-        live_layout.addWidget(QLabel("Every"))
-        live_layout.addWidget(self.live_refresh_minutes_spin)
-
-        self.live_data_source_label = QLabel(format_intraday_source_label("yfinance"))
-        self.live_data_source_label.setWordWrap(True)
-        live_layout.addWidget(self.live_data_source_label, stretch=1)
-
-        self.live_data_status_label = QLabel("Live data: off")
-        live_layout.addWidget(self.live_data_status_label)
-        live_group.setLayout(live_layout)
-        layout.addWidget(live_group)
 
         self.dashboard_widget.setLayout(layout)
         self.populate_kis_account_combo()
@@ -327,70 +295,6 @@ class DashboardMixin:
             for profile in discover_account_profiles()
             if str(profile.get("account_no") or "").strip()
         }
-
-    def _setup_live_data_timer(self) -> None:
-        self.live_data_timer = QTimer(self)
-        self.live_data_timer.setInterval(LIVE_INTRADAY_REFRESH_INTERVAL_MS)
-        self.live_data_timer.timeout.connect(self._run_live_intraday_refresh_tick)
-
-    def _on_live_data_toggled(self, enabled: bool) -> None:
-        if self.live_data_timer is None:
-            return
-        if enabled:
-            self._on_live_refresh_interval_changed(
-                self.live_refresh_minutes_spin.value()
-            )
-            self.live_data_timer.start()
-            self.live_data_status_label.setText("Live data: on")
-            self.append_log("Live intraday auto refresh enabled.")
-            self._run_live_intraday_refresh_tick()
-            return
-
-        self.live_data_timer.stop()
-        self.live_data_status_label.setText("Live data: off")
-        self.append_log("Live intraday auto refresh disabled.")
-
-    def _on_live_refresh_interval_changed(self, minutes: int) -> None:
-        interval_ms = max(1, int(minutes)) * 60 * 1000
-        if self.live_data_timer is not None:
-            self.live_data_timer.setInterval(interval_ms)
-
-    def _run_live_intraday_refresh_tick(self) -> None:
-        if (
-            not hasattr(self, "live_data_checkbox")
-            or not self.live_data_checkbox.isChecked()
-        ):
-            return
-        if not self._is_us_regular_market_open():
-            self.live_data_status_label.setText(
-                "Live data: waiting for U.S. market hours"
-            )
-            return
-        if (
-            self.intraday_bulk_worker is not None
-            and self.intraday_bulk_worker.isRunning()
-        ):
-            self.live_data_status_label.setText("Live data: refresh already running")
-            return
-
-        self.live_data_status_label.setText("Live data: refreshing watchlist")
-        self.refresh_watchlist_intraday_cache(
-            show_messages=False, triggered_by_live=True
-        )
-
-    @staticmethod
-    def _is_us_regular_market_open(now: Optional[dt.datetime] = None) -> bool:
-        if now is None:
-            market_now = dt.datetime.now(US_MARKET_ZONE)
-        elif now.tzinfo is None:
-            market_now = now.replace(tzinfo=US_MARKET_ZONE)
-        else:
-            market_now = now.astimezone(US_MARKET_ZONE)
-
-        if market_now.weekday() >= 5:
-            return False
-        current_time = market_now.time()
-        return US_MARKET_OPEN_TIME <= current_time < US_MARKET_CLOSE_TIME
 
     def _selected_dashboard_kis_profile(self) -> Optional[dict]:
         if not hasattr(self, "kis_environment_combo") or not hasattr(
@@ -1029,9 +933,8 @@ class DashboardMixin:
         ):
             return
 
-        # trade_kis_environment_combo is built later, in _build_watchlist_tab
-        # (Dashboard is built first). This can fire during Dashboard's own
-        # startup population, before that widget exists yet.
+        # Dashboard owns the shared environment alias. Keep the fallback for
+        # lightweight tests and callbacks that run during partial setup.
         environment = (
             self.trade_kis_environment_combo.currentText()
             if hasattr(self, "trade_kis_environment_combo")
@@ -1118,8 +1021,6 @@ class DashboardMixin:
                         f"US stocks: ${ovrs_stock:,.2f} | "
                         f"USD cash: ${ovrs_cash:,.2f}]{frcr_note}"
                     )
-                    self.update_trade_plan_feedback()
-                    self.recalculate_watchlist_scoreboard_sizes()  # also refreshes ORB panel
                     if hasattr(self, "refresh_execution_queue"):
                         self.refresh_execution_queue(environment, show_log=False)
                     return
@@ -1135,8 +1036,6 @@ class DashboardMixin:
             self.append_log(
                 f"KIS position sizing unavailable for {environment}: {fallback_reason}."
             )
-            self.update_trade_plan_feedback()
-            self.recalculate_watchlist_scoreboard_sizes()
             if hasattr(self, "refresh_execution_queue"):
                 self.refresh_execution_queue(environment, show_log=False)
             return
@@ -1152,8 +1051,6 @@ class DashboardMixin:
         self.append_log(
             f"No KIS snapshot ({fallback_reason}). Using default {environment} balance: ${default_val:,.2f}"
         )
-        self.update_trade_plan_feedback()
-        self.recalculate_watchlist_scoreboard_sizes()  # also refreshes ORB panel
         if hasattr(self, "refresh_execution_queue"):
             self.refresh_execution_queue(environment, show_log=False)
 
@@ -1372,7 +1269,6 @@ class DashboardMixin:
 
         text = (
             f"Scanner yielded {len(self.scanner_results)} candidates.\n"
-            f"Watchlist contains {len(self.watchlist.items)} symbols.\n"
             + ("\n".join(buylist_lines) + "\n" if buylist_lines else "")
             + f"Active trade plans: {len(self.trade_manager.get_active_plans())}.\n"
             f"MySQL cache: {db_status}.\n"
@@ -1414,105 +1310,6 @@ class DashboardMixin:
     def _previous_weekday(day: dt.date) -> dt.date:
         """Backward-compatible name for callers of the old dashboard helper."""
         return previous_nyse_trading_day(day)
-
-    def run_single_stock_ai_analysis(self) -> None:
-        """Run the new detailed single stock AI quantitative analysis."""
-        existing_worker = self.__dict__.get("single_ai_worker")
-        if existing_worker is not None and existing_worker.isRunning():
-            QMessageBox.information(
-                self,
-                "Analysis running",
-                "A single-stock AI analysis is already running. Wait for it to finish before starting another one.",
-            )
-            return
-        selected_rows = self.watchlist_table.selectionModel().selectedRows()
-        if not selected_rows:
-            QMessageBox.information(
-                self,
-                "No Selection",
-                "Please select a stock from the watchlist to analyze.",
-            )
-            return
-
-        row = selected_rows[0].row()
-        symbol_item = self.watchlist_table.item(row, 0)
-        if symbol_item is None:
-            return
-
-        symbol = symbol_item.text().strip().upper()
-
-        # Show sidebar and set loading state
-        self.ai_sidebar.setVisible(True)
-        self.ai_report_view.setHtml(
-            f"<h3>Analyzing {symbol}...</h3><p>Running detailed quantitative swing-trading assessment. Please wait...</p>"
-        )
-
-        # Create and start the worker thread for single stock analysis
-        self.single_ai_worker = SingleStockAiWorker(
-            symbol, self.watchlist.get(symbol), self.db_engine, self
-        )
-        self.single_ai_worker.finished_analysis.connect(
-            self.on_single_stock_ai_finished
-        )
-        self._track_worker("single_ai_worker", self.single_ai_worker)
-        self.single_ai_worker.start()
-
-    def on_single_stock_ai_finished(self, ai_res: dict) -> None:
-        """Called when single stock AI analysis worker thread finishes."""
-        if "error" in ai_res:
-            self.ai_report_view.setHtml(
-                f"<h3>Analysis Failed</h3><p>{ai_res['error']}</p>"
-            )
-            return
-
-        full_json = ai_res.get("full_json")
-        if not full_json:
-            self.ai_report_view.setHtml(
-                "<h3>Analysis Error</h3><p>Could not retrieve report data.</p>"
-            )
-            return
-
-        # Update the local watchlist dictionary and scores mapping
-        symbol = full_json.get("symbol", "").upper().strip()
-        item = self.watchlist.get(symbol)
-        if item:
-            item.ai_analysis = ai_res
-
-        # Update self.watchlist_scores so the table row matches
-        if not hasattr(self, "watchlist_scores"):
-            self.watchlist_scores = {}
-
-        # Map back to scoreboard structure expected by table formatter
-        self.watchlist_scores[symbol] = {
-            "price": full_json.get("risk_assessment", {}).get("entry_price", 0.0),
-            "total_score": full_json.get("total_score", 0),
-            "status": full_json.get("decision", "WATCHING"),
-            "rr": 0.0,
-            "stop_adr": full_json.get("risk_assessment", {}).get(
-                "stop_distance_pct", 0.0
-            ),
-            "risk_percent": full_json.get("risk_assessment", {}).get(
-                "account_risk_pct", 0.0
-            ),
-            "position_percent": full_json.get("risk_assessment", {}).get(
-                "position_size_pct", 0.0
-            ),
-            "env": (
-                self.watchlist_env_combo.currentText()
-                if hasattr(self, "watchlist_env_combo")
-                else "PROD"
-            ),
-        }
-
-        # Format the html report
-        from src.core.scoring import render_quant_analysis_html
-
-        html = render_quant_analysis_html(full_json)
-        self.ai_report_view.setHtml(html)
-
-        # Redraw table and save state on main GUI thread safely
-        self.populate_watchlist_table()
-        self._save_state()
 
     def _score_growth_rank(self, stock: dict) -> float:
         return stock.get("growth_rank", 0.0) / 100.0

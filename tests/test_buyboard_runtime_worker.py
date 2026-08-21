@@ -15,6 +15,7 @@ import logging
 import os
 import threading
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -80,6 +81,12 @@ from src.services.kis_realtime_market_data import (
     SubscriptionPriority,
 )
 from src.services.realtime_market_data import QuoteSnapshot, RestPollingMarketDataService
+from src.services.schema_migration import (
+    MigrationEntriesBlockedError,
+    MigrationPhase,
+    SchemaMigrationManager,
+)
+from src.services.state_sync import LocalDeviceRole, claim_main_device
 from src.services.stop_change_coordinator import (
     StopChangeCoordinator,
     stop_change_coordinator_for,
@@ -265,6 +272,37 @@ def _seed_card(engine, **overrides):
     return repo.create_trade_card(engine, TradeCardState(**fields))
 
 
+def _current_us_session_date() -> str:
+    return dt.datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+
+
+def _waiting_orb_queue_item() -> ExecutionQueueItem:
+    candidate = OrbCandidate(
+        symbol="AAPL",
+        window="5m",
+        orb_low=95.0,
+        orb_high=101.5,
+        breakout_price=100.0,
+        breakout_trigger=100.1,
+        entry_trigger=101.5,
+        current_price=100.0,
+        source_session_date=_current_us_session_date(),
+        shares=10,
+        risk_percent=0.01,
+        status=OrbCandidateStatus.WAITING_BREAKOUT,
+    )
+    return ExecutionQueueItem(
+        symbol="AAPL",
+        environment="PROD",
+        account_no="1",
+        breakout_price=100.0,
+        current_price=100.0,
+        candidates={"5m": candidate},
+        selected_window="5m",
+        selected_candidate=candidate,
+    )
+
+
 def _ready_runtime_state(**overrides):
     values = dict(
         lease_current=True,
@@ -288,6 +326,47 @@ def _ready_runtime_state(**overrides):
 def test_construction_builds_nothing(tmp_path):
     worker, _ = _worker(tmp_path)
     assert worker.runtime is None
+
+
+def test_unclaimed_new_store_allows_read_only_standby_migration_bootstrap(tmp_path):
+    worker, engine = _worker(tmp_path, standby_only=True, device_id="laptop")
+    manager = SchemaMigrationManager(
+        engine,
+        backup_path=tmp_path / "migration-backup.json",
+        legacy_paths=(),
+    )
+
+    worker._require_standby_migration_ready(manager)
+
+    assert manager.state.phase == MigrationPhase.NOT_STARTED
+
+
+def test_new_store_with_an_execution_owner_keeps_standby_migration_blocked(tmp_path):
+    worker, engine = _worker(tmp_path, standby_only=True, device_id="laptop")
+    manager = SchemaMigrationManager(
+        engine,
+        backup_path=tmp_path / "migration-backup.json",
+        legacy_paths=(),
+    )
+    owner = LocalDeviceRole("pc", "PC", True)
+    assert claim_main_device(engine, owner).success is True
+
+    with pytest.raises(MigrationEntriesBlockedError):
+        worker._require_standby_migration_ready(manager)
+
+
+def test_incomplete_migration_phase_never_uses_first_owner_bootstrap(tmp_path):
+    worker, _ = _worker(tmp_path, standby_only=True, device_id="laptop")
+
+    class _IncompleteMigration:
+        state = SimpleNamespace(phase=MigrationPhase.AWAITING_RECONCILIATION)
+
+        @staticmethod
+        def require_entries_ready():
+            raise MigrationEntriesBlockedError("still reconciling")
+
+    with pytest.raises(MigrationEntriesBlockedError, match="still reconciling"):
+        worker._require_standby_migration_ready(_IncompleteMigration())
 
 
 def test_card_cache_downloads_payload_only_when_revision_changes(
@@ -1850,7 +1929,12 @@ def test_run_one_cycle_excludes_cards_from_accounts_with_startup_errors(tmp_path
     monkeypatch.setattr(trading_engine_module, "is_buyboard_engine_enabled", lambda: True)
 
     broker = _FakeBroker()
-    worker, engine = _worker(tmp_path, broker=broker)
+    queue_item = _waiting_orb_queue_item()
+    worker, engine = _worker(
+        tmp_path,
+        broker=broker,
+        execution_queue_item_lookup=lambda _symbol, _env: queue_item,
+    )
     worker.runtime = _build_test_runtime(
         buying_power_provider=worker._buying_power_provider,
         card_lookup=worker._card_lookup,
@@ -1862,6 +1946,7 @@ def test_run_one_cycle_excludes_cards_from_accounts_with_startup_errors(tmp_path
     card = _seed_card(
         engine,
         board_status=BoardStatus.BUY_TODAY,
+        breakout_price=100.0,
         entry_runtime_status=EntryRuntimeStatus.RETRY_COOLDOWN,
     )
     import datetime as dt
@@ -1895,15 +1980,19 @@ def test_run_one_cycle_refreshes_orb_observation_for_reconciliation_blocked_acco
         symbol="AAPL",
         window="5m",
         orb_low=95.0,
-        orb_high=101.0,
+        orb_high=101.5,
+        breakout_price=101.25,
+        breakout_trigger=101.35125,
         entry_trigger=101.5,
         current_price=100.5,
+        source_session_date=_current_us_session_date(),
         shares=10,
         status=OrbCandidateStatus.WAITING_BREAKOUT,
     )
     item = ExecutionQueueItem(
         symbol="AAPL",
         environment="PROD",
+        account_no="1",
         breakout_price=101.25,
         current_price=100.5,
         candidates={"5m": candidate},
@@ -1924,6 +2013,7 @@ def test_run_one_cycle_refreshes_orb_observation_for_reconciliation_blocked_acco
     _seed_card(
         engine,
         board_status=BoardStatus.BUY_TODAY,
+        breakout_price=101.25,
         entry_runtime_status=EntryRuntimeStatus.ORB_FORMING,
     )
     worker.startup_reconciliation_errors = {"1": "simulated KIS outage"}
@@ -2485,7 +2575,11 @@ def test_one_cycle_persists_engine_changes(tmp_path, monkeypatch):
 
     monkeypatch.setattr(trading_engine_module, "is_buyboard_engine_enabled", lambda: True)
 
-    worker, engine = _worker(tmp_path)
+    queue_item = _waiting_orb_queue_item()
+    worker, engine = _worker(
+        tmp_path,
+        execution_queue_item_lookup=lambda _symbol, _env: queue_item,
+    )
     worker.runtime = _build_test_runtime(
         buying_power_provider=worker._buying_power_provider,
         card_lookup=worker._card_lookup,
@@ -2499,6 +2593,7 @@ def test_one_cycle_persists_engine_changes(tmp_path, monkeypatch):
     card = _seed_card(
         engine,
         board_status=BoardStatus.BUY_TODAY,
+        breakout_price=100.0,
         entry_runtime_status=EntryRuntimeStatus.RETRY_COOLDOWN,
     )
     card.next_retry_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=1)  # already due
@@ -2578,12 +2673,20 @@ def test_sync_orb_plans_applies_the_execution_queue_bridge(tmp_path):
         card_lookup=worker._card_lookup,
         broker=worker._broker,
     )
-    card = _seed_card(engine, board_status=BoardStatus.BUY_TODAY)
-    candidate = OrbCandidate(
-        symbol="AAPL", window="5m", orb_low=95.0, orb_high=101.0, entry_trigger=101.5,
-        shares=10, status=OrbCandidateStatus.EXECUTE_READY,
+    card = _seed_card(
+        engine,
+        board_status=BoardStatus.BUY_TODAY,
+        breakout_price=100.0,
     )
-    item = ExecutionQueueItem(symbol="AAPL", environment="PROD")
+    candidate = OrbCandidate(
+        symbol="AAPL", window="5m", orb_low=95.0, orb_high=101.5,
+        breakout_price=100.0, breakout_trigger=100.1, entry_trigger=101.5,
+        source_session_date=_current_us_session_date(), shares=10,
+        status=OrbCandidateStatus.EXECUTE_READY,
+    )
+    item = ExecutionQueueItem(
+        symbol="AAPL", environment="PROD", account_no="1", breakout_price=100.0
+    )
     item.selected_candidate = candidate
     worker._execution_queue_item_lookup = lambda symbol, env: item
 
@@ -2594,22 +2697,62 @@ def test_sync_orb_plans_applies_the_execution_queue_bridge(tmp_path):
     assert card.entry_trigger == 101.5
 
 
+def test_sync_orb_plans_blocks_same_symbol_active_in_multiple_accounts(tmp_path):
+    worker, engine = _worker(tmp_path)
+    first = _seed_card(
+        engine,
+        account_no="1",
+        symbol="AAPL",
+        board_status=BoardStatus.BUY_TODAY,
+        entry_runtime_status=EntryRuntimeStatus.EXECUTE_READY,
+    )
+    second = _seed_card(
+        engine,
+        account_no="2",
+        symbol="AAPL",
+        board_status=BoardStatus.BUY_TODAY,
+        entry_runtime_status=EntryRuntimeStatus.EXECUTE_READY,
+    )
+    lookups = []
+    worker._execution_queue_item_lookup = (
+        lambda symbol, env: lookups.append((symbol, env))
+    )
+
+    changed = worker._sync_orb_plans([first, second])
+
+    assert changed == [first, second]
+    assert lookups == []
+    assert first.entry_runtime_status == EntryRuntimeStatus.RISK_INVALID
+    assert second.entry_runtime_status == EntryRuntimeStatus.RISK_INVALID
+    assert "multiple accounts" in first.entry_block_reason
+    assert "multiple accounts" in second.entry_block_reason
+
+
 def test_sync_orb_plans_does_not_mark_price_only_movement_for_db_write(tmp_path):
     worker, engine = _worker(tmp_path)
-    card = _seed_card(engine, board_status=BoardStatus.BUY_TODAY)
+    card = _seed_card(
+        engine,
+        board_status=BoardStatus.BUY_TODAY,
+        breakout_price=100.0,
+    )
     candidate = OrbCandidate(
         symbol="AAPL",
         window="5m",
         orb_low=95.0,
-        orb_high=101.0,
+        orb_high=101.5,
+        breakout_price=100.0,
+        breakout_trigger=100.1,
         entry_trigger=101.5,
         current_price=100.0,
+        source_session_date=_current_us_session_date(),
         shares=10,
         status=OrbCandidateStatus.WAITING_BREAKOUT,
     )
     item = ExecutionQueueItem(
         symbol="AAPL",
         environment="PROD",
+        account_no="1",
+        breakout_price=100.0,
         current_price=100.0,
         candidates={"5m": candidate},
         selected_window="5m",
@@ -2629,16 +2772,25 @@ def test_sync_orb_plans_returns_fully_rejected_card_to_buylist(tmp_path):
     card = _seed_card(
         engine,
         board_status=BoardStatus.BUY_TODAY,
+        breakout_price=100.0,
         planned_quantity=10,
         target_position_quantity=10,
     )
-    item = ExecutionQueueItem(symbol="AAPL", environment="PROD")
+    item = ExecutionQueueItem(
+        symbol="AAPL",
+        environment="PROD",
+        account_no="1",
+        breakout_price=100.0,
+    )
     item.candidates = {
         window: OrbCandidate(
             symbol="AAPL",
             window=window,
             status=OrbCandidateStatus.REJECTED,
             valid=False,
+            breakout_price=100.0,
+            source_session_date=_current_us_session_date(),
+            terminal_rejection=True,
             reason=f"{window} invalid",
         )
         for window in ("1m", "5m", "30m")
@@ -2653,13 +2805,16 @@ def test_sync_orb_plans_returns_fully_rejected_card_to_buylist(tmp_path):
     assert "all ORB plans invalid" in card.buy_today_note
 
 
-def test_sync_orb_plans_is_a_no_op_without_a_lookup_wired(tmp_path):
+def test_sync_orb_plans_fails_closed_without_a_lookup_wired(tmp_path):
     worker, engine = _worker(tmp_path)
     card = _seed_card(engine, board_status=BoardStatus.BUY_TODAY)
-    assert worker._sync_orb_plans([card]) == []
+    assert worker._sync_orb_plans([card]) == [card]
+    assert card.entry_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE
+    assert card.entry_trigger is None
+    assert card.planned_quantity == 0
 
 
-def test_sync_orb_plans_arms_target_plan_without_intraday_lookup(tmp_path):
+def test_sync_orb_plans_blocks_target_only_plan_without_intraday_lookup(tmp_path):
     worker, engine = _worker(tmp_path)
     card = _seed_card(
         engine,
@@ -2672,7 +2827,9 @@ def test_sync_orb_plans_arms_target_plan_without_intraday_lookup(tmp_path):
     changed = worker._sync_orb_plans([card])
 
     assert changed == [card]
-    assert card.entry_runtime_status == EntryRuntimeStatus.EXECUTE_READY
+    assert card.entry_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE
+    assert card.entry_trigger is None
+    assert card.planned_quantity == 0
 
 
 def test_sync_orb_plans_skips_positioned_cards(tmp_path):
@@ -2717,6 +2874,52 @@ def test_sync_quote_subscriptions_adds_and_removes(tmp_path):
     subscribed = set(worker.runtime.market_data.subscribed_symbols())
     assert "AAPL" in subscribed
     assert "STALE" not in subscribed
+
+
+def test_sync_quote_subscriptions_excludes_inactive_board_cards(tmp_path):
+    worker, _ = _worker(tmp_path)
+    configured = {}
+
+    class _MarketData:
+        def configure_desired_channels(self, **kwargs):
+            configured.update(kwargs)
+
+    worker.runtime = SimpleNamespace(market_data=_MarketData())
+    cards = [
+        TradeCardState(
+            environment="PROD",
+            account_no="1",
+            symbol="WATCH",
+            board_status=BoardStatus.WATCHLIST,
+        ),
+        TradeCardState(
+            environment="PROD",
+            account_no="1",
+            symbol="BUY",
+            board_status=BoardStatus.BUYLIST,
+        ),
+        TradeCardState(
+            environment="PROD",
+            account_no="1",
+            symbol="DONE",
+            board_status=BoardStatus.CLOSED,
+        ),
+        TradeCardState(
+            environment="PROD",
+            account_no="1",
+            symbol="ACTIVE",
+            board_status=BoardStatus.OPEN_POSITION,
+        ),
+    ]
+
+    worker._sync_quote_subscriptions(cards)
+
+    assert configured["trade_priorities"] == {
+        "ACTIVE": int(SubscriptionPriority.OPEN_POSITION),
+    }
+    assert configured["quote_priorities"] == {
+        "ACTIVE": int(SubscriptionPriority.CRITICAL_EXIT),
+    }
 
 
 def test_controlled_live_planning_cards_are_display_only_and_not_executable(
@@ -2875,6 +3078,167 @@ class _AccountExecutionBroker(FakeExecutionBroker):
 
     def get_positions(self, **kwargs):
         return self.positions
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_runtime_executes_crossed_lower_trigger_orb_once_in_auto_mode(
+    tmp_path, monkeypatch
+):
+    broker = _AccountExecutionBroker()
+    broker.positions["overseas"]["holdings"] = []
+    broker.queue_acceptance(broker_order_id="B-LOWER-ORB")
+    worker, engine, _ = _guarded_reconciliation_worker(
+        tmp_path, monkeypatch, broker
+    )
+    monkeypatch.setattr(
+        "src.services.trading_engine.is_buyboard_engine_enabled", lambda: True
+    )
+    monkeypatch.setattr(
+        execution_config, "KIS_LIVE_EXECUTION_MODE", "FULL_LIVE"
+    )
+    worker.runtime.trading_engine._market_is_open_fn = lambda: True
+    session_date = _current_us_session_date()
+    one_minute = OrbCandidate(
+        symbol="AAPL",
+        window="1m",
+        orb_high=99.0,
+        orb_low=95.0,
+        breakout_price=97.0,
+        breakout_trigger=97.097,
+        entry_trigger=99.0,
+        current_price=100.0,
+        source_session_date=session_date,
+        shares=200,
+        risk_percent=0.01,
+        score=10.0,
+        status=OrbCandidateStatus.WAITING_BREAKOUT,
+    )
+    five_minute = OrbCandidate(
+        symbol="AAPL",
+        window="5m",
+        orb_high=101.0,
+        orb_low=96.0,
+        breakout_price=97.0,
+        breakout_trigger=97.097,
+        entry_trigger=101.0,
+        current_price=100.0,
+        source_session_date=session_date,
+        shares=200,
+        risk_percent=0.01,
+        score=20.0,
+        status=OrbCandidateStatus.WAITING_BREAKOUT,
+    )
+    queue_item = ExecutionQueueItem(
+        symbol="AAPL",
+        environment="PROD",
+        account_no="1",
+        breakout_price=97.0,
+        current_price=100.0,
+        candidates={"1m": one_minute, "5m": five_minute},
+        selected_window="5m",
+        selected_candidate=five_minute,
+    )
+    worker._execution_queue_item_lookup = lambda *_args: queue_item
+    _seed_card(
+        engine,
+        board_status=BoardStatus.BUY_TODAY,
+        breakout_price=97.0,
+        buffer_pct=0.001,
+        entry_runtime_status=EntryRuntimeStatus.ORB_FORMING,
+    )
+
+    worker._run_startup_reconciliation()
+    seeded = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert worker._card_action_ready(seeded), (
+        worker._latest_reconciliation_snapshots,
+        worker.startup_reconciled_accounts,
+        worker.startup_reconciliation_errors,
+    )
+    worker._run_one_cycle()
+
+    stored = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert stored.board_status == BoardStatus.ENTRY_PENDING, (
+        stored.entry_runtime_status,
+        stored.entry_block_reason,
+        stored.selected_orb_window,
+        stored.entry_trigger,
+        stored.entry_orb_high,
+        stored.planned_quantity,
+        worker.device_state,
+        worker.startup_reconciliation_complete,
+        worker.startup_reconciliation_errors,
+    )
+    assert len(broker.submit_calls) == 1, {
+        "card": stored.to_dict(),
+        "startup_errors": worker.startup_reconciliation_errors,
+        "device_state": worker.device_state,
+    }
+    assert stored.board_status == BoardStatus.ENTRY_PENDING
+    assert stored.selected_orb_window == "1m"
+    assert stored.entry_trigger == 99.0
+    assert stored.entry_orb_high == 99.0
+    assert stored.planned_quantity == 200
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_runtime_active_queue_order_lock_blocks_crossing_submission(
+    tmp_path, monkeypatch
+):
+    broker = _AccountExecutionBroker()
+    broker.positions["overseas"]["holdings"] = []
+    broker.queue_acceptance(broker_order_id="MUST-NOT-SUBMIT")
+    worker, engine, _ = _guarded_reconciliation_worker(
+        tmp_path, monkeypatch, broker
+    )
+    monkeypatch.setattr(
+        "src.services.trading_engine.is_buyboard_engine_enabled", lambda: True
+    )
+    monkeypatch.setattr(execution_config, "KIS_LIVE_EXECUTION_MODE", "FULL_LIVE")
+    worker.runtime.trading_engine._market_is_open_fn = lambda: True
+    candidate = OrbCandidate(
+        symbol="AAPL",
+        window="1m",
+        orb_high=99.0,
+        orb_low=95.0,
+        breakout_price=97.0,
+        breakout_trigger=97.097,
+        entry_trigger=99.0,
+        source_session_date=_current_us_session_date(),
+        shares=200,
+        risk_percent=0.01,
+        status=OrbCandidateStatus.WAITING_BREAKOUT,
+    )
+    queue_item = ExecutionQueueItem(
+        symbol="AAPL",
+        environment="PROD",
+        account_no="1",
+        breakout_price=97.0,
+        current_price=100.0,
+        candidates={"1m": candidate},
+        selected_window="1m",
+        selected_candidate=candidate,
+        locked=True,
+        manual_window_lock=False,
+        order_status="SUBMITTED",
+        order_id="EXISTING-ORDER",
+    )
+    worker._execution_queue_item_lookup = lambda *_args: queue_item
+    _seed_card(
+        engine,
+        board_status=BoardStatus.BUY_TODAY,
+        breakout_price=97.0,
+        buffer_pct=0.001,
+        entry_runtime_status=EntryRuntimeStatus.ORB_FORMING,
+    )
+
+    worker._run_startup_reconciliation()
+    worker._run_one_cycle()
+
+    stored = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert broker.submit_calls == []
+    assert stored.board_status == BoardStatus.BUY_TODAY
+    assert stored.entry_runtime_status == EntryRuntimeStatus.ORDER_PENDING
+    assert "active order lock" in stored.entry_block_reason
 
 
 @pytest.mark.usefixtures("trading_enabled")

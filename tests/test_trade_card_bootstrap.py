@@ -103,6 +103,40 @@ def test_bootstrap_uses_default_account_for_legacy_buylist(tmp_path, monkeypatch
     assert card.buylist_member is True
 
 
+def test_zero_orb_buffer_round_trips_through_buylist_and_watchlist_bootstrap(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        trade_card_repository,
+        "LOCAL_TRADE_CARDS_FILE",
+        tmp_path / "trade_cards.json",
+    )
+    engine = _engine(tmp_path)
+    manager = BuylistManager()
+    buylist_item = _buylist_item("ZERO", account_no="12345678-01")
+    buylist_item.buffer_pct = 0.0
+    manager.add(buylist_item)
+    watchlist = Watchlist()
+    watch_item = watchlist.add("NONE", "No Buffer")
+    watch_item.selected_orb_plan = {"window": "5m", "buffer_pct": 0.0}
+
+    bootstrap_trade_cards_from_current_state(
+        engine,
+        buylist_manager=manager,
+        watchlist=watchlist,
+        default_account_no="12345678-01",
+    )
+
+    buylist_card = trade_card_repository.get_trade_card(
+        engine, "PROD", "12345678-01", "ZERO"
+    )
+    watchlist_card = trade_card_repository.get_trade_card(
+        engine, "PROD", "12345678-01", "NONE"
+    )
+    assert buylist_card.buffer_pct == 0.0
+    assert watchlist_card.buffer_pct == 0.0
+
+
 def test_bootstrap_never_overwrites_existing_kanban_lifecycle(tmp_path, monkeypatch):
     monkeypatch.setattr(
         trade_card_repository,

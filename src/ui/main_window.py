@@ -19,10 +19,11 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QKeySequence
-from PyQt5.QtWidgets import (QApplication, QDialog, QHBoxLayout, QLabel,
-                             QLineEdit, QMainWindow, QMessageBox, QProgressBar,
-                             QPushButton, QSizePolicy, QStyle, QSystemTrayIcon,
-                             QTabWidget, QTextEdit, QVBoxLayout, QWidget)
+from PyQt5.QtWidgets import (QApplication, QComboBox, QDialog, QHBoxLayout,
+                             QLabel, QLineEdit, QMainWindow, QMessageBox,
+                             QProgressBar, QPushButton, QSizePolicy, QStyle,
+                             QSystemTrayIcon, QTabWidget, QTextEdit,
+                             QVBoxLayout, QWidget)
 
 try:
     from PyQt5.QtWebEngineWidgets import QWebEngineView
@@ -34,7 +35,6 @@ from src.core.order_state import (BrokerOrder, OrderIntent, OrderSide,
 from src.core import execution_config
 from src.core.runtime_readiness import EngineReadiness, RuntimeDeviceState
 from src.core.scanner import StockScanner
-from src.core.trade_reviewer import TradeReviewer
 from src.core.watchlist import BuylistManager, TradePlanManager, Watchlist
 from src.infrastructure.database.mirror_engine import resolve_data_engine
 from src.infrastructure.database.coordination_engine import (
@@ -74,7 +74,10 @@ from src.services.order_ledger import (append_order, find_open_orders,
                                        has_open_order, load_order_ledger,
                                        merge_orders, save_order_ledger,
                                        update_order)
-from src.services.runtime_status import safe_mark_runtime_process_stopped
+from src.services.runtime_status import (
+    record_runtime_heartbeat,
+    safe_mark_runtime_process_stopped,
+)
 from src.services.sleep_readiness import write_sleep_readiness_snapshot
 from src.services.state_sync import (
     LocalDeviceRole,
@@ -91,20 +94,20 @@ from src.ui.charts.controller import ChartsControllerMixin
 from src.ui.charts.renderer import ChartsRenderMixin
 from src.ui.controllers import (AccountController, BuylistController,
                                 BuylistExecutionController,
-                                ChartDataController, ScannerController,
-                                WatchlistController)
+                                ChartDataController, ScannerController)
 from src.ui.dialogs import (BackupEnvDialog, RestoreBackupDialog,
                             RestoreEnvDialog, SettingsDialog)
 from src.ui.filter_catalog import (DEFAULT_SCANNER_SETUPS, DEFAULT_SETTINGS,
                                    DEFAULT_TAB_OPTIONS)
 from src.ui.health import HealthPanelMixin
 from src.ui.mixins.dashboard_mixin import DashboardMixin
+from src.ui.mixins.chart_command_routing_mixin import ChartCommandRoutingMixin
+from src.ui.mixins.planning_support_mixin import PlanningSupportMixin
 from src.ui.mixins.scanner_mixin import ScannerMixin
 from src.ui.mixins.sidebar_mixin import SidebarMixin
-from src.ui.mixins.watchlist_mixin import WatchlistMixin
 from src.ui.order_workers import HandoffReconciliationWorker
-from src.ui.workers import PcRemoteStatusWorker, WatchlistAiWorker
-from src.utils.config import DATA_DIR, ROOT_DIR, RULEBOOK_DIR, get_env_value
+from src.ui.workers import PcRemoteStatusWorker
+from src.utils.config import DATA_DIR, ROOT_DIR, get_env_value
 from src.utils.data_loader import get_default_universe
 from src.utils.device_identity import detect_local_device_kind, runtime_device_kind
 from src.utils.intraday_helpers import \
@@ -117,7 +120,6 @@ from src.utils.storage import load_json
 __all__ = [
     "MainWindow",
     "QTimer",
-    "WatchlistAiWorker",
     "_extract_latest_opening_bar",
     "append_order",
     "find_open_orders",
@@ -135,7 +137,6 @@ REFERENCE_SYMBOL = "SPY"
 KST_ZONE = ZoneInfo("Asia/Seoul")
 US_MARKET_ZONE = ZoneInfo("America/New_York")
 MARKET_DATA_READY_TIME_KST = dt.time(7, 0)
-LIVE_INTRADAY_REFRESH_INTERVAL_MS = 5 * 60 * 1000
 LOCAL_MIRROR_SYNC_INTERVAL_MS = 15 * 60 * 1000
 TRADINGVIEW_REFRESH_INTERVAL_SECONDS = 5 * 60
 KIS_DAILY_CHART_FAILURE_COOLDOWN_SECONDS = 30 * 60
@@ -357,6 +358,23 @@ class CoordinationDatabaseInitWorker(QThread):
                 None,
                 "The configured shared coordination database could not be reached. "
                 "Verify its SQL endpoint, TLS CA, username, password, and Internet connection.",
+            )
+
+
+class CoordinationRuntimeHeartbeatWorker(QThread):
+    """Publish this local ``main.py`` process to shared coordination."""
+
+    def __init__(self, engine, *, hostname: str, parent=None) -> None:
+        super().__init__(parent)
+        self.engine = engine
+        self.hostname = str(hostname or "").strip()
+
+    def run(self) -> None:
+        try:
+            record_runtime_heartbeat(self.engine, hostname=self.hostname)
+        except Exception as exc:  # the independent DB probes own user notices
+            logger.debug(
+                "Coordination runtime heartbeat failed: %s", type(exc).__name__
             )
 
 
@@ -638,6 +656,49 @@ class ControlOwnerUpdate:
     error: str = ""
 
 
+def _control_runtime_identity_available(
+    record, *, now: Optional[dt.datetime] = None
+) -> bool:
+    """Accept only a fresh runtime identity that can participate in control."""
+
+    state = getattr(record, "state", "")
+    state_value = str(getattr(state, "value", state) or "").upper()
+    if state_value not in {
+        RuntimeDeviceState.STARTING.value,
+        RuntimeDeviceState.STANDBY.value,
+        RuntimeDeviceState.STANDBY_READY.value,
+        RuntimeDeviceState.ACTIVE.value,
+    }:
+        return False
+    updated_at = getattr(record, "updated_at", None)
+    if not isinstance(updated_at, dt.datetime):
+        return False
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=dt.timezone.utc)
+    reference = now or dt.datetime.now(dt.timezone.utc)
+    age_seconds = (reference - updated_at.astimezone(dt.timezone.utc)).total_seconds()
+    return -5.0 <= age_seconds <= 120.0
+
+
+def _control_target_role_from_records(
+    records, target_label: str
+) -> Optional[LocalDeviceRole]:
+    candidates = [
+        record
+        for record in records
+        if _control_runtime_identity_available(record)
+        if runtime_device_kind(record.hostname, record.details) == target_label
+    ]
+    if not candidates:
+        return None
+    record = max(candidates, key=lambda item: item.updated_at)
+    return LocalDeviceRole(
+        device_id=record.device_id,
+        hostname=record.hostname,
+        is_main=False,
+    )
+
+
 class ControlOwnerWorker(QThread):
     """Switch either owner without blocking the Qt event loop."""
 
@@ -661,23 +722,59 @@ class ControlOwnerWorker(QThread):
 
     def run(self) -> None:
         try:
+            target = self.target
+            if target is None and self.target_label != "Locked":
+                from src.services.runtime_device_state_repository import (
+                    list_runtime_device_states,
+                )
+
+                target = _control_target_role_from_records(
+                    list_runtime_device_states(self.engine),
+                    self.target_label,
+                )
+                if target is None:
+                    self.completed.emit(
+                        ControlOwnerUpdate(
+                            control=self.control,
+                            success=False,
+                            target_label=self.target_label,
+                            error=(
+                                f"No {self.target_label} runtime is registered in "
+                                "shared coordination. Start or restart main.py on "
+                                "that device."
+                            ),
+                        )
+                    )
+                    return
+            if (
+                target is not None
+                and target.device_id == self.initiated_by.device_id
+            ):
+                # This worker is executing inside the selected local main.py
+                # process, so refresh its proof immediately instead of making
+                # a user action race the periodic heartbeat timer. Remote
+                # targets must still publish their own independent heartbeat.
+                record_runtime_heartbeat(
+                    self.engine,
+                    hostname=target.hostname,
+                )
             if self.control == "operator":
                 result = set_operator_control(
                     self.engine,
                     self.initiated_by,
-                    self.target,
+                    target,
                 )
                 success = bool(result.success)
                 error = str(result.error or "")
             else:
                 from src.services.control_ownership import switch_execution_owner
 
-                if self.target is None:
+                if target is None:
                     raise ValueError("Execution Owner cannot be Locked")
                 result = switch_execution_owner(
                     self.engine,
                     initiated_by=self.initiated_by,
-                    target_device_id=self.target.device_id,
+                    target_device_id=target.device_id,
                 )
                 success = bool(result.success)
                 error = str(result.error or "")
@@ -741,8 +838,9 @@ class MainWindow(
     HealthPanelMixin,
     DashboardMixin,
     ScannerMixin,
-    WatchlistMixin,
+    PlanningSupportMixin,
     BuylistMixin,
+    ChartCommandRoutingMixin,
     BuyboardMixin,
     ChartsControllerMixin,
     ChartsRenderMixin,
@@ -787,7 +885,6 @@ class MainWindow(
         self.scanner = StockScanner()
         self.watchlist = self._load_watchlist()
         self.buylist_manager = self._load_buylist()
-        self.watchlist_scores = {}
         self.trade_manager = self._load_trade_plans()
         self.order_ledger: List[BrokerOrder] = load_order_ledger()
         self.scanner_setups = self._load_scanner_setups()
@@ -800,7 +897,6 @@ class MainWindow(
             for k, v in DEFAULT_SETTINGS["shortcuts"].items():
                 if k not in self.settings["shortcuts"]:
                     self.settings["shortcuts"][k] = v
-        self.reviewer = TradeReviewer(rulebook_dir=RULEBOOK_DIR)
         # MySQL is optional, and establishing a connection must never block the
         # desktop window from appearing.  A short-lived worker finishes setup
         # after the event loop begins.
@@ -814,6 +910,8 @@ class MainWindow(
         self.db_initializing = True
         self.database_init_worker = None
         self.coordination_database_init_worker = None
+        self._coordination_runtime_heartbeat_worker = None
+        self._last_coordination_runtime_heartbeat_attempt = None
         self.database_recovery_worker = None
         self._coordination_database_configured = coordination_database_configured()
         self._coordination_database_ready = False
@@ -897,9 +995,7 @@ class MainWindow(
         self.intraday_fetch_attempts: dict[str, dt.datetime] = {}
         self._cached_market_data_status = None
         self.market_data_status_worker = None
-        self.orb_trade_plan_column_data: dict[int, dict] = {}
-        self.updating_orb_selection = False
-        self.intraday_bulk_purpose = "watchlist"
+        self.intraday_bulk_purpose = "buyboard_orb"
         self.pending_scanner_orb_source: Optional[dict] = None
         self.scanner_results: List[dict] = []
         self.scanner_results_by_setup: dict[str, List[dict]] = {}
@@ -912,7 +1008,6 @@ class MainWindow(
         # be skipped and picked up once the user actually switches to the tab
         # (see on_tab_changed / flush_stale_chart_views), instead of paying the
         # cost synchronously in the middle of an unrelated chart interaction.
-        self._watchlist_table_dirty = False
         self._dashboard_summary_dirty = False
         self._charts_tab_chart_stale = False
         self._intraday_tab_chart_stale = False
@@ -920,8 +1015,6 @@ class MainWindow(
         self.running_scanner_setup_name: Optional[str] = None
         self.running_scanner_show_warnings = True
         self.scanner_worker = None
-        self.watchlist_worker = None
-        self.single_ai_worker = None
         self.kis_order_worker = None
         self._refresh_last_finished_at: Dict[str, Optional[str]] = {}
         self._refresh_last_log_count: Dict[str, int] = {}
@@ -943,7 +1036,6 @@ class MainWindow(
         self.intraday_fetch_worker = None
         self.intraday_bulk_worker = None
         self._intraday_provider_warning_log_keys: set[str] = set()
-        self.live_data_timer = None
         self.current_tradingview_symbol = ""
         self.tradingview_refresh_timestamps: dict[str, dt.datetime] = {}
         self.kis_daily_chart_unavailable_until: Optional[dt.datetime] = None
@@ -986,8 +1078,6 @@ class MainWindow(
 
         # Create menu bar
         self._create_menu_bar()
-        self._setup_live_data_timer()
-
         # Recover historical.py refresh state (e.g. main.py was restarted mid-refresh)
         # before the window is shown, then keep polling it live for the rest of the session.
         # Seed the "already seen" terminal-event marker from whatever's on disk so a
@@ -1015,7 +1105,6 @@ class MainWindow(
 
     def _init_controllers(self) -> None:
         """Initialize non-rendering workflow controllers."""
-        self.watchlist_controller = WatchlistController(self)
         self.buylist_execution_controller = BuylistExecutionController(self)
         self.buylist_controller = BuylistController(self)
         self.scanner_controller = ScannerController(self)
@@ -1161,6 +1250,7 @@ class MainWindow(
             self._last_coordination_database_notice = notice
             return
         self._bind_remote_state_engine(engine, is_main_device=False)
+        self._start_coordination_runtime_heartbeat(force=True)
         if self.__dict__.get("_last_coordination_database_notice"):
             self.append_log("Shared online coordination database recovered.")
         else:
@@ -1171,6 +1261,41 @@ class MainWindow(
         self._last_coordination_database_notice = ""
         self._start_state_sync()
         self._sync_buyboard_runtime_worker()
+
+    def _start_coordination_runtime_heartbeat(self, *, force: bool = False) -> None:
+        """Refresh the shared process heartbeat independently of PC MySQL."""
+
+        if self.__dict__.get("_database_shutting_down", False):
+            return
+        if not self.__dict__.get("_coordination_database_ready", False):
+            return
+        engine = self.__dict__.get("coordination_db_engine")
+        role = self.__dict__.get("state_sync_role")
+        if engine is None or role is None:
+            return
+        worker = self.__dict__.get("_coordination_runtime_heartbeat_worker")
+        if worker is not None:
+            return
+        now = time.monotonic()
+        last_attempt = self.__dict__.get(
+            "_last_coordination_runtime_heartbeat_attempt"
+        )
+        cadence = float(execution_config.COORDINATION_DEVICE_HEARTBEAT_SECONDS)
+        if (
+            not force
+            and last_attempt is not None
+            and now - float(last_attempt) < cadence
+        ):
+            return
+        self._last_coordination_runtime_heartbeat_attempt = now
+        worker = CoordinationRuntimeHeartbeatWorker(
+            engine,
+            hostname=role.hostname,
+            parent=self,
+        )
+        self._coordination_runtime_heartbeat_worker = worker
+        self._track_worker("_coordination_runtime_heartbeat_worker", worker)
+        worker.start()
 
     def _on_optional_database_initialized(
         self, engine, source: str = "none", pc_engine=None, error: str = ""
@@ -1853,13 +1978,11 @@ class MainWindow(
             )
         if "watchlist" in updated_keys:
             self.watchlist = self._load_watchlist()
-            self.populate_watchlist_table()
         if "buylist" in updated_keys:
             self.buylist_manager = self._load_buylist()
             self.populate_buylist_dashboard()
         if "trade_plans" in updated_keys:
             self.trade_manager = self._load_trade_plans()
-            self.populate_trade_plan_table()
         if "execution_queue" in updated_keys:
             # Lazily reloaded on next access (_ensure_execution_queue_manager
             # caches on self.execution_queue_manager) -- just drop the stale
@@ -1998,8 +2121,6 @@ class MainWindow(
         worker_names = (
             "_local_mirror_sync_worker",
             "scanner_worker",
-            "watchlist_worker",
-            "single_ai_worker",
             "intraday_fetch_worker",
             "intraday_bulk_worker",
         )
@@ -3305,7 +3426,6 @@ class MainWindow(
             self.__dict__.get("_database_transition_generation", 0) + 1
         )
         timers = [
-            self.__dict__.get("live_data_timer"),
             self.__dict__.get("state_sync_timer"),
             self.__dict__.get("sleep_readiness_timer"),
             self.__dict__.get("pc_status_timer"),
@@ -3339,8 +3459,6 @@ class MainWindow(
             self.__dict__.get("state_sync_worker"),
             self.__dict__.get("_pc_status_worker"),
             self.__dict__.get("scanner_worker"),
-            self.__dict__.get("watchlist_worker"),
-            self.__dict__.get("single_ai_worker"),
             self.__dict__.get("kis_order_worker"),
             self.__dict__.get("intraday_fetch_worker"),
             self.__dict__.get("intraday_bulk_worker"),
@@ -3790,10 +3908,6 @@ class MainWindow(
         self._add_configured_tab("scanner", self.scanner_widget, "Scanner")
         self._build_scanner_tab()
 
-        self.watchlist_widget = QWidget()
-        self._add_configured_tab("watchlist", self.watchlist_widget, "Watchlist")
-        self._build_watchlist_tab()
-
         # The Buy Board is the sole operator-facing execution surface. The
         # persisted buylist/execution-queue models remain compatibility inputs
         # for ORB calculation and state migration, but no legacy dashboard is
@@ -3822,20 +3936,14 @@ class MainWindow(
         self._build_health_tab()
 
         self.intraday_charts_widget = QWidget()
-        self._add_configured_tab(
-            "intraday_charts", self.intraday_charts_widget, "Intraday Charts"
-        )
-        self._build_intraday_charts_tab()
+        # A single empty, hidden combo preserves the one unguarded completion
+        # callback in the shared chart controller. No retired chart view,
+        # controls, web engine, shortcuts, or symbol population are created.
+        self.intraday_symbol_combo = QComboBox(self.intraday_charts_widget)
+        self.intraday_symbol_combo.setVisible(False)
 
-        # Wire env combo â†’ watchlist refresh (Trade Plan tab removed)
-        self.watchlist_env_combo.currentIndexChanged.connect(
-            self.on_watchlist_env_changed
-        )
-        self.watchlist_env_combo.currentIndexChanged.connect(
-            self.populate_watchlist_table
-        )
-        # currentIndexChanged was emitted during addItems before the signal was connected,
-        # so populate_trade_account_combo was never called. Trigger it once explicitly now.
+        # Account selectors are built on Dashboard; populate the shared trade
+        # account alias once after all tabs finish constructing.
         self.populate_trade_account_combo()
 
     def _add_configured_tab(self, key: str, widget: QWidget, label: str) -> None:
@@ -4277,24 +4385,7 @@ class MainWindow(
 
     @staticmethod
     def _control_runtime_identity_available(record) -> bool:
-        state = getattr(record, "state", "")
-        state_value = str(getattr(state, "value", state) or "").upper()
-        if state_value not in {
-            RuntimeDeviceState.STARTING.value,
-            RuntimeDeviceState.STANDBY.value,
-            RuntimeDeviceState.STANDBY_READY.value,
-            RuntimeDeviceState.ACTIVE.value,
-        }:
-            return False
-        updated_at = getattr(record, "updated_at", None)
-        if not isinstance(updated_at, dt.datetime):
-            return False
-        if updated_at.tzinfo is None:
-            updated_at = updated_at.replace(tzinfo=dt.timezone.utc)
-        age_seconds = (
-            dt.datetime.now(dt.timezone.utc) - updated_at.astimezone(dt.timezone.utc)
-        ).total_seconds()
-        return -5.0 <= age_seconds <= 120.0
+        return _control_runtime_identity_available(record)
 
     def _control_identity_kind(
         self, *, device_id: str = "", hostname: str = ""
@@ -4330,21 +4421,10 @@ class MainWindow(
     def _control_target_role(self, target_label: str) -> Optional[LocalDeviceRole]:
         if target_label == "Locked":
             return None
-        records = list(self.__dict__.get("_runtime_device_records", ()) or ())
-        candidates = [
-            record
-            for record in records
-            if self._control_runtime_identity_available(record)
-            if self._control_device_kind(record.hostname, record.details)
-            == target_label
-        ]
-        if candidates:
-            record = max(candidates, key=lambda item: item.updated_at)
-            return LocalDeviceRole(
-                device_id=record.device_id,
-                hostname=record.hostname,
-                is_main=False,
-            )
+        records = self.__dict__.get("_runtime_device_records", ()) or ()
+        target = _control_target_role_from_records(records, target_label)
+        if target is not None:
+            return target
         # A device-kind guess from this process's hardware is not a published
         # target identity. In particular, battery-less CI/VM hosts classify a
         # DESKTOP-named laptop role as PC. Ownership changes require a fresh
@@ -4375,15 +4455,6 @@ class MainWindow(
             )
             return
         target = self._control_target_role(target_label)
-        if target_label != "Locked" and target is None:
-            QMessageBox.information(
-                self,
-                "Device not available",
-                f"No {target_label} runtime is registered in shared coordination. "
-                f"Start or restart main.py on the {target_label}, then wait "
-                "for its Executor Ready status.",
-            )
-            return
         worker = self.__dict__.get("control_owner_worker")
         if worker is not None and worker.isRunning():
             return
@@ -4472,10 +4543,10 @@ class MainWindow(
             return
         revisions = result.revisions
         summary = (
-            f"watchlist r{revisions.get('watchlist', 0)}, "
-            f"buylist r{revisions.get('buylist', 0)}, "
-            f"trade plans r{revisions.get('trade_plans', 0)}, "
-            f"execution queue r{revisions.get('execution_queue', 0)}"
+            f"planning snapshot r{revisions.get('buylist', 0)}/"
+            f"{revisions.get('trade_plans', 0)}, "
+            f"execution queue r{revisions.get('execution_queue', 0)}, "
+            f"compatibility state r{revisions.get('watchlist', 0)}"
         )
         if result.execution_owner_heartbeat_fresh:
             owner = result.execution_owner_hostname or "Execution Owner"
@@ -4492,7 +4563,31 @@ class MainWindow(
             QMessageBox.warning(self, "Plan published; executor not verified", message)
         self._start_state_sync()
 
+    def _has_cached_local_operator_control(self) -> bool:
+        """Use only the last background-verified control row for plan edits."""
+
+        control = self.__dict__.get("_cached_operator_control")
+        role = self.__dict__.get("state_sync_role")
+        return bool(
+            control is not None
+            and role is not None
+            and not bool(getattr(control, "locked", True))
+            and str(getattr(control, "device_id", "") or "").strip()
+            == str(getattr(role, "device_id", "") or "").strip()
+            and str(getattr(role, "device_id", "") or "").strip()
+        )
+
     def _refresh_control_ownership_status(self, result: StateReconcileResult) -> None:
+        # ORB planning actions are synchronous UI gestures.  They must never
+        # issue a blocking ownership query on the UI thread, so retain the
+        # latest result from the background state-sync worker and fail closed
+        # whenever that result was unavailable.
+        self._cached_operator_control = (
+            result.operator_control
+            if not str(getattr(result, "operator_control_error", "") or "").strip()
+            else None
+        )
+        self._cached_operator_control_verified_at = result.last_verified_at
         label = self.__dict__.get("control_ownership_status")
         if label is None:
             return
@@ -4545,8 +4640,7 @@ class MainWindow(
             f"PC Executor Ready: {readiness['PC']} | "
             f"Laptop Executor Ready: {readiness['Laptop']} | "
             f"Live Trading: {live_text} | "
-            f"Revisions W/B/Q: {revisions.get('watchlist', 0)}/"
-            f"{revisions.get('buylist', 0)}/"
+            f"Plan/Queue Revisions: {revisions.get('buylist', 0)}/"
             f"{revisions.get('execution_queue', 0)} | Verified: {verified_text}"
             f" | Last Command: {command_text}"
         )
@@ -4588,7 +4682,15 @@ class MainWindow(
 
     def append_log(self, message: str) -> None:
         """Request an in-app log update from any thread."""
-        self.log_message_requested.emit(str(message))
+        text = str(message)
+        # A shared legacy intraday worker still carries old internal naming.
+        # Keep those implementation labels out of the operator-facing log now
+        # that the Watchlist UI has been removed.
+        text = text.replace(
+            "Intraday watchlist refresh requires",
+            "Intraday refresh requires",
+        ).replace("watchlist symbols", "planning symbols")
+        self.log_message_requested.emit(text)
 
     @pyqtSlot(str)
     def _append_log_on_ui_thread(self, message: str) -> None:
@@ -5061,6 +5163,7 @@ class MainWindow(
             return
         if self.__dict__.get("_coordination_database_configured", False):
             self._start_coordination_database_initialization()
+        self._start_coordination_runtime_heartbeat()
         if self.__dict__.get("database_recovery_worker") is not None:
             return
         if self._pc_status_worker is not None:
@@ -5369,17 +5472,11 @@ class MainWindow(
             self.tradingview_full_view_shortcut.setKey(
                 parse_key(shortcuts.get("full_view", "F"))
             )
-        if hasattr(self, "tradingview_watchlist_shortcut"):
-            self.tradingview_watchlist_shortcut.setKey(
-                parse_key(shortcuts.get("add_watchlist", "W"))
-            )
-
         # 4. Update Button Labels
         t_key = shortcuts.get("set_target", "T")
         d_key = shortcuts.get("draw_line", "D")
         e_key = shortcuts.get("erase_drawing", "E")
         f_key = shortcuts.get("full_view", "F")
-        w_key = shortcuts.get("add_watchlist", "W")
 
         if hasattr(self, "intraday_set_target_button"):
             self.intraday_set_target_button.setText(f"Set Breakout Price ({t_key})")
@@ -5414,13 +5511,6 @@ class MainWindow(
             self.tradingview_line_tool_button.setText(f"Line Tool ({d_key})")
         if hasattr(self, "tradingview_full_view_button"):
             self.tradingview_full_view_button.setText(f"Full View ({f_key})")
-        if hasattr(self, "tradingview_add_watchlist_button"):
-            cur_wl = self.tradingview_add_watchlist_button.text()
-            self.tradingview_add_watchlist_button.setText(
-                f"Remove from Watchlist ({w_key})"
-                if cur_wl.startswith("Remove")
-                else f"Add to Watchlist ({w_key})"
-            )
         if hasattr(
             self, "tradingview_queue_btn"
         ) and self.tradingview_queue_btn.text().startswith("Queue"):
@@ -5435,17 +5525,17 @@ class MainWindow(
         QMessageBox.information(
             self,
             "About",
-            "Stock Dashboard\n\nA PyQt5 trading dashboard prototype with scanner, watchlist, and trade planning.",
+            "Stock Dashboard\n\nA PyQt5 trading dashboard with scanner, Buy Board, chart review, and guarded execution.",
         )
 
     def save_local_data(self) -> None:
-        """Persist watchlist and trade plans on demand."""
+        """Persist local planning and chart state on demand."""
         self._save_state()
-        self.append_log("Saved local watchlist, trade plans, and scanner setups.")
+        self.append_log("Saved local planning, chart, and scanner state.")
         QMessageBox.information(
             self,
             "Saved",
-            "Local watchlist, trade plans, and scanner setups have been saved.",
+            "Local planning, chart, and scanner state has been saved.",
         )
 
     def show_restore_backup_dialog(self) -> None:

@@ -477,6 +477,8 @@ class BuylistMonitoringMixin:
                     show_messages=False,
                     triggered_by_live=True,
                     source="buylist monitor",
+                    symbols=[item.symbol for item in queue_watching_items],
+                    purpose="buyboard_orb",
                 )
 
         for item in stop_reprice_items:

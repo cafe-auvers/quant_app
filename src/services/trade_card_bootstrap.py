@@ -205,7 +205,11 @@ def bootstrap_trade_cards_from_current_state(
             buylist_member=False,
             breakout_price=getattr(item, "breakout_price", None),
             selected_orb_window=plan.get("window"),
-            buffer_pct=float(plan.get("buffer_pct", 0.001) or 0.001),
+            buffer_pct=float(
+                0.001
+                if plan.get("buffer_pct") in (None, "")
+                else plan.get("buffer_pct")
+            ),
             position_percent=float(plan.get("capital_percent", 0.0) or 0.0),
             planned_quantity=int(plan.get("shares", 0) or 0),
             target_position_quantity=int(plan.get("shares", 0) or 0),

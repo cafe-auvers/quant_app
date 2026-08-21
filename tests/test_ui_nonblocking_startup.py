@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from datetime import datetime, timezone
 import threading
 import time
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from PyQt5.QtCore import QCoreApplication
@@ -257,6 +258,10 @@ def test_database_outage_renders_local_snapshot_read_only_instead_of_emptying_bo
                 account_no="1",
                 symbol="MAX",
                 board_status=BoardStatus.BUY_TODAY,
+                # The local canonical snapshot, not the compatibility queue,
+                # owns the published target.  Recovery may enrich that target
+                # with current-session ORB geometry but must never invent it.
+                breakout_price=13.28,
             )
         ],
         path=snapshot_path,
@@ -264,12 +269,23 @@ def test_database_outage_renders_local_snapshot_read_only_instead_of_emptying_bo
     candidate = OrbCandidate(
         symbol="MAX",
         window="30m",
+        orb_high=13.40,
+        orb_low=13.00,
         breakout_price=13.28,
+        breakout_trigger=13.29328,
+        entry_trigger=13.40,
         current_price=13.46,
+        source_session_date=datetime.now(
+            ZoneInfo("America/New_York")
+        ).date().isoformat(),
+        stop_loss=13.00,
+        shares=10,
         status=OrbCandidateStatus.WAITING_BREAKOUT,
+        valid=True,
     )
     queue_item = ExecutionQueueItem(
         symbol="MAX",
+        account_no="1",
         breakout_price=13.28,
         current_price=13.46,
         candidates={"30m": candidate},
@@ -705,7 +721,7 @@ def test_buyboard_orb_refresh_targets_only_buy_today_and_is_independent_of_readi
             "show_messages": False,
             "triggered_by_live": True,
             "source": "Buy Today ORB",
-            "symbols": ["WEX", "STIM"],
+                "symbols": ["WEX"],
             "purpose": "buyboard_orb",
         }
     ]

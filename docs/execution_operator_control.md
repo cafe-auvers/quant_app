@@ -41,6 +41,21 @@ laptop to appear as a PC.
    trade plans, and execution queue, reads all four rows back, and reports
    whether the execution owner's heartbeat is fresh.
 
+Set the Buy Board **Buffer %** before a symbol is first queued. The field is a
+planning default only: editing it does not rewrite an existing Buy Today card,
+an ORB window lock, or a published execution queue row. The current Buy Board
+does not provide an in-place buffer replacement for an existing plan, and
+**Remove from Today** followed by re-activation does not make the new header
+value overwrite that plan. Treat the persisted value as immutable and verify
+it before publishing. See
+[Buy Board ORB Planning](orb_buyboard_planning.md).
+
+ORB candidates persist both the New York source-session date and the account
+used for sizing. Yesterday's cached bars and a candidate sized for another
+account are rejected before they can update a Buy Today card. The compatibility
+ORB queue has one row per symbol, so one symbol may be active in Buy Today for
+only one account at a time.
+
 The header's **Live Trading** field includes the configured execution
 envelope. For example, `CONTROLLED_LIVE: STIM, max $0.01/entry` means that
 other Buy Today cards are planning-only and that an order above the displayed
@@ -51,11 +66,30 @@ itself; confirm the mode, symbol scope, and cap shown beside it.
 
 Pre-market publishing and live Buy Today activation are separate paths:
 
-- **Publish Today's Plan** atomically publishes the watchlist, buylist, trade
-  plans, and execution queue. It is a pre-market bulk synchronization step.
+- **Publish Today's Plan** atomically publishes the legacy migration snapshot,
+  buylist, trade plans, and execution queue. It is a pre-market bulk
+  synchronization step; there is no Watchlist tab.
 - During the regular session, **Activate for Buy Today** becomes an
   `ADD_BUY_TODAY` operator command. It does not use the full-plan publish
   button.
+
+The optimized **Refresh / Select ORB Plans...** dialog follows the same
+planning boundary. Before market open, only the current Operator Control device
+may refresh the queue snapshot or change automatic/manual ORB-window selection.
+Locked, unverified, and non-owner devices get a read-only cached view. During
+the regular session the dialog is read-only for every device and does not
+refresh or persist selection changes; live candidate evaluation remains the
+Execution Owner runtime's responsibility.
+
+A permitted pre-market window lock/unlock is local until **Publish Today's
+Plan** succeeds. Switching Execution Owner alone does not copy that queue
+change; the new executor otherwise retains the last published plan snapshot.
+
+Chart breakout Set/Clear actions are separate, version-fenced Operator Control
+commands. Passive Buylist targets may be planned during market hours because
+they are not executable, but a published Buy Today target is immutable during
+the regular session. Premarket Buy Today edits clear the old ORB geometry, and
+a stale queue target cannot overwrite or restore the canonical card.
 
 The market-open command sequence is:
 

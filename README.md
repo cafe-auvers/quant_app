@@ -1,6 +1,6 @@
 # PyQt5 Trading Dashboard
 
-A desktop trading dashboard for US-market swing trading with scanner workflows, watchlist/ORB planning, a durable Kanban Buy Board, chart review, KIS account visibility, and guarded KIS order submission.
+A desktop trading dashboard for US-market swing trading with scanner workflows, Buy Board ORB planning, chart review, KIS account visibility, and guarded KIS order submission.
 
 ## Current Capabilities
 
@@ -8,17 +8,17 @@ A desktop trading dashboard for US-market swing trading with scanner workflows, 
 - Guarded KIS overseas order submission with a durable local order ledger.
 - Conservative fill reconciliation from account snapshots; broker acceptance is not treated as a fill.
 - Rule-based scanner presets backed by a KIS-registered US universe, Yahoo/KIS data paths, and MySQL caches.
-- Watchlist management with user-entered `breakout_price` levels for setup validation.
-- ORB planning where entry is valid only after price clears both ORB high and the buffered breakout price.
+- Chart-based `breakout_price` entry and Buy Board ORB planning; there is no operator-facing Watchlist tab.
+- A read-only Buy Today `ORB Combinations...` comparison covering all 24 risk/window cases, kept separate from the optimized pre-market `Refresh / Select ORB Plans...` selector; the optimized view is read-only during regular market hours.
+- ORB planning where entry is valid only after price clears both ORB high and the persisted buffered breakout price.
 - A strategy-neutral `MarketSnapshot -> Strategy -> Signal` interface, with the existing ORB behavior as the first plugin.
 - An append-only, redacted trading event journal and a read-only Health tab for KIS, MySQL, mirror freshness, and reconciliation status.
-- Buy dashboard monitoring with partial-exit and EMA-close exit workflow support.
-- An eight-column Kanban Buy Board (`Watchlist` through `Closed`) backed by one durable trade-card aggregate per production account and symbol.
+- Buy Board monitoring with partial-exit and EMA-close exit workflow support.
+- A six-column operator-facing Kanban Buy Board (`Buylist` through `Sell All`) backed by one durable trade-card aggregate per production account and symbol. Hidden `WATCHLIST`/`CLOSED` lifecycle values remain only for migration and history compatibility.
 - Typed, revision-fenced board commands: drag/drop records intent, while the background runtime and broker reconciliation own order effects and automatic lifecycle moves.
 - Guarded Kanban entry, partial-exit, sell-all, stop-management, ownership, failover/readiness, and external-order review paths. The engine remains fail-closed unless its production gates are explicitly satisfied.
 - Daily, hourly, TradingView, and intraday chart views with persisted drawings and breakout markers.
 - Shutdown-safe local JSON persistence with atomic writes, rolling `.bak` recovery, and save-status metadata.
-- Optional OpenAI-backed trade review with deterministic fallback analysis.
 
 ## Strategy Terminology
 
@@ -42,7 +42,7 @@ src/
     health/                     Production health panel and background probe
     mixins/                     Tab rendering, widget callbacks, and UI glue inherited by MainWindow
   api/                          KIS account, order, intraday, and daily-price adapters
-  core/                         Scanner, watchlist, trade-card/Kanban, order, and execution models
+  core/                         Scanner, ORB, trade-card/Kanban, order, and execution models
   infrastructure/               Database schemas, repositories, refresh, and local-mirror support
   strategy/                     Strategy contracts and the built-in ORB plugin
   risk/                         Position sizing and final pre-trade approval
@@ -55,9 +55,9 @@ tests/                          Pytest regression suite
 md_archive/                     Historical implementation notes and completed plans
 ```
 
-UI mixins keep PyQt tab construction, widget callbacks, table refreshes, and log/state-save side effects close to the widgets. `src/ui/controllers/` owns workflows that are easier to unit test outside the full `MainWindow`, including KIS account sync, scanner orchestration, watchlist ORB refreshes, chart data loading, and buylist execution queue refresh/submission coordination.
+UI mixins keep PyQt tab construction, widget callbacks, table refreshes, and log/state-save side effects close to the widgets. `src/ui/controllers/` owns workflows that are easier to unit test outside the full `MainWindow`, including KIS account sync, scanner orchestration, chart data loading, and execution-queue refresh/submission coordination.
 
-The **Buy Board** is separate from the legacy Buy Dashboard. Its UI is a read-only projection of canonical trade-card, ownership, and order state. Board gestures are revision-aware requests; they never call KIS directly or mark an order filled. See [Kanban Logic and Architecture](docs/kanban_architecture.md) for the lifecycle, runtime flow, component boundaries, and safety gates.
+The **Buy Board** is the operator surface for planning and execution. Its cards are read-only projections of canonical trade-card, ownership, and order state. Board gestures are revision-aware requests; they never call KIS directly or mark an order filled. See [Buy Board ORB Planning](docs/orb_buyboard_planning.md) for the planning controls and [Kanban Logic and Architecture](docs/kanban_architecture.md) for the lifecycle, runtime flow, component boundaries, and safety gates.
 
 ## Setup
 
@@ -117,6 +117,7 @@ Only enable KIS intraday after the endpoint, TR ID, request parameters, output f
 
 - `PROJECT_ARCHITECTURE.md` is the canonical architecture and maintenance map.
 - `docs/kanban_architecture.md` explains the Kanban state machine, command/runtime flow, persistence, safety boundaries, and component architecture.
+- `docs/orb_buyboard_planning.md` explains Buffer %, the 24-case read-only comparison, Operator-Control-only pre-market ORB selection, market-hours read-only behavior, and published-plan immutability.
 - `docs/kanban_production_readiness.md` records the detailed production invariants and rollout evidence requirements.
 - `rulebooks/` contains active trading rules used by review workflows.
 - `md_archive/` contains completed implementation notes and old planning documents that are not canonical.

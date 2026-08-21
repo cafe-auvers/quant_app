@@ -22,6 +22,7 @@ from src.services.broker import BrokerSubmissionResult
 from src.services.intraday_provider import IntradayProviderName, IntradayResult
 from src.services.realtime_market_data import QuoteSnapshot
 from src.services.trading_engine import TradingEngine
+from src.risk.pre_trade import PreTradeRiskRejectedError
 
 
 @pytest.fixture(autouse=True)
@@ -337,9 +338,10 @@ def test_guarded_runtime_consumes_upward_extreme_before_latest_trade(
     )
     card = _card(
         entry_trigger=104.0,
-        breakout_price=104.0,
+        entry_orb_high=104.0,
+        breakout_price=100.0,
         planned_quantity=10,
-        entry_runtime_status=EntryRuntimeStatus.EXECUTE_READY,
+        entry_runtime_status=EntryRuntimeStatus.WAITING_BREAKOUT,
     )
     monkeypatch.setattr(runtime_module.execution_config, "is_buyboard_engine_enabled", lambda: True)
     monkeypatch.setattr(
@@ -435,6 +437,105 @@ def test_submit_order_wrapper_supplies_a_fresh_risk_decision(monkeypatch):
     # directly -- it still delegates every call to the exact same
     # configured broker underneath.
     assert captured["broker"]._gateway is broker
+
+
+def test_submit_order_revalidates_capital_percent_against_equity_not_cash(
+    monkeypatch,
+):
+    broker = _FakeBroker()
+    card = _card(
+        planned_quantity=200,
+        entry_orb_low=95.0,
+        risk_percent=0.01,
+    )
+    captured = {}
+
+    def fake_submit_guarded(**kwargs):
+        captured.update(kwargs)
+        return BrokerOrder.create(
+            environment=kwargs["environment"],
+            account_no=kwargs["account_no"],
+            symbol=kwargs["symbol"],
+            side=OrderSide.BUY,
+            intent=OrderIntent.ENTRY,
+            quantity_requested=kwargs["quantity"],
+            limit_price=kwargs["limit_price"],
+            status=OrderStatus.ACCEPTED,
+        )
+
+    monkeypatch.setattr(
+        workflow_module, "submit_guarded_overseas_order", fake_submit_guarded
+    )
+    runtime = runtime_module.build_buyboard_runtime(
+        # The $20,000 order is affordable, but it is 80% of cash.  Its ORB
+        # capital allocation is correctly 20% of the $100,000 equity base.
+        buying_power_provider=lambda _env, _acct: 25_000.0,
+        account_equity_provider=lambda _env, _acct: 100_000.0,
+        card_lookup=lambda _env, _acct, _symbol: card,
+        broker=broker,
+    )
+
+    result = runtime.entry_attempt_manager._submit_order(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        intent=OrderIntent.ENTRY,
+        quantity=200,
+        limit_price=100.0,
+        exchange="NASD",
+        attempt_group_id="g1",
+        attempt_number=1,
+        attempt_deadline_at=None,
+        capital_reservation_id="",
+    )
+
+    assert result.status == UnifiedExecutionStatus.ACKNOWLEDGED
+    assert captured["quantity"] == 200
+    assert captured["pre_trade_risk_decision"].approved is True
+
+
+def test_submit_order_fails_closed_without_positive_fresh_equity(trading_enabled):
+    broker = _FakeBroker()
+    card = _card(
+        planned_quantity=200,
+        entry_orb_low=95.0,
+        risk_percent=0.01,
+    )
+    broker_calls = []
+
+    def record_broker_submit(**kwargs):
+        broker_calls.append(kwargs)
+        raise AssertionError("a missing-equity entry reached the broker")
+
+    broker.submit_order = record_broker_submit
+    runtime = runtime_module.build_buyboard_runtime(
+        buying_power_provider=lambda _env, _acct: 100_000.0,
+        account_equity_provider=lambda _env, _acct: 0.0,
+        card_lookup=lambda _env, _acct, _symbol: card,
+        broker=broker,
+    )
+
+    with pytest.raises(
+        PreTradeRiskRejectedError,
+        match="Fresh positive account equity is required",
+    ):
+        runtime.entry_attempt_manager._submit_order(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            intent=OrderIntent.ENTRY,
+            quantity=200,
+            limit_price=100.0,
+            exchange="NASD",
+            attempt_group_id="g1",
+            attempt_number=1,
+            attempt_deadline_at=None,
+            capital_reservation_id="",
+        )
+
+    assert broker_calls == []
 
 
 def test_submit_order_wrapper_denies_when_card_is_unknown(monkeypatch):

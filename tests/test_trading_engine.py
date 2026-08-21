@@ -59,9 +59,16 @@ def _buy_today_card(**overrides):
         entry_runtime_status=EntryRuntimeStatus.EXECUTE_READY,
         planned_quantity=10,
         entry_trigger=100.0,
+        entry_orb_high=100.0,
+        entry_orb_low=95.0,
+        selected_orb_window="5m",
+        breakout_price=99.0,
+        buffer_pct=0.001,
         kanban_priority=0,
     )
     fields.update(overrides)
+    if "entry_orb_high" not in overrides and "entry_trigger" in overrides:
+        fields["entry_orb_high"] = overrides["entry_trigger"]
     return TradeCardState(**fields)
 
 
@@ -204,7 +211,7 @@ def test_fresh_quote_allows_entry_submission_and_moves_to_entry_pending(tmp_path
     assert card.entry_runtime_status == EntryRuntimeStatus.ORDER_PENDING
 
 
-def test_target_allocation_sizes_entry_without_orb_or_history_data(tmp_path):
+def test_target_allocation_cannot_execute_without_complete_orb_plan(tmp_path):
     submitted = []
 
     def submit(**kwargs):
@@ -237,11 +244,11 @@ def test_target_allocation_sizes_entry_without_orb_or_history_data(tmp_path):
 
     engine.run_heartbeat([card])
 
-    assert len(submitted) == 1
-    assert submitted[0]["quantity"] == 200
-    assert card.planned_quantity == 200
-    assert card.target_position_quantity == 200
-    assert card.board_status == BoardStatus.ENTRY_PENDING
+    assert submitted == []
+    assert card.planned_quantity == 0
+    assert card.target_position_quantity == 0
+    assert card.board_status == BoardStatus.BUY_TODAY
+    assert card.entry_runtime_status == EntryRuntimeStatus.ORB_FORMING
 
 
 def _entry_event_engine(tmp_path, now, submitted):
@@ -342,6 +349,83 @@ def test_fresh_representative_maximum_triggers_exactly_one_entry(tmp_path):
     assert len(submitted) == 1
     assert submitted[0]["limit_price"] == 105.0
     assert card.board_status == BoardStatus.ENTRY_PENDING
+
+
+def test_waiting_breakout_executes_immediately_on_brief_fresh_orh_crossing(tmp_path):
+    now = dt.datetime(2026, 8, 16, 14, 30, tzinfo=dt.timezone.utc)
+    submitted = []
+    engine = _entry_event_engine(tmp_path, now, submitted)
+    card = _buy_today_card(
+        entry_runtime_status=EntryRuntimeStatus.WAITING_BREAKOUT,
+        entry_trigger=104.0,
+    )
+    crossing = QuoteSnapshot(
+        symbol="AAPL",
+        last_price=105.0,
+        bid=104.9,
+        ask=105.0,
+        broker_event_at=now,
+        received_at=now,
+        processed_at=now,
+    )
+
+    changed = engine.evaluate_entry_quote([card], crossing)
+
+    assert card in changed
+    assert len(submitted) == 1
+    assert submitted[0]["quantity"] == 10
+    assert card.board_status == BoardStatus.ENTRY_PENDING
+
+
+def test_waiting_breakout_with_corrupt_orb_geometry_cannot_execute(tmp_path):
+    now = dt.datetime(2026, 8, 16, 14, 30, tzinfo=dt.timezone.utc)
+    submitted = []
+    engine = _entry_event_engine(tmp_path, now, submitted)
+    card = _buy_today_card(
+        entry_runtime_status=EntryRuntimeStatus.WAITING_BREAKOUT,
+        entry_trigger=104.0,
+        entry_orb_high=103.0,
+    )
+    crossing = QuoteSnapshot(
+        symbol="AAPL",
+        last_price=105.0,
+        broker_event_at=now,
+        received_at=now,
+        processed_at=now,
+    )
+
+    assert engine.evaluate_entry_quote([card], crossing) == []
+    assert submitted == []
+    assert card.entry_runtime_status == EntryRuntimeStatus.WAITING_BREAKOUT
+
+
+def test_live_cross_cannot_bypass_retry_cooldown(tmp_path):
+    now = dt.datetime(2026, 8, 16, 14, 30, tzinfo=dt.timezone.utc)
+    submitted = []
+    prepared = []
+    engine = _entry_event_engine(tmp_path, now, submitted)
+    card = _buy_today_card(
+        entry_runtime_status=EntryRuntimeStatus.RETRY_COOLDOWN,
+        next_retry_at=now + dt.timedelta(seconds=30),
+    )
+    crossing = QuoteSnapshot(
+        symbol="AAPL",
+        last_price=105.0,
+        broker_event_at=now,
+        received_at=now,
+        processed_at=now,
+    )
+
+    changed = engine.evaluate_entry_quote(
+        [card],
+        crossing,
+        prepare_entry_plan=lambda *_args: prepared.append(True) or True,
+    )
+
+    assert changed == []
+    assert prepared == []
+    assert submitted == []
+    assert card.entry_runtime_status == EntryRuntimeStatus.RETRY_COOLDOWN
 
 
 def test_card_without_execute_ready_status_is_ignored(tmp_path):

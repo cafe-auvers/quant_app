@@ -319,57 +319,6 @@ class ChartsNavigationMixin:
         elif self.tradingview_symbol_combo.isEditable():
             self.tradingview_symbol_combo.setEditText(symbol)
 
-    def add_current_tradingview_symbol_to_watchlist(self) -> None:
-        symbol = (
-            self.tradingview_symbol_combo.currentText().strip().upper()
-            if hasattr(self, "tradingview_symbol_combo")
-            else ""
-        )
-        if not symbol:
-            QMessageBox.information(
-                self, "No symbol", "Load a symbol before adding it to the watchlist."
-            )
-            return
-        existing = self.watchlist.get(symbol)
-        if existing is not None:
-            self.watchlist.remove(symbol)
-            self.mark_watchlist_and_dashboard_dirty()
-            self._save_state()
-            self.append_log(f"Removed {symbol} from watchlist from TradingView.")
-            self._update_tradingview_watchlist_btn()
-            return
-        name = symbol
-        selected = self._get_sidebar_selected_data()
-        if selected and str(selected.get("symbol", "")).strip().upper() == symbol:
-            name = selected.get("name", symbol) or symbol
-        self.watchlist.add(symbol=symbol, name=name)
-        self.mark_watchlist_and_dashboard_dirty()
-        self._save_state()
-        self.prefetch_intraday_cache_for_symbol(symbol)
-        self.append_log(f"Added/updated {symbol} in watchlist from TradingView.")
-        self._update_tradingview_watchlist_btn()
-
-    def _update_tradingview_watchlist_btn(self, _text: str = "") -> None:
-        btn = self.__dict__.get("tradingview_add_watchlist_button")
-        if btn is None:
-            return
-        combo = self.__dict__.get("tradingview_symbol_combo")
-        symbol = combo.currentText().strip().upper() if combo is not None else ""
-        watchlist = self.__dict__.get("watchlist")
-        in_watchlist = (
-            symbol and watchlist is not None and watchlist.get(symbol) is not None
-        )
-        if in_watchlist:
-            btn.setText("Remove from Watchlist (W)")
-            btn.setStyleSheet(
-                "background-color: #c0392b; color: white; font-weight: 600;"
-            )
-        else:
-            btn.setText("Add to Watchlist (W)")
-            btn.setStyleSheet(
-                "background-color: #27ae60; color: white; font-weight: 600;"
-            )
-
     def _tradingview_queue_toggle(self) -> None:
         symbol = (
             self.tradingview_symbol_combo.currentText().strip().upper()

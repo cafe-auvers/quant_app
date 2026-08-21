@@ -7,7 +7,6 @@ from src.risk.orb_position import (
 )
 from src.risk.position_sizer import PositionSizer
 from src.ui.main_window import MainWindow
-from src.ui.workers import WatchlistAiWorker
 
 
 def test_orb_sizing_call_sites_share_authoritative_calculation():
@@ -15,7 +14,6 @@ def test_orb_sizing_call_sites_share_authoritative_calculation():
     expected = calculate_orb_position_values(*args)
 
     assert MainWindow._calculate_orb_position_values(*args) == expected
-    assert WatchlistAiWorker._calculate_position_values(*args) == expected
     execution_values = calculate_position_values(*args)
     assert execution_values == {
         key: (int(value) if key == "shares" else value)
@@ -36,7 +34,6 @@ def test_orb_risk_thresholds_remain_inclusive_at_10_and_exclusive_at_30():
     assert is_orb_position_plan_valid(at_ten, adr_percent=10.0) is True
     assert is_orb_position_plan_valid(at_thirty, adr_percent=10.0) is False
     assert MainWindow._orb_position_plan_is_valid(at_ten, 10.0) is True
-    assert WatchlistAiWorker._is_plan_valid(at_thirty, 10.0) is False
 
 
 def test_orb_recommendation_score_is_shared_across_call_sites():
@@ -44,7 +41,6 @@ def test_orb_recommendation_score_is_shared_across_call_sites():
     expected = score_orb_position_recommendation(sizing, 0.01)
 
     assert MainWindow._score_orb_position_recommendation(sizing, 0.01) == expected
-    assert WatchlistAiWorker._score_recommendation(sizing, 0.01) == expected
 
 
 def test_pre_p1_position_sizer_import_remains_compatible():

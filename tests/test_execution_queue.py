@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pandas as pd
 import pytest
 
@@ -202,6 +204,47 @@ def test_current_price_above_entry_trigger_with_valid_risk_is_execute_ready():
     assert candidate.status == OrbCandidateStatus.EXECUTE_READY
     assert candidate.valid is True
     assert candidate.shares >= 1
+    assert candidate.source_session_date == "2026-07-01"
+
+
+def test_candidate_source_session_date_survives_queue_round_trip():
+    manager = ExecutionQueueManager()
+    candidate = build_orb_candidate(
+        symbol="AAPL",
+        window="1m",
+        intraday=_intraday(minutes=3, high=101.0, low=99.0),
+        breakout_price=100.0,
+        current_price=102.0,
+        account_size=100000.0,
+        risk_percent=0.005,
+        adr_percent=5.0,
+    )
+    manager.upsert_item(symbol="AAPL", candidates={"1m": candidate})
+
+    restored = ExecutionQueueManager.from_dict(manager.to_dict())
+
+    assert (
+        restored.get_item("AAPL", "PROD")
+        .candidates["1m"]
+        .source_session_date
+        == "2026-07-01"
+    )
+
+
+def test_terminal_rejection_proof_survives_queue_round_trip():
+    manager = ExecutionQueueManager()
+    candidate = OrbCandidate(
+        symbol="AAPL",
+        window="1m",
+        status=OrbCandidateStatus.REJECTED,
+        terminal_rejection=True,
+        reason="structural breakout rejection",
+    )
+    manager.upsert_item(symbol="AAPL", candidates={"1m": candidate})
+
+    restored = ExecutionQueueManager.from_dict(manager.to_dict())
+
+    assert restored.get_item("AAPL", "PROD").candidates["1m"].terminal_rejection
 
 
 def test_orb_high_must_clear_buffered_breakout_trigger():
@@ -239,6 +282,107 @@ def test_after_order_submission_selected_window_is_locked():
     assert item.status == ExecutionQueueStatus.ORDER_SUBMITTED
 
 
+def test_safe_account_reassignment_discards_detached_queue_state():
+    manager = ExecutionQueueManager()
+    old_candidate = _candidate("1m", 50)
+    item = manager.upsert_item(
+        symbol="AAPL",
+        account_no="account-1",
+        candidates={"1m": old_candidate},
+    )
+    item.locked = True
+    item.manual_window_lock = True
+    item.locked_reason = "Manual ORB selection"
+    item.order_status = "REJECTED"
+    item.order_id = "terminal-old-order"
+
+    new_candidate = _candidate("5m", 80)
+    reassigned = manager.upsert_item(
+        symbol="AAPL",
+        account_no="account-2",
+        candidates={"5m": new_candidate},
+    )
+
+    assert reassigned.account_no == "account-2"
+    assert reassigned.candidates == {"5m": new_candidate}
+    assert reassigned.selected_window == "5m"
+    assert reassigned.selected_candidate is new_candidate
+    assert reassigned.locked is False
+    assert reassigned.manual_window_lock is False
+    assert reassigned.locked_reason is None
+    assert reassigned.order_status is None
+    assert reassigned.order_id is None
+
+
+@pytest.mark.parametrize(
+    "order_status",
+    ["SUBMITTED", "WORKING", "UNKNOWN_SUBMISSION_STATE", "FILLED"],
+)
+def test_account_reassignment_refuses_unresolved_or_live_order(order_status):
+    manager = ExecutionQueueManager()
+    manager.upsert_item(
+        symbol="AAPL",
+        account_no="account-1",
+        candidates={"1m": _candidate("1m", 50)},
+    )
+    manager.mark_order_submitted(
+        "AAPL",
+        order_id="ORDER-1",
+        order_status=order_status,
+    )
+    before = manager.get_item("AAPL", "PROD").to_dict()
+
+    with pytest.raises(ValueError, match="requires broker reconciliation"):
+        manager.upsert_item(
+            symbol="AAPL",
+            account_no="account-2",
+            candidates={"5m": _candidate("5m", 80)},
+        )
+
+    assert manager.get_item("AAPL", "PROD").to_dict() == before
+
+
+def test_account_reassignment_does_not_reapply_symbol_scoped_saved_lock():
+    manager = ExecutionQueueManager()
+    manager.upsert_item(
+        symbol="AAPL",
+        account_no="account-1",
+        candidates={"1m": _candidate("1m", 50)},
+    )
+    watch_item = SimpleNamespace(
+        symbol="AAPL",
+        name="Apple",
+        breakout_price=100.0,
+        stop_loss=98.0,
+        selected_orb_plan={
+            "window": "5m",
+            "risk_percent": 0.02,
+            "buffer_pct": 0.02,
+        },
+    )
+
+    reassigned = manager.build_or_update_from_watchlist_item(
+        watch_item,
+        {
+            "1m": _intraday(high=101.0),
+            "5m": _intraday(high=101.0),
+            "30m": _intraday(high=101.0),
+        },
+        current_price=102.0,
+        account_size=100_000.0,
+        risk_percent=0.005,
+        account_no="account-2",
+        adr_percent=5.0,
+        buffer_pct=0.001,
+        force_buffer_pct=True,
+    )
+
+    assert reassigned.account_no == "account-2"
+    assert reassigned.manual_window_lock is False
+    assert reassigned.locked is False
+    assert reassigned.locked_reason is None
+
+
 def test_order_failure_unlocks_selected_candidate_for_retry():
     manager = ExecutionQueueManager()
     manager.upsert_item(symbol="AAPL", candidates={"1m": _candidate("1m", 50)})
@@ -255,7 +399,11 @@ def test_order_failure_unlocks_selected_candidate_for_retry():
 
 def test_execution_queue_serializes_enum_values_round_trip():
     manager = ExecutionQueueManager()
-    manager.upsert_item(symbol="AAPL", candidates={"1m": _candidate("1m", 50)})
+    manager.upsert_item(
+        symbol="AAPL",
+        account_no="12345678-01",
+        candidates={"1m": _candidate("1m", 50)},
+    )
     manager.mark_order_submitted("AAPL", order_id="ORDER-1")
 
     restored = ExecutionQueueManager.from_dict(manager.to_dict())
@@ -269,6 +417,10 @@ def test_execution_queue_serializes_enum_values_round_trip():
         == OrbCandidateStatus.EXECUTE_READY
     )
     assert restored.items[queue_key("AAPL", "PROD")].environment == "PROD"
+    assert (
+        restored.items[queue_key("AAPL", "PROD")].account_no
+        == "12345678-01"
+    )
 
 
 def test_execution_queue_legacy_naive_timestamp_is_normalized_to_utc():
@@ -356,7 +508,57 @@ def test_duplicate_pending_or_submitted_orders_are_prevented():
     assert manager.has_pending_or_submitted_order("AAPL") is True
     assert manager.has_pending_or_submitted_order("AAPL", environment="PROD") is True
     assert duplicate_candidate.status == OrbCandidateStatus.REJECTED
+    assert duplicate_candidate.terminal_rejection is False
     assert "Duplicate" in duplicate_candidate.reason
+
+
+@pytest.mark.parametrize("account_size", [None, 0.0, float("nan")])
+def test_missing_or_zero_sizing_equity_never_proves_terminal_rejection(account_size):
+    candidate = build_orb_candidate(
+        symbol="AAPL",
+        window="1m",
+        intraday=_intraday(minutes=3, high=101.0, low=100.9),
+        breakout_price=100.0,
+        current_price=102.0,
+        account_size=account_size,
+        risk_percent=0.005,
+        adr_percent=5.0,
+    )
+
+    assert candidate.status == OrbCandidateStatus.RISK_INVALID
+    assert candidate.terminal_rejection is False
+
+
+def test_missing_current_price_never_proves_terminal_rejection():
+    candidate = build_orb_candidate(
+        symbol="AAPL",
+        window="1m",
+        intraday=_intraday(minutes=3, high=101.0, low=99.0),
+        breakout_price=100.0,
+        current_price=None,
+        account_size=100_000.0,
+        risk_percent=0.005,
+        adr_percent=5.0,
+    )
+
+    assert candidate.status == OrbCandidateStatus.RISK_INVALID
+    assert candidate.terminal_rejection is False
+
+
+def test_structural_rejection_with_known_equity_is_terminal():
+    candidate = build_orb_candidate(
+        symbol="AAPL",
+        window="1m",
+        intraday=_intraday(minutes=3, high=99.0, low=98.0),
+        breakout_price=100.0,
+        current_price=102.0,
+        account_size=100_000.0,
+        risk_percent=0.005,
+        adr_percent=5.0,
+    )
+
+    assert candidate.status == OrbCandidateStatus.REJECTED
+    assert candidate.terminal_rejection is True
 
 
 def test_unknown_submission_state_resolves_and_blocks_duplicate():

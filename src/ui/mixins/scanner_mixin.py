@@ -39,7 +39,6 @@ from src.core.orb import (calculate_orb_range, evaluate_orb_entry_signal,
 from src.core.order_state import (OPEN_ORDER_STATUSES, BrokerOrder,
                                   OrderIntent, OrderSide, OrderStatus)
 from src.core.scanner import ComparisonOperator, ScanRule, StockScanner
-from src.core.trade_reviewer import TradeReviewer, TradeSetup
 from src.core.watchlist import (BuylistItem, BuylistManager, TradePlan,
                                 TradePlanManager, Watchlist)
 from src.risk.position_sizer import PositionSizer
@@ -69,8 +68,7 @@ from src.ui.filter_catalog import (DEFAULT_SCANNER_SETUPS, DEFAULT_SETTINGS,
 from src.ui.workers import (FxRateWorker, IntradayBulkFetchWorker,
                             IntradayFetchWorker, KisAccountWorker,
                             KisOrderWorker, KisStartupAccountsWorker,
-                            OrderReconciliationWorker, ScannerWorker,
-                            SingleStockAiWorker, WatchlistAiWorker)
+                            OrderReconciliationWorker, ScannerWorker)
 from src.utils.data_loader import (_extract_symbol_history,
                                    download_price_history)
 from src.utils.intraday_helpers import \
@@ -170,11 +168,6 @@ class ScannerMixin:
 
         self.scanner_selection_label = QLabel("Selected symbol: None")
         form_layout.addRow(self.scanner_selection_label)
-
-        add_watchlist_button = QPushButton("Add selected to Watchlist")
-        add_watchlist_button.setObjectName("addWatchlistButton")
-        add_watchlist_button.clicked.connect(self.add_selected_scanner_to_watchlist)
-        form_layout.addRow(add_watchlist_button)
 
         self.scanner_metrics_details = QTextBrowser()
         self.scanner_metrics_details.setMinimumHeight(200)
@@ -1388,7 +1381,7 @@ class ScannerMixin:
         )
 
     def load_scanner_item_to_trade_plan(self, row: int, column: int) -> None:
-        """Scanner double-click: select symbol on chart and refresh ORB panel."""
+        """Scanner double-click: select the symbol for chart review."""
         symbol_item = self.scanner_table.item(row, 0)
         if symbol_item is None:
             return
@@ -1399,32 +1392,3 @@ class ScannerMixin:
 
         symbol = stock["symbol"]
         self._set_chart_symbol(symbol)
-        self.refresh_watchlist_orb_panel(symbol)
-
-    def add_selected_scanner_to_watchlist(self) -> None:
-        """Add the selected scanner entry to the watchlist."""
-        if not self.selected_scan_symbol:
-            QMessageBox.warning(
-                self,
-                "No selection",
-                "Please select a stock from the scanner results first.",
-            )
-            return
-
-        stock = self._get_scanner_stock(self.selected_scan_symbol)
-        if stock is None:
-            QMessageBox.warning(
-                self,
-                "Not found",
-                "Selected stock is no longer available in scanner results.",
-            )
-            return
-
-        self.watchlist.add(
-            symbol=stock["symbol"], name=stock["name"], entry_price=stock["price"]
-        )
-        self.populate_watchlist_table()
-        self.update_dashboard_summary()
-        self._save_state()
-        self.prefetch_intraday_cache_for_symbol(stock["symbol"])
-        self.append_log(f"Added {stock['symbol']} to watchlist.")

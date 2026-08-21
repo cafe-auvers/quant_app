@@ -26,7 +26,6 @@ def test_main_window_constructs_and_closes_offscreen_without_external_io(monkeyp
 
     watchlist = Watchlist()
     watchlist.add("STIM", "Neuronetics")
-    score_calls = []
 
     monkeypatch.setattr(controller_layout, "QWebEngineView", None)
     monkeypatch.setattr(health_panel_module, "QWebEngineView", None)
@@ -45,24 +44,6 @@ def test_main_window_constructs_and_closes_offscreen_without_external_io(monkeyp
     )
     monkeypatch.setattr(
         main_window_module.MainWindow, "_load_watchlist", lambda _self: watchlist
-    )
-    monkeypatch.setattr(
-        main_window_module.MainWindow,
-        "_calculate_item_scores",
-        lambda _self, item, *, use_live_fallback=True: (
-            score_calls.append((item.symbol, use_live_fallback))
-            or {
-                "symbol": item.symbol,
-                "price": 0.0,
-                "total_score": 0.0,
-                "status": "WATCHING",
-                "stop_adr": None,
-                "risk_percent": 0.01,
-                "position_percent": 0.0,
-                "trade_plan": "Cached data unavailable",
-                "env": "PROD",
-            }
-        ),
     )
     monkeypatch.setattr(main_window_module.MainWindow, "_load_buylist", lambda _self: BuylistManager())
     monkeypatch.setattr(
@@ -112,13 +93,38 @@ def test_main_window_constructs_and_closes_offscreen_without_external_io(monkeyp
     tradingview_index = tab_labels.index("TradingView Chart")
     assert tab_labels[tradingview_index + 1] == "Health"
     assert "Buy Board" in tab_labels
+    assert "Watchlist" not in tab_labels
     assert "Buy Dashboard" not in tab_labels
     assert not hasattr(window, "main_device_button")
     assert not hasattr(window, "buylist_widget")
+    assert not hasattr(window, "watchlist_widget")
+    assert not hasattr(window, "watchlist_table")
+    assert not hasattr(window, "watchlist_buffer_pct_input")
+    assert not hasattr(window, "analyze_stock_ai_button")
+    assert not hasattr(window, "save_watchlist_snapshot_button")
+    assert not hasattr(window, "live_data_checkbox")
+    assert window.buyboard_orb_buffer_pct_input.text() == "0.1"
+    header_layout = window.buyboard_widget.layout().itemAt(0).layout()
+    assert header_layout.indexOf(window.buyboard_orb_buffer_pct_input) < (
+        header_layout.indexOf(window._buyboard_engine_status_label)
+    )
+    assert not hasattr(window, "tradingview_add_watchlist_button")
+    assert not hasattr(window, "tradingview_watchlist_shortcut")
+    assert not hasattr(window, "add_current_tradingview_symbol_to_watchlist")
+    assert not hasattr(window, "_update_tradingview_watchlist_btn")
+    assert window.intraday_symbol_combo.count() == 0
+    assert not hasattr(window, "intraday_status_label")
+    assert not hasattr(window, "intraday_chart_view")
+    assert not hasattr(window, "_build_watchlist_tab")
+    assert not hasattr(window, "run_watchlist_ai_review")
+    assert not hasattr(window, "populate_watchlist_table")
+    sidebar_sources = [
+        window.sidebar_source_combo.itemText(index)
+        for index in range(window.sidebar_source_combo.count())
+    ]
+    assert "Watchlist" not in sidebar_sources
     from src.ui.buyboard.columns import BOARD_COLUMN_ORDER
 
     assert set(window.buyboard_columns.keys()) == set(BOARD_COLUMN_ORDER)
-    assert score_calls == []
-
     assert window.close() is True
     assert window._database_shutting_down is True

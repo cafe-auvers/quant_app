@@ -72,6 +72,9 @@ for the current formula.
   seconds while positions exist, not one query per card.
 - Unchanged runtime readiness uses one revision read plus one UPDATE; it no
   longer selects the same device row before and after every heartbeat.
+- Each running desktop publishes its compact `main.py` process heartbeat to
+  TiDB every 15 seconds. This is independent of the PC MySQL probe, so a
+  laptop remains an eligible Execution Owner while the PC is off.
 - The external watchdog still receives its 30-second heartbeat, but successful
   heartbeat audit rows are compacted to one every five minutes. Failure and
   recovery status transitions are always recorded.
@@ -91,6 +94,7 @@ polls.
 | Protective ownership proof | 10 seconds, one bulk read only while positions exist |
 | Writable probe | 15 seconds per running device |
 | Runtime readiness heartbeat | 15 seconds per running device |
+| `main.py` process heartbeat | 15 seconds per running device |
 | Card and Buy Board revision checks | 60 seconds per running device |
 | Planning/control display sync | 60 seconds per running device |
 | Operator-command pickup outside regular session | 60 seconds |
@@ -113,6 +117,7 @@ daily pattern:
 | --- | ---: |
 | Writable probes | 345,600 |
 | Two-device readiness revision + heartbeat UPDATE | 691,200 |
+| Two-device `main.py` process heartbeats | 691,200 |
 | Active-owner lease proof | 259,200 |
 | Two-device card revision checks | 86,400 |
 | Regular/off-hours operator-command checks | 549,420 |
@@ -121,12 +126,12 @@ daily pattern:
 | Two-device Buy Board revision checks | 86,400 |
 | Planning/control state sync | 302,400 |
 | Minute account-reconciliation relational reads, two accounts | 518,400 |
-| **Scheduled total** | **3,288,300** |
-| **With 25% reconnect/scheduling margin** | **4,110,375** |
+| **Scheduled total** | **3,979,500** |
+| **With 25% reconnect/scheduling margin** | **4,974,375** |
 
 For capacity planning, this project applies a conservative **8 RU per small
-scheduled statement**. That reserves about **32.9 million RUs/month** for the
-entire continuously running background workload, leaving about **17.1 million
+scheduled statement**. That reserves about **39.8 million RUs/month** for the
+entire continuously running background workload, leaving about **10.2 million
 RUs** for real state transitions, bulk projection payloads, order journals,
 TiDB background jobs, and measurement error. Ten thousand separately rendered
 material changes would add roughly 5 million public-endpoint egress RUs at the
@@ -170,15 +175,26 @@ and [spending-limit controls](https://docs.pingcap.com/tidbcloud/manage-serverle
    location.
 2. Stop `main.py` on both devices outside the regular session.
 3. Add the same `COORD_DB_*` SQL values to both `.env` files.
-4. Start one device first. Wait for `Shared online coordination database
-   connected` and allow schema/card migration and broker reconciliation to
-   finish.
-5. Start the second device and wait for its fresh `STANDBY_READY` identity.
-6. Explicitly choose Execution Owner and Operator Control. Publish Today's
-   Plan before market open and verify both devices display the same revisions
-   and Buy Today cards.
-7. Run a paper/controlled-live validation before relying on unattended PROD
+4. Start the intended first Execution Owner by itself. On a brand-new,
+   unclaimed coordination store it performs read-only broker reconciliation
+   and publishes `STANDBY_READY`; it cannot submit an entry in this bootstrap
+   state.
+5. Choose that device as Execution Owner. The readiness-fenced claim creates
+   the first exact lease; only then does the owner run schema/card migration,
+   perform another broker reconciliation, and become `ACTIVE`.
+6. Start the second device and wait for its fresh `STANDBY_READY` identity.
+7. Explicitly choose Operator Control. Publish Today's Plan before market
+   open and verify both devices display the same revisions and Buy Today
+   cards.
+8. Run a paper/controlled-live validation before relying on unattended PROD
    execution.
+
+If the first device reports `New entries remain blocked until post-migration
+reconciliation completes` while the shared migration row is still
+`NOT_STARTED` and Execution Owner is unassigned, update to a runtime containing
+the first-owner bootstrap fix. Do not manually edit the migration row or mark
+reconciliation complete: the active owner must produce that evidence through
+the normal broker reconciliation path.
 
 Do not configure TiDB on only one device. When `COORD_DB_*` is present, an
 unreachable coordination store fails closed; the application does not fall

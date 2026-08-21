@@ -1,12 +1,12 @@
 """Static UI catalogs and default options for the dashboard."""
 
 DEFAULT_SETTINGS = {
+    "orb_buffer_percent": 0.10,
     "shortcuts": {
         "set_target": "T",
         "draw_line": "D",
         "erase_drawing": "E",
         "full_view": "F",
-        "add_watchlist": "W",
         "prev_symbol": "Up",
         "next_symbol": "Down",
         "pan_left": "Left",
@@ -101,12 +101,10 @@ SCANNER_METRICS_LABELS = {
 DEFAULT_TAB_OPTIONS = {
     "dashboard": True,
     "scanner": True,
-    "watchlist": True,
     "buyboard": True,
     "charts": False,
     "tradingview": True,
     "health": True,
-    "intraday_charts": False,
     "trade_plan": True,
 }
 
@@ -163,4 +161,3 @@ FILTER_CATALOG = [
     ("Relative strength", "rs_slope_20d", "rs_slope_20d", "20-day change in stock/SPY relative strength.", "Preferred: > 0"),
     ("Final scoring", "score", "score", "Weighted ranking score from selected metrics. Not a raw yfinance field.", "Rank descending; no hard threshold unless needed")
 ]
-

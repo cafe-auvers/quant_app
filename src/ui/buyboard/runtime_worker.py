@@ -95,10 +95,17 @@ from src.services.runtime_device_state_repository import (
     require_compatible_runtime_schema,
     save_runtime_device_state,
 )
-from src.services.state_sync import LocalDeviceRole, get_synced_state_revisions
+from src.services.state_sync import (
+    LocalDeviceRole,
+    get_main_device,
+    get_synced_state_revisions,
+)
 from src.services.kis_realtime_market_data import StopRule, SubscriptionPriority
 from src.services.stop_change_coordinator import stop_change_coordinator_for
-from src.services.trade_card_orb_bridge import TradeCardOrbEvaluator
+from src.services.trade_card_orb_bridge import (
+    TradeCardOrbEvaluator,
+    queue_has_execution_order_lock,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +123,27 @@ _QUOTE_SUBSCRIBED_STATUSES = {
 # ORB is an active-session entry concern.  Watchlist and Buylist remain
 # planning-only and retain only their configured breakout target.
 _ORB_SYNCED_STATUSES = {BoardStatus.BUY_TODAY}
+
+
+def _ambiguous_buy_today_orb_keys(
+    cards: List[TradeCardState],
+) -> set[tuple[str, str]]:
+    """Find symbols whose legacy ORB queue row cannot identify an account."""
+
+    accounts_by_symbol: Dict[tuple[str, str], set[str]] = {}
+    for card in cards:
+        if card.board_status != BoardStatus.BUY_TODAY:
+            continue
+        key = (
+            str(card.environment or "").strip().upper(),
+            str(card.symbol or "").strip().upper(),
+        )
+        accounts_by_symbol.setdefault(key, set()).add(
+            str(card.account_no or "").strip()
+        )
+    return {
+        key for key, accounts in accounts_by_symbol.items() if len(accounts) > 1
+    }
 
 
 def _buy_today_subscription_priority(card: TradeCardState) -> SubscriptionPriority:
@@ -592,6 +620,32 @@ class BuyboardRuntimeWorker(QThread):
             lease_epoch=int(getattr(lease, "lease_epoch", 0) or 0),
         )
 
+    def _require_standby_migration_ready(
+        self, migration_manager: SchemaMigrationManager
+    ) -> None:
+        """Fence incomplete cutovers without deadlocking first ownership.
+
+        A brand-new coordination store has neither a migration nor an
+        Execution Owner.  Its read-only runtime must be allowed to reconcile
+        broker truth and publish ``STANDBY_READY``; otherwise the ownership
+        switch cannot acquire the first readiness-fenced lease, and the
+        lease-owned migration can never start.  This exception authorizes no
+        mutation: the worker remains observation-only.  Any existing owner or
+        any migration phase beyond ``NOT_STARTED`` keeps the normal entry
+        readiness fence in place.
+        """
+
+        state = migration_manager.state
+        if state.phase == MigrationPhase.NOT_STARTED:
+            ownership = get_main_device(self._lease_engine or self._db_engine)
+            if ownership.success and ownership.main_device is None:
+                logger.info(
+                    "Unclaimed coordination store is awaiting its first "
+                    "Execution Owner; standby reconciliation remains read-only"
+                )
+                return
+        migration_manager.require_entries_ready()
+
     def run(self) -> None:  # noqa: D401 - Qt override
         if not is_buyboard_engine_enabled():
             return
@@ -613,7 +667,7 @@ class BuyboardRuntimeWorker(QThread):
             )
             self._schema_migration_manager = migration_manager
             if self._standby_only:
-                migration_manager.require_entries_ready()
+                self._require_standby_migration_ready(migration_manager)
             else:
                 lease = self._execution_lease_value()
                 migration_manager.prepare_cutover(
@@ -1390,12 +1444,18 @@ class BuyboardRuntimeWorker(QThread):
                     changed_ids.add(id(card))
                     changed.append(card)
 
+        ambiguous_orb_keys = _ambiguous_buy_today_orb_keys(cards)
         if allow_mutations:
             # Synchronize ORB state before deriving action/subscription sets.
             # A card whose three ORB windows are terminal-invalid can return
             # to Buylist here and leave both evaluation and feed capacity in
             # this same cycle.
-            _track(self._sync_orb_plans(cards))
+            _track(
+                self._sync_orb_plans(
+                    cards,
+                    ambiguous_orb_keys=ambiguous_orb_keys,
+                )
+            )
 
         # The periodic refresh runs over every account regardless of
         # readiness. Later work is gated per card/action: an unrelated
@@ -1408,7 +1468,14 @@ class BuyboardRuntimeWorker(QThread):
             else []
         )
         execution_ready_cards = [
-            card for card in ready_cards if self._card_in_execution_scope(card)
+            card
+            for card in ready_cards
+            if self._card_in_execution_scope(card)
+            and (
+                str(card.environment or "").strip().upper(),
+                str(card.symbol or "").strip().upper(),
+            )
+            not in ambiguous_orb_keys
         ]
         observation_cards = [
             card for card in cards if card.board_status in _QUOTE_SUBSCRIBED_STATUSES
@@ -1460,7 +1527,9 @@ class BuyboardRuntimeWorker(QThread):
                     )
                     _track(
                         self.runtime.trading_engine.evaluate_entry_quote(
-                            execution_ready_cards, quote
+                            execution_ready_cards,
+                            quote,
+                            prepare_entry_plan=self._prepare_crossed_orb_entry_plan,
                         )
                     )
                     self._collect_market_breach_ack_candidates(
@@ -1520,7 +1589,9 @@ class BuyboardRuntimeWorker(QThread):
                         )
                         _track(
                             self.runtime.trading_engine.evaluate_entry_quote(
-                                execution_ready_cards, quote
+                                execution_ready_cards,
+                                quote,
+                                prepare_entry_plan=self._prepare_crossed_orb_entry_plan,
                             )
                         )
                         self._collect_market_breach_ack_candidates(
@@ -2582,7 +2653,12 @@ class BuyboardRuntimeWorker(QThread):
             equity_usd = usable_usd + float(breakdown.get("ovrs_stock_usd", 0.0) or 0.0)
         return usable_usd, equity_usd
 
-    def _sync_orb_plans(self, cards: List[TradeCardState]) -> List[TradeCardState]:
+    def _sync_orb_plans(
+        self,
+        cards: List[TradeCardState],
+        *,
+        ambiguous_orb_keys: Optional[set[tuple[str, str]]] = None,
+    ) -> List[TradeCardState]:
         """Review finding P0-2: without this, a card dragged to Buy Today
         never progresses past ORB_FORMING -- nothing else recomputes
         entry_trigger/planned_quantity/etc. Reads whatever the legacy
@@ -2591,39 +2667,87 @@ class BuyboardRuntimeWorker(QThread):
         second, competing ORB recalculation.
         """
         changed: List[TradeCardState] = []
+
+        def block_unverified_plan(card: TradeCardState, reason: str) -> None:
+            before = (
+                card.entry_runtime_status,
+                card.entry_block_reason,
+                card.entry_trigger,
+                card.entry_orb_high,
+                card.entry_orb_low,
+                card.stop_adr,
+                card.planned_quantity,
+                card.target_position_quantity,
+                card.selected_orb_window,
+            )
+            card.entry_runtime_status = EntryRuntimeStatus.DATA_UNAVAILABLE
+            card.entry_block_reason = reason
+            card.entry_trigger = None
+            card.entry_orb_high = None
+            card.entry_orb_low = None
+            card.stop_adr = None
+            card.planned_quantity = 0
+            card.target_position_quantity = 0
+            card.selected_orb_window = None
+            after = (
+                card.entry_runtime_status,
+                card.entry_block_reason,
+                card.entry_trigger,
+                card.entry_orb_high,
+                card.entry_orb_low,
+                card.stop_adr,
+                card.planned_quantity,
+                card.target_position_quantity,
+                card.selected_orb_window,
+            )
+            if before != after:
+                changed.append(card)
+
+        ambiguous = (
+            _ambiguous_buy_today_orb_keys(cards)
+            if ambiguous_orb_keys is None
+            else set(ambiguous_orb_keys)
+        )
         for card in cards:
             if card.board_status not in _ORB_SYNCED_STATUSES:
                 continue
-            target_plan_ready = bool(
-                card.board_status == BoardStatus.BUY_TODAY
-                and float(card.breakout_price or 0.0) > 0
-                and (
-                    int(card.planned_quantity or 0) > 0
-                    or float(card.position_percent or 0.0) > 0
-                )
+            symbol_key = (
+                str(card.environment or "").strip().upper(),
+                str(card.symbol or "").strip().upper(),
             )
-            if self._execution_queue_item_lookup is None:
-                if target_plan_ready and card.entry_runtime_status in {
-                    None,
-                    EntryRuntimeStatus.ORB_FORMING,
-                }:
-                    card.entry_runtime_status = EntryRuntimeStatus.EXECUTE_READY
-                    card.entry_block_reason = ""
+            if symbol_key in ambiguous:
+                reason = (
+                    "ORB execution blocked: the same symbol is active in "
+                    "multiple accounts, but the ORB queue is not account-scoped"
+                )
+                if (
+                    card.entry_runtime_status != EntryRuntimeStatus.RISK_INVALID
+                    or card.entry_block_reason != reason
+                ):
+                    card.entry_runtime_status = EntryRuntimeStatus.RISK_INVALID
+                    card.entry_block_reason = reason
                     changed.append(card)
+                continue
+            if self._execution_queue_item_lookup is None:
+                block_unverified_plan(
+                    card,
+                    "Current-session ORB plan is unavailable",
+                )
                 continue
             try:
                 item = self._execution_queue_item_lookup(card.symbol, card.environment)
             except Exception:
                 logger.exception("execution_queue_item_lookup failed for %s", card.symbol)
+                block_unverified_plan(
+                    card,
+                    "Current-session ORB plan lookup failed",
+                )
                 continue
             if item is None:
-                if target_plan_ready and card.entry_runtime_status in {
-                    None,
-                    EntryRuntimeStatus.ORB_FORMING,
-                }:
-                    card.entry_runtime_status = EntryRuntimeStatus.EXECUTE_READY
-                    card.entry_block_reason = ""
-                    changed.append(card)
+                block_unverified_plan(
+                    card,
+                    "Current-session ORB plan is unavailable",
+                )
                 continue
             before = (
                 card.board_status,
@@ -2668,6 +2792,36 @@ class BuyboardRuntimeWorker(QThread):
                 changed.append(card)
         return changed
 
+    def _prepare_crossed_orb_entry_plan(self, card, quote) -> bool:
+        """Select any crossed current-session ORB before immediate entry."""
+
+        if self._execution_queue_item_lookup is None:
+            return False
+        try:
+            item = self._execution_queue_item_lookup(card.symbol, card.environment)
+        except Exception:
+            logger.exception(
+                "execution_queue_item_lookup failed during live crossing for %s",
+                card.symbol,
+            )
+            return False
+        if item is None:
+            return False
+        if queue_has_execution_order_lock(item):
+            reason = "ORB execution blocked: the queue has an active order lock"
+            changed = (
+                card.entry_runtime_status != EntryRuntimeStatus.ORDER_PENDING
+                or card.entry_block_reason != reason
+            )
+            card.entry_runtime_status = EntryRuntimeStatus.ORDER_PENDING
+            card.entry_block_reason = reason
+            return changed
+        return self._orb_evaluator.select_crossed_candidate(
+            card,
+            item,
+            last_price=quote.last_price,
+        )
+
     def _sync_quote_subscriptions(self, cards: List[TradeCardState]) -> None:
         market_data = self.runtime.market_data
         configure = getattr(market_data, "configure_desired_channels", None)
@@ -2675,6 +2829,13 @@ class BuyboardRuntimeWorker(QThread):
             trade_priorities: Dict[str, int] = {}
             quote_priorities: Dict[str, int] = {}
             for card in cards:
+                # Planning/archive cards do not participate in execution and
+                # must not consume KIS WebSocket resolution or subscription
+                # capacity.  Passing them as DISPLAY_ONLY still makes the
+                # coordinator resolve both channels before it applies its
+                # capacity limits.
+                if card.board_status not in _QUOTE_SUBSCRIBED_STATUSES:
+                    continue
                 symbol = card.symbol
                 if card.board_status in {BoardStatus.SELL_ALL, BoardStatus.PARTIAL_SELL} or card.exit_all_required:
                     trade_priority = SubscriptionPriority.CRITICAL_EXIT

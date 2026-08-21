@@ -50,6 +50,7 @@ methods for the exact finding each one addresses):
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional
@@ -112,6 +113,53 @@ _TRADING_HALT_EXIT_WARNING = "TRADING_HALT_EXIT_PENDING"
 # _DATA_STALE_WARNING already is, so a liquidation cancel that the broker
 # will not confirm is visible on the board, not just in the log.
 _EXIT_CANCEL_STALLED_WARNING = "EXIT_CANCEL_STALLED"
+_SUPPORTED_ORB_WINDOWS = {"1m", "5m", "30m"}
+_LIVE_ORB_SELECTION_STATUSES = {
+    EntryRuntimeStatus.ORB_FORMING,
+    EntryRuntimeStatus.WAITING_BREAKOUT,
+    EntryRuntimeStatus.ARMED,
+    EntryRuntimeStatus.EXECUTE_READY,
+    EntryRuntimeStatus.DATA_UNAVAILABLE,
+}
+
+
+def _complete_orb_entry_plan(card: TradeCardState) -> bool:
+    """Return whether a card contains executable, risk-sized ORB geometry.
+
+    A daily breakout/allocation is planning intent, not an entry plan.  This
+    boundary deliberately requires the fields copied from a verified ORB
+    candidate before either quote recovery or a live crossing can arm a BUY.
+    """
+
+    window = str(card.selected_orb_window or card.entry_orb_window or "").strip()
+    try:
+        trigger = float(card.entry_trigger or 0.0)
+        orb_high = float(card.entry_orb_high or 0.0)
+        orb_low = float(card.entry_orb_low or 0.0)
+        breakout = float(card.breakout_price or 0.0)
+        buffer_pct = float(card.buffer_pct)
+        quantity = int(card.planned_quantity or 0)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not all(
+        math.isfinite(value)
+        for value in (trigger, orb_high, orb_low, breakout, buffer_pct)
+    ):
+        return False
+    buffered_breakout = breakout * (1.0 + buffer_pct)
+    return bool(
+        window in _SUPPORTED_ORB_WINDOWS
+        and trigger > 0
+        and orb_high > 0
+        and orb_low > 0
+        and breakout > 0
+        and 0.0 <= buffer_pct <= 1.0
+        and math.isclose(trigger, orb_high, rel_tol=1e-9, abs_tol=1e-6)
+        and orb_high > buffered_breakout
+        and orb_low < trigger
+        and orb_low <= orb_high
+        and quantity > 0
+    )
 
 
 def classify_market_data_outage_risk(
@@ -292,7 +340,13 @@ class TradingEngine:
         return changed
 
     def evaluate_entry_quote(
-        self, cards: List[TradeCardState], quote: QuoteSnapshot
+        self,
+        cards: List[TradeCardState],
+        quote: QuoteSnapshot,
+        *,
+        prepare_entry_plan: Optional[
+            Callable[[TradeCardState, QuoteSnapshot], bool]
+        ] = None,
     ) -> List[TradeCardState]:
         """Consume one representative trade event for BUY_TODAY entries.
 
@@ -319,7 +373,51 @@ class TradingEngine:
         ]
         if not matching:
             return []
-        return self._evaluate_buy_today(matching, quote_overrides={symbol: quote})
+        prepared: List[TradeCardState] = []
+        if prepare_entry_plan is not None:
+            for card in matching:
+                # A live event may choose among current ORB windows, but it
+                # must never erase an attempt manager's cooldown/capital/
+                # order state and thereby manufacture an early retry.
+                if card.entry_runtime_status not in _LIVE_ORB_SELECTION_STATUSES:
+                    continue
+                try:
+                    if prepare_entry_plan(card, quote):
+                        prepared.append(card)
+                except Exception:
+                    logger.exception(
+                        "Live ORB candidate selection failed for %s (%s:%s)",
+                        card.symbol,
+                        card.environment,
+                        card.account_no,
+                    )
+        promoted: List[TradeCardState] = []
+        for card in matching:
+            if card.entry_runtime_status not in {
+                EntryRuntimeStatus.WAITING_BREAKOUT,
+                EntryRuntimeStatus.ARMED,
+            }:
+                continue
+            if not _complete_orb_entry_plan(card):
+                continue
+            if quote.last_price < float(card.entry_trigger):
+                continue
+            card.entry_runtime_status = EntryRuntimeStatus.EXECUTE_READY
+            card.entry_block_reason = ""
+            promoted.append(card)
+
+        evaluated = self._evaluate_buy_today(
+            matching,
+            quote_overrides={symbol: quote},
+        )
+        changed: List[TradeCardState] = []
+        seen: set[int] = set()
+        for card in [*prepared, *promoted, *evaluated]:
+            if id(card) in seen:
+                continue
+            seen.add(id(card))
+            changed.append(card)
+        return changed
 
     def evaluate_pending_stop_handoff(
         self, cards: List[TradeCardState], quote: QuoteSnapshot
@@ -548,7 +646,10 @@ class TradingEngine:
                     card.entry_runtime_status = EntryRuntimeStatus.EXECUTE_READY
                     changed.append(card)
                 elif card.entry_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE:
-                    if self._market_data.entry_quote_ready(card.symbol, now=now):
+                    if (
+                        _complete_orb_entry_plan(card)
+                        and self._market_data.entry_quote_ready(card.symbol, now=now)
+                    ):
                         card.entry_runtime_status = EntryRuntimeStatus.EXECUTE_READY
                         changed.append(card)
             except Exception:
@@ -571,7 +672,7 @@ class TradingEngine:
         a BUY) of the ORB trigger, the current ask, and the current last
         price.
         """
-        entry_trigger = card.entry_trigger or card.breakout_price
+        entry_trigger = card.entry_trigger
         if not entry_trigger:
             return None
         candidates = [entry_trigger]
@@ -585,30 +686,10 @@ class TradingEngine:
     def _target_plan_quantity(
         self, card: TradeCardState, *, entry_price: float
     ) -> int:
-        """Size a persisted target allocation without using history bars."""
+        """Return the quantity already approved by the current ORB plan."""
 
         planned = max(0, int(card.planned_quantity or 0))
-        if planned > 0:
-            return planned
-        try:
-            position_percent = float(card.position_percent or 0.0)
-            account_equity = float(
-                self._account_equity_provider(card.environment, card.account_no)
-                or 0.0
-            )
-        except (TypeError, ValueError, OverflowError):
-            return 0
-        if position_percent <= 0 or account_equity <= 0 or entry_price <= 0:
-            return 0
-        planned = int(
-            account_equity * (position_percent / 100.0) / entry_price
-        )
-        if planned > 0:
-            card.planned_quantity = planned
-            card.target_position_quantity = max(
-                int(card.target_position_quantity or 0), planned
-            )
-        return max(0, planned)
+        return planned if entry_price > 0 else 0
 
     # -- BUY_TODAY -> entry attempts -------------------------------------
 
@@ -636,6 +717,14 @@ class TradingEngine:
             if card.entry_runtime_status != EntryRuntimeStatus.EXECUTE_READY:
                 continue
             try:
+                if not _complete_orb_entry_plan(card):
+                    card.entry_runtime_status = EntryRuntimeStatus.ORB_FORMING
+                    card.entry_block_reason = (
+                        "A complete current-session ORB entry plan is required"
+                    )
+                    if card not in changed:
+                        changed.append(card)
+                    continue
                 # Section 827-832 step 2: "WebSocket disconnects... block new
                 # entries" -- checked independently of quote staleness so a
                 # disconnect blocks entries immediately, not only once the
@@ -651,7 +740,7 @@ class TradingEngine:
                         card.entry_runtime_status = EntryRuntimeStatus.DATA_UNAVAILABLE
                         changed.append(card)
                     continue
-                entry_trigger = card.entry_trigger or card.breakout_price
+                entry_trigger = card.entry_trigger
                 if entry_trigger and quote.last_price < entry_trigger:
                     continue
                 price = self._marketable_entry_price(card, quote)

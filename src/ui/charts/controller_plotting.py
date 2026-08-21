@@ -428,7 +428,7 @@ class ChartsPlottingMixin:
             split_html = (
                 self._generate_message_html(
                     symbol,
-                    "No 1H chart data available. Update Watchlist Intraday or wait for background fetch.",
+                    "No 1H chart data available. Wait for the Buy Board background fetch.",
                 )
                 if split_history.empty
                 else self._generate_local_chart_html(

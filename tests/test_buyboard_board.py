@@ -9,7 +9,15 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QApplication, QLabel, QMenu, QMessageBox, QWidget
+from PyQt5.QtWidgets import (
+    QApplication,
+    QDialog,
+    QLabel,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QWidget,
+)
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
@@ -192,6 +200,7 @@ class _FakeMainWindow(QWidget):
         self._engine = engine
         self.dispatched = []
         self.refresh_count = 0
+        self.cached_local_operator_control = True
         # Applies a dispatched ReorderCard's target_priority directly onto
         # the matching card object, the same effect the real
         # apply_board_command -> repository round trip has -- so tests can
@@ -207,6 +216,9 @@ class _FakeMainWindow(QWidget):
 
     def refresh_buyboard(self):
         self.refresh_count += 1
+
+    def _has_cached_local_operator_control(self):
+        return self.cached_local_operator_control
 
     def _buyboard_dispatch_command(self, command, **_kwargs):
         self.dispatched.append(command)
@@ -366,6 +378,7 @@ def test_buy_today_context_menu_refreshes_and_opens_orb_plans(tmp_path, monkeypa
     )
     queue_item = ExecutionQueueItem(
         symbol=card.symbol,
+        account_no=card.account_no,
         candidates={"5m": candidate},
     )
     window.execution_queue_manager = SimpleNamespace(
@@ -381,6 +394,7 @@ def test_buy_today_context_menu_refreshes_and_opens_orb_plans(tmp_path, monkeypa
         "show_orb_plan_dialog",
         lambda parent, item, **kwargs: shown.append((parent, item, kwargs)),
     )
+    monkeypatch.setattr(board_module, "is_regular_session_open", lambda: False)
     monkeypatch.setattr(
         QMenu,
         "exec_",
@@ -399,7 +413,111 @@ def test_buy_today_context_menu_refreshes_and_opens_orb_plans(tmp_path, monkeypa
         (("PROD",), {"symbols": ["AAPL"], "create_missing": False})
     ]
     assert shown and shown[0][1] is queue_item
+    assert shown[0][2]["read_only"] is False
     assert window.dispatched == []
+
+
+def test_buy_today_context_menu_opens_read_only_orb_combinations(
+    tmp_path, monkeypatch
+):
+    _ensure_app()
+    engine = _make_engine(tmp_path)
+    card = repo.create_trade_card(
+        engine,
+        _card(board_status=BoardStatus.BUY_TODAY, buffer_pct=0.001),
+    )
+    window = _FakeMainWindow(engine, cards=[card])
+    queue_item = ExecutionQueueItem(
+        symbol=card.symbol,
+        account_no=card.account_no,
+        candidates={
+            window: OrbCandidate(
+                symbol=card.symbol,
+                window=window,
+                orb_high=100.0,
+                breakout_price=99.0,
+                breakout_trigger=99.099,
+                entry_trigger=100.0,
+                stop_loss=98.0,
+                stop_loss_percent=2.0,
+                stop_adr=50.0,
+                status=OrbCandidateStatus.WAITING_BREAKOUT,
+            )
+            for window in ("1m", "5m", "30m")
+        },
+    )
+    window.execution_queue_manager = SimpleNamespace(
+        get_item=lambda symbol, environment: queue_item
+    )
+    shown = []
+    monkeypatch.setattr(
+        board_module,
+        "_account_equity_lookup_for",
+        lambda _window: lambda _environment, _account_no: 100_000.0,
+    )
+    monkeypatch.setattr(
+        board_module.dialogs,
+        "show_orb_combinations_dialog",
+        lambda parent, item, combinations, **kwargs: shown.append(
+            (parent, item, combinations, kwargs)
+        ),
+    )
+    captured_menu = {}
+
+    def choose_combinations(menu, _pos):
+        captured_menu["menu"] = menu
+        return _find_action_by_text(menu, "ORB Combinations...")
+
+    monkeypatch.setattr(QMenu, "exec_", choose_combinations)
+
+    board_module._handle_card_context_menu(
+        window,
+        card_drag_payload(BoardCardProjection(card=card)),
+        None,
+    )
+
+    menu = captured_menu["menu"]
+    assert _find_action_by_text(menu, "ORB Combinations...") is not None
+    assert _find_action_by_text(menu, "Refresh / Select ORB Plans...") is not None
+    assert shown and shown[0][1] is queue_item
+    assert len(shown[0][2]) == 24
+    assert shown[0][3]["buffer_pct"] == pytest.approx(0.001)
+    assert window.dispatched == []
+
+
+@pytest.mark.parametrize(
+    "show_dialog",
+    [board_module._show_orb_plans, board_module._show_orb_combinations],
+)
+def test_orb_dialogs_block_same_symbol_active_in_multiple_accounts(
+    monkeypatch, show_dialog
+):
+    _ensure_app()
+    first = _card(
+        account_no="1",
+        symbol="AAPL",
+        board_status=BoardStatus.BUY_TODAY,
+    )
+    second = _card(
+        account_no="2",
+        symbol="AAPL",
+        board_status=BoardStatus.BUY_TODAY,
+    )
+    window = _FakeMainWindow(engine=None, cards=[first, second])
+    window.refresh_execution_queue = lambda *_args, **_kwargs: pytest.fail(
+        "ambiguous ORB dialog must not refresh the shared queue"
+    )
+    warnings = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda *args: warnings.append(args),
+    )
+
+    show_dialog(window, first)
+
+    assert warnings
+    assert "multiple accounts" in warnings[0][2]
 
 
 def test_orb_dialog_marks_waiting_breakout_as_a_valid_plan():
@@ -411,6 +529,146 @@ def test_orb_dialog_marks_waiting_breakout_as_a_valid_plan():
     )
 
     assert board_dialogs._orb_plan_classification(candidate) == "VALID"
+    assert (
+        board_dialogs._orb_plan_classification(candidate, stale=True)
+        == "INVALID"
+    )
+
+
+def test_premarket_operator_can_lock_stale_window_without_selecting_stale_metrics(
+    monkeypatch,
+):
+    _ensure_app()
+    card = _card(board_status=BoardStatus.BUY_TODAY)
+    window = _FakeMainWindow(engine=None, cards=[card])
+    candidate = OrbCandidate(
+        symbol=card.symbol,
+        window="5m",
+        source_session_date="2000-01-01",
+        status=OrbCandidateStatus.WAITING_BREAKOUT,
+    )
+    queue_item = ExecutionQueueItem(
+        symbol=card.symbol,
+        account_no=card.account_no,
+        candidates={"5m": candidate},
+    )
+    window.execution_queue_manager = SimpleNamespace(
+        get_item=lambda *_args: queue_item
+    )
+    refresh_calls = []
+    window.refresh_execution_queue = lambda *args, **kwargs: refresh_calls.append(
+        (args, kwargs)
+    ) or 1
+    saves = []
+    window._save_execution_queue_state = lambda: saves.append(True)
+    shown = []
+    monkeypatch.setattr(board_module, "is_regular_session_open", lambda: False)
+    monkeypatch.setattr(
+        board_module.dialogs,
+        "show_orb_plan_dialog",
+        lambda parent, item, **kwargs: shown.append(kwargs),
+    )
+
+    board_module._show_orb_plans(window, card)
+    shown[0]["lock_window"]("5m")
+
+    assert shown[0]["read_only"] is False
+    assert shown[0]["stale_windows"] == {"5m"}
+    assert queue_item.manual_window_lock is True
+    assert queue_item.selected_window == "5m"
+    assert queue_item.selected_candidate is None
+    assert saves == [True]
+    # Opening the editable dialog refreshes once; locking stale premarket
+    # structure must not immediately reattach yesterday's metrics.
+    assert len(refresh_calls) == 1
+
+
+def test_editable_orb_dialog_enables_window_only_lock_for_selected_stale_row(
+    monkeypatch,
+):
+    _ensure_app()
+    candidate = OrbCandidate(
+        symbol="AAPL",
+        window="5m",
+        source_session_date="2000-01-01",
+        status=OrbCandidateStatus.WAITING_BREAKOUT,
+    )
+    queue_item = ExecutionQueueItem(
+        symbol="AAPL",
+        account_no="1",
+        candidates={"5m": candidate},
+        selected_window="5m",
+    )
+    observed = {}
+
+    def inspect_dialog(dialog):
+        buttons = {
+            button.text(): button
+            for button in dialog.findChildren(QPushButton)
+        }
+        observed["lock_enabled"] = buttons["Lock Selected Plan"].isEnabled()
+        observed["labels"] = [
+            label.text() for label in dialog.findChildren(QLabel)
+        ]
+        return QDialog.Rejected
+
+    monkeypatch.setattr(QDialog, "exec_", inspect_dialog)
+
+    board_dialogs.show_orb_plan_dialog(
+        None,
+        queue_item,
+        lock_window=lambda _window: None,
+        unlock_auto=lambda: None,
+        stale_windows={"5m"},
+        read_only=False,
+    )
+
+    assert observed["lock_enabled"] is True
+    assert any("Publish Today's Plan" in text for text in observed["labels"])
+
+
+@pytest.mark.parametrize("market_open,owns_control", [(True, True), (False, False)])
+def test_optimized_orb_selection_is_read_only_without_mutation_authority(
+    monkeypatch, market_open, owns_control
+):
+    _ensure_app()
+    card = _card(board_status=BoardStatus.BUY_TODAY)
+    window = _FakeMainWindow(engine=None, cards=[card])
+    window.cached_local_operator_control = owns_control
+    candidate = OrbCandidate(
+        symbol=card.symbol,
+        window="5m",
+        source_session_date="2000-01-01",
+        status=OrbCandidateStatus.WAITING_BREAKOUT,
+    )
+    queue_item = ExecutionQueueItem(
+        symbol=card.symbol,
+        account_no=card.account_no,
+        candidates={"5m": candidate},
+    )
+    window.execution_queue_manager = SimpleNamespace(
+        get_item=lambda *_args: queue_item
+    )
+    window.refresh_execution_queue = lambda *_args, **_kwargs: pytest.fail(
+        "read-only optimized view must not refresh/mutate the queue"
+    )
+    shown = []
+    monkeypatch.setattr(
+        board_module, "is_regular_session_open", lambda: market_open
+    )
+    monkeypatch.setattr(
+        board_module.dialogs,
+        "show_orb_plan_dialog",
+        lambda parent, item, **kwargs: shown.append(kwargs),
+    )
+    monkeypatch.setattr(QMessageBox, "information", lambda *_args: None)
+
+    board_module._show_orb_plans(window, card)
+
+    assert shown[0]["read_only"] is True
+    shown[0]["lock_window"]("5m")
+    assert queue_item.manual_window_lock is False
+    assert queue_item.selected_window is None
 
 
 def test_context_menu_offers_cancel_entry_for_entry_pending_card(tmp_path, monkeypatch):
@@ -461,7 +719,9 @@ def test_context_menu_has_no_cancel_entry_action_for_open_position(tmp_path, mon
     assert _find_action_by_text(captured_menu["menu"], "Open TradingView Chart") is not None
 
 
-def test_buylist_context_menu_exposes_activation_removal_and_chart(tmp_path, monkeypatch):
+def test_buylist_context_menu_exposes_activation_and_chart_without_watchlist(
+    tmp_path, monkeypatch
+):
     _ensure_app()
     engine = _make_engine(tmp_path)
     card = repo.create_trade_card(engine, _card(board_status=BoardStatus.BUYLIST))
@@ -482,8 +742,38 @@ def test_buylist_context_menu_exposes_activation_removal_and_chart(tmp_path, mon
 
     menu = captured_menu["menu"]
     assert _find_action_by_text(menu, "Activate for Buy Today") is not None
-    assert _find_action_by_text(menu, "Move to Watchlist") is not None
+    assert _find_action_by_text(menu, "Move to Watchlist") is None
     assert _find_action_by_text(menu, "Open TradingView Chart") is not None
+
+
+def test_buyboard_buffer_parser_uses_percent_units_and_safe_default():
+    class _Input:
+        def __init__(self, value):
+            self.value = value
+
+        def text(self):
+            return self.value
+
+    window = SimpleNamespace(
+        buyboard_orb_buffer_pct_input=_Input("0.10"),
+        settings={},
+    )
+    assert board_module.buyboard_orb_buffer_pct(window) == pytest.approx(0.001)
+
+    window.buyboard_orb_buffer_pct_input.value = "nan"
+    assert board_module.buyboard_orb_buffer_pct(window) == pytest.approx(0.001)
+
+    window.settings["orb_buffer_percent"] = 0.25
+    for invalid in ("", "-0.01", "inf", "101"):
+        window.buyboard_orb_buffer_pct_input.value = invalid
+        assert board_module.buyboard_orb_buffer_pct(window) == pytest.approx(
+            0.0025
+        )
+
+    window.buyboard_orb_buffer_pct_input.value = "0"
+    assert board_module.buyboard_orb_buffer_pct(window) == 0.0
+    window.buyboard_orb_buffer_pct_input.value = "100"
+    assert board_module.buyboard_orb_buffer_pct(window) == 1.0
 
 
 def test_portfolio_summary_aggregates_positions_capital_and_live_pnl():

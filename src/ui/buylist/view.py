@@ -1,7 +1,10 @@
 """Buylist widgets, table rendering, and execution-queue persistence."""
 
+import datetime as dt
+import math
 from typing import Any, List, Optional, Tuple
 
+import pandas as pd
 from PyQt5.QtCore import Qt, QThread, QTimer
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (QAbstractItemView, QDialog, QHBoxLayout,
@@ -11,6 +14,11 @@ from PyQt5.QtWidgets import (QAbstractItemView, QDialog, QHBoxLayout,
 
 from src.services.app_state import (
     archive_non_production_execution_queue_state, quarantine_rejected_records)
+from src.services import buying_power_cache
+from src.infrastructure.database.repositories.market_bars import \
+    load_symbol_history_from_db
+from src.services.intraday_data_service import load_best_intraday_history
+from src.utils.intraday_helpers import utcnow_naive as _utcnow_naive
 from src.utils.storage import load_json, save_json
 
 from .constants import EXECUTION_QUEUE_FILE
@@ -649,6 +657,91 @@ class BuylistViewMixin:
 
         return is_pre_entry_execution_queue_item(item)
 
+    def _buylist_load_cached_intraday_interval(
+        self, symbol: str, interval: str, window_days: int = 7
+    ) -> pd.DataFrame:
+        """Load queue-planning bars without depending on WatchlistMixin."""
+
+        symbol = str(symbol or "").strip().upper()
+        if (
+            not symbol
+            or not bool(getattr(self, "db_enabled", False))
+            or getattr(self, "db_engine", None) is None
+        ):
+            return pd.DataFrame()
+        since = _utcnow_naive() - dt.timedelta(
+            days=max(1, min(7, int(window_days or 7)))
+        )
+        try:
+            bars, source = load_best_intraday_history(
+                symbol,
+                self.db_engine,
+                interval=interval,
+                since=since,
+            )
+            self.__dict__.setdefault("latest_intraday_sources", {})[
+                (symbol, interval)
+            ] = source
+            return bars
+        except Exception:
+            return pd.DataFrame()
+
+    @staticmethod
+    def _buylist_latest_intraday_session(intraday: pd.DataFrame) -> pd.DataFrame:
+        if intraday is None or intraday.empty:
+            return pd.DataFrame()
+        bars = intraday.sort_index().copy()
+        session_dates = pd.to_datetime(bars.index).date
+        latest_date = session_dates[-1]
+        return bars[session_dates == latest_date]
+
+    def _buylist_adr_percent_for_symbol(self, symbol: str) -> Optional[float]:
+        """Calculate ADR for queue sizing without a Watchlist UI helper."""
+
+        if (
+            not symbol
+            or not bool(getattr(self, "db_enabled", False))
+            or getattr(self, "db_engine", None) is None
+        ):
+            return None
+        history = load_symbol_history_from_db(
+            str(symbol).strip().upper(), self.db_engine, interval="1d"
+        )
+        if history.empty or len(history) < 2:
+            return None
+        prev_close = history["Close"].astype(float).shift(1)
+        adr = (
+            (history["High"].astype(float) - history["Low"].astype(float))
+            / prev_close
+        ).replace([float("inf"), float("-inf")], pd.NA)
+        value = adr.rolling(20, min_periods=5).mean().iloc[-1]
+        if pd.isna(value):
+            return None
+        return float(value * 100.0)
+
+    def _buylist_signal_price(self, symbol: str) -> float:
+        """Return only the Buy Board's already-observed intraday price."""
+
+        try:
+            price = float(
+                getattr(self, "latest_intraday_prices", {}).get(
+                    str(symbol or "").strip().upper(), 0.0
+                )
+            )
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        return price if math.isfinite(price) and price > 0 else 0.0
+
+    @staticmethod
+    def _buylist_risk_fraction(input_widget) -> float:
+        try:
+            raw_percent = float(input_widget.text())
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return 0.01
+        if not math.isfinite(raw_percent) or raw_percent <= 0 or raw_percent > 100:
+            return 0.01
+        return raw_percent / 100.0
+
     def _execution_queue_target_items(
         self,
         env: str,
@@ -656,12 +749,35 @@ class BuylistViewMixin:
         *,
         create_missing: bool = False,
     ) -> Tuple[List[Any], List[str]]:
-        watch_items = list(getattr(getattr(self, "watchlist", None), "items", []) or [])
-        watch_by_symbol = {
+        # Existing Buylist mirrors and canonical cards are active planning
+        # sources. Legacy Watchlist rows are read only for a one-time,
+        # explicitly requested import (``create_missing=True``); they never
+        # override an existing queue row on periodic refresh.
+        legacy_items = list(
+            getattr(getattr(self, "watchlist", None), "items", []) or []
+        )
+        legacy_by_symbol = {
             str(getattr(item, "symbol", "") or "").strip().upper(): item
-            for item in watch_items
+            for item in legacy_items
             if str(getattr(item, "symbol", "") or "").strip()
         }
+        canonical_by_symbol = {}
+        active_canonical_symbols: set[str] = set()
+        for projection in tuple(
+            self.__dict__.get("_buyboard_current_projections", ()) or ()
+        ):
+            card = getattr(projection, "card", projection)
+            if str(getattr(card, "environment", "") or "").upper() != env:
+                continue
+            status = str(
+                getattr(getattr(card, "board_status", ""), "value", None)
+                or getattr(card, "board_status", "")
+            ).upper()
+            symbol = str(getattr(card, "symbol", "") or "").strip().upper()
+            if symbol and status not in {"", "WATCHLIST", "CLOSED"}:
+                canonical_by_symbol.setdefault(symbol, card)
+            if symbol and status == "BUY_TODAY":
+                active_canonical_symbols.add(symbol)
         queued_symbols = [
             str(getattr(item, "symbol", "") or "").strip().upper()
             for item in list(
@@ -682,23 +798,34 @@ class BuylistViewMixin:
             target_symbols = (
                 requested
                 if create_missing
-                else [symbol for symbol in requested if symbol in queued_symbols]
+                else [
+                    symbol
+                    for symbol in requested
+                    if symbol in queued_symbols
+                    or symbol in active_canonical_symbols
+                ]
             )
 
         targets: List[Any] = []
         missing: List[str] = []
         for symbol in target_symbols:
-            item = watch_by_symbol.get(symbol)
-            if item is None:
-                existing = (
-                    self.buylist_manager.get(symbol, env)
-                    if hasattr(self, "buylist_manager")
-                    else None
-                )
-                if existing is not None and self._is_execution_queue_buylist_item(
-                    existing
-                ):
-                    item = existing
+            existing = (
+                self.buylist_manager.get(symbol, env)
+                if hasattr(self, "buylist_manager")
+                else None
+            )
+            # Canonical TradeCard state owns the target.  A local Buylist
+            # mirror may lag after a chart Set/Clear command and must never
+            # rebuild the queue with the superseded breakout level.
+            item = canonical_by_symbol.get(symbol)
+            if (
+                item is None
+                and existing is not None
+                and self._is_execution_queue_buylist_item(existing)
+            ):
+                item = existing
+            if item is None and create_missing:
+                item = legacy_by_symbol.get(symbol)
             if item is None:
                 missing.append(symbol)
                 continue
@@ -715,14 +842,7 @@ class BuylistViewMixin:
         from src.ui.buylist.execution_controller import \
             ExecutionQueueRefreshRequest
 
-        env = (
-            env
-            or (
-                self.watchlist_env_combo.currentText()
-                if hasattr(self, "watchlist_env_combo")
-                else "PROD"
-            )
-        ).upper()
+        env = str(env or "PROD").upper()
         requested_symbols = None
         if symbols is not None:
             requested_symbols = []
@@ -737,30 +857,143 @@ class BuylistViewMixin:
             create_missing=create_missing,
         )
         manager = None
-        account_size = 100000.0
+        account_size = 0.0
         risk_percent = 0.01
         buffer_pct = 0.001
         account_no = ""
         if target_items:
             manager = self._ensure_execution_queue_manager()
-            account_size = (
-                self._get_account_balance_for_env(env)
-                if hasattr(self, "_get_account_balance_for_env")
-                else 100000.0
+            risk_percent = self._buylist_risk_fraction(
+                getattr(self, "risk_percent_input", None)
             )
-            risk_percent = (
-                self._parse_float(self.risk_percent_input, 1.0) / 100.0
-                if hasattr(self, "risk_percent_input")
-                else 0.01
-            )
-            if risk_percent <= 0:
-                risk_percent = 0.01
-            buffer_pct = (
-                self._watchlist_orb_buffer_pct()
-                if hasattr(self, "_watchlist_orb_buffer_pct")
-                else 0.001
-            )
+            if hasattr(self, "_buyboard_orb_buffer_pct"):
+                buffer_pct = self._buyboard_orb_buffer_pct()
             account_no = self._first_account_no_for_environment(env) or ""
+
+        published_buffers: dict[str, set[float]] = {}
+        active_accounts: dict[str, set[str]] = {}
+        canonical_accounts: dict[str, set[str]] = {}
+        for projection in tuple(
+            self.__dict__.get("_buyboard_current_projections", ()) or ()
+        ):
+            card = getattr(projection, "card", projection)
+            if str(getattr(card, "environment", "") or "").upper() != env:
+                continue
+            status = str(
+                getattr(getattr(card, "board_status", ""), "value", None)
+                or getattr(card, "board_status", "")
+            ).upper()
+            symbol = str(getattr(card, "symbol", "") or "").strip().upper()
+            card_account = str(
+                getattr(card, "account_no", "") or ""
+            ).strip()
+            if symbol and card_account and status not in {"", "WATCHLIST", "CLOSED"}:
+                canonical_accounts.setdefault(symbol, set()).add(card_account)
+            if symbol and card_account and status == "BUY_TODAY":
+                active_accounts.setdefault(symbol, set()).add(card_account)
+            if status in {"", "WATCHLIST", "BUYLIST", "CLOSED"}:
+                continue
+            try:
+                value = float(getattr(card, "buffer_pct", None))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if symbol and math.isfinite(value) and 0.0 <= value <= 1.0:
+                published_buffers.setdefault(symbol, set()).add(value)
+
+        target_accounts: dict[str, str] = {}
+        queue_accounts: dict[str, str] = {}
+        for item in target_items:
+            symbol = str(
+                getattr(item, "symbol", "") or ""
+            ).strip().upper()
+            if not symbol:
+                continue
+            mirror = self.buylist_manager.get(symbol, env)
+            mirror_account = str(
+                getattr(mirror, "kis_account_no", "") or ""
+            ).strip()
+            item_account = str(
+                getattr(item, "kis_account_no", "") or ""
+            ).strip()
+            target_accounts[symbol] = mirror_account or item_account
+            queue_item = (
+                manager.get_item(symbol, env)
+                if manager is not None
+                else None
+            )
+            queue_accounts[symbol] = str(
+                getattr(queue_item, "account_no", "") or ""
+            ).strip()
+
+        def account_no_for_symbol(symbol: str) -> str:
+            active = active_accounts.get(symbol, set())
+            if len(active) > 1:
+                raise ValueError(
+                    f"{symbol} is active in Buy Today for multiple accounts"
+                )
+            if active:
+                return next(iter(active))
+
+            canonical = canonical_accounts.get(symbol, set())
+            if len(canonical) == 1:
+                return next(iter(canonical))
+
+            mirror_account = target_accounts.get(symbol, "")
+            queue_account = queue_accounts.get(symbol, "")
+            if len(canonical) > 1:
+                for candidate_account in (mirror_account, queue_account):
+                    if candidate_account in canonical:
+                        return candidate_account
+                raise ValueError(
+                    f"{symbol} exists in Buylist for multiple accounts"
+                )
+            return mirror_account or queue_account or account_no
+
+        def account_size_for_account(
+            environment: str, resolved_account_no: str
+        ) -> Optional[float]:
+            snapshot = buying_power_cache.get_snapshot(
+                environment,
+                resolved_account_no,
+            )
+            try:
+                equity = float(
+                    getattr(snapshot, "total_equity_usd", 0.0) or 0.0
+                )
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if math.isfinite(equity) and equity > 0:
+                return equity
+            return None
+
+        def persisted_buffer_for_symbol(symbol: str) -> Optional[float]:
+            """Freeze every existing queue row to its published buffer.
+
+            The header is a default for a newly queued plan. Periodic ORB
+            refreshes, executor handoff, and manual window locks must keep the
+            buffer already written to that symbol's Buylist/card state.
+            """
+
+            canonical = published_buffers.get(symbol, set())
+            if len(canonical) > 1:
+                raise ValueError(
+                    f"Conflicting published ORB buffers exist for {symbol}"
+                )
+            if canonical:
+                return next(iter(canonical))
+            existing = self.buylist_manager.get(symbol, env)
+            if existing is not None:
+                try:
+                    value = float(getattr(existing, "buffer_pct", None))
+                except (TypeError, ValueError, OverflowError):
+                    value = None
+                if (
+                    value is not None
+                    and math.isfinite(value)
+                    and 0.0 <= value <= 1.0
+                ):
+                    return value
+            return None
 
         return ExecutionQueueRefreshRequest(
             env=env,
@@ -772,29 +1005,27 @@ class BuylistViewMixin:
             account_size=account_size,
             risk_percent=risk_percent,
             buffer_pct=buffer_pct,
+            buffer_pct_for_symbol=persisted_buffer_for_symbol,
             account_no=account_no,
+            account_no_for_symbol=account_no_for_symbol,
+            account_size_for_account=account_size_for_account,
             trade_card_engine=(
                 self._execution_state_engine()
                 if callable(getattr(self, "_execution_state_engine", None))
                 else self.__dict__.get("pc_db_engine")
             ),
-            watchlist=self.__dict__.get("watchlist"),
-            latest_intraday_session=self._latest_intraday_session,
-            load_intraday_interval=lambda symbol, interval, window_days: self._load_cached_intraday_interval(
+            latest_intraday_session=self._buylist_latest_intraday_session,
+            load_intraday_interval=lambda symbol, interval, window_days: self._buylist_load_cached_intraday_interval(
                 symbol,
                 interval,
                 window_days=window_days,
             ),
-            signal_price_for_symbol=(
-                self._watchlist_orb_signal_price
-                if hasattr(self, "_watchlist_orb_signal_price")
-                else lambda _symbol: 0.0
-            ),
+            signal_price_for_symbol=self._buylist_signal_price,
             set_latest_intraday_price=lambda symbol, price: self.latest_intraday_prices.__setitem__(
                 symbol, price
             ),
             has_duplicate_open_order=self._has_duplicate_open_order,
-            adr_percent_for_symbol=self._calculate_adr_percent_for_symbol,
+            adr_percent_for_symbol=self._buylist_adr_percent_for_symbol,
         )
 
     def _apply_execution_queue_refresh_result(
@@ -819,7 +1050,7 @@ class BuylistViewMixin:
                 )
             else:
                 self.append_log(
-                    f"[Execution Queue/{result.env}] No selected watchlist symbols could be queued."
+                    f"[Execution Queue/{result.env}] No selected planning symbols could be queued."
                 )
             if result.missing_symbols:
                 self.append_log(
@@ -875,7 +1106,7 @@ class BuylistViewMixin:
         return result.refreshed
 
     def _apply_execution_queue_item_to_buylist(
-        self, queue_item, watch_item, env: str, buffer_pct: float
+        self, queue_item, planning_item, env: str, buffer_pct: float
     ) -> None:
         from src.ui.buylist.execution_controller import \
             BuylistExecutionController
@@ -885,7 +1116,7 @@ class BuylistViewMixin:
             self, "buylist_execution_controller", BuylistExecutionController
         )
         controller.apply_execution_queue_item_to_buylist(
-            queue_item, watch_item, env, buffer_pct
+            queue_item, planning_item, env, buffer_pct
         )
 
     def _queue_item_for_buylist_item(self, item):
@@ -893,35 +1124,12 @@ class BuylistViewMixin:
             return None
         return self._execution_queue_item_for_buylist_item(item)
 
-    def _clear_persisted_watchlist_orb_selection(self, symbol: str) -> bool:
-        """Return a watchlist symbol to automatic ORB-window selection.
-
-        A checked plan in the Watchlist ORB panel is deliberately durable and
-        re-locks its queue row on refresh. The Buylist dialog's ``Unlock
-        (Auto)`` action must clear that source of truth as well as the queue
-        row, otherwise its apparent unlock lasts only until the next refresh.
-        """
-        watchlist = self.__dict__.get("watchlist")
-        getter = getattr(watchlist, "get", None)
-        if not callable(getter):
-            return False
-        watch_item = getter(symbol)
-        if watch_item is None or not getattr(watch_item, "selected_orb_plan", None):
-            return False
-        watch_item.selected_orb_plan = None
-        self._save_state()
-        self.append_log(
-            f"Cleared saved Watchlist ORB selection for {str(symbol).strip().upper()}; auto selection is enabled."
-        )
-        return True
-
     def _unlock_execution_queue_item_for_auto(self, queue_item) -> None:
-        """Clear both in-memory and durable manual ORB selection state."""
+        """Return the canonical execution-queue row to automatic selection."""
         from src.core.execution_queue import select_best_orb_candidate
 
         manager = self.__dict__.get("execution_queue_manager")
         upgrade_margin = getattr(manager, "upgrade_margin", 0.0) if manager else 0.0
-        self._clear_persisted_watchlist_orb_selection(queue_item.symbol)
         queue_item.locked = False
         queue_item.manual_window_lock = False
         queue_item.locked_reason = None
@@ -961,7 +1169,7 @@ class BuylistViewMixin:
         if candidate is None:
             return (
                 f"{item.symbol} has no ORB candidate computed yet.\n\n"
-                "Click 'Refresh Queue' on the watchlist to recalculate."
+                "Refresh the Buy Today ORB plans and try again."
             )
 
         account_no = self._first_account_no_for_environment(env) or "<not selected>"

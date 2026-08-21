@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import fields
+from dataclasses import fields, replace
 from datetime import datetime
 from typing import Any, Callable, Dict, Optional
 
@@ -12,9 +12,11 @@ from src.core.board_workflow import (
     AnyBoardCommand,
     BoardActionContext,
     CancelEntry,
+    ClearBreakoutPrice,
     RequestPartialSell,
     RequestSellAll,
     SetBreakevenStop,
+    SetBreakoutPrice,
     SetManualStop,
 )
 from src.core.trade_card_state import BoardStatus
@@ -34,6 +36,8 @@ from src.services.state_sync import LocalDeviceRole
 
 _BOARD_TO_OPERATOR_TYPE = {
     ActivateForToday: OperatorCommandType.ADD_BUY_TODAY,
+    SetBreakoutPrice: OperatorCommandType.SET_BREAKOUT_PRICE,
+    ClearBreakoutPrice: OperatorCommandType.CLEAR_BREAKOUT_PRICE,
     CancelEntry: OperatorCommandType.CANCEL_ENTRY,
     RequestPartialSell: OperatorCommandType.SELL_PARTIAL,
     RequestSellAll: OperatorCommandType.SELL_ALL,
@@ -119,6 +123,8 @@ def _validate_broker_confirmed_board_state(engine, command: AnyBoardCommand) -> 
         command.symbol,
     )
     if card is None:
+        if isinstance(command, SetBreakoutPrice) and command.expected_card_version == 0:
+            return
         raise execution_workflow_service.BoardCommandRejectedError(
             f"No canonical card exists for {command.symbol}."
         )
@@ -132,6 +138,24 @@ def _validate_broker_confirmed_board_state(engine, command: AnyBoardCommand) -> 
         raise execution_workflow_service.BoardCommandRejectedError(
             f"{command.symbol} already has an active Buy Today, entry, or position state."
         )
+    if isinstance(command, ActivateForToday):
+        for other in trade_card_repository.list_trade_cards(
+            engine,
+            environment=command.environment,
+            raise_on_error=True,
+        ):
+            if (
+                str(other.symbol or "").strip().upper()
+                == str(command.symbol or "").strip().upper()
+                and str(other.account_no or "").strip()
+                != str(command.account_no or "").strip()
+                and other.board_status == BoardStatus.BUY_TODAY
+            ):
+                raise execution_workflow_service.BoardCommandRejectedError(
+                    f"{command.symbol} is already active in Buy Today for "
+                    "another account. The ORB queue is symbol-scoped, so "
+                    "only one account can activate that symbol at a time."
+                )
     if isinstance(command, (RequestPartialSell, RequestSellAll)):
         available = max(
             0,
@@ -171,6 +195,17 @@ def process_claimed_board_operator_command(
     executing = start_operator_command(engine, executor, accepted.command_id)
     try:
         command = deserialize_board_command(executing)
+        resolved_context = context or BoardActionContext()
+        breakout_plan_command = isinstance(
+            command, (SetBreakoutPrice, ClearBreakoutPrice)
+        )
+        if breakout_plan_command:
+            # submit_operator_command already proved that the requester held
+            # Operator Control.  Preserve that durable authorization when a
+            # different device is the execution owner consuming the request.
+            resolved_context = replace(
+                resolved_context, local_operator_control=True
+            )
         _validate_broker_confirmed_board_state(engine, command)
         before = trade_card_repository.get_trade_card(
             engine, command.environment, command.account_no, command.symbol
@@ -180,8 +215,8 @@ def process_claimed_board_operator_command(
         result = handler(
             engine,
             command,
-            context=context or BoardActionContext(),
-            claim_kanban_ownership=True,
+            context=resolved_context,
+            claim_kanban_ownership=not breakout_plan_command,
         )
         after = getattr(result, "card", None)
         if after is None:

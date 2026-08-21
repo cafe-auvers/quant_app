@@ -9,11 +9,12 @@ or above the ceiling explained to the user as becoming a Sell All.
 """
 from __future__ import annotations
 
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
 
 from PyQt5.QtGui import QColor, QFont
 from PyQt5.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
@@ -31,6 +32,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt
 
 from src.core.execution_queue import OrbCandidateStatus, SUPPORTED_ORB_WINDOWS
+from src.core.orb_combinations import OrbPositionCombination
 from src.core.trade_card_state import TradeCardState
 
 
@@ -41,9 +43,11 @@ _RISK_VALID_ORB_STATUSES = {
 }
 
 
-def _orb_plan_classification(candidate) -> str:
+def _orb_plan_classification(candidate, *, stale: bool = False) -> str:
     """Return the trader-facing validity of one computed ORB plan."""
 
+    if stale:
+        return "INVALID"
     if candidate.status in _RISK_VALID_ORB_STATUSES:
         return "VALID"
     if candidate.status in {
@@ -60,6 +64,9 @@ def show_orb_plan_dialog(
     *,
     lock_window: Callable[[str], None],
     unlock_auto: Callable[[], None],
+    stale_windows: Iterable[str] = (),
+    read_only: bool = False,
+    read_only_reason: str = "",
 ) -> None:
     """Show every ORB plan and allow a durable manual/automatic selection.
 
@@ -69,6 +76,9 @@ def show_orb_plan_dialog(
     """
 
     candidates = dict(getattr(queue_item, "candidates", {}) or {})
+    stale_window_set = {
+        str(window or "").strip() for window in stale_windows
+    }
     if not candidates:
         QMessageBox.warning(
             parent,
@@ -93,6 +103,29 @@ def show_orb_plan_dialog(
 
     lock_label = QLabel()
     layout.addWidget(lock_label)
+
+    if read_only:
+        read_only_label = QLabel(
+            str(read_only_reason or "ORB selection is read-only.")
+        )
+        read_only_label.setWordWrap(True)
+        read_only_label.setStyleSheet(
+            "font-weight: bold; padding: 4px 8px; background-color: #fff3e0; "
+            "color: #e65100; border-radius: 4px;"
+        )
+        layout.addWidget(read_only_label)
+    else:
+        publish_label = QLabel(
+            "A window change is saved on this device only. After locking or "
+            "returning to automatic selection, click Publish Today's Plan "
+            "to hand the change to another Execution Owner."
+        )
+        publish_label.setWordWrap(True)
+        publish_label.setStyleSheet(
+            "padding: 4px 8px; background-color: #e3f2fd; color: #0d47a1; "
+            "border-radius: 4px;"
+        )
+        layout.addWidget(publish_label)
 
     columns = [
         "Window",
@@ -162,7 +195,8 @@ def show_orb_plan_dialog(
             candidate = candidates.get(window)
             if candidate is None:
                 continue
-            classification = _orb_plan_classification(candidate)
+            is_stale = window in stale_window_set
+            classification = _orb_plan_classification(candidate, stale=is_stale)
             if classification == "VALID":
                 valid_windows.append(window)
             elif classification == "FORMING":
@@ -173,10 +207,16 @@ def show_orb_plan_dialog(
             is_selected = window == selected_window
             if is_selected:
                 selected_row = row
-            status_text = str(getattr(candidate.status, "value", candidate.status))
+            status_text = (
+                OrbCandidateStatus.NOT_AVAILABLE.value
+                if is_stale
+                else str(getattr(candidate.status, "value", candidate.status))
+            )
             details = "; ".join(getattr(candidate, "warnings", ()) or ())
             if not details:
                 details = str(getattr(candidate, "reason", "") or "OK")
+            if is_stale:
+                details = "Current-session ORB minute bars are unavailable"
             values = [
                 f"> {window}" if is_selected else window,
                 classification,
@@ -214,6 +254,7 @@ def show_orb_plan_dialog(
         )
         if selected_row >= 0:
             table.selectRow(selected_row)
+        _update_action_buttons()
 
     def _update_lock_label() -> None:
         selected = _selected_window() or "none"
@@ -256,31 +297,217 @@ def show_orb_plan_dialog(
     button_row.addWidget(close_button)
     layout.addLayout(button_row)
 
-    def _lock_selected() -> None:
+    def _selected_action_window() -> str:
         row = table.currentRow()
         if row < 0 or table.item(row, 0) is None:
+            return ""
+        return str(table.item(row, 0).data(Qt.UserRole) or "")
+
+    def _update_action_buttons() -> None:
+        window = _selected_action_window()
+        lock_button.setEnabled(not read_only and bool(window))
+        auto_button.setEnabled(not read_only)
+        tooltip = str(read_only_reason or "ORB selection is read-only.")
+        lock_button.setToolTip(tooltip if read_only else "")
+        auto_button.setToolTip(tooltip if read_only else "")
+
+    def _lock_selected() -> None:
+        if read_only:
+            return
+        window = _selected_action_window()
+        if not window:
             QMessageBox.warning(
                 dialog, "ORB Plans", "Select an ORB plan row first."
             )
-            return
-        window = str(table.item(row, 0).data(Qt.UserRole) or "")
-        if not window:
             return
         lock_window(window)
         _populate()
         _update_lock_label()
 
     def _unlock_auto() -> None:
+        if read_only:
+            return
         unlock_auto()
         _populate()
         _update_lock_label()
 
     lock_button.clicked.connect(_lock_selected)
     auto_button.clicked.connect(_unlock_auto)
+    table.itemSelectionChanged.connect(_update_action_buttons)
     close_button.clicked.connect(dialog.accept)
     _populate()
     _update_lock_label()
     dialog.exec_()
+
+
+def _orb_combination_classification(
+    combination: OrbPositionCombination,
+) -> str:
+    if combination.valid:
+        return "VALID"
+    if combination.status in {
+        OrbCandidateStatus.FORMING,
+        OrbCandidateStatus.NOT_AVAILABLE,
+    }:
+        return "FORMING"
+    return "INVALID"
+
+
+def show_orb_combinations_dialog(
+    parent,
+    queue_item,
+    combinations: list[OrbPositionCombination],
+    *,
+    buffer_pct: float,
+) -> None:
+    """Show every risk/window sizing option without changing plan selection."""
+
+    dialog = QDialog(parent)
+    dialog.setWindowTitle(f"ORB Combinations - {queue_item.symbol} [PROD]")
+    dialog.setMinimumWidth(1200)
+    dialog.setMinimumHeight(520)
+    layout = QVBoxLayout(dialog)
+    layout.setSpacing(8)
+
+    valid_count = sum(item.valid for item in combinations)
+    sizing_equity = (
+        float(combinations[0].account_equity) if combinations else 0.0
+    )
+    summary = QLabel(
+        f"{len(combinations)} combinations | {valid_count} valid | "
+        f"Plan buffer: {float(buffer_pct) * 100.0:.4g}% | "
+        f"Queue sizing equity: ${sizing_equity:,.2f}"
+    )
+    summary.setStyleSheet(
+        "font-weight: bold; padding: 4px 8px; background-color: #e3f2fd; "
+        "color: #0d47a1; border-radius: 4px;"
+    )
+    layout.addWidget(summary)
+
+    explanation = QLabel(
+        "Read-only comparison of all 0.25%-2.00% risk cases across 1m, 5m, "
+        "and 30m ORBs. Use the separate ORB Plans dialog to select or lock "
+        "the optimized plan."
+    )
+    explanation.setWordWrap(True)
+    layout.addWidget(explanation)
+
+    valid_only = QCheckBox("Valid combinations only")
+    valid_only.setChecked(False)
+    layout.addWidget(valid_only)
+
+    metrics = [
+        ("Classification", lambda item: _orb_combination_classification(item)),
+        ("ORB Status", lambda item: str(item.status.value)),
+        ("Risk %", lambda item: f"{item.risk_percent * 100.0:.2f}%"),
+        ("Window", lambda item: item.window),
+        ("Recommendation", lambda item: f"{item.score:.1f}"),
+        ("ORB High", lambda item: _format_optional_price(item.orb_high)),
+        (
+            "Breakout Price",
+            lambda item: _format_optional_price(item.breakout_price),
+        ),
+        (
+            "Buffer %",
+            lambda item: (
+                f"{item.buffer_pct * 100.0:.4g}%"
+                if item.buffer_pct is not None
+                else "-"
+            ),
+        ),
+        (
+            "Buffered Breakout",
+            lambda item: _format_optional_price(item.breakout_trigger),
+        ),
+        ("Entry Trigger", lambda item: _format_optional_price(item.entry_trigger)),
+        ("Stop Price", lambda item: _format_optional_price(item.stop_price)),
+        ("Risk / Share", lambda item: f"${item.risk_per_share:.2f}"),
+        ("Shares", lambda item: f"{item.shares:,}"),
+        ("Investment", lambda item: f"${item.investment:,.2f}"),
+        ("Capital %", lambda item: f"{item.capital_percent:.2f}%"),
+        (
+            "ADR %",
+            lambda item: (
+                f"{item.adr_percent:.2f}%"
+                if item.adr_percent is not None
+                else "-"
+            ),
+        ),
+        ("Stop Loss %", lambda item: f"{item.stop_loss_percent:.2f}%"),
+        (
+            "SL / ADR",
+            lambda item: (
+                f"{item.stop_adr:.2f}%" if item.stop_adr is not None else "-"
+            ),
+        ),
+        ("Reason / Current State", lambda item: item.reason),
+    ]
+    table = QTableWidget(len(metrics), 1)
+    table.setHorizontalHeaderLabels([""])
+    table.verticalHeader().setVisible(False)
+    table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+    table.setSelectionMode(QAbstractItemView.NoSelection)
+    table.setAlternatingRowColors(False)
+    layout.addWidget(table, 1)
+
+    colors = {
+        "VALID": (QColor("#1b5e20"), QColor("#c8e6c9")),
+        "FORMING": (QColor("#4a148c"), QColor("#e1bee7")),
+        "INVALID": (QColor("#b71c1c"), QColor("#ffcdd2")),
+    }
+
+    def populate() -> None:
+        visible = [
+            item
+            for item in combinations
+            if not valid_only.isChecked() or item.valid
+        ]
+        table.setRowCount(len(metrics))
+        table.setColumnCount(1 + len(visible))
+        table.setHorizontalHeaderLabels(
+            ["Metric"]
+            + [
+                f"{item.risk_percent * 100.0:.2f}% {item.window}"
+                for item in visible
+            ]
+        )
+        for row, (label, _formatter) in enumerate(metrics):
+            metric = QTableWidgetItem(label)
+            bold = QFont(metric.font())
+            bold.setBold(True)
+            metric.setFont(bold)
+            table.setItem(row, 0, metric)
+        for column, item in enumerate(visible, start=1):
+            classification = _orb_combination_classification(item)
+            foreground, background = colors[classification]
+            for row, (_label, formatter) in enumerate(metrics):
+                cell = QTableWidgetItem(formatter(item))
+                cell.setTextAlignment(Qt.AlignCenter)
+                cell.setForeground(foreground)
+                cell.setBackground(background)
+                table.setItem(row, column, cell)
+            table.setColumnWidth(column, 112)
+        table.setColumnWidth(0, 150)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        table.horizontalHeader().setStretchLastSection(False)
+
+    close_button = QPushButton("Close")
+    close_button.clicked.connect(dialog.accept)
+    button_row = QHBoxLayout()
+    button_row.addStretch()
+    button_row.addWidget(close_button)
+    layout.addLayout(button_row)
+
+    valid_only.stateChanged.connect(populate)
+    populate()
+    dialog.exec_()
+
+
+def _format_optional_price(value) -> str:
+    try:
+        return f"${float(value):.2f}" if value is not None else "-"
+    except (TypeError, ValueError, OverflowError):
+        return "-"
 
 
 def prompt_partial_sell_quantity(parent, card: TradeCardState) -> Optional[int]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import datetime as dt
+import gc
 import json
 
 import pytest
@@ -22,6 +23,13 @@ from src.api.kis_websocket import (
 
 
 NOW = dt.datetime(2026, 8, 16, 1, 0, tzinfo=dt.timezone.utc)
+
+
+def _run_async(awaitable):
+    with asyncio.Runner(
+        loop_factory=kis_websocket_module._websocket_event_loop
+    ) as runner:
+        return runner.run(awaitable)
 
 
 def test_parse_realtime_frame_preserves_count_and_payload_identity():
@@ -88,6 +96,54 @@ def test_windows_transport_uses_private_selector_loop(monkeypatch):
         loop.close()
 
 
+def test_windows_selector_loop_recovers_from_transient_socketpair_failure(
+    monkeypatch,
+):
+    real_socketpair = kis_websocket_module.socket.socketpair
+    attempts = []
+
+    def flaky_socketpair(*args, **kwargs):
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise OSError(10014, "temporary socket-pair startup failure")
+        return real_socketpair(*args, **kwargs)
+
+    monkeypatch.setattr(kis_websocket_module.socket, "socketpair", flaky_socketpair)
+    monkeypatch.setattr(kis_websocket_module, "_EVENT_LOOP_RETRY_SECONDS", 0)
+
+    loop = kis_websocket_module._ResilientWindowsSelectorEventLoop()
+    try:
+        # One injected failure must be recovered.  Windows itself may report
+        # another transient socket-pair failure during a busy test run.
+        assert len(attempts) >= 2
+    finally:
+        loop.close()
+
+
+def test_windows_selector_loop_exhausted_startup_cleans_partial_loop(
+    monkeypatch,
+):
+    attempts = []
+
+    def failing_socketpair(*args, **kwargs):
+        attempts.append(True)
+        raise OSError(10014, "persistent socket-pair startup failure")
+
+    monkeypatch.setattr(
+        kis_websocket_module.socket, "socketpair", failing_socketpair
+    )
+    monkeypatch.setattr(kis_websocket_module, "_EVENT_LOOP_RETRY_SECONDS", 0)
+
+    def construct_failed_loop():
+        with pytest.raises(OSError, match="persistent socket-pair"):
+            kis_websocket_module._ResilientWindowsSelectorEventLoop()
+
+    construct_failed_loop()
+    gc.collect()
+
+    assert len(attempts) == kis_websocket_module._EVENT_LOOP_START_ATTEMPTS
+
+
 def test_thread_bootstrap_retries_before_creating_coroutine():
     attempts = []
 
@@ -95,7 +151,7 @@ def test_thread_bootstrap_retries_before_creating_coroutine():
         attempts.append(True)
         if len(attempts) == 1:
             raise OSError(10014, "temporary socket-pair startup failure")
-        return asyncio.SelectorEventLoop()
+        return kis_websocket_module._ResilientWindowsSelectorEventLoop()
 
     client = KisWebSocketClient(
         url="ws://example",
@@ -134,7 +190,7 @@ def test_malformed_frame_is_dropped_without_changing_connected_state():
     client = KisWebSocketClient(url="ws://example", approval_keys=_Keys())
     client._connected = True
 
-    asyncio.run(client._handle_raw("bad frame"))
+    _run_async(client._handle_raw("bad frame"))
 
     assert client.malformed_frame_count == 1
     assert client.is_connected() is True
@@ -189,7 +245,7 @@ def test_reconnect_resubscribes_every_desired_subscription():
     operations = []
     client.on_operation(operations.append)
 
-    asyncio.run(client.run_forever())
+    _run_async(client.run_forever())
 
     assert len(sockets) == 2
     assert sockets[0].sent[0]["body"]["input"]["tr_key"] == "DNASAAPL"

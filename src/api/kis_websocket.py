@@ -12,8 +12,10 @@ import hashlib
 import json
 import logging
 import random
+import socket
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Iterable, Optional, Tuple
@@ -29,6 +31,79 @@ _EVENT_LOOP_START_ATTEMPTS = 3
 _EVENT_LOOP_RETRY_SECONDS = 0.25
 
 
+class _ResilientWindowsSelectorEventLoop(asyncio.SelectorEventLoop):
+    """Selector loop with recoverable Windows self-pipe construction.
+
+    CPython's selector-loop constructor creates a private ``socketpair``.
+    When Windows reports a transient WinError 10014 there, construction exits
+    before ``_ssock`` exists.  The partially initialized loop is later
+    finalized by CPython, whose normal cleanup assumes ``_ssock`` exists and
+    emits a second, misleading traceback.  Initialize those attributes first,
+    retry the transient operation in place, and make partial cleanup safe.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        self._ssock = None
+        self._csock = None
+        super().__init__(*args, **kwargs)
+
+    def _make_self_pipe(self) -> None:
+        internal_fds_before = int(getattr(self, "_internal_fds", 0))
+        last_error: Optional[OSError] = None
+        for attempt in range(1, _EVENT_LOOP_START_ATTEMPTS + 1):
+            try:
+                self._ssock, self._csock = socket.socketpair()
+                self._ssock.setblocking(False)
+                self._csock.setblocking(False)
+                self._internal_fds += 1
+                self._add_reader(self._ssock.fileno(), self._read_from_self)
+                return
+            except OSError as exc:
+                last_error = exc
+                ssock = getattr(self, "_ssock", None)
+                if ssock is not None:
+                    try:
+                        self._remove_reader(ssock.fileno())
+                    except Exception:
+                        pass
+                for attribute in ("_ssock", "_csock"):
+                    candidate = getattr(self, attribute, None)
+                    if candidate is not None:
+                        try:
+                            candidate.close()
+                        except OSError:
+                            pass
+                    setattr(self, attribute, None)
+                self._internal_fds = internal_fds_before
+                if attempt < _EVENT_LOOP_START_ATTEMPTS:
+                    time.sleep(_EVENT_LOOP_RETRY_SECONDS * attempt)
+        assert last_error is not None
+        selector = getattr(self, "_selector", None)
+        if selector is not None:
+            selector.close()
+            self._selector = None
+        # Construction cannot return this loop.  Marking it closed prevents
+        # BaseEventLoop.__del__ from warning about the already-cleaned partial
+        # object (or trying to clean it a second time).
+        self._closed = True
+        raise last_error
+
+    def _close_self_pipe(self) -> None:
+        ssock = getattr(self, "_ssock", None)
+        csock = getattr(self, "_csock", None)
+        if ssock is not None and csock is not None:
+            super()._close_self_pipe()
+            return
+        for candidate in (ssock, csock):
+            if candidate is not None:
+                try:
+                    candidate.close()
+                except OSError:
+                    pass
+        self._ssock = None
+        self._csock = None
+
+
 def _websocket_event_loop() -> asyncio.AbstractEventLoop:
     """Create the private loop used by the WebSocket transport thread.
 
@@ -40,7 +115,7 @@ def _websocket_event_loop() -> asyncio.AbstractEventLoop:
     """
 
     if sys.platform == "win32":
-        return asyncio.SelectorEventLoop()
+        return _ResilientWindowsSelectorEventLoop()
     return asyncio.new_event_loop()
 
 

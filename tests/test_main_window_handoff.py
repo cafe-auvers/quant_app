@@ -954,8 +954,6 @@ def test_failed_final_release_aborts_close_and_restores_protection(monkeypatch):
     window._buyboard_live_metric_timer = live_metric_timer
     for name in (
         "scanner_worker",
-        "watchlist_worker",
-        "single_ai_worker",
         "kis_order_worker",
         "intraday_fetch_worker",
         "intraday_bulk_worker",

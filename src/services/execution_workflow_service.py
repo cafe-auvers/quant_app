@@ -27,6 +27,7 @@ received.
 from __future__ import annotations
 
 import inspect
+import math
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -430,6 +431,71 @@ def _board_action_name(command, card) -> str:
     return "PRESENTATION"
 
 
+def _is_breakout_plan_command(command) -> bool:
+    types = _load_board_types()
+    return isinstance(command, (types.SetBreakoutPrice, types.ClearBreakoutPrice))
+
+
+def _require_breakout_plan_mutation_policy(command, card, context) -> None:
+    """Authorize canonical breakout edits independently of executor state.
+
+    A passive BUYLIST target never submits a broker order, so it may still be
+    planned while the regular session is open.  A published BUY_TODAY plan is
+    immutable after the open.  Every direct edit requires verified local
+    Operator Control; the operator-command consumer supplies the same flag
+    only after consuming a durably authorized request.
+    """
+
+    if not _is_breakout_plan_command(command):
+        return
+    types = _load_board_types()
+    if isinstance(command, types.SetBreakoutPrice):
+        try:
+            price = float(command.price)
+            buffer_pct = float(command.buffer_pct)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise BoardCommandRejectedError(
+                "Breakout price and buffer must be finite numbers"
+            ) from exc
+        if not math.isfinite(price) or price <= 0:
+            raise BoardCommandRejectedError(
+                "Breakout price must be a finite positive number"
+            )
+        if not math.isfinite(buffer_pct) or not 0.0 <= buffer_pct <= 1.0:
+            raise BoardCommandRejectedError(
+                "ORB buffer must be between 0% and 100%"
+            )
+    if not context.local_operator_control:
+        raise BoardCommandRejectedError(
+            "Only the current Operator Control owner may change breakout planning"
+        )
+    if context.regular_session_open is None:
+        raise BoardCommandRejectedError(
+            "Market-session state is unavailable; breakout planning fails closed"
+        )
+    if card is None:
+        return
+
+    from src.core.trade_card_state import BoardStatus
+
+    allowed = {
+        BoardStatus.WATCHLIST,
+        BoardStatus.BUYLIST,
+        BoardStatus.BUY_TODAY,
+    }
+    if card.board_status not in allowed:
+        raise BoardCommandRejectedError(
+            f"Cannot change breakout planning from {card.board_status.value}"
+        )
+    if (
+        card.board_status == BoardStatus.BUY_TODAY
+        and context.regular_session_open is True
+    ):
+        raise BoardCommandRejectedError(
+            "The published Buy Today plan is immutable during regular market hours"
+        )
+
+
 def _is_execution_affecting(command, card) -> bool:
     return _board_action_name(command, card) != "PRESENTATION"
 
@@ -577,6 +643,35 @@ def _require_board_action_not_conflicted(engine, command, card) -> List[Executio
     types = _load_board_types()
     active_orders = _active_owned_orders(engine, card)
 
+    if _is_breakout_plan_command(command):
+        from src.core.trade_card_state import PositionRuntimeStatus
+
+        durable_entry_or_position = bool(
+            active_orders
+            or card.entry_client_order_id
+            or card.entry_pending_attempt_number
+            or card.entry_submission_unresolved
+            or card.entry_cancel_in_flight
+            or card.entry_cancel_reason
+            or card.entry_cancel_command_id
+            or card.entry_remaining_target_quantity
+            or card.capital_reservation_id
+            or card.broker_quantity
+            or card.orderable_quantity
+            or card.average_entry_price
+            or card.position_runtime_status != PositionRuntimeStatus.NONE
+            or card.exit_client_order_id
+            or card.exit_pending_attempt_number
+            or card.exit_submission_unresolved
+            or card.exit_cancel_in_flight
+            or card.reserved_sell_quantity
+            or card.pending_stop_command_id
+        )
+        if durable_entry_or_position:
+            raise BoardCommandRejectedError(
+                "Breakout planning cannot change after entry, order, reservation, or position evidence exists"
+            )
+
     # BUY_TODAY -> BUYLIST is a harmless presentation change only while no
     # entry identity has been consumed.  The runtime persists that identity
     # before crossing the broker boundary, so allowing the drag afterward
@@ -677,6 +772,72 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
     )
 
     types = _load_board_types()
+
+    def clear_executable_entry_plan() -> None:
+        card.selected_orb_window = None
+        card.position_percent = 0.0
+        card.planned_quantity = 0
+        card.target_position_quantity = 0
+        card.entry_orb_window = None
+        card.entry_orb_high = None
+        card.entry_orb_low = None
+        card.entry_trigger = None
+        card.stop_adr = None
+        card.entry_block_reason = ""
+        card.next_retry_at = None
+        card.entry_attempt_group_id = ""
+        card.entry_attempt_count = 0
+        card.entry_client_order_id = ""
+        card.entry_pending_attempt_number = 0
+        card.entry_submission_unresolved = False
+        card.entry_cancel_in_flight = False
+        card.entry_cancel_reason = ""
+        card.entry_cancel_command_id = ""
+        card.entry_remaining_target_quantity = 0
+        card.capital_reservation_id = ""
+        card.market_data_last_trusted_price = None
+        card.market_data_last_trusted_at = None
+        card.market_data_outage_started_at = None
+        card.market_data_outage_risk_tier = ""
+
+    if isinstance(command, types.SetBreakoutPrice):
+        try:
+            previous_breakout = float(card.breakout_price or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            previous_breakout = 0.0
+        had_canonical_target = bool(
+            math.isfinite(previous_breakout) and previous_breakout > 0
+        )
+        if card.board_status == BoardStatus.WATCHLIST:
+            _move_board_card(card, BoardStatus.BUYLIST)
+        clear_executable_entry_plan()
+        # The Buy Board header is a default for a genuinely new plan. A target
+        # revision on an existing plan (especially BUY_TODAY) keeps its frozen
+        # buffer across devices and executor handoff.
+        if card.board_status == BoardStatus.BUYLIST and not had_canonical_target:
+            card.buffer_pct = float(command.buffer_pct)
+        card.breakout_price = float(command.price)
+        card.watchlist_member = False
+        card.buylist_member = True
+        card.buy_today_note = ""
+        card.entry_runtime_status = (
+            EntryRuntimeStatus.ORB_FORMING
+            if card.board_status == BoardStatus.BUY_TODAY
+            else None
+        )
+        return
+
+    if isinstance(command, types.ClearBreakoutPrice):
+        if card.board_status in {BoardStatus.WATCHLIST, BoardStatus.BUY_TODAY}:
+            _move_board_card(card, BoardStatus.BUYLIST)
+        clear_executable_entry_plan()
+        card.breakout_price = None
+        card.watchlist_member = False
+        card.buylist_member = True
+        card.session_date = None
+        card.buy_today_note = ""
+        card.entry_runtime_status = None
+        return
 
     def request_stop_change(stop_type, price: float) -> None:
         requested_at = command.requested_at
@@ -872,23 +1033,11 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
             symbol=card.symbol,
         )
         card.buylist_member = monitoring_command.enabled
-        if (
-            card.breakout_price
-            and (
-                int(card.planned_quantity or 0) > 0
-                or float(card.position_percent or 0.0) > 0
-            )
-        ):
-            # A durable target/allocation is a complete monitoring plan.
-            # ORB history can refine it later, but is not a prerequisite.
-            card.entry_runtime_status = EntryRuntimeStatus.EXECUTE_READY
-            card.entry_block_reason = ""
-        else:
-            # Planning columns do not own ORB runtime state.  Every activation
-            # starts a fresh current-session observation instead of carrying a
-            # stale Buylist diagnostic into Buy Today.
-            card.entry_runtime_status = EntryRuntimeStatus.ORB_FORMING
-            card.entry_block_reason = ""
+        # Planning columns do not own current-session ORB runtime state.
+        # Every activation starts a fresh observation; a target/allocation by
+        # itself must never bypass the 1m/5m/30m ORB requirement.
+        card.entry_runtime_status = EntryRuntimeStatus.ORB_FORMING
+        card.entry_block_reason = ""
     elif isinstance(command, types.RequestSellAll):
         # This is durable liquidation intent only.  The engine cancels a
         # conflicting BUY, refreshes quantity, submits, and reconciliation
@@ -926,7 +1075,9 @@ def request_board_action(
         CancelQueuedSellAll,
         RequestPartialSell,
         RequestSellAll,
+        ClearBreakoutPrice,
         SetBreakevenStop,
+        SetBreakoutPrice,
         SetManualStop,
         SetOrbStop,
     )
@@ -939,6 +1090,7 @@ def request_board_action(
         TradeCardNotFoundError,
         TradeCardVersionConflictError,
     )
+    from src.core.trade_card_state import BoardStatus, TradeCardState
 
     resolved_context = context or BoardActionContext()
     intent_only_types = (
@@ -992,7 +1144,46 @@ def request_board_action(
     card = trade_card_repository.get_trade_card(
         engine, command.environment, command.account_no, command.symbol
     )
+    _require_breakout_plan_mutation_policy(command, card, resolved_context)
     if card is None:
+        if isinstance(command, SetBreakoutPrice):
+            if command.expected_card_version != 0:
+                raise TradeCardNotFoundError(
+                    f"No trade card for {command.environment}:{command.account_no}:{command.symbol}"
+                )
+            trade_card_repository.ensure_trade_cards_table(engine)
+            with engine.begin() as conn:
+                current = trade_card_repository.get_trade_card_in_transaction(
+                    conn,
+                    command.environment,
+                    command.account_no,
+                    command.symbol,
+                    for_update=True,
+                )
+                if current is not None:
+                    raise TradeCardVersionConflictError(
+                        f"Command {command.command_id} expected a missing card, "
+                        f"stored version is {current.version}"
+                    )
+                _require_breakout_plan_mutation_policy(
+                    command, None, resolved_context
+                )
+                created = TradeCardState(
+                    environment=command.environment,
+                    account_no=command.account_no,
+                    symbol=command.symbol,
+                    board_status=BoardStatus.BUYLIST,
+                    buylist_member=True,
+                )
+                _apply_board_mutation(
+                    command,
+                    created,
+                    context=resolved_context,
+                    active_orders=(),
+                )
+                updated = trade_card_repository.insert_trade_card(conn, created)
+            trade_card_repository.sync_trade_card_local_snapshot(updated)
+            return BoardWorkflowResult(card=updated, command_id=command.command_id)
         raise TradeCardNotFoundError(
             f"No trade card for {command.environment}:{command.account_no}:{command.symbol}"
         )
@@ -1001,6 +1192,25 @@ def request_board_action(
             f"Command {command.command_id} expected version "
             f"{command.expected_card_version}, stored version is {card.version}"
         )
+
+    if isinstance(command, ActivateForToday):
+        for other in trade_card_repository.list_trade_cards(
+            engine,
+            environment=command.environment,
+            raise_on_error=True,
+        ):
+            if (
+                str(other.symbol or "").strip().upper()
+                == str(command.symbol or "").strip().upper()
+                and str(other.account_no or "").strip()
+                != str(command.account_no or "").strip()
+                and other.board_status == BoardStatus.BUY_TODAY
+            ):
+                raise BoardCommandRejectedError(
+                    f"{command.symbol} is already active in Buy Today for "
+                    "another account. The ORB queue is symbol-scoped, so "
+                    "only one account can activate that symbol at a time."
+                )
 
     _require_current_board_runtime(command, card, resolved_context)
 
@@ -1049,6 +1259,9 @@ def request_board_action(
                     f"Command {command.command_id} expected version "
                     f"{command.expected_card_version}, stored version is {current.version}"
                 )
+            _require_breakout_plan_mutation_policy(
+                command, current, resolved_context
+            )
             _require_current_board_runtime(command, current, resolved_context)
             ownership = get_ownership_in_transaction(
                 conn,

@@ -16,8 +16,8 @@ the laptop has no recovery path without this.
 
 | File | What it is |
 |---|---|
-| `watchlist.json` | Watchlist |
-| `buylist.json` | Buy Dashboard state |
+| `watchlist.json` | Legacy planning/migration compatibility state (no Watchlist tab) |
+| `buylist.json` | Buy Board queue compatibility state (no Buy Dashboard tab) |
 | `trade_plans.json` | Legacy trade plans |
 | `scanner_setups.json` | Saved scanner threshold presets |
 | `chart_drawings.json` | User-drawn chart lines |
@@ -40,8 +40,8 @@ genuinely optional):
 - `data/sp500_tickers.csv`, `data/us_kis_tickers.csv` -- ticker-universe
   caches, auto-re-fetched from source whenever the cache file is missing
   (`get_sp500_tickers`/`get_us_kis_tickers` in `data_loader.py`).
-- `data/watchlist_snapshot_*.json` -- one-off manual debug exports (Save
-  Data Snapshot button), not live state.
+- `data/watchlist_snapshot_*.json` -- legacy one-off debug exports, not live
+  state.
 - `data/device_role.json`, `data/state_metadata.json` -- see "What this
   does NOT recover" below for why these are safe to skip.
 
@@ -134,10 +134,9 @@ shared PC MySQL database on startup if it's reachable
 ([pc_sync_data_pipeline.md](pc_sync_data_pipeline.md)) -- expected, and it
 merges by revision rather than clobbering the restore. `scanner_setups`/
 `chart_drawings`/`tab_options`/`settings` are **not** stored in MySQL at
-all, so this restore is their only recovery path. If this machine should
-resume being the primary editor, click **"Become Main Device"** once the
-restored data looks right -- a fresh machine always starts pull-only, it
-doesn't happen automatically.
+all, so this restore is their only recovery path. Once the restored data
+looks right, explicitly verify **Execution Owner** and **Operator Control**
+before publishing or trading; restore never changes either shared owner.
 
 ## What this does NOT recover
 
@@ -155,7 +154,7 @@ to normal work after a total laptop loss. Everything else needed:
 | `data/sp500_tickers.csv`, `data/us_kis_tickers.csv` | No, and doesn't need to be | Auto-re-fetched from source (Wikipedia / KIS master file) the next time the scanner needs a universe and finds no cache |
 | `data/device_role.json` | No, and shouldn't be | Regenerates automatically; a copied one resets itself by design |
 | `data/state_metadata.json` (sync bookkeeping) | No, and doesn't need to be | Its absence just makes the next reconcile trust remote MySQL for `watchlist`/`buylist`/`trade_plans` -- the safe default, not a data-loss path (`activate_device_as_main` explicitly pulls before ever claiming write ownership, so there's no blind-overwrite risk either) |
-| `data/watchlist_snapshot_*.json` (manual debug exports) | No | Not live state; re-create with the Save Data Snapshot button if still needed |
+| `data/watchlist_snapshot_*.json` (legacy debug exports) | No | Not live state and no longer created by the active UI |
 
 **Bottom line:** for the common case (laptop dies, PC + MySQL survive), the
 JSON restore plus a fresh `git clone` + `.env` restore is everything you

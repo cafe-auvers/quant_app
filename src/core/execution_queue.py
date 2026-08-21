@@ -24,7 +24,7 @@ from src.risk.orb_position import (
     validate_orb_position_values,
 )
 from src.strategy import MarketSnapshot, PortfolioSnapshot
-from src.strategy.orb import ORBStrategy, ORBStrategyConfig
+from src.strategy.orb import ORBStrategy, ORBStrategyConfig, market_local_index
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +92,39 @@ UNKNOWN_SUBMISSION_ORDER_STATUS_VALUES = {
     "AMBIGUOUS",
     "TIMEOUT",
     "NETWORK_ERROR",
+}
+
+# An execution-queue row is symbol-scoped, so changing its account detaches
+# every account-sized candidate and any order identity stored on the row.  A
+# terminal no-fill result can be discarded during a safe reassignment; a
+# possibly-live order or confirmed fill must stay bound to its original
+# account until broker reconciliation resolves it elsewhere.
+_ACCOUNT_REASSIGNMENT_BLOCKING_QUEUE_STATUSES = {
+    ExecutionQueueStatus.ORDER_PENDING,
+    ExecutionQueueStatus.ORDER_SUBMITTED,
+    ExecutionQueueStatus.UNKNOWN_SUBMISSION_STATE,
+    ExecutionQueueStatus.FILLED,
+}
+_ACCOUNT_REASSIGNMENT_BLOCKING_ORDER_STATUSES = (
+    UNKNOWN_SUBMISSION_ORDER_STATUS_VALUES
+    | {
+        "PENDING",
+        "SUBMITTING",
+        "ORDER_PENDING",
+        "SUBMITTED",
+        "ACCEPTED",
+        "WORKING",
+        "ORDER_SUBMITTED",
+        "CANCEL_REQUESTED",
+        "PARTIALLY_FILLED",
+        "FILLED",
+    }
+)
+_ACCOUNT_REASSIGNMENT_SAFE_TERMINAL_ORDER_STATUSES = {
+    "REJECTED",
+    "CANCELLED",
+    "CANCELED",
+    "EXPIRED",
 }
 
 NON_PRE_ENTRY_BUYLIST_STATUSES = {
@@ -182,6 +215,10 @@ class OrbCandidate:
     breakout_trigger: Optional[float] = None
     entry_trigger: Optional[float] = None
     current_price: Optional[float] = None
+    # Calendar date of the newest source bar in America/New_York.  Queue
+    # refresh time cannot prove that cached minute bars belong to today's
+    # session, so execution persists the source identity explicitly.
+    source_session_date: Optional[str] = None
     stop_loss: Optional[float] = None
     shares: int = 0
     capital_percent: float = 0.0
@@ -191,6 +228,13 @@ class OrbCandidate:
     score: float = 0.0
     status: OrbCandidateStatus = OrbCandidateStatus.NOT_AVAILABLE
     valid: bool = False
+    # Explicit proof that this window is permanently unusable for the current
+    # published plan.  Status alone is insufficient: REJECTED also represents
+    # duplicate-order protection, while RISK_INVALID can mean that price or
+    # sizing equity was temporarily unavailable.  Legacy rows intentionally
+    # default to False so they cannot hide a Buy Today card without a fresh
+    # evaluation that had known positive sizing equity.
+    terminal_rejection: bool = False
     warnings: List[str] = field(default_factory=list)
     reason: str = ""
 
@@ -215,6 +259,10 @@ class OrbCandidate:
 class ExecutionQueueItem:
     symbol: str
     environment: str = PRODUCTION_ENVIRONMENT
+    # The queue remains keyed by environment+symbol for compatibility, but
+    # the account used for risk sizing is persisted so a candidate can never
+    # be silently applied to a different account.
+    account_no: str = ""
     name: str = ""
     breakout_price: Optional[float] = None
     current_price: Optional[float] = None
@@ -232,12 +280,14 @@ class ExecutionQueueItem:
 
     def __post_init__(self) -> None:
         self.environment = _require_production_environment(self.environment)
+        self.account_no = str(self.account_no or "").strip()
         self.last_updated = _parse_utc_timestamp(self.last_updated)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "symbol": self.symbol,
             "environment": self.environment,
+            "account_no": self.account_no,
             "name": self.name,
             "breakout_price": self.breakout_price,
             "current_price": self.current_price,
@@ -282,6 +332,7 @@ class ExecutionQueueItem:
         return cls(
             symbol=str(data.get("symbol", "")).upper(),
             environment=str(data.get("environment") or PRODUCTION_ENVIRONMENT).upper(),
+            account_no=str(data.get("account_no") or "").strip(),
             name=str(data.get("name", "")),
             breakout_price=_optional_float(data.get("breakout_price")),
             current_price=_optional_float(data.get("current_price")),
@@ -492,16 +543,48 @@ def build_queue_display_state(
 
 
 def _candidate_unavailable(
-    symbol: str, window: str, status: OrbCandidateStatus, reason: str
+    symbol: str,
+    window: str,
+    status: OrbCandidateStatus,
+    reason: str,
+    *,
+    source_session_date: Optional[str] = None,
 ) -> OrbCandidate:
     return OrbCandidate(
         symbol=symbol.upper(),
         window=window,
+        source_session_date=source_session_date,
         status=status,
         valid=False,
         warnings=[reason],
         reason=reason,
     )
+
+
+def _has_known_positive_sizing_equity(account_size: Any) -> bool:
+    try:
+        equity = float(account_size)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(equity) and equity > 0
+
+
+def _intraday_source_session_date(intraday: pd.DataFrame) -> Optional[str]:
+    """Return the newest bar's U.S.-market session date.
+
+    Naive KIS/cache indexes are normalized by the same compatibility helper
+    used by the ORB strategy itself.  If an index cannot be trusted, the
+    candidate remains unlabelled and runtime execution fails closed until a
+    refresh provides explicit current-session provenance.
+    """
+
+    try:
+        local_index = market_local_index(intraday.sort_index().index)
+        if local_index is None or local_index.empty:
+            return None
+        return local_index[-1].date().isoformat()
+    except (AttributeError, TypeError, ValueError):
+        return None
 
 
 def calculate_position_values(
@@ -554,6 +637,7 @@ def build_orb_candidate(
     lock_risk_percent: bool = False,
 ) -> OrbCandidate:
     symbol = str(symbol or "").upper()
+    has_sizing_equity = _has_known_positive_sizing_equity(account_size)
     if window not in SUPPORTED_ORB_WINDOWS:
         return _candidate_unavailable(
             symbol,
@@ -565,6 +649,8 @@ def build_orb_candidate(
         return _candidate_unavailable(
             symbol, window, OrbCandidateStatus.NOT_AVAILABLE, "intraday data missing"
         )
+
+    source_session_date = _intraday_source_session_date(intraday)
 
     breakout = _optional_float(breakout_price)
     price = _optional_float(current_price)
@@ -582,7 +668,11 @@ def build_orb_candidate(
     orb_range = strategy_evaluation.orb_range
     if orb_range is None:
         return _candidate_unavailable(
-            symbol, window, OrbCandidateStatus.FORMING, "ORB window has not completed"
+            symbol,
+            window,
+            OrbCandidateStatus.FORMING,
+            "ORB window has not completed",
+            source_session_date=source_session_date,
         )
 
     orb_high = float(orb_range.high)
@@ -601,6 +691,7 @@ def build_orb_candidate(
             breakout_trigger=None,
             entry_trigger=orb_high,
             current_price=price,
+            source_session_date=source_session_date,
             stop_loss=candidate_stop,
             status=OrbCandidateStatus.REJECTED,
             valid=False,
@@ -617,6 +708,7 @@ def build_orb_candidate(
             orb_low=orb_low,
             breakout_price=breakout,
             current_price=price,
+            source_session_date=source_session_date,
             stop_loss=candidate_stop,
             status=OrbCandidateStatus.REJECTED,
             valid=False,
@@ -630,7 +722,11 @@ def build_orb_candidate(
     entry_signal = strategy_evaluation.entry
     if entry_signal is None:
         return _candidate_unavailable(
-            symbol, window, OrbCandidateStatus.FORMING, "ORB window has not completed"
+            symbol,
+            window,
+            OrbCandidateStatus.FORMING,
+            "ORB window has not completed",
+            source_session_date=source_session_date,
         )
     breakout_trigger = float(entry_signal.breakout_trigger)
     entry_trigger = float(entry_signal.entry_trigger)
@@ -649,9 +745,13 @@ def build_orb_candidate(
             breakout_trigger=breakout_trigger,
             entry_trigger=entry_trigger,
             current_price=price,
+            source_session_date=source_session_date,
             stop_loss=candidate_stop,
             status=OrbCandidateStatus.REJECTED,
             valid=False,
+            terminal_rejection=(
+                has_sizing_equity and price is not None and price > 0
+            ),
             warnings=[reason],
             reason=reason,
         )
@@ -717,6 +817,11 @@ def build_orb_candidate(
     score = score_orb_candidate(sizing, risk_percent)
 
     if warnings:
+        terminal_rejection = (
+            has_sizing_equity
+            and price is not None
+            and price > 0
+        )
         return OrbCandidate(
             symbol=symbol,
             window=window,
@@ -726,6 +831,7 @@ def build_orb_candidate(
             breakout_trigger=breakout_trigger,
             entry_trigger=entry_trigger,
             current_price=price,
+            source_session_date=source_session_date,
             stop_loss=candidate_stop,
             shares=int(sizing.get("shares", 0) or 0),
             capital_percent=float(sizing.get("capital_percent", 0.0) or 0.0),
@@ -735,6 +841,7 @@ def build_orb_candidate(
             score=score,
             status=OrbCandidateStatus.RISK_INVALID,
             valid=False,
+            terminal_rejection=terminal_rejection,
             warnings=warnings,
             reason="; ".join(warnings),
         )
@@ -750,6 +857,7 @@ def build_orb_candidate(
             breakout_trigger=breakout_trigger,
             entry_trigger=entry_trigger,
             current_price=price,
+            source_session_date=source_session_date,
             stop_loss=candidate_stop,
             shares=int(sizing["shares"]),
             capital_percent=float(sizing["capital_percent"]),
@@ -773,6 +881,7 @@ def build_orb_candidate(
             breakout_trigger=breakout_trigger,
             entry_trigger=entry_trigger,
             current_price=price,
+            source_session_date=source_session_date,
             stop_loss=candidate_stop,
             shares=int(sizing["shares"]),
             capital_percent=float(sizing["capital_percent"]),
@@ -795,6 +904,7 @@ def build_orb_candidate(
         breakout_trigger=breakout_trigger,
         entry_trigger=entry_trigger,
         current_price=price,
+        source_session_date=source_session_date,
         stop_loss=candidate_stop,
         shares=int(sizing["shares"]),
         capital_percent=float(sizing["capital_percent"]),
@@ -910,11 +1020,44 @@ class ExecutionQueueManager:
         key = queue_key(symbol, environment)
         return self.items.get(key)
 
+    @staticmethod
+    def _account_reassignment_block_reason(
+        item: ExecutionQueueItem,
+    ) -> Optional[str]:
+        order_status = str(item.order_status or "").strip().upper()
+        if item.status in _ACCOUNT_REASSIGNMENT_BLOCKING_QUEUE_STATUSES:
+            return item.status.value
+        if order_status in _ACCOUNT_REASSIGNMENT_BLOCKING_ORDER_STATUSES:
+            return order_status
+        if (
+            item.order_id
+            and order_status
+            not in _ACCOUNT_REASSIGNMENT_SAFE_TERMINAL_ORDER_STATUSES
+        ):
+            return order_status or "unresolved order identity"
+        return None
+
+    @staticmethod
+    def _reset_for_account_reassignment(item: ExecutionQueueItem) -> None:
+        """Discard facts that were computed or locked for another account."""
+
+        item.candidates = {}
+        item.selected_window = None
+        item.selected_candidate = None
+        item.status = ExecutionQueueStatus.WATCHING
+        item.locked = False
+        item.locked_reason = None
+        item.manual_window_lock = False
+        item.order_status = None
+        item.order_id = None
+        item.warnings = []
+
     def upsert_item(
         self,
         *,
         symbol: str,
         environment: str = PRODUCTION_ENVIRONMENT,
+        account_no: Optional[str] = None,
         name: str = "",
         breakout_price: Optional[float] = None,
         current_price: Optional[float] = None,
@@ -927,12 +1070,28 @@ class ExecutionQueueManager:
         existing = self.items.get(item_key)
         if existing is None:
             existing = ExecutionQueueItem(
-                symbol=symbol_key, environment=environment_key, name=name
+                symbol=symbol_key,
+                environment=environment_key,
+                account_no=str(account_no or "").strip(),
+                name=name,
             )
             self.items[item_key] = existing
 
         existing.symbol = symbol_key
         existing.environment = environment_key
+        if account_no is not None:
+            requested_account = str(account_no or "").strip()
+            if requested_account != existing.account_no:
+                blocked_by = self._account_reassignment_block_reason(existing)
+                if blocked_by:
+                    raise ValueError(
+                        f"Cannot reassign {symbol_key} execution queue from "
+                        f"account {existing.account_no or '<unassigned>'} to "
+                        f"{requested_account or '<unassigned>'}: "
+                        f"{blocked_by} requires broker reconciliation"
+                    )
+                self._reset_for_account_reassignment(existing)
+                existing.account_no = requested_account
         existing.name = name or existing.name
         existing.breakout_price = breakout_price
         existing.current_price = current_price
@@ -982,16 +1141,30 @@ class ExecutionQueueManager:
         account_size: float,
         risk_percent: float,
         environment: str = PRODUCTION_ENVIRONMENT,
+        account_no: str = "",
         adr_percent: Optional[float] = None,
         buffer_pct: float = DEFAULT_ORB_BUFFER_PCT,
         duplicate_pending_order: bool = False,
+        force_buffer_pct: bool = False,
     ) -> ExecutionQueueItem:
         symbol = str(getattr(item, "symbol", "")).upper()
+        previous = self.get_item(symbol, environment)
+        account_changed = bool(
+            previous is not None
+            and str(account_no or "").strip() != previous.account_no
+        )
         breakout_price = _optional_float(getattr(item, "breakout_price", None))
         stop_loss = _optional_float(getattr(item, "stop_loss", None))
         selected_window, selected_risk_percent, selected_buffer_pct = (
             _saved_orb_selection(item)
         )
+        if account_changed:
+            # A legacy/manual selection is symbol-scoped, not account-scoped.
+            # Reusing its risk/window lock would immediately undo the safe
+            # reset performed by ``upsert_item`` for the new account.
+            selected_window = None
+            selected_risk_percent = None
+            selected_buffer_pct = None
         candidates = {}
         for window in SUPPORTED_ORB_WINDOWS:
             use_saved_selection = window == selected_window
@@ -1010,9 +1183,14 @@ class ExecutionQueueManager:
                 adr_percent=adr_percent,
                 stop_loss=stop_loss,
                 buffer_pct=(
-                    selected_buffer_pct
-                    if use_saved_selection and selected_buffer_pct is not None
-                    else buffer_pct
+                    buffer_pct
+                    if force_buffer_pct
+                    else (
+                        selected_buffer_pct
+                        if use_saved_selection
+                        and selected_buffer_pct is not None
+                        else buffer_pct
+                    )
                 ),
                 duplicate_pending_order=duplicate_pending_order,
                 lock_risk_percent=(
@@ -1022,6 +1200,7 @@ class ExecutionQueueManager:
         queue_item = self.upsert_item(
             symbol=symbol,
             environment=environment,
+            account_no=account_no,
             name=str(getattr(item, "name", "") or symbol),
             breakout_price=breakout_price,
             current_price=current_price,

@@ -137,6 +137,24 @@ class SetManualStop(BoardCommand):
 
 
 @dataclass(frozen=True)
+class SetBreakoutPrice(BoardCommand):
+    """Create or revise the canonical, non-broker breakout target."""
+
+    price: float = 0.0
+    buffer_pct: float = 0.001
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        object.__setattr__(self, "price", float(self.price or 0.0))
+        object.__setattr__(self, "buffer_pct", float(self.buffer_pct))
+
+
+@dataclass(frozen=True)
+class ClearBreakoutPrice(BoardCommand):
+    """Remove a canonical target without leaving an executable entry plan."""
+
+
+@dataclass(frozen=True)
 class ReorderCard(BoardCommand):
     target_priority: int = 0
 
@@ -170,6 +188,8 @@ AnyBoardCommand = Union[
     SetOrbStop,
     SetBreakevenStop,
     SetManualStop,
+    SetBreakoutPrice,
+    ClearBreakoutPrice,
     ReorderCard,
     AdoptExternalOrder,
 ]
@@ -193,6 +213,11 @@ class BoardActionContext:
     device_active: bool = True
     regular_session_open: Optional[bool] = None
     session_date: Optional[date] = None
+    # True only after the caller matched its local device identity against a
+    # fresh cached Operator Control record.  Accepted operator-queue requests
+    # carry the same authorization durably and are promoted to this state by
+    # the queue consumer before applying their canonical mutation.
+    local_operator_control: bool = False
     restriction_reasons: Tuple[str, ...] = ()
 
 
