@@ -10,7 +10,7 @@ from src.services.runtime_status import (
     mark_runtime_process_stopped,
     record_runtime_heartbeat,
 )
-from src.ui.main_window import MainWindow
+from src.ui.main_window import CoordinationRuntimeHeartbeatWorker, MainWindow
 from src.ui.workers import PcRemoteStatusWorker
 
 
@@ -58,6 +58,20 @@ def test_runtime_heartbeat_becomes_inactive_when_stale():
     assert status.active is False
     assert status.age_seconds is not None
     assert status.age_seconds >= 240
+
+
+def test_coordination_heartbeat_worker_publishes_local_main_process():
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    worker = CoordinationRuntimeHeartbeatWorker(
+        engine,
+        hostname="LAPTOP",
+    )
+
+    worker.run()
+
+    status = get_runtime_process_status(engine, "laptop")
+    assert status.observed is True
+    assert status.active is True
 
 
 def test_pc_status_worker_checks_database_when_listener_is_off(monkeypatch):
@@ -175,6 +189,53 @@ class _StatusWorkerStub:
 
     def deleteLater(self):
         self.deleted = True
+
+
+class _CoordinationHeartbeatWorkerStub:
+    instances = []
+
+    def __init__(self, engine, *, hostname, parent=None):
+        self.engine = engine
+        self.hostname = hostname
+        self.parent = parent
+        self.started = False
+        self.__class__.instances.append(self)
+
+    def start(self):
+        self.started = True
+
+
+def test_coordination_heartbeat_uses_online_store_and_hard_cadence(monkeypatch):
+    import src.ui.main_window as main_window
+
+    _CoordinationHeartbeatWorkerStub.instances = []
+    monkeypatch.setattr(
+        main_window,
+        "CoordinationRuntimeHeartbeatWorker",
+        _CoordinationHeartbeatWorkerStub,
+    )
+    clock = iter((100.0, 105.0, 116.0))
+    monkeypatch.setattr(main_window.time, "monotonic", lambda: next(clock))
+    coordination_engine = object()
+    window = MainWindow.__new__(MainWindow)
+    window._database_shutting_down = False
+    window._coordination_database_ready = True
+    window.coordination_db_engine = coordination_engine
+    window.state_sync_role = SimpleNamespace(hostname="LAPTOP")
+    window._coordination_runtime_heartbeat_worker = None
+    window._last_coordination_runtime_heartbeat_attempt = None
+    window._track_worker = lambda *_args, **_kwargs: None
+
+    window._start_coordination_runtime_heartbeat(force=True)
+    first = _CoordinationHeartbeatWorkerStub.instances[-1]
+    window._coordination_runtime_heartbeat_worker = None
+    window._start_coordination_runtime_heartbeat()
+    window._start_coordination_runtime_heartbeat()
+
+    assert first.engine is coordination_engine
+    assert first.hostname == "LAPTOP"
+    assert first.started is True
+    assert len(_CoordinationHeartbeatWorkerStub.instances) == 2
 
 
 def test_pc_status_poll_does_not_wait_for_local_database_initialization(monkeypatch):

@@ -50,7 +50,7 @@ from src.services.state_sync import (
     set_live_trading_control,
     set_operator_control,
 )
-from src.ui.main_window import MainWindow
+from src.ui.main_window import ControlOwnerWorker, MainWindow
 from src.utils.device_identity import (
     DEVICE_KIND_LAPTOP,
     DEVICE_KIND_PC,
@@ -145,6 +145,57 @@ def test_laptop_owner_target_uses_published_device_kind():
     assert target is not None
     assert target.device_id == laptop.device_id
     assert target.hostname == laptop.hostname
+
+
+def test_owner_worker_refreshes_a_missing_cached_target_from_shared_db(engine, roles):
+    pc, laptop = roles
+    record_runtime_heartbeat(engine, hostname=laptop.hostname, pid=17)
+    save_runtime_device_state(
+        engine,
+        device_id=laptop.device_id,
+        hostname=laptop.hostname,
+        state=RuntimeDeviceState.STANDBY_READY,
+        details=_details(device_kind="Laptop"),
+    )
+    completed = []
+    worker = ControlOwnerWorker(
+        engine,
+        pc,
+        control="execution",
+        target=None,
+        target_label="Laptop",
+    )
+    worker.completed.connect(completed.append)
+
+    worker.run()
+
+    assert completed[0].success is True
+    assert get_main_device(engine).main_device.device_id == laptop.device_id
+
+
+def test_local_owner_click_refreshes_its_own_process_heartbeat(engine, roles):
+    _pc, laptop = roles
+    save_runtime_device_state(
+        engine,
+        device_id=laptop.device_id,
+        hostname=laptop.hostname,
+        state=RuntimeDeviceState.STANDBY_READY,
+        details=_details(device_kind="Laptop"),
+    )
+    completed = []
+    worker = ControlOwnerWorker(
+        engine,
+        laptop,
+        control="execution",
+        target=None,
+        target_label="Laptop",
+    )
+    worker.completed.connect(completed.append)
+
+    worker.run()
+
+    assert completed[0].success is True
+    assert get_main_device(engine).main_device.device_id == laptop.device_id
 
 
 def test_stopped_historical_identity_is_not_an_owner_target(monkeypatch):

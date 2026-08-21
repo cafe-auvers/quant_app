@@ -74,7 +74,10 @@ from src.services.order_ledger import (append_order, find_open_orders,
                                        has_open_order, load_order_ledger,
                                        merge_orders, save_order_ledger,
                                        update_order)
-from src.services.runtime_status import safe_mark_runtime_process_stopped
+from src.services.runtime_status import (
+    record_runtime_heartbeat,
+    safe_mark_runtime_process_stopped,
+)
 from src.services.sleep_readiness import write_sleep_readiness_snapshot
 from src.services.state_sync import (
     LocalDeviceRole,
@@ -360,6 +363,23 @@ class CoordinationDatabaseInitWorker(QThread):
             )
 
 
+class CoordinationRuntimeHeartbeatWorker(QThread):
+    """Publish this local ``main.py`` process to shared coordination."""
+
+    def __init__(self, engine, *, hostname: str, parent=None) -> None:
+        super().__init__(parent)
+        self.engine = engine
+        self.hostname = str(hostname or "").strip()
+
+    def run(self) -> None:
+        try:
+            record_runtime_heartbeat(self.engine, hostname=self.hostname)
+        except Exception as exc:  # the independent DB probes own user notices
+            logger.debug(
+                "Coordination runtime heartbeat failed: %s", type(exc).__name__
+            )
+
+
 @dataclass(frozen=True)
 class MarketDataStatusResult:
     """Slow market-cache watermarks resolved outside the GUI thread."""
@@ -638,6 +658,49 @@ class ControlOwnerUpdate:
     error: str = ""
 
 
+def _control_runtime_identity_available(
+    record, *, now: Optional[dt.datetime] = None
+) -> bool:
+    """Accept only a fresh runtime identity that can participate in control."""
+
+    state = getattr(record, "state", "")
+    state_value = str(getattr(state, "value", state) or "").upper()
+    if state_value not in {
+        RuntimeDeviceState.STARTING.value,
+        RuntimeDeviceState.STANDBY.value,
+        RuntimeDeviceState.STANDBY_READY.value,
+        RuntimeDeviceState.ACTIVE.value,
+    }:
+        return False
+    updated_at = getattr(record, "updated_at", None)
+    if not isinstance(updated_at, dt.datetime):
+        return False
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=dt.timezone.utc)
+    reference = now or dt.datetime.now(dt.timezone.utc)
+    age_seconds = (reference - updated_at.astimezone(dt.timezone.utc)).total_seconds()
+    return -5.0 <= age_seconds <= 120.0
+
+
+def _control_target_role_from_records(
+    records, target_label: str
+) -> Optional[LocalDeviceRole]:
+    candidates = [
+        record
+        for record in records
+        if _control_runtime_identity_available(record)
+        if runtime_device_kind(record.hostname, record.details) == target_label
+    ]
+    if not candidates:
+        return None
+    record = max(candidates, key=lambda item: item.updated_at)
+    return LocalDeviceRole(
+        device_id=record.device_id,
+        hostname=record.hostname,
+        is_main=False,
+    )
+
+
 class ControlOwnerWorker(QThread):
     """Switch either owner without blocking the Qt event loop."""
 
@@ -661,23 +724,59 @@ class ControlOwnerWorker(QThread):
 
     def run(self) -> None:
         try:
+            target = self.target
+            if target is None and self.target_label != "Locked":
+                from src.services.runtime_device_state_repository import (
+                    list_runtime_device_states,
+                )
+
+                target = _control_target_role_from_records(
+                    list_runtime_device_states(self.engine),
+                    self.target_label,
+                )
+                if target is None:
+                    self.completed.emit(
+                        ControlOwnerUpdate(
+                            control=self.control,
+                            success=False,
+                            target_label=self.target_label,
+                            error=(
+                                f"No {self.target_label} runtime is registered in "
+                                "shared coordination. Start or restart main.py on "
+                                "that device."
+                            ),
+                        )
+                    )
+                    return
+            if (
+                target is not None
+                and target.device_id == self.initiated_by.device_id
+            ):
+                # This worker is executing inside the selected local main.py
+                # process, so refresh its proof immediately instead of making
+                # a user action race the periodic heartbeat timer. Remote
+                # targets must still publish their own independent heartbeat.
+                record_runtime_heartbeat(
+                    self.engine,
+                    hostname=target.hostname,
+                )
             if self.control == "operator":
                 result = set_operator_control(
                     self.engine,
                     self.initiated_by,
-                    self.target,
+                    target,
                 )
                 success = bool(result.success)
                 error = str(result.error or "")
             else:
                 from src.services.control_ownership import switch_execution_owner
 
-                if self.target is None:
+                if target is None:
                     raise ValueError("Execution Owner cannot be Locked")
                 result = switch_execution_owner(
                     self.engine,
                     initiated_by=self.initiated_by,
-                    target_device_id=self.target.device_id,
+                    target_device_id=target.device_id,
                 )
                 success = bool(result.success)
                 error = str(result.error or "")
@@ -814,6 +913,8 @@ class MainWindow(
         self.db_initializing = True
         self.database_init_worker = None
         self.coordination_database_init_worker = None
+        self._coordination_runtime_heartbeat_worker = None
+        self._last_coordination_runtime_heartbeat_attempt = None
         self.database_recovery_worker = None
         self._coordination_database_configured = coordination_database_configured()
         self._coordination_database_ready = False
@@ -1161,6 +1262,7 @@ class MainWindow(
             self._last_coordination_database_notice = notice
             return
         self._bind_remote_state_engine(engine, is_main_device=False)
+        self._start_coordination_runtime_heartbeat(force=True)
         if self.__dict__.get("_last_coordination_database_notice"):
             self.append_log("Shared online coordination database recovered.")
         else:
@@ -1171,6 +1273,41 @@ class MainWindow(
         self._last_coordination_database_notice = ""
         self._start_state_sync()
         self._sync_buyboard_runtime_worker()
+
+    def _start_coordination_runtime_heartbeat(self, *, force: bool = False) -> None:
+        """Refresh the shared process heartbeat independently of PC MySQL."""
+
+        if self.__dict__.get("_database_shutting_down", False):
+            return
+        if not self.__dict__.get("_coordination_database_ready", False):
+            return
+        engine = self.__dict__.get("coordination_db_engine")
+        role = self.__dict__.get("state_sync_role")
+        if engine is None or role is None:
+            return
+        worker = self.__dict__.get("_coordination_runtime_heartbeat_worker")
+        if worker is not None:
+            return
+        now = time.monotonic()
+        last_attempt = self.__dict__.get(
+            "_last_coordination_runtime_heartbeat_attempt"
+        )
+        cadence = float(execution_config.COORDINATION_DEVICE_HEARTBEAT_SECONDS)
+        if (
+            not force
+            and last_attempt is not None
+            and now - float(last_attempt) < cadence
+        ):
+            return
+        self._last_coordination_runtime_heartbeat_attempt = now
+        worker = CoordinationRuntimeHeartbeatWorker(
+            engine,
+            hostname=role.hostname,
+            parent=self,
+        )
+        self._coordination_runtime_heartbeat_worker = worker
+        self._track_worker("_coordination_runtime_heartbeat_worker", worker)
+        worker.start()
 
     def _on_optional_database_initialized(
         self, engine, source: str = "none", pc_engine=None, error: str = ""
@@ -4277,24 +4414,7 @@ class MainWindow(
 
     @staticmethod
     def _control_runtime_identity_available(record) -> bool:
-        state = getattr(record, "state", "")
-        state_value = str(getattr(state, "value", state) or "").upper()
-        if state_value not in {
-            RuntimeDeviceState.STARTING.value,
-            RuntimeDeviceState.STANDBY.value,
-            RuntimeDeviceState.STANDBY_READY.value,
-            RuntimeDeviceState.ACTIVE.value,
-        }:
-            return False
-        updated_at = getattr(record, "updated_at", None)
-        if not isinstance(updated_at, dt.datetime):
-            return False
-        if updated_at.tzinfo is None:
-            updated_at = updated_at.replace(tzinfo=dt.timezone.utc)
-        age_seconds = (
-            dt.datetime.now(dt.timezone.utc) - updated_at.astimezone(dt.timezone.utc)
-        ).total_seconds()
-        return -5.0 <= age_seconds <= 120.0
+        return _control_runtime_identity_available(record)
 
     def _control_identity_kind(
         self, *, device_id: str = "", hostname: str = ""
@@ -4330,21 +4450,10 @@ class MainWindow(
     def _control_target_role(self, target_label: str) -> Optional[LocalDeviceRole]:
         if target_label == "Locked":
             return None
-        records = list(self.__dict__.get("_runtime_device_records", ()) or ())
-        candidates = [
-            record
-            for record in records
-            if self._control_runtime_identity_available(record)
-            if self._control_device_kind(record.hostname, record.details)
-            == target_label
-        ]
-        if candidates:
-            record = max(candidates, key=lambda item: item.updated_at)
-            return LocalDeviceRole(
-                device_id=record.device_id,
-                hostname=record.hostname,
-                is_main=False,
-            )
+        records = self.__dict__.get("_runtime_device_records", ()) or ()
+        target = _control_target_role_from_records(records, target_label)
+        if target is not None:
+            return target
         # A device-kind guess from this process's hardware is not a published
         # target identity. In particular, battery-less CI/VM hosts classify a
         # DESKTOP-named laptop role as PC. Ownership changes require a fresh
@@ -4375,15 +4484,6 @@ class MainWindow(
             )
             return
         target = self._control_target_role(target_label)
-        if target_label != "Locked" and target is None:
-            QMessageBox.information(
-                self,
-                "Device not available",
-                f"No {target_label} runtime is registered in shared coordination. "
-                f"Start or restart main.py on the {target_label}, then wait "
-                "for its Executor Ready status.",
-            )
-            return
         worker = self.__dict__.get("control_owner_worker")
         if worker is not None and worker.isRunning():
             return
@@ -5061,6 +5161,7 @@ class MainWindow(
             return
         if self.__dict__.get("_coordination_database_configured", False):
             self._start_coordination_database_initialization()
+        self._start_coordination_runtime_heartbeat()
         if self.__dict__.get("database_recovery_worker") is not None:
             return
         if self._pc_status_worker is not None:

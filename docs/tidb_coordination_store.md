@@ -72,6 +72,9 @@ for the current formula.
   seconds while positions exist, not one query per card.
 - Unchanged runtime readiness uses one revision read plus one UPDATE; it no
   longer selects the same device row before and after every heartbeat.
+- Each running desktop publishes its compact `main.py` process heartbeat to
+  TiDB every 15 seconds. This is independent of the PC MySQL probe, so a
+  laptop remains an eligible Execution Owner while the PC is off.
 - The external watchdog still receives its 30-second heartbeat, but successful
   heartbeat audit rows are compacted to one every five minutes. Failure and
   recovery status transitions are always recorded.
@@ -91,6 +94,7 @@ polls.
 | Protective ownership proof | 10 seconds, one bulk read only while positions exist |
 | Writable probe | 15 seconds per running device |
 | Runtime readiness heartbeat | 15 seconds per running device |
+| `main.py` process heartbeat | 15 seconds per running device |
 | Card and Buy Board revision checks | 60 seconds per running device |
 | Planning/control display sync | 60 seconds per running device |
 | Operator-command pickup outside regular session | 60 seconds |
@@ -113,6 +117,7 @@ daily pattern:
 | --- | ---: |
 | Writable probes | 345,600 |
 | Two-device readiness revision + heartbeat UPDATE | 691,200 |
+| Two-device `main.py` process heartbeats | 691,200 |
 | Active-owner lease proof | 259,200 |
 | Two-device card revision checks | 86,400 |
 | Regular/off-hours operator-command checks | 549,420 |
@@ -121,12 +126,12 @@ daily pattern:
 | Two-device Buy Board revision checks | 86,400 |
 | Planning/control state sync | 302,400 |
 | Minute account-reconciliation relational reads, two accounts | 518,400 |
-| **Scheduled total** | **3,288,300** |
-| **With 25% reconnect/scheduling margin** | **4,110,375** |
+| **Scheduled total** | **3,979,500** |
+| **With 25% reconnect/scheduling margin** | **4,974,375** |
 
 For capacity planning, this project applies a conservative **8 RU per small
-scheduled statement**. That reserves about **32.9 million RUs/month** for the
-entire continuously running background workload, leaving about **17.1 million
+scheduled statement**. That reserves about **39.8 million RUs/month** for the
+entire continuously running background workload, leaving about **10.2 million
 RUs** for real state transitions, bulk projection payloads, order journals,
 TiDB background jobs, and measurement error. Ten thousand separately rendered
 material changes would add roughly 5 million public-endpoint egress RUs at the
