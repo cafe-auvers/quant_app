@@ -448,7 +448,6 @@ def _sync_completed_window(*, auto_claim_enabled: bool):
     window._initial_state_sync_complete = False
     window._last_state_sync_notice = ""
     window._bind_remote_state_engine = lambda *a, **k: None
-    window._update_main_device_button = lambda **k: None
     window.update_dashboard_summary = lambda: None
     window.append_log = window._logs.append if hasattr(window, "_logs") else print
     window._state_sync_action = "reconcile"
@@ -632,8 +631,8 @@ def test_successful_auto_claim_activation_begins_post_claim_handoff():
     assert window._current_lease_token == "tok-1"
 
 
-def test_manual_activation_begins_reconciliation_without_auto_arm_permission():
-    """Manual 'Use This Device as Main' reconciles but cannot auto-arm trading."""
+def test_explicit_activation_begins_reconciliation_without_auto_arm_permission():
+    """Explicit execution activation cannot auto-arm trading."""
     window = _sync_completed_window(auto_claim_enabled=True)
     window.state_sync_role = ss.LocalDeviceRole("pc-id", "PC", False)
     window._state_sync_action = "activate"

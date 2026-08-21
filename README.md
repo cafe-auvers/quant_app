@@ -81,6 +81,10 @@ data-refresh PC, sharing one MySQL database over LAN/Tailscale), see
 [docs/pc_sync_data_pipeline.md](docs/pc_sync_data_pipeline.md) for the full
 architecture and automation.
 
+For live control, handoff, Buy Today publishing, and the distinction between
+**Execution Owner** and **Operator Control**, see
+[docs/execution_operator_control.md](docs/execution_operator_control.md).
+
 ## Configuration
 
 Database and API credentials are local-only and belong in `.env` (gitignored, never commit it). See `.env.example` for the full list of variables to fill in, covering MySQL connection settings, KIS broker API credentials, and optional integration keys.

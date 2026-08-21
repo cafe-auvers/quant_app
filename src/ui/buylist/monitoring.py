@@ -12,6 +12,7 @@ from src.core.entry_monitoring_command import build_entry_monitoring_command
 from src.core.execution_queue import (
     BROKER_UNCERTAIN_STATUSES,
     POSITION_HOLDING_STATUSES,
+    ExecutionQueueStatus,
 )
 from src.core.order_state import OrderIntent, OrderSide
 
@@ -446,7 +447,13 @@ class BuylistMonitoringMixin:
         # plus the terminal "SOLD" status, so this can never silently drift
         # from what handoff reconciliation treats as broker-uncertain/held.
         _skip_statuses = (
-            BROKER_UNCERTAIN_STATUSES | POSITION_HOLDING_STATUSES | {"SOLD"}
+            BROKER_UNCERTAIN_STATUSES
+            | POSITION_HOLDING_STATUSES
+            | {
+                "SOLD",
+                ExecutionQueueStatus.REJECTED.value,
+                ExecutionQueueStatus.EXPIRED.value,
+            }
         )
         queue_watching_items = [
             it

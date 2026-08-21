@@ -91,8 +91,13 @@ class SubscriptionPriority(IntEnum):
     CRITICAL_EXIT = 0
     OPEN_POSITION = 1
     ENTRY_PENDING = 2
-    BUY_TODAY = 3
-    DISPLAY_ONLY = 4
+    # A price-qualified entry and an armed breakout must win capacity before
+    # an ORB that is still forming. Existing positions/orders remain ahead of
+    # every new entry.
+    ENTRY_READY = 3
+    ENTRY_ARMED = 4
+    BUY_TODAY = 5
+    DISPLAY_ONLY = 6
 
 
 class SubscriptionSessionStatus(str, Enum):

@@ -141,6 +141,8 @@ def get_trade_card(
     environment: str,
     account_no: str,
     symbol: str,
+    *,
+    raise_on_error: bool = False,
 ) -> Optional[TradeCardState]:
     if engine is None:
         return None
@@ -159,6 +161,8 @@ def get_trade_card(
             ).first()
         return _row_to_card(row) if row is not None else None
     except SQLAlchemyError as exc:
+        if raise_on_error:
+            raise
         logger.info("trade_card_repository: get_trade_card failed: %s", exc)
         return None
 
@@ -189,6 +193,7 @@ def list_trade_cards(
     *,
     environment: Optional[str] = None,
     account_no: Optional[str] = None,
+    raise_on_error: bool = False,
 ) -> List[TradeCardState]:
     if engine is None:
         return []
@@ -203,6 +208,8 @@ def list_trade_cards(
             rows = conn.execute(statement).fetchall()
         return [_row_to_card(row) for row in rows]
     except SQLAlchemyError as exc:
+        if raise_on_error:
+            raise
         logger.info("trade_card_repository: list_trade_cards failed: %s", exc)
         return []
 

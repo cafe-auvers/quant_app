@@ -128,9 +128,14 @@ def test_watchlist_to_buylist(tmp_path):
 
 def test_buylist_to_buy_today_activation(tmp_path):
     engine = _make_engine(tmp_path)
-    card = _seed(engine, board_status=BoardStatus.BUYLIST)
+    card = _seed(
+        engine,
+        board_status=BoardStatus.BUYLIST,
+        buy_today_note="Buy Today rejected - all ORB plans invalid.",
+    )
     result = apply_board_command(engine, _cmd(ActivateForToday, card))
     assert result.board_status == BoardStatus.BUY_TODAY
+    assert result.buy_today_note == ""
 
 
 def test_illegal_transition_rejected(tmp_path):

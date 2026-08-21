@@ -1867,6 +1867,7 @@ def run_account_reconciliation_pass(
                 engine,
                 environment=environment,
                 account_no=account_no,
+                raise_on_error=True,
             )
             continue
         return AccountReconciliationResult(snapshot=snapshot, plan=plan)

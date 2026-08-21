@@ -278,6 +278,45 @@ def test_database_outage_spools_and_directly_delivers_critical_alert(tmp_path):
     ]
 
 
+def test_known_offline_alert_skips_a_second_database_attempt(tmp_path, monkeypatch):
+    provider = FakeProvider()
+    service, _ = _service(tmp_path, provider=provider)
+    monkeypatch.setattr(
+        service,
+        "raise_alert",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("known outage must not retry the database")
+        ),
+    )
+
+    service.sink_offline(
+        CriticalAlertType.DATABASE_UNAVAILABLE,
+        "prod-db",
+        "canonical database unavailable",
+    )
+
+    assert len(provider.deliveries) == 1
+    assert provider.deliveries[0]["offline_spool"] is True
+    assert len(service.local_spool.pending_alerts()) == 1
+
+
+def test_execution_thread_can_spool_known_outage_without_waiting_on_delivery(
+    tmp_path,
+):
+    provider = FakeProvider()
+    service, _ = _service(tmp_path, provider=provider)
+
+    service.sink_offline(
+        CriticalAlertType.DATABASE_UNAVAILABLE,
+        "prod-db-fast-path",
+        "canonical database unavailable",
+        deliver_directly=False,
+    )
+
+    assert provider.deliveries == []
+    assert len(service.local_spool.pending_alerts()) == 1
+
+
 def test_spool_failure_does_not_suppress_direct_critical_alert_delivery(tmp_path):
     provider = FakeProvider()
     service, _ = _service(tmp_path, provider=provider)

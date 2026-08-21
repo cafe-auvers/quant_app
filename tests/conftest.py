@@ -33,6 +33,7 @@ if str(ROOT_DIR) not in sys.path:
 from src.services import (
     app_state,
     event_journal,
+    state_sync,
     trade_card_repository,
     trading_state,
 )  # noqa: E402  (needs sys.path set up above)
@@ -68,6 +69,24 @@ def _isolate_trade_card_snapshot(monkeypatch, tmp_path):
         app_state,
         "KANBAN_STATE_METADATA_FILE",
         tmp_path / "kanban_state_metadata.json",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_local_device_identity(monkeypatch, tmp_path):
+    """Never let ownership tests replace the workstation's durable UUID.
+
+    Several state-sync helpers persist the effective local role as part of a
+    normal claim/demotion. Tests deliberately exercise those helpers with
+    identities such as ``laptop-id``; without a session-wide redirect, an
+    otherwise isolated test can strand the real execution lease on the next
+    application restart.
+    """
+
+    monkeypatch.setattr(
+        state_sync,
+        "LOCAL_DEVICE_ROLE_FILE",
+        tmp_path / "device_role.json",
     )
 
 

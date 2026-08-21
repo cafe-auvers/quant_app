@@ -700,6 +700,7 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
     if isinstance(command, types.CancelEntry):
         if card.board_status == BoardStatus.BUY_TODAY and not card.entry_client_order_id:
             _move_board_card(card, BoardStatus.BUYLIST)
+            card.buy_today_note = ""
             card.entry_runtime_status = None
             card.entry_block_reason = ""
             card.entry_attempt_group_id = ""
@@ -847,8 +848,10 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
     _move_board_card(card, target)
     if isinstance(command, types.MoveToWatchlist):
         card.watchlist_member = True
+        card.buy_today_note = ""
     elif isinstance(command, types.MoveToBuylist):
         card.buylist_member = True
+        card.buy_today_note = ""
         card.session_date = None
         card.entry_runtime_status = None
         card.entry_block_reason = ""
@@ -856,6 +859,7 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
             card.entry_attempt_group_id = ""
             card.entry_attempt_count = 0
     elif isinstance(command, types.ActivateForToday):
+        card.buy_today_note = ""
         if context is not None and context.session_date is not None:
             card.session_date = context.session_date
         else:
@@ -1210,7 +1214,7 @@ def list_board_projections(
         return []
     projection_context = context or BoardProjectionContext()
     cards = trade_card_repository.list_trade_cards(
-        engine, environment=environment
+        engine, environment=environment, raise_on_error=True
     )
     if board_statuses is not None:
         visible_statuses = set(board_statuses)

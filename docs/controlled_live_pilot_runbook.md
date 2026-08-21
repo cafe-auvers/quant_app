@@ -65,6 +65,21 @@ workflow after reconciliation, never an inline retry.
 Missing, malformed, unreviewed, or mismatched values prevent the active
 runtime or WebSocket service from composing.
 
+Placing a card in Buy Today does not expand this pilot envelope. A Buy Today
+symbol outside `KIS_CONTROLLED_LIVE_SYMBOLS` remains planning-only, and a
+planned entry above `KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL` remains blocked
+at the final broker adapter. The dashboard header displays the mode, symbols,
+and cap; verify that full text rather than relying on "Live Trading: Enabled."
+Promotion to `FULL_LIVE` is a separate financial-scope decision and must not
+be inferred from an ownership or Operator Control change.
+
+The runtime prioritizes WebSocket capacity among symbols already inside this
+envelope: `EXECUTE_READY` first, then armed/waiting-breakout, then still-forming
+Buy Today plans. This priority does not authorize an unlisted symbol and cannot
+replace a missing live-verified symbol subscription key. A card whose 1m, 5m,
+and 30m plans are all terminal-invalid returns to Buylist and releases its Buy
+Today feed capacity.
+
 ## Supervised sequence
 
 1. Start with the in-process trading switch off.

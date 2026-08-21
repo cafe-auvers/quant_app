@@ -15,7 +15,7 @@ import threading
 import uuid
 import weakref
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -53,6 +53,7 @@ TRADE_PLANS_KEY = "trade_plans"
 # it against fresh intraday data before resuming auto-submission.
 EXECUTION_QUEUE_KEY = "execution_queue"
 MAIN_DEVICE_KEY = "__main_device__"
+OPERATOR_CONTROL_KEY = "__operator_control__"
 LIVE_TRADING_CONTROL_KEY = "__live_trading_control__"
 
 SYNCED_STATE_KEYS = (WATCHLIST_KEY, BUYLIST_KEY, TRADE_PLANS_KEY, EXECUTION_QUEUE_KEY)
@@ -137,6 +138,46 @@ class LiveTradingControlResult:
     error: str = ""
 
 
+@dataclass(frozen=True)
+class OperatorControl:
+    """The device allowed to create future manual operator commands.
+
+    A locked control has no owner.  This state is deliberately independent
+    from :class:`MainDevice`, which remains the execution owner.
+    """
+
+    device_id: str
+    hostname: str
+    locked: bool
+    revision: int
+    updated_at: datetime
+    updated_by_host: str = ""
+    updated_by_device: str = ""
+    previous_device_id: str = ""
+    previous_hostname: str = ""
+
+
+@dataclass(frozen=True)
+class OperatorControlResult:
+    success: bool
+    control: Optional[OperatorControl] = None
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class PlanPublishResult:
+    success: bool
+    revisions: Dict[str, int] = None
+    verified_at: Optional[datetime] = None
+    execution_owner_hostname: str = ""
+    execution_owner_heartbeat_fresh: bool = False
+    error: str = ""
+
+    def __post_init__(self) -> None:
+        if self.revisions is None:
+            object.__setattr__(self, "revisions", {})
+
+
 def _device_role_path(path: Path | None = None) -> Path:
     return Path(path) if path is not None else LOCAL_DEVICE_ROLE_FILE
 
@@ -217,6 +258,35 @@ def _get_state_sync_table(metadata: MetaData) -> Table:
     )
 
 
+def _get_operator_control_audit_table(metadata: MetaData) -> Table:
+    return Table(
+        "operator_control_audit",
+        metadata,
+        Column("revision", BigInteger, primary_key=True),
+        Column("previous_device_id", String(64), nullable=False, server_default=""),
+        Column("previous_hostname", String(128), nullable=False, server_default=""),
+        Column("new_device_id", String(64), nullable=False, server_default=""),
+        Column("new_hostname", String(128), nullable=False, server_default=""),
+        Column("locked", BigInteger, nullable=False, server_default=text("1")),
+        Column("updated_by_host", String(128), nullable=False, server_default=""),
+        Column("updated_by_device", String(64), nullable=False, server_default=""),
+        Column("updated_at", DateTime, nullable=False),
+    )
+
+
+def _get_live_trading_control_audit_table(metadata: MetaData) -> Table:
+    return Table(
+        "live_trading_control_audit",
+        metadata,
+        Column("revision", BigInteger, primary_key=True),
+        Column("previous_enabled", BigInteger, nullable=False, server_default=text("0")),
+        Column("enabled", BigInteger, nullable=False, server_default=text("0")),
+        Column("updated_by_host", String(128), nullable=False, server_default=""),
+        Column("updated_by_device", String(64), nullable=False, server_default=""),
+        Column("updated_at", DateTime, nullable=False),
+    )
+
+
 def _ensure_state_sync_table(engine: Engine) -> Table:
     metadata = MetaData()
     table = _get_state_sync_table(metadata)
@@ -245,6 +315,20 @@ def _ensure_state_sync_table(engine: Engine) -> Table:
             with engine.begin() as conn:
                 conn.execute(text(statement))
         _ensured_engines.add(engine)
+    return table
+
+
+def _ensure_operator_control_audit_table(engine: Engine) -> Table:
+    metadata = MetaData()
+    table = _get_operator_control_audit_table(metadata)
+    metadata.create_all(engine)
+    return table
+
+
+def _ensure_live_trading_control_audit_table(engine: Engine) -> Table:
+    metadata = MetaData()
+    table = _get_live_trading_control_audit_table(metadata)
+    metadata.create_all(engine)
     return table
 
 
@@ -366,6 +450,7 @@ def set_live_trading_control(
         )
     try:
         table = _ensure_state_sync_table(engine)
+        audit_table = _ensure_live_trading_control_audit_table(engine)
         with engine.begin() as conn:
             row = _select_row(
                 conn,
@@ -373,6 +458,13 @@ def set_live_trading_control(
                 LIVE_TRADING_CONTROL_KEY,
                 for_update=True,
             )
+            previous_enabled = False
+            if row is not None:
+                previous_enabled = bool(
+                    _decode_payload(
+                        row.payload, LIVE_TRADING_CONTROL_KEY
+                    ).get("enabled", False)
+                )
             revision = int(row.revision or 0) + 1 if row is not None else 1
             values = {
                 "payload": json.dumps(
@@ -398,6 +490,16 @@ def set_live_trading_control(
                     .where(table.c.revision == int(row.revision or 0))
                     .values(**values)
                 )
+            conn.execute(
+                audit_table.insert().values(
+                    revision=revision,
+                    previous_enabled=1 if previous_enabled else 0,
+                    enabled=1 if enabled else 0,
+                    updated_by_host=role.hostname,
+                    updated_by_device=role.device_id,
+                    updated_at=_server_now(engine),
+                )
+            )
             written_row = _select_row(conn, table, LIVE_TRADING_CONTROL_KEY)
         if written_row is None:
             return LiveTradingControlResult(
@@ -418,6 +520,359 @@ def set_live_trading_control(
     except (SQLAlchemyError, ValueError, TypeError) as exc:
         logger.info("Could not update shared live-trading control: %s", exc)
         return LiveTradingControlResult(False, error=str(exc))
+
+
+def _operator_control_from_state(state: RemoteState) -> OperatorControl:
+    locked = bool(state.payload.get("locked", False))
+    device_id = str(state.payload.get("device_id") or "").strip()
+    hostname = str(state.payload.get("hostname") or "").strip()
+    if not locked and not device_id:
+        raise ValueError("Operator-control ownership row has no device_id")
+    return OperatorControl(
+        device_id="" if locked else device_id,
+        hostname="" if locked else hostname,
+        locked=locked,
+        revision=state.revision,
+        updated_at=state.updated_at,
+        updated_by_host=state.updated_by_host,
+        updated_by_device=state.updated_by_device,
+        previous_device_id=str(
+            state.payload.get("previous_device_id") or ""
+        ).strip(),
+        previous_hostname=str(
+            state.payload.get("previous_hostname") or ""
+        ).strip(),
+    )
+
+
+def get_operator_control(engine: Optional[Engine]) -> OperatorControlResult:
+    """Read the independent manual-command owner.
+
+    A missing row upgrades fail-closed to ``Locked``; an operator must make
+    the first explicit assignment before either machine can submit commands.
+    """
+
+    pulled = pull_state(engine, OPERATOR_CONTROL_KEY)
+    if pulled.status == PULL_MISSING:
+        return OperatorControlResult(
+            True,
+            OperatorControl(
+                device_id="",
+                hostname="",
+                locked=True,
+                revision=0,
+                updated_at=datetime.min,
+            ),
+        )
+    if pulled.status != PULL_OK or pulled.state is None:
+        return OperatorControlResult(
+            False,
+            error=pulled.error or "Could not read operator-control ownership.",
+        )
+    try:
+        return OperatorControlResult(
+            True,
+            control=_operator_control_from_state(pulled.state),
+        )
+    except (TypeError, ValueError) as exc:
+        return OperatorControlResult(False, error=str(exc))
+
+
+def set_operator_control(
+    engine: Optional[Engine],
+    updated_by: LocalDeviceRole,
+    owner: Optional[LocalDeviceRole],
+) -> OperatorControlResult:
+    """Atomically assign future manual commands to ``owner`` or lock them.
+
+    The switch never changes execution ownership and never touches an
+    already accepted command.  Every real change advances a shared revision
+    and appends the before/after assignment to ``operator_control_audit``.
+    """
+
+    if engine is None:
+        return OperatorControlResult(
+            False, error="Shared operator-control database is unavailable."
+        )
+    try:
+        table = _ensure_state_sync_table(engine)
+        audit_table = _ensure_operator_control_audit_table(engine)
+        with engine.begin() as conn:
+            row = _select_row(conn, table, OPERATOR_CONTROL_KEY, for_update=True)
+            previous_device_id = ""
+            previous_hostname = ""
+            previous_locked = True
+            if row is not None:
+                previous = _operator_control_from_state(
+                    _remote_state_from_row(row, OPERATOR_CONTROL_KEY)
+                )
+                previous_device_id = previous.device_id
+                previous_hostname = previous.hostname
+                previous_locked = previous.locked
+
+            locked = owner is None
+            new_device_id = "" if locked else str(owner.device_id or "").strip()
+            new_hostname = "" if locked else str(owner.hostname or "").strip()
+            if not locked and not new_device_id:
+                return OperatorControlResult(
+                    False, error="Operator-control target has no device identity."
+                )
+            if (
+                previous_locked == locked
+                and previous_device_id == new_device_id
+                and previous_hostname == new_hostname
+                and row is not None
+            ):
+                return OperatorControlResult(
+                    True,
+                    control=_operator_control_from_state(
+                        _remote_state_from_row(row, OPERATOR_CONTROL_KEY)
+                    ),
+                )
+
+            revision = int(row.revision or 0) + 1 if row is not None else 1
+            payload = json.dumps(
+                {
+                    "device_id": new_device_id,
+                    "hostname": new_hostname,
+                    "locked": locked,
+                    "previous_device_id": previous_device_id,
+                    "previous_hostname": previous_hostname,
+                },
+                separators=(",", ":"),
+            )
+            values = {
+                "payload": payload,
+                "revision": revision,
+                "updated_at": _server_now(engine),
+                "updated_by_host": updated_by.hostname,
+                "updated_by_device": updated_by.device_id,
+            }
+            if row is None:
+                conn.execute(
+                    table.insert().values(
+                        state_key=OPERATOR_CONTROL_KEY,
+                        **values,
+                    )
+                )
+            else:
+                result = conn.execute(
+                    table.update()
+                    .where(table.c.state_key == OPERATOR_CONTROL_KEY)
+                    .where(table.c.revision == int(row.revision or 0))
+                    .values(**values)
+                )
+                if result.rowcount != 1:
+                    return OperatorControlResult(
+                        False,
+                        error="Operator-control ownership changed before commit.",
+                    )
+            conn.execute(
+                audit_table.insert().values(
+                    revision=revision,
+                    previous_device_id=previous_device_id,
+                    previous_hostname=previous_hostname,
+                    new_device_id=new_device_id,
+                    new_hostname=new_hostname,
+                    locked=1 if locked else 0,
+                    updated_by_host=updated_by.hostname,
+                    updated_by_device=updated_by.device_id,
+                    updated_at=_server_now(engine),
+                )
+            )
+            written = _select_row(conn, table, OPERATOR_CONTROL_KEY)
+        if written is None:
+            return OperatorControlResult(
+                False, error="Operator-control ownership was not persisted."
+            )
+        return OperatorControlResult(
+            True,
+            control=_operator_control_from_state(
+                _remote_state_from_row(written, OPERATOR_CONTROL_KEY)
+            ),
+        )
+    except (SQLAlchemyError, TypeError, ValueError) as exc:
+        logger.info("Could not update operator-control ownership: %s", exc)
+        return OperatorControlResult(False, error=str(exc))
+
+
+def get_synced_state_revisions(
+    engine: Optional[Engine],
+) -> Dict[str, int]:
+    """Return canonical plan revisions without pulling their large payloads."""
+
+    if engine is None:
+        return {}
+    try:
+        table = _ensure_state_sync_table(engine)
+        with engine.connect() as conn:
+            rows = conn.execute(
+                select(table.c.state_key, table.c.revision).where(
+                    table.c.state_key.in_(SYNCED_STATE_KEYS)
+                )
+            ).fetchall()
+        revisions = {state_key: 0 for state_key in SYNCED_STATE_KEYS}
+        revisions.update(
+            {str(row.state_key): int(row.revision or 0) for row in rows}
+        )
+        return revisions
+    except SQLAlchemyError as exc:
+        logger.debug("Could not read synchronized state revisions: %s", exc)
+        return {}
+    except (TypeError, ValueError) as exc:
+        logger.info("Could not read synchronized state revisions: %s", exc)
+        return {}
+
+
+def publish_planning_snapshot(
+    engine: Optional[Engine],
+    role: LocalDeviceRole,
+    payloads: Dict[str, Dict[str, Any]],
+    *,
+    expected_revisions: Dict[str, int],
+    market_is_open: bool,
+) -> PlanPublishResult:
+    """Atomically publish the four pre-market planning documents.
+
+    This is the narrow exception that lets the Operator Control owner prepare
+    tomorrow's plan while the PC remains Execution Owner.  It is disabled
+    during the regular session and while any operator command is in flight.
+    """
+
+    if engine is None:
+        return PlanPublishResult(False, error="Shared planning database is unavailable.")
+    if market_is_open:
+        return PlanPublishResult(
+            False,
+            error=(
+                "Market is open. Full plan publish is disabled; use Live "
+                "Intervention commands instead."
+            ),
+        )
+    if set(payloads) != set(SYNCED_STATE_KEYS):
+        return PlanPublishResult(
+            False,
+            error="A full plan publish requires watchlist, buylist, trade_plans, and execution_queue.",
+        )
+    try:
+        encoded = {
+            key: json.dumps(value, default=str, separators=(",", ":"))
+            for key, value in payloads.items()
+        }
+        expected = {key: int(expected_revisions.get(key, 0)) for key in payloads}
+        if any(value < 0 for value in expected.values()):
+            raise ValueError("Expected revisions must be non-negative")
+    except (TypeError, ValueError) as exc:
+        return PlanPublishResult(False, error=str(exc))
+
+    try:
+        from src.services.operator_commands import (
+            OperatorCommandStatus,
+            ensure_operator_commands_table,
+        )
+
+        table = _ensure_state_sync_table(engine)
+        command_table = ensure_operator_commands_table(engine)
+        written_revisions: Dict[str, int] = {}
+        with engine.begin() as conn:
+            operator_row = _select_row(
+                conn, table, OPERATOR_CONTROL_KEY, for_update=True
+            )
+            if operator_row is None:
+                return PlanPublishResult(
+                    False,
+                    error="Operator Control is Locked; assign it before publishing.",
+                )
+            operator_payload = _decode_payload(
+                operator_row.payload, OPERATOR_CONTROL_KEY
+            )
+            if bool(operator_payload.get("locked", False)):
+                return PlanPublishResult(
+                    False,
+                    error="Operator Control is Locked; assign it before publishing.",
+                )
+            if str(operator_payload.get("device_id") or "") != role.device_id:
+                return PlanPublishResult(
+                    False,
+                    error="Only the current Operator Control owner may publish the plan.",
+                )
+            active_statuses = (
+                OperatorCommandStatus.PENDING.value,
+                OperatorCommandStatus.ACCEPTED.value,
+                OperatorCommandStatus.EXECUTING.value,
+                OperatorCommandStatus.BROKER_SUBMITTED.value,
+                OperatorCommandStatus.PARTIALLY_FILLED.value,
+            )
+            active_command = conn.execute(
+                select(command_table.c.command_id)
+                .where(command_table.c.status.in_(active_statuses))
+                .limit(1)
+            ).first()
+            if active_command is not None:
+                return PlanPublishResult(
+                    False,
+                    error="Full plan publish is blocked while an operator command is in flight.",
+                )
+
+            rows = {
+                key: _select_row(conn, table, key, for_update=True)
+                for key in SYNCED_STATE_KEYS
+            }
+            for key, row in rows.items():
+                current_revision = int(row.revision or 0) if row is not None else 0
+                if current_revision != expected[key]:
+                    return PlanPublishResult(
+                        False,
+                        revisions={
+                            item: int(value.revision or 0) if value is not None else 0
+                            for item, value in rows.items()
+                        },
+                        error=(
+                            f"Remote {key} revision changed from {expected[key]} "
+                            f"to {current_revision}; refresh before publishing."
+                        ),
+                    )
+            for key, row in rows.items():
+                revision = expected[key] + 1
+                values = {
+                    "payload": encoded[key],
+                    "revision": revision,
+                    "updated_at": _server_now(engine),
+                    "updated_by_host": role.hostname,
+                    "updated_by_device": role.device_id,
+                }
+                if row is None:
+                    conn.execute(
+                        table.insert().values(state_key=key, **values)
+                    )
+                else:
+                    conn.execute(
+                        table.update()
+                        .where(table.c.state_key == key)
+                        .where(table.c.revision == expected[key])
+                        .values(**values)
+                    )
+                written_revisions[key] = revision
+
+        ownership = get_main_device(engine)
+        owner = ownership.main_device if ownership.success else None
+        heartbeat_fresh = False
+        if owner is not None:
+            from src.services.runtime_status import get_runtime_process_status
+
+            heartbeat_fresh = get_runtime_process_status(
+                engine, owner.hostname
+            ).active
+        return PlanPublishResult(
+            True,
+            revisions=written_revisions,
+            verified_at=datetime.now(timezone.utc),
+            execution_owner_hostname=owner.hostname if owner else "",
+            execution_owner_heartbeat_fresh=heartbeat_fresh,
+        )
+    except (SQLAlchemyError, TypeError, ValueError) as exc:
+        logger.info("Could not publish full planning snapshot: %s", exc)
+        return PlanPublishResult(False, error=str(exc))
 
 
 def _main_device_from_state(state: RemoteState) -> MainDevice:
@@ -464,6 +919,7 @@ def claim_main_device(
     *,
     expected_standby_generation: int = 0,
     standby_max_age_seconds: float = 60.0,
+    require_operator_handoff_clear: bool = False,
 ) -> OwnershipResult:
     """Atomically make ``role`` the sole remote writer.
 
@@ -482,9 +938,48 @@ def claim_main_device(
             )
 
             runtime_table = ensure_runtime_device_state_table(engine)
+        operator_command_table = None
+        nontransferable_statuses: tuple[str, ...] = ()
+        if require_operator_handoff_clear:
+            from src.services.operator_commands import (
+                NONTRANSFERABLE_OPERATOR_COMMAND_STATUSES,
+                ensure_operator_commands_table,
+            )
+
+            operator_command_table = ensure_operator_commands_table(engine)
+            nontransferable_statuses = tuple(
+                status.value
+                for status in NONTRANSFERABLE_OPERATOR_COMMAND_STATUSES
+            )
         table = _ensure_state_sync_table(engine)
         with engine.begin() as conn:
             row = _select_row(conn, table, MAIN_DEVICE_KEY, for_update=True)
+            if operator_command_table is not None:
+                in_flight = conn.execute(
+                    select(
+                        operator_command_table.c.command_id,
+                        operator_command_table.c.command_type,
+                        operator_command_table.c.status,
+                    )
+                    .where(
+                        operator_command_table.c.status.in_(
+                            nontransferable_statuses
+                        )
+                    )
+                    .order_by(operator_command_table.c.created_at.asc())
+                    .limit(1)
+                    .with_for_update()
+                ).first()
+                if in_flight is not None:
+                    return OwnershipResult(
+                        False,
+                        error=(
+                            "Execution-owner switch is paused while operator "
+                            f"command {in_flight.command_type} "
+                            f"({in_flight.status}) is in flight. Wait for its "
+                            "terminal result, then retry."
+                        ),
+                    )
             if runtime_table is not None:
                 from src.services.runtime_device_state_repository import (
                     verify_standby_generation_for_claim,

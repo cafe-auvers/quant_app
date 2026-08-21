@@ -46,6 +46,20 @@ affected symbols/partitions. The older full-content verifier remains the
 fallback for explicit integrity and handoff workflows; it is not the normal
 dashboard restart path.
 
+Trading-device duties are assigned independently of these storage roles.
+**Execution Owner** selects the only process allowed to execute; **Operator
+Control** selects the only device allowed to create new manual live commands,
+or can be Locked. Locking Operator Control does not stop already-authorized
+Buy Today monitoring or position protection. Pre-market full-plan publish and
+market-open operator commands are different workflows. See
+[Execution Owner and Operator Control](execution_operator_control.md) for the
+exact handoff, retry, and Buy Today rules.
+
+These execution roles do not move storage roles. Even with both controls set to
+Laptop, powering off the PC removes canonical MySQL. The laptop's SQLite mirror
+continues market-data display only; it never becomes a writable execution
+authority. New entries and operator commands close until MySQL returns.
+
 ## Architecture
 
 ```mermaid
@@ -388,8 +402,8 @@ either machine.
   disappearing from the account inventory.
   Monitoring/trading only resume once every configured account clears
   unambiguously **and** the broker-corrected state has been synchronously
-  saved and strictly republished. The manual **Use This Device as Main** path
-  uses the same reconciliation fence and never auto-arms live trading.
+  saved and strictly republished. Explicit **Execution Owner** transfer uses
+  the same reconciliation fence and never auto-arms live trading.
 - **Strict shutdown ordering**: `closeEvent` now finishes the final local
   save, strictly re-publishes buylist + execution_queue to MySQL
   (`publish_handoff_snapshot` -- returns failure, not just a log line, if
@@ -417,8 +431,8 @@ AUTO_ARM_TRADING_ON_HANDOFF=0
 `EXPECTED_AUTO_CLAIM_HOSTNAME` must match `platform.node()` exactly on the
 PC or auto-claim silently stays off -- cheap insurance against an
 accidentally copy-pasted `.env`. The laptop deliberately never auto-reclaims
-on startup; it stays pull-only until "Use This Device as Main" is clicked
-manually. Keep both automation flags at `0` until the physical S3/wake and
+on startup; assign it explicitly with the **Execution Owner: Laptop** control
+when required. Keep both automation flags at `0` until the physical S3/wake and
 post-resume MySQL/KIS checks below pass. Enable auto-claim first; leave
 auto-arm off through several supervised handoffs.
 
@@ -494,12 +508,21 @@ the wake time itself is harmless idle time either way.
 - Broker API outage during handoff: reconciliation retries with backoff and
   refuses to trade until it gets an unambiguous snapshot -- correct
   fail-safe, but the position is unprotected until it (or KIS) recovers.
-- Shared-MySQL outage while a device is main: after the 90-second lease-
-  freshness limit, **all** KIS submissions fail closed, including stop-loss
-  and other protective exits. This is the intentional split-brain policy.
+- Shared-MySQL outage while a device is main: new entries and ordinary
+  mutations fail closed immediately. An already-active executor may use its
+  cached exact lease/ownership proof and fsynced local journal for eligible
+  protective cancellation/SELL work for 30 seconds by default. After that
+  emergency allowance, **all** KIS submissions fail closed, including
+  stop-loss and other protective exits. A cold-started executor has no offline
+  allowance. This is the intentional split-brain policy.
   Treat a MySQL CRITICAL health result during a live position as a high-
   severity operational alert and be prepared to manage the position directly
   in KIS until coordination recovers.
+- The dashboard remote-shutdown button refuses to power off the database PC
+  during the regular session while the Buy Board engine and Live Trading are
+  armed. Physical shutdown remains outside the app's control. Independent
+  laptop/PC operation requires relocating canonical MySQL to a third always-on
+  host or managed MySQL service.
 - `orders.json`/`event_journal.jsonl` stay local-only per device. Broker-truth
   discovery makes this a completeness gap for the PC's own order-history
   view, not a correctness problem for reconciliation itself.

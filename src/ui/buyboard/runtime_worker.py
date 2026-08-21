@@ -36,9 +36,11 @@ from typing import Callable, Dict, List, Optional, Tuple
 from PyQt5.QtCore import QThread, pyqtSignal
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 
 from src.core import execution_config
 from src.core.account_broker_snapshot import AccountBrokerSnapshot, ReconciliationAction
+from src.core.board_workflow import BoardActionContext
 from src.core.execution_config import is_buyboard_engine_enabled
 from src.core.execution_mode import ExecutionLease, ExecutionSource
 from src.core.runtime_readiness import EngineReadiness, RuntimeDeviceState
@@ -87,10 +89,12 @@ from src.services.schema_migration import (
     SchemaMigrationManager,
 )
 from src.utils.redaction import scrub_sensitive_text
+from src.utils.device_identity import detect_local_device_kind
 from src.services.runtime_device_state_repository import (
     require_compatible_runtime_schema,
     save_runtime_device_state,
 )
+from src.services.state_sync import LocalDeviceRole, get_synced_state_revisions
 from src.services.kis_realtime_market_data import StopRule, SubscriptionPriority
 from src.services.stop_change_coordinator import stop_change_coordinator_for
 from src.services.trade_card_orb_bridge import TradeCardOrbEvaluator
@@ -111,6 +115,17 @@ _QUOTE_SUBSCRIBED_STATUSES = {
 # ORB is an active-session entry concern.  Watchlist and Buylist remain
 # planning-only and retain only their configured breakout target.
 _ORB_SYNCED_STATUSES = {BoardStatus.BUY_TODAY}
+
+
+def _buy_today_subscription_priority(card: TradeCardState) -> SubscriptionPriority:
+    if card.entry_runtime_status == EntryRuntimeStatus.EXECUTE_READY:
+        return SubscriptionPriority.ENTRY_READY
+    if card.entry_runtime_status in {
+        EntryRuntimeStatus.WAITING_BREAKOUT,
+        EntryRuntimeStatus.ARMED,
+    }:
+        return SubscriptionPriority.ENTRY_ARMED
+    return SubscriptionPriority.BUY_TODAY
 
 
 class BuyboardRuntimeWorker(QThread):
@@ -200,6 +215,7 @@ class BuyboardRuntimeWorker(QThread):
             device_id or getattr(execution_lease, "device_id", "") or ""
         )
         self._hostname = str(hostname or platform.node())
+        self._device_kind = detect_local_device_kind(self._hostname)
         self._external_alerting = external_alerting
         self._schema_migration_manager = schema_migration_manager
         self._regular_session_open = regular_session_open or is_regular_session_open
@@ -352,6 +368,7 @@ class BuyboardRuntimeWorker(QThread):
             hostname=self._hostname,
             state=state,
             handoff_confirmed=handoff_confirmed,
+            details=self._runtime_readiness_details(state),
         )
         # Durable state is the authorization source. Local state changes only
         # after that write succeeds, especially for ACTIVE.
@@ -371,7 +388,98 @@ class BuyboardRuntimeWorker(QThread):
             device_id=self._device_id,
             hostname=self._hostname,
             state=RuntimeDeviceState.STANDBY,
+            details=self._runtime_readiness_details(RuntimeDeviceState.STANDBY),
         )
+
+    def _runtime_readiness_details(
+        self, state: RuntimeDeviceState
+    ) -> Dict[str, object]:
+        """Publish the execution-switch facts checked by the other machine."""
+
+        readiness = self.engine_readiness(include_device_state=False)
+        revisions = (
+            {}
+            if self._database_probe_completed and not self._database_writable
+            else get_synced_state_revisions(self._db_engine)
+        )
+        stable_market_data = all(
+            (
+                readiness.websocket_connected,
+                readiness.critical_trade_subscriptions_acked,
+                readiness.critical_quote_subscriptions_acked,
+                readiness.accumulator_draining_within_budget,
+            )
+        )
+        reconciliation_ready = bool(
+            readiness.startup_reconciliation_complete
+            and readiness.account_reconciliation_fresh
+        )
+        command_consumer_ready = bool(
+            self.runtime is not None
+            and state
+            not in {
+                RuntimeDeviceState.SHUTTING_DOWN,
+                RuntimeDeviceState.STOPPED,
+                RuntimeDeviceState.FAILED,
+            }
+        )
+        state_revisions_current = bool(revisions) and all(
+            key in revisions
+            for key in ("watchlist", "buylist", "trade_plans", "execution_queue")
+        )
+        executor_ready = bool(
+            state in {RuntimeDeviceState.STANDBY_READY, RuntimeDeviceState.ACTIVE}
+            and readiness.standby_ready
+            and stable_market_data
+            and reconciliation_ready
+            and command_consumer_ready
+            and state_revisions_current
+        )
+        return {
+            "device_id": self._device_id,
+            "hostname": self._hostname,
+            "device_kind": self._device_kind,
+            "main_py_alive": state
+            not in {RuntimeDeviceState.STOPPED, RuntimeDeviceState.FAILED},
+            "db_connected": bool(self._database_writable),
+            "kis_ready": reconciliation_ready,
+            "broker_account": str(self._account_no or "all configured accounts"),
+            "environment": self._environment,
+            "account_environment_ready": bool(
+                self._environment in {"PROD", "PAPER"} and reconciliation_ready
+            ),
+            "market_data_ready": stable_market_data,
+            "command_consumer_ready": command_consumer_ready,
+            "order_reconciliation_ready": reconciliation_ready,
+            "latest_watchlist_revision": int(revisions.get("watchlist", 0) or 0),
+            "latest_buylist_revision": int(revisions.get("buylist", 0) or 0),
+            "latest_trade_plans_revision": int(
+                revisions.get("trade_plans", 0) or 0
+            ),
+            "latest_execution_queue_revision": int(
+                revisions.get("execution_queue", 0) or 0
+            ),
+            "state_revisions_current": state_revisions_current,
+            "no_stale_local_state": state_revisions_current,
+            "power_state": (
+                "SHUTTING_DOWN"
+                if state == RuntimeDeviceState.SHUTTING_DOWN
+                else "AWAKE"
+            ),
+            "sleep_blocker_active": state
+            not in {
+                RuntimeDeviceState.SHUTTING_DOWN,
+                RuntimeDeviceState.STOPPED,
+                RuntimeDeviceState.FAILED,
+            },
+            "executor_ready": executor_ready,
+            "executor_not_ready_reason": (
+                ""
+                if executor_ready
+                else ", ".join(readiness.standby_blockers)
+                or f"runtime state is {state.value}"
+            ),
+        }
 
     def _probe_database_writable(self) -> bool:
         """Exercise a write statement without changing application data."""
@@ -394,7 +502,8 @@ class BuyboardRuntimeWorker(QThread):
                 # normal heartbeat is permitted until a complete fresh pass.
                 self._recovery_reconciliation_required = True
         except Exception as exc:
-            if not had_prior_probe or was_writable:
+            outage_started = not had_prior_probe or was_writable
+            if outage_started:
                 logger.warning(
                     "Buyboard runtime database is unavailable: %s",
                     scrub_sensitive_text(exc, account_no=self._account_no),
@@ -407,6 +516,14 @@ class BuyboardRuntimeWorker(QThread):
             self._database_writable = False
             if self.execution_gateway is not None:
                 self.execution_gateway.note_canonical_database_unavailable()
+            if outage_started:
+                self._raise_external_alert(
+                    CriticalAlertType.DATABASE_UNAVAILABLE,
+                    f"{self._environment}:{self._device_id}",
+                    "The canonical trading database is unavailable; new "
+                    "entries are closed and only bounded protective actions "
+                    "remain eligible.",
+                )
         return self._database_writable
 
     def _flush_execution_journal(self) -> None:
@@ -515,18 +632,58 @@ class BuyboardRuntimeWorker(QThread):
                 start_market_data = getattr(self.runtime.market_data, "start", None)
                 if callable(start_market_data):
                     start_market_data()
-            # Startup reconciliation is projection-only.  Reducer commands
-            # remain journaled but cannot cross the broker boundary until the
-            # device reaches ACTIVE after the final pass.
-            self._run_startup_reconciliation(execute_commands=False)
-            if (
-                migration_manager.state.phase
-                == MigrationPhase.AWAITING_RECONCILIATION
-                and self.startup_reconciliation_complete
-            ):
-                migration_manager.mark_reconciliation_complete()
-            self._probe_database_writable()
-            self._set_device_state(RuntimeDeviceState.STANDBY)
+            # Establish the exact database/lease proof before caching cards
+            # for outage protection. If MySQL disappears during startup
+            # reconciliation, those last-known cards and ownership proofs
+            # remain available to the bounded emergency path instead of an
+            # empty read replacing them.
+            database_writable = self._probe_database_writable()
+            if database_writable and not self._standby_only:
+                self._lease_current = self._lease_still_current()
+                if not self._lease_current:
+                    raise LeaseExpiredError(
+                        "The execution lease expired before startup reconciliation"
+                    )
+            if database_writable:
+                # Startup reconciliation is projection-only. Reducer commands
+                # remain journaled but cannot cross the broker boundary until
+                # the device reaches ACTIVE after the final pass.
+                self._run_startup_reconciliation(execute_commands=False)
+                if (
+                    migration_manager.state.phase
+                    == MigrationPhase.AWAITING_RECONCILIATION
+                    and self.startup_reconciliation_complete
+                ):
+                    migration_manager.mark_reconciliation_complete()
+                database_writable = self._probe_database_writable()
+            if database_writable:
+                self._set_device_state(RuntimeDeviceState.STANDBY)
+            else:
+                # There is no safe durable state write while canonical MySQL
+                # is absent. Keep the worker alive but locally non-active so
+                # it can recover automatically; no startup-time mutation is
+                # authorized from an unreconciled cold start.
+                self.device_state = RuntimeDeviceState.STANDBY
+                self.error_occurred.emit(
+                    "Canonical trading database is offline. New entries are "
+                    "closed; the runtime will retry and reconcile automatically."
+                )
+        except SQLAlchemyError as exc:
+            logger.warning(
+                "Buyboard runtime startup paused because the canonical "
+                "database is unavailable: %s",
+                scrub_sensitive_text(exc, account_no=self._account_no),
+            )
+            try:
+                self._close_market_data()
+            except Exception:
+                logger.exception("Could not close market data after startup failure")
+            self.device_state = RuntimeDeviceState.FAILED
+            self.error_occurred.emit(
+                "Buy Board execution stayed closed because the canonical "
+                "trading database is offline."
+            )
+            return
         except Exception as exc:  # noqa: BLE001 - must not crash the app
             logger.exception("BuyboardRuntimeWorker failed to start")
             try:
@@ -571,11 +728,45 @@ class BuyboardRuntimeWorker(QThread):
                     allow_mutations = self.device_state == RuntimeDeviceState.ACTIVE
                     self._run_one_cycle(allow_mutations=allow_mutations)
                     self.last_heartbeat_at = datetime.now(timezone.utc)
-                    if self._external_alerting is not None:
+                    if (
+                        database_writable
+                        and self.device_state == RuntimeDeviceState.ACTIVE
+                    ):
+                        # ACTIVE is not a one-time declaration. Publish the
+                        # current readiness/revision facts every heartbeat so
+                        # the other machine never switches ownership using a
+                        # stale startup-era snapshot.
+                        self._set_device_state(RuntimeDeviceState.ACTIVE)
+                    if database_writable and self._external_alerting is not None:
                         self._external_alerting.publish_heartbeat_if_due()
                         self._external_alerting.process_due()
                     if not allow_mutations:
                         self._advance_startup_readiness()
+                except SQLAlchemyError as exc:
+                    # MySQL can disappear after the successful probe but
+                    # before a strict card/reconciliation read. Mark the
+                    # outage immediately and preserve the prior card cache;
+                    # the next cycle can continue bounded protection without
+                    # another canonical read.
+                    self._database_writable = False
+                    if self.execution_gateway is not None:
+                        self.execution_gateway.note_canonical_database_unavailable()
+                    logger.warning(
+                        "Buyboard runtime cycle paused because the canonical "
+                        "database became unavailable: %s",
+                        scrub_sensitive_text(exc, account_no=self._account_no),
+                    )
+                    self._raise_external_alert(
+                        CriticalAlertType.DATABASE_UNAVAILABLE,
+                        f"{self._environment}:{self._device_id}",
+                        "The canonical trading database became unavailable; "
+                        "new entries are closed and only bounded protective "
+                        "actions remain eligible.",
+                    )
+                    self.error_occurred.emit(
+                        "Canonical trading database went offline. New entries "
+                        "are closed; cached position protection remains bounded."
+                    )
                 except Exception:  # noqa: BLE001 - one bad cycle must not kill the loop
                     logger.exception("BuyboardRuntimeWorker heartbeat cycle failed")
                     if self.device_state == RuntimeDeviceState.STANDBY_READY:
@@ -605,6 +796,10 @@ class BuyboardRuntimeWorker(QThread):
             )
             return False
         self._recovery_reconciliation_required = False
+        self._resolve_external_alert(
+            CriticalAlertType.DATABASE_UNAVAILABLE,
+            f"{self._environment}:{self._device_id}",
+        )
         if self.device_state == RuntimeDeviceState.ACTIVE:
             self._accepting_commands = True
         return True
@@ -754,7 +949,13 @@ class BuyboardRuntimeWorker(QThread):
             return False
 
     def _card_lookup(self, environment: str, account_no: str, symbol: str) -> Optional[TradeCardState]:
-        return repo.get_trade_card(self._db_engine, environment, account_no, symbol)
+        return repo.get_trade_card(
+            self._db_engine,
+            environment,
+            account_no,
+            symbol,
+            raise_on_error=True,
+        )
 
     def _persist_execution_identity(self, card: TradeCardState) -> None:
         """Durably commit command identity before a guarded gateway call."""
@@ -883,7 +1084,11 @@ class BuyboardRuntimeWorker(QThread):
         broker call for the worker's own blank account scope.
         """
         assert self.runtime is not None
-        cards = repo.list_trade_cards(self._db_engine, environment=self._environment)
+        cards = repo.list_trade_cards(
+            self._db_engine,
+            environment=self._environment,
+            raise_on_error=True,
+        )
         self._configure_verified_mutation_budgets(cards)
         self._cache_emergency_ownership_proofs(cards)
         for card in cards:
@@ -921,6 +1126,22 @@ class BuyboardRuntimeWorker(QThread):
                         self._execute_reconciliation_commands(result)
                     )
                 self._handle_reconciliation_result(result)
+            except SQLAlchemyError as exc:
+                # A canonical outage is an expected infrastructure failure,
+                # not a Python crash. Keep it concise; readiness still fails
+                # closed and the external incident uses its offline spool.
+                logger.warning(
+                    "Startup reconciliation paused for account %s because "
+                    "the canonical database is unavailable: %s",
+                    account_no,
+                    scrub_sensitive_text(exc, account_no=account_no),
+                )
+                self._invalidate_account_reconciliation(
+                    account_no,
+                    str(exc),
+                    confirm_for_operator=True,
+                )
+                continue
             except Exception as exc:
                 # Review finding P0: this account did NOT get reconciled --
                 # startup_reconciliation_complete below must reflect that,
@@ -979,7 +1200,9 @@ class BuyboardRuntimeWorker(QThread):
         )
         if canonical_available:
             cards = repo.list_trade_cards(
-                self._db_engine, environment=self._environment
+                self._db_engine,
+                environment=self._environment,
+                raise_on_error=True,
             )
             if self._account_no:
                 cards = [
@@ -995,6 +1218,20 @@ class BuyboardRuntimeWorker(QThread):
             cards = self._cached_cards
 
         allow_mutations = bool(allow_mutations and self._accepting_commands)
+        operator_commands_changed = False
+        if canonical_available and allow_mutations:
+            operator_commands_changed = self._process_operator_commands()
+            if operator_commands_changed:
+                cards = repo.list_trade_cards(
+                    self._db_engine,
+                    environment=self._environment,
+                    raise_on_error=True,
+                )
+                if self._account_no:
+                    cards = [
+                        card for card in cards if card.account_no == self._account_no
+                    ]
+                self._cached_cards = cards
         reconciliation_changed = False
         if canonical_available:
             reconciliation_changed = bool(
@@ -1005,7 +1242,9 @@ class BuyboardRuntimeWorker(QThread):
             # Reconciliation persists cloned reducer outputs. Reload before
             # the heartbeat so every later decision sees current truth.
             cards = repo.list_trade_cards(
-                self._db_engine, environment=self._environment
+                self._db_engine,
+                environment=self._environment,
+                raise_on_error=True,
             )
             if self._account_no:
                 cards = [
@@ -1022,6 +1261,13 @@ class BuyboardRuntimeWorker(QThread):
                 if id(card) not in changed_ids:
                     changed_ids.add(id(card))
                     changed.append(card)
+
+        if allow_mutations:
+            # Synchronize ORB state before deriving action/subscription sets.
+            # A card whose three ORB windows are terminal-invalid can return
+            # to Buylist here and leave both evaluation and feed capacity in
+            # this same cycle.
+            _track(self._sync_orb_plans(cards))
 
         # The periodic refresh runs over every account regardless of
         # readiness. Later work is gated per card/action: an unrelated
@@ -1055,12 +1301,6 @@ class BuyboardRuntimeWorker(QThread):
         }
         stop_card_keys = [card.card_key for card in observation_cards]
 
-        if allow_mutations:
-            # ORB observation is not an account/broker mutation. Keep each
-            # Buy Today plan current even when reconciliation blocks that
-            # account from submitting an order. Execution below remains
-            # restricted to ``execution_ready_cards``.
-            _track(self._sync_orb_plans(cards))
         # Observation readiness is intentionally broader than mutation
         # readiness: a reconciliation failure may block a command but must
         # never make the feed stop watching an existing position.
@@ -1174,8 +1414,50 @@ class BuyboardRuntimeWorker(QThread):
         self._acknowledge_market_breach_candidates(
             breach_ack_candidates, durable_breach_keys
         )
-        if changed or reconciliation_changed:
+        if changed or reconciliation_changed or operator_commands_changed:
             self.board_changed.emit()
+
+    def _process_operator_commands(self, *, limit: int = 20) -> bool:
+        """Apply live human requests only while this runtime owns execution."""
+
+        from src.services.operator_command_service import (
+            process_next_board_operator_command,
+        )
+
+        executor = LocalDeviceRole(
+            device_id=self._device_id,
+            hostname=self._hostname,
+            is_main=True,
+        )
+        changed = False
+        context = BoardActionContext(
+            enforce_runtime_fences=False,
+            engine_enabled=True,
+            readiness_generation=int(self.readiness_generation or 0),
+            reconciliation_in_progress=bool(
+                self.reconciliation_accounts_in_progress
+            ),
+            action_ready=True,
+            device_active=True,
+            regular_session_open=is_regular_session_open(),
+        )
+        for _ in range(max(1, int(limit))):
+            result = process_next_board_operator_command(
+                self._db_engine,
+                executor,
+                context=context,
+            )
+            if result is None:
+                break
+            changed = True
+            logger.info(
+                "Operator command %s %s -> %s%s",
+                result.command_type.value,
+                result.command_id,
+                result.status.value,
+                f": {result.error_message}" if result.error_message else "",
+            )
+        return changed
 
     _EXIT_CANCEL_STALLED_WARNING = "EXIT_CANCEL_STALLED"
     _UNRECONCILED_BROKER_ORDER_WARNING = "UNRECONCILED_BROKER_ORDER"
@@ -1597,7 +1879,26 @@ class BuyboardRuntimeWorker(QThread):
         if self._external_alerting is None:
             return
         try:
-            self._external_alerting.raise_alert(alert_type, dedupe_key, message)
+            sink_offline = getattr(self._external_alerting, "sink_offline", None)
+            sink = getattr(self._external_alerting, "sink", None)
+            if not self._database_writable and callable(sink_offline):
+                # Never spend the execution thread's short emergency lease
+                # allowance waiting on an alert webhook. The fsynced local
+                # spool is durable; the external watchdog independently sees
+                # the missing runtime heartbeat during the outage.
+                sink_offline(
+                    alert_type,
+                    dedupe_key,
+                    message,
+                    deliver_directly=False,
+                )
+            elif callable(sink):
+                sink(alert_type, dedupe_key, message)
+            else:
+                # Compatibility for focused test doubles and older adapters.
+                self._external_alerting.raise_alert(
+                    alert_type, dedupe_key, message
+                )
         except Exception:
             logger.exception("Could not persist external alert %s", alert_type.value)
 
@@ -2183,6 +2484,8 @@ class BuyboardRuntimeWorker(QThread):
                     changed.append(card)
                 continue
             before = (
+                card.board_status,
+                card.board_status_updated_at,
                 card.name,
                 card.breakout_price,
                 card.entry_runtime_status,
@@ -2197,9 +2500,12 @@ class BuyboardRuntimeWorker(QThread):
                 card.selected_orb_window,
                 card.market_data_last_trusted_price,
                 card.market_data_last_trusted_at,
+                card.buy_today_note,
             )
             self._orb_evaluator.update_card(card, item)
             after = (
+                card.board_status,
+                card.board_status_updated_at,
                 card.name,
                 card.breakout_price,
                 card.entry_runtime_status,
@@ -2214,6 +2520,7 @@ class BuyboardRuntimeWorker(QThread):
                 card.selected_orb_window,
                 card.market_data_last_trusted_price,
                 card.market_data_last_trusted_at,
+                card.buy_today_note,
             )
             if before != after:
                 changed.append(card)
@@ -2235,7 +2542,7 @@ class BuyboardRuntimeWorker(QThread):
                     trade_priority = SubscriptionPriority.ENTRY_PENDING
                 elif card.board_status == BoardStatus.BUY_TODAY:
                     trade_priority = (
-                        SubscriptionPriority.BUY_TODAY
+                        _buy_today_subscription_priority(card)
                         if self._card_in_execution_scope(card)
                         else SubscriptionPriority.DISPLAY_ONLY
                     )
@@ -2252,7 +2559,7 @@ class BuyboardRuntimeWorker(QThread):
                     quote_priority = SubscriptionPriority.ENTRY_PENDING
                 elif card.board_status == BoardStatus.BUY_TODAY:
                     quote_priority = (
-                        SubscriptionPriority.BUY_TODAY
+                        _buy_today_subscription_priority(card)
                         if self._card_in_execution_scope(card)
                         else SubscriptionPriority.DISPLAY_ONLY
                     )

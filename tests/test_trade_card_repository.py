@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import pytest
 from sqlalchemy import create_engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import NullPool
 
 from src.core.trade_card_state import BoardStatus, TradeCardState
@@ -58,6 +59,27 @@ def test_create_then_get_round_trips(tmp_path):
     assert fetched is not None
     assert fetched.symbol == "AAPL"
     assert fetched.version == 1
+
+
+def test_strict_reads_do_not_turn_database_outage_into_missing_cards(monkeypatch):
+    outage = OperationalError(
+        "SELECT trade_cards", {}, RuntimeError("canonical database offline")
+    )
+    monkeypatch.setattr(
+        repo,
+        "_ensure_trade_cards_table",
+        lambda _engine: (_ for _ in ()).throw(outage),
+    )
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+
+    assert repo.list_trade_cards(engine) == []
+    assert repo.get_trade_card(engine, "PROD", "1", "AAPL") is None
+    with pytest.raises(OperationalError):
+        repo.list_trade_cards(engine, raise_on_error=True)
+    with pytest.raises(OperationalError):
+        repo.get_trade_card(
+            engine, "PROD", "1", "AAPL", raise_on_error=True
+        )
 
 
 def test_create_duplicate_raises_version_conflict(tmp_path):

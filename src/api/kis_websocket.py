@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import random
+import sys
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -23,6 +24,24 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from src.api.kis_ws_auth import KisWsApprovalKeyProvider, KisWsAuthError
 
 logger = logging.getLogger(__name__)
+
+_EVENT_LOOP_START_ATTEMPTS = 3
+_EVENT_LOOP_RETRY_SECONDS = 0.25
+
+
+def _websocket_event_loop() -> asyncio.AbstractEventLoop:
+    """Create the private loop used by the WebSocket transport thread.
+
+    The Windows Proactor constructor can intermittently fail while creating
+    its internal socket pair (WinError 10014), particularly during a busy Qt
+    startup.  WebSocket traffic needs ordinary socket readiness only, so a
+    thread-local Selector loop avoids that IOCP bootstrap without changing
+    the process-wide asyncio policy.
+    """
+
+    if sys.platform == "win32":
+        return asyncio.SelectorEventLoop()
+    return asyncio.new_event_loop()
 
 
 def _utc_now() -> datetime:
@@ -165,6 +184,9 @@ class KisWebSocketClient:
         clock: Callable[[], datetime] = _utc_now,
         random_source: Callable[[], float] = random.random,
         critical_alert: CriticalCallback = lambda message: None,
+        event_loop_factory: Optional[
+            Callable[[], asyncio.AbstractEventLoop]
+        ] = None,
     ) -> None:
         self._url = str(url or "")
         self._approval_keys = approval_keys
@@ -175,6 +197,7 @@ class KisWebSocketClient:
         self._clock = clock
         self._random = random_source
         self._critical_alert = critical_alert
+        self._event_loop_factory = event_loop_factory or _websocket_event_loop
         self._desired: Dict[Tuple[str, str], KisWsSubscription] = {}
         self._desired_lock = threading.Lock()
         self._data_callbacks: list[DataCallback] = []
@@ -303,16 +326,77 @@ class KisWebSocketClient:
             raise ValueError("KIS WebSocket URL is not configured")
         self._stop_event.clear()
         self._thread = threading.Thread(
-            target=lambda: asyncio.run(self.run_forever()),
+            target=self._run_thread,
             name="KisWebSocketClient",
             daemon=True,
         )
         self._thread.start()
 
+    def _run_thread(self) -> None:
+        """Own one event loop and contain bootstrap failures inside the thread."""
+
+        loop: Optional[asyncio.AbstractEventLoop] = None
+        try:
+            for attempt in range(1, _EVENT_LOOP_START_ATTEMPTS + 1):
+                try:
+                    loop = self._event_loop_factory()
+                    break
+                except OSError as exc:
+                    if attempt >= _EVENT_LOOP_START_ATTEMPTS:
+                        raise
+                    logger.warning(
+                        "KIS WebSocket event-loop startup failed (%s); "
+                        "retrying (%d/%d)",
+                        exc,
+                        attempt,
+                        _EVENT_LOOP_START_ATTEMPTS,
+                    )
+                    if self._stop_event.wait(
+                        _EVENT_LOOP_RETRY_SECONDS * attempt
+                    ):
+                        return
+            if loop is None or self._stop_event.is_set():
+                return
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(self.run_forever())
+        except Exception as exc:
+            self._connected = False
+            self._loop = None
+            logger.exception("KIS WebSocket thread stopped during startup")
+            self._notify_connection(
+                False,
+                f"KIS WebSocket thread failed: {exc}",
+                self._reconnect_generation,
+            )
+        finally:
+            if loop is not None:
+                try:
+                    pending = asyncio.all_tasks(loop)
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        loop.run_until_complete(
+                            asyncio.gather(*pending, return_exceptions=True)
+                        )
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                except Exception:
+                    logger.debug(
+                        "KIS WebSocket event-loop cleanup failed", exc_info=True
+                    )
+                finally:
+                    loop.close()
+            asyncio.set_event_loop(None)
+
     def stop(self) -> None:
         self._stop_event.set()
-        if self._loop is not None and self._socket is not None:
-            asyncio.run_coroutine_threadsafe(self._socket.close(), self._loop)
+        loop = self._loop
+        socket = self._socket
+        if loop is not None and socket is not None:
+            close_coro = socket.close()
+            try:
+                asyncio.run_coroutine_threadsafe(close_coro, loop)
+            except RuntimeError:
+                close_coro.close()
         if self._thread is not None:
             self._thread.join(timeout=5)
             self._thread = None

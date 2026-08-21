@@ -164,8 +164,8 @@ flowchart TB
 | Column | How it is entered | What the heartbeat does | How it leaves | Lifetime / expiry behavior |
 |---|---|---|---|---|
 | `WATCHLIST` | Bootstrap, migration, or `MoveToWatchlist` | May copy an already-computed ORB candidate into pre-entry fields. It does not subscribe the symbol for live execution quotes and cannot place an order. | User moves it to Buylist. | No automatic expiry. It persists until a command or authoritative reconciliation changes it. |
-| `BUYLIST` | User move, safe entry withdrawal, zero-fill user/EOD cancellation, migration | May refresh the existing ORB plan, but never attempts an entry. | User moves it to Watchlist or activates it for today. | No automatic expiry. |
-| `BUY_TODAY` | `ActivateForToday`, or return from a rejected/TTL-cancelled zero-fill attempt | Subscribes live quotes, syncs the selected ORB candidate, recovers retry/capital/data states, and attempts a BUY only when `EXECUTE_READY`, the regular session is open, the quote is fresh and over the trigger, and all ownership/risk/capital/readiness gates pass. | Submission/duplicate/ambiguous result moves it to Entry Pending; a pre-identity user removal or EOD cleanup moves it to Buylist. | Today's authorization ends in the EOD window, **60 seconds before regular close by default**. With no durable order it resets to Buylist. If a durable order exists, it becomes Entry Pending instead of being discarded. |
+| `BUYLIST` | User move, safe entry withdrawal, all-window ORB rejection, zero-fill user/EOD cancellation, migration | Does not subscribe the symbol for Buy Today execution and never attempts an entry. An automatic ORB rejection return displays a durable memo with each window's reason. | User moves it to Watchlist or activates it for today. | No automatic expiry. |
+| `BUY_TODAY` | `ActivateForToday`, or return from a rejected/TTL-cancelled zero-fill attempt | Subscribes live quotes, syncs the selected ORB candidate, recovers retry/capital/data states, and attempts a BUY only when `EXECUTE_READY`, the regular session is open, the quote is fresh and over the trigger, and all ownership/risk/capital/readiness gates pass. | Submission/duplicate/ambiguous result moves it to Entry Pending; a pre-identity user removal or EOD cleanup moves it to Buylist. If all 1m, 5m, and 30m plans are conclusively `REJECTED`/`RISK_INVALID`, a card with no BUY identity automatically returns to Buylist. | Today's authorization ends in the EOD window, **60 seconds before regular close by default**. With no durable order it resets to Buylist. If a durable order exists, it becomes Entry Pending instead of being discarded. |
 | `ENTRY_PENDING` | A submitted, duplicate, discovered, or ambiguous BUY identity | Reconciles the tracked entry every heartbeat. Any fill is immediately projected and protected; the engine never waits for the TTL before applying a fill. It blocks a second BUY while identity/status is unresolved. | Any fill moves the visible card to Open Position; confirmed zero-fill user/EOD cancel moves to Buylist; automatic TTL cancel or rejection returns a zero-fill card to Buy Today for cooldown/retry. | Entry attempt deadline is **15 seconds** by default. Deadline passage requests cancellation; it does **not** mark the order canceled. The card can remain pending without a maximum duration while broker identity or cancel confirmation is unresolved. |
 | `OPEN_POSITION` | Any confirmed entry fill or broker holding discovery | Keeps broker quantity/orderable quantity reconciled, evaluates the active stop on execution-grade regular-session events, flags stale/outage data, and may retry an incomplete entry target while safe. | User requests Partial Sell/Sell All; stop or outage policy initiates Sell All; broker reconciliation can update lifecycle facts. | No position expiry. At EOD the engine stops trying to complete any remaining entry target, but the existing position and protection remain open. |
 | `PARTIAL_SELL` | User requests a positive quantity below current orderable shares | Submits one partial SELL when no conflicting sell is working, reconciles it each heartbeat, and escalates to cancel after its attempt deadline. A stop cancels/supersedes the partial path before full liquidation. | Terminal reconciliation returns to Open Position with refreshed shares; stop/liquidation moves to Sell All. | Each partial-exit attempt has a **10-second** deadline. The deadline requests cancel; it does not assume completion. Rejected/error submissions wait **5 seconds** before retry. |
@@ -330,6 +330,24 @@ There is deliberately no `Board -> KIS` edge.
 - Other devices run as standby/read-only. Their broker is wrapped in `ReadOnlyBroker` even if higher-level code is invoked accidentally.
 - Role changes stop and recompose the worker while retaining market-data handoff so an unacknowledged stop breach is not discarded.
 
+### Cross-device operator commands
+
+Execution ownership and human input ownership are independent. The Execution
+Owner is the only runtime that may mutate canonical live state or reach KIS.
+The Operator Control device may submit idempotent human requests, but never
+applies them directly. During the regular session, Buy Today activation,
+entry cancellation, partial/sell-all, and stop changes use the append-only
+`operator_commands` table. A locked Operator Control rejects new inserts but
+does not stop existing automatic execution or protection.
+
+The Execution Owner claims and applies requests exactly once. Pending requests
+may follow a safe owner transfer. A transfer is fenced while a request is
+already accepted or later in its nonterminal lifecycle, so no executor change
+can strand in-flight human intent. Pre-market **Publish Today's Plan** remains
+a separate atomic four-document publish and is disabled during the regular
+session. See [execution_operator_control.md](execution_operator_control.md)
+for the operator workflow and troubleshooting checklist.
+
 ### Startup and readiness
 
 Before mutation, the worker performs startup reconciliation for every discovered account. Its readiness value exposes independent facts:
@@ -351,15 +369,16 @@ Readiness is action-specific. A new entry needs complete new-entry evidence, a k
 An active cycle performs this high-level sequence:
 
 1. Load canonical cards, verified mutation budgets, and emergency ownership proofs.
-2. Refresh account/order state when due and persist reconciliation results.
-3. Reload cards so subsequent decisions use the newest broker truth.
-4. Select action-ready cards while continuing quote observation for every relevant position.
-5. Copy the existing execution queue's ORB candidate into pre-entry cards; do not recompute ORB logic.
-6. Synchronize quote subscriptions and stop rules.
-7. Drain execution-grade market events; evaluate active stops, pending-stop handoff, and ready entries.
-8. Run the trading heartbeat stages.
-9. Rotate any newly changed stop rules and immediately evaluate detached events.
-10. Persist changed cards with optimistic versions, acknowledge only durable stop breaches, emit board refreshes, and raise critical alerts.
+2. If active, claim and apply queued operator commands, then reload canonical cards.
+3. Refresh account/order state when due and persist reconciliation results.
+4. Reload cards so subsequent decisions use the newest broker truth.
+5. Copy the existing execution queue's ORB candidate into pre-entry cards; return conclusively rejected all-window plans to Buylist.
+6. Select action-ready cards while continuing quote observation for every relevant position.
+7. Synchronize quote subscriptions and stop rules.
+8. Drain execution-grade market events; evaluate active stops, pending-stop handoff, and ready entries.
+9. Run the trading heartbeat stages.
+10. Rotate any newly changed stop rules and immediately evaluate detached events.
+11. Persist changed cards with optimistic versions, acknowledge only durable stop breaches, emit board refreshes, and raise critical alerts.
 
 The heartbeat stages are ordered:
 
@@ -383,13 +402,15 @@ Each stage isolates failures per card and the outer heartbeat isolates failures 
 
 1. `ActivateForToday` moves a safe Buylist card to `BUY_TODAY` and records monitoring intent.
 2. `TradeCardOrbEvaluator` copies the existing execution queue candidate into the card. Candidate status maps to badges such as `ORB_FORMING`, `WAITING_BREAKOUT`, `ARMED`, `EXECUTE_READY`, or `RISK_INVALID`.
-3. The runtime attempts an entry only during the regular session when the card is `EXECUTE_READY`, the execution-grade quote is connected/fresh, and price clears the persisted entry trigger.
-4. The live marketable price and current account equity/buying power are used for final sizing. A fresh `PreTradeRiskDecision` must match the complete submitted order fingerprint.
-5. Attempt group, attempt number, client order ID, and capital reservation correlation are persisted before crossing the broker boundary.
-6. `EntryAttemptManager` serializes the symbol, applies capital and mutation-budget controls, and submits through the shared gateway.
-7. Submitted, duplicate, or ambiguous outcomes move the card to `ENTRY_PENDING`; ambiguous state blocks resubmission until reconciled.
-8. Reconciliation applies cumulative fill evidence. The first confirmed fill moves the card to `OPEN_POSITION`, freezes entry ORB facts, and installs initial protection. Remaining target quantity may be retried under the entry-completion policy.
-9. A broker-confirmed zero-fill cancellation/expiry returns the card to `BUYLIST`. A UI cancel request alone does not.
+3. Once all three supported windows are present and terminal-invalid, a pre-identity card returns to Buylist, clears its live entry plan, releases its execution feed subscription, and records one rejection memo. Missing, unavailable, or forming data cannot trigger this return.
+4. Ready entries receive the highest new-entry subscription priority; armed/waiting-breakout entries rank next; still-forming Buy Today plans rank after them. Working orders, open positions, and protective exits always remain ahead of new entries.
+5. The runtime attempts an entry only during the regular session when the card is `EXECUTE_READY`, the execution-grade quote is connected/fresh, and price clears the persisted entry trigger.
+6. The live marketable price and current account equity/buying power are used for final sizing. A fresh `PreTradeRiskDecision` must match the complete submitted order fingerprint.
+7. Attempt group, attempt number, client order ID, and capital reservation correlation are persisted before crossing the broker boundary.
+8. `EntryAttemptManager` serializes the symbol, applies capital and mutation-budget controls, and submits through the shared gateway.
+9. Submitted, duplicate, or ambiguous outcomes move the card to `ENTRY_PENDING`; ambiguous state blocks resubmission until reconciled.
+10. Reconciliation applies cumulative fill evidence. The first confirmed fill moves the card to `OPEN_POSITION`, freezes entry ORB facts, and installs initial protection. Remaining target quantity may be retried under the entry-completion policy.
+11. A broker-confirmed zero-fill cancellation/expiry returns the card to `BUYLIST`. A UI cancel request alone does not.
 
 ## Position, Stop, and Exit Logic
 
@@ -453,6 +474,23 @@ Canonical SQL state is authoritative whenever reachable. The Kanban path uses ro
 Every successful standalone card write updates `data/trade_cards.json` using the application's atomic write and rolling `.bak` behavior. The snapshot is a recovery/migration tier, not a peer database and not normal runtime authority.
 
 During a canonical-database outage, normal entry mutation is closed. The narrowly bounded emergency path permits only eligible protective work with a recently verified lease/ownership proof and durable local emergency-journal evidence. Recovery requires reconciliation before the canonical mutation gate reopens.
+
+Strict runtime reads propagate database failure instead of converting it to an
+empty TradeCard collection. If MySQL disappears between the write probe and a
+cycle read, the worker preserves its last canonical card cache, marks the
+gateway offline immediately, and stops database heartbeat/incident-table calls
+until recovery. This keeps the cycle available for bounded protection rather
+than spending it on repeated connection timeouts. Known-offline critical alerts
+are fsynced to the local spool without retrying the database or waiting on a
+webhook from the execution thread; the independent watchdog observes the
+missing heartbeat, and the spool is imported after database recovery.
+
+Execution ownership does not relocate the database. In the documented
+two-machine deployment, Laptop-as-Execution-Owner still depends on MySQL hosted
+by the PC. The local SQLite market-data mirror and TradeCard recovery snapshot
+are intentionally not writable peer authorities. Continuous operation with
+either trading device powered off requires an independent highly available
+canonical MySQL deployment.
 
 Shutdown is ordered: close command acceptance, flush journals, perform final read-only reconciliation, close market data, and persist the final device state. Failed shutdown preparation remains visible instead of pretending the runtime stopped cleanly.
 

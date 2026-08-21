@@ -512,6 +512,51 @@ class ExternalAlertingService:
             return
         except Exception as exc:
             database_error = str(exc)
+        self._deliver_offline_incident(
+            resolved_type,
+            key,
+            str(message),
+            database_error=database_error,
+        )
+
+    def sink_offline(
+        self,
+        alert_class: str,
+        dedupe_key: str,
+        message: str,
+        *,
+        database_error: str = "Canonical database is unavailable",
+        deliver_directly: bool = True,
+    ) -> None:
+        """Spool/deliver an incident when the caller already proved DB loss.
+
+        Retrying the same unavailable database before writing the local spool
+        adds another connection timeout at the worst possible moment. This
+        seam preserves the same durable and external-delivery behavior while
+        skipping that known-futile retry.
+        """
+
+        resolved_type = self._normalize_type(alert_class).value
+        key = str(dedupe_key or "").strip()
+        if not key:
+            raise ValueError("Critical alert requires a dedupe_key")
+        self._deliver_offline_incident(
+            resolved_type,
+            key,
+            str(message),
+            database_error=str(database_error),
+            deliver_directly=bool(deliver_directly),
+        )
+
+    def _deliver_offline_incident(
+        self,
+        resolved_type: str,
+        key: str,
+        message: str,
+        *,
+        database_error: str,
+        deliver_directly: bool = True,
+    ) -> None:
         pending = None
         is_new_pending = False
         spool_error: Optional[Exception] = None
@@ -519,7 +564,7 @@ class ExternalAlertingService:
             pending, is_new_pending = self.local_spool.record_alert_occurrence(
                 alert_type=resolved_type,
                 dedupe_key=key,
-                message=str(message),
+                message=message,
                 database_error=database_error,
             )
         except Exception as exc:
@@ -528,6 +573,13 @@ class ExternalAlertingService:
             spool_error = exc
         if pending is not None and not is_new_pending:
             return
+        if not deliver_directly:
+            if pending is None:
+                raise RuntimeError(
+                    "Critical alert could not be written to the offline spool: "
+                    f"{spool_error}"
+                )
+            return
         offline_event_id = (
             str(pending["event_id"]) if pending is not None else uuid4().hex
         )
@@ -535,7 +587,7 @@ class ExternalAlertingService:
             "incident_id": f"offline-{offline_event_id}",
             "alert_type": resolved_type,
             "dedupe_key": key,
-            "message": str(message),
+            "message": message,
             "device_id": self.device_id,
             "requires_acknowledgement": True,
             "offline_spool": pending is not None,
