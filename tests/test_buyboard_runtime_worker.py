@@ -2766,6 +2766,52 @@ def test_sync_quote_subscriptions_adds_and_removes(tmp_path):
     assert "STALE" not in subscribed
 
 
+def test_sync_quote_subscriptions_excludes_inactive_board_cards(tmp_path):
+    worker, _ = _worker(tmp_path)
+    configured = {}
+
+    class _MarketData:
+        def configure_desired_channels(self, **kwargs):
+            configured.update(kwargs)
+
+    worker.runtime = SimpleNamespace(market_data=_MarketData())
+    cards = [
+        TradeCardState(
+            environment="PROD",
+            account_no="1",
+            symbol="WATCH",
+            board_status=BoardStatus.WATCHLIST,
+        ),
+        TradeCardState(
+            environment="PROD",
+            account_no="1",
+            symbol="BUY",
+            board_status=BoardStatus.BUYLIST,
+        ),
+        TradeCardState(
+            environment="PROD",
+            account_no="1",
+            symbol="DONE",
+            board_status=BoardStatus.CLOSED,
+        ),
+        TradeCardState(
+            environment="PROD",
+            account_no="1",
+            symbol="ACTIVE",
+            board_status=BoardStatus.OPEN_POSITION,
+        ),
+    ]
+
+    worker._sync_quote_subscriptions(cards)
+
+    assert configured["trade_priorities"] == {
+        "ACTIVE": int(SubscriptionPriority.OPEN_POSITION),
+    }
+    assert configured["quote_priorities"] == {
+        "ACTIVE": int(SubscriptionPriority.CRITICAL_EXIT),
+    }
+
+
 def test_controlled_live_planning_cards_are_display_only_and_not_executable(
     tmp_path, monkeypatch
 ):

@@ -2705,6 +2705,13 @@ class BuyboardRuntimeWorker(QThread):
             trade_priorities: Dict[str, int] = {}
             quote_priorities: Dict[str, int] = {}
             for card in cards:
+                # Planning/archive cards do not participate in execution and
+                # must not consume KIS WebSocket resolution or subscription
+                # capacity.  Passing them as DISPLAY_ONLY still makes the
+                # coordinator resolve both channels before it applies its
+                # capacity limits.
+                if card.board_status not in _QUOTE_SUBSCRIBED_STATUSES:
+                    continue
                 symbol = card.symbol
                 if card.board_status in {BoardStatus.SELL_ALL, BoardStatus.PARTIAL_SELL} or card.exit_all_required:
                     trade_priority = SubscriptionPriority.CRITICAL_EXIT
