@@ -1946,6 +1946,7 @@ def test_run_one_cycle_excludes_cards_from_accounts_with_startup_errors(tmp_path
     card = _seed_card(
         engine,
         board_status=BoardStatus.BUY_TODAY,
+        breakout_price=100.0,
         entry_runtime_status=EntryRuntimeStatus.RETRY_COOLDOWN,
     )
     import datetime as dt
@@ -2012,6 +2013,7 @@ def test_run_one_cycle_refreshes_orb_observation_for_reconciliation_blocked_acco
     _seed_card(
         engine,
         board_status=BoardStatus.BUY_TODAY,
+        breakout_price=101.25,
         entry_runtime_status=EntryRuntimeStatus.ORB_FORMING,
     )
     worker.startup_reconciliation_errors = {"1": "simulated KIS outage"}
@@ -2591,6 +2593,7 @@ def test_one_cycle_persists_engine_changes(tmp_path, monkeypatch):
     card = _seed_card(
         engine,
         board_status=BoardStatus.BUY_TODAY,
+        breakout_price=100.0,
         entry_runtime_status=EntryRuntimeStatus.RETRY_COOLDOWN,
     )
     card.next_retry_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=1)  # already due
@@ -2670,7 +2673,11 @@ def test_sync_orb_plans_applies_the_execution_queue_bridge(tmp_path):
         card_lookup=worker._card_lookup,
         broker=worker._broker,
     )
-    card = _seed_card(engine, board_status=BoardStatus.BUY_TODAY)
+    card = _seed_card(
+        engine,
+        board_status=BoardStatus.BUY_TODAY,
+        breakout_price=100.0,
+    )
     candidate = OrbCandidate(
         symbol="AAPL", window="5m", orb_low=95.0, orb_high=101.5,
         breakout_price=100.0, breakout_trigger=100.1, entry_trigger=101.5,
@@ -2723,7 +2730,11 @@ def test_sync_orb_plans_blocks_same_symbol_active_in_multiple_accounts(tmp_path)
 
 def test_sync_orb_plans_does_not_mark_price_only_movement_for_db_write(tmp_path):
     worker, engine = _worker(tmp_path)
-    card = _seed_card(engine, board_status=BoardStatus.BUY_TODAY)
+    card = _seed_card(
+        engine,
+        board_status=BoardStatus.BUY_TODAY,
+        breakout_price=100.0,
+    )
     candidate = OrbCandidate(
         symbol="AAPL",
         window="5m",
@@ -2761,16 +2772,23 @@ def test_sync_orb_plans_returns_fully_rejected_card_to_buylist(tmp_path):
     card = _seed_card(
         engine,
         board_status=BoardStatus.BUY_TODAY,
+        breakout_price=100.0,
         planned_quantity=10,
         target_position_quantity=10,
     )
-    item = ExecutionQueueItem(symbol="AAPL", environment="PROD", account_no="1")
+    item = ExecutionQueueItem(
+        symbol="AAPL",
+        environment="PROD",
+        account_no="1",
+        breakout_price=100.0,
+    )
     item.candidates = {
         window: OrbCandidate(
             symbol="AAPL",
             window=window,
             status=OrbCandidateStatus.REJECTED,
             valid=False,
+            breakout_price=100.0,
             source_session_date=_current_us_session_date(),
             terminal_rejection=True,
             reason=f"{window} invalid",

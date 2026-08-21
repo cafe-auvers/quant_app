@@ -710,10 +710,6 @@ class ChartsLayoutMixin:
         )
         self.tradingview_full_view_button = QPushButton("Full View (F)")
         self.tradingview_full_view_button.clicked.connect(self.reset_chart_full_view)
-        self.tradingview_add_watchlist_button = QPushButton("Add to Watchlist (W)")
-        self.tradingview_add_watchlist_button.clicked.connect(
-            self.add_current_tradingview_symbol_to_watchlist
-        )
         self.tradingview_queue_btn = QPushButton("Queue for Buy (Q)")
         self.tradingview_queue_btn.setMinimumWidth(150)
         self.tradingview_queue_btn.clicked.connect(self._tradingview_queue_toggle)
@@ -724,19 +720,15 @@ class ChartsLayoutMixin:
         tools_layout.addWidget(self.tradingview_line_tool_button)
         tools_layout.addWidget(self.tradingview_clear_target_button)
         tools_layout.addWidget(self.tradingview_erase_all_button)
-        tools_layout.addWidget(self.tradingview_add_watchlist_button)
         tools_layout.addWidget(self.tradingview_queue_btn)
         tools_layout.addWidget(self.tradingview_activate_btn)
         tools_layout.addWidget(self.tradingview_full_view_button)
         tools_layout.addStretch(1)
         layout.addLayout(tools_layout)
 
-        # Update queue/watchlist/activate buttons whenever symbol changes
+        # Update canonical queue/activate controls whenever the symbol changes.
         self.tradingview_symbol_combo.currentTextChanged.connect(
             self._update_tradingview_queue_btn
-        )
-        self.tradingview_symbol_combo.currentTextChanged.connect(
-            self._update_tradingview_watchlist_btn
         )
         self.tradingview_symbol_combo.currentTextChanged.connect(
             self._update_tradingview_activate_btn
@@ -806,13 +798,6 @@ class ChartsLayoutMixin:
         self.tradingview_full_view_shortcut.activated.connect(
             self.reset_chart_full_view
         )
-        self.tradingview_watchlist_shortcut = QShortcut(
-            QKeySequence("W"), self.tradingview_widget
-        )
-        self.tradingview_watchlist_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
-        self.tradingview_watchlist_shortcut.activated.connect(
-            self.add_current_tradingview_symbol_to_watchlist
-        )
         self.tradingview_load_shortcut = QShortcut(
             QKeySequence(Qt.Key_F4), self.tradingview_widget
         )
@@ -828,6 +813,5 @@ class ChartsLayoutMixin:
             lambda: self.load_tradingview_chart(force=True, fetch_live=True)
         )
         self._update_tradingview_queue_btn()
-        self._update_tradingview_watchlist_btn()
         self._update_tradingview_activate_btn()
         self.load_tradingview_chart(show_empty_message=False)

@@ -110,6 +110,8 @@ def test_main_window_constructs_and_closes_offscreen_without_external_io(monkeyp
     )
     assert not hasattr(window, "tradingview_add_watchlist_button")
     assert not hasattr(window, "tradingview_watchlist_shortcut")
+    assert not hasattr(window, "add_current_tradingview_symbol_to_watchlist")
+    assert not hasattr(window, "_update_tradingview_watchlist_btn")
     assert window.intraday_symbol_combo.count() == 0
     assert not hasattr(window, "intraday_status_label")
     assert not hasattr(window, "intraday_chart_view")

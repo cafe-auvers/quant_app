@@ -3930,20 +3930,6 @@ class MainWindow(
             "tradingview", self.tradingview_widget, "TradingView Chart"
         )
         self._build_tradingview_tab()
-        # The shared chart builder still creates two retired controls. Remove
-        # them immediately so there is no hidden action or shortcut that can
-        # mutate the persisted migration input.
-        watchlist_button = self.__dict__.get("tradingview_add_watchlist_button")
-        if watchlist_button is not None:
-            watchlist_button.setParent(None)
-            watchlist_button.deleteLater()
-            del self.tradingview_add_watchlist_button
-        watchlist_shortcut = self.__dict__.get("tradingview_watchlist_shortcut")
-        if watchlist_shortcut is not None:
-            watchlist_shortcut.setEnabled(False)
-            watchlist_shortcut.setParent(None)
-            watchlist_shortcut.deleteLater()
-            del self.tradingview_watchlist_shortcut
 
         self.health_widget = QWidget()
         self._add_configured_tab("health", self.health_widget, "Health")

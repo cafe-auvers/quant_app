@@ -74,8 +74,14 @@ def _card(symbol: str = "AAPL", **overrides) -> TradeCardState:
         symbol=symbol,
         board_status=BoardStatus.BUY_TODAY,
         entry_runtime_status=EntryRuntimeStatus.EXECUTE_READY,
+        # This helper bypasses the normal current-session ORB bridge, so it
+        # must supply the same complete, internally consistent geometry that
+        # production requires before TradingEngine may cross the broker gate.
+        breakout_price=99.0,
         entry_trigger=100.0,
+        entry_orb_high=100.0,
         entry_orb_low=95.0,
+        entry_orb_window="5m",
         stop_adr=30.0,
         risk_percent=0.01,
         selected_orb_window="5m",
