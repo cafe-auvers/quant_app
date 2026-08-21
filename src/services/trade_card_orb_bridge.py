@@ -78,7 +78,7 @@ def _positive_float(value) -> float | None:
         number = float(value)
     except (TypeError, ValueError):
         return None
-    return number if number > 0 else None
+    return number if math.isfinite(number) and number > 0 else None
 
 
 def _complete_candidate_for_card(
@@ -434,9 +434,6 @@ class TradeCardOrbEvaluator:
         execution_queue_item: ExecutionQueueItem,
         candidate,
     ) -> None:
-        queue_breakout = _positive_float(execution_queue_item.breakout_price)
-        if queue_breakout is not None:
-            card.breakout_price = queue_breakout
         card.selected_orb_window = (
             candidate.window or execution_queue_item.selected_window
         )
@@ -598,9 +595,34 @@ class TradeCardOrbEvaluator:
 
         if execution_queue_item.name and not card.name:
             card.name = execution_queue_item.name
+        canonical_breakout = _positive_float(card.breakout_price)
         queue_breakout = _positive_float(execution_queue_item.breakout_price)
-        if queue_breakout is not None:
-            card.breakout_price = queue_breakout
+        if (
+            canonical_breakout is None
+            or queue_breakout is None
+            or not math.isclose(
+                canonical_breakout,
+                queue_breakout,
+                rel_tol=1e-9,
+                abs_tol=1e-6,
+            )
+        ):
+            _clear_entry_plan(card)
+            card.entry_runtime_status = EntryRuntimeStatus.DATA_UNAVAILABLE
+            if canonical_breakout is None:
+                card.entry_block_reason = (
+                    "ORB execution blocked: the canonical breakout target is unavailable"
+                )
+            elif queue_breakout is None:
+                card.entry_block_reason = (
+                    "ORB execution blocked: the queue breakout snapshot is unavailable"
+                )
+            else:
+                card.entry_block_reason = (
+                    "ORB execution blocked: the queue breakout does not match the "
+                    "canonical target; waiting for a refreshed published plan"
+                )
+            return card
         observed_price = _positive_float(execution_queue_item.current_price)
         if observed_price is not None:
             card.market_data_last_trusted_price = observed_price

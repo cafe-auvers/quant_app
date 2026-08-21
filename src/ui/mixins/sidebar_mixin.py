@@ -39,7 +39,6 @@ from src.core.orb import (calculate_orb_range, evaluate_orb_entry_signal,
 from src.core.order_state import (OPEN_ORDER_STATUSES, BrokerOrder,
                                   OrderIntent, OrderSide, OrderStatus)
 from src.core.scanner import ComparisonOperator, ScanRule, StockScanner
-from src.core.trade_reviewer import TradeReviewer, TradeSetup
 from src.core.watchlist import (BuylistItem, BuylistManager, TradePlan,
                                 TradePlanManager, Watchlist)
 from src.risk.position_sizer import PositionSizer

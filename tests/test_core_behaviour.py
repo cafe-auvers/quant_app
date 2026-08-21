@@ -102,16 +102,10 @@ def test_orb_position_values_match_risk_plan_example():
     assert round(sizing["sl_adr"]) == 104
 
 
-def test_orb_risk_cases_include_custom_risk_and_headers():
+def test_orb_risk_cases_include_custom_risk():
     cases = MainWindow._orb_risk_cases(0.03)
-    headers = MainWindow._orb_position_plan_headers(cases)
 
     assert cases == [0.0025, 0.005, 0.0075, 0.01, 0.0125, 0.015, 0.0175, 0.02, 0.03]
-    assert headers[:4] == ["Metric", "0.25% 1m", "0.25% 5m", "0.25% 30m"]
-    assert "0.75% 1m" in headers
-    assert "1.25% 5m" in headers
-    assert "1.75% 30m" in headers
-    assert "3.00% 1m" in headers
 
 
 def test_orb_position_validity_requires_at_least_one_share():
@@ -140,85 +134,6 @@ def test_orb_position_rounds_fractional_shares_up_before_filtering():
     assert sizing["investment"] == 100.0
     assert sizing["capital_percent"] == 10.0
     assert MainWindow._orb_position_plan_is_valid(sizing, adr_percent=20.0) is True
-
-
-def test_watchlist_orb_no_entry_overrides_buy_ready_status_without_row_color():
-    display_status = MainWindow._watchlist_display_status("BUY_READY", "NO_ENTRY")
-    row_color = MainWindow._watchlist_status_row_color(display_status, "NO_ENTRY")
-
-    assert display_status == "NO_ENTRY"
-    assert row_color is None
-
-
-def test_watchlist_buy_ready_color_uses_effective_display_status():
-    display_status = MainWindow._watchlist_display_status("BUY_READY", None)
-    row_color = MainWindow._watchlist_status_row_color(display_status, None)
-
-    assert display_status == "BUY_READY"
-    assert row_color.getRgb()[:3] == (39, 174, 96)
-
-
-def test_watchlist_waiting_entry_status_is_green():
-    display_status = MainWindow._watchlist_display_status("BUY_READY", "WAITING_ENTRY")
-    row_color = MainWindow._watchlist_status_row_color(display_status, "WAITING_ENTRY")
-
-    assert display_status == "WAITING_ENTRY"
-    assert row_color.getRgb()[:3] == (39, 174, 96)
-
-
-def test_watchlist_below_breakout_has_no_special_row_color():
-    display_status = MainWindow._watchlist_display_status("BUY_READY", "BELOW_BREAKOUT")
-    row_color = MainWindow._watchlist_status_row_color(display_status, "BELOW_BREAKOUT")
-
-    assert display_status == "BELOW_BREAKOUT"
-    assert row_color is None
-
-
-def test_watchlist_score_cache_merge_preserves_orb_status():
-    merged = MainWindow._merge_watchlist_score_cache(
-        {"orb_status": "NO_ENTRY", "price": 100.0},
-        {"status": "BUY_READY", "price": 101.0},
-    )
-
-    assert merged["orb_status"] == "NO_ENTRY"
-    assert merged["status"] == "BUY_READY"
-    assert merged["price"] == 101.0
-
-
-def test_watchlist_orb_status_derivation_uses_only_valid_real_sizing_records():
-    records = [
-        {"valid": False, "sizing": {}, "entry_signal_key": "confirmed_orb_breakout", "status_reason": "invalid_sizing"},
-        {"valid": True, "sizing": {"shares": 10}, "entry_signal_key": "no_entry"},
-    ]
-
-    assert MainWindow._derive_watchlist_orb_status(records) == "WAITING_ENTRY"
-    assert MainWindow._derive_watchlist_orb_status([]) == "NO_INTRADAY"
-
-
-def test_watchlist_orb_status_derivation_splits_no_entry_reasons():
-    no_intraday = [
-        {"valid": False, "sizing": {}, "status_reason": "no_intraday"},
-    ]
-    no_valid_orb = [
-        {"valid": False, "sizing": {}, "status_reason": "no_orb"},
-        {"valid": False, "sizing": {}, "status_reason": "invalid_sizing"},
-    ]
-    below_breakout = [
-        {"valid": False, "sizing": {"shares": 10}, "status_reason": "below_breakout"},
-    ]
-
-    assert MainWindow._derive_watchlist_orb_status(no_intraday) == "NO_INTRADAY"
-    assert MainWindow._derive_watchlist_orb_status(no_valid_orb) == "NO_VALID_ORB"
-    assert MainWindow._derive_watchlist_orb_status(below_breakout) == "BELOW_BREAKOUT"
-
-
-def test_watchlist_orb_status_derivation_detects_confirmed_entry():
-    records = [
-        {"valid": True, "sizing": {"shares": 10}, "entry_signal_key": "no_entry"},
-        {"valid": True, "sizing": {"shares": 5}, "entry_signal_key": "confirmed_orb_breakout"},
-    ]
-
-    assert MainWindow._derive_watchlist_orb_status(records) == "BUY_READY"
 
 
 def test_orb_position_validity_requires_capital_percent_between_10_and_30():
@@ -285,8 +200,6 @@ def test_orb_recommendation_prefers_ideal_sl_adr_capital_and_lower_risk():
     less_ideal_score = MainWindow._score_orb_position_recommendation(less_ideal, risk_percent=0.02)
 
     assert ideal_score > less_ideal_score
-    assert MainWindow._format_orb_recommendation(ideal_score, valid=True).startswith("Excellent")
-    assert MainWindow._format_orb_recommendation(ideal_score, valid=False) == "Invalid"
 
 
 def test_orb_best_recommendation_prefers_higher_score_then_lower_risk():
@@ -431,21 +344,6 @@ def test_orb_entry_signal_buffer_applied_correctly():
     assert result.breakout_trigger == 100.1
     assert result.entry_trigger == 100.0
     assert result.signal == "orb_high_below_breakout_trigger"
-
-
-def test_orb_plan_records_sort_best_recommendation_first():
-    records = [
-        {"valid": True, "recommendation_score": 70.0, "risk_percent": 0.005},
-        {"valid": False, "recommendation_score": 99.0, "risk_percent": 0.0025},
-        {"valid": True, "recommendation_score": 90.0, "risk_percent": 0.02},
-        {"valid": True, "recommendation_score": 90.0, "risk_percent": 0.005},
-    ]
-
-    sorted_records = MainWindow._sort_orb_plan_records(records)
-
-    assert sorted_records[0]["recommendation_score"] == 90.0
-    assert sorted_records[0]["risk_percent"] == 0.005
-    assert sorted_records[-1]["valid"] is False
 
 
 def test_extract_latest_opening_bar_returns_first_bar_of_latest_session():
@@ -1764,71 +1662,6 @@ def test_tradingview_step_uses_sidebar_symbol_order():
     assert window.sidebar_stock_list.current_row == 1
 
 
-def test_tradingview_add_current_symbol_to_watchlist():
-    class Combo:
-        def currentText(self):
-            return "MSFT"
-
-    window = MainWindow.__new__(MainWindow)
-    window.tradingview_symbol_combo = Combo()
-    window.watchlist = Watchlist()
-    window._get_sidebar_selected_data = lambda: {"symbol": "MSFT", "name": "Microsoft"}
-    window.populate_watchlist_table = lambda: None
-    window.update_dashboard_summary = lambda: None
-    window._save_state = lambda: None
-    window.prefetch_intraday_cache_for_symbol = lambda symbol: None
-    window.append_log = lambda message: None
-
-    window.add_current_tradingview_symbol_to_watchlist()
-
-    item = window.watchlist.get("MSFT")
-    assert item is not None
-    assert item.name == "Microsoft"
-
-
-def test_tradingview_add_current_symbol_toggles_existing_watchlist_item():
-    class Combo:
-        def currentText(self):
-            return "MSFT"
-
-    window = MainWindow.__new__(MainWindow)
-    window.tradingview_symbol_combo = Combo()
-    window.watchlist = Watchlist()
-    window.watchlist.add("MSFT", "Microsoft")
-    window.populate_watchlist_table = lambda: None
-    window.update_dashboard_summary = lambda: None
-    window._save_state = lambda: None
-    window.append_log = lambda message: None
-
-    window.add_current_tradingview_symbol_to_watchlist()
-
-    assert window.watchlist.get("MSFT") is None
-
-
-def test_tradingview_add_current_symbol_removes_regardless_of_sidebar_source():
-    class Combo:
-        def currentText(self):
-            return "MSFT"
-
-    class SidebarSourceCombo:
-        def currentData(self):
-            return {"type": "scan", "setup": "Breakout"}
-
-    window = MainWindow.__new__(MainWindow)
-    window.tradingview_symbol_combo = Combo()
-    window.sidebar_source_combo = SidebarSourceCombo()
-    window.watchlist = Watchlist()
-    window.watchlist.add("MSFT", "Microsoft")
-    window.populate_watchlist_table = lambda: None
-    window.update_dashboard_summary = lambda: None
-    window._save_state = lambda: None
-    window.append_log = lambda message: None
-
-    window.add_current_tradingview_symbol_to_watchlist()
-
-    assert window.watchlist.get("MSFT") is None
-
-
 def test_tradingview_activate_dispatches_buyboard_command_without_legacy_monitor():
     from src.core.board_workflow import BoardCardProjection
     from src.core.trade_card_state import BoardStatus, TradeCardState
@@ -1868,6 +1701,7 @@ def test_tradingview_activate_dispatches_buyboard_command_without_legacy_monitor
         account_no="1",
         symbol="AAPL",
         board_status=BoardStatus.BUYLIST,
+        breakout_price=100.0,
     )
     window._buyboard_current_projections = (BoardCardProjection(card=card),)
     logs = []
@@ -1876,9 +1710,11 @@ def test_tradingview_activate_dispatches_buyboard_command_without_legacy_monitor
     window.prefetch_intraday_cache_for_symbol = lambda _symbol: None
     window._update_tradingview_activate_btn = lambda: None
     dispatched = []
-    window._buyboard_dispatch_command = lambda command, **kwargs: dispatched.append(
-        (command, kwargs)
-    )
+    def dispatch(command, **kwargs):
+        dispatched.append((command, kwargs))
+        return True
+
+    window._buyboard_dispatch_command = dispatch
 
     window._tradingview_activate_toggle()
 
@@ -2189,75 +2025,16 @@ def test_trade_plan_account_value_extracts_tot_evlu_amt():
     assert MainWindow._extract_kis_account_value_krw(snapshot) == 10_000_000
 
 
-def test_trade_plan_latest_price_updates_entry_and_stop():
-    class Input:
-        def __init__(self, value=""):
-            self.value = value
-
-        def text(self):
-            return self.value
-
-        def setText(self, value):
-            self.value = value
-
-        def blockSignals(self, blocked):
-            return False
-
+def test_chart_latest_price_updates_shared_cache():
     window = MainWindow.__new__(MainWindow)
     window.latest_intraday_prices = {}
-    window.symbol_input = Input("AAPL")
-    window.entry_price_input = Input()
-    window.stop_loss_input = Input()
-    window.update_trade_plan_feedback = lambda: None
 
     window.update_trade_prices_from_latest("AAPL", 100.0)
 
     assert window.latest_intraday_prices["AAPL"] == 100.0
-    assert window.entry_price_input.text() == "100.00"
-    assert window.stop_loss_input.text() == "92.00"
 
 
-def test_intraday_watchlist_step_wraps_and_plots():
-    class Combo:
-        def __init__(self):
-            self.items = ["AAPL", "MSFT"]
-            self.index = 0
-
-        def count(self):
-            return len(self.items)
-
-        def currentIndex(self):
-            return self.index
-
-        def setCurrentIndex(self, index):
-            self.index = index
-
-        def currentText(self):
-            return self.items[self.index]
-
-    window = MainWindow.__new__(MainWindow)
-    window.intraday_symbol_combo = Combo()
-    window.plot_count = 0
-    window.plot_intraday_watchlist_symbol = lambda: setattr(window, "plot_count", window.plot_count + 1)
-
-    window.step_intraday_watchlist_symbol(1)
-    assert window.intraday_symbol_combo.currentText() == "MSFT"
-    assert window.plot_count == 1
-
-    window.step_intraday_watchlist_symbol(1)
-    assert window.intraday_symbol_combo.currentText() == "AAPL"
-    assert window.plot_count == 2
-
-
-def test_intraday_window_days_parser_and_backfill_decision():
-    class Combo:
-        def currentText(self):
-            return "7D"
-
-    window = MainWindow.__new__(MainWindow)
-    window.intraday_window_combo = Combo()
-
-    assert window._get_intraday_window_days() == 7
+def test_intraday_cache_backfill_decision():
     since = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None) - dt.timedelta(days=7)
     empty = pd.DataFrame()
     assert MainWindow._intraday_cache_needs_backfill(empty, since) is True

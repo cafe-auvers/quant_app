@@ -66,8 +66,9 @@ itself; confirm the mode, symbol scope, and cap shown beside it.
 
 Pre-market publishing and live Buy Today activation are separate paths:
 
-- **Publish Today's Plan** atomically publishes the watchlist, buylist, trade
-  plans, and execution queue. It is a pre-market bulk synchronization step.
+- **Publish Today's Plan** atomically publishes the legacy migration snapshot,
+  buylist, trade plans, and execution queue. It is a pre-market bulk
+  synchronization step; there is no Watchlist tab.
 - During the regular session, **Activate for Buy Today** becomes an
   `ADD_BUY_TODAY` operator command. It does not use the full-plan publish
   button.
@@ -83,6 +84,12 @@ Execution Owner runtime's responsibility.
 A permitted pre-market window lock/unlock is local until **Publish Today's
 Plan** succeeds. Switching Execution Owner alone does not copy that queue
 change; the new executor otherwise retains the last published plan snapshot.
+
+Chart breakout Set/Clear actions are separate, version-fenced Operator Control
+commands. Passive Buylist targets may be planned during market hours because
+they are not executable, but a published Buy Today target is immutable during
+the regular session. Premarket Buy Today edits clear the old ORB geometry, and
+a stale queue target cannot overwrite or restore the canonical card.
 
 The market-open command sequence is:
 

@@ -78,6 +78,13 @@ def _build_queue_window(monkeypatch, tmp_path):
         "EXECUTION_QUEUE_FILE",
         tmp_path / "execution_queue.json",
     )
+    monkeypatch.setattr(
+        buylist_view_module.buying_power_cache,
+        "get_snapshot",
+        lambda environment, account_no: SimpleNamespace(
+            total_equity_usd=100_000.0
+        ),
+    )
 
     watchlist = Watchlist()
     watchlist.items.append(
@@ -108,17 +115,15 @@ def _build_queue_window(monkeypatch, tmp_path):
     window.populate_buylist_dashboard = lambda: None
     window.update_dashboard_summary = lambda: None
     window._save_state = lambda: None
-    window._parse_float = lambda input_widget, default=0.0: float(
-        input_widget.text() or default
-    )
-    window._get_account_balance_for_env = lambda _env: 100000.0
     window._first_account_no_for_environment = lambda _env: "12345678"
     window._has_duplicate_open_order = lambda *args, **kwargs: False
-    window._watchlist_orb_buffer_pct = lambda: 0.001
-    window._watchlist_orb_signal_price = lambda _symbol: 101.0
-    window._calculate_adr_percent_for_symbol = lambda _symbol: 5.0
-    window._load_cached_intraday_interval = lambda *_args, **_kwargs: _intraday()
-    window._latest_intraday_session = lambda frame: frame
+    window._buyboard_orb_buffer_pct = lambda: 0.001
+    window._buylist_signal_price = lambda _symbol: 101.0
+    window._buylist_adr_percent_for_symbol = lambda _symbol: 5.0
+    window._buylist_load_cached_intraday_interval = (
+        lambda *_args, **_kwargs: _intraday()
+    )
+    window._buylist_latest_intraday_session = lambda frame: frame
     window.buylist_prod_positions_label = None
     window.buylist_prod_capital_label = None
     window.buylist_prod_pnl_label = None
@@ -172,6 +177,42 @@ def test_intentional_selected_symbol_creates_one_buylist_queue_item(
     assert result.status_counts == {"EXECUTE_READY": 1}
 
 
+def test_explicit_buy_today_refresh_builds_queue_from_canonical_card_without_mirror(
+    monkeypatch, tmp_path
+):
+    window = _build_queue_window(monkeypatch, tmp_path)
+    window._buyboard_current_projections = (
+        SimpleNamespace(
+            card=SimpleNamespace(
+                environment="PROD",
+                account_no="12345678",
+                symbol="AAPL",
+                name="Apple",
+                board_status="BUY_TODAY",
+                breakout_price=100.0,
+                buffer_pct=0.001,
+            )
+        ),
+    )
+
+    refreshed = MainWindow.refresh_execution_queue(
+        window,
+        "PROD",
+        show_log=False,
+        symbols=["AAPL"],
+        create_missing=False,
+    )
+
+    assert refreshed == 1
+    queue_item = window.execution_queue_manager.get_item("AAPL", "PROD")
+    assert queue_item is not None
+    assert queue_item.account_no == "12345678"
+    assert queue_item.breakout_price == pytest.approx(100.0)
+    mirror = window.buylist_manager.get("AAPL", "PROD")
+    assert mirror is not None
+    assert mirror.kis_account_no == "12345678"
+
+
 def test_queue_refresh_uses_the_cards_account_not_the_selected_ui_account(
     monkeypatch, tmp_path
 ):
@@ -217,7 +258,6 @@ def test_existing_queue_preserves_buylist_mirror_account_after_ui_switch(
     original_shares = queue_item.candidates["1m"].shares
 
     window._first_account_no_for_environment = lambda _env: "other-account"
-    window._get_account_balance_for_env = lambda _env: 250_000.0
     monkeypatch.setattr(
         buylist_view_module.buying_power_cache,
         "get_snapshot",
@@ -261,6 +301,7 @@ def test_active_canonical_account_reassigns_queue_and_repairs_mirror(
                 account_no="account-2",
                 symbol="AAPL",
                 board_status="BUY_TODAY",
+                breakout_price=100.0,
                 buffer_pct=0.001,
             )
         ),
@@ -307,12 +348,12 @@ def test_missing_canonical_equity_retains_last_good_published_queue(
                 account_no="12345678",
                 symbol="AAPL",
                 board_status="BUY_TODAY",
+                breakout_price=100.0,
                 buffer_pct=0.001,
             )
         ),
     )
     window._first_account_no_for_environment = lambda _env: "other-account"
-    window._get_account_balance_for_env = lambda _env: 250_000.0
     monkeypatch.setattr(
         buylist_view_module.buying_power_cache,
         "get_snapshot",
@@ -367,6 +408,7 @@ def test_existing_queue_row_keeps_published_buffer_when_header_changes(
                 account_no="12345678",
                 symbol="AAPL",
                 board_status="BUY_TODAY",
+                breakout_price=100.0,
                 buffer_pct=0.001,
             )
         ),
@@ -383,7 +425,48 @@ def test_existing_queue_row_keeps_published_buffer_when_header_changes(
     assert buylist_item.buffer_pct == pytest.approx(0.001)
 
 
-def test_saved_watchlist_orb_plan_is_reapplied_to_execution_queue(
+def test_canonical_target_replaces_a_stale_local_buylist_mirror(
+    monkeypatch, tmp_path
+):
+    window = _build_queue_window(monkeypatch, tmp_path)
+    MainWindow.refresh_execution_queue(
+        window,
+        "PROD",
+        show_log=False,
+        symbols=["AAPL"],
+        create_missing=True,
+    )
+    mirror = window.buylist_manager.get("AAPL", "PROD")
+    assert mirror.breakout_price == pytest.approx(100.0)
+    window._buyboard_current_projections = (
+        SimpleNamespace(
+            card=SimpleNamespace(
+                environment="PROD",
+                account_no="12345678",
+                symbol="AAPL",
+                name="Apple",
+                board_status="BUY_TODAY",
+                breakout_price=102.0,
+                buffer_pct=0.001,
+            )
+        ),
+    )
+
+    refreshed = MainWindow.refresh_execution_queue(
+        window,
+        "PROD",
+        show_log=False,
+        symbols=["AAPL"],
+        create_missing=False,
+    )
+
+    assert refreshed == 1
+    queue_item = window.execution_queue_manager.get_item("AAPL", "PROD")
+    assert queue_item.breakout_price == pytest.approx(102.0)
+    assert mirror.breakout_price == pytest.approx(102.0)
+
+
+def test_legacy_watchlist_orb_plan_is_imported_once_with_canonical_buffer(
     monkeypatch, tmp_path
 ):
     window = _build_queue_window(monkeypatch, tmp_path)
@@ -415,11 +498,11 @@ def test_saved_watchlist_orb_plan_is_reapplied_to_execution_queue(
     assert queue_item.selected_window == "5m"
     assert candidate is queue_item.candidates["5m"]
     assert candidate.risk_percent == pytest.approx(0.005)
-    assert candidate.breakout_trigger == pytest.approx(100.2)
-    assert buylist_item.buffer_pct == pytest.approx(0.002)
+    assert candidate.breakout_trigger == pytest.approx(100.1)
+    assert buylist_item.buffer_pct == pytest.approx(0.001)
 
 
-def test_unlock_auto_clears_durable_watchlist_orb_selection(
+def test_unlock_auto_ignores_preserved_legacy_watchlist_selection(
     monkeypatch, tmp_path
 ):
     window = _build_queue_window(monkeypatch, tmp_path)
@@ -450,8 +533,8 @@ def test_unlock_auto_clears_durable_watchlist_orb_selection(
 
     MainWindow._unlock_execution_queue_item_for_auto(window, queue_item)
 
-    assert watch_item.selected_orb_plan is None
-    assert len(save_calls) == saves_before_unlock + 1
+    assert watch_item.selected_orb_plan is not None
+    assert len(save_calls) == saves_before_unlock
     assert queue_item.manual_window_lock is False
     assert queue_item.locked is False
 
@@ -459,6 +542,37 @@ def test_unlock_auto_clears_durable_watchlist_orb_selection(
 
     assert queue_item.manual_window_lock is False
     assert queue_item.locked is False
+
+
+def test_execution_refresh_does_not_call_watchlist_mixin_helpers(
+    monkeypatch, tmp_path
+):
+    window = _build_queue_window(monkeypatch, tmp_path)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("legacy WatchlistMixin helper was called")
+
+    for helper_name in (
+        "_parse_float",
+        "_get_account_balance_for_env",
+        "_watchlist_orb_buffer_pct",
+        "_watchlist_orb_signal_price",
+        "_calculate_adr_percent_for_symbol",
+        "_load_cached_intraday_interval",
+        "_latest_intraday_session",
+    ):
+        setattr(window, helper_name, forbidden)
+
+    refreshed = MainWindow.refresh_execution_queue(
+        window,
+        "PROD",
+        show_log=False,
+        symbols=["AAPL"],
+        create_missing=True,
+    )
+
+    assert refreshed == 1
+    assert window.buylist_manager.get("AAPL", "PROD") is not None
 
 
 def test_watchlist_selected_orb_plan_round_trips_without_nonfinite_values():
@@ -833,6 +947,46 @@ def test_rejected_execution_queue_item_is_not_refreshed_by_legacy_monitor(
     MainWindow._run_buylist_monitor_cycle(window, "PROD")
 
     assert refreshes == []
+
+
+def test_queue_monitor_refreshes_only_live_buy_today_symbols(monkeypatch, tmp_path):
+    window = _build_queue_window(monkeypatch, tmp_path)
+    refreshes = []
+    waiting = SimpleNamespace(
+        symbol="AAPL",
+        environment="PROD",
+        monitoring_status=ExecutionQueueStatus.WAITING_BREAKOUT.value,
+        breakout_method="execution_queue:5m",
+        orb_monitor_enabled=True,
+        _buy_order_pending=False,
+    )
+    rejected = SimpleNamespace(
+        symbol="MSFT",
+        environment="PROD",
+        monitoring_status=ExecutionQueueStatus.REJECTED.value,
+        breakout_method="execution_queue:5m",
+        orb_monitor_enabled=True,
+        _buy_order_pending=False,
+    )
+    window.buylist_manager = SimpleNamespace(items=[waiting, rejected])
+    window._restore_monitorable_buylist_error_positions = lambda *_args: None
+    window._populate_buylist_env_table = lambda *_args: None
+    window.intraday_bulk_worker = None
+    window.refresh_watchlist_intraday_cache = (
+        lambda **kwargs: refreshes.append(kwargs)
+    )
+
+    MainWindow._run_buylist_monitor_cycle(window, "PROD")
+
+    assert refreshes == [
+        {
+            "show_messages": False,
+            "triggered_by_live": True,
+            "source": "buylist monitor",
+            "symbols": ["AAPL"],
+            "purpose": "buyboard_orb",
+        }
+    ]
 
 
 def _healthy_buyboard_worker():

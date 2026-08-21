@@ -43,6 +43,8 @@ from src.services.state_sync import (
 
 class OperatorCommandType(str, Enum):
     ADD_BUY_TODAY = "ADD_BUY_TODAY"
+    SET_BREAKOUT_PRICE = "SET_BREAKOUT_PRICE"
+    CLEAR_BREAKOUT_PRICE = "CLEAR_BREAKOUT_PRICE"
     CANCEL_ENTRY = "CANCEL_ENTRY"
     SELL_PARTIAL = "SELL_PARTIAL"
     SELL_ALL = "SELL_ALL"

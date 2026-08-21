@@ -9,10 +9,11 @@ def test_refactored_ui_modules_importable():
         BuylistExecutionController,
         ChartDataController,
         ScannerController,
-        WatchlistController,
     )
     from src.ui.filter_catalog import DEFAULT_SCANNER_SETUPS, DEFAULT_TAB_OPTIONS
     from src.ui.main_window import MainWindow, _extract_latest_opening_bar
+    from src.ui.mixins.planning_support_mixin import PlanningSupportMixin
+    from src.ui import workers
     from src.ui.workers import ScannerWorker
 
     assert AccountController is not None
@@ -20,8 +21,11 @@ def test_refactored_ui_modules_importable():
     assert ChartBridge is not None
     assert ChartDataController is not None
     assert MainWindow is not None
+    assert PlanningSupportMixin in MainWindow.__mro__
     assert ScannerController is not None
-    assert WatchlistController is not None
+    assert all(base.__name__ != "WatchlistMixin" for base in MainWindow.__mro__)
+    assert not hasattr(workers, "WatchlistAiWorker")
+    assert not hasattr(workers, "SingleStockAiWorker")
     assert _extract_latest_opening_bar is not None
     assert ScannerWorker is not None
     assert set(DEFAULT_SCANNER_SETUPS) == {"Setup 1", "Setup 2"}

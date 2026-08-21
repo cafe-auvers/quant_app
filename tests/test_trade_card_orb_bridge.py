@@ -13,7 +13,13 @@ from src.services.trade_card_orb_bridge import (
 
 
 def _card(**overrides):
-    fields = dict(environment="PROD", account_no="1", symbol="AAPL", board_status=BoardStatus.BUY_TODAY)
+    fields = dict(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        board_status=BoardStatus.BUY_TODAY,
+        breakout_price=101.5,
+    )
     fields.update(overrides)
     return TradeCardState(**fields)
 
@@ -587,6 +593,47 @@ def test_queue_candidate_without_account_provenance_is_never_applied():
     assert card.entry_trigger is None
     assert card.planned_quantity == 0
     assert "no account sizing provenance" in card.entry_block_reason
+
+
+def test_changed_canonical_target_cannot_execute_a_stale_queue_plan():
+    now = datetime(2026, 8, 19, 13, 35, tzinfo=timezone.utc)
+    candidate = _candidate(source_session_date="2026-08-19")
+    item = _queue_item(candidate, last_updated=now)
+    card = _card(
+        breakout_price=102.0,
+        entry_trigger=101.6,
+        entry_orb_high=101.6,
+        entry_orb_low=95.0,
+        planned_quantity=20,
+        target_position_quantity=20,
+    )
+
+    TradeCardOrbEvaluator(clock=lambda: now).update_card(card, item)
+
+    assert card.breakout_price == 102.0
+    assert card.entry_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE
+    assert card.entry_trigger is None
+    assert card.entry_orb_high is None
+    assert card.entry_orb_low is None
+    assert card.planned_quantity == 0
+    assert "does not match" in card.entry_block_reason
+
+
+def test_missing_canonical_target_is_never_restored_from_queue():
+    card = _card(
+        breakout_price=None,
+        entry_trigger=101.6,
+        planned_quantity=20,
+    )
+    item = _queue_item(_candidate())
+
+    TradeCardOrbEvaluator().update_card(card, item)
+
+    assert card.breakout_price is None
+    assert card.entry_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE
+    assert card.entry_trigger is None
+    assert card.planned_quantity == 0
+    assert "canonical breakout target is unavailable" in card.entry_block_reason
 
 
 def test_candidate_without_source_session_provenance_is_never_applied():

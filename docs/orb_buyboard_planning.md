@@ -30,6 +30,12 @@ assumption that removing and re-activating it applied the new header value.
 Changing the header alone is not a planning mutation and is not handed to the
 executor.
 
+Drawing a target for a symbol that has no canonical breakout creates a genuinely
+new Buylist plan and snapshots the current header buffer. Revising a non-empty
+target retains that plan's existing buffer. An explicit chart **Clear** followed
+by drawing a new target creates a new passive plan; this is distinct from
+**Remove from Today**, which preserves the plan and its buffer.
+
 ## Buy Today context actions
 
 Right-click a card in **Buy Today** for two separate ORB views.
@@ -83,6 +89,27 @@ Plan** before switching Execution Owner or expecting the other machine to use
 it. Until that publish completes, a different Execution Owner continues from
 the last published snapshot; changing ownership does not transmit an
 unpublished local lock or unlock.
+
+## Chart target changes
+
+TradingView's Set, Clear, Queue, and Activate controls use the same canonical
+Buy Board command path; they do not write to the retired Watchlist data or
+silently edit a local Buylist mirror. A newly drawn target creates a versioned
+Buylist card for the explicitly selected KIS account. Clearing a passive target
+leaves a non-executable Buylist card with no breakout level.
+
+Every Set/Clear request requires verified Operator Control and a known market
+session. A published Buy Today target may be changed or cleared only before the
+regular session opens. Setting it then invalidates the previous ORB geometry,
+quantity, and trigger so the plan must be rebuilt; clearing it moves the safe,
+zero-evidence card back to Buylist and clears every executable entry field.
+During regular market hours the published target is immutable. Any existing
+entry/order/reservation/cancellation/position evidence also rejects the change.
+
+The canonical trade card always wins over local compatibility data. If a local
+execution-queue target is missing or differs after a chart edit, execution is
+`DATA_UNAVAILABLE` until a fresh queue snapshot matches; the stale queue can
+never restore the old target or submit against it.
 
 ## Execution boundary
 

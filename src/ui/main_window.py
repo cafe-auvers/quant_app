@@ -19,10 +19,11 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QKeySequence
-from PyQt5.QtWidgets import (QApplication, QDialog, QHBoxLayout, QLabel,
-                             QLineEdit, QMainWindow, QMessageBox, QProgressBar,
-                             QPushButton, QSizePolicy, QStyle, QSystemTrayIcon,
-                             QTabWidget, QTextEdit, QVBoxLayout, QWidget)
+from PyQt5.QtWidgets import (QApplication, QComboBox, QDialog, QHBoxLayout,
+                             QLabel, QLineEdit, QMainWindow, QMessageBox,
+                             QProgressBar, QPushButton, QSizePolicy, QStyle,
+                             QSystemTrayIcon, QTabWidget, QTextEdit,
+                             QVBoxLayout, QWidget)
 
 try:
     from PyQt5.QtWebEngineWidgets import QWebEngineView
@@ -34,7 +35,6 @@ from src.core.order_state import (BrokerOrder, OrderIntent, OrderSide,
 from src.core import execution_config
 from src.core.runtime_readiness import EngineReadiness, RuntimeDeviceState
 from src.core.scanner import StockScanner
-from src.core.trade_reviewer import TradeReviewer
 from src.core.watchlist import BuylistManager, TradePlanManager, Watchlist
 from src.infrastructure.database.mirror_engine import resolve_data_engine
 from src.infrastructure.database.coordination_engine import (
@@ -101,12 +101,13 @@ from src.ui.filter_catalog import (DEFAULT_SCANNER_SETUPS, DEFAULT_SETTINGS,
                                    DEFAULT_TAB_OPTIONS)
 from src.ui.health import HealthPanelMixin
 from src.ui.mixins.dashboard_mixin import DashboardMixin
+from src.ui.mixins.chart_command_routing_mixin import ChartCommandRoutingMixin
+from src.ui.mixins.planning_support_mixin import PlanningSupportMixin
 from src.ui.mixins.scanner_mixin import ScannerMixin
 from src.ui.mixins.sidebar_mixin import SidebarMixin
-from src.ui.mixins.watchlist_mixin import WatchlistMixin
 from src.ui.order_workers import HandoffReconciliationWorker
 from src.ui.workers import PcRemoteStatusWorker
-from src.utils.config import DATA_DIR, ROOT_DIR, RULEBOOK_DIR, get_env_value
+from src.utils.config import DATA_DIR, ROOT_DIR, get_env_value
 from src.utils.data_loader import get_default_universe
 from src.utils.device_identity import detect_local_device_kind, runtime_device_kind
 from src.utils.intraday_helpers import \
@@ -136,7 +137,6 @@ REFERENCE_SYMBOL = "SPY"
 KST_ZONE = ZoneInfo("Asia/Seoul")
 US_MARKET_ZONE = ZoneInfo("America/New_York")
 MARKET_DATA_READY_TIME_KST = dt.time(7, 0)
-LIVE_INTRADAY_REFRESH_INTERVAL_MS = 5 * 60 * 1000
 LOCAL_MIRROR_SYNC_INTERVAL_MS = 15 * 60 * 1000
 TRADINGVIEW_REFRESH_INTERVAL_SECONDS = 5 * 60
 KIS_DAILY_CHART_FAILURE_COOLDOWN_SECONDS = 30 * 60
@@ -838,8 +838,9 @@ class MainWindow(
     HealthPanelMixin,
     DashboardMixin,
     ScannerMixin,
-    WatchlistMixin,
+    PlanningSupportMixin,
     BuylistMixin,
+    ChartCommandRoutingMixin,
     BuyboardMixin,
     ChartsControllerMixin,
     ChartsRenderMixin,
@@ -884,7 +885,6 @@ class MainWindow(
         self.scanner = StockScanner()
         self.watchlist = self._load_watchlist()
         self.buylist_manager = self._load_buylist()
-        self.watchlist_scores = {}
         self.trade_manager = self._load_trade_plans()
         self.order_ledger: List[BrokerOrder] = load_order_ledger()
         self.scanner_setups = self._load_scanner_setups()
@@ -897,7 +897,6 @@ class MainWindow(
             for k, v in DEFAULT_SETTINGS["shortcuts"].items():
                 if k not in self.settings["shortcuts"]:
                     self.settings["shortcuts"][k] = v
-        self.reviewer = TradeReviewer(rulebook_dir=RULEBOOK_DIR)
         # MySQL is optional, and establishing a connection must never block the
         # desktop window from appearing.  A short-lived worker finishes setup
         # after the event loop begins.
@@ -996,9 +995,7 @@ class MainWindow(
         self.intraday_fetch_attempts: dict[str, dt.datetime] = {}
         self._cached_market_data_status = None
         self.market_data_status_worker = None
-        self.orb_trade_plan_column_data: dict[int, dict] = {}
-        self.updating_orb_selection = False
-        self.intraday_bulk_purpose = "watchlist"
+        self.intraday_bulk_purpose = "buyboard_orb"
         self.pending_scanner_orb_source: Optional[dict] = None
         self.scanner_results: List[dict] = []
         self.scanner_results_by_setup: dict[str, List[dict]] = {}
@@ -1011,7 +1008,6 @@ class MainWindow(
         # be skipped and picked up once the user actually switches to the tab
         # (see on_tab_changed / flush_stale_chart_views), instead of paying the
         # cost synchronously in the middle of an unrelated chart interaction.
-        self._watchlist_table_dirty = False
         self._dashboard_summary_dirty = False
         self._charts_tab_chart_stale = False
         self._intraday_tab_chart_stale = False
@@ -1040,7 +1036,6 @@ class MainWindow(
         self.intraday_fetch_worker = None
         self.intraday_bulk_worker = None
         self._intraday_provider_warning_log_keys: set[str] = set()
-        self.live_data_timer = None
         self.current_tradingview_symbol = ""
         self.tradingview_refresh_timestamps: dict[str, dt.datetime] = {}
         self.kis_daily_chart_unavailable_until: Optional[dt.datetime] = None
@@ -1083,8 +1078,6 @@ class MainWindow(
 
         # Create menu bar
         self._create_menu_bar()
-        self._setup_live_data_timer()
-
         # Recover historical.py refresh state (e.g. main.py was restarted mid-refresh)
         # before the window is shown, then keep polling it live for the rest of the session.
         # Seed the "already seen" terminal-event marker from whatever's on disk so a
@@ -1985,16 +1978,11 @@ class MainWindow(
             )
         if "watchlist" in updated_keys:
             self.watchlist = self._load_watchlist()
-            # Keep legacy compatibility state synchronized without assuming
-            # the removed Watchlist tab/table exists.
-            if hasattr(self, "watchlist_table"):
-                self.populate_watchlist_table()
         if "buylist" in updated_keys:
             self.buylist_manager = self._load_buylist()
             self.populate_buylist_dashboard()
         if "trade_plans" in updated_keys:
             self.trade_manager = self._load_trade_plans()
-            self.populate_trade_plan_table()
         if "execution_queue" in updated_keys:
             # Lazily reloaded on next access (_ensure_execution_queue_manager
             # caches on self.execution_queue_manager) -- just drop the stale
@@ -3438,7 +3426,6 @@ class MainWindow(
             self.__dict__.get("_database_transition_generation", 0) + 1
         )
         timers = [
-            self.__dict__.get("live_data_timer"),
             self.__dict__.get("state_sync_timer"),
             self.__dict__.get("sleep_readiness_timer"),
             self.__dict__.get("pc_status_timer"),
@@ -3943,25 +3930,31 @@ class MainWindow(
             "tradingview", self.tradingview_widget, "TradingView Chart"
         )
         self._build_tradingview_tab()
-        # Legacy chart code may still construct these controls while local
-        # Watchlist data remains migration-compatible. They are no longer an
-        # operator-facing workflow.
+        # The shared chart builder still creates two retired controls. Remove
+        # them immediately so there is no hidden action or shortcut that can
+        # mutate the persisted migration input.
         watchlist_button = self.__dict__.get("tradingview_add_watchlist_button")
         if watchlist_button is not None:
-            watchlist_button.setVisible(False)
+            watchlist_button.setParent(None)
+            watchlist_button.deleteLater()
+            del self.tradingview_add_watchlist_button
         watchlist_shortcut = self.__dict__.get("tradingview_watchlist_shortcut")
         if watchlist_shortcut is not None:
             watchlist_shortcut.setEnabled(False)
+            watchlist_shortcut.setParent(None)
+            watchlist_shortcut.deleteLater()
+            del self.tradingview_watchlist_shortcut
 
         self.health_widget = QWidget()
         self._add_configured_tab("health", self.health_widget, "Health")
         self._build_health_tab()
 
         self.intraday_charts_widget = QWidget()
-        # This legacy view is built only as a compatibility target for shared
-        # chart helpers. It was Watchlist-backed and is no longer exposed as a
-        # tab, even if an older tab_options.json enabled it.
-        self._build_intraday_charts_tab()
+        # A single empty, hidden combo preserves the one unguarded completion
+        # callback in the shared chart controller. No retired chart view,
+        # controls, web engine, shortcuts, or symbol population are created.
+        self.intraday_symbol_combo = QComboBox(self.intraday_charts_widget)
+        self.intraday_symbol_combo.setVisible(False)
 
         # Account selectors are built on Dashboard; populate the shared trade
         # account alias once after all tabs finish constructing.

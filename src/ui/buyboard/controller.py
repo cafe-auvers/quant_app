@@ -422,6 +422,11 @@ def _safe_regular_session_open() -> bool | None:
 
 
 def _action_context(main_window, command: AnyBoardCommand) -> BoardActionContext:
+    checker = getattr(main_window, "_has_cached_local_operator_control", None)
+    try:
+        local_operator_control = bool(checker()) if callable(checker) else False
+    except Exception:
+        local_operator_control = False
     worker = _worker_for(main_window)
     if worker is None:
         return BoardActionContext(
@@ -431,6 +436,7 @@ def _action_context(main_window, command: AnyBoardCommand) -> BoardActionContext
             device_active=False,
             regular_session_open=_safe_regular_session_open(),
             session_date=market_session_date(),
+            local_operator_control=local_operator_control,
             restriction_reasons=("Runtime worker unavailable",),
         )
 
@@ -474,6 +480,7 @@ def _action_context(main_window, command: AnyBoardCommand) -> BoardActionContext
         device_active=getattr(worker, "device_state", None) == RuntimeDeviceState.ACTIVE,
         regular_session_open=regular_session_open,
         session_date=market_session_date(),
+        local_operator_control=local_operator_control,
         restriction_reasons=tuple(dict.fromkeys(reasons)),
     )
 

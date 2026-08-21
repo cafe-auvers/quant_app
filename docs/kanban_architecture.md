@@ -231,6 +231,8 @@ An ambiguous submission, unknown broker identity, or unconfirmed cancellation ha
 |---|---|---|
 | Drop into Buylist | `MoveToBuylist` or `CancelEntry` | Move when safe; otherwise request cancellation |
 | Drop into Buy Today | `ActivateForToday` | Authorize today's entry monitoring |
+| Draw/set a chart breakout | `SetBreakoutPrice(price)` | Create or revise the canonical Buylist target for the selected account; a premarket Buy Today revision clears old ORB geometry and must be rebuilt |
+| Clear a chart breakout | `ClearBreakoutPrice` | Clear a passive target, or premarket remand a zero-evidence Buy Today card to Buylist while atomically removing executable entry fields |
 | Drop queued Sell All into Open Positions | `CancelQueuedSellAll` | Withdraw a local premarket sell-at-open intent before submission |
 | Drop into Partial Sell | `RequestPartialSell(quantity)` | Persist partial-exit intent; quantity at/above orderable shares becomes Sell All |
 | Drop into Sell All | `RequestSellAll` | Persist liquidation intent; premarket requests may queue for market open |
@@ -260,6 +262,15 @@ card gesture
 ```
 
 The service makes no broker call in this sequence. If validation fails, the widget never moves; the board refreshes from canonical state and shows the rejection.
+
+`SetBreakoutPrice` and `ClearBreakoutPrice` require verified Operator Control.
+If market-session state cannot be determined, they fail closed. Passive Buylist
+planning may be changed during the regular session because it is not executable;
+a published Buy Today target is immutable from the open until the regular
+session ends. Any entry order, reservation, cancellation, or broker-position
+evidence also blocks target replacement or removal. The execution bridge
+requires the queue target to match the canonical card exactly, so an older local
+queue cannot restore a cleared target or execute after a target revision.
 
 ## Read Projection Flow
 

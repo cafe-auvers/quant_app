@@ -258,6 +258,10 @@ def test_database_outage_renders_local_snapshot_read_only_instead_of_emptying_bo
                 account_no="1",
                 symbol="MAX",
                 board_status=BoardStatus.BUY_TODAY,
+                # The local canonical snapshot, not the compatibility queue,
+                # owns the published target.  Recovery may enrich that target
+                # with current-session ORB geometry but must never invent it.
+                breakout_price=13.28,
             )
         ],
         path=snapshot_path,

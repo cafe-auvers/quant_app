@@ -38,10 +38,6 @@ _EXPORTS: Dict[str, Tuple[str, str]] = {
         "src.ui.controllers.scanner_controller",
         "ScannerController",
     ),
-    "WatchlistController": (
-        "src.ui.controllers.watchlist_controller",
-        "WatchlistController",
-    ),
 }
 
 __all__ = list(_EXPORTS)

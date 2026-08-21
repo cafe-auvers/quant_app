@@ -128,6 +128,7 @@ def _request(**overrides):
         "risk_percent": 0.01,
         "buffer_pct": 0.001,
         "account_no": "12345678",
+        "account_size_for_account": lambda environment, account: 100_000.0,
         "latest_intraday_session": lambda frame: frame,
         "load_intraday_interval": lambda symbol, interval, window_days: [],
         "signal_price_for_symbol": lambda symbol: 101.0,
@@ -215,6 +216,26 @@ def test_missing_canonical_account_equity_defers_without_rebuilding_queue():
     assert manager.build_calls == 0
 
 
+def test_selected_account_estimate_cannot_replace_missing_exact_equity():
+    controller = BuylistExecutionController(SimpleNamespace())
+    manager = FakeQueueManager()
+
+    result = controller.refresh_execution_queue(
+        _request(
+            manager=manager,
+            account_no="selected-account",
+            account_size=999_999.0,
+            account_no_for_symbol=lambda symbol: "selected-account",
+            account_size_for_account=lambda environment, account: None,
+        )
+    )
+
+    assert result.refreshed == 0
+    assert result.failures == []
+    assert result.status_counts == {"ACCOUNT_EQUITY_UNAVAILABLE": 1}
+    assert manager.build_calls == 0
+
+
 def test_queue_refresh_repairs_compatibility_mirror_account():
     controller = BuylistExecutionController(SimpleNamespace())
     manager = FakeBuylistManager()
@@ -233,7 +254,7 @@ def test_queue_refresh_repairs_compatibility_mirror_account():
     assert existing.kis_account_no == "canonical-account"
 
 
-def test_queue_addition_writes_through_watchlist_card_to_canonical_buylist(
+def test_queue_addition_promotes_passive_canonical_card_to_buylist(
     tmp_path, monkeypatch
 ):
     monkeypatch.setattr(
@@ -257,14 +278,12 @@ def test_queue_addition_writes_through_watchlist_card_to_canonical_buylist(
         ),
     )
     manager = FakeBuylistManager()
-    watch_item = _target()
     controller = BuylistExecutionController(SimpleNamespace())
 
     result = controller.refresh_execution_queue(
         _request(
             buylist_manager=manager,
             trade_card_engine=engine,
-            watchlist=SimpleNamespace(items=[watch_item]),
         )
     )
 

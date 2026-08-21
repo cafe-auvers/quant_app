@@ -48,7 +48,7 @@ flowchart TB
 
     subgraph Startup[Startup and recovery]
         direction LR
-        Window --> State[Load local JSON state\nwatchlist, buylist, queue, orders, drawings, settings]
+        Window --> State[Load local JSON state\nlegacy migration data, buylist, queue, orders, drawings, settings]
         Window --> UI[Build tabs, menus, sidebar, and status log]
         Window --> DBInit[Connect canonical MySQL, or fall back to\nthe offline SQLite mirror when unreachable]
         Window --> AccountPreload[Preload KIS account profiles and snapshots]
@@ -74,7 +74,7 @@ flowchart TB
         MySQL --> Scanner[Scanner rules and results]
         Daily --> Scanner
         Scanner --> Charts[Daily, hourly, and TradingView charts]
-        Charts --> Breakout[Persist daily breakout price]
+        Charts --> Breakout[Version-fenced canonical breakout command]
         Breakout --> ORB[ORBStrategy range and trigger signal]
         IntradayCache --> ORB
         ORB --> ORBRisk[ORB position sizing and risk validation]
@@ -165,9 +165,9 @@ flowchart LR
     subgraph Desktop[PyQt5 desktop application]
         direction TB
         UI[MainWindow and tab mixins\nwidgets, tables, Buy Board, dialogs, charts]
-        Controllers[UI controllers\naccount, scanner, watchlist, chart, execution]
-        Workers[QThread workers\nnetwork, refresh, scanner, review,\norder submission/query/cancel, reconciliation,\nKanban projection/runtime, PC status polling]
-        Core[Core domain\nscanner, watchlist, scoring, trade cards,\nboard commands/transitions, execution state]
+        Controllers[UI controllers\naccount, scanner, chart, Buy Board, execution]
+        Workers[QThread workers\nnetwork, refresh, scanner,\norder submission/query/cancel, reconciliation,\nKanban projection/runtime, PC status polling]
+        Core[Core domain\nscanner, legacy planning models, scoring, trade cards,\nboard commands/transitions, execution state]
         Strategy[Strategy contracts and plugins\nMarketSnapshot, PortfolioSnapshot, Signal,\nORBStrategy]
         Risk[Risk\nposition sizing]
         Services[Services\napp state, intraday orchestration,\ntrade-card/ownership/order repositories,\nKanban runtime, guarded execution, reconciliation,\ncross-machine state sync, PC remote control,\nruntime heartbeats, historical refresh control,\ncloud/env backup]
@@ -320,8 +320,9 @@ MainWindow(
   HealthPanelMixin,
   DashboardMixin,
   ScannerMixin,
-  WatchlistMixin,
+  PlanningSupportMixin,
   BuylistMixin,
+  ChartCommandRoutingMixin,
   BuyboardMixin,
   ChartsControllerMixin,
   ChartsRenderMixin,
@@ -343,14 +344,20 @@ Supporting UI modules:
 | `src/ui/mixins/sidebar_mixin.py` | Left sidebar source switching, selected-symbol routing, and sidebar actions |
 | `src/ui/mixins/dashboard_mixin.py` | Dashboard tab, KIS account snapshot UI, profile selection widgets, FX/account-size display, summary widgets |
 | `src/ui/mixins/scanner_mixin.py` | Scanner tab, scanner setup/rule UI, worker signal wiring, scanner result table actions |
-| `src/ui/mixins/watchlist_mixin.py` | Transitional compatibility helpers still shared by chart/cache/trade-plan code; `_build_watchlist_tab()` is not called and no Watchlist widgets are constructed |
+| `src/ui/mixins/planning_support_mixin.py` | Neutral account sizing, cached-intraday, ORB-risk, and chart refresh helpers; it contains no Watchlist widgets, actions, AI, or table projection |
+| `src/ui/mixins/chart_command_routing_mixin.py` | Routes visible chart target, queue, and activation gestures through version-fenced canonical Buy Board commands; legacy persisted targets are never execution authority |
 | `src/ui/mixins/buylist_mixin.py` | Compatibility import for `src/ui/buylist/`; existing imports and monkeypatch-based tests continue to work |
 | `src/ui/mixins/charts_render_mixin.py` | Compatibility import for `src/ui/charts/renderer.py` |
 | `src/ui/mixins/charts_controller_mixin.py` | Compatibility import for `src/ui/charts/controller.py` |
-| `src/ui/workers.py` | `QThread` workers for KIS snapshots, intraday fetches, scanner runs, review jobs, and PC status polling |
+| `src/ui/workers.py` | `QThread` workers for KIS snapshots, intraday fetches, scanner runs, and PC status polling |
 | `src/ui/order_workers.py` | `QThread` workers for KIS order submission, query, cancel, and reconciliation |
 | `src/ui/chart_bridge.py` | `QWebChannel` bridge used by chart JavaScript to persist drawings and breakout-price markers |
 | `src/ui/filter_catalog.py` | Default scanner setups, scanner metric labels, tab defaults, and settings defaults |
+
+The retired Watchlist-backed Intraday Charts view is not constructed. Startup creates
+only an empty hidden symbol combo as a temporary compatibility target for one shared
+chart-fetch completion callback; it has no tab, chart engine, controls, shortcuts, or
+symbols and cannot start work by itself.
 
 ### UI Workflow Controllers
 
@@ -375,13 +382,12 @@ Current tab construction in `_setup_tabs()`:
 | `tradingview` | TradingView Chart | `_build_tradingview_tab()` |
 | `health` | Health | `_build_health_tab()` |
 
-`data/tab_options.json` persists active tab visibility. The legacy
-`_build_trade_plan_tab()` method remains only as a compatibility target and is
-not called. `_setup_tabs()` still builds the Watchlist-backed intraday chart
-controls on an unregistered compatibility widget because active single-symbol
-fetch completion callbacks share those control handles. That widget is never
-added to the tab bar and cannot be restored by an old `tab_options.json`; remove
-its construction only together with those shared fetch/chart callbacks.
+`data/tab_options.json` persists active tab visibility. The Watchlist builder is
+deleted. A legacy Trade Plan builder remains dormant inside the shared chart
+controller, but `_setup_tabs()` never calls or exposes it. Startup keeps only
+one empty, hidden symbol combo for a shared fetch-completion callback; it does
+not construct the retired intraday chart, actions, shortcuts, or symbol source,
+and an old `tab_options.json` cannot restore that view.
 
 ## Worker Layer
 
@@ -506,7 +512,7 @@ Local JSON state is read/written through `src/utils/storage.py` and service help
 | `data/legacy_non_prod_execution_queue.json` | One-time archive of non-production execution queue rows removed from actionable state |
 | `data/trade_plans.json` | Saved trade plans |
 | `data/scanner_setups.json` | Named scanner rule presets |
-| `data/chart_drawings.json` | Saved chart line drawings; watchlist breakout prices are persisted in `data/watchlist.json` |
+| `data/chart_drawings.json` | Saved chart line drawings; executable breakout targets live on canonical trade cards, while legacy Watchlist values are migration-only |
 | `data/tab_options.json` | Tab visibility settings |
 | `data/orders.json` | Local broker-order ledger, created when the first order is recorded |
 | `data/event_journal.jsonl` | Append-only, gitignored trading lifecycle journal; timestamped archives preserve earlier events when the active file rotates |
@@ -722,7 +728,7 @@ The chart experience is generated by `MainWindow` and coordinated with `ChartBri
 - `QWebEngineView` is used when PyQtWebEngine is installed.
 - Fallback text is shown when WebEngine is unavailable.
 - Chart drawings are saved through `QWebChannel` into `data/chart_drawings.json`.
-- Breakout prices are user-entered daily structural levels persisted on watchlist items. Legacy `target_price` JSON values are migrated into `breakout_price` only when no breakout price exists.
+- Breakout prices are user-entered daily structural levels persisted on canonical trade cards. Chart Set/Clear actions are Operator-Control-authorized, version-fenced commands; stale legacy or execution-queue values cannot overwrite or resurrect the canonical target.
 - ORB entry validation uses `entry_trigger = max(orb_high, breakout_price * (1 + buffer_pct))`; profit management uses rule-based exits rather than fixed take-profit targets.
 - Daily, hourly, and intraday views use normalized OHLCV DataFrames.
 - RS/TI65 and growth overlays load from MySQL indicators when available, with local fallbacks.
