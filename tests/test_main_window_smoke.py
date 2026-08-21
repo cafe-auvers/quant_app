@@ -108,10 +108,13 @@ def test_main_window_constructs_and_closes_offscreen_without_external_io(monkeyp
     assert header_layout.indexOf(window.buyboard_orb_buffer_pct_input) < (
         header_layout.indexOf(window._buyboard_engine_status_label)
     )
-    assert not hasattr(window, "tradingview_add_watchlist_button")
-    assert not hasattr(window, "tradingview_watchlist_shortcut")
-    assert not hasattr(window, "add_current_tradingview_symbol_to_watchlist")
-    assert not hasattr(window, "_update_tradingview_watchlist_btn")
+    assert window.tradingview_add_watchlist_button.text() in {
+        "Add to Watchlist (W)",
+        "In Watchlist (W)",
+    }
+    assert window.tradingview_watchlist_shortcut.isEnabled()
+    assert hasattr(window, "add_current_tradingview_symbol_to_watchlist")
+    assert hasattr(window, "_update_tradingview_watchlist_btn")
     assert window.intraday_symbol_combo.count() == 0
     assert not hasattr(window, "intraday_status_label")
     assert not hasattr(window, "intraday_chart_view")
@@ -122,7 +125,9 @@ def test_main_window_constructs_and_closes_offscreen_without_external_io(monkeyp
         window.sidebar_source_combo.itemText(index)
         for index in range(window.sidebar_source_combo.count())
     ]
-    assert "Watchlist" not in sidebar_sources
+    assert "Watchlist" in sidebar_sources
+    assert hasattr(window, "sidebar_move_buylist_button")
+    assert hasattr(window, "sidebar_remove_watchlist_button")
     from src.ui.buyboard.columns import BOARD_COLUMN_ORDER
 
     assert set(window.buyboard_columns.keys()) == set(BOARD_COLUMN_ORDER)

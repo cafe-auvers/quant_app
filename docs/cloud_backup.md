@@ -16,7 +16,7 @@ the laptop has no recovery path without this.
 
 | File | What it is |
 |---|---|
-| `watchlist.json` | Legacy planning/migration compatibility state (no Watchlist tab) |
+| `watchlist.json` | User-managed passive Watchlist state (shown in the sidebar; no dedicated Watchlist tab) |
 | `buylist.json` | Buy Board queue compatibility state (no Buy Dashboard tab) |
 | `trade_plans.json` | Legacy trade plans |
 | `scanner_setups.json` | Saved scanner threshold presets |

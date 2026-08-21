@@ -39,6 +39,7 @@ from src.ui.buyboard.columns import BOARD_COLUMN_ORDER, BoardColumnList
 from src.ui.buyboard.drag_commands import (
     CancelEntry,
     CancelPartialSell,
+    MoveToWatchlist,
     ReorderCard,
     RequestPartialSell,
 )
@@ -719,7 +720,7 @@ def test_context_menu_has_no_cancel_entry_action_for_open_position(tmp_path, mon
     assert _find_action_by_text(captured_menu["menu"], "Open TradingView Chart") is not None
 
 
-def test_buylist_context_menu_exposes_activation_and_chart_without_watchlist(
+def test_buylist_context_menu_exposes_activation_chart_and_watchlist_demotion(
     tmp_path, monkeypatch
 ):
     _ensure_app()
@@ -742,8 +743,31 @@ def test_buylist_context_menu_exposes_activation_and_chart_without_watchlist(
 
     menu = captured_menu["menu"]
     assert _find_action_by_text(menu, "Activate for Buy Today") is not None
-    assert _find_action_by_text(menu, "Move to Watchlist") is None
+    assert _find_action_by_text(menu, "Move to Watchlist") is not None
     assert _find_action_by_text(menu, "Open TradingView Chart") is not None
+
+
+def test_buylist_context_menu_dispatches_versioned_watchlist_demotion(
+    tmp_path, monkeypatch
+):
+    _ensure_app()
+    engine = _make_engine(tmp_path)
+    card = repo.create_trade_card(engine, _card(board_status=BoardStatus.BUYLIST))
+    window = _FakeMainWindow(engine, cards=[card])
+
+    def choose_move(menu, _pos):
+        return _find_action_by_text(menu, "Move to Watchlist")
+
+    monkeypatch.setattr(QMenu, "exec_", choose_move)
+    board_module._handle_card_context_menu(
+        window,
+        card_drag_payload(BoardCardProjection(card=card)),
+        None,
+    )
+
+    assert len(window.dispatched) == 1
+    assert isinstance(window.dispatched[0], MoveToWatchlist)
+    assert window.dispatched[0].expected_card_version == card.version
 
 
 def test_buyboard_buffer_parser_uses_percent_units_and_safe_default():

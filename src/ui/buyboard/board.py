@@ -1053,6 +1053,7 @@ def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
     actions = {}
     if card.board_status == BoardStatus.BUYLIST:
         actions["activate"] = menu.addAction("Activate for Buy Today")
+        actions["move_watchlist"] = menu.addAction("Move to Watchlist")
         menu.addSeparator()
     elif card.board_status == BoardStatus.BUY_TODAY:
         actions["orb_combinations"] = menu.addAction("ORB Combinations...")
@@ -1098,6 +1099,11 @@ def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
 
     if chosen is actions.get("activate"):
         command = ActivateForToday(**common)
+        main_window._buyboard_dispatch_command(
+            command, interaction_fingerprint=interaction_fingerprint
+        )
+    elif chosen is actions.get("move_watchlist"):
+        command = MoveToWatchlist(**common)
         main_window._buyboard_dispatch_command(
             command, interaction_fingerprint=interaction_fingerprint
         )

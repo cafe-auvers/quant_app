@@ -15,7 +15,11 @@ from typing import Optional
 
 from sqlalchemy.engine import Engine
 
-from src.core.trade_card_state import BoardStatus, TradeCardState
+from src.core.trade_card_state import (
+    BoardStatus,
+    TradeCardState,
+    is_passive_planning_card,
+)
 from src.services import trade_card_repository
 
 
@@ -51,13 +55,17 @@ def reconcile_buylist_item(
     watchlist=None,
     existing_card: Optional[TradeCardState] = None,
     existing_card_loaded: bool = False,
+    explicit_watchlist_promotion: bool = False,
 ) -> BuylistMembershipSyncResult:
     """Ensure one Buylist item has a safe canonical representation.
 
     Missing rows retain the established legacy migration mapping.  For an
     existing row, only ``WATCHLIST -> BUYLIST`` is accepted, and only when
     the legacy row maps to passive ``BUYLIST`` state.  Every other existing
-    lifecycle is canonical and remains untouched.
+    lifecycle is canonical and remains untouched.  A canonical WATCHLIST
+    row deliberately moved back from BUYLIST is not re-promoted by a stale
+    compatibility mirror.  An explicit user promotion must opt in with
+    ``explicit_watchlist_promotion``.
 
     ``existing_card_loaded`` lets a bootstrap pass reuse its bulk read.  CAS
     conflicts are re-read before one retry so a concurrent promotion is
@@ -88,6 +96,18 @@ def reconcile_buylist_item(
     )
 
     for _attempt in range(2):
+        if (
+            current is not None
+            and current.board_status == BoardStatus.WATCHLIST
+            and (
+                not current.watchlist_member
+                or not is_passive_planning_card(current)
+            )
+        ):
+            # Neither an explicit click nor a stale compatibility mirror may
+            # hide broker/order/stop/exit evidence by relabelling the card as
+            # a passive Buylist candidate. No CAS is attempted in this case.
+            return BuylistMembershipSyncResult(action="unsafe", card=current)
         report = trade_card_repository.build_trade_card_migration(
             buylist_manager=SimpleNamespace(items=[normalized_item]),
             watchlist=watchlist,
@@ -111,14 +131,44 @@ def reconcile_buylist_item(
         ):
             return BuylistMembershipSyncResult(action="unchanged", card=current)
 
+        watchlist_symbols = {
+            _normalized_symbol(getattr(watch_item, "symbol", ""))
+            for watch_item in list(getattr(watchlist, "items", ()) or ())
+        }
+        explicitly_demoted = bool(
+            current.previous_board_status == BoardStatus.BUYLIST
+            and not current.buylist_member
+        )
+        if not explicit_watchlist_promotion and (
+            symbol in watchlist_symbols or explicitly_demoted
+        ):
+            return BuylistMembershipSyncResult(action="unchanged", card=current)
+
         promoted = copy.deepcopy(current)
         promoted.previous_board_status = current.board_status
         promoted.board_status = BoardStatus.BUYLIST
         promoted.board_status_updated_at = datetime.now(timezone.utc)
         promoted.buylist_member = True
         promoted.watchlist_member = bool(
-            current.watchlist_member or row.card.watchlist_member
+            not explicit_watchlist_promotion
+            and (current.watchlist_member or row.card.watchlist_member)
         )
+        if explicit_watchlist_promotion:
+            # Promotion is a planning-stage move, not an instruction to arm
+            # an entry.  Legacy ORB geometry must be selected again on the
+            # Buy Board before this candidate can reach Buy Today.
+            promoted.selected_orb_window = None
+            promoted.position_percent = 0.0
+            promoted.planned_quantity = 0
+            promoted.target_position_quantity = 0
+            promoted.entry_orb_window = None
+            promoted.entry_orb_high = None
+            promoted.entry_orb_low = None
+            promoted.entry_trigger = None
+            promoted.stop_adr = None
+            promoted.entry_runtime_status = None
+            promoted.entry_block_reason = ""
+            promoted.session_date = None
         try:
             stored = trade_card_repository.update_trade_card(
                 engine,
@@ -144,6 +194,7 @@ def add_to_buylist(
     engine: Optional[Engine] = None,
     default_account_no: str = "",
     watchlist=None,
+    explicit_watchlist_promotion: bool = False,
 ) -> BuylistMembershipSyncResult:
     """Write a Buylist addition through to canonical Kanban state."""
 
@@ -153,4 +204,5 @@ def add_to_buylist(
         item,
         default_account_no=default_account_no,
         watchlist=watchlist,
+        explicit_watchlist_promotion=explicit_watchlist_promotion,
     )

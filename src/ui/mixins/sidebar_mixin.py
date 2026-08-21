@@ -113,6 +113,29 @@ class SidebarMixin:
         self.sidebar_selected_label.setWordWrap(True)
         sidebar_layout.addWidget(self.sidebar_selected_label)
 
+        self.sidebar_add_watchlist_button = QPushButton("Add to Watchlist")
+        self.sidebar_add_watchlist_button.setObjectName("sidebarAddWatchlistButton")
+        self.sidebar_add_watchlist_button.clicked.connect(
+            self.sidebar_add_selected_to_watchlist
+        )
+        sidebar_layout.addWidget(self.sidebar_add_watchlist_button)
+
+        self.sidebar_move_buylist_button = QPushButton("Move to Buylist")
+        self.sidebar_move_buylist_button.setObjectName("sidebarMoveBuylistButton")
+        self.sidebar_move_buylist_button.clicked.connect(
+            self.sidebar_move_selected_to_buylist
+        )
+        sidebar_layout.addWidget(self.sidebar_move_buylist_button)
+
+        self.sidebar_remove_watchlist_button = QPushButton("Remove from Watchlist")
+        self.sidebar_remove_watchlist_button.setObjectName(
+            "sidebarRemoveWatchlistButton"
+        )
+        self.sidebar_remove_watchlist_button.clicked.connect(
+            self.sidebar_remove_selected_from_watchlist
+        )
+        sidebar_layout.addWidget(self.sidebar_remove_watchlist_button)
+
         chart_button = QPushButton("Show Chart")
         chart_button.clicked.connect(self.sidebar_show_chart)
         sidebar_layout.addWidget(chart_button)
@@ -122,7 +145,7 @@ class SidebarMixin:
         self.addDockWidget(Qt.LeftDockWidgetArea, self.stock_sidebar)
         self.refresh_sidebar_sources()
     def refresh_sidebar_sources(self, selected_source: Optional[dict] = None) -> None:
-        """Refresh sidebar source options for scanner results and Buylist."""
+        """Refresh sidebar source options for scans and passive planning stages."""
         if not hasattr(self, "sidebar_source_combo"):
             return
 
@@ -131,6 +154,7 @@ class SidebarMixin:
         self.sidebar_source_combo.clear()
         for setup_name in sorted(self.scanner_setups.keys()):
             self.sidebar_source_combo.addItem(f"Scan: {setup_name}", {"type": "scan", "setup": setup_name})
+        self.sidebar_source_combo.addItem("Watchlist", {"type": "watchlist"})
         self.sidebar_source_combo.addItem("Buylist", {"type": "buylist"})
 
         selected_index = 0
@@ -180,7 +204,7 @@ class SidebarMixin:
             return "?"
 
     def refresh_stock_sidebar(self, *args) -> None:
-        """Refresh sidebar stock list from scanner results or Buylist."""
+        """Refresh sidebar stock list from scans, Watchlist, or Buylist."""
         if not hasattr(self, "sidebar_stock_list"):
             return
 
@@ -225,6 +249,21 @@ class SidebarMixin:
                     "ai_summary": buy_item.ai_summary,
                 })
                 self.sidebar_stock_list.addItem(item)
+        elif source.get("type") == "watchlist":
+            for watch_item in self.watchlist.items:
+                label = (
+                    f"{watch_item.symbol} "
+                    f"({self._format_sidebar_added_date(watch_item.added_date)})"
+                )
+                item = QListWidgetItem(label)
+                item.setData(Qt.UserRole, {
+                    "symbol": watch_item.symbol,
+                    "name": watch_item.name,
+                    "price": watch_item.entry_price,
+                    "source": "watchlist",
+                    "breakout_price": watch_item.breakout_price,
+                })
+                self.sidebar_stock_list.addItem(item)
         if current_symbol:
             for row in range(self.sidebar_stock_list.count()):
                 item = self.sidebar_stock_list.item(row)
@@ -264,13 +303,47 @@ class SidebarMixin:
         data = self._get_sidebar_selected_data()
         if not data:
             self.sidebar_selected_label.setText("Selected: None")
+            self._update_sidebar_watchlist_actions()
             return
 
         symbol = data.get("symbol", "")
         self.selected_scan_symbol = symbol
         self._set_chart_symbol(symbol)
         self.sidebar_selected_label.setText(f"Selected: {symbol}")
+        self._update_sidebar_watchlist_actions()
         self.apply_sidebar_selection_to_current_tab()
+
+    def _update_sidebar_watchlist_actions(self) -> None:
+        data = self._get_sidebar_selected_data()
+        symbol = str((data or {}).get("symbol") or "").strip().upper()
+        source = str((data or {}).get("source") or "").strip().lower()
+        watchlist = self.__dict__.get("watchlist")
+        in_watchlist = bool(
+            symbol
+            and watchlist is not None
+            and getattr(watchlist, "get", lambda _symbol: None)(symbol) is not None
+        )
+        pending = bool(self.__dict__.get("_planning_membership_pending", False))
+
+        add_button = self.__dict__.get("sidebar_add_watchlist_button")
+        if add_button is not None:
+            add_button.setText("In Watchlist" if in_watchlist else "Add to Watchlist")
+            # Demotion is a versioned Buy Board command; never create dual
+            # membership by locally adding an existing Buylist row.
+            add_button.setEnabled(
+                bool(symbol)
+                and source != "buylist"
+                and not in_watchlist
+                and not pending
+            )
+        move_button = self.__dict__.get("sidebar_move_buylist_button")
+        if move_button is not None:
+            move_button.setEnabled(bool(symbol) and source == "watchlist" and not pending)
+        remove_button = self.__dict__.get("sidebar_remove_watchlist_button")
+        if remove_button is not None:
+            remove_button.setEnabled(
+                bool(symbol) and source == "watchlist" and not pending
+            )
     def apply_sidebar_selection_to_current_tab(self) -> None:
         """Apply selected sidebar stock to the active workflow tab."""
         if not hasattr(self, "tabs"):
@@ -317,3 +390,52 @@ class SidebarMixin:
                 self._set_tradingview_symbol(symbol)
             self.tabs.setCurrentWidget(self.tradingview_widget)
             self.load_tradingview_chart(force=True)
+
+    def sidebar_add_selected_to_watchlist(self) -> None:
+        """Add the selected scan/sidebar symbol to the passive Watchlist."""
+
+        data = self._get_sidebar_selected_data()
+        if not data:
+            QMessageBox.warning(self, "No selection", "Select a stock first.")
+            return
+        if data.get("source") == "buylist":
+            QMessageBox.information(
+                self,
+                "Use Buy Board",
+                "Use 'Move to Watchlist' on the Buy Board card to demote a Buylist stock safely.",
+            )
+            return
+        add_candidate = getattr(self, "_add_watchlist_candidate", None)
+        if callable(add_candidate):
+            add_candidate(
+                data.get("symbol", ""),
+                name=data.get("name") or data.get("symbol", ""),
+                entry_price=data.get("price"),
+                source="Sidebar",
+            )
+
+    def sidebar_move_selected_to_buylist(self) -> None:
+        """Promote the selected passive Watchlist item to Buylist."""
+
+        data = self._get_sidebar_selected_data()
+        if not data or data.get("source") != "watchlist":
+            QMessageBox.warning(
+                self, "Watchlist selection required", "Select a Watchlist stock first."
+            )
+            return
+        promote = getattr(self, "_promote_watchlist_candidate", None)
+        if callable(promote):
+            promote(str(data.get("symbol") or ""))
+
+    def sidebar_remove_selected_from_watchlist(self) -> None:
+        """Remove the selected passive candidate without touching active plans."""
+
+        data = self._get_sidebar_selected_data()
+        if not data or data.get("source") != "watchlist":
+            QMessageBox.warning(
+                self, "Watchlist selection required", "Select a Watchlist stock first."
+            )
+            return
+        remove_candidate = getattr(self, "_remove_watchlist_candidate", None)
+        if callable(remove_candidate):
+            remove_candidate(str(data.get("symbol") or ""))

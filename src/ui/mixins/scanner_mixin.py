@@ -169,6 +169,11 @@ class ScannerMixin:
         self.scanner_selection_label = QLabel("Selected symbol: None")
         form_layout.addRow(self.scanner_selection_label)
 
+        add_watchlist_button = QPushButton("Add selected to Watchlist")
+        add_watchlist_button.setObjectName("addWatchlistButton")
+        add_watchlist_button.clicked.connect(self.add_selected_scanner_to_watchlist)
+        form_layout.addRow(add_watchlist_button)
+
         self.scanner_metrics_details = QTextBrowser()
         self.scanner_metrics_details.setMinimumHeight(200)
         self.scanner_metrics_details.setMaximumHeight(280)
@@ -1392,3 +1397,30 @@ class ScannerMixin:
 
         symbol = stock["symbol"]
         self._set_chart_symbol(symbol)
+
+    def add_selected_scanner_to_watchlist(self) -> None:
+        """Persist the selected scan result in the passive Watchlist stage."""
+
+        if not self.selected_scan_symbol:
+            QMessageBox.warning(
+                self,
+                "No selection",
+                "Please select a stock from the scanner results first.",
+            )
+            return
+        stock = self._get_scanner_stock(self.selected_scan_symbol)
+        if stock is None:
+            QMessageBox.warning(
+                self,
+                "Not found",
+                "Selected stock is no longer available in scanner results.",
+            )
+            return
+        add_candidate = getattr(self, "_add_watchlist_candidate", None)
+        if callable(add_candidate):
+            add_candidate(
+                stock["symbol"],
+                name=stock.get("name") or stock["symbol"],
+                entry_price=stock.get("price"),
+                source="Scanner",
+            )

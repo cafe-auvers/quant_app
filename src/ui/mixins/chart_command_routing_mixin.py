@@ -1,8 +1,9 @@
 """Route chart planning controls through canonical Buy Board commands.
 
-The retired Watchlist remains loadable as compatibility data, but it must not
-be an authority for a visible chart target or for an executable entry.  This
-mixin deliberately sits ahead of :class:`BuyboardMixin` and
+Watchlist remains a passive persisted planning stage. Canonical card state
+wins whenever it is available, while its local mirror remains usable for
+offline, non-executable chart review. This mixin deliberately sits ahead of
+:class:`BuyboardMixin` and
 :class:`ChartsControllerMixin` in ``MainWindow``'s MRO.
 """
 
@@ -59,11 +60,10 @@ class _CanonicalChartWatchlistView:
         card = self._owner._chart_buyboard_card(
             symbol, self._owner._chart_command_environment()
         )
-        # A retired Watchlist target is never allowed to reappear merely
-        # because no canonical card exists.  It remains persisted only for
-        # backward-compatible migration/recovery tooling.
         target = self._owner._chart_positive_price(
-            getattr(card, "breakout_price", None) if card is not None else None
+            getattr(card, "breakout_price", None)
+            if card is not None
+            else getattr(item, "breakout_price", None)
         )
         if item is None and card is None:
             return None
@@ -75,7 +75,7 @@ class _CanonicalChartWatchlistView:
 
     def __getattr__(self, name: str) -> Any:
         if name in {"add", "remove", "save"}:
-            raise RuntimeError("Chart rendering cannot mutate retired Watchlist state")
+            raise RuntimeError("Chart rendering cannot mutate Watchlist state directly")
         if self._source is None:
             raise AttributeError(name)
         return getattr(self._source, name)

@@ -20,7 +20,11 @@ from typing import Mapping, Optional
 
 from sqlalchemy.engine import Engine
 
-from src.core.trade_card_state import BoardStatus, TradeCardState
+from src.core.trade_card_state import (
+    BoardStatus,
+    TradeCardState,
+    is_passive_planning_card,
+)
 from src.services import trade_card_repository
 from src.services.buylist_membership_service import reconcile_buylist_item
 from src.services.position_manager import PositionManager, extract_overseas_holdings
@@ -32,6 +36,7 @@ class TradeCardBootstrapResult:
 
     created_keys: tuple[str, ...] = ()
     buylist_promoted_keys: tuple[str, ...] = ()
+    watchlist_revived_keys: tuple[str, ...] = ()
     holding_updated_keys: tuple[str, ...] = ()
     skipped_watchlist_symbols: tuple[str, ...] = ()
 
@@ -40,6 +45,7 @@ class TradeCardBootstrapResult:
         return bool(
             self.created_keys
             or self.buylist_promoted_keys
+            or self.watchlist_revived_keys
             or self.holding_updated_keys
         )
 
@@ -50,6 +56,18 @@ def _normalized_account(value: object) -> str:
 
 def _normalized_symbol(value: object) -> str:
     return str(value or "").strip().upper()
+
+
+def _membership_is_newer_than_card(item, card: TradeCardState) -> bool:
+    added_at = getattr(item, "added_date", None)
+    changed_at = getattr(card, "board_status_updated_at", None)
+    if not isinstance(added_at, datetime) or not isinstance(changed_at, datetime):
+        return False
+    if added_at.tzinfo is None:
+        added_at = added_at.replace(tzinfo=timezone.utc)
+    if changed_at.tzinfo is None:
+        changed_at = changed_at.replace(tzinfo=timezone.utc)
+    return added_at.astimezone(timezone.utc) > changed_at.astimezone(timezone.utc)
 
 
 def _snapshot_is_fresh(
@@ -104,6 +122,7 @@ def bootstrap_trade_cards_from_current_state(
     existing_by_key = {card.card_key: card for card in existing_cards}
     created_keys: list[str] = []
     buylist_promoted_keys: list[str] = []
+    watchlist_revived_keys: list[str] = []
     holding_updated_keys: list[str] = []
     skipped_watchlist_symbols: list[str] = []
     fallback_account = _normalized_account(default_account_no)
@@ -190,11 +209,78 @@ def bootstrap_trade_cards_from_current_state(
         if not fallback_account:
             skipped_watchlist_symbols.append(symbol)
             continue
-        key = f"PROD:{fallback_account}:{symbol}"
-        if key in existing_by_key:
+        other_accounts = {
+            card.account_no
+            for card in existing_by_key.values()
+            if card.environment == "PROD"
+            and card.symbol == symbol
+            and card.account_no != fallback_account
+        }
+        if other_accounts:
+            # Watchlist JSON has no account identity.  Never guess the current
+            # fallback account when canonical truth already places this symbol
+            # under another account.
+            skipped_watchlist_symbols.append(symbol)
             continue
-        plan = getattr(item, "selected_orb_plan", None)
-        plan = plan if isinstance(plan, dict) else {}
+        key = f"PROD:{fallback_account}:{symbol}"
+        existing = existing_by_key.get(key)
+        if existing is not None:
+            # A passive WATCHLIST row with membership false is the recoverable
+            # tombstone written by Remove. If a newer synchronized membership
+            # exists, revive only that exact passive lifecycle; never pull
+            # BUYLIST or an execution state backwards.
+            if (
+                existing.board_status == BoardStatus.WATCHLIST
+                and not existing.watchlist_member
+                and is_passive_planning_card(existing)
+                and _membership_is_newer_than_card(item, existing)
+            ):
+                current = existing
+                for _attempt in range(2):
+                    revived = copy.deepcopy(current)
+                    revived.watchlist_member = True
+                    revived.buylist_member = False
+                    revived.name = str(
+                        getattr(item, "name", "") or revived.name or symbol
+                    )
+                    revived.breakout_price = getattr(item, "breakout_price", None)
+                    revived.selected_orb_window = None
+                    revived.position_percent = 0.0
+                    revived.planned_quantity = 0
+                    revived.target_position_quantity = 0
+                    revived.entry_orb_window = None
+                    revived.entry_orb_high = None
+                    revived.entry_orb_low = None
+                    revived.entry_trigger = None
+                    revived.stop_adr = None
+                    revived.entry_runtime_status = None
+                    revived.entry_block_reason = ""
+                    revived.session_date = None
+                    try:
+                        stored = trade_card_repository.update_trade_card(
+                            engine,
+                            revived,
+                            expected_version=current.version,
+                        )
+                        existing_by_key[key] = stored
+                        watchlist_revived_keys.append(stored.card_key)
+                        break
+                    except (
+                        trade_card_repository.TradeCardVersionConflictError,
+                        trade_card_repository.TradeCardNotFoundError,
+                    ):
+                        current = trade_card_repository.get_trade_card(
+                            engine, "PROD", fallback_account, symbol
+                        )
+                        if (
+                            current is None
+                            or current.board_status != BoardStatus.WATCHLIST
+                            or current.watchlist_member
+                            or not is_passive_planning_card(current)
+                            or not _membership_is_newer_than_card(item, current)
+                        ):
+                            break
+            continue
         card = TradeCardState(
             environment="PROD",
             account_no=fallback_account,
@@ -204,17 +290,16 @@ def bootstrap_trade_cards_from_current_state(
             watchlist_member=True,
             buylist_member=False,
             breakout_price=getattr(item, "breakout_price", None),
-            selected_orb_window=plan.get("window"),
-            buffer_pct=float(
-                0.001
-                if plan.get("buffer_pct") in (None, "")
-                else plan.get("buffer_pct")
-            ),
-            position_percent=float(plan.get("capital_percent", 0.0) or 0.0),
-            planned_quantity=int(plan.get("shares", 0) or 0),
-            target_position_quantity=int(plan.get("shares", 0) or 0),
-            entry_trigger=plan.get("entry_trigger"),
-            stop_adr=plan.get("stop_adr"),
+            # The retired Watchlist ORB table is not execution authority.
+            # Bootstrap carries only passive identity + breakout target; the
+            # Buy Board must calculate/select fresh ORB geometry explicitly.
+            selected_orb_window=None,
+            buffer_pct=0.001,
+            position_percent=0.0,
+            planned_quantity=0,
+            target_position_quantity=0,
+            entry_trigger=None,
+            stop_adr=None,
         )
         try:
             stored = trade_card_repository.create_trade_card(engine, card)
@@ -302,6 +387,7 @@ def bootstrap_trade_cards_from_current_state(
     return TradeCardBootstrapResult(
         created_keys=tuple(dict.fromkeys(created_keys)),
         buylist_promoted_keys=tuple(dict.fromkeys(buylist_promoted_keys)),
+        watchlist_revived_keys=tuple(dict.fromkeys(watchlist_revived_keys)),
         holding_updated_keys=tuple(dict.fromkeys(holding_updated_keys)),
         skipped_watchlist_symbols=tuple(dict.fromkeys(skipped_watchlist_symbols)),
     )

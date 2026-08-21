@@ -129,7 +129,10 @@ class BuyboardProjectionWorker(QThread):
                 request.engine,
                 environment="PROD",
                 context=request.context,
-                board_statuses=BOARD_COLUMN_ORDER,
+                # Watchlist is intentionally hidden from the Kanban columns,
+                # but remains in the shared projection snapshot so lightweight
+                # chart/sidebar actions can address the exact versioned card.
+                board_statuses=(*BOARD_COLUMN_ORDER, BoardStatus.WATCHLIST),
             )
             if request.revision_only:
                 # Bootstrap may itself have normalized a newly synced

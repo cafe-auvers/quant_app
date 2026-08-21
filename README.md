@@ -8,13 +8,14 @@ A desktop trading dashboard for US-market swing trading with scanner workflows, 
 - Guarded KIS overseas order submission with a durable local order ledger.
 - Conservative fill reconciliation from account snapshots; broker acceptance is not treated as a fill.
 - Rule-based scanner presets backed by a KIS-registered US universe, Yahoo/KIS data paths, and MySQL caches.
-- Chart-based `breakout_price` entry and Buy Board ORB planning; there is no operator-facing Watchlist tab.
+- A persisted, cross-device Watchlist planning stage available from the stock sidebar, Scanner, and TradingView; the former full Watchlist tab is not built.
+- Chart-based `breakout_price` planning and Buy Board ORB execution, with an explicit Watchlist -> Buylist -> Buy Today progression.
 - A read-only Buy Today `ORB Combinations...` comparison covering all 24 risk/window cases, kept separate from the optimized pre-market `Refresh / Select ORB Plans...` selector; the optimized view is read-only during regular market hours.
 - ORB planning where entry is valid only after price clears both ORB high and the persisted buffered breakout price.
 - A strategy-neutral `MarketSnapshot -> Strategy -> Signal` interface, with the existing ORB behavior as the first plugin.
 - An append-only, redacted trading event journal and a read-only Health tab for KIS, MySQL, mirror freshness, and reconciliation status.
 - Buy Board monitoring with partial-exit and EMA-close exit workflow support.
-- A six-column operator-facing Kanban Buy Board (`Buylist` through `Sell All`) backed by one durable trade-card aggregate per production account and symbol. Hidden `WATCHLIST`/`CLOSED` lifecycle values remain only for migration and history compatibility.
+- A six-column operator-facing Kanban Buy Board (`Buylist` through `Sell All`) backed by one durable trade-card aggregate per production account and symbol. `WATCHLIST` remains a hidden, passive planning stage shown in the sidebar; `CLOSED` remains hidden for history.
 - Typed, revision-fenced board commands: drag/drop records intent, while the background runtime and broker reconciliation own order effects and automatic lifecycle moves.
 - Guarded Kanban entry, partial-exit, sell-all, stop-management, ownership, failover/readiness, and external-order review paths. The engine remains fail-closed unless its production gates are explicitly satisfied.
 - Daily, hourly, TradingView, and intraday chart views with persisted drawings and breakout markers.

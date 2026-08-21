@@ -214,6 +214,13 @@ def test_all_chart_renderers_mask_stale_legacy_target_with_canonical_target():
     assert window.watchlist is original
 
 
+def test_offline_passive_watchlist_target_remains_visible_without_canonical_card():
+    window = _RenderWindow()
+    window._buyboard_current_projections = ()
+
+    assert window.load_tradingview_chart() == 999.0
+
+
 def test_action_context_propagates_cached_operator_control_without_runtime():
     command = SetBreakoutPrice(
         environment="PROD",

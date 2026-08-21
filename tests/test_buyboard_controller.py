@@ -157,7 +157,11 @@ def test_projection_render_warnings_are_severe_and_rate_limited(
 
 def test_watchlist_to_buylist(tmp_path):
     engine = _make_engine(tmp_path)
-    card = _seed(engine, board_status=BoardStatus.WATCHLIST)
+    card = _seed(
+        engine,
+        board_status=BoardStatus.WATCHLIST,
+        watchlist_member=True,
+    )
     result = apply_board_command(engine, _cmd(MoveToBuylist, card))
     assert result.board_status == BoardStatus.BUYLIST
     assert result.buylist_member is True
@@ -179,7 +183,11 @@ def test_buylist_to_buy_today_activation(tmp_path):
 def test_illegal_transition_rejected(tmp_path):
     """Watchlist -> Buy Today directly is not on the graph (spec section 17-31)."""
     engine = _make_engine(tmp_path)
-    card = _seed(engine, board_status=BoardStatus.WATCHLIST)
+    card = _seed(
+        engine,
+        board_status=BoardStatus.WATCHLIST,
+        watchlist_member=True,
+    )
     with pytest.raises(CommandRejectedError):
         apply_board_command(engine, _cmd(ActivateForToday, card))
 
@@ -188,7 +196,11 @@ def test_stale_command_version_rejected(tmp_path):
     """Spec section 317: "The backend must reject stale commands when
     expected_card_version does not match the current version." """
     engine = _make_engine(tmp_path)
-    card = _seed(engine, board_status=BoardStatus.WATCHLIST)
+    card = _seed(
+        engine,
+        board_status=BoardStatus.WATCHLIST,
+        watchlist_member=True,
+    )
     apply_board_command(engine, _cmd(MoveToBuylist, card))  # bumps to version 2
 
     with pytest.raises(TradeCardVersionConflictError):

@@ -173,7 +173,7 @@ Delete `RefreshWorker` and `HourlyRefreshWorker` classes entirely.
 ### 7. `tests/test_refactor_boundaries.py`
 
 Drop `RefreshWorker` from the import and the `assert RefreshWorker is not None` line.
-Keep `ScannerWorker`; the later Watchlist removal retired `WatchlistAiWorker` too.
+Keep `ScannerWorker`; the later Watchlist-tab removal retired `WatchlistAiWorker` too.
 
 ### 8. Misc safety items to check while implementing (not design changes)
 

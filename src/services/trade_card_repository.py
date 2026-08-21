@@ -249,6 +249,41 @@ def list_trade_cards(
         return []
 
 
+def list_trade_cards_for_symbol(
+    engine: Optional[Engine],
+    environment: str,
+    symbol: str,
+    *,
+    raise_on_error: bool = False,
+) -> List[TradeCardState]:
+    """Return canonical rows for one symbol across accounts.
+
+    Watchlist's compact JSON model is account-agnostic.  Membership services
+    use this narrow query to prevent a selected fallback account from creating
+    a second canonical planning card when the symbol already belongs to a
+    different account.
+    """
+
+    if engine is None:
+        return []
+    try:
+        table = _ensure_trade_cards_table(engine)
+        statement = select(table).where(
+            table.c.environment == str(environment or "").upper(),
+            table.c.symbol == str(symbol or "").strip().upper(),
+        )
+        with engine.connect() as conn:
+            rows = conn.execute(statement).fetchall()
+        return [_row_to_card(row) for row in rows]
+    except SQLAlchemyError as exc:
+        if raise_on_error:
+            raise
+        logger.info(
+            "trade_card_repository: list_trade_cards_for_symbol failed: %s", exc
+        )
+        return []
+
+
 def get_trade_card_collection_revision(
     engine: Optional[Engine],
     *,

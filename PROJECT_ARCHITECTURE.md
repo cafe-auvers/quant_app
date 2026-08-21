@@ -4,7 +4,7 @@ This document describes the current architecture of the PyQt5 trading dashboard 
 
 ## Product Scope
 
-Quant App is a desktop trading dashboard for US-market swing trading, scanner review, Buy Board ORB planning, KIS account visibility, and guarded KIS order submission. There is no operator-facing Watchlist tab.
+Quant App is a desktop trading dashboard for US-market swing trading, scanner review, passive Watchlist planning, Buy Board ORB planning, KIS account visibility, and guarded KIS order submission. The Watchlist remains available through lightweight sidebar, Scanner, and TradingView actions; only its former dedicated tab was removed.
 
 The application is not a headless service. `main.py` creates a `QApplication`, installs a small Qt warning filter, imports `src.ui.main_window.MainWindow`, and starts the PyQt event loop.
 
@@ -344,6 +344,7 @@ Supporting UI modules:
 | `src/ui/mixins/sidebar_mixin.py` | Left sidebar source switching, selected-symbol routing, and sidebar actions |
 | `src/ui/mixins/dashboard_mixin.py` | Dashboard tab, KIS account snapshot UI, profile selection widgets, FX/account-size display, summary widgets |
 | `src/ui/mixins/scanner_mixin.py` | Scanner tab, scanner setup/rule UI, worker signal wiring, scanner result table actions |
+| `src/ui/mixins/watchlist_actions_mixin.py` | Lightweight passive Watchlist add/view/remove actions, TradingView shortcut/button, and nonblocking Watchlist-to-Buylist handoff; it does not build the retired tab, AI, bulk table, or ORB monitor |
 | `src/ui/mixins/planning_support_mixin.py` | Neutral account sizing, cached-intraday, ORB-risk, and chart refresh helpers; it contains no Watchlist widgets, actions, AI, or table projection |
 | `src/ui/mixins/chart_command_routing_mixin.py` | Routes visible chart target, queue, and activation gestures through version-fenced canonical Buy Board commands; legacy persisted targets are never execution authority |
 | `src/ui/mixins/buylist_mixin.py` | Compatibility import for `src/ui/buylist/`; existing imports and monkeypatch-based tests continue to work |
@@ -409,6 +410,7 @@ Most workers live in `src/ui/workers.py`; KIS order submission/query/cancel and 
 | `HealthProbeWorker` | `health/panel.py` | Run local read-only production checks and load recent redacted journal events without blocking Qt |
 | `BuyboardProjectionWorker` | `buyboard/controller.py` | Bootstrap missing cards and build read-only card/order/ownership projections without blocking Qt |
 | `BuyboardRuntimeWorker` | `buyboard/runtime_worker.py` | Run active or standby Kanban startup reconciliation, readiness/lease checks, account refresh, market-data drain, trading heartbeat, persistence, shutdown reconciliation, and alerts |
+| `PlanningMembershipWorker` | `planning_membership_worker.py` | Apply one passive Watchlist/Buylist membership change without blocking the Qt thread; completion merges only that symbol back into current UI state |
 
 ## Service Layer
 
@@ -428,7 +430,8 @@ Most workers live in `src/ui/workers.py`; KIS order submission/query/cancel and 
 | `src/services/buyboard_runtime.py` | Kanban composition root wiring the broker-neutral trading engine, entry/position/EOD services, market data, risk revalidation, capital reservations, lease, and shared gateway |
 | `src/services/trading_engine.py` | One-second Kanban decision pipeline for retry recovery, entries, order reconciliation, entry completion, partial/full exits, stale quotes, stops, and EOD cleanup |
 | `src/services/trade_card_repository.py` | Canonical SQL trade-card rows with unique account/symbol identity, optimistic versions, and an atomic `data/trade_cards.json` recovery snapshot |
-| `src/services/trade_card_bootstrap.py` | Create-only bridge from loaded legacy Watchlist/Buylist state into missing cards; may project fresh cached holdings before the runtime owns reconciliation |
+| `src/services/trade_card_bootstrap.py` | Create-only bridge from loaded Watchlist/Buylist state into missing cards; may project fresh cached holdings before the runtime owns reconciliation |
+| `src/services/planning_membership_service.py` | Canonical-safe, passive Watchlist add/remove and explicit Watchlist-to-Buylist promotion; never selects an ORB, arms Buy Today, subscribes quotes, or touches the broker |
 | `src/services/trade_card_orb_bridge.py` | Copies the existing execution queue's selected ORB candidate into pre-entry card fields without duplicating ORB calculations |
 | `src/services/execution_ownership_repository.py` | Durable `LEGACY`/`KANBAN`/`MANUAL` ownership assignment and optimistic ownership revision per account and symbol |
 | `src/services/entry_attempt_manager.py` | Per-symbol serialized entry attempts, durable attempt identity/cooldown, capital reservations, and deadline/cancel handling |
@@ -504,7 +507,7 @@ Local JSON state is read/written through `src/utils/storage.py` and service help
 
 | File | Purpose |
 |---|---|
-| `data/watchlist.json` | Legacy planning/migration compatibility state; there is no operator-facing Watchlist tab |
+| `data/watchlist.json` | User-managed passive Watchlist membership and planning metadata, synchronized between devices; there is no dedicated Watchlist tab |
 | `data/buylist.json` | Buy dashboard and monitoring items |
 | `data/execution_queue.json` | Dynamic ORB execution queue items, selected candidates, status, and warnings |
 | `data/trade_cards.json` | Atomic local recovery snapshot of canonical Kanban trade cards; not authoritative while the database is reachable |
@@ -512,7 +515,7 @@ Local JSON state is read/written through `src/utils/storage.py` and service help
 | `data/legacy_non_prod_execution_queue.json` | One-time archive of non-production execution queue rows removed from actionable state |
 | `data/trade_plans.json` | Saved trade plans |
 | `data/scanner_setups.json` | Named scanner rule presets |
-| `data/chart_drawings.json` | Saved chart line drawings; executable breakout targets live on canonical trade cards, while legacy Watchlist values are migration-only |
+| `data/chart_drawings.json` | Saved chart line drawings; authoritative breakout targets live on canonical trade cards, including passive Watchlist cards |
 | `data/tab_options.json` | Tab visibility settings |
 | `data/orders.json` | Local broker-order ledger, created when the first order is recorded |
 | `data/event_journal.jsonl` | Append-only, gitignored trading lifecycle journal; timestamped archives preserve earlier events when the active file rotates |

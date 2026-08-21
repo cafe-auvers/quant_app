@@ -97,21 +97,21 @@ def _clear(card):
     )
 
 
-def test_set_missing_symbol_atomically_creates_passive_buylist(engine):
+def test_set_missing_symbol_atomically_creates_passive_watchlist(engine):
     result = request_board_action(
         engine, _set(buffer_pct=0.005), context=_context()
     )
 
     assert result.card.version == 1
-    assert result.card.board_status == BoardStatus.BUYLIST
-    assert result.card.buylist_member is True
-    assert result.card.watchlist_member is False
+    assert result.card.board_status == BoardStatus.WATCHLIST
+    assert result.card.buylist_member is False
+    assert result.card.watchlist_member is True
     assert result.card.breakout_price == 101.5
     assert result.card.buffer_pct == pytest.approx(0.005)
     assert result.card.entry_runtime_status is None
 
 
-def test_existing_watchlist_is_normalized_to_buylist(engine):
+def test_existing_watchlist_target_stays_passive_watchlist(engine):
     card = _seed(
         engine,
         board_status=BoardStatus.WATCHLIST,
@@ -121,9 +121,54 @@ def test_existing_watchlist_is_normalized_to_buylist(engine):
 
     result = request_board_action(engine, _set(card), context=_context())
 
-    assert result.card.board_status == BoardStatus.BUYLIST
-    assert result.card.watchlist_member is False
-    assert result.card.buylist_member is True
+    assert result.card.board_status == BoardStatus.WATCHLIST
+    assert result.card.watchlist_member is True
+    assert result.card.buylist_member is False
+    assert result.card.breakout_price == 101.5
+    assert result.card.entry_runtime_status is None
+
+
+def test_clear_watchlist_target_keeps_passive_watchlist_membership(engine):
+    card = _seed(
+        engine,
+        board_status=BoardStatus.WATCHLIST,
+        buylist_member=False,
+        watchlist_member=True,
+        breakout_price=101.5,
+        selected_orb_window="5m",
+        planned_quantity=20,
+        target_position_quantity=20,
+        entry_trigger=102.0,
+    )
+
+    result = request_board_action(engine, _clear(card), context=_context())
+
+    assert result.card.board_status == BoardStatus.WATCHLIST
+    assert result.card.watchlist_member is True
+    assert result.card.buylist_member is False
+    assert result.card.breakout_price is None
+    assert result.card.selected_orb_window is None
+    assert result.card.planned_quantity == 0
+    assert result.card.target_position_quantity == 0
+    assert result.card.entry_trigger is None
+
+
+def test_removed_watchlist_tombstone_fences_stale_target_update(engine):
+    card = _seed(
+        engine,
+        board_status=BoardStatus.WATCHLIST,
+        buylist_member=False,
+        watchlist_member=False,
+    )
+
+    with pytest.raises(BoardCommandRejectedError, match="removed"):
+        request_board_action(engine, _set(card), context=_context())
+
+    stored = card_repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert stored.board_status == BoardStatus.WATCHLIST
+    assert stored.watchlist_member is False
+    assert stored.breakout_price is None
+    assert stored.version == card.version
 
 
 @pytest.mark.parametrize(
@@ -380,7 +425,7 @@ def test_authorized_operator_queue_can_create_passive_market_hours_target(engine
     assert outcome.command_id == queued.command.command_id
     assert outcome.status == OperatorCommandStatus.COMPLETED
     stored = card_repo.get_trade_card(engine, "PROD", "1", "AAPL")
-    assert stored.board_status == BoardStatus.BUYLIST
+    assert stored.board_status == BoardStatus.WATCHLIST
     assert stored.breakout_price == 123.45
 
 

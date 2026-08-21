@@ -103,7 +103,7 @@ def test_bootstrap_uses_default_account_for_legacy_buylist(tmp_path, monkeypatch
     assert card.buylist_member is True
 
 
-def test_zero_orb_buffer_round_trips_through_buylist_and_watchlist_bootstrap(
+def test_buylist_buffer_round_trips_but_watchlist_bootstrap_discards_retired_orb_plan(
     tmp_path, monkeypatch
 ):
     monkeypatch.setattr(
@@ -118,7 +118,15 @@ def test_zero_orb_buffer_round_trips_through_buylist_and_watchlist_bootstrap(
     manager.add(buylist_item)
     watchlist = Watchlist()
     watch_item = watchlist.add("NONE", "No Buffer")
-    watch_item.selected_orb_plan = {"window": "5m", "buffer_pct": 0.0}
+    watch_item.breakout_price = 123.45
+    watch_item.selected_orb_plan = {
+        "window": "5m",
+        "buffer_pct": 0.0,
+        "capital_percent": 25.0,
+        "shares": 40,
+        "entry_trigger": 124.0,
+        "stop_adr": 30.0,
+    }
 
     bootstrap_trade_cards_from_current_state(
         engine,
@@ -134,7 +142,14 @@ def test_zero_orb_buffer_round_trips_through_buylist_and_watchlist_bootstrap(
         engine, "PROD", "12345678-01", "NONE"
     )
     assert buylist_card.buffer_pct == 0.0
-    assert watchlist_card.buffer_pct == 0.0
+    assert watchlist_card.breakout_price == 123.45
+    assert watchlist_card.buffer_pct == pytest.approx(0.001)
+    assert watchlist_card.selected_orb_window is None
+    assert watchlist_card.position_percent == 0.0
+    assert watchlist_card.planned_quantity == 0
+    assert watchlist_card.target_position_quantity == 0
+    assert watchlist_card.entry_trigger is None
+    assert watchlist_card.stop_adr is None
 
 
 def test_bootstrap_never_overwrites_existing_kanban_lifecycle(tmp_path, monkeypatch):
