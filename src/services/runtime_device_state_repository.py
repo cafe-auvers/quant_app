@@ -246,6 +246,52 @@ def save_runtime_device_state(
     return _record(row)
 
 
+def refresh_runtime_device_state(
+    engine: Engine,
+    *,
+    device_id: str,
+    hostname: str,
+    state: RuntimeDeviceState,
+    schema_version: int = CURRENT_EXECUTION_SCHEMA_VERSION,
+    details: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Refresh an unchanged readiness row with one UPDATE statement.
+
+    State transitions still use :func:`save_runtime_device_state` because
+    they must calculate/read back the handoff generation.  Normal ACTIVE or
+    STANDBY_READY heartbeats already know that generation and must not spend
+    three cloud requests selecting the same row before and after every touch.
+    A missing or concurrently changed row returns ``False`` so the caller can
+    fall back to the full transition path.
+    """
+
+    device_id = str(device_id or "").strip()
+    if not device_id:
+        raise ValueError("runtime device state requires device_id")
+    state = state if isinstance(state, RuntimeDeviceState) else RuntimeDeviceState(state)
+    table = ensure_runtime_device_state_table(engine)
+    values = {
+        "hostname": str(hostname or ""),
+        "schema_version": int(schema_version),
+        "details_json": json.dumps(
+            dict(details) if details is not None else {},
+            default=str,
+            separators=(",", ":"),
+        ),
+        "updated_at": _server_now(engine),
+    }
+    with engine.begin() as conn:
+        result = conn.execute(
+            table.update()
+            .where(
+                table.c.device_id == device_id,
+                table.c.state == state.value,
+            )
+            .values(**values)
+        )
+    return result.rowcount == 1
+
+
 def confirm_standby_handoff(
     engine: Engine,
     *,

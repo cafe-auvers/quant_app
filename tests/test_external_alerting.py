@@ -231,6 +231,24 @@ def test_heartbeat_is_published_on_the_expected_cadence(tmp_path):
     assert service.watchdog_is_external is True
 
 
+def test_successful_heartbeat_audit_is_compacted_while_webhook_stays_frequent(
+    tmp_path,
+):
+    provider = FakeProvider()
+    service, now = _service(
+        tmp_path,
+        provider=provider,
+        heartbeat_audit_interval_seconds=60,
+    )
+
+    assert service.publish_heartbeat_if_due() is True
+    now[0] += timedelta(seconds=10)
+    assert service.publish_heartbeat_if_due() is True
+
+    assert len(provider.heartbeats) == 2
+    assert len(service.heartbeat_attempts()) == 1
+
+
 def test_heartbeat_publication_failure_is_durable_and_retried(tmp_path):
     provider = FakeProvider()
     provider.heartbeat_failures = 1

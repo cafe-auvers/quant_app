@@ -284,3 +284,30 @@ def test_migration_respects_watchlist_membership(tmp_path):
         engine, buylist_manager=manager, watchlist=watchlist, apply=False
     )
     assert report.creates[0].card.watchlist_member is True
+
+
+def test_collection_revision_changes_without_returning_payloads(tmp_path):
+    engine = _make_engine(tmp_path)
+    empty = repo.get_trade_card_collection_revision(engine, environment="PROD")
+    assert empty.row_count == 0
+
+    repo.create_trade_card(
+        engine,
+        _card(),
+        local_snapshot_path=tmp_path / "trade_cards.json",
+    )
+    created = repo.get_trade_card_collection_revision(engine, environment="PROD")
+    assert created.row_count == 1
+    assert created != empty
+
+    card = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    card.name = "Updated"
+    repo.update_trade_card(
+        engine,
+        card,
+        expected_version=card.version,
+        local_snapshot_path=tmp_path / "trade_cards.json",
+    )
+    updated = repo.get_trade_card_collection_revision(engine, environment="PROD")
+    assert updated.version_sum == created.version_sum + 1
+    assert updated != created

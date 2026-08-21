@@ -332,6 +332,14 @@ def _ensure_live_trading_control_audit_table(engine: Engine) -> Table:
     return table
 
 
+def ensure_state_sync_tables(engine: Engine) -> None:
+    """Public one-time provisioning hook for a coordination-only database."""
+
+    _ensure_state_sync_table(engine)
+    _ensure_operator_control_audit_table(engine)
+    _ensure_live_trading_control_audit_table(engine)
+
+
 def _server_now(engine: Engine):
     if engine.dialect.name == "mysql":
         return func.utc_timestamp(6)

@@ -12,18 +12,18 @@ process may act?" Operator Control answers "which device may send the next
 human instruction?" Neither role, by itself, arms live trading or bypasses
 per-symbol market-data, account, risk, order-identity, or broker checks.
 
-The roles are stored in PC MySQL as `__main_device__` and
-`__operator_control__`. A real app window never falls back to its private
-SQLite database for ownership. If shared MySQL is unavailable, ownership and
-live execution fail closed; the local database remains recovery material only.
+The roles are stored in the shared coordination database as `__main_device__`
+and `__operator_control__`. When `COORD_DB_*` is configured, that authority is
+the TLS-connected TiDB Cloud SQL database; otherwise the legacy deployment
+uses PC MySQL. A real app window never falls back to its private SQLite
+database for ownership. If the selected shared store is unavailable,
+ownership and live execution fail closed.
 
-Assigning **Execution Owner: Laptop** moves execution authority, not the MySQL
-server. In the current deployment, the PC must remain powered on because it
-hosts the one canonical trading database. Powering off the PC therefore affects
-the laptop executor even when both Execution Owner and Operator Control say
-Laptop. The local SQLite mirror can keep charts/scanner reads available, but it
-does not contain a second writable ownership, command, order, or TradeCard
-authority.
+Assigning **Execution Owner: Laptop** moves execution authority, not data
+storage. With TiDB coordination configured on both devices, the PC may be
+powered off: historical reads move to the laptop mirror while ownership,
+commands, orders, and TradeCards remain online. See
+[TiDB Cloud Coordination Store](tidb_coordination_store.md).
 
 Each running device also publishes an explicit `device_kind` (`PC` or
 `Laptop`) with its readiness record. On Windows this is derived from system
@@ -66,6 +66,12 @@ The market-open command sequence is:
 4. A valid request moves the canonical card into Buy Today. The active
    runtime then monitors it and the normal entry engine decides whether an
    order may be submitted.
+
+The executor checks this command queue every second during the regular
+session. The general planning/UI sync remains once per minute because it is
+not the execution channel. An execution-owner switch also force-loads the
+latest canonical cards, quote subscriptions, and stops before the target may
+become `ACTIVE`; it never relies on the minute display refresh for handoff.
 
 If the current-session 1m, 5m, and 30m ORB plans all reach terminal
 `REJECTED`/`RISK_INVALID` states before any BUY identity exists, the Execution
@@ -111,7 +117,7 @@ checks and is waiting for the execution lease. It is not an execution error
 and is no longer rendered as a red per-card restriction. The selected
 Execution Owner must progress to `ACTIVE` before it can mutate or submit.
 
-## If the database PC goes offline
+## If a shared coordination database goes offline
 
 The outage policy distinguishes continuity from authority:
 
@@ -127,7 +133,7 @@ The outage policy distinguishes continuity from authority:
   device still reaching MySQL.
 - A cold-started or not-yet-active laptop has no offline execution authority.
   It waits closed for MySQL rather than guessing from the recovery snapshot.
-- When MySQL returns, the emergency journal is folded into canonical state and
+- When the shared store returns, the emergency journal is folded into canonical state and
   a full fresh KIS reconciliation must succeed before ordinary execution
   reopens. A failed database read is never interpreted as an empty card list.
 

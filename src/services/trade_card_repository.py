@@ -62,6 +62,32 @@ LOCAL_TRADE_CARDS_FILE = DATA_DIR / "trade_cards.json"
 
 _ensured_engines: "weakref.WeakSet[Engine]" = weakref.WeakSet()
 _ensure_lock = threading.Lock()
+_local_change_generations: "weakref.WeakKeyDictionary[Engine, int]" = (
+    weakref.WeakKeyDictionary()
+)
+_local_change_lock = threading.Lock()
+
+
+def local_trade_card_change_generation(engine: Optional[Engine]) -> int:
+    """Return a process-local token incremented after every card SQL write.
+
+    The runtime can poll the remote collection revision once per minute while
+    still observing writes made through this process's shared engine on its
+    next one-second market cycle.  Database CAS/version checks remain the
+    authority; this token is only a safe cache invalidation hint.
+    """
+
+    if engine is None:
+        return 0
+    with _local_change_lock:
+        return int(_local_change_generations.get(engine, 0))
+
+
+def _mark_local_trade_card_changed(engine: Engine) -> None:
+    with _local_change_lock:
+        _local_change_generations[engine] = int(
+            _local_change_generations.get(engine, 0)
+        ) + 1
 
 
 def invalidate_trade_cards_table_cache(engine: Engine) -> None:
@@ -83,6 +109,15 @@ class TradeCardVersionConflictError(RuntimeError):
 
 class TradeCardNotFoundError(RuntimeError):
     """No row exists for the requested (environment, account_no, symbol)."""
+
+
+@dataclass(frozen=True)
+class TradeCardCollectionRevision:
+    """Compact change token used instead of downloading every card each tick."""
+
+    row_count: int
+    version_sum: int
+    updated_at: Optional[datetime]
 
 
 def _get_trade_cards_table(metadata: MetaData) -> Table:
@@ -214,6 +249,52 @@ def list_trade_cards(
         return []
 
 
+def get_trade_card_collection_revision(
+    engine: Optional[Engine],
+    *,
+    environment: Optional[str] = None,
+    account_no: Optional[str] = None,
+    raise_on_error: bool = False,
+) -> Optional[TradeCardCollectionRevision]:
+    """Return a three-value token that changes after any normal card write.
+
+    This query returns one small row and never transfers card JSON payloads.
+    The runtime performs a full reload only when the token differs from its
+    cache. Exact optimistic versions still protect every subsequent write.
+    """
+
+    if engine is None:
+        return None
+    try:
+        table = _ensure_trade_cards_table(engine)
+        statement = select(
+            func.count(table.c.id),
+            func.coalesce(func.sum(table.c.version), 0),
+            func.max(table.c.updated_at),
+        )
+        if environment:
+            statement = statement.where(
+                table.c.environment == str(environment).upper()
+            )
+        if account_no:
+            statement = statement.where(table.c.account_no == str(account_no))
+        with engine.connect() as conn:
+            row = conn.execute(statement).one()
+        return TradeCardCollectionRevision(
+            row_count=int(row[0] or 0),
+            version_sum=int(row[1] or 0),
+            updated_at=row[2],
+        )
+    except SQLAlchemyError as exc:
+        if raise_on_error:
+            raise
+        logger.info(
+            "trade_card_repository: get_trade_card_collection_revision failed: %s",
+            exc,
+        )
+        return None
+
+
 def _upsert_local_snapshot_card(
     card: TradeCardState, path: Optional[Path] = None
 ) -> None:
@@ -274,6 +355,7 @@ def insert_trade_card(conn, card: TradeCardState) -> TradeCardState:
         raise TradeCardVersionConflictError(
             f"A trade card already exists for {card.card_key}"
         ) from exc
+    _mark_local_trade_card_changed(conn.engine)
     card.version = 1
     return card
 
@@ -321,6 +403,7 @@ def update_trade_card_in_transaction(
             f"Expected version {expected_version} for {card.card_key}, "
             f"stored version is {existing.version}"
         )
+    _mark_local_trade_card_changed(conn.engine)
     card.version = next_version
     return card
 

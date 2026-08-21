@@ -37,6 +37,10 @@ from src.core.scanner import StockScanner
 from src.core.trade_reviewer import TradeReviewer
 from src.core.watchlist import BuylistManager, TradePlanManager, Watchlist
 from src.infrastructure.database.mirror_engine import resolve_data_engine
+from src.infrastructure.database.coordination_engine import (
+    coordination_database_configured,
+    init_coordination_engine,
+)
 from src.infrastructure.database.mirror_freshness import (
     local_mirror_hourly_is_stale, local_mirror_is_stale)
 from src.infrastructure.database.operational_engine import (
@@ -333,6 +337,29 @@ class DatabaseInitWorker(QThread):
             self.initialized.emit(None, "none", None, str(exc))
 
 
+class CoordinationDatabaseInitWorker(QThread):
+    """Connect/provision the tiny Internet coordination store off the UI thread."""
+
+    initialized = pyqtSignal(object, str)
+
+    def run(self) -> None:
+        if not coordination_database_configured():
+            self.initialized.emit(None, "")
+            return
+        try:
+            engine = init_coordination_engine(ensure_schema=True, raise_on_error=True)
+            self.initialized.emit(engine, "")
+        except Exception as exc:  # credentials/endpoints must never reach UI logs
+            logger.debug(
+                "Coordination database initialization failed: %s", type(exc).__name__
+            )
+            self.initialized.emit(
+                None,
+                "The configured shared coordination database could not be reached. "
+                "Verify its SQL endpoint, TLS CA, username, password, and Internet connection.",
+            )
+
+
 @dataclass(frozen=True)
 class MarketDataStatusResult:
     """Slow market-cache watermarks resolved outside the GUI thread."""
@@ -559,7 +586,8 @@ class StateSyncWorker(QThread):
                 operator_result.error
                 or "Could not read shared operator-control ownership."
             )
-        result.state_revisions = get_synced_state_revisions(self.engine)
+        if not result.state_revisions:
+            result.state_revisions = get_synced_state_revisions(self.engine)
         try:
             from src.services.runtime_device_state_repository import (
                 list_runtime_device_states,
@@ -778,13 +806,19 @@ class MainWindow(
         # after the event loop begins.
         self.db_engine = None
         self.pc_db_engine = None
+        self.coordination_db_engine = None
         self._pc_probe_engine = None
         self._local_mirror_engine = None
         self.db_engine_source = "none"
         self.db_enabled = False
         self.db_initializing = True
         self.database_init_worker = None
+        self.coordination_database_init_worker = None
         self.database_recovery_worker = None
+        self._coordination_database_configured = coordination_database_configured()
+        self._coordination_database_ready = False
+        self._coordination_transition_generation = 0
+        self._last_coordination_database_notice = ""
         self._pc_database_ready = False
         self._pc_database_coordination_ready = False
         self._last_pc_database_probe_ready = False
@@ -991,7 +1025,9 @@ class MainWindow(
     def _execution_state_engine(self):
         """Return the one shared Kanban coordination store.
 
-        The shared PC database is preferred whenever it is reachable.
+        A configured Internet coordination database is preferred. The PC
+        database remains an optional historical-data source and the legacy
+        coordination fallback when no dedicated store is configured.
         Watchlist/Buylist/Buy Today membership and main-device ownership
         must stay synced across the laptop and PC -- exactly one device may
         ever be Main, and that is only knowable through the store they both
@@ -1016,6 +1052,13 @@ class MainWindow(
             )
         ):
             return self.__dict__.get("operational_db_engine")
+        if self.__dict__.get("_coordination_database_configured", False):
+            coordination_engine = self.__dict__.get("coordination_db_engine")
+            if coordination_engine is not None and self.__dict__.get(
+                "_coordination_database_ready", False
+            ):
+                return coordination_engine
+            return None
         pc_engine = self.__dict__.get("pc_db_engine")
         if pc_engine is not None and self.__dict__.get(
             "_pc_database_ready", pc_engine is not None
@@ -1030,6 +1073,8 @@ class MainWindow(
         local_engine = self.__dict__.get("operational_db_engine")
         if engine is local_engine:
             return bool(self.__dict__.get("_operational_database_ready", True))
+        if engine is self.__dict__.get("coordination_db_engine"):
+            return bool(self.__dict__.get("_coordination_database_ready", False))
         return bool(
             self.__dict__.get("_pc_database_ready", engine is not None)
         )
@@ -1044,11 +1089,12 @@ class MainWindow(
     def _execution_state_generation(self) -> int:
         """Return the generation for the current coordination-store route."""
 
-        key = (
-            "_operational_state_generation"
-            if self._using_local_operational_authority()
-            else "_database_transition_generation"
-        )
+        if self._using_local_operational_authority():
+            key = "_operational_state_generation"
+        elif self.__dict__.get("_coordination_database_configured", False):
+            key = "_coordination_transition_generation"
+        else:
+            key = "_database_transition_generation"
         return int(self.__dict__.get(key, 0) or 0)
 
     def _execution_state_metadata_path(self):
@@ -1064,6 +1110,7 @@ class MainWindow(
         """Begin optional database setup after widgets have been rendered."""
         if self.__dict__.get("_database_shutting_down", False):
             return
+        self._start_coordination_database_initialization()
         if self.database_init_worker is not None and self.database_init_worker.isRunning():
             return
         worker = DatabaseInitWorker()
@@ -1071,6 +1118,59 @@ class MainWindow(
         worker.initialized.connect(self._on_optional_database_initialized)
         self._track_worker("database_init_worker", worker)
         worker.start()
+
+    def _start_coordination_database_initialization(self) -> None:
+        if self.__dict__.get("_database_shutting_down", False):
+            return
+        if self.__dict__.get("_coordination_database_ready", False):
+            return
+        worker = self.__dict__.get("coordination_database_init_worker")
+        if worker is not None:
+            return
+        worker = CoordinationDatabaseInitWorker()
+        self.coordination_database_init_worker = worker
+        worker.initialized.connect(self._on_coordination_database_initialized)
+        self._track_worker("coordination_database_init_worker", worker)
+        worker.start()
+
+    def _on_coordination_database_initialized(self, engine, error: str = "") -> None:
+        if self.__dict__.get("_database_shutting_down", False):
+            if engine is not None:
+                engine.dispose()
+            return
+        configured = bool(
+            self.__dict__.get("_coordination_database_configured", False)
+        )
+        self.coordination_db_engine = engine
+        self._coordination_database_ready = bool(configured and engine is not None)
+        self._coordination_transition_generation = int(
+            self.__dict__.get("_coordination_transition_generation", 0) or 0
+        ) + 1
+        if not configured:
+            return
+        if engine is None:
+            self._pc_database_coordination_ready = False
+            self._shared_live_trading_available = False
+            self._initial_state_sync_complete = False
+            self._bind_remote_state_engine(None, is_main_device=False)
+            notice = error or "Shared coordination database is unavailable."
+            if notice != self.__dict__.get(
+                "_last_coordination_database_notice", ""
+            ):
+                self.append_log(notice)
+            self._last_coordination_database_notice = notice
+            return
+        self._bind_remote_state_engine(engine, is_main_device=False)
+        if self.__dict__.get("_last_coordination_database_notice"):
+            self.append_log("Shared online coordination database recovered.")
+        else:
+            self.append_log(
+                "Shared online coordination database connected. Execution ownership "
+                "is independent of whether the PC historical database is online."
+            )
+        self._last_coordination_database_notice = ""
+        self._start_state_sync()
+        self._sync_buyboard_runtime_worker()
 
     def _on_optional_database_initialized(
         self, engine, source: str = "none", pc_engine=None, error: str = ""
@@ -1098,7 +1198,10 @@ class MainWindow(
         self.db_enabled = engine is not None
         self.db_initializing = False
         self._pc_database_ready = bool(source == "pc" and pc_engine is not None)
-        if not self._using_local_operational_authority():
+        if (
+            not self._using_local_operational_authority()
+            and not self.__dict__.get("_coordination_database_configured", False)
+        ):
             self._pc_database_coordination_ready = False
         self._last_pc_database_probe_ready = self._pc_database_ready
         self._main_availability_probe_complete = True
@@ -1626,7 +1729,7 @@ class MainWindow(
                 and self.state_sync_role.is_main
                 and self._initial_state_sync_complete
             ),
-            generation=self.__dict__.get("_database_transition_generation", 0),
+            generation=self._execution_state_generation(),
             auto_claim=auto_claim,
             expected_owner_device_id=expected_owner_device_id,
             expected_standby_generation=expected_standby_generation,
@@ -1764,6 +1867,11 @@ class MainWindow(
             self.__dict__.pop("execution_queue_manager", None)
             if hasattr(self, "populate_buylist_dashboard"):
                 self.populate_buylist_dashboard()
+        if updated_keys.intersection({"watchlist", "buylist", "execution_queue"}):
+            # Planning state is normalized into canonical trade-card rows by
+            # an explicit projection refresh.  Do it on the actual sync event
+            # instead of paying for a full board rebuild every few seconds.
+            self.refresh_buyboard()
 
         notices = []
         if result.conflict_keys:
@@ -3225,6 +3333,7 @@ class MainWindow(
             self._capture_buyboard_market_data_for_restart(runtime_worker)
         candidate_workers = [
             self.__dict__.get("database_init_worker"),
+            self.__dict__.get("coordination_database_init_worker"),
             self.__dict__.get("database_recovery_worker"),
             self.__dict__.get("_local_mirror_sync_worker"),
             self.__dict__.get("state_sync_worker"),
@@ -4133,7 +4242,11 @@ class MainWindow(
         # Pull-only devices stay current while both applications remain open,
         # and former main devices promptly notice an ownership transfer.
         self.state_sync_timer = QTimer(self)
-        self.state_sync_timer.setInterval(15_000)
+        # Shared planning/control display refresh. Actual operator commands,
+        # broker-boundary authority checks, and handoff button actions use
+        # their own immediate paths; unchanged JSON revisions need one cloud
+        # check per minute, not four per minute.
+        self.state_sync_timer.setInterval(60_000)
         self.state_sync_timer.timeout.connect(self._start_state_sync)
         self.state_sync_timer.start()
 
@@ -4232,12 +4345,11 @@ class MainWindow(
                 hostname=record.hostname,
                 is_main=False,
             )
-        role = self.__dict__.get("state_sync_role")
-        if (
-            role is not None
-            and detect_local_device_kind(role.hostname) == target_label
-        ):
-            return LocalDeviceRole(role.device_id, role.hostname, False)
+        # A device-kind guess from this process's hardware is not a published
+        # target identity. In particular, battery-less CI/VM hosts classify a
+        # DESKTOP-named laptop role as PC. Ownership changes require a fresh
+        # runtime row with an explicit device_kind and eligible state; without
+        # that row the button must report the target unavailable.
         return None
 
     def _set_control_owner_buttons_enabled(self, enabled: bool) -> None:
@@ -4257,8 +4369,9 @@ class MainWindow(
             QMessageBox.warning(
                 self,
                 "Shared control unavailable",
-                "The PC MySQL coordination store is unavailable. Ownership "
-                "cannot be changed, and execution remains fail-closed.",
+                "The shared coordination database is unavailable. Ownership "
+                "cannot be changed, and execution remains fail-closed. If TiDB "
+                "is configured, verify its SQL endpoint, TLS, and Internet connection.",
             )
             return
         target = self._control_target_role(target_label)
@@ -4266,7 +4379,7 @@ class MainWindow(
             QMessageBox.information(
                 self,
                 "Device not available",
-                f"No {target_label} runtime is registered in shared MySQL. "
+                f"No {target_label} runtime is registered in shared coordination. "
                 f"Start or restart main.py on the {target_label}, then wait "
                 "for its Executor Ready status.",
             )
@@ -4314,7 +4427,7 @@ class MainWindow(
             QMessageBox.warning(
                 self,
                 "Publish unavailable",
-                "The shared PC MySQL coordination store is unavailable.",
+                "The shared coordination database is unavailable.",
             )
             return
         worker = self.__dict__.get("plan_publish_worker")
@@ -4678,17 +4791,30 @@ class MainWindow(
             text_value = "DB: Local (Syncing...)" if reconciling else "DB: Local"
             dot_color = "#ffb300"
             text_color = "#9a6700"
+            online_coordination = self._execution_state_ready()
             tooltip = (
                 "Market-data reads remain on the laptop's local SQLite mirror "
-                "while PC/local market data is reconciled. The canonical "
-                "trading database is offline, so new entries and operator "
-                "commands remain closed."
+                "while PC/local market data is reconciled. Shared online "
+                "coordination remains available for ownership and execution."
+                if online_coordination
+                else (
+                    "Market-data reads remain on the laptop's local SQLite mirror "
+                    "while PC/local market data is reconciled. The shared "
+                    "coordination database is offline, so new entries and operator "
+                    "commands remain closed."
+                )
                 if reconciling
                 else (
                     "Market-data reads are using the laptop's local SQLite "
-                    "mirror. The canonical trading database is offline: new "
-                    "entries and operator commands are closed; an already-active "
-                    "runtime has only bounded emergency position protection."
+                    "mirror. Shared online coordination remains available for "
+                    "ownership and execution."
+                    if online_coordination
+                    else (
+                        "Market-data reads are using the laptop's local SQLite "
+                        "mirror. The shared coordination database is offline: new "
+                        "entries and operator commands are closed; an already-active "
+                        "runtime has only bounded emergency position protection."
+                    )
                 )
             )
         else:
@@ -4733,14 +4859,18 @@ class MainWindow(
         self._database_transition_generation = (
             self.__dict__.get("_database_transition_generation", 0) + 1
         )
-        if self._using_local_operational_authority():
+        execution_engine = self._execution_state_engine()
+        if execution_engine is not None:
             try:
                 self._bind_remote_state_engine(
-                    self._execution_state_engine(),
-                    is_main_device=bool(self.state_sync_role.is_main),
+                    execution_engine,
+                    is_main_device=bool(
+                        self.state_sync_role.is_main
+                        and self._using_local_operational_authority()
+                    ),
                 )
             except Exception:
-                logger.exception("Could not retain local Kanban persistence")
+                logger.exception("Could not retain shared Kanban persistence")
         else:
             self._pc_database_coordination_ready = False
             self._shared_live_trading_available = False
@@ -4765,10 +4895,16 @@ class MainWindow(
             self.db_engine = local_engine
             self.db_engine_source = "local_mirror"
             self.db_enabled = True
-            self.append_log(
-                "PC database went offline; switched automatically to the local data mirror. "
-                "Canonical trading coordination and new entries are closed until MySQL recovers."
-            )
+            if self._execution_state_ready():
+                self.append_log(
+                    "PC historical database went offline; switched to the local "
+                    "data mirror. Shared coordination and execution remain online."
+                )
+            else:
+                self.append_log(
+                    "PC database went offline; switched automatically to the local data mirror. "
+                    "Shared coordination and new entries are closed until it recovers."
+                )
         else:
             self.db_engine = None
             self.db_engine_source = "none"
@@ -4805,10 +4941,16 @@ class MainWindow(
         self.db_engine_source = "pc"
         self.db_enabled = True
         self._pc_database_ready = True
-        if not self._using_local_operational_authority():
+        if (
+            not self._using_local_operational_authority()
+            and not self.__dict__.get("_coordination_database_configured", False)
+        ):
             self._pc_database_coordination_ready = False
         self._last_pc_database_probe_ready = True
-        if not self._using_local_operational_authority():
+        if (
+            not self._using_local_operational_authority()
+            and not self.__dict__.get("_coordination_database_configured", False)
+        ):
             self._initial_state_sync_complete = False
         self._cached_market_data_status = None
         self._update_database_source_indicator()
@@ -4917,6 +5059,8 @@ class MainWindow(
         """
         if self.__dict__.get("_database_shutting_down", False):
             return
+        if self.__dict__.get("_coordination_database_configured", False):
+            self._start_coordination_database_initialization()
         if self.__dict__.get("database_recovery_worker") is not None:
             return
         if self._pc_status_worker is not None:
@@ -5083,6 +5227,7 @@ class MainWindow(
             live_session
             and is_buyboard_engine_enabled()
             and trading_state.is_trading_enabled()
+            and self._execution_state_engine() is self.__dict__.get("pc_db_engine")
         ):
             QMessageBox.warning(
                 self,

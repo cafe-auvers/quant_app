@@ -1123,7 +1123,15 @@ def request_board_action(
     return BoardWorkflowResult(card=updated, command_id=command.command_id)
 
 
-def project_board_card(engine, card, *, context=None):
+def project_board_card(
+    engine,
+    card,
+    *,
+    context=None,
+    ownership=None,
+    all_orders=None,
+    external_orders=None,
+):
     """Build one read-only projection from card, order, external, and owner truth."""
     import copy
 
@@ -1132,16 +1140,22 @@ def project_board_card(engine, card, *, context=None):
     from src.services.execution_ownership_repository import get_ownership
 
     projection_context = context or BoardProjectionContext()
-    ownership = get_ownership(
-        engine,
-        environment=card.environment,
-        account_no=card.account_no,
-        symbol=card.symbol,
-    )
-    all_orders = _active_owned_orders(engine, card)
+    if ownership is None:
+        ownership = get_ownership(
+            engine,
+            environment=card.environment,
+            account_no=card.account_no,
+            symbol=card.symbol,
+        )
+    if all_orders is None:
+        all_orders = _active_owned_orders(engine, card)
     orders = [order for order in all_orders if _card_tracks_order(card, order)]
     unlinked_orders = [order for order in all_orders if order not in orders]
-    external = _active_external_orders(engine, card)
+    external = (
+        _active_external_orders(engine, card)
+        if external_orders is None
+        else list(external_orders)
+    )
     ambiguous_count = sum(
         order.status == ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE
         or order.broker_identity_status == BrokerIdentityStatus.AMBIGUOUS
@@ -1204,11 +1218,15 @@ def list_board_projections(
         BoardProjectionContext,
     )
     from src.core.discovered_external_order import ExternalOrderDisposition
+    from src.core.execution_ownership import ExecutionOwnership
     from src.services import trade_card_repository
     from src.services.discovered_external_order_repository import (
         list_discovered_external_orders,
     )
     from src.services.execution_order_repository import list_execution_orders
+    from src.services.execution_ownership_repository import (
+        list_execution_ownership,
+    )
 
     if engine is None:
         return []
@@ -1216,13 +1234,59 @@ def list_board_projections(
     cards = trade_card_repository.list_trade_cards(
         engine, environment=environment, raise_on_error=True
     )
+    ownership_rows = list_execution_ownership(engine, environment=environment)
+    all_execution_orders = list_execution_orders(engine, environment=environment)
+    all_external_orders = list_discovered_external_orders(
+        engine, environment=environment
+    )
     if board_statuses is not None:
         visible_statuses = set(board_statuses)
         cards = [card for card in cards if card.board_status in visible_statuses]
-    card_projections = [
-        project_board_card(engine, card, context=context)
-        for card in cards
-    ]
+    ownership_by_scope = {
+        (row.environment, row.account_no, row.symbol): row
+        for row in ownership_rows
+    }
+    owned_by_scope = {}
+    for order in all_execution_orders:
+        if order.status in TERMINAL_EXECUTION_ORDER_STATUSES:
+            continue
+        owned_by_scope.setdefault(
+            (order.environment, order.account_no, order.symbol), []
+        ).append(order)
+    terminal = {
+        ExecutionOrderStatus.FILLED,
+        ExecutionOrderStatus.CANCELLED,
+        ExecutionOrderStatus.EXPIRED,
+        ExecutionOrderStatus.REJECTED,
+    }
+    external_by_scope = {}
+    for order in all_external_orders:
+        if (
+            order.disposition != ExternalOrderDisposition.DISCOVERED_UNOWNED
+            or order.broker_status in terminal
+        ):
+            continue
+        external_by_scope.setdefault(
+            (order.environment, order.account_no, order.symbol), []
+        ).append(order)
+    card_projections = []
+    for card in cards:
+        scope = (card.environment, card.account_no, card.symbol)
+        ownership = ownership_by_scope.get(scope) or ExecutionOwnership(
+            environment=card.environment,
+            account_no=card.account_no,
+            symbol=card.symbol,
+        )
+        card_projections.append(
+            project_board_card(
+                engine,
+                card,
+                context=context,
+                ownership=ownership,
+                all_orders=owned_by_scope.get(scope, ()),
+                external_orders=external_by_scope.get(scope, ()),
+            )
+        )
     card_scopes = {
         (projection.card.environment, projection.card.account_no, projection.card.symbol)
         for projection in card_projections
@@ -1231,12 +1295,6 @@ def list_board_projections(
         external.external_order_id
         for projection in card_projections
         for external in projection.external_orders
-    }
-    terminal = {
-        ExecutionOrderStatus.FILLED,
-        ExecutionOrderStatus.CANCELLED,
-        ExecutionOrderStatus.EXPIRED,
-        ExecutionOrderStatus.REJECTED,
     }
     standalone_external = [
         BoardExternalOrderProjection(
@@ -1252,9 +1310,7 @@ def list_board_projections(
                 )
             ),
         )
-        for order in list_discovered_external_orders(
-            engine, environment=environment
-        )
+        for order in all_external_orders
         if order.external_order_id not in attached_external_ids
         and order.disposition == ExternalOrderDisposition.DISCOVERED_UNOWNED
         and order.broker_status not in terminal
@@ -1273,11 +1329,56 @@ def list_board_projections(
                 )
             ),
         )
-        for order in list_execution_orders(engine, environment=environment)
+        for order in all_execution_orders
         if order.status not in TERMINAL_EXECUTION_ORDER_STATUSES
         and (order.environment, order.account_no, order.symbol) not in card_scopes
     ]
     return [*card_projections, *standalone_external, *standalone_owned]
+
+
+def get_board_projection_revision(engine, *, environment="PROD"):
+    """Return one compact token covering every table used by the board.
+
+    A timer can compare this single SQL result once per minute and avoid both
+    JSON transfer and UI rebuild when nothing changed.  The full projection
+    remains normalized relational state; this token is only invalidation.
+    """
+
+    from sqlalchemy import func, literal, select, union_all
+    from src.services.discovered_external_order_repository import (
+        ensure_discovered_external_orders_table,
+    )
+    from src.services.execution_order_repository import (
+        ensure_execution_orders_table,
+    )
+    from src.services.execution_ownership_repository import (
+        ensure_execution_ownership_table,
+    )
+    from src.services.trade_card_repository import ensure_trade_cards_table
+
+    environment = str(environment or "PROD").upper()
+    tables = (
+        ("cards", ensure_trade_cards_table(engine)),
+        ("owners", ensure_execution_ownership_table(engine)),
+        ("orders", ensure_execution_orders_table(engine)),
+        ("external", ensure_discovered_external_orders_table(engine)),
+    )
+    statements = []
+    for name, table in tables:
+        statements.append(
+            select(
+                literal(name).label("source"),
+                func.count(table.c.id).label("row_count"),
+                func.coalesce(func.sum(table.c.version), 0).label("version_sum"),
+                func.max(table.c.updated_at).label("updated_at"),
+            ).where(table.c.environment == environment)
+        )
+    with engine.connect() as conn:
+        rows = conn.execute(union_all(*statements)).fetchall()
+    return tuple(
+        (str(row.source), int(row.row_count or 0), int(row.version_sum or 0), str(row.updated_at or ""))
+        for row in rows
+    )
 
 
 def get_board_projection(

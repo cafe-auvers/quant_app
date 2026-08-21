@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import threading
 import weakref
-from typing import Optional
+from typing import List, Optional
 
 from sqlalchemy import Column, DateTime, Integer, MetaData, String, Table, UniqueConstraint, func, select
 from sqlalchemy.engine import Connection, Engine
@@ -94,6 +94,22 @@ def get_ownership(engine: Engine, *, environment: str, account_no: str, symbol: 
     if row is None:
         return ExecutionOwnership(environment=environment, account_no=account_no, symbol=symbol)
     return _row_to_ownership(row)
+
+
+def list_execution_ownership(
+    engine: Engine, *, environment: Optional[str] = None
+) -> List[ExecutionOwnership]:
+    """Bulk-read ownership for projections and emergency-proof refreshes."""
+
+    table = ensure_execution_ownership_table(engine)
+    statement = select(table)
+    if environment:
+        statement = statement.where(
+            table.c.environment == str(environment or "").upper()
+        )
+    with engine.connect() as conn:
+        rows = conn.execute(statement).fetchall()
+    return [_row_to_ownership(row) for row in rows]
 
 
 def get_ownership_in_transaction(

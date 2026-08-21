@@ -25,12 +25,14 @@ access confirmed from a mobile hotspot (genuinely off the home network).
   2. Run `historical.py` on a schedule to keep that database's price
      history, hourly bars, chart indicators, and scanner metrics fresh.
 
-There is exactly **one canonical database**, living on the PC. The laptop's
-SQLite file is an offline market-data mirror rather than a peer database:
-cross-machine application state, ownership, runtime heartbeats, and intraday
-trading data continue to use only PC MySQL. Normal synchronization is PC to
-laptop, and laptop market data is never promoted back to the PC. Startup and
-reconnect wait only for a successful MySQL connection check, then use the PC
+There are two deliberately separate database roles. PC MySQL is the canonical
+historical-data source. When `COORD_DB_*` is configured, the small canonical
+execution-coordination store lives in TiDB Cloud; without it, PC MySQL remains
+the legacy coordination fallback. The laptop's SQLite file is an offline
+market-data mirror rather than a peer authority. Normal historical
+synchronization is PC to laptop, and laptop market data is never promoted back
+to the PC. Historical reconnect waits only for a successful MySQL connection
+check, then uses the PC
 database immediately. The SQLite safety backup is disposable and updates in
 the background; it never blocks PC routing. Full hourly backup is limited to
 SPY and symbols in scanner results, watchlist, or buylist.
@@ -55,10 +57,11 @@ market-open operator commands are different workflows. See
 [Execution Owner and Operator Control](execution_operator_control.md) for the
 exact handoff, retry, and Buy Today rules.
 
-These execution roles do not move storage roles. Even with both controls set to
-Laptop, powering off the PC removes canonical MySQL. The laptop's SQLite mirror
-continues market-data display only; it never becomes a writable execution
-authority. New entries and operator commands close until MySQL returns.
+These execution roles do not move storage roles. With TiDB coordination
+configured on both devices, powering off the PC removes only the historical
+source: the laptop mirror continues display while TiDB remains the writable execution
+authority. If TiDB is not configured, the legacy PC-hosted coordination path
+still closes new entries and operator commands until PC MySQL returns.
 
 ## Architecture
 
@@ -279,9 +282,10 @@ morning) for dependencies:
 ## What happens if the PC doesn't work one day?
 
 - **The laptop's `main.py` doesn't crash.** It falls back to
-  `data/local_mirror.db`, while keeping PC-only state synchronization and
-  runtime coordination disabled. Scanner and chart cache reads continue to
-  work from the mirror.
+  `data/local_mirror.db`. Scanner and chart cache reads continue from the
+  mirror. TiDB-backed state synchronization and runtime coordination remain
+  available; the legacy PC-hosted coordination path is disabled until MySQL
+  returns.
 - **Staleness is explicit.** If the mirror is current through the latest
   completed market session, the dashboard uses it silently. If it is stale,
   the dashboard asks whether to refresh the laptop copy directly from Yahoo
@@ -508,21 +512,20 @@ the wake time itself is harmless idle time either way.
 - Broker API outage during handoff: reconciliation retries with backoff and
   refuses to trade until it gets an unambiguous snapshot -- correct
   fail-safe, but the position is unprotected until it (or KIS) recovers.
-- Shared-MySQL outage while a device is main: new entries and ordinary
+- Shared-coordination outage while a device is main: new entries and ordinary
   mutations fail closed immediately. An already-active executor may use its
   cached exact lease/ownership proof and fsynced local journal for eligible
   protective cancellation/SELL work for 30 seconds by default. After that
   emergency allowance, **all** KIS submissions fail closed, including
   stop-loss and other protective exits. A cold-started executor has no offline
   allowance. This is the intentional split-brain policy.
-  Treat a MySQL CRITICAL health result during a live position as a high-
+  Treat a coordination-database CRITICAL result during a live position as a high-
   severity operational alert and be prepared to manage the position directly
   in KIS until coordination recovers.
-- The dashboard remote-shutdown button refuses to power off the database PC
-  during the regular session while the Buy Board engine and Live Trading are
-  armed. Physical shutdown remains outside the app's control. Independent
-  laptop/PC operation requires relocating canonical MySQL to a third always-on
-  host or managed MySQL service.
+- The dashboard remote-shutdown button refuses to power off the PC during live
+  trading only when that PC MySQL instance is still the selected legacy
+  coordination authority. With TiDB coordination online, PC shutdown affects
+  historical-data freshness but not ordinary execution authority.
 - `orders.json`/`event_journal.jsonl` stay local-only per device. Broker-truth
   discovery makes this a completeness gap for the PC's own order-history
   view, not a correctness problem for reconciliation itself.

@@ -40,6 +40,7 @@ from src.services.state_sync import (
     claim_main_device_if_stale,
     claim_main_device_if_unclaimed,
     get_main_device,
+    get_synced_state_revisions,
     pull_state,
     publish_planning_snapshot,
     push_state,
@@ -987,6 +988,8 @@ def reconcile_state_with_remote(
             return result
 
         sync_entries = _read_sync_entries(metadata_path)
+        remote_revisions = get_synced_state_revisions(engine)
+        result.state_revisions = dict(remote_revisions)
         metadata_updates: Dict[str, Dict[str, Any]] = {}
         key_to_file = _synced_key_to_file()
 
@@ -997,6 +1000,17 @@ def reconcile_state_with_remote(
             base_entry = sync_entries.get(state_key)
             has_base, base_revision, base_hash = _base_sync_values(base_entry)
             local_dirty = has_base and local_hash != base_hash
+
+            # The four planning payloads can be large. A single compact
+            # revision query proves an unchanged pull-only row needs no JSON
+            # transfer. Main-device local changes still follow the guarded
+            # push path below.
+            if (
+                not is_main
+                and has_base
+                and int(remote_revisions.get(state_key, 0) or 0) == base_revision
+            ):
+                continue
 
             pulled = pull_state(engine, state_key)
             if pulled.status == PULL_ERROR:

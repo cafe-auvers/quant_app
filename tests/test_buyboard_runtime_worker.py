@@ -290,6 +290,34 @@ def test_construction_builds_nothing(tmp_path):
     assert worker.runtime is None
 
 
+def test_card_cache_downloads_payload_only_when_revision_changes(
+    tmp_path, monkeypatch
+):
+    worker, engine = _worker(tmp_path)
+    _seed_card(engine)
+    real_list = repo.list_trade_cards
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(True)
+        return real_list(*args, **kwargs)
+
+    monkeypatch.setattr(repo, "list_trade_cards", counted)
+
+    first = worker._load_cards_if_changed()
+    second = worker._load_cards_if_changed()
+    assert first is second
+    assert len(calls) == 1
+
+    card = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    card.name = "Changed elsewhere"
+    repo.update_trade_card(engine, card, expected_version=card.version)
+
+    third = worker._load_cards_if_changed()
+    assert third[0].name == "Changed elsewhere"
+    assert len(calls) == 2
+
+
 def test_default_worker_scheduler_uses_production_spacing_and_no_retry(
     tmp_path, monkeypatch
 ):
@@ -2564,6 +2592,36 @@ def test_sync_orb_plans_applies_the_execution_queue_bridge(tmp_path):
     assert changed == [card]
     assert card.entry_runtime_status == EntryRuntimeStatus.EXECUTE_READY
     assert card.entry_trigger == 101.5
+
+
+def test_sync_orb_plans_does_not_mark_price_only_movement_for_db_write(tmp_path):
+    worker, engine = _worker(tmp_path)
+    card = _seed_card(engine, board_status=BoardStatus.BUY_TODAY)
+    candidate = OrbCandidate(
+        symbol="AAPL",
+        window="5m",
+        orb_low=95.0,
+        orb_high=101.0,
+        entry_trigger=101.5,
+        current_price=100.0,
+        shares=10,
+        status=OrbCandidateStatus.WAITING_BREAKOUT,
+    )
+    item = ExecutionQueueItem(
+        symbol="AAPL",
+        environment="PROD",
+        current_price=100.0,
+        candidates={"5m": candidate},
+        selected_window="5m",
+    )
+    worker._execution_queue_item_lookup = lambda *_args: item
+    assert worker._sync_orb_plans([card]) == [card]
+
+    item.current_price = 100.25
+    item.last_updated = dt.datetime.now(dt.timezone.utc)
+
+    assert worker._sync_orb_plans([card]) == []
+    assert card.market_data_last_trusted_price == 100.25
 
 
 def test_sync_orb_plans_returns_fully_rejected_card_to_buylist(tmp_path):

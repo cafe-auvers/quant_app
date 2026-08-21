@@ -160,7 +160,7 @@ def test_projection_filter_skips_hidden_cards_before_per_card_queries(
     )
     projected_symbols = []
 
-    def project(_engine, card, *, context=None):
+    def project(_engine, card, *, context=None, **_preloaded):
         projected_symbols.append(card.symbol)
         return BoardCardProjection(card=card)
 

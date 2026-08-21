@@ -66,6 +66,8 @@ class BuyboardProjectionRequest:
     account_snapshot_fetched_at: dict
     runtime_running: bool
     generation: int
+    revision_only: bool = False
+    expected_revision: object = None
 
 
 class BuyboardProjectionWorker(QThread):
@@ -76,6 +78,7 @@ class BuyboardProjectionWorker(QThread):
     def __init__(self, request: BuyboardProjectionRequest) -> None:
         super().__init__()
         self.request = request
+        self.resolved_revision = None
 
     def run(self) -> None:
         started_at = time.perf_counter()
@@ -85,6 +88,18 @@ class BuyboardProjectionWorker(QThread):
             from src.services.trade_card_bootstrap import (
                 bootstrap_trade_cards_from_current_state,
             )
+
+            if request.revision_only:
+                current_revision = (
+                    execution_workflow_service.get_board_projection_revision(
+                        request.engine, environment="PROD"
+                    ),
+                    request.context,
+                )
+                self.resolved_revision = current_revision
+                if current_revision == request.expected_revision:
+                    self.completed.emit(None, "", request.generation)
+                    return
 
             kwargs = {}
             if not request.runtime_running:
@@ -116,6 +131,15 @@ class BuyboardProjectionWorker(QThread):
                 context=request.context,
                 board_statuses=BOARD_COLUMN_ORDER,
             )
+            if request.revision_only:
+                # Bootstrap may itself have normalized a newly synced
+                # Watchlist/Buylist item, so capture the post-projection token.
+                self.resolved_revision = (
+                    execution_workflow_service.get_board_projection_revision(
+                        request.engine, environment="PROD"
+                    ),
+                    request.context,
+                )
             self.completed.emit(projections, "", request.generation)
         except SQLAlchemyError as exc:
             logger.warning(
@@ -484,7 +508,7 @@ def _claims_kanban_ownership(command: AnyBoardCommand) -> bool:
 class BuyboardMixin:
     """Build the board and route all gestures through the workflow service."""
 
-    _BUYBOARD_PROJECTION_REFRESH_MS = 3000
+    _BUYBOARD_PROJECTION_REFRESH_MS = 60_000
     _BUYBOARD_LIVE_METRIC_REFRESH_MS = 750
     _BUYBOARD_ORB_DATA_REFRESH_MS = 60_000
     _BUYBOARD_BROKER_TRUTH_REFRESH_MS = 30_000
@@ -516,7 +540,7 @@ class BuyboardMixin:
         # trigger immediate board_changed refreshes.
         timer = QTimer(self)
         timer.setInterval(self._BUYBOARD_PROJECTION_REFRESH_MS)
-        timer.timeout.connect(self.refresh_buyboard)
+        timer.timeout.connect(lambda: self.refresh_buyboard(revision_only=True))
         timer.start()
         self._buyboard_projection_timer = timer
 
@@ -990,7 +1014,9 @@ class BuyboardMixin:
 
         refresh_buyboard_live_metrics(self)
 
-    def _buyboard_projection_request(self, generation: int):
+    def _buyboard_projection_request(
+        self, generation: int, *, revision_only: bool = False
+    ):
         engine = self._buyboard_engine()
         if engine is None:
             return None
@@ -1031,6 +1057,8 @@ class BuyboardMixin:
             ),
             runtime_running=runtime_running,
             generation=generation,
+            revision_only=bool(revision_only),
+            expected_revision=self.__dict__.get("_buyboard_projection_revision"),
         )
 
     def _bootstrap_buyboard_projection(self) -> None:
@@ -1091,7 +1119,7 @@ class BuyboardMixin:
                 len(result.holding_updated_keys),
             )
 
-    def refresh_buyboard(self) -> None:
+    def refresh_buyboard(self, *, revision_only: bool = False) -> None:
         from .board import populate_buyboard_columns
 
         if bool(self.__dict__.get("_database_shutting_down", False)):
@@ -1113,7 +1141,11 @@ class BuyboardMixin:
             self.__dict__.get("_buyboard_projection_generation", 0)
         ) + 1
         self._buyboard_projection_generation = generation
-        request = self._buyboard_projection_request(generation)
+        request = (
+            self._buyboard_projection_request(generation, revision_only=True)
+            if revision_only
+            else self._buyboard_projection_request(generation)
+        )
         if request is None:
             self._show_buyboard_recovery_snapshot()
             return
@@ -1135,6 +1167,12 @@ class BuyboardMixin:
                 self._buyboard_refresh_pending = True
                 return
             self._show_buyboard_recovery_snapshot()
+            return
+        worker = self.__dict__.get("_buyboard_projection_worker")
+        resolved_revision = getattr(worker, "resolved_revision", None)
+        if resolved_revision is not None:
+            self._buyboard_projection_revision = resolved_revision
+        if projections is None:
             return
         if int(self.__dict__.get("_buyboard_interaction_depth", 0) or 0) > 0:
             self._buyboard_deferred_projection = (projections, error, generation)

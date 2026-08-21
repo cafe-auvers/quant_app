@@ -383,6 +383,7 @@ class ExternalAlertingService:
         escalation_every_attempts: int = 2,
         max_escalation_level: int = 3,
         heartbeat_interval_seconds: float = 30.0,
+        heartbeat_audit_interval_seconds: float = 300.0,
         local_spool: Optional[LocalAlertSpool] = None,
         spool_import_fault_hook: Optional[Callable[[str], None]] = None,
     ) -> None:
@@ -399,11 +400,18 @@ class ExternalAlertingService:
         self.heartbeat_interval_seconds = max(
             0.001, float(heartbeat_interval_seconds)
         )
+        self.heartbeat_audit_interval_seconds = max(
+            self.heartbeat_interval_seconds,
+            float(heartbeat_audit_interval_seconds),
+        )
         self.local_spool = local_spool or LocalAlertSpool()
         self._spool_import_fault_hook = spool_import_fault_hook or (
             lambda _point: None
         )
         self._last_heartbeat_attempt_at: Optional[datetime] = None
+        self._last_heartbeat_published_at: Optional[datetime] = None
+        self._last_heartbeat_audited_at: Optional[datetime] = None
+        self._last_heartbeat_audit_status = ""
         ensure_external_alert_tables(engine)
 
     @staticmethod
@@ -1038,38 +1046,61 @@ class ExternalAlertingService:
             provider_id = str(self.provider.publish_heartbeat(payload) or "")
             status = "PUBLISHED"
             succeeded = True
+            self._last_heartbeat_published_at = now
         except Exception as exc:
             status = "FAILED"
             error = str(exc)
             succeeded = False
-        table = _heartbeat_table(MetaData())
-        try:
-            with self.engine.begin() as conn:
-                conn.execute(
-                    table.insert().values(
-                        device_id=self.device_id,
-                        attempted_at=_db_datetime(now),
-                        status=status,
-                        provider_delivery_id=provider_id,
-                        error=error,
+        audit_due = bool(
+            not self._last_heartbeat_audit_status
+            or status != self._last_heartbeat_audit_status
+            or self._last_heartbeat_audited_at is None
+            or (now - _as_utc(self._last_heartbeat_audited_at)).total_seconds()
+            >= self.heartbeat_audit_interval_seconds
+        )
+        if audit_due:
+            table = _heartbeat_table(MetaData())
+            try:
+                with self.engine.begin() as conn:
+                    conn.execute(
+                        table.insert().values(
+                            device_id=self.device_id,
+                            attempted_at=_db_datetime(now),
+                            status=status,
+                            provider_delivery_id=provider_id,
+                            error=error,
+                        )
                     )
+            except Exception:
+                self.local_spool.append(
+                    "HEARTBEAT_ATTEMPT",
+                    {
+                        "device_id": self.device_id,
+                        "attempted_at": now.isoformat(),
+                        "status": status,
+                        "provider_delivery_id": provider_id,
+                        "error": error,
+                    },
                 )
-        except Exception:
-            self.local_spool.append(
-                "HEARTBEAT_ATTEMPT",
-                {
-                    "device_id": self.device_id,
-                    "attempted_at": now.isoformat(),
-                    "status": status,
-                    "provider_delivery_id": provider_id,
-                    "error": error,
-                },
-            )
+            self._last_heartbeat_audited_at = now
+            self._last_heartbeat_audit_status = status
         return succeeded
 
     def publish_heartbeat_if_due(self) -> bool:
         table = _heartbeat_table(MetaData())
         now = _as_utc(self._clock())
+        # A successful publication in this process suppresses the durable
+        # lookup until the interval expires. Failures remain immediately
+        # retryable (the runtime itself applies a separate poll cadence).
+        if self._last_heartbeat_published_at is not None and (
+            now - _as_utc(self._last_heartbeat_published_at)
+        ).total_seconds() < self.heartbeat_interval_seconds:
+            return False
+        if self._last_heartbeat_attempt_at is not None:
+            # This process already owns the cadence. The external endpoint is
+            # the heartbeat authority; re-reading its TiDB audit row before
+            # every publication only adds quota cost and no safety.
+            return self.publish_heartbeat()
         try:
             with self.engine.begin() as conn:
                 last = conn.execute(
@@ -1082,7 +1113,7 @@ class ExternalAlertingService:
                     .limit(1)
                 ).scalar_one_or_none()
         except Exception:
-            last = self._last_heartbeat_attempt_at
+            last = self._last_heartbeat_published_at
         if last is not None and (
             now - _as_utc(last)
         ).total_seconds() < self.heartbeat_interval_seconds:

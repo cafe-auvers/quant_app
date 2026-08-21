@@ -84,6 +84,57 @@ def test_buyboard_projection_worker_uses_authoritative_services(monkeypatch):
     assert completed == [(projections, "", 4)]
 
 
+def test_minute_projection_check_skips_bootstrap_and_payload_when_unchanged(
+    monkeypatch,
+):
+    revision = (("cards", 3, 7, "now"),)
+    context = BoardProjectionContext(readiness_generation=9)
+    expected = (revision, context)
+    monkeypatch.setattr(
+        buyboard_controller.execution_workflow_service,
+        "get_board_projection_revision",
+        lambda *_args, **_kwargs: revision,
+    )
+    monkeypatch.setattr(
+        buyboard_controller.execution_workflow_service,
+        "list_board_projections",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unchanged timer check downloaded the projection")
+        ),
+    )
+    from src.services import trade_card_bootstrap
+
+    monkeypatch.setattr(
+        trade_card_bootstrap,
+        "bootstrap_trade_cards_from_current_state",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unchanged timer check ran bootstrap")
+        ),
+    )
+    request = buyboard_controller.BuyboardProjectionRequest(
+        engine=object(),
+        context=context,
+        buylist_manager=object(),
+        watchlist=object(),
+        default_account_no="account",
+        account_snapshots={},
+        account_snapshot_fetched_at={},
+        runtime_running=True,
+        generation=5,
+        revision_only=True,
+        expected_revision=expected,
+    )
+    completed = []
+    worker = buyboard_controller.BuyboardProjectionWorker(request)
+    worker.completed.connect(lambda *args: completed.append(args))
+
+    worker.run()
+
+    assert completed == [(None, "", 5)]
+    assert worker.resolved_revision == expected
+    assert buyboard_controller.BuyboardMixin._BUYBOARD_PROJECTION_REFRESH_MS == 60_000
+
+
 class _Signal:
     def __init__(self):
         self.callback = None

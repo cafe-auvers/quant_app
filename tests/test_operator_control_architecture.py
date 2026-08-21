@@ -147,7 +147,7 @@ def test_laptop_owner_target_uses_published_device_kind():
     assert target.hostname == laptop.hostname
 
 
-def test_stopped_historical_identity_is_not_an_owner_target():
+def test_stopped_historical_identity_is_not_an_owner_target(monkeypatch):
     stale_pc = SimpleNamespace(
         device_id="old-pc-id",
         hostname="DESKTOP-OLD",
@@ -160,8 +160,41 @@ def test_stopped_historical_identity_is_not_an_owner_target():
     window.state_sync_role = LocalDeviceRole(
         "laptop-id", "DESKTOP-T5V57VV", False
     )
+    monkeypatch.setattr(
+        "src.ui.main_window.detect_local_device_kind",
+        lambda _hostname: DEVICE_KIND_PC,
+    )
 
     assert window._control_target_role("PC") is None
+
+
+def test_online_coordination_store_survives_pc_historical_outage():
+    coordination_engine = object()
+    window = MainWindow.__new__(MainWindow)
+    window._qt_base_initialized = True
+    window.operational_db_engine = object()
+    window.pc_db_engine = None
+    window._pc_database_ready = False
+    window._coordination_database_configured = True
+    window.coordination_db_engine = coordination_engine
+    window._coordination_database_ready = True
+
+    assert window._execution_state_engine() is coordination_engine
+    assert window._execution_state_ready() is True
+
+
+def test_configured_coordination_store_never_falls_back_to_pc_mysql():
+    window = MainWindow.__new__(MainWindow)
+    window._qt_base_initialized = True
+    window.operational_db_engine = object()
+    window.pc_db_engine = object()
+    window._pc_database_ready = True
+    window._coordination_database_configured = True
+    window.coordination_db_engine = None
+    window._coordination_database_ready = False
+
+    assert window._execution_state_engine() is None
+    assert window._execution_state_ready() is False
 
 
 def test_new_text_columns_have_no_mysql_server_defaults():

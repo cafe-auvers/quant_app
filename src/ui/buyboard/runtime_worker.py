@@ -91,6 +91,7 @@ from src.services.schema_migration import (
 from src.utils.redaction import scrub_sensitive_text
 from src.utils.device_identity import detect_local_device_kind
 from src.services.runtime_device_state_repository import (
+    refresh_runtime_device_state,
     require_compatible_runtime_schema,
     save_runtime_device_state,
 )
@@ -249,6 +250,18 @@ class BuyboardRuntimeWorker(QThread):
         ] = None
         self.execution_gateway: Optional[ExecutionCommandGateway] = None
         self._cached_cards: List[TradeCardState] = []
+        self._card_cache_initialized = False
+        self._card_collection_revision = None
+        self._last_card_revision_checked_at: Optional[datetime] = None
+        self._local_card_change_generation = (
+            repo.local_trade_card_change_generation(self._db_engine)
+        )
+        self._last_database_probe_at: Optional[datetime] = None
+        self._last_lease_checked_at: Optional[datetime] = None
+        self._last_device_state_published_at: Optional[datetime] = None
+        self._last_ownership_proof_at: Optional[datetime] = None
+        self._last_alert_poll_at: Optional[datetime] = None
+        self._last_operator_command_poll_at: Optional[datetime] = None
         self.last_market_data_drain_at: Optional[datetime] = None
         # Per real account_no (never this worker's own possibly-blank
         # self._account_no -- review finding: this worker is intentionally
@@ -374,7 +387,29 @@ class BuyboardRuntimeWorker(QThread):
         # after that write succeeds, especially for ACTIVE.
         self.device_state = state
         self.readiness_generation = int(record.readiness_generation or 0)
+        self._last_device_state_published_at = datetime.now(timezone.utc)
         return record
+
+    def _publish_device_state_if_due(self, state: RuntimeDeviceState) -> None:
+        """Refresh durable readiness at a safe cadence, not every local tick."""
+
+        now = datetime.now(timezone.utc)
+        last = self._last_device_state_published_at
+        if last is not None and (
+            now - last
+        ).total_seconds() < execution_config.COORDINATION_DEVICE_HEARTBEAT_SECONDS:
+            self.device_state = state
+            return
+        if state == self.device_state and refresh_runtime_device_state(
+            self._db_engine,
+            device_id=self._device_id,
+            hostname=self._hostname,
+            state=state,
+            details=self._runtime_readiness_details(state),
+        ):
+            self._last_device_state_published_at = now
+            return
+        self._set_device_state(state)
 
     def _demote_standby_readiness(self) -> None:
         """Close the local claim path immediately, then clear durable readiness."""
@@ -481,8 +516,18 @@ class BuyboardRuntimeWorker(QThread):
             ),
         }
 
-    def _probe_database_writable(self) -> bool:
+    def _probe_database_writable(self, *, force: bool = False) -> bool:
         """Exercise a write statement without changing application data."""
+
+        now = datetime.now(timezone.utc)
+        if (
+            not force
+            and self._last_database_probe_at is not None
+            and (now - self._last_database_probe_at).total_seconds()
+            < execution_config.COORDINATION_DATABASE_PROBE_SECONDS
+        ):
+            return self._database_writable
+        self._last_database_probe_at = now
 
         had_prior_probe = self._database_probe_completed
         was_writable = self._database_writable
@@ -637,9 +682,9 @@ class BuyboardRuntimeWorker(QThread):
             # reconciliation, those last-known cards and ownership proofs
             # remain available to the bounded emergency path instead of an
             # empty read replacing them.
-            database_writable = self._probe_database_writable()
+            database_writable = self._probe_database_writable(force=True)
             if database_writable and not self._standby_only:
-                self._lease_current = self._lease_still_current()
+                self._lease_current = self._lease_still_current(force=True)
                 if not self._lease_current:
                     raise LeaseExpiredError(
                         "The execution lease expired before startup reconciliation"
@@ -655,7 +700,7 @@ class BuyboardRuntimeWorker(QThread):
                     and self.startup_reconciliation_complete
                 ):
                     migration_manager.mark_reconciliation_complete()
-                database_writable = self._probe_database_writable()
+                database_writable = self._probe_database_writable(force=True)
             if database_writable:
                 self._set_device_state(RuntimeDeviceState.STANDBY)
             else:
@@ -733,13 +778,20 @@ class BuyboardRuntimeWorker(QThread):
                         and self.device_state == RuntimeDeviceState.ACTIVE
                     ):
                         # ACTIVE is not a one-time declaration. Publish the
-                        # current readiness/revision facts every heartbeat so
-                        # the other machine never switches ownership using a
-                        # stale startup-era snapshot.
-                        self._set_device_state(RuntimeDeviceState.ACTIVE)
+                        # current readiness/revision facts on the independent
+                        # durable-device cadence so handoff never relies on a
+                        # startup-era snapshot without writing every tick.
+                        self._publish_device_state_if_due(RuntimeDeviceState.ACTIVE)
                     if database_writable and self._external_alerting is not None:
-                        self._external_alerting.publish_heartbeat_if_due()
-                        self._external_alerting.process_due()
+                        now = datetime.now(timezone.utc)
+                        if (
+                            self._last_alert_poll_at is None
+                            or (now - self._last_alert_poll_at).total_seconds()
+                            >= execution_config.COORDINATION_ALERT_POLL_SECONDS
+                        ):
+                            self._last_alert_poll_at = now
+                            self._external_alerting.publish_heartbeat_if_due()
+                            self._external_alerting.process_due()
                     if not allow_mutations:
                         self._advance_startup_readiness()
                 except SQLAlchemyError as exc:
@@ -825,7 +877,7 @@ class BuyboardRuntimeWorker(QThread):
                     return
             # Subsequent writes are successor-owned heartbeats. They preserve
             # this readiness generation and do not refresh confirmation time.
-            self._set_device_state(RuntimeDeviceState.STANDBY_READY)
+            self._publish_device_state_if_due(RuntimeDeviceState.STANDBY_READY)
             return
         # The lease was acquired against the prior standby generation. Perform
         # the immediate activation reconciliation with the command gate shut.
@@ -838,6 +890,9 @@ class BuyboardRuntimeWorker(QThread):
         # rechecked.  KIS stop breaches remain latched until the engine
         # acknowledges them, so draining here cannot lose protective intent.
         self._refresh_observation_after_final_reconciliation()
+        # Force a fresh database read while preserving the no-argument seam
+        # used by readiness diagnostics/tests.
+        self._last_lease_checked_at = None
         self._lease_current = self._lease_still_current()
         readiness = self.engine_readiness(include_device_state=False)
         if not (self._lease_current and readiness.standby_ready):
@@ -871,6 +926,13 @@ class BuyboardRuntimeWorker(QThread):
 
         if self.runtime is None:
             return
+        # A standby may have intentionally polled the shared card collection
+        # only once per minute.  Ownership activation is an exceptional
+        # safety boundary: force a full canonical read and install every new
+        # quote subscription/stop before declaring this successor ACTIVE.
+        cards = self._load_cards_if_changed(force=True)
+        self._sync_quote_subscriptions(cards)
+        self._sync_market_stop_rules(cards, apply_pending_changes=False)
         self.runtime.market_data.poll_once()
         self.last_market_data_drain_at = datetime.now(timezone.utc)
 
@@ -920,7 +982,7 @@ class BuyboardRuntimeWorker(QThread):
         if callable(stop_market_data):
             stop_market_data()
 
-    def _lease_still_current(self) -> bool:
+    def _lease_still_current(self, *, force: bool = False) -> bool:
         """Review finding P0-1: "Stop the worker immediately on lease
         loss." Every order submission already re-checks the lease at the
         broker boundary (``submit_guarded_overseas_order``); this
@@ -928,6 +990,15 @@ class BuyboardRuntimeWorker(QThread):
         keep polling quotes/hammering the DB on behalf of a board it no
         longer has authority over.
         """
+        now = datetime.now(timezone.utc)
+        if (
+            not force
+            and self._last_lease_checked_at is not None
+            and (now - self._last_lease_checked_at).total_seconds()
+            < execution_config.COORDINATION_LEASE_POLL_SECONDS
+        ):
+            return self._lease_current
+        self._last_lease_checked_at = now
         if self._execution_authority is None:
             if (
                 self.execution_gateway is not None
@@ -937,6 +1008,7 @@ class BuyboardRuntimeWorker(QThread):
                 self.execution_gateway.note_canonical_lease_verified(
                     self._execution_lease_value()
                 )
+            self._lease_current = True
             return True
         try:
             self._execution_authority.require_current_lease(self._lease_engine, self._execution_lease)
@@ -944,8 +1016,10 @@ class BuyboardRuntimeWorker(QThread):
                 self.execution_gateway.note_canonical_lease_verified(
                     self._execution_lease_value()
                 )
+            self._lease_current = True
             return True
         except LeaseExpiredError:
+            self._lease_current = False
             return False
 
     def _card_lookup(self, environment: str, account_no: str, symbol: str) -> Optional[TradeCardState]:
@@ -1047,12 +1121,49 @@ class BuyboardRuntimeWorker(QThread):
         gateway = self.execution_gateway
         if gateway is None or not self._database_writable:
             return
-        for card in cards:
+        now = datetime.now(timezone.utc)
+        if (
+            self._last_ownership_proof_at is not None
+            and (now - self._last_ownership_proof_at).total_seconds()
+            < execution_config.COORDINATION_OWNERSHIP_PROOF_SECONDS
+        ):
+            return
+        self._last_ownership_proof_at = now
+        # Offline proof exists only to protect a real position. Buylist and
+        # Buy Today cards cannot use the emergency mutation path, so querying
+        # ownership for every candidate wastes one round-trip per card.
+        protected_cards = [
+            card
+            for card in cards
+            if int(card.broker_quantity or 0) > 0
+            or card.board_status
+            in {
+                BoardStatus.OPEN_POSITION,
+                BoardStatus.PARTIAL_SELL,
+                BoardStatus.SELL_ALL,
+            }
+        ]
+        if not protected_cards:
+            return
+        from src.services.execution_ownership_repository import (
+            list_execution_ownership,
+        )
+
+        ownership_by_key = {
+            (row.environment, row.account_no, row.symbol): row
+            for row in list_execution_ownership(
+                self._db_engine, environment=self._environment
+            )
+        }
+        for card in protected_cards:
             try:
-                gateway.note_canonical_ownership_verified(
-                    environment=card.environment,
-                    account_no=card.account_no,
-                    symbol=card.symbol,
+                ownership = ownership_by_key.get(
+                    (card.environment, card.account_no, card.symbol)
+                )
+                if ownership is None:
+                    continue
+                gateway.note_canonical_ownership_snapshot_verified(
+                    ownership,
                     source=ExecutionSource.KANBAN_BOARD,
                     strategy_instance_id=self._strategy_instance_id,
                 )
@@ -1193,24 +1304,58 @@ class BuyboardRuntimeWorker(QThread):
 
     # -- per-cycle heartbeat --------------------------------------------------
 
+    def _load_cards_if_changed(self, *, force: bool = False) -> List[TradeCardState]:
+        """Refresh card payloads only after a compact revision token changes."""
+
+        now = datetime.now(timezone.utc)
+        local_generation = repo.local_trade_card_change_generation(self._db_engine)
+        interval = (
+            execution_config.COORDINATION_STANDBY_CARD_POLL_SECONDS
+            if self._standby_only
+            else execution_config.COORDINATION_ACTIVE_CARD_POLL_SECONDS
+        )
+        if (
+            not force
+            and self._card_cache_initialized
+            and local_generation == self._local_card_change_generation
+            and self._last_card_revision_checked_at is not None
+            and (now - self._last_card_revision_checked_at).total_seconds() < interval
+        ):
+            return self._cached_cards
+        revision = repo.get_trade_card_collection_revision(
+            self._db_engine,
+            environment=self._environment,
+            account_no=self._account_no or None,
+            raise_on_error=True,
+        )
+        self._last_card_revision_checked_at = now
+        self._local_card_change_generation = local_generation
+        if (
+            not force
+            and self._card_cache_initialized
+            and revision == self._card_collection_revision
+        ):
+            return self._cached_cards
+        cards = repo.list_trade_cards(
+            self._db_engine,
+            environment=self._environment,
+            account_no=self._account_no or None,
+            raise_on_error=True,
+        )
+        self._cached_cards = cards
+        self._card_cache_initialized = True
+        self._card_collection_revision = revision
+        return cards
+
     def _run_one_cycle(self, *, allow_mutations: bool = True) -> None:
         assert self.runtime is not None
         canonical_available = bool(
             self._database_writable or not self._database_probe_completed
         )
         if canonical_available:
-            cards = repo.list_trade_cards(
-                self._db_engine,
-                environment=self._environment,
-                raise_on_error=True,
-            )
-            if self._account_no:
-                cards = [
-                    card for card in cards if card.account_no == self._account_no
-                ]
+            cards = self._load_cards_if_changed()
             self._configure_verified_mutation_budgets(cards)
             self._cache_emergency_ownership_proofs(cards)
-            self._cached_cards = cards
         else:
             # Observation continues from the last canonical snapshot. Only
             # protective SELL commands can get through the gateway while
@@ -1222,16 +1367,7 @@ class BuyboardRuntimeWorker(QThread):
         if canonical_available and allow_mutations:
             operator_commands_changed = self._process_operator_commands()
             if operator_commands_changed:
-                cards = repo.list_trade_cards(
-                    self._db_engine,
-                    environment=self._environment,
-                    raise_on_error=True,
-                )
-                if self._account_no:
-                    cards = [
-                        card for card in cards if card.account_no == self._account_no
-                    ]
-                self._cached_cards = cards
+                cards = self._load_cards_if_changed(force=True)
         reconciliation_changed = False
         if canonical_available:
             reconciliation_changed = bool(
@@ -1239,18 +1375,10 @@ class BuyboardRuntimeWorker(QThread):
                     cards, execute_commands=allow_mutations
                 )
             )
-            # Reconciliation persists cloned reducer outputs. Reload before
-            # the heartbeat so every later decision sees current truth.
-            cards = repo.list_trade_cards(
-                self._db_engine,
-                environment=self._environment,
-                raise_on_error=True,
-            )
-            if self._account_no:
-                cards = [
-                    card for card in cards if card.account_no == self._account_no
-                ]
-            self._cached_cards = cards
+            # Reconciliation persists cloned reducer outputs. Reload only
+            # when it actually changed durable state.
+            if reconciliation_changed:
+                cards = self._load_cards_if_changed(force=True)
 
         changed_ids: set = set()
         changed: List[TradeCardState] = []
@@ -1419,6 +1547,20 @@ class BuyboardRuntimeWorker(QThread):
 
     def _process_operator_commands(self, *, limit: int = 20) -> bool:
         """Apply live human requests only while this runtime owns execution."""
+
+        now = datetime.now(timezone.utc)
+        interval = (
+            execution_config.COORDINATION_OPERATOR_COMMAND_POLL_SECONDS
+            if self._regular_session_open()
+            else execution_config.COORDINATION_OFF_HOURS_POLL_SECONDS
+        )
+        if (
+            self._last_operator_command_poll_at is not None
+            and (now - self._last_operator_command_poll_at).total_seconds()
+            < interval
+        ):
+            return False
+        self._last_operator_command_poll_at = now
 
         from src.services.operator_command_service import (
             process_next_board_operator_command,
@@ -2498,8 +2640,6 @@ class BuyboardRuntimeWorker(QThread):
                 card.target_position_quantity,
                 card.entry_block_reason,
                 card.selected_orb_window,
-                card.market_data_last_trusted_price,
-                card.market_data_last_trusted_at,
                 card.buy_today_note,
             )
             self._orb_evaluator.update_card(card, item)
@@ -2518,10 +2658,12 @@ class BuyboardRuntimeWorker(QThread):
                 card.target_position_quantity,
                 card.entry_block_reason,
                 card.selected_orb_window,
-                card.market_data_last_trusted_price,
-                card.market_data_last_trusted_at,
                 card.buy_today_note,
             )
+            # Live price/timestamp are observation data, not a durable state
+            # transition.  Keep them current in memory, and include their
+            # latest values whenever a plan/status field really changes, but
+            # never write a full TradeCard JSON row for price-only movement.
             if before != after:
                 changed.append(card)
         return changed

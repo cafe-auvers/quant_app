@@ -282,6 +282,33 @@ def test_pull_only_pc_cannot_seed_or_overwrite_first_sync(monkeypatch, tmp_path)
     assert app_state.load_json(pc_paths["WATCHLIST_FILE"], {}) == current
 
 
+def test_unchanged_pull_only_sync_uses_revisions_without_payload_downloads(
+    monkeypatch, tmp_path
+):
+    engine = _make_engine(tmp_path)
+    laptop_paths = _use_machine(monkeypatch, tmp_path / "laptop")
+    _save_local_state(laptop_paths, {"items": [{"symbol": "AAPL"}]})
+    laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    assert not app_state.reconcile_state_with_remote(engine, laptop).errors
+
+    _use_machine(monkeypatch, tmp_path / "pc")
+    pc = ss.LocalDeviceRole("pc-id", "PC", False)
+    assert not app_state.reconcile_state_with_remote(engine, pc).errors
+
+    payload_reads = []
+    real_pull = app_state.pull_state
+
+    def counted_pull(*args, **kwargs):
+        payload_reads.append(True)
+        return real_pull(*args, **kwargs)
+
+    monkeypatch.setattr(app_state, "pull_state", counted_pull)
+    result = app_state.reconcile_state_with_remote(engine, pc)
+
+    assert not result.errors
+    assert payload_reads == []
+
+
 def test_activating_pc_deactivates_laptop_and_rejects_old_writer(
     monkeypatch, tmp_path
 ):
