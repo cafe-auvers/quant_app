@@ -95,7 +95,11 @@ from src.services.runtime_device_state_repository import (
     require_compatible_runtime_schema,
     save_runtime_device_state,
 )
-from src.services.state_sync import LocalDeviceRole, get_synced_state_revisions
+from src.services.state_sync import (
+    LocalDeviceRole,
+    get_main_device,
+    get_synced_state_revisions,
+)
 from src.services.kis_realtime_market_data import StopRule, SubscriptionPriority
 from src.services.stop_change_coordinator import stop_change_coordinator_for
 from src.services.trade_card_orb_bridge import TradeCardOrbEvaluator
@@ -592,6 +596,32 @@ class BuyboardRuntimeWorker(QThread):
             lease_epoch=int(getattr(lease, "lease_epoch", 0) or 0),
         )
 
+    def _require_standby_migration_ready(
+        self, migration_manager: SchemaMigrationManager
+    ) -> None:
+        """Fence incomplete cutovers without deadlocking first ownership.
+
+        A brand-new coordination store has neither a migration nor an
+        Execution Owner.  Its read-only runtime must be allowed to reconcile
+        broker truth and publish ``STANDBY_READY``; otherwise the ownership
+        switch cannot acquire the first readiness-fenced lease, and the
+        lease-owned migration can never start.  This exception authorizes no
+        mutation: the worker remains observation-only.  Any existing owner or
+        any migration phase beyond ``NOT_STARTED`` keeps the normal entry
+        readiness fence in place.
+        """
+
+        state = migration_manager.state
+        if state.phase == MigrationPhase.NOT_STARTED:
+            ownership = get_main_device(self._lease_engine or self._db_engine)
+            if ownership.success and ownership.main_device is None:
+                logger.info(
+                    "Unclaimed coordination store is awaiting its first "
+                    "Execution Owner; standby reconciliation remains read-only"
+                )
+                return
+        migration_manager.require_entries_ready()
+
     def run(self) -> None:  # noqa: D401 - Qt override
         if not is_buyboard_engine_enabled():
             return
@@ -613,7 +643,7 @@ class BuyboardRuntimeWorker(QThread):
             )
             self._schema_migration_manager = migration_manager
             if self._standby_only:
-                migration_manager.require_entries_ready()
+                self._require_standby_migration_ready(migration_manager)
             else:
                 lease = self._execution_lease_value()
                 migration_manager.prepare_cutover(

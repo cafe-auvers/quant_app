@@ -170,15 +170,26 @@ and [spending-limit controls](https://docs.pingcap.com/tidbcloud/manage-serverle
    location.
 2. Stop `main.py` on both devices outside the regular session.
 3. Add the same `COORD_DB_*` SQL values to both `.env` files.
-4. Start one device first. Wait for `Shared online coordination database
-   connected` and allow schema/card migration and broker reconciliation to
-   finish.
-5. Start the second device and wait for its fresh `STANDBY_READY` identity.
-6. Explicitly choose Execution Owner and Operator Control. Publish Today's
-   Plan before market open and verify both devices display the same revisions
-   and Buy Today cards.
-7. Run a paper/controlled-live validation before relying on unattended PROD
+4. Start the intended first Execution Owner by itself. On a brand-new,
+   unclaimed coordination store it performs read-only broker reconciliation
+   and publishes `STANDBY_READY`; it cannot submit an entry in this bootstrap
+   state.
+5. Choose that device as Execution Owner. The readiness-fenced claim creates
+   the first exact lease; only then does the owner run schema/card migration,
+   perform another broker reconciliation, and become `ACTIVE`.
+6. Start the second device and wait for its fresh `STANDBY_READY` identity.
+7. Explicitly choose Operator Control. Publish Today's Plan before market
+   open and verify both devices display the same revisions and Buy Today
+   cards.
+8. Run a paper/controlled-live validation before relying on unattended PROD
    execution.
+
+If the first device reports `New entries remain blocked until post-migration
+reconciliation completes` while the shared migration row is still
+`NOT_STARTED` and Execution Owner is unassigned, update to a runtime containing
+the first-owner bootstrap fix. Do not manually edit the migration row or mark
+reconciliation complete: the active owner must produce that evidence through
+the normal broker reconciliation path.
 
 Do not configure TiDB on only one device. When `COORD_DB_*` is present, an
 unreachable coordination store fails closed; the application does not fall

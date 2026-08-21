@@ -80,6 +80,12 @@ from src.services.kis_realtime_market_data import (
     SubscriptionPriority,
 )
 from src.services.realtime_market_data import QuoteSnapshot, RestPollingMarketDataService
+from src.services.schema_migration import (
+    MigrationEntriesBlockedError,
+    MigrationPhase,
+    SchemaMigrationManager,
+)
+from src.services.state_sync import LocalDeviceRole, claim_main_device
 from src.services.stop_change_coordinator import (
     StopChangeCoordinator,
     stop_change_coordinator_for,
@@ -288,6 +294,47 @@ def _ready_runtime_state(**overrides):
 def test_construction_builds_nothing(tmp_path):
     worker, _ = _worker(tmp_path)
     assert worker.runtime is None
+
+
+def test_unclaimed_new_store_allows_read_only_standby_migration_bootstrap(tmp_path):
+    worker, engine = _worker(tmp_path, standby_only=True, device_id="laptop")
+    manager = SchemaMigrationManager(
+        engine,
+        backup_path=tmp_path / "migration-backup.json",
+        legacy_paths=(),
+    )
+
+    worker._require_standby_migration_ready(manager)
+
+    assert manager.state.phase == MigrationPhase.NOT_STARTED
+
+
+def test_new_store_with_an_execution_owner_keeps_standby_migration_blocked(tmp_path):
+    worker, engine = _worker(tmp_path, standby_only=True, device_id="laptop")
+    manager = SchemaMigrationManager(
+        engine,
+        backup_path=tmp_path / "migration-backup.json",
+        legacy_paths=(),
+    )
+    owner = LocalDeviceRole("pc", "PC", True)
+    assert claim_main_device(engine, owner).success is True
+
+    with pytest.raises(MigrationEntriesBlockedError):
+        worker._require_standby_migration_ready(manager)
+
+
+def test_incomplete_migration_phase_never_uses_first_owner_bootstrap(tmp_path):
+    worker, _ = _worker(tmp_path, standby_only=True, device_id="laptop")
+
+    class _IncompleteMigration:
+        state = SimpleNamespace(phase=MigrationPhase.AWAITING_RECONCILIATION)
+
+        @staticmethod
+        def require_entries_ready():
+            raise MigrationEntriesBlockedError("still reconciling")
+
+    with pytest.raises(MigrationEntriesBlockedError, match="still reconciling"):
+        worker._require_standby_migration_ready(_IncompleteMigration())
 
 
 def test_card_cache_downloads_payload_only_when_revision_changes(
