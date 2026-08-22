@@ -570,6 +570,10 @@ Database behavior is split by responsibility under `src/infrastructure/database/
 - `intraday_price_history` for 1m/5m intraday bars, keyed by `source`.
 - `chart_indicators` for RS/TI65-style chart overlays.
 - `scanner_metrics` for scanner-ready metrics.
+- `stock_profiles` for one basic KIS-master profile per configured US symbol,
+  progressively enriched with Yahoo sector/industry metadata.
+- `earnings_events` and `fundamental_sync_state` for cached chart earnings and
+  positive/negative provider freshness state.
 - `init_local_mirror_engine()` / `sync_local_mirror_from_pc_checkpointed()` and related helpers manage `data/local_mirror.db`, its checkpointed top-up from PC MySQL, and staleness checks (`local_mirror_is_stale`, `local_mirror_hourly_is_stale`).
 
 The app can run without MySQL. When MySQL is configured (whether local or the always-on PC's canonical instance), refresh and scanner workflows use cached tables for speed and freshness checks; see [Two-Machine Data Pipeline](#two-machine-data-pipeline-pc-sync) for the multi-device case.
@@ -594,7 +598,7 @@ main.py "Update 1D/1H Data" action or scripts/run_daily_refresh.py
   -> UI can request termination independent of subprocess ownership
 ```
 
-`historical.py` and `scripts/run_daily_refresh.py` write to canonical MySQL when reachable and to the local SQLite mirror otherwise; laptop-only bars written while the PC is unreachable are never uploaded back to MySQL once it returns. `scripts/run_daily_refresh.py` is the freshness-gated entry point (checks every symbol/table against the expected latest NYSE session before refreshing) used by the PC's morning routine; calling `historical.py` directly re-fetches unconditionally. See `docs/historical_refactor_plan.md` for the original design rationale.
+`historical.py` and `scripts/run_daily_refresh.py` write to canonical MySQL when reachable and to the local SQLite mirror otherwise; laptop-only bars written while the PC is unreachable are never uploaded back to MySQL once it returns. `scripts/run_daily_refresh.py` is the freshness-gated entry point (checks every symbol/table against the expected latest NYSE session before refreshing) used by the PC's morning routine; calling `historical.py` directly re-fetches unconditionally. Every PC schema initialization idempotently seeds `stock_profiles` from the complete cached KIS universe without Internet access. A completed 1D refresh downloads Nasdaq's full listing metadata once to fill sector/industry in bulk, then sends only unresolved symbols through the bounded Yahoo fallback. The same supplemental phase fills the next 100 days of Nasdaq earnings-calendar events and adds full Yahoo quarterly history for 100 never-attempted symbols per run. Successful profile rows are fresh for 30 days and unavailable rows wait seven days before retry, so failures cannot starve the remaining universe. All provider phases are supplemental: an outage cannot invalidate otherwise-current price/scanner data. See `docs/historical_refactor_plan.md` for the original design rationale.
 
 ## Two-Machine Data Pipeline (PC Sync)
 

@@ -20,6 +20,8 @@ except ImportError:
     QWebChannel = None
 
 from src.core.orb import resample_intraday_bars
+from src.core.chart_fundamentals import (
+    ChartFundamentalContext, canonical_symbol)
 from src.infrastructure.database.repositories.chart_indicators import (
     calculate_chart_indicators, load_chart_indicators_from_db,
     refresh_chart_indicators_for_symbol)
@@ -27,6 +29,8 @@ from src.infrastructure.database.repositories.market_bars import \
     delete_intraday_history_for_symbol
 from src.services.intraday_data_service import (format_intraday_source_label,
                                                 load_best_intraday_history)
+from src.services.chart_fundamentals import ChartFundamentalService
+from src.ui.fundamental_worker import ChartFundamentalRefreshWorker
 from src.ui.workers import IntradayBulkFetchWorker, IntradayFetchWorker
 from src.utils.intraday_helpers import intraday_cache_needs_backfill
 from src.utils.intraday_helpers import utcnow_naive as _utcnow_naive
@@ -109,9 +113,27 @@ class ChartsDataFlowMixin:
                 if hasattr(self, "tradingview_show_growth_6m_checkbox")
                 else False
             ),
+            "show_earnings_events": (
+                self.tradingview_show_earnings_checkbox.isChecked()
+                if hasattr(self, "tradingview_show_earnings_checkbox")
+                else True
+            ),
+            "show_earnings_line": (
+                self.tradingview_show_earnings_checkbox.isChecked()
+                if hasattr(self, "tradingview_show_earnings_checkbox")
+                else True
+            ),
+            "show_stock_profile_watermark": True,
+            "earnings_horizon_days": 14,
             "window_days": self._get_tradingview_window_days(),
         }
         now = dt.datetime.now(dt.timezone.utc)
+        fundamental_generation = self._chart_fundamental_generation(symbol)
+        fundamental_context = self._load_cached_chart_fundamental_context(
+            symbol,
+            now=now,
+            horizon_days=int(base_options["earnings_horizon_days"]),
+        )
 
         split_enabled = (
             hasattr(self, "tradingview_split_screen_checkbox")
@@ -129,6 +151,7 @@ class ChartsDataFlowMixin:
                 force=force,
                 fetch_live=fetch_live,
                 view_key="left",
+                fundamental_context=fundamental_context,
             )
             if not skip_split_view:
                 split_status = self._render_tradingview_chart_view(
@@ -141,6 +164,7 @@ class ChartsDataFlowMixin:
                     force=force,
                     fetch_live=fetch_live,
                     view_key="right",
+                    fundamental_context=fundamental_context,
                 )
             else:
                 split_status = "1H skipped (drawing sync)"
@@ -149,6 +173,9 @@ class ChartsDataFlowMixin:
                 f"ema={int(base_options['show_ema'])}|rs={int(base_options.get('show_rs', True))}"
             )
             self.tradingview_status_label.setText(f"{primary_status} | {split_status}")
+            self._schedule_chart_fundamental_refresh(
+                symbol, fundamental_generation, now=now
+            )
             return
 
         if hasattr(self, "tradingview_split_chart_view"):
@@ -168,12 +195,16 @@ class ChartsDataFlowMixin:
             force=force,
             fetch_live=fetch_live,
             view_key="single",
+            fundamental_context=fundamental_context,
         )
         self.current_tradingview_symbol = (
             f"{tradingview_symbol}|{timeframe}|volume={int(base_options['show_volume'])}|"
             f"ema={int(base_options['show_ema'])}|rs={int(base_options.get('show_rs', True))}"
         )
         self.tradingview_status_label.setText(status)
+        self._schedule_chart_fundamental_refresh(
+            symbol, fundamental_generation, now=now
+        )
 
     def _render_tradingview_chart_view(
         self,
@@ -186,6 +217,7 @@ class ChartsDataFlowMixin:
         force: bool,
         view_key: str,
         fetch_live: bool = False,
+        fundamental_context: Optional[ChartFundamentalContext] = None,
     ) -> str:
         options = {
             "show_volume": bool(base_options.get("show_volume", True)),
@@ -195,6 +227,16 @@ class ChartsDataFlowMixin:
             "show_growth_1m": bool(base_options.get("show_growth_1m", True)),
             "show_growth_3m": bool(base_options.get("show_growth_3m", True)),
             "show_growth_6m": bool(base_options.get("show_growth_6m", False)),
+            "show_earnings_events": bool(
+                base_options.get("show_earnings_events", True)
+            ),
+            "show_earnings_line": bool(base_options.get("show_earnings_line", True)),
+            "show_stock_profile_watermark": bool(
+                base_options.get("show_stock_profile_watermark", True)
+            ),
+            "earnings_horizon_days": int(
+                base_options.get("earnings_horizon_days", 14) or 14
+            ),
             "window_days": int(base_options.get("window_days", 7) or 7),
             "timeframe": timeframe,
             "view_key": view_key,
@@ -212,13 +254,21 @@ class ChartsDataFlowMixin:
                     "show_growth_6m": False,
                 }
             )
-        refresh_key = (
+        base_refresh_key = (
             f"{view_key}|{tradingview_symbol}|{timeframe}|"
             f"volume={int(options['show_volume'])}|ema={int(options['show_ema'])}|"
             f"rs={int(options.get('show_rs', True))}|adr={int(options.get('show_adr', False))}|"
             f"g1={int(options.get('show_growth_1m', False))}|g3={int(options.get('show_growth_3m', False))}|"
             f"g6={int(options.get('show_growth_6m', False))}|window={options.get('window_days', 7)}"
         )
+        refresh_key = base_refresh_key
+        if fundamental_context is not None:
+            refresh_key += (
+                f"|earnings={int(options.get('show_earnings_events', True))}"
+                f"|earnings_line={int(options.get('show_earnings_line', True))}"
+                f"|profile={int(options.get('show_stock_profile_watermark', True))}"
+                f"|fundamentals={fundamental_context.revision_token}"
+            )
         last_refresh = self.tradingview_refresh_timestamps.get(refresh_key)
         if not force and not self._tradingview_refresh_due(last_refresh, now=now):
             next_refresh = last_refresh + dt.timedelta(
@@ -295,6 +345,23 @@ class ChartsDataFlowMixin:
             if options.get("show_rs", True)
             else pd.DataFrame()
         )
+        view_context = fundamental_context
+        if view_context is not None and timeframe.strip().upper() == "1D":
+            try:
+                view_context = ChartFundamentalService.align_context_to_chart(
+                    view_context, chart_history.index
+                )
+            except (TypeError, ValueError):
+                # Supplemental data must never suppress an otherwise valid
+                # price chart. Invalid/mixed EPS series is omitted and logged
+                # by the provider/service path on its next refresh.
+                view_context = view_context.__class__(
+                    symbol=view_context.symbol,
+                    stock_profile=view_context.stock_profile,
+                    earnings_events=view_context.earnings_events,
+                    next_earnings=view_context.next_earnings,
+                    revision_token=view_context.revision_token,
+                )
         html_content = self._generate_tradingview_lightweight_chart_html(
             tradingview_symbol,
             chart_history,
@@ -306,6 +373,22 @@ class ChartsDataFlowMixin:
             buy_price=buy_price,
             stop_loss=buy_stop_loss,
             interaction_settings=self.__dict__.get("settings", {}),
+            stock_profile=(
+                view_context.stock_profile if view_context is not None else None
+            ),
+            earnings_events=(
+                view_context.earnings_events
+                if view_context is not None and timeframe.strip().upper() == "1D"
+                else ()
+            ),
+            earnings_line=(
+                view_context.earnings_line
+                if view_context is not None and timeframe.strip().upper() == "1D"
+                else ()
+            ),
+            upcoming_earnings=(
+                view_context.next_earnings if view_context is not None else None
+            ),
         )
         if QWebEngineView is not None and isinstance(target_view, QWebEngineView):
             target_view.setHtml(html_content, QUrl("https://www.tradingview.com/"))
@@ -315,6 +398,121 @@ class ChartsDataFlowMixin:
             )
         self.tradingview_refresh_timestamps[refresh_key] = now
         return f"Loaded {timeframe} chart for {tradingview_symbol}"
+
+    def _chart_fundamental_generation(self, symbol: str) -> int:
+        canonical = canonical_symbol(symbol)
+        previous = self.__dict__.get("_chart_fundamental_request_symbol", "")
+        generation = int(
+            self.__dict__.get("_chart_fundamental_request_generation", 0) or 0
+        )
+        if canonical != previous:
+            generation += 1
+            self._chart_fundamental_request_symbol = canonical
+            self._chart_fundamental_request_generation = generation
+        return generation
+
+    def _load_cached_chart_fundamental_context(
+        self,
+        symbol: str,
+        *,
+        now: dt.datetime,
+        horizon_days: int,
+    ) -> ChartFundamentalContext:
+        canonical = canonical_symbol(symbol)
+        engine = self.__dict__.get("db_engine")
+        if engine is None or not self.__dict__.get("db_enabled", False):
+            return ChartFundamentalContext(symbol=canonical)
+        try:
+            return ChartFundamentalService(engine).load_chart_fundamental_context(
+                canonical,
+                as_of=now,
+                horizon_days=horizon_days,
+            )
+        except Exception as exc:
+            append_log = getattr(self, "append_log", None)
+            if callable(append_log):
+                append_log(
+                    f"Chart supplemental cache unavailable for {canonical}: {exc}"
+                )
+            return ChartFundamentalContext(symbol=canonical)
+
+    def _schedule_chart_fundamental_refresh(
+        self, symbol: str, generation: int, *, now: dt.datetime
+    ) -> bool:
+        if self.__dict__.get("db_engine_source") != "pc":
+            return False
+        engine = self.__dict__.get("db_engine")
+        if engine is None or self.__dict__.get("_database_shutting_down", False):
+            return False
+        canonical = canonical_symbol(symbol)
+        workers = self.__dict__.setdefault("_fundamental_refresh_workers", [])
+        if any(
+            getattr(worker, "symbol", "") == canonical
+            and getattr(worker, "isRunning", lambda: False)()
+            for worker in workers
+        ):
+            return False
+        try:
+            if not ChartFundamentalService(engine).refresh_required(
+                canonical, as_of=now
+            ):
+                return False
+        except Exception as exc:
+            append_log = getattr(self, "append_log", None)
+            if callable(append_log):
+                append_log(
+                    f"Could not inspect supplemental cache freshness for {canonical}: {exc}"
+                )
+            return False
+        worker = ChartFundamentalRefreshWorker(engine, canonical, generation)
+        worker.completed.connect(self._on_chart_fundamental_refresh_completed)
+        worker.failed.connect(self._on_chart_fundamental_refresh_failed)
+        workers.append(worker)
+        self._fundamental_refresh_worker = worker
+        track_worker = getattr(self, "_track_worker", None)
+        if callable(track_worker):
+            track_worker(
+                "_fundamental_refresh_worker",
+                worker,
+                collection_name="_fundamental_refresh_workers",
+            )
+        worker.start()
+        return True
+
+    def _on_chart_fundamental_refresh_completed(
+        self, context: ChartFundamentalContext, generation: int
+    ) -> None:
+        active = (
+            self.tradingview_symbol_combo.currentText().strip().upper()
+            if hasattr(self, "tradingview_symbol_combo")
+            else ""
+        )
+        current_generation = int(
+            self.__dict__.get("_chart_fundamental_request_generation", 0) or 0
+        )
+        if (
+            canonical_symbol(active) != context.symbol
+            or int(generation) != current_generation
+        ):
+            return
+        tradingview_symbol = self._to_tradingview_symbol(context.symbol)
+        for key in list(self.tradingview_refresh_timestamps):
+            if f"|{tradingview_symbol}|" in key:
+                self.tradingview_refresh_timestamps.pop(key, None)
+        append_log = getattr(self, "append_log", None)
+        if callable(append_log):
+            append_log(
+                f"Updated chart profile/earnings cache for {context.symbol} "
+                f"({len(context.earnings_events)} earnings events)."
+            )
+        self.load_tradingview_chart(force=True)
+
+    def _on_chart_fundamental_refresh_failed(
+        self, symbol: str, message: str, generation: int
+    ) -> None:
+        append_log = getattr(self, "append_log", None)
+        if callable(append_log):
+            append_log(f"Chart profile/earnings refresh failed for {symbol}: {message}")
 
     @staticmethod
     def _format_chart_latest_text(history: pd.DataFrame, timeframe: str) -> str:
@@ -449,14 +647,17 @@ class ChartsDataFlowMixin:
         target_price = (
             watchlist_item.breakout_price if watchlist_item is not None else None
         )
-        drawings = self.chart_drawings.get(symbol, [])
+        intraday_options = self._get_intraday_chart_options()
+        drawings = self._build_combined_drawings(
+            symbol, intraday_options.get("timeframe", "1H")
+        )
         self._set_html_or_text(
             self.intraday_chart_view,
             self._generate_local_chart_html(
                 symbol,
                 chart_history,
                 compact=False,
-                options=self._get_intraday_chart_options(),
+                options=intraday_options,
                 target_price=target_price,
                 drawings=drawings,
                 interaction_settings=self.__dict__.get("settings", {}),
@@ -508,7 +709,16 @@ class ChartsDataFlowMixin:
         return 260
 
     def _get_intraday_chart_options(self) -> dict:
+        interval = (
+            self.intraday_interval_combo.currentText().strip().upper()
+            if hasattr(self, "intraday_interval_combo")
+            else "1H"
+        )
+        interval_timeframe = self._normalize_drawing_timeframe(interval)
+        if not interval_timeframe:
+            interval_timeframe = "1H"
         return {
+            "timeframe": interval_timeframe,
             "show_volume": self.intraday_show_volume_checkbox.isChecked(),
             "show_rs": False,
             "show_ema": self.intraday_show_ema_checkbox.isChecked(),

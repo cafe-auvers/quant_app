@@ -136,11 +136,14 @@ def init_mysql_engine(
         if ensure_schema:
             from .schema import (_ensure_chart_indicator_manifests_table,
                                  _ensure_chart_indicators_table,
+                                 _ensure_earnings_events_table,
+                                 _ensure_fundamental_sync_state_table,
                                  _ensure_hourly_price_history_table,
                                  _ensure_intraday_price_history_table,
                                  _ensure_price_history_table,
                                  _ensure_scanner_metric_snapshots_table,
-                                 _ensure_scanner_metrics_table)
+                                 _ensure_scanner_metrics_table,
+                                 _ensure_stock_profiles_table)
 
             _ensure_price_history_table(engine)
             _ensure_hourly_price_history_table(engine)
@@ -149,6 +152,20 @@ def init_mysql_engine(
             _ensure_intraday_price_history_table(engine)
             _ensure_scanner_metrics_table(engine)
             _ensure_scanner_metric_snapshots_table(engine)
+            _ensure_stock_profiles_table(engine)
+            _ensure_earnings_events_table(engine)
+            _ensure_fundamental_sync_state_table(engine)
+            try:
+                from src.services.chart_fundamentals import (
+                    seed_default_universe_stock_profiles,
+                )
+
+                seed_default_universe_stock_profiles(engine)
+            except Exception as exc:
+                # Supplemental chart metadata must not disable an otherwise
+                # healthy market-data database.  The next startup/refresh can
+                # retry the idempotent universe seed.
+                logger.warning("Stock profile universe seed failed: %s", exc)
         return engine
     except (ImportError, OSError, SQLAlchemyError, ValueError, TypeError) as exc:
         if engine is not None:

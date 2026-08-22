@@ -26,6 +26,30 @@ class _State:
         self.logs.append(message)
 
 
+@pytest.fixture(autouse=True)
+def _disable_supplemental_provider_network(monkeypatch):
+    monkeypatch.setattr(
+        historical,
+        "refresh_nasdaq_universe_stock_profiles",
+        lambda *_args, **_kwargs: {"complete": 0, "changed": 0},
+    )
+    monkeypatch.setattr(
+        historical,
+        "refresh_universe_upcoming_earnings",
+        lambda *_args, **_kwargs: {
+            "events": 0,
+            "symbols": 0,
+            "changed": 0,
+            "failed_dates": 0,
+        },
+    )
+    monkeypatch.setattr(
+        historical,
+        "refresh_universe_earnings_history",
+        lambda *_args, **_kwargs: {"attempted": 0},
+    )
+
+
 def test_read_refresh_symbols_from_stdin_normalizes_and_deduplicates(monkeypatch):
     monkeypatch.setattr(
         historical.sys,
@@ -110,6 +134,10 @@ def test_run_1d_downloads_only_stale_payload_but_checks_full_derived_universe(mo
         calls["watermark_kwargs"] = kwargs
         return watermarks
 
+    def refresh_profiles(engine, tickers, **kwargs):
+        calls["profiles"] = (list(tickers), kwargs["max_symbols"])
+        return {"attempted": 3, "refreshed": 3, "unavailable": 0}
+
     monkeypatch.setattr(historical, "refresh_universe_history_to_db", refresh_history)
     monkeypatch.setattr(
         historical,
@@ -120,6 +148,9 @@ def test_run_1d_downloads_only_stale_payload_but_checks_full_derived_universe(mo
     monkeypatch.setattr(historical, "refresh_scanner_metrics_to_db", refresh_scanner)
     monkeypatch.setattr(historical, "get_chart_indicator_refresh_plan", chart_plan)
     monkeypatch.setattr(historical, "is_scanner_metrics_snapshot_current", scanner_current)
+    monkeypatch.setattr(
+        historical, "refresh_universe_stock_profiles", refresh_profiles
+    )
 
     historical.run_1d(
         object(),
@@ -134,8 +165,18 @@ def test_run_1d_downloads_only_stale_payload_but_checks_full_derived_universe(mo
     assert calls["chart_plan_watermarks"] is watermarks
     assert calls["scanner"] == (["SPY", "AAPL", "MSFT"], False, watermarks)
     assert calls["scanner_current_watermarks"] is watermarks
+    assert calls["profiles"] == (
+        ["SPY", "AAPL", "MSFT"],
+        historical.PROFILE_REFRESH_BATCH_SIZE,
+    )
     assert state.updated_count == 1
-    assert state.completed == ["daily_history", "chart_indicators", "scanner_metrics"]
+    assert state.completed == [
+        "daily_history",
+        "chart_indicators",
+        "scanner_metrics",
+        "stock_profiles",
+        "earnings_events",
+    ]
 
 
 def test_derived_only_run_never_calls_price_downloader(monkeypatch):

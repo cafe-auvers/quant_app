@@ -32,6 +32,12 @@ if str(REPO_ROOT) not in sys.path:
 from src.services.historical_refresh_control import (
     MODE_1D, MODE_1H, is_derived_data_complete, lock_path, status_path,
 )
+from src.services.chart_fundamentals import (
+    refresh_nasdaq_universe_stock_profiles,
+    refresh_universe_earnings_history,
+    refresh_universe_stock_profiles,
+    refresh_universe_upcoming_earnings,
+)
 from src.utils.data_loader import get_default_universe
 from src.utils.db_loader import (
     get_chart_indicator_refresh_plan,
@@ -51,6 +57,15 @@ from src.utils.storage import save_json
 REFERENCE_SYMBOL = "SPY"
 RECENT_LOG_LIMIT = 50
 PROGRESS_WRITE_MIN_INTERVAL = 1.0  # seconds; throttles pure-progress-percent writes
+PROFILE_REFRESH_BATCH_SIZE = max(
+    1, min(2000, int(os.getenv("PROFILE_REFRESH_BATCH_SIZE", "500")))
+)
+EARNINGS_HISTORY_REFRESH_BATCH_SIZE = max(
+    1, min(500, int(os.getenv("EARNINGS_HISTORY_REFRESH_BATCH_SIZE", "100")))
+)
+EARNINGS_CALENDAR_HORIZON_DAYS = max(
+    14, min(180, int(os.getenv("EARNINGS_CALENDAR_HORIZON_DAYS", "100")))
+)
 
 
 def _now_iso() -> str:
@@ -312,6 +327,62 @@ def run_1d(
     ):
         raise RuntimeError("Scanner metrics snapshot remains incomplete.")
     state.complete_phase("scanner_metrics")
+
+    # Profiles are supplemental and never invalidate otherwise-current price
+    # or scanner data. Seed rows are created during schema initialization;
+    # this bounded phase progressively enriches sector/industry while a
+    # seven-day negative cache rotates past unsupported/provider-failed rows.
+    state.set_phase("stock_profiles")
+    try:
+        bulk_summary = refresh_nasdaq_universe_stock_profiles(
+            engine,
+            universe_tickers,
+        )
+        state.log(
+            "Nasdaq stock profiles: "
+            f"{bulk_summary['complete']} sector/industry profiles available, "
+            f"{bulk_summary['changed']} changed."
+        )
+    except Exception as exc:
+        state.log(f"Nasdaq stock profile refresh deferred: {exc}")
+    try:
+        refresh_universe_stock_profiles(
+            engine,
+            universe_tickers,
+            max_symbols=PROFILE_REFRESH_BATCH_SIZE,
+            progress_callback=state.update_progress,
+            log_callback=state.log,
+        )
+    except Exception as exc:
+        state.log(f"Stock profile enrichment deferred: {exc}")
+    state.complete_phase("stock_profiles")
+
+    state.set_phase("earnings_events")
+    try:
+        calendar_summary = refresh_universe_upcoming_earnings(
+            engine,
+            universe_tickers,
+            horizon_days=EARNINGS_CALENDAR_HORIZON_DAYS,
+        )
+        state.log(
+            "Nasdaq earnings calendar: "
+            f"{calendar_summary['events']} events across "
+            f"{calendar_summary['symbols']} symbols, "
+            f"{calendar_summary['changed']} changed, "
+            f"{calendar_summary['failed_dates']} dates deferred."
+        )
+    except Exception as exc:
+        state.log(f"Nasdaq earnings calendar refresh deferred: {exc}")
+    try:
+        refresh_universe_earnings_history(
+            engine,
+            universe_tickers,
+            max_symbols=EARNINGS_HISTORY_REFRESH_BATCH_SIZE,
+            log_callback=state.log,
+        )
+    except Exception as exc:
+        state.log(f"Yahoo earnings history enrichment deferred: {exc}")
+    state.complete_phase("earnings_events")
 
 
 def run_1h(engine, tickers: List[str], backfill: bool, state: RunState) -> None:
