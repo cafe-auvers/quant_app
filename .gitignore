@@ -59,6 +59,7 @@ data/*.json.bak
 data/*.jsonl
 data/*.lock
 data/cache/
+data/pre_restore_backup_*/
 
 # Historical refresh process runtime state (historical.py / historical_refresh_control.py)
 data/refresh_status_*.json

@@ -1,5 +1,10 @@
 # Decouple 1D/1H Historical Data Refresh into a Standalone Process
 
+> **Status:** Implemented. This document is retained as the design and rollout
+> record. Current operator commands are documented in
+> [Two-PC Data Sync](pc_sync_data_pipeline.md); current module boundaries are in
+> [PROJECT_ARCHITECTURE.md](../PROJECT_ARCHITECTURE.md).
+
 ## Context
 
 `main.py` (PyQt5 dashboard) currently runs the "Update 1D Data" and "Update 1H Data"

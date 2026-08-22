@@ -7,11 +7,12 @@ legacy UI) targeting `master` with these required status checks:
 
 - `test (3.11)`
 - `test (3.12)`
+- `Gate 1 deterministic simulation`
 
 For this single-maintainer repository, requiring a pull request is optional.
-Requiring both status checks and preventing force pushes/deletions is
+Requiring all three status checks and preventing force pushes/deletions is
 recommended. After saving the rule, open a small pull request and confirm its
-merge button remains blocked until both matrix jobs pass.
+merge button remains blocked until both matrix jobs and Gate 1 pass.
 
 Branch protection is GitHub-hosted state and cannot be enforced by
 `.github/workflows/ci.yml` itself. Re-check this rule if the workflow/job name

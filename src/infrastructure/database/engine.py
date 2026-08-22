@@ -13,7 +13,11 @@ from .settings import (_MYSQL_HOST_FORBIDDEN_CHARACTERS,
                        MYSQL_CONNECT_TIMEOUT_SECONDS,
                        MYSQL_POOL_RECYCLE_SECONDS,
                        MYSQL_READ_WRITE_TIMEOUT_SECONDS, logger)
-def validate_mysql_identifier(value: str, *, label: str = "database name") -> str:
+
+
+def validate_mysql_identifier(
+    value: object, *, label: str = "database name"
+) -> str:
     """Accept a deliberately narrow set of safe MySQL identifier characters."""
     identifier = str(value or "").strip()
     if (
@@ -79,11 +83,11 @@ def get_mysql_connection_url(db_name: Optional[str] = None) -> URL:
         db_name = validate_mysql_identifier(db_name)
     config = validate_mysql_config()
     if db_name is None:
-        db_name = config["database"]
+        db_name = str(config["database"])
     db_name = validate_mysql_identifier(str(db_name))
 
     host = str(config["host"])
-    port = int(config["port"])
+    port = validate_mysql_port(config["port"])
     user = str(config["user"])
     password = str(config["password"])
 
@@ -142,12 +146,18 @@ def init_mysql_engine(
                                  _ensure_intraday_price_history_table,
                                  _ensure_market_alignment_tables,
                                  _ensure_market_pulse_tables,
+                                 _ensure_price_history_indexes,
                                  _ensure_price_history_table,
                                  _ensure_scanner_metric_snapshots_table,
                                  _ensure_scanner_metrics_table,
                                  _ensure_stock_profiles_table)
 
             _ensure_price_history_table(engine)
+            if not _ensure_price_history_indexes(engine):
+                logger.warning(
+                    "Price-history performance index could not be installed; "
+                    "freshness checks may be slower"
+                )
             _ensure_hourly_price_history_table(engine)
             _ensure_chart_indicators_table(engine)
             _ensure_chart_indicator_manifests_table(engine)

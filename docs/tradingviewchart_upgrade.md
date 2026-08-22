@@ -1,4 +1,14 @@
-Implement a production-quality **earnings-data subsystem, earnings chart overlay, upcoming-earnings indicator, and stock profile watermark** in:
+# TradingView Fundamentals Upgrade — Implementation Record
+
+> **Status:** Implemented. This file preserves the original feature brief and
+> completion criteria. For maintained runtime behavior, see
+> [PROJECT_ARCHITECTURE.md](../PROJECT_ARCHITECTURE.md), especially Charting,
+> and [Leadership and Market Context](market_alignment.md). Do not treat future
+> tense below as unfinished functionality without verifying the code and tests.
+
+The original brief requested a production-quality **earnings-data subsystem,
+earnings chart overlay, upcoming-earnings indicator, and stock profile
+watermark** in:
 
 ```text
 cafe-auvers/quant_app
