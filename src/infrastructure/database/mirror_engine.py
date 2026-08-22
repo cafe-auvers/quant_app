@@ -20,6 +20,7 @@ from .schema import (_ensure_chart_indicator_manifests_table,
                      _ensure_earnings_events_table,
                      _ensure_fundamental_sync_state_table,
                      _ensure_hourly_price_history_table,
+                     _ensure_market_alignment_tables,
                      _ensure_price_history_table,
                      _ensure_scanner_metric_snapshots_table,
                      _ensure_scanner_metrics_table,
@@ -57,6 +58,8 @@ MIRRORED_TABLES: Tuple[Tuple[str, str], ...] = (
     ("stock_profiles", "updated_at"),
     ("earnings_events", "updated_at"),
     ("fundamental_sync_state", "updated_at"),
+    ("stock_market_alignment_daily", "updated_at"),
+    ("market_alignment_batches", "updated_at"),
 )
 HOURLY_MIRROR_TABLES: Tuple[Tuple[str, str], ...] = (
     ("hourly_price_history", "timestamp"),
@@ -194,6 +197,20 @@ _RECONCILE_TABLE_SPECS: Tuple[_ReconcileTableSpec, ...] = (
         "updated_at",
         "updated_at",
     ),
+    _ReconcileTableSpec(
+        "stock_market_alignment_daily",
+        ("symbol", "as_of_date", "feature_version"),
+        ("as_of_date", "feature_version"),
+        "updated_at",
+        "updated_at",
+    ),
+    _ReconcileTableSpec(
+        "market_alignment_batches",
+        ("as_of_date", "feature_version"),
+        ("as_of_date", "feature_version"),
+        "updated_at",
+        "updated_at",
+    ),
 )
 
 
@@ -220,6 +237,7 @@ _BOOLEAN_RECONCILE_COLUMNS = frozenset(
         "parabolic_flag",
         "rs_above_sma_50",
         "is_date_estimated",
+        "is_provisional",
     }
 )
 
@@ -385,6 +403,7 @@ def init_local_mirror_engine(db_path=None) -> Optional[Engine]:
         _ensure_stock_profiles_table(engine)
         _ensure_earnings_events_table(engine)
         _ensure_fundamental_sync_state_table(engine)
+        _ensure_market_alignment_tables(engine)
         _ensure_local_mirror_handoff_tracking(engine)
         _ensure_local_mirror_sync_state(engine)
         return engine

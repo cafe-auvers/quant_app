@@ -22,6 +22,7 @@ from src.services.app_state import StateReconcileResult
 from src.services.execution_authority import ExecutionAuthority, LeaseHandle
 from src.services.handoff_reconciliation import PostClaimReconciliationResult
 from src.core.runtime_readiness import RuntimeDeviceState
+from src.core.order_state import BrokerOrder, OrderSide, OrderStatus
 from src.core.trade_card_state import BoardStatus, TradeCardState
 from src.services import trade_card_repository
 from src.services.runtime_device_state_repository import (
@@ -950,6 +951,27 @@ def test_missing_database_is_explicitly_unknown_exposure():
     assert exposure.inspection_confirmed is False
     assert exposure.is_clear is False
     assert "UNKNOWN EXPOSURE" in exposure.labels[0]
+
+
+def test_shutdown_exposure_ignores_open_sim_legacy_orders(tmp_path):
+    engine = _make_engine(tmp_path)
+    window = _base_window(is_main=True, lease_token="tok-1", pc_engine=engine)
+    sim_order = BrokerOrder.create(
+        environment="SIM",
+        account_no="12345678",
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        quantity_requested=1,
+        limit_price=1.0,
+    )
+    sim_order.status = OrderStatus.ACCEPTED
+    window.order_ledger = [sim_order]
+
+    exposure = MainWindow._execution_shutdown_exposure(window)
+
+    assert exposure.inspection_confirmed is True
+    assert exposure.is_clear is True
+    assert exposure.working_orders == ()
 
 
 def test_failed_final_release_aborts_close_and_restores_protection(monkeypatch):

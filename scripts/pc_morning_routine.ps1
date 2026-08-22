@@ -7,12 +7,14 @@ setup_pc_morning_task.ps1). Chains, in order:
      deployment target, not a dev workspace: nobody should be editing code
      here, so discarding local state is intentional and safe (see
      docs/pc_sync_data_pipeline.md).
-  2. scripts/run_daily_refresh.py -- gates on whether the database's actual
+  2. Merge the latest tracked .env.example schema into the PC's private .env
+     without replacing configured values, then regenerate .env.pc.
+  3. scripts/run_daily_refresh.py -- gates on whether the database's actual
      latest stored date is behind what's expected (same check the dashboard
      itself shows as "Needs refresh"), and if so, runs historical.py
      --mode 1d then --mode 1h. This self-heals multi-day gaps, not just
      "yesterday."
-  3. Launches main.py (detached) so the dashboard is visible if you check
+  4. Launches main.py (detached) so the dashboard is visible if you check
      in during the PC's short on-window.
 
 Each step's outcome is logged; a failure in one step doesn't block the next
@@ -82,6 +84,24 @@ try {
     Write-Log "WARN: git sync failed ($($_.Exception.Message)) -- continuing with whatever code is already on disk."
 } finally {
     Pop-Location
+}
+
+# --- 1.25. Environment schema sync -----------------------------------------
+# .env and .env.pc remain gitignored.  Only the non-secret schema/defaults in
+# .env.example arrive through Git; this step preserves every configured local
+# .env value and adds newly documented settings before any Python process
+# reads configuration.
+
+try {
+    $envSyncOutput = & $PythonExe (Join-Path $RepoRoot "scripts\sync_env_files.py") 2>&1
+    $envSyncExitCode = $LASTEXITCODE
+    Write-Log "Environment sync (exit code $envSyncExitCode): $envSyncOutput"
+    if ($envSyncExitCode -ne 0) {
+        throw "Environment synchronization failed with exit code $envSyncExitCode."
+    }
+} catch {
+    Write-Log "ERROR: environment sync failed ($($_.Exception.Message)); aborting before refresh or app launch."
+    exit 1
 }
 
 # --- 1.5. Keep the venv's packages on the tested dependency graph ----------

@@ -18,60 +18,22 @@ def _base_window(current_widget):
     window.intraday_charts_widget = object()
     window.tradingview_widget = object()
     window.tabs = _FakeTabs(current_widget)
-    window._dashboard_summary_dirty = False
     window._intraday_tab_chart_stale = False
     window._tradingview_tab_chart_stale = False
     return window
 
 
-# The method names are compatibility callbacks used by shared chart code; the
-# retired Watchlist table is no longer part of their behavior.
-
-def test_mark_watchlist_and_dashboard_dirty_defers_when_tabs_hidden():
-    window = _base_window(current_widget=object())  # some other tab active
-    calls = []
-    window.update_dashboard_summary = lambda: calls.append("dashboard")
+# The method names remain as compatibility callbacks used by shared chart code.
+def test_retired_dashboard_summary_callbacks_are_noops():
+    window = _base_window(current_widget=None)
+    window.update_dashboard_summary = lambda: (_ for _ in ()).throw(
+        AssertionError("retired Dashboard summary must not refresh")
+    )
 
     window.mark_watchlist_and_dashboard_dirty()
-
-    assert calls == []
-    assert window._dashboard_summary_dirty is True
-
-
-def test_mark_watchlist_and_dashboard_dirty_refreshes_visible_dashboard():
-    window = _base_window(current_widget=None)
-    window.tabs = _FakeTabs(window.dashboard_widget)
-    calls = []
-    window.update_dashboard_summary = lambda: calls.append("dashboard")
-
-    window.mark_watchlist_and_dashboard_dirty()
-
-    assert calls == ["dashboard"]
-    assert window._dashboard_summary_dirty is False
-
-
-def test_flush_dirty_watchlist_and_dashboard_catches_up_on_tab_switch():
-    window = _base_window(current_widget=None)
-    window._dashboard_summary_dirty = True
-    window.tabs = _FakeTabs(window.dashboard_widget)
-    calls = []
-    window.update_dashboard_summary = lambda: calls.append("dashboard")
-
     window._flush_dirty_watchlist_and_dashboard()
 
-    assert calls == ["dashboard"]
-    assert window._dashboard_summary_dirty is False
-
-
-def test_flush_dirty_watchlist_and_dashboard_noop_when_nothing_dirty():
-    window = _base_window(current_widget=None)
-    window.tabs = _FakeTabs(window.dashboard_widget)
-    calls = []
-    window.update_dashboard_summary = lambda: calls.append("dashboard")
-
-    window._flush_dirty_watchlist_and_dashboard()
-
-    assert calls == []
+    assert "_dashboard_summary_dirty" not in window.__dict__
 
 
 # --- refresh_other_chart_views_for_symbol / flush_stale_chart_views ---

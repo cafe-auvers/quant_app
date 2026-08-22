@@ -38,7 +38,12 @@ REFRESH_MODES = (MODE_1D, MODE_1H)
 # metrics for 1D; the hourly bars themselves for 1H) is considered consistent
 # with the freshly-saved price history.
 REQUIRED_PHASES: Dict[str, Tuple[str, ...]] = {
-    MODE_1D: ("daily_history", "chart_indicators", "scanner_metrics"),
+    MODE_1D: (
+        "daily_history",
+        "chart_indicators",
+        "scanner_metrics",
+        "market_alignment",
+    ),
     MODE_1H: ("hourly_history",),
 }
 

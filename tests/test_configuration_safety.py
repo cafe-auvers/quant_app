@@ -95,6 +95,8 @@ def test_init_mysql_uses_preprovisioned_database_with_bounded_timeouts(monkeypat
             "_ensure_stock_profiles_table",
             "_ensure_earnings_events_table",
             "_ensure_fundamental_sync_state_table",
+            "_ensure_market_pulse_tables",
+            "_ensure_market_alignment_tables",
         ):
         monkeypatch.setattr(schema_module, name, lambda _engine: None)
 

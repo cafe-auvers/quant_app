@@ -24,6 +24,7 @@ from src.services.event_journal import (
     inspect_event_journal,
     scrub_sensitive_text,
 )
+from src.services.repository_sync import RepositoryStatus
 from src.utils.market_calendar import expected_latest_market_data_date
 
 KIS_API_HEALTH_MAX_AGE = dt.timedelta(minutes=15)
@@ -75,6 +76,7 @@ class HealthContext:
     handoff_blocked_symbols: Sequence[str] = field(default_factory=tuple)
     market_data_metrics: Any = None
     request_scheduler_metrics: Any = None
+    repository_status: Optional[RepositoryStatus] = None
 
 
 @dataclass(frozen=True)
@@ -696,6 +698,66 @@ def _request_scheduler_check(metrics: Any) -> HealthCheck:
     )
 
 
+def _repository_check(status: Optional[RepositoryStatus]) -> HealthCheck:
+    """Report whether this checkout matches its tracked remote branch."""
+    if status is None:
+        return HealthCheck(
+            "Application Git version",
+            HealthLevel.UNKNOWN,
+            "Tracked Git branch has not been checked",
+        )
+    if status.error:
+        return HealthCheck(
+            "Application Git version",
+            HealthLevel.UNKNOWN,
+            "Could not compare with the tracked Git branch",
+            status.error,
+        )
+
+    comparison = (
+        f"{status.branch} at {status.local_revision}; {status.upstream} at "
+        f"{status.remote_revision}; {status.ahead_count} ahead, "
+        f"{status.behind_count} behind."
+    )
+    if status.behind_count and status.ahead_count:
+        return HealthCheck(
+            "Application Git version",
+            HealthLevel.WARNING,
+            "Local and remote Git branches have diverged",
+            comparison + " Manual Git reconciliation is required.",
+        )
+    if status.behind_count:
+        local_note = (
+            " Local changes block automatic sync." if status.dirty else ""
+        )
+        return HealthCheck(
+            "Application Git version",
+            HealthLevel.WARNING,
+            "Recent Git is not synced",
+            comparison + local_note,
+        )
+    if status.dirty:
+        return HealthCheck(
+            "Application Git version",
+            HealthLevel.WARNING,
+            "Latest tracked Git is present, with local changes",
+            comparison,
+        )
+    if status.ahead_count:
+        return HealthCheck(
+            "Application Git version",
+            HealthLevel.WARNING,
+            "Latest tracked Git is present, with local commits ahead",
+            comparison,
+        )
+    return HealthCheck(
+        "Application Git version",
+        HealthLevel.HEALTHY,
+        "Synced with most recent Git",
+        comparison,
+    )
+
+
 def collect_health_snapshot(context: HealthContext) -> HealthSnapshot:
     """Run read-only local probes and combine them with cached runtime state."""
     token_check, configured = inspect_kis_token()
@@ -709,6 +771,7 @@ def collect_health_snapshot(context: HealthContext) -> HealthSnapshot:
             scrub_sensitive_text(exc),
         )
     checks = [
+        _repository_check(context.repository_status),
         token_check,
         _kis_api_check(context, configured),
         _mysql_check(context),

@@ -38,6 +38,10 @@ from src.services.chart_fundamentals import (
     refresh_universe_stock_profiles,
     refresh_universe_upcoming_earnings,
 )
+from src.services.market_alignment import (
+    alignment_reference_tickers,
+    refresh_market_alignment_to_db,
+)
 from src.utils.data_loader import get_default_universe
 from src.utils.db_loader import (
     get_chart_indicator_refresh_plan,
@@ -226,6 +230,14 @@ def build_refresh_tickers(
     return list(dict.fromkeys([REFERENCE_SYMBOL, *normalized]))
 
 
+def build_daily_history_tickers(stock_tickers: List[str]) -> List[str]:
+    """Add shared alignment proxies to the normal 1D batch download."""
+
+    return list(
+        dict.fromkeys([*stock_tickers, *alignment_reference_tickers()])
+    )
+
+
 def read_refresh_symbols_from_stdin() -> List[str]:
     symbols = [line.strip().upper() for line in sys.stdin.read().splitlines() if line.strip()]
     return list(dict.fromkeys(symbols))
@@ -357,6 +369,15 @@ def run_1d(
         state.log(f"Stock profile enrichment deferred: {exc}")
     state.complete_phase("stock_profiles")
 
+    state.set_phase("market_alignment")
+    refresh_market_alignment_to_db(
+        universe_tickers,
+        engine,
+        force=force_derived,
+        log_callback=state.log,
+    )
+    state.complete_phase("market_alignment")
+
     state.set_phase("earnings_events")
     try:
         calendar_summary = refresh_universe_upcoming_earnings(
@@ -434,13 +455,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         universe_tickers = build_refresh_tickers(
             args.universe_limit, refresh=not selective
         )
+        history_universe_tickers = (
+            build_daily_history_tickers(universe_tickers)
+            if mode == MODE_1D
+            else universe_tickers
+        )
         if args.symbols_stdin:
             requested_symbols = read_refresh_symbols_from_stdin()
             if not requested_symbols:
                 raise ValueError(
                     "--symbols-stdin requires at least one symbol; use --derived-only for an empty 1D history plan."
                 )
-            universe_set = set(universe_tickers)
+            universe_set = set(history_universe_tickers)
             tickers = [symbol for symbol in requested_symbols if symbol in universe_set]
             dropped = len(requested_symbols) - len(tickers)
             if dropped:
@@ -454,7 +480,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 )
             state.log(
                 f"Starting selective {mode} refresh for {len(tickers)} of "
-                f"{len(universe_tickers)} universe symbols..."
+                f"{len(history_universe_tickers)} daily input symbols..."
             )
         elif args.derived_only:
             tickers = []
@@ -462,7 +488,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 f"Starting derived-only 1d refresh for {len(universe_tickers)} universe symbols..."
             )
         else:
-            tickers = universe_tickers
+            tickers = history_universe_tickers
             state.log(f"Starting {mode} refresh for {len(tickers)} symbols...")
 
         if mode == MODE_1D:

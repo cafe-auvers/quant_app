@@ -8,7 +8,7 @@ import logging
 from dataclasses import replace
 from typing import List, Optional
 
-from PyQt5.QtCore import QThread, Qt, pyqtSignal
+from PyQt5.QtCore import QThread, Qt, QUrl, pyqtSignal
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QAbstractItemView,
@@ -42,10 +42,14 @@ from src.services.health import (
 )
 from src.services.order_ledger import load_order_ledger
 from src.services.pnl_history import (
+    BrokerRealizedPnlSeries,
     PnlDailySnapshot,
     compute_unrealized_pnl_usd,
+    load_pnl_history,
     record_daily_pnl_snapshot,
 )
+from src.services.repository_sync import inspect_repository
+from src.ui.charts.render_assets import lightweight_charts_base_path
 from src.ui.health.pnl_chart import (
     SERIES_COMBINED,
     SERIES_REALIZED,
@@ -53,9 +57,12 @@ from src.ui.health.pnl_chart import (
     UNIT_KRW,
     UNIT_PCT,
     UNIT_USD,
+    VIEW_CUMULATIVE,
+    VIEW_DAILY,
     generate_pnl_chart_html,
     pnl_chart_points,
 )
+from src.utils.config import ROOT_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +70,7 @@ logger = logging.getLogger(__name__)
 class HealthProbeWorker(QThread):
     completed = pyqtSignal(object, list, list)
     failed = pyqtSignal(str)
+    repository_checked = pyqtSignal(object)
 
     def __init__(
         self,
@@ -72,6 +80,7 @@ class HealthProbeWorker(QThread):
         unrealized_usd_today: float = 0.0,
         fx_rate_today: Optional[float] = None,
         capital_base_usd_today: Optional[float] = None,
+        broker_realized_series: Optional[List[BrokerRealizedPnlSeries]] = None,
     ) -> None:
         super().__init__()
         self.context = context
@@ -79,6 +88,7 @@ class HealthProbeWorker(QThread):
         self.unrealized_usd_today = unrealized_usd_today
         self.fx_rate_today = fx_rate_today
         self.capital_base_usd_today = capital_base_usd_today
+        self.broker_realized_series = list(broker_realized_series or [])
 
     def run(self) -> None:
         try:
@@ -88,6 +98,9 @@ class HealthProbeWorker(QThread):
             except Exception as exc:
                 orders = self.context.orders
                 context = replace(self.context, order_ledger_error=str(exc))
+            repository_status = inspect_repository(ROOT_DIR, fetch=True)
+            self.repository_checked.emit(repository_status)
+            context = replace(context, repository_status=repository_status)
             snapshot = collect_health_snapshot(context)
             events = load_recent_events(limit=300, symbol=self.journal_symbol)
             pnl_snapshots: List[PnlDailySnapshot] = []
@@ -97,6 +110,7 @@ class HealthProbeWorker(QThread):
                     unrealized_usd_today=self.unrealized_usd_today,
                     fx_rate_today=self.fx_rate_today,
                     capital_base_usd_today=self.capital_base_usd_today,
+                    broker_realized_series=self.broker_realized_series,
                 )
             except Exception:
                 logger.exception("Failed to build daily P&L snapshot history")
@@ -125,6 +139,10 @@ class HealthPanelMixin:
         ("KRW (₩)", UNIT_KRW),
         ("Percent (%)", UNIT_PCT),
     ]
+    _PNL_VIEW_ITEMS = [
+        ("Cumulative", VIEW_CUMULATIVE),
+        ("Daily change", VIEW_DAILY),
+    ]
 
     def _build_health_tab(self) -> None:
         layout = QVBoxLayout(self.health_widget)
@@ -142,7 +160,7 @@ class HealthPanelMixin:
         layout.addLayout(controls)
 
         self.health_summary_label = QLabel(
-            "Open this tab or click Refresh Health to run read-only local checks."
+            "Open this tab or click Refresh Health to run non-destructive system checks."
         )
         self.health_summary_label.setWordWrap(True)
         layout.addWidget(self.health_summary_label)
@@ -232,6 +250,15 @@ class HealthPanelMixin:
         )
         controls.addWidget(self.health_pnl_unit_combo)
 
+        controls.addWidget(QLabel("View:"))
+        self.health_pnl_view_combo = QComboBox()
+        for label, _value in self._PNL_VIEW_ITEMS:
+            self.health_pnl_view_combo.addItem(label)
+        self.health_pnl_view_combo.currentIndexChanged.connect(
+            self._refresh_pnl_dashboard_view
+        )
+        controls.addWidget(self.health_pnl_view_combo)
+
         controls.addStretch()
         self.health_pnl_table_toggle = QPushButton("Show Table")
         self.health_pnl_table_toggle.setCheckable(True)
@@ -249,6 +276,7 @@ class HealthPanelMixin:
 
         if QWebEngineView is not None:
             self.health_pnl_chart_view = QWebEngineView()
+            self.health_pnl_chart_view.setMinimumHeight(320)
         else:  # pragma: no cover - PyQtWebEngine is a pinned hard dependency
             self.health_pnl_chart_view = QTextEdit()
             self.health_pnl_chart_view.setReadOnly(True)
@@ -265,8 +293,13 @@ class HealthPanelMixin:
 
         pnl_layout.addWidget(self.health_pnl_view_stack)
 
-        self._pnl_snapshots: List[PnlDailySnapshot] = []
-        self._render_pnl_dashboard_placeholder()
+        # Show durable history immediately. The asynchronous health refresh
+        # will then update it with the latest KIS/account values.
+        self._pnl_snapshots = load_pnl_history()
+        if self._pnl_snapshots:
+            self._refresh_pnl_dashboard_view()
+        else:
+            self._render_pnl_dashboard_placeholder()
         return pnl_tab
 
     def _on_pnl_table_toggle(self, checked: bool) -> None:
@@ -285,35 +318,52 @@ class HealthPanelMixin:
             return self._PNL_UNIT_ITEMS[index][1]
         return UNIT_USD
 
+    def _selected_pnl_view(self) -> str:
+        index = self.health_pnl_view_combo.currentIndex()
+        if 0 <= index < len(self._PNL_VIEW_ITEMS):
+            return self._PNL_VIEW_ITEMS[index][1]
+        return VIEW_CUMULATIVE
+
+    def _set_pnl_chart_html(self, html_content: str) -> None:
+        asset_base = str(lightweight_charts_base_path().resolve()) + "/"
+        self.health_pnl_chart_view.setHtml(
+            html_content, QUrl.fromLocalFile(asset_base)
+        )
+
     def _render_pnl_dashboard_placeholder(self) -> None:
         if isinstance(self.health_pnl_chart_view, QTextEdit):
             self.health_pnl_chart_view.setPlainText(
                 "No P&L history yet. It starts building the next time this tab refreshes."
             )
         elif QWebEngineView is not None:
-            self.health_pnl_chart_view.setHtml(generate_pnl_chart_html([]))
+            self._set_pnl_chart_html(generate_pnl_chart_html([]))
         self.health_pnl_table.setRowCount(0)
 
     def _refresh_pnl_dashboard_view(self, *_args) -> None:
         snapshots = self.__dict__.get("_pnl_snapshots") or []
         series = self._selected_pnl_series()
         unit = self._selected_pnl_unit()
+        view = self._selected_pnl_view()
 
         if not snapshots:
             self._render_pnl_dashboard_placeholder()
             return
 
         if isinstance(self.health_pnl_chart_view, QTextEdit):
-            points = pnl_chart_points(snapshots, series=series, unit=unit)
+            points = pnl_chart_points(
+                snapshots, series=series, unit=unit, view=view
+            )
             lines = [f"{point['time']}: {point['value']:,.2f}" for point in points]
             self.health_pnl_chart_view.setPlainText(
                 "\n".join(lines) or "No data yet for this unit."
             )
         elif QWebEngineView is not None:
-            html_content = generate_pnl_chart_html(snapshots, series=series, unit=unit)
-            self.health_pnl_chart_view.setHtml(html_content)
+            html_content = generate_pnl_chart_html(
+                snapshots, series=series, unit=unit, view=view
+            )
+            self._set_pnl_chart_html(html_content)
 
-        self._populate_pnl_table(snapshots, unit=unit)
+        self._populate_pnl_table(snapshots, unit=unit, view=view)
 
         latest = snapshots[-1]
         fx_note = (
@@ -328,33 +378,56 @@ class HealthPanelMixin:
             f"As of {latest.date}: realized ${latest.realized_usd:,.2f}, "
             f"unrealized ${latest.unrealized_usd:,.2f}, total ${latest.total_usd:,.2f} "
             f"({fx_note}, {capital_note}). Unrealized history only accumulates from the "
-            f"day this dashboard started tracking; realized P&L is backfilled from your "
-            f"full order history."
+            f"day this dashboard started tracking. Realized source: "
+            f"{latest.realized_source}."
         )
 
-    def _populate_pnl_table(self, snapshots: List[PnlDailySnapshot], *, unit: str) -> None:
+    def _populate_pnl_table(
+        self,
+        snapshots: List[PnlDailySnapshot],
+        *,
+        unit: str,
+        view: str,
+    ) -> None:
         unit_suffix = {UNIT_USD: "$", UNIT_KRW: "₩", UNIT_PCT: "%"}.get(unit, "")
+        view_label = "Cumulative" if view == VIEW_CUMULATIVE else "Daily change"
         self.health_pnl_table.setHorizontalHeaderLabels(
             [
                 "Date",
-                f"Realized ({unit_suffix})",
-                f"Unrealized ({unit_suffix})",
-                f"Total ({unit_suffix})",
+                f"Realized ({view_label}, {unit_suffix})",
+                f"Unrealized ({view_label}, {unit_suffix})",
+                f"Total ({view_label}, {unit_suffix})",
             ]
         )
+        realized_points = {
+            point["time"]: point["value"]
+            for point in pnl_chart_points(
+                snapshots, series=SERIES_REALIZED, unit=unit, view=view
+            )
+        }
+        unrealized_points = {
+            point["time"]: point["value"]
+            for point in pnl_chart_points(
+                snapshots, series=SERIES_UNREALIZED, unit=unit, view=view
+            )
+        }
+        total_points = {
+            point["time"]: point["value"]
+            for point in pnl_chart_points(
+                snapshots, series=SERIES_COMBINED, unit=unit, view=view
+            )
+        }
         ordered = list(reversed(snapshots))
         self.health_pnl_table.setRowCount(len(ordered))
         for row, snapshot in enumerate(ordered):
-            realized_pt = pnl_chart_points([snapshot], series=SERIES_REALIZED, unit=unit)
-            unrealized_pt = pnl_chart_points(
-                [snapshot], series=SERIES_UNREALIZED, unit=unit
-            )
-            total_pt = pnl_chart_points([snapshot], series=SERIES_COMBINED, unit=unit)
+            realized = realized_points.get(snapshot.date)
+            unrealized = unrealized_points.get(snapshot.date)
+            total = total_points.get(snapshot.date)
             values = [
                 snapshot.date,
-                f"{realized_pt[0]['value']:,.2f}" if realized_pt else "—",
-                f"{unrealized_pt[0]['value']:,.2f}" if unrealized_pt else "—",
-                f"{total_pt[0]['value']:,.2f}" if total_pt else "—",
+                f"{realized:,.2f}" if realized is not None else "—",
+                f"{unrealized:,.2f}" if unrealized is not None else "—",
+                f"{total:,.2f}" if total is not None else "—",
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
@@ -372,9 +445,6 @@ class HealthPanelMixin:
                         "avg_cost": item.avg_cost,
                     }
                 )
-        prices = dict(self.__dict__.get("latest_intraday_prices", {}) or {})
-        unrealized_usd_today = compute_unrealized_pnl_usd(positions, prices)
-
         fx_rate = 0.0
         if hasattr(self, "usd_krw_rate_input"):
             fx_rate = self._parse_float(self.usd_krw_rate_input, 0.0)
@@ -382,10 +452,64 @@ class HealthPanelMixin:
         if hasattr(self, "account_size_input"):
             capital_base = self._parse_float(self.account_size_input, 0.0)
 
+        prices = dict(self.__dict__.get("latest_intraday_prices", {}) or {})
+        unrealized_usd_today = compute_unrealized_pnl_usd(positions, prices)
+        broker_unrealized_usd = 0.0
+        broker_unrealized_available = False
+        broker_realized_series: List[BrokerRealizedPnlSeries] = []
+        for key, snapshot in (
+            self.__dict__.get("kis_account_snapshots", {}) or {}
+        ).items():
+            if not isinstance(key, tuple) or len(key) != 2:
+                continue
+            environment, account_no = key
+            if str(environment).upper() != "PROD" or not isinstance(snapshot, dict):
+                continue
+            overseas = snapshot.get("overseas")
+            if isinstance(overseas, dict):
+                broker_unrealized_available = True
+                for holding in overseas.get("holdings") or []:
+                    try:
+                        broker_unrealized_usd += float(
+                            holding.get("profit_loss", 0.0) or 0.0
+                        )
+                    except (AttributeError, TypeError, ValueError):
+                        continue
+                actual = overseas.get("realized_pnl") or {}
+                if (
+                    isinstance(actual, dict)
+                    and actual.get("complete") is True
+                    and str(actual.get("currency") or "").upper() == "USD"
+                    and isinstance(actual.get("daily_usd"), dict)
+                ):
+                    broker_realized_series.append(
+                        BrokerRealizedPnlSeries(
+                            account_no=str(account_no),
+                            start_date=str(actual.get("start_date") or ""),
+                            end_date=str(actual.get("end_date") or ""),
+                            daily_usd=actual["daily_usd"],
+                        )
+                    )
+            domestic = snapshot.get("domestic")
+            if isinstance(domestic, dict) and fx_rate > 0:
+                broker_unrealized_available = True
+                try:
+                    broker_unrealized_usd += float(
+                        domestic.get("summary", {}).get(
+                            "evaluation_profit_loss_krw", 0.0
+                        )
+                        or 0.0
+                    ) / fx_rate
+                except (AttributeError, TypeError, ValueError):
+                    pass
+        if broker_unrealized_available:
+            unrealized_usd_today = broker_unrealized_usd
+
         return (
             unrealized_usd_today,
             fx_rate if fx_rate > 0 else None,
             capital_base if capital_base > 0 else None,
+            broker_realized_series,
         )
 
     def _health_context(self) -> HealthContext:
@@ -481,17 +605,26 @@ class HealthPanelMixin:
         self.health_refresh_button.setEnabled(False)
         self.health_checked_at_label.setText("Checking...")
         symbol = self.health_journal_symbol_input.text().strip().upper()
-        unrealized_usd_today, fx_rate_today, capital_base_usd_today = self._pnl_inputs()
+        (
+            unrealized_usd_today,
+            fx_rate_today,
+            capital_base_usd_today,
+            broker_realized_series,
+        ) = self._pnl_inputs()
         worker = HealthProbeWorker(
             self._health_context(),
             symbol,
             unrealized_usd_today=unrealized_usd_today,
             fx_rate_today=fx_rate_today,
             capital_base_usd_today=capital_base_usd_today,
+            broker_realized_series=broker_realized_series,
         )
         self._health_probe_worker = worker
         worker.completed.connect(self._on_health_probe_completed)
         worker.failed.connect(self._on_health_probe_failed)
+        apply_repository_status = getattr(self, "_apply_repository_status", None)
+        if callable(apply_repository_status):
+            worker.repository_checked.connect(apply_repository_status)
         self._track_worker("_health_probe_worker", worker)
         worker.start()
 

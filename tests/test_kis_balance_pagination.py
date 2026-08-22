@@ -1,6 +1,7 @@
 """Fail-closed pagination tests for broker position discovery."""
 from __future__ import annotations
 
+import datetime as dt
 from types import SimpleNamespace
 
 import pytest
@@ -115,6 +116,56 @@ def test_overseas_maximum_page_exhaustion_fails_closed(monkeypatch):
     assert len(calls) == 2
 
 
+def test_overseas_period_profit_aggregates_actual_rows_by_trade_date(monkeypatch):
+    client = _client()
+    responses = [
+        (
+            {
+                "output1": [
+                    {"trad_day": "20260820", "ovrs_rlzt_pfls_amt": "12.50"},
+                    {"trad_day": "20260820", "ovrs_rlzt_pfls_amt": "-2.25"},
+                ],
+                "output2": [{"ovrs_rlzt_pfls_tot_amt": "10.25"}],
+                "ctx_area_fk200": "next-fk",
+                "ctx_area_nk200": "next-nk",
+            },
+            {"tr_cont": "F"},
+        ),
+        (
+            {
+                "output1": [
+                    {"trad_day": "20260821", "ovrs_rlzt_pfls_amt": "5.00"}
+                ],
+                "output2": [{"ovrs_rlzt_pfls_tot_amt": "15.25"}],
+            },
+            {},
+        ),
+    ]
+    calls = []
+
+    def fake_get(endpoint, tr_id, params, tr_cont=""):
+        calls.append((endpoint, tr_id, dict(params), tr_cont))
+        return responses.pop(0)
+
+    monkeypatch.setattr(client, "_get_with_headers", fake_get)
+    monkeypatch.setattr(kis_snapshot.time, "sleep", lambda _seconds: None)
+
+    result = client.get_overseas_period_profit(
+        start_date=dt.date(2026, 8, 1),
+        end_date=dt.date(2026, 8, 22),
+    )
+
+    assert result["complete"] is True
+    assert result["daily_usd"] == {
+        "2026-08-20": pytest.approx(10.25),
+        "2026-08-21": pytest.approx(5.0),
+    }
+    assert calls[0][0] == kis_snapshot.OVERSEAS_PERIOD_PROFIT_ENDPOINT
+    assert calls[0][1] == kis_snapshot.OVERSEAS_PERIOD_PROFIT_TR_ID
+    assert calls[0][2]["WCRC_FRCR_DVSN_CD"] == "01"
+    assert calls[1][3] == "N"
+
+
 def test_holding_only_on_page_two_blocks_handoff(monkeypatch):
     client = _client()
     responses = [
@@ -160,4 +211,3 @@ def test_holding_only_on_page_two_blocks_handoff(monkeypatch):
 
     assert result.ok is False
     assert result.blocked_symbols == ["MSFT"]
-

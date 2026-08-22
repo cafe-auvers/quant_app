@@ -812,6 +812,11 @@ def test_tradingview_lightweight_chart_html_includes_rs_ti65_indicator():
     assert "Relative vs SPY" in chart_html
     assert "Relative SMA 50" in chart_html
     assert 'id="rs-chart"' in chart_html
+    assert 'id="linked-crosshair-vertical"' in chart_html
+    assert "chart.subscribeCrosshairMove((param) =>" in chart_html
+    assert "rsChart.subscribeCrosshairMove((param) =>" in chart_html
+    assert "updateLinkedVerticalCrosshair(container, param);" in chart_html
+    assert "updateLinkedVerticalCrosshair(rsContainer, param);" in chart_html
     assert '"value": 0.0, "color": "#9ca3af"' in chart_html
     assert '"value": 10.0, "color": "#22c55e"' in chart_html
     assert '"value": -5.0, "color": "#ef4444"' in chart_html

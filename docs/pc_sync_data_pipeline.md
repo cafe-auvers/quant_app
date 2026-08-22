@@ -99,16 +99,20 @@ flowchart LR
            -> Windows auto-login (registry AutoAdminLogon)
            -> Task Scheduler "QuantApp_MorningRoutine" (AtLogOn trigger) runs pc_morning_routine.ps1:
                 1. git fetch + reset --hard origin/master
-                2. venv python -m pip install -r requirements.txt (keeps
+                2. merge the newly pulled .env.example schema into the PC's
+                   gitignored .env without replacing configured values, then
+                   regenerate its gitignored .env.pc
+                3. venv python -m pip install --require-hashes -r
+                   requirements.lock (keeps
                    dependencies in sync with the laptop, not just code)
-                3. scripts/run_daily_refresh.py: checks every symbol and
+                4. scripts/run_daily_refresh.py: checks every symbol and
                    both daily/1H tables against the dashboard's expected
                    latest NYSE trading date (including regular holidays),
                    then runs only stale historical.py modes; a multi-day gap
                    self-heals because historical.py refetches a wide window
                    (1y), not just "yesterday"
-                4. launches main.py so the dashboard is visible if you check in
-                5. launches pc_remote_control_listener.py for remote shutdown
+                5. launches main.py so the dashboard is visible if you check in
+                6. launches pc_remote_control_listener.py for remote shutdown
 10:00 KST  "Automatic-PC-Shutdown" waits for any live historical refresh,
            then shuts the PC down; after its configured wait limit it exits
            safely without killing a partial refresh
@@ -138,6 +142,10 @@ replaced.
   `main_py_stderr.log`. The routine sets `QUANT_LOCAL_MIRROR_ENABLED=0` so a
   MySQL outage fails visibly on the authoritative PC instead of being masked
   by a machine-local fallback there.
+- `scripts/sync_env_files.py` — reconciles each machine's private `.env`
+  against the tracked `.env.example` schema without replacing configured
+  values, then regenerates `.env.pc` with blank `MYSQL_*` values. The morning
+  routine invokes it after Git sync and before any configuration consumer.
 - `scripts/run_daily_refresh.py` — the DB-freshness gate.
 - `scripts/sync_local_mirror_from_pc.py` — repeatable PC-to-laptop mirror
   top-up and before/after report. The dashboard also runs this sync quietly
@@ -262,9 +270,9 @@ be configured for that once these two setup scripts have been run.
 
 ## How do I make sure the PC is running the latest code and dependencies?
 
-**Via git** (`origin` -> the repo's GitHub URL) for
-code, and `pip install -r requirements.txt` (also run automatically each
-morning) for dependencies:
+**Via git** (`origin` -> the repo's GitHub URL) for code and the non-secret
+environment schema, and `pip install --require-hashes -r requirements.lock`
+(also run automatically each morning) for dependencies:
 
 1. Develop and commit on the laptop as normal, `git push` when ready.
 2. Every morning, `pc_morning_routine.ps1` does `git fetch origin` then
@@ -272,12 +280,22 @@ morning) for dependencies:
    reset, not a merge/pull, since the PC's clone is a deployment target
    (nobody edits code on it), so this guarantees an exact, reproducible copy
    of GitHub rather than risking a stuck merge conflict in an unattended run.
-3. It then runs `pip install -r requirements.txt` against the venv, so a
+3. It immediately applies the newly pulled `.env.example` to the PC's local
+   `.env` and `.env.pc`. Existing private `.env` values are preserved, newly
+   added settings receive safe template defaults, and all generated
+   `.env.pc` `MYSQL_*` values remain blank. The active application reads the
+   PC's `.env`.
+4. It then runs `pip install --require-hashes -r requirements.lock` against the venv, so a
    dependency added on the laptop (like `tzdata` above) shows up on the PC
    the very next morning too, not just code changes.
-4. **Prerequisite**: non-interactive git auth on the PC (Git Credential
+5. **Prerequisite**: non-interactive git auth on the PC (Git Credential
    Manager signed in once, cached via Windows Credential Manager) -- a
    scheduled task has no one there to answer a login prompt.
+
+Only `.env.example` travels through Git. The synchronization deliberately
+does not transmit laptop secrets or laptop-specific values to the PC. For an
+intentional credential/value change, update the PC's private `.env` directly
+or provision it once from `.env.pc`; subsequent template changes are automatic.
 
 ## What happens if the PC doesn't work one day?
 

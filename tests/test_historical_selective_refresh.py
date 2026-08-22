@@ -48,6 +48,11 @@ def _disable_supplemental_provider_network(monkeypatch):
         "refresh_universe_earnings_history",
         lambda *_args, **_kwargs: {"attempted": 0},
     )
+    monkeypatch.setattr(
+        historical,
+        "refresh_market_alignment_to_db",
+        lambda *_args, **_kwargs: {"symbols_calculated": 0, "skipped": True},
+    )
 
 
 def test_read_refresh_symbols_from_stdin_normalizes_and_deduplicates(monkeypatch):
@@ -175,6 +180,7 @@ def test_run_1d_downloads_only_stale_payload_but_checks_full_derived_universe(mo
         "chart_indicators",
         "scanner_metrics",
         "stock_profiles",
+        "market_alignment",
         "earnings_events",
     ]
 
@@ -216,6 +222,28 @@ def test_derived_only_run_never_calls_price_downloader(monkeypatch):
         ("scanner", ["SPY", "AAPL", "MSFT"]),
     ]
     assert any("skipping downloads" in message for message in state.logs)
+
+
+def test_hourly_run_never_invokes_daily_market_alignment(monkeypatch):
+    state = _State()
+    calls = []
+    monkeypatch.setattr(
+        historical,
+        "refresh_universe_hourly_history_to_db",
+        lambda tickers, *_args, **_kwargs: calls.extend(tickers) or list(tickers),
+    )
+    monkeypatch.setattr(
+        historical,
+        "refresh_market_alignment_to_db",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("1H refresh must not calculate daily alignment")
+        ),
+    )
+
+    historical.run_1h(object(), ["AAPL"], False, state)
+
+    assert calls == ["AAPL"]
+    assert state.completed == ["hourly_history"]
 
 
 def test_run_1d_does_not_mark_failed_derived_cache_complete(monkeypatch):

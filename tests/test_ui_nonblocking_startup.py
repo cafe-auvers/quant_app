@@ -29,6 +29,7 @@ from src.ui.buyboard import board as buyboard_board
 from src.ui.buyboard import controller as buyboard_controller
 from src.ui.charts.controller_data_flow import ChartsDataFlowMixin
 from src.ui.mixins.dashboard_mixin import DashboardMixin
+from src.ui.main_window import MainWindow, MarketDataStatusResult
 
 
 def test_market_data_status_formatting_never_queries_the_database():
@@ -39,6 +40,32 @@ def test_market_data_status_formatting_never_queries_the_database():
     )
 
     assert DashboardMixin._format_market_data_status(window) == "Checking..."
+
+
+def test_market_data_status_result_controls_1d_and_1h_freshness_independently():
+    engine = object()
+    polls = []
+    window = SimpleNamespace(
+        db_engine=engine,
+        _database_shutting_down=False,
+        _format_market_data_status_from_date=lambda _value: "Up to date",
+        _poll_refresh_status=lambda: polls.append(True),
+        update_dashboard_summary=lambda: None,
+    )
+    result = MarketDataStatusResult(
+        engine=engine,
+        latest_daily=datetime(2026, 8, 21),
+        latest_hourly=datetime(2026, 8, 20),
+        expected_date=datetime(2026, 8, 21).date(),
+        daily_is_stale=False,
+        hourly_is_stale=True,
+    )
+
+    MainWindow._on_market_data_status_completed(window, result)
+
+    assert window._historical_data_freshness == {"1d": "fresh", "1h": "stale"}
+    assert window._historical_data_expected_date.isoformat() == "2026-08-21"
+    assert polls == [True]
 
 
 def test_buyboard_projection_worker_uses_authoritative_services(monkeypatch):

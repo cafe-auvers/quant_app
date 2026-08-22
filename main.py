@@ -8,6 +8,25 @@ import sys
 import traceback
 
 
+def _synchronize_repository_environment() -> None:
+    """Apply the latest tracked environment schema before loading values."""
+
+    from src.utils.config import ENV_FILE, ROOT_DIR
+    from src.utils.env_sync import synchronize_environment_files
+
+    result = synchronize_environment_files(
+        ROOT_DIR / ".env.example",
+        ENV_FILE,
+        ROOT_DIR / ".env.pc",
+    )
+    if result.env_changed or result.pc_env_changed:
+        sys.stderr.write(
+            "Environment files synchronized from .env.example "
+            f"(.env={'updated' if result.env_changed else 'current'}, "
+            f".env.pc={'updated' if result.pc_env_changed else 'current'}).\n"
+        )
+
+
 def _load_repository_environment() -> None:
     """Load gitignored ``.env`` values before application modules import.
 
@@ -40,6 +59,7 @@ def _configure_qt_rendering_environment(platform: str | None = None) -> None:
 
 # Load operational configuration before importing any application module that
 # snapshots environment-backed settings at module import time.
+_synchronize_repository_environment()
 _load_repository_environment()
 _configure_qt_rendering_environment()
 

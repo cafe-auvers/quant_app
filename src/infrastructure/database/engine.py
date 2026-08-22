@@ -140,6 +140,8 @@ def init_mysql_engine(
                                  _ensure_fundamental_sync_state_table,
                                  _ensure_hourly_price_history_table,
                                  _ensure_intraday_price_history_table,
+                                 _ensure_market_alignment_tables,
+                                 _ensure_market_pulse_tables,
                                  _ensure_price_history_table,
                                  _ensure_scanner_metric_snapshots_table,
                                  _ensure_scanner_metrics_table,
@@ -155,6 +157,8 @@ def init_mysql_engine(
             _ensure_stock_profiles_table(engine)
             _ensure_earnings_events_table(engine)
             _ensure_fundamental_sync_state_table(engine)
+            _ensure_market_pulse_tables(engine)
+            _ensure_market_alignment_tables(engine)
             try:
                 from src.services.chart_fundamentals import (
                     seed_default_universe_stock_profiles,

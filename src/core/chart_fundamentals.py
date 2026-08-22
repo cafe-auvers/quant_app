@@ -65,6 +65,8 @@ class StockProfile:
     sector_key: Optional[str] = None
     industry_name: Optional[str] = None
     industry_key: Optional[str] = None
+    market_cap: Optional[float] = None
+    market_cap_as_of_date: Optional[dt.date] = None
     category: Optional[str] = None
     fund_family: Optional[str] = None
     profile_status: ProfileStatus = ProfileStatus.OK

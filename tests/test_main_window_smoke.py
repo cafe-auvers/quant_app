@@ -4,7 +4,7 @@ from types import SimpleNamespace
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QPushButton
 
 from src.core.trade_card_state import BoardStatus, TradeCardState
 from src.core.watchlist import BuylistManager, TradePlanManager, Watchlist
@@ -96,6 +96,8 @@ def test_main_window_constructs_and_closes_offscreen_without_external_io(monkeyp
     assert window.centralWidget() is not None
     assert window.tabs.count() > 0
     tab_labels = [window.tabs.tabText(index) for index in range(window.tabs.count())]
+    scanner_index = tab_labels.index("Scanner")
+    assert tab_labels[scanner_index + 1] == "Market Pulse"
     tradingview_index = tab_labels.index("TradingView Chart")
     assert tab_labels[tradingview_index + 1] == "Health"
     assert "Buy Board" in tab_labels
@@ -108,6 +110,12 @@ def test_main_window_constructs_and_closes_offscreen_without_external_io(monkeyp
     assert not hasattr(window, "watchlist_table")
     assert not hasattr(window, "watchlist_buffer_pct_input")
     assert not hasattr(window, "analyze_stock_ai_button")
+    assert not hasattr(window, "dashboard_summary_label")
+    assert window.findChild(QPushButton, "refreshSummaryButton") is None
+    assert window.refresh_db_button.text() == "Checking Historical 1D Data..."
+    assert window.refresh_db_button.isEnabled() is False
+    assert window.refresh_hourly_button.text() == "Checking Historical 1H Data..."
+    assert window.refresh_hourly_button.isEnabled() is False
     assert not hasattr(window, "save_watchlist_snapshot_button")
     assert not hasattr(window, "live_data_checkbox")
     assert not hasattr(window, "scanner_orb_score_checkbox")

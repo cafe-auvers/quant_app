@@ -1123,6 +1123,9 @@ class ScannerMixin:
         if running:
             self._confirm_and_terminate_refresh(MODE_1D, "1D Data")
             return False
+        if self.__dict__.get("_historical_data_freshness", {}).get(MODE_1D) == "fresh":
+            self.append_log("Historical 1D data is already up to date.")
+            return False
 
         self.append_log(
             "Launching 1D data refresh as a background process (historical.py)..."
@@ -1161,6 +1164,9 @@ class ScannerMixin:
         running, _ = is_refresh_running(MODE_1H)
         if running:
             self._confirm_and_terminate_refresh(MODE_1H, "1H Data")
+            return False
+        if self.__dict__.get("_historical_data_freshness", {}).get(MODE_1H) == "fresh":
+            self.append_log("Historical 1H data is already up to date.")
             return False
 
         self.append_log(
@@ -1249,8 +1255,7 @@ class ScannerMixin:
             )
             return
 
-        button.setText(label_prefix)
-        button.setEnabled(True)
+        self._apply_historical_data_freshness_to_button(mode, button)
         outcome = status.get("status")
         if outcome not in ("completed", "error", "terminated"):
             return
@@ -1288,6 +1293,42 @@ class ScannerMixin:
         self.progress_label.setText(self._refresh_terminal_summary_text(mode, status))
         if is_new_terminal_event:
             self._handle_refresh_terminal_status(mode, status)
+
+    def _apply_historical_data_freshness_to_button(self, mode: str, button) -> None:
+        """Render the resting refresh button from verified database freshness."""
+        interval = "1D" if mode == MODE_1D else "1H"
+        state = self.__dict__.get("_historical_data_freshness", {}).get(
+            mode, "checking"
+        )
+        expected_date = self.__dict__.get("_historical_data_expected_date")
+        expected_text = str(expected_date) if expected_date else "the latest market date"
+        if state == "fresh":
+            button.setText(f"Historical {interval} Data Up to Date ({expected_text})")
+            button.setEnabled(False)
+            button.setToolTip(
+                f"All actively tracked {interval} symbols are verified through "
+                f"{expected_text}."
+            )
+            return
+        if state == "stale":
+            button.setText(f"Update Historical {interval} Data")
+            button.setEnabled(True)
+            button.setToolTip(
+                f"One or more actively tracked {interval} symbols are missing data "
+                f"through {expected_text}."
+            )
+            return
+        if state == "unavailable":
+            button.setText(f"Historical {interval} Status Unavailable")
+            button.setEnabled(False)
+            error = str(self.__dict__.get("_historical_data_freshness_error") or "")
+            button.setToolTip(
+                error or "The market-data database is unavailable, so freshness cannot be verified."
+            )
+            return
+        button.setText(f"Checking Historical {interval} Data...")
+        button.setEnabled(False)
+        button.setToolTip("Checking every actively tracked symbol in the market-data cache.")
 
     def _clear_refresh_success_if_current(
         self,
@@ -1367,6 +1408,10 @@ class ScannerMixin:
                 self.append_log(derived_note)
             self.progress_label.setText(f"{mode.upper()} refresh terminated.")
             self.update_dashboard_summary(force=True)
+
+        refresh_freshness = getattr(self, "_start_market_data_status_refresh", None)
+        if callable(refresh_freshness):
+            refresh_freshness(force=True)
 
         if mode == MODE_1D and getattr(
             self, "_pending_local_mirror_hourly_refresh", False

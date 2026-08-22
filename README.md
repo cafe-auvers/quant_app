@@ -8,6 +8,8 @@ A desktop trading dashboard for US-market swing trading with scanner workflows, 
 - Guarded KIS overseas order submission with a durable local order ledger.
 - Conservative fill reconciliation from account snapshots; broker acceptance is not treated as a fill.
 - Rule-based scanner presets backed by a KIS-registered US universe, Yahoo/KIS data paths, and MySQL caches.
+- A read-only Market Pulse tab with cached broad-market, sector, industry, and thematic ETF performance ranked by completed-session daily returns.
+- A precomputed Leadership and Market Context overlay on the TradingView-style chart, with an expandable calculation audit and no chart-time provider calls.
 - A persisted, cross-device Watchlist planning stage available from the stock sidebar, Scanner, and TradingView; the former full Watchlist tab is not built.
 - Chart-based `breakout_price` planning and Buy Board ORB execution, with an explicit Watchlist -> Buylist -> Buy Today progression.
 - A read-only Buy Today `ORB Combinations...` comparison covering all 24 risk/window cases, kept separate from the optimized pre-market `Refresh / Select ORB Plans...` selector; the optimized view is read-only during regular market hours.
@@ -90,7 +92,22 @@ For live control, handoff, Buy Today publishing, and the distinction between
 
 Database and API credentials are local-only and belong in `.env` (gitignored, never commit it). See `.env.example` for the full list of variables to fill in, covering MySQL connection settings, KIS broker API credentials, and optional integration keys.
 
-After changing `.env`, regenerate the PC-specific copy with `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\sync_pc_env.ps1`. The script duplicates every variable into `.env.pc`, preserves every non-MySQL value exactly, and blanks all `MYSQL_*` values for manual entry on the PC. Both `.env` and `.env.pc` are gitignored; copy `.env.pc` to the PC checkout as `.env` after filling the MySQL values.
+Every `python main.py` startup synchronizes `.env` with the latest tracked
+`.env.example` before configuration is loaded. Existing private values always
+win, new keys receive their template defaults, template comments/order are
+refreshed, and machine-local extra keys are retained. The same pass regenerates
+`.env.pc`, preserving every non-MySQL value from `.env` and blanking every
+`MYSQL_*` value for manual PC configuration. Run
+`powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\sync_pc_env.ps1`
+when you want to apply the synchronization immediately without starting the
+app.
+
+The PC morning routine runs this synchronization immediately after its Git
+update, so a newly pulled `.env.example` is applied before refresh or app
+startup. Both `.env` and `.env.pc` remain gitignored: Git carries only the
+non-secret template, never private values. The application reads `.env`; use
+`.env.pc` only as the initial PC setup copy, then keep the PC's configured
+`.env` in place.
 
 Only enable KIS intraday after the endpoint, TR ID, request parameters, output field, and raw OHLCV field mappings have been verified.
 
@@ -120,6 +137,7 @@ Only enable KIS intraday after the endpoint, TR ID, request parameters, output f
 - `docs/kanban_architecture.md` explains the Kanban state machine, command/runtime flow, persistence, safety boundaries, and component architecture.
 - `docs/orb_buyboard_planning.md` explains Buffer %, the 24-case read-only comparison, Operator-Control-only pre-market ORB selection, market-hours read-only behavior, and published-plan immutability.
 - `docs/kanban_production_readiness.md` records the detailed production invariants and rollout evidence requirements.
+- `docs/market_pulse.md` documents the Market Pulse universe, EOD calculations, batched refresh, and idempotent cache schema.
 - `rulebooks/` contains active trading rules used by review workflows.
 - `md_archive/` contains completed implementation notes and old planning documents that are not canonical.
 

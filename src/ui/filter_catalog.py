@@ -104,6 +104,7 @@ SCANNER_METRICS_LABELS = {
 DEFAULT_TAB_OPTIONS = {
     "dashboard": True,
     "scanner": True,
+    "market_pulse": True,
     "buyboard": True,
     "tradingview": True,
     "health": True,

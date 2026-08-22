@@ -23,6 +23,7 @@ from src.core.chart_fundamentals import (
     canonical_symbol,
 )
 from src.infrastructure.database.schema import (
+    _ensure_stock_profiles_table,
     _get_earnings_events_table,
     _get_fundamental_sync_state_table,
     _get_stock_profiles_table,
@@ -55,6 +56,7 @@ def _fundamental_tables(engine: Engine):
         cached = _table_cache.get(engine)
         if cached is not None:
             return cached
+        _ensure_stock_profiles_table(engine)
         metadata = MetaData()
         cached = (
             _get_stock_profiles_table(metadata),
@@ -85,6 +87,8 @@ def _profile_record(profile: StockProfile) -> dict:
         "sector_key": profile.sector_key,
         "industry_name": profile.industry_name,
         "industry_key": profile.industry_key,
+        "market_cap": profile.market_cap,
+        "market_cap_as_of_date": profile.market_cap_as_of_date,
         "category": profile.category,
         "fund_family": profile.fund_family,
         "profile_status": str(_enum_value(profile.profile_status)),
@@ -108,6 +112,8 @@ _PROFILE_CONTENT_COLUMNS = (
     "sector_key",
     "industry_name",
     "industry_key",
+    "market_cap",
+    "market_cap_as_of_date",
     "category",
     "fund_family",
     "profile_status",
@@ -245,6 +251,8 @@ def load_stock_profile(engine: Engine, symbol: str) -> Optional[StockProfile]:
         sector_key=row["sector_key"],
         industry_name=row["industry_name"],
         industry_key=row["industry_key"],
+        market_cap=row["market_cap"],
+        market_cap_as_of_date=row["market_cap_as_of_date"],
         category=row["category"],
         fund_family=row["fund_family"],
         profile_status=ProfileStatus(row["profile_status"]),
@@ -276,6 +284,8 @@ def load_stock_profiles(engine: Engine) -> dict[str, StockProfile]:
             sector_key=row["sector_key"],
             industry_name=row["industry_name"],
             industry_key=row["industry_key"],
+            market_cap=row["market_cap"],
+            market_cap_as_of_date=row["market_cap_as_of_date"],
             category=row["category"],
             fund_family=row["fund_family"],
             profile_status=ProfileStatus(row["profile_status"]),

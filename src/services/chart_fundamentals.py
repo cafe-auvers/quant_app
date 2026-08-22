@@ -504,6 +504,11 @@ def refresh_nasdaq_universe_stock_profiles(
                 market=profile.market or cached.market,
                 currency=profile.currency or cached.currency,
                 country=profile.country or cached.country,
+                market_cap=profile.market_cap or cached.market_cap,
+                market_cap_as_of_date=(
+                    profile.market_cap_as_of_date
+                    or cached.market_cap_as_of_date
+                ),
             )
         if profile.sector_name and profile.industry_name:
             complete += 1
