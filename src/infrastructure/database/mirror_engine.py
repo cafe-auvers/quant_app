@@ -17,10 +17,13 @@ from src.utils.config import DATA_DIR
 from .engine import init_mysql_engine
 from .schema import (_ensure_chart_indicator_manifests_table,
                      _ensure_chart_indicators_table,
+                     _ensure_earnings_events_table,
+                     _ensure_fundamental_sync_state_table,
                      _ensure_hourly_price_history_table,
                      _ensure_price_history_table,
                      _ensure_scanner_metric_snapshots_table,
                      _ensure_scanner_metrics_table,
+                     _ensure_stock_profiles_table,
                      _ensure_symbol_refresh_failures_table)
 from .settings import logger
 
@@ -51,6 +54,9 @@ MIRRORED_TABLES: Tuple[Tuple[str, str], ...] = (
     ("scanner_metrics", "date"),
     ("scanner_metric_snapshots", "snapshot_date"),
     ("symbol_refresh_failures", "last_attempt_at"),
+    ("stock_profiles", "updated_at"),
+    ("earnings_events", "updated_at"),
+    ("fundamental_sync_state", "updated_at"),
 )
 HOURLY_MIRROR_TABLES: Tuple[Tuple[str, str], ...] = (
     ("hourly_price_history", "timestamp"),
@@ -167,6 +173,27 @@ _RECONCILE_TABLE_SPECS: Tuple[_ReconcileTableSpec, ...] = (
         "last_attempt_at",
         "last_attempt_at",
     ),
+    _ReconcileTableSpec(
+        "stock_profiles",
+        ("symbol",),
+        ("symbol",),
+        "updated_at",
+        "updated_at",
+    ),
+    _ReconcileTableSpec(
+        "earnings_events",
+        ("symbol", "event_key"),
+        ("symbol",),
+        "updated_at",
+        "updated_at",
+    ),
+    _ReconcileTableSpec(
+        "fundamental_sync_state",
+        ("symbol", "dataset"),
+        ("symbol",),
+        "updated_at",
+        "updated_at",
+    ),
 )
 
 
@@ -192,6 +219,7 @@ _BOOLEAN_RECONCILE_COLUMNS = frozenset(
         "breakout_50d",
         "parabolic_flag",
         "rs_above_sma_50",
+        "is_date_estimated",
     }
 )
 
@@ -354,6 +382,9 @@ def init_local_mirror_engine(db_path=None) -> Optional[Engine]:
         _ensure_scanner_metrics_table(engine)
         _ensure_scanner_metric_snapshots_table(engine)
         _ensure_symbol_refresh_failures_table(engine)
+        _ensure_stock_profiles_table(engine)
+        _ensure_earnings_events_table(engine)
+        _ensure_fundamental_sync_state_table(engine)
         _ensure_local_mirror_handoff_tracking(engine)
         _ensure_local_mirror_sync_state(engine)
         return engine

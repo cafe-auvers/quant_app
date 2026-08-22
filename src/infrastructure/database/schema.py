@@ -3,8 +3,8 @@
 import weakref
 from typing import List, Set
 
-from sqlalchemy import (Boolean, Column, DateTime, Float, Integer, MetaData,
-                        String, Table, insert, inspect, select, text)
+from sqlalchemy import (Boolean, Column, Date, DateTime, Float, Index, Integer,
+                        MetaData, String, Table, insert, inspect, select, text)
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Engine
@@ -357,5 +357,114 @@ def _get_scanner_metric_snapshots_table(metadata: MetaData) -> Table:
 def _ensure_scanner_metric_snapshots_table(engine: Engine) -> Table:
     metadata = MetaData()
     table = _get_scanner_metric_snapshots_table(metadata)
+    metadata.create_all(engine)
+    return table
+
+
+def _get_stock_profiles_table(metadata: MetaData) -> Table:
+    """Company metadata keyed by the application's canonical symbol."""
+    table = Table(
+        "stock_profiles",
+        metadata,
+        Column("symbol", String(32), primary_key=True),
+        Column("provider_symbol", String(32)),
+        Column("company_name", String(255), nullable=False),
+        Column("short_name", String(255)),
+        Column("quote_type", String(40)),
+        Column("exchange", String(40)),
+        Column("market", String(80)),
+        Column("currency", String(16)),
+        Column("country", String(80)),
+        Column("sector_name", String(160)),
+        Column("sector_key", String(160)),
+        Column("industry_name", String(200)),
+        Column("industry_key", String(200)),
+        Column("category", String(200)),
+        Column("fund_family", String(200)),
+        Column("profile_status", String(20), nullable=False),
+        Column("source", String(40), nullable=False),
+        Column("last_checked_at", DateTime, nullable=False),
+        Column("last_successful_sync_at", DateTime),
+        Column("created_at", DateTime, nullable=False, default=_utcnow_naive),
+        Column("updated_at", DateTime, nullable=False, default=_utcnow_naive),
+    )
+    Index("ix_stock_profiles_sector_key", table.c.sector_key)
+    Index("ix_stock_profiles_industry_key", table.c.industry_key)
+    return table
+
+
+def _ensure_stock_profiles_table(engine: Engine) -> Table:
+    metadata = MetaData()
+    table = _get_stock_profiles_table(metadata)
+    metadata.create_all(engine)
+    return table
+
+
+def _get_earnings_events_table(metadata: MetaData) -> Table:
+    """Quarterly reported and mutable expected earnings events."""
+    table = Table(
+        "earnings_events",
+        metadata,
+        Column("symbol", String(32), primary_key=True),
+        Column("event_key", String(80), primary_key=True),
+        Column("report_date", Date, nullable=False),
+        Column("report_datetime_utc", DateTime),
+        Column("fiscal_period_end", Date),
+        Column("event_status", String(20), nullable=False),
+        Column("report_timing", String(20), nullable=False),
+        Column("is_date_estimated", Boolean, nullable=False, default=False),
+        Column("reported_eps", Float),
+        Column("estimated_eps", Float),
+        Column("statement_diluted_eps", Float),
+        Column("statement_basic_eps", Float),
+        Column("eps_basis", String(20)),
+        Column("eps_surprise", Float),
+        Column("eps_surprise_pct", Float),
+        Column("revenue", Float),
+        Column("estimated_revenue", Float),
+        Column("eps_yoy_growth_pct", Float),
+        Column("previous_eps_yoy_growth_pct", Float),
+        Column("eps_growth_status", String(40), nullable=False),
+        Column("previous_eps_growth_status", String(40), nullable=False),
+        Column("revenue_yoy_growth_pct", Float),
+        Column("previous_revenue_yoy_growth_pct", Float),
+        Column("ttm_eps", Float),
+        Column("source", String(40), nullable=False),
+        Column("source_updated_at", DateTime, nullable=False),
+        Column("created_at", DateTime, nullable=False, default=_utcnow_naive),
+        Column("updated_at", DateTime, nullable=False, default=_utcnow_naive),
+    )
+    Index("ix_earnings_events_symbol_report_date", table.c.symbol, table.c.report_date)
+    return table
+
+
+def _ensure_earnings_events_table(engine: Engine) -> Table:
+    metadata = MetaData()
+    table = _get_earnings_events_table(metadata)
+    metadata.create_all(engine)
+    return table
+
+
+def _get_fundamental_sync_state_table(metadata: MetaData) -> Table:
+    """Positive/negative cache state for provider datasets, including empty results."""
+    return Table(
+        "fundamental_sync_state",
+        metadata,
+        Column("symbol", String(32), primary_key=True),
+        Column("dataset", String(24), primary_key=True),
+        Column("status", String(20), nullable=False),
+        Column("source", String(40), nullable=False),
+        Column("payload_fingerprint", String(64)),
+        Column("last_error", String(500)),
+        Column("last_checked_at", DateTime, nullable=False),
+        Column("last_successful_sync_at", DateTime),
+        Column("created_at", DateTime, nullable=False, default=_utcnow_naive),
+        Column("updated_at", DateTime, nullable=False, default=_utcnow_naive),
+    )
+
+
+def _ensure_fundamental_sync_state_table(engine: Engine) -> Table:
+    metadata = MetaData()
+    table = _get_fundamental_sync_state_table(metadata)
     metadata.create_all(engine)
     return table

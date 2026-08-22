@@ -1,14 +1,16 @@
-"""Lightweight Charts HTML generation."""
+"""Local chart HTML renderer."""
 
 from __future__ import annotations
 
-import datetime as dt
 import html
 import json
-from typing import Any, List, Mapping, Optional
-from zoneinfo import ZoneInfo
+import math
+from typing import Any, Iterable, List, Mapping, Optional
 
 import pandas as pd
+
+from src.core.chart_fundamentals import (
+    EarningsEvent, EarningsLinePoint, StockProfile, UpcomingEarnings, canonical_symbol)
 
 try:
     from PyQt5.QtWebEngineWidgets import QWebEngineView
@@ -19,19 +21,12 @@ try:
 except ImportError:
     QWebChannel = None
 
-REFERENCE_SYMBOL = "SPY"
-KST_ZONE = ZoneInfo("Asia/Seoul")
-US_MARKET_ZONE = ZoneInfo("America/New_York")
-MARKET_DATA_READY_TIME_KST = dt.time(7, 0)
-LIVE_INTRADAY_REFRESH_INTERVAL_MS = 5 * 60 * 1000
-TRADINGVIEW_REFRESH_INTERVAL_SECONDS = 5 * 60
-KIS_DAILY_CHART_FAILURE_COOLDOWN_SECONDS = 30 * 60
-US_MARKET_OPEN_TIME = dt.time(9, 30)
-US_MARKET_CLOSE_TIME = dt.time(16, 0)
 from .render_assets import _lightweight_charts_script_tag
+from .render_fundamentals import build_fundamental_render_payload
 from .render_metrics import ChartRenderMetricsMixin
 from .models import normalize_chart_interaction_settings
 from .render_primitives import ChartRenderPrimitivesMixin
+from .render_viewport import default_visible_bar_count
 
 
 class ChartLightweightRenderMixin:
@@ -47,6 +42,10 @@ class ChartLightweightRenderMixin:
         buy_price: Optional[float] = None,
         stop_loss: Optional[float] = None,
         interaction_settings: Optional[Mapping[str, Any]] = None,
+        stock_profile: Optional[StockProfile] = None,
+        earnings_events: Optional[Iterable[EarningsEvent]] = None,
+        earnings_line: Optional[Iterable[EarningsLinePoint]] = None,
+        upcoming_earnings: Optional[UpcomingEarnings] = None,
     ) -> str:
         """Generate a stable TradingView Lightweight Charts page from local OHLCV data."""
         options = options or {}
@@ -69,7 +68,10 @@ class ChartLightweightRenderMixin:
         candles = []
         volumes = []
         date_labels = [pd.Timestamp(item).strftime("%Y-%m-%d") for item in chart_history.index]
-        uses_intraday_time = bool(options.get("timeframe", "").upper() == "1H") or len(set(date_labels)) < len(date_labels)
+        chart_timeframe = str(options.get("timeframe", "1D")).strip().upper()
+        uses_intraday_time = bool(chart_timeframe and chart_timeframe != "1D") or len(
+            set(date_labels)
+        ) < len(date_labels)
         time_visible = "true" if uses_intraday_time else "false"
 
         def chart_time_value(timestamp) -> str | int:
@@ -106,10 +108,14 @@ class ChartLightweightRenderMixin:
             return chart_time_value(value)
 
         def future_time_values() -> List[str | int]:
-            timeframe = str(options.get("timeframe", "1D")).strip().upper()
             last_timestamp = pd.Timestamp(chart_history.index[-1])
             if uses_intraday_time:
-                step = pd.Timedelta(minutes=5) if timeframe == "5M" else pd.Timedelta(hours=1)
+                if chart_timeframe == "1H":
+                    step = pd.Timedelta(hours=1)
+                elif chart_timeframe.endswith("M") and chart_timeframe[:-1].isdigit():
+                    step = pd.Timedelta(minutes=int(chart_timeframe[:-1]))
+                else:
+                    step = pd.Timedelta(hours=1)
                 return [
                     chart_time_value(last_timestamp + step * offset)
                     for offset in range(1, 501)
@@ -144,12 +150,37 @@ class ChartLightweightRenderMixin:
                 "color": "rgba(14, 203, 129, 0.35)" if close_price >= open_price else "rgba(239, 68, 68, 0.35)",
             })
 
+        canonical_display_symbol = canonical_symbol(storage_symbol or symbol)
         safe_symbol = html.escape(symbol)
         header_metrics = ChartRenderMetricsMixin._format_chart_header_metrics(chart_history, options)
         adr_chips = ChartRenderMetricsMixin._format_chart_adr_metrics(chart_history, options)
         candles_json = json.dumps(candles)
         volumes_json = json.dumps(volumes)
-        future_whitespace_json = json.dumps([{"time": value} for value in future_time_values()])
+        future_values = future_time_values()
+        future_whitespace_json = json.dumps([{"time": value} for value in future_values])
+
+        first_chart_date = pd.Timestamp(chart_history.index[0]).date()
+        last_chart_date = pd.Timestamp(chart_history.index[-1]).date()
+        fundamental_payload = build_fundamental_render_payload(
+            canonical_display_symbol=canonical_display_symbol,
+            stock_profile=stock_profile,
+            options=options,
+            upcoming_earnings=upcoming_earnings,
+            earnings_events=earnings_events,
+            earnings_line=earnings_line,
+            first_chart_date=first_chart_date,
+            last_chart_date=last_chart_date,
+            uses_intraday_time=uses_intraday_time,
+            chart_time_value=chart_time_value,
+            candles=candles,
+            future_values=future_values,
+        )
+        watermark_html = fundamental_payload["watermark_html"]
+        upcoming_badge_html = fundamental_payload["upcoming_badge_html"]
+        earnings_markers_json = fundamental_payload["earnings_markers_json"]
+        earnings_tooltips_json = fundamental_payload["earnings_tooltips_json"]
+        earnings_whitespace_json = fundamental_payload["earnings_whitespace_json"]
+        earnings_line_json = fundamental_payload["earnings_line_json"]
         drawing_lines = []
         for drawing in drawings or []:
             if not isinstance(drawing, dict) or drawing.get("type") != "line":
@@ -284,29 +315,14 @@ class ChartLightweightRenderMixin:
                 });
                 volumeSeries.setData(volumes);
             """
-        # The daily default historically showed 81 candles plus 40 future slots.
-        # Count actual sessions for intraday data so split 1H starts on the same
-        # market date instead of guessing how many hourly bars make a session.
-        default_visible_sessions = 81
-        if uses_intraday_time:
-            session_labels = [
-                pd.Timestamp(timestamp).strftime("%Y-%m-%d")
-                for timestamp in chart_history.index
-            ]
-            recent_sessions = list(dict.fromkeys(session_labels))[
-                -default_visible_sessions:
-            ]
-            first_visible_session = recent_sessions[0] if recent_sessions else ""
-            default_visible_data_bars = sum(
-                label >= first_visible_session for label in session_labels
-            )
-        else:
-            default_visible_data_bars = min(
-                default_visible_sessions, len(chart_history)
-            )
+        default_visible_data_bars = default_visible_bar_count(
+            chart_history,
+            uses_intraday_time=uses_intraday_time,
+        )
         bridge_enabled = QWebEngineView is not None and QWebChannel is not None
         bridge_script = '<script src="qrc:///qtwebchannel/qwebchannel.js"></script>' if bridge_enabled else ""
         symbol_json = json.dumps((storage_symbol or symbol).strip().upper())
+        chart_timeframe_json = json.dumps(chart_timeframe)
         view_key_json = json.dumps(str(options.get("view_key", "single")))
         sync_crosshair_json = json.dumps(bool(options.get("sync_crosshair", False)))
         uses_intraday_time_json = json.dumps(uses_intraday_time)
@@ -339,6 +355,16 @@ class ChartLightweightRenderMixin:
                     display: flex;
                     align-items: center;
                     gap: 14px;
+                }}
+                #earnings-upcoming-badge {{
+                    color: #fde68a;
+                    background: rgba(245, 158, 11, 0.18);
+                    border: 1px solid rgba(245, 158, 11, 0.5);
+                    border-radius: 999px;
+                    padding: 2px 8px;
+                    font-size: 12px;
+                    font-weight: 700;
+                    white-space: nowrap;
                 }}
                 #header-row2 {{
                     display: flex;
@@ -383,6 +409,56 @@ class ChartLightweightRenderMixin:
                     width: 100%;
                     height: 100%;
                 }}
+                #stock-profile-watermark {{
+                    position: absolute;
+                    left: 50%;
+                    top: 48%;
+                    transform: translate(-50%, -50%);
+                    z-index: 2;
+                    max-width: 70%;
+                    padding: clamp(8px, 1.6vw, 14px) clamp(14px, 3vw, 24px);
+                    border: 1px solid rgba(156, 163, 175, 0.20);
+                    border-radius: 4px;
+                    background: rgba(107, 114, 128, 0.30);
+                    color: rgba(229, 231, 235, 0.74);
+                    text-align: center;
+                    pointer-events: none;
+                    user-select: none;
+                    line-height: 1.15;
+                }}
+                .watermark-symbol {{
+                    color: rgba(249, 250, 251, 0.78);
+                    font-size: clamp(26px, 5vw, 40px);
+                    font-weight: 800;
+                    letter-spacing: 0.04em;
+                }}
+                .watermark-company {{
+                    margin-top: 3px;
+                    font-size: clamp(16px, 2.7vw, 22px);
+                    font-weight: 600;
+                }}
+                .watermark-sector, .watermark-industry {{
+                    margin-top: 3px;
+                    font-size: clamp(13px, 2.2vw, 18px);
+                }}
+                #chart-tooltip {{
+                    display: none;
+                    position: absolute;
+                    left: 12px;
+                    top: 10px;
+                    z-index: 7;
+                    max-width: min(310px, 62%);
+                    padding: 7px 9px;
+                    border: 1px solid rgba(107, 114, 128, 0.6);
+                    border-radius: 4px;
+                    background: rgba(15, 20, 25, 0.90);
+                    color: #d1d5db;
+                    font-size: 11px;
+                    line-height: 1.35;
+                    white-space: pre-line;
+                    pointer-events: none;
+                    user-select: none;
+                }}
                 #rs-chart {{
                     display: {rs_panel_display};
                     width: 100%;
@@ -415,6 +491,7 @@ class ChartLightweightRenderMixin:
                 <div id="header-row1">
                     <div id="symbol">{safe_symbol}</div>
                     <div id="metrics">{html.escape(header_metrics)} | {html.escape(str(options.get("timeframe", "1D")))} | {score_summary}</div>
+                    {upcoming_badge_html}
                 </div>
                 <div id="header-row2">
                     <div id="adr-metrics">{adr_chips}</div>
@@ -423,6 +500,8 @@ class ChartLightweightRenderMixin:
             <div id="chart-area">
                 <div id="price-panel">
                     <div id="chart"></div>
+                    {watermark_html}
+                    <div id="chart-tooltip"></div>
                     <canvas id="drawing-overlay"></canvas>
                 </div>
                 <div id="rs-chart"><div id="rs-empty">RS/TI65 data unavailable for this timeframe.</div></div>
@@ -432,6 +511,10 @@ class ChartLightweightRenderMixin:
                 const candles = {candles_json};
                 const volumes = {volumes_json};
                 const futureWhitespace = {future_whitespace_json};
+                const earningsWhitespace = {earnings_whitespace_json};
+                const earningsMarkers = {earnings_markers_json};
+                const earningsTooltips = {earnings_tooltips_json};
+                const earningsLinePoints = {earnings_line_json};
                 const emaSeries = {ema_json};
                 const rsPoints = {rs_points_json};
                 const rsSmaPoints = {rs_sma_points_json};
@@ -453,9 +536,11 @@ class ChartLightweightRenderMixin:
                 const chartViewKey = {view_key_json};
                 const crosshairSyncEnabled = {sync_crosshair_json};
                 const usesIntradayTime = {uses_intraday_time_json};
+                const chartTimeframe = {chart_timeframe_json};
                 const container = document.getElementById('chart');
                 const rsContainer = document.getElementById('rs-chart');
                 const pricePanel = document.getElementById('price-panel');
+                const chartTooltip = document.getElementById('chart-tooltip');
                 let chartBridge = null;
                 let drawingMode = false;
                 let eraseMode = false;
@@ -535,7 +620,86 @@ class ChartLightweightRenderMixin:
                     wickUpColor: '#0ecb81',
                     wickDownColor: '#ef4444'
                 }});
-                candleSeries.setData(candles.concat(futureWhitespace));
+                function mergeSeriesData(...groups) {{
+                    const byTime = new Map();
+                    groups.forEach(group => group.forEach(point => {{
+                        const key = String(point.time);
+                        const existing = byTime.get(key);
+                        if (!existing || Object.keys(point).length > Object.keys(existing).length) {{
+                            byTime.set(key, point);
+                        }}
+                    }}));
+                    return Array.from(byTime.values()).sort((left, right) => {{
+                        if (typeof left.time === 'number' && typeof right.time === 'number') {{
+                            return left.time - right.time;
+                        }}
+                        return String(left.time).localeCompare(String(right.time));
+                    }});
+                }}
+                candleSeries.setData(
+                    mergeSeriesData(futureWhitespace, earningsWhitespace, candles)
+                );
+                function applyEarningsMarkers(dense) {{
+                    const markerData = earningsMarkers.map(marker => ({{
+                        time: marker.time,
+                        position: marker.position,
+                        color: marker.color,
+                        shape: marker.shape,
+                        text: dense ? 'E' : marker.fullText
+                    }}));
+                    candleSeries.setMarkers(markerData);
+                }}
+                if (earningsMarkers.length > 0) applyEarningsMarkers(false);
+
+                let earningsLineSeries = null;
+                if (earningsLinePoints.length > 0) {{
+                    earningsLineSeries = chart.addLineSeries({{
+                        title: 'TTM EPS',
+                        color: '#c084fc',
+                        lineWidth: 2,
+                        lineType: LightweightCharts.LineType.WithSteps,
+                        priceScaleId: 'earnings',
+                        priceLineVisible: false,
+                        lastValueVisible: false,
+                        crosshairMarkerVisible: true
+                    }});
+                    chart.priceScale('earnings').applyOptions({{
+                        visible: false,
+                        autoScale: true,
+                        scaleMargins: {{ top: 0.58, bottom: 0.10 }}
+                    }});
+                    earningsLineSeries.setData(earningsLinePoints);
+                }}
+
+                const earningsTooltipByTime = new Map(
+                    earningsTooltips.map(item => [String(item.time), item.lines])
+                );
+                chart.subscribeCrosshairMove(param => {{
+                    if (!chartTooltip || !param || param.time == null || !param.point) {{
+                        if (chartTooltip) chartTooltip.style.display = 'none';
+                        return;
+                    }}
+                    const lines = [];
+                    const candle = param.seriesData.get(candleSeries);
+                    if (candle && candle.open != null) {{
+                        lines.push(
+                            `O ${{Number(candle.open).toFixed(2)}}  H ${{Number(candle.high).toFixed(2)}}  ` +
+                            `L ${{Number(candle.low).toFixed(2)}}  C ${{Number(candle.close).toFixed(2)}}`
+                        );
+                    }}
+                    const eventLines = earningsTooltipByTime.get(String(param.time));
+                    if (eventLines) lines.push(...eventLines);
+                    if (lines.length === 0) {{
+                        chartTooltip.style.display = 'none';
+                        return;
+                    }}
+                    chartTooltip.textContent = lines.join('\\n');
+                    chartTooltip.style.display = 'block';
+                }});
+                chart.timeScale().subscribeVisibleLogicalRangeChange(range => {{
+                    if (!range || earningsMarkers.length === 0) return;
+                    applyEarningsMarkers((range.to - range.from) > 160);
+                }});
                 function formatPrice(value) {{
                     return Number(value).toFixed(2);
                 }}
@@ -858,11 +1022,44 @@ class ChartLightweightRenderMixin:
                         : null;
                 }}
 
+                function normalizeDrawingTimeframe(drawing, startValue, endValue) {{
+                    const provided = String(drawing?.timeframe || "").toUpperCase();
+                    if (provided) return provided;
+                    const startText = String(startValue || "").toUpperCase();
+                    const endText = String(endValue || "").toUpperCase();
+                    if (
+                        startText.length > 10 ||
+                        endText.length > 10 ||
+                        startText.includes(' ') ||
+                        endText.includes(' ') ||
+                        startText.includes('T') ||
+                        endText.includes('T')
+                    ) {{
+                        return "INTRADAY";
+                    }}
+                    return "1D";
+                }}
+
+                function drawingTimeframesMatch(drawingTimeframe) {{
+                    if (!drawingTimeframe) return true;
+                    if (chartTimeframe === drawingTimeframe) return true;
+                    if (chartTimeframe === "1D" || drawingTimeframe === "1D") return false;
+                    return true;
+                }}
+
                 function normalizeIncomingDrawing(drawing) {{
                     if (!drawing) return null;
-                    if (drawing.start && drawing.end) return drawing;
-                    const startTime = incomingDrawingTime(drawing.start_date, 'first');
-                    const endTime = incomingDrawingTime(drawing.end_date, 'last');
+                    const normalizedTimeframe = normalizeDrawingTimeframe(
+                        drawing,
+                        drawing.start?.time,
+                        drawing.end?.time
+                    );
+                    if (drawing.start && drawing.end) {{
+                        drawing.timeframe = normalizedTimeframe;
+                        return drawing;
+                    }}
+                    const startTime = incomingDrawingTime(drawing.start_date, "first");
+                    const endTime = incomingDrawingTime(drawing.end_date, "last");
                     if (startTime == null || endTime == null) return null;
                     return {{
                         id: String(drawing.id || ''),
@@ -870,7 +1067,8 @@ class ChartLightweightRenderMixin:
                         end: {{ time: endTime, value: Number(drawing.end_price) }},
                         color: drawing.color || null,
                         dash: drawing.dash || null,
-                        readonly: drawing.readonly || false
+                        readonly: drawing.readonly || false,
+                        timeframe: normalizedTimeframe
                     }};
                 }}
 
@@ -883,6 +1081,7 @@ class ChartLightweightRenderMixin:
                         color: drawing.color || null,
                         dash: drawing.dash || null,
                         readonly: drawing.readonly || false,
+                        timeframe: drawing.timeframe || chartTimeframe,
                     }};
                     if (!Number.isFinite(normalized.start.value) || !Number.isFinite(normalized.end.value)) return;
                     drawingSeries.set(normalized.id, normalized);
@@ -897,7 +1096,8 @@ class ChartLightweightRenderMixin:
                             start_date: normalizeTimeForSave(normalized.start.time),
                             start_price: normalized.start.value,
                             end_date: normalizeTimeForSave(normalized.end.time),
-                            end_price: normalized.end.value
+                            end_price: normalized.end.value,
+                            timeframe: normalized.timeframe || chartTimeframe
                         }}));
                     }}
                 }}
@@ -913,19 +1113,24 @@ class ChartLightweightRenderMixin:
                             start_date: normalizeTimeForSave(drawing.start.time),
                             start_price: Number(drawing.start.value),
                             end_date: normalizeTimeForSave(drawing.end.time),
-                            end_price: Number(drawing.end.value)
+                            end_price: Number(drawing.end.value),
+                            timeframe: drawing.timeframe || chartTimeframe
                         }}));
                     }}
                 }}
 
                 function removeDrawingLine(drawingId, persist) {{
-                    if (!drawingSeries.has(drawingId)) return;
-                    if (drawingSeries.get(drawingId)?.readonly) return;
-                    drawingSeries.delete(drawingId);
-                    if (selectedDrawingId === drawingId) selectedDrawingId = null;
+                    const normalizedId = String(drawingId);
+                    if (!drawingSeries.has(normalizedId)) return;
+                    if (drawingSeries.get(normalizedId)?.readonly) return;
+                    drawingSeries.delete(normalizedId);
+                    if (selectedDrawingId === normalizedId) selectedDrawingId = null;
                     renderDrawings();
                     if (persist && chartBridge && chartBridge.deleteChartDrawing) {{
-                        chartBridge.deleteChartDrawing(symbolName, drawingId);
+                        chartBridge.deleteChartDrawing(
+                            symbolName,
+                            JSON.stringify({{ id: normalizedId, timeframe: chartTimeframe }})
+                        );
                     }}
                 }}
 
@@ -993,12 +1198,23 @@ class ChartLightweightRenderMixin:
                 }};
                 window.upsertSyncedDrawing = function(drawing) {{
                     const normalized = normalizeIncomingDrawing(drawing);
+                    if (!normalized || !drawingTimeframesMatch(normalized.timeframe)) return;
                     if (normalized) addDrawingLine(normalized, false);
                 }};
-                window.removeSyncedDrawing = function(drawingId) {{
-                    if (!drawingSeries.has(String(drawingId))) return;
-                    drawingSeries.delete(String(drawingId));
-                    if (selectedDrawingId === String(drawingId)) selectedDrawingId = null;
+                window.removeSyncedDrawing = function(payload) {{
+                    const drawingPayload = payload && typeof payload === 'object'
+                        ? payload
+                        : {{ id: payload, timeframe: chartTimeframe }};
+                    const incomingTimeframe = normalizeDrawingTimeframe(
+                        drawingPayload,
+                        drawingPayload.start_date,
+                        drawingPayload.end_date
+                    );
+                    if (!drawingTimeframesMatch(incomingTimeframe)) return;
+                    const drawingId = String(drawingPayload.id || '');
+                    if (!drawingId || !drawingSeries.has(drawingId)) return;
+                    drawingSeries.delete(drawingId);
+                    if (selectedDrawingId === drawingId) selectedDrawingId = null;
                     renderDrawings();
                 }};
                 function resolveSyncedTime(value) {{

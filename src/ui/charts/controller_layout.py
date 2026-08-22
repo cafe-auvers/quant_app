@@ -37,7 +37,24 @@ US_MARKET_CLOSE_TIME = dt.time(16, 0)
 
 class ChartsLayoutMixin:
     def _build_combined_drawings(self, symbol: str, timeframe: str) -> list:
-        return list(self.chart_drawings.get(symbol, []))
+        symbol_key = (symbol or "").strip().upper()
+        if not symbol_key:
+            return []
+        drawings = self.chart_drawings.get(symbol_key, [])
+        requested_timeframe = self._normalize_drawing_timeframe(timeframe)
+        if not requested_timeframe:
+            return list(drawings)
+        return [
+            drawing
+            for drawing in drawings
+            if isinstance(drawing, dict)
+            and self._drawing_timeframes_match(
+                requested_timeframe,
+                self._resolve_drawing_timeframe(
+                    drawing, default=requested_timeframe
+                ),
+            )
+        ]
 
     def _build_trade_plan_tab(self) -> None:
         """Build content for the trade plan tab."""
@@ -634,6 +651,11 @@ class ChartsLayoutMixin:
         self.tradingview_show_growth_6m_checkbox.stateChanged.connect(
             lambda _state: self.load_tradingview_chart(force=True)
         )
+        self.tradingview_show_earnings_checkbox = QCheckBox("Earnings")
+        self.tradingview_show_earnings_checkbox.setChecked(True)
+        self.tradingview_show_earnings_checkbox.stateChanged.connect(
+            lambda _state: self.load_tradingview_chart(force=True)
+        )
         controls_layout.addWidget(self.tradingview_split_screen_checkbox)
         controls_layout.addWidget(self.tradingview_show_volume_checkbox)
         controls_layout.addWidget(self.tradingview_show_ema_checkbox)
@@ -642,6 +664,7 @@ class ChartsLayoutMixin:
         controls_layout.addWidget(self.tradingview_show_growth_1m_checkbox)
         controls_layout.addWidget(self.tradingview_show_growth_3m_checkbox)
         controls_layout.addWidget(self.tradingview_show_growth_6m_checkbox)
+        controls_layout.addWidget(self.tradingview_show_earnings_checkbox)
         controls_layout.addWidget(previous_button)
         controls_layout.addWidget(next_button)
         controls_layout.addWidget(refresh_button)

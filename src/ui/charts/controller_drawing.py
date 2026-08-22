@@ -479,7 +479,101 @@ class ChartsDrawingMixin:
             f"window.applySyncedTargetPrice({price_json});",
         )
 
+    @staticmethod
+    def _normalize_drawing_timeframe(timeframe: str | None) -> str:
+        if timeframe is None:
+            return ""
+        normalized = str(timeframe).strip().upper().replace(" ", "")
+        if not normalized:
+            return ""
+        if normalized.endswith("MIN"):
+            normalized = normalized[:-3] + "M"
+        return normalized
+
+    @staticmethod
+    def _infer_drawing_timeframe_from_dates(
+        start_date: object, end_date: object
+    ) -> str:
+        for value in (start_date, end_date):
+            if value is None:
+                continue
+            text = str(value).strip()
+            if not text:
+                continue
+            if (
+                len(text) > 10
+                or " " in text
+                or "T" in text
+                or "Z" in text
+            ):
+                return "INTRADAY"
+        return "1D"
+
+    @staticmethod
+    def _is_intraday_drawing_timeframe(timeframe: str | None) -> bool:
+        return bool(timeframe) and timeframe != "1D"
+
+    def _resolve_drawing_timeframe(self, drawing: dict, default: str | None = None) -> str:
+        raw_timeframe = None
+        if isinstance(drawing, dict):
+            raw_timeframe = drawing.get("timeframe")
+        resolved = self._normalize_drawing_timeframe(
+            raw_timeframe if raw_timeframe is not None else default
+        )
+        if resolved:
+            return resolved
+        if isinstance(drawing, dict):
+            inferred = self._infer_drawing_timeframe_from_dates(
+                drawing.get("start_date"), drawing.get("end_date")
+            )
+            if inferred:
+                return inferred
+        return self._normalize_drawing_timeframe(default)
+
+    def _drawing_timeframes_match(self, requested: str, existing: str) -> bool:
+        requested_tf = self._normalize_drawing_timeframe(requested)
+        existing_tf = self._normalize_drawing_timeframe(existing)
+        if not requested_tf or not existing_tf:
+            return True
+        if requested_tf == existing_tf:
+            return True
+        if (
+            requested_tf == "1D"
+            or existing_tf == "1D"
+            or not self._is_intraday_drawing_timeframe(requested_tf)
+            or not self._is_intraday_drawing_timeframe(existing_tf)
+        ):
+            return False
+        return True
+
+    def _active_chart_drawing_timeframe(self) -> str:
+        # ``MainWindow.__new__`` is used by pure controller tests. Accessing a
+        # missing Qt attribute through ``hasattr`` can invoke sip before the
+        # QWidget base is initialized, so inspect the instance dictionary.
+        tabs = self.__dict__.get("tabs")
+        if (
+            tabs is not None
+            and tabs.currentWidget() is self.__dict__.get("tradingview_widget")
+            and self.__dict__.get("tradingview_timeframe_combo") is not None
+        ):
+            return self._normalize_drawing_timeframe(
+                self.tradingview_timeframe_combo.currentText()
+            )
+        if (
+            tabs is not None
+            and tabs.currentWidget() is self.__dict__.get("intraday_charts_widget")
+            and self.__dict__.get("intraday_interval_combo") is not None
+        ):
+            return self._normalize_drawing_timeframe(
+                self.intraday_interval_combo.currentText()
+        )
+        return "1D"
+
     def _sync_tradingview_drawing(self, symbol: str, drawing: dict) -> None:
+        drawing = dict(drawing or {})
+        drawing["timeframe"] = self._resolve_drawing_timeframe(
+            drawing, default=self._active_chart_drawing_timeframe()
+        )
         drawing_json = json.dumps(drawing, separators=(",", ":"))
         self._run_tradingview_split_javascript(
             symbol,
@@ -487,8 +581,18 @@ class ChartsDrawingMixin:
             f"window.upsertSyncedDrawing({drawing_json});",
         )
 
-    def _remove_tradingview_drawing(self, symbol: str, drawing_id: str) -> None:
-        drawing_id_json = json.dumps(str(drawing_id))
+    def _remove_tradingview_drawing(
+        self, symbol: str, drawing_id: str, timeframe: str | None = None
+    ) -> None:
+        payload = {
+            "id": str(drawing_id),
+        }
+        resolved_timeframe = self._resolve_drawing_timeframe(
+            {}, default=self._normalize_drawing_timeframe(timeframe or None)
+        )
+        if resolved_timeframe:
+            payload["timeframe"] = resolved_timeframe
+        drawing_id_json = json.dumps(payload, separators=(",", ":"))
         self._run_tradingview_split_javascript(
             symbol,
             "window.removeSyncedDrawing && "
@@ -563,6 +667,10 @@ class ChartsDrawingMixin:
             return
         try:
             drawing = json.loads(drawing_json)
+            active_timeframe = self._active_chart_drawing_timeframe()
+            drawing_timeframe = self._resolve_drawing_timeframe(
+                drawing, default=active_timeframe
+            )
             clean_drawing = {
                 "id": str(
                     drawing.get("id") or f"{symbol}-{dt.datetime.now().timestamp()}"
@@ -572,6 +680,7 @@ class ChartsDrawingMixin:
                 "start_price": round(float(drawing["start_price"]), 2),
                 "end_date": str(drawing["end_date"]),
                 "end_price": round(float(drawing["end_price"]), 2),
+                "timeframe": drawing_timeframe,
             }
         except (json.JSONDecodeError, KeyError, TypeError, ValueError):
             return
@@ -591,6 +700,10 @@ class ChartsDrawingMixin:
         try:
             drawing = json.loads(drawing_json)
             drawing_id = str(drawing["id"])
+            active_timeframe = self._active_chart_drawing_timeframe()
+            drawing_timeframe = self._resolve_drawing_timeframe(
+                drawing, default=active_timeframe
+            )
             clean_drawing = {
                 "id": drawing_id,
                 "type": "line",
@@ -598,36 +711,65 @@ class ChartsDrawingMixin:
                 "start_price": round(float(drawing["start_price"]), 2),
                 "end_date": str(drawing["end_date"]),
                 "end_price": round(float(drawing["end_price"]), 2),
+                "timeframe": drawing_timeframe,
             }
         except (json.JSONDecodeError, KeyError, TypeError, ValueError):
             return
 
         drawings = self.chart_drawings.get(symbol, [])
         for index, existing in enumerate(drawings):
-            if str(existing.get("id")) == drawing_id:
-                drawings[index] = clean_drawing
-                self.chart_drawings[symbol] = drawings
-                self._sync_tradingview_drawing(symbol, clean_drawing)
-                self._save_state()
-                if not self._is_active_tradingview_line_tool_symbol(symbol):
-                    self.refresh_other_chart_views_for_symbol(symbol)
-                self.append_log(f"Updated chart line for {symbol}.")
-                return
+            if str(existing.get("id")) != drawing_id:
+                continue
+            existing_timeframe = self._resolve_drawing_timeframe(
+                existing, default=active_timeframe
+            )
+            if not self._drawing_timeframes_match(
+                drawing_timeframe, existing_timeframe
+            ):
+                continue
+            drawings[index] = clean_drawing
+            self.chart_drawings[symbol] = drawings
+            self._sync_tradingview_drawing(symbol, clean_drawing)
+            self._save_state()
+            if not self._is_active_tradingview_line_tool_symbol(symbol):
+                self.refresh_other_chart_views_for_symbol(symbol)
+            self.append_log(f"Updated chart line for {symbol}.")
+            return
 
-    def delete_chart_drawing(self, symbol: str, drawing_id: str) -> None:
+    def delete_chart_drawing(
+        self, symbol: str, drawing_id: str, timeframe: str | None = None
+    ) -> None:
         symbol = symbol.strip().upper()
+        requested_timeframe = self._resolve_drawing_timeframe(
+            {"timeframe": timeframe},
+            default=self._active_chart_drawing_timeframe(),
+        )
         drawing_id = str(drawing_id)
         drawings = self.chart_drawings.get(symbol, [])
-        remaining = [
-            drawing for drawing in drawings if str(drawing.get("id")) != drawing_id
-        ]
-        if len(remaining) == len(drawings):
+        remaining = []
+        removed = False
+        for drawing in drawings:
+            if not isinstance(drawing, dict):
+                continue
+            if str(drawing.get("id")) == drawing_id:
+                drawing_timeframe = self._resolve_drawing_timeframe(
+                    drawing, default=requested_timeframe
+                )
+                if self._drawing_timeframes_match(
+                    requested_timeframe, drawing_timeframe
+                ):
+                    removed = True
+                    continue
+            remaining.append(drawing)
+        if not removed:
             return
         if remaining:
             self.chart_drawings[symbol] = remaining
         else:
             self.chart_drawings.pop(symbol, None)
-        self._remove_tradingview_drawing(symbol, drawing_id)
+        self._remove_tradingview_drawing(
+            symbol, drawing_id, timeframe=requested_timeframe
+        )
         self._save_state()
         if not self._is_active_tradingview_line_tool_symbol(symbol):
             self._reset_chart_mode_buttons()
@@ -709,6 +851,7 @@ class ChartsDrawingMixin:
 
     def _get_chart_render_options_for_timeframe(self, timeframe: str) -> dict:
         options = self._get_chart_render_options()
+        options["timeframe"] = self._normalize_drawing_timeframe(timeframe)
         timeframe = timeframe.strip().upper()
         if timeframe == "1H":
             options.update(

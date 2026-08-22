@@ -110,6 +110,10 @@ def test_run_1d_downloads_only_stale_payload_but_checks_full_derived_universe(mo
         calls["watermark_kwargs"] = kwargs
         return watermarks
 
+    def refresh_profiles(engine, tickers, **kwargs):
+        calls["profiles"] = (list(tickers), kwargs["max_symbols"])
+        return {"attempted": 3, "refreshed": 3, "unavailable": 0}
+
     monkeypatch.setattr(historical, "refresh_universe_history_to_db", refresh_history)
     monkeypatch.setattr(
         historical,
@@ -120,6 +124,9 @@ def test_run_1d_downloads_only_stale_payload_but_checks_full_derived_universe(mo
     monkeypatch.setattr(historical, "refresh_scanner_metrics_to_db", refresh_scanner)
     monkeypatch.setattr(historical, "get_chart_indicator_refresh_plan", chart_plan)
     monkeypatch.setattr(historical, "is_scanner_metrics_snapshot_current", scanner_current)
+    monkeypatch.setattr(
+        historical, "refresh_universe_stock_profiles", refresh_profiles
+    )
 
     historical.run_1d(
         object(),
@@ -134,8 +141,17 @@ def test_run_1d_downloads_only_stale_payload_but_checks_full_derived_universe(mo
     assert calls["chart_plan_watermarks"] is watermarks
     assert calls["scanner"] == (["SPY", "AAPL", "MSFT"], False, watermarks)
     assert calls["scanner_current_watermarks"] is watermarks
+    assert calls["profiles"] == (
+        ["SPY", "AAPL", "MSFT"],
+        historical.PROFILE_REFRESH_BATCH_SIZE,
+    )
     assert state.updated_count == 1
-    assert state.completed == ["daily_history", "chart_indicators", "scanner_metrics"]
+    assert state.completed == [
+        "daily_history",
+        "chart_indicators",
+        "scanner_metrics",
+        "stock_profiles",
+    ]
 
 
 def test_derived_only_run_never_calls_price_downloader(monkeypatch):

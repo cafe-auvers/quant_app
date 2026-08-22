@@ -90,9 +90,12 @@ def test_init_mysql_uses_preprovisioned_database_with_bounded_timeouts(monkeypat
         "_ensure_chart_indicators_table",
         "_ensure_chart_indicator_manifests_table",
         "_ensure_intraday_price_history_table",
-        "_ensure_scanner_metrics_table",
-        "_ensure_scanner_metric_snapshots_table",
-    ):
+            "_ensure_scanner_metrics_table",
+            "_ensure_scanner_metric_snapshots_table",
+            "_ensure_stock_profiles_table",
+            "_ensure_earnings_events_table",
+            "_ensure_fundamental_sync_state_table",
+        ):
         monkeypatch.setattr(schema_module, name, lambda _engine: None)
 
     result = db_loader.init_mysql_engine()

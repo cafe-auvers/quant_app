@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+import json
 
 from PyQt5.QtCore import QObject, pyqtSlot
 
@@ -34,7 +35,21 @@ class ChartBridge(QObject):
 
     @pyqtSlot(str, str)
     def deleteChartDrawing(self, symbol: str, drawing_id: str) -> None:
-        self.window.delete_chart_drawing(symbol, drawing_id)
+        drawing_id_value = str(drawing_id)
+        timeframe = None
+        try:
+            payload = json.loads(drawing_id)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = None
+        if isinstance(payload, dict):
+            requested_id = payload.get("id")
+            if requested_id is not None:
+                drawing_id_value = str(requested_id)
+            payload_timeframe = str(payload.get("timeframe", "")).strip().upper()
+            timeframe = payload_timeframe or None
+        self.window.delete_chart_drawing(
+            symbol, drawing_id_value, timeframe=timeframe
+        )
 
     @pyqtSlot(str)
     def clearChartDrawings(self, symbol: str) -> None:

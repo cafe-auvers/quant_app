@@ -38,6 +38,10 @@ class ChartRenderOptions:
     show_growth_1m: bool = True
     show_growth_3m: bool = True
     show_growth_6m: bool = False
+    show_earnings_events: bool = True
+    show_earnings_line: bool = True
+    show_stock_profile_watermark: bool = True
+    earnings_horizon_days: int = 14
     extra: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -55,9 +59,19 @@ class ChartRenderOptions:
                 "show_growth_1m",
                 "show_growth_3m",
                 "show_growth_6m",
+                "show_earnings_events",
+                "show_earnings_line",
+                "show_stock_profile_watermark",
             )
             if name in values
         }
+        if "earnings_horizon_days" in values:
+            try:
+                known["earnings_horizon_days"] = max(
+                    0, int(values.pop("earnings_horizon_days"))
+                )
+            except (TypeError, ValueError, OverflowError):
+                values.pop("earnings_horizon_days", None)
         return cls(**known, extra=values)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -69,6 +83,10 @@ class ChartRenderOptions:
             "show_growth_1m": self.show_growth_1m,
             "show_growth_3m": self.show_growth_3m,
             "show_growth_6m": self.show_growth_6m,
+            "show_earnings_events": self.show_earnings_events,
+            "show_earnings_line": self.show_earnings_line,
+            "show_stock_profile_watermark": self.show_stock_profile_watermark,
+            "earnings_horizon_days": self.earnings_horizon_days,
             **self.extra,
         }
 
