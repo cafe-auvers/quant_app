@@ -2,8 +2,10 @@ import json
 
 import pandas as pd
 
+from src.services import app_state
 from src.ui.charts import controller_drawing
 from src.ui.charts.controller_drawing import ChartsDrawingMixin
+from src.ui.charts.controller_layout import ChartsLayoutMixin
 from src.ui.charts.render_lightweight import ChartLightweightRenderMixin
 
 
@@ -94,6 +96,176 @@ def test_line_creation_syncs_while_tradingview_line_tool_stays_active():
     assert synced == [("AAPL", window.chart_drawings["AAPL"][0])]
 
 
+def test_daily_and_hourly_drawings_share_one_scope():
+    window = ChartsDrawingMixin()
+
+    assert window._drawing_timeframes_match("1D", "1H")
+    assert window._drawing_timeframes_match("1D", "INTRADAY")
+    assert not window._drawing_timeframes_match("1D", "5M")
+
+
+def test_daily_and_hourly_views_load_the_same_saved_drawings():
+    class Window(ChartsDrawingMixin, ChartsLayoutMixin):
+        pass
+
+    window = Window()
+    window.chart_drawings = {
+        "AAPL": [
+            {
+                "id": "daily-line",
+                "type": "line",
+                "start_date": "2026-01-02",
+                "start_price": 10.0,
+                "end_date": "2026-01-05",
+                "end_price": 12.0,
+                "timeframe": "1D",
+            },
+            {
+                "id": "hourly-line",
+                "type": "line",
+                "start_date": "2026-01-02 15:30:00",
+                "start_price": 11.0,
+                "end_date": "2026-01-05 15:30:00",
+                "end_price": 13.0,
+                "timeframe": "1H",
+            },
+        ]
+    }
+
+    assert {drawing["id"] for drawing in window._build_combined_drawings("AAPL", "1D")} == {
+        "daily-line",
+        "hourly-line",
+    }
+    assert {drawing["id"] for drawing in window._build_combined_drawings("AAPL", "1H")} == {
+        "daily-line",
+        "hourly-line",
+    }
+
+
+def test_hourly_edit_and_delete_apply_to_daily_origin_drawing():
+    window = ChartsDrawingMixin()
+    window.chart_drawings = {
+        "AAPL": [
+            {
+                "id": "shared-line",
+                "type": "line",
+                "start_date": "2026-01-02",
+                "start_price": 10.0,
+                "end_date": "2026-01-05",
+                "end_price": 12.0,
+                "timeframe": "1D",
+            }
+        ]
+    }
+    window._save_state = lambda: None
+    window._is_active_tradingview_line_tool_symbol = lambda symbol: True
+    window._sync_tradingview_drawing = lambda symbol, drawing: None
+    window._remove_tradingview_drawing = lambda symbol, drawing_id, timeframe=None: None
+    window.append_log = lambda message: None
+
+    window.update_chart_drawing(
+        "AAPL",
+        json.dumps(
+            {
+                "id": "shared-line",
+                "start_date": "2026-01-02 15:30:00",
+                "start_price": 11.0,
+                "end_date": "2026-01-05 15:30:00",
+                "end_price": 13.0,
+                "timeframe": "1H",
+            }
+        ),
+    )
+    assert window.chart_drawings["AAPL"][0]["start_price"] == 11.0
+
+    window.delete_chart_drawing("AAPL", "shared-line", timeframe="1H")
+    assert "AAPL" not in window.chart_drawings
+
+
+def test_hourly_line_creation_pushes_to_both_split_views(monkeypatch):
+    window = _split_window(monkeypatch)
+    window.chart_drawings = {}
+    window.tradingview_line_tool_active = True
+    window._save_state = lambda: None
+    window.append_log = lambda message: None
+
+    window.save_chart_drawing(
+        "AAPL",
+        json.dumps(
+            {
+                "id": "shared-line",
+                "start_date": "2026-01-02 15:30:00",
+                "start_price": 11.1,
+                "end_date": "2026-01-05 15:30:00",
+                "end_price": 13.2,
+                "timeframe": "1H",
+            }
+        ),
+    )
+
+    assert window.chart_drawings["AAPL"][0]["timeframe"] == "1H"
+    for view in (
+        window.tradingview_chart_view,
+        window.tradingview_split_chart_view,
+    ):
+        assert len(view.page().scripts) == 1
+        assert "window.upsertSyncedDrawing" in view.page().scripts[0]
+        assert '"timeframe":"1H"' in view.page().scripts[0]
+        assert ', "AAPL")' in view.page().scripts[0]
+
+
+def test_finished_sibling_page_reconciles_drawings_missed_while_loading(monkeypatch):
+    window = _split_window(monkeypatch)
+    window.chart_drawings = {
+        "AAPL": [
+            {
+                "id": "daily-during-hourly-load",
+                "type": "line",
+                "start_date": "2026-01-02",
+                "start_price": 10.0,
+                "end_date": "2026-01-05",
+                "end_price": 12.0,
+                "timeframe": "1D",
+            }
+        ]
+    }
+
+    window._resync_tradingview_drawings_in_view(
+        window.tradingview_split_chart_view
+    )
+
+    scripts = window.tradingview_split_chart_view.page().scripts
+    assert len(scripts) == 1
+    assert "window.replaceSyncedDrawings" in scripts[0]
+    assert "daily-during-hourly-load" in scripts[0]
+    assert '"timeframe":"1D"' in scripts[0]
+
+
+def test_persisted_drawing_keeps_its_timeframe(tmp_path, monkeypatch):
+    drawings_path = tmp_path / "chart_drawings.json"
+    monkeypatch.setattr(app_state, "CHART_DRAWINGS_FILE", drawings_path)
+    app_state.save_json(
+        drawings_path,
+        {
+            "AAPL": [
+                {
+                    "id": "hourly-line",
+                    "type": "line",
+                    "start_date": "2026-01-02 15:30:00",
+                    "start_price": 11.1,
+                    "end_date": "2026-01-05 15:30:00",
+                    "end_price": 13.2,
+                    "timeframe": "1H",
+                }
+            ]
+        },
+    )
+
+    loaded = app_state.load_chart_drawings_state()
+
+    assert loaded["AAPL"][0]["timeframe"] == "1H"
+
+
 def test_lightweight_split_html_supports_direct_state_and_crosshair_sync():
     history = pd.DataFrame(
         {
@@ -117,6 +289,8 @@ def test_lightweight_split_html_supports_direct_state_and_crosshair_sync():
     assert "window.applySyncedTargetPrice" in chart_html
     assert "targetMode = false;" in chart_html
     assert "window.upsertSyncedDrawing" in chart_html
+    assert "window.replaceSyncedDrawings" in chart_html
+    assert 'new Set(["1D", "1H", "INTRADAY"])' in chart_html
     assert "syncChartCrosshair" in chart_html
     assert "window.showSyncedCrosshair" in chart_html
     assert "resolveSyncedTime" in chart_html

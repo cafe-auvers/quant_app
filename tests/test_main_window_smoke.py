@@ -150,6 +150,8 @@ def test_main_window_constructs_and_closes_offscreen_without_external_io(monkeyp
     )
     assert orb_settings_action is window.orb_settings_action
     assert window.tradingview_show_stock_profile_checkbox.isChecked()
+    assert window.tradingview_stock_profile_opacity_slider.value() == 70
+    assert window.tradingview_stock_profile_opacity_slider.isHidden()
     assert window.tradingview_show_volume_checkbox.isHidden()
     assert not hasattr(window, "charts_widget")
     assert not hasattr(window, "chart_view")
@@ -165,11 +167,22 @@ def test_main_window_constructs_and_closes_offscreen_without_external_io(monkeyp
         window.sidebar_source_combo.itemText(index)
         for index in range(window.sidebar_source_combo.count())
     ]
+    assert sidebar_sources[0] == "Universe"
+    assert window.sidebar_source_combo.currentData() == {"type": "universe"}
     assert "Watchlist" in sidebar_sources
     assert "Buylist" in sidebar_sources
     assert "Buy Today" in sidebar_sources
     assert hasattr(window, "sidebar_move_buylist_button")
     assert hasattr(window, "sidebar_remove_watchlist_button")
+
+    window._on_scanner_universe_loaded(["ZZZ", "AAPL"])
+    assert [
+        window.sidebar_stock_list.item(row).data(Qt.UserRole)["symbol"]
+        for row in range(window.sidebar_stock_list.count())
+    ] == ["AAPL", "ZZZ"]
+    assert window._select_sidebar_universe_symbol("OUTSIDE") is True
+    assert window.sidebar_source_combo.currentData() == {"type": "universe"}
+    assert window._get_sidebar_selected_symbol() == "OUTSIDE"
 
     health_index = tab_labels.index("Health")
     window.tabs.setCurrentIndex(health_index)

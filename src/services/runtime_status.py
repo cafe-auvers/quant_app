@@ -26,6 +26,10 @@ from sqlalchemy import (
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
+from src.infrastructure.database.coordination_engine import (
+    coordination_autocommit_connection,
+    coordination_read_connection,
+)
 
 MAIN_APP_PROCESS = "main.py"
 DEFAULT_HEARTBEAT_MAX_AGE_SECONDS = 60
@@ -90,7 +94,7 @@ def _server_now(engine: Engine):
 def database_server_hostname(engine: Engine) -> str:
     """Return the host name of the MySQL server that owns the shared data."""
     if engine.dialect.name == "mysql":
-        with engine.connect() as conn:
+        with coordination_read_connection(engine) as conn:
             hostname = conn.execute(text("SELECT @@hostname")).scalar()
         return _normalized_hostname(str(hostname or ""))
     return _normalized_hostname(platform.node())
@@ -114,7 +118,7 @@ def record_runtime_heartbeat(
     # One heartbeat UPDATE is already atomic.  Driver autocommit avoids a
     # separate cloud-billed COMMIT statement for this 30-second liveness
     # touch; multi-statement lifecycle transitions keep explicit transactions.
-    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+    with coordination_autocommit_connection(engine) as conn:
         # The steady heartbeat changes one timestamp only.  Including pid,
         # active, and the CASE expression in every UPDATE made TiDB rewrite
         # and plan fields whose values almost never change.  The exact pid and
@@ -214,7 +218,7 @@ def get_runtime_process_status(
         return RuntimeProcessStatus(hostname, process_name, False, False)
 
     table = _ensure_runtime_status_table(engine)
-    with engine.connect() as conn:
+    with coordination_read_connection(engine) as conn:
         row = conn.execute(
             select(table).where(
                 table.c.hostname == hostname,

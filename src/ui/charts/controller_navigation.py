@@ -52,6 +52,9 @@ class ChartsNavigationMixin:
 
     def _get_chart_symbol_universe(self) -> set:
         symbols = set(self.universe_tickers)
+        symbols.update(
+            self.__dict__.get("_sidebar_universe_extra_symbols", set())
+        )
         symbols.update(item.symbol for item in self.watchlist.items)
         symbols.update(
             stock["symbol"] for stock in self.scanner_results if stock.get("symbol")

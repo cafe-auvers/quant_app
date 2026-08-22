@@ -11,7 +11,11 @@ from src.core.board_workflow import (
     ClearBreakoutPrice,
     SetBreakoutPrice,
 )
-from src.core.execution_order_record import ExecutionOrderRecord
+from src.core.execution_order_record import (
+    BrokerIdentityStatus,
+    ExecutionOrderRecord,
+    ExecutionOrderStatus,
+)
 from src.core.order_state import OrderIntent, OrderSide
 from src.core.trade_card_state import (
     BoardStatus,
@@ -171,20 +175,23 @@ def test_removed_watchlist_tombstone_fences_stale_target_update(engine):
     assert stored.version == card.version
 
 
-@pytest.mark.parametrize(
-    "context, expected_text",
-    [
-        (_context(operator=False), "Operator Control"),
-        (_context(market_open=None), "session state is unavailable"),
-    ],
-)
-def test_breakout_mutation_fails_closed_without_authority_or_session_truth(
-    engine, context, expected_text
-):
-    with pytest.raises(BoardCommandRejectedError, match=expected_text):
-        request_board_action(engine, _set(), context=context)
+def test_breakout_mutation_fails_closed_without_operator_authority(engine):
+    with pytest.raises(BoardCommandRejectedError, match="Operator Control"):
+        request_board_action(engine, _set(), context=_context(operator=False))
 
     assert card_repo.get_trade_card(engine, "PROD", "1", "AAPL") is None
+
+
+def test_setting_breakout_does_not_depend_on_market_session_state(engine):
+    card = _seed(engine, breakout_price=100.0)
+
+    result = request_board_action(
+        engine,
+        _set(card, price=102.0),
+        context=_context(market_open=None),
+    )
+
+    assert result.card.breakout_price == 102.0
 
 
 @pytest.mark.parametrize("price", [0.0, -1.0, math.inf, math.nan])
@@ -228,10 +235,7 @@ def test_passive_buylist_target_can_be_planned_during_market_hours(engine):
     assert result.card.entry_runtime_status is None
 
 
-@pytest.mark.parametrize("command_kind", ["set", "clear"])
-def test_published_buy_today_target_is_immutable_during_market_hours(
-    engine, command_kind
-):
+def test_buy_today_breakout_can_be_revised_during_market_hours(engine):
     card = _seed(
         engine,
         board_status=BoardStatus.BUY_TODAY,
@@ -243,18 +247,35 @@ def test_published_buy_today_target_is_immutable_during_market_hours(
         planned_quantity=20,
         target_position_quantity=20,
     )
-    command = _set(card, price=102.0) if command_kind == "set" else _clear(card)
+
+    result = request_board_action(
+        engine,
+        _set(card, price=102.0),
+        context=_context(market_open=True),
+    )
+
+    assert result.card.board_status == BoardStatus.BUY_TODAY
+    assert result.card.breakout_price == 102.0
+    assert result.card.entry_runtime_status == EntryRuntimeStatus.ORB_FORMING
+    assert result.card.entry_trigger is None
+    assert result.card.planned_quantity == 0
+
+
+def test_buy_today_breakout_cannot_be_cleared_during_market_hours(engine):
+    card = _seed(
+        engine,
+        board_status=BoardStatus.BUY_TODAY,
+        breakout_price=100.0,
+        entry_runtime_status=EntryRuntimeStatus.WAITING_BREAKOUT,
+    )
 
     with pytest.raises(BoardCommandRejectedError, match="immutable"):
         request_board_action(
-            engine, command, context=_context(market_open=True)
+            engine, _clear(card), context=_context(market_open=True)
         )
 
     stored = card_repo.get_trade_card(engine, "PROD", "1", "AAPL")
-    assert stored.version == card.version
     assert stored.breakout_price == 100.0
-    assert stored.entry_trigger == 101.0
-    assert stored.planned_quantity == 20
 
 
 def test_premarket_buy_today_set_invalidates_old_orb_geometry(engine):
@@ -380,6 +401,113 @@ def test_clear_rejects_an_active_local_order_even_without_card_identity(engine):
     assert stored.breakout_price == 100.0
 
 
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        {"entry_client_order_id": "entry-1"},
+        {"entry_submission_unresolved": True},
+        {"entry_cancel_in_flight": True},
+        {"entry_remaining_target_quantity": 5},
+        {"capital_reservation_id": "reservation-1"},
+    ],
+)
+def test_unfilled_entry_or_reservation_evidence_does_not_lock_breakout_price(
+    engine, evidence
+):
+    card = _seed(
+        engine,
+        board_status=BoardStatus.BUY_TODAY,
+        breakout_price=100.0,
+        entry_trigger=101.0,
+        planned_quantity=20,
+        target_position_quantity=20,
+        **evidence,
+    )
+
+    result = request_board_action(
+        engine,
+        _set(card, price=102.0),
+        context=_context(market_open=True),
+    )
+
+    assert result.card.breakout_price == 102.0
+    for field, value in evidence.items():
+        assert getattr(result.card, field) == value
+
+
+def test_unfilled_active_order_does_not_lock_or_get_erased_by_breakout_revision(engine):
+    card = _seed(
+        engine,
+        board_status=BoardStatus.ENTRY_PENDING,
+        breakout_price=100.0,
+        entry_runtime_status=EntryRuntimeStatus.ORDER_PENDING,
+        entry_client_order_id="entry-prepared-1",
+        capital_reservation_id="reservation-1",
+    )
+    record_execution_order(
+        engine,
+        ExecutionOrderRecord(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            intent=OrderIntent.ENTRY,
+            client_order_id="entry-prepared-1",
+            submitted_quantity=5,
+            remaining_quantity=5,
+            capital_reservation_id="reservation-1",
+        ),
+    )
+
+    result = request_board_action(
+        engine,
+        _set(card, price=102.0),
+        context=_context(market_open=True),
+    )
+
+    assert result.card.board_status == BoardStatus.ENTRY_PENDING
+    assert result.card.breakout_price == 102.0
+    assert result.card.entry_client_order_id == "entry-prepared-1"
+    assert result.card.capital_reservation_id == "reservation-1"
+    assert result.card.entry_runtime_status == EntryRuntimeStatus.ORDER_PENDING
+
+
+def test_confirmed_filled_order_locks_breakout_even_if_card_projection_is_stale(engine):
+    card = _seed(
+        engine,
+        board_status=BoardStatus.BUY_TODAY,
+        breakout_price=100.0,
+    )
+    record_execution_order(
+        engine,
+        ExecutionOrderRecord(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            intent=OrderIntent.ENTRY,
+            client_order_id="entry-filled-1",
+            broker_order_id="broker-filled-1",
+            broker_identity_status=BrokerIdentityStatus.EXACT,
+            status=ExecutionOrderStatus.FILLED,
+            submitted_quantity=5,
+            filled_quantity=5,
+            remaining_quantity=0,
+            average_fill_price=100.5,
+        ),
+    )
+
+    with pytest.raises(BoardCommandRejectedError, match="fill or position"):
+        request_board_action(
+            engine,
+            _set(card, price=102.0),
+            context=_context(market_open=True),
+        )
+
+    stored = card_repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert stored.breakout_price == 100.0
+
+
 def test_operator_queue_mapping_round_trips_breakout_commands():
     command = _set(price=123.45)
     payload = serialize_board_command(command)
@@ -429,7 +557,7 @@ def test_authorized_operator_queue_can_create_passive_market_hours_target(engine
     assert stored.breakout_price == 123.45
 
 
-def test_operator_queue_cannot_rewrite_buy_today_during_market_hours(engine):
+def test_operator_queue_can_rewrite_unfilled_buy_today_during_market_hours(engine):
     executor = LocalDeviceRole("pc-id", "TRADING-PC", False)
     operator = LocalDeviceRole("laptop-id", "TRADING-LAPTOP", False)
     claim_main_device(engine, executor)
@@ -451,7 +579,6 @@ def test_operator_queue_cannot_rewrite_buy_today_during_market_hours(engine):
     )
 
     assert outcome.command_id == queued.command.command_id
-    assert outcome.status == OperatorCommandStatus.REJECTED
-    assert "immutable" in outcome.error_message
+    assert outcome.status == OperatorCommandStatus.COMPLETED
     stored = card_repo.get_trade_card(engine, "PROD", "1", "AAPL")
-    assert stored.breakout_price == 100.0
+    assert stored.breakout_price == 123.45

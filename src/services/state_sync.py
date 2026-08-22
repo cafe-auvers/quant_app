@@ -36,6 +36,7 @@ from sqlalchemy import (
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import SQLAlchemyError
 
+from src.infrastructure.database.coordination_engine import coordination_read_connection
 from src.services.runtime_status import MAIN_APP_PROCESS, heartbeat_row_is_stale
 from src.utils.config import DATA_DIR
 from src.utils.storage import load_json, save_json
@@ -395,7 +396,7 @@ def pull_state(engine: Optional[Engine], state_key: str) -> PullResult:
         return PullResult(PULL_ERROR, error="State sync database is unavailable.")
     try:
         table = _ensure_state_sync_table(engine)
-        with engine.connect() as conn:
+        with coordination_read_connection(engine) as conn:
             row = _select_row(conn, table, state_key)
         if row is None:
             return PullResult(PULL_MISSING)
@@ -723,7 +724,7 @@ def get_synced_state_revisions(
         return {}
     try:
         table = _ensure_state_sync_table(engine)
-        with engine.connect() as conn:
+        with coordination_read_connection(engine) as conn:
             rows = conn.execute(
                 select(table.c.state_key, table.c.revision).where(
                     table.c.state_key.in_(SYNCED_STATE_KEYS)
@@ -772,7 +773,7 @@ def get_coordination_status_snapshot(
             *SYNCED_STATE_KEYS,
         )
         control_keys = (LIVE_TRADING_CONTROL_KEY, OPERATOR_CONTROL_KEY)
-        with engine.connect() as conn:
+        with coordination_read_connection(engine) as conn:
             rows = conn.execute(
                 select(
                     table.c.state_key,

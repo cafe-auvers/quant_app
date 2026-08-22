@@ -30,6 +30,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.engine import Engine
 
+from src.infrastructure.database.coordination_engine import coordination_read_connection
 from src.utils.config import DATA_DIR
 
 
@@ -875,7 +876,7 @@ class ExternalAlertingService:
     def due_incidents(self) -> List[AlertIncident]:
         now = _db_datetime(self._clock())
         table = _incident_table(MetaData())
-        with self.engine.connect() as conn:
+        with coordination_read_connection(self.engine) as conn:
             rows = conn.execute(
                 select(table)
                 .where(
@@ -904,7 +905,7 @@ class ExternalAlertingService:
         if not values:
             return set()
         table = _incident_table(MetaData())
-        with self.engine.connect() as conn:
+        with coordination_read_connection(self.engine) as conn:
             rows = conn.execute(
                 select(table.c.alert_type, table.c.dedupe_key).where(
                     table.c.status == AlertIncidentStatus.OPEN.value,
@@ -1129,7 +1130,7 @@ class ExternalAlertingService:
             # every publication only adds quota cost and no safety.
             return self.publish_heartbeat()
         try:
-            with self.engine.connect() as conn:
+            with coordination_read_connection(self.engine) as conn:
                 last = conn.execute(
                     select(table.c.attempted_at)
                     .where(
@@ -1149,7 +1150,7 @@ class ExternalAlertingService:
 
     def delivery_attempts(self, incident_id: str) -> List[Dict[str, Any]]:
         table = _attempt_table(MetaData())
-        with self.engine.connect() as conn:
+        with coordination_read_connection(self.engine) as conn:
             rows = conn.execute(
                 select(table)
                 .where(table.c.incident_id == incident_id)
@@ -1159,7 +1160,7 @@ class ExternalAlertingService:
 
     def heartbeat_attempts(self) -> List[Dict[str, Any]]:
         table = _heartbeat_table(MetaData())
-        with self.engine.connect() as conn:
+        with coordination_read_connection(self.engine) as conn:
             rows = conn.execute(
                 select(table)
                 .where(table.c.device_id == self.device_id)

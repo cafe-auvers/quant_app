@@ -106,6 +106,7 @@ class SidebarMixin:
 
         self.sidebar_stock_list = QListWidget()
         self.sidebar_stock_list.setMinimumWidth(145)
+        self.sidebar_stock_list.setUniformItemSizes(True)
         self.sidebar_stock_list.itemSelectionChanged.connect(self.on_sidebar_selection_changed)
         self.sidebar_stock_list.itemDoubleClicked.connect(self.sidebar_show_chart)
         sidebar_layout.addWidget(self.sidebar_stock_list, 1)
@@ -146,13 +147,14 @@ class SidebarMixin:
         self.addDockWidget(Qt.LeftDockWidgetArea, self.stock_sidebar)
         self.refresh_sidebar_sources()
     def refresh_sidebar_sources(self, selected_source: Optional[dict] = None) -> None:
-        """Refresh sidebar source options for scans and passive planning stages."""
+        """Refresh sidebar source options, keeping Universe as the default."""
         if not hasattr(self, "sidebar_source_combo"):
             return
 
         current_data = selected_source or self.sidebar_source_combo.currentData()
         self.sidebar_source_combo.blockSignals(True)
         self.sidebar_source_combo.clear()
+        self.sidebar_source_combo.addItem("Universe", {"type": "universe"})
         for setup_name in sorted(self.scanner_setups.keys()):
             self.sidebar_source_combo.addItem(f"Scan: {setup_name}", {"type": "scan", "setup": setup_name})
         self.sidebar_source_combo.addItem("Watchlist", {"type": "watchlist"})
@@ -194,6 +196,48 @@ class SidebarMixin:
                 if self.sidebar_source_combo.currentIndex() != index:
                     self.sidebar_source_combo.setCurrentIndex(index)
                 return
+    def _set_sidebar_source_to_universe(self) -> None:
+        if not hasattr(self, "sidebar_source_combo"):
+            return
+        for index in range(self.sidebar_source_combo.count()):
+            data = self.sidebar_source_combo.itemData(index) or {}
+            if data.get("type") == "universe":
+                if self.sidebar_source_combo.currentIndex() != index:
+                    self.sidebar_source_combo.setCurrentIndex(index)
+                return
+
+    def _select_sidebar_universe_symbol(self, symbol: str, name: str = "") -> bool:
+        """Select a symbol without inheriting a scan/watchlist restriction."""
+
+        symbol = str(symbol or "").strip().upper()
+        if not symbol or not hasattr(self, "sidebar_stock_list"):
+            return False
+        extras = self.__dict__.setdefault("_sidebar_universe_extra_symbols", set())
+        extras.add(symbol)
+        if name:
+            self.__dict__.setdefault("_sidebar_universe_extra_names", {})[symbol] = str(
+                name
+            ).strip()
+        self._set_sidebar_source_to_universe()
+        source = self.sidebar_source_combo.currentData() or {}
+        if source.get("type") != "universe":
+            return False
+        for row in range(self.sidebar_stock_list.count()):
+            item = self.sidebar_stock_list.item(row)
+            data = item.data(Qt.UserRole) or {}
+            if str(data.get("symbol", "")).strip().upper() == symbol:
+                self.sidebar_stock_list.setCurrentRow(row)
+                return True
+        # Setting the already-selected source doesn't emit currentIndexChanged.
+        # Refresh only when the requested extra symbol isn't in the current list.
+        self.refresh_stock_sidebar()
+        for row in range(self.sidebar_stock_list.count()):
+            item = self.sidebar_stock_list.item(row)
+            data = item.data(Qt.UserRole) or {}
+            if str(data.get("symbol", "")).strip().upper() == symbol:
+                self.sidebar_stock_list.setCurrentRow(row)
+                return True
+        return False
     @staticmethod
     def _format_sidebar_added_date(added_date) -> str:
         """Format an item's added_date for the sidebar label, e.g. 2026/08/11."""
@@ -214,7 +258,29 @@ class SidebarMixin:
         self.sidebar_stock_list.clear()
         source = self.sidebar_source_combo.currentData() or {}
 
-        if source.get("type") == "scan":
+        if source.get("type") == "universe":
+            symbols = {
+                str(value or "").strip().upper()
+                for value in self.__dict__.get("universe_tickers", ())
+                if str(value or "").strip()
+            }
+            symbols.update(
+                self.__dict__.get("_sidebar_universe_extra_symbols", set())
+            )
+            extra_names = self.__dict__.get("_sidebar_universe_extra_names", {})
+            for symbol in sorted(symbols):
+                item = QListWidgetItem(symbol)
+                item.setData(
+                    Qt.UserRole,
+                    {
+                        "symbol": symbol,
+                        "name": extra_names.get(symbol) or symbol,
+                        "price": None,
+                        "source": "universe",
+                    },
+                )
+                self.sidebar_stock_list.addItem(item)
+        elif source.get("type") == "scan":
             setup_name = source.get("setup", "")
             for stock in self.scanner_results_by_setup.get(setup_name, []):
                 symbol = stock.get("symbol", "")
@@ -314,7 +380,11 @@ class SidebarMixin:
                 if data.get("symbol") == current_symbol:
                     self.sidebar_stock_list.setCurrentRow(row)
                     break
-        if self.sidebar_stock_list.currentRow() < 0 and self.sidebar_stock_list.count() > 0:
+        if (
+            self.sidebar_stock_list.currentRow() < 0
+            and self.sidebar_stock_list.count() > 0
+            and source.get("type") != "universe"
+        ):
             # Symbol no longer in list (e.g. removed) — stay at same position rather than jumping to top
             restore = min(current_row, self.sidebar_stock_list.count() - 1) if current_row >= 0 else 0
             self.sidebar_stock_list.setCurrentRow(restore)

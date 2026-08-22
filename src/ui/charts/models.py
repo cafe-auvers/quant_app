@@ -41,6 +41,7 @@ class ChartRenderOptions:
     show_earnings_events: bool = True
     show_earnings_line: bool = True
     show_stock_profile_watermark: bool = True
+    stock_profile_watermark_opacity: float = 0.70
     earnings_horizon_days: int = 14
     extra: Dict[str, Any] = field(default_factory=dict)
 
@@ -72,6 +73,14 @@ class ChartRenderOptions:
                 )
             except (TypeError, ValueError, OverflowError):
                 values.pop("earnings_horizon_days", None)
+        if "stock_profile_watermark_opacity" in values:
+            try:
+                known["stock_profile_watermark_opacity"] = max(
+                    0.20,
+                    min(1.0, float(values.pop("stock_profile_watermark_opacity"))),
+                )
+            except (TypeError, ValueError, OverflowError):
+                values.pop("stock_profile_watermark_opacity", None)
         return cls(**known, extra=values)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -86,6 +95,7 @@ class ChartRenderOptions:
             "show_earnings_events": self.show_earnings_events,
             "show_earnings_line": self.show_earnings_line,
             "show_stock_profile_watermark": self.show_stock_profile_watermark,
+            "stock_profile_watermark_opacity": self.stock_profile_watermark_opacity,
             "earnings_horizon_days": self.earnings_horizon_days,
             **self.extra,
         }

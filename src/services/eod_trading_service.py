@@ -42,6 +42,7 @@ from src.services.position_manager import (
     _default_cancel_intent_factory,
     request_cancel_with_lifecycle,
 )
+from src.utils.market_calendar import is_nyse_trading_day, next_nyse_trading_day
 
 # Statuses that mean "the broker has already finished with this order" --
 # no cancel call is needed or safe to attempt.
@@ -110,18 +111,26 @@ class EodTradingService:
         cards: List[TradeCardState],
         *,
         market_closed: bool = True,
+        current_session_date: Optional[date] = None,
     ) -> List[TradeCardState]:
         """Section 13's table, applied to every card. The caller owns the
         timing gate and supplies whether the market has actually closed.
         """
+        session_today = current_session_date or market_session_date()
         changed: List[TradeCardState] = []
         for card in cards:
             if card.board_status == BoardStatus.BUY_TODAY:
                 # Always restore correlation to an already-durable order;
                 # only the no-order reset itself waits for the closing bell.
+                scheduled_session_due = bool(
+                    card.session_date is None
+                    or card.session_date <= session_today
+                )
                 if self._reset_buy_today_with_no_order(
                     card,
-                    allow_no_order_reset=market_closed,
+                    allow_no_order_reset=(
+                        market_closed and scheduled_session_due
+                    ),
                 ):
                     changed.append(card)
             elif card.board_status == BoardStatus.ENTRY_PENDING:
@@ -153,18 +162,51 @@ class EodTradingService:
         for card in cards:
             if card.board_status != BoardStatus.BUY_TODAY:
                 continue
+            repaired_session = False
+            if (
+                card.session_date is not None
+                and not is_nyse_trading_day(card.session_date)
+            ):
+                # Repair cards activated by older builds on a weekend or
+                # holiday so they remain armed for the next real session.
+                card.session_date = next_nyse_trading_day(card.session_date)
+                repaired_session = True
+                if card.entry_runtime_status == EntryRuntimeStatus.SESSION_COMPLETE:
+                    card.entry_runtime_status = EntryRuntimeStatus.ORB_FORMING
+                    card.entry_block_reason = ""
             prior_session = bool(
                 card.session_date is not None and card.session_date < session_today
             )
+            scheduled_session_due = bool(
+                card.session_date is None
+                or card.session_date <= session_today
+            )
+            if (
+                not scheduled_session_due
+                and card.entry_runtime_status == EntryRuntimeStatus.SESSION_COMPLETE
+            ):
+                # Older builds could mark a post-close activation complete
+                # even though its intended session had not started yet.
+                card.entry_runtime_status = EntryRuntimeStatus.ORB_FORMING
+                card.entry_block_reason = ""
+                repaired_session = True
             already_complete = (
                 card.entry_runtime_status == EntryRuntimeStatus.SESSION_COMPLETE
             )
-            if not (market_closed or prior_session or already_complete):
+            if not (
+                (market_closed and scheduled_session_due)
+                or prior_session
+                or already_complete
+            ):
+                if repaired_session:
+                    changed.append(card)
                 continue
             if self._reset_buy_today_with_no_order(
                 card,
                 allow_no_order_reset=True,
             ):
+                changed.append(card)
+            elif repaired_session:
                 changed.append(card)
         return changed
 

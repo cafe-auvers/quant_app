@@ -546,6 +546,11 @@ def _get_market_pulse_snapshots_table(metadata: MetaData) -> Table:
         Column("monthly_return", Float),
         Column("pct_above_52w_low", Float),
         Column("pct_below_52w_high", Float),
+        Column("stock1", String(20)),
+        Column("stock2", String(20)),
+        Column("stock3", String(20)),
+        Column("stock4", String(20)),
+        Column("component_rank_method", String(40)),
         Column("status", String(20), nullable=False, default="available"),
         Column("error_message", String(500)),
         Column("source_session_date", Date),
@@ -566,7 +571,45 @@ def _ensure_market_pulse_tables(engine: Engine) -> tuple[Table, Table]:
     instruments = _get_market_pulse_instruments_table(metadata)
     snapshots = _get_market_pulse_snapshots_table(metadata)
     metadata.create_all(engine)
+    _ensure_market_pulse_component_columns(engine)
     return instruments, snapshots
+
+
+def _ensure_market_pulse_component_columns(engine: Engine) -> None:
+    """Idempotently extend older Market Pulse caches with holding symbols."""
+
+    try:
+        inspector = inspect(engine)
+        if not inspector.has_table("market_pulse_snapshots"):
+            return
+        columns = {
+            column["name"]
+            for column in inspector.get_columns("market_pulse_snapshots")
+        }
+        missing = [
+            name
+            for name in (
+                "stock1",
+                "stock2",
+                "stock3",
+                "stock4",
+                "component_rank_method",
+            )
+            if name not in columns
+        ]
+        if missing:
+            with engine.begin() as conn:
+                for name in missing:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE market_pulse_snapshots ADD COLUMN "
+                            f"{name} VARCHAR({40 if name == 'component_rank_method' else 20})"
+                        )
+                    )
+    except SQLAlchemyError:
+        # Market Pulse can still use its local JSON snapshot if the optional
+        # database cache cannot be migrated during startup.
+        return
 
 
 def _get_stock_market_alignment_daily_table(metadata: MetaData) -> Table:

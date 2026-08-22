@@ -15,6 +15,8 @@ from src.core.market_pulse import (
     MarketPulseRow,
     MarketPulseSnapshot,
     calculate_market_pulse_metrics,
+    calculate_relative_strength_vs_benchmark,
+    rank_symbols_by_relative_strength,
     rank_market_pulse_rows,
     snapshot_to_dict,
 )
@@ -26,6 +28,7 @@ from src.infrastructure.database.schema import (
     _get_market_pulse_snapshots_table,
 )
 from src.services.market_pulse import (
+    MarketPulseComponentsBatch,
     MarketPulseHistoryBatch,
     MarketPulseRefreshError,
     MarketPulseRefreshInProgress,
@@ -198,6 +201,32 @@ def test_daily_ranking_is_independent_stable_and_missing_last():
     ]
 
 
+def test_component_symbols_rank_by_63_session_strength_relative_to_spy():
+    benchmark = _history([100.0 + index for index in range(80)])
+    histories = {
+        "WEAK": _history([100.0 + index * 0.5 for index in range(80)]),
+        "STRONG": _history([100.0 + index * 2.0 for index in range(80)]),
+    }
+
+    strong_score = calculate_relative_strength_vs_benchmark(
+        histories["STRONG"], benchmark, AS_OF, sessions=63
+    )
+    weak_score = calculate_relative_strength_vs_benchmark(
+        histories["WEAK"], benchmark, AS_OF, sessions=63
+    )
+    ranked = rank_symbols_by_relative_strength(
+        ["WEAK", "MISSING", "STRONG"],
+        histories,
+        benchmark,
+        AS_OF,
+        sessions=63,
+    )
+
+    assert strong_score is not None and weak_score is not None
+    assert strong_score > weak_score
+    assert ranked == ("STRONG", "WEAK", "MISSING")
+
+
 def test_sql_repository_seeds_same_ticker_in_sections_and_upserts_idempotently():
     engine = create_engine("sqlite:///:memory:", future=True)
     repository = MarketPulseSnapshotRepository(engine)
@@ -223,13 +252,23 @@ def test_sql_repository_seeds_same_ticker_in_sections_and_upserts_idempotently()
         assert conn.scalar(select(func.count()).select_from(snapshot_table)) == 2
 
     updated = _snapshot(
-        [_row(SECTORS, "GDX", 0.05), _row(INDUSTRIES_THEMES, "GDX", 0.05)]
+        [
+            _row(SECTORS, "GDX", 0.05, stock1="AEM", stock2="NEM"),
+            _row(
+                INDUSTRIES_THEMES,
+                "GDX",
+                0.05,
+                stock1="AEM",
+                stock2="NEM",
+            ),
+        ]
     )
     repository.upsert_snapshot(updated, instruments)
     cached = repository.load_latest_snapshot()
     assert cached is not None
     assert len(cached.rows) == 2
     assert all(row.daily_return == pytest.approx(0.05) for row in cached.rows)
+    assert all((row.stock1, row.stock2) == ("AEM", "NEM") for row in cached.rows)
 
     with pytest.raises(IntegrityError):
         with engine.begin() as conn:
@@ -297,6 +336,63 @@ def test_successful_refresh_is_batched_ranked_and_cached(tmp_path):
     assert snapshot.as_of_date == AS_OF
     assert [row.rank for row in snapshot.rows] == [1, 2]
     assert service.load_cached_snapshot() is not None
+
+
+def test_refresh_attaches_only_daily_universe_components(tmp_path, monkeypatch):
+    class _ComponentsProvider(_FakeProvider):
+        def fetch_components(self, tickers, *, eligible_symbols, limit):
+            assert list(tickers) == ["GDX"]
+            assert eligible_symbols == {
+                "AEM": "Agnico Eagle Mines",
+                "NEM": "Newmont",
+                "WPM": "Wheaton Precious Metals",
+                "AU": "Anglogold Ashanti",
+            }
+            assert limit == 10
+            return MarketPulseComponentsBatch(
+                {"GDX": ("AEM", "NEM", "WPM", "AU")},
+                {},
+                "fake_holdings",
+            )
+
+    monkeypatch.setattr(
+        "src.services.market_pulse.get_default_universe_name_map",
+        lambda **_kwargs: {
+            "AEM": "Agnico Eagle Mines",
+            "NEM": "Newmont",
+            "WPM": "Wheaton Precious Metals",
+            "AU": "Anglogold Ashanti",
+        },
+    )
+    service = _service(
+        tmp_path,
+        _ComponentsProvider(
+            {
+                "GDX": _history(range(100, 352)),
+                "SPY": _history([100.0 + index for index in range(252)]),
+                "AEM": _history([100.0 + index for index in range(252)]),
+                "NEM": _history([100.0 + index * 2 for index in range(252)]),
+                "WPM": _history([100.0 + index * 3 for index in range(252)]),
+                "AU": _history([100.0 + index * 4 for index in range(252)]),
+            }
+        ),
+        (MarketPulseInstrument(SECTORS, "Gold Miners", "GDX", 1),),
+    )
+
+    snapshot = service.refresh(
+        now=dt.datetime(2026, 8, 22, 8, 0, tzinfo=dt.timezone(dt.timedelta(hours=9)))
+    )
+
+    row = snapshot.rows[0]
+    assert (row.stock1, row.stock2, row.stock3, row.stock4) == (
+        "AU",
+        "WPM",
+        "NEM",
+        "AEM",
+    )
+    cached = service.load_cached_snapshot()
+    assert cached is not None
+    assert cached.rows[0].stock4 == "AEM"
 
 
 def test_partial_failure_keeps_successes_and_marks_failed_row_unavailable(tmp_path):
@@ -416,6 +512,29 @@ def test_common_market_date_uses_majority_and_marks_lagging_ticker(tmp_path):
     assert next(row for row in snapshot.rows if row.ticker == "OLD").status == "stale"
 
 
+def test_refresh_merges_utc_cached_daily_bars_with_naive_provider_bars(
+    tmp_path, monkeypatch
+):
+    instrument = MarketPulseInstrument(MARKET_SEGMENTS, "Alpha", "AAA", 1)
+    cached = _history(range(100, 351), end=AS_OF - dt.timedelta(days=1))
+    cached.index = cached.index.tz_localize("UTC")
+    provider = _FakeProvider({"AAA": _history([350.0, 351.0])})
+    service = _service(tmp_path, provider, (instrument,))
+    service.set_engine(create_engine("sqlite:///:memory:"))
+    monkeypatch.setattr(
+        "src.services.market_pulse.load_universe_history_from_db",
+        lambda *_args, **_kwargs: {"AAA": cached},
+    )
+
+    snapshot = service.refresh(
+        now=dt.datetime(2026, 8, 22, 8, 0, tzinfo=dt.timezone(dt.timedelta(hours=9)))
+    )
+
+    assert snapshot.as_of_date == AS_OF
+    assert snapshot.rows[0].status == "available"
+    assert snapshot.rows[0].close == pytest.approx(351.0)
+
+
 def test_yfinance_provider_uses_one_batch_loader_call(monkeypatch):
     calls = []
     dates = pd.bdate_range(end=AS_OF, periods=2)
@@ -446,6 +565,41 @@ def test_yfinance_provider_uses_one_batch_loader_call(monkeypatch):
     assert calls[0][1]["fallback_to_single"] is False
     assert calls[0][1]["timeout_seconds"] == 15.0
     assert set(result.histories) == {"AAA", "BBB"}
+
+
+def test_yfinance_components_keep_weight_order_and_resolve_primary_listings(
+    monkeypatch,
+):
+    holdings = pd.DataFrame(
+        {
+            "Name": ["Newmont", "Agnico", "Barrick", "Wheaton", "Anglogold"],
+            "Holding Percent": [0.11, 0.10, 0.08, 0.06, 0.05],
+        },
+        index=["NEM", "AEM.TO", "ABX.TO", "WPM.TO", "AU"],
+    )
+
+    class _FundsData:
+        top_holdings = holdings
+
+    class _Ticker:
+        funds_data = _FundsData()
+
+    monkeypatch.setattr("src.services.market_pulse.yf.Ticker", lambda _symbol: _Ticker())
+
+    result = YFinanceMarketPulseProvider().fetch_components(
+        ["GDX"],
+        eligible_symbols={
+            "AEM": "Agnico Eagle Mines Ltd",
+            "NEM": "Newmont Corp",
+            "WPM": "Wheaton Precious Metals Corp",
+            "AU": "Anglogold Ashanti PLC",
+            "ABX": "Abacus Global Management Inc",
+        },
+        limit=4,
+    )
+
+    assert result.components["GDX"] == ("NEM", "AEM", "WPM", "AU")
+    assert not result.failures
 
 
 def test_provider_discards_partial_session_after_completed_market_date(monkeypatch):

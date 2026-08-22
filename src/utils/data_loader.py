@@ -1140,3 +1140,26 @@ def get_default_universe(max_symbols: Optional[int] = None, refresh: bool = Fals
     if kis_symbols:
         return kis_symbols
     return get_sp500_tickers(max_symbols=max_symbols)
+
+
+def get_default_universe_name_map(
+    max_symbols: Optional[int] = None,
+    refresh: bool = False,
+) -> Dict[str, str]:
+    """Return daily-universe symbols with cached KIS company names when available."""
+
+    symbols = get_default_universe(max_symbols=max_symbols, refresh=refresh)
+    result = {symbol: "" for symbol in symbols}
+    if not DEFAULT_UNIVERSE_CACHE.exists() or not result:
+        return result
+    try:
+        frame = pd.read_csv(DEFAULT_UNIVERSE_CACHE, dtype=str).fillna("")
+    except Exception:
+        return result
+    if "Symbol" not in frame.columns or "Name" not in frame.columns:
+        return result
+    for raw_symbol, raw_name in zip(frame["Symbol"], frame["Name"]):
+        symbol = normalize_yahoo_symbol(raw_symbol)
+        if symbol in result:
+            result[symbol] = str(raw_name or "").strip()
+    return result

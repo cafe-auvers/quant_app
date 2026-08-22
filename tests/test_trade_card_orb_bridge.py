@@ -1,7 +1,7 @@
 """Tests for src.services.trade_card_orb_bridge (code review finding P0-2)."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from src.core.execution_queue import ExecutionQueueItem, OrbCandidate, OrbCandidateStatus
@@ -668,6 +668,25 @@ def test_forming_plan_becomes_session_complete_after_market_close():
     assert card.entry_runtime_status == EntryRuntimeStatus.SESSION_COMPLETE
     assert card.entry_block_reason == "Regular session is complete"
     assert card.planned_quantity == 0
+
+
+def test_future_session_buy_today_stays_forming_after_prior_session_close():
+    now = datetime(2026, 8, 21, 20, 5, tzinfo=timezone.utc)  # Friday 16:05 ET
+    card = _card(session_date=date(2026, 8, 24))
+    item = _queue_item(
+        _candidate(
+            status=OrbCandidateStatus.FORMING,
+            shares=0,
+            source_session_date="2026-08-21",
+        ),
+        last_updated=now,
+    )
+
+    TradeCardOrbEvaluator(clock=lambda: now).update_card(card, item)
+
+    assert card.board_status == BoardStatus.BUY_TODAY
+    assert card.entry_runtime_status == EntryRuntimeStatus.ORB_FORMING
+    assert card.entry_block_reason == ""
 
 
 def test_best_waiting_plan_is_visible_before_it_becomes_execute_ready():

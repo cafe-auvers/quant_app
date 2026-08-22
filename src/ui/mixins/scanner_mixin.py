@@ -836,6 +836,17 @@ class ScannerMixin:
         """Retain the asynchronously loaded universe for future scans/searches."""
         self.universe_tickers = list(tickers or [])
         self.append_log(f"Loaded {len(self.universe_tickers):,} scanner universe symbols.")
+        populate_chart_symbols = getattr(
+            self, "populate_tradingview_watchlist_symbols", None
+        )
+        if callable(populate_chart_symbols):
+            populate_chart_symbols()
+        sidebar_source = self.__dict__.get("sidebar_source_combo")
+        if (
+            sidebar_source is not None
+            and (sidebar_source.currentData() or {}).get("type") == "universe"
+        ):
+            self.refresh_stock_sidebar()
 
     def run_all_scanners(
         self, checked: bool = False, show_warnings: bool = True

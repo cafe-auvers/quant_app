@@ -27,6 +27,10 @@ from sqlalchemy.engine import Engine
 
 from src.core.runtime_readiness import RuntimeDeviceState
 from src.core.schema_version import CURRENT_EXECUTION_SCHEMA_VERSION
+from src.infrastructure.database.coordination_engine import (
+    coordination_autocommit_connection,
+    coordination_read_connection,
+)
 from src.services.state_sync import get_main_device
 from src.services.runtime_status import get_runtime_process_status
 
@@ -300,7 +304,7 @@ def refresh_runtime_device_state(
                 table.c.schema_version == int(schema_version),
             )
         )
-    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+    with coordination_autocommit_connection(engine) as conn:
         result = conn.execute(
             table.update()
             .where(*predicates)
@@ -398,7 +402,7 @@ def get_runtime_device_state(
     engine: Engine, *, device_id: str
 ) -> Optional[RuntimeDeviceRecord]:
     table = ensure_runtime_device_state_table(engine)
-    with engine.connect() as conn:
+    with coordination_read_connection(engine) as conn:
         row = conn.execute(
             select(table).where(table.c.device_id == str(device_id or ""))
         ).first()
@@ -409,7 +413,7 @@ def list_runtime_device_states(engine: Engine) -> list[RuntimeDeviceRecord]:
     """Return the latest readiness publication for every known device."""
 
     table = ensure_runtime_device_state_table(engine)
-    with engine.connect() as conn:
+    with coordination_read_connection(engine) as conn:
         rows = conn.execute(select(table).order_by(table.c.hostname.asc())).fetchall()
     return [_record(row) for row in rows]
 
@@ -447,7 +451,7 @@ def require_compatible_runtime_schema(
         RuntimeDeviceState.ACTIVE.value,
         RuntimeDeviceState.SHUTTING_DOWN.value,
     }
-    with engine.connect() as conn:
+    with coordination_read_connection(engine) as conn:
         conflicting_rows = conn.execute(
             select(table).where(
                 table.c.device_id != str(device_id or ""),
@@ -503,7 +507,7 @@ def find_standby_successor(
     """Return a fresh standby successor; stale rows never authorize release."""
 
     table = ensure_runtime_device_state_table(engine)
-    with engine.connect() as conn:
+    with coordination_read_connection(engine) as conn:
         statement = (
             select(table)
             .where(table.c.device_id != str(excluding_device_id or ""))

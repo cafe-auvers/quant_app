@@ -22,6 +22,7 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, Optional, Tuple
 
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from websockets.exceptions import ConnectionClosed
 
 from src.api.kis_ws_auth import KisWsApprovalKeyProvider, KisWsAuthError
 
@@ -577,6 +578,11 @@ class KisWebSocketClient:
                 )
             for callback in list(self._data_callbacks):
                 callback(frame)
+        except ConnectionClosed:
+            # A close can race with the explicit PINGPONG reply.  Let the
+            # connection loop handle reconnect/stop semantics instead of
+            # counting a normal transport transition as a malformed frame.
+            raise
         except Exception:
             self.malformed_frame_count += 1
             logger.exception("Malformed KIS WebSocket frame dropped; connection remains open")

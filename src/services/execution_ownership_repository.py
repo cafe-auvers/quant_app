@@ -18,6 +18,7 @@ from sqlalchemy import Column, DateTime, Integer, MetaData, String, Table, Uniqu
 from sqlalchemy.engine import Connection, Engine
 
 from src.core.execution_ownership import ExecutionOwner, ExecutionOwnership
+from src.infrastructure.database.coordination_engine import coordination_read_connection
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +85,7 @@ def get_ownership(engine: Engine, *, environment: str, account_no: str, symbol: 
     environment = str(environment or "").upper()
     account_no = str(account_no or "")
     symbol = str(symbol or "").upper()
-    with engine.connect() as conn:
+    with coordination_read_connection(engine) as conn:
         row = conn.execute(
             select(table).where(
                 table.c.environment == environment, table.c.account_no == account_no,
@@ -107,7 +108,7 @@ def list_execution_ownership(
         statement = statement.where(
             table.c.environment == str(environment or "").upper()
         )
-    with engine.connect() as conn:
+    with coordination_read_connection(engine) as conn:
         rows = conn.execute(statement).fetchall()
     return [_row_to_ownership(row) for row in rows]
 

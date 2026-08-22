@@ -36,6 +36,7 @@ from src.core.execution_mode import ExecutionLease
 from src.core.order_recovery_state import OrderRecoveryState
 from src.core.order_state import OrderStatus
 from src.core.schema_version import CURRENT_EXECUTION_SCHEMA_VERSION
+from src.infrastructure.database.coordination_engine import coordination_read_connection
 from src.services.capital_reservation_repository import (
     ensure_capital_reservations_table,
     fetch_reservation,
@@ -341,7 +342,7 @@ class SchemaMigrationManager:
                 }
                 continue
             reflected = Table(table_name, metadata, autoload_with=self.engine)
-            with self.engine.connect() as conn:
+            with coordination_read_connection(self.engine) as conn:
                 rows = conn.execute(select(reflected)).fetchall()
             database[table_name] = {
                 "existed": True,

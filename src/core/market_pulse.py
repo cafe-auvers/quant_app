@@ -22,6 +22,7 @@ SECTION_LABELS: Mapping[str, str] = {
     INDUSTRIES_THEMES: "Industries & Themes",
 }
 SECTION_ORDER = tuple(SECTION_LABELS)
+COMPONENT_RANK_METHOD = "relative_strength_63d_vs_spy"
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,10 @@ class MarketPulseRow:
     monthly_return: Optional[float]
     pct_above_52w_low: Optional[float]
     pct_below_52w_high: Optional[float]
+    stock1: Optional[str] = None
+    stock2: Optional[str] = None
+    stock3: Optional[str] = None
+    stock4: Optional[str] = None
     status: str = "available"
     error: str = ""
     source_session_date: Optional[dt.date] = None
@@ -69,6 +74,7 @@ class MarketPulseSnapshot:
     rows: tuple[MarketPulseRow, ...]
     failures: Mapping[str, str]
     stale: bool = False
+    component_rank_method: str = COMPONENT_RANK_METHOD
 
 
 def load_market_pulse_instruments(path: Path) -> tuple[MarketPulseInstrument, ...]:
@@ -129,12 +135,18 @@ def _normalize_daily_frame(history: pd.DataFrame, as_of_date: dt.date) -> pd.Dat
         return pd.DataFrame()
     frame = history.copy()
     try:
-        index = pd.DatetimeIndex(pd.to_datetime(frame.index))
-    except (TypeError, ValueError):
+        # SQL cache rows are UTC-aware while yfinance daily rows are naive.
+        # Converting the combined index in one ``pd.to_datetime`` call rejects
+        # that otherwise valid mixture.  Daily bars are session-date values,
+        # so normalize each element independently before merging duplicates.
+        index = pd.DatetimeIndex(
+            [pd.Timestamp(pd.Timestamp(value).date()) for value in frame.index]
+        )
+    except (AttributeError, TypeError, ValueError):
         return pd.DataFrame()
     # Daily bars represent exchange session dates. Preserve that calendar date
     # instead of shifting it through UTC (which is especially error-prone in KST).
-    frame.index = pd.DatetimeIndex([pd.Timestamp(value.date()) for value in index])
+    frame.index = index
     frame = frame.loc[frame.index.date <= as_of_date]
     if frame.empty:
         return frame
@@ -231,6 +243,97 @@ def latest_valid_session_date(
     return pd.Timestamp(valid.index[-1]).date()
 
 
+def calculate_relative_strength_vs_benchmark(
+    stock_history: pd.DataFrame,
+    benchmark_history: pd.DataFrame,
+    as_of_date: dt.date,
+    *,
+    sessions: int = 63,
+) -> Optional[float]:
+    """Return a stock's lookback return relative to the benchmark return."""
+
+    if sessions < 1:
+        raise ValueError("Relative-strength sessions must be positive")
+    stock = _normalize_daily_frame(stock_history, as_of_date)
+    benchmark = _normalize_daily_frame(benchmark_history, as_of_date)
+    if stock.empty or benchmark.empty:
+        return None
+    stock_column = _reference_column(stock)
+    benchmark_column = _reference_column(benchmark)
+    if stock_column not in stock.columns or benchmark_column not in benchmark.columns:
+        return None
+    aligned = pd.concat(
+        [
+            pd.to_numeric(stock[stock_column], errors="coerce").rename("stock"),
+            pd.to_numeric(benchmark[benchmark_column], errors="coerce").rename(
+                "benchmark"
+            ),
+        ],
+        axis=1,
+        join="inner",
+    ).dropna()
+    if (
+        len(aligned) <= sessions
+        or aligned.index[-1] != pd.Timestamp(as_of_date)
+    ):
+        return None
+    current_stock = _finite_number(aligned["stock"].iloc[-1])
+    prior_stock = _finite_number(aligned["stock"].iloc[-(sessions + 1)])
+    current_benchmark = _finite_number(aligned["benchmark"].iloc[-1])
+    prior_benchmark = _finite_number(aligned["benchmark"].iloc[-(sessions + 1)])
+    if (
+        current_stock is None
+        or prior_stock is None
+        or current_benchmark is None
+        or prior_benchmark is None
+        or current_stock <= 0
+        or prior_stock <= 0
+        or current_benchmark <= 0
+        or prior_benchmark <= 0
+    ):
+        return None
+    return (current_stock / prior_stock) / (
+        current_benchmark / prior_benchmark
+    ) - 1.0
+
+
+def rank_symbols_by_relative_strength(
+    symbols: Sequence[str],
+    histories: Mapping[str, pd.DataFrame],
+    benchmark_history: pd.DataFrame,
+    as_of_date: dt.date,
+    *,
+    sessions: int = 63,
+) -> tuple[str, ...]:
+    """Sort symbols by benchmark-relative return, preserving missing-score order."""
+
+    unique = tuple(
+        dict.fromkeys(str(symbol or "").strip().upper() for symbol in symbols)
+    )
+    scores = {
+        symbol: calculate_relative_strength_vs_benchmark(
+            histories.get(symbol, pd.DataFrame()),
+            benchmark_history,
+            as_of_date,
+            sessions=sessions,
+        )
+        for symbol in unique
+        if symbol
+    }
+    original_positions = {symbol: index for index, symbol in enumerate(unique)}
+    return tuple(
+        sorted(
+            (symbol for symbol in unique if symbol),
+            key=lambda symbol: (
+                scores.get(symbol) is None,
+                -scores[symbol] if scores.get(symbol) is not None else 0.0,
+                original_positions[symbol],
+                symbol,
+            ),
+        )
+    )
+
+
 def rank_market_pulse_rows(rows: Iterable[MarketPulseRow]) -> tuple[MarketPulseRow, ...]:
     """Assign deterministic daily-performance ranks independently by section."""
 
@@ -252,11 +355,12 @@ def rank_market_pulse_rows(rows: Iterable[MarketPulseRow]) -> tuple[MarketPulseR
 
 def snapshot_to_dict(snapshot: MarketPulseSnapshot) -> dict:
     return {
-        "version": 1,
+        "version": 3,
         "as_of_date": snapshot.as_of_date.isoformat(),
         "refreshed_at": snapshot.refreshed_at.isoformat(),
         "source": snapshot.source,
         "stale": snapshot.stale,
+        "component_rank_method": snapshot.component_rank_method,
         "failures": dict(snapshot.failures),
         "rows": [
             {
@@ -271,6 +375,10 @@ def snapshot_to_dict(snapshot: MarketPulseSnapshot) -> dict:
                 "monthly_return": row.monthly_return,
                 "pct_above_52w_low": row.pct_above_52w_low,
                 "pct_below_52w_high": row.pct_below_52w_high,
+                "stock1": row.stock1,
+                "stock2": row.stock2,
+                "stock3": row.stock3,
+                "stock4": row.stock4,
                 "status": row.status,
                 "error": row.error,
                 "source_session_date": (
@@ -286,6 +394,10 @@ def snapshot_to_dict(snapshot: MarketPulseSnapshot) -> dict:
 
 def snapshot_from_dict(payload: Mapping) -> Optional[MarketPulseSnapshot]:
     try:
+        component_rank_method = str(
+            payload.get("component_rank_method") or ""
+        ).strip()
+        components_are_ranked = component_rank_method == COMPONENT_RANK_METHOD
         rows = tuple(
             MarketPulseRow(
                 section=str(raw["section"]),
@@ -299,6 +411,26 @@ def snapshot_from_dict(payload: Mapping) -> Optional[MarketPulseSnapshot]:
                 monthly_return=_finite_number(raw.get("monthly_return")),
                 pct_above_52w_low=_finite_number(raw.get("pct_above_52w_low")),
                 pct_below_52w_high=_finite_number(raw.get("pct_below_52w_high")),
+                stock1=(
+                    str(raw.get("stock1") or "").strip().upper() or None
+                    if components_are_ranked
+                    else None
+                ),
+                stock2=(
+                    str(raw.get("stock2") or "").strip().upper() or None
+                    if components_are_ranked
+                    else None
+                ),
+                stock3=(
+                    str(raw.get("stock3") or "").strip().upper() or None
+                    if components_are_ranked
+                    else None
+                ),
+                stock4=(
+                    str(raw.get("stock4") or "").strip().upper() or None
+                    if components_are_ranked
+                    else None
+                ),
                 status=str(raw.get("status") or "available"),
                 error=str(raw.get("error") or ""),
                 source_session_date=(
@@ -321,6 +453,7 @@ def snapshot_from_dict(payload: Mapping) -> Optional[MarketPulseSnapshot]:
             rows=rank_market_pulse_rows(rows),
             failures=dict(payload.get("failures") or {}),
             stale=bool(payload.get("stale", False)),
+            component_rank_method=component_rank_method,
         )
     except (KeyError, TypeError, ValueError, OverflowError):
         return None

@@ -11,6 +11,8 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from src.utils.market_calendar import (
+    current_or_next_nyse_session_date,
+    is_nyse_trading_day,
     is_regular_session_open,
     next_nyse_regular_session_open,
     nyse_regular_session_close_time,
@@ -171,6 +173,29 @@ def test_next_regular_open_skips_weekends_and_holidays():
 
     assert next_open == dt.datetime(2026, 7, 6, 9, 30, tzinfo=eastern)
     assert seconds_until_nyse_regular_session_open(friday_after_close) == 65 * 60 * 60
+
+
+def test_buy_today_session_date_rolls_closed_days_to_next_market_open():
+    eastern = ZoneInfo("America/New_York")
+
+    saturday = dt.datetime(2026, 8, 22, 12, 0, tzinfo=eastern)
+    labor_day = dt.datetime(2026, 9, 7, 12, 0, tzinfo=eastern)
+    monday_premarket = dt.datetime(2026, 8, 24, 8, 0, tzinfo=eastern)
+
+    assert not is_nyse_trading_day(saturday.date())
+    assert not is_nyse_trading_day(labor_day.date())
+    assert current_or_next_nyse_session_date(saturday) == dt.date(2026, 8, 24)
+    assert current_or_next_nyse_session_date(labor_day) == dt.date(2026, 9, 8)
+    assert current_or_next_nyse_session_date(monday_premarket) == dt.date(2026, 8, 24)
+
+
+def test_buy_today_session_date_rolls_post_close_activation_forward():
+    eastern = ZoneInfo("America/New_York")
+    friday_after_close = dt.datetime(2026, 8, 21, 16, 5, tzinfo=eastern)
+
+    assert current_or_next_nyse_session_date(friday_after_close) == dt.date(
+        2026, 8, 24
+    )
 
 
 def test_live_factory_requires_both_enable_and_protocol_verification(monkeypatch):

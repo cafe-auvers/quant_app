@@ -439,11 +439,12 @@ def _is_breakout_plan_command(command) -> bool:
 def _require_breakout_plan_mutation_policy(command, card, context) -> None:
     """Authorize canonical breakout edits independently of executor state.
 
-    A passive BUYLIST target never submits a broker order, so it may still be
-    planned while the regular session is open.  A published BUY_TODAY plan is
-    immutable after the open.  Every direct edit requires verified local
-    Operator Control; the operator-command consumer supplies the same flag
-    only after consuming a durably authorized request.
+    Setting a breakout price is planning metadata until a fill is confirmed,
+    so BUYLIST, BUY_TODAY, and an unfilled ENTRY_PENDING card may be revised
+    regardless of regular-session state. Clearing an active Buy Today plan is
+    still a lifecycle change and retains its session fence. Every direct edit
+    requires verified local Operator Control; the operator-command consumer
+    supplies the same flag only after consuming a durably authorized request.
     """
 
     if not _is_breakout_plan_command(command):
@@ -469,7 +470,10 @@ def _require_breakout_plan_mutation_policy(command, card, context) -> None:
         raise BoardCommandRejectedError(
             "Only the current Operator Control owner may change breakout planning"
         )
-    if context.regular_session_open is None:
+    if (
+        isinstance(command, types.ClearBreakoutPrice)
+        and context.regular_session_open is None
+    ):
         raise BoardCommandRejectedError(
             "Market-session state is unavailable; breakout planning fails closed"
         )
@@ -483,6 +487,8 @@ def _require_breakout_plan_mutation_policy(command, card, context) -> None:
         BoardStatus.BUYLIST,
         BoardStatus.BUY_TODAY,
     }
+    if isinstance(command, types.SetBreakoutPrice):
+        allowed.add(BoardStatus.ENTRY_PENDING)
     if card.board_status not in allowed:
         raise BoardCommandRejectedError(
             f"Cannot change breakout planning from {card.board_status.value}"
@@ -493,7 +499,8 @@ def _require_breakout_plan_mutation_policy(command, card, context) -> None:
             "before changing its breakout target"
         )
     if (
-        card.board_status == BoardStatus.BUY_TODAY
+        isinstance(command, types.ClearBreakoutPrice)
+        and card.board_status == BoardStatus.BUY_TODAY
         and context.regular_session_open is True
     ):
         raise BoardCommandRejectedError(
@@ -648,18 +655,59 @@ def _require_board_action_not_conflicted(engine, command, card) -> List[Executio
     types = _load_board_types()
     from src.core.trade_card_state import (
         BoardStatus,
+        PositionRuntimeStatus,
         has_durable_execution_evidence,
     )
+    from src.services.execution_order_repository import list_execution_orders_for_card
 
-    active_orders = _active_owned_orders(engine, card)
+    owned_orders = list_execution_orders_for_card(
+        engine,
+        environment=card.environment,
+        account_no=card.account_no,
+        symbol=card.symbol,
+    )
+    active_orders = [
+        order
+        for order in owned_orders
+        if order.status not in TERMINAL_EXECUTION_ORDER_STATUSES
+    ]
 
     def has_durable_entry_or_position_evidence() -> bool:
         return bool(active_orders or has_durable_execution_evidence(card))
 
-    if _is_breakout_plan_command(command):
+    def has_confirmed_fill_or_position_evidence() -> bool:
+        return bool(
+            max(0, int(card.broker_quantity or 0)) > 0
+            or max(0, int(card.orderable_quantity or 0)) > 0
+            or float(card.average_entry_price or 0.0) > 0
+            or card.position_runtime_status != PositionRuntimeStatus.NONE
+            or any(
+                max(0, int(order.filled_quantity or 0)) > 0
+                or order.status == ExecutionOrderStatus.FILLED
+                for order in owned_orders
+            )
+        )
+
+    if isinstance(command, types.SetBreakoutPrice):
+        if has_confirmed_fill_or_position_evidence():
+            raise BoardCommandRejectedError(
+                "Breakout price cannot change after a fill or position is confirmed"
+            )
+        if (
+            card.board_status == BoardStatus.WATCHLIST
+            and has_durable_entry_or_position_evidence()
+        ):
+            raise BoardCommandRejectedError(
+                "Breakout planning cannot change on a hidden Watchlist card while execution evidence exists"
+            )
+        # Changing the reference price does not mutate or replace an
+        # already-persisted unfilled order. Its identity, reservation, and
+        # reconciliation lifecycle are preserved by _apply_board_mutation.
+        return active_orders
+    elif isinstance(command, types.ClearBreakoutPrice):
         if has_durable_entry_or_position_evidence():
             raise BoardCommandRejectedError(
-                "Breakout planning cannot change after entry, order, reservation, or position evidence exists"
+                "Breakout planning cannot be removed after entry, order, reservation, or position evidence exists"
             )
 
     planning_stage_move = isinstance(command, types.MoveToWatchlist) or (
@@ -782,6 +830,7 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         EntryRuntimeStatus,
         PositionRuntimeStatus,
         StopType,
+        has_durable_execution_evidence,
     )
     from src.services.position_manager import (
         compute_breakeven_stop_price,
@@ -825,7 +874,11 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         had_canonical_target = bool(
             math.isfinite(previous_breakout) and previous_breakout > 0
         )
-        clear_executable_entry_plan()
+        preserve_unfilled_execution = bool(
+            active_orders or has_durable_execution_evidence(card)
+        )
+        if not preserve_unfilled_execution:
+            clear_executable_entry_plan()
         # The Buy Board header is a default for a genuinely new plan. A target
         # revision on an existing plan (especially BUY_TODAY) keeps its frozen
         # buffer across devices and executor handoff.
@@ -840,12 +893,13 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
             card.buylist_member = False
         else:
             card.buylist_member = True
-        card.buy_today_note = ""
-        card.entry_runtime_status = (
-            EntryRuntimeStatus.ORB_FORMING
-            if card.board_status == BoardStatus.BUY_TODAY
-            else None
-        )
+        if not preserve_unfilled_execution:
+            card.buy_today_note = ""
+            card.entry_runtime_status = (
+                EntryRuntimeStatus.ORB_FORMING
+                if card.board_status == BoardStatus.BUY_TODAY
+                else None
+            )
         return
 
     if isinstance(command, types.ClearBreakoutPrice):
@@ -1054,9 +1108,9 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         if context is not None and context.session_date is not None:
             card.session_date = context.session_date
         else:
-            from src.core.exit_policy import market_session_date
+            from src.utils.market_calendar import current_or_next_nyse_session_date
 
-            card.session_date = market_session_date()
+            card.session_date = current_or_next_nyse_session_date()
         monitoring_command = build_entry_monitoring_command(
             environment=card.environment,
             account_no=card.account_no,
@@ -1600,6 +1654,9 @@ def get_board_projection_revision(engine, *, environment="PROD"):
     """
 
     from sqlalchemy import func, literal, select, union_all
+    from src.infrastructure.database.coordination_engine import (
+        coordination_read_connection,
+    )
     from src.services.discovered_external_order_repository import (
         ensure_discovered_external_orders_table,
     )
@@ -1628,7 +1685,7 @@ def get_board_projection_revision(engine, *, environment="PROD"):
                 func.max(table.c.updated_at).label("updated_at"),
             ).where(table.c.environment == environment)
         )
-    with engine.connect() as conn:
+    with coordination_read_connection(engine) as conn:
         rows = conn.execute(union_all(*statements)).fetchall()
     return tuple(
         (str(row.source), int(row.row_count or 0), int(row.version_sum or 0), str(row.updated_at or ""))

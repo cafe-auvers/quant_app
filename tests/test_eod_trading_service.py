@@ -120,6 +120,69 @@ def test_buy_today_with_no_order_does_not_reset_before_market_close(tmp_path):
     assert card.entry_runtime_status == EntryRuntimeStatus.ARMED
 
 
+def test_closed_day_buy_today_waits_for_its_scheduled_market_session(tmp_path):
+    service, _, _ = _service(tmp_path)
+    card = _card(
+        board_status=BoardStatus.BUY_TODAY,
+        session_date=date(2026, 8, 24),
+        entry_runtime_status=EntryRuntimeStatus.ORB_FORMING,
+    )
+
+    changed = service.run_eod_cleanup(
+        [card],
+        market_closed=True,
+        current_session_date=date(2026, 8, 21),
+    )
+
+    assert changed == []
+    assert card.board_status == BoardStatus.BUY_TODAY
+    assert card.session_date == date(2026, 8, 24)
+
+
+def test_weekend_activation_from_older_build_is_retargeted_not_expired(tmp_path):
+    service, _, _ = _service(tmp_path)
+    card = _card(
+        board_status=BoardStatus.BUY_TODAY,
+        session_date=date(2026, 8, 22),
+        entry_runtime_status=EntryRuntimeStatus.SESSION_COMPLETE,
+        entry_block_reason="Regular session is complete",
+    )
+
+    changed = service.expire_buy_today_cards(
+        [card],
+        market_closed=False,
+        current_session_date=date(2026, 8, 22),
+    )
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.BUY_TODAY
+    assert card.session_date == date(2026, 8, 24)
+    assert card.entry_runtime_status == EntryRuntimeStatus.ORB_FORMING
+    assert card.entry_block_reason == ""
+
+
+def test_future_session_marked_complete_by_older_build_is_rearmed(tmp_path):
+    service, _, _ = _service(tmp_path)
+    card = _card(
+        board_status=BoardStatus.BUY_TODAY,
+        session_date=date(2026, 8, 24),
+        entry_runtime_status=EntryRuntimeStatus.SESSION_COMPLETE,
+        entry_block_reason="Regular session is complete",
+    )
+
+    changed = service.expire_buy_today_cards(
+        [card],
+        market_closed=True,
+        current_session_date=date(2026, 8, 21),
+    )
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.BUY_TODAY
+    assert card.session_date == date(2026, 8, 24)
+    assert card.entry_runtime_status == EntryRuntimeStatus.ORB_FORMING
+    assert card.entry_block_reason == ""
+
+
 def test_buy_today_from_prior_session_expires_after_offline_restart(tmp_path):
     service, _, _ = _service(tmp_path)
     card = _card(

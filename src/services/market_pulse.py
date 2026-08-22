@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import re
 import threading
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Mapping, Optional, Protocol, Sequence
 
 import pandas as pd
+import yfinance as yf
 from sqlalchemy.engine import Engine
 
 from src.core.market_pulse import (
@@ -19,6 +22,7 @@ from src.core.market_pulse import (
     MarketPulseRow,
     MarketPulseSnapshot,
     calculate_market_pulse_metrics,
+    rank_symbols_by_relative_strength,
     latest_valid_session_date,
     load_market_pulse_instruments,
     rank_market_pulse_rows,
@@ -33,7 +37,11 @@ from src.infrastructure.database.repositories.market_pulse import (
     MarketPulseSnapshotRepository,
 )
 from src.utils.config import DATA_DIR, ROOT_DIR
-from src.utils.data_loader import _extract_symbol_history, download_price_history
+from src.utils.data_loader import (
+    _extract_symbol_history,
+    download_price_history,
+    get_default_universe_name_map,
+)
 from src.utils.market_calendar import expected_latest_market_data_date
 from src.utils.storage import load_json, save_json
 
@@ -58,6 +66,13 @@ class MarketPulseHistoryBatch:
     failures: Mapping[str, str]
     source: str
     raw_history: pd.DataFrame
+
+
+@dataclass(frozen=True)
+class MarketPulseComponentsBatch:
+    components: Mapping[str, tuple[str, ...]]
+    failures: Mapping[str, str]
+    source: str
 
 
 class MarketPulseHistoryProvider(Protocol):
@@ -136,6 +151,140 @@ class YFinanceMarketPulseProvider:
             else:
                 histories[symbol] = frame
         return MarketPulseHistoryBatch(histories, failures, self.source, raw)
+
+    @staticmethod
+    def _company_name_tokens(value: object) -> set[str]:
+        ignored = {
+            "ADR", "ADS", "CLASS", "CO", "COM", "COMMON", "CORP",
+            "CORPORATION", "INC", "INCORPORATED", "LTD", "LIMITED", "ORD",
+            "PLC", "SHS", "STOCK", "THE", "USD",
+        }
+        return {
+            token
+            for token in re.findall(r"[A-Z0-9]+", str(value or "").upper())
+            if token not in ignored and not token.startswith("USD")
+        }
+
+    @classmethod
+    def _company_names_match(cls, left: object, right: object) -> bool:
+        left_tokens = cls._company_name_tokens(left)
+        right_tokens = cls._company_name_tokens(right)
+        if not left_tokens or not right_tokens:
+            return False
+        smaller = min(len(left_tokens), len(right_tokens))
+        required = 1 if smaller == 1 else 2
+        overlap = len(left_tokens & right_tokens)
+        return overlap >= required and overlap / smaller >= 0.6
+
+    @staticmethod
+    def _eligible_holding_symbol(
+        raw_symbol: object,
+        eligible: set[str],
+        *,
+        holding_name: object = "",
+        eligible_names: Optional[Mapping[str, str]] = None,
+    ) -> Optional[str]:
+        symbol = str(raw_symbol or "").strip().upper().replace("/", "-")
+        if not symbol:
+            return None
+        if symbol in eligible:
+            return symbol
+        yahoo_symbol = symbol.replace(".", "-")
+        if yahoo_symbol in eligible:
+            return yahoo_symbol
+
+        # Yahoo commonly reports a fund's primary Canadian/Australian listing
+        # even when the same ticker is available in the KIS U.S. universe.
+        # Strip only a known exchange suffix and still require membership in
+        # the daily universe before exposing the symbol in the UI.
+        if "." in symbol:
+            base, suffix = symbol.rsplit(".", 1)
+            if suffix in {
+                "AS", "AX", "BR", "CO", "DE", "F", "HE", "HK", "IR",
+                "JK", "KQ", "KS", "L", "LS", "MC", "MI", "NZ", "OL",
+                "PA", "SI", "ST", "SW", "T", "TO", "V", "WA",
+            } and base in eligible and YFinanceMarketPulseProvider._company_names_match(
+                holding_name, (eligible_names or {}).get(base, "")
+            ):
+                return base
+        return None
+
+    def fetch_components(
+        self,
+        tickers: Sequence[str],
+        *,
+        eligible_symbols: Sequence[str] | Mapping[str, str],
+        limit: int = 4,
+    ) -> MarketPulseComponentsBatch:
+        """Return top weighted holdings that exist in the daily stock universe."""
+
+        symbols = list(dict.fromkeys(str(value).strip().upper() for value in tickers))
+        raw_eligible_names = (
+            dict(eligible_symbols) if isinstance(eligible_symbols, Mapping) else {}
+        )
+        eligible_names = {
+            str(symbol).strip().upper().replace("/", "-").replace(".", "-"): str(
+                name or ""
+            ).strip()
+            for symbol, name in raw_eligible_names.items()
+            if str(symbol).strip()
+        }
+        eligible = {
+            str(value).strip().upper().replace("/", "-").replace(".", "-")
+            for value in eligible_symbols
+            if str(value).strip()
+        }
+        if not symbols or not eligible:
+            reason = "Daily scanner universe is empty"
+            return MarketPulseComponentsBatch(
+                {}, {symbol: reason for symbol in symbols}, "yfinance_top_holdings"
+            )
+
+        def fetch_one(symbol: str) -> tuple[str, tuple[str, ...], str]:
+            try:
+                holdings = yf.Ticker(symbol).funds_data.top_holdings
+                if holdings is None or holdings.empty:
+                    return symbol, (), "No ETF holdings returned"
+                frame = holdings.copy()
+                if "Holding Percent" in frame.columns:
+                    frame["Holding Percent"] = pd.to_numeric(
+                        frame["Holding Percent"], errors="coerce"
+                    )
+                    frame = frame.sort_values(
+                        "Holding Percent", ascending=False, kind="stable"
+                    )
+                selected = []
+                for raw_holding, holding in frame.iterrows():
+                    resolved = self._eligible_holding_symbol(
+                        raw_holding,
+                        eligible,
+                        holding_name=holding.get("Name", ""),
+                        eligible_names=eligible_names,
+                    )
+                    if resolved is not None and resolved not in selected:
+                        selected.append(resolved)
+                    if len(selected) >= max(1, int(limit)):
+                        break
+                if not selected:
+                    return symbol, (), "No reported holdings matched the daily universe"
+                return symbol, tuple(selected), ""
+            except Exception as exc:
+                return symbol, (), str(exc) or type(exc).__name__
+
+        components = {}
+        failures = {}
+        workers = min(8, max(1, len(symbols)))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(fetch_one, symbol): symbol for symbol in symbols}
+            for future in as_completed(futures):
+                symbol, selected, error = future.result()
+                if selected:
+                    components[symbol] = selected
+                if error:
+                    failures[symbol] = error
+        return MarketPulseComponentsBatch(
+            components, failures, "yfinance_top_holdings"
+        )
 
 
 class MarketPulseService:
@@ -256,6 +405,63 @@ class MarketPulseService:
         # without silently dragging the entire dashboard backward.
         return max(counts, key=lambda value: (counts[value], value))
 
+    def _load_component_histories(
+        self,
+        symbols: Sequence[str],
+        known_histories: Mapping[str, pd.DataFrame],
+        *,
+        as_of_date: dt.date,
+        expected_date: dt.date,
+    ) -> Mapping[str, pd.DataFrame]:
+        requested = list(
+            dict.fromkeys(
+                ["SPY", *(str(value).strip().upper() for value in symbols)]
+            )
+        )
+        histories = {
+            symbol: known_histories[symbol]
+            for symbol in requested
+            if symbol in known_histories and not known_histories[symbol].empty
+        }
+        if self.engine is not None:
+            try:
+                cached = load_universe_history_from_db(
+                    requested, self.engine, interval="1d"
+                )
+                histories = dict(self._merge_histories(histories, cached))
+            except Exception:
+                logger.warning(
+                    "Market Pulse component-history cache load failed",
+                    exc_info=True,
+                )
+
+        missing = [
+            symbol
+            for symbol in requested
+            if latest_valid_session_date(
+                histories.get(symbol, pd.DataFrame()), expected_date
+            )
+            != as_of_date
+        ]
+        if missing:
+            try:
+                fresh = self.provider.fetch(
+                    missing,
+                    latest_completed_session=expected_date,
+                )
+                histories = dict(self._merge_histories(histories, fresh.histories))
+                if fresh.failures:
+                    logger.warning(
+                        "Market Pulse relative-strength history returned partial failures",
+                        extra={"failures": dict(fresh.failures)},
+                    )
+            except Exception:
+                logger.warning(
+                    "Market Pulse relative-strength history refresh failed",
+                    exc_info=True,
+                )
+        return histories
+
     def refresh(
         self,
         *,
@@ -313,6 +519,44 @@ class MarketPulseService:
 
             histories = self._merge_histories(cached_histories, batch.histories)
             as_of_date = self._resolve_common_as_of_date(histories, tickers, expected_date)
+            components: Mapping[str, tuple[str, ...]] = {}
+            fetch_components = getattr(self.provider, "fetch_components", None)
+            if callable(fetch_components):
+                try:
+                    component_batch = fetch_components(
+                        tickers,
+                        eligible_symbols=get_default_universe_name_map(
+                            max_symbols=None, refresh=False
+                        ),
+                        limit=10,
+                    )
+                    components = component_batch.components
+                    if component_batch.failures:
+                        logger.warning(
+                            "Market Pulse component provider returned partial failures",
+                            extra={"failures": dict(component_batch.failures)},
+                        )
+                except Exception:
+                    # Price awareness remains usable if the optional holdings
+                    # endpoint is temporarily unavailable.
+                    logger.warning(
+                        "Market Pulse component refresh failed", exc_info=True
+                    )
+            component_symbols = list(
+                dict.fromkeys(
+                    symbol
+                    for values in components.values()
+                    for symbol in values
+                )
+            )
+            component_histories: Mapping[str, pd.DataFrame] = {}
+            if component_symbols:
+                component_histories = self._load_component_histories(
+                    component_symbols,
+                    histories,
+                    as_of_date=as_of_date,
+                    expected_date=expected_date,
+                )
             failures = dict(batch.failures)
             rows = []
             for item in instruments:
@@ -337,6 +581,14 @@ class MarketPulseService:
                     # provider refresh stays visible to the operator.
                     status = "cached"
 
+                stocks = rank_symbols_by_relative_strength(
+                    components.get(item.ticker, ()),
+                    component_histories,
+                    component_histories.get("SPY", pd.DataFrame()),
+                    as_of_date,
+                    sessions=63,
+                )[:4]
+                padded_stocks = stocks + (None,) * (4 - len(stocks))
                 rows.append(
                     MarketPulseRow(
                         section=item.section,
@@ -350,6 +602,10 @@ class MarketPulseService:
                         monthly_return=metrics.monthly_return,
                         pct_above_52w_low=metrics.pct_above_52w_low,
                         pct_below_52w_high=metrics.pct_below_52w_high,
+                        stock1=padded_stocks[0],
+                        stock2=padded_stocks[1],
+                        stock3=padded_stocks[2],
+                        stock4=padded_stocks[3],
                         status=status,
                         error=error,
                         source_session_date=session_date,

@@ -23,6 +23,7 @@ except ImportError:
     QWebChannel = None
 
 from .render_assets import _lightweight_charts_script_tag
+from .render_drawing_assets import DRAWING_TIMEFRAME_SYNC_JS
 from .render_earnings_assets import EARNINGS_CHART_CSS, EARNINGS_EVENT_RUNTIME_JS
 from .render_measurement_assets import (
     RIGHT_DRAG_MEASUREMENT_CSS,
@@ -241,6 +242,9 @@ class ChartLightweightRenderMixin:
                     entry["dash"] = list(drawing["dash"])
                 if drawing.get("readonly"):
                     entry["readonly"] = True
+                drawing_timeframe = str(drawing.get("timeframe") or "").strip().upper()
+                if drawing_timeframe:
+                    entry["timeframe"] = drawing_timeframe
                 drawing_lines.append(entry)
             except (KeyError, TypeError, ValueError):
                 continue
@@ -296,6 +300,16 @@ class ChartLightweightRenderMixin:
         rs_panel_display = "block" if show_rs_panel else "none"
         rs_panel_height = "30%" if show_rs_panel else "0"
         rs_empty_display = "none" if rs_points else "flex"
+        try:
+            stock_profile_opacity = max(
+                0.20,
+                min(
+                    1.0,
+                    float(options.get("stock_profile_watermark_opacity", 0.70)),
+                ),
+            )
+        except (TypeError, ValueError, OverflowError):
+            stock_profile_opacity = 0.70
         volume_js = ""
         if bool(options.get("show_volume", True)):
             volume_js = """
@@ -408,6 +422,7 @@ class ChartLightweightRenderMixin:
                     pointer-events: none;
                     user-select: none;
                     line-height: 1.15;
+                    opacity: {stock_profile_opacity:.2f};
                 }}
                 .watermark-symbol {{
                     color: rgba(249, 250, 251, 0.78);
@@ -1020,50 +1035,7 @@ class ChartLightweightRenderMixin:
                     }}
                 }}
 
-                function incomingDrawingTime(value, prefer) {{
-                    if (!usesIntradayTime) return String(value || '').slice(0, 10);
-                    if (typeof value === 'number') return value;
-                    const text = String(value || '');
-                    const day = text.slice(0, 10);
-                    const dayMatches = candles
-                        .map(candle => candle.time)
-                        .filter(time => normalizeTimeForSave(time).slice(0, 10) === day);
-                    if (text.length <= 10 && dayMatches.length > 0) {{
-                        return prefer === 'last'
-                            ? dayMatches[dayMatches.length - 1]
-                            : dayMatches[0];
-                    }}
-                    const parsed = Date.parse(text.replace(' ', 'T') + (text.includes('Z') ? '' : 'Z'));
-                    if (Number.isFinite(parsed)) return Math.floor(parsed / 1000);
-                    return dayMatches.length > 0
-                        ? (prefer === 'last' ? dayMatches[dayMatches.length - 1] : dayMatches[0])
-                        : null;
-                }}
-
-                function normalizeDrawingTimeframe(drawing, startValue, endValue) {{
-                    const provided = String(drawing?.timeframe || "").toUpperCase();
-                    if (provided) return provided;
-                    const startText = String(startValue || "").toUpperCase();
-                    const endText = String(endValue || "").toUpperCase();
-                    if (
-                        startText.length > 10 ||
-                        endText.length > 10 ||
-                        startText.includes(' ') ||
-                        endText.includes(' ') ||
-                        startText.includes('T') ||
-                        endText.includes('T')
-                    ) {{
-                        return "INTRADAY";
-                    }}
-                    return "1D";
-                }}
-
-                function drawingTimeframesMatch(drawingTimeframe) {{
-                    if (!drawingTimeframe) return true;
-                    if (chartTimeframe === drawingTimeframe) return true;
-                    if (chartTimeframe === "1D" || drawingTimeframe === "1D") return false;
-                    return true;
-                }}
+                {DRAWING_TIMEFRAME_SYNC_JS}
 
                 function normalizeIncomingDrawing(drawing) {{
                     if (!drawing) return null;
@@ -1214,12 +1186,21 @@ class ChartLightweightRenderMixin:
                     targetMode = false;
                     renderTargetLine(price);
                 }};
-                window.upsertSyncedDrawing = function(drawing) {{
+                window.upsertSyncedDrawing = function(drawing, expectedSymbol) {{
+                    if (
+                        expectedSymbol
+                        && String(expectedSymbol).trim().toUpperCase() !== symbolName
+                    ) return false;
                     const normalized = normalizeIncomingDrawing(drawing);
-                    if (!normalized || !drawingTimeframesMatch(normalized.timeframe)) return;
-                    if (normalized) addDrawingLine(normalized, false);
+                    if (!normalized || !drawingTimeframesMatch(normalized.timeframe)) return false;
+                    addDrawingLine(normalized, false);
+                    return true;
                 }};
-                window.removeSyncedDrawing = function(payload) {{
+                window.removeSyncedDrawing = function(payload, expectedSymbol) {{
+                    if (
+                        expectedSymbol
+                        && String(expectedSymbol).trim().toUpperCase() !== symbolName
+                    ) return false;
                     const drawingPayload = payload && typeof payload === 'object'
                         ? payload
                         : {{ id: payload, timeframe: chartTimeframe }};
@@ -1228,12 +1209,33 @@ class ChartLightweightRenderMixin:
                         drawingPayload.start_date,
                         drawingPayload.end_date
                     );
-                    if (!drawingTimeframesMatch(incomingTimeframe)) return;
+                    if (!drawingTimeframesMatch(incomingTimeframe)) return false;
                     const drawingId = String(drawingPayload.id || '');
-                    if (!drawingId || !drawingSeries.has(drawingId)) return;
+                    if (!drawingId || !drawingSeries.has(drawingId)) return false;
                     drawingSeries.delete(drawingId);
                     if (selectedDrawingId === drawingId) selectedDrawingId = null;
                     renderDrawings();
+                    return true;
+                }};
+                window.replaceSyncedDrawings = function(expectedSymbol, drawings) {{
+                    if (String(expectedSymbol || '').trim().toUpperCase() !== symbolName) {{
+                        return false;
+                    }}
+                    const incomingIds = new Set();
+                    (Array.isArray(drawings) ? drawings : []).forEach((drawing) => {{
+                        const normalized = normalizeIncomingDrawing(drawing);
+                        if (!normalized || !drawingTimeframesMatch(normalized.timeframe)) return;
+                        incomingIds.add(String(normalized.id));
+                        addDrawingLine(normalized, false);
+                    }});
+                    Array.from(drawingSeries.entries()).forEach(([drawingId, drawing]) => {{
+                        if (!drawing.readonly && !incomingIds.has(String(drawingId))) {{
+                            drawingSeries.delete(drawingId);
+                            if (selectedDrawingId === drawingId) selectedDrawingId = null;
+                        }}
+                    }});
+                    renderDrawings();
+                    return true;
                 }};
                 function resolveSyncedTime(value) {{
                     const text = String(value || '');

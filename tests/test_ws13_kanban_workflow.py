@@ -241,6 +241,30 @@ def test_buylist_to_buy_today_is_a_revision_aware_workflow_request(tmp_path):
     assert result.card.version == card.version + 1
 
 
+def test_buy_today_activation_without_context_targets_next_market_session(
+    tmp_path, monkeypatch
+):
+    from src.utils import market_calendar
+
+    engine = _engine(tmp_path)
+    card = _seed(engine, board_status=BoardStatus.BUYLIST)
+    projection = _projection(engine, card)
+    next_session = date(2026, 8, 24)
+    monkeypatch.setattr(
+        market_calendar,
+        "current_or_next_nyse_session_date",
+        lambda: next_session,
+    )
+
+    result = workflow.request_board_action(
+        engine,
+        _command(ActivateForToday, projection),
+    )
+
+    assert result.card.board_status == BoardStatus.BUY_TODAY
+    assert result.card.session_date == next_session
+
+
 def test_stale_card_revision_cannot_overwrite_reconciled_truth(tmp_path):
     engine = _engine(tmp_path)
     card = _seed(engine)

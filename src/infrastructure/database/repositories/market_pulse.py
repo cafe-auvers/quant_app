@@ -11,6 +11,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Engine
 
 from src.core.market_pulse import (
+    COMPONENT_RANK_METHOD,
     MarketPulseInstrument,
     MarketPulseRow,
     MarketPulseSnapshot,
@@ -125,6 +126,11 @@ class MarketPulseSnapshotRepository:
                     "monthly_return": row.monthly_return,
                     "pct_above_52w_low": row.pct_above_52w_low,
                     "pct_below_52w_high": row.pct_below_52w_high,
+                    "stock1": row.stock1,
+                    "stock2": row.stock2,
+                    "stock3": row.stock3,
+                    "stock4": row.stock4,
+                    "component_rank_method": snapshot.component_rank_method,
                     "status": row.status,
                     "error_message": row.error or None,
                     "source_session_date": row.source_session_date,
@@ -145,6 +151,11 @@ class MarketPulseSnapshotRepository:
                     "monthly_return",
                     "pct_above_52w_low",
                     "pct_below_52w_high",
+                    "stock1",
+                    "stock2",
+                    "stock3",
+                    "stock4",
+                    "component_rank_method",
                     "status",
                     "error_message",
                     "source_session_date",
@@ -173,6 +184,11 @@ class MarketPulseSnapshotRepository:
                     snapshots.c.monthly_return,
                     snapshots.c.pct_above_52w_low,
                     snapshots.c.pct_below_52w_high,
+                    snapshots.c.stock1,
+                    snapshots.c.stock2,
+                    snapshots.c.stock3,
+                    snapshots.c.stock4,
+                    snapshots.c.component_rank_method,
                     snapshots.c.status,
                     snapshots.c.error_message,
                     snapshots.c.source_session_date,
@@ -202,6 +218,26 @@ class MarketPulseSnapshotRepository:
                 monthly_return=item.monthly_return,
                 pct_above_52w_low=item.pct_above_52w_low,
                 pct_below_52w_high=item.pct_below_52w_high,
+                stock1=(
+                    item.stock1
+                    if item.component_rank_method == COMPONENT_RANK_METHOD
+                    else None
+                ),
+                stock2=(
+                    item.stock2
+                    if item.component_rank_method == COMPONENT_RANK_METHOD
+                    else None
+                ),
+                stock3=(
+                    item.stock3
+                    if item.component_rank_method == COMPONENT_RANK_METHOD
+                    else None
+                ),
+                stock4=(
+                    item.stock4
+                    if item.component_rank_method == COMPONENT_RANK_METHOD
+                    else None
+                ),
                 status=str(item.status),
                 error=str(item.error_message or ""),
                 source_session_date=item.source_session_date,
@@ -222,4 +258,7 @@ class MarketPulseSnapshotRepository:
             source=str(records[0].source),
             rows=rank_market_pulse_rows(rows),
             failures=failures,
+            component_rank_method=str(
+                records[0].component_rank_method or ""
+            ),
         )

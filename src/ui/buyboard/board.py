@@ -1014,6 +1014,11 @@ def _show_orb_combinations(main_window, card: TradeCardState) -> None:
 
 
 def _open_card_in_tradingview(main_window, symbol: str) -> None:
+    select_unfiltered_symbol = getattr(
+        main_window, "_select_sidebar_universe_symbol", None
+    )
+    if callable(select_unfiltered_symbol):
+        select_unfiltered_symbol(symbol)
     set_tradingview_symbol = getattr(main_window, "_set_tradingview_symbol", None)
     if callable(set_tradingview_symbol):
         set_tradingview_symbol(symbol)

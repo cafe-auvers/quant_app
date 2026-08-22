@@ -1,5 +1,6 @@
 import datetime as dt
 import os
+from dataclasses import replace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -98,6 +99,36 @@ def test_table_model_formats_percentage_once_and_keeps_missing_last():
     assert model.rows[-1].ticker == "BBB"
     model.sort(3, Qt.AscendingOrder)
     assert {row.ticker: row.rank for row in model.rows} == {"AAA": 1, "BBB": 2}
+
+
+def test_component_columns_open_the_in_app_tradingview_chart():
+    global _APP
+    _APP = QApplication.instance() or QApplication([])
+    component_row = _row(SECTORS, "GDX", 0.02)
+    component_row = replace(component_row, stock1="AEM", stock2="NEM")
+    model = MarketPulseTableModel([component_row])
+    host = _Host(_Service(_snapshot()))
+    host.tradingview_widget = QWidget()
+    host.tabs.addTab(host.tradingview_widget, "TradingView")
+    state = {"sidebar_symbol": "OLD", "chart_symbol": "OLD"}
+    loaded = []
+    host._select_sidebar_universe_symbol = lambda symbol: state.update(
+        sidebar_symbol=symbol
+    )
+    host._set_tradingview_symbol = lambda symbol: state.update(chart_symbol=symbol)
+    # MainWindow.on_tab_changed reapplies the sidebar selection when the
+    # TradingView tab becomes active. This reproduced the old-symbol overwrite.
+    host.tabs.currentChanged.connect(
+        lambda _index: host._set_tradingview_symbol(state["sidebar_symbol"])
+    )
+    host.load_tradingview_chart = lambda **kwargs: loaded.append(kwargs)
+
+    host._open_market_pulse_component_chart(model.index(0, 9))
+
+    assert state == {"sidebar_symbol": "AEM", "chart_symbol": "AEM"}
+    assert host.tabs.currentWidget() is host.tradingview_widget
+    assert loaded == [{"force": True}]
+    host.close()
 
 
 def test_market_pulse_page_loads_cache_and_renders_all_sections():

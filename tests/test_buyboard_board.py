@@ -153,6 +153,33 @@ def test_buy_today_projection_refreshes_active_buy_today_sidebar():
     assert window._buyboard_current_projections == (card,)
 
 
+def test_open_card_chart_switches_sidebar_to_unfiltered_universe():
+    calls = []
+
+    class _Tabs:
+        def setCurrentWidget(self, widget):
+            calls.append(("tab", widget))
+
+    window = SimpleNamespace(
+        _select_sidebar_universe_symbol=lambda symbol: calls.append(
+            ("universe", symbol)
+        ),
+        _set_tradingview_symbol=lambda symbol: calls.append(("symbol", symbol)),
+        tabs=_Tabs(),
+        tradingview_widget="tradingview",
+        load_tradingview_chart=lambda **kwargs: calls.append(("load", kwargs)),
+    )
+
+    board_module._open_card_in_tradingview(window, "WEX")
+
+    assert calls == [
+        ("universe", "WEX"),
+        ("symbol", "WEX"),
+        ("tab", "tradingview"),
+        ("load", {"force": True}),
+    ]
+
+
 def test_standalone_broker_warning_remains_visible_when_watchlist_is_hidden():
     rendered = {status: [] for status in BOARD_COLUMN_ORDER}
 

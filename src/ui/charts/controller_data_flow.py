@@ -139,6 +139,11 @@ class ChartsDataFlowMixin:
                 if hasattr(self, "tradingview_show_stock_profile_checkbox")
                 else True
             ),
+            "stock_profile_watermark_opacity": (
+                self.tradingview_stock_profile_opacity_slider.value() / 100.0
+                if hasattr(self, "tradingview_stock_profile_opacity_slider")
+                else 0.70
+            ),
             "earnings_horizon_days": 14,
             "window_days": self._get_tradingview_window_days(),
         }
@@ -259,6 +264,9 @@ class ChartsDataFlowMixin:
             "show_earnings_line": bool(base_options.get("show_earnings_line", True)),
             "show_stock_profile_watermark": bool(
                 base_options.get("show_stock_profile_watermark", True)
+            ),
+            "stock_profile_watermark_opacity": float(
+                base_options.get("stock_profile_watermark_opacity", 0.70)
             ),
             "earnings_horizon_days": int(
                 base_options.get("earnings_horizon_days", 14) or 14

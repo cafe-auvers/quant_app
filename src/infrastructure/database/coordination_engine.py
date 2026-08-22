@@ -11,8 +11,8 @@ import logging
 from pathlib import Path
 from typing import Dict, Optional
 
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine import URL, Engine
+from sqlalchemy import create_engine, event, text
+from sqlalchemy.engine import URL, Connection, Engine
 from sqlalchemy.exc import SQLAlchemyError
 
 from src.infrastructure.database.engine import (
@@ -22,6 +22,9 @@ from src.infrastructure.database.engine import (
 from src.utils.config import get_env_value, resolve_repo_path
 
 logger = logging.getLogger(__name__)
+
+
+_READ_ENGINE_ATTRIBUTE = "_quant_coordination_read_engine"
 
 
 def get_coordination_database_config() -> Dict[str, object]:
@@ -104,6 +107,32 @@ def _coordination_connect_args(config: Dict[str, object]) -> Dict[str, object]:
     return args
 
 
+def coordination_autocommit_connection(engine: Engine) -> Connection:
+    """Return a one-statement, rollback-free coordination connection.
+
+    The production coordination engine owns a separate autocommit reader
+    pool.  Keeping that pool separate matters: changing isolation level on a
+    transactional pool checkout sends two additional ``SET autocommit``
+    requests.  The reader also omits ``pool_pre_ping`` because recycling at
+    240 seconds is already below TiDB Cloud's public-endpoint idle timeout.
+    Consequently a routine read emits the SELECT itself -- no ping, COMMIT,
+    ROLLBACK, or isolation-toggle request.  Non-coordination engines retain
+    their normal connection behavior for unit tests and local stores.
+    """
+
+    read_engine = getattr(engine, _READ_ENGINE_ATTRIBUTE, None)
+    if read_engine is not None:
+        return read_engine.connect()
+    return engine.connect().execution_options(isolation_level="AUTOCOMMIT")
+
+
+def coordination_read_connection(engine: Engine) -> Connection:
+    """Return the low-request autocommit connection for a read operation."""
+
+    read_engine = getattr(engine, _READ_ENGINE_ATTRIBUTE, None)
+    return (read_engine or engine).connect()
+
+
 def init_coordination_engine(
     *, ensure_schema: bool = True, raise_on_error: bool = False
 ) -> Optional[Engine]:
@@ -114,8 +143,10 @@ def init_coordination_engine(
     engine: Optional[Engine] = None
     try:
         config = get_coordination_database_config()
+        connection_url = get_coordination_connection_url()
+        connect_args = _coordination_connect_args(config)
         engine = create_engine(
-            get_coordination_connection_url(),
+            connection_url,
             future=True,
             pool_pre_ping=True,
             # AWS public load balancers can close an idle connection after
@@ -124,9 +155,33 @@ def init_coordination_engine(
             pool_size=3,
             max_overflow=1,
             pool_timeout=3,
-            connect_args=_coordination_connect_args(config),
+            connect_args=connect_args,
         )
-        with engine.connect() as conn:
+        # SQLAlchemy 2.0.43 added ``skip_autocommit_rollback`` specifically
+        # for this case.  Without it, closing a read-only AUTOCOMMIT
+        # connection still called DBAPI.rollback(), which TiDB billed as a
+        # standalone request.  A dedicated pool avoids per-checkout
+        # isolation toggles and makes every ordinary read exactly one SQL
+        # request.
+        read_engine = create_engine(
+            connection_url,
+            future=True,
+            isolation_level="AUTOCOMMIT",
+            skip_autocommit_rollback=True,
+            pool_pre_ping=False,
+            pool_recycle=240,
+            pool_size=2,
+            max_overflow=0,
+            pool_timeout=3,
+            connect_args=connect_args,
+        )
+        setattr(engine, _READ_ENGINE_ATTRIBUTE, read_engine)
+        event.listen(
+            engine,
+            "engine_disposed",
+            lambda _engine: read_engine.dispose(),
+        )
+        with coordination_read_connection(engine) as conn:
             conn.execute(text("SELECT 1"))
         if ensure_schema:
             from src.services.coordination_schema import ensure_coordination_schema
