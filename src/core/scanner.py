@@ -1,5 +1,6 @@
 """Stock scanner with rule-based filtering."""
-from typing import List, Dict, Callable
+import math
+from typing import Callable, Dict, List, Tuple
 from dataclasses import dataclass
 from enum import Enum
 
@@ -77,13 +78,37 @@ class StockScanner:
         Returns:
             Filtered list of stocks that pass all rules
         """
-        results = []
-        
-        for stock in stocks:
-            if all(rule.evaluate(stock) for rule in self.rules):
-                results.append(stock)
-        
+        results, _ = self.scan_with_funnel(stocks)
         return results
+
+    def scan_with_funnel(self, stocks: List[Dict]) -> Tuple[List[Dict], List[int]]:
+        """Apply rules in order and report the remaining count after each rule."""
+        remaining = list(stocks)
+        remaining_counts = []
+
+        for rule in self.rules:
+            remaining = [stock for stock in remaining if rule.evaluate(stock)]
+            remaining_counts.append(len(remaining))
+
+        return remaining, remaining_counts
+
+    @staticmethod
+    def score_results(
+        stocks: List[Dict], scorers: List[Callable[[Dict], float]]
+    ) -> List[Dict]:
+        """Score already-filtered stocks and sort them by score descending."""
+        for stock in stocks:
+            scores = []
+            for scorer in scorers:
+                try:
+                    score = float(scorer(stock))
+                except (ArithmeticError, TypeError, ValueError):
+                    score = 0.0
+                scores.append(score if math.isfinite(score) else 0.0)
+            stock["score"] = sum(scores) / len(scores) if scores else 0.0
+
+        stocks.sort(key=lambda stock: stock["score"], reverse=True)
+        return stocks
     
     def scan_with_scoring(self, stocks: List[Dict], 
                          scorers: List[Callable[[Dict], float]]) -> List[Dict]:
@@ -97,17 +122,7 @@ class StockScanner:
         Returns:
             Filtered and scored stocks, sorted by score descending
         """
-        results = self.scan(stocks)
-        
-        # Add scores
-        for stock in results:
-            scores = [scorer(stock) for scorer in scorers]
-            stock['score'] = sum(scores) / len(scores) if scores else 0.0
-        
-        # Sort by score descending
-        results.sort(key=lambda x: x['score'], reverse=True)
-        
-        return results
+        return self.score_results(self.scan(stocks), scorers)
 
     def set_threshold_rules(self,
                             min_price_history_days: float = 1,

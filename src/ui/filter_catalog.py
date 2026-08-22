@@ -1,7 +1,10 @@
 """Static UI catalogs and default options for the dashboard."""
 
+from src.risk.orb_position import DEFAULT_ORB_SETTINGS
+
 DEFAULT_SETTINGS = {
     "orb_buffer_percent": 0.10,
+    "orb_settings": DEFAULT_ORB_SETTINGS.to_dict(),
     "shortcuts": {
         "set_target": "T",
         "draw_line": "D",
@@ -102,7 +105,6 @@ DEFAULT_TAB_OPTIONS = {
     "dashboard": True,
     "scanner": True,
     "buyboard": True,
-    "charts": False,
     "tradingview": True,
     "health": True,
     "trade_plan": True,
@@ -137,7 +139,7 @@ FILTER_CATALOG = [
     ("Trend", "trend_intensity", "trend_intensity", "Scaled score based on how strongly price is above 50EMA.", "Minimum: >= 80; strict: >= 90"),
     ("Trend", "trend_score", "trend_score", "Improved trend score after penalizing overextension.", "Minimum: >= 70; strict: >= 75—80"),
     ("Volume quality", "relative_volume", "relative_volume", "Latest volume divided by 20-day average volume.", "Candidate: >= 1.2; breakout confirmation: >= 1.5"),
-    ("Volume quality", "volume_expansion", "volume_expansion", "Boolean flag for strong volume above average.", "True if volume >= 1.5 Ã— avg_volume_20d"),
+    ("Volume quality", "volume_expansion", "volume_expansion", "Latest daily volume divided by the prior day's volume.", "Expansion: >= 1.5; contraction: < 1.0"),
     ("Volume quality", "volume_dryup_ratio", "volume_dryup_ratio", "5-day average volume divided by 20-day average volume. Finds quiet consolidation.", "Good base: < 0.8; very tight: < 0.6"),
     ("Breakout / consolidation", "high_20d", "high_20d", "Highest high over 20 trading days.", "Reference pivot"),
     ("Breakout / consolidation", "high_50d", "high_50d", "Highest high over 50 trading days.", "Reference pivot"),

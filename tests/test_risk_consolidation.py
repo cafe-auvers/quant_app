@@ -1,9 +1,13 @@
 from src.core.execution_queue import calculate_position_values
 from src.core.position_sizer import PositionSizer as LegacyPositionSizer
 from src.risk.orb_position import (
+    OrbSettings,
     calculate_orb_position_values,
+    configure_orb_settings,
+    get_orb_settings,
     is_orb_position_plan_valid,
     score_orb_position_recommendation,
+    validate_orb_position_values,
 )
 from src.risk.position_sizer import PositionSizer
 from src.ui.main_window import MainWindow
@@ -66,3 +70,41 @@ def test_shared_orb_sizing_fails_closed_for_unsafe_inputs():
         100.0,
         8.0,
     )["shares"] == 0.0
+
+
+def test_custom_orb_settings_control_bounds_warnings_and_scoring():
+    original = get_orb_settings()
+    custom = OrbSettings(
+        capital_min_percent=20.0,
+        capital_ideal_percent=25.0,
+        capital_max_percent=40.0,
+        stop_adr_min_percent=30.0,
+        stop_adr_ideal_percent=45.0,
+        stop_adr_max_percent=60.0,
+    )
+    try:
+        configure_orb_settings(custom)
+        below_capital = {
+            "shares": 1.0,
+            "capital_percent": 19.0,
+            "stop_loss_percent": 1.0,
+            "sl_adr": 45.0,
+        }
+        ideal = {
+            "shares": 1.0,
+            "capital_percent": 25.0,
+            "stop_loss_percent": 1.0,
+            "sl_adr": 45.0,
+        }
+        old_ideal = {**ideal, "capital_percent": 17.5, "sl_adr": 65.0}
+
+        assert is_orb_position_plan_valid(below_capital, 10.0) is False
+        assert "below 20%" in validate_orb_position_values(
+            below_capital, 10.0
+        )[0]
+        assert is_orb_position_plan_valid(ideal, 10.0) is True
+        assert score_orb_position_recommendation(
+            ideal, 0.01
+        ) > score_orb_position_recommendation(old_ideal, 0.01)
+    finally:
+        configure_orb_settings(original)

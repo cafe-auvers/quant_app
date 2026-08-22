@@ -7,7 +7,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import Boolean, MetaData, Table, delete, func, select
+from sqlalchemy import (Boolean, Float, Integer, MetaData, Numeric, String,
+                        Table, and_, case, cast, delete, false, func, select)
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -16,7 +17,8 @@ from src.utils.market_calendar import expected_latest_market_data_date
 from ..formatting import _format_elapsed, _format_eta
 from ..schema import (_ensure_scanner_metric_snapshots_table,
                       _ensure_scanner_metrics_table,
-                      _get_scanner_metrics_table)
+                      _get_scanner_metrics_table,
+                      _get_stock_profiles_table)
 from ..settings import (REFERENCE_SYMBOL, SCANNER_METRIC_WRITE_CHUNK_SIZE,
                         SCANNER_METRICS_CACHE_VERSION,
                         SCANNER_QUERY_SYMBOL_CHUNK_SIZE)
@@ -357,6 +359,184 @@ def load_scanner_metrics_from_db(tickers: List[str], engine: Engine, date: Optio
             return results
     except SQLAlchemyError:
         return []
+
+
+def _scanner_rule_expression(
+    table: Table, rule: dict, column_overrides: Optional[dict] = None
+):
+    """Build one parameterized scanner predicate from a validated table column."""
+    attribute = str(rule.get("attribute") or "").strip()
+    overrides = column_overrides or {}
+    if attribute in overrides:
+        column = overrides[attribute]
+    elif attribute in table.columns:
+        column = table.c[attribute]
+    else:
+        return false()
+
+    raw_threshold = rule.get("threshold", "")
+    if isinstance(column.type, Boolean):
+        if isinstance(raw_threshold, bool):
+            threshold = raw_threshold
+        else:
+            value = str(raw_threshold).strip().lower()
+            if value in ("true", "yes", "1"):
+                threshold = True
+            elif value in ("false", "no", "0"):
+                threshold = False
+            else:
+                return false()
+    elif isinstance(column.type, (Float, Integer, Numeric)):
+        try:
+            threshold = float(raw_threshold)
+        except (TypeError, ValueError):
+            return false()
+    elif isinstance(column.type, String):
+        threshold = str(raw_threshold)
+    else:
+        return false()
+
+    operator = str(rule.get("operator") or ">=")
+    comparison_column = column
+    comparison_threshold = threshold
+    if isinstance(column.type, Boolean) and operator in (">", "<", ">=", "<="):
+        comparison_column = cast(column, Integer)
+        comparison_threshold = int(threshold)
+
+    if operator == ">":
+        return comparison_column > comparison_threshold
+    if operator == "<":
+        return comparison_column < comparison_threshold
+    if operator == "==":
+        return comparison_column == comparison_threshold
+    if operator == ">=":
+        return comparison_column >= comparison_threshold
+    if operator == "<=":
+        return comparison_column <= comparison_threshold
+    if operator == "!=":
+        return comparison_column != comparison_threshold
+    return false()
+
+
+def _scanner_rows_to_dicts(table: Table, rows: list) -> List[dict]:
+    results = []
+    for row in rows:
+        row_dict = {}
+        for idx, column in enumerate(table.columns):
+            value = row[idx]
+            if isinstance(column.type, Boolean) and value is not None:
+                value = bool(value)
+            row_dict[column.name] = value
+        results.append(row_dict)
+    return results
+
+
+def query_scanner_metrics_with_funnel(
+    tickers: List[str],
+    engine: Engine,
+    rules: List[dict],
+    date: Optional[dt.datetime] = None,
+) -> Tuple[List[dict], dict]:
+    """Filter the cached snapshot in SQL and count each cumulative rule stage."""
+    symbols, _ = _scanner_metric_and_input_symbols(tickers)
+    if not symbols:
+        return [], {"universe_count": 0, "rule_counts": []}
+
+    snapshot_date = date or scanner_metrics_snapshot_date()
+    metadata = MetaData()
+    table = _get_scanner_metrics_table(metadata)
+    uses_name = any(
+        str(rule.get("attribute") or "").strip() == "name" for rule in rules
+    )
+    profiles_table = _get_stock_profiles_table(metadata) if uses_name else None
+    from_clause = (
+        table.outerjoin(
+            profiles_table, table.c.symbol == profiles_table.c.symbol
+        )
+        if profiles_table is not None
+        else table
+    )
+    column_overrides = (
+        {"name": profiles_table.c.company_name}
+        if profiles_table is not None
+        else {}
+    )
+    rule_expressions = [
+        _scanner_rule_expression(table, rule, column_overrides)
+        for rule in rules
+    ]
+    cumulative_expressions = []
+    cumulative_expression = None
+    for expression in rule_expressions:
+        cumulative_expression = (
+            and_(cumulative_expression, expression)
+            if cumulative_expression is not None
+            else expression
+        )
+        cumulative_expressions.append(cumulative_expression)
+
+    universe_count = 0
+    rule_counts = [0] * len(rule_expressions)
+    rows = []
+    query_chunk_size = (
+        len(symbols)
+        if getattr(engine.dialect, "name", "") == "mysql"
+        else SCANNER_QUERY_SYMBOL_CHUNK_SIZE
+    )
+    try:
+        with engine.connect() as conn:
+            for chunk in _record_chunks(symbols, query_chunk_size):
+                base_conditions = (
+                    table.c.symbol.in_(chunk),
+                    table.c.date == snapshot_date,
+                    table.c.price_history_days >= 1,
+                )
+                aggregate_columns = [func.count().label("universe_count")]
+                aggregate_columns.extend(
+                    func.sum(case((expression, 1), else_=0)).label(
+                        f"rule_count_{index}"
+                    )
+                    for index, expression in enumerate(cumulative_expressions)
+                )
+                aggregate_row = conn.execute(
+                    select(*aggregate_columns).select_from(from_clause).where(
+                        *base_conditions
+                    )
+                ).one()
+                universe_count += int(aggregate_row[0] or 0)
+                for index in range(len(rule_counts)):
+                    rule_counts[index] += int(aggregate_row[index + 1] or 0)
+
+                final_conditions = list(base_conditions)
+                if cumulative_expressions:
+                    final_conditions.append(cumulative_expressions[-1])
+                result_columns = [table]
+                if profiles_table is not None:
+                    result_columns.append(
+                        profiles_table.c.company_name.label("name")
+                    )
+                rows.extend(
+                    conn.execute(
+                        select(*result_columns)
+                        .select_from(from_clause)
+                        .where(*final_conditions)
+                    ).fetchall()
+                )
+    except SQLAlchemyError as exc:
+        driver_error = getattr(exc, "orig", None)
+        detail = f": {driver_error}" if driver_error is not None else ""
+        raise RuntimeError(f"Unable to query scanner metrics{detail}") from exc
+
+    results = _scanner_rows_to_dicts(table, rows)
+    if profiles_table is not None:
+        name_index = len(table.columns)
+        for result, row in zip(results, rows):
+            result["name"] = row[name_index]
+
+    return results, {
+        "universe_count": universe_count,
+        "rule_counts": rule_counts,
+    }
 
 
 def refresh_scanner_metrics_to_db(

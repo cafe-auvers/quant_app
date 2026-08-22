@@ -15,12 +15,10 @@ class _FakeTabs:
 def _base_window(current_widget):
     window = MainWindow.__new__(MainWindow)
     window.dashboard_widget = object()
-    window.charts_widget = object()
     window.intraday_charts_widget = object()
     window.tradingview_widget = object()
     window.tabs = _FakeTabs(current_widget)
     window._dashboard_summary_dirty = False
-    window._charts_tab_chart_stale = False
     window._intraday_tab_chart_stale = False
     window._tradingview_tab_chart_stale = False
     return window
@@ -82,11 +80,8 @@ def test_refresh_other_chart_views_marks_hidden_tabs_stale_without_reloading():
     calls = []
     window = _base_window(current_widget=None)
     window.tabs = _FakeTabs(window.tradingview_widget)
-    window.chart_symbol_input = object()
-    window._get_chart_symbol = lambda: "AAPL"
     window.intraday_symbol_combo = SimpleNamespace(currentText=lambda: "AAPL")
     window.tradingview_symbol_combo = SimpleNamespace(currentText=lambda: "AAPL")
-    window.plot_selected_symbol = lambda **kw: calls.append("charts")
     window.plot_intraday_watchlist_symbol = lambda **kw: calls.append("intraday")
     window.load_tradingview_chart = lambda **kw: calls.append("tradingview")
 
@@ -95,7 +90,6 @@ def test_refresh_other_chart_views_marks_hidden_tabs_stale_without_reloading():
     # Nothing should reload synchronously -- the whole point is to avoid
     # rebuilding chart HTML for tabs the user isn't looking at right now.
     assert calls == []
-    assert window._charts_tab_chart_stale is True
     assert window._intraday_tab_chart_stale is True
     # TradingView tab is the active one, not an "other" tab -> not marked.
     assert window._tradingview_tab_chart_stale is False
@@ -105,44 +99,35 @@ def test_refresh_other_chart_views_ignores_non_matching_symbol():
     calls = []
     window = _base_window(current_widget=None)
     window.tabs = _FakeTabs(window.tradingview_widget)
-    window.chart_symbol_input = object()
-    window._get_chart_symbol = lambda: "MSFT"
     window.intraday_symbol_combo = SimpleNamespace(currentText=lambda: "MSFT")
     window.tradingview_symbol_combo = SimpleNamespace(currentText=lambda: "MSFT")
-    window.plot_selected_symbol = lambda **kw: calls.append("charts")
     window.plot_intraday_watchlist_symbol = lambda **kw: calls.append("intraday")
     window.load_tradingview_chart = lambda **kw: calls.append("tradingview")
 
     window.refresh_other_chart_views_for_symbol("AAPL")
 
     assert calls == []
-    assert window._charts_tab_chart_stale is False
     assert window._intraday_tab_chart_stale is False
 
 
 def test_flush_stale_chart_views_refreshes_only_the_now_active_tab():
     calls = []
     window = _base_window(current_widget=None)
-    window._charts_tab_chart_stale = True
     window._intraday_tab_chart_stale = True
-    window.tabs = _FakeTabs(window.charts_widget)
-    window.plot_selected_symbol = lambda **kw: calls.append("charts")
+    window.tabs = _FakeTabs(window.intraday_charts_widget)
     window.plot_intraday_watchlist_symbol = lambda **kw: calls.append("intraday")
     window.load_tradingview_chart = lambda **kw: calls.append("tradingview")
 
     window.flush_stale_chart_views()
 
-    assert calls == ["charts"]
-    assert window._charts_tab_chart_stale is False
-    # Intraday tab is still stale -- it isn't the tab the user switched to.
-    assert window._intraday_tab_chart_stale is True
+    assert calls == ["intraday"]
+    assert window._intraday_tab_chart_stale is False
 
 
 def test_flush_stale_chart_views_noop_when_nothing_stale():
     calls = []
     window = _base_window(current_widget=None)
-    window.tabs = _FakeTabs(window.charts_widget)
-    window.plot_selected_symbol = lambda **kw: calls.append("charts")
+    window.tabs = _FakeTabs(window.tradingview_widget)
     window.plot_intraday_watchlist_symbol = lambda **kw: calls.append("intraday")
     window.load_tradingview_chart = lambda **kw: calls.append("tradingview")
 

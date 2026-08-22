@@ -43,7 +43,7 @@ class ChartsDrawingMixin:
             and self.tabs.currentWidget() is self.intraday_charts_widget
         ):
             return getattr(self, "intraday_chart_view", None)
-        return getattr(self, "chart_view", None)
+        return None
 
     def _active_chart_command_views(self) -> List[Any]:
         active_view = self._active_chart_view()
@@ -77,7 +77,7 @@ class ChartsDrawingMixin:
                 if hasattr(self, "intraday_symbol_combo")
                 else ""
             )
-        return self._get_chart_symbol() or (self.selected_scan_symbol or "")
+        return ""
 
     def _active_chart_buttons(self) -> dict:
         if (
@@ -98,11 +98,7 @@ class ChartsDrawingMixin:
                 "draw": getattr(self, "intraday_draw_line_button", None),
                 "erase": getattr(self, "intraday_erase_line_button", None),
             }
-        return {
-            "target": getattr(self, "chart_set_target_button", None),
-            "draw": getattr(self, "chart_draw_line_button", None),
-            "erase": getattr(self, "chart_erase_line_button", None),
-        }
+        return {"target": None, "draw": None, "erase": None}
 
     @staticmethod
     def _set_button_state(button, text: str, active: bool = False) -> None:
@@ -117,7 +113,7 @@ class ChartsDrawingMixin:
         t_key = shortcuts.get("set_target", "T")
         d_key = shortcuts.get("draw_line", "D")
         e_key = shortcuts.get("erase_drawing", "E")
-        for prefix in ["chart", "intraday"]:
+        for prefix in ["intraday"]:
             self._set_button_state(
                 self.__dict__.get(f"{prefix}_set_target_button"),
                 f"Set Breakout Price ({t_key})",
@@ -824,45 +820,3 @@ class ChartsDrawingMixin:
                     "window.clearTargetPrice && window.clearTargetPrice();"
                 )
         self.clear_chart_target_price(symbol)
-
-    def _get_chart_options(self) -> dict:
-        return {
-            "show_volume": self.chart_show_volume_checkbox.isChecked(),
-            "show_rs": self.chart_show_rs_checkbox.isChecked(),
-            "show_ema": self.chart_show_ema_checkbox.isChecked(),
-            "show_adr": self.chart_show_adr_checkbox.isChecked(),
-            "show_growth_1m": self.chart_show_growth_1m_checkbox.isChecked(),
-            "show_growth_3m": self.chart_show_growth_3m_checkbox.isChecked(),
-            "show_growth_6m": self.chart_show_growth_6m_checkbox.isChecked(),
-        }
-
-    def _get_chart_navigation_state(self) -> dict:
-        symbol = self._get_chart_symbol() or (self.selected_scan_symbol or "")
-        return self.chart_view_windows.get(symbol.strip().upper(), {}).copy()
-
-    def _get_chart_render_options(self) -> dict:
-        options = self._get_chart_options()
-        navigation = self._get_chart_navigation_state()
-        if "bars" in navigation:
-            options["visible_bars"] = navigation["bars"]
-        if "end" in navigation:
-            options["visible_end"] = navigation["end"]
-        return options
-
-    def _get_chart_render_options_for_timeframe(self, timeframe: str) -> dict:
-        options = self._get_chart_render_options()
-        options["timeframe"] = self._normalize_drawing_timeframe(timeframe)
-        timeframe = timeframe.strip().upper()
-        if timeframe == "1H":
-            options.update(
-                {
-                    "show_rs": False,
-                    "show_adr": False,
-                    "show_growth_1m": False,
-                    "show_growth_3m": False,
-                    "show_growth_6m": False,
-                    "intraday_chart": True,
-                    "max_history_bars": 2000,
-                }
-            )
-        return options

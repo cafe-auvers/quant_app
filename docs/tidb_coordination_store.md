@@ -119,6 +119,10 @@ for the current formula.
   `(status, created_at, command_id)` index. This is the only cloud cadence
   relaxed in response to the second production RU sample; local quote, stop,
   and broker-boundary lease checks are unchanged.
+- Guarded pending-order lookups share one canonical snapshot for two seconds
+  across all heartbeat stages. This removes repeated list-then-fetch reads of
+  the same order while the one-second quote/stop loop keeps running. An
+  `UNKNOWN_SUBMISSION_STATE` retains its one-second reconciliation cadence.
 
 The minimum cadences are hard floors in `execution_config.py`; an accidental
 environment value cannot turn the background loops back into one-second cloud
@@ -137,6 +141,7 @@ polls.
 | Planning/control display sync | 60 seconds per running device |
 | Operator-command pickup outside regular session | 60 seconds |
 | Alert queue check | 30 seconds; successful DB audit every 5 minutes |
+| Stable pending-order snapshot | 2 seconds; unknown submissions stay at 1 second |
 
 ### Supported worst-case calculation
 

@@ -222,15 +222,11 @@ class SidebarMixin:
                 label = f"{symbol}"
                 if price is not None:
                     label += f"  {float(price):.2f}"
-                if stock.get("orb_score"):
-                    label += f"  ORB {float(stock.get('orb_score', 0.0)):.0f}"
                 item = QListWidgetItem(label)
                 item.setData(Qt.UserRole, {
                     "symbol": symbol,
                     "name": stock.get("name", symbol),
                     "price": price,
-                    "orb_score": stock.get("orb_score"),
-                    "orb_plan": stock.get("orb_plan"),
                     "source": "scanner",
                     "setup": setup_name,
                 })
@@ -355,7 +351,7 @@ class SidebarMixin:
 
         symbol = data.get("symbol", "")
         self.selected_scan_symbol = symbol
-        self._set_chart_symbol(symbol)
+        self._set_tradingview_symbol(symbol)
         self.sidebar_selected_label.setText(f"Selected: {symbol}")
         self._update_sidebar_watchlist_actions()
         self.apply_sidebar_selection_to_current_tab()
@@ -406,9 +402,6 @@ class SidebarMixin:
 
         if hasattr(self, "trade_plan_widget") and current_widget is self.trade_plan_widget:
             self._seed_trade_plan_fields(symbol=symbol, price=price, name=name, overwrite=True)
-        elif current_widget is self.charts_widget:
-            self._set_chart_symbol(symbol)
-            self.plot_selected_symbol(show_warnings=False, use_live_fallback=False)
         elif current_widget is self.intraday_charts_widget:
             self._set_intraday_symbol(symbol)
             self.plot_intraday_watchlist_symbol()
@@ -423,23 +416,17 @@ class SidebarMixin:
             self.scanner_selection_label.setText(f"Selected symbol: {symbol}")
             self.update_scanner_preview_chart(symbol)
     def sidebar_show_chart(self, *args) -> None:
-        """Show selected sidebar stock on the TradingView chart tab or Charts tab (if Buylist)."""
+        """Show the selected sidebar stock on the TradingView chart tab."""
         data = self._get_sidebar_selected_data()
         if not data:
             QMessageBox.warning(self, "No selection", "Select a stock from the sidebar first.")
             return
 
         symbol = data.get("symbol", "")
-        self._set_chart_symbol(symbol)
-
-        if data.get("source") == "buylist":
-            self.tabs.setCurrentWidget(self.charts_widget)
-            self.plot_selected_symbol(show_warnings=False, use_live_fallback=False)
-        else:
-            if hasattr(self, "tradingview_symbol_combo"):
-                self._set_tradingview_symbol(symbol)
-            self.tabs.setCurrentWidget(self.tradingview_widget)
-            self.load_tradingview_chart(force=True)
+        if hasattr(self, "tradingview_symbol_combo"):
+            self._set_tradingview_symbol(symbol)
+        self.tabs.setCurrentWidget(self.tradingview_widget)
+        self.load_tradingview_chart(force=True)
 
     def sidebar_add_selected_to_watchlist(self) -> None:
         """Add the selected scan/sidebar symbol to the passive Watchlist."""

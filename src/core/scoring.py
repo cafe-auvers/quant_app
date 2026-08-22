@@ -9,7 +9,7 @@ import requests
 
 from src.utils.config import get_env_value
 from src.risk.position_sizer import PositionSizer
-from src.risk.orb_position import MAX_CAPITAL_PERCENT
+from src.risk.orb_position import get_orb_settings
 
 
 def _finite_float(value: Any) -> Optional[float]:
@@ -260,6 +260,7 @@ def calculate_deterministic_scores(
     
     # 2. Hard reject evaluation
     warnings = []
+    orb_settings = get_orb_settings()
     
     if price < ema_50:
         warnings.append("Price is below 50-day EMA")
@@ -271,10 +272,10 @@ def calculate_deterministic_scores(
         warnings.append(f"Daily dollar volume (${dollar_volume:,.2f}) is below $35,000")
     if stop_loss_percent >= adr_percent:
         warnings.append(f"Stop loss % ({stop_loss_percent:.2f}%) is wider than ADR 20-day ({adr_percent:.2f}%)")
-    if capital_percent >= MAX_CAPITAL_PERCENT:
+    if capital_percent >= orb_settings.capital_max_percent:
         warnings.append(
             f"Capital allocation ({capital_percent:.2f}%) exceeds hard limit of "
-            f"{MAX_CAPITAL_PERCENT:.0f}%"
+            f"{orb_settings.capital_max_percent:g}%"
         )
     if shares < 1:
         warnings.append("Position size calculation resulted in 0 shares")
@@ -323,8 +324,11 @@ def calculate_deterministic_scores(
     if stop_loss_percent < adr_percent:
         risk_score += 45.0
         
-    # Capital allocation close to 17.5%
-    capital_score = max(0.0, 40.0 - abs(capital_percent - 17.5) * 2.0)
+    # Capital allocation proximity uses the same ideal as ORB recommendations.
+    capital_score = max(
+        0.0,
+        40.0 - abs(capital_percent - orb_settings.capital_ideal_percent) * 2.0,
+    )
     risk_score += capital_score
     if shares >= 1:
         risk_score += 15.0

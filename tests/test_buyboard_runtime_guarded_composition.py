@@ -200,6 +200,101 @@ def _submit_guarded_entry(runtime, broker, market_data, card) -> None:
 
 
 @pytest.mark.usefixtures("trading_enabled")
+def test_pending_order_reads_are_coalesced_without_slowing_engine_heartbeat(
+    tmp_path, monkeypatch
+):
+    clock = [100.0]
+    monkeypatch.setattr(buyboard_runtime, "monotonic", lambda: clock[0])
+    runtime, broker, _gateway, engine, market_data = _make_runtime(
+        tmp_path, monkeypatch
+    )
+    card = _persist_owned_card(engine, _card())
+    _submit_guarded_entry(runtime, broker, market_data, card)
+
+    list_calls = []
+    fetch_calls = []
+    real_list = buyboard_runtime.list_execution_orders_for_card
+    real_fetch = buyboard_runtime.fetch_execution_order
+    monkeypatch.setattr(
+        buyboard_runtime,
+        "list_execution_orders_for_card",
+        lambda *args, **kwargs: list_calls.append(True)
+        or real_list(*args, **kwargs),
+    )
+    monkeypatch.setattr(
+        buyboard_runtime,
+        "fetch_execution_order",
+        lambda *args, **kwargs: fetch_calls.append(True)
+        or real_fetch(*args, **kwargs),
+    )
+
+    lookup = runtime.trading_engine._entry_deadline_lookup
+    clock[0] += execution_config.PENDING_ORDER_RECONCILIATION_SECONDS + 0.1
+    first = lookup.find_open_entry_order(card)
+    assert first is not None
+    assert lookup.reconcile_order(first).client_order_id == first.client_order_id
+    second = lookup.find_open_entry_order(card)
+    assert second is not None
+    assert lookup.reconcile_order(second).client_order_id == second.client_order_id
+
+    # Every heartbeat stage shares the same canonical snapshot. The next
+    # database read becomes due only after the two-second pending interval.
+    assert len(list_calls) == 1
+    assert fetch_calls == []
+
+    clock[0] += execution_config.PENDING_ORDER_RECONCILIATION_SECONDS / 2
+    within_interval = lookup.find_open_entry_order(card)
+    assert within_interval is not None
+    lookup.reconcile_order(within_interval)
+    assert len(list_calls) == 1
+
+    clock[0] += execution_config.PENDING_ORDER_RECONCILIATION_SECONDS / 2 + 0.1
+    assert lookup.find_open_entry_order(card) is not None
+    assert len(list_calls) == 2
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_unknown_submission_keeps_one_second_order_read_cadence(
+    tmp_path, monkeypatch
+):
+    clock = [100.0]
+    monkeypatch.setattr(buyboard_runtime, "monotonic", lambda: clock[0])
+    runtime, broker, _gateway, engine, market_data = _make_runtime(
+        tmp_path, monkeypatch
+    )
+    card = _persist_owned_card(engine, _card())
+    broker.queue_timeout()
+    market_data.subscribe([card.symbol])
+    market_data.poll_once()
+    runtime.trading_engine.run_heartbeat([card])
+    assert card.entry_submission_unresolved is True
+
+    list_calls = []
+    real_list = buyboard_runtime.list_execution_orders_for_card
+    monkeypatch.setattr(
+        buyboard_runtime,
+        "list_execution_orders_for_card",
+        lambda *args, **kwargs: list_calls.append(True)
+        or real_list(*args, **kwargs),
+    )
+
+    lookup = runtime.trading_engine._entry_deadline_lookup
+    clock[0] += execution_config.UNKNOWN_ORDER_RECONCILIATION_SECONDS + 0.1
+    first = lookup.find_open_entry_order(card)
+    assert first is not None
+    lookup.reconcile_order(first)
+    assert len(list_calls) == 1
+    clock[0] += execution_config.UNKNOWN_ORDER_RECONCILIATION_SECONDS / 2
+    within_interval = lookup.find_open_entry_order(card)
+    assert within_interval is not None
+    lookup.reconcile_order(within_interval)
+    assert len(list_calls) == 1
+    clock[0] += execution_config.UNKNOWN_ORDER_RECONCILIATION_SECONDS / 2 + 0.1
+    assert lookup.find_open_entry_order(card) is not None
+    assert len(list_calls) == 2
+
+
+@pytest.mark.usefixtures("trading_enabled")
 def test_runtime_pre_broker_abort_retries_with_attempt_two_and_a_fresh_identity(
     tmp_path, monkeypatch
 ):

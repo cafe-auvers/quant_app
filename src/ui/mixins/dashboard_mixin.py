@@ -82,6 +82,21 @@ TRADINGVIEW_REFRESH_INTERVAL_SECONDS = 5 * 60
 KIS_DAILY_CHART_FAILURE_COOLDOWN_SECONDS = 30 * 60
 
 
+def _finite_scanner_metric(stock: dict, *keys: str) -> float:
+    """Return the first finite scanner metric, treating database NULL as zero."""
+    for key in keys:
+        raw_value = stock.get(key)
+        if raw_value is None:
+            continue
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(value):
+            return value
+    return 0.0
+
+
 class DashboardMixin:
     def _build_dashboard_tab(self) -> None:
         """Build content for the dashboard tab."""
@@ -1312,10 +1327,10 @@ class DashboardMixin:
         return previous_nyse_trading_day(day)
 
     def _score_growth_rank(self, stock: dict) -> float:
-        return stock.get("growth_rank", 0.0) / 100.0
+        return _finite_scanner_metric(stock, "growth_rank", "growth_rank_1m") / 100.0
 
     def _score_trend_intensity(self, stock: dict) -> float:
-        return stock.get("trend_intensity", 0.0) / 100.0
+        return _finite_scanner_metric(stock, "trend_intensity") / 100.0
 
     def _score_adr(self, stock: dict) -> float:
-        return stock.get("adr", 0.0) / 5.0
+        return _finite_scanner_metric(stock, "adr", "adr_20") / 5.0

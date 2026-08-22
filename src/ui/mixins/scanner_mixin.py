@@ -3,7 +3,6 @@ from __future__ import annotations
 import datetime as dt
 import html
 import json
-import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
@@ -12,15 +11,13 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 from PyQt5.QtCore import Qt, QThread, QTimer, QUrl
 from PyQt5.QtGui import QColor, QKeySequence
-from PyQt5.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
-                             QDialogButtonBox, QDockWidget, QFormLayout,
-                             QGroupBox, QHBoxLayout, QHeaderView,
+from PyQt5.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QDockWidget,
+                             QFormLayout, QGroupBox, QHBoxLayout,
                              QKeySequenceEdit, QLabel, QLineEdit, QListWidget,
                              QListWidgetItem, QMenu, QMessageBox, QProgressBar,
                              QPushButton, QScrollArea, QShortcut, QSizePolicy,
-                             QSlider, QSpinBox, QSplitter, QTableWidget,
-                             QTableWidgetItem, QTabWidget, QTextBrowser,
-                             QTextEdit, QVBoxLayout, QWidget)
+                             QSlider, QSpinBox, QSplitter, QTabWidget,
+                             QTextBrowser, QTextEdit, QVBoxLayout, QWidget)
 
 try:
     from PyQt5.QtWebEngineWidgets import QWebEngineView
@@ -34,14 +31,11 @@ except ImportError:
 from src.api.kis_account_snapshot_dual import (KisEnvironment,
                                                discover_account_profiles,
                                                load_config)
-from src.core.orb import (calculate_orb_range, evaluate_orb_entry_signal,
-                          resample_intraday_bars)
 from src.core.order_state import (OPEN_ORDER_STATUSES, BrokerOrder,
                                   OrderIntent, OrderSide, OrderStatus)
 from src.core.scanner import ComparisonOperator, ScanRule, StockScanner
 from src.core.watchlist import (BuylistItem, BuylistManager, TradePlan,
                                 TradePlanManager, Watchlist)
-from src.risk.position_sizer import PositionSizer
 from src.services.app_state import (SCANNER_SETUPS_FILE, SETTINGS_FILE,
                                     load_buylist_state,
                                     load_chart_drawings_state,
@@ -65,8 +59,7 @@ from src.ui.dialogs import AddFilterDialog, SettingsDialog
 from src.ui.filter_catalog import (DEFAULT_SCANNER_SETUPS, DEFAULT_SETTINGS,
                                    DEFAULT_TAB_OPTIONS, FILTER_CATALOG,
                                    SCANNER_METRICS_LABELS)
-from src.ui.workers import (FxRateWorker, IntradayBulkFetchWorker,
-                            IntradayFetchWorker, KisAccountWorker,
+from src.ui.workers import (FxRateWorker, IntradayFetchWorker, KisAccountWorker,
                             KisOrderWorker, KisStartupAccountsWorker,
                             OrderReconciliationWorker, ScannerWorker)
 from src.utils.data_loader import (_extract_symbol_history,
@@ -119,6 +112,8 @@ class ScannerMixin:
 
         # Rules Panel (Non-scrollable, fits naturally)
         self.active_rule_widgets = []
+        self.active_rule_count_labels = []
+        self._loading_scanner_rules = False
 
         from PyQt5.QtWidgets import QFrame
 
@@ -142,12 +137,24 @@ class ScannerMixin:
         self.rules_scroll_layout.addStretch()
         self.rules_container.setLayout(self.rules_scroll_layout)
 
-        # Header label on top
+        # Header row: universe count followed by the active filter title.
+        rules_header_layout = QHBoxLayout()
+        self.scanner_universe_count_label = QLabel("Universe: —")
+        self.scanner_universe_count_label.setObjectName("scannerUniverseCount")
+        self.scanner_universe_count_label.setMinimumWidth(110)
+        self.scanner_universe_count_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.scanner_universe_count_label.setStyleSheet(
+            "font-weight: bold; color: #2962ff; font-size: 13px; "
+            "margin-top: 8px; margin-bottom: 4px;"
+        )
         active_rules_label = QLabel("Active Filter Rules")
         active_rules_label.setStyleSheet(
             "font-weight: bold; color: #131722; font-size: 14px; margin-top: 8px; margin-bottom: 4px;"
         )
-        form_layout.addRow(active_rules_label)
+        rules_header_layout.addWidget(self.scanner_universe_count_label)
+        rules_header_layout.addWidget(active_rules_label)
+        rules_header_layout.addStretch()
+        form_layout.addRow(rules_header_layout)
         form_layout.addRow(self.rules_container)
 
         self.add_rule_button = QPushButton("＋ Add Filter Rule")
@@ -155,11 +162,18 @@ class ScannerMixin:
         self.add_rule_button.clicked.connect(self.show_add_rule_menu)
         form_layout.addRow(self.add_rule_button)
 
-        self.populate_scanner_setup_combo()
+        self._scanner_live_refresh_timer = QTimer(self.scanner_widget)
+        self._scanner_live_refresh_timer.setSingleShot(True)
+        self._scanner_live_refresh_timer.setInterval(300)
+        self._scanner_live_refresh_timer.timeout.connect(
+            self._run_live_scanner_refresh
+        )
+        self._scanner_live_refresh_pending = False
+        self._scanner_run_is_live = False
 
-        self.scanner_orb_score_checkbox = QCheckBox("Score by ORB recommendation")
-        self.scanner_orb_score_checkbox.setChecked(True)
-        form_layout.addRow(self.scanner_orb_score_checkbox)
+        self._scanner_live_refresh_enabled = False
+        self.populate_scanner_setup_combo()
+        self._scanner_live_refresh_enabled = True
 
         run_button = QPushButton("Run Scanner")
         run_button.setObjectName("runScannerButton")
@@ -184,34 +198,7 @@ class ScannerMixin:
         form_layout.addRow("Metrics Details", self.scanner_metrics_details)
 
         form_group.setLayout(form_layout)
-        layout.addWidget(form_group, 1)
-
-        table_layout = QVBoxLayout()
-        self.scanner_table = QTableWidget(0, 9)
-        self.scanner_table.setHorizontalHeaderLabels(
-            [
-                "Symbol",
-                "Name",
-                "Price",
-                "Volume",
-                "Dollar Vol",
-                "ADR",
-                "Growth Rank",
-                "Trend Intensity",
-                "ORB Score",
-            ]
-        )
-        self.scanner_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.scanner_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.scanner_table.cellClicked.connect(self.on_scanner_row_selected)
-        self.scanner_table.cellDoubleClicked.connect(
-            self.load_scanner_item_to_trade_plan
-        )
-        self.scanner_table.itemSelectionChanged.connect(
-            self.on_scanner_selection_changed
-        )
-        table_layout.addWidget(self.scanner_table)
-        layout.addLayout(table_layout, 3)
+        layout.addWidget(form_group)
 
         self.scanner_widget.setLayout(layout)
 
@@ -266,6 +253,12 @@ class ScannerMixin:
         attr_label = QLabel(label_text)
         attr_label.setObjectName("attrLabel")
 
+        count_label = QLabel("—")
+        count_label.setObjectName("funnelCountLabel")
+        count_label.setMinimumWidth(70)
+        count_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        count_label.setToolTip("Symbols remaining after this filter")
+
         op_combo = QComboBox()
         op_combo.setObjectName("opCombo")
         op_combo.addItems([">=", "<=", ">", "<", "==", "!="])
@@ -279,6 +272,7 @@ class ScannerMixin:
         del_btn.setToolTip("Delete this rule")
         del_btn.setObjectName("delBtn")
 
+        row_layout.addWidget(count_label, 0)
         row_layout.addWidget(attr_label, 3)
         row_layout.addWidget(op_combo, 1)
         row_layout.addWidget(val_input, 2)
@@ -301,6 +295,14 @@ class ScannerMixin:
                 font-size: 12px;
                 font-weight: bold;
                 padding: 1px 4px;
+            }
+            QLabel#funnelCountLabel {
+                border: none;
+                background-color: transparent;
+                color: #2962ff;
+                font-size: 12px;
+                font-weight: bold;
+                padding: 1px 6px 1px 0;
             }
             QComboBox {
                 border: none;
@@ -348,15 +350,23 @@ class ScannerMixin:
 
         entry = (attribute, op_combo, val_input, del_btn, row_widget)
         self.active_rule_widgets.append(entry)
+        self.active_rule_count_labels.append(count_label)
 
         del_btn.clicked.connect(lambda: self.remove_scanner_rule_row(entry))
+        op_combo.currentTextChanged.connect(self._invalidate_current_scanner_funnel)
+        val_input.textChanged.connect(self._invalidate_current_scanner_funnel)
+        self._invalidate_current_scanner_funnel()
 
     def remove_scanner_rule_row(self, entry: tuple) -> None:
         """Remove a rule row from the rules layout."""
         attr_key, op_combo, val_input, del_btn, row_widget = entry
+        index = self.active_rule_widgets.index(entry) if entry in self.active_rule_widgets else -1
         row_widget.deleteLater()
         if entry in self.active_rule_widgets:
             self.active_rule_widgets.remove(entry)
+        if index >= 0 and index < len(self.active_rule_count_labels):
+            self.active_rule_count_labels.pop(index)
+        self._invalidate_current_scanner_funnel()
 
     def clear_scanner_rules(self) -> None:
         """Clear all scanner rules from the UI."""
@@ -365,13 +375,17 @@ class ScannerMixin:
 
     def load_scanner_rules(self, rules: list) -> None:
         """Load list of rules into the UI scroll area."""
-        self.clear_scanner_rules()
-        for rule in rules:
-            self.add_scanner_rule_row(
-                attribute=rule.get("attribute", "volume"),
-                operator=rule.get("operator", ">="),
-                threshold=rule.get("threshold", ""),
-            )
+        self._loading_scanner_rules = True
+        try:
+            self.clear_scanner_rules()
+            for rule in rules:
+                self.add_scanner_rule_row(
+                    attribute=rule.get("attribute", "volume"),
+                    operator=rule.get("operator", ">="),
+                    threshold=rule.get("threshold", ""),
+                )
+        finally:
+            self._loading_scanner_rules = False
 
     def get_current_scanner_rules_from_ui(self) -> list:
         """Extract rule dicts from active UI widgets."""
@@ -393,6 +407,104 @@ class ScannerMixin:
                     val = "True"
                 rules.append({"attribute": attr_key, "operator": op, "threshold": val})
         return rules
+
+    def _invalidate_current_scanner_funnel(self, *_args) -> None:
+        """Clear stale funnel values when the visible rule set changes."""
+        if getattr(self, "_loading_scanner_rules", False):
+            return
+        setup_name = (
+            self.scanner_setup_combo.currentText()
+            if hasattr(self, "scanner_setup_combo")
+            else ""
+        )
+        if setup_name:
+            self.__dict__.setdefault("scanner_funnel_counts_by_setup", {}).pop(
+                setup_name, None
+            )
+        self._display_scanner_funnel()
+        self._schedule_live_scanner_refresh()
+
+    def _schedule_live_scanner_refresh(self) -> None:
+        """Debounce live database filtering while the user edits a rule."""
+        timer = self.__dict__.get("_scanner_live_refresh_timer")
+        if (
+            timer is not None
+            and getattr(self, "_scanner_live_refresh_enabled", False)
+            and not getattr(self, "_loading_scanner_rules", False)
+        ):
+            timer.start()
+
+    def _run_live_scanner_refresh(self) -> None:
+        """Run the visible rules against the cached snapshot without dialogs."""
+        if self._scanner_is_running():
+            self._scanner_live_refresh_pending = True
+            return
+        if (
+            getattr(self, "db_initializing", False)
+            or not getattr(self, "db_enabled", False)
+            or getattr(self, "db_engine", None) is None
+        ):
+            return
+
+        self._scanner_live_refresh_pending = False
+        self._scanner_run_is_live = True
+        self.running_scanner_setup_name = self.scanner_setup_combo.currentText()
+        self.running_scanner_show_warnings = False
+        self._start_scanner_worker()
+
+    def _start_pending_live_scanner_refresh(self) -> None:
+        """Run the latest edit after an older scanner query leaves the worker."""
+        if not getattr(self, "_scanner_live_refresh_pending", False):
+            return
+        self._scanner_live_refresh_pending = False
+        timer = self.__dict__.get("_scanner_live_refresh_timer")
+        if timer is not None:
+            timer.start(150)
+
+    def _display_scanner_funnel(self, setup_name: Optional[str] = None) -> None:
+        """Show the universe and sequential remaining counts beside the rules."""
+        if not hasattr(self, "scanner_universe_count_label"):
+            return
+        if setup_name is None and hasattr(self, "scanner_setup_combo"):
+            setup_name = self.scanner_setup_combo.currentText()
+
+        funnel = self.__dict__.get("scanner_funnel_counts_by_setup", {}).get(
+            setup_name or "", {}
+        )
+        setup_combo = getattr(self, "scanner_setup_combo", None)
+        if (
+            funnel.get("rules") is not None
+            and setup_combo is not None
+            and setup_name == setup_combo.currentText()
+            and self._scanner_rule_signature(funnel.get("rules") or [])
+            != self._scanner_rule_signature(self.get_current_scanner_rules_from_ui())
+        ):
+            funnel = {}
+        universe_count = funnel.get("universe_count")
+        rule_counts = list(funnel.get("rule_counts") or [])
+        if universe_count is None:
+            self.scanner_universe_count_label.setText("Universe: —")
+        else:
+            self.scanner_universe_count_label.setText(
+                f"Universe: {int(universe_count):,}"
+            )
+
+        previous_count = universe_count
+        for index, label in enumerate(self.active_rule_count_labels):
+            if index >= len(rule_counts):
+                label.setText("—")
+                label.setToolTip("Symbols remaining after this filter")
+                continue
+            count = int(rule_counts[index])
+            label.setText(f"{count:,}")
+            if previous_count is None:
+                label.setToolTip(f"{count:,} symbols remain")
+            else:
+                removed = max(0, int(previous_count) - count)
+                label.setToolTip(
+                    f"{count:,} remain; {removed:,} filtered out by this rule"
+                )
+            previous_count = count
 
     def update_scanner_metrics_details(self, symbol: str) -> None:
         """Populate the metrics details browser with formatted values for a symbol."""
@@ -496,17 +608,18 @@ class ScannerMixin:
             ]
         self.load_scanner_rules(rules)
 
-        if hasattr(self, "scanner_table"):
-            self.scanner_results = list(
-                self.scanner_results_by_setup.get(setup_name, [])
-            )
-            self.scanner_dataframe = pd.DataFrame(self.scanner_results)
-            self.populate_scanner_table()
+        self.scanner_results = list(
+            self.scanner_results_by_setup.get(setup_name, [])
+        )
+        self.scanner_dataframe = pd.DataFrame(self.scanner_results)
+        self.populate_scanner_table()
+        self._display_scanner_funnel(setup_name)
 
         if hasattr(self, "scanner_metrics_details"):
             self.scanner_metrics_details.setHtml(
                 "<i>Select a symbol to view detailed computed metrics.</i>"
             )
+        self._schedule_live_scanner_refresh()
 
     def get_current_scanner_setup_values(self) -> dict:
         """Read scanner setup values from filter inputs."""
@@ -546,6 +659,68 @@ class ScannerMixin:
             "min_trend_intensity": min_trend_intensity,
             "rules": rules,
         }
+
+    @staticmethod
+    def _rules_for_scanner_setup(setup: dict) -> list:
+        """Return explicit rules, including legacy threshold-only setups."""
+        rules = list(setup.get("rules") or [])
+        if rules:
+            return rules
+        return [
+            {
+                "attribute": "volume",
+                "operator": ">=",
+                "threshold": setup.get("min_volume", 40000.0),
+            },
+            {
+                "attribute": "dollar_volume",
+                "operator": ">=",
+                "threshold": setup.get("min_dollar_volume", 35000.0),
+            },
+            {
+                "attribute": "adr_20",
+                "operator": ">=",
+                "threshold": setup.get("min_adr", 2.4),
+            },
+            {
+                "attribute": "growth_rank_1m",
+                "operator": ">=",
+                "threshold": setup.get("min_growth_rank", 97.04),
+            },
+            {
+                "attribute": "trend_intensity",
+                "operator": ">=",
+                "threshold": setup.get("min_trend_intensity", 90.0),
+            },
+        ]
+
+    @staticmethod
+    def _scanner_rule_signature(rules: list) -> tuple:
+        """Normalize rule values so UI strings and persisted numbers compare equally."""
+        signature = []
+        for rule in rules or []:
+            threshold = rule.get("threshold", "")
+            if isinstance(threshold, bool):
+                threshold_text = "true" if threshold else "false"
+            else:
+                raw_text = str(threshold).strip()
+                if raw_text.lower() in ("true", "yes"):
+                    threshold_text = "true"
+                elif raw_text.lower() in ("false", "no"):
+                    threshold_text = "false"
+                else:
+                    try:
+                        threshold_text = f"{float(raw_text):.15g}"
+                    except (TypeError, ValueError):
+                        threshold_text = raw_text
+            signature.append(
+                (
+                    str(rule.get("attribute") or ""),
+                    str(rule.get("operator") or ">="),
+                    threshold_text,
+                )
+            )
+        return tuple(signature)
 
     def save_current_scanner_setup(self) -> None:
         """Save or update the scanner setup from current filter values."""
@@ -591,12 +766,6 @@ class ScannerMixin:
             and self.scanner_worker.isRunning()
         )
 
-    def _scanner_orb_scoring_enabled(self) -> bool:
-        return bool(
-            hasattr(self, "scanner_orb_score_checkbox")
-            and self.scanner_orb_score_checkbox.isChecked()
-        )
-
     def _prepare_scanner_run(self, show_warnings: bool = True) -> bool:
         """Validate that a database scanner run can start."""
         if self._scanner_is_running():
@@ -629,6 +798,22 @@ class ScannerMixin:
         self.progress_label.setText("Scanning market-data cache...")
         self.progress_bar.setValue(0)
 
+        setup_name = self.running_scanner_setup_name
+        if setup_name == "__ALL__":
+            scanner_rules_by_setup = {
+                name: self._rules_for_scanner_setup(setup)
+                for name, setup in self.scanner_setups.items()
+            }
+        else:
+            active_name = setup_name or self.scanner_setup_combo.currentText()
+            if active_name == self.scanner_setup_combo.currentText():
+                active_setup = self.get_current_scanner_setup_values()
+            else:
+                active_setup = self.scanner_setups.get(active_name, {})
+            scanner_rules_by_setup = {
+                active_name: self._rules_for_scanner_setup(active_setup)
+            }
+
         self.scanner_worker = ScannerWorker(
             tickers=self.universe_tickers or None,
             engine=self.db_engine,
@@ -638,6 +823,7 @@ class ScannerMixin:
             min_growth_rank=0,
             min_trend_intensity=0,
             universe_limit=self.universe_limit,
+            scanner_rules_by_setup=scanner_rules_by_setup,
         )
         self.scanner_worker.universe_loaded.connect(self._on_scanner_universe_loaded)
         self.scanner_worker.log_message.connect(self.append_log)
@@ -678,37 +864,7 @@ class ScannerMixin:
         )
         scanner = StockScanner()
 
-        # Load rules from setup
-        rules = setup.get("rules")
-        if not rules:
-            # Generate from basic fields for backward compatibility
-            rules = [
-                {
-                    "attribute": "volume",
-                    "operator": ">=",
-                    "threshold": setup.get("min_volume", 40000.0),
-                },
-                {
-                    "attribute": "dollar_volume",
-                    "operator": ">=",
-                    "threshold": setup.get("min_dollar_volume", 35000.0),
-                },
-                {
-                    "attribute": "adr_20",
-                    "operator": ">=",
-                    "threshold": setup.get("min_adr", 2.4),
-                },
-                {
-                    "attribute": "growth_rank_1m",
-                    "operator": ">=",
-                    "threshold": setup.get("min_growth_rank", 97.04),
-                },
-                {
-                    "attribute": "trend_intensity",
-                    "operator": ">=",
-                    "threshold": setup.get("min_trend_intensity", 90.0),
-                },
-            ]
+        rules = ScannerMixin._rules_for_scanner_setup(setup)
 
         op_map = {
             ">": ComparisonOperator.GREATER_THAN,
@@ -719,15 +875,18 @@ class ScannerMixin:
             "!=": ComparisonOperator.NOT_EQUAL,
         }
 
-        # Always add a rule to require at least 1 day of price history
-        scanner.add_rule(
-            ScanRule(
-                name="price_history_days",
-                attribute="price_history_days",
-                operator=ComparisonOperator.GREATER_EQUAL,
-                threshold=1.0,
-            )
+        # Scanner metric rows without usable price history are not part of the
+        # scannable universe. Visible funnel stages correspond only to the
+        # user's active rules.
+        history_rule = ScanRule(
+            name="price_history_days",
+            attribute="price_history_days",
+            operator=ComparisonOperator.GREATER_EQUAL,
+            threshold=1.0,
         )
+        scannable_metrics = [
+            stock for stock in stock_metrics if history_rule.evaluate(stock)
+        ]
 
         for r in rules:
             attr = r.get("attribute")
@@ -752,8 +911,15 @@ class ScannerMixin:
                 ScanRule(name=attr, attribute=attr, operator=op, threshold=threshold)
             )
 
-        return scanner.scan_with_scoring(
-            stock_metrics,
+        filtered, rule_counts = scanner.scan_with_funnel(scannable_metrics)
+        self.__dict__.setdefault("scanner_funnel_counts_by_setup", {})[
+            setup_name
+        ] = {
+            "universe_count": len(scannable_metrics),
+            "rule_counts": rule_counts,
+        }
+        return scanner.score_results(
+            filtered,
             scorers=[
                 self._score_growth_rank,
                 self._score_trend_intensity,
@@ -761,153 +927,89 @@ class ScannerMixin:
             ],
         )
 
-    def _start_scanner_orb_score_phase(self, selected_source: dict) -> None:
-        symbols = sorted(
-            {
-                stock.get("symbol", "").strip().upper()
-                for results in self.scanner_results_by_setup.values()
-                for stock in results
-                if stock.get("symbol")
-            }
+    def _show_scanner_results_for_setup(self, setup_name: str) -> None:
+        """Display cached results and funnel values for a scanner setup."""
+        self.scanner_results = list(self.scanner_results_by_setup.get(setup_name, []))
+        self.scanner_dataframe = pd.DataFrame(self.scanner_results)
+        self.populate_scanner_table()
+        self._display_scanner_funnel(setup_name)
+
+    def _on_database_scanner_finished(self, payload: dict) -> None:
+        """Apply rows and funnel aggregates already filtered by the database."""
+        setup_name = (
+            self.running_scanner_setup_name or self.scanner_setup_combo.currentText()
         )
-        if not symbols:
-            self._finish_scanner_after_orb_phase(selected_source)
-            return
-        if (
-            self.intraday_bulk_worker is not None
-            and self.intraday_bulk_worker.isRunning()
-        ):
-            self.append_log(
-                "Scanner ORB phase skipped fetch because intraday refresh is already running; scoring cached data."
+        results_by_setup = payload.get("results_by_setup") or {}
+        funnels_by_setup = payload.get("funnels_by_setup") or {}
+        rules_by_setup = payload.get("rules_by_setup") or {}
+        is_live = bool(getattr(self, "_scanner_run_is_live", False))
+
+        for name, rows in results_by_setup.items():
+            requested_rules = list(rules_by_setup.get(name) or [])
+            if name == self.scanner_setup_combo.currentText():
+                visible_rules = self.get_current_scanner_rules_from_ui()
+                if self._scanner_rule_signature(
+                    requested_rules
+                ) != self._scanner_rule_signature(visible_rules):
+                    self._scanner_live_refresh_pending = True
+                    continue
+            scored_rows = StockScanner.score_results(
+                list(rows or []),
+                scorers=[
+                    self._score_growth_rank,
+                    self._score_trend_intensity,
+                    self._score_adr,
+                ],
             )
-            self._score_scanner_results_by_orb()
-            self._finish_scanner_after_orb_phase(selected_source)
-            return
+            self.scanner_results_by_setup[name] = scored_rows
+            funnel = dict(funnels_by_setup.get(name) or {})
+            funnel["rules"] = requested_rules
+            self.scanner_funnel_counts_by_setup[name] = funnel
+            if not is_live:
+                self.append_log(
+                    f"Scanner completed for {name}: {len(scored_rows)} symbols found."
+                )
 
-        self.pending_scanner_orb_source = selected_source
-        self.intraday_bulk_purpose = "scanner_orb"
-        engine = self.db_engine if self.db_enabled else None
-        self.progress_label.setText(
-            f"Scanner ORB phase: fetching {len(symbols)} candidate symbols..."
-        )
-        self.append_log(
-            f"Scanner ORB phase: fetching provider intraday data for {len(symbols)} candidates."
-        )
-        profile = self._selected_dashboard_kis_profile() or {}
-        self.intraday_bulk_worker = IntradayBulkFetchWorker(
-            symbols,
-            engine,
-            window_days=7,
-            environment=profile.get("environment", "PROD"),
-            account_no=profile.get("account_no", ""),
-            exchange="NASD",
-            allow_fallback=True,
-        )
-        self.intraday_bulk_worker.progress.connect(self._on_intraday_bulk_progress)
-        self.intraday_bulk_worker.provider_warning.connect(
-            self._log_intraday_provider_warning
-        )
-        self.intraday_bulk_worker.finished_bulk.connect(self._on_intraday_bulk_finished)
-        self._track_worker("intraday_bulk_worker", self.intraday_bulk_worker)
-        self.intraday_bulk_worker.start()
-
-    def _finish_scanner_after_orb_phase(self, selected_source: Optional[dict]) -> None:
         active_setup = self.scanner_setup_combo.currentText()
+        if setup_name != "__ALL__" and setup_name in results_by_setup:
+            active_setup = setup_name
         self.scanner_results = list(
-            self.scanner_results_by_setup.get(active_setup, self.scanner_results)
+            self.scanner_results_by_setup.get(active_setup, [])
         )
         self.scanner_dataframe = pd.DataFrame(self.scanner_results)
         self.populate_scanner_table()
+        self._display_scanner_funnel(active_setup)
+        selected_source = {"type": "scan", "setup": active_setup}
         if hasattr(self, "sidebar_source_combo"):
-            self.refresh_sidebar_sources(
-                selected_source=selected_source
-                or {"type": "scan", "setup": active_setup}
-            )
+            self.refresh_sidebar_sources(selected_source=selected_source)
         self.update_dashboard_summary()
+
+        queried_universe = sum(
+            int((funnels_by_setup.get(name) or {}).get("universe_count") or 0)
+            for name in results_by_setup
+        )
+        if (
+            queried_universe == 0
+            and self.running_scanner_show_warnings
+            and not is_live
+        ):
+            QMessageBox.warning(
+                self,
+                "Scanner Empty",
+                "No cached scanner snapshot was found for the universe. "
+                "Run Update 1D Data first, then scan again.",
+            )
         self.progress_label.setText("Scanner complete.")
         self.progress_bar.setValue(100)
         self.running_scanner_setup_name = None
         self.running_scanner_show_warnings = True
+        self._scanner_run_is_live = False
+        self._start_pending_live_scanner_refresh()
 
-    def _score_scanner_results_by_orb(self) -> None:
-        for setup_name, results in list(self.scanner_results_by_setup.items()):
-            enriched = []
-            for stock in results:
-                stock_copy = dict(stock)
-                stock_copy.update(self._calculate_best_orb_scan_score(stock_copy))
-                enriched.append(stock_copy)
-            enriched.sort(key=lambda item: item.get("orb_score", -1.0), reverse=True)
-            self.scanner_results_by_setup[setup_name] = enriched
-
-    def _calculate_best_orb_scan_score(self, stock: dict) -> dict:
-        symbol = str(stock.get("symbol", "")).strip().upper()
-        if not symbol:
-            return {"orb_score": 0.0, "orb_plan": ""}
-        account_size = (
-            self._parse_float(self.account_size_input, 0.0)
-            if hasattr(self, "account_size_input")
-            else 0.0
-        )
-        selected_risk_percent = (
-            self._parse_float(self.risk_percent_input, 0.0) / 100.0
-            if hasattr(self, "risk_percent_input")
-            else 0.0
-        )
-        risk_cases = self._orb_risk_cases(selected_risk_percent)
-        adr_percent = float(stock.get("adr") or 0.0)
-        five_minute = self._latest_intraday_session(
-            self._load_cached_intraday_interval(symbol, "5m", window_days=7)
-        )
-        one_minute = self._latest_intraday_session(
-            self._load_cached_intraday_interval(symbol, "1m", window_days=7)
-        )
-        best: Optional[dict] = None
-        for risk_percent in risk_cases:
-            for window, history in [
-                ("1m", one_minute),
-                ("5m", five_minute),
-                ("30m", five_minute),
-            ]:
-                orb_range = calculate_orb_range(symbol, history, window)
-                if orb_range is None:
-                    continue
-                sizing = self._calculate_orb_position_values(
-                    account_size=account_size,
-                    risk_percent=risk_percent,
-                    entry_price=float(orb_range.high),
-                    stop_price=float(orb_range.low),
-                    adr_percent=adr_percent,
-                )
-                if not self._orb_position_plan_is_valid(sizing, adr_percent):
-                    continue
-                recommendation_score = self._score_orb_position_recommendation(
-                    sizing, risk_percent
-                )
-                candidate = {
-                    "orb_score": recommendation_score,
-                    "orb_plan": f"{risk_percent * 100:.2f}% {window}",
-                    "orb_entry": float(orb_range.high),
-                    "orb_stop": float(orb_range.low),
-                    "orb_shares": sizing["shares"],
-                    "risk_percent": risk_percent,
-                }
-                if best is None or (candidate["orb_score"], -risk_percent) > (
-                    best["orb_score"],
-                    -best["risk_percent"],
-                ):
-                    best = candidate
-        if best is None:
-            return {"orb_score": 0.0, "orb_plan": ""}
-        best.pop("risk_percent", None)
-        return best
-
-    def _show_scanner_results_for_setup(self, setup_name: str) -> None:
-        """Display cached results for a scanner setup in the Scanner tab table."""
-        self.scanner_results = list(self.scanner_results_by_setup.get(setup_name, []))
-        self.scanner_dataframe = pd.DataFrame(self.scanner_results)
-        self.populate_scanner_table()
-
-    def _on_scanner_finished(self, stock_metrics: list, _: object) -> None:
+    def _on_scanner_finished(self, stock_metrics: list, payload: object) -> None:
+        if isinstance(payload, dict) and payload.get("database_filtered"):
+            self._on_database_scanner_finished(payload)
+            return
         setup_name = (
             self.running_scanner_setup_name or self.scanner_setup_combo.currentText()
         )
@@ -916,10 +1018,17 @@ class ScannerMixin:
             if setup_name == "__ALL__":
                 for name in self.scanner_setups:
                     self.scanner_results_by_setup[name] = []
+                    self._scan_metrics_for_setup(name, [])
             else:
                 self.scanner_results_by_setup[setup_name] = []
+                self._scan_metrics_for_setup(setup_name, [])
             self.scanner_dataframe = pd.DataFrame()
             self.populate_scanner_table()
+            self._display_scanner_funnel(
+                self.scanner_setup_combo.currentText()
+                if setup_name == "__ALL__"
+                else setup_name
+            )
             self.update_dashboard_summary()
             self.append_log("Scanner completed: no cached database rows found.")
             if self.running_scanner_show_warnings:
@@ -930,6 +1039,9 @@ class ScannerMixin:
                 )
             self.progress_label.setText("Scanner complete.")
             self.running_scanner_setup_name = None
+            self.running_scanner_show_warnings = True
+            self._scanner_run_is_live = False
+            self._start_pending_live_scanner_refresh()
             return
 
         if setup_name == "__ALL__":
@@ -962,27 +1074,32 @@ class ScannerMixin:
         self.scanner_dataframe = pd.DataFrame(self.scanner_results)
 
         self.populate_scanner_table()
+        self._display_scanner_funnel(
+            self.scanner_setup_combo.currentText()
+            if setup_name == "__ALL__"
+            else setup_name
+        )
         if hasattr(self, "sidebar_source_combo"):
             self.refresh_sidebar_sources(selected_source=selected_source)
         self.update_dashboard_summary()
-        if (
-            self._scanner_orb_scoring_enabled()
-            and self.running_scanner_show_warnings
-            and self.scanner_results
-        ):
-            self._start_scanner_orb_score_phase(selected_source=selected_source)
-            return
         self.progress_label.setText("Scanner complete.")
         self.progress_bar.setValue(100)
         self.running_scanner_setup_name = None
         self.running_scanner_show_warnings = True
+        self._scanner_run_is_live = False
+        self._start_pending_live_scanner_refresh()
 
     def _on_scanner_error(self, error_message: str) -> None:
         self.append_log(f"Scanner error: {error_message}")
-        QMessageBox.warning(self, "Scanner failed", error_message)
+        if self.running_scanner_show_warnings and not getattr(
+            self, "_scanner_run_is_live", False
+        ):
+            QMessageBox.warning(self, "Scanner failed", error_message)
         self.progress_label.setText("Scanner failed.")
         self.running_scanner_setup_name = None
         self.running_scanner_show_warnings = True
+        self._scanner_run_is_live = False
+        self._start_pending_live_scanner_refresh()
 
     def refresh_data_to_db(self) -> bool:
         """Launch (or terminate) the standalone 1D historical.py refresh process."""
@@ -1314,37 +1431,7 @@ class ScannerMixin:
         return f"{label} refresh: {outcome}."
 
     def populate_scanner_table(self) -> None:
-        """Populate the scanner table with the latest scan results."""
-        self.scanner_table.setRowCount(0)
-        for stock in self.scanner_results:
-            row = self.scanner_table.rowCount()
-            self.scanner_table.insertRow(row)
-            self.scanner_table.setItem(row, 0, QTableWidgetItem(stock["symbol"]))
-            self.scanner_table.setItem(
-                row, 1, QTableWidgetItem(stock.get("name", stock["symbol"]))
-            )
-            self.scanner_table.setItem(
-                row, 2, QTableWidgetItem(f"{stock['price']:.2f}")
-            )
-            self.scanner_table.setItem(row, 3, QTableWidgetItem(str(stock["volume"])))
-            self.scanner_table.setItem(
-                row, 4, QTableWidgetItem(f"{stock['dollar_volume']:.0f}")
-            )
-            self.scanner_table.setItem(row, 5, QTableWidgetItem(f"{stock['adr']:.2f}%"))
-            self.scanner_table.setItem(
-                row, 6, QTableWidgetItem(f"{stock['growth_rank']:.2f}")
-            )
-            self.scanner_table.setItem(
-                row, 7, QTableWidgetItem(f"{stock['trend_intensity']:.1f}")
-            )
-            orb_score = stock.get("orb_score")
-            orb_plan = stock.get("orb_plan", "")
-            orb_text = (
-                ""
-                if orb_score is None
-                else f"{float(orb_score):.1f} {orb_plan}".strip()
-            )
-            self.scanner_table.setItem(row, 8, QTableWidgetItem(orb_text))
+        """Refresh shared symbol views after scanner results change."""
         if hasattr(self, "sidebar_source_combo"):
             source = self.sidebar_source_combo.currentData() or {}
             if (
@@ -1352,51 +1439,16 @@ class ScannerMixin:
                 and source.get("setup") == self.scanner_setup_combo.currentText()
             ):
                 self.refresh_stock_sidebar()
-        self.populate_chart_symbol_combo()
-
-    def on_scanner_row_selected(self, row: int, column: int) -> None:
-        """Handle scanner row selection."""
-        self._select_scanner_row(row)
-
-    def on_scanner_selection_changed(self) -> None:
-        """Handle keyboard or mouse scanner row selection changes."""
-        selected_items = self.scanner_table.selectedItems()
-        if not selected_items:
-            return
-        self._select_scanner_row(selected_items[0].row())
-
-    def _select_scanner_row(self, row: int) -> None:
-        """Update app state from the selected scanner row."""
-        symbol_item = self.scanner_table.item(row, 0)
-        if not symbol_item:
-            return
-        self.selected_scan_symbol = symbol_item.text()
-        self.scanner_selection_label.setText(
-            f"Selected symbol: {self.selected_scan_symbol}"
-        )
-        self._set_chart_symbol(self.selected_scan_symbol)
-        self.update_scanner_metrics_details(self.selected_scan_symbol)
+        self.populate_tradingview_watchlist_symbols()
 
     def update_scanner_preview_chart(self, symbol: str) -> None:
-        pass
+        """Update Scanner-tab details from the shared sidebar selection."""
+        self.update_scanner_metrics_details(symbol)
 
     def _get_scanner_stock(self, symbol: str) -> Optional[dict]:
         return next(
             (item for item in self.scanner_results if item["symbol"] == symbol), None
         )
-
-    def load_scanner_item_to_trade_plan(self, row: int, column: int) -> None:
-        """Scanner double-click: select the symbol for chart review."""
-        symbol_item = self.scanner_table.item(row, 0)
-        if symbol_item is None:
-            return
-
-        stock = self._get_scanner_stock(symbol_item.text())
-        if stock is None:
-            return
-
-        symbol = stock["symbol"]
-        self._set_chart_symbol(symbol)
 
     def add_selected_scanner_to_watchlist(self) -> None:
         """Persist the selected scan result in the passive Watchlist stage."""

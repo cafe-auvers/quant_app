@@ -2,42 +2,17 @@
 
 from __future__ import annotations
 
-import datetime as dt
-from zoneinfo import ZoneInfo
-
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtWidgets import QComboBox, QMessageBox
-
-try:
-    from PyQt5.QtWebEngineWidgets import QWebEngineView
-except ImportError:
-    QWebEngineView = None
-try:
-    from PyQt5.QtWebChannel import QWebChannel
-except ImportError:
-    QWebChannel = None
-
-
-REFERENCE_SYMBOL = "SPY"
-KST_ZONE = ZoneInfo("Asia/Seoul")
-US_MARKET_ZONE = ZoneInfo("America/New_York")
-MARKET_DATA_READY_TIME_KST = dt.time(7, 0)
-LIVE_INTRADAY_REFRESH_INTERVAL_MS = 5 * 60 * 1000
-TRADINGVIEW_REFRESH_INTERVAL_SECONDS = 5 * 60
-KIS_DAILY_CHART_FAILURE_COOLDOWN_SECONDS = 30 * 60
-US_MARKET_OPEN_TIME = dt.time(9, 30)
-US_MARKET_CLOSE_TIME = dt.time(16, 0)
+from PyQt5.QtWidgets import QMessageBox
 
 
 class ChartsNavigationMixin:
     def _refresh_active_chart_for_symbol(self, symbol: str) -> None:
         """Force-refresh the current chart view if it matches symbol."""
         symbol = symbol.strip().upper()
-        if (
-            hasattr(self, "tabs")
-            and hasattr(self, "tradingview_widget")
-            and self.tabs.currentWidget() is self.tradingview_widget
-        ):
+        tabs = self.__dict__.get("tabs")
+        active_widget = tabs.currentWidget() if tabs is not None else None
+        if active_widget is self.__dict__.get("tradingview_widget"):
             active = (
                 self.tradingview_symbol_combo.currentText().strip().upper()
                 if hasattr(self, "tradingview_symbol_combo")
@@ -45,73 +20,35 @@ class ChartsNavigationMixin:
             )
             if active == symbol:
                 QTimer.singleShot(50, lambda: self.load_tradingview_chart(force=True))
-        else:
-            chart_sym = (
-                self._get_chart_symbol() if hasattr(self, "chart_symbol_input") else ""
+        elif active_widget is self.__dict__.get("intraday_charts_widget"):
+            intraday_symbol = (
+                self.intraday_symbol_combo.currentText().strip().upper()
+                if hasattr(self, "intraday_symbol_combo")
+                else ""
             )
-            if chart_sym and chart_sym.strip().upper() == symbol:
+            if intraday_symbol == symbol:
                 QTimer.singleShot(
-                    50, lambda: self.plot_selected_symbol(show_warnings=False)
+                    50,
+                    lambda: self.plot_intraday_watchlist_symbol(allow_fetch=False),
                 )
 
     def _active_chart_timeframe(self) -> str:
         """Return the timeframe currently selected on the active chart tab."""
-        if hasattr(self, "tabs") and self.tabs.currentWidget() is self.__dict__.get(
-            "tradingview_widget"
-        ):
+        tabs = self.__dict__.get("tabs")
+        active_widget = tabs.currentWidget() if tabs is not None else None
+        if active_widget is self.__dict__.get("tradingview_widget"):
             return (
                 self.tradingview_timeframe_combo.currentText().strip().upper()
                 if hasattr(self, "tradingview_timeframe_combo")
                 else "1D"
             )
-        return (
-            self.chart_timeframe_combo.currentText().strip().upper()
-            if hasattr(self, "chart_timeframe_combo")
-            else "1D"
-        )
-
-    def _set_chart_symbol(self, symbol: str) -> None:
-        symbol = symbol.strip().upper()
-        if isinstance(self.chart_symbol_input, QComboBox):
-            self.chart_symbol_input.setEditText(symbol)
-        else:
-            self.chart_symbol_input.setText(symbol)
-
-    def _get_chart_symbol(self) -> str:
-        if isinstance(self.chart_symbol_input, QComboBox):
-            return self.chart_symbol_input.currentText().strip().upper()
-        return self.chart_symbol_input.text().strip().upper()
-
-    def populate_chart_symbol_combo(self) -> None:
-        if not hasattr(self, "chart_symbol_input") or not isinstance(
-            self.chart_symbol_input, QComboBox
-        ):
-            return
-
-        current_text = self.chart_symbol_input.currentText().strip().upper()
-        symbols = self._get_chart_symbol_universe()
-
-        self.chart_symbol_input.blockSignals(True)
-        self.chart_symbol_input.clear()
-        self.chart_symbol_input.addItems(sorted(symbols))
-        self.chart_symbol_input.setEditText(current_text)
-        self.chart_symbol_input.blockSignals(False)
-
-    def filter_chart_symbol_combo(self, text: str) -> None:
-        if not isinstance(self.chart_symbol_input, QComboBox):
-            return
-
-        prefix = text.strip().upper()
-        filtered = self._filter_symbols_by_prefix(
-            self._get_chart_symbol_universe(), prefix
-        )
-
-        self.chart_symbol_input.blockSignals(True)
-        self.chart_symbol_input.clear()
-        self.chart_symbol_input.addItems(filtered)
-        self.chart_symbol_input.setEditText(prefix)
-        self.chart_symbol_input.blockSignals(False)
-        self.chart_symbol_input.showPopup()
+        if active_widget is self.__dict__.get("intraday_charts_widget"):
+            return (
+                self.intraday_interval_combo.currentText().strip().upper()
+                if hasattr(self, "intraday_interval_combo")
+                else "1H"
+            )
+        return "1D"
 
     def _get_chart_symbol_universe(self) -> set:
         symbols = set(self.universe_tickers)
@@ -189,21 +126,6 @@ class ChartsNavigationMixin:
         ):
             self.plot_intraday_watchlist_symbol(allow_fetch=allow_fetch)
 
-    def refresh_chart_views_for_symbol(
-        self, symbol: str, allow_fetch: bool = False
-    ) -> None:
-        symbol = symbol.strip().upper()
-        if not symbol:
-            return
-        chart_symbol = (
-            self._get_chart_symbol()
-            if self.__dict__.get("chart_symbol_input") is not None
-            else ""
-        )
-        if chart_symbol and chart_symbol.strip().upper() == symbol:
-            self.plot_selected_symbol(show_warnings=False)
-        self.refresh_intraday_chart_if_symbol(symbol, allow_fetch=allow_fetch)
-
     def refresh_other_chart_views_for_symbol(self, symbol: str) -> None:
         """Keep other (currently hidden) chart tabs in sync with an edit made
         on the active tab (breakout price set, drawing added/changed).
@@ -223,17 +145,6 @@ class ChartsNavigationMixin:
             if self.__dict__.get("tabs") is not None
             else None
         )
-        chart_symbol = (
-            self._get_chart_symbol()
-            if self.__dict__.get("chart_symbol_input") is not None
-            else ""
-        )
-        if (
-            active_widget is not self.__dict__.get("charts_widget")
-            and chart_symbol
-            and chart_symbol.strip().upper() == symbol
-        ):
-            self._charts_tab_chart_stale = True
         intraday_symbol_combo = self.__dict__.get("intraday_symbol_combo")
         if (
             active_widget is not self.__dict__.get("intraday_charts_widget")
@@ -259,12 +170,6 @@ class ChartsNavigationMixin:
         )
         if active_widget is None:
             return
-        if (
-            self.__dict__.get("_charts_tab_chart_stale")
-            and active_widget is self.__dict__.get("charts_widget")
-        ):
-            self._charts_tab_chart_stale = False
-            self.plot_selected_symbol(show_warnings=False)
         if (
             self.__dict__.get("_intraday_tab_chart_stale")
             and active_widget is self.__dict__.get("intraday_charts_widget")
