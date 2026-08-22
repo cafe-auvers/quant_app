@@ -168,7 +168,10 @@ replaced.
 - `scripts/Configure-AutomaticShutdown.ps1` — the 10:00 shutdown. Lives here
   (not only in the standalone `PC-Automation` folder) specifically so the
   PC's `git fetch`/`reset --hard` step can actually reach it.
-- BIOS wake instructions — `PC-Automation/docs/BIOS-Startup-Instructions.md`.
+- BIOS wake configuration is machine/motherboard-specific and is not stored in
+  this repository. Older deployments may have a separate `PC-Automation`
+  checkout; otherwise follow the motherboard manual and the verified Windows
+  task steps below.
 
 ## Remote access: LAN vs. Tailscale
 
@@ -374,9 +377,8 @@ must not be committed.
 > **Status: implemented and unit-tested, but never run against
 > a real PC, real S3 sleep/wake cycle, or real KIS credentials.** Follow the
 > runbook below and the verification checklist before trusting this with a
-> live position. Leave `AUTO_ARM_TRADING_ON_HANDOFF` off for the first
-> several real cycles even after the wake/sleep mechanics are confirmed
-> working.
+> live position. Automatic ownership claim is disabled by default and never
+> changes the shared Live Trading switch.
 
 ### What it does
 
@@ -422,10 +424,11 @@ either machine.
   raises instead of returning a partial position snapshot. Malformed nonempty
   PROD account settings likewise block the handoff rather than silently
   disappearing from the account inventory.
-  Monitoring/trading only resume once every configured account clears
+  Monitoring only resumes once every configured account clears
   unambiguously **and** the broker-corrected state has been synchronously
   saved and strictly republished. Explicit **Execution Owner** transfer uses
-  the same reconciliation fence and never auto-arms live trading.
+  the same reconciliation fence. Order mutation still requires the separate,
+  canonical Live Trading control and every normal runtime/broker gate.
 - **Strict shutdown ordering**: `closeEvent` now finishes the final local
   save, strictly re-publishes buylist + execution_queue to MySQL
   (`publish_handoff_snapshot` -- returns failure, not just a log line, if
@@ -434,11 +437,10 @@ either machine.
   local save, strict publication, local demotion, or writer fencing fails,
   ownership is retained; the next device must wait for the stale-heartbeat
   fenced takeover path rather than seeing a false clean handoff.
-- **Kill switch auto-arm is a separate, stricter gate**
-  (`_auto_arm_trading_kill_switch`) from the claim itself -- requires its
-  own `AUTO_ARM_TRADING_ON_HANDOFF` flag, a currently-held lease, a reachable
-  database, and a clean reconciliation pass. `TRADING_ENABLED`'s existing
-  environment hard-lock is untouched and always wins.
+- **No handoff auto-arm**: `_auto_arm_trading_kill_switch` is now a
+  compatibility hook that only refreshes the displayed canonical switch.
+  Handoff never turns Live Trading on or off. The shared switch remains under
+  operator control, and `TRADING_ENABLED`'s environment hard-lock always wins.
 - **Health tab**: a new "Main-device handoff" check shows lease age,
   pull-only owner, reconciliation-in-progress, and any blocked symbols.
 
@@ -447,16 +449,15 @@ either machine.
 ```
 AUTO_CLAIM_MAIN_ON_HANDOFF=0
 EXPECTED_AUTO_CLAIM_HOSTNAME=<the PC's exact hostname>
-AUTO_ARM_TRADING_ON_HANDOFF=0
 ```
 
 `EXPECTED_AUTO_CLAIM_HOSTNAME` must match `platform.node()` exactly on the
 PC or auto-claim silently stays off -- cheap insurance against an
 accidentally copy-pasted `.env`. The laptop deliberately never auto-reclaims
 on startup; assign it explicitly with the **Execution Owner: Laptop** control
-when required. Keep both automation flags at `0` until the physical S3/wake and
-post-resume MySQL/KIS checks below pass. Enable auto-claim first; leave
-auto-arm off through several supervised handoffs.
+when required. Keep auto-claim at `0` until the physical S3/wake and post-resume
+MySQL/KIS checks below pass. Dry runs must keep the shared Live Trading switch
+off; enable it separately only for an explicitly supervised production test.
 
 ### Wake/sleep model: S3 instead of full shutdown
 
@@ -500,7 +501,8 @@ the wake time itself is harmless idle time either way.
    .\scripts\setup_pc_morning_task.ps1        # re-run to add the Daily 08:00 WakeToRun trigger
    .\scripts\Configure-AutomaticShutdown.ps1 -DisableTask   # keep the old task registered but inert
    ```
-5. Set the three `.env` flags above (PC only).
+5. Set the two `.env` values above on the PC only, leaving auto-claim disabled
+   until the checklist is complete.
 
 ### Verification checklist (do this before trusting it with a live position)
 
@@ -519,11 +521,11 @@ the wake time itself is harmless idle time either way.
       feature).
 - [ ] Run the two-process dry run from the implementation plan (a throwaway
       test engine + a **stub** broker, never real KIS credentials) end to
-      end before ever enabling `AUTO_ARM_TRADING_ON_HANDOFF` against a real
-      account.
-- [ ] Once software behavior is trusted, enable `AUTO_ARM_TRADING_ON_HANDOFF`
-      and watch the Health tab's "Main-device handoff" check closely for the
-      first several real handoffs.
+      end with the canonical Live Trading switch off.
+- [ ] Once software behavior is trusted, enable only
+      `AUTO_CLAIM_MAIN_ON_HANDOFF` and watch the Health tab's
+      "Main-device handoff" check closely for the first several real handoffs.
+      Live Trading remains a separate deliberate operator action.
 
 ### Known residual risks (accepted, not solved by this design)
 

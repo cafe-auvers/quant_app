@@ -15,10 +15,14 @@ from .sql_helpers import _clean_symbols, _execute_bulk_upsert
 from .time_utils import _utcnow_naive
 
 _ensured_engines: weakref.WeakSet[Engine] = weakref.WeakSet()
+_price_history_index_ensured_engines: weakref.WeakSet[
+    Engine
+] = weakref.WeakSet()
 _hourly_ensured_engines: weakref.WeakSet[Engine] = weakref.WeakSet()
 
+
 def _get_price_history_table(metadata: MetaData) -> Table:
-    return Table(
+    table = Table(
         "price_history",
         metadata,
         Column("symbol", String(20), primary_key=True),
@@ -32,6 +36,11 @@ def _get_price_history_table(metadata: MetaData) -> Table:
         Column("volume", Float),
         Column("updated_at", DateTime, default=_utcnow_naive, nullable=False),
     )
+    # Global freshness checks filter by interval and ask for MAX(date). The
+    # primary key starts with symbol, so it cannot serve that query without a
+    # full cache scan.
+    Index("ix_price_history_interval_date", table.c.interval, table.c.date)
+    return table
 
 
 def _ensure_price_history_table(engine: Engine) -> Table:
@@ -42,6 +51,20 @@ def _ensure_price_history_table(engine: Engine) -> Table:
         _ensure_price_history_interval_column(engine)
         _ensured_engines.add(engine)
     return price_history
+
+
+def _ensure_price_history_indexes(engine: Engine) -> bool:
+    """Install optional price-history indexes during explicit schema setup."""
+    if engine in _price_history_index_ensured_engines:
+        return True
+    price_history = _get_price_history_table(MetaData())
+    try:
+        for index in price_history.indexes:
+            index.create(engine, checkfirst=True)
+    except SQLAlchemyError:
+        return False
+    _price_history_index_ensured_engines.add(engine)
+    return True
 
 
 def _ensure_price_history_interval_column(engine: Engine) -> None:

@@ -248,15 +248,137 @@ class SidebarMixin:
         except (TypeError, ValueError):
             return "?"
 
+    def _sidebar_source_signature(self, source: dict) -> tuple:
+        """Return every value that can affect the selected sidebar rows."""
+
+        source_type = source.get("type")
+        if source_type == "universe":
+            symbols = {
+                str(value or "").strip().upper()
+                for value in self.__dict__.get("universe_tickers", ())
+                if str(value or "").strip()
+            }
+            symbols.update(
+                self.__dict__.get("_sidebar_universe_extra_symbols", set())
+            )
+            extra_names = self.__dict__.get("_sidebar_universe_extra_names", {})
+            return (
+                source_type,
+                tuple(
+                    (symbol, extra_names.get(symbol) or symbol)
+                    for symbol in sorted(symbols)
+                ),
+            )
+        if source_type == "scan":
+            setup_name = source.get("setup", "")
+            return (
+                source_type,
+                setup_name,
+                tuple(
+                    (
+                        stock.get("symbol", ""),
+                        stock.get("name", stock.get("symbol", "")),
+                        stock.get("price"),
+                    )
+                    for stock in self.__dict__.get(
+                        "scanner_results_by_setup", {}
+                    ).get(setup_name, [])
+                ),
+            )
+        if source_type == "buylist":
+            return (
+                source_type,
+                tuple(
+                    (
+                        item.symbol,
+                        self._format_sidebar_added_date(item.added_date),
+                        item.name,
+                        item.entry_price,
+                        item.breakout_price,
+                        item.stop_loss,
+                        item.notes,
+                        item.ai_summary,
+                    )
+                    for item in getattr(
+                        self.__dict__.get("buylist_manager"), "items", ()
+                    )
+                ),
+            )
+        if source_type == "buy_today":
+            projection_loader = getattr(
+                self, "_buyboard_projection_values", None
+            )
+            values = (
+                tuple(projection_loader() or ())
+                if callable(projection_loader)
+                else tuple(
+                    self.__dict__.get("_buyboard_current_projections", ())
+                    or ()
+                )
+            )
+            rows = []
+            for value in values:
+                card = getattr(value, "card", value)
+                if (
+                    getattr(card, "board_status", None)
+                    != BoardStatus.BUY_TODAY
+                ):
+                    continue
+                rows.append(
+                    (
+                        str(getattr(card, "symbol", "") or "").strip().upper(),
+                        str(getattr(card, "environment", "") or "")
+                        .strip()
+                        .upper(),
+                        str(getattr(card, "account_no", "") or "").strip(),
+                        getattr(card, "name", ""),
+                        getattr(card, "market_data_last_trusted_price", None),
+                        getattr(card, "entry_trigger", None),
+                        getattr(card, "breakout_price", None),
+                        getattr(card, "active_stop_price", None),
+                        getattr(
+                            getattr(card, "entry_runtime_status", None),
+                            "value",
+                            getattr(card, "entry_runtime_status", None),
+                        ),
+                    )
+                )
+            return source_type, tuple(rows)
+        if source_type == "watchlist":
+            return (
+                source_type,
+                tuple(
+                    (
+                        item.symbol,
+                        self._format_sidebar_added_date(item.added_date),
+                        item.name,
+                        item.entry_price,
+                        item.breakout_price,
+                    )
+                    for item in getattr(
+                        self.__dict__.get("watchlist"), "items", ()
+                    )
+                ),
+            )
+        return (source_type,)
+
     def refresh_stock_sidebar(self, *args) -> None:
         """Refresh the shared stock list from the selected planning source."""
         if not hasattr(self, "sidebar_stock_list"):
             return
 
+        source = self.sidebar_source_combo.currentData() or {}
+        signature = self._sidebar_source_signature(source)
+        if signature == self.__dict__.get("_sidebar_render_signature"):
+            # Watchlist membership can change while Universe rows remain the
+            # same. Refresh action availability without rebuilding the list
+            # or reapplying the symbol to an already-active chart.
+            self._update_sidebar_watchlist_actions()
+            return
+
         current_symbol = self._get_sidebar_selected_symbol()
         current_row = self.sidebar_stock_list.currentRow()
         self.sidebar_stock_list.clear()
-        source = self.sidebar_source_combo.currentData() or {}
 
         if source.get("type") == "universe":
             symbols = {
@@ -388,6 +510,7 @@ class SidebarMixin:
             # Symbol no longer in list (e.g. removed) — stay at same position rather than jumping to top
             restore = min(current_row, self.sidebar_stock_list.count() - 1) if current_row >= 0 else 0
             self.sidebar_stock_list.setCurrentRow(restore)
+        self._sidebar_render_signature = signature
         self.on_sidebar_selection_changed()
     def _get_sidebar_selected_data(self) -> Optional[dict]:
         if not hasattr(self, "sidebar_stock_list"):

@@ -20,7 +20,7 @@ At the time of this design, TiDB Cloud Starter includes 5 GiB row storage,
 at zero so quota exhaustion rejects or throttles work instead of creating a
 bill. Recheck the current
 [Starter plan limits](https://docs.pingcap.com/tidbcloud/select-cluster-tier/)
-and [Serverless RU FAQ](https://docs.pingcap.com/tidbcloud/serverless-faqs/)
+and [Starter RU FAQ](https://docs.pingcap.com/tidbcloud/serverless-faqs/?plan=starter)
 before production use because cloud quotas can change.
 
 ## Configuration
@@ -43,7 +43,7 @@ Both pools recycle connections after four minutes. Startup provisions only
 the coordination tables; it does not create historical-data tables. The
 recycle period stays below the
 documented 340-second AWS idle timeout; see TiDB's
-[standard connection guidance](https://docs.pingcap.com/tidbcloud/connect-via-standard-connection-serverless/).
+[Starter/Essential connection guidance](https://docs.pingcap.com/tidbcloud/connect-to-tidb-cluster-serverless/?plan=starter).
 
 ## Traffic budget
 
@@ -254,7 +254,7 @@ TiDB states that SQL queries, bulk operations, and its own background jobs all
 consume RUs. `EXPLAIN ANALYZE` reports statement RU but excludes gateway egress;
 the authoritative total is the cluster **Usage this month** pane, and the
 **Diagnosis > SQL Statements** view identifies high Total/Mean RU statements.
-See the official [Starter RU FAQ](https://docs.pingcap.com/tidbcloud/serverless-faqs/).
+See the official [Starter RU FAQ](https://docs.pingcap.com/tidbcloud/serverless-faqs/?plan=starter).
 
 After deploying the optimized version to both devices, record **Usage this
 month**, run both continuously for 24 hours, then subtract the starting value:
@@ -271,7 +271,7 @@ acceptable, but understand the safety trade-off: TiDB documents that quota
 exhaustion denies new connections and throttles existing ones. Reaching the
 limit can therefore stop ordinary trading coordination; free-tier monitoring
 is an operational requirement, not an optional cost report. See
-[quota behavior](https://docs.pingcap.com/tidbcloud/serverless-faqs/)
+[quota behavior](https://docs.pingcap.com/tidbcloud/serverless-faqs/?plan=starter)
 and [spending-limit controls](https://docs.pingcap.com/tidbcloud/manage-serverless-spend-limit/).
 
 ## Safe cutover

@@ -138,6 +138,8 @@ Only enable KIS intraday after the endpoint, TR ID, request parameters, output f
 - `docs/orb_buyboard_planning.md` explains Buffer %, the 24-case read-only comparison, Operator-Control-only pre-market ORB selection, market-hours read-only behavior, and published-plan immutability.
 - `docs/kanban_production_readiness.md` records the detailed production invariants and rollout evidence requirements.
 - `docs/market_pulse.md` documents the Market Pulse universe, EOD calculations, batched refresh, and idempotent cache schema.
+- `docs/performance-audit.md` records reproducible responsiveness measurements, implemented optimizations, and remaining limits.
+- `docs/wiki/` contains the Wiki-ready operator and maintainer guide set when the GitHub Wiki repository has not yet been initialized.
 - `rulebooks/` contains active trading rules used by review workflows.
 - `md_archive/` contains completed implementation notes and old planning documents that are not canonical.
 

@@ -36,7 +36,7 @@ For database-related helpers, prefer isolated in-memory or temporary test fixtur
 
 ## Commit & Pull Request Guidelines
 
-This workspace does not include Git history, so no existing commit convention is available. Use concise, imperative commit messages, for example `Add latest cache date to dashboard`.
+Use concise, imperative commit messages consistent with the repository history, for example `Add latest cache date to dashboard`.
 
 Pull requests should include a short summary, test results such as `pytest -q`, and screenshots for visible PyQt UI changes. Link related issues or notes when a change affects trading rules, risk behavior, or persisted data formats.
 

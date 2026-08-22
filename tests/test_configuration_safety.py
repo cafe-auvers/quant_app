@@ -86,6 +86,7 @@ def test_init_mysql_uses_preprovisioned_database_with_bounded_timeouts(monkeypat
     )
     for name in (
         "_ensure_price_history_table",
+        "_ensure_price_history_indexes",
         "_ensure_hourly_price_history_table",
         "_ensure_chart_indicators_table",
         "_ensure_chart_indicator_manifests_table",

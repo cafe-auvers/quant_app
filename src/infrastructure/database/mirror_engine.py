@@ -21,6 +21,7 @@ from .schema import (_ensure_chart_indicator_manifests_table,
                      _ensure_fundamental_sync_state_table,
                      _ensure_hourly_price_history_table,
                      _ensure_market_alignment_tables,
+                     _ensure_price_history_indexes,
                      _ensure_price_history_table,
                      _ensure_scanner_metric_snapshots_table,
                      _ensure_scanner_metrics_table,
@@ -394,6 +395,11 @@ def init_local_mirror_engine(db_path=None) -> Optional[Engine]:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         _ensure_price_history_table(engine)
+        if not _ensure_price_history_indexes(engine):
+            logger.warning(
+                "Local price-history index could not be installed; freshness "
+                "checks may be slower"
+            )
         _ensure_hourly_price_history_table(engine)
         _ensure_chart_indicators_table(engine)
         _ensure_chart_indicator_manifests_table(engine)
@@ -463,5 +469,3 @@ def mirror_table_stats(engine: Engine, table_name: str, watermark_column: str) -
         return {"row_count": int(count or 0), "latest": latest}
     except SQLAlchemyError as exc:
         return {"row_count": 0, "latest": None, "error": str(exc)}
-
-
