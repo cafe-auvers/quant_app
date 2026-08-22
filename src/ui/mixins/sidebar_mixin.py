@@ -39,6 +39,7 @@ from src.core.orb import (calculate_orb_range, evaluate_orb_entry_signal,
 from src.core.order_state import (OPEN_ORDER_STATUSES, BrokerOrder,
                                   OrderIntent, OrderSide, OrderStatus)
 from src.core.scanner import ComparisonOperator, ScanRule, StockScanner
+from src.core.trade_card_state import BoardStatus
 from src.core.watchlist import (BuylistItem, BuylistManager, TradePlan,
                                 TradePlanManager, Watchlist)
 from src.risk.position_sizer import PositionSizer
@@ -156,6 +157,7 @@ class SidebarMixin:
             self.sidebar_source_combo.addItem(f"Scan: {setup_name}", {"type": "scan", "setup": setup_name})
         self.sidebar_source_combo.addItem("Watchlist", {"type": "watchlist"})
         self.sidebar_source_combo.addItem("Buylist", {"type": "buylist"})
+        self.sidebar_source_combo.addItem("Buy Today", {"type": "buy_today"})
 
         selected_index = 0
         if isinstance(current_data, dict):
@@ -174,14 +176,13 @@ class SidebarMixin:
             self._flush_dirty_watchlist_and_dashboard()
         if not hasattr(self, "stock_sidebar"):
             return
-        if self.tabs.currentWidget() is self.__dict__.get("health_widget"):
-            self.stock_sidebar.setVisible(False)
+        current_widget = self.tabs.currentWidget()
+        self.stock_sidebar.setVisible(True)
+        if current_widget is self.__dict__.get("health_widget"):
             refresh_health = getattr(self, "refresh_health_panel", None)
             if callable(refresh_health):
                 refresh_health()
-            return
-        self.stock_sidebar.setVisible(True)
-        if self.tabs.currentWidget() is self.intraday_charts_widget:
+        if current_widget is self.__dict__.get("intraday_charts_widget"):
             self._set_sidebar_source_to_buylist()
         self.apply_sidebar_selection_to_current_tab()
     def _set_sidebar_source_to_buylist(self) -> None:
@@ -204,7 +205,7 @@ class SidebarMixin:
             return "?"
 
     def refresh_stock_sidebar(self, *args) -> None:
-        """Refresh sidebar stock list from scans, Watchlist, or Buylist."""
+        """Refresh the shared stock list from the selected planning source."""
         if not hasattr(self, "sidebar_stock_list"):
             return
 
@@ -247,6 +248,52 @@ class SidebarMixin:
                     "stop_loss": buy_item.stop_loss,
                     "notes": buy_item.notes,
                     "ai_summary": buy_item.ai_summary,
+                })
+                self.sidebar_stock_list.addItem(item)
+        elif source.get("type") == "buy_today":
+            projection_loader = getattr(self, "_buyboard_projection_values", None)
+            projection_values = (
+                tuple(projection_loader() or ())
+                if callable(projection_loader)
+                else tuple(
+                    self.__dict__.get("_buyboard_current_projections", ()) or ()
+                )
+            )
+            for value in projection_values:
+                card = getattr(value, "card", value)
+                if getattr(card, "board_status", None) != BoardStatus.BUY_TODAY:
+                    continue
+                symbol = str(getattr(card, "symbol", "") or "").strip().upper()
+                if not symbol:
+                    continue
+                environment = str(
+                    getattr(card, "environment", "") or ""
+                ).strip().upper()
+                account_no = str(getattr(card, "account_no", "") or "").strip()
+                account_label = "/".join(
+                    part for part in (environment, account_no) if part
+                )
+                label = symbol + (f" ({account_label})" if account_label else "")
+                price = (
+                    getattr(card, "market_data_last_trusted_price", None)
+                    or getattr(card, "entry_trigger", None)
+                    or getattr(card, "breakout_price", None)
+                )
+                item = QListWidgetItem(label)
+                item.setData(Qt.UserRole, {
+                    "symbol": symbol,
+                    "name": getattr(card, "name", "") or symbol,
+                    "price": price,
+                    "source": "buy_today",
+                    "environment": environment,
+                    "account_no": account_no,
+                    "breakout_price": getattr(card, "breakout_price", None),
+                    "stop_loss": getattr(card, "active_stop_price", None),
+                    "entry_runtime_status": getattr(
+                        getattr(card, "entry_runtime_status", None),
+                        "value",
+                        getattr(card, "entry_runtime_status", None),
+                    ),
                 })
                 self.sidebar_stock_list.addItem(item)
         elif source.get("type") == "watchlist":
@@ -332,7 +379,7 @@ class SidebarMixin:
             # membership by locally adding an existing Buylist row.
             add_button.setEnabled(
                 bool(symbol)
-                and source != "buylist"
+                and source not in {"buylist", "buy_today"}
                 and not in_watchlist
                 and not pending
             )
@@ -367,7 +414,10 @@ class SidebarMixin:
             self.plot_intraday_watchlist_symbol()
         elif current_widget is self.tradingview_widget:
             self._set_tradingview_symbol(symbol)
-            if hasattr(self, "tradingview_symbol_combo"):
+            if (
+                hasattr(self, "tradingview_symbol_combo")
+                and not self.__dict__.get("_suppress_sidebar_tradingview_load", False)
+            ):
                 self.load_tradingview_chart(force=True)
         elif current_widget is self.scanner_widget:
             self.scanner_selection_label.setText(f"Selected symbol: {symbol}")
@@ -398,11 +448,11 @@ class SidebarMixin:
         if not data:
             QMessageBox.warning(self, "No selection", "Select a stock first.")
             return
-        if data.get("source") == "buylist":
+        if data.get("source") in {"buylist", "buy_today"}:
             QMessageBox.information(
                 self,
                 "Use Buy Board",
-                "Use 'Move to Watchlist' on the Buy Board card to demote a Buylist stock safely.",
+                "Use the Buy Board card actions to change an active planning-stage stock safely.",
             )
             return
         add_candidate = getattr(self, "_add_watchlist_candidate", None)

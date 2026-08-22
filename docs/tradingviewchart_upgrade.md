@@ -1598,7 +1598,7 @@ Recommended stale-while-revalidate behavior:
 
 1. load cached profile and earnings data from DB;
 2. render the chart immediately with cached data;
-3. determine whether profile or earnings data is stale;
+3. determine whether profile or earnings data is stale on a background worker;
 4. start a background refresh only if needed;
 5. upsert normalized provider results;
 6. invalidate the relevant chart refresh key;
@@ -1610,6 +1610,19 @@ If no cached enrichment exists:
 2. initially show only the symbol watermark;
 3. start background profile/earnings retrieval;
 4. update the chart after successful retrieval if the symbol remains selected.
+
+Chart navigation must remain responsive while moving rapidly through symbols:
+
+- keep a short-lived, symbol-scoped in-memory cache of normalized profile and earnings context;
+- keep provider-freshness database checks off the PyQt main thread;
+- bound concurrent per-symbol refresh workers so rapid navigation cannot create an unbounded worker backlog;
+- query only the daily/hourly bars and indicator rows that the chart can render;
+- load the vendored Lightweight Charts library from one stable local URL so Chromium can reuse its resource and compiled-script caches;
+- create bottom `E` badge DOM nodes once per page and reposition them through one animation-frame callback during pan, zoom, or resize;
+- never trigger two full chart renders for one Previous/Next navigation action.
+- render database-cached earnings in the same initial page as ADR and RS/TI65;
+- never force-reload the visible chart when a background provider refresh completes;
+- let the unattended daily refresh gate run the supplemental earnings phase even when price and indicator caches are already current.
 
 ---
 
@@ -2353,4 +2366,35 @@ Explicitly confirm every item:
 [ ] missing enrichment cannot break price-chart loading
 [ ] no trading or execution behavior was changed
 [ ] full pytest suite passes
+```
+
+---
+
+# 48. TEMPORARY RIGHT-DRAG PERCENTAGE MEASUREMENT
+
+Replace the browser/WebEngine right-click menu inside the price chart with a temporary point-to-point percentage measurement.
+
+Required behavior:
+
+- pressing the right mouse button on any valid price-chart point starts the measurement;
+- dragging draws a dotted line from the exact press coordinates to the current pointer coordinates;
+- the label shows `(end price / start price - 1) * 100`, including a leading `+` for gains;
+- both endpoints use chart-coordinate prices, not a candle's OHLC values or a selected date;
+- the regular OHLC tooltip is hidden while measuring;
+- releasing the right mouse button immediately removes the line and label;
+- the measurement is never saved as a drawing and does not call the persistence bridge;
+- left-button drawing, target-price, zoom, scroll, and earnings interactions remain unchanged;
+- the native context menu must not appear inside the price chart.
+
+Acceptance checks:
+
+```text
+[ ] right-button drag draws a dotted point-to-point guide
+[ ] the percentage is calculated from the exact start and end chart prices
+[ ] upward measurements have a positive value and downward measurements have a negative value
+[ ] OHLC values are not used as measurement endpoints
+[ ] releasing the right button clears the guide and label
+[ ] the measurement is not persisted or synchronized
+[ ] the browser/WebEngine context menu is suppressed in the price panel
+[ ] existing left-button chart tools still work
 ```

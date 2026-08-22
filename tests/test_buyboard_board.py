@@ -125,6 +125,34 @@ def test_hidden_lifecycle_cards_are_not_rendered_but_remain_in_projection_cache(
     assert window._buyboard_current_projections == (watchlist, buylist, closed)
 
 
+def test_buy_today_projection_refreshes_active_buy_today_sidebar():
+    rendered = {status: [] for status in BOARD_COLUMN_ORDER}
+    refreshes = []
+
+    class _Column:
+        def __init__(self, status):
+            self.status = status
+
+        def set_cards(self, values, _quote_lookup, _equity_lookup):
+            rendered[self.status] = list(values)
+
+    class _SourceCombo:
+        def currentData(self):
+            return {"type": "buy_today"}
+
+    card = _card(board_status=BoardStatus.BUY_TODAY)
+    window = SimpleNamespace(
+        buyboard_columns={status: _Column(status) for status in BOARD_COLUMN_ORDER},
+        sidebar_source_combo=_SourceCombo(),
+        refresh_stock_sidebar=lambda: refreshes.append(True),
+    )
+
+    board_module.populate_buyboard_columns(window, [card])
+
+    assert refreshes == [True]
+    assert window._buyboard_current_projections == (card,)
+
+
 def test_standalone_broker_warning_remains_visible_when_watchlist_is_hidden():
     rendered = {status: [] for status in BOARD_COLUMN_ORDER}
 

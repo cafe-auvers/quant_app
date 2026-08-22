@@ -504,6 +504,12 @@ def _sync_account_filter_options(main_window, cards) -> Optional[str]:
 def populate_buyboard_columns(main_window, cards) -> None:
     cards = list(cards)
     main_window._buyboard_current_projections = tuple(cards)
+    source_combo = main_window.__dict__.get("sidebar_source_combo")
+    source = source_combo.currentData() if source_combo is not None else {}
+    if isinstance(source, dict) and source.get("type") == "buy_today":
+        refresh_sidebar = getattr(main_window, "refresh_stock_sidebar", None)
+        if callable(refresh_sidebar):
+            refresh_sidebar()
     visible_statuses = set(BOARD_COLUMN_ORDER)
     visible_cards = [
         value

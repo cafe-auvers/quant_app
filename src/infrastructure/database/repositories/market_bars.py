@@ -250,6 +250,7 @@ def load_hourly_history_from_db(
     start: Optional[dt.datetime] = None,
     end: Optional[dt.datetime] = None,
     source: Optional[str] = None,
+    max_rows: Optional[int] = None,
 ) -> pd.DataFrame:
     metadata = MetaData()
     hourly_history = _get_hourly_price_history_table(metadata)
@@ -260,7 +261,10 @@ def load_hourly_history_from_db(
         stmt = stmt.where(hourly_history.c.timestamp >= start)
     if end is not None:
         stmt = stmt.where(hourly_history.c.timestamp <= end)
-    stmt = stmt.order_by(hourly_history.c.timestamp)
+    if max_rows is not None and int(max_rows) > 0:
+        stmt = stmt.order_by(hourly_history.c.timestamp.desc()).limit(int(max_rows))
+    else:
+        stmt = stmt.order_by(hourly_history.c.timestamp)
 
     try:
         _ensure_hourly_price_history_table(engine)
@@ -429,6 +433,7 @@ def load_symbol_history_from_db(
     start: Optional[dt.datetime] = None,
     end: Optional[dt.datetime] = None,
     interval: str = "1d",
+    max_rows: Optional[int] = None,
 ) -> pd.DataFrame:
     metadata = MetaData()
     price_history = _get_price_history_table(metadata)
@@ -440,7 +445,10 @@ def load_symbol_history_from_db(
         stmt = stmt.where(price_history.c.date >= start)
     if end is not None:
         stmt = stmt.where(price_history.c.date <= end)
-    stmt = stmt.order_by(price_history.c.date)
+    if max_rows is not None and int(max_rows) > 0:
+        stmt = stmt.order_by(price_history.c.date.desc()).limit(int(max_rows))
+    else:
+        stmt = stmt.order_by(price_history.c.date)
 
     try:
         _ensure_price_history_table(engine)

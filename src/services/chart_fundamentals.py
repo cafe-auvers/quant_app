@@ -653,21 +653,13 @@ def refresh_universe_earnings_history(
             if canonical_symbol(symbol)
         )
     )
-    states = load_fundamental_sync_states(engine, EARNINGS_DATASET)
-    due = [
-        symbol
-        for symbol in canonical_symbols
-        if ChartFundamentalService._state_due(
-            states.get(symbol),
-            now,
-            normal_interval=EARNINGS_FRESH_FOR,
-            unavailable_interval=BULK_UNAVAILABLE_FRESH_FOR,
+    due = list(
+        get_universe_earnings_history_due_symbols(
+            engine,
+            canonical_symbols,
+            as_of=now,
         )
-    ]
-    # Never let yesterday's successful rows starve symbols that have never
-    # received a full-history attempt.
-    symbol_order = {symbol: index for index, symbol in enumerate(canonical_symbols)}
-    due.sort(key=lambda symbol: (symbol in states, symbol_order[symbol]))
+    )
     selected = due[: max(0, int(max_symbols))]
     worker = service or ChartFundamentalService(engine)
     refreshed = 0
@@ -693,3 +685,36 @@ def refresh_universe_earnings_history(
             f"{summary['remaining']} stale remaining."
         )
     return summary
+
+
+def get_universe_earnings_history_due_symbols(
+    engine: Engine,
+    symbols: Iterable[str],
+    *,
+    as_of: Optional[dt.datetime] = None,
+) -> tuple[str, ...]:
+    """Return stale earnings symbols, prioritizing those never attempted."""
+
+    now = _aware_utc(as_of or _utcnow())
+    assert now is not None
+    canonical_symbols = list(
+        dict.fromkeys(
+            canonical_symbol(symbol)
+            for symbol in symbols
+            if canonical_symbol(symbol)
+        )
+    )
+    states = load_fundamental_sync_states(engine, EARNINGS_DATASET)
+    due = [
+        symbol
+        for symbol in canonical_symbols
+        if ChartFundamentalService._state_due(
+            states.get(symbol),
+            now,
+            normal_interval=EARNINGS_FRESH_FOR,
+            unavailable_interval=BULK_UNAVAILABLE_FRESH_FOR,
+        )
+    ]
+    symbol_order = {symbol: index for index, symbol in enumerate(canonical_symbols)}
+    due.sort(key=lambda symbol: (symbol in states, symbol_order[symbol]))
+    return tuple(due)

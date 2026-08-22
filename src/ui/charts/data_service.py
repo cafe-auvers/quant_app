@@ -38,7 +38,9 @@ class ChartDataController(WindowController):
         if timeframe == "1H":
             hourly_history = pd.DataFrame()
             if self.db_enabled and self.db_engine is not None:
-                hourly_history = load_hourly_history_from_db(symbol, self.db_engine)
+                hourly_history = load_hourly_history_from_db(
+                    symbol, self.db_engine, max_rows=1000
+                )
 
             cached = self._load_cached_intraday_5m(symbol, window_days=window_days)
             cached_hourly = pd.DataFrame()
@@ -60,7 +62,12 @@ class ChartDataController(WindowController):
 
         history = pd.DataFrame()
         if self.db_enabled:
-            history = load_symbol_history_from_db(symbol, self.db_engine, interval="1d")
+            history = load_symbol_history_from_db(
+                symbol,
+                self.db_engine,
+                interval="1d",
+                max_rows=260,
+            )
         if force_refresh and use_live_fallback:
             latest = self._fetch_latest_daily_bar_for_chart(symbol)
             if history.empty or latest.empty:

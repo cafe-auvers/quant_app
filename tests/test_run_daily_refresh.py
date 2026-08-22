@@ -22,6 +22,11 @@ def _set_derived_current(monkeypatch, refresh):
     monkeypatch.setattr(
         refresh, "is_scanner_metrics_snapshot_current", lambda *args, **kwargs: True
     )
+    monkeypatch.setattr(
+        refresh,
+        "get_universe_earnings_history_due_symbols",
+        lambda *args, **kwargs: (),
+    )
 
 
 def test_refresh_gate_retries_hourly_when_daily_data_is_current(monkeypatch):
@@ -119,6 +124,48 @@ def test_refresh_gate_skips_only_when_every_symbol_and_mode_is_current(monkeypat
 
     assert modes == []
     assert "All 2 refresh symbols and derived caches are current" in reason
+
+
+def test_refresh_gate_runs_supplemental_daily_job_when_only_earnings_are_stale(
+    monkeypatch,
+):
+    refresh = _load_refresh_module()
+    expected_date = dt.date(2026, 6, 23)
+    tickers = ["SPY", "AAPL"]
+
+    monkeypatch.setattr(
+        refresh,
+        "resolve_data_engine",
+        lambda: SimpleNamespace(engine=object(), source="pc", pc_engine=object()),
+    )
+    monkeypatch.setattr(refresh, "_refresh_tickers", lambda: tickers)
+    monkeypatch.setattr(refresh, "expected_latest_market_data_date", lambda: expected_date)
+    monkeypatch.setattr(refresh, "get_chronically_failing_symbols", lambda *args, **kwargs: set())
+    _set_derived_current(monkeypatch, refresh)
+    monkeypatch.setattr(
+        refresh,
+        "get_price_history_watermarks",
+        lambda *args, **kwargs: {
+            symbol: (dt.datetime(2026, 6, 23), 250) for symbol in tickers
+        },
+    )
+    monkeypatch.setattr(
+        refresh,
+        "get_latest_hourly_price_history_timestamps",
+        lambda *args, **kwargs: {
+            symbol: dt.datetime(2026, 6, 23, 20, 30) for symbol in tickers
+        },
+    )
+    monkeypatch.setattr(
+        refresh,
+        "get_universe_earnings_history_due_symbols",
+        lambda *args, **kwargs: ("AAPL",),
+    )
+
+    targets, reason = refresh._refresh_targets_needed()
+
+    assert targets == {"1d": []}
+    assert "Earnings history needs refresh for 1 symbol" in reason
 
 
 def test_refresh_gate_skips_when_only_chronically_failing_symbols_are_stale(monkeypatch):
@@ -335,6 +382,11 @@ def test_refresh_gate_can_resume_derived_work_without_price_downloads(monkeypatc
     monkeypatch.setattr(
         refresh, "is_scanner_metrics_snapshot_current", lambda *args, **kwargs: True
     )
+    monkeypatch.setattr(
+        refresh,
+        "get_universe_earnings_history_due_symbols",
+        lambda *args, **kwargs: (),
+    )
 
     targets, reason = refresh._refresh_targets_needed()
 
@@ -385,6 +437,11 @@ def test_derived_only_refresh_does_not_retry_chronic_history(monkeypatch):
         refresh,
         "is_scanner_metrics_snapshot_current",
         lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        refresh,
+        "get_universe_earnings_history_due_symbols",
+        lambda *args, **kwargs: (),
     )
 
     targets, reason = refresh._refresh_targets_needed()

@@ -13,6 +13,7 @@ from src.services.chart_fundamentals import ChartFundamentalService
 
 class ChartFundamentalRefreshWorker(QThread):
     completed = pyqtSignal(object, int)
+    not_required = pyqtSignal(str, int)
     failed = pyqtSignal(str, str, int)
 
     def __init__(
@@ -34,6 +35,9 @@ class ChartFundamentalRefreshWorker(QThread):
             # Provider objects and their network-backed yfinance Ticker are
             # deliberately constructed only after the QThread has started.
             service = self._service_factory(self.engine)
+            if not service.refresh_required(self.symbol):
+                self.not_required.emit(self.symbol, self.generation)
+                return
             context = service.refresh_symbol(self.symbol)
             self.completed.emit(context, self.generation)
         except Exception as exc:
