@@ -835,8 +835,11 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         ):
             card.buffer_pct = float(command.buffer_pct)
         card.breakout_price = float(command.price)
-        card.watchlist_member = card.board_status == BoardStatus.WATCHLIST
-        card.buylist_member = card.board_status != BoardStatus.WATCHLIST
+        if card.board_status == BoardStatus.WATCHLIST:
+            card.watchlist_member = True
+            card.buylist_member = False
+        else:
+            card.buylist_member = True
         card.buy_today_note = ""
         card.entry_runtime_status = (
             EntryRuntimeStatus.ORB_FORMING
@@ -850,8 +853,11 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
             _move_board_card(card, BoardStatus.BUYLIST)
         clear_executable_entry_plan()
         card.breakout_price = None
-        card.watchlist_member = card.board_status == BoardStatus.WATCHLIST
-        card.buylist_member = card.board_status != BoardStatus.WATCHLIST
+        if card.board_status == BoardStatus.WATCHLIST:
+            card.watchlist_member = True
+            card.buylist_member = False
+        else:
+            card.buylist_member = True
         card.session_date = None
         card.buy_today_note = ""
         card.entry_runtime_status = None
@@ -1034,7 +1040,7 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         card.buy_today_note = ""
     elif isinstance(command, types.MoveToBuylist):
         clear_executable_entry_plan()
-        card.watchlist_member = False
+        card.watchlist_member = True
         card.buylist_member = True
         card.buy_today_note = ""
         card.session_date = None

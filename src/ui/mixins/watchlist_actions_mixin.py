@@ -48,11 +48,7 @@ class WatchlistActionsMixin:
             projection_lookup(symbol) if callable(projection_lookup) else None
         )
         card = projection.card if projection is not None else None
-        archived_canonical = bool(
-            card is not None
-            and card.board_status == BoardStatus.WATCHLIST
-            and not card.watchlist_member
-        )
+        archived_canonical = bool(card is not None and not card.watchlist_member)
         if existing is not None and not archived_canonical:
             self._update_watchlist_action_surfaces()
             QMessageBox.information(
@@ -104,12 +100,26 @@ class WatchlistActionsMixin:
         selected_symbol = self._normalized_watchlist_symbol(selected.get("symbol"))
         name = selected.get("name") if selected_symbol == symbol else symbol
         entry_price = selected.get("price") if selected_symbol == symbol else None
+        if self._tradingview_symbol_in_watchlist(symbol):
+            self._remove_watchlist_candidate(symbol, confirm=False)
+            return
         self._add_watchlist_candidate(
             symbol,
             name=name or symbol,
             entry_price=entry_price,
             source="TradingView",
         )
+
+    def _tradingview_symbol_in_watchlist(self, symbol: str) -> bool:
+        symbol = self._normalized_watchlist_symbol(symbol)
+        if not symbol:
+            return False
+        projection = self._chart_buyboard_projection(symbol)
+        card = projection.card if projection is not None else None
+        if card is not None:
+            return bool(card.watchlist_member)
+        watchlist = self.__dict__.get("watchlist")
+        return bool(watchlist is not None and watchlist.get(symbol) is not None)
 
     def _update_tradingview_watchlist_btn(self, _text: str = "") -> None:
         button = self.__dict__.get("tradingview_add_watchlist_button")
@@ -119,32 +129,31 @@ class WatchlistActionsMixin:
         symbol = self._normalized_watchlist_symbol(
             combo.currentText() if combo is not None else ""
         )
-        watchlist = self.__dict__.get("watchlist")
-        in_watchlist = bool(
-            symbol and watchlist is not None and watchlist.get(symbol) is not None
-        )
         projection = self._chart_buyboard_projection(symbol) if symbol else None
         card = projection.card if projection is not None else None
-        if (
-            card is not None
-            and card.board_status == BoardStatus.WATCHLIST
-            and not card.watchlist_member
-        ):
-            # Canonical removal wins over a stale local mirror. The explicit
-            # Add action can then reconcile/revive the passive membership.
-            in_watchlist = False
-        in_other_stage = bool(
-            card is not None and card.board_status != BoardStatus.WATCHLIST
+        in_watchlist = self._tradingview_symbol_in_watchlist(symbol)
+        supports_watchlist_toggle = bool(
+            card is None
+            or (
+                card.board_status in {BoardStatus.WATCHLIST, BoardStatus.BUYLIST}
+                and is_passive_planning_card(card)
+            )
         )
         if in_watchlist:
-            button.setText("In Watchlist (W)")
-        elif in_other_stage:
+            button.setText("Remove from Watchlist (W)")
+        elif not supports_watchlist_toggle:
             button.setText(f"In {card.board_status.value.replace('_', ' ').title()}")
         else:
             button.setText("Add to Watchlist (W)")
-        button.setEnabled(bool(symbol) and not in_watchlist and not in_other_stage)
+        button.setEnabled(bool(symbol) and supports_watchlist_toggle)
         button.setStyleSheet(
-            "" if in_watchlist else "background-color: #27ae60; color: white; font-weight: 600;"
+            "background-color: #c0392b; color: white; font-weight: 600;"
+            if in_watchlist
+            else (
+                "background-color: #27ae60; color: white; font-weight: 600;"
+                if supports_watchlist_toggle
+                else ""
+            )
         )
 
     @staticmethod
@@ -279,19 +288,22 @@ class WatchlistActionsMixin:
     def _promote_watchlist_candidate(self, symbol: str) -> bool:
         return self._start_planning_membership_change("promote", symbol)
 
-    def _remove_watchlist_candidate(self, symbol: str) -> bool:
+    def _remove_watchlist_candidate(
+        self, symbol: str, *, confirm: bool = True
+    ) -> bool:
         symbol = self._normalized_watchlist_symbol(symbol)
         if not symbol:
             return False
-        answer = QMessageBox.question(
-            self,
-            "Remove from Watchlist",
-            f"Remove {symbol} from Watchlist?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if answer != QMessageBox.Yes:
-            return False
+        if confirm:
+            answer = QMessageBox.question(
+                self,
+                "Remove from Watchlist",
+                f"Remove {symbol} from Watchlist?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return False
         return self._start_planning_membership_change("remove", symbol)
 
     @staticmethod
@@ -329,7 +341,6 @@ class WatchlistActionsMixin:
                 completed_item = getattr(result, "buylist_item", None)
                 if completed_item is not None:
                     self.buylist_manager.add(copy.deepcopy(completed_item))
-                self.watchlist.remove(symbol)
             elif outcome.request.operation == "remove":
                 self.watchlist.remove(symbol)
             save = getattr(self, "_save_state", None)
@@ -348,7 +359,7 @@ class WatchlistActionsMixin:
             append_log = getattr(self, "append_log", None)
             if callable(append_log):
                 verb = (
-                    "Moved to Buylist"
+                    "Added to Buylist"
                     if outcome.request.operation == "promote"
                     else (
                         "Removed from Watchlist"
@@ -494,7 +505,7 @@ class WatchlistActionsMixin:
                 else getattr(watch_item, "breakout_price", None)
             )
             button.setText(
-                "Move to Buylist (Q)" if target is not None else "Set Breakout First"
+                "Add to Buylist (Q)" if target is not None else "Set Breakout First"
             )
             button.setEnabled(target is not None and not pending)
             button.setStyleSheet(

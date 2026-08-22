@@ -242,20 +242,29 @@ def add_watchlist_candidate(
             stored = trade_card_repository.create_trade_card(engine, card)
         else:
             if (
-                current.board_status != BoardStatus.WATCHLIST
+                current.board_status not in {
+                    BoardStatus.WATCHLIST,
+                    BoardStatus.BUYLIST,
+                }
                 or not is_passive_planning_card(current)
             ):
                 raise PlanningMembershipError(
                     f"{normalized_symbol} is already in {current.board_status.value}; "
-                    "it cannot also be added as a passive Watchlist candidate"
+                    "its Watchlist membership cannot be changed"
                 )
             updated = copy.deepcopy(current)
             updated.watchlist_member = True
-            updated.buylist_member = False
             updated.name = str(name or updated.name or normalized_symbol)
             if breakout_price is not None:
                 updated.breakout_price = _optional_positive(breakout_price)
-            _clear_executable_geometry(updated)
+            if current.board_status == BoardStatus.WATCHLIST:
+                updated.buylist_member = False
+                _clear_executable_geometry(updated)
+            else:
+                # Watchlist is an independent saved-symbol membership. Adding
+                # it to a passive Buylist card must not demote or rewrite the
+                # card's Buylist plan.
+                updated.buylist_member = True
             stored = trade_card_repository.update_trade_card(
                 engine, updated, expected_version=current.version
             )
@@ -265,8 +274,11 @@ def add_watchlist_candidate(
         ) from exc
 
     local = watchlist.add(normalized_symbol, str(name or normalized_symbol), entry_price)
-    if breakout_price is not None:
-        local.breakout_price = _optional_positive(breakout_price)
+    local.breakout_price = _optional_positive(
+        breakout_price
+        if breakout_price is not None
+        else getattr(stored, "breakout_price", None)
+    )
     return PlanningMembershipResult(
         action="added_to_watchlist",
         symbol=normalized_symbol,
@@ -284,7 +296,7 @@ def promote_watchlist_to_buylist(
     default_account_no: str,
     buffer_pct: float = 0.001,
 ) -> PlanningMembershipResult:
-    """Explicitly move a passive Watchlist candidate into passive Buylist."""
+    """Add a passive Watchlist candidate to Buylist without unsaving it."""
 
     normalized_symbol = _symbol(symbol)
     source = watchlist.get(normalized_symbol)
@@ -319,7 +331,7 @@ def promote_watchlist_to_buylist(
             engine,
             candidate,
             default_account_no=account_no,
-            watchlist=None,
+            watchlist=watchlist,
             explicit_watchlist_promotion=True,
         )
         card = sync.card
@@ -349,11 +361,9 @@ def promote_watchlist_to_buylist(
             "Shared planning storage is unavailable; the Watchlist item was not promoted"
         ) from exc
 
-    # Canonical CAS succeeded (or already agreed) before either compatibility
-    # collection changes, so a failed canonical write never makes the symbol
-    # disappear from the user's Watchlist.
+    # Buylist is an additional planning membership. The saved Watchlist row
+    # deliberately remains so the symbol is still available in that view.
     buylist_manager.add(candidate)
-    watchlist.remove(normalized_symbol)
     return PlanningMembershipResult(
         action="promoted_to_buylist",
         symbol=normalized_symbol,
@@ -370,12 +380,10 @@ def remove_watchlist_candidate(
     engine: Optional[Engine],
     default_account_no: str,
 ) -> PlanningMembershipResult:
-    """Archive one passive WATCHLIST card, then remove its local membership."""
+    """Remove Watchlist membership while preserving an overlapping Buylist."""
 
     normalized_symbol = _symbol(symbol)
     source = watchlist.get(normalized_symbol)
-    if source is None:
-        return PlanningMembershipResult("unchanged", normalized_symbol)
     account_no = _account(default_account_no)
     if engine is None or not account_no:
         raise PlanningMembershipError(
@@ -387,22 +395,29 @@ def remove_watchlist_candidate(
             engine, normalized_symbol, account_no
         )
         if current is not None:
-            if (
-                current.board_status != BoardStatus.WATCHLIST
-                or not is_passive_planning_card(current)
-            ):
+            if not is_passive_planning_card(current) or current.board_status not in {
+                BoardStatus.WATCHLIST,
+                BoardStatus.BUYLIST,
+            }:
                 raise PlanningMembershipError(
                     f"{normalized_symbol} is not a passive Watchlist candidate"
                 )
             archived = copy.deepcopy(current)
             archived.watchlist_member = False
-            archived.buylist_member = False
-            archived.breakout_price = None
-            _clear_executable_geometry(archived)
-            archived.board_status_updated_at = datetime.now(timezone.utc)
+            if current.board_status == BoardStatus.WATCHLIST:
+                archived.buylist_member = False
+                archived.breakout_price = None
+                _clear_executable_geometry(archived)
+                archived.board_status_updated_at = datetime.now(timezone.utc)
+            else:
+                # W removes only the independent Watchlist membership. The
+                # Buylist card and all passive planning metadata survive.
+                archived.buylist_member = True
             stored = trade_card_repository.update_trade_card(
                 engine, archived, expected_version=current.version
             )
+        elif source is None:
+            return PlanningMembershipResult("unchanged", normalized_symbol)
     except SQLAlchemyError as exc:
         raise PlanningMembershipError(
             "Shared planning storage is unavailable; the Watchlist item was not removed"
@@ -525,13 +540,44 @@ def sync_legacy_planning_membership_from_card(
                 buy_item.name,
             )
             item_changed = before != after
-        removed = watchlist.remove(symbol)
+        watch_changed = False
+        if card.watchlist_member:
+            converted = _watchlist_from_buylist(buy_item, card=card)
+            if watch_item is None:
+                watchlist.items.append(converted)
+                watch_changed = True
+            else:
+                before = (
+                    watch_item.name,
+                    watch_item.entry_price,
+                    watch_item.breakout_price,
+                    watch_item.stop_loss,
+                    watch_item.notes,
+                    watch_item.selected_orb_plan,
+                )
+                watch_item.name = converted.name
+                watch_item.entry_price = converted.entry_price
+                watch_item.breakout_price = converted.breakout_price
+                watch_item.stop_loss = converted.stop_loss
+                watch_item.notes = converted.notes
+                watch_item.selected_orb_plan = None
+                after = (
+                    watch_item.name,
+                    watch_item.entry_price,
+                    watch_item.breakout_price,
+                    watch_item.stop_loss,
+                    watch_item.notes,
+                    watch_item.selected_orb_plan,
+                )
+                watch_changed = before != after
+        else:
+            watch_changed = bool(watchlist.remove(symbol))
         return PlanningMembershipResult(
             "synced_buylist",
             symbol,
             card=card,
             buylist_item=buy_item,
-            changed=bool(removed or item_changed),
+            changed=bool(watch_changed or item_changed),
         )
 
     return PlanningMembershipResult("ignored_non_planning", symbol, card=card)

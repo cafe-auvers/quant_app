@@ -147,6 +147,156 @@ class ChartRenderMetricsMixin:
         return aligned.dropna(subset=required)
 
     @staticmethod
+    def _rebase_relative_strength_to_percent(
+        indicator_history: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Express the stock/SPY ratio as performance since the first chart bar."""
+        if indicator_history.empty or "relative_strength" not in indicator_history.columns:
+            return pd.DataFrame()
+
+        rebased = indicator_history.copy()
+        relative_strength = pd.to_numeric(
+            rebased["relative_strength"], errors="coerce"
+        )
+        valid = relative_strength.dropna()
+        if valid.empty or float(valid.iloc[0]) == 0:
+            return pd.DataFrame()
+
+        anchor_ratio = float(valid.iloc[0])
+        rebased["relative_strength"] = (
+            relative_strength / anchor_ratio - 1.0
+        ) * 100.0
+        if "rs_sma_50" in rebased.columns:
+            rs_sma = pd.to_numeric(rebased["rs_sma_50"], errors="coerce")
+            rebased["rs_sma_50"] = (rs_sma / anchor_ratio - 1.0) * 100.0
+        return rebased
+
+    @staticmethod
+    def _build_relative_indicator_payload(
+        chart_history: pd.DataFrame,
+        indicators: Optional[pd.DataFrame],
+        chart_time_by_timestamp: dict,
+    ) -> dict:
+        indicator_history = ChartRenderMetricsMixin._align_chart_indicators(
+            chart_history, indicators
+        )
+        indicator_history = (
+            ChartRenderMetricsMixin._rebase_relative_strength_to_percent(
+                indicator_history
+            )
+        )
+        payload = {
+            "rs_points": [],
+            "rs_sma_points": [],
+            "rs_markers": [],
+            "ti65_background": [],
+            "relative_summary": "vs SPY N/A",
+            "score_summary": "RS Score N/A",
+        }
+        if indicator_history.empty:
+            return payload
+
+        row_count = len(indicator_history)
+
+        def values(name, default=None):
+            if name in indicator_history.columns:
+                return indicator_history[name].to_numpy()
+            return [default] * row_count
+
+        relative_strength_values = values("relative_strength")
+        rs_sma_values = values("rs_sma_50")
+        plus_4pct_values = values("is_plus_4pct_change", False)
+        minus_4pct_values = values("is_minus_4pct_change", False)
+        pct_change_values = values("pct_change_today")
+        ti65_bullish_values = values("is_ti65_bullish", False)
+        ti65_bearish_values = values("is_ti65_bearish", False)
+        indicator_index = pd.DatetimeIndex(indicator_history.index)
+        indicator_index = (
+            indicator_index.tz_convert(None)
+            if indicator_index.tz is not None
+            else indicator_index.tz_localize(None)
+        )
+
+        for position, timestamp in enumerate(indicator_index):
+            time_value = chart_time_by_timestamp.get(timestamp)
+            if time_value is None:
+                continue
+            rs_value = relative_strength_values[position]
+            sma_value = rs_sma_values[position]
+            if pd.notna(rs_value):
+                current_rs_value = round(float(rs_value), 6)
+                color = (
+                    "#22c55e" if current_rs_value > 0 else
+                    "#ef4444" if current_rs_value < 0 else
+                    "#9ca3af"
+                )
+                payload["rs_points"].append(
+                    {"time": time_value, "value": current_rs_value, "color": color}
+                )
+                if bool(plus_4pct_values[position]):
+                    pct_val = pct_change_values[position]
+                    label = f"+{round(float(pct_val))}%" if pd.notna(pct_val) else "+4%"
+                    payload["rs_markers"].append(
+                        {"time": time_value, "position": "aboveBar", "color": "#22c55e", "shape": "circle", "text": label}
+                    )
+                if bool(minus_4pct_values[position]):
+                    pct_val = pct_change_values[position]
+                    label = f"{round(float(pct_val))}%" if pd.notna(pct_val) else "-4%"
+                    payload["rs_markers"].append(
+                        {"time": time_value, "position": "belowBar", "color": "#ef4444", "shape": "circle", "text": label}
+                    )
+            if pd.notna(sma_value):
+                payload["rs_sma_points"].append(
+                    {"time": time_value, "value": round(float(sma_value), 6)}
+                )
+            if bool(ti65_bullish_values[position]):
+                payload["ti65_background"].append(
+                    {"time": time_value, "value": 1, "color": "rgba(34, 197, 94, 0.18)"}
+                )
+            elif bool(ti65_bearish_values[position]):
+                payload["ti65_background"].append(
+                    {"time": time_value, "value": 1, "color": "rgba(239, 68, 68, 0.18)"}
+                )
+
+        if payload["rs_points"]:
+            anchor_label = indicator_index[0].strftime("%Y-%m-%d")
+            latest_relative = float(payload["rs_points"][-1]["value"])
+            color = (
+                "#22c55e" if latest_relative > 0 else
+                "#ef4444" if latest_relative < 0 else
+                "#9ca3af"
+            )
+            payload["relative_summary"] = (
+                f'vs SPY since {anchor_label} '
+                f'<span style="color:{color}">{latest_relative:+.1f}%</span>'
+            )
+
+        latest_scores = (
+            indicator_history.dropna(subset=["rs_score_current"]).tail(1)
+            if "rs_score_current" in indicator_history.columns
+            else pd.DataFrame()
+        )
+        if not latest_scores.empty:
+            latest_score = latest_scores.iloc[-1]
+
+            def score_span(label, value) -> str:
+                text = "N/A" if pd.isna(value) else str(int(round(float(value))))
+                color = (
+                    ' style="color:#22c55e"'
+                    if pd.notna(value) and float(value) > 85
+                    else ""
+                )
+                return f"{label} <span{color}>{text}</span>"
+
+            payload["score_summary"] = (
+                f"RS Score {score_span('C', latest_score.get('rs_score_current'))} | "
+                f"{score_span('W', latest_score.get('rs_score_week'))} | "
+                f"{score_span('M', latest_score.get('rs_score_month'))} | "
+                f"{score_span('Y', latest_score.get('rs_score_yesterday'))}"
+            )
+        return payload
+
+    @staticmethod
     def _generate_indicator_panel_svg(
         indicator_history: pd.DataFrame,
         x_for,
@@ -156,6 +306,13 @@ class ChartRenderMetricsMixin:
         top: int,
         bottom: int,
     ) -> str:
+        indicator_history = (
+            ChartRenderMetricsMixin._rebase_relative_strength_to_percent(
+                indicator_history
+            )
+        )
+        if indicator_history.empty:
+            return ""
         rs = indicator_history["relative_strength"].astype(float)
         rs_sma = indicator_history["rs_sma_50"].astype(float)
         values = pd.concat([rs, rs_sma]).dropna()
@@ -163,11 +320,11 @@ class ChartRenderMetricsMixin:
             return ""
 
         panel_height = bottom - top
-        min_value = float(values.min())
-        max_value = float(values.max())
+        min_value = min(0.0, float(values.min()))
+        max_value = max(0.0, float(values.max()))
         if min_value == max_value:
-            min_value *= 0.98
-            max_value *= 1.02
+            min_value = -1.0
+            max_value = 1.0
         padding = (max_value - min_value) * 0.12
         min_value -= padding
         max_value += padding
@@ -189,9 +346,29 @@ class ChartRenderMetricsMixin:
             for index, value in enumerate(rs_sma)
             if pd.notna(value)
         ]
-        rs_line = " ".join(f"{x:.1f},{y:.1f}" for _, x, y in points_rs)
         sma_line = " ".join(f"{x:.1f},{y:.1f}" for _, x, y in points_sma)
-        fill_points = " ".join(f"{x:.1f},{y:.1f}" for _, x, y in points_rs + list(reversed(points_sma)))
+        zero_y = y_for(0.0)
+        relative_axis_labels = []
+        for axis_value in (max_value, min_value):
+            label = f"{axis_value:+.1f}%"
+            relative_axis_labels.append(
+                f'<text x="{width - right + 6}" y="{y_for(axis_value) + 4:.1f}" '
+                f'fill="#94a3b8" font-size="11">{label}</text>'
+            )
+        rs_segment_elements = []
+        for previous, current in zip(points_rs, points_rs[1:]):
+            _, previous_x, previous_y = previous
+            _, current_x, current_y = current
+            segment_color = (
+                "#22c55e"
+                if float(rs.iloc[current[0]]) >= 0.0
+                else "#ef4444"
+            )
+            rs_segment_elements.append(
+                f'<line x1="{previous_x:.1f}" y1="{previous_y:.1f}" '
+                f'x2="{current_x:.1f}" y2="{current_y:.1f}" '
+                f'stroke="{segment_color}" stroke-width="2.4" stroke-linecap="round" />'
+            )
 
         marker_elements = []
         background_elements = []
@@ -243,16 +420,18 @@ class ChartRenderMetricsMixin:
             )
 
         return f"""
-            <text x="{left}" y="{top - 14}" fill="#e5e7eb" font-size="14" font-weight="600">Relative Strength vs SPY</text>
-            <text x="{width - 280}" y="{top - 14}" fill="#16a34a" font-size="12">RS above SMA</text>
-            <text x="{width - 176}" y="{top - 14}" fill="#ef4444" font-size="12">RS below SMA</text>
+            <text x="{left}" y="{top - 14}" fill="#e5e7eb" font-size="14" font-weight="600">Relative Performance vs SPY (%)</text>
+            <text x="{width - 310}" y="{top - 14}" fill="#16a34a" font-size="12">Above 0% = beating SPY</text>
+            <text x="{width - 150}" y="{top - 14}" fill="#ef4444" font-size="12">Below 0% = losing</text>
             <line x1="{left}" y1="{bottom}" x2="{width - right}" y2="{bottom}" stroke="#555" />
             <line x1="{left}" y1="{top}" x2="{width - right}" y2="{top}" stroke="#333" />
             <line x1="{left}" y1="{top + panel_height / 2:.1f}" x2="{width - right}" y2="{top + panel_height / 2:.1f}" stroke="#333" />
             {''.join(background_elements)}
-            <polygon points="{fill_points}" fill="#22c55e" opacity="0.14" />
+            <line x1="{left}" y1="{zero_y:.1f}" x2="{width - right}" y2="{zero_y:.1f}" stroke="#94a3b8" stroke-width="1" stroke-dasharray="5 4" />
+            <text x="{width - right + 6}" y="{zero_y + 4:.1f}" fill="#cbd5e1" font-size="11">0%</text>
+            {''.join(relative_axis_labels)}
             <polyline points="{sma_line}" fill="none" stroke="#e5e7eb" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" />
-            <polyline points="{rs_line}" fill="none" stroke="#22c55e" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round" />
+            {''.join(rs_segment_elements)}
             {''.join(marker_elements)}
             {table}
         """

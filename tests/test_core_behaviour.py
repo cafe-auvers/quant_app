@@ -663,7 +663,7 @@ def test_tradingview_lightweight_chart_html_includes_rs_ti65_indicator():
     )
     indicators = pd.DataFrame(
         {
-            "relative_strength": [1.0, 1.1, 1.2],
+            "relative_strength": [1.0, 1.1, 0.95],
             "rs_sma_50": [1.0, 1.05, 1.1],
             "rs_score_current": [50.0, 75.0, 90.0],
             "rs_score_yesterday": [None, 50.0, 75.0],
@@ -687,9 +687,14 @@ def test_tradingview_lightweight_chart_html_includes_rs_ti65_indicator():
         indicators=indicators,
     )
 
-    assert "RS vs SPY" in chart_html
-    assert "RS SMA 50" in chart_html
+    assert "Relative vs SPY" in chart_html
+    assert "Relative SMA 50" in chart_html
     assert 'id="rs-chart"' in chart_html
+    assert '"value": 0.0, "color": "#9ca3af"' in chart_html
+    assert '"value": 10.0, "color": "#22c55e"' in chart_html
+    assert '"value": -5.0, "color": "#ef4444"' in chart_html
+    assert "SPY baseline" in chart_html
+    assert "vs SPY since 2026-01-01" in chart_html
     # rs_score_current's latest value (90) is > 85, so score_span() highlights it in
     # a <span style="color:#22c55e"> wrapper rather than emitting plain "C 90" text.
     assert "RS Score C" in chart_html
@@ -727,7 +732,22 @@ def test_tradingview_indicator_alignment_accepts_date_column_and_timezone():
     )
 
     assert list(aligned["relative_strength"]) == [1.0, 1.1, 1.2]
-    assert '"value": 1.2' in chart_html
+    assert '"value": 20.0' in chart_html
+
+
+def test_relative_strength_is_rebased_to_insightful_percentages():
+    indicators = pd.DataFrame(
+        {
+            "relative_strength": [0.03, 0.033, 0.027],
+            "rs_sma_50": [0.03, 0.0315, 0.03],
+        },
+        index=pd.date_range("2026-01-01", periods=3, freq="D"),
+    )
+
+    rebased = MainWindow._rebase_relative_strength_to_percent(indicators)
+
+    assert list(rebased["relative_strength"].round(6)) == [0.0, 10.0, -10.0]
+    assert list(rebased["rs_sma_50"].round(6)) == [0.0, 5.0, 0.0]
 
 
 def test_tradingview_intraday_chart_projects_daily_drawings_to_bar_times():
@@ -1135,11 +1155,12 @@ def test_chart_html_includes_indicator_panel_when_indicators_available():
 
     chart_html = MainWindow._generate_local_chart_html("AAPL", history, indicators=indicators)
 
-    assert "Relative Strength vs SPY" in chart_html
-    assert "RS above SMA" in chart_html
+    assert "Relative Performance vs SPY (%)" in chart_html
+    assert "Above 0% = beating SPY" in chart_html
+    assert "Below 0% = losing" in chart_html
     assert 'y2="790"' in chart_html
-    assert "RS SMA" in chart_html
-    assert '"relative_strength": 1.0' in chart_html
+    assert "Relative SMA" in chart_html
+    assert '"relative_performance_pct": 0.0' in chart_html
 
 
 def test_chart_html_respects_visibility_options():
@@ -1177,7 +1198,7 @@ def test_chart_html_respects_visibility_options():
     )
 
     assert ">Volume<" not in chart_html
-    assert "Relative Strength vs SPY" not in chart_html
+    assert "Relative Performance vs SPY (%)" not in chart_html
     assert "EMA 10" not in chart_html
     assert "ADR" not in chart_html
     assert 'y1="560"' in chart_html

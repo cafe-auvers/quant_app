@@ -164,6 +164,7 @@ def test_watchlist_to_buylist(tmp_path):
     )
     result = apply_board_command(engine, _cmd(MoveToBuylist, card))
     assert result.board_status == BoardStatus.BUYLIST
+    assert result.watchlist_member is True
     assert result.buylist_member is True
     assert result.version == 2
 

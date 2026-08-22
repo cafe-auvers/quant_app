@@ -116,7 +116,7 @@ def test_main_window_constructs_and_closes_offscreen_without_external_io(monkeyp
     )
     assert window.tradingview_add_watchlist_button.text() in {
         "Add to Watchlist (W)",
-        "In Watchlist (W)",
+        "Remove from Watchlist (W)",
     }
     assert window.tradingview_watchlist_shortcut.isEnabled()
     assert hasattr(window, "add_current_tradingview_symbol_to_watchlist")

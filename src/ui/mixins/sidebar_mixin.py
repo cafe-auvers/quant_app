@@ -121,7 +121,7 @@ class SidebarMixin:
         )
         sidebar_layout.addWidget(self.sidebar_add_watchlist_button)
 
-        self.sidebar_move_buylist_button = QPushButton("Move to Buylist")
+        self.sidebar_move_buylist_button = QPushButton("Add to Buylist")
         self.sidebar_move_buylist_button.setObjectName("sidebarMoveBuylistButton")
         self.sidebar_move_buylist_button.clicked.connect(
             self.sidebar_move_selected_to_buylist
