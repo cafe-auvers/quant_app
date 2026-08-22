@@ -56,9 +56,10 @@ from .repositories.scanner import (get_universe_stock_metrics_from_db,
 from .repositories.fundamentals import (
     EARNINGS_DATASET, PROFILE_DATASET, ensure_fundamental_tables,
     load_earnings_events, load_fundamental_sync_state,
-    load_fundamental_sync_states, load_stock_profile,
+    load_fundamental_sync_states, load_stock_profile, load_stock_profiles,
     normalized_payload_fingerprint, record_fundamental_sync_state,
-    seed_stock_profiles, upsert_earnings_events, upsert_stock_profile)
+    seed_stock_profiles, upsert_earnings_events, upsert_earnings_events_bulk,
+    upsert_stock_profile)
 from .schema import (CHRONIC_FAILURE_THRESHOLD,
                      _ensure_chart_indicator_manifests_table,
                      _ensure_chart_indicators_table,

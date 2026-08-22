@@ -40,17 +40,24 @@ from src.infrastructure.database.repositories.fundamentals import (
     load_earnings_events,
     load_fundamental_sync_state,
     load_stock_profile,
+    load_stock_profiles,
     record_fundamental_sync_state,
     seed_stock_profiles,
     upsert_earnings_events,
+    upsert_earnings_events_bulk,
     upsert_stock_profile,
 )
 from src.services.chart_fundamentals import (
     ChartFundamentalService,
+    refresh_nasdaq_universe_stock_profiles,
+    refresh_universe_earnings_history,
+    refresh_universe_upcoming_earnings,
     refresh_universe_stock_profiles,
     seed_default_universe_stock_profiles,
 )
 from src.services.fundamental_providers import (
+    NasdaqStockProfileUniverseProvider,
+    NasdaqUpcomingEarningsUniverseProvider,
     YahooEarningsProvider,
     YahooStockProfileProvider,
 )
@@ -60,6 +67,17 @@ from src.ui.charts.render_lightweight import ChartLightweightRenderMixin
 
 UTC = dt.timezone.utc
 NOW = dt.datetime(2026, 8, 21, 12, tzinfo=UTC)
+
+
+class _JsonResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
 
 
 def _event(
@@ -450,6 +468,202 @@ def test_universe_profile_enrichment_is_bounded_and_advances_to_next_symbols():
     assert second["attempted"] == 1
     assert second["remaining"] == 0
     assert provider.calls == ["AAPL", "MSFT", "NVDA"]
+
+
+def test_nasdaq_universe_provider_normalizes_share_classes_and_profile_fields():
+    payload = {
+        "data": {
+            "rows": [
+                {
+                    "symbol": "AAPL",
+                    "name": "Apple Inc. Common Stock",
+                    "country": "United States",
+                    "sector": "Technology",
+                    "industry": "Consumer Electronics",
+                },
+                {
+                    "symbol": "BRK/B",
+                    "name": "Berkshire Hathaway Inc.",
+                    "country": "United States",
+                    "sector": "Consumer Discretionary",
+                    "industry": "Diversified Holdings",
+                },
+            ]
+        }
+    }
+    provider = NasdaqStockProfileUniverseProvider(
+        http_get=lambda *_args, **_kwargs: _JsonResponse(payload),
+        now=lambda: NOW,
+    )
+
+    profiles = provider.fetch_stock_profiles(("AAPL", "BRK-B", "MSFT"))
+
+    assert [profile.symbol for profile in profiles] == ["AAPL", "BRK-B"]
+    assert profiles[0].sector_name == "Technology"
+    assert profiles[0].industry_name == "Consumer Electronics"
+    assert profiles[0].profile_status is ProfileStatus.OK
+
+
+def test_nasdaq_profile_refresh_preserves_baseline_exchange_and_is_idempotent():
+    engine = create_engine("sqlite:///:memory:", future=True)
+    baseline = replace(
+        _profile("AAPL"),
+        company_name="Apple baseline",
+        exchange="NASD",
+        sector_name=None,
+        industry_name=None,
+        profile_status=ProfileStatus.PARTIAL,
+        source="kis_master",
+    )
+    seed_stock_profiles(engine, (baseline,))
+    provider = SimpleNamespace(
+        fetch_stock_profiles=lambda _symbols: (
+            replace(
+                baseline,
+                company_name="Apple Inc.",
+                exchange=None,
+                sector_name="Technology",
+                industry_name="Consumer Electronics",
+                profile_status=ProfileStatus.OK,
+                source="nasdaq",
+            ),
+        )
+    )
+
+    first = refresh_nasdaq_universe_stock_profiles(
+        engine, ("AAPL",), provider=provider
+    )
+    second = refresh_nasdaq_universe_stock_profiles(
+        engine, ("AAPL",), provider=provider
+    )
+    stored = load_stock_profiles(engine)["AAPL"]
+
+    assert first["complete"] == 1
+    assert first["changed"] == 1
+    assert second["changed"] == 0
+    assert stored.exchange == "NASD"
+    assert stored.sector_name == "Technology"
+    assert stored.industry_name == "Consumer Electronics"
+
+
+def test_nasdaq_earnings_calendar_creates_expected_and_prior_year_events():
+    def get(_url, *, params, **_kwargs):
+        rows = []
+        if params["date"] == "2026-08-24":
+            rows = [{
+                "symbol": "AAPL",
+                "time": "time-pre-market",
+                "fiscalQuarterEnding": "Jun/2026",
+                "epsForecast": "$1.25",
+                "lastYearRptDt": "8/25/2025",
+                "lastYearEPS": "($0.50)",
+            }]
+        return _JsonResponse({"data": {"rows": rows}})
+
+    provider = NasdaqUpcomingEarningsUniverseProvider(
+        http_get=get,
+        now=lambda: NOW,
+    )
+
+    events = provider.fetch_earnings(("AAPL", "MSFT"), horizon_days=3)
+    expected = next(event for event in events if event.event_status is EventStatus.EXPECTED)
+    prior = next(event for event in events if event.event_status is EventStatus.REPORTED)
+
+    assert expected.symbol == "AAPL"
+    assert expected.report_date == dt.date(2026, 8, 24)
+    assert expected.report_timing is ReportTiming.BMO
+    assert expected.estimated_eps == pytest.approx(1.25)
+    assert expected.fiscal_period_end == dt.date(2026, 6, 30)
+    assert prior.reported_eps == pytest.approx(-0.5)
+    assert prior.eps_basis == "REPORTED"
+
+
+def test_nasdaq_earnings_calendar_keeps_other_dates_after_retried_failure():
+    def get(_url, *, params, **_kwargs):
+        if params["date"] == "2026-08-21":
+            raise OSError("temporary socket failure")
+        rows = [{"symbol": "AAPL"}] if params["date"] == "2026-08-24" else []
+        return _JsonResponse({"data": {"rows": rows}})
+
+    provider = NasdaqUpcomingEarningsUniverseProvider(
+        http_get=get,
+        now=lambda: NOW,
+    )
+
+    events = provider.fetch_earnings(("AAPL",), horizon_days=3)
+
+    assert any(event.symbol == "AAPL" for event in events)
+    assert provider.failed_dates == (dt.date(2026, 8, 21),)
+
+
+def test_bulk_earnings_calendar_persistence_is_idempotent():
+    engine = create_engine("sqlite:///:memory:", future=True)
+    event = EarningsEvent(
+        symbol="AAPL",
+        event_key="NEXT_EXPECTED",
+        report_date=dt.date(2026, 10, 29),
+        event_status=EventStatus.EXPECTED,
+        source="nasdaq",
+        source_updated_at=NOW,
+    )
+    provider = SimpleNamespace(
+        fetch_earnings=lambda _symbols, horizon_days: (event,)
+    )
+
+    first = refresh_universe_upcoming_earnings(
+        engine, ("AAPL",), provider=provider
+    )
+    second = refresh_universe_upcoming_earnings(
+        engine, ("AAPL",), provider=provider
+    )
+
+    assert first == {
+        "universe": 1,
+        "events": 1,
+        "symbols": 1,
+        "changed": 1,
+        "failed_dates": 0,
+    }
+    assert second["changed"] == 0
+    stored = load_earnings_events(engine, "AAPL")
+    assert len(stored) == 1
+    assert stored[0].event_key == "NEXT_EXPECTED"
+    assert stored[0].report_date == dt.date(2026, 10, 29)
+
+
+def test_earnings_history_batch_prioritizes_never_attempted_symbols():
+    engine = create_engine("sqlite:///:memory:", future=True)
+    ensure_fundamental_tables(engine)
+    record_fundamental_sync_state(
+        engine,
+        symbol="AAPL",
+        dataset=EARNINGS_DATASET,
+        status=ProfileStatus.OK,
+        source="yahoo",
+        checked_at=NOW - dt.timedelta(days=2),
+        successful_at=NOW - dt.timedelta(days=2),
+        payload_fingerprint="old",
+    )
+
+    class EarningsService:
+        def __init__(self):
+            self.calls = []
+
+        def refresh_earnings(self, symbol):
+            self.calls.append(symbol)
+            return ProfileStatus.OK
+
+    service = EarningsService()
+    summary = refresh_universe_earnings_history(
+        engine,
+        ("AAPL", "MSFT", "NVDA"),
+        max_symbols=2,
+        as_of=NOW,
+        service=service,
+    )
+
+    assert service.calls == ["MSFT", "NVDA"]
+    assert summary["attempted"] == 2
 
 
 def test_fundamental_tables_indexes_and_idempotent_accumulating_upserts():

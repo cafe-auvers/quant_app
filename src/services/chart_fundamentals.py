@@ -30,14 +30,18 @@ from src.infrastructure.database.repositories.fundamentals import (
     load_fundamental_sync_state,
     load_fundamental_sync_states,
     load_stock_profile,
+    load_stock_profiles,
     normalized_payload_fingerprint,
     record_fundamental_sync_state,
     seed_stock_profiles,
     upsert_earnings_events,
+    upsert_earnings_events_bulk,
     upsert_stock_profile,
 )
 from src.services.fundamental_providers import (
     EarningsProvider,
+    NasdaqStockProfileUniverseProvider,
+    NasdaqUpcomingEarningsUniverseProvider,
     StockProfileProvider,
     YahooEarningsProvider,
     YahooStockProfileProvider,
@@ -320,6 +324,13 @@ class ChartFundamentalService:
         ensure_fundamental_tables(self.engine)
         return self._refresh_profile(canonical)
 
+    def refresh_earnings(self, symbol: str) -> ProfileStatus:
+        """Refresh only earnings for a bounded universe-history job."""
+
+        canonical = canonical_symbol(symbol)
+        ensure_fundamental_tables(self.engine)
+        return self._refresh_earnings(canonical)
+
     def _refresh_profile(self, symbol: str) -> ProfileStatus:
         logger.info("stock_profile_sync_started symbol=%s", symbol)
         checked_at = self._now()
@@ -370,7 +381,7 @@ class ChartFundamentalService:
         )
         return result.status
 
-    def _refresh_earnings(self, symbol: str) -> None:
+    def _refresh_earnings(self, symbol: str) -> ProfileStatus:
         logger.info("earnings_sync_started symbol=%s", symbol)
         checked_at = self._now()
         old_events = load_earnings_events(self.engine, symbol)
@@ -397,7 +408,7 @@ class ChartFundamentalService:
                 payload_fingerprint=None,
                 last_error=str(exc),
             )
-            return
+            return ProfileStatus.UNAVAILABLE
         if not isinstance(result, EarningsProviderResult):
             raise TypeError("earnings provider returned an invalid result")
         changed = 0
@@ -457,6 +468,84 @@ class ChartFundamentalService:
             len(result.events),
             changed,
         )
+        return result.status
+
+
+def refresh_nasdaq_universe_stock_profiles(
+    engine: Engine,
+    symbols: Iterable[str],
+    *,
+    provider: Optional[NasdaqStockProfileUniverseProvider] = None,
+) -> dict[str, int]:
+    """Fill sector/industry for the full universe with one Nasdaq download."""
+
+    canonical_symbols = list(
+        dict.fromkeys(
+            canonical_symbol(symbol)
+            for symbol in symbols
+            if canonical_symbol(symbol)
+        )
+    )
+    worker = provider or NasdaqStockProfileUniverseProvider()
+    fetched = worker.fetch_stock_profiles(canonical_symbols)
+    existing = load_stock_profiles(engine)
+    merged = []
+    complete = 0
+    for profile in fetched:
+        cached = existing.get(canonical_symbol(profile.symbol))
+        if cached is not None:
+            profile = replace(
+                profile,
+                provider_symbol=profile.provider_symbol or cached.provider_symbol,
+                company_name=profile.company_name or cached.company_name,
+                short_name=profile.short_name or cached.short_name,
+                quote_type=profile.quote_type or cached.quote_type,
+                exchange=profile.exchange or cached.exchange,
+                market=profile.market or cached.market,
+                currency=profile.currency or cached.currency,
+                country=profile.country or cached.country,
+            )
+        if profile.sector_name and profile.industry_name:
+            complete += 1
+        merged.append(profile)
+    changed = seed_stock_profiles(engine, merged)
+    return {
+        "universe": len(canonical_symbols),
+        "fetched": len(fetched),
+        "complete": complete,
+        "changed": changed,
+    }
+
+
+def refresh_universe_upcoming_earnings(
+    engine: Engine,
+    symbols: Iterable[str],
+    *,
+    horizon_days: int = 100,
+    provider: Optional[NasdaqUpcomingEarningsUniverseProvider] = None,
+) -> dict[str, int]:
+    """Fill expected and prior-year earnings events using bulk calendar pages."""
+
+    canonical_symbols = list(
+        dict.fromkeys(
+            canonical_symbol(symbol)
+            for symbol in symbols
+            if canonical_symbol(symbol)
+        )
+    )
+    worker = provider or NasdaqUpcomingEarningsUniverseProvider()
+    events = worker.fetch_earnings(
+        canonical_symbols,
+        horizon_days=horizon_days,
+    )
+    changed = upsert_earnings_events_bulk(engine, events)
+    return {
+        "universe": len(canonical_symbols),
+        "events": len(events),
+        "symbols": len({event.symbol for event in events}),
+        "changed": changed,
+        "failed_dates": len(getattr(worker, "failed_dates", ())),
+    }
 
 
 def refresh_universe_stock_profiles(
@@ -481,11 +570,21 @@ def refresh_universe_stock_profiles(
         )
     )
     states = load_fundamental_sync_states(engine, PROFILE_DATASET)
+    profiles = load_stock_profiles(engine)
     due = [
         symbol
         for symbol in canonical_symbols
         if ChartFundamentalService._state_due(
-            states.get(symbol),
+            states.get(symbol) or (
+                {
+                    "status": profiles[symbol].profile_status.value,
+                    "last_checked_at": profiles[symbol].last_checked_at,
+                }
+                if symbol in profiles
+                and profiles[symbol].sector_name
+                and profiles[symbol].industry_name
+                else None
+            ),
             now,
             normal_interval=PROFILE_FRESH_FOR,
             unavailable_interval=BULK_UNAVAILABLE_FRESH_FOR,
@@ -528,6 +627,68 @@ def refresh_universe_stock_profiles(
     if log_callback is not None:
         log_callback(
             "Stock profile enrichment: "
+            f"{refreshed} refreshed, {unavailable} unavailable, "
+            f"{summary['remaining']} stale remaining."
+        )
+    return summary
+
+
+def refresh_universe_earnings_history(
+    engine: Engine,
+    symbols: Iterable[str],
+    *,
+    max_symbols: int = 100,
+    as_of: Optional[dt.datetime] = None,
+    service: Optional[ChartFundamentalService] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
+) -> dict[str, int]:
+    """Incrementally fetch complete Yahoo earnings history for every symbol."""
+
+    now = _aware_utc(as_of or _utcnow())
+    assert now is not None
+    canonical_symbols = list(
+        dict.fromkeys(
+            canonical_symbol(symbol)
+            for symbol in symbols
+            if canonical_symbol(symbol)
+        )
+    )
+    states = load_fundamental_sync_states(engine, EARNINGS_DATASET)
+    due = [
+        symbol
+        for symbol in canonical_symbols
+        if ChartFundamentalService._state_due(
+            states.get(symbol),
+            now,
+            normal_interval=EARNINGS_FRESH_FOR,
+            unavailable_interval=BULK_UNAVAILABLE_FRESH_FOR,
+        )
+    ]
+    # Never let yesterday's successful rows starve symbols that have never
+    # received a full-history attempt.
+    symbol_order = {symbol: index for index, symbol in enumerate(canonical_symbols)}
+    due.sort(key=lambda symbol: (symbol in states, symbol_order[symbol]))
+    selected = due[: max(0, int(max_symbols))]
+    worker = service or ChartFundamentalService(engine)
+    refreshed = 0
+    unavailable = 0
+    for symbol in selected:
+        status = worker.refresh_earnings(symbol)
+        if status is ProfileStatus.UNAVAILABLE:
+            unavailable += 1
+        else:
+            refreshed += 1
+    summary = {
+        "universe": len(canonical_symbols),
+        "due": len(due),
+        "attempted": len(selected),
+        "refreshed": refreshed,
+        "unavailable": unavailable,
+        "remaining": max(0, len(due) - len(selected)),
+    }
+    if log_callback is not None:
+        log_callback(
+            "Earnings history enrichment: "
             f"{refreshed} refreshed, {unavailable} unavailable, "
             f"{summary['remaining']} stale remaining."
         )

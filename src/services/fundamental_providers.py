@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import calendar
 import datetime as dt
+import logging
 import math
 from dataclasses import replace
-from typing import Callable, Optional, Protocol
+from typing import Callable, Iterable, Optional, Protocol
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import requests
 import yfinance as yf
 
 from src.core.chart_fundamentals import (
@@ -27,6 +30,87 @@ from src.utils.data_loader import normalize_yahoo_symbol
 
 
 US_MARKET_ZONE = ZoneInfo("America/New_York")
+NASDAQ_STOCK_SCREENER_URL = "https://api.nasdaq.com/api/screener/stocks"
+NASDAQ_EARNINGS_CALENDAR_URL = "https://api.nasdaq.com/api/calendar/earnings"
+NASDAQ_REQUEST_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Origin": "https://www.nasdaq.com",
+    "Referer": "https://www.nasdaq.com/",
+    "User-Agent": "Mozilla/5.0",
+}
+logger = logging.getLogger(__name__)
+
+
+def _utcnow() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def _nasdaq_report_timing(value: object) -> ReportTiming:
+    text = str(value or "").strip().lower()
+    if "pre-market" in text or "before" in text:
+        return ReportTiming.BMO
+    if "after-hours" in text or "after" in text:
+        return ReportTiming.AMC
+    return ReportTiming.UNKNOWN
+
+
+def _financial_number(value: object) -> Optional[float]:
+    text = str(value or "").strip().replace("$", "").replace(",", "")
+    if not text or text.lower() in {"n/a", "na", "none", "-"}:
+        return None
+    negative = text.startswith("(") and text.endswith(")")
+    if negative:
+        text = text[1:-1]
+    number = _finite(text)
+    return -number if negative and number is not None else number
+
+
+def _calendar_date(value: object) -> Optional[dt.date]:
+    text = str(value or "").strip()
+    if not text or text.lower() in {"n/a", "na", "none"}:
+        return None
+    try:
+        return pd.Timestamp(text).date()
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _fiscal_quarter_end(value: object) -> Optional[dt.date]:
+    text = str(value or "").strip()
+    try:
+        month_text, year_text = text.split("/", 1)
+        month = list(calendar.month_abbr).index(month_text[:3].title())
+        year = int(year_text)
+        return dt.date(year, month, calendar.monthrange(year, month)[1])
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _request_json(
+    http_get: Callable,
+    url: str,
+    *,
+    params: dict,
+    timeout_seconds: float,
+) -> dict:
+    last_error = None
+    for _attempt in range(3):
+        try:
+            response = http_get(
+                url,
+                params=params,
+                headers=NASDAQ_REQUEST_HEADERS,
+                timeout=timeout_seconds,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError("provider returned a non-object payload")
+            return payload
+        except Exception as exc:  # provider/network boundary
+            last_error = exc
+    assert last_error is not None
+    raise last_error
 
 
 class StockProfileProvider(Protocol):
@@ -37,6 +121,172 @@ class StockProfileProvider(Protocol):
 class EarningsProvider(Protocol):
     def fetch_earnings(self, symbol: str) -> EarningsProviderResult:
         ...
+
+
+def _nasdaq_symbol(value: object) -> str:
+    return canonical_symbol(value).replace("/", "-")
+
+
+class NasdaqStockProfileUniverseProvider:
+    """Download Nasdaq's full US listing metadata in one request."""
+
+    def __init__(
+        self,
+        *,
+        http_get: Optional[Callable] = None,
+        now: Callable[[], dt.datetime] = _utcnow,
+        timeout_seconds: float = 30.0,
+    ):
+        self._session = requests.Session() if http_get is None else None
+        self._http_get = http_get or self._session.get
+        self._now = now
+        self._timeout_seconds = max(1.0, float(timeout_seconds))
+
+    def fetch_stock_profiles(self, symbols: Iterable[str]) -> tuple[StockProfile, ...]:
+        wanted = {
+            canonical_symbol(symbol)
+            for symbol in symbols
+            if canonical_symbol(symbol)
+        }
+        if not wanted:
+            return ()
+        payload = _request_json(
+            self._http_get,
+            NASDAQ_STOCK_SCREENER_URL,
+            params={"tableonly": "true", "download": "true"},
+            timeout_seconds=self._timeout_seconds,
+        )
+        rows = (((payload or {}).get("data") or {}).get("rows") or [])
+        if not isinstance(rows, list):
+            raise ValueError("Nasdaq stock screener returned invalid rows")
+        checked_at = self._now()
+        profiles = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            symbol = _nasdaq_symbol(row.get("symbol"))
+            if symbol not in wanted:
+                continue
+            company_name = clean_optional_text(row.get("name")) or symbol
+            sector = clean_optional_text(row.get("sector"))
+            industry = clean_optional_text(row.get("industry"))
+            profiles.append(
+                StockProfile(
+                    symbol=symbol,
+                    provider_symbol=yahoo_provider_symbol(symbol),
+                    company_name=company_name,
+                    short_name=company_name,
+                    quote_type="EQUITY",
+                    market="US",
+                    currency="USD",
+                    country=clean_optional_text(row.get("country")) or "United States",
+                    sector_name=sector,
+                    industry_name=industry,
+                    profile_status=(
+                        ProfileStatus.OK
+                        if sector and industry
+                        else ProfileStatus.PARTIAL
+                    ),
+                    source="nasdaq",
+                    last_checked_at=checked_at,
+                    last_successful_sync_at=checked_at,
+                    updated_at=checked_at,
+                )
+            )
+        return tuple(profiles)
+
+
+class NasdaqUpcomingEarningsUniverseProvider:
+    """Load the next quarter's earnings calendar in daily bulk requests."""
+
+    def __init__(
+        self,
+        *,
+        http_get: Optional[Callable] = None,
+        now: Callable[[], dt.datetime] = _utcnow,
+        timeout_seconds: float = 20.0,
+    ):
+        self._session = requests.Session() if http_get is None else None
+        self._http_get = http_get or self._session.get
+        self._now = now
+        self._timeout_seconds = max(1.0, float(timeout_seconds))
+        self.failed_dates: tuple[dt.date, ...] = ()
+
+    def fetch_earnings(
+        self,
+        symbols: Iterable[str],
+        *,
+        horizon_days: int = 100,
+    ) -> tuple[EarningsEvent, ...]:
+        wanted = {
+            canonical_symbol(symbol)
+            for symbol in symbols
+            if canonical_symbol(symbol)
+        }
+        if not wanted:
+            return ()
+        checked_at = self._now()
+        market_date = checked_at.astimezone(US_MARKET_ZONE).date()
+        horizon = max(1, min(180, int(horizon_days)))
+        expected_by_symbol: dict[str, EarningsEvent] = {}
+        prior_by_key: dict[tuple[str, dt.date], EarningsEvent] = {}
+        failed_dates = []
+        for offset in range(horizon + 1):
+            report_date = market_date + dt.timedelta(days=offset)
+            if report_date.weekday() >= 5:
+                continue
+            try:
+                payload = _request_json(
+                    self._http_get,
+                    NASDAQ_EARNINGS_CALENDAR_URL,
+                    params={"date": report_date.isoformat()},
+                    timeout_seconds=self._timeout_seconds,
+                )
+            except Exception as exc:  # preserve every other successful date
+                failed_dates.append(report_date)
+                logger.warning(
+                    "Nasdaq earnings calendar date failed: date=%s error=%s",
+                    report_date,
+                    exc,
+                )
+                continue
+            rows = (((payload or {}).get("data") or {}).get("rows") or [])
+            if not isinstance(rows, list):
+                raise ValueError("Nasdaq earnings calendar returned invalid rows")
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                symbol = _nasdaq_symbol(row.get("symbol"))
+                if symbol not in wanted or symbol in expected_by_symbol:
+                    continue
+                timing = _nasdaq_report_timing(row.get("time"))
+                expected_by_symbol[symbol] = EarningsEvent(
+                    symbol=symbol,
+                    event_key="NEXT_EXPECTED",
+                    report_date=report_date,
+                    event_status=EventStatus.EXPECTED,
+                    report_timing=timing,
+                    is_date_estimated=True,
+                    estimated_eps=_financial_number(row.get("epsForecast")),
+                    fiscal_period_end=_fiscal_quarter_end(row.get("fiscalQuarterEnding")),
+                    source="nasdaq",
+                    source_updated_at=checked_at,
+                )
+                prior_date = _calendar_date(row.get("lastYearRptDt"))
+                prior_eps = _financial_number(row.get("lastYearEPS"))
+                if prior_date is not None and prior_date < market_date:
+                    prior_by_key[(symbol, prior_date)] = EarningsEvent(
+                        symbol=symbol,
+                        event_key=f"REPORT:{prior_date.isoformat()}:NASDAQ",
+                        report_date=prior_date,
+                        event_status=EventStatus.REPORTED,
+                        reported_eps=prior_eps,
+                        eps_basis="REPORTED" if prior_eps is not None else None,
+                        source="nasdaq",
+                        source_updated_at=checked_at,
+                    )
+        self.failed_dates = tuple(failed_dates)
+        return tuple(prior_by_key.values()) + tuple(expected_by_symbol.values())
 
 
 class YahooTickerClient:
@@ -50,12 +300,6 @@ class YahooTickerClient:
         if provider_symbol not in self._tickers:
             self._tickers[provider_symbol] = self._ticker_factory(provider_symbol)
         return self._tickers[provider_symbol]
-
-
-def _utcnow() -> dt.datetime:
-    return dt.datetime.now(dt.timezone.utc)
-
-
 def _finite(value: object) -> Optional[float]:
     try:
         number = float(value)

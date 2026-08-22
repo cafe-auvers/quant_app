@@ -182,9 +182,17 @@ def seed_stock_profiles(
             if existing is not None:
                 existing_source = str(existing.get("source") or "").lower()
                 existing_status = str(existing.get("profile_status") or "").upper()
+                incoming_source = str(record.get("source") or "").lower()
                 may_replace = (
-                    existing_source == "kis_master"
+                    existing_source in {"kis_master", incoming_source}
                     or existing_status == ProfileStatus.UNAVAILABLE.value
+                    or (
+                        incoming_source == "nasdaq"
+                        and (
+                            not existing.get("sector_name")
+                            or not existing.get("industry_name")
+                        )
+                    )
                 )
                 if not may_replace:
                     continue
@@ -245,6 +253,39 @@ def load_stock_profile(engine: Engine, symbol: str) -> Optional[StockProfile]:
         last_successful_sync_at=row["last_successful_sync_at"],
         updated_at=row["updated_at"],
     )
+
+
+def load_stock_profiles(engine: Engine) -> dict[str, StockProfile]:
+    """Load the complete profile cache in one query for universe jobs."""
+
+    table = _fundamental_tables(engine)[0]
+    with engine.connect() as conn:
+        rows = conn.execute(select(table)).mappings().all()
+    return {
+        str(row["symbol"]): StockProfile(
+            symbol=row["symbol"],
+            provider_symbol=row["provider_symbol"],
+            company_name=row["company_name"],
+            short_name=row["short_name"],
+            quote_type=row["quote_type"],
+            exchange=row["exchange"],
+            market=row["market"],
+            currency=row["currency"],
+            country=row["country"],
+            sector_name=row["sector_name"],
+            sector_key=row["sector_key"],
+            industry_name=row["industry_name"],
+            industry_key=row["industry_key"],
+            category=row["category"],
+            fund_family=row["fund_family"],
+            profile_status=ProfileStatus(row["profile_status"]),
+            source=row["source"],
+            last_checked_at=row["last_checked_at"],
+            last_successful_sync_at=row["last_successful_sync_at"],
+            updated_at=row["updated_at"],
+        )
+        for row in rows
+    }
 
 
 def _event_record(event: EarningsEvent) -> dict:
@@ -385,6 +426,65 @@ def upsert_earnings_events(
                 stale = stale.where(table.c.event_key.not_in(expected_keys))
             removed = int(conn.execute(stale).rowcount or 0)
     return len(changed_records) + removed + removed_aliases
+
+
+def upsert_earnings_events_bulk(
+    engine: Engine,
+    events: Iterable[EarningsEvent],
+) -> int:
+    """Upsert a universe calendar with one existing-row read and bulk writes."""
+
+    table = _fundamental_tables(engine)[1]
+    records_by_key = {
+        (canonical_symbol(event.symbol), event.event_key): _event_record(event)
+        for event in events
+        if canonical_symbol(event.symbol) and str(event.event_key).strip()
+    }
+    if not records_by_key:
+        return 0
+    with engine.begin() as conn:
+        existing_rows = []
+        symbols = sorted({key[0] for key in records_by_key})
+        for index in range(0, len(symbols), 500):
+            existing_rows.extend(
+                conn.execute(
+                    select(table).where(
+                        table.c.symbol.in_(symbols[index : index + 500])
+                    )
+                ).mappings().all()
+            )
+        existing_by_key = {
+            (str(row["symbol"]), str(row["event_key"])): row
+            for row in existing_rows
+        }
+        now = _utcnow_naive()
+        changed_records = []
+        for key, record in records_by_key.items():
+            existing = existing_by_key.get(key)
+            if (
+                existing is not None
+                and str(existing.get("source") or "").lower() == "yahoo"
+                and str(record.get("source") or "").lower() == "nasdaq"
+            ):
+                continue
+            if existing is not None and not any(
+                existing.get(name) != record.get(name)
+                for name in _EVENT_CONTENT_COLUMNS
+            ):
+                continue
+            record["created_at"] = (
+                existing.get("created_at") if existing is not None else None
+            ) or now
+            record["updated_at"] = now
+            changed_records.append(record)
+        _execute_bulk_upsert(
+            conn,
+            table,
+            changed_records,
+            ("symbol", "event_key"),
+            engine.dialect.name,
+        )
+    return len(changed_records)
 
 
 def load_earnings_events(

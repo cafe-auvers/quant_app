@@ -36,7 +36,7 @@ from src.infrastructure.database import (
     init_local_mirror_engine, init_mysql_engine,
     is_scanner_metrics_snapshot_current, load_chart_indicators_from_db,
     load_earnings_events, load_fundamental_sync_state,
-    load_fundamental_sync_states, load_stock_profile,
+    load_fundamental_sync_states, load_stock_profile, load_stock_profiles,
     load_hourly_history_from_db, load_intraday_history_from_db,
     load_scanner_metrics_from_db, load_symbol_history_from_db,
     load_universe_history_from_db, local_mirror_hourly_is_stale,
@@ -55,7 +55,8 @@ from src.infrastructure.database import (
     scanner_metrics_input_fingerprint, scanner_metrics_snapshot_date,
     sync_local_mirror_from_pc, sync_local_mirror_from_pc_atomic,
     sync_local_mirror_from_pc_checkpointed, sync_mirror_table,
-    seed_stock_profiles, upsert_earnings_events, upsert_stock_profile,
+    seed_stock_profiles, upsert_earnings_events, upsert_earnings_events_bulk,
+    upsert_stock_profile,
     validate_mysql_config, validate_mysql_identifier, validate_mysql_port)
 
 __all__ = [name for name in globals() if not name.startswith("_")]

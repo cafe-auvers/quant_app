@@ -26,6 +26,30 @@ class _State:
         self.logs.append(message)
 
 
+@pytest.fixture(autouse=True)
+def _disable_supplemental_provider_network(monkeypatch):
+    monkeypatch.setattr(
+        historical,
+        "refresh_nasdaq_universe_stock_profiles",
+        lambda *_args, **_kwargs: {"complete": 0, "changed": 0},
+    )
+    monkeypatch.setattr(
+        historical,
+        "refresh_universe_upcoming_earnings",
+        lambda *_args, **_kwargs: {
+            "events": 0,
+            "symbols": 0,
+            "changed": 0,
+            "failed_dates": 0,
+        },
+    )
+    monkeypatch.setattr(
+        historical,
+        "refresh_universe_earnings_history",
+        lambda *_args, **_kwargs: {"attempted": 0},
+    )
+
+
 def test_read_refresh_symbols_from_stdin_normalizes_and_deduplicates(monkeypatch):
     monkeypatch.setattr(
         historical.sys,
@@ -151,6 +175,7 @@ def test_run_1d_downloads_only_stale_payload_but_checks_full_derived_universe(mo
         "chart_indicators",
         "scanner_metrics",
         "stock_profiles",
+        "earnings_events",
     ]
 
 
