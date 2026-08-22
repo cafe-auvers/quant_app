@@ -51,6 +51,14 @@ def test_existing_runtime_heartbeat_is_one_update_without_a_prefetch():
         statement.startswith("UPDATE APP_RUNTIME_STATUS")
         for statement in statements
     ) == 1
+    heartbeat_update = next(
+        statement
+        for statement in statements
+        if statement.startswith("UPDATE APP_RUNTIME_STATUS")
+    )
+    assert "SET HEARTBEAT_AT" in heartbeat_update
+    assert "SET PID" not in heartbeat_update
+    assert "STARTED_AT" not in heartbeat_update
     assert not any(statement.startswith("SELECT") for statement in statements)
     assert commits == []
 

@@ -1772,6 +1772,20 @@ def load_account_local_state(
 
 def apply_reconciliation_plan(engine: Engine, plan: ReconciliationPlan) -> None:
     """Atomically persist one account plan without re-running decisions."""
+    versioned = [
+        *plan.card_creates,
+        *plan.card_updates,
+        *plan.order_updates,
+        *plan.reservation_updates,
+        *plan.external_order_creates,
+        *plan.external_order_updates,
+    ]
+    # An unchanged broker snapshot has no schema or transaction work to do.
+    # Opening table-provisioning/``engine.begin()`` paths for an empty plan
+    # emitted billed COMMITs even though no canonical row changed.
+    if not versioned:
+        return
+
     from src.services import trade_card_repository
     from src.services.capital_reservation_repository import (
         ensure_capital_reservations_table,
@@ -1796,14 +1810,6 @@ def apply_reconciliation_plan(engine: Engine, plan: ReconciliationPlan) -> None:
     ensure_capital_reservations_table(engine)
     ensure_discovered_external_orders_table(engine)
 
-    versioned = [
-        *plan.card_creates,
-        *plan.card_updates,
-        *plan.order_updates,
-        *plan.reservation_updates,
-        *plan.external_order_creates,
-        *plan.external_order_updates,
-    ]
     original_versions = {id(item): item.version for item in versioned}
     original_card_updated_at = {
         id(card): card.updated_at for card in (*plan.card_creates, *plan.card_updates)

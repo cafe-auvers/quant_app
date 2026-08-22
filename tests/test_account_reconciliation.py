@@ -5,7 +5,7 @@ from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 
 from src.core.account_broker_snapshot import (
     AccountBrokerSnapshot,
@@ -54,6 +54,19 @@ from src.services import account_reconciliation as reconciliation_module
 
 
 NOW = datetime(2026, 8, 15, 14, 0, tzinfo=timezone.utc)
+
+
+def test_unchanged_reconciliation_plan_emits_no_commit(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'no-op-plan.db'}", future=True)
+    commits = []
+    event.listen(engine, "commit", lambda _connection: commits.append(True))
+
+    apply_reconciliation_plan(
+        engine,
+        ReconciliationPlan(snapshot_id="unchanged"),
+    )
+
+    assert commits == []
 
 
 def _completeness(**overrides) -> SnapshotCompleteness:

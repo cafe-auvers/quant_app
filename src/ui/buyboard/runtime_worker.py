@@ -287,6 +287,7 @@ class BuyboardRuntimeWorker(QThread):
         self._last_database_probe_at: Optional[datetime] = None
         self._last_lease_checked_at: Optional[datetime] = None
         self._last_device_state_published_at: Optional[datetime] = None
+        self._last_device_state_details: Optional[Dict[str, object]] = None
         self._last_ownership_proof_at: Optional[datetime] = None
         self._last_alert_poll_at: Optional[datetime] = None
         self._last_operator_command_poll_at: Optional[datetime] = None
@@ -403,19 +404,21 @@ class BuyboardRuntimeWorker(QThread):
         if not self._device_id:
             self.device_state = state
             return
+        details = self._runtime_readiness_details(state)
         record = save_runtime_device_state(
             self._db_engine,
             device_id=self._device_id,
             hostname=self._hostname,
             state=state,
             handoff_confirmed=handoff_confirmed,
-            details=self._runtime_readiness_details(state),
+            details=details,
         )
         # Durable state is the authorization source. Local state changes only
         # after that write succeeds, especially for ACTIVE.
         self.device_state = state
         self.readiness_generation = int(record.readiness_generation or 0)
         self._last_device_state_published_at = datetime.now(timezone.utc)
+        self._last_device_state_details = details
         return record
 
     def _publish_device_state_if_due(self, state: RuntimeDeviceState) -> None:
@@ -428,14 +431,22 @@ class BuyboardRuntimeWorker(QThread):
         ).total_seconds() < execution_config.COORDINATION_DEVICE_HEARTBEAT_SECONDS:
             self.device_state = state
             return
+        details = self._runtime_readiness_details(state)
+        heartbeat_only = bool(
+            state == self.device_state
+            and self._last_device_state_details is not None
+            and details == self._last_device_state_details
+        )
         if state == self.device_state and refresh_runtime_device_state(
             self._db_engine,
             device_id=self._device_id,
             hostname=self._hostname,
             state=state,
-            details=self._runtime_readiness_details(state),
+            details=details,
+            heartbeat_only=heartbeat_only,
         ):
             self._last_device_state_published_at = now
+            self._last_device_state_details = details
             return
         self._set_device_state(state)
 
@@ -1847,6 +1858,29 @@ class BuyboardRuntimeWorker(QThread):
         """
 
         card_keys = {card.card_key for card in cards}
+        first_observation = any(
+            warning_name not in self._card_alert_presence_by_warning
+            for warning_name, _alert_type in self._RECOVERABLE_CARD_ALERTS
+        )
+        durable_open_keys = None
+        if first_observation and self._external_alerting is not None:
+            lookup = getattr(self._external_alerting, "open_incident_keys", None)
+            if callable(lookup):
+                try:
+                    durable_open_keys = set(
+                        lookup(
+                            alert_type
+                            for _warning_name, alert_type in self._RECOVERABLE_CARD_ALERTS
+                        )
+                    )
+                except Exception:
+                    # Do not mark the first observation complete when the
+                    # canonical lookup fails.  A later heartbeat retries the
+                    # recovery sweep instead of silently stranding incidents.
+                    logger.exception(
+                        "Could not load recoverable external-alert incidents"
+                    )
+                    return
         for warning_name, alert_type in self._RECOVERABLE_CARD_ALERTS:
             present_now = {
                 card.card_key
@@ -1855,11 +1889,25 @@ class BuyboardRuntimeWorker(QThread):
                 and self._warning_is_actionable(card, warning_name)
             }
             previous = self._card_alert_presence_by_warning.get(warning_name)
-            cleared = (
-                card_keys - present_now
-                if previous is None
-                else previous - present_now
-            )
+            if previous is None:
+                candidates = card_keys - present_now
+                if durable_open_keys is not None:
+                    alert_value = alert_type.value
+                    cleared = {
+                        card_key
+                        for card_key in candidates
+                        if (
+                            alert_value,
+                            f"{card_key}:{warning_name}",
+                        )
+                        in durable_open_keys
+                    }
+                else:
+                    # Compatibility for lightweight alert adapters that have
+                    # not implemented the bulk read seam.
+                    cleared = candidates
+            else:
+                cleared = previous - present_now
             for card_key in cleared:
                 self._resolve_external_alert(
                     alert_type,
