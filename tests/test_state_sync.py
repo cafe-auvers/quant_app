@@ -4,7 +4,7 @@ from __future__ import annotations
 import datetime as dt
 from types import SimpleNamespace
 
-from sqlalchemy import MetaData, create_engine, text
+from sqlalchemy import MetaData, create_engine, event, text
 from sqlalchemy.dialects import mysql
 from sqlalchemy.pool import NullPool
 from sqlalchemy.schema import CreateTable
@@ -249,6 +249,47 @@ def test_live_trading_control_database_failure_is_not_treated_as_off(tmp_path):
     assert result.success is False
     assert result.control is None
     assert result.error
+
+
+def test_coordination_status_snapshot_combines_control_and_revision_reads(tmp_path):
+    engine = _make_engine(tmp_path)
+    laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    assert ss.claim_main_device(engine, laptop).success
+    assert ss.set_live_trading_control(engine, laptop, True).success
+    assert ss.set_operator_control(engine, laptop, laptop).success
+    expected_revisions = {}
+    for state_key in ss.SYNCED_STATE_KEYS:
+        pushed = ss.push_state(
+            engine,
+            state_key,
+            {"items": []},
+            device_id=laptop.device_id,
+            expected_revision=0,
+        )
+        assert pushed.status == ss.PUSH_WRITTEN
+        expected_revisions[state_key] = pushed.revision
+
+    app_state_selects = []
+
+    def record_statement(_conn, _cursor, statement, _params, _context, _many):
+        normalized = statement.lower().lstrip()
+        if normalized.startswith("select") and "app_state_sync" in normalized:
+            app_state_selects.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record_statement)
+    try:
+        snapshot = ss.get_coordination_status_snapshot(engine)
+    finally:
+        event.remove(engine, "before_cursor_execute", record_statement)
+
+    assert len(app_state_selects) == 1
+    assert snapshot.live_trading.success is True
+    assert snapshot.live_trading.control is not None
+    assert snapshot.live_trading.control.enabled is True
+    assert snapshot.operator_control.success is True
+    assert snapshot.operator_control.control is not None
+    assert snapshot.operator_control.control.device_id == laptop.device_id
+    assert snapshot.state_revisions == expected_revisions
 
 
 def test_pull_only_pc_cannot_seed_or_overwrite_first_sync(monkeypatch, tmp_path):

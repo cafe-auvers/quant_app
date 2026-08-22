@@ -81,9 +81,8 @@ from src.services.runtime_status import (
 from src.services.sleep_readiness import write_sleep_readiness_snapshot
 from src.services.state_sync import (
     LocalDeviceRole,
+    get_coordination_status_snapshot,
     get_live_trading_control,
-    get_operator_control,
-    get_synced_state_revisions,
     load_local_device_role,
     set_operator_control,
     set_live_trading_control,
@@ -588,7 +587,8 @@ class StateSyncWorker(QThread):
                 errors=[f"State sync failed: {exc}"],
                 local_role=self.role,
             )
-        control_result = get_live_trading_control(self.engine)
+        coordination_status = get_coordination_status_snapshot(self.engine)
+        control_result = coordination_status.live_trading
         if control_result.success and control_result.control is not None:
             result.live_trading_enabled = control_result.control.enabled
             result.live_trading_revision = control_result.control.revision
@@ -597,7 +597,7 @@ class StateSyncWorker(QThread):
                 control_result.error
                 or "Could not read shared live-trading control."
             )
-        operator_result = get_operator_control(self.engine)
+        operator_result = coordination_status.operator_control
         if operator_result.success:
             result.operator_control = operator_result.control
         else:
@@ -606,7 +606,7 @@ class StateSyncWorker(QThread):
                 or "Could not read shared operator-control ownership."
             )
         if not result.state_revisions:
-            result.state_revisions = get_synced_state_revisions(self.engine)
+            result.state_revisions = coordination_status.state_revisions
         try:
             from src.services.runtime_device_state_repository import (
                 list_runtime_device_states,

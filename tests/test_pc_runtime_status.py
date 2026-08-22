@@ -2,7 +2,7 @@ import datetime as dt
 import threading
 from types import SimpleNamespace
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 
 from src.services.pc_remote_control import PcServiceStatus, PcStatus
 from src.services.runtime_status import (
@@ -29,6 +29,30 @@ def test_runtime_heartbeat_reports_active_and_explicitly_stopped_process():
 
     assert stopped.observed is True
     assert stopped.active is False
+
+
+def test_existing_runtime_heartbeat_is_one_update_without_a_prefetch():
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    record_runtime_heartbeat(engine, hostname="DATA-PC", pid=123)
+    statements = []
+    commits = []
+
+    def capture(_conn, _cursor, statement, _parameters, _context, _many):
+        statements.append(" ".join(statement.upper().split()))
+
+    event.listen(engine, "before_cursor_execute", capture)
+    event.listen(engine, "commit", lambda _connection: commits.append(True))
+    try:
+        record_runtime_heartbeat(engine, hostname="DATA-PC", pid=123)
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+
+    assert sum(
+        statement.startswith("UPDATE APP_RUNTIME_STATUS")
+        for statement in statements
+    ) == 1
+    assert not any(statement.startswith("SELECT") for statement in statements)
+    assert commits == []
 
 
 def test_runtime_heartbeat_becomes_inactive_when_stale():
@@ -214,7 +238,7 @@ def test_coordination_heartbeat_uses_online_store_and_hard_cadence(monkeypatch):
         "CoordinationRuntimeHeartbeatWorker",
         _CoordinationHeartbeatWorkerStub,
     )
-    clock = iter((100.0, 105.0, 116.0))
+    clock = iter((100.0, 115.0, 131.0))
     monkeypatch.setattr(main_window.time, "monotonic", lambda: next(clock))
     coordination_engine = object()
     window = MainWindow.__new__(MainWindow)

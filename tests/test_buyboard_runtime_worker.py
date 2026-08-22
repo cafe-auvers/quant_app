@@ -1041,6 +1041,24 @@ def test_database_probe_logs_one_concise_warning_for_an_outage(
     assert all(record.exc_info is None for record in warnings)
 
 
+def test_recent_runtime_state_write_replaces_redundant_writable_probe(tmp_path):
+    worker, _ = _worker(tmp_path)
+    now = dt.datetime.now(dt.timezone.utc)
+    worker._database_writable = True
+    worker._database_probe_completed = True
+    worker._last_database_probe_at = now - dt.timedelta(minutes=2)
+    worker._last_device_state_published_at = now
+
+    class MustNotOpenTransaction:
+        @staticmethod
+        def begin():
+            raise AssertionError("recent real runtime write should satisfy probe")
+
+    worker._db_engine = MustNotOpenTransaction()
+
+    assert worker._probe_database_writable() is True
+
+
 def test_database_outage_alert_uses_offline_spool_seam(tmp_path):
     worker, _ = _worker(tmp_path)
     calls = []

@@ -555,7 +555,7 @@ def find_active_execution_order_for_scope(
     return _row_to_record(row) if row is not None else None
 
 
-# --- standalone convenience wrappers (own transaction each) -----------------
+# --- standalone convenience wrappers ----------------------------------------
 
 
 def record_execution_order(engine: Engine, record: ExecutionOrderRecord) -> ExecutionOrderRecord:
@@ -574,7 +574,10 @@ def save_execution_order(
 
 def fetch_execution_order(engine: Engine, client_order_id: str) -> Optional[ExecutionOrderRecord]:
     ensure_execution_orders_table(engine)
-    with engine.begin() as conn:
+    # A read must not create a committing transaction.  On the shared TiDB
+    # coordination store, ``engine.begin()`` emitted a billed COMMIT for each
+    # broker reconciliation lookup even though no row was changed.
+    with engine.connect() as conn:
         return get_execution_order(conn, client_order_id)
 
 
@@ -587,7 +590,7 @@ def list_execution_orders_for_card(
 ) -> List[ExecutionOrderRecord]:
     """Return durable guarded orders for one card, newest records first."""
     table = ensure_execution_orders_table(engine)
-    with engine.begin() as conn:
+    with engine.connect() as conn:
         rows = conn.execute(
             select(table)
             .where(
@@ -608,7 +611,7 @@ def list_execution_orders_for_account(
 ) -> List[ExecutionOrderRecord]:
     """Return every durable order in one account for a single C1 pass."""
     table = ensure_execution_orders_table(engine)
-    with engine.begin() as conn:
+    with engine.connect() as conn:
         rows = conn.execute(
             select(table)
             .where(
@@ -631,6 +634,6 @@ def list_execution_orders(
         statement = statement.where(
             table.c.environment == str(environment or "").upper()
         )
-    with engine.begin() as conn:
+    with engine.connect() as conn:
         rows = conn.execute(statement.order_by(table.c.id.asc())).fetchall()
     return [_row_to_record(row) for row in rows]
