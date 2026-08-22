@@ -24,6 +24,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.utils.data_loader import get_default_universe
+from src.services.chart_fundamentals import (
+    get_universe_earnings_history_due_symbols,
+)
 from src.utils.db_loader import (
     CHRONIC_FAILURE_THRESHOLD,
     get_chart_indicator_refresh_plan,
@@ -161,10 +164,17 @@ def _refresh_targets_needed() -> Tuple[Dict[str, List[str]], str]:
             strict=True,
         )
 
+    earnings_due = ()
+    if not daily_stale:
+        earnings_due = get_universe_earnings_history_due_symbols(
+            engine,
+            tickers,
+        )
+
     targets: Dict[str, List[str]] = {}
     reasons = []
     derived_daily_needed = bool(chart_refresh_plan) or not scanner_current
-    if daily_stale or derived_daily_needed:
+    if daily_stale or derived_daily_needed or earnings_due:
         targets["1d"] = daily_stale
     if daily_stale:
         reasons.append(_describe_stale("1D", daily_stale, expected_date))
@@ -174,6 +184,10 @@ def _refresh_targets_needed() -> Tuple[Dict[str, List[str]], str]:
         )
     if not scanner_current:
         reasons.append("Scanner metrics snapshot is missing or stale.")
+    if earnings_due:
+        reasons.append(
+            f"Earnings history needs refresh for {len(earnings_due)} symbol(s)."
+        )
     if hourly_stale:
         targets["1h"] = hourly_stale
         reasons.append(_describe_stale("1H", hourly_stale, expected_date))

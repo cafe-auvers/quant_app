@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 
 from src.services.external_alerting import (
     AlertIncidentStatus,
@@ -216,6 +216,53 @@ def test_recovered_incident_stops_retrying_and_reopens_on_recurrence(tmp_path):
     assert recurrence.incident_id == first.incident_id
     assert recurrence.status == AlertIncidentStatus.OPEN
     assert recurrence.occurrence_count == 2
+
+
+def test_open_incident_key_sweep_is_one_read_without_commit(tmp_path):
+    service, _ = _service(tmp_path)
+    service.raise_alert(
+        CriticalAlertType.MARKET_DATA_OUTAGE,
+        "PROD:1:AAPL:MARKET_DATA_OUTAGE_LOW",
+        "market-data outage",
+    )
+    service.raise_alert(
+        CriticalAlertType.DATABASE_UNAVAILABLE,
+        "PROD:database",
+        "database unavailable",
+    )
+    statements = []
+    commits = []
+    event.listen(
+        service.engine,
+        "before_cursor_execute",
+        lambda _conn, _cursor, statement, _params, _context, _many: statements.append(
+            " ".join(statement.upper().split())
+        ),
+    )
+    event.listen(service.engine, "commit", lambda _connection: commits.append(True))
+
+    keys = service.open_incident_keys(
+        [CriticalAlertType.MARKET_DATA_OUTAGE, CriticalAlertType.STALE_CRITICAL_SYMBOL]
+    )
+
+    assert keys == {
+        (
+            CriticalAlertType.MARKET_DATA_OUTAGE.value,
+            "PROD:1:AAPL:MARKET_DATA_OUTAGE_LOW",
+        )
+    }
+    assert sum("FROM EXTERNAL_ALERT_INCIDENTS" in item for item in statements) == 1
+    assert commits == []
+
+
+def test_empty_due_incident_poll_is_read_only(tmp_path):
+    service, _ = _service(tmp_path)
+    commits = []
+    event.listen(service.engine, "commit", lambda _connection: commits.append(True))
+
+    assert service.due_incidents() == []
+
+    assert commits == []
 
 
 def test_heartbeat_is_published_on_the_expected_cadence(tmp_path):

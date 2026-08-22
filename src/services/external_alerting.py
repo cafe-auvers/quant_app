@@ -13,7 +13,7 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Protocol
+from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol
 from uuid import uuid4
 from pathlib import Path
 
@@ -875,7 +875,7 @@ class ExternalAlertingService:
     def due_incidents(self) -> List[AlertIncident]:
         now = _db_datetime(self._clock())
         table = _incident_table(MetaData())
-        with self.engine.begin() as conn:
+        with self.engine.connect() as conn:
             rows = conn.execute(
                 select(table)
                 .where(
@@ -885,6 +885,33 @@ class ExternalAlertingService:
                 .order_by(table.c.next_attempt_at, table.c.created_at)
             ).fetchall()
         return [_row_to_incident(row) for row in rows]
+
+    def open_incident_keys(
+        self,
+        alert_types: Iterable[CriticalAlertType | str],
+    ) -> set[tuple[str, str]]:
+        """Return open durable keys for a bounded set of alert classes.
+
+        Runtime startup uses this one read to reconcile stale card incidents.
+        Previously it called ``resolve_alert`` for every absent warning on
+        every card, producing four SELECT+COMMIT pairs per card even when no
+        durable incident existed.
+        """
+
+        values = tuple(
+            dict.fromkeys(self._normalize_type(item).value for item in alert_types)
+        )
+        if not values:
+            return set()
+        table = _incident_table(MetaData())
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                select(table.c.alert_type, table.c.dedupe_key).where(
+                    table.c.status == AlertIncidentStatus.OPEN.value,
+                    table.c.alert_type.in_(values),
+                )
+            ).fetchall()
+        return {(str(row.alert_type), str(row.dedupe_key)) for row in rows}
 
     def process_due(self) -> int:
         processed = self._drain_local_spool()
@@ -1102,7 +1129,7 @@ class ExternalAlertingService:
             # every publication only adds quota cost and no safety.
             return self.publish_heartbeat()
         try:
-            with self.engine.begin() as conn:
+            with self.engine.connect() as conn:
                 last = conn.execute(
                     select(table.c.attempted_at)
                     .where(
@@ -1122,7 +1149,7 @@ class ExternalAlertingService:
 
     def delivery_attempts(self, incident_id: str) -> List[Dict[str, Any]]:
         table = _attempt_table(MetaData())
-        with self.engine.begin() as conn:
+        with self.engine.connect() as conn:
             rows = conn.execute(
                 select(table)
                 .where(table.c.incident_id == incident_id)
@@ -1132,7 +1159,7 @@ class ExternalAlertingService:
 
     def heartbeat_attempts(self) -> List[Dict[str, Any]]:
         table = _heartbeat_table(MetaData())
-        with self.engine.begin() as conn:
+        with self.engine.connect() as conn:
             rows = conn.execute(
                 select(table)
                 .where(table.c.device_id == self.device_id)

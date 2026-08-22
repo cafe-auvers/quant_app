@@ -832,14 +832,18 @@ def refresh_chart_indicators_to_db(
     return list(dict.fromkeys(updated))
 
 
-def load_chart_indicators_from_db(symbol: str, engine: Engine) -> pd.DataFrame:
+def load_chart_indicators_from_db(
+    symbol: str, engine: Engine, max_rows: Optional[int] = None
+) -> pd.DataFrame:
     metadata = MetaData()
     chart_indicators = _get_chart_indicators_table(metadata)
-    stmt = (
-        select(chart_indicators)
-        .where(chart_indicators.c.symbol == symbol.strip().upper())
-        .order_by(chart_indicators.c.date)
+    stmt = select(chart_indicators).where(
+        chart_indicators.c.symbol == symbol.strip().upper()
     )
+    if max_rows is not None and int(max_rows) > 0:
+        stmt = stmt.order_by(chart_indicators.c.date.desc()).limit(int(max_rows))
+    else:
+        stmt = stmt.order_by(chart_indicators.c.date)
 
     try:
         with engine.connect() as conn:

@@ -118,11 +118,14 @@ COORDINATION_OWNERSHIP_PROOF_SECONDS = max(
 COORDINATION_ALERT_POLL_SECONDS = max(
     30.0, _env_float("COORDINATION_ALERT_POLL_SECONDS", 30.0)
 )
-# Operator commands are the only coordination reads kept at one second while
-# the US regular session is open.  Off hours, published-state changes are
-# event-driven locally and a minute is sufficient for cross-device pickup.
+# Operator commands are the hottest remaining coordination read while the US
+# regular session is open.  Production measurements near 20 RU/s were
+# consistent with the remaining empty-queue lookup's one-second cadence. Three
+# seconds keeps remote live-intervention pickup prompt while leaving enough
+# of the 10 RU/s operating target for lease/readiness/background traffic.
+# The local market/stop loop and broker-boundary lease proof are independent.
 COORDINATION_OPERATOR_COMMAND_POLL_SECONDS = max(
-    1.0, _env_float("COORDINATION_OPERATOR_COMMAND_POLL_SECONDS", 1.0)
+    3.0, _env_float("COORDINATION_OPERATOR_COMMAND_POLL_SECONDS", 3.0)
 )
 COORDINATION_OFF_HOURS_POLL_SECONDS = max(
     60.0, _env_float("COORDINATION_OFF_HOURS_POLL_SECONDS", 60.0)

@@ -115,11 +115,28 @@ def record_runtime_heartbeat(
     # separate cloud-billed COMMIT statement for this 30-second liveness
     # touch; multi-statement lifecycle transitions keep explicit transactions.
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-        # The normal heartbeat is one UPDATE, not SELECT + UPDATE.  Besides
-        # removing a race between those statements, this avoids one TiDB RU
-        # read on every heartbeat from both machines.  ``started_at`` changes
-        # only when a genuinely new/restarted process takes over the row.
+        # The steady heartbeat changes one timestamp only.  Including pid,
+        # active, and the CASE expression in every UPDATE made TiDB rewrite
+        # and plan fields whose values almost never change.  The exact pid and
+        # active predicates make a restarted/stopped process miss this lean
+        # path and fall through to the full lifecycle update below.
         now = _server_now(engine)
+        result = conn.execute(
+            table.update()
+            .where(
+                table.c.hostname == hostname,
+                table.c.process_name == process_name,
+                table.c.pid == pid,
+                table.c.active.is_(True),
+            )
+            .values(heartbeat_at=now)
+        )
+        if result.rowcount == 1:
+            return
+
+        # A new pid, an explicitly stopped row, or a first publication needs
+        # the full identity transition.  This exceptional path remains an
+        # UPDATE followed by INSERT-on-miss, never SELECT-before-UPDATE.
         result = conn.execute(
             table.update()
             .where(

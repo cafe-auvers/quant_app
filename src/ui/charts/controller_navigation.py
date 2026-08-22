@@ -300,13 +300,17 @@ class ChartsNavigationMixin:
         next_index = (current_index + int(direction)) % len(symbols)
         next_symbol = symbols[next_index]
         self._set_tradingview_symbol(next_symbol)
-        if hasattr(self, "sidebar_stock_list"):
-            for row in range(self.sidebar_stock_list.count()):
-                item = self.sidebar_stock_list.item(row)
-                data = item.data(Qt.UserRole) or {}
-                if str(data.get("symbol", "")).strip().upper() == next_symbol:
-                    self.sidebar_stock_list.setCurrentRow(row)
-                    break
+        self._suppress_sidebar_tradingview_load = True
+        try:
+            if hasattr(self, "sidebar_stock_list"):
+                for row in range(self.sidebar_stock_list.count()):
+                    item = self.sidebar_stock_list.item(row)
+                    data = item.data(Qt.UserRole) or {}
+                    if str(data.get("symbol", "")).strip().upper() == next_symbol:
+                        self.sidebar_stock_list.setCurrentRow(row)
+                        break
+        finally:
+            self._suppress_sidebar_tradingview_load = False
         self.load_tradingview_chart(force=True)
 
     def _set_tradingview_symbol(self, symbol: str) -> None:

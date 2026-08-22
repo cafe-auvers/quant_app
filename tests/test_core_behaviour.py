@@ -21,6 +21,7 @@ from src.api.kis_account_snapshot_dual import KisEnvironment, load_config, split
 from src.api.kis_intraday import normalize_intraday_rows
 from src.ui.main_window import MainWindow
 from src.ui.main_window import _extract_latest_opening_bar
+from src.ui.charts.render_measurement_assets import RIGHT_DRAG_MEASUREMENT_JS
 from src.utils.db_loader import (
     calculate_chart_indicators,
     _get_price_history_table,
@@ -585,9 +586,8 @@ def test_tradingview_lightweight_chart_html_uses_local_ohlcv_data():
         target_price=12.0,
     )
 
-    # The library is vendored/inlined (see _lightweight_charts_script_tag) so
-    # chart reloads don't depend on a network fetch to a CDN; just confirm
-    # the expected pinned version made it into the page either way.
+    # The library is vendored behind a stable local URL so chart reloads can
+    # reuse Chromium's resource/compiled-script caches without a CDN fetch.
     assert "4.2.3" in chart_html
     assert "createChart" in chart_html
     assert '"time": "2026-01-01"' in chart_html
@@ -616,10 +616,38 @@ def test_tradingview_lightweight_chart_html_uses_local_ohlcv_data():
     assert "pointer-events: none" in chart_html
     assert "enableLineToolMode" in chart_html
     assert "embed-widget-advanced-chart.js" not in chart_html
-    # Library should be inlined from the vendored asset, not fetched from a
-    # CDN on every reload (this is what previously caused a network round
-    # trip on every chart re-render / redraw).
+    # Library should be loaded from the vendored asset, not fetched from a CDN
+    # on every chart re-render / redraw.
     assert "unpkg.com" not in chart_html
+
+
+def test_tradingview_right_drag_measures_point_to_point_percentage_temporarily():
+    history = pd.DataFrame(
+        {
+            "Open": [10.0, 11.0],
+            "High": [11.0, 12.0],
+            "Low": [9.0, 10.0],
+            "Close": [10.5, 11.5],
+            "Volume": [1000, 1200],
+        },
+        index=pd.date_range("2026-01-01", periods=2, freq="D"),
+    )
+
+    chart_html = MainWindow._generate_tradingview_lightweight_chart_html(
+        "AAPL", history, drawings=[]
+    )
+
+    assert 'id="measurement-overlay"' in chart_html
+    assert "event.button !== 2" in chart_html
+    assert "event.button !== 0" in chart_html
+    assert "coordinateToPrice(y)" in RIGHT_DRAG_MEASUREMENT_JS
+    assert "((end.price / start.price) - 1) * 100" in chart_html
+    assert "setLineDash([5, 5])" in chart_html
+    assert "clearRightDragMeasurement();" in chart_html
+    assert "window.isRightDragMeasuring" in chart_html
+    assert "coordinateToTime" not in RIGHT_DRAG_MEASUREMENT_JS
+    assert "seriesData" not in RIGHT_DRAG_MEASUREMENT_JS
+    assert "saveChartDrawing" not in RIGHT_DRAG_MEASUREMENT_JS
 
 
 def test_tradingview_lightweight_chart_html_includes_rs_ti65_indicator():
@@ -1002,11 +1030,16 @@ def test_price_history_and_hourly_history_use_separate_tables():
 
     loaded_daily = load_symbol_history_from_db("AAPL", engine, interval="1d")
     loaded_hourly = load_hourly_history_from_db("AAPL", engine, source="test")
+    latest_hourly = load_hourly_history_from_db(
+        "AAPL", engine, source="test", max_rows=1
+    )
 
     assert len(loaded_daily) == 1
     assert len(loaded_hourly) == 2
+    assert len(latest_hourly) == 1
     assert loaded_daily.iloc[-1]["Close"] == 11.0
     assert loaded_hourly.iloc[-1]["Close"] == 11.5
+    assert latest_hourly.iloc[0]["Close"] == 11.5
     assert get_latest_price_history_date(engine, interval="1d") == dt.datetime(2026, 1, 5)
     assert get_latest_hourly_price_history_timestamp(engine, symbol="AAPL", source="test") == dt.datetime(2026, 1, 5, 15, 30)
 

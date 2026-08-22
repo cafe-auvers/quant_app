@@ -254,6 +254,7 @@ def refresh_runtime_device_state(
     state: RuntimeDeviceState,
     schema_version: int = CURRENT_EXECUTION_SCHEMA_VERSION,
     details: Optional[Dict[str, Any]] = None,
+    heartbeat_only: bool = False,
 ) -> bool:
     """Refresh an unchanged readiness row with one UPDATE statement.
 
@@ -270,27 +271,39 @@ def refresh_runtime_device_state(
         raise ValueError("runtime device state requires device_id")
     state = state if isinstance(state, RuntimeDeviceState) else RuntimeDeviceState(state)
     table = ensure_runtime_device_state_table(engine)
-    values = {
-        "hostname": str(hostname or ""),
-        "schema_version": int(schema_version),
-        "details_json": json.dumps(
-            dict(details) if details is not None else {},
-            default=str,
-            separators=(",", ":"),
-        ),
-        "updated_at": _server_now(engine),
-    }
+    values = {"updated_at": _server_now(engine)}
+    if not heartbeat_only:
+        values.update(
+            hostname=str(hostname or ""),
+            schema_version=int(schema_version),
+            details_json=json.dumps(
+                dict(details) if details is not None else {},
+                default=str,
+                separators=(",", ":"),
+            ),
+        )
     # This unchanged-state heartbeat is one conditional UPDATE and is atomic
     # on its own.  Autocommit prevents a second billed COMMIT statement while
     # transition paths continue to use save_runtime_device_state's explicit
     # transaction and read-back generation checks.
+    predicates = [
+        table.c.device_id == device_id,
+        table.c.state == state.value,
+    ]
+    if heartbeat_only:
+        # A copied/stale local cache must not keep a row fresh under the wrong
+        # identity or schema.  A mismatch returns False and makes the caller
+        # take the full transition/read-back path.
+        predicates.extend(
+            (
+                table.c.hostname == str(hostname or ""),
+                table.c.schema_version == int(schema_version),
+            )
+        )
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
         result = conn.execute(
             table.update()
-            .where(
-                table.c.device_id == device_id,
-                table.c.state == state.value,
-            )
+            .where(*predicates)
             .values(**values)
         )
     return result.rowcount == 1

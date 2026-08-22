@@ -7,7 +7,7 @@ from typing import List, Optional
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-from PyQt5.QtCore import Qt, QUrl
+from PyQt5.QtCore import Qt, QTimer, QUrl
 from PyQt5.QtWidgets import QMessageBox
 
 try:
@@ -35,6 +35,8 @@ from src.ui.workers import IntradayBulkFetchWorker, IntradayFetchWorker
 from src.utils.intraday_helpers import intraday_cache_needs_backfill
 from src.utils.intraday_helpers import utcnow_naive as _utcnow_naive
 
+from .render_assets import lightweight_charts_base_path
+
 REFERENCE_SYMBOL = "SPY"
 KST_ZONE = ZoneInfo("Asia/Seoul")
 US_MARKET_ZONE = ZoneInfo("America/New_York")
@@ -42,6 +44,11 @@ MARKET_DATA_READY_TIME_KST = dt.time(7, 0)
 LIVE_INTRADAY_REFRESH_INTERVAL_MS = 5 * 60 * 1000
 TRADINGVIEW_REFRESH_INTERVAL_SECONDS = 5 * 60
 KIS_DAILY_CHART_FAILURE_COOLDOWN_SECONDS = 30 * 60
+CHART_FUNDAMENTAL_CONTEXT_CACHE_SECONDS = 30
+CHART_FUNDAMENTAL_FRESHNESS_CACHE_SECONDS = 5 * 60
+CHART_FUNDAMENTAL_CACHE_MAX_SYMBOLS = 128
+MAX_CONCURRENT_CHART_FUNDAMENTAL_WORKERS = 2
+CHART_REFERENCE_HISTORY_CACHE_SECONDS = 30
 US_MARKET_OPEN_TIME = dt.time(9, 30)
 US_MARKET_CLOSE_TIME = dt.time(16, 0)
 
@@ -245,6 +252,7 @@ class ChartsDataFlowMixin:
         options["max_history_bars"] = self._tradingview_max_history_bars(
             timeframe, options["window_days"]
         )
+        options["history_is_normalized"] = True
         if timeframe.strip().upper() != "1D":
             options.update(
                 {
@@ -391,7 +399,8 @@ class ChartsDataFlowMixin:
             ),
         )
         if QWebEngineView is not None and isinstance(target_view, QWebEngineView):
-            target_view.setHtml(html_content, QUrl("https://www.tradingview.com/"))
+            asset_base = str(lightweight_charts_base_path().resolve()) + "/"
+            target_view.setHtml(html_content, QUrl.fromLocalFile(asset_base))
         else:
             target_view.setPlainText(
                 f"TradingView Lightweight Chart for {tradingview_symbol} requires PyQtWebEngine."
@@ -422,12 +431,24 @@ class ChartsDataFlowMixin:
         engine = self.__dict__.get("db_engine")
         if engine is None or not self.__dict__.get("db_enabled", False):
             return ChartFundamentalContext(symbol=canonical)
+        cache_key = (id(engine), canonical, int(horizon_days))
+        cache = self.__dict__.setdefault("_chart_fundamental_context_cache", {})
+        cached = cache.get(cache_key)
+        if cached is not None:
+            cached_at, context = cached
+            age_seconds = (now - cached_at).total_seconds()
+            if 0 <= age_seconds < CHART_FUNDAMENTAL_CONTEXT_CACHE_SECONDS:
+                return context
         try:
-            return ChartFundamentalService(engine).load_chart_fundamental_context(
+            context = ChartFundamentalService(engine).load_chart_fundamental_context(
                 canonical,
                 as_of=now,
                 horizon_days=horizon_days,
             )
+            cache[cache_key] = (now, context)
+            while len(cache) > CHART_FUNDAMENTAL_CACHE_MAX_SYMBOLS:
+                cache.pop(next(iter(cache)))
+            return context
         except Exception as exc:
             append_log = getattr(self, "append_log", None)
             if callable(append_log):
@@ -452,21 +473,32 @@ class ChartsDataFlowMixin:
             for worker in workers
         ):
             return False
-        try:
-            if not ChartFundamentalService(engine).refresh_required(
-                canonical, as_of=now
-            ):
+        freshness_key = (id(engine), canonical)
+        freshness_cache = self.__dict__.setdefault(
+            "_chart_fundamental_freshness_cache", {}
+        )
+        last_fresh_check = freshness_cache.get(freshness_key)
+        if last_fresh_check is not None:
+            age_seconds = (now - last_fresh_check).total_seconds()
+            if 0 <= age_seconds < CHART_FUNDAMENTAL_FRESHNESS_CACHE_SECONDS:
                 return False
-        except Exception as exc:
-            append_log = getattr(self, "append_log", None)
-            if callable(append_log):
-                append_log(
-                    f"Could not inspect supplemental cache freshness for {canonical}: {exc}"
-                )
+        running_workers = [
+            worker
+            for worker in workers
+            if getattr(worker, "isRunning", lambda: False)()
+        ]
+        if len(running_workers) >= MAX_CONCURRENT_CHART_FUNDAMENTAL_WORKERS:
+            self._pending_chart_fundamental_refresh = (
+                canonical,
+                int(generation),
+                now,
+            )
             return False
         worker = ChartFundamentalRefreshWorker(engine, canonical, generation)
         worker.completed.connect(self._on_chart_fundamental_refresh_completed)
+        worker.not_required.connect(self._on_chart_fundamental_refresh_not_required)
         worker.failed.connect(self._on_chart_fundamental_refresh_failed)
+        worker.finished.connect(self._drain_pending_chart_fundamental_refresh)
         workers.append(worker)
         self._fundamental_refresh_worker = worker
         track_worker = getattr(self, "_track_worker", None)
@@ -479,33 +511,64 @@ class ChartsDataFlowMixin:
         worker.start()
         return True
 
+    def _on_chart_fundamental_refresh_not_required(
+        self, symbol: str, _generation: int
+    ) -> None:
+        engine = self.__dict__.get("db_engine")
+        if engine is None:
+            return
+        freshness_cache = self.__dict__.setdefault(
+            "_chart_fundamental_freshness_cache", {}
+        )
+        freshness_cache[(id(engine), canonical_symbol(symbol))] = (
+            dt.datetime.now(dt.timezone.utc)
+        )
+        while len(freshness_cache) > CHART_FUNDAMENTAL_CACHE_MAX_SYMBOLS:
+            freshness_cache.pop(next(iter(freshness_cache)))
+
+    def _drain_pending_chart_fundamental_refresh(self) -> None:
+        pending = self.__dict__.pop("_pending_chart_fundamental_refresh", None)
+        if pending is None or self.__dict__.get("_database_shutting_down", False):
+            return
+        symbol, generation, requested_at = pending
+        QTimer.singleShot(
+            0,
+            lambda: self._schedule_chart_fundamental_refresh(
+                symbol,
+                generation,
+                now=requested_at,
+            ),
+        )
+
     def _on_chart_fundamental_refresh_completed(
         self, context: ChartFundamentalContext, generation: int
     ) -> None:
-        active = (
-            self.tradingview_symbol_combo.currentText().strip().upper()
-            if hasattr(self, "tradingview_symbol_combo")
-            else ""
-        )
-        current_generation = int(
-            self.__dict__.get("_chart_fundamental_request_generation", 0) or 0
-        )
-        if (
-            canonical_symbol(active) != context.symbol
-            or int(generation) != current_generation
-        ):
-            return
-        tradingview_symbol = self._to_tradingview_symbol(context.symbol)
-        for key in list(self.tradingview_refresh_timestamps):
-            if f"|{tradingview_symbol}|" in key:
-                self.tradingview_refresh_timestamps.pop(key, None)
+        # The chart has already rendered the database-cached context together
+        # with price, ADR and RS/TI65.  A provider refresh must only warm the
+        # cache for the next load; force-reloading the active QWebEngine page
+        # makes earnings appear to arrive as a separate chart update.
+        del generation
+        engine = self.__dict__.get("db_engine")
+        now = dt.datetime.now(dt.timezone.utc)
+        if engine is not None:
+            context_cache = self.__dict__.setdefault(
+                "_chart_fundamental_context_cache", {}
+            )
+            context_cache[(id(engine), context.symbol, 14)] = (now, context)
+            while len(context_cache) > CHART_FUNDAMENTAL_CACHE_MAX_SYMBOLS:
+                context_cache.pop(next(iter(context_cache)))
+            freshness_cache = self.__dict__.setdefault(
+                "_chart_fundamental_freshness_cache", {}
+            )
+            freshness_cache[(id(engine), context.symbol)] = now
+            while len(freshness_cache) > CHART_FUNDAMENTAL_CACHE_MAX_SYMBOLS:
+                freshness_cache.pop(next(iter(freshness_cache)))
         append_log = getattr(self, "append_log", None)
         if callable(append_log):
             append_log(
-                f"Updated chart profile/earnings cache for {context.symbol} "
+                f"Refreshed chart profile/earnings cache for {context.symbol} "
                 f"({len(context.earnings_events)} earnings events)."
             )
-        self.load_tradingview_chart(force=True)
 
     def _on_chart_fundamental_refresh_failed(
         self, symbol: str, message: str, generation: int
@@ -535,22 +598,41 @@ class ChartsDataFlowMixin:
         symbol = symbol.strip().upper()
         timeframe = timeframe.strip().upper()
         if timeframe == "1D" and self.db_enabled and self.db_engine is not None:
-            indicators = load_chart_indicators_from_db(symbol, self.db_engine)
+            indicators = load_chart_indicators_from_db(
+                symbol, self.db_engine, max_rows=len(chart_history)
+            )
             if indicators.empty and refresh_chart_indicators_for_symbol(
                 symbol, self.db_engine, reference_symbol=REFERENCE_SYMBOL
             ):
-                indicators = load_chart_indicators_from_db(symbol, self.db_engine)
+                indicators = load_chart_indicators_from_db(
+                    symbol, self.db_engine, max_rows=len(chart_history)
+                )
             if not indicators.empty:
                 return self._align_chart_indicators(chart_history, indicators)
 
-        reference_history = self._load_chart_history_for_timeframe(
-            REFERENCE_SYMBOL, timeframe, use_live_fallback=False
+        reference_cache = self.__dict__.setdefault(
+            "_chart_reference_history_cache", {}
         )
-        # The displayed symbol history already bounds the output.  Keeping the
-        # full reference avoids shortening RS/TI65 independently of the chart.
-        reference_history = self._normalize_chart_history(
-            reference_history, REFERENCE_SYMBOL, max_rows=None
-        )
+        reference_key = (id(self.__dict__.get("db_engine")), timeframe)
+        now = dt.datetime.now(dt.timezone.utc)
+        cached_reference = reference_cache.get(reference_key)
+        reference_history = pd.DataFrame()
+        if cached_reference is not None:
+            cached_at, cached_history = cached_reference
+            age_seconds = (now - cached_at).total_seconds()
+            if 0 <= age_seconds < CHART_REFERENCE_HISTORY_CACHE_SECONDS:
+                reference_history = cached_history
+        if reference_history.empty:
+            reference_history = self._load_chart_history_for_timeframe(
+                REFERENCE_SYMBOL, timeframe, use_live_fallback=False
+            )
+            # The displayed symbol history already bounds the output. Keeping
+            # the complete loaded reference avoids shortening RS/TI65.
+            reference_history = self._normalize_chart_history(
+                reference_history, REFERENCE_SYMBOL, max_rows=None
+            )
+            if not reference_history.empty:
+                reference_cache[reference_key] = (now, reference_history)
         if reference_history.empty or "Close" not in reference_history.columns:
             return pd.DataFrame()
         indicators = calculate_chart_indicators(

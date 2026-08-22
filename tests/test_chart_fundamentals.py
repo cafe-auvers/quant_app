@@ -49,6 +49,7 @@ from src.infrastructure.database.repositories.fundamentals import (
 )
 from src.services.chart_fundamentals import (
     ChartFundamentalService,
+    get_universe_earnings_history_due_symbols,
     refresh_nasdaq_universe_stock_profiles,
     refresh_universe_earnings_history,
     refresh_universe_upcoming_earnings,
@@ -63,6 +64,7 @@ from src.services.fundamental_providers import (
 )
 from src.ui.charts.controller_data_flow import ChartsDataFlowMixin
 from src.ui.charts.render_lightweight import ChartLightweightRenderMixin
+from src.ui.fundamental_worker import ChartFundamentalRefreshWorker
 
 
 UTC = dt.timezone.utc
@@ -654,6 +656,11 @@ def test_earnings_history_batch_prioritizes_never_attempted_symbols():
             return ProfileStatus.OK
 
     service = EarningsService()
+    assert get_universe_earnings_history_due_symbols(
+        engine,
+        ("AAPL", "MSFT", "NVDA"),
+        as_of=NOW,
+    ) == ("MSFT", "NVDA", "AAPL")
     summary = refresh_universe_earnings_history(
         engine,
         ("AAPL", "MSFT", "NVDA"),
@@ -896,9 +903,103 @@ def test_chart_html_renders_escaped_watermark_markers_badge_and_independent_scal
     assert "249/124" in page
     assert "priceScaleId: 'earnings'" in page
     assert "chart.priceScale('earnings')" in page
-    assert "candleSeries.setMarkers" in page
+    assert "candleSeries.setMarkers" not in page
+    assert 'id="earnings-event-layer"' in page
+    assert "className = 'earnings-event-badge'" in page
+    assert '<path d="M7 1 H23 L29 7 V23 H19 L15 31 L11 23 H1 V7 Z">' in page
+    assert "chart.timeScale().timeToCoordinate(marker.time)" in page
+    assert "bottom: 24px" in page
+    assert "carriedEarningsLines(activeCrosshairTime)" in page
+    assert "restoreChartTooltip();" in page
     assert '"time": "2026-08-27"' in page
     assert "mergeSeriesData(futureWhitespace, earningsWhitespace, candles)" in page
+
+
+def test_earnings_badges_use_surprise_colors_and_not_price_coordinates():
+    base = replace(
+        enrich_earnings_history(_six_quarters())[-1],
+        report_date=dt.date(2026, 8, 19),
+    )
+    positive = replace(
+        base,
+        event_key="positive",
+        report_date=dt.date(2026, 8, 18),
+        reported_eps=1.20,
+        estimated_eps=1.00,
+    )
+    negative = replace(
+        base,
+        event_key="negative",
+        report_date=dt.date(2026, 8, 19),
+        reported_eps=0.80,
+        estimated_eps=1.00,
+    )
+    neutral = replace(
+        base,
+        event_key="neutral",
+        report_date=dt.date(2026, 8, 20),
+        reported_eps=1.00,
+        estimated_eps=1.00,
+    )
+
+    page = ChartLightweightRenderMixin._generate_tradingview_lightweight_chart_html(
+        "NVDA",
+        _history(),
+        storage_symbol="NVDA",
+        earnings_events=[positive, negative, neutral],
+    )
+
+    assert '"color": "#089981"' in page
+    assert '"color": "#f23645"' in page
+    assert '"color": "#787b86"' in page
+    assert '"label": "E"' in page
+    assert '"position": "aboveBar"' not in page
+    assert '"shape": "circle"' not in page
+
+
+def test_latest_reported_earnings_remains_available_before_visible_chart_range():
+    earlier_report = replace(
+        enrich_earnings_history(_six_quarters())[-1],
+        report_date=dt.date(2026, 8, 1),
+    )
+
+    page = ChartLightweightRenderMixin._generate_tradingview_lightweight_chart_html(
+        "NVDA",
+        _history(),
+        storage_symbol="NVDA",
+        earnings_events=[earlier_report],
+    )
+
+    assert "const earningsMarkers = [];" in page
+    assert "Report date: 2026-08-01" in page
+    assert '"reported": true' in page
+    assert ".filter(item => item.reported)" in page
+    assert "time == null" in page
+    assert "reportedEarningsSortValues" in page
+
+
+def test_earnings_badges_reuse_dom_nodes_during_pan_and_resize():
+    page = ChartLightweightRenderMixin._generate_tradingview_lightweight_chart_html(
+        "NVDA",
+        _history(),
+        storage_symbol="NVDA",
+        earnings_events=enrich_earnings_history(_six_quarters()),
+    )
+
+    assert "const earningsBadgeEntries" in page
+    assert "scheduleEarningsEventBadgeRender" in page
+    assert "window.requestAnimationFrame" in page
+    assert "earningsEventLayer.replaceChildren()" not in page
+
+
+def test_chart_library_is_a_cacheable_local_asset():
+    page = ChartLightweightRenderMixin._generate_tradingview_lightweight_chart_html(
+        "NVDA", _history()
+    )
+
+    assert 'src="file:///' in page
+    assert 'data-lightweight-charts-version="4.2.3"' in page
+    assert "unpkg.com" not in page
 
 
 def test_renderer_omits_profile_fields_from_the_wrong_symbol():
@@ -924,6 +1025,95 @@ def test_stale_worker_completion_cannot_rerender_another_symbol():
     )
     context = ChartFundamentalContext(symbol="AAPL")
     ChartsDataFlowMixin._on_chart_fundamental_refresh_completed(window, context, 2)
+
+
+def test_active_worker_completion_warms_cache_without_reloading_chart():
+    engine = object()
+    refresh_timestamps = {"single|NVDA|1D|fundamentals=old": NOW}
+    window = SimpleNamespace(
+        db_engine=engine,
+        tradingview_refresh_timestamps=refresh_timestamps,
+        load_tradingview_chart=lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("earnings refresh must not reload the visible chart")
+        ),
+    )
+    context = ChartFundamentalContext(
+        symbol="NVDA",
+        earnings_events=tuple(enrich_earnings_history(_six_quarters())),
+        revision_token="new",
+    )
+
+    ChartsDataFlowMixin._on_chart_fundamental_refresh_completed(window, context, 4)
+
+    cached = window._chart_fundamental_context_cache[(id(engine), "NVDA", 14)]
+    assert cached[1] is context
+    assert window.tradingview_refresh_timestamps is refresh_timestamps
+    assert refresh_timestamps == {"single|NVDA|1D|fundamentals=old": NOW}
+
+
+def test_chart_fundamental_context_reuses_short_lived_memory_cache(monkeypatch):
+    calls = []
+
+    class Service:
+        def __init__(self, engine):
+            self.engine = engine
+
+        def load_chart_fundamental_context(self, symbol, **_kwargs):
+            calls.append(symbol)
+            return ChartFundamentalContext(symbol=symbol, revision_token=str(len(calls)))
+
+    monkeypatch.setattr(
+        "src.ui.charts.controller_data_flow.ChartFundamentalService", Service
+    )
+    window = SimpleNamespace(db_engine=object(), db_enabled=True)
+
+    first = ChartsDataFlowMixin._load_cached_chart_fundamental_context(
+        window, "NVDA", now=NOW, horizon_days=14
+    )
+    second = ChartsDataFlowMixin._load_cached_chart_fundamental_context(
+        window,
+        "NVDA",
+        now=NOW + dt.timedelta(seconds=10),
+        horizon_days=14,
+    )
+    refreshed = ChartsDataFlowMixin._load_cached_chart_fundamental_context(
+        window,
+        "NVDA",
+        now=NOW + dt.timedelta(seconds=31),
+        horizon_days=14,
+    )
+
+    assert first is second
+    assert refreshed is not first
+    assert calls == ["NVDA", "NVDA"]
+
+
+def test_fundamental_worker_checks_freshness_off_the_ui_thread():
+    refreshes = []
+    skipped = []
+
+    class Service:
+        def __init__(self, _engine):
+            pass
+
+        def refresh_required(self, symbol):
+            return False
+
+        def refresh_symbol(self, symbol):
+            refreshes.append(symbol)
+            return ChartFundamentalContext(symbol=symbol)
+
+    worker = ChartFundamentalRefreshWorker(
+        object(), "NVDA", 4, service_factory=Service
+    )
+    worker.not_required.connect(
+        lambda symbol, generation: skipped.append((symbol, generation))
+    )
+
+    worker.run()
+
+    assert refreshes == []
+    assert skipped == [("NVDA", 4)]
 
 
 def test_split_view_loads_one_context_and_schedules_one_provider_refresh():
@@ -985,3 +1175,53 @@ def test_split_view_loads_one_context_and_schedules_one_provider_refresh():
     assert window.refresh_schedules == 1
     assert len(window.rendered_contexts) == 2
     assert window.rendered_contexts[0] is window.rendered_contexts[1]
+
+
+def test_cached_earnings_are_passed_to_the_initial_chart_render():
+    event = enrich_earnings_history(_six_quarters())[-1]
+    context = ChartFundamentalContext(
+        symbol="NVDA",
+        earnings_events=(event,),
+        revision_token="cached",
+    )
+    order = []
+
+    class Combo:
+        def currentText(self):
+            return "NVDA"
+
+    class View:
+        def setVisible(self, _visible):
+            pass
+
+    class Label:
+        def setText(self, _text):
+            pass
+
+    class Window(ChartsDataFlowMixin):
+        tradingview_symbol_combo = Combo()
+        tradingview_chart_view = View()
+        tradingview_split_chart_view = View()
+        tradingview_status_label = Label()
+
+        def _to_tradingview_symbol(self, symbol):
+            return symbol
+
+        def _get_tradingview_window_days(self):
+            return 7
+
+        def _load_cached_chart_fundamental_context(self, *_args, **_kwargs):
+            order.append("cached earnings")
+            return context
+
+        def _render_tradingview_chart_view(self, _view, **kwargs):
+            order.append("initial render")
+            assert kwargs["fundamental_context"].earnings_events == (event,)
+            return "loaded"
+
+        def _schedule_chart_fundamental_refresh(self, *_args, **_kwargs):
+            order.append("background refresh")
+
+    Window().load_tradingview_chart()
+
+    assert order == ["cached earnings", "initial render", "background refresh"]

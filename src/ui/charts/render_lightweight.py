@@ -22,6 +22,11 @@ except ImportError:
     QWebChannel = None
 
 from .render_assets import _lightweight_charts_script_tag
+from .render_earnings_assets import EARNINGS_CHART_CSS, EARNINGS_EVENT_RUNTIME_JS
+from .render_measurement_assets import (
+    RIGHT_DRAG_MEASUREMENT_CSS,
+    RIGHT_DRAG_MEASUREMENT_JS,
+)
 from .render_fundamentals import build_fundamental_render_payload
 from .render_metrics import ChartRenderMetricsMixin
 from .models import normalize_chart_interaction_settings
@@ -59,20 +64,34 @@ class ChartLightweightRenderMixin:
         full_view_cond_js = ChartRenderPrimitivesMixin._get_js_key_condition(shortcuts.get("full_view", "F"))
         pan_left_cond_js = ChartRenderPrimitivesMixin._get_js_key_condition(shortcuts.get("pan_left", "Left"))
         pan_right_cond_js = ChartRenderPrimitivesMixin._get_js_key_condition(shortcuts.get("pan_right", "Right"))
-        chart_history = ChartRenderPrimitivesMixin._normalize_chart_history(
-            history, symbol, max_rows=options.get("max_history_bars", 260)
-        )
+        if bool(options.get("history_is_normalized", False)):
+            chart_history = history
+        else:
+            chart_history = ChartRenderPrimitivesMixin._normalize_chart_history(
+                history, symbol, max_rows=options.get("max_history_bars", 260)
+            )
         if chart_history.empty:
             return ChartRenderPrimitivesMixin._generate_message_html(symbol, "No chart data available.")
 
         candles = []
         volumes = []
-        date_labels = [pd.Timestamp(item).strftime("%Y-%m-%d") for item in chart_history.index]
+        chart_index = pd.DatetimeIndex(chart_history.index)
+        date_labels = chart_index.strftime("%Y-%m-%d").tolist()
         chart_timeframe = str(options.get("timeframe", "1D")).strip().upper()
         uses_intraday_time = bool(chart_timeframe and chart_timeframe != "1D") or len(
             set(date_labels)
         ) < len(date_labels)
         time_visible = "true" if uses_intraday_time else "false"
+
+        if uses_intraday_time:
+            utc_index = (
+                chart_index.tz_localize("UTC")
+                if chart_index.tz is None
+                else chart_index.tz_convert("UTC")
+            )
+            chart_times = (utc_index.asi8 // 1_000_000_000).tolist()
+        else:
+            chart_times = date_labels
 
         def chart_time_value(timestamp) -> str | int:
             timestamp = pd.Timestamp(timestamp)
@@ -84,20 +103,25 @@ class ChartLightweightRenderMixin:
                 return int(timestamp.timestamp())
             return timestamp.strftime("%Y-%m-%d")
 
+        chart_times_by_date = {}
+        for date_label, time_value in zip(date_labels, chart_times):
+            chart_times_by_date.setdefault(date_label, []).append(time_value)
         chart_time_lookup = {
-            pd.Timestamp(timestamp).strftime("%Y-%m-%d"): chart_time_value(timestamp)
-            for timestamp in chart_history.index
+            date_label: values[-1]
+            for date_label, values in chart_times_by_date.items()
         }
-        first_chart_time = chart_time_value(chart_history.index[0])
+        normalized_chart_index = (
+            chart_index.tz_convert(None)
+            if chart_index.tz is not None
+            else chart_index.tz_localize(None)
+        )
+        chart_time_by_timestamp = dict(zip(normalized_chart_index, chart_times))
+        first_chart_time = chart_times[0]
 
         def drawing_time_value(value, prefer: str = "first") -> str | int:
             text = str(value)
             if uses_intraday_time and len(text) <= 10:
-                day_matches = [
-                    chart_time_value(timestamp)
-                    for timestamp in chart_history.index
-                    if pd.Timestamp(timestamp).strftime("%Y-%m-%d") == text[:10]
-                ]
+                day_matches = chart_times_by_date.get(text[:10], ())
                 if day_matches:
                     return day_matches[-1] if prefer == "last" else day_matches[0]
                 date_keys = sorted(chart_time_lookup.keys())
@@ -108,7 +132,7 @@ class ChartLightweightRenderMixin:
             return chart_time_value(value)
 
         def future_time_values() -> List[str | int]:
-            last_timestamp = pd.Timestamp(chart_history.index[-1])
+            last_timestamp = chart_index[-1]
             if uses_intraday_time:
                 if chart_timeframe == "1H":
                     step = pd.Timedelta(hours=1)
@@ -130,13 +154,17 @@ class ChartLightweightRenderMixin:
                 values.append(chart_time_value(current))
             return values
 
-        for timestamp, row in chart_history.iterrows():
-            time_value = chart_time_value(timestamp)
-            open_price = float(row["Open"])
-            high_price = float(row["High"])
-            low_price = float(row["Low"])
-            close_price = float(row["Close"])
-            volume = 0.0 if pd.isna(row["Volume"]) else float(row["Volume"])
+        price_columns = chart_history[["Open", "High", "Low", "Close", "Volume"]]
+        for time_value, row in zip(
+            chart_times,
+            price_columns.itertuples(index=False, name=None),
+        ):
+            open_price, high_price, low_price, close_price, raw_volume = row
+            open_price = float(open_price)
+            high_price = float(high_price)
+            low_price = float(low_price)
+            close_price = float(close_price)
+            volume = 0.0 if pd.isna(raw_volume) else float(raw_volume)
             candles.append({
                 "time": time_value,
                 "open": open_price,
@@ -159,8 +187,8 @@ class ChartLightweightRenderMixin:
         future_values = future_time_values()
         future_whitespace_json = json.dumps([{"time": value} for value in future_values])
 
-        first_chart_date = pd.Timestamp(chart_history.index[0]).date()
-        last_chart_date = pd.Timestamp(chart_history.index[-1]).date()
+        first_chart_date = chart_index[0].date()
+        last_chart_date = chart_index[-1].date()
         fundamental_payload = build_fundamental_render_payload(
             canonical_display_symbol=canonical_display_symbol,
             stock_profile=stock_profile,
@@ -232,8 +260,8 @@ class ChartLightweightRenderMixin:
                 ema_series[f"EMA {span}"] = {
                     "color": color,
                     "data": [
-                        {"time": chart_time_value(timestamp), "value": float(value)}
-                        for timestamp, value in ema.items()
+                        {"time": time_value, "value": float(value)}
+                        for time_value, value in zip(chart_times, ema.to_numpy())
                         if not pd.isna(value)
                     ],
                 }
@@ -245,32 +273,46 @@ class ChartLightweightRenderMixin:
         ti65_background = []
         score_summary = "RS Score N/A"
         if bool(options.get("show_rs", True)) and not indicator_history.empty:
-            indicator_lookup = indicator_history.to_dict("index")
-            for timestamp in chart_history.index:
-                lookup_timestamp = pd.Timestamp(timestamp)
-                if lookup_timestamp.tzinfo is not None:
-                    lookup_timestamp = lookup_timestamp.tz_convert(None)
-                row = indicator_lookup.get(lookup_timestamp)
-                if row is None:
+            row_count = len(indicator_history)
+
+            def indicator_values(name, default=None):
+                if name in indicator_history.columns:
+                    return indicator_history[name].to_numpy()
+                return [default] * row_count
+
+            relative_strength_values = indicator_values("relative_strength")
+            rs_sma_values = indicator_values("rs_sma_50")
+            plus_4pct_values = indicator_values("is_plus_4pct_change", False)
+            minus_4pct_values = indicator_values("is_minus_4pct_change", False)
+            pct_change_values = indicator_values("pct_change_today")
+            ti65_bullish_values = indicator_values("is_ti65_bullish", False)
+            ti65_bearish_values = indicator_values("is_ti65_bearish", False)
+            indicator_index = pd.DatetimeIndex(indicator_history.index)
+            if indicator_index.tz is not None:
+                indicator_index = indicator_index.tz_convert(None)
+            else:
+                indicator_index = indicator_index.tz_localize(None)
+            for position, timestamp in enumerate(indicator_index):
+                time_value = chart_time_by_timestamp.get(timestamp)
+                if time_value is None:
                     continue
-                time_value = chart_time_value(timestamp)
-                rs_value = row.get("relative_strength")
-                sma_value = row.get("rs_sma_50")
+                rs_value = relative_strength_values[position]
+                sma_value = rs_sma_values[position]
                 if pd.notna(rs_value):
                     rs_points.append({"time": time_value, "value": float(rs_value)})
-                    if bool(row.get("is_plus_4pct_change")):
-                        pct_val = row.get("pct_change_today")
+                    if bool(plus_4pct_values[position]):
+                        pct_val = pct_change_values[position]
                         pct_label = f"+{round(float(pct_val))}%" if pd.notna(pct_val) else "+4%"
                         rs_markers.append({"time": time_value, "position": "aboveBar", "color": "#22c55e", "shape": "circle", "text": pct_label})
-                    if bool(row.get("is_minus_4pct_change")):
-                        pct_val = row.get("pct_change_today")
+                    if bool(minus_4pct_values[position]):
+                        pct_val = pct_change_values[position]
                         pct_label = f"{round(float(pct_val))}%" if pd.notna(pct_val) else "-4%"
                         rs_markers.append({"time": time_value, "position": "belowBar", "color": "#ef4444", "shape": "circle", "text": pct_label})
                 if pd.notna(sma_value):
                     rs_sma_points.append({"time": time_value, "value": float(sma_value)})
-                if bool(row.get("is_ti65_bullish")):
+                if bool(ti65_bullish_values[position]):
                     ti65_background.append({"time": time_value, "value": 1, "color": "rgba(34, 197, 94, 0.18)"})
-                elif bool(row.get("is_ti65_bearish")):
+                elif bool(ti65_bearish_values[position]):
                     ti65_background.append({"time": time_value, "value": 1, "color": "rgba(239, 68, 68, 0.18)"})
 
             latest_scores = (
@@ -356,16 +398,7 @@ class ChartLightweightRenderMixin:
                     align-items: center;
                     gap: 14px;
                 }}
-                #earnings-upcoming-badge {{
-                    color: #fde68a;
-                    background: rgba(245, 158, 11, 0.18);
-                    border: 1px solid rgba(245, 158, 11, 0.5);
-                    border-radius: 999px;
-                    padding: 2px 8px;
-                    font-size: 12px;
-                    font-weight: 700;
-                    white-space: nowrap;
-                }}
+                {EARNINGS_CHART_CSS}
                 #header-row2 {{
                     display: flex;
                     align-items: center;
@@ -441,24 +474,6 @@ class ChartLightweightRenderMixin:
                     margin-top: 3px;
                     font-size: clamp(13px, 2.2vw, 18px);
                 }}
-                #chart-tooltip {{
-                    display: none;
-                    position: absolute;
-                    left: 12px;
-                    top: 10px;
-                    z-index: 7;
-                    max-width: min(310px, 62%);
-                    padding: 7px 9px;
-                    border: 1px solid rgba(107, 114, 128, 0.6);
-                    border-radius: 4px;
-                    background: rgba(15, 20, 25, 0.90);
-                    color: #d1d5db;
-                    font-size: 11px;
-                    line-height: 1.35;
-                    white-space: pre-line;
-                    pointer-events: none;
-                    user-select: none;
-                }}
                 #rs-chart {{
                     display: {rs_panel_display};
                     width: 100%;
@@ -483,6 +498,7 @@ class ChartLightweightRenderMixin:
                     z-index: 5;
                     pointer-events: none;
                 }}
+                {RIGHT_DRAG_MEASUREMENT_CSS}
             </style>
             {bridge_script}
         </head>
@@ -501,8 +517,10 @@ class ChartLightweightRenderMixin:
                 <div id="price-panel">
                     <div id="chart"></div>
                     {watermark_html}
+                    <div id="earnings-event-layer" aria-label="Earnings events"></div>
                     <div id="chart-tooltip"></div>
                     <canvas id="drawing-overlay"></canvas>
+                    <canvas id="measurement-overlay" aria-label="Percentage measurement"></canvas>
                 </div>
                 <div id="rs-chart"><div id="rs-empty">RS/TI65 data unavailable for this timeframe.</div></div>
             </div>
@@ -541,6 +559,7 @@ class ChartLightweightRenderMixin:
                 const rsContainer = document.getElementById('rs-chart');
                 const pricePanel = document.getElementById('price-panel');
                 const chartTooltip = document.getElementById('chart-tooltip');
+                const earningsEventLayer = document.getElementById('earnings-event-layer');
                 let chartBridge = null;
                 let drawingMode = false;
                 let eraseMode = false;
@@ -639,17 +658,6 @@ class ChartLightweightRenderMixin:
                 candleSeries.setData(
                     mergeSeriesData(futureWhitespace, earningsWhitespace, candles)
                 );
-                function applyEarningsMarkers(dense) {{
-                    const markerData = earningsMarkers.map(marker => ({{
-                        time: marker.time,
-                        position: marker.position,
-                        color: marker.color,
-                        shape: marker.shape,
-                        text: dense ? 'E' : marker.fullText
-                    }}));
-                    candleSeries.setMarkers(markerData);
-                }}
-                if (earningsMarkers.length > 0) applyEarningsMarkers(false);
 
                 let earningsLineSeries = null;
                 if (earningsLinePoints.length > 0) {{
@@ -671,35 +679,9 @@ class ChartLightweightRenderMixin:
                     earningsLineSeries.setData(earningsLinePoints);
                 }}
 
-                const earningsTooltipByTime = new Map(
-                    earningsTooltips.map(item => [String(item.time), item.lines])
-                );
-                chart.subscribeCrosshairMove(param => {{
-                    if (!chartTooltip || !param || param.time == null || !param.point) {{
-                        if (chartTooltip) chartTooltip.style.display = 'none';
-                        return;
-                    }}
-                    const lines = [];
-                    const candle = param.seriesData.get(candleSeries);
-                    if (candle && candle.open != null) {{
-                        lines.push(
-                            `O ${{Number(candle.open).toFixed(2)}}  H ${{Number(candle.high).toFixed(2)}}  ` +
-                            `L ${{Number(candle.low).toFixed(2)}}  C ${{Number(candle.close).toFixed(2)}}`
-                        );
-                    }}
-                    const eventLines = earningsTooltipByTime.get(String(param.time));
-                    if (eventLines) lines.push(...eventLines);
-                    if (lines.length === 0) {{
-                        chartTooltip.style.display = 'none';
-                        return;
-                    }}
-                    chartTooltip.textContent = lines.join('\\n');
-                    chartTooltip.style.display = 'block';
-                }});
-                chart.timeScale().subscribeVisibleLogicalRangeChange(range => {{
-                    if (!range || earningsMarkers.length === 0) return;
-                    applyEarningsMarkers((range.to - range.from) > 160);
-                }});
+                {EARNINGS_EVENT_RUNTIME_JS}
+                {RIGHT_DRAG_MEASUREMENT_JS}
+
                 function formatPrice(value) {{
                     return Number(value).toFixed(2);
                 }}
@@ -1384,6 +1366,7 @@ class ChartLightweightRenderMixin:
                     chart.timeScale().setVisibleLogicalRange(range);
                     if (rsChart) rsChart.timeScale().setVisibleLogicalRange(range);
                     renderDrawings();
+                    renderEarningsEventBadges();
                 }};
                 window.panView = function(deltaBars) {{
                     const current = chart.timeScale().getVisibleLogicalRange();
@@ -1392,6 +1375,7 @@ class ChartLightweightRenderMixin:
                     chart.timeScale().setVisibleLogicalRange(range);
                     if (rsChart) rsChart.timeScale().setVisibleLogicalRange(range);
                     renderDrawings();
+                    renderEarningsEventBadges();
                 }};
 
                 document.addEventListener('keydown', (event) => {{
@@ -1446,6 +1430,7 @@ class ChartLightweightRenderMixin:
                 }});
 
                 overlay.addEventListener('mousedown', (event) => {{
+                    if (event.button !== 0) return;
                     const point = eventPoint(event);
                     const chartPoint = chartPointFromEvent(event);
                     if (eraseMode) {{

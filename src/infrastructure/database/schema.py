@@ -14,6 +14,7 @@ from .sql_helpers import _clean_symbols, _execute_bulk_upsert
 from .time_utils import _utcnow_naive
 
 _ensured_engines: weakref.WeakSet[Engine] = weakref.WeakSet()
+_hourly_ensured_engines: weakref.WeakSet[Engine] = weakref.WeakSet()
 
 def _get_price_history_table(metadata: MetaData) -> Table:
     return Table(
@@ -82,7 +83,9 @@ def _get_hourly_price_history_table(metadata: MetaData) -> Table:
 def _ensure_hourly_price_history_table(engine: Engine) -> Table:
     metadata = MetaData()
     hourly_history = _get_hourly_price_history_table(metadata)
-    metadata.create_all(engine)
+    if engine not in _hourly_ensured_engines:
+        metadata.create_all(engine)
+        _hourly_ensured_engines.add(engine)
     return hourly_history
 
 

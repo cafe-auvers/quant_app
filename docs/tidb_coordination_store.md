@@ -78,8 +78,13 @@ for the current formula.
   the PC MySQL probe, so a laptop remains an eligible Execution Owner while
   the PC is off.
 - An unchanged runtime-readiness heartbeat is likewise one atomic autocommit
-  UPDATE. State transitions, handoffs, ownership changes, commands, orders,
-  and broker evidence retain their explicit transactions.
+  UPDATE. After the first full publication, stable readiness rewrites only
+  `updated_at`; hostname, schema, and readiness JSON are sent again only when
+  those details change. State transitions, handoffs, ownership changes,
+  commands, orders, and broker evidence retain their explicit transactions.
+- A steady `main.py` process heartbeat similarly updates only `heartbeat_at`
+  when the exact PID is still active. A new PID, stopped row, or missing row
+  automatically takes the full lifecycle update/insert path.
 - Repository fetch/list helpers use read-only connection scopes. Broker
   reconciliation and board projection reads therefore do not emit a COMMIT
   for data they did not change.
@@ -99,6 +104,9 @@ for the current formula.
 - The external watchdog still receives its 30-second heartbeat, but successful
   heartbeat audit rows are compacted to one every five minutes. Failure and
   recovery status transitions are always recorded.
+- Empty alert-queue reads use non-committing connections. Runtime startup
+  loads all relevant OPEN alert keys once, replacing four SELECT+COMMIT pairs
+  per card, and an unchanged account-reconciliation plan opens no transaction.
 - Planning/control state sync is once per minute. Publishing, operator commands,
   control-button actions, broker-boundary checks, and owner activation use
   their immediate paths and do not wait for that display-sync timer.
@@ -106,6 +114,11 @@ for the current formula.
   refresh is one conditional SELECT. It returns payload text only for the two
   tiny control rows; the larger planning documents contribute revision numbers
   only. This replaces at least one separate control query per device per minute.
+- The regular-session operator-command pickup uses a three-second hard floor,
+  and its empty/oldest-pending lookup is backed by one covering
+  `(status, created_at, command_id)` index. This is the only cloud cadence
+  relaxed in response to the second production RU sample; local quote, stop,
+  and broker-boundary lease checks are unchanged.
 
 The minimum cadences are hard floors in `execution_config.py`; an accidental
 environment value cannot turn the background loops back into one-second cloud
@@ -114,7 +127,7 @@ polls.
 | Coordination work | Hard cadence |
 | --- | ---: |
 | Local quote/ORB/stop evaluation | 1 second, no TiDB request |
-| Operator-command pickup, regular session | 1 second, active executor only |
+| Operator-command pickup, regular session | 3 seconds, active executor only |
 | Lease proof | 10 seconds, active executor only |
 | Protective ownership proof | 10 seconds, one bulk read only while positions exist |
 | Writable probe | 60-second fallback; normally satisfied by readiness write |
@@ -145,21 +158,21 @@ daily pattern:
 | Two-device `main.py` process heartbeats | 172,800 |
 | Active-owner lease proof | 259,200 |
 | Two-device card revision checks | 86,400 |
-| Regular/off-hours operator-command checks | 549,420 |
+| Regular/off-hours operator-command checks | 206,220 |
 | Bulk protective ownership proof | 259,200 |
 | Alert queue plus compacted heartbeat audits | 190,080 |
 | Two-device Buy Board revision checks | 86,400 |
 | Planning/control state sync | 216,000 |
 | Minute account-reconciliation relational reads, two accounts | 259,200 |
 | Transaction COMMITs for fallback writable probes | 86,400 |
-| **Scheduled total** | **2,597,100** |
-| **With 25% reconnect/scheduling margin** | **3,246,375** |
+| **Scheduled total** | **2,253,900** |
+| **With 25% reconnect/scheduling margin** | **2,817,375** |
 
 For capacity planning, this project applies a conservative **8 RU per small
 scheduled statement**. After batching the control and revision display reads
 and removing separate COMMIT statements from the two single-UPDATE heartbeat
-paths, that deliberately conservative calculation reserves about **26.0
-million RUs/month**, leaving about **24.0 million
+paths, that deliberately conservative calculation reserves about **22.5
+million RUs/month**, leaving about **27.5 million
 RUs** for real state transitions, bulk projection payloads, order journals,
 TiDB background jobs, and measurement error. Ten thousand separately rendered
 material changes would add roughly 5 million public-endpoint egress RUs at the
@@ -197,6 +210,25 @@ The control/revision display reads are also now one compact conditional query
 instead of separate control and revision fetches. This should materially
 outperform the deliberately conservative 26.0M model,
 which still assumes that every fallback writable probe fires.
+
+A subsequent regular-session sample remained near 20 RU/s after those broad
+optimizations. The only scheduled one-Hz coordination statement left was the
+active executor's empty operator-command pickup. Its cadence is now one query
+every three seconds and its lookup is covered by an index. If the one-Hz lookup
+accounts for the observed roughly 20 RU/s baseline, its cadence contribution
+falls to about 6.7 RU/s, leaving roughly 3.3 RU/s for periodic lease,
+readiness, revision, and alert work. The post-deployment regular-session idle
+target is **10 RU/s or less** over a representative interval; short
+transition/reconciliation spikes are assessed separately.
+
+The next SQL-statements capture isolated the remaining write and startup
+overhead: 95 runtime-readiness heartbeats averaged 6.70 RU, 98 `main.py`
+heartbeats averaged 5.85 RU, 803 standalone COMMITs were recorded, and the
+startup recoverable-alert sweep selected incidents 356 times (four alert
+classes across 89 cards). The steady heartbeats now use timestamp-only UPDATEs
+without changing their 30-second cadence or 60-second freshness fence. The
+alert sweep is one bulk read, read-only alert polling emits no COMMIT, and an
+unchanged reconciliation plan skips schema and transaction work entirely.
 
 TiDB states that SQL queries, bulk operations, and its own background jobs all
 consume RUs. `EXPLAIN ANALYZE` reports statement RU but excludes gateway egress;

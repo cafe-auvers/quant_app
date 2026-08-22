@@ -20,6 +20,7 @@ from typing import Any, Dict, Iterable, Optional
 from sqlalchemy import (
     Column,
     DateTime,
+    Index,
     MetaData,
     String,
     Table,
@@ -145,7 +146,7 @@ _ensure_lock = threading.Lock()
 
 
 def _table(metadata: MetaData) -> Table:
-    return Table(
+    table = Table(
         "operator_commands",
         metadata,
         Column("command_id", String(64), primary_key=True),
@@ -172,6 +173,17 @@ def _table(metadata: MetaData) -> Table:
         Column("state_before_hash", String(64), nullable=False, server_default=""),
         Column("state_after_hash", String(64), nullable=False, server_default=""),
     )
+    # The active executor normally asks only whether a PENDING row exists,
+    # then claims the oldest one.  Keep both the idle lookup and ordered claim
+    # on one compact covering index instead of scanning the append-only audit
+    # table every few seconds.
+    Index(
+        "ix_operator_commands_status_created",
+        table.c.status,
+        table.c.created_at,
+        table.c.command_id,
+    )
+    return table
 
 
 def ensure_operator_commands_table(engine: Engine) -> Table:
@@ -201,6 +213,22 @@ def ensure_operator_commands_table(engine: Engine) -> Table:
                                 f"{definition}"
                             )
                         )
+            # ``create_all`` does not add indexes to a table that already
+            # exists.  Run the check once per Engine so deployed coordination
+            # stores receive the covering poll index as well as new stores.
+            # Two upgraded desktops can start together: if both observe the
+            # missing index, accept the losing CREATE only after confirming
+            # that the other process actually installed this exact name.
+            for index in table.indexes:
+                try:
+                    index.create(bind=engine, checkfirst=True)
+                except SQLAlchemyError:
+                    installed = {
+                        str(item.get("name") or "")
+                        for item in inspect(engine).get_indexes(table.name)
+                    }
+                    if str(index.name or "") not in installed:
+                        raise
             _ensured_engines.add(engine)
     return table
 

@@ -1404,6 +1404,38 @@ def test_pull_only_successor_reaches_standby_ready_but_never_active(
     assert worker.device_state == RuntimeDeviceState.STANDBY_READY
 
 
+def test_unchanged_runtime_readiness_uses_timestamp_only_heartbeat(
+    tmp_path, monkeypatch
+):
+    import src.ui.buyboard.runtime_worker as runtime_worker_module
+
+    worker, _ = _worker(tmp_path, device_id="main-device")
+    worker.device_state = RuntimeDeviceState.ACTIVE
+    details = {"executor_ready": True, "device_kind": "PC"}
+    worker._last_device_state_details = dict(details)
+    worker._last_device_state_published_at = dt.datetime.now(
+        dt.timezone.utc
+    ) - dt.timedelta(
+        seconds=execution_config.COORDINATION_DEVICE_HEARTBEAT_SECONDS + 1
+    )
+    calls = []
+    monkeypatch.setattr(
+        worker,
+        "_runtime_readiness_details",
+        lambda _state: dict(details),
+    )
+    monkeypatch.setattr(
+        runtime_worker_module,
+        "refresh_runtime_device_state",
+        lambda *args, **kwargs: calls.append(kwargs) or True,
+    )
+
+    worker._publish_device_state_if_due(RuntimeDeviceState.ACTIVE)
+
+    assert len(calls) == 1
+    assert calls[0]["heartbeat_only"] is True
+
+
 def test_pull_only_successor_is_handoff_ready_before_market_open_without_quotes(
     tmp_path, monkeypatch
 ):
@@ -2539,6 +2571,38 @@ def test_flat_closed_card_does_not_reopen_persisted_position_alerts(tmp_path):
         CriticalAlertType.CANCEL_CONFIRMATION_TIMEOUT,
         "PROD:1:STIM:EXIT_CANCEL_STALLED",
     ) in [(alert_type, dedupe_key) for alert_type, dedupe_key, _ in resolutions]
+
+
+def test_initial_recoverable_alert_sweep_resolves_only_durable_open_keys(tmp_path):
+    worker, _ = _worker(tmp_path)
+    lookups = []
+    resolutions = []
+    card = TradeCardState(
+        environment="PROD",
+        account_no="1",
+        symbol="STIM",
+        board_status=BoardStatus.CLOSED,
+    )
+    open_key = "PROD:1:STIM:DATA_STALE"
+
+    class Alerting:
+        def open_incident_keys(self, alert_types):
+            lookups.append(tuple(alert_types))
+            return {(CriticalAlertType.STALE_CRITICAL_SYMBOL.value, open_key)}
+
+        def resolve_alert(self, alert_type, dedupe_key, *, resolved_by):
+            resolutions.append((alert_type, dedupe_key, resolved_by))
+            return True
+
+    worker._external_alerting = Alerting()
+
+    worker._emit_stalled_liquidation_alerts([card])
+    worker._emit_stalled_liquidation_alerts([card])
+
+    assert len(lookups) == 1
+    assert [(item[0], item[1]) for item in resolutions] == [
+        (CriticalAlertType.STALE_CRITICAL_SYMBOL, open_key)
+    ]
 
 
 def test_unreconciled_broker_order_warning_fires_alert_exactly_once(tmp_path):
