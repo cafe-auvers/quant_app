@@ -7,11 +7,15 @@ execution paths cannot drift independently.
 """
 from src.risk.position_sizer import PositionSize, PositionSizer, SizingMethod
 from src.risk.orb_position import (
+    DEFAULT_ORB_SETTINGS,
     MAX_CAPITAL_PERCENT,
     MAX_STOP_ADR,
     MIN_CAPITAL_PERCENT,
     MIN_STOP_ADR,
+    OrbSettings,
     calculate_orb_position_values,
+    configure_orb_settings,
+    get_orb_settings,
     is_orb_position_plan_valid,
     score_orb_position_recommendation,
     validate_orb_position_values,
@@ -26,10 +30,12 @@ from src.risk.pre_trade import (
 )
 
 __all__ = [
+    "DEFAULT_ORB_SETTINGS",
     "MAX_CAPITAL_PERCENT",
     "MAX_STOP_ADR",
     "MIN_CAPITAL_PERCENT",
     "MIN_STOP_ADR",
+    "OrbSettings",
     "PositionSize",
     "PositionSizer",
     "SizingMethod",
@@ -39,6 +45,8 @@ __all__ = [
     "normalize_share_quantity",
     "orb_candidate_plan_id",
     "calculate_orb_position_values",
+    "configure_orb_settings",
+    "get_orb_settings",
     "is_orb_position_plan_valid",
     "score_orb_position_recommendation",
     "require_pre_trade_risk_approval",

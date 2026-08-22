@@ -219,7 +219,6 @@ class BuylistViewMixin:
         symbol = symbol_item.text().strip().upper()
         if not symbol:
             return
-        self._set_chart_symbol(symbol)
         if hasattr(self, "tradingview_symbol_combo"):
             self._set_tradingview_symbol(symbol)
         self.tabs.setCurrentWidget(self.tradingview_widget)

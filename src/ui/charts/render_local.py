@@ -129,6 +129,13 @@ class ChartLocalRenderMixin:
             else pd.DataFrame()
         )
         has_indicators = not indicator_history.empty
+        relative_performance_history = (
+            ChartRenderMetricsMixin._rebase_relative_strength_to_percent(
+                indicator_history
+            )
+            if has_indicators
+            else pd.DataFrame()
+        )
         width = 1180
         height = 360 if compact else (840 if has_indicators else 620)
         left = 62 if compact else 72
@@ -257,19 +264,28 @@ class ChartLocalRenderMixin:
                 "low": float(row["Low"]),
                 "close": float(row["Close"]),
                 "volume": float(row["Volume"]) if pd.notna(row["Volume"]) else 0.0,
-                "relative_strength": None,
-                "rs_sma_50": None,
+                "relative_performance_pct": None,
+                "relative_sma_50_pct": None,
                 "rs_score_current": None,
             }
             for index, (_, row) in enumerate(chart_history.iterrows())
         ]
         if has_indicators:
-            for index, (_, row) in enumerate(indicator_history.iterrows()):
+            for index, (_, row) in enumerate(relative_performance_history.iterrows()):
                 if index >= len(chart_points):
                     break
-                for column in ["relative_strength", "rs_sma_50", "rs_score_current"]:
-                    value = row.get(column)
-                    chart_points[index][column] = None if pd.isna(value) else float(value)
+                value = row.get("relative_strength")
+                chart_points[index]["relative_performance_pct"] = (
+                    None if pd.isna(value) else float(value)
+                )
+                value = row.get("rs_sma_50")
+                chart_points[index]["relative_sma_50_pct"] = (
+                    None if pd.isna(value) else float(value)
+                )
+                value = row.get("rs_score_current")
+                chart_points[index]["rs_score_current"] = (
+                    None if pd.isna(value) else float(value)
+                )
         chart_points_json = json.dumps(chart_points)
         visible_state_json = json.dumps(visible_state)
         drawing_dates_json = json.dumps(full_drawing_dates)
@@ -623,6 +639,12 @@ class ChartLocalRenderMixin:
                     return Number(value).toFixed(decimals);
                 }}
 
+                function formatSignedPercent(value) {{
+                    if (value === null || value === undefined || Number.isNaN(Number(value))) return "N/A";
+                    const numeric = Number(value);
+                    return `${{numeric >= 0 ? "+" : ""}}${{numeric.toFixed(1)}}%`;
+                }}
+
                 function setHoverText(lines) {{
                     hoverText.textContent = "";
                     lines.forEach((line, index) => {{
@@ -886,7 +908,7 @@ class ChartLocalRenderMixin:
                         `${{bar.date}}    Price ${{cursorPrice.toFixed(2)}}`,
                         `O ${{bar.open.toFixed(2)}}  H ${{bar.high.toFixed(2)}}  L ${{bar.low.toFixed(2)}}`,
                         `C ${{bar.close.toFixed(2)}}  Volume ${{formatVolume(bar.volume)}}`,
-                        `RS ${{formatOptional(bar.relative_strength, 4)}}  RS SMA ${{formatOptional(bar.rs_sma_50, 4)}}  Score ${{formatOptional(bar.rs_score_current, 0)}}`
+                        `vs SPY ${{formatSignedPercent(bar.relative_performance_pct)}}  Relative SMA ${{formatSignedPercent(bar.relative_sma_50_pct)}}  Score ${{formatOptional(bar.rs_score_current, 0)}}`
                     ];
                     setHoverText(hoverLines);
 

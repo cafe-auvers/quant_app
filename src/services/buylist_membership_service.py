@@ -150,8 +150,7 @@ def reconcile_buylist_item(
         promoted.board_status_updated_at = datetime.now(timezone.utc)
         promoted.buylist_member = True
         promoted.watchlist_member = bool(
-            not explicit_watchlist_promotion
-            and (current.watchlist_member or row.card.watchlist_member)
+            current.watchlist_member or row.card.watchlist_member
         )
         if explicit_watchlist_promotion:
             # Promotion is a planning-stage move, not an instruction to arm

@@ -266,78 +266,19 @@ class ChartLightweightRenderMixin:
                     ],
                 }
         ema_json = json.dumps(ema_series)
-        indicator_history = ChartRenderMetricsMixin._align_chart_indicators(chart_history, indicators)
-        rs_points = []
-        rs_sma_points = []
-        rs_markers = []
-        ti65_background = []
-        score_summary = "RS Score N/A"
-        if bool(options.get("show_rs", True)) and not indicator_history.empty:
-            row_count = len(indicator_history)
-
-            def indicator_values(name, default=None):
-                if name in indicator_history.columns:
-                    return indicator_history[name].to_numpy()
-                return [default] * row_count
-
-            relative_strength_values = indicator_values("relative_strength")
-            rs_sma_values = indicator_values("rs_sma_50")
-            plus_4pct_values = indicator_values("is_plus_4pct_change", False)
-            minus_4pct_values = indicator_values("is_minus_4pct_change", False)
-            pct_change_values = indicator_values("pct_change_today")
-            ti65_bullish_values = indicator_values("is_ti65_bullish", False)
-            ti65_bearish_values = indicator_values("is_ti65_bearish", False)
-            indicator_index = pd.DatetimeIndex(indicator_history.index)
-            if indicator_index.tz is not None:
-                indicator_index = indicator_index.tz_convert(None)
-            else:
-                indicator_index = indicator_index.tz_localize(None)
-            for position, timestamp in enumerate(indicator_index):
-                time_value = chart_time_by_timestamp.get(timestamp)
-                if time_value is None:
-                    continue
-                rs_value = relative_strength_values[position]
-                sma_value = rs_sma_values[position]
-                if pd.notna(rs_value):
-                    rs_points.append({"time": time_value, "value": float(rs_value)})
-                    if bool(plus_4pct_values[position]):
-                        pct_val = pct_change_values[position]
-                        pct_label = f"+{round(float(pct_val))}%" if pd.notna(pct_val) else "+4%"
-                        rs_markers.append({"time": time_value, "position": "aboveBar", "color": "#22c55e", "shape": "circle", "text": pct_label})
-                    if bool(minus_4pct_values[position]):
-                        pct_val = pct_change_values[position]
-                        pct_label = f"{round(float(pct_val))}%" if pd.notna(pct_val) else "-4%"
-                        rs_markers.append({"time": time_value, "position": "belowBar", "color": "#ef4444", "shape": "circle", "text": pct_label})
-                if pd.notna(sma_value):
-                    rs_sma_points.append({"time": time_value, "value": float(sma_value)})
-                if bool(ti65_bullish_values[position]):
-                    ti65_background.append({"time": time_value, "value": 1, "color": "rgba(34, 197, 94, 0.18)"})
-                elif bool(ti65_bearish_values[position]):
-                    ti65_background.append({"time": time_value, "value": 1, "color": "rgba(239, 68, 68, 0.18)"})
-
-            latest_scores = (
-                indicator_history.dropna(subset=["rs_score_current"]).tail(1)
-                if "rs_score_current" in indicator_history.columns
-                else pd.DataFrame()
+        indicator_payload = (
+            ChartRenderMetricsMixin._build_relative_indicator_payload(
+                chart_history, indicators, chart_time_by_timestamp
             )
-            if not latest_scores.empty:
-                latest_score = latest_scores.iloc[-1]
-                def score_text(value) -> str:
-                    return "N/A" if pd.isna(value) else str(int(round(float(value))))
-                def score_span(label, value) -> str:
-                    txt = score_text(value)
-                    try:
-                        is_high = not pd.isna(value) and float(value) > 85
-                    except (TypeError, ValueError):
-                        is_high = False
-                    color = ' style="color:#22c55e"' if is_high else ''
-                    return f'{label} <span{color}>{txt}</span>'
-                score_summary = (
-                    f"RS Score {score_span('C', latest_score.get('rs_score_current'))} | "
-                    f"{score_span('W', latest_score.get('rs_score_week'))} | "
-                    f"{score_span('M', latest_score.get('rs_score_month'))} | "
-                    f"{score_span('Y', latest_score.get('rs_score_yesterday'))}"
-                )
+            if bool(options.get("show_rs", True))
+            else {}
+        )
+        rs_points = indicator_payload.get("rs_points", [])
+        rs_sma_points = indicator_payload.get("rs_sma_points", [])
+        rs_markers = indicator_payload.get("rs_markers", [])
+        ti65_background = indicator_payload.get("ti65_background", [])
+        relative_summary = indicator_payload.get("relative_summary", "vs SPY N/A")
+        score_summary = indicator_payload.get("score_summary", "RS Score N/A")
         rs_points_json = json.dumps(rs_points)
         rs_sma_points_json = json.dumps(rs_sma_points)
         rs_markers_json = json.dumps(rs_markers)
@@ -506,7 +447,7 @@ class ChartLightweightRenderMixin:
             <div id="header">
                 <div id="header-row1">
                     <div id="symbol">{safe_symbol}</div>
-                    <div id="metrics">{html.escape(header_metrics)} | {html.escape(str(options.get("timeframe", "1D")))} | {score_summary}</div>
+                    <div id="metrics">{html.escape(header_metrics)} | {html.escape(str(options.get("timeframe", "1D")))} | {relative_summary} | {score_summary}</div>
                     {upcoming_badge_html}
                 </div>
                 <div id="header-row2">
@@ -811,12 +752,36 @@ class ChartLightweightRenderMixin:
                     }});
                     rsBackground.setData(alignedTi65Background.concat(futureWhitespace));
                     const rsSeries = rsChart.addLineSeries({{
-                        title: 'RS vs SPY',
-                        color: '#22c55e',
+                        title: 'Relative vs SPY',
+                        color: '#9ca3af',
                         lineWidth: 2,
-                        priceLineVisible: false
+                        priceLineVisible: false,
+                        priceFormat: {{
+                            type: 'custom',
+                            minMove: 0.1,
+                            formatter: value => `${{value >= 0 ? '+' : ''}}${{value.toFixed(1)}}%`
+                        }}
                     }});
                     rsSeries.setData(alignedRsPoints.concat(futureWhitespace));
+                    const rsBaselineSeries = rsChart.addLineSeries({{
+                        title: 'SPY baseline',
+                        color: '#94a3b8',
+                        lineWidth: 1,
+                        lineStyle: LightweightCharts.LineStyle.Dashed,
+                        lastValueVisible: false,
+                        priceLineVisible: false,
+                        priceFormat: {{
+                            type: 'custom',
+                            minMove: 0.1,
+                            formatter: value => `${{value >= 0 ? '+' : ''}}${{value.toFixed(1)}}%`
+                        }}
+                    }});
+                    const alignedRsBaselinePoints = alignedRsPoints.map(point =>
+                        Object.prototype.hasOwnProperty.call(point, 'value')
+                            ? {{ time: point.time, value: 0 }}
+                            : {{ time: point.time }}
+                    );
+                    rsBaselineSeries.setData(alignedRsBaselinePoints.concat(futureWhitespace));
 
                     // Custom fixed-size spike marker primitive (dots on the RS line, zoom-invariant)
                     class RsSpikePrimitive {{
@@ -885,10 +850,15 @@ class ChartLightweightRenderMixin:
                         rsSeries.attachPrimitive(spikePrimitive);
                     }}
                     const rsSmaSeries = rsChart.addLineSeries({{
-                        title: 'RS SMA 50',
+                        title: 'Relative SMA 50',
                         color: '#e5e7eb',
                         lineWidth: 1,
-                        priceLineVisible: false
+                        priceLineVisible: false,
+                        priceFormat: {{
+                            type: 'custom',
+                            minMove: 0.1,
+                            formatter: value => `${{value >= 0 ? '+' : ''}}${{value.toFixed(1)}}%`
+                        }}
                     }});
                     rsSmaSeries.setData(alignedRsSmaPoints.concat(futureWhitespace));
                     let syncingRange = false;

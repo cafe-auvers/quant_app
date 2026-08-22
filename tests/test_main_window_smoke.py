@@ -99,6 +99,7 @@ def test_main_window_constructs_and_closes_offscreen_without_external_io(monkeyp
     tradingview_index = tab_labels.index("TradingView Chart")
     assert tab_labels[tradingview_index + 1] == "Health"
     assert "Buy Board" in tab_labels
+    assert "Charts" not in tab_labels
     assert "Watchlist" not in tab_labels
     assert "Buy Dashboard" not in tab_labels
     assert not hasattr(window, "main_device_button")
@@ -109,6 +110,12 @@ def test_main_window_constructs_and_closes_offscreen_without_external_io(monkeyp
     assert not hasattr(window, "analyze_stock_ai_button")
     assert not hasattr(window, "save_watchlist_snapshot_button")
     assert not hasattr(window, "live_data_checkbox")
+    assert not hasattr(window, "scanner_orb_score_checkbox")
+    assert not hasattr(window, "scanner_table")
+    assert window.scanner_universe_count_label.text() == "Universe: —"
+    assert len(window.active_rule_count_labels) == len(window.active_rule_widgets)
+    assert window._scanner_live_refresh_timer.isSingleShot()
+    assert window._scanner_live_refresh_timer.interval() == 300
     assert window.buyboard_orb_buffer_pct_input.text() == "0.1"
     header_layout = window.buyboard_widget.layout().itemAt(0).layout()
     assert header_layout.indexOf(window.buyboard_orb_buffer_pct_input) < (
@@ -116,11 +123,30 @@ def test_main_window_constructs_and_closes_offscreen_without_external_io(monkeyp
     )
     assert window.tradingview_add_watchlist_button.text() in {
         "Add to Watchlist (W)",
-        "In Watchlist (W)",
+        "Remove from Watchlist (W)",
     }
     assert window.tradingview_watchlist_shortcut.isEnabled()
     assert hasattr(window, "add_current_tradingview_symbol_to_watchlist")
     assert hasattr(window, "_update_tradingview_watchlist_btn")
+    tools_menu = next(
+        action.menu()
+        for action in window.menuBar().actions()
+        if action.text() == "Tools"
+    )
+    chart_settings_action = next(
+        action for action in tools_menu.actions() if action.text() == "Chart Settings"
+    )
+    assert chart_settings_action is window.chart_settings_action
+    orb_settings_action = next(
+        action for action in tools_menu.actions() if action.text() == "ORB Settings"
+    )
+    assert orb_settings_action is window.orb_settings_action
+    assert window.tradingview_show_stock_profile_checkbox.isChecked()
+    assert window.tradingview_show_volume_checkbox.isHidden()
+    assert not hasattr(window, "charts_widget")
+    assert not hasattr(window, "chart_view")
+    assert not hasattr(window, "_build_charts_tab")
+    assert "charts" not in window.tab_options
     assert window.intraday_symbol_combo.count() == 0
     assert not hasattr(window, "intraday_status_label")
     assert not hasattr(window, "intraday_chart_view")

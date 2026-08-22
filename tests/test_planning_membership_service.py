@@ -107,7 +107,7 @@ def _buylist_item(symbol="AAPL", *, account_no="1"):
     )
 
 
-def test_explicit_watchlist_promotion_is_passive_and_moves_json_membership(engine):
+def test_explicit_watchlist_promotion_is_passive_and_keeps_watchlist_membership(engine):
     watchlist = Watchlist()
     source = watchlist.add("AAPL", "Apple", 99.0)
     source.breakout_price = 101.0
@@ -144,19 +144,74 @@ def test_explicit_watchlist_promotion_is_passive_and_moves_json_membership(engin
     )
 
     assert result.action == "promoted_to_buylist"
-    assert watchlist.get("AAPL") is None
+    assert watchlist.get("AAPL") is source
     mirror = buylist.get("AAPL", "PROD")
     assert mirror is not None
     assert mirror.orb_monitor_enabled is False
     assert mirror.position_percent == 0.0
     stored = trade_card_repository.get_trade_card(engine, "PROD", "1", "AAPL")
     assert stored.board_status == BoardStatus.BUYLIST
-    assert stored.watchlist_member is False
+    assert stored.watchlist_member is True
     assert stored.buylist_member is True
     assert stored.selected_orb_window is None
     assert stored.planned_quantity == 0
     assert stored.target_position_quantity == 0
     assert stored.entry_trigger is None
+
+
+def test_watchlist_toggle_on_buylist_preserves_buylist_plan(engine):
+    watchlist = Watchlist()
+    watchlist.add("AAPL", "Apple").breakout_price = 101.0
+    buylist = BuylistManager()
+    mirror = _buylist_item()
+    buylist.add(mirror)
+    trade_card_repository.create_trade_card(
+        engine,
+        TradeCardState(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            board_status=BoardStatus.BUYLIST,
+            watchlist_member=True,
+            buylist_member=True,
+            breakout_price=101.0,
+            buffer_pct=0.003,
+        ),
+    )
+
+    removed = remove_watchlist_candidate(
+        watchlist,
+        "AAPL",
+        engine=engine,
+        default_account_no="1",
+    )
+
+    stored = trade_card_repository.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert removed.action == "removed_from_watchlist"
+    assert watchlist.get("AAPL") is None
+    assert buylist.get("AAPL", "PROD") is mirror
+    assert stored.board_status == BoardStatus.BUYLIST
+    assert stored.watchlist_member is False
+    assert stored.buylist_member is True
+    assert stored.breakout_price == 101.0
+    assert stored.buffer_pct == pytest.approx(0.003)
+
+    added = add_watchlist_candidate(
+        watchlist,
+        symbol="AAPL",
+        name="Apple",
+        engine=engine,
+        default_account_no="1",
+    )
+
+    stored = trade_card_repository.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert added.action == "added_to_watchlist"
+    assert watchlist.get("AAPL") is not None
+    assert watchlist.get("AAPL").breakout_price == 101.0
+    assert buylist.get("AAPL", "PROD") is mirror
+    assert stored.board_status == BoardStatus.BUYLIST
+    assert stored.watchlist_member is True
+    assert stored.buylist_member is True
 
 
 def test_promotion_does_not_rewrite_an_advanced_canonical_lifecycle(engine):
@@ -1024,6 +1079,30 @@ def test_buylist_sync_with_matching_existing_mirror_is_idempotent():
     second = sync_legacy_planning_membership_from_card(watchlist, buylist, card)
 
     assert first.changed is False
+    assert second.changed is False
+
+
+def test_buylist_sync_retains_overlapping_watchlist_mirror():
+    watchlist = Watchlist()
+    buylist = BuylistManager()
+    buylist.add(_buylist_item())
+    card = TradeCardState(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        name="Apple",
+        board_status=BoardStatus.BUYLIST,
+        watchlist_member=True,
+        buylist_member=True,
+        breakout_price=101.0,
+    )
+
+    first = sync_legacy_planning_membership_from_card(watchlist, buylist, card)
+    second = sync_legacy_planning_membership_from_card(watchlist, buylist, card)
+
+    assert first.changed is True
+    assert watchlist.get("AAPL") is not None
+    assert watchlist.get("AAPL").breakout_price == 101.0
     assert second.changed is False
 
 

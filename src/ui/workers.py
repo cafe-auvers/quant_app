@@ -397,6 +397,7 @@ class ScannerWorker(QThread):
         min_growth_rank: float,
         min_trend_intensity: float,
         universe_limit: Optional[int] = None,
+        scanner_rules_by_setup: Optional[dict] = None,
     ):
         super().__init__()
         self.tickers = list(tickers or [])
@@ -407,11 +408,14 @@ class ScannerWorker(QThread):
         self.min_growth_rank = min_growth_rank
         self.min_trend_intensity = min_trend_intensity
         self.universe_limit = universe_limit
+        self.scanner_rules_by_setup = scanner_rules_by_setup
 
     def run(self) -> None:
         try:
-            from src.infrastructure.database.repositories.scanner import \
-                get_universe_stock_metrics_from_db
+            from src.infrastructure.database.repositories.scanner import (
+                get_universe_stock_metrics_from_db,
+                query_scanner_metrics_with_funnel,
+            )
 
             if self.engine is None:
                 raise RuntimeError(
@@ -427,6 +431,33 @@ class ScannerWorker(QThread):
                     raise RuntimeError("Scanner universe is empty.")
                 self.universe_loaded.emit(list(self.tickers))
             if self.isInterruptionRequested():
+                return
+
+            if self.scanner_rules_by_setup is not None:
+                self.log_message.emit(
+                    "Querying scanner snapshot with database filters..."
+                )
+                results_by_setup = {}
+                funnels_by_setup = {}
+                for setup_name, rules in self.scanner_rules_by_setup.items():
+                    if self.isInterruptionRequested():
+                        return
+                    results, funnel = query_scanner_metrics_with_funnel(
+                        self.tickers,
+                        self.engine,
+                        list(rules or []),
+                    )
+                    results_by_setup[setup_name] = results
+                    funnels_by_setup[setup_name] = funnel
+                self.finished_scan.emit(
+                    [],
+                    {
+                        "database_filtered": True,
+                        "results_by_setup": results_by_setup,
+                        "funnels_by_setup": funnels_by_setup,
+                        "rules_by_setup": self.scanner_rules_by_setup,
+                    },
+                )
                 return
 
             self.log_message.emit("Running scanner using MySQL cache...")

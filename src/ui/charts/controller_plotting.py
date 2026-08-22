@@ -7,32 +7,18 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-from PyQt5.QtWidgets import QComboBox, QMessageBox
 
 try:
     from PyQt5.QtWebEngineWidgets import QWebEngineView
 except ImportError:
     QWebEngineView = None
-try:
-    from PyQt5.QtWebChannel import QWebChannel
-except ImportError:
-    QWebChannel = None
 
 from src.api.kis_account_snapshot_dual import KisEnvironment, load_config
-from src.infrastructure.database.repositories.chart_indicators import (
-    load_chart_indicators_from_db, refresh_chart_indicators_for_symbol)
 from src.infrastructure.database.repositories.market_bars import \
     save_symbol_history_to_db
 
-REFERENCE_SYMBOL = "SPY"
 KST_ZONE = ZoneInfo("Asia/Seoul")
-US_MARKET_ZONE = ZoneInfo("America/New_York")
-MARKET_DATA_READY_TIME_KST = dt.time(7, 0)
-LIVE_INTRADAY_REFRESH_INTERVAL_MS = 5 * 60 * 1000
-TRADINGVIEW_REFRESH_INTERVAL_SECONDS = 5 * 60
 KIS_DAILY_CHART_FAILURE_COOLDOWN_SECONDS = 30 * 60
-US_MARKET_OPEN_TIME = dt.time(9, 30)
-US_MARKET_CLOSE_TIME = dt.time(16, 0)
 
 
 class ChartsPlottingMixin:
@@ -194,6 +180,7 @@ class ChartsPlottingMixin:
     def update_chart_window(
         self, symbol: str, visible_bars: int, visible_end: int
     ) -> None:
+        """Apply viewport callbacks from the shared intraday chart renderer."""
         symbol = symbol.strip().upper()
         if not symbol:
             return
@@ -201,66 +188,23 @@ class ChartsPlottingMixin:
             "bars": max(20, int(visible_bars)),
             "end": max(1, int(visible_end)),
         }
-        self._set_chart_symbol(symbol)
-        self.plot_selected_symbol(show_warnings=False)
-
-    def pan_chart_window(self, delta_bars: int) -> None:
-        symbol = self._get_chart_symbol() or (self.selected_scan_symbol or "")
-        symbol = symbol.strip().upper()
-        if not symbol:
-            return
-
-        state = self.chart_view_windows.get(symbol, {"bars": 90})
-        visible_bars = max(20, int(state.get("bars", 90)))
-        visible_end = int(state.get("end", 0))
-        max_end = visible_end
-        timeframe = (
-            self.chart_timeframe_combo.currentText().strip().upper()
-            if hasattr(self, "chart_timeframe_combo")
-            and not (
-                hasattr(self, "chart_split_screen_checkbox")
-                and self.chart_split_screen_checkbox.isChecked()
-            )
-            else "1D"
-        )
-        if self.db_enabled and self.db_engine is not None:
-            history = self._load_chart_history_for_timeframe(
-                symbol, timeframe, use_live_fallback=False
-            )
-            chart_history = self._normalize_chart_history(history, symbol)
-            if not chart_history.empty:
-                max_end = len(chart_history) + min(30, max(0, visible_bars - 5))
-                if visible_end <= 0:
-                    visible_end = len(chart_history)
-        if max_end <= 0:
-            return
-
-        next_end = max(1, min(max_end, visible_end + int(delta_bars)))
-        self.update_chart_window(symbol, visible_bars, next_end)
+        tabs = self.__dict__.get("tabs")
+        if (
+            tabs is not None
+            and tabs.currentWidget() is self.__dict__.get("intraday_charts_widget")
+            and self.__dict__.get("intraday_symbol_combo") is not None
+            and self.intraday_symbol_combo.currentText().strip().upper() == symbol
+        ):
+            self.plot_intraday_watchlist_symbol(allow_fetch=False)
 
     def step_chart_symbol(self, direction: int) -> None:
-        if not isinstance(self.chart_symbol_input, QComboBox):
-            return
-        if self.chart_symbol_input.count() == 0:
-            self.populate_chart_symbol_combo()
-        count = self.chart_symbol_input.count()
-        if count == 0:
-            return
-
-        current_symbol = self._get_chart_symbol()
-        symbols = [
-            self.chart_symbol_input.itemText(index).strip().upper()
-            for index in range(count)
-        ]
-        try:
-            current_index = symbols.index(current_symbol)
-        except ValueError:
-            current_index = 0 if direction > 0 else count - 1
-
-        next_index = max(0, min(count - 1, current_index + int(direction)))
-        self.chart_symbol_input.setCurrentIndex(next_index)
-        self._set_chart_symbol(self.chart_symbol_input.itemText(next_index))
-        self.plot_selected_symbol(show_warnings=False)
+        """Route the shared renderer callback to the active remaining chart."""
+        tabs = self.__dict__.get("tabs")
+        active_widget = tabs.currentWidget() if tabs is not None else None
+        if active_widget is self.__dict__.get("tradingview_widget"):
+            self.step_tradingview_watchlist_symbol(direction)
+        elif active_widget is self.__dict__.get("intraday_charts_widget"):
+            self.step_intraday_watchlist_symbol(direction)
 
     def reset_chart_full_view(self, symbol: Optional[str] = None) -> None:
         tabs = self.__dict__.get("tabs")
@@ -282,219 +226,7 @@ class ChartsPlottingMixin:
                         "window.resetFullView && window.resetFullView();"
                     )
             return
-        self.chart_view_windows.pop(symbol, None)
         if is_intraday:
+            self.chart_view_windows.pop(symbol, None)
             self._set_intraday_symbol(symbol)
-            self.plot_intraday_watchlist_symbol()
-            return
-        self._set_chart_symbol(symbol)
-        self.plot_selected_symbol(show_warnings=False)
-
-    def plot_selected_symbol(
-        self,
-        checked: bool = False,
-        show_warnings: bool = True,
-        use_live_fallback: bool = False,
-    ) -> None:
-        """Plot a symbol's price history using a local in-app chart."""
-        symbol = self._get_chart_symbol()
-        if not symbol and self.selected_scan_symbol:
-            symbol = self.selected_scan_symbol
-
-        if not symbol:
-            if show_warnings:
-                QMessageBox.warning(
-                    self, "No symbol", "Enter or select a symbol to plot."
-                )
-            return
-
-        split_enabled = (
-            hasattr(self, "chart_split_screen_checkbox")
-            and self.chart_split_screen_checkbox.isChecked()
-        )
-        timeframes = (
-            ["1D", "1H"]
-            if split_enabled
-            else [
-                (
-                    self.chart_timeframe_combo.currentText().strip().upper()
-                    if hasattr(self, "chart_timeframe_combo")
-                    else "1D"
-                )
-            ]
-        )
-
-        histories = {
-            timeframe: self._load_chart_history_for_timeframe(
-                symbol, timeframe, use_live_fallback=use_live_fallback
-            )
-            for timeframe in timeframes
-        }
-        if all(history.empty for history in histories.values()):
-            if show_warnings:
-                QMessageBox.warning(
-                    self,
-                    "No data",
-                    f"Unable to validate {symbol}. Symbol may not exist.",
-                )
-            else:
-                self._set_html_or_text(
-                    self.chart_view,
-                    self._generate_message_html(symbol, "No chart data found."),
-                    f"{symbol}: no chart data found.",
-                )
-            return
-
-        chart_histories = {
-            timeframe: self._normalize_chart_history(
-                history,
-                symbol,
-                max_rows=self._get_chart_render_options_for_timeframe(timeframe).get(
-                    "max_history_bars", 180
-                ),
-            )
-            for timeframe, history in histories.items()
-        }
-        if all(history.empty for history in chart_histories.values()):
-            if show_warnings:
-                QMessageBox.warning(
-                    self, "No data", f"Unable to build a chart for {symbol}."
-                )
-            else:
-                self._set_html_or_text(
-                    self.chart_view,
-                    self._generate_message_html(
-                        symbol, "Unable to build chart from available data."
-                    ),
-                    f"{symbol}: unable to build chart from available data.",
-                )
-            return
-
-        indicators = pd.DataFrame()
-        if "1D" in timeframes and self.db_enabled and self.db_engine is not None:
-            indicators = load_chart_indicators_from_db(symbol, self.db_engine)
-            if indicators.empty and refresh_chart_indicators_for_symbol(
-                symbol, self.db_engine, reference_symbol=REFERENCE_SYMBOL
-            ):
-                indicators = load_chart_indicators_from_db(symbol, self.db_engine)
-
-        watchlist_item = self.watchlist.get(symbol)
-        target_price = (
-            watchlist_item.breakout_price if watchlist_item is not None else None
-        )
-        primary_timeframe = timeframes[0]
-        drawings = self._build_combined_drawings(symbol, primary_timeframe)
-        primary_history = chart_histories.get(primary_timeframe, pd.DataFrame())
-        primary_options = self._get_chart_render_options_for_timeframe(
-            primary_timeframe
-        )
-        primary_window_start, primary_window_end = self._get_visible_time_window(
-            primary_history, primary_options
-        )
-        if primary_history.empty:
-            primary_html = self._generate_message_html(
-                symbol, f"No {primary_timeframe} chart data available."
-            )
-        else:
-            primary_html = self._generate_local_chart_html(
-                symbol,
-                primary_history,
-                indicators=indicators if primary_timeframe == "1D" else pd.DataFrame(),
-                options=primary_options,
-                target_price=target_price,
-                drawings=drawings,
-                interaction_settings=self.__dict__.get("settings", {}),
-            )
-        self._set_html_or_text(
-            self.chart_view,
-            primary_html,
-            (
-                f"{symbol} chart data loaded.\n\n"
-                f"Latest close: {float(primary_history['Close'].iloc[-1]):.2f}"
-                if not primary_history.empty
-                else f"{symbol}: no {primary_timeframe} chart data."
-            ),
-        )
-
-        if split_enabled:
-            self.chart_split_view.setVisible(True)
-            split_history = chart_histories.get("1H", pd.DataFrame())
-            split_options = self._get_chart_render_options_for_timeframe("1H")
-            if primary_window_start is not None and primary_window_end is not None:
-                split_options["visible_start_time"] = primary_window_start
-                split_options["visible_end_time"] = primary_window_end
-                split_options["visible_end_time_is_date"] = primary_timeframe == "1D"
-            split_drawings = self._build_combined_drawings(symbol, "1H")
-            split_html = (
-                self._generate_message_html(
-                    symbol,
-                    "No 1H chart data available. Wait for the Buy Board background fetch.",
-                )
-                if split_history.empty
-                else self._generate_local_chart_html(
-                    symbol,
-                    split_history,
-                    indicators=pd.DataFrame(),
-                    options=split_options,
-                    target_price=target_price,
-                    drawings=split_drawings,
-                    interaction_settings=self.__dict__.get("settings", {}),
-                )
-            )
-            self._set_html_or_text(
-                self.chart_split_view,
-                split_html,
-                (
-                    f"{symbol} 1H chart loaded."
-                    if not split_history.empty
-                    else f"{symbol}: no 1H chart data."
-                ),
-            )
-        else:
-            self.chart_split_view.setVisible(False)
-        if not primary_history.empty:
-            self.statusBar().showMessage(
-                f"{symbol} {primary_timeframe} chart loaded. "
-                f"Indicator cache: {'loaded' if not indicators.empty else 'not available'}."
-            )
-
-    def _draw_placeholder_chart(self) -> None:
-        """Display placeholder chart."""
-        placeholder_html = """
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <meta charset="UTF-8">
-            <title>Chart Placeholder</title>
-            <style>
-                body {
-                    margin: 0;
-                    padding: 0;
-                    background-color: #1e1e1e;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    height: 100vh;
-                    color: white;
-                    font-family: Arial, sans-serif;
-                }
-                .placeholder {
-                    text-align: center;
-                    font-size: 18px;
-                    color: #888;
-                }
-            </style>
-        </head>
-        <body>
-            <div class="placeholder">
-                <p>Select a symbol and click "Plot Selected Symbol" to view the local chart</p>
-            </div>
-        </body>
-        </html>
-        """
-        if QWebEngineView is not None:
-            self.chart_view.setHtml(placeholder_html)
-        else:
-            self.chart_view.setPlainText(
-                "Select a symbol and click Plot Selected Symbol."
-            )
+            self.plot_intraday_watchlist_symbol(allow_fetch=False)

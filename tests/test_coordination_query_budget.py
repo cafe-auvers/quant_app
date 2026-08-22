@@ -26,6 +26,8 @@ def test_cloud_coordination_poll_floors_preserve_monthly_budget():
     assert execution_config.COORDINATION_DATABASE_PROBE_SECONDS >= 60.0
     assert execution_config.COORDINATION_DEVICE_HEARTBEAT_SECONDS >= 30.0
     assert execution_config.COORDINATION_OPERATOR_COMMAND_POLL_SECONDS >= 3.0
+    assert execution_config.PENDING_ORDER_RECONCILIATION_SECONDS >= 2
+    assert execution_config.UNKNOWN_ORDER_RECONCILIATION_SECONDS >= 1
     assert execution_config.DURABLE_ORDER_OBSERVATION_SECONDS >= 3600
 
 

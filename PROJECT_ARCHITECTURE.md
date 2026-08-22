@@ -379,7 +379,6 @@ Current tab construction in `_setup_tabs()`:
 | `dashboard` | Dashboard | `_build_dashboard_tab()` |
 | `scanner` | Scanner | `_build_scanner_tab()` |
 | `buyboard` | Buy Board | `_build_buyboard_tab()` |
-| `charts` | Charts | `_build_charts_tab()` |
 | `tradingview` | TradingView Chart | `_build_tradingview_tab()` |
 | `health` | Health | `_build_health_tab()` |
 

@@ -46,6 +46,7 @@ from src.infrastructure.database.mirror_freshness import (
 from src.infrastructure.database.operational_engine import (
     init_local_operational_engine,
 )
+from src.risk.orb_position import configure_orb_settings
 from src.services import trading_state
 from src.services.app_state import (EXECUTION_QUEUE_FILE, SETTINGS_FILE,
                                     SaveResult, StateReconcileResult,
@@ -105,6 +106,7 @@ from src.ui.mixins.planning_support_mixin import PlanningSupportMixin
 from src.ui.mixins.scanner_mixin import ScannerMixin
 from src.ui.mixins.sidebar_mixin import SidebarMixin
 from src.ui.mixins.watchlist_actions_mixin import WatchlistActionsMixin
+from src.ui.orb_settings_dialog import OrbSettingsDialog
 from src.ui.order_workers import HandoffReconciliationWorker
 from src.ui.workers import PcRemoteStatusWorker
 from src.utils.config import DATA_DIR, ROOT_DIR, get_env_value
@@ -115,7 +117,7 @@ from src.utils.intraday_helpers import \
 from src.utils.market_calendar import (expected_latest_market_data_date,
                                        is_regular_session_open,
                                        seconds_until_nyse_regular_session_open)
-from src.utils.storage import load_json
+from src.utils.storage import load_json, save_json
 
 __all__ = [
     "MainWindow",
@@ -893,6 +895,8 @@ class MainWindow(
         self.chart_drawings = self._load_chart_drawings()
         self.tab_options = self._load_tab_options()
         self.settings = load_json(SETTINGS_FILE, DEFAULT_SETTINGS)
+        orb_settings = configure_orb_settings(self.settings.get("orb_settings"))
+        self.settings["orb_settings"] = orb_settings.to_dict()
         if "shortcuts" not in self.settings:
             self.settings["shortcuts"] = DEFAULT_SETTINGS["shortcuts"].copy()
         else:
@@ -998,9 +1002,9 @@ class MainWindow(
         self._cached_market_data_status = None
         self.market_data_status_worker = None
         self.intraday_bulk_purpose = "buyboard_orb"
-        self.pending_scanner_orb_source: Optional[dict] = None
         self.scanner_results: List[dict] = []
         self.scanner_results_by_setup: dict[str, List[dict]] = {}
+        self.scanner_funnel_counts_by_setup: dict[str, dict] = {}
         self.scanner_dataframe = pd.DataFrame()
         self.selected_scan_symbol: Optional[str] = None
         self.chart_view_windows: dict[str, dict] = {}
@@ -1011,7 +1015,6 @@ class MainWindow(
         # (see on_tab_changed / flush_stale_chart_views), instead of paying the
         # cost synchronously in the middle of an unrelated chart interaction.
         self._dashboard_summary_dirty = False
-        self._charts_tab_chart_stale = False
         self._intraday_tab_chart_stale = False
         self._tradingview_tab_chart_stale = False
         self.running_scanner_setup_name: Optional[str] = None
@@ -3935,10 +3938,6 @@ class MainWindow(
         # A no-op whenever BUYBOARD_ENGINE_ENABLED is unset (the default).
         self._sync_buyboard_runtime_worker()
 
-        self.charts_widget = QWidget()
-        self._add_configured_tab("charts", self.charts_widget, "Charts")
-        self._build_charts_tab()
-
         self.tradingview_widget = QWidget()
         self._add_configured_tab(
             "tradingview", self.tradingview_widget, "TradingView Chart"
@@ -3986,6 +3985,13 @@ class MainWindow(
         exit_action.triggered.connect(self.close)
 
         tools_menu = menubar.addMenu("Tools")
+        self.chart_settings_action = tools_menu.addAction("Chart Settings")
+        self.chart_settings_action.triggered.connect(
+            self.show_chart_settings_dialog
+        )
+        self.orb_settings_action = tools_menu.addAction("ORB Settings")
+        self.orb_settings_action.triggered.connect(self.show_orb_settings_dialog)
+        tools_menu.addSeparator()
         refresh_action = tools_menu.addAction("Refresh Dashboard")
         refresh_action.triggered.connect(self._refresh_dashboard_summary_manually)
         refresh_db_action = tools_menu.addAction("Update 1D Data")
@@ -5387,6 +5393,45 @@ class MainWindow(
             self._apply_shortcuts()
             self.append_log("Settings updated and shortcuts applied.")
 
+    def show_orb_settings_dialog(self) -> None:
+        """Edit, persist, and apply ORB scoring and validity settings."""
+        dialog = OrbSettingsDialog(self.settings.get("orb_settings"), self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        orb_settings = dialog.orb_settings()
+        updated_settings = dict(self.settings)
+        updated_settings["orb_settings"] = orb_settings.to_dict()
+        try:
+            save_json(SETTINGS_FILE, updated_settings)
+        except Exception as exc:
+            logger.exception("Failed to save ORB settings")
+            QMessageBox.warning(
+                self,
+                "ORB Settings",
+                f"The ORB settings could not be saved:\n{exc}",
+            )
+            return
+
+        self.settings = updated_settings
+        configure_orb_settings(orb_settings)
+        self.append_log("ORB scoring ideals and validity bounds updated.")
+
+        refresh_queue = getattr(self, "refresh_execution_queue", None)
+        if callable(refresh_queue):
+            try:
+                refresh_queue("PROD", show_log=False)
+            except Exception:
+                logger.exception(
+                    "ORB settings were saved, but the execution queue refresh failed"
+                )
+                self.append_log(
+                    "ORB settings saved; queued plans will update on their next refresh."
+                )
+        refresh_board = getattr(self, "refresh_buyboard", None)
+        if callable(refresh_board):
+            refresh_board()
+
     def _apply_shortcuts(self) -> None:
         """Apply configured keyboard shortcuts from settings."""
         shortcuts = self.settings.get("shortcuts", {})
@@ -5428,37 +5473,7 @@ class MainWindow(
                 parse_key(shortcuts.get("full_view", "F"))
             )
 
-        # 2. Charts tab shortcuts
-        if hasattr(self, "chart_target_shortcut"):
-            self.chart_target_shortcut.setKey(
-                parse_key(shortcuts.get("set_target", "T"))
-            )
-        if hasattr(self, "chart_draw_shortcut"):
-            self.chart_draw_shortcut.setKey(parse_key(shortcuts.get("draw_line", "D")))
-        if hasattr(self, "chart_erase_shortcut"):
-            self.chart_erase_shortcut.setKey(
-                parse_key(shortcuts.get("erase_drawing", "E"))
-            )
-        if hasattr(self, "chart_left_shortcut"):
-            self.chart_left_shortcut.setKey(
-                parse_key(shortcuts.get("pan_left", "Left"))
-            )
-        if hasattr(self, "chart_right_shortcut"):
-            self.chart_right_shortcut.setKey(
-                parse_key(shortcuts.get("pan_right", "Right"))
-            )
-        if hasattr(self, "chart_up_shortcut"):
-            self.chart_up_shortcut.setKey(parse_key(shortcuts.get("prev_symbol", "Up")))
-        if hasattr(self, "chart_down_shortcut"):
-            self.chart_down_shortcut.setKey(
-                parse_key(shortcuts.get("next_symbol", "Down"))
-            )
-        if hasattr(self, "chart_full_view_shortcut"):
-            self.chart_full_view_shortcut.setKey(
-                parse_key(shortcuts.get("full_view", "F"))
-            )
-
-        # 3. TradingView widget shortcuts
+        # 2. TradingView widget shortcuts
         if hasattr(self, "tradingview_draw_shortcut"):
             self.tradingview_draw_shortcut.setKey(
                 parse_key(shortcuts.get("draw_line", "D"))
@@ -5487,7 +5502,7 @@ class MainWindow(
             self.tradingview_full_view_shortcut.setKey(
                 parse_key(shortcuts.get("full_view", "F"))
             )
-        # 4. Update Button Labels
+        # 3. Update Button Labels
         t_key = shortcuts.get("set_target", "T")
         d_key = shortcuts.get("draw_line", "D")
         e_key = shortcuts.get("erase_drawing", "E")
@@ -5510,15 +5525,6 @@ class MainWindow(
             self.intraday_activate_btn.setText(
                 "Deactivate (A)" if cur.startswith("Deactivate") else "Activate (A)"
             )
-
-        if hasattr(self, "chart_set_target_button"):
-            self.chart_set_target_button.setText(f"Set Breakout Price ({t_key})")
-        if hasattr(self, "chart_draw_line_button"):
-            self.chart_draw_line_button.setText(f"Draw Line ({d_key})")
-        if hasattr(self, "chart_erase_line_button"):
-            self.chart_erase_line_button.setText(f"Erase Drawing ({e_key})")
-        if hasattr(self, "chart_full_view_button"):
-            self.chart_full_view_button.setText(f"Full View ({f_key})")
 
         if hasattr(self, "tradingview_set_target_button"):
             self.tradingview_set_target_button.setText(f"Set Breakout Price ({t_key})")

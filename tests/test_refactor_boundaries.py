@@ -129,6 +129,66 @@ def test_scanner_worker_loads_cold_universe_off_the_calling_ui_path(monkeypatch)
     assert errors == []
 
 
+def test_scanner_worker_uses_database_where_query_for_configured_rules(monkeypatch):
+    import src.ui.workers as workers
+    import src.infrastructure.database.repositories.scanner as scanner_repository
+
+    legacy_loads = []
+    query_calls = []
+    monkeypatch.setattr(
+        scanner_repository,
+        "get_universe_stock_metrics_from_db",
+        lambda *args, **kwargs: legacy_loads.append((args, kwargs)),
+    )
+
+    def query(tickers, engine, rules):
+        query_calls.append((tickers, engine, rules))
+        return ([{"symbol": "AAPL"}], {"universe_count": 2, "rule_counts": [1]})
+
+    monkeypatch.setattr(
+        scanner_repository,
+        "query_scanner_metrics_with_funnel",
+        query,
+    )
+    completions = []
+    worker = workers.ScannerWorker(
+        tickers=["AAPL", "MSFT"],
+        engine="engine",
+        min_volume=0,
+        min_dollar_volume=0,
+        min_adr=0,
+        min_growth_rank=0,
+        min_trend_intensity=0,
+        scanner_rules_by_setup={
+            "Live": [
+                {"attribute": "volume", "operator": ">=", "threshold": 100_000}
+            ]
+        },
+    )
+    worker.finished_scan.connect(
+        lambda rows, payload: completions.append((rows, payload))
+    )
+
+    worker.run()
+
+    assert legacy_loads == []
+    assert query_calls == [
+        (
+            ["AAPL", "MSFT"],
+            "engine",
+            [{"attribute": "volume", "operator": ">=", "threshold": 100_000}],
+        )
+    ]
+    assert completions[0][0] == []
+    assert completions[0][1]["database_filtered"] is True
+    assert completions[0][1]["results_by_setup"] == {
+        "Live": [{"symbol": "AAPL"}]
+    }
+    assert completions[0][1]["funnels_by_setup"] == {
+        "Live": {"universe_count": 2, "rule_counts": [1]}
+    }
+
+
 def test_database_init_worker_never_raises_connection_errors_into_the_ui(monkeypatch):
     import src.ui.main_window as main_window
 

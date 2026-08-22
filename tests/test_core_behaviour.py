@@ -13,7 +13,7 @@ from src.core.orb import (
     OrbEntrySignal,
     resample_intraday_bars,
 )
-from src.core.scanner import StockScanner
+from src.core.scanner import ComparisonOperator, ScanRule, StockScanner
 from src.core.trade_reviewer import TradeReviewer, TradeSetup
 from src.core.watchlist import TradePlan, TradePlanManager, Watchlist
 import src.api.kis_account_snapshot_dual as kis_snapshot
@@ -72,6 +72,128 @@ def test_scanner_threshold_rules_filter_candidates():
     ])
 
     assert [item["symbol"] for item in results] == ["PASS"]
+
+
+def test_scanner_funnel_reports_sequential_remaining_counts():
+    scanner = StockScanner()
+    scanner.add_rule(
+        ScanRule(
+            name="Volume",
+            attribute="volume",
+            operator=ComparisonOperator.GREATER_EQUAL,
+            threshold=100_000,
+        )
+    )
+    scanner.add_rule(
+        ScanRule(
+            name="ADR",
+            attribute="adr_20",
+            operator=ComparisonOperator.GREATER_EQUAL,
+            threshold=3.0,
+        )
+    )
+
+    results, remaining_counts = scanner.scan_with_funnel(
+        [
+            {"symbol": "PASS", "volume": 200_000, "adr_20": 4.0},
+            {"symbol": "LOW_ADR", "volume": 150_000, "adr_20": 2.0},
+            {"symbol": "LOW_VOLUME", "volume": 50_000, "adr_20": 5.0},
+        ]
+    )
+
+    assert remaining_counts == [2, 1]
+    assert [item["symbol"] for item in results] == ["PASS"]
+
+
+def test_scanner_scoring_accepts_nullable_database_metrics():
+    rows = [
+        {
+            "symbol": "NULLS",
+            "growth_rank": None,
+            "growth_rank_1m": None,
+            "trend_intensity": None,
+            "adr": None,
+            "adr_20": None,
+        },
+        {
+            "symbol": "FALLBACKS",
+            "growth_rank": None,
+            "growth_rank_1m": 80.0,
+            "trend_intensity": 90.0,
+            "adr": None,
+            "adr_20": 5.0,
+        },
+    ]
+
+    scored = StockScanner.score_results(
+        rows,
+        [
+            lambda stock: MainWindow._score_growth_rank(None, stock),
+            lambda stock: MainWindow._score_trend_intensity(None, stock),
+            lambda stock: MainWindow._score_adr(None, stock),
+        ],
+    )
+
+    assert [item["symbol"] for item in scored] == ["FALLBACKS", "NULLS"]
+    assert scored[0]["score"] == pytest.approx(0.9)
+    assert scored[1]["score"] == 0.0
+
+
+def test_scanner_scoring_contains_invalid_scorer_outputs():
+    def invalid(_stock):
+        raise TypeError("nullable metric")
+
+    rows = StockScanner.score_results(
+        [{"symbol": "SAFE"}],
+        [invalid, lambda _stock: None, lambda _stock: float("nan")],
+    )
+
+    assert rows == [{"symbol": "SAFE", "score": 0.0}]
+
+
+def test_scanner_setup_stores_funnel_counts_for_active_rules():
+    class ScannerHarness:
+        scanner_setups = {
+            "Momentum": {
+                "rules": [
+                    {"attribute": "volume", "operator": ">=", "threshold": 100_000},
+                    {"attribute": "adr_20", "operator": ">=", "threshold": 3.0},
+                ]
+            }
+        }
+        scanner_funnel_counts_by_setup = {}
+
+        @staticmethod
+        def get_current_scanner_setup_values():
+            return {}
+
+        @staticmethod
+        def _score_growth_rank(_stock):
+            return 0.0
+
+        @staticmethod
+        def _score_trend_intensity(_stock):
+            return 0.0
+
+        @staticmethod
+        def _score_adr(_stock):
+            return 0.0
+
+    metrics = [
+        {"symbol": "PASS", "price_history_days": 20, "volume": 200_000, "adr_20": 4.0},
+        {"symbol": "LOW_ADR", "price_history_days": 20, "volume": 150_000, "adr_20": 2.0},
+        {"symbol": "LOW_VOLUME", "price_history_days": 20, "volume": 50_000, "adr_20": 5.0},
+        {"symbol": "NO_HISTORY", "price_history_days": 0, "volume": 500_000, "adr_20": 6.0},
+    ]
+    harness = ScannerHarness()
+
+    results = MainWindow._scan_metrics_for_setup(harness, "Momentum", metrics)
+
+    assert [item["symbol"] for item in results] == ["PASS"]
+    assert harness.scanner_funnel_counts_by_setup["Momentum"] == {
+        "universe_count": 3,
+        "rule_counts": [2, 1],
+    }
 
 
 def test_position_sizer_risk_based_calculation():
@@ -434,14 +556,14 @@ def test_tab_options_normalization_excludes_retired_watchlist_chart_tab():
     options = MainWindow._normalize_tab_options({})
 
     assert options["tradingview"] is True
-    assert options["charts"] is False
+    assert "charts" not in options
     assert "intraday_charts" not in options
 
 
 def test_tab_options_normalization_accepts_file_shape():
     options = MainWindow._normalize_tab_options({"tabs": {"charts": True, "intraday_charts": True}})
 
-    assert options["charts"] is True
+    assert "charts" not in options
     assert "intraday_charts" not in options
     assert options["tradingview"] is True
 
@@ -663,7 +785,7 @@ def test_tradingview_lightweight_chart_html_includes_rs_ti65_indicator():
     )
     indicators = pd.DataFrame(
         {
-            "relative_strength": [1.0, 1.1, 1.2],
+            "relative_strength": [1.0, 1.1, 0.95],
             "rs_sma_50": [1.0, 1.05, 1.1],
             "rs_score_current": [50.0, 75.0, 90.0],
             "rs_score_yesterday": [None, 50.0, 75.0],
@@ -687,9 +809,14 @@ def test_tradingview_lightweight_chart_html_includes_rs_ti65_indicator():
         indicators=indicators,
     )
 
-    assert "RS vs SPY" in chart_html
-    assert "RS SMA 50" in chart_html
+    assert "Relative vs SPY" in chart_html
+    assert "Relative SMA 50" in chart_html
     assert 'id="rs-chart"' in chart_html
+    assert '"value": 0.0, "color": "#9ca3af"' in chart_html
+    assert '"value": 10.0, "color": "#22c55e"' in chart_html
+    assert '"value": -5.0, "color": "#ef4444"' in chart_html
+    assert "SPY baseline" in chart_html
+    assert "vs SPY since 2026-01-01" in chart_html
     # rs_score_current's latest value (90) is > 85, so score_span() highlights it in
     # a <span style="color:#22c55e"> wrapper rather than emitting plain "C 90" text.
     assert "RS Score C" in chart_html
@@ -727,7 +854,22 @@ def test_tradingview_indicator_alignment_accepts_date_column_and_timezone():
     )
 
     assert list(aligned["relative_strength"]) == [1.0, 1.1, 1.2]
-    assert '"value": 1.2' in chart_html
+    assert '"value": 20.0' in chart_html
+
+
+def test_relative_strength_is_rebased_to_insightful_percentages():
+    indicators = pd.DataFrame(
+        {
+            "relative_strength": [0.03, 0.033, 0.027],
+            "rs_sma_50": [0.03, 0.0315, 0.03],
+        },
+        index=pd.date_range("2026-01-01", periods=3, freq="D"),
+    )
+
+    rebased = MainWindow._rebase_relative_strength_to_percent(indicators)
+
+    assert list(rebased["relative_strength"].round(6)) == [0.0, 10.0, -10.0]
+    assert list(rebased["rs_sma_50"].round(6)) == [0.0, 5.0, 0.0]
 
 
 def test_tradingview_intraday_chart_projects_daily_drawings_to_bar_times():
@@ -1135,11 +1277,12 @@ def test_chart_html_includes_indicator_panel_when_indicators_available():
 
     chart_html = MainWindow._generate_local_chart_html("AAPL", history, indicators=indicators)
 
-    assert "Relative Strength vs SPY" in chart_html
-    assert "RS above SMA" in chart_html
+    assert "Relative Performance vs SPY (%)" in chart_html
+    assert "Above 0% = beating SPY" in chart_html
+    assert "Below 0% = losing" in chart_html
     assert 'y2="790"' in chart_html
-    assert "RS SMA" in chart_html
-    assert '"relative_strength": 1.0' in chart_html
+    assert "Relative SMA" in chart_html
+    assert '"relative_performance_pct": 0.0' in chart_html
 
 
 def test_chart_html_respects_visibility_options():
@@ -1177,7 +1320,7 @@ def test_chart_html_respects_visibility_options():
     )
 
     assert ">Volume<" not in chart_html
-    assert "Relative Strength vs SPY" not in chart_html
+    assert "Relative Performance vs SPY (%)" not in chart_html
     assert "EMA 10" not in chart_html
     assert "ADR" not in chart_html
     assert 'y1="560"' in chart_html
@@ -1541,7 +1684,6 @@ def test_chart_drawing_delete_updates_state():
             }
         ]
     }
-    window.chart_erase_line_button = type("Button", (), {"setText": lambda self, text: None, "setStyleSheet": lambda self, style: None})()
     window.append_log = lambda message: None
     window._save_state = lambda: None
 
@@ -1822,16 +1964,6 @@ def test_chart_viewport_can_include_right_side_blank_space():
 def test_update_chart_window_stores_symbol_view_state():
     window = MainWindow.__new__(MainWindow)
     window.chart_view_windows = {}
-    window.selected_scan_symbol = None
-    window.chart_symbol_input = type(
-        "Combo",
-        (),
-        {
-            "setText": lambda self, text: setattr(self, "value", text),
-            "text": lambda self: getattr(self, "value", ""),
-        },
-    )()
-    window.plot_selected_symbol = lambda show_warnings=False: None
 
     window.update_chart_window("aapl", 35, 80)
 
@@ -1841,16 +1973,22 @@ def test_update_chart_window_stores_symbol_view_state():
 def test_reset_chart_full_view_clears_symbol_view_state():
     window = MainWindow.__new__(MainWindow)
     window.chart_view_windows = {"AAPL": {"bars": 35, "end": 80}}
-    window.selected_scan_symbol = None
-    window.chart_symbol_input = type(
-        "Input",
+    window.intraday_charts_widget = object()
+    window.tradingview_widget = object()
+    window.tabs = type(
+        "Tabs",
+        (),
+        {"currentWidget": lambda self: window.intraday_charts_widget},
+    )()
+    window.intraday_symbol_combo = type(
+        "Combo",
         (),
         {
-            "setText": lambda self, text: setattr(self, "value", text),
-            "text": lambda self: getattr(self, "value", "AAPL"),
+            "findText": lambda self, text: 0,
+            "setCurrentIndex": lambda self, index: None,
         },
     )()
-    window.plot_selected_symbol = lambda show_warnings=False: None
+    window.plot_intraday_watchlist_symbol = lambda allow_fetch=False: None
 
     window.reset_chart_full_view("AAPL")
 

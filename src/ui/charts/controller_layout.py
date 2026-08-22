@@ -23,6 +23,11 @@ except ImportError:
 
 from src.api.kis_account_snapshot_dual import KisEnvironment
 from src.ui.chart_bridge import ChartBridge
+from src.ui.chart_settings_dialog import (
+    CHART_SETTING_GROUPS,
+    TRADINGVIEW_CHART_SETTINGS,
+    ChartSettingsDialog,
+)
 
 REFERENCE_SYMBOL = "SPY"
 KST_ZONE = ZoneInfo("Asia/Seoul")
@@ -36,6 +41,51 @@ US_MARKET_CLOSE_TIME = dt.time(16, 0)
 
 
 class ChartsLayoutMixin:
+    def _initialize_chart_setting_checkboxes(self, definitions, parent) -> None:
+        """Create hidden state holders for settings shown in the modal dialog."""
+        for name, label, default in definitions:
+            if hasattr(self, name):
+                continue
+            checkbox = QCheckBox(label, parent)
+            checkbox.setObjectName(name)
+            checkbox.setChecked(default)
+            checkbox.hide()
+            setattr(self, name, checkbox)
+
+    def show_chart_settings_dialog(self) -> None:
+        """Open chart settings and refresh only the affected visible chart."""
+        current_values = {
+            name: getattr(self, name).isChecked()
+            for _title, definitions in CHART_SETTING_GROUPS
+            for name, _label, _default in definitions
+            if hasattr(self, name)
+        }
+        dialog = ChartSettingsDialog(current_values, self)
+        if dialog.exec_() != dialog.Accepted:
+            return
+
+        changed_names = set()
+        for name, checked in dialog.values().items():
+            checkbox = getattr(self, name, None)
+            if checkbox is None or checkbox.isChecked() == checked:
+                continue
+            signals_were_blocked = checkbox.blockSignals(True)
+            checkbox.setChecked(checked)
+            checkbox.blockSignals(signals_were_blocked)
+            changed_names.add(name)
+
+        tradingview_names = {
+            name for name, _label, _default in TRADINGVIEW_CHART_SETTINGS
+        }
+        active_widget = (
+            self.tabs.currentWidget() if hasattr(self, "tabs") else None
+        )
+        if changed_names & tradingview_names:
+            if active_widget is getattr(self, "tradingview_widget", None):
+                self.load_tradingview_chart(force=True)
+            else:
+                self._tradingview_tab_chart_stale = True
+
     def _build_combined_drawings(self, symbol: str, timeframe: str) -> list:
         symbol_key = (symbol or "").strip().upper()
         if not symbol_key:
@@ -398,178 +448,12 @@ class ChartsLayoutMixin:
         )
         self._apply_chart_queue_btn_state(symbol, btn)
 
-    def _build_charts_tab(self) -> None:
-        """Build content for the charts tab."""
-        layout = QVBoxLayout()
-        button_layout = QHBoxLayout()
-        self.chart_symbol_input = QComboBox()
-        self.chart_symbol_input.setEditable(True)
-        self.chart_symbol_input.setInsertPolicy(QComboBox.NoInsert)
-        self.chart_symbol_input.lineEdit().setPlaceholderText(
-            "Symbol (or select scanner row)"
-        )
-        self.populate_chart_symbol_combo()
-        self.chart_symbol_input.lineEdit().textEdited.connect(
-            self.filter_chart_symbol_combo
-        )
-        self.chart_symbol_input.activated.connect(
-            lambda _index: self.plot_selected_symbol(show_warnings=False)
-        )
-        plot_button = QPushButton("Plot Selected Symbol")
-        plot_button.clicked.connect(
-            lambda: self.plot_selected_symbol(use_live_fallback=True)
-        )
-
-        button_layout.addWidget(QLabel("Symbol:"))
-        button_layout.addWidget(self.chart_symbol_input)
-        self.chart_timeframe_combo = QComboBox()
-        self.chart_timeframe_combo.addItems(["1D", "1H"])
-        self.chart_timeframe_combo.currentTextChanged.connect(
-            lambda _text: self.plot_selected_symbol(show_warnings=False)
-        )
-        button_layout.addWidget(QLabel("Timeframe:"))
-        button_layout.addWidget(self.chart_timeframe_combo)
-        self.chart_split_screen_checkbox = QCheckBox("Split 1D / 1H")
-        self.chart_split_screen_checkbox.stateChanged.connect(
-            lambda _state: self.plot_selected_symbol(show_warnings=False)
-        )
-        button_layout.addWidget(self.chart_split_screen_checkbox)
-        button_layout.addWidget(plot_button)
-
-        layout.addLayout(button_layout)
-
-        settings_layout = QHBoxLayout()
-        settings_layout.addWidget(QLabel("Chart settings:"))
-        self.chart_show_volume_checkbox = QCheckBox("Volume")
-        self.chart_show_volume_checkbox.setChecked(True)
-        self.chart_show_rs_checkbox = QCheckBox("RS vs SPY")
-        self.chart_show_rs_checkbox.setChecked(True)
-        self.chart_show_ema_checkbox = QCheckBox("EMA lines")
-        self.chart_show_ema_checkbox.setChecked(True)
-        self.chart_show_adr_checkbox = QCheckBox("ADR")
-        self.chart_show_adr_checkbox.setChecked(True)
-        self.chart_show_growth_1m_checkbox = QCheckBox("1M growth")
-        self.chart_show_growth_1m_checkbox.setChecked(True)
-        self.chart_show_growth_3m_checkbox = QCheckBox("3M growth")
-        self.chart_show_growth_3m_checkbox.setChecked(True)
-        self.chart_show_growth_6m_checkbox = QCheckBox("6M growth")
-        self.chart_show_growth_6m_checkbox.setChecked(False)
-
-        for checkbox in [
-            self.chart_show_volume_checkbox,
-            self.chart_show_rs_checkbox,
-            self.chart_show_ema_checkbox,
-            self.chart_show_adr_checkbox,
-            self.chart_show_growth_1m_checkbox,
-            self.chart_show_growth_3m_checkbox,
-            self.chart_show_growth_6m_checkbox,
-        ]:
-            checkbox.stateChanged.connect(
-                lambda _state: self.plot_selected_symbol(show_warnings=False)
-            )
-            settings_layout.addWidget(checkbox)
-        settings_layout.addStretch(1)
-        layout.addLayout(settings_layout)
-
-        if QWebEngineView is not None:
-            self.chart_view = QWebEngineView()
-            if QWebChannel is not None:
-                if not hasattr(self, "chart_bridge"):
-                    self.chart_bridge = ChartBridge(self)
-                self.chart_channel = QWebChannel()
-                self.chart_channel.registerObject("chartBridge", self.chart_bridge)
-                self.chart_view.page().setWebChannel(self.chart_channel)
-            self.chart_split_view = QWebEngineView()
-            if QWebChannel is not None:
-                if not hasattr(self, "chart_bridge"):
-                    self.chart_bridge = ChartBridge(self)
-                self.chart_split_channel = QWebChannel()
-                self.chart_split_channel.registerObject(
-                    "chartBridge", self.chart_bridge
-                )
-                self.chart_split_view.page().setWebChannel(self.chart_split_channel)
-        else:
-            self.chart_view = QTextEdit()
-            self.chart_view.setReadOnly(True)
-            self.chart_split_view = QTextEdit()
-            self.chart_split_view.setReadOnly(True)
-
-        chart_area_layout = QVBoxLayout()
-        self.chart_set_target_button = QPushButton("Set Breakout Price (T)")
-        self.chart_set_target_button.clicked.connect(self.enable_chart_target_mode)
-        self.chart_draw_line_button = QPushButton("Draw Line (D)")
-        self.chart_draw_line_button.clicked.connect(self.enable_chart_drawing_mode)
-        self.chart_erase_line_button = QPushButton("Erase Drawing (E)")
-        self.chart_erase_line_button.setObjectName("eraseLineButton")
-        self.chart_erase_line_button.clicked.connect(self.enable_chart_erase_mode)
-        self.chart_erase_all_button = QPushButton("Erase All")
-        self.chart_erase_all_button.setObjectName("eraseAllButton")
-        self.chart_erase_all_button.clicked.connect(self.clear_current_chart_drawings)
-        self.chart_full_view_button = QPushButton("Full View (F)")
-        self.chart_full_view_button.clicked.connect(self.reset_chart_full_view)
-
-        chart_views_layout = QHBoxLayout()
-        chart_views_layout.addWidget(self.chart_view, 1)
-        chart_views_layout.addWidget(self.chart_split_view, 1)
-        self.chart_split_view.setVisible(False)
-        chart_area_layout.addLayout(chart_views_layout, 1)
-        chart_tools_layout = QHBoxLayout()
-        chart_tools_layout.addWidget(self.chart_set_target_button)
-        chart_tools_layout.addWidget(self.chart_draw_line_button)
-        chart_tools_layout.addWidget(self.chart_erase_line_button)
-        chart_tools_layout.addWidget(self.chart_erase_all_button)
-        chart_tools_layout.addWidget(self.chart_full_view_button)
-        chart_tools_layout.addStretch(1)
-        chart_area_layout.addLayout(chart_tools_layout)
-
-        layout.addLayout(chart_area_layout, 1)
-        self.charts_widget.setLayout(layout)
-        self.chart_target_shortcut = QShortcut(QKeySequence("T"), self.charts_widget)
-        self.chart_target_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
-        self.chart_target_shortcut.activated.connect(self.enable_chart_target_mode)
-        self.chart_draw_shortcut = QShortcut(QKeySequence("D"), self.charts_widget)
-        self.chart_draw_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
-        self.chart_draw_shortcut.activated.connect(self.enable_chart_drawing_mode)
-        self.chart_erase_shortcut = QShortcut(QKeySequence("E"), self.charts_widget)
-        self.chart_erase_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
-        self.chart_erase_shortcut.activated.connect(self.enable_chart_erase_mode)
-        self.chart_left_shortcut = QShortcut(
-            QKeySequence(Qt.Key_Left), self.charts_widget
-        )
-        self.chart_left_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
-        self.chart_left_shortcut.activated.connect(
-            lambda: self.pan_chart_window(-self._chart_pan_step_bars())
-        )
-        self.chart_right_shortcut = QShortcut(
-            QKeySequence(Qt.Key_Right), self.charts_widget
-        )
-        self.chart_right_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
-        self.chart_right_shortcut.activated.connect(
-            lambda: self.pan_chart_window(self._chart_pan_step_bars())
-        )
-        self.chart_up_shortcut = QShortcut(QKeySequence(Qt.Key_Up), self.charts_widget)
-        self.chart_up_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
-        self.chart_up_shortcut.activated.connect(lambda: self.step_chart_symbol(-1))
-        self.chart_down_shortcut = QShortcut(
-            QKeySequence(Qt.Key_Down), self.charts_widget
-        )
-        self.chart_down_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
-        self.chart_down_shortcut.activated.connect(lambda: self.step_chart_symbol(1))
-        self.chart_full_view_shortcut = QShortcut(QKeySequence("F"), self.charts_widget)
-        self.chart_full_view_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
-        self.chart_full_view_shortcut.activated.connect(self.reset_chart_full_view)
-        self.chart_load_shortcut = QShortcut(
-            QKeySequence(Qt.Key_F4), self.charts_widget
-        )
-        self.chart_load_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
-        self.chart_load_shortcut.activated.connect(
-            lambda: self.plot_selected_symbol(use_live_fallback=True)
-        )
-        self._draw_placeholder_chart()
-
     def _build_tradingview_tab(self) -> None:
         """Build a TradingView widget tab for watchlist symbols."""
         layout = QVBoxLayout()
+        self._initialize_chart_setting_checkboxes(
+            TRADINGVIEW_CHART_SETTINGS, self.tradingview_widget
+        )
 
         controls_layout = QHBoxLayout()
         self.tradingview_symbol_combo = QComboBox()
@@ -611,60 +495,6 @@ class ChartsLayoutMixin:
         )
         controls_layout.addWidget(QLabel("5M window:"))
         controls_layout.addWidget(self.tradingview_window_combo)
-        self.tradingview_split_screen_checkbox = QCheckBox("Split 1D / 1H")
-        self.tradingview_split_screen_checkbox.setChecked(True)
-        self.tradingview_split_screen_checkbox.stateChanged.connect(
-            lambda _state: self.load_tradingview_chart(force=True)
-        )
-        self.tradingview_show_volume_checkbox = QCheckBox("Volume")
-        self.tradingview_show_volume_checkbox.setChecked(True)
-        self.tradingview_show_volume_checkbox.stateChanged.connect(
-            lambda _state: self.load_tradingview_chart(force=True)
-        )
-        self.tradingview_show_ema_checkbox = QCheckBox("EMA 10/20/50")
-        self.tradingview_show_ema_checkbox.setChecked(True)
-        self.tradingview_show_ema_checkbox.stateChanged.connect(
-            lambda _state: self.load_tradingview_chart(force=True)
-        )
-        self.tradingview_show_rs_checkbox = QCheckBox("RS/TI65")
-        self.tradingview_show_rs_checkbox.setChecked(True)
-        self.tradingview_show_rs_checkbox.stateChanged.connect(
-            lambda _state: self.load_tradingview_chart(force=True)
-        )
-        self.tradingview_show_adr_checkbox = QCheckBox("ADR")
-        self.tradingview_show_adr_checkbox.setChecked(True)
-        self.tradingview_show_adr_checkbox.stateChanged.connect(
-            lambda _state: self.load_tradingview_chart(force=True)
-        )
-        self.tradingview_show_growth_1m_checkbox = QCheckBox("1M growth")
-        self.tradingview_show_growth_1m_checkbox.setChecked(True)
-        self.tradingview_show_growth_1m_checkbox.stateChanged.connect(
-            lambda _state: self.load_tradingview_chart(force=True)
-        )
-        self.tradingview_show_growth_3m_checkbox = QCheckBox("3M growth")
-        self.tradingview_show_growth_3m_checkbox.setChecked(True)
-        self.tradingview_show_growth_3m_checkbox.stateChanged.connect(
-            lambda _state: self.load_tradingview_chart(force=True)
-        )
-        self.tradingview_show_growth_6m_checkbox = QCheckBox("6M growth")
-        self.tradingview_show_growth_6m_checkbox.setChecked(False)
-        self.tradingview_show_growth_6m_checkbox.stateChanged.connect(
-            lambda _state: self.load_tradingview_chart(force=True)
-        )
-        self.tradingview_show_earnings_checkbox = QCheckBox("Earnings")
-        self.tradingview_show_earnings_checkbox.setChecked(True)
-        self.tradingview_show_earnings_checkbox.stateChanged.connect(
-            lambda _state: self.load_tradingview_chart(force=True)
-        )
-        controls_layout.addWidget(self.tradingview_split_screen_checkbox)
-        controls_layout.addWidget(self.tradingview_show_volume_checkbox)
-        controls_layout.addWidget(self.tradingview_show_ema_checkbox)
-        controls_layout.addWidget(self.tradingview_show_rs_checkbox)
-        controls_layout.addWidget(self.tradingview_show_adr_checkbox)
-        controls_layout.addWidget(self.tradingview_show_growth_1m_checkbox)
-        controls_layout.addWidget(self.tradingview_show_growth_3m_checkbox)
-        controls_layout.addWidget(self.tradingview_show_growth_6m_checkbox)
-        controls_layout.addWidget(self.tradingview_show_earnings_checkbox)
         controls_layout.addWidget(previous_button)
         controls_layout.addWidget(next_button)
         controls_layout.addWidget(refresh_button)

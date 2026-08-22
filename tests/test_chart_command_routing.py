@@ -188,9 +188,6 @@ class _RenderProbe:
     def load_tradingview_chart(self):
         return self.watchlist.get("WEX").breakout_price
 
-    def plot_selected_symbol(self):
-        return self.watchlist.get("WEX").breakout_price
-
     def plot_intraday_watchlist_symbol(self):
         return self.watchlist.get("WEX").breakout_price
 
@@ -209,7 +206,6 @@ def test_all_chart_renderers_mask_stale_legacy_target_with_canonical_target():
     original = window.watchlist
 
     assert window.load_tradingview_chart() == 197.71
-    assert window.plot_selected_symbol() == 197.71
     assert window.plot_intraday_watchlist_symbol() == 197.71
     assert window.watchlist is original
 

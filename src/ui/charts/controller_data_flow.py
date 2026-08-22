@@ -130,7 +130,11 @@ class ChartsDataFlowMixin:
                 if hasattr(self, "tradingview_show_earnings_checkbox")
                 else True
             ),
-            "show_stock_profile_watermark": True,
+            "show_stock_profile_watermark": (
+                self.tradingview_show_stock_profile_checkbox.isChecked()
+                if hasattr(self, "tradingview_show_stock_profile_checkbox")
+                else True
+            ),
             "earnings_horizon_days": 14,
             "window_days": self._get_tradingview_window_days(),
         }
@@ -799,7 +803,7 @@ class ChartsDataFlowMixin:
         interval_timeframe = self._normalize_drawing_timeframe(interval)
         if not interval_timeframe:
             interval_timeframe = "1H"
-        return {
+        options = {
             "timeframe": interval_timeframe,
             "show_volume": self.intraday_show_volume_checkbox.isChecked(),
             "show_rs": False,
@@ -812,6 +816,21 @@ class ChartsDataFlowMixin:
             "visible_bars": 2000,
             "intraday_chart": True,
         }
+        symbol = (
+            self.intraday_symbol_combo.currentText().strip().upper()
+            if hasattr(self, "intraday_symbol_combo")
+            else ""
+        )
+        navigation = (
+            self.__dict__.get("chart_view_windows", {}).get(symbol, {})
+            if symbol
+            else {}
+        )
+        if "bars" in navigation:
+            options["visible_bars"] = navigation["bars"]
+        if "end" in navigation:
+            options["visible_end"] = navigation["end"]
+        return options
 
     def _intraday_fetch_key(self, symbol: str, window_days: int) -> str:
         return f"{symbol.strip().upper()}:{max(1, min(7, int(window_days or 7)))}"
@@ -1049,19 +1068,6 @@ class ChartsDataFlowMixin:
 
     def _on_intraday_bulk_finished(self, updated: list, failed: list) -> None:
         purpose = str(getattr(self, "intraday_bulk_purpose", "watchlist") or "watchlist")
-        if purpose == "scanner_orb":
-            self.intraday_bulk_purpose = "watchlist"
-            self.append_log(
-                f"Scanner ORB phase intraday fetch complete: {len(updated)} updated, {len(failed)} failed."
-            )
-            if failed:
-                self.append_log("Scanner ORB fetch failures: " + "; ".join(failed[:5]))
-            self._score_scanner_results_by_orb()
-            selected_source = self.pending_scanner_orb_source
-            self.pending_scanner_orb_source = None
-            self._finish_scanner_after_orb_phase(selected_source)
-            return
-
         self.refresh_intraday_button.setEnabled(True)
         if hasattr(self, "refresh_watchlist_orb_button"):
             self.refresh_watchlist_orb_button.setEnabled(True)

@@ -109,6 +109,7 @@ import logging
 import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from time import monotonic
 from typing import Any, Callable, Optional
 from uuid import uuid4
 
@@ -395,9 +396,9 @@ def _revalidate_and_approve(
     if stop_price is not None and stop_price >= limit_price:
         reasons.append("Stop is not below the entry price")
 
-    # Reuse the same canonical thresholds is_orb_position_plan_valid already
-    # enforces elsewhere (MIN/MAX_CAPITAL_PERCENT, MIN/MAX_STOP_ADR) instead
-    # of duplicating the numbers here. adr_percent=None because raw ADR% is
+    # Reuse the same configured bounds is_orb_position_plan_valid already
+    # enforces elsewhere instead of duplicating the values here.
+    # adr_percent=None because raw ADR% is
     # not itself persisted on the card (only the already-computed sl_adr
     # ratio is, in card.stop_adr) -- this skips only the
     # stop_loss_percent-vs-adr_percent cross-check, not the capital/sl_adr
@@ -586,6 +587,48 @@ def build_buyboard_runtime(
     legacy_lease = execution_lease if isinstance(execution_lease, LeaseHandle) else None
     resolved_equity_provider = account_equity_provider or buying_power_provider
     guarded_record_cache: Dict[str, ExecutionOrderRecord] = {}
+    guarded_record_cached_at: dict[str, float] = {}
+    guarded_card_record_cache: dict[
+        tuple[str, str, str],
+        tuple[float, tuple[ExecutionOrderRecord, ...]],
+    ] = {}
+
+    def guarded_record_cache_seconds(record: ExecutionOrderRecord) -> float:
+        """Keep ambiguous submissions hot while coalescing stable order reads."""
+
+        if record.status == ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE:
+            return float(execution_config.UNKNOWN_ORDER_RECONCILIATION_SECONDS)
+        return float(execution_config.PENDING_ORDER_RECONCILIATION_SECONDS)
+
+    def guarded_records_cache_seconds(
+        records: tuple[ExecutionOrderRecord, ...],
+    ) -> float:
+        if not records:
+            return float(execution_config.PENDING_ORDER_RECONCILIATION_SECONDS)
+        return min(guarded_record_cache_seconds(record) for record in records)
+
+    def remember_guarded_record(
+        record: ExecutionOrderRecord,
+        *,
+        observed_at: Optional[float] = None,
+    ) -> None:
+        """Refresh both lookup caches after a canonical read or local mutation."""
+
+        cached_at = monotonic() if observed_at is None else float(observed_at)
+        guarded_record_cache[record.client_order_id] = record
+        guarded_record_cached_at[record.client_order_id] = cached_at
+        card_key = (record.environment, record.account_no, record.symbol)
+        cached_card = guarded_card_record_cache.get(card_key)
+        records = list(cached_card[1]) if cached_card is not None else []
+        replaced = False
+        for index, existing in enumerate(records):
+            if existing.client_order_id == record.client_order_id:
+                records[index] = record
+                replaced = True
+                break
+        if not replaced:
+            records.append(record)
+        guarded_card_record_cache[card_key] = (cached_at, tuple(records))
 
     def cache_recent_guarded_record(client_order_id: str) -> None:
         if not guarded_mode or not client_order_id:
@@ -593,7 +636,7 @@ def build_buyboard_runtime(
         assert isinstance(resolved_broker, ExecutionCommandGateway)
         record = resolved_broker.cached_execution_record(client_order_id)
         if record is not None:
-            guarded_record_cache[record.client_order_id] = record
+            remember_guarded_record(record)
 
     def cancel_runtime_order(intent: CancelIntent) -> Any:
         try:
@@ -871,15 +914,27 @@ def build_buyboard_runtime(
         engine = resolved_broker.database_engine
         assert engine is not None
         if resolved_broker.canonical_database_writable:
-            records = list_execution_orders_for_card(
-                engine,
-                environment=card.environment,
-                account_no=card.account_no,
-                symbol=card.symbol,
+            card_key = (card.environment, card.account_no, card.symbol)
+            now = monotonic()
+            cached_card = guarded_card_record_cache.get(card_key)
+            cache_is_fresh = bool(
+                cached_card is not None
+                and 0.0 <= now - cached_card[0]
+                < guarded_records_cache_seconds(cached_card[1])
             )
-            guarded_record_cache.update(
-                {record.client_order_id: record for record in records}
-            )
+            if cache_is_fresh:
+                records = list(cached_card[1])
+            else:
+                records = list_execution_orders_for_card(
+                    engine,
+                    environment=card.environment,
+                    account_no=card.account_no,
+                    symbol=card.symbol,
+                )
+                guarded_card_record_cache[card_key] = (now, tuple(records))
+                for record in records:
+                    guarded_record_cache[record.client_order_id] = record
+                    guarded_record_cached_at[record.client_order_id] = now
             for record in records:
                 resolved_broker.remember_canonical_execution_record(record)
         else:
@@ -927,9 +982,19 @@ def build_buyboard_runtime(
         engine = resolved_broker.database_engine
         assert engine is not None
         if resolved_broker.canonical_database_writable:
-            record = fetch_execution_order(engine, order.client_order_id)
+            now = monotonic()
+            record = guarded_record_cache.get(order.client_order_id)
+            cached_at = guarded_record_cached_at.get(order.client_order_id)
+            cache_is_fresh = bool(
+                record is not None
+                and cached_at is not None
+                and 0.0 <= now - cached_at < guarded_record_cache_seconds(record)
+            )
+            if not cache_is_fresh:
+                record = fetch_execution_order(engine, order.client_order_id)
+            if record is not None and not cache_is_fresh:
+                remember_guarded_record(record, observed_at=now)
             if record is not None:
-                guarded_record_cache[order.client_order_id] = record
                 resolved_broker.remember_canonical_execution_record(record)
         else:
             record = (

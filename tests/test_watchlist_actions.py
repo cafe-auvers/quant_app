@@ -78,6 +78,76 @@ def test_add_watchlist_candidate_routes_through_membership_worker():
     ]
 
 
+def test_tradingview_w_toggles_existing_watchlist_without_confirmation():
+    window = _Window()
+    window.watchlist = Watchlist()
+    window.watchlist.add("WEX", "WEX Inc.")
+    window._chart_buyboard_projection = lambda _symbol: BoardCardProjection(
+        card=_card(BoardStatus.WATCHLIST)
+    )
+    window.tradingview_symbol_combo = type(
+        "Combo", (), {"currentText": lambda self: "WEX"}
+    )()
+    removals = []
+    window._remove_watchlist_candidate = (
+        lambda symbol, *, confirm=True: removals.append((symbol, confirm)) or True
+    )
+
+    window.add_current_tradingview_symbol_to_watchlist()
+
+    assert removals == [("WEX", False)]
+
+
+def test_tradingview_w_adds_watchlist_membership_to_buylist_symbol():
+    window = _Window()
+    window.watchlist = Watchlist()
+    buylist_card = _card(BoardStatus.BUYLIST)
+    buylist_card.watchlist_member = False
+    window._chart_buyboard_projection = lambda _symbol: BoardCardProjection(
+        card=buylist_card
+    )
+    window.tradingview_symbol_combo = type(
+        "Combo", (), {"currentText": lambda self: "WEX"}
+    )()
+    window._get_sidebar_selected_data = lambda: {}
+    additions = []
+    window._add_watchlist_candidate = (
+        lambda symbol, **kwargs: additions.append((symbol, kwargs)) or True
+    )
+
+    window.add_current_tradingview_symbol_to_watchlist()
+
+    assert additions == [
+        (
+            "WEX",
+            {"name": "WEX", "entry_price": None, "source": "TradingView"},
+        )
+    ]
+
+
+def test_tradingview_watchlist_button_toggles_for_buylist_symbol():
+    window = _Window()
+    window.watchlist = Watchlist()
+    window.tradingview_add_watchlist_button = _Button()
+    window.tradingview_symbol_combo = type(
+        "Combo", (), {"currentText": lambda self: "WEX"}
+    )()
+    card = _card(BoardStatus.BUYLIST)
+    card.watchlist_member = True
+    window._chart_buyboard_projection = lambda _symbol: BoardCardProjection(card=card)
+
+    window._update_tradingview_watchlist_btn()
+
+    assert window.tradingview_add_watchlist_button.text == "Remove from Watchlist (W)"
+    assert window.tradingview_add_watchlist_button.enabled is True
+
+    card.watchlist_member = False
+    window._update_tradingview_watchlist_btn()
+
+    assert window.tradingview_add_watchlist_button.text == "Add to Watchlist (W)"
+    assert window.tradingview_add_watchlist_button.enabled is True
+
+
 def test_passive_add_without_selected_account_fails_before_worker(
     monkeypatch,
 ):
@@ -236,7 +306,7 @@ def test_chart_queue_button_labels_each_passive_stage_explicitly():
         card=_card(BoardStatus.WATCHLIST)
     )
     window._apply_chart_queue_btn_state("WEX", button)
-    assert button.text == "Move to Buylist (Q)"
+    assert button.text == "Add to Buylist (Q)"
     assert button.enabled
 
     window._chart_buyboard_projection = lambda _symbol: BoardCardProjection(
@@ -406,5 +476,5 @@ def test_worker_completion_preserves_unrelated_state_added_during_sql_wait():
     )
 
     assert window.watchlist.get("NEW") is not None
-    assert window.watchlist.get("WEX") is None
+    assert window.watchlist.get("WEX") is not None
     assert window.buylist_manager.get("WEX", "PROD") is not None

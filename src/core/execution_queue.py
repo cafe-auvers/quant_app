@@ -17,9 +17,8 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 import pandas as pd
 
 from src.risk.orb_position import (
-    MAX_CAPITAL_PERCENT,
-    MIN_CAPITAL_PERCENT,
     calculate_orb_position_values,
+    is_orb_position_plan_valid,
     score_orb_position_recommendation,
     validate_orb_position_values,
 )
@@ -790,11 +789,7 @@ def build_orb_candidate(
                 stop_price=candidate_stop,
                 adr_percent=adr_percent,
             )
-            _cap = float(_s.get("capital_percent", 0.0))
-            if (
-                MIN_CAPITAL_PERCENT <= _cap < MAX_CAPITAL_PERCENT
-                and int(_s.get("shares", 0)) >= 1
-            ):
+            if is_orb_position_plan_valid(_s, adr_percent):
                 _sc = score_orb_candidate(_s, _rc)
                 if _sc > _best_score:
                     _best_score = _sc

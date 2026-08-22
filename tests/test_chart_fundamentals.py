@@ -1143,12 +1143,14 @@ def test_split_view_loads_one_context_and_schedules_one_provider_refresh():
         def __init__(self):
             self.tradingview_symbol_combo = Combo("NVDA")
             self.tradingview_split_screen_checkbox = Check(True)
+            self.tradingview_show_stock_profile_checkbox = Check(False)
             self.tradingview_split_chart_view = View()
             self.tradingview_chart_view = View()
             self.tradingview_status_label = Label()
             self.context_loads = 0
             self.refresh_schedules = 0
             self.rendered_contexts = []
+            self.rendered_profile_options = []
 
         def _to_tradingview_symbol(self, symbol):
             return symbol
@@ -1162,6 +1164,9 @@ def test_split_view_loads_one_context_and_schedules_one_provider_refresh():
 
         def _render_tradingview_chart_view(self, _view, **kwargs):
             self.rendered_contexts.append(kwargs["fundamental_context"])
+            self.rendered_profile_options.append(
+                kwargs["base_options"]["show_stock_profile_watermark"]
+            )
             return kwargs["timeframe"]
 
         def _schedule_chart_fundamental_refresh(self, *_args, **_kwargs):
@@ -1175,6 +1180,7 @@ def test_split_view_loads_one_context_and_schedules_one_provider_refresh():
     assert window.refresh_schedules == 1
     assert len(window.rendered_contexts) == 2
     assert window.rendered_contexts[0] is window.rendered_contexts[1]
+    assert window.rendered_profile_options == [False, False]
 
 
 def test_cached_earnings_are_passed_to_the_initial_chart_render():

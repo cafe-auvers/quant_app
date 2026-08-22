@@ -438,10 +438,6 @@ class ChartCommandRoutingMixin:
         with self._canonical_chart_watchlist_view():
             return super().load_tradingview_chart(*args, **kwargs)
 
-    def plot_selected_symbol(self, *args, **kwargs):
-        with self._canonical_chart_watchlist_view():
-            return super().plot_selected_symbol(*args, **kwargs)
-
     def plot_intraday_watchlist_symbol(self, *args, **kwargs):
         with self._canonical_chart_watchlist_view():
             return super().plot_intraday_watchlist_symbol(*args, **kwargs)
