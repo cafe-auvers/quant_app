@@ -755,14 +755,18 @@ def load_chart_drawings_state() -> Dict[str, Any]:
                 )
                 continue
             try:
-                clean_drawings.append({
+                clean_drawing = {
                     "id": str(drawing.get("id") or f"{symbol_key}-{index}"),
                     "type": "line",
                     "start_date": str(drawing["start_date"]),
                     "start_price": float(drawing["start_price"]),
                     "end_date": str(drawing["end_date"]),
                     "end_price": float(drawing["end_price"]),
-                })
+                }
+                timeframe = str(drawing.get("timeframe") or "").strip().upper()
+                if timeframe:
+                    clean_drawing["timeframe"] = timeframe
+                clean_drawings.append(clean_drawing)
             except (KeyError, TypeError, ValueError) as exc:
                 rejected.append(
                     {

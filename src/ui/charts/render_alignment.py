@@ -13,7 +13,7 @@ MARKET_ALIGNMENT_OVERLAY_CSS = """
 #market-alignment-overlay {
     position: absolute;
     top: 10px;
-    right: 10px;
+    right: 68px;
     left: auto;
     z-index: 8;
     min-width: 190px;

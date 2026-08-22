@@ -155,7 +155,7 @@ def test_chart_html_anchors_overlay_upper_right_and_toggle_is_dom_only():
     assert '#market-alignment-overlay {' in page
     assert "position: absolute;" in page
     assert "top: 10px;" in page
-    assert "right: 10px;" in page
+    assert "right: 68px;" in page
     assert "left: auto;" in page
     assert "left: 10px;" not in page
     assert page.index('id="chart"') < page.index('id="market-alignment-overlay"')

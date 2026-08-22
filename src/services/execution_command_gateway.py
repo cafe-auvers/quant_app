@@ -81,6 +81,7 @@ from src.core.order_state import (
     OrderSide,
     OrderStatus,
 )
+from src.infrastructure.database.coordination_engine import coordination_read_connection
 from src.services import trading_state
 from src.services.capital_reservation_repository import (
     ensure_capital_reservations_table,
@@ -1657,7 +1658,7 @@ class ExecutionCommandGateway:
                 request.strategy_instance_id,
             )
             self._require_verified_lease(request.lease)
-            with engine.connect() as conn:
+            with coordination_read_connection(engine) as conn:
                 require_no_active_unowned_external_order(
                     conn,
                     environment=environment,
@@ -1844,7 +1845,7 @@ class ExecutionCommandGateway:
                 request.source, request.strategy_instance_id,
             )
             self._require_verified_lease(request.lease)
-            with engine.connect() as conn:
+            with coordination_read_connection(engine) as conn:
                 require_no_active_unowned_external_order(
                     conn,
                     environment=record.environment,

@@ -93,6 +93,7 @@ def test_chart_compatibility_modules_export_static_composites_and_models():
         "show_growth_3m": True,
         "show_growth_6m": False,
         "show_stock_profile_watermark": True,
+        "stock_profile_watermark_opacity": 0.70,
         "show_earnings_events": True,
         "show_earnings_line": True,
         "earnings_horizon_days": 14,

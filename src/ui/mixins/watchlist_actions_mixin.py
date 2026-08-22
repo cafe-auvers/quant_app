@@ -434,6 +434,13 @@ class WatchlistActionsMixin:
                 if callable(append_log):
                     append_log(f"[Chart] Requested move to Watchlist for {symbol}.")
             return
+        if card is not None and card.board_status != BoardStatus.WATCHLIST:
+            # Canonical active state outranks the retained Watchlist mirror.
+            # BUY_TODAY remains a Buylist member, so its legacy mirror may
+            # legitimately still contain the symbol; that must not turn Q
+            # back into an "add to Buylist" action after activation.
+            super()._chart_queue_toggle(symbol)
+            return
         if (
             card is not None
             and card.board_status == BoardStatus.WATCHLIST
@@ -488,6 +495,11 @@ class WatchlistActionsMixin:
             button.setStyleSheet(
                 "background-color: #c0392b; color: white; font-weight: 600;"
             )
+            return
+        if card is not None and card.board_status != BoardStatus.WATCHLIST:
+            # Do not let a stale/retained Watchlist item paint an active
+            # canonical card as a green "Add to Buylist" action.
+            super()._apply_chart_queue_btn_state(symbol, button)
             return
         if (
             card is not None

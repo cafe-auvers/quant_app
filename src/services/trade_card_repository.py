@@ -44,6 +44,7 @@ from sqlalchemy import (
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
+from src.infrastructure.database.coordination_engine import coordination_read_connection
 from src.core.kanban_transitions import (
     require_single_card_per_symbol,
     migrate_legacy_status_to_board_status,
@@ -186,7 +187,7 @@ def get_trade_card(
     symbol = str(symbol or "").upper()
     try:
         table = _ensure_trade_cards_table(engine)
-        with engine.connect() as conn:
+        with coordination_read_connection(engine) as conn:
             row = conn.execute(
                 select(table).where(
                     table.c.environment == environment,
@@ -239,7 +240,7 @@ def list_trade_cards(
             statement = statement.where(table.c.environment == str(environment).upper())
         if account_no:
             statement = statement.where(table.c.account_no == str(account_no))
-        with engine.connect() as conn:
+        with coordination_read_connection(engine) as conn:
             rows = conn.execute(statement).fetchall()
         return [_row_to_card(row) for row in rows]
     except SQLAlchemyError as exc:
@@ -272,7 +273,7 @@ def list_trade_cards_for_symbol(
             table.c.environment == str(environment or "").upper(),
             table.c.symbol == str(symbol or "").strip().upper(),
         )
-        with engine.connect() as conn:
+        with coordination_read_connection(engine) as conn:
             rows = conn.execute(statement).fetchall()
         return [_row_to_card(row) for row in rows]
     except SQLAlchemyError as exc:
@@ -313,7 +314,7 @@ def get_trade_card_collection_revision(
             )
         if account_no:
             statement = statement.where(table.c.account_no == str(account_no))
-        with engine.connect() as conn:
+        with coordination_read_connection(engine) as conn:
             row = conn.execute(statement).one()
         return TradeCardCollectionRevision(
             row_count=int(row[0] or 0),

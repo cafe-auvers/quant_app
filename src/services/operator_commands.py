@@ -32,6 +32,7 @@ from sqlalchemy import (
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
+from src.infrastructure.database.coordination_engine import coordination_read_connection
 from src.services.state_sync import (
     MAIN_DEVICE_KEY,
     OPERATOR_CONTROL_KEY,
@@ -409,7 +410,7 @@ def submit_operator_command(
             ).first()
         return OperatorCommandInsertResult(_record(row), True)
     except IntegrityError:
-        with engine.connect() as conn:
+        with coordination_read_connection(engine) as conn:
             existing = conn.execute(
                 select(table).where(table.c.idempotency_key == idempotency_key)
             ).first()
@@ -430,7 +431,7 @@ def claim_next_operator_command(
     # coordination row merely to prove an empty queue (important during
     # startup/recovery and for compatibility runtimes); a command that lands
     # after this observation is picked up on the next heartbeat.
-    with engine.connect() as conn:
+    with coordination_read_connection(engine) as conn:
         pending_exists = conn.execute(
             select(table.c.command_id)
             .where(table.c.status == OperatorCommandStatus.PENDING.value)
@@ -592,7 +593,7 @@ def get_operator_command(
     engine: Engine, command_id: str
 ) -> Optional[OperatorCommandRecord]:
     table = ensure_operator_commands_table(engine)
-    with engine.connect() as conn:
+    with coordination_read_connection(engine) as conn:
         row = conn.execute(
             select(table).where(table.c.command_id == str(command_id))
         ).first()
@@ -616,6 +617,6 @@ def list_operator_commands(
         ]
         statement = statement.where(table.c.status.in_(values))
     statement = statement.limit(max(1, int(limit)))
-    with engine.connect() as conn:
+    with coordination_read_connection(engine) as conn:
         rows = conn.execute(statement).fetchall()
     return [_record(row) for row in rows]

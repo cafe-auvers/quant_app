@@ -918,12 +918,24 @@ def test_build_buyboard_runtime_wires_real_market_session_hooks():
 def test_eod_processing_window_stays_open_through_market_close(
     monkeypatch, seconds_left, expected
 ):
+    monkeypatch.setattr(runtime_module, "is_nyse_trading_day", lambda: True)
     monkeypatch.setattr(
         runtime_module,
         "seconds_until_regular_session_close",
         lambda: seconds_left,
     )
     assert runtime_module._eod_window_reached() is expected
+
+
+def test_eod_processing_window_is_closed_on_non_trading_days(monkeypatch):
+    monkeypatch.setattr(runtime_module, "is_nyse_trading_day", lambda: False)
+    monkeypatch.setattr(
+        runtime_module,
+        "seconds_until_regular_session_close",
+        lambda: -60.0,
+    )
+
+    assert runtime_module._eod_window_reached() is False
 
 
 # --- P1-1: capital_reservation_engine is actually threaded through ----------

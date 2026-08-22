@@ -179,6 +179,7 @@ from src.services.realtime_market_data import (
 )
 from src.services.trading_engine import EntryDeadlineLookup, TradingEngine
 from src.utils.market_calendar import (
+    is_nyse_trading_day,
     is_regular_session_open,
     seconds_until_regular_session_close,
 )
@@ -233,6 +234,8 @@ def _marketable_sell_limit_price(
 
 def _eod_window_reached() -> bool:
     """Keep EOD processing active from the final window through post-close."""
+    if not is_nyse_trading_day():
+        return False
     seconds_left = seconds_until_regular_session_close()
     return seconds_left <= execution_config.EOD_ENTRY_CLEANUP_SECONDS_BEFORE_CLOSE
 

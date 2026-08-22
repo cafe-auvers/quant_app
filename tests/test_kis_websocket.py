@@ -9,6 +9,8 @@ import json
 import pytest
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from websockets.exceptions import ConnectionClosedOK
+from websockets.frames import Close
 import src.api.kis_websocket as kis_websocket_module
 
 from src.api.kis_websocket import (
@@ -194,6 +196,23 @@ def test_malformed_frame_is_dropped_without_changing_connected_state():
 
     assert client.malformed_frame_count == 1
     assert client.is_connected() is True
+
+
+def test_clean_close_during_ping_reply_is_not_counted_as_malformed():
+    client = KisWebSocketClient(url="ws://example", approval_keys=_Keys())
+
+    class _ClosingSocket:
+        async def pong(self, _payload):
+            close = Close(1000, "OK")
+            raise ConnectionClosedOK(close, close, True)
+
+    client._socket = _ClosingSocket()
+    ping = json.dumps({"header": {"tr_id": "PINGPONG"}})
+
+    with pytest.raises(ConnectionClosedOK):
+        _run_async(client._handle_raw(ping))
+
+    assert client.malformed_frame_count == 0
 
 
 def test_reconnect_resubscribes_every_desired_subscription():

@@ -54,6 +54,10 @@ class MarketPulseTableModel(QAbstractTableModel):
         ("Monthly %", "monthly_return"),
         ("% Above 52W Low", "pct_above_52w_low"),
         ("% Below 52W High", "pct_below_52w_high"),
+        ("stock1", "stock1"),
+        ("stock2", "stock2"),
+        ("stock3", "stock3"),
+        ("stock4", "stock4"),
     )
     HEADER_TOOLTIPS = (
         "Daily performance rank. This rank stays fixed when another column is sorted.",
@@ -65,6 +69,10 @@ class MarketPulseTableModel(QAbstractTableModel):
         "Reference price / 21 sessions earlier - 1.",
         "Reference price / lowest reference price in the last 252 sessions - 1.",
         "Reference price / highest reference price in the last 252 sessions - 1. Values are zero near the high and negative below it.",
+        "Strongest eligible reported ETF holding by 63-session return relative to SPY. Click to open its TradingView chart.",
+        "Second-strongest eligible reported ETF holding by 63-session return relative to SPY. Click to open its TradingView chart.",
+        "Third-strongest eligible reported ETF holding by 63-session return relative to SPY. Click to open its TradingView chart.",
+        "Fourth-strongest eligible reported ETF holding by 63-session return relative to SPY. Click to open its TradingView chart.",
     )
 
     def __init__(self, rows: Sequence[MarketPulseRow] = (), parent=None) -> None:
@@ -140,7 +148,11 @@ class MarketPulseTableModel(QAbstractTableModel):
         if role == Qt.FontRole and index.column() >= 2:
             font = QFont("Consolas")
             font.setStyleHint(QFont.Monospace)
+            if index.column() >= 9 and value:
+                font.setUnderline(True)
             return font
+        if role == Qt.ForegroundRole and index.column() >= 9 and value:
+            return QColor("#1565c0")
         if role in (Qt.ToolTipRole, Qt.AccessibleDescriptionRole):
             metric_help = self.HEADER_TOOLTIPS[index.column()]
             state = "Available"
@@ -259,7 +271,7 @@ class MarketPulseMixin:
         heading.setObjectName("marketPulseHeading")
         heading.setStyleSheet("font-size: 22px; font-weight: 700; color: #131722;")
         subtitle = QLabel(
-            "Read-only context for comparing scanned stocks with market, sector, and thematic leadership."
+            "Market, sector, and thematic leadership. Components are ordered by 63-session relative strength versus SPY."
         )
         subtitle.setWordWrap(True)
         subtitle.setStyleSheet("color: #5d606b;")
@@ -276,7 +288,7 @@ class MarketPulseMixin:
         self.market_pulse_refresh_button = QPushButton("Refresh")
         self.market_pulse_refresh_button.setObjectName("marketPulseRefreshButton")
         self.market_pulse_refresh_button.setToolTip(
-            "Refresh all active ETF proxies in one background batch."
+            "Refresh ETF proxies, eligible holdings, and their relative-strength order."
         )
         self.market_pulse_refresh_button.clicked.connect(self.refresh_market_pulse)
         status_box.addWidget(self.market_pulse_as_of_label, 0, Qt.AlignRight)
@@ -361,6 +373,7 @@ class MarketPulseMixin:
         table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         table.setShowGrid(False)
+        table.clicked.connect(self._open_market_pulse_component_chart)
         table.setStyleSheet(
             "QTableView { border: 1px solid #e0e3eb; border-radius: 5px; "
             "background: #ffffff; alternate-background-color: #f8f9fb; }"
@@ -368,15 +381,36 @@ class MarketPulseMixin:
             "font-weight: 600; border: none; border-right: 1px solid #e0e3eb; "
             "border-bottom: 1px solid #d1d4dc; padding: 7px 5px; }"
         )
-        widths = (56, 230, 78, 92, 92, 92, 92, 175, 175)
+        widths = (56, 230, 78, 92, 92, 92, 92, 175, 175, 76, 76, 76, 76)
         header = table.horizontalHeader()
         for column, width in enumerate(widths):
             header.setSectionResizeMode(column, QHeaderView.Fixed)
             table.setColumnWidth(column, width)
         header.setSectionResizeMode(1, QHeaderView.Stretch)
-        table.setMinimumWidth(850)
+        table.setMinimumWidth(1150)
         self._resize_market_pulse_table(table, 0)
         return table
+
+    def _open_market_pulse_component_chart(self, index: QModelIndex) -> None:
+        if not index.isValid() or index.column() < 9:
+            return
+        symbol = str(index.data(Qt.UserRole) or "").strip().upper()
+        if not symbol:
+            return
+        set_symbol = getattr(self, "_set_tradingview_symbol", None)
+        tradingview_widget = self.__dict__.get("tradingview_widget")
+        if not callable(set_symbol) or tradingview_widget is None:
+            return
+        select_unfiltered_symbol = getattr(
+            self, "_select_sidebar_universe_symbol", None
+        )
+        if callable(select_unfiltered_symbol):
+            select_unfiltered_symbol(symbol)
+        set_symbol(symbol)
+        self.tabs.setCurrentWidget(tradingview_widget)
+        load_chart = getattr(self, "load_tradingview_chart", None)
+        if callable(load_chart):
+            load_chart(force=True)
 
     @staticmethod
     def _resize_market_pulse_table(table: QTableView, row_count: int) -> None:

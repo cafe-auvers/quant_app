@@ -41,7 +41,8 @@ def test_coordination_url_does_not_expose_password(monkeypatch):
 
 
 def test_coordination_engine_uses_small_tls_pool(monkeypatch):
-    captured = {}
+    captured = []
+    engines = []
 
     class _Connection:
         def __enter__(self):
@@ -54,7 +55,11 @@ def test_coordination_engine_uses_small_tls_pool(monkeypatch):
             return None
 
     class _Engine:
+        def __init__(self):
+            self.connect_count = 0
+
         def connect(self):
+            self.connect_count += 1
             return _Connection()
 
         def dispose(self):
@@ -80,18 +85,30 @@ def test_coordination_engine_uses_small_tls_pool(monkeypatch):
     )
 
     def _create_engine(url, **kwargs):
-        captured.update(kwargs)
-        captured["url"] = url
-        return _Engine()
+        captured.append({**kwargs, "url": url})
+        engine = _Engine()
+        engines.append(engine)
+        return engine
 
     monkeypatch.setattr(coordination, "create_engine", _create_engine)
+    monkeypatch.setattr(coordination.event, "listen", lambda *_args, **_kwargs: None)
 
     assert coordination.init_coordination_engine(ensure_schema=False) is not None
-    assert captured["pool_size"] == 3
-    assert captured["max_overflow"] == 1
-    assert captured["pool_recycle"] == 240
-    assert captured["connect_args"]["ssl_verify_cert"] is True
-    assert captured["connect_args"]["ssl_verify_identity"] is True
+    assert len(captured) == 2
+    writer, reader = captured
+    assert writer["pool_size"] == 3
+    assert writer["max_overflow"] == 1
+    assert writer["pool_pre_ping"] is True
+    assert writer["pool_recycle"] == 240
+    assert writer["connect_args"]["ssl_verify_cert"] is True
+    assert writer["connect_args"]["ssl_verify_identity"] is True
+    assert reader["isolation_level"] == "AUTOCOMMIT"
+    assert reader["skip_autocommit_rollback"] is True
+    assert reader["pool_pre_ping"] is False
+    assert reader["pool_size"] == 2
+    assert reader["max_overflow"] == 0
+    assert engines[0].connect_count == 0
+    assert engines[1].connect_count == 1
 
 
 def test_coordination_schema_excludes_historical_market_tables():

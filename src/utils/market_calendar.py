@@ -81,9 +81,27 @@ def nyse_holidays(year: int) -> Set[dt.date]:
     return {day for day in holidays if day.year == year}
 
 
+def is_nyse_trading_day(day: Optional[dt.date] = None) -> bool:
+    """Return whether ``day`` has a regular NYSE session."""
+
+    resolved_day = day or _as_us_market_time(None).date()
+    return (
+        resolved_day.weekday() < 5
+        and resolved_day not in nyse_holidays(resolved_day.year)
+    )
+
+
+def next_nyse_trading_day(day: dt.date) -> dt.date:
+    """Roll ``day`` forward until it is a regular NYSE trading day."""
+
+    while not is_nyse_trading_day(day):
+        day += dt.timedelta(days=1)
+    return day
+
+
 def previous_nyse_trading_day(day: dt.date) -> dt.date:
     """Roll ``day`` backward until it is a regular NYSE trading day."""
-    while day.weekday() >= 5 or day in nyse_holidays(day.year):
+    while not is_nyse_trading_day(day):
         day -= dt.timedelta(days=1)
     return day
 
@@ -126,11 +144,30 @@ def is_regular_session_open(now: Optional[dt.datetime] = None) -> bool:
     never has to guess "is the market open" from a hardcoded ``True``.
     """
     moment = _as_us_market_time(now)
-    if moment.weekday() >= 5 or moment.date() in nyse_holidays(moment.year):
+    if not is_nyse_trading_day(moment.date()):
         return False
     return US_MARKET_OPEN_TIME <= moment.time() < nyse_regular_session_close_time(
         moment.date()
     )
+
+
+def current_or_next_nyse_session_date(
+    now: Optional[dt.datetime] = None,
+) -> dt.date:
+    """Return the session a newly activated Buy Today card should target.
+
+    Premarket and regular-session activations target the current trading day.
+    Post-close, weekend, and holiday activations target the next trading day.
+    """
+
+    moment = _as_us_market_time(now)
+    day = moment.date()
+    if (
+        is_nyse_trading_day(day)
+        and moment.time() < nyse_regular_session_close_time(day)
+    ):
+        return day
+    return next_nyse_trading_day(day + dt.timedelta(days=1))
 
 
 def next_nyse_regular_session_open(
@@ -148,10 +185,7 @@ def next_nyse_regular_session_open(
     moment = _as_us_market_time(now)
     candidate = moment.date()
     for _ in range(370):
-        if (
-            candidate.weekday() < 5
-            and candidate not in nyse_holidays(candidate.year)
-        ):
+        if is_nyse_trading_day(candidate):
             opens_at = dt.datetime.combine(
                 candidate,
                 US_MARKET_OPEN_TIME,

@@ -9,7 +9,7 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QDoubleValidator, QIntValidator, QKeySequence
 from PyQt5.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox,
                              QFormLayout, QGroupBox, QHBoxLayout, QHeaderView,
-                             QLabel, QLineEdit, QPushButton, QShortcut,
+                             QLabel, QLineEdit, QPushButton, QShortcut, QSlider,
                              QTableWidget, QTextEdit, QVBoxLayout)
 
 try:
@@ -26,6 +26,8 @@ from src.ui.chart_bridge import ChartBridge
 from src.ui.chart_settings_dialog import (
     CHART_SETTING_GROUPS,
     TRADINGVIEW_CHART_SETTINGS,
+    TRADINGVIEW_STOCK_PROFILE_OPACITY_DEFAULT,
+    TRADINGVIEW_STOCK_PROFILE_OPACITY_NAME,
     ChartSettingsDialog,
 )
 
@@ -60,12 +62,22 @@ class ChartsLayoutMixin:
             for name, _label, _default in definitions
             if hasattr(self, name)
         }
+        opacity_slider = self.__dict__.get(
+            TRADINGVIEW_STOCK_PROFILE_OPACITY_NAME
+        )
+        if opacity_slider is not None:
+            current_values[TRADINGVIEW_STOCK_PROFILE_OPACITY_NAME] = (
+                opacity_slider.value()
+            )
         dialog = ChartSettingsDialog(current_values, self)
         if dialog.exec_() != dialog.Accepted:
             return
 
         changed_names = set()
-        for name, checked in dialog.values().items():
+        dialog_values = dialog.values()
+        for name, checked in dialog_values.items():
+            if name == TRADINGVIEW_STOCK_PROFILE_OPACITY_NAME:
+                continue
             checkbox = getattr(self, name, None)
             if checkbox is None or checkbox.isChecked() == checked:
                 continue
@@ -74,9 +86,25 @@ class ChartsLayoutMixin:
             checkbox.blockSignals(signals_were_blocked)
             changed_names.add(name)
 
+        requested_opacity = int(
+            dialog_values.get(
+                TRADINGVIEW_STOCK_PROFILE_OPACITY_NAME,
+                TRADINGVIEW_STOCK_PROFILE_OPACITY_DEFAULT,
+            )
+        )
+        if (
+            opacity_slider is not None
+            and opacity_slider.value() != requested_opacity
+        ):
+            signals_were_blocked = opacity_slider.blockSignals(True)
+            opacity_slider.setValue(requested_opacity)
+            opacity_slider.blockSignals(signals_were_blocked)
+            changed_names.add(TRADINGVIEW_STOCK_PROFILE_OPACITY_NAME)
+
         tradingview_names = {
             name for name, _label, _default in TRADINGVIEW_CHART_SETTINGS
         }
+        tradingview_names.add(TRADINGVIEW_STOCK_PROFILE_OPACITY_NAME)
         active_widget = (
             self.tabs.currentWidget() if hasattr(self, "tabs") else None
         )
@@ -454,6 +482,17 @@ class ChartsLayoutMixin:
         self._initialize_chart_setting_checkboxes(
             TRADINGVIEW_CHART_SETTINGS, self.tradingview_widget
         )
+        if not hasattr(self, TRADINGVIEW_STOCK_PROFILE_OPACITY_NAME):
+            opacity_slider = QSlider(Qt.Horizontal, self.tradingview_widget)
+            opacity_slider.setObjectName(TRADINGVIEW_STOCK_PROFILE_OPACITY_NAME)
+            opacity_slider.setRange(20, 100)
+            opacity_slider.setValue(TRADINGVIEW_STOCK_PROFILE_OPACITY_DEFAULT)
+            opacity_slider.hide()
+            setattr(
+                self,
+                TRADINGVIEW_STOCK_PROFILE_OPACITY_NAME,
+                opacity_slider,
+            )
 
         controls_layout = QHBoxLayout()
         self.tradingview_symbol_combo = QComboBox()
@@ -529,6 +568,17 @@ class ChartsLayoutMixin:
                 )
                 self.tradingview_split_chart_view.page().setWebChannel(
                     self.tradingview_split_chart_channel
+                )
+            for chart_view in (
+                self.tradingview_chart_view,
+                self.tradingview_split_chart_view,
+            ):
+                chart_view.loadFinished.connect(
+                    lambda loaded, view=chart_view: (
+                        self._resync_tradingview_drawings_in_view(view)
+                        if loaded
+                        else None
+                    )
                 )
         else:
             self.tradingview_chart_view = QTextEdit()

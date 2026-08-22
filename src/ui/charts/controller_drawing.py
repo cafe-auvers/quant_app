@@ -533,6 +533,12 @@ class ChartsDrawingMixin:
             return True
         if requested_tf == existing_tf:
             return True
+        shared_daily_hourly_timeframes = {"1D", "1H", "INTRADAY"}
+        if {
+            requested_tf,
+            existing_tf,
+        }.issubset(shared_daily_hourly_timeframes):
+            return True
         if (
             requested_tf == "1D"
             or existing_tf == "1D"
@@ -571,10 +577,82 @@ class ChartsDrawingMixin:
             drawing, default=self._active_chart_drawing_timeframe()
         )
         drawing_json = json.dumps(drawing, separators=(",", ":"))
-        self._run_tradingview_split_javascript(
+        symbol_json = json.dumps(symbol.strip().upper())
+        self._run_tradingview_drawing_javascript(
             symbol,
             "window.upsertSyncedDrawing && "
-            f"window.upsertSyncedDrawing({drawing_json});",
+            f"window.upsertSyncedDrawing({drawing_json}, {symbol_json});",
+        )
+
+    def _run_tradingview_drawing_javascript(
+        self, symbol: str, script: str
+    ) -> None:
+        """Push drawing state to every currently active TradingView chart."""
+        symbol = symbol.strip().upper()
+        if not symbol or QWebEngineView is None:
+            return
+        tabs = self.__dict__.get("tabs")
+        if (
+            tabs is None
+            or tabs.currentWidget() is not self.__dict__.get("tradingview_widget")
+        ):
+            return
+        symbol_combo = self.__dict__.get("tradingview_symbol_combo")
+        if (
+            symbol_combo is None
+            or symbol_combo.currentText().strip().upper() != symbol
+        ):
+            return
+
+        views = [self.__dict__.get("tradingview_chart_view")]
+        split_view = self.__dict__.get("tradingview_split_chart_view")
+        split_checkbox = self.__dict__.get("tradingview_split_screen_checkbox")
+        split_enabled = False
+        if split_checkbox is not None:
+            split_enabled = bool(split_checkbox.isChecked())
+        elif split_view is not None:
+            split_enabled = bool(split_view.isVisible())
+        if split_enabled:
+            views.append(split_view)
+
+        for view in views:
+            if isinstance(view, QWebEngineView):
+                view.page().runJavaScript(script, lambda result: None)
+
+    def _tradingview_drawing_snapshot_script(self, symbol: str) -> str:
+        symbol = symbol.strip().upper()
+        drawings = [
+            drawing
+            for drawing in self.chart_drawings.get(symbol, [])
+            if isinstance(drawing, dict)
+        ]
+        return (
+            "window.replaceSyncedDrawings && "
+            f"window.replaceSyncedDrawings({json.dumps(symbol)}, "
+            f"{json.dumps(drawings, separators=(',', ':'))});"
+        )
+
+    def _resync_tradingview_drawings_in_view(self, view) -> None:
+        """Reconcile a freshly loaded page with the latest persisted drawings."""
+        if QWebEngineView is None or not isinstance(view, QWebEngineView):
+            return
+        symbol_combo = self.__dict__.get("tradingview_symbol_combo")
+        if symbol_combo is None:
+            return
+        symbol = symbol_combo.currentText().strip().upper()
+        if not symbol:
+            return
+        view.page().runJavaScript(
+            self._tradingview_drawing_snapshot_script(symbol),
+            lambda result: None,
+        )
+
+    def _sync_all_tradingview_drawings(self, symbol: str) -> None:
+        symbol = symbol.strip().upper()
+        if not symbol:
+            return
+        self._run_tradingview_drawing_javascript(
+            symbol, self._tradingview_drawing_snapshot_script(symbol)
         )
 
     def _remove_tradingview_drawing(
@@ -589,10 +667,11 @@ class ChartsDrawingMixin:
         if resolved_timeframe:
             payload["timeframe"] = resolved_timeframe
         drawing_id_json = json.dumps(payload, separators=(",", ":"))
-        self._run_tradingview_split_javascript(
+        symbol_json = json.dumps(symbol.strip().upper())
+        self._run_tradingview_drawing_javascript(
             symbol,
             "window.removeSyncedDrawing && "
-            f"window.removeSyncedDrawing({drawing_id_json});",
+            f"window.removeSyncedDrawing({drawing_id_json}, {symbol_json});",
         )
 
     def set_chart_target_price(self, symbol: str, breakout_price: float) -> None:
@@ -786,6 +865,7 @@ class ChartsDrawingMixin:
         if not symbol or symbol not in self.chart_drawings:
             return
         self.chart_drawings.pop(symbol, None)
+        self._sync_all_tradingview_drawings(symbol)
         self._save_state()
         self._reset_chart_mode_buttons()
         self.refresh_other_chart_views_for_symbol(symbol)

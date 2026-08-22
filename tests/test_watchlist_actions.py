@@ -317,6 +317,27 @@ def test_chart_queue_button_labels_each_passive_stage_explicitly():
     assert button.enabled
 
 
+def test_buy_today_canonical_state_outranks_retained_watchlist_mirror():
+    window = _Window()
+    window.watchlist = Watchlist()
+    window.watchlist.add("WEX", "Retained navigation item").breakout_price = 25.0
+    card = _card(BoardStatus.BUY_TODAY)
+    card.buylist_member = True
+    window._chart_buyboard_projection = lambda _symbol: BoardCardProjection(card=card)
+    window._chart_positive_price = lambda value: float(value) if value else None
+    promoted = []
+    window._promote_watchlist_candidate = lambda symbol: promoted.append(symbol)
+
+    window._chart_queue_toggle("WEX")
+    button = _Button()
+    window._apply_chart_queue_btn_state("WEX", button)
+
+    assert window.base_queue_symbol == "WEX"
+    assert window.base_button_symbol == "WEX"
+    assert promoted == []
+    assert "#27ae60" not in button.style
+
+
 def test_archived_watchlist_tombstone_requires_explicit_readd(monkeypatch):
     window = _Window()
     window.watchlist = Watchlist()

@@ -28,7 +28,6 @@ from src.core.board_workflow import (
 from src.core.execution_config import (
     is_buyboard_engine_enabled,
 )
-from src.core.exit_policy import market_session_date
 from src.core.runtime_readiness import RuntimeDeviceState
 from src.core.trade_card_state import (
     BoardStatus,
@@ -43,7 +42,10 @@ from src.services.trade_card_repository import (
     TradeCardVersionConflictError,
 )
 from src.utils.config import get_env_value
-from src.utils.market_calendar import is_regular_session_open
+from src.utils.market_calendar import (
+    current_or_next_nyse_session_date,
+    is_regular_session_open,
+)
 
 from .card import board_interaction_fingerprint, card_drag_payload
 
@@ -441,7 +443,7 @@ def _action_context(main_window, command: AnyBoardCommand) -> BoardActionContext
             action_ready=False,
             device_active=False,
             regular_session_open=_safe_regular_session_open(),
-            session_date=market_session_date(),
+            session_date=current_or_next_nyse_session_date(),
             local_operator_control=local_operator_control,
             restriction_reasons=("Runtime worker unavailable",),
         )
@@ -485,7 +487,7 @@ def _action_context(main_window, command: AnyBoardCommand) -> BoardActionContext
         action_ready=ready,
         device_active=getattr(worker, "device_state", None) == RuntimeDeviceState.ACTIVE,
         regular_session_open=regular_session_open,
-        session_date=market_session_date(),
+        session_date=current_or_next_nyse_session_date(),
         local_operator_control=local_operator_control,
         restriction_reasons=tuple(dict.fromkeys(reasons)),
     )

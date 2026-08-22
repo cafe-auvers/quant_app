@@ -57,6 +57,7 @@ from src.core.discovered_external_order import (
     ExternalOrderDisposition,
     adopt_external_order,
 )
+from src.infrastructure.database.coordination_engine import coordination_read_connection
 from src.core.execution_order_record import (
     AdoptedOrderPermission,
     ExecutionOrderRecord,
@@ -444,7 +445,7 @@ def fetch_discovered_external_order(
     engine: Engine, external_order_id: str
 ) -> Optional[DiscoveredExternalOrder]:
     ensure_discovered_external_orders_table(engine)
-    with engine.connect() as conn:
+    with coordination_read_connection(engine) as conn:
         return get_discovered_external_order(conn, external_order_id)
 
 
@@ -469,7 +470,7 @@ def list_discovered_external_orders_for_account(
 ) -> list[DiscoveredExternalOrder]:
     """Return the permanent A4b audit records for one account."""
     table = ensure_discovered_external_orders_table(engine)
-    with engine.connect() as conn:
+    with coordination_read_connection(engine) as conn:
         rows = conn.execute(
             select(table)
             .where(
@@ -491,7 +492,7 @@ def list_discovered_external_orders(
         statement = statement.where(
             table.c.environment == str(environment or "").upper()
         )
-    with engine.connect() as conn:
+    with coordination_read_connection(engine) as conn:
         rows = conn.execute(statement.order_by(table.c.id.asc())).fetchall()
     return [_row_to_order(row) for row in rows]
 

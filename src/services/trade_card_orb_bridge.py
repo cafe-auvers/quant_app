@@ -36,6 +36,10 @@ from src.core.execution_queue import (
     OrbCandidateStatus,
 )
 from src.core.trade_card_state import BoardStatus, EntryRuntimeStatus, TradeCardState
+from src.utils.market_calendar import (
+    is_nyse_trading_day,
+    nyse_regular_session_close_time,
+)
 
 # ORB begins only when the trader activates a planning card for Buy Today.
 # Watchlist and Buylist retain their configured breakout target without
@@ -69,7 +73,6 @@ _LIVE_SELECTION_CARD_STATUSES = {
 
 _US_MARKET_ZONE = ZoneInfo("America/New_York")
 _US_REGULAR_OPEN = time(9, 30)
-_US_REGULAR_CLOSE = time(16, 0)
 _ORB_WINDOW_MINUTES = {"1m": 1, "5m": 5, "30m": 30}
 
 
@@ -330,11 +333,24 @@ def _display_candidate(
     return None
 
 
-def _regular_session_complete(*, now: datetime) -> bool:
+def _regular_session_complete(
+    *,
+    now: datetime,
+    scheduled_session_date=None,
+) -> bool:
     reference = now
     if reference.tzinfo is None:
         reference = reference.replace(tzinfo=timezone.utc)
-    return reference.astimezone(_US_MARKET_ZONE).time() >= _US_REGULAR_CLOSE
+    market_now = reference.astimezone(_US_MARKET_ZONE)
+    session_day = market_now.date()
+    return bool(
+        is_nyse_trading_day(session_day)
+        and (
+            scheduled_session_date is None
+            or scheduled_session_date <= session_day
+        )
+        and market_now.time() >= nyse_regular_session_close_time(session_day)
+    )
 
 
 def all_supported_orb_plans_rejected(
@@ -688,7 +704,10 @@ class TradeCardOrbEvaluator:
         )
         if (
             card.board_status == BoardStatus.BUY_TODAY
-            and _regular_session_complete(now=now)
+            and _regular_session_complete(
+                now=now,
+                scheduled_session_date=card.session_date,
+            )
             and (
                 candidate is None
                 or candidate.status == OrbCandidateStatus.FORMING

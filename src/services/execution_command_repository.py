@@ -51,6 +51,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import IntegrityError
+from src.infrastructure.database.coordination_engine import coordination_read_connection
 
 from src.utils.redaction import hash_redacted_payload, redact_payload
 
@@ -359,7 +360,7 @@ def record_command(engine: Engine, command: ExecutionCommand) -> ExecutionComman
 
 def get_command_by_idempotency_key(engine: Engine, idempotency_key: str) -> Optional[ExecutionCommand]:
     ensure_execution_commands_table(engine)
-    with engine.connect() as conn:
+    with coordination_read_connection(engine) as conn:
         return get_command(conn, idempotency_key)
 
 
@@ -372,7 +373,7 @@ def list_execution_commands_for_account(
     """Return the durable command audit stream for one account in order."""
 
     table = ensure_execution_commands_table(engine)
-    with engine.connect() as conn:
+    with coordination_read_connection(engine) as conn:
         rows = conn.execute(
             select(table)
             .where(

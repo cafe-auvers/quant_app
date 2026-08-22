@@ -8,6 +8,7 @@ from typing import Optional, Tuple
 from sqlalchemy import select
 
 from src.core.runtime_readiness import RuntimeDeviceState
+from src.infrastructure.database.coordination_engine import coordination_read_connection
 from src.services.runtime_device_state_repository import (
     RuntimeDeviceRecord,
     get_runtime_device_state,
@@ -44,7 +45,7 @@ class ExecutionOwnerSwitchResult:
 def _server_reference_time(engine) -> datetime:
     from src.services.runtime_device_state_repository import _server_now
 
-    with engine.connect() as conn:
+    with coordination_read_connection(engine) as conn:
         value = conn.execute(select(_server_now(engine))).scalar()
     if value is None:
         return datetime.now(timezone.utc)

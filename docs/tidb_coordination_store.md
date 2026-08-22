@@ -35,10 +35,13 @@ TiDB Cloud management or Data Service API keys are not SQL login credentials
 and are not used by the desktop application. Never add either kind of secret
 to Git, documentation, screenshots, or logs.
 
-The connection is TLS-authenticated, uses a three-connection pool with one
-overflow slot, verifies the certificate hostname, and recycles connections
-after four minutes. Startup provisions only the coordination tables; it does
-not create historical-data tables. The recycle period stays below the
+The connection is TLS-authenticated and verifies the certificate hostname.
+Transactional writes use a three-connection pool with one overflow slot.
+Routine reads use a separate two-connection AUTOCOMMIT pool so a checkout
+emits only its SELECT: no pre-ping, isolation toggle, COMMIT, or ROLLBACK.
+Both pools recycle connections after four minutes. Startup provisions only
+the coordination tables; it does not create historical-data tables. The
+recycle period stays below the
 documented 340-second AWS idle timeout; see TiDB's
 [standard connection guidance](https://docs.pingcap.com/tidbcloud/connect-via-standard-connection-serverless/).
 
@@ -85,9 +88,11 @@ for the current formula.
 - A steady `main.py` process heartbeat similarly updates only `heartbeat_at`
   when the exact PID is still active. A new PID, stopped row, or missing row
   automatically takes the full lifecycle update/insert path.
-- Repository fetch/list helpers use read-only connection scopes. Broker
-  reconciliation and board projection reads therefore do not emit a COMMIT
-  for data they did not change.
+- Repository fetch/list helpers use the dedicated read-only AUTOCOMMIT pool.
+  SQLAlchemy 2.0.43 or newer is required so closing those connections skips
+  DBAPI rollback. Broker reconciliation and board projection reads therefore
+  emit neither COMMIT nor ROLLBACK for data they did not change, and the read
+  pool omits checkout pre-pings that would otherwise add another request.
 - Exact broker fills, status changes, identity/recovery changes, and absence
   evidence are still persisted immediately. An otherwise unchanged working
   order refreshes its durable audit timestamp at most hourly; an unchanged
@@ -114,7 +119,7 @@ for the current formula.
   refresh is one conditional SELECT. It returns payload text only for the two
   tiny control rows; the larger planning documents contribute revision numbers
   only. This replaces at least one separate control query per device per minute.
-- The regular-session operator-command pickup uses a three-second hard floor,
+- The regular-session operator-command pickup uses a ten-second hard floor,
   and its empty/oldest-pending lookup is backed by one covering
   `(status, created_at, command_id)` index. This is the only cloud cadence
   relaxed in response to the second production RU sample; local quote, stop,
@@ -131,7 +136,7 @@ polls.
 | Coordination work | Hard cadence |
 | --- | ---: |
 | Local quote/ORB/stop evaluation | 1 second, no TiDB request |
-| Operator-command pickup, regular session | 3 seconds, active executor only |
+| Operator-command pickup, regular session | 10 seconds, active executor only |
 | Lease proof | 10 seconds, active executor only |
 | Protective ownership proof | 10 seconds, one bulk read only while positions exist |
 | Writable probe | 60-second fallback; normally satisfied by readiness write |
@@ -163,21 +168,21 @@ daily pattern:
 | Two-device `main.py` process heartbeats | 172,800 |
 | Active-owner lease proof | 259,200 |
 | Two-device card revision checks | 86,400 |
-| Regular/off-hours operator-command checks | 206,220 |
+| Regular/off-hours operator-command checks | 86,100 |
 | Bulk protective ownership proof | 259,200 |
 | Alert queue plus compacted heartbeat audits | 190,080 |
 | Two-device Buy Board revision checks | 86,400 |
 | Planning/control state sync | 216,000 |
 | Minute account-reconciliation relational reads, two accounts | 259,200 |
 | Transaction COMMITs for fallback writable probes | 86,400 |
-| **Scheduled total** | **2,253,900** |
-| **With 25% reconnect/scheduling margin** | **2,817,375** |
+| **Scheduled total** | **2,133,780** |
+| **With 25% reconnect/scheduling margin** | **2,667,225** |
 
 For capacity planning, this project applies a conservative **8 RU per small
 scheduled statement**. After batching the control and revision display reads
 and removing separate COMMIT statements from the two single-UPDATE heartbeat
-paths, that deliberately conservative calculation reserves about **22.5
-million RUs/month**, leaving about **27.5 million
+paths, that deliberately conservative calculation reserves about **21.4
+million RUs/month**, leaving about **28.6 million
 RUs** for real state transitions, bulk projection payloads, order journals,
 TiDB background jobs, and measurement error. Ten thousand separately rendered
 material changes would add roughly 5 million public-endpoint egress RUs at the
@@ -218,13 +223,23 @@ which still assumes that every fallback writable probe fires.
 
 A subsequent regular-session sample remained near 20 RU/s after those broad
 optimizations. The only scheduled one-Hz coordination statement left was the
-active executor's empty operator-command pickup. Its cadence is now one query
-every three seconds and its lookup is covered by an index. If the one-Hz lookup
-accounts for the observed roughly 20 RU/s baseline, its cadence contribution
-falls to about 6.7 RU/s, leaving roughly 3.3 RU/s for periodic lease,
-readiness, revision, and alert work. The post-deployment regular-session idle
-target is **10 RU/s or less** over a representative interval; short
-transition/reconciliation spikes are assessed separately.
+active executor's empty operator-command pickup. Its cadence was changed to
+one query every three seconds and its lookup was covered by an index. The
+post-deployment regular-session idle target remained **10 RU/s or less** over
+a representative interval; short transition/reconciliation spikes are
+assessed separately.
+
+The next production measurement disproved the three-second estimate: the rate
+was still about 17--18 RU/s. A read-only statement-summary sample then found
+1,082 standalone ROLLBACKs in 20 minutes. SQLAlchemy's implicit read
+transaction was issuing a ROLLBACK whenever a normal ``engine.connect()``
+scope closed, so the previous COMMIT removal had only changed the
+transaction-control verb. Pool pre-pings also add network requests that do not
+appear as application SELECT digests. Routine coordination reads now use a
+dedicated AUTOCOMMIT pool with both pre-ping and autocommit rollback disabled,
+making each read exactly one SQL request. The regular-session command floor is
+ten seconds, providing margin below the 10 RU/s target rather than depending
+on the failed three-second estimate.
 
 The next SQL-statements capture isolated the remaining write and startup
 overhead: 95 runtime-readiness heartbeats averaged 6.70 RU, 98 `main.py`

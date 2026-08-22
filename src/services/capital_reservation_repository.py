@@ -58,6 +58,7 @@ from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import SQLAlchemyError
 
 from src.core.capital_reservation import CapitalReservation, CapitalReservationStatus
+from src.infrastructure.database.coordination_engine import coordination_read_connection
 
 logger = logging.getLogger(__name__)
 
@@ -203,7 +204,7 @@ def list_active_reservations(
     if engine is None:
         return []
     table = _ensure_table(engine)
-    with engine.connect() as conn:
+    with coordination_read_connection(engine) as conn:
         rows = conn.execute(
             select(table).where(
                 table.c.environment == str(environment or "").upper(),
@@ -220,7 +221,7 @@ def fetch_reservation(
     if engine is None:
         return None
     table = _ensure_table(engine)
-    with engine.connect() as conn:
+    with coordination_read_connection(engine) as conn:
         row = conn.execute(
             select(table).where(table.c.reservation_id == str(reservation_id or ""))
         ).first()

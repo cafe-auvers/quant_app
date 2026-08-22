@@ -898,6 +898,7 @@ def test_chart_html_renders_escaped_watermark_markers_badge_and_independent_scal
     assert "Technology Sector" in page
     assert "Semiconductors" in page
     assert "pointer-events: none" in page
+    assert "opacity: 0.70;" in page
     assert "background: rgba(107, 114, 128, 0.30)" in page
     assert "E 6d AMC" in page
     assert "249/124" in page
