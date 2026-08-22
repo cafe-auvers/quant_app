@@ -21,6 +21,7 @@ from typing import Any, Dict, Optional
 
 from sqlalchemy import (
     BigInteger,
+    case,
     Column,
     DateTime,
     MetaData,
@@ -162,6 +163,15 @@ class OperatorControlResult:
     success: bool
     control: Optional[OperatorControl] = None
     error: str = ""
+
+
+@dataclass(frozen=True)
+class CoordinationStatusSnapshot:
+    """Small shared-control snapshot fetched with one database statement."""
+
+    live_trading: LiveTradingControlResult
+    operator_control: OperatorControlResult
+    state_revisions: Dict[str, int]
 
 
 @dataclass(frozen=True)
@@ -730,6 +740,134 @@ def get_synced_state_revisions(
     except (TypeError, ValueError) as exc:
         logger.info("Could not read synchronized state revisions: %s", exc)
         return {}
+
+
+def get_coordination_status_snapshot(
+    engine: Optional[Engine],
+) -> CoordinationStatusSnapshot:
+    """Read controls and planning revisions in one compact query.
+
+    Planning payloads can be large, so the SQL projection returns their
+    revision only.  Payload text is selected solely for the two small control
+    rows.  Missing rows preserve the same fail-closed defaults as the
+    individual control readers.
+    """
+
+    failed_live = LiveTradingControlResult(
+        False,
+        error="Could not read shared live-trading control.",
+    )
+    failed_operator = OperatorControlResult(
+        False,
+        error="Could not read shared operator-control ownership.",
+    )
+    if engine is None:
+        return CoordinationStatusSnapshot(failed_live, failed_operator, {})
+
+    try:
+        table = _ensure_state_sync_table(engine)
+        requested_keys = (
+            LIVE_TRADING_CONTROL_KEY,
+            OPERATOR_CONTROL_KEY,
+            *SYNCED_STATE_KEYS,
+        )
+        control_keys = (LIVE_TRADING_CONTROL_KEY, OPERATOR_CONTROL_KEY)
+        with engine.connect() as conn:
+            rows = conn.execute(
+                select(
+                    table.c.state_key,
+                    case(
+                        (table.c.state_key.in_(control_keys), table.c.payload),
+                        else_=None,
+                    ).label("control_payload"),
+                    table.c.revision,
+                    table.c.updated_at,
+                    table.c.updated_by_host,
+                    table.c.updated_by_device,
+                ).where(table.c.state_key.in_(requested_keys))
+            ).fetchall()
+    except SQLAlchemyError as exc:
+        logger.debug("Could not read coordination status snapshot: %s", exc)
+        error = str(exc)
+        return CoordinationStatusSnapshot(
+            LiveTradingControlResult(False, error=error),
+            OperatorControlResult(False, error=error),
+            {},
+        )
+
+    rows_by_key = {str(row.state_key): row for row in rows}
+    revisions = {state_key: 0 for state_key in SYNCED_STATE_KEYS}
+    for state_key in SYNCED_STATE_KEYS:
+        row = rows_by_key.get(state_key)
+        if row is not None:
+            try:
+                revisions[state_key] = int(row.revision or 0)
+            except (TypeError, ValueError):
+                logger.info("Invalid synchronized revision for %s", state_key)
+                revisions[state_key] = 0
+
+    live_row = rows_by_key.get(LIVE_TRADING_CONTROL_KEY)
+    if live_row is None:
+        live_result = LiveTradingControlResult(
+            True,
+            LiveTradingControl(False, 0, datetime.min),
+        )
+    else:
+        try:
+            live_state = RemoteState(
+                payload=_decode_payload(
+                    live_row.control_payload,
+                    LIVE_TRADING_CONTROL_KEY,
+                ),
+                revision=int(live_row.revision or 1),
+                updated_at=live_row.updated_at,
+                updated_by_host=live_row.updated_by_host or "",
+                updated_by_device=live_row.updated_by_device or "",
+            )
+            enabled = live_state.payload.get("enabled")
+            if not isinstance(enabled, bool):
+                raise ValueError(
+                    "Shared live-trading control has an invalid enabled value."
+                )
+            live_result = LiveTradingControlResult(
+                True,
+                LiveTradingControl(
+                    enabled=enabled,
+                    revision=live_state.revision,
+                    updated_at=live_state.updated_at,
+                    updated_by_host=live_state.updated_by_host,
+                    updated_by_device=live_state.updated_by_device,
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            live_result = LiveTradingControlResult(False, error=str(exc))
+
+    operator_row = rows_by_key.get(OPERATOR_CONTROL_KEY)
+    if operator_row is None:
+        operator_result = OperatorControlResult(
+            True,
+            OperatorControl("", "", True, 0, datetime.min),
+        )
+    else:
+        try:
+            operator_state = RemoteState(
+                payload=_decode_payload(
+                    operator_row.control_payload,
+                    OPERATOR_CONTROL_KEY,
+                ),
+                revision=int(operator_row.revision or 1),
+                updated_at=operator_row.updated_at,
+                updated_by_host=operator_row.updated_by_host or "",
+                updated_by_device=operator_row.updated_by_device or "",
+            )
+            operator_result = OperatorControlResult(
+                True,
+                control=_operator_control_from_state(operator_state),
+            )
+        except (TypeError, ValueError) as exc:
+            operator_result = OperatorControlResult(False, error=str(exc))
+
+    return CoordinationStatusSnapshot(live_result, operator_result, revisions)
 
 
 def publish_planning_snapshot(

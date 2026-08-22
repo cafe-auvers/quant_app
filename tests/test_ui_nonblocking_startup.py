@@ -139,6 +139,57 @@ def test_minute_projection_check_skips_bootstrap_and_payload_when_unchanged(
     assert buyboard_controller.BuyboardMixin._BUYBOARD_PROJECTION_REFRESH_MS == 60_000
 
 
+def test_changed_minute_projection_uses_one_revision_read_and_no_bootstrap(
+    monkeypatch,
+):
+    old_revision = (("cards", 2, 6, "old"),)
+    new_revision = (("cards", 3, 7, "new"),)
+    context = BoardProjectionContext(readiness_generation=9)
+    revision_calls = []
+    monkeypatch.setattr(
+        buyboard_controller.execution_workflow_service,
+        "get_board_projection_revision",
+        lambda *_args, **_kwargs: revision_calls.append(True) or new_revision,
+    )
+    projections = [object()]
+    monkeypatch.setattr(
+        buyboard_controller.execution_workflow_service,
+        "list_board_projections",
+        lambda *_args, **_kwargs: projections,
+    )
+    from src.services import trade_card_bootstrap
+
+    monkeypatch.setattr(
+        trade_card_bootstrap,
+        "bootstrap_trade_cards_from_current_state",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("minute canonical refresh ran compatibility bootstrap")
+        ),
+    )
+    request = buyboard_controller.BuyboardProjectionRequest(
+        engine=object(),
+        context=context,
+        buylist_manager=object(),
+        watchlist=object(),
+        default_account_no="account",
+        account_snapshots={},
+        account_snapshot_fetched_at={},
+        runtime_running=True,
+        generation=6,
+        revision_only=True,
+        expected_revision=(old_revision, context),
+    )
+    completed = []
+    worker = buyboard_controller.BuyboardProjectionWorker(request)
+    worker.completed.connect(lambda *args: completed.append(args))
+
+    worker.run()
+
+    assert revision_calls == [True]
+    assert completed == [(projections, "", 6)]
+    assert worker.resolved_revision == (new_revision, context)
+
+
 class _Signal:
     def __init__(self):
         self.callback = None

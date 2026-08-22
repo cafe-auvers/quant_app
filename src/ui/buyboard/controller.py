@@ -89,6 +89,7 @@ class BuyboardProjectionWorker(QThread):
                 bootstrap_trade_cards_from_current_state,
             )
 
+            current_revision = None
             if request.revision_only:
                 current_revision = (
                     execution_workflow_service.get_board_projection_revision(
@@ -109,21 +110,27 @@ class BuyboardProjectionWorker(QThread):
                         request.account_snapshot_fetched_at
                     ),
                 }
-            try:
-                bootstrap_trade_cards_from_current_state(
-                    request.engine,
-                    buylist_manager=request.buylist_manager,
-                    watchlist=request.watchlist,
-                    default_account_no=request.default_account_no,
-                    **kwargs,
-                )
-            except SQLAlchemyError:
-                logger.debug(
-                    "Buy Board bootstrap paused because the canonical "
-                    "database is unavailable"
-                )
-            except Exception:
-                logger.exception("Buy Board bootstrap refresh failed")
+            # A periodic revision refresh responds to canonical database
+            # changes and must not re-import unchanged local planning mirrors.
+            # Explicit/local planning actions already request a full refresh,
+            # which retains the compatibility bootstrap below.  Skipping it
+            # here removes one duplicate full TradeCard read per minute.
+            if not request.revision_only:
+                try:
+                    bootstrap_trade_cards_from_current_state(
+                        request.engine,
+                        buylist_manager=request.buylist_manager,
+                        watchlist=request.watchlist,
+                        default_account_no=request.default_account_no,
+                        **kwargs,
+                    )
+                except SQLAlchemyError:
+                    logger.debug(
+                        "Buy Board bootstrap paused because the canonical "
+                        "database is unavailable"
+                    )
+                except Exception:
+                    logger.exception("Buy Board bootstrap refresh failed")
 
             projections = execution_workflow_service.list_board_projections(
                 request.engine,
@@ -135,14 +142,10 @@ class BuyboardProjectionWorker(QThread):
                 board_statuses=(*BOARD_COLUMN_ORDER, BoardStatus.WATCHLIST),
             )
             if request.revision_only:
-                # Bootstrap may itself have normalized a newly synced
-                # Watchlist/Buylist item, so capture the post-projection token.
-                self.resolved_revision = (
-                    execution_workflow_service.get_board_projection_revision(
-                        request.engine, environment="PROD"
-                    ),
-                    request.context,
-                )
+                # No compatibility bootstrap ran, so the pre-read token is
+                # the exact revision that triggered this projection.  Avoid a
+                # second four-table aggregate query after downloading it.
+                self.resolved_revision = current_revision
             self.completed.emit(projections, "", request.generation)
         except SQLAlchemyError as exc:
             logger.warning(

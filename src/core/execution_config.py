@@ -95,14 +95,22 @@ COORDINATION_ACTIVE_CARD_POLL_SECONDS = max(
 COORDINATION_STANDBY_CARD_POLL_SECONDS = max(
     60.0, _env_float("COORDINATION_STANDBY_CARD_POLL_SECONDS", 60.0)
 )
+# The runtime-device heartbeat is itself a real coordination-store write, and
+# every safety-critical mutation independently proves database/lease state.
+# A separate no-op write once per minute is sufficient to detect a connection
+# that is readable but not writable without paying for the same proof every
+# 15 seconds on both machines.
 COORDINATION_DATABASE_PROBE_SECONDS = max(
-    15.0, _env_float("COORDINATION_DATABASE_PROBE_SECONDS", 15.0)
+    60.0, _env_float("COORDINATION_DATABASE_PROBE_SECONDS", 60.0)
 )
 COORDINATION_LEASE_POLL_SECONDS = max(
     10.0, _env_float("COORDINATION_LEASE_POLL_SECONDS", 10.0)
 )
+# Two publications still fit inside the 60-second runtime-freshness fence.
+# This state is for readiness/handoff display; it does not drive the
+# one-second market loop or relax the per-order lease proof.
 COORDINATION_DEVICE_HEARTBEAT_SECONDS = max(
-    15.0, _env_float("COORDINATION_DEVICE_HEARTBEAT_SECONDS", 15.0)
+    30.0, _env_float("COORDINATION_DEVICE_HEARTBEAT_SECONDS", 30.0)
 )
 COORDINATION_OWNERSHIP_PROOF_SECONDS = max(
     10.0, _env_float("COORDINATION_OWNERSHIP_PROOF_SECONDS", 10.0)
@@ -128,6 +136,12 @@ UNKNOWN_ORDER_RECONCILIATION_SECONDS = _env_int(
 ACTIVE_ACCOUNT_REFRESH_SECONDS = _env_int("ACTIVE_ACCOUNT_REFRESH_SECONDS", 5)
 IDLE_ACCOUNT_REFRESH_SECONDS = _env_int("IDLE_ACCOUNT_REFRESH_SECONDS", 20)
 FULL_RECONCILIATION_SECONDS = _env_int("FULL_RECONCILIATION_SECONDS", 60)
+# Broker status/fill/recovery transitions are persisted immediately.  When an
+# exact working order is observed with no semantic change, its durable
+# last-seen audit timestamp is coalesced; terminal rows need no periodic touch.
+DURABLE_ORDER_OBSERVATION_SECONDS = max(
+    3600, _env_int("DURABLE_ORDER_OBSERVATION_SECONDS", 3600)
+)
 AMBIGUOUS_SUBMISSION_CANDIDATE_WINDOW_SECONDS = _env_int(
     "AMBIGUOUS_SUBMISSION_CANDIDATE_WINDOW_SECONDS", 60
 )

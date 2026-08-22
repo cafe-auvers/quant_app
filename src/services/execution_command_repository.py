@@ -344,7 +344,7 @@ def get_command(conn: Connection, idempotency_key: str) -> Optional[ExecutionCom
     return _row_to_command(row) if row is not None else None
 
 
-# --- standalone convenience wrappers (own transaction each) -----------------
+# --- standalone convenience wrappers ----------------------------------------
 
 
 def record_command(engine: Engine, command: ExecutionCommand) -> ExecutionCommand:
@@ -359,7 +359,7 @@ def record_command(engine: Engine, command: ExecutionCommand) -> ExecutionComman
 
 def get_command_by_idempotency_key(engine: Engine, idempotency_key: str) -> Optional[ExecutionCommand]:
     ensure_execution_commands_table(engine)
-    with engine.begin() as conn:
+    with engine.connect() as conn:
         return get_command(conn, idempotency_key)
 
 
@@ -372,7 +372,7 @@ def list_execution_commands_for_account(
     """Return the durable command audit stream for one account in order."""
 
     table = ensure_execution_commands_table(engine)
-    with engine.begin() as conn:
+    with engine.connect() as conn:
         rows = conn.execute(
             select(table)
             .where(

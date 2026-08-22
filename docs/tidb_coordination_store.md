@@ -73,14 +73,39 @@ for the current formula.
 - Unchanged runtime readiness uses one revision read plus one UPDATE; it no
   longer selects the same device row before and after every heartbeat.
 - Each running desktop publishes its compact `main.py` process heartbeat to
-  TiDB every 15 seconds. This is independent of the PC MySQL probe, so a
-  laptop remains an eligible Execution Owner while the PC is off.
+  TiDB every 30 seconds. An existing heartbeat is one UPDATE, with no
+  SELECT-before-UPDATE or separate COMMIT statement. This is independent of
+  the PC MySQL probe, so a laptop remains an eligible Execution Owner while
+  the PC is off.
+- An unchanged runtime-readiness heartbeat is likewise one atomic autocommit
+  UPDATE. State transitions, handoffs, ownership changes, commands, orders,
+  and broker evidence retain their explicit transactions.
+- Repository fetch/list helpers use read-only connection scopes. Broker
+  reconciliation and board projection reads therefore do not emit a COMMIT
+  for data they did not change.
+- Exact broker fills, status changes, identity/recovery changes, and absence
+  evidence are still persisted immediately. An otherwise unchanged working
+  order refreshes its durable audit timestamp at most hourly; an unchanged
+  terminal order is not rewritten. The in-memory/account readiness proof
+  remains on the normal reconciliation cadence.
+- A minute-triggered canonical Buy Board refresh performs one revision query
+  and one four-table projection only when that token changed. It no longer
+  runs the local compatibility bootstrap, duplicates the TradeCard payload
+  read, or repeats the revision query. Explicit local planning changes retain
+  the bootstrap path.
+- A recent successful runtime-readiness UPDATE is reused as the writable-store
+  proof. The separate no-op writable transaction remains only as a startup,
+  recovery, or missing-heartbeat fallback.
 - The external watchdog still receives its 30-second heartbeat, but successful
   heartbeat audit rows are compacted to one every five minutes. Failure and
   recovery status transitions are always recorded.
 - Planning/control state sync is once per minute. Publishing, operator commands,
   control-button actions, broker-boundary checks, and owner activation use
   their immediate paths and do not wait for that display-sync timer.
+- Each minute's live-control, Operator Control, and planning-revision display
+  refresh is one conditional SELECT. It returns payload text only for the two
+  tiny control rows; the larger planning documents contribute revision numbers
+  only. This replaces at least one separate control query per device per minute.
 
 The minimum cadences are hard floors in `execution_config.py`; an accidental
 environment value cannot turn the background loops back into one-second cloud
@@ -92,9 +117,9 @@ polls.
 | Operator-command pickup, regular session | 1 second, active executor only |
 | Lease proof | 10 seconds, active executor only |
 | Protective ownership proof | 10 seconds, one bulk read only while positions exist |
-| Writable probe | 15 seconds per running device |
-| Runtime readiness heartbeat | 15 seconds per running device |
-| `main.py` process heartbeat | 15 seconds per running device |
+| Writable probe | 60-second fallback; normally satisfied by readiness write |
+| Runtime readiness heartbeat | 30 seconds per running device |
+| `main.py` process heartbeat | 30 seconds per running device |
 | Card and Buy Board revision checks | 60 seconds per running device |
 | Planning/control display sync | 60 seconds per running device |
 | Operator-command pickup outside regular session | 60 seconds |
@@ -115,23 +140,26 @@ daily pattern:
 
 | Background source | SQL statements/month |
 | --- | ---: |
-| Writable probes | 345,600 |
-| Two-device readiness revision + heartbeat UPDATE | 691,200 |
-| Two-device `main.py` process heartbeats | 691,200 |
+| Fallback writable probes (assumes every fallback fires) | 86,400 |
+| Two-device readiness revision + heartbeat UPDATE | 345,600 |
+| Two-device `main.py` process heartbeats | 172,800 |
 | Active-owner lease proof | 259,200 |
 | Two-device card revision checks | 86,400 |
 | Regular/off-hours operator-command checks | 549,420 |
 | Bulk protective ownership proof | 259,200 |
 | Alert queue plus compacted heartbeat audits | 190,080 |
 | Two-device Buy Board revision checks | 86,400 |
-| Planning/control state sync | 302,400 |
-| Minute account-reconciliation relational reads, two accounts | 518,400 |
-| **Scheduled total** | **3,979,500** |
-| **With 25% reconnect/scheduling margin** | **4,974,375** |
+| Planning/control state sync | 216,000 |
+| Minute account-reconciliation relational reads, two accounts | 259,200 |
+| Transaction COMMITs for fallback writable probes | 86,400 |
+| **Scheduled total** | **2,597,100** |
+| **With 25% reconnect/scheduling margin** | **3,246,375** |
 
 For capacity planning, this project applies a conservative **8 RU per small
-scheduled statement**. That reserves about **39.8 million RUs/month** for the
-entire continuously running background workload, leaving about **10.2 million
+scheduled statement**. After batching the control and revision display reads
+and removing separate COMMIT statements from the two single-UPDATE heartbeat
+paths, that deliberately conservative calculation reserves about **26.0
+million RUs/month**, leaving about **24.0 million
 RUs** for real state transitions, bulk projection payloads, order journals,
 TiDB background jobs, and measurement error. Ten thousand separately rendered
 material changes would add roughly 5 million public-endpoint egress RUs at the
@@ -147,15 +175,40 @@ projection, revision-only idle refresh, and no price-only TradeCard writes.
 
 ### Production verification and quota guardrail
 
+The first two-device production sample on 2026-08-21 exposed a higher idle
+rate than the original paper estimate: the dashboard was roughly 18--22 RU/s
+and showed a 20.19 RU/s point. The sorted SQL Statements view identified the
+avoidable work clearly: about 1,100 COMMITs consumed roughly 2,990 RU; runtime
+and process heartbeat writes ran about every 15 seconds; existing process
+heartbeats used SELECT + UPDATE; and repository list/fetch calls committed
+read-only transactions. The cadence and transaction changes documented above
+were made from that evidence. Treat the 26.0M calculation as a design budget,
+not proof of the post-change bill; only a new measured interval can provide
+that proof. Storage was not the problem: the same production check found 18
+coordination tables, roughly 349 rows, and about 0.008 MiB of row/index data.
+
+The second pass traced the remaining cascade behind that sample. An unchanged
+exact broker order was advancing only its observation timestamps, which bumped
+the order version; the Buy Board then detected that version and performed two
+revision aggregates plus two full TradeCard reads around an idempotent local
+bootstrap. Observation-only writes are now coalesced/removed as described
+above, and a changed minute refresh uses one aggregate plus one projection.
+The control/revision display reads are also now one compact conditional query
+instead of separate control and revision fetches. This should materially
+outperform the deliberately conservative 26.0M model,
+which still assumes that every fallback writable probe fires.
+
 TiDB states that SQL queries, bulk operations, and its own background jobs all
 consume RUs. `EXPLAIN ANALYZE` reports statement RU but excludes gateway egress;
 the authoritative total is the cluster **Usage this month** pane, and the
 **Diagnosis > SQL Statements** view identifies high Total/Mean RU statements.
 See the official [Starter RU FAQ](https://docs.pingcap.com/tidbcloud/serverless-faqs/).
 
-After both devices have run for 24 hours, calculate:
+After deploying the optimized version to both devices, record **Usage this
+month**, run both continuously for 24 hours, then subtract the starting value:
 
 ```text
+observed_24_hour_RU = ending_usage_this_month - starting_usage_this_month
 projected_monthly_RU = observed_24_hour_RU * 30
 ```
 

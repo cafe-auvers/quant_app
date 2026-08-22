@@ -515,6 +515,56 @@ def _clear_absence(order: ExecutionOrderRecord) -> None:
     order.last_absence_holding_quantity = None
 
 
+def _parse_utc_timestamp(value: object) -> Optional[datetime]:
+    try:
+        parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _stamp_exact_order_observation_if_due(
+    order: ExecutionOrderRecord,
+    before: ExecutionOrderRecord,
+    checked_at: str,
+) -> None:
+    """Persist semantic broker changes immediately; coalesce audit-only time.
+
+    ``last_broker_seen_at`` and ``last_reconciled_at`` are not authorization
+    or freshness inputs anywhere in the execution path.  Rewriting an
+    otherwise identical row on every broker poll consumed TiDB writes and
+    invalidated the full Buy Board projection.  Active orders retain a
+    hourly durable audit trail; terminal rows remain stable after their
+    terminal evidence was first committed.
+    """
+
+    ignored = {"last_broker_seen_at", "last_reconciled_at", "version"}
+    semantic_change = any(
+        value != getattr(before, name)
+        for name, value in vars(order).items()
+        if name not in ignored
+    )
+    if semantic_change or not order.last_reconciled_at:
+        due = True
+    elif order.status in _TERMINAL_EXECUTION_STATUSES:
+        due = False
+    else:
+        observed = _parse_utc_timestamp(checked_at)
+        prior = _parse_utc_timestamp(order.last_reconciled_at)
+        due = bool(
+            observed is None
+            or prior is None
+            or (observed - prior).total_seconds() < 0.0
+            or (observed - prior).total_seconds()
+            >= execution_config.DURABLE_ORDER_OBSERVATION_SECONDS
+        )
+    if due:
+        order.last_broker_seen_at = checked_at
+        order.last_reconciled_at = checked_at
+
+
 def _snapshot_status(
     snapshot: BrokerOrderStatusSnapshot,
 ) -> Optional[ExecutionOrderStatus]:
@@ -525,9 +575,8 @@ def _apply_exact_order_snapshot(
     order: ExecutionOrderRecord, snapshot: BrokerOrderStatusSnapshot
 ) -> Optional[str]:
     """Mutate a cloned order from exact broker evidence; return contradiction text."""
+    before = copy.deepcopy(order)
     _clear_absence(order)
-    order.last_broker_seen_at = snapshot.checked_at
-    order.last_reconciled_at = snapshot.checked_at
     order.filled_quantity = max(order.filled_quantity, snapshot.filled_quantity)
     if snapshot.remaining_quantity or snapshot.status == OrderStatus.FILLED:
         order.remaining_quantity = max(0, snapshot.remaining_quantity)
@@ -541,6 +590,7 @@ def _apply_exact_order_snapshot(
     target = _snapshot_status(snapshot)
     if target is None:
         _set_recovery_state(order, OrderRecoveryState.MANUAL_INTERVENTION_REQUIRED)
+        _stamp_exact_order_observation_if_due(order, before, snapshot.checked_at)
         return f"Broker returned unrecognized order status {snapshot.status.value}"
     preserve_ambiguous_cancel = bool(
         order.status == ExecutionOrderStatus.CANCEL_PENDING
@@ -565,6 +615,7 @@ def _apply_exact_order_snapshot(
             _set_recovery_state(
                 order, OrderRecoveryState.MANUAL_INTERVENTION_REQUIRED
             )
+            _stamp_exact_order_observation_if_due(order, before, snapshot.checked_at)
             return (
                 f"Broker status {target.value} contradicts local transition from "
                 f"{order.status.value}"
@@ -579,6 +630,7 @@ def _apply_exact_order_snapshot(
         and order.recovery_state == OrderRecoveryState.AWAITING_CANCEL_CONFIRMATION
     ):
         _set_recovery_state(order, OrderRecoveryState.TERMINAL_RECONCILED)
+    _stamp_exact_order_observation_if_due(order, before, snapshot.checked_at)
     return None
 
 
