@@ -47,7 +47,7 @@ import tempfile
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
@@ -80,6 +80,10 @@ KIS_PROD_BASE_URL = "https://openapi.koreainvestment.com:9443"
 TOKEN_ENDPOINT = "/oauth2/tokenP"
 DOMESTIC_BALANCE_ENDPOINT = "/uapi/domestic-stock/v1/trading/inquire-balance"
 OVERSEAS_BALANCE_ENDPOINT = "/uapi/overseas-stock/v1/trading/inquire-balance"
+OVERSEAS_PERIOD_PROFIT_ENDPOINT = (
+    "/uapi/overseas-stock/v1/trading/inquire-period-profit"
+)
+OVERSEAS_PERIOD_PROFIT_TR_ID = "TTTS3039R"
 # CTRP6548R: overseas present balance — returns frcr_evlu_tota (total foreign
 # asset value in KRW) and dncl_amt (KRW deposit). Used as fallback when the
 # per-exchange TTTS3012R query returns no holdings (e.g. pre-settlement).
@@ -559,6 +563,77 @@ class KisAccountClient:
             "tot_asst_krw": tot_asst_krw,
         }
 
+    def get_overseas_period_profit(
+        self,
+        *,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+    ) -> Dict[str, Any]:
+        """Fetch authoritative USD realized P/L rows for the current year.
+
+        KIS exposes actual closed-trade P/L separately from the balance API.
+        The dashboard previously tried to reconstruct it only from its local
+        order ledger, which necessarily misses trades placed outside this app.
+        """
+        end = end_date or datetime.now(timezone.utc).date()
+        start = start_date or date(end.year, 1, 1)
+        if start > end:
+            raise ValueError("start_date must be on or before end_date")
+
+        params = {
+            "CANO": self.config.cano,
+            "ACNT_PRDT_CD": self.config.account_product_code,
+            # For this API NASD means the United States as a whole, rather
+            # than only securities listed on Nasdaq.
+            "OVRS_EXCG_CD": "NASD",
+            "NATN_CD": "",
+            "CRCY_CD": self.config.overseas_currency,
+            "PDNO": "",
+            "INQR_STRT_DT": start.strftime("%Y%m%d"),
+            "INQR_END_DT": end.strftime("%Y%m%d"),
+            "WCRC_FRCR_DVSN_CD": "01",  # foreign currency (USD)
+            "CTX_AREA_FK200": "",
+            "CTX_AREA_NK200": "",
+        }
+        pages = self._query_balance_pages(
+            endpoint=OVERSEAS_PERIOD_PROFIT_ENDPOINT,
+            tr_id=OVERSEAS_PERIOD_PROFIT_TR_ID,
+            params=params,
+            cursor_width=200,
+        )
+
+        daily_usd: Dict[str, float] = {}
+        rows: List[Dict[str, Any]] = []
+        for page in pages:
+            for row in self._as_list(page.get("output1")):
+                rows.append(row)
+                raw_date = "".join(
+                    char for char in clean_str(row.get("trad_day")) if char.isdigit()
+                )
+                if len(raw_date) != 8:
+                    continue
+                try:
+                    realized_date = datetime.strptime(raw_date, "%Y%m%d").date()
+                except ValueError:
+                    continue
+                value = to_number(row.get("ovrs_rlzt_pfls_amt"))
+                key = realized_date.isoformat()
+                daily_usd[key] = daily_usd.get(key, 0.0) + value
+
+        summary_page = next(
+            (page for page in reversed(pages) if self._as_list(page.get("output2"))),
+            pages[-1],
+        )
+        return {
+            "complete": True,
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
+            "currency": self.config.overseas_currency,
+            "daily_usd": dict(sorted(daily_usd.items())),
+            "summary": first_dict(summary_page.get("output2")),
+            "raw_rows": rows,
+        }
+
     def get_account_snapshot(
         self, include_domestic: bool, include_overseas: bool
     ) -> Dict[str, Any]:
@@ -577,7 +652,19 @@ class KisAccountClient:
         if include_domestic:
             snapshot["domestic"] = self.get_domestic_balance()
         if include_overseas:
-            snapshot["overseas"] = self.get_overseas_balance()
+            overseas = self.get_overseas_balance()
+            try:
+                # The period-profit endpoint is read-only but independent of
+                # balance.  Keep a balance snapshot usable if this optional
+                # P/L query is unavailable or not enabled for an account.
+                time.sleep(0.3)
+                overseas["realized_pnl"] = self.get_overseas_period_profit()
+            except Exception as exc:
+                overseas["realized_pnl"] = {
+                    "complete": False,
+                    "error": str(exc),
+                }
+            snapshot["overseas"] = overseas
         return snapshot
 
     def _headers(self, tr_id: str, tr_cont: str = "") -> Dict[str, str]:

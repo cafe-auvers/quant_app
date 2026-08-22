@@ -11,6 +11,7 @@ import pandas as pd
 
 from src.core.chart_fundamentals import (
     EarningsEvent, EarningsLinePoint, StockProfile, UpcomingEarnings, canonical_symbol)
+from src.core.market_alignment import MarketAlignmentSnapshot
 
 try:
     from PyQt5.QtWebEngineWidgets import QWebEngineView
@@ -26,6 +27,11 @@ from .render_earnings_assets import EARNINGS_CHART_CSS, EARNINGS_EVENT_RUNTIME_J
 from .render_measurement_assets import (
     RIGHT_DRAG_MEASUREMENT_CSS,
     RIGHT_DRAG_MEASUREMENT_JS,
+)
+from .render_alignment import (
+    MARKET_ALIGNMENT_OVERLAY_CSS,
+    MARKET_ALIGNMENT_OVERLAY_JS,
+    build_market_alignment_overlay,
 )
 from .render_fundamentals import build_fundamental_render_payload
 from .render_metrics import ChartRenderMetricsMixin
@@ -51,6 +57,7 @@ class ChartLightweightRenderMixin:
         earnings_events: Optional[Iterable[EarningsEvent]] = None,
         earnings_line: Optional[Iterable[EarningsLinePoint]] = None,
         upcoming_earnings: Optional[UpcomingEarnings] = None,
+        alignment_snapshot: Optional[MarketAlignmentSnapshot] = None,
     ) -> str:
         """Generate a stable TradingView Lightweight Charts page from local OHLCV data."""
         options = options or {}
@@ -204,6 +211,7 @@ class ChartLightweightRenderMixin:
             future_values=future_values,
         )
         watermark_html = fundamental_payload["watermark_html"]
+        alignment_overlay_html = build_market_alignment_overlay(alignment_snapshot)
         upcoming_badge_html = fundamental_payload["upcoming_badge_html"]
         earnings_markers_json = fundamental_payload["earnings_markers_json"]
         earnings_tooltips_json = fundamental_payload["earnings_tooltips_json"]
@@ -373,6 +381,7 @@ class ChartLightweightRenderMixin:
                 #chart-area {{
                     width: 100%;
                     height: calc(100% - 56px);
+                    position: relative;
                 }}
                 #price-panel {{
                     width: 100%;
@@ -431,6 +440,22 @@ class ChartLightweightRenderMixin:
                     color: #9ca3af;
                     font-size: 12px;
                 }}
+                #linked-crosshair-vertical {{
+                    display: none;
+                    position: absolute;
+                    top: 0;
+                    bottom: 0;
+                    width: 1px;
+                    z-index: 6;
+                    pointer-events: none;
+                    background: repeating-linear-gradient(
+                        to bottom,
+                        rgba(209, 213, 219, 0.78) 0,
+                        rgba(209, 213, 219, 0.78) 4px,
+                        transparent 4px,
+                        transparent 8px
+                    );
+                }}
                 #drawing-overlay {{
                     position: absolute;
                     inset: 0;
@@ -440,6 +465,7 @@ class ChartLightweightRenderMixin:
                     pointer-events: none;
                 }}
                 {RIGHT_DRAG_MEASUREMENT_CSS}
+                {MARKET_ALIGNMENT_OVERLAY_CSS}
             </style>
             {bridge_script}
         </head>
@@ -457,6 +483,7 @@ class ChartLightweightRenderMixin:
             <div id="chart-area">
                 <div id="price-panel">
                     <div id="chart"></div>
+                    {alignment_overlay_html}
                     {watermark_html}
                     <div id="earnings-event-layer" aria-label="Earnings events"></div>
                     <div id="chart-tooltip"></div>
@@ -464,6 +491,7 @@ class ChartLightweightRenderMixin:
                     <canvas id="measurement-overlay" aria-label="Percentage measurement"></canvas>
                 </div>
                 <div id="rs-chart"><div id="rs-empty">RS/TI65 data unavailable for this timeframe.</div></div>
+                <div id="linked-crosshair-vertical" aria-hidden="true"></div>
             </div>
             {_lightweight_charts_script_tag()}
             <script>
@@ -499,6 +527,8 @@ class ChartLightweightRenderMixin:
                 const container = document.getElementById('chart');
                 const rsContainer = document.getElementById('rs-chart');
                 const pricePanel = document.getElementById('price-panel');
+                const chartArea = document.getElementById('chart-area');
+                const linkedCrosshairVertical = document.getElementById('linked-crosshair-vertical');
                 const chartTooltip = document.getElementById('chart-tooltip');
                 const earningsEventLayer = document.getElementById('earnings-event-layer');
                 let chartBridge = null;
@@ -509,6 +539,7 @@ class ChartLightweightRenderMixin:
                 let targetMode = false;
                 let drawingStart = null;
                 let drawingPreview = null;
+                {MARKET_ALIGNMENT_OVERLAY_JS}
                 const drawingSeries = new Map();
                 let targetPrice = {target_price_json};
                 let targetLine = null;
@@ -874,6 +905,41 @@ class ChartLightweightRenderMixin:
                         chart.timeScale().setVisibleLogicalRange(range);
                         syncingRange = false;
                     }});
+                    chart.subscribeCrosshairMove((param) => {{
+                        updateLinkedVerticalCrosshair(container, param);
+                    }});
+                    rsChart.subscribeCrosshairMove((param) => {{
+                        updateLinkedVerticalCrosshair(rsContainer, param);
+                    }});
+                }}
+
+                function hideLinkedVerticalCrosshair() {{
+                    if (linkedCrosshairVertical) {{
+                        linkedCrosshairVertical.style.display = 'none';
+                    }}
+                }}
+
+                function updateLinkedVerticalCrosshair(sourceContainer, param) {{
+                    if (
+                        !chartArea
+                        || !linkedCrosshairVertical
+                        || !sourceContainer
+                        || !param
+                        || !param.point
+                        || !Number.isFinite(Number(param.point.x))
+                    ) {{
+                        hideLinkedVerticalCrosshair();
+                        return;
+                    }}
+                    const areaRect = chartArea.getBoundingClientRect();
+                    const sourceRect = sourceContainer.getBoundingClientRect();
+                    const x = sourceRect.left - areaRect.left + Number(param.point.x);
+                    if (x < 0 || x > areaRect.width) {{
+                        hideLinkedVerticalCrosshair();
+                        return;
+                    }}
+                    linkedCrosshairVertical.style.left = `${{Math.round(x)}}px`;
+                    linkedCrosshairVertical.style.display = 'block';
                 }}
 
                 function normalizeTimeForSave(time) {{

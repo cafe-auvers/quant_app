@@ -22,12 +22,16 @@ UNIT_USD = "usd"
 UNIT_KRW = "krw"
 UNIT_PCT = "pct"
 
+VIEW_CUMULATIVE = "cumulative"
+VIEW_DAILY = "daily"
+
 _SERIES_LABELS = {
     SERIES_COMBINED: "Total P&L (Realized + Unrealized)",
     SERIES_REALIZED: "Realized P&L",
     SERIES_UNREALIZED: "Unrealized P&L",
 }
 _UNIT_LABELS = {UNIT_USD: "USD ($)", UNIT_KRW: "KRW (₩)", UNIT_PCT: "% of account"}
+_VIEW_LABELS = {VIEW_CUMULATIVE: "Cumulative", VIEW_DAILY: "Daily change"}
 
 # Validated status colors (dataviz palette): good/critical, dark chart surface.
 _COLOR_GOOD = "#0ca30c"
@@ -62,12 +66,26 @@ def _convert_value(
 
 
 def pnl_chart_points(
-    snapshots: Sequence[PnlDailySnapshot], *, series: str, unit: str
+    snapshots: Sequence[PnlDailySnapshot],
+    *,
+    series: str,
+    unit: str,
+    view: str = VIEW_CUMULATIVE,
 ) -> List[dict]:
     """Pure helper (no HTML) so the table-view fallback can reuse the same data."""
     points = []
+    previous_usd: Optional[float] = None
     for snapshot in snapshots:
-        value = _convert_value(_series_usd_value(snapshot, series), snapshot, unit)
+        cumulative_usd = _series_usd_value(snapshot, series)
+        usd_value = cumulative_usd
+        if view == VIEW_DAILY:
+            usd_value = (
+                cumulative_usd
+                if previous_usd is None
+                else cumulative_usd - previous_usd
+            )
+        previous_usd = cumulative_usd
+        value = _convert_value(usd_value, snapshot, unit)
         if value is None:
             continue
         points.append({"time": snapshot.date, "value": round(value, 4)})
@@ -79,10 +97,12 @@ def generate_pnl_chart_html(
     *,
     series: str = SERIES_COMBINED,
     unit: str = UNIT_USD,
+    view: str = VIEW_CUMULATIVE,
 ) -> str:
-    points = pnl_chart_points(snapshots, series=series, unit=unit)
+    points = pnl_chart_points(snapshots, series=series, unit=unit, view=view)
     series_label = _SERIES_LABELS.get(series, series)
     unit_label = _UNIT_LABELS.get(unit, unit)
+    view_label = _VIEW_LABELS.get(view, view)
 
     if not points:
         if not snapshots:
@@ -96,10 +116,8 @@ def generate_pnl_chart_html(
             )
         return _message_html(message)
 
-    is_positive = points[-1]["value"] >= 0
-    line_color = _COLOR_GOOD if is_positive else _COLOR_CRITICAL
     data_json = json.dumps(points)
-    title = html.escape(f"{series_label} · {unit_label}")
+    title = html.escape(f"{view_label} · {series_label} · {unit_label}")
 
     return f"""
 <!DOCTYPE html>
@@ -134,8 +152,22 @@ def generate_pnl_chart_html(
       vertLines: {{ color: '{_COLOR_GRID}' }},
       horzLines: {{ color: '{_COLOR_GRID}' }}
     }},
-    rightPriceScale: {{ borderColor: '{_COLOR_AXIS}' }},
-    timeScale: {{ borderColor: '{_COLOR_AXIS}' }},
+    rightPriceScale: {{
+      borderColor: '{_COLOR_AXIS}',
+      autoScale: true,
+      minimumWidth: 88,
+      scaleMargins: {{ top: 0.16, bottom: 0.16 }},
+    }},
+    timeScale: {{
+      borderColor: '{_COLOR_AXIS}',
+      rightOffset: 0.75,
+      barSpacing: 28,
+      minBarSpacing: 8,
+      fixLeftEdge: true,
+      fixRightEdge: true,
+      timeVisible: false,
+    }},
+    crosshair: {{ mode: LightweightCharts.CrosshairMode.Normal }},
   }});
   const series = chart.addBaselineSeries({{
     baseValue: {{ type: 'price', price: 0 }},
@@ -146,6 +178,9 @@ def generate_pnl_chart_html(
     bottomFillColor1: 'rgba(208,59,59,0.03)',
     bottomFillColor2: 'rgba(208,59,59,0.28)',
     lineWidth: 2,
+    priceLineVisible: true,
+    lastValueVisible: true,
+    priceFormat: {{ type: 'price', precision: 2, minMove: 0.01 }},
   }});
   series.setData(points);
   chart.timeScale().fitContent();
@@ -166,9 +201,13 @@ def generate_pnl_chart_html(
       legendValue.innerText = param.time + ':  ' + point.value.toLocaleString(undefined, {{maximumFractionDigits: 2}});
     }}
   }});
-  window.addEventListener('resize', function() {{
+  function resizeChart() {{
     chart.applyOptions({{ width: container.clientWidth, height: container.clientHeight }});
-  }});
+  }}
+  window.addEventListener('resize', resizeChart);
+  if (typeof ResizeObserver !== 'undefined') {{
+    new ResizeObserver(resizeChart).observe(container);
+  }}
 </script>
 </body>
 </html>

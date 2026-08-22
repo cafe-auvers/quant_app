@@ -2,10 +2,9 @@
 
 Builds a date-indexed equity curve from two sources:
 
-- **Realized P&L** is derived retroactively from the full order ledger via
-  FIFO lot matching (BUY fills open a lot, SELL fills close the oldest open
-  lot first). This is fully backfillable from day one of trading history,
-  because it only needs data the ledger already has.
+- **Realized P&L** uses KIS's actual period-profit rows where available, so
+  externally placed trades and broker costs are included. The full local
+  order ledger is FIFO-matched as a fallback outside KIS coverage.
 - **Unrealized P&L** is a mark-to-market snapshot of currently open buylist
   positions against the latest known price. There is no historical price
   history stored per position, so this can only be captured going forward
@@ -13,10 +12,9 @@ Builds a date-indexed equity curve from two sources:
   (i.e. realized-only) until then.
 
 Snapshots are keyed by US market session date (one row per trading day) and
-merged/persisted idempotently: calling this repeatedly re-derives the
-realized curve fresh from the ledger every time (so it can never drift), while
-preserving each past day's *already recorded* unrealized/FX/capital-base
-values and only overwriting today's.
+merged/persisted idempotently. Fresh KIS rows replace, rather than add to, the
+same account/date's local reconstruction. Past unrealized/FX/capital-base
+values are preserved and only today's values are overwritten.
 """
 from __future__ import annotations
 
@@ -41,6 +39,16 @@ def _utc_now_iso() -> str:
 
 
 @dataclass
+class BrokerRealizedPnlSeries:
+    """Authoritative broker realized P/L coverage for one account."""
+
+    account_no: str
+    start_date: str
+    end_date: str
+    daily_usd: Mapping[str, float]
+
+
+@dataclass
 class PnlDailySnapshot:
     """One day's point on the P&L equity curve.
 
@@ -56,6 +64,7 @@ class PnlDailySnapshot:
     fx_rate: Optional[float] = None  # KRW per USD in effect that day
     capital_base_usd: Optional[float] = None  # account size used for % conversion
     computed_at: str = ""
+    realized_source: str = "local order history"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -78,26 +87,20 @@ class PnlDailySnapshot:
             fx_rate=_optional_float(data.get("fx_rate")),
             capital_base_usd=_optional_float(data.get("capital_base_usd")),
             computed_at=str(data.get("computed_at", "")),
+            realized_source=str(
+                data.get("realized_source") or "local order history"
+            ),
         )
 
 
-def compute_realized_pnl_by_date(orders: Iterable[BrokerOrder]) -> Dict[str, float]:
-    """FIFO-match BUY lots to SELL fills per (environment, account_no, symbol).
+def _normalized_account_no(value: Any) -> str:
+    return "".join(char for char in str(value or "") if char.isalnum()).upper()
 
-    Returns realized P&L in USD *for that day only* (a delta, not cumulative),
-    keyed by US market session date "YYYY-MM-DD". Only PROD orders count —
-    the buylist/trading path only ever runs live orders in that environment.
 
-    Each ledger row is treated as one fill event at its full filled_quantity /
-    avg_fill_price, bucketed by its updated_at (falling back to submitted_at).
-    The ledger stores order-level running averages, not per-fill timestamps,
-    so this is the finest granularity available.
-
-    A SELL that exceeds the tracked open lots (e.g. a position opened before
-    the ledger existed) can only realize P&L for the portion with a known
-    cost basis; the untracked remainder is silently excluded rather than
-    guessed at.
-    """
+def _compute_ledger_realized_pnl_by_account_date(
+    orders: Iterable[BrokerOrder],
+) -> Dict[Tuple[str, str], float]:
+    """FIFO-match the local ledger, retaining account identity for overrides."""
     fills = [
         order
         for order in orders
@@ -106,10 +109,11 @@ def compute_realized_pnl_by_date(orders: Iterable[BrokerOrder]) -> Dict[str, flo
     fills.sort(key=lambda order: order.updated_at or order.submitted_at or "")
 
     open_lots: Dict[Tuple[str, str, str], Deque[List[float]]] = defaultdict(deque)
-    daily_delta: Dict[str, float] = defaultdict(float)
+    daily_delta: Dict[Tuple[str, str], float] = defaultdict(float)
 
     for order in fills:
-        key = (order.environment, order.account_no, order.symbol)
+        account_no = _normalized_account_no(order.account_no)
+        key = (str(order.environment).upper(), account_no, order.symbol)
         quantity = float(order.filled_quantity)
         price = float(order.avg_fill_price)
         session_date = market_session_date_from_value(
@@ -136,7 +140,58 @@ def compute_realized_pnl_by_date(orders: Iterable[BrokerOrder]) -> Dict[str, flo
             else:
                 lots[0][0] = lot_quantity
         if session_date is not None and abs(realized) > 1e-9:
-            daily_delta[str(session_date)] += realized
+            daily_delta[(account_no, str(session_date))] += realized
+
+    return dict(daily_delta)
+
+
+def compute_realized_pnl_by_date(
+    orders: Iterable[BrokerOrder],
+    *,
+    broker_realized_series: Optional[Iterable[BrokerRealizedPnlSeries]] = None,
+) -> Dict[str, float]:
+    """FIFO-match BUY lots to SELL fills per (environment, account_no, symbol).
+
+    Returns realized P&L in USD *for that day only* (a delta, not cumulative),
+    keyed by US market session date "YYYY-MM-DD". Only PROD orders count —
+    the buylist/trading path only ever runs live orders in that environment.
+
+    Each ledger row is treated as one fill event at its full filled_quantity /
+    avg_fill_price, bucketed by its updated_at (falling back to submitted_at).
+    The ledger stores order-level running averages, not per-fill timestamps,
+    so this is the finest granularity available.
+
+    A SELL that exceeds the tracked open lots (e.g. a position opened before
+    the ledger existed) can only realize P&L for the portion with a known
+    cost basis; the untracked remainder is silently excluded rather than
+    guessed at. When KIS period-profit data is supplied for an account/date
+    range, it is authoritative for that covered account and replaces (rather
+    than adds to) the local reconstruction, preventing double-counting.
+    """
+    ledger_daily = _compute_ledger_realized_pnl_by_account_date(orders)
+    broker_by_account: Dict[str, BrokerRealizedPnlSeries] = {}
+    for series in broker_realized_series or ():
+        account_no = _normalized_account_no(series.account_no)
+        if account_no and series.start_date <= series.end_date:
+            broker_by_account[account_no] = series
+
+    daily_delta: Dict[str, float] = defaultdict(float)
+    for (account_no, session_date), value in ledger_daily.items():
+        broker = broker_by_account.get(account_no)
+        if broker and broker.start_date <= session_date <= broker.end_date:
+            continue
+        daily_delta[session_date] += value
+
+    for account_no, series in broker_by_account.items():
+        for raw_date, raw_value in series.daily_usd.items():
+            session_date = str(raw_date)
+            if not (series.start_date <= session_date <= series.end_date):
+                continue
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                continue
+            daily_delta[session_date] += value
 
     return dict(daily_delta)
 
@@ -169,16 +224,54 @@ def build_pnl_history(
     fx_rate_today: Optional[float],
     capital_base_usd_today: Optional[float],
     existing: Optional[Iterable[PnlDailySnapshot]] = None,
+    broker_realized_series: Optional[Iterable[BrokerRealizedPnlSeries]] = None,
 ) -> List[PnlDailySnapshot]:
     """Merge a freshly-derived realized curve with previously stored days.
 
-    The realized curve is always recomputed from ``orders`` (the source of
-    truth), so it can never drift from the ledger. Unrealized/FX/capital-base
-    are read-through from the previous snapshot for every day except
-    ``today``, which takes the freshly supplied live values.
+    Realized P/L prefers supplied broker series and uses ``orders`` only as a
+    fallback. Unrealized/FX/capital-base are read through from the previous
+    snapshot for every day except ``today``, which takes fresh live values.
     """
     existing_by_date = {snap.date: snap for snap in (existing or [])}
-    daily_delta = compute_realized_pnl_by_date(orders)
+    broker_realized_series = tuple(broker_realized_series or ())
+    daily_delta = compute_realized_pnl_by_date(
+        orders, broker_realized_series=broker_realized_series
+    )
+    if broker_realized_series:
+        realized_source = "KIS actual period P/L (local fallback outside coverage)"
+    else:
+        # Opening Health can race the asynchronous startup KIS preload. Do not
+        # replace previously fetched broker truth with a partial local-ledger
+        # reconstruction during that window. Preserve the stored actual curve
+        # through its last known date, then allow newer ledger deltas as a
+        # clearly labelled temporary fallback until KIS refreshes again.
+        stored_actual = sorted(
+            (
+                snap
+                for snap in existing_by_date.values()
+                if snap.realized_source.startswith("KIS actual")
+                or snap.realized_source.startswith("stored KIS actual")
+            ),
+            key=lambda snap: snap.date,
+        )
+        if stored_actual:
+            last_stored_date = stored_actual[-1].date
+            prior_realized = 0.0
+            stored_daily: Dict[str, float] = {}
+            for snapshot in stored_actual:
+                stored_daily[snapshot.date] = (
+                    snapshot.realized_usd - prior_realized
+                )
+                prior_realized = snapshot.realized_usd
+            daily_delta = {
+                date: value
+                for date, value in daily_delta.items()
+                if date > last_stored_date
+            }
+            daily_delta.update(stored_daily)
+            realized_source = "stored KIS actual P/L (live refresh pending)"
+        else:
+            realized_source = "local order history"
 
     all_dates = sorted(set(daily_delta) | set(existing_by_date) | {today})
 
@@ -222,6 +315,7 @@ def build_pnl_history(
                 fx_rate=fx_rate,
                 capital_base_usd=capital_base,
                 computed_at=computed_at,
+                realized_source=realized_source,
             )
         )
 
@@ -260,6 +354,7 @@ def record_daily_pnl_snapshot(
     unrealized_usd_today: float,
     fx_rate_today: Optional[float],
     capital_base_usd_today: Optional[float],
+    broker_realized_series: Optional[Iterable[BrokerRealizedPnlSeries]] = None,
     today: Optional[str] = None,
     path: Path = PNL_HISTORY_FILE,
 ) -> List[PnlDailySnapshot]:
@@ -273,6 +368,7 @@ def record_daily_pnl_snapshot(
         fx_rate_today=fx_rate_today,
         capital_base_usd_today=capital_base_usd_today,
         existing=existing,
+        broker_realized_series=broker_realized_series,
     )
     save_pnl_history(updated, path)
     return updated

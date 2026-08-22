@@ -147,24 +147,12 @@ class PlanningSupportMixin:
         )
 
     def mark_watchlist_and_dashboard_dirty(self) -> None:
-        """Legacy chart callback name; only the live Dashboard needs refreshing."""
-        tabs = self.__dict__.get("tabs")
-        active_widget = tabs.currentWidget() if tabs is not None else None
-        if active_widget is self.__dict__.get("dashboard_widget"):
-            self.update_dashboard_summary()
-        else:
-            self._dashboard_summary_dirty = True
+        """Compatibility no-op now that the Dashboard summary is retired."""
+        return None
 
     def _flush_dirty_watchlist_and_dashboard(self) -> None:
-        """Flush the Dashboard half of the legacy deferred-refresh callback."""
-        tabs = self.__dict__.get("tabs")
-        active_widget = tabs.currentWidget() if tabs is not None else None
-        if (
-            self.__dict__.get("_dashboard_summary_dirty")
-            and active_widget is self.__dict__.get("dashboard_widget")
-        ):
-            self._dashboard_summary_dirty = False
-            self.update_dashboard_summary()
+        """Compatibility no-op now that the Dashboard summary is retired."""
+        return None
 
     def update_trade_prices_from_latest(self, symbol: str, latest_price: float) -> None:
         """Keep the shared current-price cache synchronized after chart fetches."""

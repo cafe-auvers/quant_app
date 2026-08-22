@@ -44,4 +44,4 @@ Pull requests should include a short summary, test results such as `pytest -q`, 
 
 Keep secrets out of source control. Store local database credentials in `.env` using keys such as `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_USER`, `MYSQL_PASSWORD`, and `MYSQL_DB`. Treat files in `data/` as local state unless intentionally adding sample data.
 
-Whenever `.env` changes, run `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\sync_pc_env.ps1` to regenerate the gitignored `.env.pc` copy. Preserve all non-MySQL values from `.env` and keep every generated `MYSQL_*` value blank for manual PC configuration; never commit either environment file.
+Application startup and the PC morning routine automatically merge the tracked `.env.example` schema into the local `.env`, then regenerate the gitignored `.env.pc` copy. Run `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\sync_pc_env.ps1` when an immediate manual sync is needed. Preserve all existing `.env` values, preserve every non-MySQL value in `.env.pc`, and keep every generated `MYSQL_*` value blank for manual PC configuration; never commit either environment file.

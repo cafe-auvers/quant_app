@@ -71,6 +71,7 @@ from src.services.historical_refresh_control import (MODE_1D, MODE_1H,
                                                      is_refresh_running,
                                                      read_status,
                                                      reconcile_stale_status)
+from src.services.market_pulse import MarketPulseService
 from src.services.order_ledger import (append_order, find_open_orders,
                                        has_open_order, load_order_ledger,
                                        merge_orders, save_order_ledger,
@@ -106,6 +107,7 @@ from src.ui.mixins.planning_support_mixin import PlanningSupportMixin
 from src.ui.mixins.scanner_mixin import ScannerMixin
 from src.ui.mixins.sidebar_mixin import SidebarMixin
 from src.ui.mixins.watchlist_actions_mixin import WatchlistActionsMixin
+from src.ui.market_pulse import MarketPulseMixin
 from src.ui.orb_settings_dialog import OrbSettingsDialog
 from src.ui.order_workers import HandoffReconciliationWorker
 from src.ui.workers import PcRemoteStatusWorker
@@ -382,11 +384,14 @@ class CoordinationRuntimeHeartbeatWorker(QThread):
 
 @dataclass(frozen=True)
 class MarketDataStatusResult:
-    """Slow market-cache watermarks resolved outside the GUI thread."""
+    """Slow market-cache freshness and watermarks resolved off the GUI thread."""
 
     engine: object
     latest_daily: object = None
     latest_hourly: object = None
+    expected_date: object = None
+    daily_is_stale: Optional[bool] = None
+    hourly_is_stale: Optional[bool] = None
     error: str = ""
 
 
@@ -395,9 +400,16 @@ class MarketDataStatusWorker(QThread):
 
     completed = pyqtSignal(object)
 
-    def __init__(self, engine) -> None:
+    def __init__(
+        self,
+        engine,
+        tickers: Optional[List[str]] = None,
+        universe_limit: Optional[int] = None,
+    ) -> None:
         super().__init__()
         self.engine = engine
+        self.tickers = list(tickers or []) or None
+        self.universe_limit = universe_limit
 
     def run(self) -> None:
         try:
@@ -406,10 +418,21 @@ class MarketDataStatusWorker(QThread):
             from src.infrastructure.database.repositories.market_watermarks import \
                 get_latest_price_history_date
 
+            tickers = self.tickers
+            if tickers is None:
+                tickers = get_default_universe(max_symbols=self.universe_limit)
+            expected_date = expected_latest_market_data_date()
             result = MarketDataStatusResult(
                 engine=self.engine,
                 latest_daily=get_latest_price_history_date(self.engine),
                 latest_hourly=get_latest_hourly_price_history_timestamp(self.engine),
+                expected_date=expected_date,
+                daily_is_stale=local_mirror_is_stale(
+                    self.engine, expected_date, tickers=tickers
+                ),
+                hourly_is_stale=local_mirror_hourly_is_stale(
+                    self.engine, expected_date, tickers=tickers
+                ),
             )
         except Exception as exc:
             result = MarketDataStatusResult(engine=self.engine, error=str(exc))
@@ -840,6 +863,7 @@ class MainWindow(
     SidebarMixin,
     HealthPanelMixin,
     DashboardMixin,
+    MarketPulseMixin,
     ScannerMixin,
     WatchlistActionsMixin,
     PlanningSupportMixin,
@@ -1000,7 +1024,15 @@ class MainWindow(
         self.latest_intraday_sources: dict[tuple[str, str], str] = {}
         self.intraday_fetch_attempts: dict[str, dt.datetime] = {}
         self._cached_market_data_status = None
+        self._historical_data_freshness = {
+            MODE_1D: "checking",
+            MODE_1H: "checking",
+        }
+        self._historical_data_expected_date = None
+        self._historical_data_freshness_error = ""
         self.market_data_status_worker = None
+        self.market_pulse_service = MarketPulseService()
+        self.market_pulse_worker = None
         self.intraday_bulk_purpose = "buyboard_orb"
         self.scanner_results: List[dict] = []
         self.scanner_results_by_setup: dict[str, List[dict]] = {}
@@ -1014,7 +1046,6 @@ class MainWindow(
         # be skipped and picked up once the user actually switches to the tab
         # (see on_tab_changed / flush_stale_chart_views), instead of paying the
         # cost synchronously in the middle of an unrelated chart interaction.
-        self._dashboard_summary_dirty = False
         self._intraday_tab_chart_stale = False
         self._tradingview_tab_chart_stale = False
         self.running_scanner_setup_name: Optional[str] = None
@@ -1034,6 +1065,8 @@ class MainWindow(
         self._last_order_reconciliation_at = ""
         self._last_order_reconciliation_error = ""
         self._health_probe_worker = None
+        self._repository_status_worker = None
+        self._repository_status = None
         self.kis_retry_timer = None
         self.fx_rate_worker = None
         self._tracked_workers: dict[QThread, tuple[str, Optional[str]]] = {}
@@ -1327,6 +1360,9 @@ class MainWindow(
         self.db_engine_source = source
         self.db_enabled = engine is not None
         self.db_initializing = False
+        market_pulse_service = self.__dict__.get("market_pulse_service")
+        if market_pulse_service is not None:
+            market_pulse_service.set_engine(engine)
         self._pc_database_ready = bool(source == "pc" and pc_engine is not None)
         if (
             not self._using_local_operational_authority()
@@ -1368,19 +1404,43 @@ class MainWindow(
         # never launches duplicate connection attempts in separate QThreads.
         self._poll_pc_status()
 
-    def _start_market_data_status_refresh(self) -> None:
-        """Refresh slow DB watermarks on a worker, never on the Qt thread."""
+    def _start_market_data_status_refresh(self, *, force: bool = False) -> None:
+        """Verify 1D/1H freshness on a worker, never on the Qt thread."""
         if not self.db_enabled or self.db_engine is None:
             self._cached_market_data_status = None
+            self._historical_data_freshness = {
+                MODE_1D: "unavailable",
+                MODE_1H: "unavailable",
+            }
+            self._historical_data_expected_date = None
+            self._historical_data_freshness_error = (
+                "The market-data database is unavailable."
+            )
+            self._poll_refresh_status()
             return
         if not self.__dict__.get("_qt_base_initialized", False):
             # Lightweight unit-test doubles deliberately bypass QObject init.
             return
         worker = self.__dict__.get("market_data_status_worker")
-        if worker is not None and worker.isRunning():
+        if (
+            worker is not None
+            and worker.isRunning()
+            and getattr(worker, "engine", None) is self.db_engine
+            and not force
+        ):
             return
         self._cached_market_data_status = "Checking..."
-        worker = MarketDataStatusWorker(self.db_engine)
+        self._historical_data_freshness = {
+            MODE_1D: "checking",
+            MODE_1H: "checking",
+        }
+        self._historical_data_freshness_error = ""
+        self._poll_refresh_status()
+        worker = MarketDataStatusWorker(
+            self.db_engine,
+            tickers=list(self.__dict__.get("universe_tickers") or []) or None,
+            universe_limit=self.__dict__.get("universe_limit"),
+        )
         self.market_data_status_worker = worker
         worker.completed.connect(self._on_market_data_status_completed)
         self._track_worker("market_data_status_worker", worker)
@@ -1395,6 +1455,12 @@ class MainWindow(
             return
         if result.error:
             self._cached_market_data_status = "Unavailable"
+            self._historical_data_freshness = {
+                MODE_1D: "unavailable",
+                MODE_1H: "unavailable",
+            }
+            self._historical_data_expected_date = None
+            self._historical_data_freshness_error = result.error
         elif result.latest_daily is None:
             self._cached_market_data_status = "No cached data"
         else:
@@ -1412,6 +1478,21 @@ class MainWindow(
                 self._cached_market_data_status = (
                     f"Daily {daily_status}; 1H latest {hourly_text} UTC"
                 )
+        if not result.error:
+            def freshness_state(value: Optional[bool]) -> str:
+                if value is True:
+                    return "stale"
+                if value is False:
+                    return "fresh"
+                return "unavailable"
+
+            self._historical_data_expected_date = result.expected_date
+            self._historical_data_freshness = {
+                MODE_1D: freshness_state(result.daily_is_stale),
+                MODE_1H: freshness_state(result.hourly_is_stale),
+            }
+            self._historical_data_freshness_error = ""
+        self._poll_refresh_status()
         self.update_dashboard_summary()
 
     def _sync_active_pc_to_local_mirror(self) -> None:
@@ -3755,7 +3836,13 @@ class MainWindow(
                 for order in list_execution_orders(engine, environment="PROD")
                 if order.status not in TERMINAL_EXECUTION_ORDER_STATUSES
             ]
-            for order in find_open_orders(self.__dict__.get("order_ledger", []) or []):
+            # The legacy ledger also contains old SIM/test orders.  They are
+            # intentionally retained for audit/history, but can never be live
+            # production exposure and must not block a PROD lease release.
+            for order in find_open_orders(
+                self.__dict__.get("order_ledger", []) or [],
+                environment="PROD",
+            ):
                 working.append(
                     f"{getattr(order, 'account_no', '')}/{order.symbol} legacy order"
                 )
@@ -3925,6 +4012,12 @@ class MainWindow(
         self._add_configured_tab("scanner", self.scanner_widget, "Scanner")
         self._build_scanner_tab()
 
+        self.market_pulse_widget = QWidget()
+        self._add_configured_tab(
+            "market_pulse", self.market_pulse_widget, "Market Pulse"
+        )
+        self._build_market_pulse_tab()
+
         # The Buy Board is the sole operator-facing execution surface. The
         # persisted buylist/execution-queue models remain compatibility inputs
         # for ORB calculation and state migration, but no legacy dashboard is
@@ -3992,8 +4085,6 @@ class MainWindow(
         self.orb_settings_action = tools_menu.addAction("ORB Settings")
         self.orb_settings_action.triggered.connect(self.show_orb_settings_dialog)
         tools_menu.addSeparator()
-        refresh_action = tools_menu.addAction("Refresh Dashboard")
-        refresh_action.triggered.connect(self._refresh_dashboard_summary_manually)
         refresh_db_action = tools_menu.addAction("Update 1D Data")
         refresh_db_action.triggered.connect(self.refresh_data_to_db)
         scan_action = tools_menu.addAction("Run All Scanners")
@@ -4115,6 +4206,9 @@ class MainWindow(
         self.local_mirror_sync_timer.setInterval(LOCAL_MIRROR_SYNC_INTERVAL_MS)
         self.local_mirror_sync_timer.timeout.connect(
             self._sync_active_pc_to_local_mirror
+        )
+        self.local_mirror_sync_timer.timeout.connect(
+            self._start_market_data_status_refresh
         )
         self.local_mirror_sync_timer.start()
 
@@ -5039,6 +5133,7 @@ class MainWindow(
 
         self._update_database_source_indicator()
         self._cached_market_data_status = None
+        self._start_market_data_status_refresh(force=True)
         self.update_dashboard_summary()
 
     def _activate_recovered_pc_database(self, engine) -> None:
@@ -5097,6 +5192,7 @@ class MainWindow(
             )
         try:
             self.update_dashboard_summary()
+            self._start_market_data_status_refresh(force=True)
             if not self._using_local_operational_authority():
                 self._start_state_sync()
             self._start_background_local_mirror_sync(engine)

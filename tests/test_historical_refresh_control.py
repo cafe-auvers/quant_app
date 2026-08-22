@@ -463,6 +463,67 @@ class _UiButtonStub(_UiTextStub):
         self.enabled = enabled
 
 
+@pytest.mark.parametrize(
+    ("mode", "state", "expected_text", "expected_enabled"),
+    [
+        (
+            hrc.MODE_1D,
+            "fresh",
+            "Historical 1D Data Up to Date (2026-08-21)",
+            False,
+        ),
+        (hrc.MODE_1H, "stale", "Update Historical 1H Data", True),
+        (hrc.MODE_1D, "checking", "Checking Historical 1D Data...", False),
+        (
+            hrc.MODE_1H,
+            "unavailable",
+            "Historical 1H Status Unavailable",
+            False,
+        ),
+    ],
+)
+def test_resting_refresh_button_reflects_verified_freshness(
+    mode, state, expected_text, expected_enabled
+):
+    import src.ui.mixins.scanner_mixin as scanner_mixin
+
+    window = scanner_mixin.ScannerMixin()
+    window._historical_data_freshness = {mode: state}
+    window._historical_data_expected_date = "2026-08-21"
+    window._historical_data_freshness_error = "Database check failed"
+    window._refresh_last_log_count = {}
+    window.append_log = lambda _message: None
+    button = _UiButtonStub()
+
+    window._apply_refresh_status_to_ui(mode, button, f"Update {mode} Data", False, {})
+
+    assert button.text() == expected_text
+    assert button.enabled is expected_enabled
+
+
+def test_running_refresh_keeps_terminate_action_enabled_even_if_previous_state_was_fresh():
+    import src.ui.mixins.scanner_mixin as scanner_mixin
+
+    window = scanner_mixin.ScannerMixin()
+    window._historical_data_freshness = {hrc.MODE_1D: "fresh"}
+    window._refresh_last_log_count = {}
+    window.progress_label = _UiTextStub()
+    window.progress_bar = _UiProgressStub()
+    window.append_log = lambda _message: None
+    button = _UiButtonStub()
+
+    window._apply_refresh_status_to_ui(
+        hrc.MODE_1D,
+        button,
+        "Update 1D Data",
+        True,
+        {"status": "running", "progress": {"percent": 25, "eta_text": "1m"}},
+    )
+
+    assert button.text().startswith("Terminate 1D Data")
+    assert button.enabled is True
+
+
 def test_completed_refresh_is_not_repainted_after_terminal_event_was_seen(monkeypatch):
     import src.ui.mixins.scanner_mixin as scanner_mixin
 

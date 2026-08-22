@@ -27,6 +27,11 @@ from src.utils.data_loader import get_default_universe
 from src.services.chart_fundamentals import (
     get_universe_earnings_history_due_symbols,
 )
+from src.core.market_alignment import ALIGNMENT_FEATURE_VERSION
+from src.infrastructure.database.repositories.market_alignment import (
+    MarketAlignmentRepository,
+)
+from src.services.market_alignment import alignment_reference_tickers
 from src.utils.db_loader import (
     CHRONIC_FAILURE_THRESHOLD,
     get_chart_indicator_refresh_plan,
@@ -45,7 +50,11 @@ def _refresh_tickers() -> List[str]:
     """Match historical.py's ticker set exactly for a meaningful stale check."""
     universe_tickers = get_default_universe(refresh=True)
     normalized = [str(symbol).strip().upper() for symbol in universe_tickers if str(symbol).strip()]
-    return list(dict.fromkeys([REFERENCE_SYMBOL, *normalized]))
+    return list(
+        dict.fromkeys(
+            [REFERENCE_SYMBOL, *normalized, *alignment_reference_tickers()]
+        )
+    )
 
 
 def _stale_symbols(
@@ -102,6 +111,12 @@ def _refresh_targets_needed() -> Tuple[Dict[str, List[str]], str]:
         )
 
     tickers = _refresh_tickers()
+    alignment_inputs = set(alignment_reference_tickers())
+    stock_tickers = [
+        symbol
+        for symbol in tickers
+        if symbol == REFERENCE_SYMBOL or symbol not in alignment_inputs
+    ]
     expected_date = expected_latest_market_data_date()
     chronic_daily = get_chronically_failing_symbols(engine, interval="1d")
     chronic_hourly = get_chronically_failing_symbols(engine, interval="1h")
@@ -115,8 +130,10 @@ def _refresh_targets_needed() -> Tuple[Dict[str, List[str]], str]:
     }
     daily_stale_all = _stale_symbols(daily_latest, tickers, expected_date)
     hourly_stale_all = _stale_symbols(
-        get_latest_hourly_price_history_timestamps(engine, tickers, strict=True),
-        tickers,
+        get_latest_hourly_price_history_timestamps(
+            engine, stock_tickers, strict=True
+        ),
+        stock_tickers,
         expected_date,
     )
     daily_canary_backoff = (
@@ -153,13 +170,13 @@ def _refresh_targets_needed() -> Tuple[Dict[str, List[str]], str]:
     if not daily_stale:
         chart_refresh_plan = get_chart_indicator_refresh_plan(
             engine,
-            tickers,
+            stock_tickers,
             reference_symbol=REFERENCE_SYMBOL,
             history_watermarks=daily_watermarks,
         )
         scanner_current = is_scanner_metrics_snapshot_current(
             engine,
-            tickers,
+            stock_tickers,
             history_watermarks=daily_watermarks,
             strict=True,
         )
@@ -168,12 +185,22 @@ def _refresh_targets_needed() -> Tuple[Dict[str, List[str]], str]:
     if not daily_stale:
         earnings_due = get_universe_earnings_history_due_symbols(
             engine,
-            tickers,
+            stock_tickers,
+        )
+
+    alignment_current = True
+    if not daily_stale and alignment_inputs.issubset(set(tickers)):
+        alignment_current = MarketAlignmentRepository(engine).is_batch_published(
+            expected_date, ALIGNMENT_FEATURE_VERSION
         )
 
     targets: Dict[str, List[str]] = {}
     reasons = []
-    derived_daily_needed = bool(chart_refresh_plan) or not scanner_current
+    derived_daily_needed = (
+        bool(chart_refresh_plan)
+        or not scanner_current
+        or not alignment_current
+    )
     if daily_stale or derived_daily_needed or earnings_due:
         targets["1d"] = daily_stale
     if daily_stale:
@@ -184,6 +211,8 @@ def _refresh_targets_needed() -> Tuple[Dict[str, List[str]], str]:
         )
     if not scanner_current:
         reasons.append("Scanner metrics snapshot is missing or stale.")
+    if not alignment_current:
+        reasons.append("Leadership/context snapshot is missing or stale.")
     if earnings_due:
         reasons.append(
             f"Earnings history needs refresh for {len(earnings_due)} symbol(s)."

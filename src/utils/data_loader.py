@@ -372,6 +372,7 @@ def _download_yfinance_batch(
     period: str,
     interval: str,
     threads: bool | int,
+    timeout: float = 15.0,
 ) -> pd.DataFrame:
     yf_logger = logging.getLogger("yfinance")
     old_level = yf_logger.level
@@ -385,6 +386,7 @@ def _download_yfinance_batch(
             auto_adjust=True,
             threads=threads,
             progress=False,
+            timeout=max(1.0, float(timeout)),
         )
     finally:
         yf_logger.setLevel(old_level)
@@ -648,6 +650,7 @@ def download_price_history(
     fallback_to_single: bool = True,
     chart_fallback: bool = True,
     required_latest_date: Optional[dt.date] = None,
+    timeout_seconds: float = 15.0,
 ) -> pd.DataFrame:
     """Download price history for a universe of tickers.
 
@@ -669,7 +672,13 @@ def download_price_history(
 
     for batch_index, batch in enumerate(batches):
         try:
-            data = _download_yfinance_batch(batch, period=period, interval=interval, threads=threads)
+            data = _download_yfinance_batch(
+                batch,
+                period=period,
+                interval=interval,
+                threads=threads,
+                timeout=timeout_seconds,
+            )
         except Exception:
             data = pd.DataFrame()
         data = _normalize_batch_download_columns(data, batch)
@@ -699,7 +708,13 @@ def download_price_history(
 
         for batch in _chunked_symbols(retry_symbols, retry_chunk_size):
             try:
-                data = _download_yfinance_batch(batch, period=period, interval=interval, threads=threads)
+                data = _download_yfinance_batch(
+                    batch,
+                    period=period,
+                    interval=interval,
+                    threads=threads,
+                    timeout=timeout_seconds,
+                )
             except Exception:
                 data = pd.DataFrame()
             data = _normalize_batch_download_columns(data, batch)

@@ -182,6 +182,8 @@ class NasdaqStockProfileUniverseProvider:
                     country=clean_optional_text(row.get("country")) or "United States",
                     sector_name=sector,
                     industry_name=industry,
+                    market_cap=_financial_number(row.get("marketCap")),
+                    market_cap_as_of_date=checked_at.date(),
                     profile_status=(
                         ProfileStatus.OK
                         if sector and industry
@@ -391,6 +393,8 @@ class YahooStockProfileProvider:
             sector_key=clean_optional_text(raw.get("sectorKey")),
             industry_name=industry,
             industry_key=clean_optional_text(raw.get("industryKey")),
+            market_cap=_finite(raw.get("marketCap")),
+            market_cap_as_of_date=checked_at.date(),
             category=category,
             fund_family=fund_family,
             profile_status=status,

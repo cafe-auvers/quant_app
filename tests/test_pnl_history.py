@@ -1,8 +1,18 @@
 import datetime as dt
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from src.core.order_state import BrokerOrder, OrderSide, OrderStatus
 from src.services import pnl_history
+from src.ui.health.pnl_chart import (
+    SERIES_REALIZED,
+    UNIT_USD,
+    VIEW_CUMULATIVE,
+    VIEW_DAILY,
+    generate_pnl_chart_html,
+    pnl_chart_points,
+)
+from src.ui.health.panel import HealthPanelMixin
 
 US_MARKET_ZONE = ZoneInfo("America/New_York")
 
@@ -76,6 +86,112 @@ def test_realized_pnl_keeps_symbols_and_accounts_separate():
     ]
     daily = pnl_history.compute_realized_pnl_by_date(orders)
     assert daily == {"2026-08-11": 10 * (60 - 50)}
+
+
+def test_kis_actual_realized_pnl_overrides_local_reconstruction_per_account():
+    orders = [
+        _filled_order(
+            account_no="A",
+            side=OrderSide.BUY,
+            quantity=10,
+            price=100.0,
+            day="2026-08-10",
+        ),
+        _filled_order(
+            account_no="A",
+            side=OrderSide.SELL,
+            quantity=10,
+            price=120.0,
+            day="2026-08-11",
+        ),
+        _filled_order(
+            account_no="B",
+            side=OrderSide.BUY,
+            quantity=2,
+            price=50.0,
+            day="2026-08-10",
+        ),
+        _filled_order(
+            account_no="B",
+            side=OrderSide.SELL,
+            quantity=2,
+            price=70.0,
+            day="2026-08-11",
+        ),
+    ]
+    actual = pnl_history.BrokerRealizedPnlSeries(
+        account_no="A",
+        start_date="2026-01-01",
+        end_date="2026-08-22",
+        daily_usd={"2026-08-11": 75.0},
+    )
+
+    daily = pnl_history.compute_realized_pnl_by_date(
+        orders, broker_realized_series=[actual]
+    )
+
+    # Account A uses KIS's actual $75, while uncovered account B retains its
+    # $40 local FIFO result. Account A's local $200 is not double-counted.
+    assert daily == {"2026-08-11": 115.0}
+
+
+def test_build_pnl_history_marks_kis_actual_realized_source():
+    actual = pnl_history.BrokerRealizedPnlSeries(
+        account_no="123-01",
+        start_date="2026-01-01",
+        end_date="2026-08-22",
+        daily_usd={"2026-08-20": 25.0, "2026-08-21": -5.0},
+    )
+
+    snapshots = pnl_history.build_pnl_history(
+        [],
+        today="2026-08-22",
+        unrealized_usd_today=10.0,
+        fx_rate_today=None,
+        capital_base_usd_today=None,
+        broker_realized_series=[actual],
+    )
+
+    assert snapshots[-1].realized_usd == 20.0
+    assert snapshots[-1].total_usd == 30.0
+    assert snapshots[-1].realized_source.startswith("KIS actual")
+
+
+def test_build_pnl_history_does_not_erase_stored_kis_actual_during_preload():
+    local_orders = [
+        _filled_order(
+            side=OrderSide.BUY,
+            quantity=10,
+            price=100.0,
+            day="2026-08-20",
+        ),
+        _filled_order(
+            side=OrderSide.SELL,
+            quantity=10,
+            price=120.0,
+            day="2026-08-21",
+        ),
+    ]
+    existing = [
+        pnl_history.PnlDailySnapshot(
+            date="2026-08-21",
+            realized_usd=75.0,
+            total_usd=75.0,
+            realized_source="KIS actual period P/L (local fallback outside coverage)",
+        )
+    ]
+
+    snapshots = pnl_history.build_pnl_history(
+        local_orders,
+        today="2026-08-22",
+        unrealized_usd_today=0.0,
+        fx_rate_today=None,
+        capital_base_usd_today=None,
+        existing=existing,
+    )
+
+    assert snapshots[-1].realized_usd == 75.0  # not local ledger's $200
+    assert snapshots[-1].realized_source.startswith("stored KIS actual")
 
 
 def test_compute_unrealized_pnl_usd_skips_positions_without_a_live_price():
@@ -195,3 +311,83 @@ def test_record_daily_pnl_snapshot_round_trips_through_disk(tmp_path):
     by_date = {snap.date: snap for snap in updated}
     assert by_date["2026-08-11"].fx_rate == 1400.0
     assert by_date["2026-08-13"].realized_usd == 300.0 + 10 * (90 - 100)
+
+
+def test_pnl_chart_supports_daily_and_cumulative_views():
+    snapshots = [
+        pnl_history.PnlDailySnapshot(date="2026-08-20", realized_usd=10.0),
+        pnl_history.PnlDailySnapshot(date="2026-08-21", realized_usd=25.0),
+        pnl_history.PnlDailySnapshot(date="2026-08-22", realized_usd=20.0),
+    ]
+
+    cumulative = pnl_chart_points(
+        snapshots,
+        series=SERIES_REALIZED,
+        unit=UNIT_USD,
+        view=VIEW_CUMULATIVE,
+    )
+    daily = pnl_chart_points(
+        snapshots,
+        series=SERIES_REALIZED,
+        unit=UNIT_USD,
+        view=VIEW_DAILY,
+    )
+
+    assert [point["value"] for point in cumulative] == [10.0, 25.0, 20.0]
+    assert [point["value"] for point in daily] == [10.0, 15.0, -5.0]
+
+
+def test_pnl_chart_html_has_readable_axis_margins_and_resizes():
+    snapshots = [
+        pnl_history.PnlDailySnapshot(date="2026-08-22", realized_usd=20.0)
+    ]
+
+    chart_html = generate_pnl_chart_html(
+        snapshots,
+        series=SERIES_REALIZED,
+        unit=UNIT_USD,
+        view=VIEW_CUMULATIVE,
+    )
+
+    assert "Cumulative · Realized P&amp;L · USD ($)" in chart_html
+    assert "scaleMargins" in chart_html
+    assert "minimumWidth: 88" in chart_html
+    assert "ResizeObserver" in chart_html
+
+
+def test_pnl_inputs_prefer_kis_actual_unrealized_and_expose_realized_series():
+    window = SimpleNamespace(
+        buylist_manager=SimpleNamespace(
+            items=[
+                SimpleNamespace(
+                    symbol="AAPL", shares_held=10, avg_cost=100.0
+                )
+            ]
+        ),
+        latest_intraday_prices={"AAPL": 150.0},
+        kis_account_snapshots={
+            ("PROD", "12345678-01"): {
+                "overseas": {
+                    "holdings": [{"symbol": "AAPL", "profit_loss": 125.5}],
+                    "realized_pnl": {
+                        "complete": True,
+                        "currency": "USD",
+                        "start_date": "2026-01-01",
+                        "end_date": "2026-08-22",
+                        "daily_usd": {"2026-08-21": 42.0},
+                    },
+                }
+            }
+        },
+    )
+
+    unrealized, fx_rate, capital_base, actual_series = (
+        HealthPanelMixin._pnl_inputs(window)
+    )
+
+    assert unrealized == 125.5  # not the local quote reconstruction of $500
+    assert fx_rate is None
+    assert capital_base is None
+    assert len(actual_series) == 1
+    assert actual_series[0].account_no == "12345678-01"
+    assert actual_series[0].daily_usd == {"2026-08-21": 42.0}

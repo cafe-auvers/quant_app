@@ -3,8 +3,9 @@
 import weakref
 from typing import List, Set
 
-from sqlalchemy import (Boolean, Column, Date, DateTime, Float, Index, Integer,
-                        MetaData, String, Table, insert, inspect, select, text)
+from sqlalchemy import (Boolean, Column, Date, DateTime, Float, ForeignKey,
+                        Index, Integer, MetaData, String, Table, Text,
+                        UniqueConstraint, insert, inspect, select, text)
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Engine
@@ -382,6 +383,8 @@ def _get_stock_profiles_table(metadata: MetaData) -> Table:
         Column("sector_key", String(160)),
         Column("industry_name", String(200)),
         Column("industry_key", String(200)),
+        Column("market_cap", Float),
+        Column("market_cap_as_of_date", Date),
         Column("category", String(200)),
         Column("fund_family", String(200)),
         Column("profile_status", String(20), nullable=False),
@@ -400,7 +403,33 @@ def _ensure_stock_profiles_table(engine: Engine) -> Table:
     metadata = MetaData()
     table = _get_stock_profiles_table(metadata)
     metadata.create_all(engine)
+    _ensure_stock_profile_alignment_columns(engine)
     return table
+
+
+def _ensure_stock_profile_alignment_columns(engine: Engine) -> None:
+    """Idempotently extend existing profile caches with segment inputs."""
+
+    try:
+        inspector = inspect(engine)
+        if not inspector.has_table("stock_profiles"):
+            return
+        columns = {column["name"] for column in inspector.get_columns("stock_profiles")}
+        statements = []
+        if "market_cap" not in columns:
+            statements.append("ALTER TABLE stock_profiles ADD COLUMN market_cap FLOAT")
+        if "market_cap_as_of_date" not in columns:
+            statements.append(
+                "ALTER TABLE stock_profiles ADD COLUMN market_cap_as_of_date DATE"
+            )
+        if statements:
+            with engine.begin() as conn:
+                for statement in statements:
+                    conn.execute(text(statement))
+    except SQLAlchemyError:
+        # Startup remains tolerant of optional-cache migration failures; the
+        # alignment batch will report missing segment classification instead.
+        return
 
 
 def _get_earnings_events_table(metadata: MetaData) -> Table:
@@ -471,3 +500,154 @@ def _ensure_fundamental_sync_state_table(engine: Engine) -> Table:
     table = _get_fundamental_sync_state_table(metadata)
     metadata.create_all(engine)
     return table
+
+
+def _get_market_pulse_instruments_table(metadata: MetaData) -> Table:
+    """Configuration records for the read-only Market Pulse universe."""
+
+    return Table(
+        "market_pulse_instruments",
+        metadata,
+        Column("id", Integer, primary_key=True, autoincrement=True),
+        Column("section", String(40), nullable=False),
+        Column("display_name", String(160), nullable=False),
+        Column("ticker", String(20), nullable=False),
+        Column("display_order", Integer, nullable=False),
+        Column("is_active", Boolean, nullable=False, default=True),
+        Column("created_at", DateTime, nullable=False, default=_utcnow_naive),
+        Column("updated_at", DateTime, nullable=False, default=_utcnow_naive),
+        UniqueConstraint(
+            "section",
+            "ticker",
+            name="uq_market_pulse_instruments_section_ticker",
+        ),
+    )
+
+
+def _get_market_pulse_snapshots_table(metadata: MetaData) -> Table:
+    """One idempotent Market Pulse metric row per instrument/session."""
+
+    if "market_pulse_instruments" not in metadata.tables:
+        _get_market_pulse_instruments_table(metadata)
+    table = Table(
+        "market_pulse_snapshots",
+        metadata,
+        Column("id", Integer, primary_key=True, autoincrement=True),
+        Column(
+            "instrument_id",
+            Integer,
+            ForeignKey("market_pulse_instruments.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        Column("as_of_date", Date, nullable=False),
+        Column("close", Float),
+        Column("daily_return", Float),
+        Column("weekly_return", Float),
+        Column("monthly_return", Float),
+        Column("pct_above_52w_low", Float),
+        Column("pct_below_52w_high", Float),
+        Column("status", String(20), nullable=False, default="available"),
+        Column("error_message", String(500)),
+        Column("source_session_date", Date),
+        Column("source", String(40), nullable=False),
+        Column("refreshed_at", DateTime, nullable=False, default=_utcnow_naive),
+        UniqueConstraint(
+            "instrument_id",
+            "as_of_date",
+            name="uq_market_pulse_snapshots_instrument_date",
+        ),
+    )
+    Index("ix_market_pulse_snapshots_as_of_date", table.c.as_of_date)
+    return table
+
+
+def _ensure_market_pulse_tables(engine: Engine) -> tuple[Table, Table]:
+    metadata = MetaData()
+    instruments = _get_market_pulse_instruments_table(metadata)
+    snapshots = _get_market_pulse_snapshots_table(metadata)
+    metadata.create_all(engine)
+    return instruments, snapshots
+
+
+def _get_stock_market_alignment_daily_table(metadata: MetaData) -> Table:
+    """Immutable per-symbol Leadership and Context snapshot rows."""
+
+    table = Table(
+        "stock_market_alignment_daily",
+        metadata,
+        Column("symbol", String(32), primary_key=True),
+        Column("as_of_date", Date, primary_key=True),
+        Column("feature_version", String(20), primary_key=True),
+        Column("market_rs", Float),
+        Column("market_rs_source", String(80), nullable=False),
+        Column("industry_peer_rs", Float),
+        Column("peer_basis", String(40), nullable=False),
+        Column("peer_count", Integer, nullable=False, default=0),
+        Column("peer_group_id", String(200)),
+        Column("peer_group_name", String(200)),
+        Column("leadership_score", Float),
+        Column("leadership_label", String(20), nullable=False),
+        Column("market_state", String(20), nullable=False),
+        Column("market_conditions_passed", Integer),
+        Column("market_cap", Float),
+        Column("market_cap_as_of_date", Date),
+        Column("segment_name", String(80)),
+        Column("segment_proxy", String(20)),
+        Column("segment_state", String(20), nullable=False),
+        Column("segment_conditions_passed", Integer),
+        Column("sector_name", String(160)),
+        Column("sector_proxy", String(20)),
+        Column("sector_state", String(20), nullable=False),
+        Column("sector_conditions_passed", Integer),
+        Column("industry_name", String(200)),
+        Column("industry_proxy_or_index", String(240)),
+        Column("industry_state", String(20), nullable=False),
+        Column("industry_conditions_passed", Integer),
+        Column("context_points", Float),
+        Column("context_available_components", Integer, nullable=False),
+        Column("context_label", String(20), nullable=False),
+        Column("is_provisional", Boolean, nullable=False, default=False),
+        Column("classification_source", String(80), nullable=False),
+        Column("calculation_details_json", Text, nullable=False),
+        Column("calculated_at", DateTime, nullable=False),
+        Column("created_at", DateTime, nullable=False, default=_utcnow_naive),
+        Column("updated_at", DateTime, nullable=False, default=_utcnow_naive),
+    )
+    Index(
+        "ix_market_alignment_symbol_date",
+        table.c.symbol,
+        table.c.as_of_date,
+    )
+    return table
+
+
+def _get_market_alignment_batches_table(metadata: MetaData) -> Table:
+    """Publication manifest; only published batches are visible to charts."""
+
+    table = Table(
+        "market_alignment_batches",
+        metadata,
+        Column("as_of_date", Date, primary_key=True),
+        Column("feature_version", String(20), primary_key=True),
+        Column("status", String(20), nullable=False),
+        Column("input_fingerprint", String(64), nullable=False),
+        Column("symbol_count", Integer, nullable=False),
+        Column("stats_json", Text, nullable=False),
+        Column("computed_at", DateTime, nullable=False),
+        Column("published_at", DateTime, nullable=False),
+        Column("updated_at", DateTime, nullable=False, default=_utcnow_naive),
+    )
+    Index(
+        "ix_market_alignment_batches_status_date",
+        table.c.status,
+        table.c.as_of_date,
+    )
+    return table
+
+
+def _ensure_market_alignment_tables(engine: Engine) -> tuple[Table, Table]:
+    metadata = MetaData()
+    snapshots = _get_stock_market_alignment_daily_table(metadata)
+    batches = _get_market_alignment_batches_table(metadata)
+    metadata.create_all(engine)
+    return snapshots, batches

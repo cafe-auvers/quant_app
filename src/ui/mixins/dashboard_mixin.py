@@ -4,16 +4,18 @@ import datetime as dt
 import html
 import json
 import math
+import os
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-from PyQt5.QtCore import Qt, QThread, QTimer, QUrl
+from PyQt5.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt5.QtGui import QColor, QDoubleValidator, QKeySequence
-from PyQt5.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
-                             QDialogButtonBox, QDockWidget, QFormLayout,
+from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
+                             QComboBox, QDialog, QDialogButtonBox, QDockWidget, QFormLayout,
                              QGroupBox, QHBoxLayout, QHeaderView,
                              QKeySequenceEdit, QLabel, QLineEdit, QListWidget,
                              QListWidgetItem, QMenu, QMessageBox, QProgressBar,
@@ -54,6 +56,12 @@ from src.services.intraday_data_service import (format_intraday_source_label,
 from src.services.order_ledger import (append_order, find_open_orders,
                                        has_open_order, load_order_ledger,
                                        save_order_ledger, update_order)
+from src.services.repository_sync import (
+    SYNC_RESULT_ENV,
+    RepositoryStatus,
+    inspect_repository,
+    launch_sync_helper,
+)
 from src.ui.chart_bridge import ChartBridge
 from src.ui.dialogs import AddFilterDialog, SettingsDialog
 from src.ui.filter_catalog import (DEFAULT_SCANNER_SETUPS, DEFAULT_SETTINGS,
@@ -63,6 +71,7 @@ from src.ui.workers import (FxRateWorker, IntradayBulkFetchWorker,
                             IntradayFetchWorker, KisAccountWorker,
                             KisOrderWorker, KisStartupAccountsWorker,
                             OrderReconciliationWorker, ScannerWorker)
+from src.utils.config import ROOT_DIR
 from src.utils.data_loader import (_extract_symbol_history,
                                    download_price_history,
                                    get_default_universe)
@@ -80,6 +89,15 @@ US_MARKET_ZONE = ZoneInfo("America/New_York")
 MARKET_DATA_READY_TIME_KST = dt.time(7, 0)
 TRADINGVIEW_REFRESH_INTERVAL_SECONDS = 5 * 60
 KIS_DAILY_CHART_FAILURE_COOLDOWN_SECONDS = 30 * 60
+
+
+class RepositoryStatusWorker(QThread):
+    """Fetch the tracked branch and compare it without blocking the GUI."""
+
+    completed = pyqtSignal(object)
+
+    def run(self) -> None:
+        self.completed.emit(inspect_repository(ROOT_DIR, fetch=True))
 
 
 def _finite_scanner_metric(stock: dict, *keys: str) -> float:
@@ -101,14 +119,6 @@ class DashboardMixin:
     def _build_dashboard_tab(self) -> None:
         """Build content for the dashboard tab."""
         layout = QVBoxLayout()
-        summary_group = QGroupBox("Dashboard Summary")
-        summary_layout = QVBoxLayout()
-        self.dashboard_summary_label = QLabel()
-        self.dashboard_summary_label.setWordWrap(True)
-        summary_layout.addWidget(self.dashboard_summary_label)
-        summary_group.setLayout(summary_layout)
-        layout.addWidget(summary_group)
-
         kis_group = QGroupBox("KIS Account Snapshot")
         kis_layout = QVBoxLayout()
 
@@ -237,19 +247,22 @@ class DashboardMixin:
         self.pc_status_button.clicked.connect(self._on_pc_status_button_clicked)
         button_layout.addWidget(self.pc_status_button)
 
-        refresh_button = QPushButton("Refresh Summary")
-        refresh_button.setObjectName("refreshSummaryButton")
-        refresh_button.clicked.connect(self._refresh_dashboard_summary_manually)
-        button_layout.addWidget(refresh_button)
-
-        self.refresh_db_button = QPushButton("Update 1D Data")
+        self.refresh_db_button = QPushButton("Checking Historical 1D Data...")
         self.refresh_db_button.setObjectName("refreshDbButton")
+        self.refresh_db_button.setEnabled(False)
         self.refresh_db_button.clicked.connect(self.refresh_data_to_db)
         button_layout.addWidget(self.refresh_db_button)
-        self.refresh_hourly_button = QPushButton("Update 1H Data")
+        self.refresh_hourly_button = QPushButton("Checking Historical 1H Data...")
         self.refresh_hourly_button.setObjectName("refreshHourlyButton")
+        self.refresh_hourly_button.setEnabled(False)
         self.refresh_hourly_button.clicked.connect(self.refresh_hourly_data_to_db)
         button_layout.addWidget(self.refresh_hourly_button)
+
+        self.git_sync_button = QPushButton("Checking Latest Git...")
+        self.git_sync_button.setObjectName("gitSyncButton")
+        self.git_sync_button.setEnabled(False)
+        self.git_sync_button.clicked.connect(self._sync_with_latest_git)
+        button_layout.addWidget(self.git_sync_button)
         # The bulk-fetch completion path still uses this compatibility handle
         # to disable/re-enable refreshes. It is deliberately not added to the
         # Dashboard: Buy Today ORB data has its own focused one-minute refresh
@@ -261,6 +274,159 @@ class DashboardMixin:
 
         self.dashboard_widget.setLayout(layout)
         self.populate_kis_account_combo()
+        QTimer.singleShot(0, self._refresh_repository_status)
+        QTimer.singleShot(0, self._show_repository_sync_result)
+
+    def _refresh_repository_status(self) -> None:
+        """Refresh the Dashboard Git state in a short-lived worker."""
+        worker = self.__dict__.get("_repository_status_worker")
+        if worker is not None and worker.isRunning():
+            return
+        button = self.__dict__.get("git_sync_button")
+        if button is not None:
+            button.setText("Checking Latest Git...")
+            button.setEnabled(False)
+            button.setToolTip(
+                "Fetching tracked Git metadata; application files are not being changed."
+            )
+        worker = RepositoryStatusWorker()
+        self._repository_status_worker = worker
+        worker.completed.connect(self._apply_repository_status)
+        self._track_worker("_repository_status_worker", worker)
+        worker.start()
+
+    def _apply_repository_status(self, status: RepositoryStatus) -> None:
+        """Drive the Git button from one remote comparison result."""
+        self._repository_status = status
+        button = self.__dict__.get("git_sync_button")
+        if button is None:
+            return
+
+        if status.error:
+            button.setText("Git Status Unavailable")
+            button.setEnabled(False)
+            button.setToolTip(status.error)
+            return
+        if status.behind_count and status.ahead_count:
+            button.setText("Git Sync Needs Manual Fix")
+            button.setEnabled(False)
+            button.setToolTip(
+                f"{status.branch} and {status.upstream} have diverged "
+                f"({status.ahead_count} ahead, {status.behind_count} behind)."
+            )
+            return
+        if status.behind_count:
+            button.setText("Recent Git Not Synced")
+            button.setEnabled(True)
+            change_note = (
+                " Local changes must be resolved first." if status.dirty else ""
+            )
+            button.setToolTip(
+                f"{status.branch} is {status.behind_count} commit(s) behind "
+                f"{status.upstream}.{change_note}"
+            )
+            return
+        if status.dirty:
+            button.setText("Latest Git Present (Local Changes)")
+            button.setEnabled(False)
+            button.setToolTip(
+                "This checkout contains the latest tracked Git commit, plus local changes."
+            )
+            return
+        if status.ahead_count:
+            button.setText("Synced with Most Recent Git (Local Ahead)")
+            button.setEnabled(False)
+            button.setToolTip(
+                f"This checkout includes {status.upstream} and has "
+                f"{status.ahead_count} additional local commit(s)."
+            )
+            return
+        button.setText("Synced with Most Recent Git")
+        button.setEnabled(False)
+        button.setToolTip(
+            f"{status.branch} matches {status.upstream} at {status.local_revision}."
+        )
+
+    def _sync_with_latest_git(self) -> None:
+        """Close safely, fast-forward the repository, and relaunch main.py."""
+        status = self.__dict__.get("_repository_status")
+        if not isinstance(status, RepositoryStatus) or status.error:
+            QMessageBox.warning(
+                self,
+                "Git Status Unavailable",
+                "The tracked Git branch could not be verified. Refresh the status and try again.",
+            )
+            self._refresh_repository_status()
+            return
+        if status.dirty:
+            QMessageBox.warning(
+                self,
+                "Git Sync Blocked",
+                "This repository has local changes. Commit, stash, or remove them before "
+                "using automatic Git sync; no files were changed.",
+            )
+            return
+        if status.ahead_count:
+            QMessageBox.warning(
+                self,
+                "Git Sync Needs Manual Review",
+                "The local branch contains commits that are not on its tracked remote "
+                "branch. Automatic sync will not overwrite or publish them.",
+            )
+            return
+        if status.behind_count == 0:
+            self._apply_repository_status(status)
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Sync with Most Recent Git",
+            f"{status.branch} is {status.behind_count} commit(s) behind "
+            f"{status.upstream}.\n\nThe dashboard will close safely, update using "
+            "fast-forward-only Git sync, and then reopen main.py. Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        if not self.close():
+            return
+
+        try:
+            launch_sync_helper(
+                ROOT_DIR,
+                parent_process_id=os.getpid(),
+                python_executable=sys.executable,
+                main_script=ROOT_DIR / "main.py",
+            )
+        except OSError as exc:
+            QMessageBox.warning(
+                self,
+                "Git Sync Could Not Start",
+                f"The updater could not start: {exc}\n\nThe dashboard will reopen "
+                "without changing Git.",
+            )
+            self._restart_application()
+            return
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
+    def _show_repository_sync_result(self) -> None:
+        """Surface the one-shot result passed by the updater process."""
+        raw_result = os.environ.pop(SYNC_RESULT_ENV, "")
+        if not raw_result:
+            return
+        outcome, _separator, message = raw_result.partition(":")
+        if outcome == "success":
+            self.append_log(message or "Git sync completed successfully.")
+            return
+        QMessageBox.warning(
+            self,
+            "Git Sync Failed",
+            (message or "The repository could not be updated.")
+            + "\n\nThe dashboard reopened without overwriting local work.",
+        )
 
     def populate_kis_account_combo(self, *args) -> None:
         """Refresh selectable KIS accounts from local configuration."""
@@ -1243,54 +1409,9 @@ class DashboardMixin:
             }
         return total_krw
 
-    def _refresh_dashboard_summary_manually(self, *_signal_args) -> None:
-        """Refresh user-requested data without consulting QObject.sender()."""
-        self.update_dashboard_summary(force=True)
-
     def update_dashboard_summary(self, *_signal_args, force: bool = False) -> None:
-        """Update the dashboard summary section."""
-        is_manual = force
-
-        if is_manual:
-            self._cached_market_data_status = "Checking..."
-            refresh_market_status = getattr(
-                self, "_start_market_data_status_refresh", None
-            )
-            if callable(refresh_market_status):
-                refresh_market_status()
-
-        symbols = [stock["symbol"] for stock in self.scanner_results]
-        _db_source_labels = {"pc": "PC", "local_mirror": "local mirror"}
-        db_status = (
-            f"enabled ({_db_source_labels.get(getattr(self, 'db_engine_source', ''), 'unknown')})"
-            if self.db_enabled
-            else "disabled"
-        )
-        market_data_status = self._format_market_data_status()
-
-        buylist_lines = []
-        if hasattr(self, "buylist_manager"):
-            env_items = [
-                it for it in self.buylist_manager.items if it.environment == "PROD"
-            ]
-            bought = [it for it in env_items if it.monitoring_status == "BOUGHT"]
-            active = [it for it in env_items if it.monitoring_status == "ACTIVE"]
-            if env_items:
-                syms = ", ".join(it.symbol for it in bought) if bought else "none"
-                buylist_lines.append(
-                    f"Buylist PROD: {len(bought)}/5 positions ({syms})"
-                    + (f", {len(active)} watching" if active else "")
-                )
-
-        text = (
-            f"Scanner yielded {len(self.scanner_results)} candidates.\n"
-            + ("\n".join(buylist_lines) + "\n" if buylist_lines else "")
-            + f"Active trade plans: {len(self.trade_manager.get_active_plans())}.\n"
-            f"MySQL cache: {db_status}.\n"
-            f"Market data status: {market_data_status}.\n"
-            f"Top scanner candidates: {', '.join(symbols[:5]) or 'None'}."
-        )
-        self.dashboard_summary_label.setText(text)
+        """Compatibility no-op retained for legacy refresh callbacks."""
+        return None
 
     def _format_market_data_status(self) -> str:
         if not self.db_enabled or self.db_engine is None:

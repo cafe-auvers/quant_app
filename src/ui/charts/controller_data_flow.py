@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 from typing import List, Optional
 from zoneinfo import ZoneInfo
 
@@ -22,6 +23,7 @@ except ImportError:
 from src.core.orb import resample_intraday_bars
 from src.core.chart_fundamentals import (
     ChartFundamentalContext, canonical_symbol)
+from src.core.market_alignment import MarketAlignmentSnapshot
 from src.infrastructure.database.repositories.chart_indicators import (
     calculate_chart_indicators, load_chart_indicators_from_db,
     refresh_chart_indicators_for_symbol)
@@ -30,12 +32,14 @@ from src.infrastructure.database.repositories.market_bars import \
 from src.services.intraday_data_service import (format_intraday_source_label,
                                                 load_best_intraday_history)
 from src.services.chart_fundamentals import ChartFundamentalService
+from src.services.market_alignment import MarketAlignmentService
 from src.ui.fundamental_worker import ChartFundamentalRefreshWorker
 from src.ui.workers import IntradayBulkFetchWorker, IntradayFetchWorker
 from src.utils.intraday_helpers import intraday_cache_needs_backfill
 from src.utils.intraday_helpers import utcnow_naive as _utcnow_naive
 
 from .render_assets import lightweight_charts_base_path
+from .render_alignment import build_market_alignment_overlay
 
 REFERENCE_SYMBOL = "SPY"
 KST_ZONE = ZoneInfo("Asia/Seoul")
@@ -145,6 +149,7 @@ class ChartsDataFlowMixin:
             now=now,
             horizon_days=int(base_options["earnings_horizon_days"]),
         )
+        alignment_snapshot = self._load_market_alignment_snapshot(symbol)
 
         split_enabled = (
             hasattr(self, "tradingview_split_screen_checkbox")
@@ -163,6 +168,7 @@ class ChartsDataFlowMixin:
                 fetch_live=fetch_live,
                 view_key="left",
                 fundamental_context=fundamental_context,
+                alignment_snapshot=alignment_snapshot,
             )
             if not skip_split_view:
                 split_status = self._render_tradingview_chart_view(
@@ -176,6 +182,7 @@ class ChartsDataFlowMixin:
                     fetch_live=fetch_live,
                     view_key="right",
                     fundamental_context=fundamental_context,
+                    alignment_snapshot=alignment_snapshot,
                 )
             else:
                 split_status = "1H skipped (drawing sync)"
@@ -185,7 +192,10 @@ class ChartsDataFlowMixin:
             )
             self.tradingview_status_label.setText(f"{primary_status} | {split_status}")
             self._schedule_chart_fundamental_refresh(
-                symbol, fundamental_generation, now=now
+                symbol,
+                fundamental_generation,
+                now=now,
+                allow_provider=fetch_live,
             )
             return
 
@@ -207,6 +217,7 @@ class ChartsDataFlowMixin:
             fetch_live=fetch_live,
             view_key="single",
             fundamental_context=fundamental_context,
+            alignment_snapshot=alignment_snapshot,
         )
         self.current_tradingview_symbol = (
             f"{tradingview_symbol}|{timeframe}|volume={int(base_options['show_volume'])}|"
@@ -214,7 +225,10 @@ class ChartsDataFlowMixin:
         )
         self.tradingview_status_label.setText(status)
         self._schedule_chart_fundamental_refresh(
-            symbol, fundamental_generation, now=now
+            symbol,
+            fundamental_generation,
+            now=now,
+            allow_provider=fetch_live,
         )
 
     def _render_tradingview_chart_view(
@@ -229,6 +243,7 @@ class ChartsDataFlowMixin:
         view_key: str,
         fetch_live: bool = False,
         fundamental_context: Optional[ChartFundamentalContext] = None,
+        alignment_snapshot: Optional[MarketAlignmentSnapshot] = None,
     ) -> str:
         options = {
             "show_volume": bool(base_options.get("show_volume", True)),
@@ -283,6 +298,9 @@ class ChartsDataFlowMixin:
             )
         last_refresh = self.tradingview_refresh_timestamps.get(refresh_key)
         if not force and not self._tradingview_refresh_due(last_refresh, now=now):
+            self._update_market_alignment_overlay_in_view(
+                target_view, alignment_snapshot
+            )
             next_refresh = last_refresh + dt.timedelta(
                 seconds=TRADINGVIEW_REFRESH_INTERVAL_SECONDS
             )
@@ -401,6 +419,7 @@ class ChartsDataFlowMixin:
             upcoming_earnings=(
                 view_context.next_earnings if view_context is not None else None
             ),
+            alignment_snapshot=alignment_snapshot,
         )
         if QWebEngineView is not None and isinstance(target_view, QWebEngineView):
             asset_base = str(lightweight_charts_base_path().resolve()) + "/"
@@ -411,6 +430,33 @@ class ChartsDataFlowMixin:
             )
         self.tradingview_refresh_timestamps[refresh_key] = now
         return f"Loaded {timeframe} chart for {tradingview_symbol}"
+
+    def _load_market_alignment_snapshot(
+        self, symbol: str
+    ) -> Optional[MarketAlignmentSnapshot]:
+        """Perform only the indexed local lookup used by the chart overlay."""
+
+        engine = self.__dict__.get("db_engine")
+        if engine is None or not self.__dict__.get("db_enabled", False):
+            return None
+        return MarketAlignmentService(engine).get_latest_market_alignment(symbol)
+
+    @staticmethod
+    def _update_market_alignment_overlay_in_view(
+        target_view,
+        snapshot: Optional[MarketAlignmentSnapshot],
+    ) -> bool:
+        """Replace only the overlay when candles are still within their refresh TTL."""
+
+        if QWebEngineView is None or not isinstance(target_view, QWebEngineView):
+            return False
+        markup = build_market_alignment_overlay(snapshot)
+        script = (
+            "window.updateMarketAlignmentOverlay && "
+            f"window.updateMarketAlignmentOverlay({json.dumps(markup)});"
+        )
+        target_view.page().runJavaScript(script)
+        return True
 
     def _chart_fundamental_generation(self, symbol: str) -> int:
         canonical = canonical_symbol(symbol)
@@ -462,8 +508,15 @@ class ChartsDataFlowMixin:
             return ChartFundamentalContext(symbol=canonical)
 
     def _schedule_chart_fundamental_refresh(
-        self, symbol: str, generation: int, *, now: dt.datetime
+        self,
+        symbol: str,
+        generation: int,
+        *,
+        now: dt.datetime,
+        allow_provider: bool = True,
     ) -> bool:
+        if not allow_provider:
+            return False
         if self.__dict__.get("db_engine_source") != "pc":
             return False
         engine = self.__dict__.get("db_engine")
