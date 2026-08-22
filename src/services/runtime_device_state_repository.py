@@ -280,7 +280,11 @@ def refresh_runtime_device_state(
         ),
         "updated_at": _server_now(engine),
     }
-    with engine.begin() as conn:
+    # This unchanged-state heartbeat is one conditional UPDATE and is atomic
+    # on its own.  Autocommit prevents a second billed COMMIT statement while
+    # transition paths continue to use save_runtime_device_state's explicit
+    # transaction and read-back generation checks.
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
         result = conn.execute(
             table.update()
             .where(

@@ -9,7 +9,20 @@ import weakref
 from dataclasses import dataclass
 from typing import Optional
 
-from sqlalchemy import Boolean, Column, DateTime, Integer, MetaData, String, Table, func, select, text
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    case,
+    func,
+    or_,
+    select,
+    text,
+)
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -98,37 +111,48 @@ def record_runtime_heartbeat(
         raise ValueError("Runtime heartbeat requires a hostname and process name")
 
     table = _ensure_runtime_status_table(engine)
-    with engine.begin() as conn:
-        row = conn.execute(
-            select(table.c.pid, table.c.active).where(
+    # One heartbeat UPDATE is already atomic.  Driver autocommit avoids a
+    # separate cloud-billed COMMIT statement for this 30-second liveness
+    # touch; multi-statement lifecycle transitions keep explicit transactions.
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        # The normal heartbeat is one UPDATE, not SELECT + UPDATE.  Besides
+        # removing a race between those statements, this avoids one TiDB RU
+        # read on every heartbeat from both machines.  ``started_at`` changes
+        # only when a genuinely new/restarted process takes over the row.
+        now = _server_now(engine)
+        result = conn.execute(
+            table.update()
+            .where(
                 table.c.hostname == hostname,
                 table.c.process_name == process_name,
             )
-        ).first()
-        values = {
-            "pid": pid,
-            "active": True,
-            "heartbeat_at": _server_now(engine),
-        }
-        if row is None:
+            .values(
+                pid=pid,
+                active=True,
+                heartbeat_at=now,
+                started_at=case(
+                    (
+                        or_(
+                            table.c.pid.is_(None),
+                            table.c.pid != pid,
+                            table.c.active.is_(False),
+                        ),
+                        now,
+                    ),
+                    else_=table.c.started_at,
+                ),
+            )
+        )
+        if result.rowcount == 0:
             conn.execute(
                 table.insert().values(
                     hostname=hostname,
                     process_name=process_name,
-                    started_at=_server_now(engine),
-                    **values,
+                    pid=pid,
+                    active=True,
+                    started_at=now,
+                    heartbeat_at=now,
                 )
-            )
-        else:
-            if int(row.pid or 0) != pid or not bool(row.active):
-                values["started_at"] = _server_now(engine)
-            conn.execute(
-                table.update()
-                .where(
-                    table.c.hostname == hostname,
-                    table.c.process_name == process_name,
-                )
-                .values(**values)
             )
 
 

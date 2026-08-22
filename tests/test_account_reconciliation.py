@@ -894,6 +894,107 @@ def test_exact_working_entry_remains_tracked_without_a_cancel_command():
     assert all(card.board_status == BoardStatus.ENTRY_PENDING for card in plan.card_updates)
 
 
+def test_unchanged_exact_working_order_coalesces_durable_observation_timestamp():
+    prior = NOW.isoformat()
+    order = _order(last_broker_seen_at=prior, last_reconciled_at=prior)
+    working = BrokerOrderStatusSnapshot(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        broker_order_id="B-1",
+        side=OrderSide.BUY,
+        status=OrderStatus.WORKING,
+        quantity_requested=10,
+        remaining_quantity=10,
+        checked_at=(NOW + timedelta(minutes=30)).isoformat(),
+    )
+
+    plan = reduce_account_reconciliation(
+        _snapshot(orders=(working,)),
+        AccountLocalState(execution_orders=(order,)),
+    )
+
+    assert plan.order_updates == ()
+
+
+def test_unchanged_working_order_refreshes_audit_after_coalescing_window():
+    prior = NOW.isoformat()
+    order = _order(last_broker_seen_at=prior, last_reconciled_at=prior)
+    working = BrokerOrderStatusSnapshot(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        broker_order_id="B-1",
+        side=OrderSide.BUY,
+        status=OrderStatus.WORKING,
+        quantity_requested=10,
+        remaining_quantity=10,
+        checked_at=(NOW + timedelta(hours=1)).isoformat(),
+    )
+
+    plan = reduce_account_reconciliation(
+        _snapshot(orders=(working,)),
+        AccountLocalState(execution_orders=(order,)),
+    )
+
+    assert plan.order_updates[0].last_reconciled_at == working.checked_at
+
+
+def test_fill_transition_persists_immediately_inside_audit_window():
+    prior = NOW.isoformat()
+    order = _order(last_broker_seen_at=prior, last_reconciled_at=prior)
+    filled = BrokerOrderStatusSnapshot(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        broker_order_id="B-1",
+        side=OrderSide.BUY,
+        status=OrderStatus.FILLED,
+        quantity_requested=10,
+        filled_quantity=10,
+        remaining_quantity=0,
+        checked_at=(NOW + timedelta(seconds=10)).isoformat(),
+    )
+
+    plan = reduce_account_reconciliation(
+        _snapshot(orders=(filled,)),
+        AccountLocalState(execution_orders=(order,)),
+    )
+
+    assert plan.order_updates[0].status == ExecutionOrderStatus.FILLED
+    assert plan.order_updates[0].last_reconciled_at == filled.checked_at
+
+
+def test_unchanged_terminal_order_is_not_rewritten_for_audit_time_only():
+    prior = NOW.isoformat()
+    order = _order(
+        status=ExecutionOrderStatus.FILLED,
+        filled_quantity=10,
+        remaining_quantity=0,
+        last_broker_seen_at=prior,
+        last_reconciled_at=prior,
+    )
+    filled = BrokerOrderStatusSnapshot(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        broker_order_id="B-1",
+        side=OrderSide.BUY,
+        status=OrderStatus.FILLED,
+        quantity_requested=10,
+        filled_quantity=10,
+        remaining_quantity=0,
+        checked_at=(NOW + timedelta(days=1)).isoformat(),
+    )
+
+    plan = reduce_account_reconciliation(
+        _snapshot(orders=(filled,)),
+        AccountLocalState(execution_orders=(order,)),
+    )
+
+    assert plan.order_updates == ()
+
+
 def test_incomplete_order_discovery_never_resolves_a_missing_order():
     card = _card()
     order = _order()

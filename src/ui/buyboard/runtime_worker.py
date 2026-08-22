@@ -557,6 +557,23 @@ class BuyboardRuntimeWorker(QThread):
             return self._database_writable
         self._last_database_probe_at = now
 
+        # A successful runtime-state heartbeat is a stronger real write-path
+        # proof than ``UPDATE ... WHERE 1 = 0``.  Reuse that recent evidence
+        # during normal ACTIVE/STANDBY_READY operation; the no-op transaction
+        # remains for startup, recovery, and any worker that has not published
+        # readiness recently.  Every actual order mutation still performs its
+        # own authoritative transaction and lease checks.
+        last_state_write = self._last_device_state_published_at
+        if (
+            not force
+            and self._database_writable
+            and last_state_write is not None
+            and 0.0 <= (now - last_state_write).total_seconds()
+            < execution_config.COORDINATION_DATABASE_PROBE_SECONDS
+        ):
+            self._database_probe_completed = True
+            return True
+
         had_prior_probe = self._database_probe_completed
         was_writable = self._database_writable
         self._database_probe_completed = True
