@@ -113,6 +113,10 @@ from src.services.discovered_external_order_repository import (
     require_no_active_unowned_external_order,
 )
 from src.services.mutation_budget_protocol import CommandType, MutationBudgetProtocol
+from src.risk.pre_trade import (
+    PreTradeRiskRejectedError,
+    require_pre_trade_risk_approval,
+)
 from src.services.kis_request_boundary import (
     install_process_kis_request_scheduler,
     kis_request_scope,
@@ -739,6 +743,21 @@ class ExecutionCommandGateway:
                     f"new_client_order_id={request.new_client_order_id!r} already exists -- a replacement "
                     "must use a fresh identity, never reuse an existing order's"
                 )
+            if original.side == OrderSide.BUY and original.intent == OrderIntent.ENTRY:
+                require_pre_trade_risk_approval(
+                    request.pre_trade_risk_decision,
+                    environment=original.environment,
+                    account_no=original.account_no,
+                    symbol=original.symbol,
+                    side=original.side,
+                    intent=original.intent,
+                    quantity=new_quantity,
+                    reference_price=new_limit_price,
+                    exchange=original.exchange,
+                    execution_policy=original.execution_policy,
+                    strategy_id=request.risk_strategy_id,
+                    plan_id=request.risk_plan_id,
+                )
 
             # 2. verify replace ownership/permission.
             self._require_ownership(
@@ -844,6 +863,9 @@ class ExecutionCommandGateway:
                 attempt_group_id=cancelled.attempt_group_id, attempt_number=cancelled.attempt_number + 1,
                 lease=request.lease, source=request.source, strategy_instance_id=request.strategy_instance_id,
                 replaces_execution_order_id=request.client_order_id,
+                pre_trade_risk_decision=request.pre_trade_risk_decision,
+                risk_strategy_id=request.risk_strategy_id,
+                risk_plan_id=request.risk_plan_id,
             )
             result = self._do_submit(submit_request)
 
@@ -1569,6 +1591,27 @@ class ExecutionCommandGateway:
             if not math.isfinite(limit_price) or limit_price <= 0:
                 raise ValueError(f"limit_price must be positive and finite, got {limit_price}")
 
+        def require_current_entry_risk_approval() -> None:
+            if request.side != OrderSide.BUY or request.intent != OrderIntent.ENTRY:
+                return
+            require_pre_trade_risk_approval(
+                request.pre_trade_risk_decision,
+                environment=environment,
+                account_no=account_no,
+                symbol=symbol,
+                side=request.side,
+                intent=request.intent,
+                quantity=quantity,
+                reference_price=limit_price,
+                exchange=request.exchange,
+                execution_policy=request.execution_policy,
+                strategy_id=request.risk_strategy_id,
+                plan_id=request.risk_plan_id,
+            )
+
+        # Approval must be valid before any command or capital row is written.
+        require_current_entry_risk_approval()
+
         # 4. caller-stable idempotency key -- never generated in here.
         client_order_id = request.client_order_id
         if not client_order_id:
@@ -1658,6 +1701,9 @@ class ExecutionCommandGateway:
                 request.strategy_instance_id,
             )
             self._require_verified_lease(request.lease)
+            # Recheck at the last possible moment because lease/database work
+            # above may consume most of the approval's short TTL.
+            require_current_entry_risk_approval()
             with coordination_read_connection(engine) as conn:
                 require_no_active_unowned_external_order(
                     conn,
@@ -1669,6 +1715,7 @@ class ExecutionCommandGateway:
             ExecutionOwnershipMismatchError,
             LeaseNotVerifiedError,
             ActiveExternalOrderFenceError,
+            PreTradeRiskRejectedError,
         ) as gate_error:
             # The broker boundary has definitely not been entered. Retire
             # every A1 artifact atomically so a final-gate race cannot look

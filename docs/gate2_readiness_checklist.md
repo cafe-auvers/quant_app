@@ -2,10 +2,13 @@
 
 Current disposition: **NOT READY / DO NOT START THE SOAK**
 
-Gate-1-certified baseline: `master@b9895a9ac387331eaf3782a7ca439d8b4838a08e`.
+Gate-1-certified safety-backup baseline:
+`master@b0422e7a92d8324e73469d286d2710ef32776ffc` (local tag
+`safety-backup-20260823`; 676 Gate-1 tests passed on that exact commit).
 Any later code change requires a new exact-head Gate-1 report before Gate 2.
 Gate 2 validates live market data only; it does not authorize broker
-mutations, the Kanban runtime, shadow execution, or live trading.
+mutations, shadow execution, or live trading. The guarded Kanban runtime may
+remain available because its live-execution envelope stays disabled.
 
 A separately approved supervised controlled-live pilot has its own stricter
 risk envelope and does not make this checklist pass. See
@@ -67,7 +70,7 @@ runtime commit through `KIS_CAPABILITY_MANIFEST_*` / `KIS_RUNTIME_COMMIT_SHA`.
 
 ```text
 TRADING_ENABLED=false
-BUYBOARD_ENGINE_ENABLED=false
+BUYBOARD_ENGINE_ENABLED=true
 KIS_WS_ENABLED=true
 KIS_WS_PROTOCOL_VERIFIED=true
 KIS_MUTATION_BUDGET_VERIFIED=false

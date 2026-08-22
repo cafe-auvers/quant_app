@@ -16,6 +16,7 @@ from src.core.execution_mode import ExecutionLease, ExecutionSource
 from src.core.execution_order_record import ExecutionOrderStatus
 from src.core.execution_result import UnifiedExecutionStatus
 from src.core.order_state import OrderIntent, OrderSide
+from src.risk.pre_trade import PreTradeRiskDecision
 from src.services import execution_workflow_service as workflow
 from src.services.execution_command_gateway import ExecutionCommandGateway
 from src.services.execution_command_repository import DuplicateCommandError
@@ -67,12 +68,35 @@ def _guarded_gateway(tmp_path, broker=None):
 LEASE = ExecutionLease(device_id="dev-1", lease_token="tok-1", lease_epoch=1)
 
 
+def _request_submit(**kwargs):
+    risk_strategy_id = "ORB"
+    risk_plan_id = f"TEST:ORB:{kwargs['symbol']}"
+    return workflow.request_submit(
+        **kwargs,
+        pre_trade_risk_decision=PreTradeRiskDecision.approve(
+            environment=kwargs["environment"],
+            account_no=kwargs["account_no"],
+            symbol=kwargs["symbol"],
+            side=kwargs["side"],
+            intent=kwargs["intent"],
+            quantity=kwargs["quantity"],
+            reference_price=kwargs["limit_price"],
+            exchange=kwargs.get("exchange", "NASD"),
+            execution_policy=kwargs.get("execution_policy", "REGULAR_LIMIT"),
+            strategy_id=risk_strategy_id,
+            plan_id=risk_plan_id,
+        ),
+        strategy_id=risk_strategy_id,
+        plan_id=risk_plan_id,
+    )
+
+
 @pytest.mark.usefixtures("trading_enabled")
 def test_request_submit_through_the_real_workflow_reaches_acknowledged(tmp_path):
     gateway, broker, engine = _guarded_gateway(tmp_path)
     broker.queue_acceptance(broker_order_id="B-1")
 
-    record = workflow.request_submit(
+    record = _request_submit(
         source=ExecutionSource.KANBAN_BOARD, environment="PROD", account_no="12345678-01", symbol="AAPL",
         side=OrderSide.BUY, intent=OrderIntent.ENTRY, quantity=10, limit_price=100.0,
         gateway=gateway, client_order_id="WF-CID-1", lease=LEASE, strategy_instance_id="test",
@@ -88,7 +112,7 @@ def test_request_submit_through_the_real_workflow_reaches_acknowledged(tmp_path)
 def test_request_submit_then_request_cancel_using_the_same_client_order_id_reaches_cancelled(tmp_path):
     gateway, broker, engine = _guarded_gateway(tmp_path)
     broker.queue_acceptance(broker_order_id="B-1")
-    workflow.request_submit(
+    _request_submit(
         source=ExecutionSource.KANBAN_BOARD, environment="PROD", account_no="12345678-01", symbol="AAPL",
         side=OrderSide.BUY, intent=OrderIntent.ENTRY, quantity=10, limit_price=100.0,
         gateway=gateway, client_order_id="WF-CID-2", lease=LEASE, strategy_instance_id="test",
@@ -109,7 +133,7 @@ def test_request_submit_then_request_cancel_using_the_same_client_order_id_reach
 def test_request_replace_preserves_the_original_and_creates_a_linked_replacement(tmp_path):
     gateway, broker, engine = _guarded_gateway(tmp_path)
     broker.queue_acceptance(broker_order_id="B-1")
-    workflow.request_submit(
+    _request_submit(
         source=ExecutionSource.KANBAN_BOARD, environment="PROD", account_no="12345678-01", symbol="AAPL",
         side=OrderSide.BUY, intent=OrderIntent.ENTRY, quantity=10, limit_price=100.0,
         gateway=gateway, client_order_id="WF-CID-3", lease=LEASE, strategy_instance_id="test",
@@ -121,6 +145,21 @@ def test_request_replace_preserves_the_original_and_creates_a_linked_replacement
         source=ExecutionSource.KANBAN_BOARD, client_order_id="WF-CID-3", new_quantity=5,
         new_limit_price=101.0, gateway=gateway, environment="PROD", account_no="12345678-01", lease=LEASE,
         new_client_order_id="WF-CID-3-REPLACEMENT", strategy_instance_id="test",
+        pre_trade_risk_decision=PreTradeRiskDecision.approve(
+            environment="PROD",
+            account_no="12345678-01",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            intent=OrderIntent.ENTRY,
+            quantity=5,
+            reference_price=101.0,
+            exchange="NASD",
+            execution_policy="REGULAR_LIMIT",
+            strategy_id="ORB",
+            plan_id="TEST:ORB:AAPL:REPLACE",
+        ),
+        risk_strategy_id="ORB",
+        risk_plan_id="TEST:ORB:AAPL:REPLACE",
     )
     assert replacement.status == ExecutionOrderStatus.ACKNOWLEDGED
     assert replacement.replaces_execution_order_id == "WF-CID-3"
@@ -166,7 +205,7 @@ def test_restart_idempotency_through_the_workflow_layers_own_stable_identity(tmp
     from src.services.execution_command_gateway import GuardedSubmissionAmbiguousError
 
     with pytest.raises(GuardedSubmissionAmbiguousError):
-        workflow.request_submit(
+        _request_submit(
             source=ExecutionSource.KANBAN_BOARD, environment="PROD", account_no="12345678-01", symbol="AAPL",
             side=OrderSide.BUY, intent=OrderIntent.ENTRY, quantity=10, limit_price=100.0,
             gateway=first_gateway, client_order_id="RESTART-STABLE-ID", lease=LEASE, strategy_instance_id="test",
@@ -184,7 +223,7 @@ def test_restart_idempotency_through_the_workflow_layers_own_stable_identity(tmp
         buying_power_provider=lambda environment, account_no: 100_000.0,
     )
     with pytest.raises(DuplicateCommandError):
-        workflow.request_submit(
+        _request_submit(
             source=ExecutionSource.KANBAN_BOARD, environment="PROD", account_no="12345678-01", symbol="AAPL",
             side=OrderSide.BUY, intent=OrderIntent.ENTRY, quantity=10, limit_price=100.0,
             gateway=second_gateway, client_order_id="RESTART-STABLE-ID", lease=LEASE, strategy_instance_id="test",
@@ -200,12 +239,12 @@ def test_request_submit_without_a_client_order_id_mints_a_fresh_one_each_call(tm
     broker.queue_acceptance(broker_order_id="B-1")
     broker.queue_acceptance(broker_order_id="B-2")
 
-    first = workflow.request_submit(
+    first = _request_submit(
         source=ExecutionSource.KANBAN_BOARD, environment="PROD", account_no="12345678-01",
         symbol="AAPL", side=OrderSide.BUY, intent=OrderIntent.ENTRY, quantity=10, limit_price=100.0,
         gateway=gateway, lease=LEASE, strategy_instance_id="test",
     )
-    second = workflow.request_submit(
+    second = _request_submit(
         source=ExecutionSource.KANBAN_BOARD, environment="PROD", account_no="12345678-01",
         symbol="MSFT", side=OrderSide.BUY, intent=OrderIntent.ENTRY, quantity=5, limit_price=50.0,
         gateway=gateway, lease=LEASE, strategy_instance_id="test",
@@ -217,7 +256,7 @@ def test_request_submit_without_a_client_order_id_mints_a_fresh_one_each_call(tm
 def test_request_cancel_without_a_cancel_command_id_mints_a_fresh_one(tmp_path):
     gateway, broker, engine = _guarded_gateway(tmp_path)
     broker.queue_acceptance(broker_order_id="B-1")
-    workflow.request_submit(
+    _request_submit(
         source=ExecutionSource.KANBAN_BOARD, environment="PROD", account_no="12345678-01", symbol="AAPL",
         side=OrderSide.BUY, intent=OrderIntent.ENTRY, quantity=10, limit_price=100.0,
         gateway=gateway, client_order_id="WF-CID-4", lease=LEASE, strategy_instance_id="test",

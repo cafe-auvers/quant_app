@@ -31,14 +31,21 @@ def _mode() -> str:
 def require_controlled_live_configuration(
     *, environment: str, scheduler: Any | None = None
 ) -> None:
-    """Validate the production pilot fence before the active worker starts."""
+    """Validate the production envelope before the active worker starts.
+
+    ``DISABLED`` is a valid engine-running state. It keeps Kanban,
+    reconciliation, and position monitoring available while
+    :func:`require_live_mutation_allowed` rejects every real broker mutation.
+    """
 
     if str(environment or "").strip().upper() != "PROD":
         return
     mode = _mode()
+    if mode == DISABLED:
+        return
     if mode not in {CONTROLLED_LIVE, FULL_LIVE}:
         raise LiveExecutionEnvelopeError(
-            "KIS_LIVE_EXECUTION_MODE must be CONTROLLED_LIVE or FULL_LIVE"
+            "KIS_LIVE_EXECUTION_MODE must be DISABLED, CONTROLLED_LIVE, or FULL_LIVE"
         )
     if not execution_config.KIS_MUTATION_BUDGET_VERIFIED or any(
         int(value) <= 0
@@ -96,6 +103,24 @@ def require_controlled_live_configuration(
             )
 
 
+def require_live_mutation_allowed(
+    *, environment: str, action: str
+) -> None:
+    """Reject every real production mutation while the envelope is disabled."""
+
+    if str(environment or "").strip().upper() != "PROD":
+        return
+    if not execution_config.is_buyboard_engine_enabled():
+        # Recovery-only legacy compatibility retains its existing fences.
+        return
+    mode = _mode()
+    if mode == DISABLED:
+        raise LiveExecutionEnvelopeError(
+            f"KIS live execution is DISABLED; refused production {action}"
+        )
+    require_controlled_live_configuration(environment=environment)
+
+
 def require_live_entry_allowed(
     *,
     environment: str,
@@ -115,7 +140,7 @@ def require_live_entry_allowed(
         return
     if not execution_config.is_buyboard_engine_enabled():
         return
-    require_controlled_live_configuration(environment=environment)
+    require_live_mutation_allowed(environment=environment, action="order submission")
     normalized_side = side if isinstance(side, OrderSide) else OrderSide(str(side).upper())
     if normalized_side != OrderSide.BUY or _mode() == FULL_LIVE:
         return

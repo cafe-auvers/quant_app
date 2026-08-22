@@ -14,7 +14,7 @@ WS0 execution qualification and the later gates complete, all execution and
 mutation settings remain disabled:
 
 - `TRADING_ENABLED=false`
-- `BUYBOARD_ENGINE_ENABLED=false`
+- `BUYBOARD_ENGINE_ENABLED=true` (runtime available; not mutation authority)
 - `KIS_WS_ENABLED=false`
 - `KIS_WS_PROTOCOL_VERIFIED=false`
 - `KIS_MUTATION_BUDGET_VERIFIED=false`

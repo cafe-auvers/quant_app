@@ -28,7 +28,12 @@ from src.api.kis_ws_auth import KisWsApprovalKeyProvider, KisWsAuthError
 
 logger = logging.getLogger(__name__)
 
-_EVENT_LOOP_START_ATTEMPTS = 3
+# Busy Windows hosts can report WinError 10014 for several consecutive
+# loopback socketpair attempts during startup (observed in the full 2,500+
+# test run even after three retries).  Bound the retry window, but make it
+# long enough to ride out that transient without dropping the market-data
+# worker while the operator is away.
+_EVENT_LOOP_START_ATTEMPTS = 8
 _EVENT_LOOP_RETRY_SECONDS = 0.25
 
 

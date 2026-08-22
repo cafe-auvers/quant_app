@@ -49,6 +49,7 @@ from src.core.trade_card_state import (
     StopType,
     TradeCardState,
 )
+from src.risk.pre_trade import PreTradeRiskDecision
 from src.services import state_sync
 from src.services import buyboard_runtime
 from src.services import execution_workflow_service as workflow
@@ -232,7 +233,7 @@ def _request(
     emergency=True,
     attempt_group_id="gate1-exit",
 ):
-    return SubmitExecutionRequest(
+    fields = dict(
         client_order_id=client_order_id,
         environment=ENVIRONMENT,
         account_no=ACCOUNT,
@@ -248,6 +249,26 @@ def _request(
         attempt_group_id=attempt_group_id,
         attempt_number=1,
     )
+    if side == OrderSide.BUY and intent == OrderIntent.ENTRY:
+        risk_plan_id = f"GATE1:CAPSTONE:{SYMBOL}"
+        fields.update(
+            pre_trade_risk_decision=PreTradeRiskDecision.approve(
+                environment=ENVIRONMENT,
+                account_no=ACCOUNT,
+                symbol=SYMBOL,
+                side=side,
+                intent=intent,
+                quantity=quantity,
+                reference_price=limit_price,
+                exchange="NASD",
+                execution_policy="REGULAR_LIMIT",
+                strategy_id="ORB",
+                plan_id=risk_plan_id,
+            ),
+            risk_strategy_id="ORB",
+            risk_plan_id=risk_plan_id,
+        )
+    return SubmitExecutionRequest(**fields)
 
 
 def _lease(main_device) -> ExecutionLease:

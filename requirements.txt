@@ -9,6 +9,6 @@ SQLAlchemy>=2.0.43,<2.1
 PyMySQL>=1.2.0,<2
 python-dotenv>=0.21.0,<2
 cryptography>=50.0.0,<51
-websockets==15.0.1
+websockets==17.0.1
 pytest>=9.0.3,<10
 tzdata>=2023.3

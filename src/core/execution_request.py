@@ -22,7 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import re
-from typing import Optional
+from typing import Any, Optional
 
 from src.core.execution_mode import ExecutionSource
 from src.core.order_state import REGULAR_LIMIT_EXECUTION, OrderIntent, OrderSide
@@ -180,6 +180,13 @@ class SubmitExecutionRequest:
     # a different one (review finding 3, third pass).
     strategy_instance_id: str = ""
     emergency: bool = False
+    # Exposure-increasing BUY/ENTRY requests carry the immutable, short-lived
+    # approval plus the exact strategy/plan identity it was built against.
+    # ``Any`` avoids a core -> risk -> core import cycle; the guarded gateway
+    # performs the strict runtime type/fingerprint validation.
+    pre_trade_risk_decision: Any = None
+    risk_strategy_id: str = ""
+    risk_plan_id: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "client_order_id", str(self.client_order_id or "").strip())
@@ -188,6 +195,8 @@ class SubmitExecutionRequest:
         object.__setattr__(self, "symbol", str(self.symbol or "").upper())
         object.__setattr__(self, "strategy_instance_id", str(self.strategy_instance_id or ""))
         object.__setattr__(self, "emergency", bool(self.emergency))
+        object.__setattr__(self, "risk_strategy_id", str(self.risk_strategy_id or ""))
+        object.__setattr__(self, "risk_plan_id", str(self.risk_plan_id or ""))
 
 
 @dataclass(frozen=True)
@@ -256,6 +265,9 @@ class ReplaceExecutionRequest:
     lease: Optional[ExecutionLease] = None
     source: ExecutionSource = ExecutionSource.SYSTEM
     strategy_instance_id: str = ""
+    pre_trade_risk_decision: Any = None
+    risk_strategy_id: str = ""
+    risk_plan_id: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "client_order_id", str(self.client_order_id or "").strip())
@@ -264,3 +276,5 @@ class ReplaceExecutionRequest:
         object.__setattr__(self, "environment", str(self.environment or "").upper())
         object.__setattr__(self, "account_no", str(self.account_no or ""))
         object.__setattr__(self, "strategy_instance_id", str(self.strategy_instance_id or ""))
+        object.__setattr__(self, "risk_strategy_id", str(self.risk_strategy_id or ""))
+        object.__setattr__(self, "risk_plan_id", str(self.risk_plan_id or ""))

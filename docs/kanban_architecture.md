@@ -517,7 +517,11 @@ Shutdown is ordered: close command acceptance, flush journals, perform final rea
 
 ## Activation and Operational Gates
 
-The board tab and projections can exist while execution is disabled. `BUYBOARD_ENGINE_ENABLED` defaults to false and only selects the guarded runtime mode; it does not satisfy the other gates.
+The guarded board runtime defaults on so Kanban lifecycle monitoring and
+protection remain available. `BUYBOARD_ENGINE_ENABLED` selects that runtime;
+it does not satisfy or bypass any broker-mutation gate. Set
+`KIS_LIVE_EXECUTION_MODE=DISABLED` to keep the engine running while all real
+production submit/sell/cancel calls are rejected at the broker boundary.
 
 Production mutation additionally depends on, among other configuration and runtime evidence:
 
@@ -531,7 +535,10 @@ Production mutation additionally depends on, among other configuration and runti
 - writable canonical storage, with only the documented protective outage exception; and
 - external critical-alert/heartbeat delivery for unattended operation.
 
-Keep the engine disabled until the evidence and operational steps in [kanban_production_readiness.md](kanban_production_readiness.md) and the [controlled-live pilot runbook](controlled_live_pilot_runbook.md) are complete.
+Keep the engine available, but keep the live-execution envelope disabled until
+the evidence and operational steps in
+[kanban_production_readiness.md](kanban_production_readiness.md) and the
+[controlled-live pilot runbook](controlled_live_pilot_runbook.md) are complete.
 
 ## Module Map
 

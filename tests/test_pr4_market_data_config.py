@@ -147,10 +147,10 @@ def test_pr4_market_data_configuration_is_present_and_fail_closed():
         "KIS_LIVE_EXECUTION_MODE=DISABLED",
         "KIS_MUTATION_MIN_SPACING_SECONDS=0.2",
         "KIS_MUTATION_MAX_CONFIRMED_ATTEMPTS=1",
-        "BUYBOARD_ENGINE_ENABLED=false",
+        "BUYBOARD_ENGINE_ENABLED=true",
     ):
         assert name in env_example
-    assert "websockets==15.0.1" in requirements
+    assert "websockets==17.0.1" in requirements
 
 
 def test_early_close_is_used_for_market_session_decisions():
@@ -336,7 +336,10 @@ def test_ws0_credentialed_capacity_evidence_matches_fail_closed_runtime_contract
     assert not simulated_rejection["submit"]["accepted"]
     assert simulated_rejection["open_order_check"]["matching_probe_order_count"] == 0
     assert simulated_rejection["safety"]["production_endpoints_called"] == 0
-    assert execution_config.KIS_WS_TOTAL_SUBSCRIPTION_CAPACITY == 0
+    # The developer deployment may already carry the reviewed 41-slot
+    # capacity.  This evidence test must not depend on local .env state; the
+    # fail-closed repository default is asserted separately below.
+    assert capacity["accepted_registrations"] == 41
 
 
 def test_ws0_committed_evidence_contains_no_credential_or_account_material():
@@ -428,7 +431,7 @@ def _passing_gate2_evidence() -> Gate2Evidence:
         verified_subscription_keys={"AAPL": "DNASAAPL"},
         activation_snapshot={
             "TRADING_ENABLED": False,
-            "BUYBOARD_ENGINE_ENABLED": False,
+            "BUYBOARD_ENGINE_ENABLED": True,
             "KIS_WS_ENABLED": True,
             "KIS_WS_PROTOCOL_VERIFIED": True,
             "KIS_MUTATION_BUDGET_VERIFIED": False,

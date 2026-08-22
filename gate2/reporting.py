@@ -57,7 +57,7 @@ from gate2.capabilities import (
 KST_ZONE = ZoneInfo("Asia/Seoul")
 SAFE_RUNTIME_EXPECTATIONS = {
     "TRADING_ENABLED": False,
-    "BUYBOARD_ENGINE_ENABLED": False,
+    "BUYBOARD_ENGINE_ENABLED": True,
     "KIS_WS_ENABLED": True,
     "KIS_WS_PROTOCOL_VERIFIED": True,
     "KIS_MUTATION_BUDGET_VERIFIED": False,

@@ -107,7 +107,7 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from time import monotonic
 from typing import Any, Callable, Optional
@@ -137,6 +137,13 @@ from src.core.order_state import (
 )
 from src.core.trade_card_state import TradeCardState
 from src.risk.orb_position import calculate_orb_position_values, is_orb_position_plan_valid
+from src.risk.portfolio import (
+    PortfolioPositionRisk,
+    PortfolioRiskLimits,
+    PortfolioRiskManager,
+    PortfolioRiskSnapshot,
+    ProposedPortfolioEntry,
+)
 from src.risk.pre_trade import PreTradeRiskDecision
 from src.services import capital_allocator
 from src.services import order_ledger
@@ -458,6 +465,78 @@ def _revalidate_and_approve(
     )
 
 
+def _default_portfolio_risk_manager() -> PortfolioRiskManager:
+    return PortfolioRiskManager(
+        PortfolioRiskLimits(
+            max_simultaneous_positions=(
+                execution_config.PORTFOLIO_MAX_SIMULTANEOUS_POSITIONS
+            ),
+            max_total_open_risk_fraction=(
+                execution_config.PORTFOLIO_MAX_TOTAL_OPEN_RISK_FRACTION
+            ),
+            max_gross_notional_fraction=(
+                execution_config.PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION
+            ),
+            max_incremental_buying_power_fraction=(
+                execution_config.PORTFOLIO_MAX_INCREMENTAL_BUYING_POWER_FRACTION
+            ),
+            max_daily_loss_fraction=(
+                execution_config.PORTFOLIO_MAX_DAILY_LOSS_FRACTION
+            ),
+            max_drawdown_fraction=(
+                execution_config.PORTFOLIO_MAX_DRAWDOWN_FRACTION
+            ),
+            max_sector_notional_fraction=(
+                execution_config.PORTFOLIO_MAX_SECTOR_NOTIONAL_FRACTION
+            ),
+            max_industry_notional_fraction=(
+                execution_config.PORTFOLIO_MAX_INDUSTRY_NOTIONAL_FRACTION
+            ),
+            max_correlation_group_notional_fraction=(
+                execution_config.PORTFOLIO_MAX_CORRELATION_GROUP_NOTIONAL_FRACTION
+            ),
+            max_strategy_notional_fraction=(
+                execution_config.PORTFOLIO_MAX_STRATEGY_NOTIONAL_FRACTION
+            ),
+            max_fx_age=timedelta(
+                seconds=execution_config.PORTFOLIO_MAX_FX_AGE_SECONDS
+            ),
+        )
+    )
+
+
+def _portfolio_position_from_card(
+    card: TradeCardState,
+) -> Optional[PortfolioPositionRisk]:
+    quantity = max(0, int(card.broker_quantity or 0))
+    if quantity <= 0:
+        return None
+    prices = []
+    for value in (
+        card.market_data_last_trusted_price,
+        card.average_entry_price,
+        card.active_stop_price,
+    ):
+        try:
+            price = float(value or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(price) and price > 0:
+            prices.append(price)
+    if not prices:
+        raise ValueError(f"Open position {card.symbol} has no usable valuation price")
+    stop_price = float(card.active_stop_price or 0.0)
+    if not math.isfinite(stop_price) or stop_price < 0:
+        raise ValueError(f"Open position {card.symbol} has an invalid stop price")
+    return PortfolioPositionRisk(
+        symbol=card.symbol,
+        quantity=quantity,
+        mark_price=max(prices),
+        stop_price=stop_price,
+        strategy_id=RISK_STRATEGY_ID,
+    )
+
+
 @dataclass
 class BuyboardRuntime:
     """Holds the fully-wired engine + the card lookup this process needs to
@@ -482,6 +561,10 @@ def build_buyboard_runtime(
     buying_power_provider: Callable[[str, str], float],
     card_lookup: Callable[[str, str, str], Optional[TradeCardState]],
     account_equity_provider: Optional[Callable[[str, str], float]] = None,
+    portfolio_cards_provider: Optional[
+        Callable[[str, str], list[TradeCardState]]
+    ] = None,
+    portfolio_risk_manager: Optional[PortfolioRiskManager] = None,
     capital_reservation_engine: Optional[Engine] = None,
     execution_authority: Optional[ExecutionAuthority] = None,
     execution_lease: Optional[Any] = None,
@@ -519,6 +602,12 @@ def build_buyboard_runtime(
     legacy Buy Dashboard's own ORB sizing
     (``src.ui.mixins.dashboard_mixin``'s ``manual_account_sizes``) already
     uses one manually-maintained figure for both today.
+
+    ``portfolio_cards_provider`` supplies the canonical account-wide card set
+    for aggregate entry risk. The production worker always provides it from
+    MySQL. Direct test/legacy compositions may omit it and still exercise the
+    manager against the current card; no SELL, cancel, or recovery action uses
+    this entry-only governor.
 
     ``capital_reservation_engine``, when supplied, makes capital
     reservations visible across devices (review finding P1-1) -- threaded
@@ -589,6 +678,9 @@ def build_buyboard_runtime(
     guarded_lease = execution_lease if isinstance(execution_lease, ExecutionLease) else None
     legacy_lease = execution_lease if isinstance(execution_lease, LeaseHandle) else None
     resolved_equity_provider = account_equity_provider or buying_power_provider
+    resolved_portfolio_risk_manager = (
+        portfolio_risk_manager or _default_portfolio_risk_manager()
+    )
     guarded_record_cache: Dict[str, ExecutionOrderRecord] = {}
     guarded_record_cached_at: dict[str, float] = {}
     guarded_card_record_cache: dict[
@@ -836,6 +928,67 @@ def build_buyboard_runtime(
             if card is not None
             else None
         )
+        if card is not None and kwargs.get("intent") == OrderIntent.ENTRY:
+            portfolio_reasons: list[str] = []
+            try:
+                portfolio_cards = (
+                    portfolio_cards_provider(environment, account_no)
+                    if portfolio_cards_provider is not None
+                    else [card]
+                )
+                positions = tuple(
+                    position
+                    for portfolio_card in portfolio_cards
+                    if (
+                        portfolio_card.environment == str(environment).upper()
+                        and portfolio_card.account_no == str(account_no)
+                    )
+                    for position in [_portfolio_position_from_card(portfolio_card)]
+                    if position is not None
+                )
+                try:
+                    usable_buying_power = float(
+                        buying_power_provider(environment, account_no)
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    usable_buying_power = 0.0
+                if (
+                    not math.isfinite(usable_buying_power)
+                    or usable_buying_power <= 0
+                ):
+                    usable_buying_power = 0.0
+                portfolio_decision = resolved_portfolio_risk_manager.evaluate_entry(
+                    ProposedPortfolioEntry(
+                        symbol=symbol,
+                        quantity=quantity,
+                        reference_price=limit_price,
+                        stop_price=float(card.entry_orb_low or 0.0),
+                        strategy_id=RISK_STRATEGY_ID,
+                    ),
+                    PortfolioRiskSnapshot(
+                        account_equity_usd=account_equity,
+                        usable_buying_power_usd=usable_buying_power,
+                        positions=positions,
+                        evaluated_at=datetime.now(timezone.utc),
+                    ),
+                )
+                portfolio_reasons.extend(portfolio_decision.reasons)
+            except Exception as exc:
+                logger.exception(
+                    "Portfolio risk snapshot failed for %s -- rejecting entry",
+                    symbol,
+                )
+                portfolio_reasons.append(
+                    f"Portfolio risk snapshot unavailable: {exc}"
+                )
+            if decision is not None and portfolio_reasons:
+                decision = replace(
+                    decision,
+                    approved=False,
+                    reasons=tuple(
+                        dict.fromkeys((*decision.reasons, *portfolio_reasons))
+                    ),
+                )
         plan_id = _entry_plan_id(card) if card is not None else f"{environment}:{symbol}"
         submit_kwargs = dict(kwargs)
         submit_kwargs["quantity"] = quantity

@@ -42,6 +42,7 @@ from src.core.trade_card_state import (
     PositionRuntimeStatus,
     TradeCardState,
 )
+from src.risk.pre_trade import PreTradeRiskDecision
 from src.services import buyboard_runtime, capital_reservation_repository
 from src.services import execution_command_gateway as gateway_module
 from src.services import trade_card_repository
@@ -57,6 +58,7 @@ from src.services.discovered_external_order_repository import (
 )
 from src.services.realtime_market_data import QuoteSnapshot, RestPollingMarketDataService
 from src.services import trading_engine as trading_engine_module
+from src.risk.portfolio import PortfolioRiskLimits, PortfolioRiskManager
 from src.services.account_reconciliation import (
     AccountLocalState,
     reduce_account_reconciliation,
@@ -110,6 +112,7 @@ def _make_runtime(
     database_writable_provider=None,
     emergency_journal=None,
     emergency_lease_allowance=None,
+    portfolio_risk_manager=None,
 ):
     _enable_guarded(monkeypatch)
     engine = create_engine(
@@ -146,6 +149,13 @@ def _make_runtime(
     runtime = buyboard_runtime.build_buyboard_runtime(
         buying_power_provider=lambda environment, account_no: buying_power,
         account_equity_provider=lambda environment, account_no: 100_000.0,
+        portfolio_cards_provider=lambda environment, account_no: trade_card_repository.list_trade_cards(
+            engine,
+            environment=environment,
+            account_no=account_no,
+            raise_on_error=True,
+        ),
+        portfolio_risk_manager=portfolio_risk_manager,
         card_lookup=lookup,
         broker=gateway,
         execution_lease=LEASE,
@@ -620,6 +630,41 @@ def test_insufficient_capital_rolls_back_the_atomic_submission(tmp_path, monkeyp
 
 
 @pytest.mark.usefixtures("trading_enabled")
+def test_canonical_portfolio_position_limit_rejects_entry_before_broker(
+    tmp_path, monkeypatch
+):
+    manager = PortfolioRiskManager(
+        PortfolioRiskLimits(max_simultaneous_positions=1)
+    )
+    runtime, broker, gateway, engine, market_data = _make_runtime(
+        tmp_path,
+        monkeypatch,
+        portfolio_risk_manager=manager,
+    )
+    entry = _persist_owned_card(engine, _card())
+    existing = _card(
+        symbol="MSFT",
+        board_status=BoardStatus.OPEN_POSITION,
+        entry_runtime_status=None,
+        broker_quantity=10,
+        orderable_quantity=10,
+        average_entry_price=100.0,
+        active_stop_price=90.0,
+    )
+    trade_card_repository.create_trade_card(engine, existing)
+    market_data.subscribe([entry.symbol])
+    market_data.poll_once()
+
+    runtime.trading_engine.run_heartbeat([entry, existing])
+
+    assert broker.submit_calls == []
+    assert capital_reservation_repository.list_active_reservations(
+        engine, environment="PROD", account_no="1"
+    ) == []
+    assert entry.entry_runtime_status == EntryRuntimeStatus.RETRY_COOLDOWN
+
+
+@pytest.mark.usefixtures("trading_enabled")
 def test_persisted_identity_survives_restart_and_unresolved_submit_is_not_retried(
     tmp_path, monkeypatch
 ):
@@ -758,8 +803,23 @@ def test_runtime_outage_cancels_completion_buy_then_submits_one_sell(
             attempt_number=1,
             lease=LEASE,
             source=ExecutionSource.KANBAN_BOARD,
-            strategy_instance_id=STRATEGY_ID,
-        )
+                strategy_instance_id=STRATEGY_ID,
+                pre_trade_risk_decision=PreTradeRiskDecision.approve(
+                    environment="PROD",
+                    account_no="1",
+                    symbol="AAPL",
+                    side=OrderSide.BUY,
+                    intent=OrderIntent.ENTRY,
+                    quantity=2,
+                    reference_price=100.0,
+                    exchange="NASD",
+                    execution_policy="REGULAR_LIMIT",
+                    strategy_id="ORB",
+                    plan_id="TEST:COMPLETION:AAPL",
+                ),
+                risk_strategy_id="ORB",
+                risk_plan_id="TEST:COMPLETION:AAPL",
+            )
     )
     assert runtime.trading_engine._entry_deadline_lookup.find_open_entry_order(card)
     market_data.subscribe([card.symbol])

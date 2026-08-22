@@ -37,6 +37,7 @@ from src.services import trading_state
 from src.services.controlled_live_policy import (
     LiveExecutionEnvelopeError,
     require_live_entry_allowed,
+    require_live_mutation_allowed,
 )
 from src.utils.config import get_env_value
 
@@ -271,7 +272,17 @@ class KisBroker:
     ) -> BrokerOrderStatusSnapshot:
         record_broker_mutation_attempt()
         # Gateway-only ownership correlation; never part of the KIS payload.
-        kwargs.pop("ownership_symbol", None)
+        ownership_symbol = str(
+            kwargs.pop("ownership_symbol", "") or kwargs.get("symbol") or ""
+        ).upper()
+        require_live_mutation_allowed(
+            environment=environment,
+            action=(
+                f"order cancellation for {ownership_symbol}"
+                if ownership_symbol
+                else "order cancellation"
+            ),
+        )
         if is_reserved:
             return kis_order.cancel_overseas_reserved_order(
                 environment=environment, account_no=account_no, **kwargs

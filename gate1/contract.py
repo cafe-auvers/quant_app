@@ -14,7 +14,10 @@ from typing import Mapping, Optional, Sequence
 
 ACTIVATION_DEFAULTS: Mapping[str, str] = {
     "TRADING_ENABLED": "false",
-    "BUYBOARD_ENGINE_ENABLED": "false",
+    # Engine availability is not broker-mutation authority.  Keeping the
+    # guarded runtime available lets reconciliation, monitoring, and Kanban
+    # state continue while the independent live envelope remains DISABLED.
+    "BUYBOARD_ENGINE_ENABLED": "true",
     "KIS_WS_ENABLED": "false",
     "KIS_WS_PROTOCOL_VERIFIED": "false",
     "KIS_MUTATION_BUDGET_VERIFIED": "false",

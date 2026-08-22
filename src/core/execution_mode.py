@@ -3,14 +3,10 @@ actually dispatches destructive broker calls to.
 
 ``docs/kanban_production_readiness.md``, Workstream 3 (PR2). The gateway is
 the *single* place a destructive broker mutation (submit/cancel/replace) can
-happen from (B1) -- but the frozen contract's own rule 4
-(``BUYBOARD_ENGINE_ENABLED`` stays ``false`` in production for the entire
-duration of this program) means the gateway must still exist, be the only
-door, and yet not change what actually happens at the broker while the flag
-is off. ``ExecutionMode`` is that split, made explicit rather than left as
-an unstated "``false`` means... what, exactly?":
+happen from (B1). ``ExecutionMode`` keeps the recovery-only legacy path
+explicit and separate from the normal guarded runtime:
 
-- ``LEGACY_COMPATIBILITY`` (the flag is off, i.e. always, for now): the
+- ``LEGACY_COMPATIBILITY`` (the flag is explicitly off): the
   gateway is a transparent pass-through to the real broker -- no new command
   journal, no new capital reservation, no new ``ExecutionOrderRecord``. The
   already-existing, already-reviewed legacy guard sequence
@@ -27,13 +23,13 @@ an unstated "``false`` means... what, exactly?":
   requirements for cancel/replace. Implemented and tested in PR2, but never
   selected in production by this PR (see the module's own activation
   criterion in the frozen contract) -- reaching this mode requires
-  ``BUYBOARD_ENGINE_ENABLED=true``, which stays false throughout this
-  program.
+  ``BUYBOARD_ENGINE_ENABLED=true``. The engine may remain available while
+  ``KIS_LIVE_EXECUTION_MODE=DISABLED`` independently blocks every real broker
+  mutation.
 
-Landing PR2's code on ``master`` is explicitly not equivalent to activating
-it (revision 3.3): every call into the gateway resolves to
-``LEGACY_COMPATIBILITY`` today, regardless of how much of ``GUARDED_ENGINE``
-exists and passes its own tests.
+Selecting guarded mode is explicitly not equivalent to arming trading. The
+shared trading switch and all live-envelope/runtime fences are rechecked at
+the broker boundary.
 """
 from __future__ import annotations
 

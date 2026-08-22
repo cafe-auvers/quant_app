@@ -23,6 +23,7 @@ from src.services.execution_ownership_repository import assign_ownership
 from src.services import trade_card_repository
 from src.services import trading_state
 from src.services.mutation_budget_protocol import AllowAllMutationBudget
+from src.risk.pre_trade import PreTradeRiskDecision
 
 
 def _request(lease: ExecutionLease, **overrides) -> SubmitExecutionRequest:
@@ -41,6 +42,26 @@ def _request(lease: ExecutionLease, **overrides) -> SubmitExecutionRequest:
         "emergency": True,
     }
     fields.update(overrides)
+    if (
+        fields["side"] == OrderSide.BUY
+        and fields["intent"] == OrderIntent.ENTRY
+        and fields.get("pre_trade_risk_decision") is None
+    ):
+        fields["risk_strategy_id"] = "ORB"
+        fields["risk_plan_id"] = "db-outage-test-plan"
+        fields["pre_trade_risk_decision"] = PreTradeRiskDecision.approve(
+            environment=fields["environment"],
+            account_no=fields["account_no"],
+            symbol=fields["symbol"],
+            side=fields["side"],
+            intent=fields["intent"],
+            quantity=fields["quantity"],
+            reference_price=fields["limit_price"],
+            exchange=fields.get("exchange", "NASD"),
+            execution_policy=fields.get("execution_policy", "REGULAR_LIMIT"),
+            strategy_id=fields["risk_strategy_id"],
+            plan_id=fields["risk_plan_id"],
+        )
     return SubmitExecutionRequest(**fields)
 
 

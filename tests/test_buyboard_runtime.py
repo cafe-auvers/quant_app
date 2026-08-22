@@ -224,6 +224,7 @@ def test_submit_callback_reaches_the_guarded_gateway_not_wrongmode(
     )
     runtime = runtime_module.build_buyboard_runtime(
         buying_power_provider=lambda env, acct: 100_000.0,
+        account_equity_provider=lambda env, acct: 10_000.0,
         card_lookup=lambda env, acct, sym: card,
         broker=guarded_gateway,
         strategy_instance_id="orb",
@@ -349,6 +350,7 @@ def test_guarded_runtime_consumes_upward_extreme_before_latest_trade(
     )
     runtime = runtime_module.build_buyboard_runtime(
         buying_power_provider=lambda *_: 100_000.0,
+        account_equity_provider=lambda *_: 10_000.0,
         card_lookup=lambda *_: card,
         capital_reservation_engine=database,
         broker=gateway,

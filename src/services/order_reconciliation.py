@@ -417,7 +417,7 @@ def cancel_and_reconcile_order(
     # gateway, not a raw KisBroker -- see order_execution_service.py's
     # identical change and src.core.execution_mode's module docstring for
     # why this changes nothing about the actual cancel behavior while
-    # BUYBOARD_ENGINE_ENABLED stays false.
+    # BUYBOARD_ENGINE_ENABLED is explicitly false in legacy recovery mode.
     broker = (
         get_legacy_execution_gateway(ownership_engine)
         if broker is None and ownership_engine is not None

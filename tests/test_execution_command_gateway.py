@@ -25,6 +25,7 @@ from src.core.discovered_external_order import (
 from src.core.execution_request import CancelExecutionRequest, ReplaceExecutionRequest, SubmitExecutionRequest
 from src.core.order_recovery_state import OrderRecoveryState
 from src.core.order_state import OrderIntent, OrderSide, OrderStatus
+from src.risk.pre_trade import PreTradeRiskDecision, PreTradeRiskRejectedError
 from src.services import execution_command_gateway as gw_module
 from src.services.execution_command_gateway import (
     AmbiguousPostBrokerPersistenceError,
@@ -65,6 +66,7 @@ from src.services.execution_lease_protocol import (
 from src.services import state_sync
 from src.services.execution_order_repository import (
     _get_execution_orders_table,
+    ensure_execution_orders_table,
     fetch_execution_order,
     record_execution_order,
     save_execution_order,
@@ -122,6 +124,25 @@ def _submit_request(**overrides):
         lease=lease, source=ExecutionSource.SYSTEM,
     )
     fields.update(overrides)
+    if fields["side"] == OrderSide.BUY and fields["intent"] == OrderIntent.ENTRY:
+        fields.setdefault("risk_strategy_id", "ORB")
+        fields.setdefault("risk_plan_id", "TEST:ORB:AAPL")
+        fields.setdefault(
+            "pre_trade_risk_decision",
+            PreTradeRiskDecision.approve(
+                environment=fields["environment"],
+                account_no=fields["account_no"],
+                symbol=fields["symbol"],
+                side=fields["side"],
+                intent=fields["intent"],
+                quantity=fields["quantity"],
+                reference_price=fields["limit_price"],
+                exchange=fields.get("exchange", "NASD"),
+                execution_policy=fields.get("execution_policy", "REGULAR_LIMIT"),
+                strategy_id=fields["risk_strategy_id"],
+                plan_id=fields["risk_plan_id"],
+            ),
+        )
     return SubmitExecutionRequest(**fields)
 
 
@@ -146,6 +167,58 @@ def _resolve_external_fence(engine, external_order):
     save_discovered_external_order(
         engine, external_order, expected_version=expected_version
     )
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_guarded_entry_requires_exact_pre_trade_approval_before_persistence(
+    tmp_path,
+):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+
+    with pytest.raises(PreTradeRiskRejectedError, match="explicit pre-trade"):
+        gateway.submit_guarded(
+            _submit_request(
+                pre_trade_risk_decision=None,
+                risk_strategy_id="",
+                risk_plan_id="",
+            )
+        )
+
+    assert broker.submit_calls == []
+    ensure_execution_orders_table(engine)
+    assert _all_order_rows(engine) == []
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_guarded_entry_rechecks_risk_immediately_before_broker_call(
+    tmp_path, monkeypatch
+):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    real_check = gw_module.require_pre_trade_risk_approval
+    checks = 0
+
+    def expire_on_final_check(*args, **kwargs):
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            raise PreTradeRiskRejectedError("approval expired at final fence")
+        return real_check(*args, **kwargs)
+
+    monkeypatch.setattr(
+        gw_module, "require_pre_trade_risk_approval", expire_on_final_check
+    )
+
+    with pytest.raises(
+        GuardedSubmissionPreBrokerAbortedError, match="expired at final fence"
+    ):
+        gateway.submit_guarded(_submit_request())
+
+    assert broker.submit_calls == []
+    record = fetch_execution_order(engine, "CID-1")
+    assert record.status == ExecutionOrderStatus.CANCELLED_LOCALLY
+    assert list_active_reservations(
+        engine, environment="PROD", account_no="12345678-01"
+    ) == []
 
 
 # --- mode selection / API split (findings 2) ---------------------------
@@ -193,16 +266,13 @@ def test_active_unowned_external_order_fences_guarded_cancel_and_replace(tmp_pat
         )
     with pytest.raises(ActiveExternalOrderFenceError):
         gateway.replace_guarded(
-            ReplaceExecutionRequest(
+            _replace_request(
                 client_order_id=owned.client_order_id,
                 replace_command_id="REPLACE-FENCED",
                 new_client_order_id="CID-REPLACEMENT",
                 new_quantity=5,
                 new_limit_price=99.0,
-                environment="PROD",
-                account_no="12345678-01",
                 lease=lease,
-                source=ExecutionSource.SYSTEM,
             )
         )
 
@@ -1196,6 +1266,24 @@ def _replace_request(**overrides):
         lease=lease, source=ExecutionSource.SYSTEM,
     )
     fields.update(overrides)
+    fields.setdefault("risk_strategy_id", "ORB")
+    fields.setdefault("risk_plan_id", "TEST:ORB:AAPL:REPLACE")
+    fields.setdefault(
+        "pre_trade_risk_decision",
+        PreTradeRiskDecision.approve(
+            environment=fields["environment"],
+            account_no=fields["account_no"],
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            intent=OrderIntent.ENTRY,
+            quantity=max(1, int(fields["new_quantity"] or 0)),
+            reference_price=max(0.01, float(fields["new_limit_price"] or 0.0)),
+            exchange="NASD",
+            execution_policy="REGULAR_LIMIT",
+            strategy_id=fields["risk_strategy_id"],
+            plan_id=fields["risk_plan_id"],
+        ),
+    )
     return ReplaceExecutionRequest(**fields)
 
 

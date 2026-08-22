@@ -745,6 +745,12 @@ class BuyboardRuntimeWorker(QThread):
                 buying_power_provider=self._buying_power_provider,
                 card_lookup=self._card_lookup,
                 account_equity_provider=self._account_equity_provider,
+                portfolio_cards_provider=lambda environment, account_no: repo.list_trade_cards(
+                    self._db_engine,
+                    environment=environment,
+                    account_no=account_no,
+                    raise_on_error=True,
+                ),
                 capital_reservation_engine=self._capital_reservation_engine,
                 execution_authority=self._execution_authority,
                 execution_lease=self._execution_lease_value(),

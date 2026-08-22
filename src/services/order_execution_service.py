@@ -228,7 +228,7 @@ def submit_guarded_overseas_order(
     # Workstream 9 (PR2): the default broker is the shared execution
     # gateway, not a raw KisBroker -- the gateway is the single component
     # permitted to invoke destructive broker operations. In
-    # LEGACY_COMPATIBILITY mode (BUYBOARD_ENGINE_ENABLED=false, always
+    # LEGACY_COMPATIBILITY mode (BUYBOARD_ENGINE_ENABLED=false, recovery-only
     # today) the gateway delegates to the exact same real KisBroker this
     # used to construct directly after enforcing durable ownership whenever
     # the shared lease/ownership database is available, so nothing about

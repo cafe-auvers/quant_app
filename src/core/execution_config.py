@@ -298,6 +298,47 @@ KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL = _env_float(
     "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL", 0.0
 )
 
+# --- Portfolio-level entry governor ---------------------------------------
+# These account-wide limits are evaluated from the canonical card set before
+# every exposure-increasing entry.  They do not restrict SELL/cancel/recovery
+# paths.  Advanced limits whose current runtime input is not yet canonical
+# (daily P&L, drawdown, classifications) default to zero/disabled rather than
+# fabricating data; PortfolioRiskManager still implements their fail-closed
+# behavior for providers that opt in.
+PORTFOLIO_MAX_SIMULTANEOUS_POSITIONS = _env_int(
+    "PORTFOLIO_MAX_SIMULTANEOUS_POSITIONS", 20
+)
+PORTFOLIO_MAX_TOTAL_OPEN_RISK_FRACTION = _env_float(
+    "PORTFOLIO_MAX_TOTAL_OPEN_RISK_FRACTION", 0.10
+)
+PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION = _env_float(
+    "PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION", 2.0
+)
+PORTFOLIO_MAX_INCREMENTAL_BUYING_POWER_FRACTION = _env_float(
+    "PORTFOLIO_MAX_INCREMENTAL_BUYING_POWER_FRACTION", 0.0
+)
+PORTFOLIO_MAX_DAILY_LOSS_FRACTION = _env_float(
+    "PORTFOLIO_MAX_DAILY_LOSS_FRACTION", 0.0
+)
+PORTFOLIO_MAX_DRAWDOWN_FRACTION = _env_float(
+    "PORTFOLIO_MAX_DRAWDOWN_FRACTION", 0.0
+)
+PORTFOLIO_MAX_SECTOR_NOTIONAL_FRACTION = _env_float(
+    "PORTFOLIO_MAX_SECTOR_NOTIONAL_FRACTION", 0.0
+)
+PORTFOLIO_MAX_INDUSTRY_NOTIONAL_FRACTION = _env_float(
+    "PORTFOLIO_MAX_INDUSTRY_NOTIONAL_FRACTION", 0.0
+)
+PORTFOLIO_MAX_CORRELATION_GROUP_NOTIONAL_FRACTION = _env_float(
+    "PORTFOLIO_MAX_CORRELATION_GROUP_NOTIONAL_FRACTION", 0.0
+)
+PORTFOLIO_MAX_STRATEGY_NOTIONAL_FRACTION = _env_float(
+    "PORTFOLIO_MAX_STRATEGY_NOTIONAL_FRACTION", 0.0
+)
+PORTFOLIO_MAX_FX_AGE_SECONDS = _env_float(
+    "PORTFOLIO_MAX_FX_AGE_SECONDS", 300.0
+)
+
 # --- End of day (section 505-511) -------------------------------------------
 EOD_ENTRY_CLEANUP_SECONDS_BEFORE_CLOSE = _env_int(
     "EOD_ENTRY_CLEANUP_SECONDS_BEFORE_CLOSE", 60
@@ -313,15 +354,14 @@ BREAKEVEN_BUFFER_BPS = _env_float("BREAKEVEN_BUFFER_BPS", 15.0)
 
 
 def is_buyboard_engine_enabled() -> bool:
-    """Fail-closed cutover flag for the new Kanban entry/position/EOD engine.
+    """Whether the guarded Kanban entry/position/EOD runtime is available.
 
-    Defaults to ``False``: while unset, the new engine services must never
-    submit, cancel, or reprice a broker order, mirroring how
-    :mod:`src.services.trading_state`'s kill switch fails closed. The legacy
-    Buy Dashboard's 60-second monitor loop remains the live, authoritative
-    trading path regardless of this flag -- flipping it on is a deliberate,
-    separate, user-directed step taken only after paper/controlled-live
-    validation (spec section 1076-1082's Phase 7), never a side effect of
-    deploying this code.
+    The engine defaults on so the production Buy Board and its protection
+    lifecycle do not silently disappear because one deployment variable is
+    missing. This is deliberately *not* live-trading authorization.
+    ``KIS_LIVE_EXECUTION_MODE=DISABLED``, the shared trading switch, execution
+    lease, ownership, reconciliation, market-data, mutation-budget, capital,
+    and risk checks remain independent fail-closed broker-boundary fences.
+    Setting this flag false is a recovery-only compatibility choice.
     """
-    return _env_bool("BUYBOARD_ENGINE_ENABLED", False)
+    return _env_bool("BUYBOARD_ENGINE_ENABLED", True)
