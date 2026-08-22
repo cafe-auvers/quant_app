@@ -896,9 +896,78 @@ def test_chart_html_renders_escaped_watermark_markers_badge_and_independent_scal
     assert "249/124" in page
     assert "priceScaleId: 'earnings'" in page
     assert "chart.priceScale('earnings')" in page
-    assert "candleSeries.setMarkers" in page
+    assert "candleSeries.setMarkers" not in page
+    assert 'id="earnings-event-layer"' in page
+    assert "className = 'earnings-event-badge'" in page
+    assert '<path d="M7 1 H23 L29 7 V23 H19 L15 31 L11 23 H1 V7 Z">' in page
+    assert "chart.timeScale().timeToCoordinate(marker.time)" in page
+    assert "bottom: 24px" in page
+    assert "carriedEarningsLines(activeCrosshairTime)" in page
+    assert "restoreChartTooltip();" in page
     assert '"time": "2026-08-27"' in page
     assert "mergeSeriesData(futureWhitespace, earningsWhitespace, candles)" in page
+
+
+def test_earnings_badges_use_surprise_colors_and_not_price_coordinates():
+    base = replace(
+        enrich_earnings_history(_six_quarters())[-1],
+        report_date=dt.date(2026, 8, 19),
+    )
+    positive = replace(
+        base,
+        event_key="positive",
+        report_date=dt.date(2026, 8, 18),
+        reported_eps=1.20,
+        estimated_eps=1.00,
+    )
+    negative = replace(
+        base,
+        event_key="negative",
+        report_date=dt.date(2026, 8, 19),
+        reported_eps=0.80,
+        estimated_eps=1.00,
+    )
+    neutral = replace(
+        base,
+        event_key="neutral",
+        report_date=dt.date(2026, 8, 20),
+        reported_eps=1.00,
+        estimated_eps=1.00,
+    )
+
+    page = ChartLightweightRenderMixin._generate_tradingview_lightweight_chart_html(
+        "NVDA",
+        _history(),
+        storage_symbol="NVDA",
+        earnings_events=[positive, negative, neutral],
+    )
+
+    assert '"color": "#089981"' in page
+    assert '"color": "#f23645"' in page
+    assert '"color": "#787b86"' in page
+    assert '"label": "E"' in page
+    assert '"position": "aboveBar"' not in page
+    assert '"shape": "circle"' not in page
+
+
+def test_latest_reported_earnings_remains_available_before_visible_chart_range():
+    earlier_report = replace(
+        enrich_earnings_history(_six_quarters())[-1],
+        report_date=dt.date(2026, 8, 1),
+    )
+
+    page = ChartLightweightRenderMixin._generate_tradingview_lightweight_chart_html(
+        "NVDA",
+        _history(),
+        storage_symbol="NVDA",
+        earnings_events=[earlier_report],
+    )
+
+    assert "const earningsMarkers = [];" in page
+    assert "Report date: 2026-08-01" in page
+    assert '"reported": true' in page
+    assert ".filter(item => item.reported)" in page
+    assert "time == null" in page
 
 
 def test_renderer_omits_profile_fields_from_the_wrong_symbol():

@@ -20,6 +20,29 @@ from src.core.chart_fundamentals import (
 )
 
 
+POSITIVE_EARNINGS_COLOR = "#089981"
+NEGATIVE_EARNINGS_COLOR = "#f23645"
+NEUTRAL_EARNINGS_COLOR = "#787b86"
+EXPECTED_EARNINGS_COLOR = "#f59e0b"
+
+
+def _reported_earnings_color(event: EarningsEvent) -> str:
+    """Return a TradingView-style surprise color without inferring missing data."""
+
+    try:
+        reported = float(event.reported_eps)
+        estimated = float(event.estimated_eps)
+    except (TypeError, ValueError, OverflowError):
+        return NEUTRAL_EARNINGS_COLOR
+    if not math.isfinite(reported) or not math.isfinite(estimated):
+        return NEUTRAL_EARNINGS_COLOR
+    if reported > estimated:
+        return POSITIVE_EARNINGS_COLOR
+    if reported < estimated:
+        return NEGATIVE_EARNINGS_COLOR
+    return NEUTRAL_EARNINGS_COLOR
+
+
 def build_fundamental_render_payload(
     *,
     canonical_display_symbol: str,
@@ -89,21 +112,11 @@ def build_fundamental_render_payload(
             continue
         if event.event_status is not EventStatus.REPORTED:
             continue
-        if not first_chart_date <= event.report_date <= last_chart_date:
+        if event.report_date > last_chart_date:
             continue
         time_value = chart_time_value(event.report_date)
         compact = format_compact_growth_pair(event)
         marker_text = f"E {compact}" if compact else "E"
-        if show_earnings_events:
-            earnings_markers.append({
-                "time": time_value,
-                "position": "aboveBar",
-                "color": "#a78bfa",
-                "shape": "circle",
-                "text": marker_text,
-                "fullText": marker_text,
-                "future": False,
-            })
         tooltip_lines = ["Earnings", f"Report date: {event.report_date.isoformat()}"]
         if event.fiscal_period_end is not None:
             tooltip_lines.append(f"Fiscal period: {event.fiscal_period_end.isoformat()}")
@@ -133,7 +146,20 @@ def build_fundamental_render_payload(
             tooltip_lines.append(f"Revenue growth: {revenue_text}")
         if event.ttm_eps is not None:
             tooltip_lines.append(f"TTM EPS: {event.ttm_eps:.2f}")
-        earnings_tooltips.append({"time": time_value, "lines": tooltip_lines})
+        earnings_tooltips.append({
+            "time": time_value,
+            "lines": tooltip_lines,
+            "reported": True,
+        })
+        if show_earnings_events and first_chart_date <= event.report_date:
+            earnings_markers.append({
+                "time": time_value,
+                "color": _reported_earnings_color(event),
+                "label": "E",
+                "detailText": marker_text,
+                "future": False,
+                "reported": True,
+            })
 
     if (
         show_earnings_events
@@ -144,15 +170,15 @@ def build_fundamental_render_payload(
         upcoming_time = chart_time_value(upcoming_earnings.next_earnings_date)
         earnings_markers.append({
             "time": upcoming_time,
-            "position": "aboveBar",
-            "color": "#f59e0b",
-            "shape": "circle",
-            "text": upcoming_earnings.badge_text,
-            "fullText": upcoming_earnings.badge_text,
+            "color": EXPECTED_EARNINGS_COLOR,
+            "label": "E",
+            "detailText": upcoming_earnings.badge_text,
             "future": upcoming_earnings.next_earnings_date > last_chart_date,
+            "reported": False,
         })
         earnings_tooltips.append({
             "time": upcoming_time,
+            "reported": False,
             "lines": [line for line in [
                 "Expected earnings",
                 f"Report date: {upcoming_earnings.next_earnings_date.isoformat()}",
