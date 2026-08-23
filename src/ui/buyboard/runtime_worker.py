@@ -288,13 +288,17 @@ class BuyboardRuntimeWorker(QThread):
             repo.local_trade_card_change_generation(self._db_engine)
         )
         from src.services.coordination_change_pulse import (
-            coordination_change_generation,
+            coordination_table_change_generation,
         )
 
-        pulse_generation = coordination_change_generation(self._db_engine)
+        pulse_generation = coordination_table_change_generation(
+            self._db_engine, {"trade_cards"}
+        )
         self._last_card_change_pulse_generation = pulse_generation
         self._last_lease_change_pulse_generation = -1
         self._last_operator_change_pulse_generation = -1
+        self._last_state_revision_change_pulse_generation = None
+        self._cached_synced_state_revisions: Optional[Dict[str, int]] = None
         self._last_database_probe_at: Optional[datetime] = None
         self._last_lease_checked_at: Optional[datetime] = None
         self._last_device_state_published_at: Optional[datetime] = None
@@ -485,7 +489,7 @@ class BuyboardRuntimeWorker(QThread):
         revisions = (
             {}
             if self._database_probe_completed and not self._database_writable
-            else get_synced_state_revisions(self._db_engine)
+            else self._readiness_state_revisions()
         )
         stable_market_data = all(
             (
@@ -566,6 +570,30 @@ class BuyboardRuntimeWorker(QThread):
                 or f"runtime state is {state.value}"
             ),
         }
+
+    def _readiness_state_revisions(self) -> Dict[str, int]:
+        """Reuse canonical plan revisions until ``app_state_sync`` changes."""
+
+        from src.services.coordination_change_pulse import (
+            coordination_table_change_generation,
+        )
+
+        pulse_generation = coordination_table_change_generation(
+            self._db_engine, {"app_state_sync"}
+        )
+        if (
+            self._cached_synced_state_revisions is not None
+            and pulse_generation
+            == self._last_state_revision_change_pulse_generation
+        ):
+            return dict(self._cached_synced_state_revisions)
+        revisions = get_synced_state_revisions(self._db_engine)
+        # A failed read returns an empty mapping. Do not cache that failure;
+        # the next readiness attempt must be allowed to prove recovery.
+        if revisions:
+            self._cached_synced_state_revisions = dict(revisions)
+            self._last_state_revision_change_pulse_generation = pulse_generation
+        return revisions
 
     def _probe_database_writable(self, *, force: bool = False) -> bool:
         """Exercise a write statement without changing application data."""
@@ -1123,10 +1151,12 @@ class BuyboardRuntimeWorker(QThread):
         now = datetime.now(timezone.utc)
         from src.services.coordination_change_pulse import (
             change_notifications_available,
-            coordination_change_generation,
+            coordination_table_change_generation,
         )
 
-        pulse_generation = coordination_change_generation(self._db_engine)
+        pulse_generation = coordination_table_change_generation(
+            self._db_engine, {"app_state_sync"}
+        )
         fallback_seconds = (
             execution_config.COORDINATION_REMOTE_FALLBACK_SECONDS
             if change_notifications_available(self._db_engine)
@@ -1454,10 +1484,12 @@ class BuyboardRuntimeWorker(QThread):
         local_generation = repo.local_trade_card_change_generation(self._db_engine)
         from src.services.coordination_change_pulse import (
             change_notifications_available,
-            coordination_change_generation,
+            coordination_table_change_generation,
         )
 
-        pulse_generation = coordination_change_generation(self._db_engine)
+        pulse_generation = coordination_table_change_generation(
+            self._db_engine, {"trade_cards"}
+        )
         if change_notifications_available(self._db_engine):
             interval = execution_config.COORDINATION_REMOTE_FALLBACK_SECONDS
         else:
@@ -1722,10 +1754,12 @@ class BuyboardRuntimeWorker(QThread):
         now = datetime.now(timezone.utc)
         from src.services.coordination_change_pulse import (
             change_notifications_available,
-            coordination_change_generation,
+            coordination_table_change_generation,
         )
 
-        pulse_generation = coordination_change_generation(self._db_engine)
+        pulse_generation = coordination_table_change_generation(
+            self._db_engine, {"operator_commands"}
+        )
         if change_notifications_available(self._db_engine):
             interval = execution_config.COORDINATION_REMOTE_FALLBACK_SECONDS
         else:

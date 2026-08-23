@@ -217,10 +217,12 @@ class _StatusWorkerStub:
         engine=None,
         *,
         coordination_notification_event_id="",
+        coordination_notification_tables=(),
         parent=None,
     ):
         self.engine = engine
         self.coordination_notification_event_id = coordination_notification_event_id
+        self.coordination_notification_tables = coordination_notification_tables
         self.parent = parent
         self.finished_status = _SignalStub()
         self.finished = _SignalStub()
@@ -349,6 +351,26 @@ def test_pc_status_poll_retains_worker_until_finished(monkeypatch):
 
     assert window._pc_status_worker is None
     assert worker.deleted is True
+
+
+def test_typed_remote_change_routes_only_affected_projection():
+    window = MainWindow.__new__(MainWindow)
+    window._database_shutting_down = False
+    window._remote_coordination_sync_pending = False
+    syncs = []
+    refreshes = []
+    window._drain_remote_coordination_sync = lambda: syncs.append(True)
+    window.refresh_buyboard = lambda **kwargs: refreshes.append(kwargs)
+
+    window._on_remote_coordination_change(("trade_cards",))
+
+    assert syncs == []
+    assert refreshes == [{"revision_only": True}]
+
+    window._on_remote_coordination_change(("app_state_sync",))
+
+    assert syncs == [True]
+    assert refreshes == [{"revision_only": True}]
 
 
 class _WidgetStub:

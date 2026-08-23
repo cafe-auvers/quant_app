@@ -794,5 +794,6 @@ def test_enabled_runtime_composition_requires_real_external_provider_urls(
     )
     service = build_external_alerting_service(engine, device_id="pc-main")
     assert isinstance(service.provider, WebhookAlertDeliveryProvider)
+    assert service.acknowledgement_timeout_seconds == 21600.0
     assert service.heartbeat_interval_seconds == 5.0
     assert service.heartbeat_audit_interval_seconds == 3600.0

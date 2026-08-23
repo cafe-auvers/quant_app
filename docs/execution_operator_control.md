@@ -104,8 +104,9 @@ The market-open command sequence is:
 
 The executor checks this command queue immediately when the database-free
 Tailscale change token advances. An old listener retains the 20-second poll;
-protocol v2 uses a one-hour missed-notification fallback. Planning/UI sync uses
-the same change pulse. An execution-owner switch also force-loads the
+protocol v2 uses a one-hour missed-notification fallback. Protocol v3 labels
+the token `operator_commands`, so unrelated readiness, card, and plan writes
+do not poll the queue. Planning/UI sync uses its matching typed pulse. An execution-owner switch also force-loads the
 latest canonical cards, quote subscriptions, and stops before the target may
 become `ACTIVE`; it never relies on the minute display refresh for handoff.
 

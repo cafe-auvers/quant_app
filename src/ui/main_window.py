@@ -5340,16 +5340,31 @@ class MainWindow(
         if board_timer is not None:
             board_timer.setInterval(int(board_seconds * 1000))
 
-    def _on_remote_coordination_change(self) -> None:
+    def _on_remote_coordination_change(
+        self, changed_tables: tuple[str, ...] = ()
+    ) -> None:
         """Perform one canonical read pass for a newly observed remote token."""
 
         if self.__dict__.get("_database_shutting_down", False):
             return
-        self._remote_coordination_sync_pending = True
-        self._drain_remote_coordination_sync()
-        refresh = getattr(self, "refresh_buyboard", None)
-        if callable(refresh):
-            refresh(revision_only=True)
+        tables = {str(table or "").lower() for table in changed_tables if table}
+        broad_fallback = not tables
+        if broad_fallback or tables & {
+            "app_state_sync",
+            "runtime_device_state",
+            "operator_commands",
+        }:
+            self._remote_coordination_sync_pending = True
+            self._drain_remote_coordination_sync()
+        if broad_fallback or tables & {
+            "trade_cards",
+            "execution_orders",
+            "execution_ownership",
+            "discovered_external_orders",
+        }:
+            refresh = getattr(self, "refresh_buyboard", None)
+            if callable(refresh):
+                refresh(revision_only=True)
 
     def _drain_remote_coordination_sync(self) -> None:
         if (
@@ -5384,29 +5399,38 @@ class MainWindow(
             acknowledge_local_change_event,
             mark_remote_coordination_change,
             publish_outbound_change_pulse,
-            read_inbound_change_pulse,
-            stage_local_change_event,
+            read_inbound_change_event,
+            stage_local_coordination_change,
         )
 
         kind = detect_local_device_kind(getattr(role, "hostname", platform.node()))
-        event_id = stage_local_change_event(engine, device_id=role.device_id)
+        change = stage_local_coordination_change(
+            engine, device_id=role.device_id
+        )
         if kind == "PC":
-            if event_id and publish_outbound_change_pulse(event_id):
-                acknowledge_local_change_event(engine, event_id)
-            inbound_event_id = read_inbound_change_pulse()
+            if change.event_id and publish_outbound_change_pulse(
+                change.event_id, tables=change.tables
+            ):
+                acknowledge_local_change_event(engine, change.event_id)
+            inbound_event = read_inbound_change_event()
+            inbound_event_id = inbound_event.event_id
             if (
                 inbound_event_id
                 and inbound_event_id
                 != self.__dict__.get("_last_inbound_coordination_event_id", "")
             ):
                 self._last_inbound_coordination_event_id = inbound_event_id
-                if mark_remote_coordination_change(engine, inbound_event_id):
-                    self._on_remote_coordination_change()
+                if mark_remote_coordination_change(
+                    engine,
+                    inbound_event_id,
+                    tables=inbound_event.tables,
+                ):
+                    self._on_remote_coordination_change(inbound_event.tables)
             return
 
         # Laptop delivery is piggy-backed on the existing asynchronous PC
         # status worker, so the one-second Qt pulse never performs socket I/O.
-        if event_id and self.__dict__.get("_pc_status_worker") is None:
+        if change.event_id and self.__dict__.get("_pc_status_worker") is None:
             self._poll_pc_status()
 
     def _poll_pc_status(self) -> None:
@@ -5429,6 +5453,7 @@ class MainWindow(
         if probe_engine is None:
             probe_engine = self.pc_db_engine
         pending_event_id = ""
+        pending_event_tables: tuple[str, ...] = ()
         role = self.__dict__.get("state_sync_role")
         execution_engine = (
             self._execution_state_engine()
@@ -5444,15 +5469,18 @@ class MainWindow(
             == "Laptop"
         ):
             from src.services.coordination_change_pulse import (
-                stage_local_change_event,
+                stage_local_coordination_change,
             )
 
-            pending_event_id = stage_local_change_event(
+            pending_change = stage_local_coordination_change(
                 execution_engine, device_id=role.device_id
             )
+            pending_event_id = pending_change.event_id
+            pending_event_tables = pending_change.tables
         worker = PcRemoteStatusWorker(
             probe_engine,
             coordination_notification_event_id=pending_event_id,
+            coordination_notification_tables=pending_event_tables,
             parent=self,
         )
         self._pc_status_worker = worker
@@ -5505,6 +5533,9 @@ class MainWindow(
         remote_event_id = str(
             getattr(status, "coordination_change_event_id", "") or ""
         )
+        remote_event_tables = tuple(
+            getattr(status, "coordination_change_tables", ()) or ()
+        )
         if (
             role is not None
             and detect_local_device_kind(
@@ -5517,8 +5548,12 @@ class MainWindow(
             != self.__dict__.get("_last_outbound_coordination_event_id", "")
         ):
             self._last_outbound_coordination_event_id = remote_event_id
-            if mark_remote_coordination_change(execution_engine, remote_event_id):
-                self._on_remote_coordination_change()
+            if mark_remote_coordination_change(
+                execution_engine,
+                remote_event_id,
+                tables=remote_event_tables,
+            ):
+                self._on_remote_coordination_change(remote_event_tables)
         db_ready = bool(status.database_ready)
         self._main_availability_probe_complete = True
         self._main_availability_probe_database_ready = db_ready

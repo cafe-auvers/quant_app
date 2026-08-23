@@ -38,23 +38,23 @@ def test_cloud_coordination_poll_floors_preserve_monthly_budget():
     assert execution_config.COORDINATION_RECONCILIATION_CACHE_SECONDS >= 900.0
     assert execution_config.EXTERNAL_WATCHDOG_HEARTBEAT_SECONDS <= 5.0
     assert execution_config.EXTERNAL_WATCHDOG_TIDB_AUDIT_SECONDS >= 3600.0
+    assert execution_config.EXTERNAL_ALERT_ACK_REMINDER_SECONDS >= 3600.0
     assert execution_config.PENDING_ORDER_RECONCILIATION_SECONDS >= 2
     assert execution_config.UNKNOWN_ORDER_RECONCILIATION_SECONDS >= 1
     assert execution_config.DURABLE_ORDER_OBSERVATION_SECONDS >= 3600
 
 
-def test_internal_change_pulse_profile_has_large_headroom_below_nine_ru_per_second():
+def test_typed_change_pulse_profile_has_large_headroom_below_nine_ru_per_second():
     """Lock the documented two-device scheduled-request envelope."""
 
     month_seconds = 30 * 24 * 60 * 60
 
     scheduled_requests = sum(
         (
-            # Two fallback write probes plus their explicit COMMITs.
-            4 * month_seconds
-            / execution_config.COORDINATION_DATABASE_PROBE_SECONDS,
-            # Two devices: revision read plus readiness UPDATE.
-            4 * month_seconds
+            # A successful readiness heartbeat is also the recurring write
+            # proof, so the no-op database probe is startup/recovery-only.
+            # Two devices each retain one crash/handoff heartbeat UPDATE.
+            2 * month_seconds
             / execution_config.COORDINATION_DEVICE_HEARTBEAT_SECONDS,
             # Lease, active/standby cards, and operator commands are woken by
             # the local/Tailscale dirty pulse. These four slots are only the
@@ -84,8 +84,8 @@ def test_internal_change_pulse_profile_has_large_headroom_below_nine_ru_per_seco
         scheduled_requests * 1.25 * 8.0 / month_seconds
     )
 
-    assert scheduled_requests <= 500_000
-    assert conservative_ru_per_second <= 1.8
+    assert scheduled_requests <= 300_000
+    assert conservative_ru_per_second <= 1.2
 
 
 def test_idle_operator_command_poll_uses_covering_index_without_commit(tmp_path):
