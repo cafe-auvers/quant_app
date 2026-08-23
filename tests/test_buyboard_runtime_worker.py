@@ -397,6 +397,31 @@ def test_card_cache_downloads_payload_only_when_revision_changes(
     assert len(calls) == 2
 
 
+def test_startup_reconciliation_seeds_card_cache_without_second_payload_download(
+    tmp_path, monkeypatch
+):
+    worker, engine = _worker(tmp_path)
+    _seed_card(engine)
+    worker.runtime = _build_test_runtime(
+        buying_power_provider=worker._buying_power_provider,
+        card_lookup=worker._card_lookup,
+        broker=worker._broker,
+    )
+    real_list = repo.list_trade_cards
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(True)
+        return real_list(*args, **kwargs)
+
+    monkeypatch.setattr(repo, "list_trade_cards", counted)
+
+    worker._run_startup_reconciliation()
+    worker._load_cards_if_changed()
+
+    assert len(calls) == 1
+
+
 def test_operator_command_lookup_runs_only_after_internal_change_pulse(
     tmp_path, monkeypatch
 ):
