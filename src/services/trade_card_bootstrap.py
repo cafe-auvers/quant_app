@@ -39,6 +39,11 @@ class TradeCardBootstrapResult:
     watchlist_revived_keys: tuple[str, ...] = ()
     holding_updated_keys: tuple[str, ...] = ()
     skipped_watchlist_symbols: tuple[str, ...] = ()
+    # The bootstrap already downloads every canonical card.  Returning that
+    # exact post-bootstrap snapshot lets the immediately-following board
+    # projection reuse it instead of paying for the same payload twice.
+    # ``None`` means a concurrent conflict prevented a trustworthy snapshot.
+    canonical_cards: Optional[tuple[TradeCardState, ...]] = None
 
     @property
     def changed(self) -> bool:
@@ -125,6 +130,7 @@ def bootstrap_trade_cards_from_current_state(
     watchlist_revived_keys: list[str] = []
     holding_updated_keys: list[str] = []
     skipped_watchlist_symbols: list[str] = []
+    canonical_snapshot_current = True
     fallback_account = _normalized_account(default_account_no)
 
     # Reuse the shared membership service used by direct Buylist additions.
@@ -272,6 +278,8 @@ def bootstrap_trade_cards_from_current_state(
                         current = trade_card_repository.get_trade_card(
                             engine, "PROD", fallback_account, symbol
                         )
+                        if current is not None:
+                            existing_by_key[key] = current
                         if (
                             current is None
                             or current.board_status != BoardStatus.WATCHLIST
@@ -381,6 +389,7 @@ def bootstrap_trade_cards_from_current_state(
                 # A concurrent runtime/device write wins.  The next board
                 # projection reloads canonical state; never retry as a blind
                 # overwrite from a cached account snapshot.
+                canonical_snapshot_current = False
                 continue
             existing_by_key[stored.card_key] = stored
 
@@ -390,4 +399,7 @@ def bootstrap_trade_cards_from_current_state(
         watchlist_revived_keys=tuple(dict.fromkeys(watchlist_revived_keys)),
         holding_updated_keys=tuple(dict.fromkeys(holding_updated_keys)),
         skipped_watchlist_symbols=tuple(dict.fromkeys(skipped_watchlist_symbols)),
+        canonical_cards=(
+            tuple(existing_by_key.values()) if canonical_snapshot_current else None
+        ),
     )

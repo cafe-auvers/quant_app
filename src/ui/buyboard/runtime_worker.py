@@ -1368,11 +1368,10 @@ class BuyboardRuntimeWorker(QThread):
         broker call for the worker's own blank account scope.
         """
         assert self.runtime is not None
-        cards = repo.list_trade_cards(
-            self._db_engine,
-            environment=self._environment,
-            raise_on_error=True,
-        )
+        # Seed the normal revisioned runtime cache during startup.  Loading
+        # directly here left the cache uninitialized, so the first one-second
+        # cycle immediately downloaded the same full TradeCard payload again.
+        cards = self._load_cards_if_changed(force=True)
         self._configure_verified_mutation_budgets(cards)
         self._cache_emergency_ownership_proofs(cards)
         for card in cards:

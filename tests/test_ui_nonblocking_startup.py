@@ -78,7 +78,10 @@ def test_buyboard_projection_worker_uses_authoritative_services(monkeypatch):
     monkeypatch.setattr(
         trade_card_bootstrap,
         "bootstrap_trade_cards_from_current_state",
-        lambda engine, **kwargs: calls.append(("bootstrap", engine, kwargs)),
+        lambda engine, **kwargs: (
+            calls.append(("bootstrap", engine, kwargs))
+            or SimpleNamespace(canonical_cards=("cached-card",))
+        ),
     )
     monkeypatch.setattr(
         buyboard_controller.execution_workflow_service,
@@ -113,6 +116,7 @@ def test_buyboard_projection_worker_uses_authoritative_services(monkeypatch):
         *BOARD_COLUMN_ORDER,
         BoardStatus.WATCHLIST,
     )
+    assert calls[1][2]["prefetched_cards"] == ("cached-card",)
     assert completed == [(projections, "", 4)]
 
 

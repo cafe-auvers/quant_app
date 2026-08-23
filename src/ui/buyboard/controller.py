@@ -104,6 +104,7 @@ class BuyboardProjectionWorker(QThread):
                     return
 
             kwargs = {}
+            prefetched_cards = None
             if not request.runtime_running:
                 kwargs = {
                     "account_snapshots": request.account_snapshots,
@@ -118,12 +119,15 @@ class BuyboardProjectionWorker(QThread):
             # here removes one duplicate full TradeCard read per minute.
             if not request.revision_only:
                 try:
-                    bootstrap_trade_cards_from_current_state(
+                    bootstrap_result = bootstrap_trade_cards_from_current_state(
                         request.engine,
                         buylist_manager=request.buylist_manager,
                         watchlist=request.watchlist,
                         default_account_no=request.default_account_no,
                         **kwargs,
+                    )
+                    prefetched_cards = getattr(
+                        bootstrap_result, "canonical_cards", None
                     )
                 except SQLAlchemyError:
                     logger.debug(
@@ -133,14 +137,19 @@ class BuyboardProjectionWorker(QThread):
                 except Exception:
                     logger.exception("Buy Board bootstrap refresh failed")
 
-            projections = execution_workflow_service.list_board_projections(
-                request.engine,
-                environment="PROD",
-                context=request.context,
+            projection_kwargs = {
+                "environment": "PROD",
+                "context": request.context,
                 # Watchlist is intentionally hidden from the Kanban columns,
                 # but remains in the shared projection snapshot so lightweight
                 # chart/sidebar actions can address the exact versioned card.
-                board_statuses=(*BOARD_COLUMN_ORDER, BoardStatus.WATCHLIST),
+                "board_statuses": (*BOARD_COLUMN_ORDER, BoardStatus.WATCHLIST),
+            }
+            if prefetched_cards is not None:
+                projection_kwargs["prefetched_cards"] = prefetched_cards
+            projections = execution_workflow_service.list_board_projections(
+                request.engine,
+                **projection_kwargs,
             )
             if request.revision_only:
                 # No compatibility bootstrap ran, so the pre-read token is

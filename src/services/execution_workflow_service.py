@@ -1526,6 +1526,7 @@ def list_board_projections(
     environment="PROD",
     context=None,
     board_statuses=None,
+    prefetched_cards=None,
 ):
     import copy
 
@@ -1549,8 +1550,12 @@ def list_board_projections(
     if engine is None:
         return []
     projection_context = context or BoardProjectionContext()
-    cards = trade_card_repository.list_trade_cards(
-        engine, environment=environment, raise_on_error=True
+    cards = (
+        list(prefetched_cards)
+        if prefetched_cards is not None
+        else trade_card_repository.list_trade_cards(
+            engine, environment=environment, raise_on_error=True
+        )
     )
     ownership_rows = list_execution_ownership(engine, environment=environment)
     all_execution_orders = list_execution_orders(engine, environment=environment)
