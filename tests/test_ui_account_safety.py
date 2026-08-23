@@ -142,6 +142,32 @@ def test_kis_account_conversion_clears_stale_size_without_live_fx_rate():
     assert logs == [
         "KIS position sizing unavailable for PROD: live USD/KRW rate is unavailable."
     ]
+    assert window._execution_queue_account_sizing_dirty is True
+
+
+def test_account_size_projection_does_not_reload_market_data_on_ui_thread():
+    profile = {"environment": "PROD", "account_no": "11111111-01"}
+    account_input = _TextInput("25000.00")
+    refresh_calls = []
+    window = SimpleNamespace(
+        trade_kis_environment_combo=_Combo(text="PROD"),
+        trade_kis_account_combo=_Combo(data=profile),
+        account_size_input=account_input,
+        usd_krw_rate_input=_TextInput(""),
+        kis_account_snapshots={},
+        _parse_float=lambda input_widget, default: (
+            float(input_widget.text()) if input_widget.text() else default
+        ),
+        append_log=lambda _message: None,
+        refresh_execution_queue=lambda *args, **kwargs: refresh_calls.append(
+            (args, kwargs)
+        ),
+    )
+
+    DashboardMixin.apply_cached_trade_account_size(window)
+
+    assert refresh_calls == []
+    assert window._execution_queue_account_sizing_dirty is True
 
 
 def test_kis_account_conversion_clears_stale_size_without_snapshot():

@@ -11,8 +11,8 @@ from .repositories.market_watermarks import \
     get_latest_hourly_price_history_timestamps
 from .schema import (_ensure_price_history_table,
                      get_chronically_failing_symbols)
-from .settings import REFERENCE_SYMBOL
-from .sql_helpers import _clean_symbols
+from .settings import CACHE_QUERY_SYMBOL_CHUNK_SIZE, REFERENCE_SYMBOL
+from .sql_helpers import _clean_symbols, _record_chunks
 
 
 def local_mirror_is_stale(
@@ -44,6 +44,38 @@ def local_mirror_is_stale(
     try:
         table = _ensure_price_history_table(engine)
         chronic = get_chronically_failing_symbols(engine, interval="1d")
+        if tickers is not None:
+            # For a tracked universe, freshness only needs proof that each
+            # symbol has a row on/after the expected date. The old GROUP BY
+            # MAX(date) scanned every historical daily row before the startup
+            # warning could appear. This bounded recent-date probe uses the
+            # (interval, date) index and normally touches only one market day.
+            tracked = set(_clean_symbols([REFERENCE_SYMBOL, *tickers]))
+            fresh_symbols = set()
+            with engine.connect() as conn:
+                for chunk in _record_chunks(
+                    sorted(tracked), CACHE_QUERY_SYMBOL_CHUNK_SIZE
+                ):
+                    stmt = (
+                        select(table.c.symbol)
+                        .where(
+                            table.c.interval == "1d",
+                            table.c.date >= expected_timestamp,
+                            table.c.symbol.in_(chunk),
+                        )
+                        .distinct()
+                    )
+                    fresh_symbols.update(
+                        str(value).upper()
+                        for value in conn.execute(stmt).scalars()
+                    )
+            if REFERENCE_SYMBOL not in fresh_symbols:
+                return True
+            tracked.discard(REFERENCE_SYMBOL)
+            return any(
+                symbol not in chronic and symbol not in fresh_symbols
+                for symbol in tracked
+            )
         stmt = (
             select(
                 table.c.symbol,
@@ -67,22 +99,6 @@ def local_mirror_is_stale(
     reference_latest = latest_by_symbol.get(REFERENCE_SYMBOL)
     if reference_latest is None or reference_latest < expected_timestamp:
         return True
-
-    if tickers is not None:
-        tracked = {
-            str(symbol).strip().upper()
-            for symbol in tickers
-            if symbol is not None and str(symbol).strip()
-        }
-        tracked.discard(REFERENCE_SYMBOL)
-        return any(
-            symbol not in chronic
-            and (
-                symbol not in latest_by_symbol
-                or latest_by_symbol[symbol] < expected_timestamp
-            )
-            for symbol in tracked
-        )
 
     return any(
         latest < expected_timestamp and symbol not in chronic

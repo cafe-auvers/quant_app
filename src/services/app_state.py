@@ -11,6 +11,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+from src.core.execution_config import (
+    COORDINATION_DEVICE_HEARTBEAT_MAX_AGE_SECONDS,
+)
 from src.core.watchlist import BuylistManager, TradePlanManager, Watchlist
 from src.services.cloud_backup import (
     STATE_BACKUP_FILENAMES,
@@ -18,11 +21,7 @@ from src.services.cloud_backup import (
     backup_state_files,
     resolve_backup_root,
 )
-from src.services.runtime_status import (
-    DEFAULT_HEARTBEAT_MAX_AGE_SECONDS,
-    MAIN_APP_PROCESS,
-    get_runtime_process_status,
-)
+from src.services.runtime_status import MAIN_APP_PROCESS, get_runtime_process_status
 from src.services.state_sync import (
     BUYLIST_KEY,
     EXECUTION_QUEUE_KEY,
@@ -1171,7 +1170,9 @@ def should_auto_claim_main(
     role: LocalDeviceRole,
     *,
     other_hostname: str = "",
-    max_heartbeat_age_seconds: int = DEFAULT_HEARTBEAT_MAX_AGE_SECONDS,
+    max_heartbeat_age_seconds: float = (
+        COORDINATION_DEVICE_HEARTBEAT_MAX_AGE_SECONDS
+    ),
 ) -> tuple[bool, str, str]:
     """Decide whether this (unattended) device should auto-claim main status.
 
@@ -1228,7 +1229,9 @@ def auto_claim_main_device_if_stale(
     role: LocalDeviceRole,
     *,
     expected_owner_device_id: str,
-    heartbeat_cutoff_seconds: int = DEFAULT_HEARTBEAT_MAX_AGE_SECONDS,
+    heartbeat_cutoff_seconds: float = (
+        COORDINATION_DEVICE_HEARTBEAT_MAX_AGE_SECONDS
+    ),
     save_lock: threading.Lock | None = None,
     expected_standby_generation: int = 0,
     metadata_path: Path | None = None,

@@ -954,15 +954,7 @@ class BuyboardRuntimeWorker(QThread):
                             # older adapters. Production uses the nonblocking
                             # publisher above.
                             self._external_alerting.publish_heartbeat_if_due()
-                    if database_writable and self._external_alerting is not None:
-                        now = datetime.now(timezone.utc)
-                        if (
-                            self._last_alert_poll_at is None
-                            or (now - self._last_alert_poll_at).total_seconds()
-                            >= execution_config.COORDINATION_ALERT_POLL_SECONDS
-                        ):
-                            self._last_alert_poll_at = now
-                            self._external_alerting.process_due()
+                    self._process_due_external_alerts()
                     if not allow_mutations:
                         self._advance_startup_readiness()
                 except SQLAlchemyError as exc:
@@ -1165,6 +1157,7 @@ class BuyboardRuntimeWorker(QThread):
         from src.services.coordination_change_pulse import (
             change_notifications_available,
             coordination_table_change_generation,
+            remote_peer_confirmed_off,
         )
 
         pulse_generation = coordination_table_change_generation(
@@ -1175,12 +1168,16 @@ class BuyboardRuntimeWorker(QThread):
             if change_notifications_available(self._db_engine)
             else execution_config.COORDINATION_LEASE_POLL_SECONDS
         )
+        peer_offline = remote_peer_confirmed_off(self._db_engine)
         if (
             not force
             and pulse_generation == self._last_lease_change_pulse_generation
             and self._last_lease_checked_at is not None
-            and (now - self._last_lease_checked_at).total_seconds()
-            < fallback_seconds
+            and (
+                peer_offline
+                or (now - self._last_lease_checked_at).total_seconds()
+                < fallback_seconds
+            )
         ):
             return self._lease_current
         self._last_lease_checked_at = now
@@ -1489,6 +1486,39 @@ class BuyboardRuntimeWorker(QThread):
 
     # -- per-cycle heartbeat --------------------------------------------------
 
+    def _process_due_external_alerts(
+        self, *, now: Optional[datetime] = None
+    ) -> bool:
+        """Poll durable alerts without keeping an idle TiDB instance awake.
+
+        When the Tailscale status probe confirms the other device is off,
+        there is no remote alert producer to observe.  Align the remaining
+        retry scan with this device's four-minute readiness heartbeat so the
+        database sees one compact burst followed by a genuinely quiet gap.
+        Local alert creation still writes immediately, and the independent
+        external watchdog heartbeat remains on its fast webhook cadence.
+        """
+
+        if not self._database_writable or self._external_alerting is None:
+            return False
+        from src.services.coordination_change_pulse import remote_peer_confirmed_off
+
+        interval = float(execution_config.COORDINATION_ALERT_POLL_SECONDS)
+        if remote_peer_confirmed_off(self._db_engine):
+            interval = max(
+                interval,
+                float(execution_config.COORDINATION_DEVICE_HEARTBEAT_SECONDS),
+            )
+        reference = now or datetime.now(timezone.utc)
+        if (
+            self._last_alert_poll_at is not None
+            and (reference - self._last_alert_poll_at).total_seconds() < interval
+        ):
+            return False
+        self._last_alert_poll_at = reference
+        self._external_alerting.process_due()
+        return True
+
     def _load_cards_if_changed(self, *, force: bool = False) -> List[TradeCardState]:
         """Refresh card payloads only after a compact revision token changes."""
 
@@ -1497,6 +1527,7 @@ class BuyboardRuntimeWorker(QThread):
         from src.services.coordination_change_pulse import (
             change_notifications_available,
             coordination_table_change_generation,
+            remote_peer_confirmed_off,
         )
 
         pulse_generation = coordination_table_change_generation(
@@ -1516,7 +1547,11 @@ class BuyboardRuntimeWorker(QThread):
             and local_generation == self._local_card_change_generation
             and pulse_generation == self._last_card_change_pulse_generation
             and self._last_card_revision_checked_at is not None
-            and (now - self._last_card_revision_checked_at).total_seconds() < interval
+            and (
+                remote_peer_confirmed_off(self._db_engine)
+                or (now - self._last_card_revision_checked_at).total_seconds()
+                < interval
+            )
         ):
             return self._cached_cards
         revision = repo.get_trade_card_collection_revision(
@@ -1767,6 +1802,7 @@ class BuyboardRuntimeWorker(QThread):
         from src.services.coordination_change_pulse import (
             change_notifications_available,
             coordination_table_change_generation,
+            remote_peer_confirmed_off,
         )
 
         pulse_generation = coordination_table_change_generation(
@@ -1783,8 +1819,11 @@ class BuyboardRuntimeWorker(QThread):
         if (
             pulse_generation == self._last_operator_change_pulse_generation
             and self._last_operator_command_poll_at is not None
-            and (now - self._last_operator_command_poll_at).total_seconds()
-            < interval
+            and (
+                remote_peer_confirmed_off(self._db_engine)
+                or (now - self._last_operator_command_poll_at).total_seconds()
+                < interval
+            )
         ):
             return False
         self._last_operator_command_poll_at = now

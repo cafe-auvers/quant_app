@@ -428,7 +428,17 @@ class MarketDataStatusWorker(QThread):
             result = MarketDataStatusResult(
                 engine=self.engine,
                 latest_daily=get_latest_price_history_date(self.engine),
-                latest_hourly=get_latest_hourly_price_history_timestamp(self.engine),
+                # The local mirror intentionally contains a scoped hourly
+                # subset. SPY is its always-present freshness canary and its
+                # primary-key lookup avoids a multi-million-row global MAX.
+                latest_hourly=get_latest_hourly_price_history_timestamp(
+                    self.engine,
+                    symbol=(
+                        REFERENCE_SYMBOL
+                        if self.hourly_tickers is not None
+                        else None
+                    ),
+                ),
                 expected_date=expected_date,
                 daily_is_stale=local_mirror_is_stale(
                     self.engine, expected_date, tickers=tickers
@@ -1029,6 +1039,7 @@ class MainWindow(
         self.latest_intraday_prices: dict[str, float] = {}
         self.latest_intraday_sources: dict[tuple[str, str], str] = {}
         self.intraday_fetch_attempts: dict[str, dt.datetime] = {}
+        self._execution_queue_account_sizing_dirty = False
         self._cached_market_data_status = None
         self._historical_data_freshness = {
             MODE_1D: "checking",
@@ -1037,6 +1048,7 @@ class MainWindow(
         self._historical_data_expected_date = None
         self._historical_data_freshness_error = ""
         self.market_data_status_worker = None
+        self._pending_local_mirror_startup_engine = None
         self.market_pulse_service = MarketPulseService()
         self.market_pulse_worker = None
         self.intraday_bulk_purpose = "buyboard_orb"
@@ -1414,6 +1426,7 @@ class MainWindow(
         self._update_database_source_indicator()
 
         if source == "pc":
+            self._pending_local_mirror_startup_engine = None
             self.append_log(
                 "PC MySQL connection verified; using it immediately. "
                 "The laptop safety backup will update in the background."
@@ -1531,6 +1544,12 @@ class MainWindow(
             self._historical_data_freshness_error = ""
         self._poll_refresh_status()
         self.update_dashboard_summary()
+        pending_startup_engine = self.__dict__.get(
+            "_pending_local_mirror_startup_engine"
+        )
+        if pending_startup_engine is result.engine:
+            self._pending_local_mirror_startup_engine = None
+            self._finish_local_mirror_startup(result)
 
     def _sync_active_pc_to_local_mirror(self) -> None:
         """Periodically preserve the active PC database for sudden failover."""
@@ -1835,21 +1854,31 @@ class MainWindow(
         progress_label.setToolTip("")
 
     def _handle_local_mirror_startup(self, engine) -> None:
-        """PC unreachable; decide whether to use the local mirror silently or ask first."""
+        """Start the offline-mirror freshness decision without blocking Qt."""
+
+        if engine is None:
+            return
+        self._pending_local_mirror_startup_engine = engine
+        self.append_log(
+            "PC unreachable; checking the local data mirror in the background."
+        )
         try:
-            self._handle_local_mirror_startup_inner(engine)
+            # MarketDataStatusWorker owns the potentially expensive SQLite
+            # universe/freshness scans. _on_market_data_status_completed opens
+            # the prompt only after that worker returns to the Qt event loop.
+            self._start_market_data_status_refresh()
         except Exception:
-            # This runs synchronously from a Qt slot invoked across a QThread
-            # signal boundary -- an uncaught exception here can silently kill
-            # the whole app (no dialog, no traceback) instead of just failing
-            # this one startup step. Log it and keep the window usable.
-            logger.exception("Local mirror startup handling failed")
+            self._pending_local_mirror_startup_engine = None
+            logger.exception("Could not start local mirror freshness worker")
             self.append_log(
                 "Local data mirror startup check failed; continuing without it "
                 "(see quant_app.log for details)."
             )
+            self.run_all_scanners(show_warnings=False)
 
     def _handle_local_mirror_startup_inner(self, engine) -> None:
+        """Synchronous compatibility helper used by focused unit tests."""
+
         expected_date = expected_latest_market_data_date()
         # Restrict staleness to the currently tracked universe. A symbol
         # dropped from the S&P 500/KIS list (delisted, ticker change, etc.)
@@ -1869,6 +1898,31 @@ class MainWindow(
         hourly_is_stale = local_mirror_hourly_is_stale(
             engine, expected_date, tickers=hourly_tickers
         )
+        MainWindow._finish_local_mirror_startup(
+            self,
+            MarketDataStatusResult(
+                engine=engine,
+                expected_date=expected_date,
+                daily_is_stale=daily_is_stale,
+                hourly_is_stale=hourly_is_stale,
+            ),
+        )
+
+    def _finish_local_mirror_startup(
+        self, result: MarketDataStatusResult
+    ) -> None:
+        """Prompt or scan using an already-computed background result."""
+
+        if result.error:
+            self.append_log(
+                "Local data mirror startup check failed; continuing with the "
+                f"existing cache. {result.error}"
+            )
+            self.run_all_scanners(show_warnings=False)
+            return
+        expected_date = result.expected_date or expected_latest_market_data_date()
+        daily_is_stale = bool(result.daily_is_stale)
+        hourly_is_stale = bool(result.hourly_is_stale)
         if not daily_is_stale and not hourly_is_stale:
             self.append_log("PC unreachable; using local data mirror (up to date).")
             self.run_all_scanners(show_warnings=False)
@@ -5320,25 +5374,78 @@ class MainWindow(
                 except Exception:
                     pass
 
-    def _configure_coordination_fallback_timers(self, pulse_supported: bool) -> None:
-        """Back off TiDB display polls while Tailscale change pulses are live."""
+    def _configure_coordination_fallback_timers(
+        self,
+        remote_poll_backoff_safe: bool,
+        *,
+        peer_confirmed_off: bool = False,
+    ) -> None:
+        """Back off or pause TiDB display polls based on peer reachability."""
 
         state_timer = self.__dict__.get("state_sync_timer")
         board_timer = self.__dict__.get("_buyboard_projection_timer")
         state_seconds = (
             execution_config.COORDINATION_REMOTE_FALLBACK_SECONDS
-            if pulse_supported
+            if remote_poll_backoff_safe
             else execution_config.COORDINATION_STATE_SYNC_SECONDS
         )
         board_seconds = (
             execution_config.COORDINATION_REMOTE_FALLBACK_SECONDS
-            if pulse_supported
+            if remote_poll_backoff_safe
             else execution_config.COORDINATION_BOARD_PROJECTION_SECONDS
         )
-        if state_timer is not None:
-            state_timer.setInterval(int(state_seconds * 1000))
-        if board_timer is not None:
-            board_timer.setInterval(int(board_seconds * 1000))
+        for timer, seconds in (
+            (state_timer, state_seconds),
+            (board_timer, board_seconds),
+        ):
+            if timer is None:
+                continue
+            if peer_confirmed_off:
+                timer.stop()
+                continue
+            desired_interval = int(seconds * 1000)
+            current_interval = getattr(timer, "interval", None)
+            current_interval = (
+                current_interval() if callable(current_interval) else None
+            )
+            # QTimer restarts its countdown when setInterval is called while
+            # active. Avoid resetting an hourly fallback on every 5s pulse.
+            if current_interval != desired_interval:
+                timer.setInterval(desired_interval)
+            is_active = getattr(timer, "isActive", None)
+            if callable(is_active) and not is_active():
+                timer.start()
+
+    @staticmethod
+    def _coordination_peer_confirmed_off(status) -> bool:
+        from src.services.pc_remote_control import PcStatus
+
+        return bool(
+            status.listener_status == PcStatus.OFF
+            and not bool(getattr(status, "database_ready", False))
+        )
+
+    @staticmethod
+    def _coordination_remote_poll_backoff_safe(status) -> bool:
+        """Return whether routine TiDB fallback reads can use the long cadence.
+
+        A reachable v2/v3 listener supplies change notifications.  A peer
+        whose listener *and* database are both off cannot make remote changes,
+        while the five-second PC status probe will notice its return before
+        restoring the appropriate notification/legacy mode.  A reachable
+        legacy or unknown listener, and a PC with a live database but no
+        listener, retain conservative short polling.
+        """
+
+        from src.services.pc_remote_control import PcStatus
+
+        listener_on = status.listener_status == PcStatus.ON
+        pulse_supported = bool(
+            listener_on
+            and getattr(status, "coordination_change_pulse_supported", False)
+        )
+        peer_confirmed_off = MainWindow._coordination_peer_confirmed_off(status)
+        return pulse_supported or peer_confirmed_off
 
     def _on_remote_coordination_change(
         self, changed_tables: tuple[str, ...] = ()
@@ -5505,10 +5612,10 @@ class MainWindow(
             return
 
         listener_on = status.listener_status == PcStatus.ON
-        pulse_supported = bool(
-            listener_on
-            and getattr(status, "coordination_change_pulse_supported", False)
+        remote_poll_backoff_safe = self._coordination_remote_poll_backoff_safe(
+            status
         )
+        peer_confirmed_off = self._coordination_peer_confirmed_off(status)
         execution_engine = (
             self._execution_state_engine()
             if self.__dict__.get("_coordination_database_configured", False)
@@ -5518,10 +5625,21 @@ class MainWindow(
             acknowledge_local_change_event,
             mark_remote_coordination_change,
             set_change_notifications_available,
+            set_remote_peer_confirmed_off,
         )
 
-        set_change_notifications_available(execution_engine, pulse_supported)
-        self._configure_coordination_fallback_timers(pulse_supported)
+        # The runtime workers use this flag to select their long missed-event
+        # fallback.  It is also safe while the peer is confirmed off: local
+        # DML remains dirty-pulse driven, and the frequent status probe flips
+        # this back as soon as the peer returns.
+        set_change_notifications_available(
+            execution_engine, remote_poll_backoff_safe
+        )
+        set_remote_peer_confirmed_off(execution_engine, peer_confirmed_off)
+        self._configure_coordination_fallback_timers(
+            remote_poll_backoff_safe,
+            peer_confirmed_off=peer_confirmed_off,
+        )
         delivered_event_id = str(
             getattr(status, "coordination_notification_event_id", "") or ""
         )
@@ -5621,8 +5739,10 @@ class MainWindow(
         self._update_database_source_indicator()
         status_timer = self.__dict__.get("pc_status_timer")
         if status_timer is not None:
-            # Reconnect quickly during an outage, then back off once healthy.
-            status_timer.setInterval(15_000 if db_ready else 5_000)
+            # This is a local/Tailscale status and change-token pulse, not a
+            # TiDB poll. Keep it at five seconds in both offline and online
+            # modes so a returning peer or a remote change is noticed fast.
+            status_timer.setInterval(5_000)
         self._last_pc_main_app_active = status.main_app_active
         if (
             status.main_app_active is True

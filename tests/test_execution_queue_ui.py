@@ -130,6 +130,50 @@ def _build_queue_window(monkeypatch, tmp_path):
     return window
 
 
+def test_successful_queue_refresh_clears_deferred_account_sizing_marker(
+    monkeypatch, tmp_path
+):
+    window = _build_queue_window(monkeypatch, tmp_path)
+    window._execution_queue_account_sizing_dirty = True
+
+    MainWindow.refresh_execution_queue(window, "PROD", show_log=False)
+
+    assert window._execution_queue_account_sizing_dirty is False
+
+
+def test_queue_adr_load_is_bounded_to_recent_daily_history(monkeypatch):
+    captured = {}
+    index = pd.date_range("2026-07-01", periods=30, freq="D", tz="UTC")
+    history = pd.DataFrame(
+        {
+            "High": [102.0] * 30,
+            "Low": [98.0] * 30,
+            "Close": [100.0] * 30,
+        },
+        index=index,
+    )
+
+    def fake_load(symbol, engine, **kwargs):
+        captured.update(symbol=symbol, engine=engine, **kwargs)
+        return history
+
+    monkeypatch.setattr(
+        buylist_view_module, "load_symbol_history_from_db", fake_load
+    )
+    engine = object()
+    window = SimpleNamespace(db_enabled=True, db_engine=engine)
+
+    value = MainWindow._buylist_adr_percent_for_symbol(window, "aapl")
+
+    assert value == pytest.approx(4.0)
+    assert captured == {
+        "symbol": "AAPL",
+        "engine": engine,
+        "interval": "1d",
+        "max_rows": 30,
+    }
+
+
 def test_refresh_execution_queue_does_not_create_rows_from_watchlist(
     monkeypatch, tmp_path
 ):

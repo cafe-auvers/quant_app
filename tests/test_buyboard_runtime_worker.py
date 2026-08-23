@@ -397,6 +397,36 @@ def test_card_cache_downloads_payload_only_when_revision_changes(
     assert len(calls) == 2
 
 
+def test_confirmed_off_peer_disables_elapsed_card_fallback(
+    tmp_path, monkeypatch
+):
+    from src.services import coordination_change_pulse
+
+    worker, engine = _worker(tmp_path)
+    _seed_card(engine)
+    real_revision = repo.get_trade_card_collection_revision
+    revision_calls = []
+
+    def counted_revision(*args, **kwargs):
+        revision_calls.append(True)
+        return real_revision(*args, **kwargs)
+
+    monkeypatch.setattr(
+        repo,
+        "get_trade_card_collection_revision",
+        counted_revision,
+    )
+    worker._load_cards_if_changed()
+    coordination_change_pulse.set_remote_peer_confirmed_off(engine, True)
+    worker._last_card_revision_checked_at = dt.datetime.now(
+        dt.timezone.utc
+    ) - dt.timedelta(days=2)
+
+    worker._load_cards_if_changed()
+
+    assert len(revision_calls) == 1
+
+
 def test_startup_reconciliation_seeds_card_cache_without_second_payload_download(
     tmp_path, monkeypatch
 ):
@@ -438,6 +468,10 @@ def test_operator_command_lookup_runs_only_after_internal_change_pulse(
     )
 
     assert worker._process_operator_commands() is False
+    coordination_change_pulse.set_remote_peer_confirmed_off(engine, True)
+    worker._last_operator_command_poll_at = dt.datetime.now(
+        dt.timezone.utc
+    ) - dt.timedelta(days=2)
     assert worker._process_operator_commands() is False
     assert len(calls) == 1
 
@@ -1536,6 +1570,52 @@ def test_unchanged_runtime_readiness_uses_timestamp_only_heartbeat(
 
     assert len(calls) == 1
     assert calls[0]["heartbeat_only"] is True
+
+
+def test_peer_off_alert_retry_poll_rides_on_four_minute_heartbeat(tmp_path):
+    from src.services import coordination_change_pulse
+
+    worker, engine = _worker(tmp_path)
+    calls = []
+    worker._database_writable = True
+    worker._external_alerting = SimpleNamespace(
+        process_due=lambda: calls.append(True)
+    )
+    coordination_change_pulse.set_remote_peer_confirmed_off(engine, True)
+    started_at = dt.datetime(2026, 8, 23, tzinfo=dt.timezone.utc)
+
+    assert worker._process_due_external_alerts(now=started_at) is True
+    assert worker._process_due_external_alerts(
+        now=started_at
+        + dt.timedelta(seconds=execution_config.COORDINATION_ALERT_POLL_SECONDS + 1)
+    ) is False
+    assert worker._process_due_external_alerts(
+        now=started_at
+        + dt.timedelta(
+            seconds=execution_config.COORDINATION_DEVICE_HEARTBEAT_SECONDS + 1
+        )
+    ) is True
+    assert len(calls) == 2
+
+
+def test_peer_online_retains_normal_alert_retry_cadence(tmp_path):
+    from src.services import coordination_change_pulse
+
+    worker, engine = _worker(tmp_path)
+    calls = []
+    worker._database_writable = True
+    worker._external_alerting = SimpleNamespace(
+        process_due=lambda: calls.append(True)
+    )
+    coordination_change_pulse.set_remote_peer_confirmed_off(engine, False)
+    started_at = dt.datetime(2026, 8, 23, tzinfo=dt.timezone.utc)
+
+    assert worker._process_due_external_alerts(now=started_at) is True
+    assert worker._process_due_external_alerts(
+        now=started_at
+        + dt.timedelta(seconds=execution_config.COORDINATION_ALERT_POLL_SECONDS + 1)
+    ) is True
+    assert len(calls) == 2
 
 
 def test_pull_only_successor_is_handoff_ready_before_market_open_without_quotes(
@@ -3663,6 +3743,32 @@ def test_persist_changed_swallows_a_stale_version_conflict(tmp_path):
 def test_lease_still_current_true_without_execution_authority(tmp_path):
     worker, _ = _worker(tmp_path)
     assert worker._lease_still_current() is True
+
+
+def test_confirmed_off_peer_disables_elapsed_lease_fallback(tmp_path):
+    from src.services import coordination_change_pulse
+
+    class _CountingAuthority:
+        def __init__(self):
+            self.calls = 0
+
+        def require_current_lease(self, engine, expected):
+            self.calls += 1
+
+    authority = _CountingAuthority()
+    worker, engine = _worker(
+        tmp_path,
+        execution_authority=authority,
+        execution_lease=LeaseHandle(device_id="pc", lease_token="tok"),
+    )
+    assert worker._lease_still_current() is True
+    coordination_change_pulse.set_remote_peer_confirmed_off(engine, True)
+    worker._last_lease_checked_at = dt.datetime.now(
+        dt.timezone.utc
+    ) - dt.timedelta(days=2)
+
+    assert worker._lease_still_current() is True
+    assert authority.calls == 1
 
 
 def test_lease_still_current_false_once_expired(tmp_path):

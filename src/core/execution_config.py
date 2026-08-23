@@ -90,7 +90,7 @@ ENGINE_HEARTBEAT_SECONDS = _env_int("ENGINE_HEARTBEAT_SECONDS", 1)
 # Published in runtime readiness so a newly deployed client refuses to share
 # the coordination store with a still-running pre-budget peer. This is a
 # protocol identity, not an operator-overridable setting.
-COORDINATION_RU_PROFILE = "typed-change-pulse-v4"
+COORDINATION_RU_PROFILE = "typed-change-pulse-v6"
 # The market/ORB loop above stays at one second. These independent cadences
 # cap Internet coordination traffic without delaying broker-boundary fencing.
 COORDINATION_ACTIVE_CARD_POLL_SECONDS = max(
@@ -110,12 +110,20 @@ COORDINATION_DATABASE_PROBE_SECONDS = max(
 COORDINATION_LEASE_POLL_SECONDS = max(
     20.0, _env_float("COORDINATION_LEASE_POLL_SECONDS", 20.0)
 )
-# A publication plus scheduling margin still fits inside the 60-second
-# runtime-freshness fence.
-# This state is for readiness/handoff display; it does not drive the
-# one-second market loop or relax the per-order lease proof.
+# Runtime liveness is the one routine TiDB write that remains while a device
+# is otherwise idle. Local/Tailscale change pulses handle five-second peer
+# synchronization, so TiDB only needs a coarse four-minute publication.
+# Every safety-critical mutation still proves its database/lease state at the
+# action boundary and publishes immediately when runtime details change.
 COORDINATION_DEVICE_HEARTBEAT_SECONDS = max(
-    45.0, _env_float("COORDINATION_DEVICE_HEARTBEAT_SECONDS", 45.0)
+    240.0, _env_float("COORDINATION_DEVICE_HEARTBEAT_SECONDS", 240.0)
+)
+# The stale-owner and standby-readiness fences must always exceed the write
+# cadence. Sixty seconds of delivery/scheduling margin prevents an ordinary
+# delayed heartbeat from authorizing an unsafe failover.
+COORDINATION_DEVICE_HEARTBEAT_MAX_AGE_SECONDS = max(
+    COORDINATION_DEVICE_HEARTBEAT_SECONDS + 60.0,
+    _env_float("COORDINATION_DEVICE_HEARTBEAT_MAX_AGE_SECONDS", 300.0),
 )
 COORDINATION_OWNERSHIP_PROOF_SECONDS = max(
     30.0, _env_float("COORDINATION_OWNERSHIP_PROOF_SECONDS", 30.0)
