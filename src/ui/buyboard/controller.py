@@ -25,9 +25,8 @@ from src.core.board_workflow import (
     BoardCardProjection,
     BoardProjectionContext,
 )
-from src.core.execution_config import (
-    is_buyboard_engine_enabled,
-)
+from src.core import execution_config
+from src.core.execution_config import is_buyboard_engine_enabled
 from src.core.runtime_readiness import RuntimeDeviceState
 from src.core.trade_card_state import (
     BoardStatus,
@@ -523,7 +522,9 @@ def _claims_kanban_ownership(command: AnyBoardCommand) -> bool:
 class BuyboardMixin:
     """Build the board and route all gestures through the workflow service."""
 
-    _BUYBOARD_PROJECTION_REFRESH_MS = 60_000
+    _BUYBOARD_PROJECTION_REFRESH_MS = int(
+        execution_config.COORDINATION_BOARD_PROJECTION_SECONDS * 1000
+    )
     _BUYBOARD_LIVE_METRIC_REFRESH_MS = 750
     _BUYBOARD_ORB_DATA_REFRESH_MS = 60_000
     _BUYBOARD_BROKER_TRUTH_REFRESH_MS = 30_000

@@ -1667,7 +1667,7 @@ def list_board_projections(
 def get_board_projection_revision(engine, *, environment="PROD"):
     """Return one compact token covering every table used by the board.
 
-    A timer can compare this single SQL result once per minute and avoid both
+    A timer can compare this single SQL result every three minutes and avoid both
     JSON transfer and UI rebuild when nothing changed.  The full projection
     remains normalized relational state; this token is only invalidation.
     """

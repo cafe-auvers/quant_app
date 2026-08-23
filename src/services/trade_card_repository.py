@@ -72,10 +72,10 @@ _local_change_lock = threading.Lock()
 def local_trade_card_change_generation(engine: Optional[Engine]) -> int:
     """Return a process-local token incremented after every card SQL write.
 
-    The runtime can poll the remote collection revision once per minute while
-    still observing writes made through this process's shared engine on its
-    next one-second market cycle.  Database CAS/version checks remain the
-    authority; this token is only a safe cache invalidation hint.
+    The runtime can poll the remote collection revision on its strict cloud
+    cadence while still observing writes made through this process's shared
+    engine on its next one-second market cycle. Database CAS/version checks
+    remain the authority; this token is only a safe cache invalidation hint.
     """
 
     if engine is None:

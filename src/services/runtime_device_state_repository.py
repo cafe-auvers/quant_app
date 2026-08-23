@@ -423,6 +423,7 @@ def require_compatible_runtime_schema(
     *,
     device_id: str,
     schema_version: int = CURRENT_EXECUTION_SCHEMA_VERSION,
+    required_coordination_profile: str = "",
     lease_engine: Optional[Engine] = None,
     max_age_seconds: float = 60.0,
     now: Optional[datetime] = None,
@@ -451,13 +452,15 @@ def require_compatible_runtime_schema(
         RuntimeDeviceState.ACTIVE.value,
         RuntimeDeviceState.SHUTTING_DOWN.value,
     }
+    predicates = [
+        table.c.device_id != str(device_id or ""),
+        table.c.state.in_(live_states),
+    ]
+    if not required_coordination_profile:
+        predicates.append(table.c.schema_version != int(schema_version))
     with coordination_read_connection(engine) as conn:
         conflicting_rows = conn.execute(
-            select(table).where(
-                table.c.device_id != str(device_id or ""),
-                table.c.state.in_(live_states),
-                table.c.schema_version != int(schema_version),
-            )
+            select(table).where(*predicates)
         ).fetchall()
         server_now = conn.execute(select(_server_now(engine))).scalar()
     reference = now or server_now or datetime.now(timezone.utc)
@@ -487,12 +490,22 @@ def require_compatible_runtime_schema(
             if is_current_owner
             else "fresh running peer"
         )
-        raise RuntimeError(
-            "Runtime schema mismatch: device "
-            f"{conflicting.device_id} is a {authority} in "
-            f"{conflicting.state.value} on schema {conflicting.schema_version}, "
-            f"while this runtime requires {schema_version}"
-        )
+        if conflicting.schema_version != int(schema_version):
+            raise RuntimeError(
+                "Runtime schema mismatch: device "
+                f"{conflicting.device_id} is a {authority} in "
+                f"{conflicting.state.value} on schema {conflicting.schema_version}, "
+                f"while this runtime requires {schema_version}"
+            )
+        if required_coordination_profile and str(
+            conflicting.details.get("coordination_ru_profile") or ""
+        ) != str(required_coordination_profile):
+            raise RuntimeError(
+                "Coordination RU profile mismatch: device "
+                f"{conflicting.device_id} is a {authority} without "
+                f"{required_coordination_profile!r}. Stop it, deploy the same "
+                "version to both devices, and restart before using TiDB."
+            )
 
 
 def find_standby_successor(

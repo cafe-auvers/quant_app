@@ -87,49 +87,64 @@ SELL_MARKETABLE_DISCOUNT_PCT = _env_float("SELL_MARKETABLE_DISCOUNT_PCT", 0.005)
 
 # --- One-second engine cadence (section 771-806) -----------------------------
 ENGINE_HEARTBEAT_SECONDS = _env_int("ENGINE_HEARTBEAT_SECONDS", 1)
+# Published in runtime readiness so a newly deployed client refuses to share
+# the coordination store with a still-running pre-budget peer. This is a
+# protocol identity, not an operator-overridable setting.
+COORDINATION_RU_PROFILE = "strict-7-9-v1"
 # The market/ORB loop above stays at one second. These independent cadences
 # cap Internet coordination traffic without delaying broker-boundary fencing.
 COORDINATION_ACTIVE_CARD_POLL_SECONDS = max(
-    60.0, _env_float("COORDINATION_ACTIVE_CARD_POLL_SECONDS", 60.0)
+    180.0, _env_float("COORDINATION_ACTIVE_CARD_POLL_SECONDS", 180.0)
 )
 COORDINATION_STANDBY_CARD_POLL_SECONDS = max(
-    60.0, _env_float("COORDINATION_STANDBY_CARD_POLL_SECONDS", 60.0)
+    300.0, _env_float("COORDINATION_STANDBY_CARD_POLL_SECONDS", 300.0)
 )
 # The runtime-device heartbeat is itself a real coordination-store write, and
 # every safety-critical mutation independently proves database/lease state.
-# A separate no-op write once per minute is sufficient to detect a connection
-# that is readable but not writable without paying for the same proof every
-# 15 seconds on both machines.
+# A separate no-op write every three minutes is sufficient to detect a
+# connection that is readable but not writable. Runtime readiness writes and
+# every safety-critical mutation independently prove the write path sooner.
 COORDINATION_DATABASE_PROBE_SECONDS = max(
-    60.0, _env_float("COORDINATION_DATABASE_PROBE_SECONDS", 60.0)
+    180.0, _env_float("COORDINATION_DATABASE_PROBE_SECONDS", 180.0)
 )
 COORDINATION_LEASE_POLL_SECONDS = max(
-    10.0, _env_float("COORDINATION_LEASE_POLL_SECONDS", 10.0)
+    20.0, _env_float("COORDINATION_LEASE_POLL_SECONDS", 20.0)
 )
-# Two publications still fit inside the 60-second runtime-freshness fence.
+# A publication plus scheduling margin still fits inside the 60-second
+# runtime-freshness fence.
 # This state is for readiness/handoff display; it does not drive the
 # one-second market loop or relax the per-order lease proof.
 COORDINATION_DEVICE_HEARTBEAT_SECONDS = max(
-    30.0, _env_float("COORDINATION_DEVICE_HEARTBEAT_SECONDS", 30.0)
+    45.0, _env_float("COORDINATION_DEVICE_HEARTBEAT_SECONDS", 45.0)
 )
 COORDINATION_OWNERSHIP_PROOF_SECONDS = max(
-    10.0, _env_float("COORDINATION_OWNERSHIP_PROOF_SECONDS", 10.0)
+    30.0, _env_float("COORDINATION_OWNERSHIP_PROOF_SECONDS", 30.0)
 )
 COORDINATION_ALERT_POLL_SECONDS = max(
-    30.0, _env_float("COORDINATION_ALERT_POLL_SECONDS", 30.0)
+    90.0, _env_float("COORDINATION_ALERT_POLL_SECONDS", 90.0)
 )
 # Operator commands are the hottest remaining coordination read while the US
 # regular session is open.  Production measurements near 20 RU/s were
 # consistent with the remaining empty-queue lookup's one-second cadence. A
 # later production sample still measured 17--18 RU/s with the three-second
-# floor, so ten seconds is now the non-overridable minimum. Local controls are
-# immediate; only a command created on the other device waits for this poll.
+# floor. Twenty seconds is now the non-overridable minimum required by the
+# 7--9 RU/s cluster budget. Local controls are immediate; only a command
+# created on the other device waits for this fallback poll.
 # The local market/stop loop and broker-boundary lease proof are independent.
 COORDINATION_OPERATOR_COMMAND_POLL_SECONDS = max(
-    10.0, _env_float("COORDINATION_OPERATOR_COMMAND_POLL_SECONDS", 10.0)
+    20.0, _env_float("COORDINATION_OPERATOR_COMMAND_POLL_SECONDS", 20.0)
 )
 COORDINATION_OFF_HOURS_POLL_SECONDS = max(
-    60.0, _env_float("COORDINATION_OFF_HOURS_POLL_SECONDS", 60.0)
+    300.0, _env_float("COORDINATION_OFF_HOURS_POLL_SECONDS", 300.0)
+)
+
+# UI projection/display polling is not an execution boundary. Local changes
+# invalidate immediately and owner activation force-loads canonical state.
+COORDINATION_STATE_SYNC_SECONDS = max(
+    180.0, _env_float("COORDINATION_STATE_SYNC_SECONDS", 180.0)
+)
+COORDINATION_BOARD_PROJECTION_SECONDS = max(
+    180.0, _env_float("COORDINATION_BOARD_PROJECTION_SECONDS", 180.0)
 )
 PENDING_ORDER_RECONCILIATION_SECONDS = max(
     2, _env_int("PENDING_ORDER_RECONCILIATION_SECONDS", 2)

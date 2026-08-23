@@ -23,12 +23,70 @@ from src.services.runtime_device_state_repository import (
 
 
 def test_cloud_coordination_poll_floors_preserve_monthly_budget():
-    assert execution_config.COORDINATION_DATABASE_PROBE_SECONDS >= 60.0
-    assert execution_config.COORDINATION_DEVICE_HEARTBEAT_SECONDS >= 30.0
-    assert execution_config.COORDINATION_OPERATOR_COMMAND_POLL_SECONDS >= 10.0
+    assert execution_config.COORDINATION_ACTIVE_CARD_POLL_SECONDS >= 180.0
+    assert execution_config.COORDINATION_STANDBY_CARD_POLL_SECONDS >= 300.0
+    assert execution_config.COORDINATION_DATABASE_PROBE_SECONDS >= 180.0
+    assert execution_config.COORDINATION_LEASE_POLL_SECONDS >= 20.0
+    assert execution_config.COORDINATION_DEVICE_HEARTBEAT_SECONDS >= 45.0
+    assert execution_config.COORDINATION_OWNERSHIP_PROOF_SECONDS >= 30.0
+    assert execution_config.COORDINATION_ALERT_POLL_SECONDS >= 90.0
+    assert execution_config.COORDINATION_OPERATOR_COMMAND_POLL_SECONDS >= 20.0
+    assert execution_config.COORDINATION_OFF_HOURS_POLL_SECONDS >= 300.0
+    assert execution_config.COORDINATION_STATE_SYNC_SECONDS >= 180.0
+    assert execution_config.COORDINATION_BOARD_PROJECTION_SECONDS >= 180.0
     assert execution_config.PENDING_ORDER_RECONCILIATION_SECONDS >= 2
     assert execution_config.UNKNOWN_ORDER_RECONCILIATION_SECONDS >= 1
     assert execution_config.DURABLE_ORDER_OBSERVATION_SECONDS >= 3600
+
+
+def test_strict_profile_has_two_x_headroom_below_nine_ru_per_second():
+    """Lock the documented two-device scheduled-request envelope."""
+
+    month_seconds = 30 * 24 * 60 * 60
+    regular_session_seconds = 22 * 6.5 * 60 * 60
+    off_hours_seconds = month_seconds - regular_session_seconds
+
+    scheduled_requests = sum(
+        (
+            # Two fallback write probes plus their explicit COMMITs.
+            4 * month_seconds
+            / execution_config.COORDINATION_DATABASE_PROBE_SECONDS,
+            # Two devices: revision read plus readiness UPDATE.
+            4 * month_seconds
+            / execution_config.COORDINATION_DEVICE_HEARTBEAT_SECONDS,
+            # Two main.py process heartbeat UPDATEs.
+            2 * month_seconds
+            / execution_config.COORDINATION_DEVICE_HEARTBEAT_SECONDS,
+            month_seconds / execution_config.COORDINATION_LEASE_POLL_SECONDS,
+            month_seconds
+            / execution_config.COORDINATION_ACTIVE_CARD_POLL_SECONDS,
+            month_seconds
+            / execution_config.COORDINATION_STANDBY_CARD_POLL_SECONDS,
+            regular_session_seconds
+            / execution_config.COORDINATION_OPERATOR_COMMAND_POLL_SECONDS,
+            off_hours_seconds
+            / execution_config.COORDINATION_OFF_HOURS_POLL_SECONDS,
+            month_seconds
+            / execution_config.COORDINATION_OWNERSHIP_PROOF_SECONDS,
+            # Two alert consumers plus two five-minute audit heartbeats.
+            2 * month_seconds
+            / execution_config.COORDINATION_ALERT_POLL_SECONDS,
+            2 * month_seconds / 300.0,
+            2 * month_seconds
+            / execution_config.COORDINATION_BOARD_PROJECTION_SECONDS,
+            # Current display synchronization has five compact request slots.
+            5 * month_seconds
+            / execution_config.COORDINATION_STATE_SYNC_SECONDS,
+            # Three relational reads per minute for each of two accounts.
+            6 * month_seconds / 60.0,
+        )
+    )
+    conservative_ru_per_second = (
+        scheduled_requests * 1.25 * 8.0 / month_seconds
+    )
+
+    assert scheduled_requests <= 1_110_000
+    assert conservative_ru_per_second <= 4.3
 
 
 def test_idle_operator_command_poll_uses_covering_index_without_commit(tmp_path):

@@ -522,6 +522,7 @@ class BuyboardRuntimeWorker(QThread):
             "kis_ready": reconciliation_ready,
             "broker_account": str(self._account_no or "all configured accounts"),
             "environment": self._environment,
+            "coordination_ru_profile": execution_config.COORDINATION_RU_PROFILE,
             "account_environment_ready": bool(
                 self._environment in {"PROD", "PAPER"} and reconciliation_ready
             ),
@@ -686,6 +687,9 @@ class BuyboardRuntimeWorker(QThread):
                 self._db_engine,
                 device_id=self._device_id,
                 lease_engine=self._lease_engine or self._db_engine,
+                required_coordination_profile=(
+                    execution_config.COORDINATION_RU_PROFILE
+                ),
             )
             migration_manager = (
                 self._schema_migration_manager
@@ -1033,7 +1037,7 @@ class BuyboardRuntimeWorker(QThread):
         if self.runtime is None:
             return
         # A standby may have intentionally polled the shared card collection
-        # only once per minute.  Ownership activation is an exceptional
+        # only once per five minutes. Ownership activation is an exceptional
         # safety boundary: force a full canonical read and install every new
         # quote subscription/stop before declaring this successor ACTIVE.
         cards = self._load_cards_if_changed(force=True)
