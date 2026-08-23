@@ -592,10 +592,13 @@ def _portfolio_projected_exposures(
             raise ValueError(
                 f"Pending BUY {order.client_order_id} has no usable valuation price"
             )
-        reservation_id = str(order.capital_reservation_id or "")
-        if reservation_id and reservation_id in seen_reservation_ids:
+        referenced_reservation_id = str(order.capital_reservation_id or "")
+        reservation = reservations.get(referenced_reservation_id)
+        active_reservation_id = (
+            referenced_reservation_id if reservation is not None else ""
+        )
+        if active_reservation_id in seen_reservation_ids:
             continue
-        reservation = reservations.get(reservation_id)
         pending_notional = quantity * price
         gross_notional = max(
             pending_notional,
@@ -615,13 +618,20 @@ def _portfolio_projected_exposures(
                 symbol=order.symbol,
                 gross_notional_usd=gross_notional,
                 open_risk_usd=open_risk,
-                source="PENDING_BUY",
-                reservation_id=reservation_id,
+                source=(
+                    "PENDING_BUY"
+                    if active_reservation_id
+                    else "PENDING_BUY_WITHOUT_ACTIVE_RESERVATION"
+                ),
+                # Only an open row may replace this exposure inside the
+                # final account-lock transaction. A dangling reference is
+                # deliberately left in the atomic baseline.
+                reservation_id=active_reservation_id,
                 strategy_id=RISK_STRATEGY_ID,
             )
         )
-        if reservation_id:
-            seen_reservation_ids.add(reservation_id)
+        if active_reservation_id:
+            seen_reservation_ids.add(active_reservation_id)
 
     for reservation_id, reservation in reservations.items():
         if reservation_id in seen_reservation_ids:

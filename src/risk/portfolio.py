@@ -343,6 +343,14 @@ class PortfolioRiskManager:
             )
         )
         existing = tuple(snapshot.positions) + projected_exposures
+        if any(
+            exposure.source == "PENDING_BUY_WITHOUT_ACTIVE_RESERVATION"
+            for exposure in projected_exposures
+        ):
+            reasons.append(
+                "Existing pending BUY has no active capital reservation; "
+                "reconcile it before adding exposure"
+            )
         existing_symbols = {position.symbol for position in existing}
         position_count_after = len(existing_symbols | {proposed.symbol})
         total_open_risk = sum(position.open_risk for position in existing)

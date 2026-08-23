@@ -18,6 +18,10 @@ from sqlalchemy.pool import NullPool
 
 from src.core import execution_config
 
+from src.core.account_broker_snapshot import (
+    AccountBrokerSnapshot,
+    SnapshotCompleteness,
+)
 from src.core.execution_mode import ExecutionLease, ExecutionMode, ExecutionSource
 from src.core.execution_ownership import ExecutionOwner, ExecutionOwnership
 from src.core.execution_order_record import AdoptedOrderPermission, ExecutionOrderStatus
@@ -28,7 +32,12 @@ from src.core.discovered_external_order import (
 )
 from src.core.execution_request import CancelExecutionRequest, ReplaceExecutionRequest, SubmitExecutionRequest
 from src.core.order_recovery_state import OrderRecoveryState
-from src.core.order_state import OrderIntent, OrderSide, OrderStatus
+from src.core.order_state import (
+    BrokerOrderStatusSnapshot,
+    OrderIntent,
+    OrderSide,
+    OrderStatus,
+)
 from src.risk.pre_trade import PreTradeRiskDecision, PreTradeRiskRejectedError
 from src.risk.portfolio import (
     PortfolioProjectedExposure,
@@ -63,6 +72,11 @@ from src.services.capital_reservation_repository import (
     fetch_reservation,
     list_active_reservations,
 )
+from src.services.account_reconciliation import (
+    AccountLocalState,
+    apply_reconciliation_plan,
+    reduce_account_reconciliation,
+)
 from src.services.execution_command_repository import (
     DuplicateCommandError,
     ExecutionCommand,
@@ -79,6 +93,7 @@ from src.services.execution_order_repository import (
     _get_execution_orders_table,
     ensure_execution_orders_table,
     fetch_execution_order,
+    list_execution_orders_for_account,
     record_execution_order,
     save_execution_order,
 )
@@ -1533,6 +1548,156 @@ def test_production_replace_transfers_net_risk_before_cancelling_original(
     assert reservations[0].remaining_projected_open_risk == pytest.approx(60.0)
     assert len(broker.cancel_calls) == 1
     assert len(broker.submit_calls) == 2
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_successful_replacement_reconciliation_retains_then_settles_shared_hold(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(
+        execution_config, "is_buyboard_engine_enabled", lambda: True
+    )
+    gateway, broker, engine = _production_guarded_gateway(tmp_path)
+    broker.queue_acceptance(broker_order_id="B-ORIGINAL")
+    original = gateway.submit_guarded(
+        _submit_request(
+            pre_trade_risk_decision=_portfolio_approval(
+                quantity=10, price=100.0
+            )
+        )
+    )
+    reservation = fetch_reservation(engine, original.capital_reservation_id)
+    pending = PortfolioProjectedExposure(
+        symbol="AAPL",
+        gross_notional_usd=1_000.0,
+        open_risk_usd=50.0,
+        source="PENDING_BUY",
+        reservation_id=reservation.reservation_id,
+    )
+    broker.queue_cancel_confirmed()
+    broker.queue_acceptance(broker_order_id="B-REPLACEMENT")
+    replacement = gateway.replace_guarded(
+        _replace_request(
+            new_quantity=12,
+            new_limit_price=100.0,
+            pre_trade_risk_decision=_portfolio_approval(
+                quantity=12,
+                price=100.0,
+                projected_exposures=(pending,),
+                replaced_reservation_id=reservation.reservation_id,
+            ),
+            risk_plan_id="TEST:ORB:AAPL",
+        )
+    )
+    observed_at = datetime.now(timezone.utc)
+
+    working_snapshot = AccountBrokerSnapshot(
+        environment="PROD",
+        account_no="12345678-01",
+        completeness=SnapshotCompleteness(
+            holdings_complete=True,
+            open_orders_complete=True,
+            history_complete=True,
+            reserved_orders_complete=True,
+            account_balance_complete=True,
+        ),
+        observed_at=observed_at,
+        session_date=observed_at.date(),
+        snapshot_id="replacement-working",
+        orders=(
+            BrokerOrderStatusSnapshot(
+                environment="PROD",
+                account_no="12345678-01",
+                symbol="AAPL",
+                broker_order_id=original.broker_order_id,
+                side=OrderSide.BUY,
+                status=OrderStatus.CANCELLED,
+                quantity_requested=10,
+                remaining_quantity=0,
+            ),
+            BrokerOrderStatusSnapshot(
+                environment="PROD",
+                account_no="12345678-01",
+                symbol="AAPL",
+                broker_order_id=replacement.broker_order_id,
+                side=OrderSide.BUY,
+                status=OrderStatus.WORKING,
+                quantity_requested=12,
+                remaining_quantity=12,
+                limit_price=100.0,
+            ),
+        ),
+    )
+    working_plan = reduce_account_reconciliation(
+        working_snapshot,
+        AccountLocalState(
+            execution_orders=tuple(
+                list_execution_orders_for_account(
+                    engine,
+                    environment="PROD",
+                    account_no="12345678-01",
+                )
+            ),
+            capital_reservations=tuple(
+                list_active_reservations(
+                    engine,
+                    environment="PROD",
+                    account_no="12345678-01",
+                )
+            ),
+        ),
+    )
+    apply_reconciliation_plan(engine, working_plan)
+
+    retained = fetch_reservation(engine, reservation.reservation_id)
+    assert retained.is_open() is True
+    assert retained.remaining_reserved_notional == pytest.approx(1_200.0)
+    assert fetch_execution_order(
+        engine, replacement.client_order_id
+    ).status == ExecutionOrderStatus.WORKING
+
+    filled_at = datetime.now(timezone.utc)
+    filled_snapshot = AccountBrokerSnapshot(
+        environment="PROD",
+        account_no="12345678-01",
+        completeness=working_snapshot.completeness,
+        observed_at=filled_at,
+        session_date=filled_at.date(),
+        snapshot_id="replacement-filled",
+        orders=(
+            BrokerOrderStatusSnapshot(
+                environment="PROD",
+                account_no="12345678-01",
+                symbol="AAPL",
+                broker_order_id=replacement.broker_order_id,
+                side=OrderSide.BUY,
+                status=OrderStatus.FILLED,
+                quantity_requested=12,
+                filled_quantity=12,
+                remaining_quantity=0,
+                avg_fill_price=100.0,
+            ),
+        ),
+    )
+    filled_plan = reduce_account_reconciliation(
+        filled_snapshot,
+        AccountLocalState(
+            execution_orders=tuple(
+                list_execution_orders_for_account(
+                    engine,
+                    environment="PROD",
+                    account_no="12345678-01",
+                )
+            ),
+            capital_reservations=(retained,),
+        ),
+    )
+    assert len(filled_plan.reservation_updates) == 1
+    apply_reconciliation_plan(engine, filled_plan)
+
+    settled = fetch_reservation(engine, reservation.reservation_id)
+    assert settled.status.value == "CONSUMED"
+    assert settled.remaining_reserved_notional == 0.0
 
 
 @pytest.mark.usefixtures("trading_enabled")

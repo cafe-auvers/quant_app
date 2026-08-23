@@ -88,3 +88,10 @@ by excluding the original pending reservation, retains the larger original or
 replacement hold through cancellation, and transfers that same durable
 reservation to the replacement. A definitive cancel rejection restores the
 original hold; an ambiguous cancel keeps the larger hold until reconciliation.
+Reconciliation groups orders that share the transferred reservation and lets
+only the current replacement-chain leaf settle it, so a cancelled predecessor
+cannot release capital beneath a live replacement. A live BUY whose referenced
+reservation is missing or closed remains fully present in the final atomic risk
+baseline, raises a critical reconciliation alert, and blocks only additional
+BUY exposure until repaired; exits, cancellation, liquidation, reconciliation,
+and recovery remain available.

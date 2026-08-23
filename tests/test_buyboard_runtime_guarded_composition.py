@@ -20,7 +20,10 @@ from src.core.discovered_external_order import (
     ExternalOrderDisposition,
     new_discovered_external_order,
 )
-from src.core.capital_reservation import CapitalReservation
+from src.core.capital_reservation import (
+    CapitalReservation,
+    CapitalReservationStatus,
+)
 from src.core.execution_mode import ExecutionLease, ExecutionSource
 from src.core.execution_order_record import (
     BrokerIdentityStatus,
@@ -66,7 +69,12 @@ from src.services.discovered_external_order_repository import (
 )
 from src.services.realtime_market_data import QuoteSnapshot, RestPollingMarketDataService
 from src.services import trading_engine as trading_engine_module
-from src.risk.portfolio import PortfolioRiskLimits, PortfolioRiskManager
+from src.risk.portfolio import (
+    PortfolioRiskLimits,
+    PortfolioRiskManager,
+    PortfolioRiskSnapshot,
+    ProposedPortfolioEntry,
+)
 from src.services.account_reconciliation import (
     AccountLocalState,
     reduce_account_reconciliation,
@@ -116,6 +124,83 @@ def test_projected_exposure_counts_partial_buy_once_with_linked_reservation():
     assert exposures[0].gross_notional_usd == pytest.approx(400.0)
     assert exposures[0].open_risk_usd == pytest.approx(20.0)
     assert exposures[0].reservation_id == reservation.reservation_id
+
+
+@pytest.mark.parametrize("include_closed_row", [False, True])
+def test_pending_buy_without_open_reservation_stays_in_atomic_risk_baseline(
+    include_closed_row,
+):
+    card = _card()
+    order = ExecutionOrderRecord(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        intent=OrderIntent.ENTRY,
+        client_order_id="dangling-entry",
+        broker_order_id="dangling-broker",
+        submitted_quantity=10,
+        submitted_limit_price=100.0,
+        status=ExecutionOrderStatus.WORKING,
+        remaining_quantity=10,
+        broker_identity_status=BrokerIdentityStatus.EXACT,
+        capital_reservation_id="closed-or-missing",
+        replaces_execution_order_id="cancelled-original",
+    )
+    closed = CapitalReservation(
+        reservation_id="closed-or-missing",
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        attempt_group_id="dangling",
+        requested_notional=1_000.0,
+        remaining_reserved_notional=0.0,
+        projected_open_risk=50.0,
+        remaining_projected_open_risk=0.0,
+        status=CapitalReservationStatus.RELEASED,
+    )
+
+    exposures = buyboard_runtime._portfolio_projected_exposures(
+        cards=(card,),
+        execution_orders=(order,),
+        active_reservations=((closed,) if include_closed_row else ()),
+    )
+    decision = PortfolioRiskManager(
+        PortfolioRiskLimits(
+            max_simultaneous_positions=30,
+            max_total_open_risk_fraction=0.20,
+            max_gross_notional_fraction=10.0,
+        )
+    ).evaluate_entry(
+        ProposedPortfolioEntry(
+            symbol="MSFT",
+            quantity=1,
+            reference_price=100.0,
+            stop_price=95.0,
+            strategy_id=STRATEGY_ID,
+            environment="PROD",
+            account_no="1",
+        ),
+        PortfolioRiskSnapshot(
+            account_equity_usd=10_000.0,
+            usable_buying_power_usd=10_000.0,
+            projected_exposures=exposures,
+            evaluated_at=datetime.now(timezone.utc),
+        ),
+    )
+
+    assert len(exposures) == 1
+    assert exposures[0].source == "PENDING_BUY_WITHOUT_ACTIVE_RESERVATION"
+    assert exposures[0].reservation_id == ""
+    assert exposures[0].gross_notional_usd == pytest.approx(1_000.0)
+    assert decision.approved is False
+    assert "no active capital reservation" in " ".join(decision.reasons)
+    assert decision.reservation_spec is not None
+    assert decision.reservation_spec.baseline_position_symbols == ("AAPL",)
+    assert decision.reservation_spec.baseline_gross_notional_usd == pytest.approx(
+        1_000.0
+    )
+    assert decision.reservation_spec.baseline_open_risk_usd == pytest.approx(50.0)
 
 
 def test_unowned_external_buy_uses_full_remaining_notional_as_open_risk():
