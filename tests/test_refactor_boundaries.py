@@ -476,6 +476,59 @@ def test_laptop_prompts_and_starts_d10_hourly_refresh_when_only_hourly_is_stale(
     assert window._run_scanners_after_local_mirror_refresh is True
 
 
+def test_laptop_startup_checks_hourly_freshness_only_for_mirrored_scope(
+    monkeypatch,
+):
+    import src.ui.main_window as main_window
+
+    class Window:
+        def __init__(self):
+            self.logs = []
+            self.watchlist = SimpleNamespace(
+                items=[SimpleNamespace(symbol="AAPL")]
+            )
+            self.buylist_manager = SimpleNamespace(items=[])
+            self.scanner_results = [{"symbol": "MSFT"}]
+            self.scanner_results_by_setup = {}
+
+        def append_log(self, message):
+            self.logs.append(message)
+
+        def run_all_scanners(self, **_kwargs):
+            self.scanner_kwargs = _kwargs
+
+    calls = {}
+    monkeypatch.setattr(
+        main_window, "get_default_universe", lambda: ["AAPL", "MSFT", "NVDA"]
+    )
+    monkeypatch.setattr(
+        main_window, "expected_latest_market_data_date", lambda: "2026-08-21"
+    )
+    monkeypatch.setattr(
+        main_window,
+        "local_mirror_is_stale",
+        lambda _engine, _expected, *, tickers: calls.setdefault(
+            "daily", list(tickers)
+        )
+        and False,
+    )
+    monkeypatch.setattr(
+        main_window,
+        "local_mirror_hourly_is_stale",
+        lambda _engine, _expected, *, tickers: calls.setdefault(
+            "hourly", list(tickers)
+        )
+        and False,
+    )
+
+    window = Window()
+    main_window.MainWindow._handle_local_mirror_startup_inner(window, object())
+
+    assert calls["daily"] == ["AAPL", "MSFT", "NVDA"]
+    assert calls["hourly"] == ["SPY", "AAPL", "MSFT"]
+    assert window.scanner_kwargs == {"show_warnings": False}
+
+
 def test_manual_refresh_cannot_start_during_database_reconciliation(monkeypatch):
     import src.ui.mixins.scanner_mixin as scanner_mixin
 

@@ -404,11 +404,13 @@ class MarketDataStatusWorker(QThread):
         self,
         engine,
         tickers: Optional[List[str]] = None,
+        hourly_tickers: Optional[List[str]] = None,
         universe_limit: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.engine = engine
         self.tickers = list(tickers or []) or None
+        self.hourly_tickers = list(hourly_tickers or []) or None
         self.universe_limit = universe_limit
 
     def run(self) -> None:
@@ -421,6 +423,7 @@ class MarketDataStatusWorker(QThread):
             tickers = self.tickers
             if tickers is None:
                 tickers = get_default_universe(max_symbols=self.universe_limit)
+            hourly_tickers = self.hourly_tickers or tickers
             expected_date = expected_latest_market_data_date()
             result = MarketDataStatusResult(
                 engine=self.engine,
@@ -431,7 +434,7 @@ class MarketDataStatusWorker(QThread):
                     self.engine, expected_date, tickers=tickers
                 ),
                 hourly_is_stale=local_mirror_hourly_is_stale(
-                    self.engine, expected_date, tickers=tickers
+                    self.engine, expected_date, tickers=hourly_tickers
                 ),
             )
         except Exception as exc:
@@ -1468,6 +1471,11 @@ class MainWindow(
         worker = MarketDataStatusWorker(
             self.db_engine,
             tickers=list(self.__dict__.get("universe_tickers") or []) or None,
+            hourly_tickers=(
+                self._relevant_hourly_symbols()
+                if self.__dict__.get("db_engine_source") == "local_mirror"
+                else None
+            ),
             universe_limit=self.__dict__.get("universe_limit"),
         )
         self.market_data_status_worker = worker
@@ -1857,8 +1865,9 @@ class MainWindow(
         daily_is_stale = local_mirror_is_stale(
             engine, expected_date, tickers=tickers
         )
+        hourly_tickers = MainWindow._relevant_hourly_symbols(self)
         hourly_is_stale = local_mirror_hourly_is_stale(
-            engine, expected_date, tickers=tickers
+            engine, expected_date, tickers=hourly_tickers
         )
         if not daily_is_stale and not hourly_is_stale:
             self.append_log("PC unreachable; using local data mirror (up to date).")

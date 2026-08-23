@@ -522,6 +522,10 @@ class HealthPanelMixin:
             self.__dict__.get("kis_startup_worker"),
         )
         mirror_tickers = list(self.__dict__.get("universe_tickers") or []) or None
+        hourly_scope_loader = getattr(self, "_relevant_hourly_symbols", None)
+        mirror_hourly_tickers = (
+            hourly_scope_loader() if callable(hourly_scope_loader) else None
+        )
 
         state_sync_role = self.__dict__.get("state_sync_role")
         is_main_device = bool(state_sync_role and state_sync_role.is_main)
@@ -557,6 +561,7 @@ class HealthPanelMixin:
             pc_database_engine=pc_database_engine,
             mirror_engine=self.__dict__.get("_local_mirror_engine"),
             mirror_tickers=mirror_tickers,
+            mirror_hourly_tickers=mirror_hourly_tickers,
             operational_store_configured=(
                 "operational_db_engine" in self.__dict__
             ),

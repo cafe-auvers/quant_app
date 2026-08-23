@@ -56,6 +56,7 @@ class HealthContext:
     pc_database_engine: Any = None
     mirror_engine: Any = None
     mirror_tickers: Optional[Sequence[str]] = None
+    mirror_hourly_tickers: Optional[Sequence[str]] = None
     operational_store_configured: bool = False
     operational_store_engine: Any = None
     kis_snapshot_count: int = 0
@@ -488,8 +489,9 @@ def _mirror_check(context: HealthContext) -> HealthCheck:
         daily_stale = local_mirror_is_stale(
             context.mirror_engine, expected_date, tickers=tickers
         )
+        hourly_tickers = context.mirror_hourly_tickers or tickers
         hourly_stale = local_mirror_hourly_is_stale(
-            context.mirror_engine, expected_date, tickers=tickers
+            context.mirror_engine, expected_date, tickers=hourly_tickers
         )
     except Exception as exc:
         return HealthCheck(
