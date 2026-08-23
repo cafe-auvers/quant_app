@@ -476,9 +476,18 @@ class PcRemoteStatusWorker(QThread):
 
     finished_status = pyqtSignal(object)  # PcServiceStatus
 
-    def __init__(self, engine=None, parent=None) -> None:
+    def __init__(
+        self,
+        engine=None,
+        *,
+        coordination_notification_event_id: str = "",
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self.engine = engine
+        self.coordination_notification_event_id = str(
+            coordination_notification_event_id or ""
+        )
 
     def run(self) -> None:
         from concurrent.futures import ThreadPoolExecutor
@@ -486,17 +495,27 @@ class PcRemoteStatusWorker(QThread):
         from sqlalchemy import text
 
         from src.infrastructure.database.engine import init_mysql_engine
-        from src.services.pc_remote_control import (PcServiceStatus, PcStatus,
-                                                    check_pc_status)
+        from src.services.pc_remote_control import (
+            PcListenerStatus,
+            PcServiceStatus,
+            PcStatus,
+            check_pc_listener,
+            notify_pc_coordination_change,
+        )
         from src.services.runtime_status import (database_server_hostname,
                                                  get_runtime_process_status,
                                                  record_runtime_heartbeat)
 
         def probe_listener():
             try:
-                return check_pc_status()
+                listener = check_pc_listener()
+                delivered = False
+                event_id = self.coordination_notification_event_id
+                if event_id and listener.coordination_change_pulse_supported:
+                    delivered = notify_pc_coordination_change(event_id)
+                return listener, delivered
             except Exception:
-                return PcStatus.UNKNOWN
+                return PcListenerStatus(PcStatus.UNKNOWN), False
 
         def probe_database():
             engine = self.engine
@@ -525,7 +544,7 @@ class PcRemoteStatusWorker(QThread):
         with ThreadPoolExecutor(max_workers=2) as executor:
             listener_future = executor.submit(probe_listener)
             database_future = executor.submit(probe_database)
-            listener_status = listener_future.result()
+            listener, notification_delivered = listener_future.result()
             db_ready, engine, owns_engine = database_future.result()
 
         db_hostname = ""
@@ -555,10 +574,20 @@ class PcRemoteStatusWorker(QThread):
 
         self.finished_status.emit(
             PcServiceStatus(
-                listener_status=listener_status,
+                listener_status=listener.status,
                 database_ready=db_ready,
                 database_hostname=db_hostname,
                 main_app_active=main_app_active,
                 main_app_last_seen_seconds=main_app_last_seen_seconds,
+                coordination_change_event_id=(
+                    listener.coordination_change_event_id
+                ),
+                coordination_change_pulse_supported=(
+                    listener.coordination_change_pulse_supported
+                ),
+                coordination_notification_event_id=(
+                    self.coordination_notification_event_id
+                ),
+                coordination_notification_delivered=notification_delivered,
             )
         )

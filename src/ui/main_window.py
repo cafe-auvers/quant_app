@@ -968,6 +968,9 @@ class MainWindow(
         self._local_mirror_progress_phase = ""
         self._local_mirror_progress_samples = []
         self._last_pc_main_app_active = None
+        self._last_inbound_coordination_event_id = ""
+        self._last_outbound_coordination_event_id = ""
+        self._remote_coordination_sync_pending = False
         self.state_sync_role = load_local_device_role()
         self.state_sync_worker = None
         self.live_trading_control_worker = None
@@ -1299,12 +1302,18 @@ class MainWindow(
         self.append_log(
             "TiDB RU profile active: "
             f"{execution_config.COORDINATION_RU_PROFILE} "
-            f"(commands {execution_config.COORDINATION_OPERATOR_COMMAND_POLL_SECONDS:g}s, "
-            f"lease {execution_config.COORDINATION_LEASE_POLL_SECONDS:g}s, "
-            f"active cards {execution_config.COORDINATION_ACTIVE_CARD_POLL_SECONDS:g}s, "
-            f"standby cards {execution_config.COORDINATION_STANDBY_CARD_POLL_SECONDS:g}s; "
+            "(local changes are dirty-event driven; "
+            f"remote fallback {execution_config.COORDINATION_REMOTE_FALLBACK_SECONDS:g}s; "
             f"external pulse {execution_config.EXTERNAL_WATCHDOG_HEARTBEAT_SECONDS:g}s)."
         )
+        from src.services.coordination_change_pulse import (
+            read_inbound_change_pulse,
+        )
+
+        # Startup reconciliation below already absorbs anything that happened
+        # before this process connected. Seed the file cursor so only later
+        # listener notifications trigger another database pass.
+        self._last_inbound_coordination_event_id = read_inbound_change_pulse()
         self._last_coordination_database_notice = ""
         self._start_state_sync()
         self._sync_buyboard_runtime_worker()
@@ -4490,12 +4499,21 @@ class MainWindow(
         # Shared planning/control display refresh. Actual operator commands,
         # broker-boundary authority checks, and handoff button actions use
         # their own immediate paths; unchanged JSON revisions need one cloud
-        # check per three minutes, not repeated sub-minute reads.
+        # check only after a dirty token, plus the configured recovery fallback.
         self.state_sync_timer.setInterval(
             int(execution_config.COORDINATION_STATE_SYNC_SECONDS * 1000)
         )
         self.state_sync_timer.timeout.connect(self._start_state_sync)
         self.state_sync_timer.start()
+
+        # This is the hot pulse requested by the operator. It reads only
+        # process memory and two tiny local files; it never polls TiDB.
+        self.coordination_change_timer = QTimer(self)
+        self.coordination_change_timer.setInterval(1_000)
+        self.coordination_change_timer.timeout.connect(
+            self._process_internal_coordination_pulse
+        )
+        self.coordination_change_timer.start()
 
         # Cross-process signal for the PC's guarded-sleep automation (see
         # src/services/sleep_readiness.py and scripts/Invoke-GuardedSleep.ps1)
@@ -5293,6 +5311,95 @@ class MainWindow(
                 except Exception:
                     pass
 
+    def _configure_coordination_fallback_timers(self, pulse_supported: bool) -> None:
+        """Back off TiDB display polls while Tailscale change pulses are live."""
+
+        state_timer = self.__dict__.get("state_sync_timer")
+        board_timer = self.__dict__.get("_buyboard_projection_timer")
+        state_seconds = (
+            execution_config.COORDINATION_REMOTE_FALLBACK_SECONDS
+            if pulse_supported
+            else execution_config.COORDINATION_STATE_SYNC_SECONDS
+        )
+        board_seconds = (
+            execution_config.COORDINATION_REMOTE_FALLBACK_SECONDS
+            if pulse_supported
+            else execution_config.COORDINATION_BOARD_PROJECTION_SECONDS
+        )
+        if state_timer is not None:
+            state_timer.setInterval(int(state_seconds * 1000))
+        if board_timer is not None:
+            board_timer.setInterval(int(board_seconds * 1000))
+
+    def _on_remote_coordination_change(self) -> None:
+        """Perform one canonical read pass for a newly observed remote token."""
+
+        if self.__dict__.get("_database_shutting_down", False):
+            return
+        self._remote_coordination_sync_pending = True
+        self._drain_remote_coordination_sync()
+        refresh = getattr(self, "refresh_buyboard", None)
+        if callable(refresh):
+            refresh(revision_only=True)
+
+    def _drain_remote_coordination_sync(self) -> None:
+        if (
+            self.__dict__.get("_database_shutting_down", False)
+            or not self.__dict__.get("_remote_coordination_sync_pending", False)
+        ):
+            return
+        worker = self.__dict__.get("state_sync_worker")
+        if worker is not None:
+            try:
+                if worker.isRunning():
+                    QTimer.singleShot(250, self._drain_remote_coordination_sync)
+                    return
+            except RuntimeError:
+                pass
+        self._remote_coordination_sync_pending = False
+        self._start_state_sync()
+
+    def _process_internal_coordination_pulse(self) -> None:
+        """Route local dirty generations without issuing a database query."""
+
+        if (
+            self.__dict__.get("_database_shutting_down", False)
+            or not self.__dict__.get("_coordination_database_ready", False)
+        ):
+            return
+        engine = self.__dict__.get("coordination_db_engine")
+        role = self.__dict__.get("state_sync_role")
+        if engine is None or role is None:
+            return
+        from src.services.coordination_change_pulse import (
+            acknowledge_local_change_event,
+            mark_remote_coordination_change,
+            publish_outbound_change_pulse,
+            read_inbound_change_pulse,
+            stage_local_change_event,
+        )
+
+        kind = detect_local_device_kind(getattr(role, "hostname", platform.node()))
+        event_id = stage_local_change_event(engine, device_id=role.device_id)
+        if kind == "PC":
+            if event_id and publish_outbound_change_pulse(event_id):
+                acknowledge_local_change_event(engine, event_id)
+            inbound_event_id = read_inbound_change_pulse()
+            if (
+                inbound_event_id
+                and inbound_event_id
+                != self.__dict__.get("_last_inbound_coordination_event_id", "")
+            ):
+                self._last_inbound_coordination_event_id = inbound_event_id
+                if mark_remote_coordination_change(engine, inbound_event_id):
+                    self._on_remote_coordination_change()
+            return
+
+        # Laptop delivery is piggy-backed on the existing asynchronous PC
+        # status worker, so the one-second Qt pulse never performs socket I/O.
+        if event_id and self.__dict__.get("_pc_status_worker") is None:
+            self._poll_pc_status()
+
     def _poll_pc_status(self) -> None:
         """Kick off a background check of the always-on PC's status.
 
@@ -5312,7 +5419,33 @@ class MainWindow(
         probe_engine = self.__dict__.get("_pc_probe_engine")
         if probe_engine is None:
             probe_engine = self.pc_db_engine
-        worker = PcRemoteStatusWorker(probe_engine, parent=self)
+        pending_event_id = ""
+        role = self.__dict__.get("state_sync_role")
+        execution_engine = (
+            self._execution_state_engine()
+            if self.__dict__.get("_coordination_database_configured", False)
+            else None
+        )
+        if (
+            role is not None
+            and execution_engine is not None
+            and detect_local_device_kind(
+                getattr(role, "hostname", platform.node())
+            )
+            == "Laptop"
+        ):
+            from src.services.coordination_change_pulse import (
+                stage_local_change_event,
+            )
+
+            pending_event_id = stage_local_change_event(
+                execution_engine, device_id=role.device_id
+            )
+        worker = PcRemoteStatusWorker(
+            probe_engine,
+            coordination_notification_event_id=pending_event_id,
+            parent=self,
+        )
         self._pc_status_worker = worker
         worker.finished_status.connect(self._on_pc_status_result)
         self._track_worker("_pc_status_worker", worker)
@@ -5335,6 +5468,48 @@ class MainWindow(
             return
 
         listener_on = status.listener_status == PcStatus.ON
+        pulse_supported = bool(
+            listener_on
+            and getattr(status, "coordination_change_pulse_supported", False)
+        )
+        execution_engine = (
+            self._execution_state_engine()
+            if self.__dict__.get("_coordination_database_configured", False)
+            else None
+        )
+        from src.services.coordination_change_pulse import (
+            acknowledge_local_change_event,
+            mark_remote_coordination_change,
+            set_change_notifications_available,
+        )
+
+        set_change_notifications_available(execution_engine, pulse_supported)
+        self._configure_coordination_fallback_timers(pulse_supported)
+        delivered_event_id = str(
+            getattr(status, "coordination_notification_event_id", "") or ""
+        )
+        if bool(
+            getattr(status, "coordination_notification_delivered", False)
+        ) and delivered_event_id:
+            acknowledge_local_change_event(execution_engine, delivered_event_id)
+        role = self.__dict__.get("state_sync_role")
+        remote_event_id = str(
+            getattr(status, "coordination_change_event_id", "") or ""
+        )
+        if (
+            role is not None
+            and detect_local_device_kind(
+                getattr(role, "hostname", platform.node())
+            )
+            == "Laptop"
+            and execution_engine is not None
+            and remote_event_id
+            and remote_event_id
+            != self.__dict__.get("_last_outbound_coordination_event_id", "")
+        ):
+            self._last_outbound_coordination_event_id = remote_event_id
+            if mark_remote_coordination_change(execution_engine, remote_event_id):
+                self._on_remote_coordination_change()
         db_ready = bool(status.database_ready)
         self._main_availability_probe_complete = True
         self._main_availability_probe_database_ready = db_ready

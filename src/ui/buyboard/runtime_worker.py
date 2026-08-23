@@ -287,6 +287,14 @@ class BuyboardRuntimeWorker(QThread):
         self._local_card_change_generation = (
             repo.local_trade_card_change_generation(self._db_engine)
         )
+        from src.services.coordination_change_pulse import (
+            coordination_change_generation,
+        )
+
+        pulse_generation = coordination_change_generation(self._db_engine)
+        self._last_card_change_pulse_generation = pulse_generation
+        self._last_lease_change_pulse_generation = -1
+        self._last_operator_change_pulse_generation = -1
         self._last_database_probe_at: Optional[datetime] = None
         self._last_lease_checked_at: Optional[datetime] = None
         self._last_device_state_published_at: Optional[datetime] = None
@@ -1113,14 +1121,27 @@ class BuyboardRuntimeWorker(QThread):
         longer has authority over.
         """
         now = datetime.now(timezone.utc)
+        from src.services.coordination_change_pulse import (
+            change_notifications_available,
+            coordination_change_generation,
+        )
+
+        pulse_generation = coordination_change_generation(self._db_engine)
+        fallback_seconds = (
+            execution_config.COORDINATION_REMOTE_FALLBACK_SECONDS
+            if change_notifications_available(self._db_engine)
+            else execution_config.COORDINATION_LEASE_POLL_SECONDS
+        )
         if (
             not force
+            and pulse_generation == self._last_lease_change_pulse_generation
             and self._last_lease_checked_at is not None
             and (now - self._last_lease_checked_at).total_seconds()
-            < execution_config.COORDINATION_LEASE_POLL_SECONDS
+            < fallback_seconds
         ):
             return self._lease_current
         self._last_lease_checked_at = now
+        self._last_lease_change_pulse_generation = pulse_generation
         if self._execution_authority is None:
             if (
                 self.execution_gateway is not None
@@ -1431,15 +1452,25 @@ class BuyboardRuntimeWorker(QThread):
 
         now = datetime.now(timezone.utc)
         local_generation = repo.local_trade_card_change_generation(self._db_engine)
-        interval = (
-            execution_config.COORDINATION_STANDBY_CARD_POLL_SECONDS
-            if self._standby_only
-            else execution_config.COORDINATION_ACTIVE_CARD_POLL_SECONDS
+        from src.services.coordination_change_pulse import (
+            change_notifications_available,
+            coordination_change_generation,
         )
+
+        pulse_generation = coordination_change_generation(self._db_engine)
+        if change_notifications_available(self._db_engine):
+            interval = execution_config.COORDINATION_REMOTE_FALLBACK_SECONDS
+        else:
+            interval = (
+                execution_config.COORDINATION_STANDBY_CARD_POLL_SECONDS
+                if self._standby_only
+                else execution_config.COORDINATION_ACTIVE_CARD_POLL_SECONDS
+            )
         if (
             not force
             and self._card_cache_initialized
             and local_generation == self._local_card_change_generation
+            and pulse_generation == self._last_card_change_pulse_generation
             and self._last_card_revision_checked_at is not None
             and (now - self._last_card_revision_checked_at).total_seconds() < interval
         ):
@@ -1452,6 +1483,7 @@ class BuyboardRuntimeWorker(QThread):
         )
         self._last_card_revision_checked_at = now
         self._local_card_change_generation = local_generation
+        self._last_card_change_pulse_generation = pulse_generation
         if (
             not force
             and self._card_cache_initialized
@@ -1688,18 +1720,29 @@ class BuyboardRuntimeWorker(QThread):
         """Apply live human requests only while this runtime owns execution."""
 
         now = datetime.now(timezone.utc)
-        interval = (
-            execution_config.COORDINATION_OPERATOR_COMMAND_POLL_SECONDS
-            if self._regular_session_open()
-            else execution_config.COORDINATION_OFF_HOURS_POLL_SECONDS
+        from src.services.coordination_change_pulse import (
+            change_notifications_available,
+            coordination_change_generation,
         )
+
+        pulse_generation = coordination_change_generation(self._db_engine)
+        if change_notifications_available(self._db_engine):
+            interval = execution_config.COORDINATION_REMOTE_FALLBACK_SECONDS
+        else:
+            interval = (
+                execution_config.COORDINATION_OPERATOR_COMMAND_POLL_SECONDS
+                if self._regular_session_open()
+                else execution_config.COORDINATION_OFF_HOURS_POLL_SECONDS
+            )
         if (
-            self._last_operator_command_poll_at is not None
+            pulse_generation == self._last_operator_change_pulse_generation
+            and self._last_operator_command_poll_at is not None
             and (now - self._last_operator_command_poll_at).total_seconds()
             < interval
         ):
             return False
         self._last_operator_command_poll_at = now
+        self._last_operator_change_pulse_generation = pulse_generation
 
         from src.services.operator_command_service import (
             process_next_board_operator_command,

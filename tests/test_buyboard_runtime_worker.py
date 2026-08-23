@@ -397,6 +397,32 @@ def test_card_cache_downloads_payload_only_when_revision_changes(
     assert len(calls) == 2
 
 
+def test_operator_command_lookup_runs_only_after_internal_change_pulse(
+    tmp_path, monkeypatch
+):
+    from src.services import coordination_change_pulse
+    from src.services import operator_command_service
+
+    worker, engine = _worker(tmp_path)
+    calls = []
+    coordination_change_pulse.set_change_notifications_available(engine, True)
+    monkeypatch.setattr(
+        operator_command_service,
+        "process_next_board_operator_command",
+        lambda *args, **kwargs: calls.append(True) or None,
+    )
+
+    assert worker._process_operator_commands() is False
+    assert worker._process_operator_commands() is False
+    assert len(calls) == 1
+
+    assert coordination_change_pulse.mark_remote_coordination_change(
+        engine, "laptop:operator-change"
+    )
+    assert worker._process_operator_commands() is False
+    assert len(calls) == 2
+
+
 def test_default_worker_scheduler_uses_production_spacing_and_no_retry(
     tmp_path, monkeypatch
 ):

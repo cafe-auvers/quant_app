@@ -5,7 +5,11 @@ from types import SimpleNamespace
 from sqlalchemy import create_engine, event, text
 
 from src.core import execution_config
-from src.services.pc_remote_control import PcServiceStatus, PcStatus
+from src.services.pc_remote_control import (
+    PcListenerStatus,
+    PcServiceStatus,
+    PcStatus,
+)
 from src.services.runtime_status import (
     get_runtime_process_status,
     mark_runtime_process_stopped,
@@ -110,8 +114,8 @@ def test_coordination_heartbeat_worker_publishes_local_main_process():
 def test_pc_status_worker_checks_database_when_listener_is_off(monkeypatch):
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     monkeypatch.setattr(
-        "src.services.pc_remote_control.check_pc_status",
-        lambda: PcStatus.OFF,
+        "src.services.pc_remote_control.check_pc_listener",
+        lambda: PcListenerStatus(PcStatus.OFF),
     )
     results = []
     worker = PcRemoteStatusWorker(engine)
@@ -128,8 +132,8 @@ def test_pc_status_worker_checks_database_when_listener_is_off(monkeypatch):
 def test_runtime_monitoring_failure_does_not_hide_database_connectivity(monkeypatch):
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     monkeypatch.setattr(
-        "src.services.pc_remote_control.check_pc_status",
-        lambda: PcStatus.OFF,
+        "src.services.pc_remote_control.check_pc_listener",
+        lambda: PcListenerStatus(PcStatus.OFF),
     )
     monkeypatch.setattr(
         "src.services.runtime_status.record_runtime_heartbeat",
@@ -147,8 +151,8 @@ def test_runtime_monitoring_failure_does_not_hide_database_connectivity(monkeypa
 
 def test_pc_status_worker_silences_expected_mysql_probe_failures(monkeypatch):
     monkeypatch.setattr(
-        "src.services.pc_remote_control.check_pc_status",
-        lambda: PcStatus.OFF,
+        "src.services.pc_remote_control.check_pc_listener",
+        lambda: PcListenerStatus(PcStatus.OFF),
     )
     probe_calls = []
 
@@ -175,14 +179,14 @@ def test_pc_status_worker_probes_listener_and_database_concurrently(monkeypatch)
 
     def listener_probe():
         rendezvous.wait(timeout=1.0)
-        return PcStatus.OFF
+        return PcListenerStatus(PcStatus.OFF)
 
     def database_probe(*, log_unavailable=True, ensure_schema=True):
         rendezvous.wait(timeout=1.0)
         return None
 
     monkeypatch.setattr(
-        "src.services.pc_remote_control.check_pc_status", listener_probe
+        "src.services.pc_remote_control.check_pc_listener", listener_probe
     )
     monkeypatch.setattr(
         "src.infrastructure.database.engine.init_mysql_engine", database_probe
@@ -208,8 +212,15 @@ class _SignalStub:
 class _StatusWorkerStub:
     instances = []
 
-    def __init__(self, engine=None, parent=None):
+    def __init__(
+        self,
+        engine=None,
+        *,
+        coordination_notification_event_id="",
+        parent=None,
+    ):
         self.engine = engine
+        self.coordination_notification_event_id = coordination_notification_event_id
         self.parent = parent
         self.finished_status = _SignalStub()
         self.finished = _SignalStub()

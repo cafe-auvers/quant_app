@@ -102,9 +102,10 @@ The market-open command sequence is:
    runtime then monitors it and the normal entry engine decides whether an
    order may be submitted.
 
-The executor checks this command queue every second during the regular
-session. The general planning/UI sync remains once per three minutes because it is
-not the execution channel. An execution-owner switch also force-loads the
+The executor checks this command queue immediately when the database-free
+Tailscale change token advances. An old listener retains the 20-second poll;
+protocol v2 uses a one-hour missed-notification fallback. Planning/UI sync uses
+the same change pulse. An execution-owner switch also force-loads the
 latest canonical cards, quote subscriptions, and stops before the target may
 become `ACTIVE`; it never relies on the minute display refresh for handoff.
 
