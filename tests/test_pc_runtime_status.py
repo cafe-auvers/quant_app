@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from sqlalchemy import create_engine, event, text
 
+from src.core import execution_config
 from src.services.pc_remote_control import PcServiceStatus, PcStatus
 from src.services.runtime_status import (
     get_runtime_process_status,
@@ -246,7 +247,8 @@ def test_coordination_heartbeat_uses_online_store_and_hard_cadence(monkeypatch):
         "CoordinationRuntimeHeartbeatWorker",
         _CoordinationHeartbeatWorkerStub,
     )
-    clock = iter((100.0, 115.0, 131.0))
+    cadence = execution_config.COORDINATION_DEVICE_HEARTBEAT_SECONDS
+    clock = iter((100.0, 100.0 + cadence - 1.0, 100.0 + cadence + 1.0))
     monkeypatch.setattr(main_window.time, "monotonic", lambda: next(clock))
     coordination_engine = object()
     window = MainWindow.__new__(MainWindow)

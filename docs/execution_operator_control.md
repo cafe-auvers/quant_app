@@ -103,7 +103,7 @@ The market-open command sequence is:
    order may be submitted.
 
 The executor checks this command queue every second during the regular
-session. The general planning/UI sync remains once per minute because it is
+session. The general planning/UI sync remains once per three minutes because it is
 not the execution channel. An execution-owner switch also force-loads the
 latest canonical cards, quote subscriptions, and stops before the target may
 become `ACTIVE`; it never relies on the minute display refresh for handoff.

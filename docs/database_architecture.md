@@ -194,8 +194,8 @@ provisions all 18 tables through `ensure_coordination_schema()`.
 | `trade_cards` | `id`; unique `(environment, account_no, symbol)` | Canonical Kanban card status, versioned JSON payload, and update time | Written for durable plan/lifecycle/order/stop/warning changes; price-only display changes stay in memory |
 | `execution_ownership` | `id`; unique `(environment, account_no, symbol)` | Per-symbol owner, strategy instance, assigning actor, and version | Assignment/adoption/handoff and ownership changes; also read at broker safety boundaries |
 | `operator_commands` | `command_id`; unique `idempotency_key` | Manual command request, payload, requester/executor, lifecycle timestamps, broker ID, and before/after hashes | Inserted immediately by the authorized operator; claimed and advanced by the Execution Owner |
-| `runtime_device_state` | `device_id` | Host/device readiness state, schema version, handoff generation/confirmation, details, and heartbeat time | Full write on readiness changes; stable heartbeat every 30 seconds per running device |
-| `app_runtime_status` | `(hostname, process_name)` | PID, active state, start time, and last heartbeat | `main.py` heartbeat every 30 seconds; lifecycle insert/update when process identity or active state changes |
+| `runtime_device_state` | `device_id` | Host/device readiness state, schema version, handoff generation/confirmation, details, and heartbeat time | Full write on readiness changes; stable heartbeat every 45 seconds per running device |
+| `app_runtime_status` | `(hostname, process_name)` | PID, active state, start time, and last heartbeat | `main.py` heartbeat every 45 seconds; lifecycle insert/update when process identity or active state changes |
 | `execution_commands` | `id`; unique `idempotency_key` | Low-level broker command journal, lease proof, target order, status, redacted response, and response hash | Recorded immediately before/around broker mutation and updated with the response/outcome |
 | `execution_orders` | `id`; unique client/broker identity keys | Canonical order identity, status, origin, recovery state, version, payload, and timestamp | Immediate identity/status/fill/recovery changes; unchanged working-order audit rewrites are coalesced |
 | `capital_reservations` | `reservation_id` | Requested/remaining notional, status, version, release and absence evidence | Reserve/release/reconciliation events using versioned conditional writes |
@@ -269,15 +269,15 @@ There is no PC relay. The principal steady-state database cadences are:
 | Coordination activity | Database cadence |
 | --- | ---: |
 | Operator-command pickup during the regular session | 3 seconds, active executor only |
-| Lease proof | 10 seconds, active executor only |
-| Protective ownership proof | 10 seconds while positions exist; one bulk read |
-| Runtime-readiness heartbeat | 30 seconds per running device |
-| `main.py` process heartbeat | 30 seconds per running device |
-| Alert queue check | 30 seconds; successful external heartbeat audit compacted to about 5 minutes |
-| Card/Buy Board revision check | 60 seconds per running device |
-| Planning/control display synchronization | 60 seconds per running device |
-| Operator-command pickup outside the regular session | 60 seconds |
-| Writable probe fallback | 60 seconds; normally satisfied by the readiness write |
+| Lease proof | 20 seconds, active executor only |
+| Protective ownership proof | 30 seconds while positions exist; one bulk read |
+| Runtime-readiness heartbeat | 45 seconds per running device |
+| `main.py` process heartbeat | 45 seconds per running device |
+| Alert queue check | 90 seconds; successful external heartbeat audit compacted to about 5 minutes |
+| Active/standby card revision check | 180/300 seconds per running device |
+| Buy Board and planning/control display synchronization | 180 seconds per running device |
+| Operator-command pickup | 20 seconds in-session; 300 seconds outside the regular session |
+| Writable probe fallback | 180 seconds; normally satisfied by the readiness write |
 
 Event-driven writes do not wait for these timers. Plan publication, control
 changes, owner activation/handoff, command insertion/claim, order status/fill

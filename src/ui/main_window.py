@@ -1296,6 +1296,14 @@ class MainWindow(
                 "Shared online coordination database connected. Execution ownership "
                 "is independent of whether the PC historical database is online."
             )
+        self.append_log(
+            "TiDB RU profile active: "
+            f"{execution_config.COORDINATION_RU_PROFILE} "
+            f"(commands {execution_config.COORDINATION_OPERATOR_COMMAND_POLL_SECONDS:g}s, "
+            f"lease {execution_config.COORDINATION_LEASE_POLL_SECONDS:g}s, "
+            f"active cards {execution_config.COORDINATION_ACTIVE_CARD_POLL_SECONDS:g}s, "
+            f"standby cards {execution_config.COORDINATION_STANDBY_CARD_POLL_SECONDS:g}s)."
+        )
         self._last_coordination_database_notice = ""
         self._start_state_sync()
         self._sync_buyboard_runtime_worker()
@@ -4470,8 +4478,10 @@ class MainWindow(
         # Shared planning/control display refresh. Actual operator commands,
         # broker-boundary authority checks, and handoff button actions use
         # their own immediate paths; unchanged JSON revisions need one cloud
-        # check per minute, not four per minute.
-        self.state_sync_timer.setInterval(60_000)
+        # check per three minutes, not repeated sub-minute reads.
+        self.state_sync_timer.setInterval(
+            int(execution_config.COORDINATION_STATE_SYNC_SECONDS * 1000)
+        )
         self.state_sync_timer.timeout.connect(self._start_state_sync)
         self.state_sync_timer.start()
 

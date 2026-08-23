@@ -557,6 +557,43 @@ def test_stopped_device_on_an_old_schema_does_not_block_startup(tmp_path):
     require_compatible_runtime_schema(engine, device_id="new-pc")
 
 
+def test_fresh_peer_without_strict_ru_profile_blocks_startup(tmp_path):
+    engine = _engine(tmp_path)
+    save_runtime_device_state(
+        engine,
+        device_id="old-client",
+        hostname="old-client",
+        state=RuntimeDeviceState.STANDBY_READY,
+        schema_version=CURRENT_EXECUTION_SCHEMA_VERSION,
+        details={},
+    )
+
+    with pytest.raises(RuntimeError, match="Coordination RU profile mismatch"):
+        require_compatible_runtime_schema(
+            engine,
+            device_id="new-client",
+            required_coordination_profile="strict-7-9-v1",
+        )
+
+
+def test_fresh_peer_with_matching_strict_ru_profile_allows_startup(tmp_path):
+    engine = _engine(tmp_path)
+    save_runtime_device_state(
+        engine,
+        device_id="peer",
+        hostname="peer",
+        state=RuntimeDeviceState.STANDBY_READY,
+        schema_version=CURRENT_EXECUTION_SCHEMA_VERSION,
+        details={"coordination_ru_profile": "strict-7-9-v1"},
+    )
+
+    require_compatible_runtime_schema(
+        engine,
+        device_id="new-client",
+        required_coordination_profile="strict-7-9-v1",
+    )
+
+
 def test_cutover_rechecks_live_lease_before_migration_mutation(tmp_path, monkeypatch):
     protocol = FakeExecutionLeaseProtocol(
         current=ExecutionLease("pc-main", "token-8", 8)

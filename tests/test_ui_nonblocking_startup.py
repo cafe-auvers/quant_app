@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 from PyQt5.QtCore import QCoreApplication
 
+from src.core import execution_config
 from src.core.board_workflow import (
     BoardActionContext,
     BoardCardProjection,
@@ -163,7 +164,10 @@ def test_minute_projection_check_skips_bootstrap_and_payload_when_unchanged(
 
     assert completed == [(None, "", 5)]
     assert worker.resolved_revision == expected
-    assert buyboard_controller.BuyboardMixin._BUYBOARD_PROJECTION_REFRESH_MS == 60_000
+    assert (
+        buyboard_controller.BuyboardMixin._BUYBOARD_PROJECTION_REFRESH_MS
+        == int(execution_config.COORDINATION_BOARD_PROJECTION_SECONDS * 1000)
+    )
 
 
 def test_changed_minute_projection_uses_one_revision_read_and_no_bootstrap(
