@@ -6,8 +6,6 @@ import datetime as dt
 import pandas as pd
 import pytest
 
-pytestmark = pytest.mark.usefixtures("authorized_full_live")
-
 from src.core.order_state import (
     BrokerOrder,
     BrokerOrderDiscoveryResult,
@@ -186,7 +184,7 @@ def test_build_buyboard_runtime_rejects_enabled_plain_broker(monkeypatch):
 
 
 def test_submit_callback_reaches_the_guarded_gateway_not_wrongmode(
-    tmp_path, trading_enabled, monkeypatch
+    tmp_path, trading_enabled, monkeypatch, authorize_full_live
 ):
     """The enabled runtime reaches submit_guarded with durable identity."""
     from sqlalchemy import create_engine
@@ -233,6 +231,7 @@ def test_submit_callback_reaches_the_guarded_gateway_not_wrongmode(
         execution_lease=lease,
         persist_card_before_execution=lambda current: persisted.append(current.to_dict()),
     )
+    authorize_full_live()
 
     fake_broker.queue_acceptance(broker_order_id="B-GUARDED-1")
     result = runtime.entry_attempt_manager._submit_order(
@@ -247,7 +246,7 @@ def test_submit_callback_reaches_the_guarded_gateway_not_wrongmode(
 
 
 def test_guarded_runtime_consumes_upward_extreme_before_latest_trade(
-    tmp_path, trading_enabled, monkeypatch
+    tmp_path, trading_enabled, monkeypatch, authorize_full_live
 ):
     from sqlalchemy import create_engine
     from sqlalchemy.pool import NullPool
@@ -361,6 +360,7 @@ def test_guarded_runtime_consumes_upward_extreme_before_latest_trade(
         execution_lease=lease,
         persist_card_before_execution=lambda current: None,
     )
+    authorize_full_live()
     runtime.trading_engine._clock = lambda: observed_at
     runtime.trading_engine._market_is_open_fn = lambda: True
 

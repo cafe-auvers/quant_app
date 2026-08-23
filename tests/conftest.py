@@ -112,10 +112,7 @@ def trading_enabled():
     yield
 
 
-@pytest.fixture
-def authorized_full_live(monkeypatch):
-    """Explicit production-mutation opt-in for gateway characterization tests."""
-
+def _authorize_full_live(monkeypatch) -> None:
     monkeypatch.setattr(execution_config, "KIS_LIVE_EXECUTION_MODE", "FULL_LIVE")
     monkeypatch.setattr(execution_config, "KIS_MUTATION_BUDGET_VERIFIED", True)
     monkeypatch.setattr(execution_config, "KIS_SUBMIT_MUTATION_CAPACITY", 10)
@@ -125,3 +122,17 @@ def authorized_full_live(monkeypatch):
     monkeypatch.setattr(execution_config, "KIS_WS_ENABLED", True)
     monkeypatch.setattr(execution_config, "KIS_WS_PROTOCOL_VERIFIED", True)
     monkeypatch.setattr(execution_config, "KIS_MARKET_DATA_MODE", "WEBSOCKET")
+
+
+@pytest.fixture
+def authorize_full_live(monkeypatch):
+    """Return an opt-in callback for tests that must build offline first."""
+
+    return lambda: _authorize_full_live(monkeypatch)
+
+
+@pytest.fixture
+def authorized_full_live(monkeypatch):
+    """Explicit production-mutation opt-in for gateway characterization tests."""
+
+    _authorize_full_live(monkeypatch)
