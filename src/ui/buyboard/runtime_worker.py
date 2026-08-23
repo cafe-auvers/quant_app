@@ -38,6 +38,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
+from src.api.kis_account_snapshot_dual import KisTransientApiError
 from src.core import execution_config
 from src.core.account_broker_snapshot import AccountBrokerSnapshot, ReconciliationAction
 from src.core.board_workflow import BoardActionContext
@@ -177,6 +178,7 @@ class BuyboardRuntimeWorker(QThread):
 
     _QUEUE_DRAIN_FAILURE_CONFIRMATIONS = 3
     _ACCOUNT_RECONCILIATION_FAILURE_CONFIRMATIONS = 3
+    _ACCOUNT_REFRESH_FAILURE_COOLDOWN_SECONDS = 30.0
 
     board_changed = pyqtSignal()
     alert = pyqtSignal(str)
@@ -320,6 +322,7 @@ class BuyboardRuntimeWorker(QThread):
         # once at startup).
         self._account_balance_refreshed_at: Dict[str, datetime] = {}
         self._account_reconciled_at: Dict[str, datetime] = {}
+        self._account_refresh_retry_not_before: Dict[str, datetime] = {}
         # Operator readiness is intentionally steadier than the per-command
         # safety gate.  A routine broker pass can outlast its 60-second
         # freshness window, but merely being in progress is not a failure.
@@ -2121,6 +2124,9 @@ class BuyboardRuntimeWorker(QThread):
         account_numbers = self._distinct_account_numbers(cards)
         self._reconciliation_required_accounts.update(account_numbers)
         for account_no in account_numbers:
+            retry_not_before = self._account_refresh_retry_not_before.get(account_no)
+            if retry_not_before is not None and now < retry_not_before:
+                continue
             account_cards = by_account.get(account_no, [])
             has_active_entry_candidate = any(
                 card.board_status in (BoardStatus.BUY_TODAY, BoardStatus.ENTRY_PENDING)
@@ -2153,11 +2159,21 @@ class BuyboardRuntimeWorker(QThread):
                         cards=account_cards,
                         position_balance_extractor=self._extract_account_balance,
                     )
-                except Exception:
-                    logger.exception(
-                        "Periodic account reconciliation failed for account %s",
-                        account_no,
-                    )
+                except Exception as exc:
+                    self._defer_account_refresh(account_no, now)
+                    if isinstance(exc, KisTransientApiError):
+                        logger.warning(
+                            "Periodic account reconciliation temporarily unavailable "
+                            "for account %s; retry deferred for %.0fs: %s",
+                            account_no,
+                            self._ACCOUNT_REFRESH_FAILURE_COOLDOWN_SECONDS,
+                            exc,
+                        )
+                    else:
+                        logger.exception(
+                            "Periodic account reconciliation failed for account %s",
+                            account_no,
+                        )
                     self._invalidate_account_reconciliation(
                         account_no,
                         "periodic account reconciliation failed",
@@ -2182,8 +2198,10 @@ class BuyboardRuntimeWorker(QThread):
                         or "account broker snapshot was incomplete"
                     )
                     self._invalidate_account_reconciliation(account_no, reason)
+                    self._defer_account_refresh(account_no, now)
                     continue
                 self._record_account_reconciliation_success(account_no, now)
+                self._account_refresh_retry_not_before.pop(account_no, None)
                 # Review finding P0: "unknown accounts can be incorrectly
                 # considered healthy" -- a full position+order
                 # reconciliation just succeeded for this account (whether
@@ -2212,16 +2230,32 @@ class BuyboardRuntimeWorker(QThread):
                 position_snapshot = self.runtime.broker.get_positions(
                     environment=self._environment, account_no=account_no
                 )
-            except Exception:
-                logger.exception(
-                    "Periodic account refresh: get_positions failed for account %s",
-                    account_no,
-                )
+            except Exception as exc:
+                self._defer_account_refresh(account_no, now)
+                if isinstance(exc, KisTransientApiError):
+                    logger.warning(
+                        "Periodic account refresh temporarily unavailable for account "
+                        "%s; retry deferred for %.0fs: %s",
+                        account_no,
+                        self._ACCOUNT_REFRESH_FAILURE_COOLDOWN_SECONDS,
+                        exc,
+                    )
+                else:
+                    logger.exception(
+                        "Periodic account refresh: get_positions failed for account %s",
+                        account_no,
+                    )
                 continue
             self._record_buying_power(account_no, position_snapshot)
             self._account_balance_refreshed_at[account_no] = now
+            self._account_refresh_retry_not_before.pop(account_no, None)
 
         return changed
+
+    def _defer_account_refresh(self, account_no: str, now: datetime) -> None:
+        self._account_refresh_retry_not_before[account_no] = now + timedelta(
+            seconds=self._ACCOUNT_REFRESH_FAILURE_COOLDOWN_SECONDS
+        )
 
     @staticmethod
     def _age_seconds(then: Optional[datetime], now: datetime) -> Optional[float]:

@@ -107,6 +107,9 @@ RATE_LIMIT_MSG_CODES = {
     "EGW00201",  # API transaction rate limit
     "EGW00215",  # API transaction rate limit variant
 }
+TRANSIENT_SERVER_MSG_CODES = {
+    "EGW00300",  # gateway routing failure
+}
 MAX_RATE_LIMIT_RETRIES = 3
 RATE_LIMIT_BACKOFF_SECONDS = (1.0, 2.0, 4.0)
 MAX_BALANCE_PAGES = 20
@@ -262,6 +265,10 @@ class KisApiError(RuntimeError):
 
 class KisRateLimitError(KisApiError):
     """Raised when KIS reports a per-second request limit error."""
+
+
+class KisTransientApiError(KisApiError):
+    """Raised when a read-only KIS request can safely be retried."""
 
 
 class KisInvalidAccountError(KisApiError):
@@ -733,7 +740,7 @@ class KisAccountClient:
                     self._parse_response(response, endpoint=endpoint),
                     response.headers,
                 )
-            except KisRateLimitError as exc:
+            except (KisRateLimitError, KisTransientApiError) as exc:
                 last_error = exc
                 if attempt >= MAX_RATE_LIMIT_RETRIES:
                     break
@@ -743,7 +750,7 @@ class KisAccountClient:
                     ]
                 )
 
-        raise last_error or KisRateLimitError("KIS request was rate limited.")
+        raise last_error or KisApiError("KIS read request failed after retries.")
 
     def _request_with_network_retry(
         self, method: str, url: str, **kwargs: Any
@@ -822,6 +829,16 @@ class KisAccountClient:
             raise KisInvalidAccountError(
                 "KIS rejected the account number/product code. "
                 "Verify the selected KIS account and product code in .env."
+            )
+        if msg_cd in TRANSIENT_SERVER_MSG_CODES or response.status_code in {
+            500,
+            502,
+            503,
+            504,
+        }:
+            raise KisTransientApiError(
+                f"KIS service temporarily unavailable at {endpoint}: "
+                f"HTTP {response.status_code}: {msg_cd} {msg1}"
             )
 
         if response.status_code >= 400:
