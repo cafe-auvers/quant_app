@@ -62,6 +62,7 @@ class _EnginePulseState:
         default_factory=dict
     )
     notifications_available: bool = False
+    remote_peer_confirmed_off: bool = False
 
 
 @dataclass(frozen=True)
@@ -309,6 +310,14 @@ def mark_remote_coordination_change(
 def set_change_notifications_available(
     engine: Optional[Engine], available: bool
 ) -> None:
+    """Record that routine remote polling may use the missed-event fallback.
+
+    This is true either when the listener can deliver change tokens or when
+    the peer is confirmed offline and therefore cannot originate a change.
+    The separate peer-off flag suppresses even the missed-event fallback in
+    the latter case. Callers clear both immediately when the peer returns.
+    """
+
     if engine is None:
         return
     with _lock:
@@ -323,6 +332,30 @@ def change_notifications_available(engine: Optional[Engine]) -> bool:
     with _lock:
         return bool(
             _states.setdefault(engine, _EnginePulseState()).notifications_available
+        )
+
+
+def set_remote_peer_confirmed_off(
+    engine: Optional[Engine], confirmed_off: bool
+) -> None:
+    """Record locally observed peer-off state without contacting TiDB."""
+
+    if engine is None:
+        return
+    with _lock:
+        _states.setdefault(engine, _EnginePulseState()).remote_peer_confirmed_off = (
+            bool(confirmed_off)
+        )
+
+
+def remote_peer_confirmed_off(engine: Optional[Engine]) -> bool:
+    if engine is None:
+        return False
+    with _lock:
+        return bool(
+            _states.setdefault(
+                engine, _EnginePulseState()
+            ).remote_peer_confirmed_off
         )
 
 

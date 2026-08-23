@@ -27,7 +27,10 @@ from sqlalchemy.engine import Engine
 
 from src.core.runtime_readiness import RuntimeDeviceState
 from src.core.schema_version import CURRENT_EXECUTION_SCHEMA_VERSION
-from src.core.execution_config import COORDINATION_RU_PROFILE
+from src.core.execution_config import (
+    COORDINATION_DEVICE_HEARTBEAT_MAX_AGE_SECONDS,
+    COORDINATION_RU_PROFILE,
+)
 from src.infrastructure.database.coordination_engine import (
     coordination_autocommit_connection,
     coordination_read_connection,
@@ -398,7 +401,7 @@ def confirm_standby_handoff(
     device_id: str,
     readiness_generation: int,
     outgoing_lease_epoch: int,
-    max_age_seconds: float = 60.0,
+    max_age_seconds: float = COORDINATION_DEVICE_HEARTBEAT_MAX_AGE_SECONDS,
     now: Optional[datetime] = None,
 ) -> bool:
     """Confirm one fresh readiness generation without refreshing its heartbeat."""
@@ -446,7 +449,7 @@ def verify_standby_generation_for_claim(
     *,
     device_id: str,
     readiness_generation: int,
-    max_age_seconds: float = 60.0,
+    max_age_seconds: float = COORDINATION_DEVICE_HEARTBEAT_MAX_AGE_SECONDS,
     now: Optional[datetime] = None,
 ) -> tuple[bool, str]:
     """Lock and validate the successor generation inside a lease claim."""
@@ -492,7 +495,7 @@ def get_runtime_device_liveness(
     engine: Engine,
     *,
     device_id: str,
-    max_age_seconds: float = 60.0,
+    max_age_seconds: float = COORDINATION_DEVICE_HEARTBEAT_MAX_AGE_SECONDS,
 ) -> RuntimeDeviceLiveness:
     """Read the canonical runtime row and its server-clock age in one query.
 
@@ -556,7 +559,7 @@ def runtime_device_row_is_stale(
     engine: Engine,
     *,
     device_id: str,
-    max_age_seconds: float = 60.0,
+    max_age_seconds: float = COORDINATION_DEVICE_HEARTBEAT_MAX_AGE_SECONDS,
 ) -> Optional[bool]:
     """Return fenced runtime staleness, or ``None`` for a legacy fallback."""
 
@@ -602,7 +605,7 @@ def require_compatible_runtime_schema(
     schema_version: int = CURRENT_EXECUTION_SCHEMA_VERSION,
     required_coordination_profile: str = "",
     lease_engine: Optional[Engine] = None,
-    max_age_seconds: float = 60.0,
+    max_age_seconds: float = COORDINATION_DEVICE_HEARTBEAT_MAX_AGE_SECONDS,
     now: Optional[datetime] = None,
 ) -> None:
     """Refuse startup while any genuinely live runtime is incompatible.
@@ -689,7 +692,7 @@ def find_standby_successor(
     engine: Engine,
     *,
     excluding_device_id: str,
-    max_age_seconds: float = 60.0,
+    max_age_seconds: float = COORDINATION_DEVICE_HEARTBEAT_MAX_AGE_SECONDS,
     now: Optional[datetime] = None,
     require_confirmed: bool = False,
     expected_outgoing_lease_epoch: int = 0,
@@ -730,7 +733,7 @@ def find_confirmed_standby_successor(
     engine: Engine,
     *,
     excluding_device_id: str,
-    max_age_seconds: float = 60.0,
+    max_age_seconds: float = COORDINATION_DEVICE_HEARTBEAT_MAX_AGE_SECONDS,
     now: Optional[datetime] = None,
     expected_outgoing_lease_epoch: int,
 ) -> Optional[RuntimeDeviceRecord]:

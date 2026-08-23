@@ -704,7 +704,13 @@ class BuylistViewMixin:
         ):
             return None
         history = load_symbol_history_from_db(
-            str(symbol).strip().upper(), self.db_engine, interval="1d"
+            str(symbol).strip().upper(),
+            self.db_engine,
+            interval="1d",
+            # ADR(20) needs only the recent window plus the previous close.
+            # Loading a symbol's entire retained history on the Qt thread made
+            # an explicit queue refresh unnecessarily expensive as well.
+            max_rows=30,
         )
         if history.empty or len(history) < 2:
             return None
@@ -1102,6 +1108,10 @@ class BuylistViewMixin:
         result = controller.refresh_execution_queue(request)
         self._last_execution_queue_refresh_result = result
         self._apply_execution_queue_refresh_result(result, show_log=show_log)
+        if result.target_count == 0 or (
+            result.refreshed == result.target_count and not result.failures
+        ):
+            self._execution_queue_account_sizing_dirty = False
         return result.refreshed
 
     def _apply_execution_queue_item_to_buylist(

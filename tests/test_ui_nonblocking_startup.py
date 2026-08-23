@@ -30,7 +30,11 @@ from src.ui.buyboard import board as buyboard_board
 from src.ui.buyboard import controller as buyboard_controller
 from src.ui.charts.controller_data_flow import ChartsDataFlowMixin
 from src.ui.mixins.dashboard_mixin import DashboardMixin
-from src.ui.main_window import MainWindow, MarketDataStatusResult
+from src.ui.main_window import (
+    MainWindow,
+    MarketDataStatusResult,
+    MarketDataStatusWorker,
+)
 
 
 def test_market_data_status_formatting_never_queries_the_database():
@@ -67,6 +71,112 @@ def test_market_data_status_result_controls_1d_and_1h_freshness_independently():
     assert window._historical_data_freshness == {"1d": "fresh", "1h": "stale"}
     assert window._historical_data_expected_date.isoformat() == "2026-08-21"
     assert polls == [True]
+
+
+def test_local_mirror_startup_schedules_freshness_check_without_database_work(
+    monkeypatch,
+):
+    import src.ui.main_window as main_window
+
+    engine = object()
+    starts = []
+    logs = []
+    window = SimpleNamespace(
+        append_log=logs.append,
+        _start_market_data_status_refresh=lambda: starts.append(True),
+        run_all_scanners=lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        main_window,
+        "local_mirror_is_stale",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("freshness SQL must stay off the Qt callback")
+        ),
+    )
+    monkeypatch.setattr(
+        main_window,
+        "local_mirror_hourly_is_stale",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("freshness SQL must stay off the Qt callback")
+        ),
+    )
+
+    MainWindow._handle_local_mirror_startup(window, engine)
+
+    assert window._pending_local_mirror_startup_engine is engine
+    assert starts == [True]
+    assert any("in the background" in message for message in logs)
+
+
+def test_background_freshness_result_finishes_pending_local_startup():
+    engine = object()
+    finished = []
+    window = SimpleNamespace(
+        db_engine=engine,
+        _database_shutting_down=False,
+        _pending_local_mirror_startup_engine=engine,
+        _format_market_data_status_from_date=lambda _value: "Up to date",
+        _poll_refresh_status=lambda: None,
+        update_dashboard_summary=lambda: None,
+        _finish_local_mirror_startup=finished.append,
+    )
+    result = MarketDataStatusResult(
+        engine=engine,
+        latest_daily=datetime(2026, 8, 21),
+        latest_hourly=datetime(2026, 8, 21),
+        expected_date=datetime(2026, 8, 21).date(),
+        daily_is_stale=True,
+        hourly_is_stale=False,
+    )
+
+    MainWindow._on_market_data_status_completed(window, result)
+
+    assert window._pending_local_mirror_startup_engine is None
+    assert finished == [result]
+
+
+def test_local_status_worker_uses_spy_instead_of_global_hourly_max(monkeypatch):
+    import src.infrastructure.database.repositories.market_bars as market_bars
+    import src.infrastructure.database.repositories.market_watermarks as watermarks
+    import src.ui.main_window as main_window
+
+    engine = object()
+    hourly_symbols = []
+    monkeypatch.setattr(
+        watermarks,
+        "get_latest_price_history_date",
+        lambda _engine: datetime(2026, 8, 21),
+    )
+    monkeypatch.setattr(
+        market_bars,
+        "get_latest_hourly_price_history_timestamp",
+        lambda _engine, symbol=None: hourly_symbols.append(symbol)
+        or datetime(2026, 8, 21),
+    )
+    monkeypatch.setattr(
+        main_window,
+        "expected_latest_market_data_date",
+        lambda: datetime(2026, 8, 21).date(),
+    )
+    monkeypatch.setattr(main_window, "local_mirror_is_stale", lambda *a, **k: False)
+    monkeypatch.setattr(
+        main_window,
+        "local_mirror_hourly_is_stale",
+        lambda *a, **k: False,
+    )
+    completed = []
+    worker = MarketDataStatusWorker(
+        engine,
+        tickers=["AAPL"],
+        hourly_tickers=["SPY", "AAPL"],
+    )
+    worker.completed.connect(completed.append)
+
+    worker.run()
+
+    assert hourly_symbols == ["SPY"]
+    assert len(completed) == 1
+    assert completed[0].error == ""
 
 
 def test_buyboard_projection_worker_uses_authoritative_services(monkeypatch):

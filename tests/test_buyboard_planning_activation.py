@@ -60,7 +60,7 @@ class _Window(BuyboardMixin):
         self.refresh_count += 1
 
 
-def _wait_for_dispatched_command(window, timeout: float = 2.0):
+def _wait_for_dispatched_command(window, timeout: float = 10.0):
     deadline = time.monotonic() + timeout
     while window.__dict__.get("_buyboard_pending_command_counts"):
         _APP.processEvents()

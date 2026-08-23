@@ -422,6 +422,27 @@ class _ProgressLabelStub:
         self.tooltip = value
 
 
+class _TimerStub:
+    def __init__(self):
+        self._interval = None
+        self.active = True
+
+    def setInterval(self, value):
+        self._interval = value
+
+    def interval(self):
+        return self._interval
+
+    def isActive(self):
+        return self.active
+
+    def start(self):
+        self.active = True
+
+    def stop(self):
+        self.active = False
+
+
 class _StateSaveManagerStub:
     def __init__(self):
         self.engine_bindings = []
@@ -507,6 +528,86 @@ def _online_pc_status():
         database_ready=True,
         database_hostname="data-pc",
     )
+
+
+def test_coordination_poll_backoff_distinguishes_offline_and_legacy_peers():
+    assert MainWindow._coordination_remote_poll_backoff_safe(
+        PcServiceStatus(
+            listener_status=PcStatus.OFF,
+            database_ready=False,
+        )
+    ) is True
+    assert MainWindow._coordination_remote_poll_backoff_safe(
+        PcServiceStatus(
+            listener_status=PcStatus.ON,
+            database_ready=False,
+            coordination_change_pulse_supported=True,
+            coordination_change_pulse_version=3,
+        )
+    ) is True
+    assert MainWindow._coordination_remote_poll_backoff_safe(
+        PcServiceStatus(
+            listener_status=PcStatus.ON,
+            database_ready=False,
+        )
+    ) is False
+    assert MainWindow._coordination_remote_poll_backoff_safe(
+        PcServiceStatus(
+            listener_status=PcStatus.OFF,
+            database_ready=True,
+        )
+    ) is False
+    assert MainWindow._coordination_remote_poll_backoff_safe(
+        PcServiceStatus(
+            listener_status=PcStatus.UNKNOWN,
+            database_ready=False,
+        )
+    ) is False
+
+
+def test_pc_change_pulse_stays_at_five_seconds_when_peer_is_online():
+    window, _manager, _logs, _summary_updates = _runtime_transition_window(
+        object()
+    )
+    window.pc_status_timer = _TimerStub()
+
+    window._on_pc_status_result(
+        PcServiceStatus(
+            listener_status=PcStatus.ON,
+            database_ready=True,
+            coordination_change_pulse_supported=True,
+            coordination_change_pulse_version=3,
+        )
+    )
+
+    assert window.pc_status_timer.interval() == 5_000
+
+
+def test_peer_offline_pauses_tidb_projection_fallback_timers():
+    window = MainWindow.__new__(MainWindow)
+    window.state_sync_timer = _TimerStub()
+    window._buyboard_projection_timer = _TimerStub()
+
+    window._configure_coordination_fallback_timers(
+        True,
+        peer_confirmed_off=True,
+    )
+
+    assert window.state_sync_timer.active is False
+    assert window._buyboard_projection_timer.active is False
+
+    window._configure_coordination_fallback_timers(
+        True,
+        peer_confirmed_off=False,
+    )
+
+    expected = int(
+        execution_config.COORDINATION_REMOTE_FALLBACK_SECONDS * 1000
+    )
+    assert window.state_sync_timer.active is True
+    assert window.state_sync_timer.interval() == expected
+    assert window._buyboard_projection_timer.active is True
+    assert window._buyboard_projection_timer.interval() == expected
 
 
 def test_runtime_pc_database_loss_switches_to_local_mirror_and_detaches_state_sync(

@@ -19,7 +19,7 @@ import src.ui.main_window as main_window_module
 from src.ui.main_window import MainWindow
 
 
-def _make_heartbeat_stale(engine, hostname: str, *, minutes: float = 5) -> None:
+def _make_heartbeat_stale(engine, hostname: str, *, minutes: float = 6) -> None:
     """Force a previously-recorded heartbeat to look old, like test_pc_runtime_status.py."""
     stale_time = (
         dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)

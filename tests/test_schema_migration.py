@@ -6,6 +6,9 @@ from pathlib import Path
 import pytest
 from sqlalchemy import MetaData, Table, create_engine, inspect, select, text
 
+from src.core.execution_config import (
+    COORDINATION_DEVICE_HEARTBEAT_MAX_AGE_SECONDS,
+)
 from src.core.runtime_readiness import RuntimeDeviceState
 from src.core.schema_version import CURRENT_EXECUTION_SCHEMA_VERSION
 from src.core.capital_reservation import CapitalReservation
@@ -419,7 +422,7 @@ def test_startup_refuses_schema_mismatch_with_another_live_device(tmp_path):
     )
     runtime_status.record_runtime_heartbeat(engine, hostname="old", pid=1)
     stale_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
-        minutes=5
+        minutes=6
     )
     with engine.begin() as conn:
         conn.execute(
@@ -480,7 +483,12 @@ def test_stale_old_schema_standby_does_not_block_current_main_runtime(tmp_path):
     require_compatible_runtime_schema(
         engine,
         device_id="main-pc",
-        now=datetime.now(timezone.utc) + timedelta(seconds=61),
+        now=(
+            datetime.now(timezone.utc)
+            + timedelta(
+                seconds=COORDINATION_DEVICE_HEARTBEAT_MAX_AGE_SECONDS + 1
+            )
+        ),
     )
 
 
@@ -501,7 +509,7 @@ def test_stale_old_schema_owner_allows_real_generation_fenced_handoff(tmp_path):
         engine, hostname=old_role.hostname, pid=1
     )
     stale_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
-        minutes=5
+        minutes=6
     )
     with engine.begin() as conn:
         conn.execute(

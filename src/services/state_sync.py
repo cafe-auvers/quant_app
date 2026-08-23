@@ -36,6 +36,9 @@ from sqlalchemy import (
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import SQLAlchemyError
 
+from src.core.execution_config import (
+    COORDINATION_DEVICE_HEARTBEAT_MAX_AGE_SECONDS,
+)
 from src.infrastructure.database.coordination_engine import coordination_read_connection
 from src.services.runtime_status import MAIN_APP_PROCESS, heartbeat_row_is_stale
 from src.utils.config import DATA_DIR
@@ -1068,7 +1071,9 @@ def claim_main_device(
     role: LocalDeviceRole,
     *,
     expected_standby_generation: int = 0,
-    standby_max_age_seconds: float = 60.0,
+    standby_max_age_seconds: float = (
+        COORDINATION_DEVICE_HEARTBEAT_MAX_AGE_SECONDS
+    ),
     require_operator_handoff_clear: bool = False,
 ) -> OwnershipResult:
     """Atomically make ``role`` the sole remote writer.
@@ -1193,9 +1198,13 @@ def claim_main_device_if_stale(
     role: LocalDeviceRole,
     *,
     expected_owner_device_id: str,
-    heartbeat_cutoff_seconds: int = 60,
+    heartbeat_cutoff_seconds: float = (
+        COORDINATION_DEVICE_HEARTBEAT_MAX_AGE_SECONDS
+    ),
     expected_standby_generation: int = 0,
-    standby_max_age_seconds: float = 60.0,
+    standby_max_age_seconds: float = (
+        COORDINATION_DEVICE_HEARTBEAT_MAX_AGE_SECONDS
+    ),
 ) -> OwnershipResult:
     """Atomically transfer ownership away from a confirmed-stale owner.
 
@@ -1321,7 +1330,9 @@ def claim_main_device_if_unclaimed(
     role: LocalDeviceRole,
     *,
     expected_standby_generation: int = 0,
-    standby_max_age_seconds: float = 60.0,
+    standby_max_age_seconds: float = (
+        COORDINATION_DEVICE_HEARTBEAT_MAX_AGE_SECONDS
+    ),
 ) -> OwnershipResult:
     """Atomically claim ownership only if the row is still genuinely missing.
 

@@ -1114,6 +1114,17 @@ class DashboardMixin:
         ):
             return
 
+        # Account/FX callbacks run on the Qt thread.  Refreshing the execution
+        # queue here used to synchronously reload 1m, 5m, and full daily
+        # history for every queued symbol.  On the multi-million-row laptop
+        # mirror that can block the event loop for minutes, commonly while the
+        # local-data freshness prompt is open.  The broker snapshot is already
+        # published to buying_power_cache below, so execution remains
+        # fail-closed and uses the newest balance.  Mark the compatibility
+        # queue projection dirty; the next explicit/intraday queue refresh can
+        # rebuild it together with genuinely new market data.
+        self._execution_queue_account_sizing_dirty = True
+
         # Dashboard owns the shared environment alias. Keep the fallback for
         # lightweight tests and callbacks that run during partial setup.
         environment = (
@@ -1202,8 +1213,6 @@ class DashboardMixin:
                         f"US stocks: ${ovrs_stock:,.2f} | "
                         f"USD cash: ${ovrs_cash:,.2f}]{frcr_note}"
                     )
-                    if hasattr(self, "refresh_execution_queue"):
-                        self.refresh_execution_queue(environment, show_log=False)
                     return
                 fallback_reason = "account value is zero or invalid in snapshot"
 
@@ -1217,8 +1226,6 @@ class DashboardMixin:
             self.append_log(
                 f"KIS position sizing unavailable for {environment}: {fallback_reason}."
             )
-            if hasattr(self, "refresh_execution_queue"):
-                self.refresh_execution_queue(environment, show_log=False)
             return
 
         # Fallback if no profile, no snapshot, or account value is invalid
@@ -1232,8 +1239,6 @@ class DashboardMixin:
         self.append_log(
             f"No KIS snapshot ({fallback_reason}). Using default {environment} balance: ${default_val:,.2f}"
         )
-        if hasattr(self, "refresh_execution_queue"):
-            self.refresh_execution_queue(environment, show_log=False)
 
     def on_account_size_text_changed(self) -> None:
         """Cache the manually entered account size for the active environment."""

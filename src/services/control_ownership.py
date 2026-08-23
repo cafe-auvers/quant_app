@@ -7,6 +7,9 @@ from typing import Optional, Tuple
 
 from sqlalchemy import select
 
+from src.core.execution_config import (
+    COORDINATION_DEVICE_HEARTBEAT_MAX_AGE_SECONDS,
+)
 from src.core.runtime_readiness import RuntimeDeviceState
 from src.infrastructure.database.coordination_engine import coordination_read_connection
 from src.services.runtime_device_state_repository import (
@@ -14,10 +17,7 @@ from src.services.runtime_device_state_repository import (
     get_runtime_device_state,
     runtime_row_owns_process_liveness,
 )
-from src.services.runtime_status import (
-    DEFAULT_HEARTBEAT_MAX_AGE_SECONDS,
-    get_runtime_process_status,
-)
+from src.services.runtime_status import get_runtime_process_status
 from src.services.state_sync import (
     LocalDeviceRole,
     MainDevice,
@@ -59,7 +59,7 @@ def check_executor_readiness(
     engine,
     *,
     target_device_id: str,
-    max_age_seconds: float = DEFAULT_HEARTBEAT_MAX_AGE_SECONDS,
+    max_age_seconds: float = COORDINATION_DEVICE_HEARTBEAT_MAX_AGE_SECONDS,
 ) -> ExecutorReadinessCheck:
     """Fail-closed readiness check for an execution-owner target."""
 
@@ -153,7 +153,7 @@ def switch_execution_owner(
     *,
     initiated_by: LocalDeviceRole,
     target_device_id: str,
-    max_age_seconds: float = DEFAULT_HEARTBEAT_MAX_AGE_SECONDS,
+    max_age_seconds: float = COORDINATION_DEVICE_HEARTBEAT_MAX_AGE_SECONDS,
 ) -> ExecutionOwnerSwitchResult:
     """Assign execution ownership only after the target passes every gate."""
 

@@ -28,7 +28,11 @@ def test_cloud_coordination_poll_floors_preserve_monthly_budget():
     assert execution_config.COORDINATION_STANDBY_CARD_POLL_SECONDS >= 300.0
     assert execution_config.COORDINATION_DATABASE_PROBE_SECONDS >= 180.0
     assert execution_config.COORDINATION_LEASE_POLL_SECONDS >= 20.0
-    assert execution_config.COORDINATION_DEVICE_HEARTBEAT_SECONDS >= 45.0
+    assert execution_config.COORDINATION_DEVICE_HEARTBEAT_SECONDS >= 240.0
+    assert (
+        execution_config.COORDINATION_DEVICE_HEARTBEAT_MAX_AGE_SECONDS
+        >= execution_config.COORDINATION_DEVICE_HEARTBEAT_SECONDS + 60.0
+    )
     assert execution_config.COORDINATION_OWNERSHIP_PROOF_SECONDS >= 30.0
     assert execution_config.COORDINATION_ALERT_POLL_SECONDS >= 90.0
     assert execution_config.COORDINATION_OPERATOR_COMMAND_POLL_SECONDS >= 20.0
