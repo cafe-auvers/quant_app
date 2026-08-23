@@ -1210,6 +1210,9 @@ def build_external_alerting_service(
         engine,
         provider,
         device_id=device_id,
+        acknowledgement_timeout_seconds=(
+            execution_config.EXTERNAL_ALERT_ACK_REMINDER_SECONDS
+        ),
         heartbeat_interval_seconds=(
             execution_config.EXTERNAL_WATCHDOG_HEARTBEAT_SECONDS
         ),

@@ -19,6 +19,7 @@ app, no scripting of the router's undocumented web UI).
 """
 from __future__ import annotations
 
+import re
 import socket
 from dataclasses import dataclass
 from enum import Enum
@@ -46,8 +47,11 @@ class PcServiceStatus:
     main_app_active: Optional[bool] = None
     main_app_last_seen_seconds: Optional[float] = None
     coordination_change_event_id: str = ""
+    coordination_change_tables: tuple[str, ...] = ()
     coordination_change_pulse_supported: bool = False
+    coordination_change_pulse_version: int = 0
     coordination_notification_event_id: str = ""
+    coordination_notification_tables: tuple[str, ...] = ()
     coordination_notification_delivered: bool = False
 
 
@@ -55,7 +59,23 @@ class PcServiceStatus:
 class PcListenerStatus:
     status: PcStatus
     coordination_change_event_id: str = ""
+    coordination_change_tables: tuple[str, ...] = ()
     coordination_change_pulse_supported: bool = False
+    coordination_change_pulse_version: int = 0
+
+
+def _change_tables(value: str) -> tuple[str, ...]:
+    if not value or value == "-":
+        return ()
+    return tuple(
+        sorted(
+            {
+                item.strip().lower()
+                for item in value.split(",")
+                if re.fullmatch(r"[A-Za-z0-9_]{1,64}", item.strip())
+            }
+        )
+    )
 
 
 def _pc_host() -> Optional[str]:
@@ -81,13 +101,24 @@ def check_pc_listener(timeout: float = CONNECT_TIMEOUT_SECONDS) -> PcListenerSta
         with socket.create_connection((host, _pc_port()), timeout=timeout) as conn:
             conn.settimeout(timeout)
             conn.sendall(b"PING\n")
-            reply = conn.recv(256).decode("utf-8", errors="replace").strip()
+            reply = conn.recv(1024).decode("utf-8", errors="replace").strip()
     except OSError:
         return PcListenerStatus(PcStatus.OFF)
     if reply == "PONG":
         # Backward-compatible response from a listener that predates change
         # pulses. Callers retain their TiDB fallback polling in this case.
         return PcListenerStatus(PcStatus.ON)
+    if reply.startswith("PONG v3"):
+        parts = reply.split(" ", 3)
+        event_id = "" if len(parts) < 3 or parts[2] == "-" else parts[2]
+        tables = _change_tables(parts[3] if len(parts) > 3 else "")
+        return PcListenerStatus(
+            PcStatus.ON,
+            coordination_change_event_id=event_id,
+            coordination_change_tables=tables,
+            coordination_change_pulse_supported=True,
+            coordination_change_pulse_version=3,
+        )
     if reply.startswith("PONG v2"):
         parts = reply.split(" ", 2)
         event_id = "" if len(parts) < 3 or parts[2] == "-" else parts[2]
@@ -95,6 +126,7 @@ def check_pc_listener(timeout: float = CONNECT_TIMEOUT_SECONDS) -> PcListenerSta
             PcStatus.ON,
             coordination_change_event_id=event_id,
             coordination_change_pulse_supported=True,
+            coordination_change_pulse_version=2,
         )
     return PcListenerStatus(PcStatus.UNKNOWN)
 
@@ -106,7 +138,11 @@ def check_pc_status(timeout: float = CONNECT_TIMEOUT_SECONDS) -> PcStatus:
 
 
 def notify_pc_coordination_change(
-    event_id: str, *, timeout: float = CONNECT_TIMEOUT_SECONDS
+    event_id: str,
+    *,
+    changed_tables: tuple[str, ...] = (),
+    protocol_version: int = 2,
+    timeout: float = CONNECT_TIMEOUT_SECONDS,
 ) -> bool:
     """Tell the PC listener that TiDB state has already changed.
 
@@ -122,8 +158,12 @@ def notify_pc_coordination_change(
     try:
         with socket.create_connection((host, _pc_port()), timeout=timeout) as conn:
             conn.settimeout(timeout)
+            table_suffix = ""
+            if int(protocol_version or 0) >= 3:
+                encoded_tables = ",".join(_change_tables(",".join(changed_tables)))
+                table_suffix = f" {encoded_tables or '-'}"
             conn.sendall(
-                f"CHANGE {token} {event_id}\n".encode("utf-8")
+                f"CHANGE {token} {event_id}{table_suffix}\n".encode("utf-8")
             )
             reply = conn.recv(64).decode("utf-8", errors="replace").strip()
     except OSError:

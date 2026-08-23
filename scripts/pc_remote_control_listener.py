@@ -3,10 +3,11 @@
 Runs on the always-on PC (launched by pc_morning_routine.ps1, alongside
 main.py). Accepts three plaintext commands over TCP, one per line:
 
-  PING              -> replies PONG v2 plus a non-secret change token. Used
+  PING              -> replies PONG v3 plus a non-secret change token and
+                       affected-table scope. Used
                        by the laptop dashboard for status and to trigger one
                        TiDB reconcile only after PC state actually changes.
-  CHANGE <token> <event-id>
+  CHANGE <token> <event-id> [table-1,table-2]
                     -> records a local-file token for main.py; it performs no
                        database I/O. Used by the laptop after its TiDB write.
   SHUTDOWN <token>  -> if <token> matches REMOTE_CONTROL_TOKEN from .env,
@@ -39,7 +40,7 @@ if str(REPO_ROOT) not in sys.path:
 from dotenv import load_dotenv
 
 from src.services.coordination_change_pulse import (
-    read_outbound_change_pulse,
+    read_outbound_change_event,
     record_inbound_change_pulse,
 )
 
@@ -65,26 +66,39 @@ def _log(message: str) -> None:
 class _Handler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
         try:
-            line = self.rfile.readline(512).decode("utf-8", errors="replace").strip()
+            line = (
+                self.rfile.readline(2048)
+                .decode("utf-8", errors="replace")
+                .strip()
+            )
         except OSError:
             return
 
         peer = self.client_address[0]
 
         if line == "PING":
-            event_id = read_outbound_change_pulse() or "-"
-            self.wfile.write(f"PONG v2 {event_id}\n".encode("utf-8"))
+            event = read_outbound_change_event()
+            event_id = event.event_id or "-"
+            tables = ",".join(event.tables) or "-"
+            self.wfile.write(
+                f"PONG v3 {event_id} {tables}\n".encode("utf-8")
+            )
             return
 
         if line.startswith("CHANGE "):
-            parts = line.split(" ", 2)
+            parts = line.split(" ", 3)
             supplied = parts[1].strip() if len(parts) > 1 else ""
             event_id = parts[2].strip() if len(parts) > 2 else ""
+            tables = tuple(
+                item.strip()
+                for item in (parts[3] if len(parts) > 3 else "").split(",")
+                if item.strip() and item.strip() != "-"
+            )
             if not TOKEN or not hmac.compare_digest(supplied, TOKEN):
                 _log(f"CHANGE request from {peer} denied: token mismatch.")
                 self.wfile.write(b"DENIED\n")
                 return
-            if not record_inbound_change_pulse(event_id):
+            if not record_inbound_change_pulse(event_id, tables=tables):
                 self.wfile.write(b"INVALID\n")
                 return
             self.wfile.write(b"OK\n")

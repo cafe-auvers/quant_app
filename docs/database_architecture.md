@@ -188,7 +188,7 @@ provisions all 18 tables through `ensure_coordination_schema()`.
 
 | Table | Primary/unique key | What it stores | When it changes |
 | --- | --- | --- | --- |
-| `app_state_sync` | `state_key` | Versioned shared payloads for `watchlist`, `buylist`, `trade_plans`, `execution_queue`, `__main_device__`, `__operator_control__`, and `__live_trading_control__` | Atomic plan publish, owner/control changes, and explicit control actions; display/revision reads normally occur every minute |
+| `app_state_sync` | `state_key` | Versioned shared payloads for `watchlist`, `buylist`, `trade_plans`, `execution_queue`, `__main_device__`, `__operator_control__`, and `__live_trading_control__` | Atomic plan publish, owner/control changes, and explicit control actions; display/revision reads follow typed change tokens with an hourly recovery fallback |
 | `operator_control_audit` | `revision` | Previous/new operator device, lock state, actor, and timestamp | Appended whenever Operator Control changes |
 | `live_trading_control_audit` | `revision` | Previous/new live-trading enabled state, actor, and timestamp | Appended whenever the shared live-trading switch changes |
 | `trade_cards` | `id`; unique `(environment, account_no, symbol)` | Canonical Kanban card status, versioned JSON payload, and update time | Written for durable plan/lifecycle/order/stop/warning changes; price-only display changes stay in memory |
@@ -202,7 +202,7 @@ provisions all 18 tables through `ensure_coordination_schema()`.
 | `discovered_external_orders` | `id`; unique external/broker identity keys | Broker orders not originally known to the application, disposition, payload, and version | Inserted/updated during broker reconciliation and adoption/rejection handling |
 | `emergency_journal_reconciliation` | `id`; unique journal sequence/idempotency keys | Proof that a locally recorded emergency request/outcome was folded into canonical state | Appended after the coordination database recovers and emergency evidence is reconciled |
 | `external_alert_incidents` | `incident_id`; unique `(alert_type, dedupe_key)` | Deduplicated alert state, occurrence/attempt counts, escalation, acknowledgement, and retry timing | Created or version-updated on alert occurrence, retry, escalation, or acknowledgement |
-| `external_alert_delivery_attempts` | `id`; unique `(incident_id, attempt_number)` | Per-attempt delivery status, provider ID, error, and escalation level | Appended for every external alert delivery attempt |
+| `external_alert_delivery_attempts` | `id`; unique `(incident_id, attempt_number)` | Per-attempt delivery status, provider ID, error, and escalation level | Appended for delivery attempts; a successful unacknowledged incident is reminded every six hours rather than every five minutes |
 | `external_alert_spool_imports` | `pending_event_id` | Idempotency record connecting an imported offline alert event to its incident | Inserted when an outage-spooled alert is imported after database recovery |
 | `application_heartbeat_attempts` | `id` | Compact audit evidence for external watchdog delivery | Failures and transitions are recorded immediately; successful evidence is compacted to roughly one row per hour while the webhook receives a five-second pulse |
 | `execution_schema_migration` | `singleton_id` | Source/target schema versions, migration phase, backup/checksum, cutover lease, reconciliation flag, error, and version | Updated only during guarded execution-schema migration, cutover, reconciliation, or rollback |
@@ -268,16 +268,16 @@ There is no PC relay. The principal steady-state database cadences are:
 
 | Coordination activity | Database cadence |
 | --- | ---: |
-| Operator-command pickup during the regular session | Internal/Tailscale change token; 20-second legacy or 3600-second v2 fallback |
-| Lease proof | Change token and every broker mutation; 20-second legacy or 3600-second v2 fallback |
+| Operator-command pickup during the regular session | Typed `operator_commands` token; 20-second legacy or 3600-second pulse fallback |
+| Lease proof | Typed `app_state_sync` token and every broker mutation; 20-second legacy or 3600-second pulse fallback |
 | Protective ownership proof | 30 seconds while positions exist; one bulk read |
 | Runtime-readiness heartbeat | 45 seconds per running device |
 | `main.py` process heartbeat | Folded into runtime readiness; `app_runtime_status` is a legacy fallback |
 | External watchdog pulse | 5 seconds over HTTPS; no TiDB request per pulse |
 | Alert queue check | 90 seconds; successful external heartbeat audit compacted to about 1 hour |
-| Active/standby card revision check | Change token; 180/300-second legacy or 3600-second v2 fallback |
-| Buy Board and planning/control display synchronization | Change token; 3600-second v2 fallback |
-| Operator-command pickup | Change token; legacy 20 seconds in-session/300 seconds off-hours |
+| Active/standby card revision check | Typed `trade_cards` token; 180/300-second legacy or 3600-second pulse fallback |
+| Buy Board and planning/control display synchronization | Matching typed token; 3600-second pulse fallback |
+| Operator-command pickup | Typed command token; legacy 20 seconds in-session/300 seconds off-hours |
 | Writable probe fallback | 180 seconds; normally satisfied by the readiness write |
 | Account-reconciliation relational comparison refresh | Relevant DML token; 900-second fallback without token delivery |
 
@@ -288,6 +288,9 @@ the event happens.
 
 The local one-second trading loop performs no unconditional one-second TiDB
 write. A TradeCard is persisted only when a durable decision changes.
+Listener protocol v3 attaches affected table names to its non-secret event ID,
+so unrelated consumers remain asleep. A protocol-v2 event remains supported
+as a conservative broad invalidation during rolling deployment.
 
 ### 6.4 Local operational SQLite
 

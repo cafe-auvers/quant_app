@@ -481,12 +481,16 @@ class PcRemoteStatusWorker(QThread):
         engine=None,
         *,
         coordination_notification_event_id: str = "",
+        coordination_notification_tables: tuple[str, ...] = (),
         parent=None,
     ) -> None:
         super().__init__(parent)
         self.engine = engine
         self.coordination_notification_event_id = str(
             coordination_notification_event_id or ""
+        )
+        self.coordination_notification_tables = tuple(
+            coordination_notification_tables or ()
         )
 
     def run(self) -> None:
@@ -512,7 +516,13 @@ class PcRemoteStatusWorker(QThread):
                 delivered = False
                 event_id = self.coordination_notification_event_id
                 if event_id and listener.coordination_change_pulse_supported:
-                    delivered = notify_pc_coordination_change(event_id)
+                    delivered = notify_pc_coordination_change(
+                        event_id,
+                        changed_tables=self.coordination_notification_tables,
+                        protocol_version=(
+                            listener.coordination_change_pulse_version
+                        ),
+                    )
                 return listener, delivered
             except Exception:
                 return PcListenerStatus(PcStatus.UNKNOWN), False
@@ -582,11 +592,20 @@ class PcRemoteStatusWorker(QThread):
                 coordination_change_event_id=(
                     listener.coordination_change_event_id
                 ),
+                coordination_change_tables=(
+                    listener.coordination_change_tables
+                ),
                 coordination_change_pulse_supported=(
                     listener.coordination_change_pulse_supported
                 ),
+                coordination_change_pulse_version=(
+                    listener.coordination_change_pulse_version
+                ),
                 coordination_notification_event_id=(
                     self.coordination_notification_event_id
+                ),
+                coordination_notification_tables=(
+                    self.coordination_notification_tables
                 ),
                 coordination_notification_delivered=notification_delivered,
             )

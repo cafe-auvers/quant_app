@@ -417,9 +417,60 @@ def test_operator_command_lookup_runs_only_after_internal_change_pulse(
     assert len(calls) == 1
 
     assert coordination_change_pulse.mark_remote_coordination_change(
-        engine, "laptop:operator-change"
+        engine,
+        "laptop:card-change",
+        tables=("trade_cards",),
     )
     assert worker._process_operator_commands() is False
+    assert len(calls) == 1
+
+    assert coordination_change_pulse.mark_remote_coordination_change(
+        engine,
+        "laptop:operator-change",
+        tables=("operator_commands",),
+    )
+    assert worker._process_operator_commands() is False
+    assert len(calls) == 2
+
+
+def test_readiness_revisions_are_cached_until_app_state_changes(
+    tmp_path, monkeypatch
+):
+    import src.ui.buyboard.runtime_worker as runtime_worker_module
+    from src.services import coordination_change_pulse
+
+    worker, engine = _worker(tmp_path)
+    calls = []
+    revisions = {
+        "watchlist": 1,
+        "buylist": 2,
+        "trade_plans": 3,
+        "execution_queue": 4,
+    }
+    monkeypatch.setattr(
+        runtime_worker_module,
+        "get_synced_state_revisions",
+        lambda _engine: calls.append(True) or dict(revisions),
+    )
+
+    assert worker._readiness_state_revisions() == revisions
+    assert worker._readiness_state_revisions() == revisions
+    assert len(calls) == 1
+
+    coordination_change_pulse.mark_remote_coordination_change(
+        engine,
+        "pc:card-only",
+        tables=("trade_cards",),
+    )
+    assert worker._readiness_state_revisions() == revisions
+    assert len(calls) == 1
+
+    coordination_change_pulse.mark_remote_coordination_change(
+        engine,
+        "pc:plan-change",
+        tables=("app_state_sync",),
+    )
+    assert worker._readiness_state_revisions() == revisions
     assert len(calls) == 2
 
 

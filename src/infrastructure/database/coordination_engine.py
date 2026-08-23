@@ -186,6 +186,14 @@ def init_coordination_engine(
         )
 
         install_coordination_change_tracking(engine)
+        # The dedicated AUTOCOMMIT pool also carries one-statement readiness
+        # refreshes. Track its semantic writes against the primary engine's
+        # pulse state while continuing to ignore timestamp-only heartbeats.
+        install_coordination_change_tracking(
+            read_engine,
+            pulse_engine=engine,
+            autocommit=True,
+        )
         with coordination_read_connection(engine) as conn:
             conn.execute(text("SELECT 1"))
         if ensure_schema:
