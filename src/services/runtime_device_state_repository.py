@@ -333,6 +333,65 @@ def refresh_runtime_device_state(
     return result.rowcount == 1
 
 
+def publish_runtime_device_state_transition(
+    engine: Engine,
+    *,
+    device_id: str,
+    hostname: str,
+    state: RuntimeDeviceState,
+    schema_version: int = CURRENT_EXECUTION_SCHEMA_VERSION,
+    details: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Publish an unconfirmed state transition as one autocommitted UPDATE.
+
+    ``STANDBY_READY`` is deliberately excluded because entering that state
+    must atomically advance and read back its readiness generation.  Every
+    other runtime transition clears handoff confirmation and preserves the
+    existing generation, so an existing device row needs neither a leading
+    SELECT nor a billed COMMIT.  A brand-new device falls back to the full
+    upsert path once.
+    """
+
+    device_id = str(device_id or "").strip()
+    if not device_id:
+        raise ValueError("runtime device state requires device_id")
+    state = state if isinstance(state, RuntimeDeviceState) else RuntimeDeviceState(state)
+    if state == RuntimeDeviceState.STANDBY_READY:
+        raise ValueError("STANDBY_READY requires generation-aware publication")
+    table = ensure_runtime_device_state_table(engine)
+    with coordination_autocommit_connection(engine) as conn:
+        result = conn.execute(
+            table.update()
+            .where(table.c.device_id == device_id)
+            .values(
+                hostname=str(hostname or ""),
+                state=state.value,
+                schema_version=int(schema_version),
+                handoff_confirmed=False,
+                confirmed_generation=0,
+                confirmed_by_lease_epoch=0,
+                confirmed_at=None,
+                details_json=json.dumps(
+                    dict(details) if details is not None else {},
+                    default=str,
+                    separators=(",", ":"),
+                ),
+                updated_at=_server_now(engine),
+            )
+        )
+    if result.rowcount == 1:
+        return True
+    save_runtime_device_state(
+        engine,
+        device_id=device_id,
+        hostname=hostname,
+        state=state,
+        schema_version=schema_version,
+        details=details,
+    )
+    return True
+
+
 def confirm_standby_handoff(
     engine: Engine,
     *,
