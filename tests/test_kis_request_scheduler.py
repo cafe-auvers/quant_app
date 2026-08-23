@@ -5,6 +5,8 @@ import time
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("authorized_full_live")
+
 from src.services.kis_request_scheduler import (
     BudgetPolicy,
     ConfirmedPreAcceptanceRejection,

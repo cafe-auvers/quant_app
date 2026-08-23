@@ -119,7 +119,7 @@ Only enable KIS intraday after the endpoint, TR ID, request parameters, output f
 - Keep the live monitor off until the production account snapshot, order review, and reconciliation paths are verified.
 - Treat successful KIS order submission as broker acceptance only.
 - Treat every Buy Board gesture as requested intent, not broker confirmation. `Entry Pending` and `Closed` are system-owned columns reached only from reconciled broker truth.
-- Keep `BUYBOARD_ENGINE_ENABLED=false` unless the execution lease, account reconciliation, database, KIS WebSocket protocol/capacity, mutation-budget, alerting, and live-execution fences described in `.env.example` have been deliberately configured and verified.
+- Keep the guarded Buy Board engine available. Engine availability never authorizes KIS mutations: use `KIS_LIVE_EXECUTION_MODE=DISABLED` for normal mutation-blocked operation, and promote only through the controlled-live runbook after the lease, reconciliation, database, WebSocket, mutation-budget, alerting, capital, and risk fences are verified.
 - Preserve the one-owner rule for each `(environment, account_no, symbol)`: Kanban may execute only `KANBAN`-owned symbols for the configured `KANBAN_STRATEGY_INSTANCE_ID`; other cards remain observation-only.
 - Manual PROD partial/full sells placed outside the U.S. regular session use a
   broker-held KIS market-on-open reservation. This prioritizes exit execution

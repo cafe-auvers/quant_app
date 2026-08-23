@@ -54,6 +54,64 @@ def test_controlled_live_configuration_requires_no_retry_spacing_and_budgets(
         )
 
 
+def test_buyboard_engine_defaults_enabled_but_accepts_explicit_recovery_disable(
+    monkeypatch,
+):
+    monkeypatch.delenv("BUYBOARD_ENGINE_ENABLED", raising=False)
+    assert execution_config.is_buyboard_engine_enabled() is True
+
+    monkeypatch.setenv("BUYBOARD_ENGINE_ENABLED", "false")
+    assert execution_config.is_buyboard_engine_enabled() is False
+
+
+@pytest.mark.parametrize("engine_enabled", [True, False])
+@pytest.mark.usefixtures("trading_enabled")
+def test_disabled_live_envelope_runs_engine_but_blocks_submit_sell_and_cancel(
+    monkeypatch, engine_enabled,
+):
+    monkeypatch.setattr(execution_config, "KIS_LIVE_EXECUTION_MODE", "DISABLED")
+    monkeypatch.setattr(
+        execution_config,
+        "is_buyboard_engine_enabled",
+        lambda: engine_enabled,
+    )
+    calls = []
+    monkeypatch.setattr(
+        kis_order,
+        "place_overseas_order",
+        lambda **kwargs: calls.append(("submit", kwargs)),
+    )
+    monkeypatch.setattr(
+        kis_order,
+        "cancel_overseas_order",
+        lambda **kwargs: calls.append(("cancel", kwargs)),
+    )
+
+    # Engine startup/reconciliation is allowed in the mutation-blocked mode.
+    require_controlled_live_configuration(environment="PROD")
+    broker = KisBroker()
+    for side in (OrderSide.BUY, OrderSide.SELL):
+        with pytest.raises(LiveExecutionEnvelopeError, match="DISABLED"):
+            broker.submit_order(
+                environment="PROD",
+                account_no="1",
+                symbol="AAPL",
+                side=side,
+                quantity=1,
+                limit_price=100.0,
+            )
+    with pytest.raises(LiveExecutionEnvelopeError, match="DISABLED"):
+        broker.cancel_order(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            broker_order_id="B-1",
+            quantity=1,
+        )
+
+    assert calls == []
+
+
 @pytest.mark.usefixtures("trading_enabled")
 def test_controlled_live_entry_envelope_blocks_unlisted_or_oversized_buy(
     monkeypatch,
@@ -123,6 +181,36 @@ def test_controlled_live_entry_cap_never_blocks_protective_sell(monkeypatch):
 
     assert result.broker_order_id == "S-1"
     assert calls[0]["side"] == "sell"
+
+
+def test_controlled_live_envelope_allows_tracked_cancellation(monkeypatch):
+    _configure_controlled_live(monkeypatch)
+    expected = object()
+    calls = []
+    monkeypatch.setattr(
+        kis_order,
+        "cancel_overseas_order",
+        lambda **kwargs: calls.append(kwargs) or expected,
+    )
+
+    result = KisBroker().cancel_order(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        broker_order_id="B-1",
+        quantity=1,
+    )
+
+    assert result is expected
+    assert calls == [
+        {
+            "environment": "PROD",
+            "account_no": "1",
+            "symbol": "AAPL",
+            "broker_order_id": "B-1",
+            "quantity": 1,
+        }
+    ]
 
 
 @pytest.mark.usefixtures("trading_enabled")

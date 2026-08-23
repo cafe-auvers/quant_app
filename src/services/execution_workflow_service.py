@@ -202,6 +202,11 @@ def request_submit(
     )
     if _resolved_mode(resolved_gateway) == ExecutionMode.GUARDED_ENGINE:
         stable_id = client_order_id or generate_client_order_id(environment, account_no, symbol, side, intent)
+        pre_trade_risk_decision = legacy_kwargs.pop(
+            "pre_trade_risk_decision", None
+        )
+        risk_strategy_id = str(legacy_kwargs.pop("strategy_id", "") or "")
+        risk_plan_id = str(legacy_kwargs.pop("plan_id", "") or "")
         request = SubmitExecutionRequest(
             client_order_id=stable_id, environment=environment, account_no=account_no, symbol=symbol,
             side=side, intent=intent, quantity=quantity, limit_price=limit_price, exchange=exchange,
@@ -210,6 +215,9 @@ def request_submit(
             lease=lease, source=source,
             strategy_instance_id=strategy_instance_id,
             emergency=emergency,
+            pre_trade_risk_decision=pre_trade_risk_decision,
+            risk_strategy_id=risk_strategy_id,
+            risk_plan_id=risk_plan_id,
         )
         return ExecutionSubmissionResult.from_execution_order(
             resolved_gateway.submit_guarded(request)
@@ -360,11 +368,19 @@ def request_replace(
     environment: str = "",
     account_no: str = "",
     strategy_instance_id: str = "",
+    pre_trade_risk_decision: Any = None,
+    risk_strategy_id: str = "",
+    risk_plan_id: str = "",
 ) -> ExecutionOrderRecord:
     """``GUARDED_ENGINE`` only -- no legacy or Kanban call site performs a
     broker-level replace today (confirmed by codebase survey); raises
     ``NotImplementedError`` in ``LEGACY_COMPATIBILITY`` mode, same as the
     gateway's own ``replace_guarded`` would if reached directly.
+
+    A production BUY/ENTRY replacement must carry a fresh portfolio decision
+    built with ``PortfolioRiskManager.evaluate_entry(...,
+    replaced_reservation_id=original.capital_reservation_id)``. The gateway
+    validates and transfers that reservation before cancelling the original.
     """
     resolved_gateway = gateway or get_default_execution_gateway()
     if _resolved_mode(resolved_gateway) != ExecutionMode.GUARDED_ENGINE:
@@ -379,6 +395,9 @@ def request_replace(
         new_client_order_id=stable_new_id, new_quantity=new_quantity, new_limit_price=new_limit_price,
         environment=environment, account_no=account_no, lease=lease, source=source,
         strategy_instance_id=strategy_instance_id,
+        pre_trade_risk_decision=pre_trade_risk_decision,
+        risk_strategy_id=risk_strategy_id,
+        risk_plan_id=risk_plan_id,
     )
     return resolved_gateway.replace_guarded(request)
 

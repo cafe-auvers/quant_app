@@ -80,6 +80,19 @@ _POSITION_BOARD_STATUSES = {
 }
 _DEFAULT_ORB_BUFFER_PERCENT = 0.10
 
+_KANBAN_RECOVERY_GUIDANCE = """The Kanban operational store is unavailable.
+
+The app is showing a read-only recovery snapshot and has locked app execution. No broker order is sent from a card gesture in this state.
+
+Safe recovery procedure:
+1. Keep BUYBOARD_ENGINE_ENABLED=true. Do not bypass the execution gateway or edit local runtime state.
+2. Restore the Kanban operational store, then restart the app and wait for ACTIVE readiness and broker reconciliation.
+3. Review every external/unmatched broker order and explicitly adopt or dismiss it before resuming normal trading.
+
+If a protective exit cannot wait for the store to recover, use the official KIS HTS/mobile interface only after checking the exact account, holdings, orderable quantity, and open orders. Cancel any conflicting order and wait for confirmation before submitting one protective SELL. Do not place a recovery BUY, and never duplicate an order between KIS and this app.
+
+After service is restored, wait for reconciliation to import or identify the manual broker action before making another change."""
+
 
 @dataclass(frozen=True)
 class BuyboardPortfolioSummary:
@@ -189,6 +202,16 @@ def build_buyboard_widget(main_window) -> None:
     )
     refresh_btn.clicked.connect(main_window.refresh_buyboard)
     header.addWidget(refresh_btn)
+
+    recovery_btn = QPushButton("Recovery Procedure...")
+    recovery_btn.setToolTip(
+        "Open the safe operator procedure used when the Kanban store is unavailable."
+    )
+    recovery_btn.clicked.connect(
+        lambda: _show_kanban_recovery_procedure(main_window)
+    )
+    recovery_btn.setVisible(False)
+    header.addWidget(recovery_btn)
     root_layout.addLayout(header)
 
     scroll = QScrollArea()
@@ -222,6 +245,15 @@ def build_buyboard_widget(main_window) -> None:
     main_window._buyboard_positions_label = positions_label
     main_window._buyboard_capital_label = capital_label
     main_window._buyboard_pnl_label = pnl_label
+    main_window._buyboard_recovery_procedure_button = recovery_btn
+
+
+def _show_kanban_recovery_procedure(main_window) -> None:
+    QMessageBox.warning(
+        main_window,
+        "Buy Board Recovery Procedure",
+        _KANBAN_RECOVERY_GUIDANCE,
+    )
 
 
 def _quote_lookup_for(main_window) -> Optional[Callable[[str], Optional[float]]]:
@@ -565,7 +597,7 @@ def populate_buyboard_columns(main_window, cards) -> None:
         )
         if recovery_active:
             main_window._buyboard_engine_status_label.setText(
-                "Board: LOCAL SNAPSHOT — Kanban store unavailable; read-only"
+                "Board: RECOVERY SNAPSHOT - Kanban unavailable; app execution locked"
             )
             main_window._buyboard_engine_status_label.setStyleSheet(
                 "color: #ad6704; font-weight: bold;"
@@ -581,6 +613,11 @@ def populate_buyboard_columns(main_window, cards) -> None:
                 if enabled
                 else "color: #888;"
             )
+        recovery_button = main_window.__dict__.get(
+            "_buyboard_recovery_procedure_button"
+        )
+        if recovery_button is not None:
+            recovery_button.setVisible(recovery_active)
 
 
 def _handle_card_dropped(main_window, payload: dict, target_status: BoardStatus) -> None:
@@ -607,7 +644,9 @@ def _handle_card_dropped(main_window, payload: dict, target_status: BoardStatus)
             main_window,
             "Buy Board",
             "This is a read-only recovery snapshot. Board changes resume after "
-            "the Kanban operational store is available.",
+            "the Kanban operational store is restored and broker reconciliation "
+            "finishes. No broker order was sent. Open Recovery Procedure for "
+            "the safe emergency and restoration steps.",
         )
         return
     card = projection.card
@@ -1050,8 +1089,12 @@ def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
     if _is_recovery_projection(projection):
         menu = QMenu(main_window)
         chart_action = menu.addAction("Open TradingView Chart")
-        if menu.exec_(global_pos) is chart_action:
+        recovery_action = menu.addAction("Recovery Procedure...")
+        selected_action = menu.exec_(global_pos)
+        if selected_action is chart_action:
             _open_card_in_tradingview(main_window, card.symbol)
+        elif selected_action is recovery_action:
+            _show_kanban_recovery_procedure(main_window)
         return
     current_payload = card_drag_payload(projection)
     common = _command_kwargs(current_payload)

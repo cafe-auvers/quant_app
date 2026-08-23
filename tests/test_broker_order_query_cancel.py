@@ -3,6 +3,8 @@ from types import SimpleNamespace
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("authorized_full_live")
+
 import src.ui.buylist.actions as buylist_actions_module
 from src.api import kis_order
 from src.core.order_state import (RESERVED_MOO_EXECUTION, BrokerOrder,

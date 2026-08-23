@@ -9,7 +9,7 @@ catalog and safe-default reference.
 | `COORD_DB_*` | Cross-device control/coordination SQL | Optional, TLS required |
 | `KIS_PROD_*` | Production account/API configuration | No secret defaults |
 | `TRADING_ENABLED` | Administrative hard-lock | Fail-closed |
-| `BUYBOARD_ENGINE_ENABLED` | Kanban execution cutover | `false` |
+| `BUYBOARD_ENGINE_ENABLED` | Guarded Kanban runtime availability | `true`; not broker authorization |
 | `KANBAN_STRATEGY_INSTANCE_ID` | Stable Kanban ownership identity | Must be deliberate |
 | `KIS_LIVE_EXECUTION_MODE` | Disabled/controlled/full-live envelope | Disabled |
 | `KIS_CONTROLLED_LIVE_*` | Symbol/notional pilot fences | Empty/zero |

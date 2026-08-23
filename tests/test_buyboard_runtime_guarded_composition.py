@@ -4,6 +4,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("authorized_full_live")
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
 
@@ -17,6 +19,10 @@ from src.core.account_broker_snapshot import (
 from src.core.discovered_external_order import (
     ExternalOrderDisposition,
     new_discovered_external_order,
+)
+from src.core.capital_reservation import (
+    CapitalReservation,
+    CapitalReservationStatus,
 )
 from src.core.execution_mode import ExecutionLease, ExecutionSource
 from src.core.execution_order_record import (
@@ -42,7 +48,13 @@ from src.core.trade_card_state import (
     PositionRuntimeStatus,
     TradeCardState,
 )
-from src.services import buyboard_runtime, capital_reservation_repository
+from src.risk.pre_trade import PreTradeRiskDecision
+from src.services import (
+    buyboard_runtime,
+    capital_reservation_repository,
+    discovered_external_order_repository,
+    execution_order_repository,
+)
 from src.services import execution_command_gateway as gateway_module
 from src.services import trade_card_repository
 from src.services.execution_command_gateway import ExecutionCommandGateway
@@ -57,6 +69,12 @@ from src.services.discovered_external_order_repository import (
 )
 from src.services.realtime_market_data import QuoteSnapshot, RestPollingMarketDataService
 from src.services import trading_engine as trading_engine_module
+from src.risk.portfolio import (
+    PortfolioRiskLimits,
+    PortfolioRiskManager,
+    PortfolioRiskSnapshot,
+    ProposedPortfolioEntry,
+)
 from src.services.account_reconciliation import (
     AccountLocalState,
     reduce_account_reconciliation,
@@ -65,6 +83,147 @@ from src.services.account_reconciliation import (
 
 LEASE = ExecutionLease(device_id="device-1", lease_token="lease-1", lease_epoch=7)
 STRATEGY_ID = "orb-live-1"
+
+
+def test_projected_exposure_counts_partial_buy_once_with_linked_reservation():
+    card = _card()
+    reservation = CapitalReservation.create(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        attempt_group_id="attempt-1",
+        requested_notional=1_000.0,
+        projected_open_risk=50.0,
+    )
+    reservation.consume(600.0)
+    order = ExecutionOrderRecord(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        intent=OrderIntent.ENTRY,
+        client_order_id="entry-1",
+        broker_order_id="broker-1",
+        submitted_quantity=10,
+        submitted_limit_price=100.0,
+        status=ExecutionOrderStatus.PARTIALLY_FILLED,
+        filled_quantity=6,
+        remaining_quantity=4,
+        broker_identity_status=BrokerIdentityStatus.EXACT,
+        capital_reservation_id=reservation.reservation_id,
+    )
+
+    exposures = buyboard_runtime._portfolio_projected_exposures(
+        cards=(card,),
+        execution_orders=(order,),
+        active_reservations=(reservation,),
+    )
+
+    assert len(exposures) == 1
+    assert exposures[0].source == "PENDING_BUY"
+    assert exposures[0].gross_notional_usd == pytest.approx(400.0)
+    assert exposures[0].open_risk_usd == pytest.approx(20.0)
+    assert exposures[0].reservation_id == reservation.reservation_id
+
+
+@pytest.mark.parametrize("include_closed_row", [False, True])
+def test_pending_buy_without_open_reservation_stays_in_atomic_risk_baseline(
+    include_closed_row,
+):
+    card = _card()
+    order = ExecutionOrderRecord(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        intent=OrderIntent.ENTRY,
+        client_order_id="dangling-entry",
+        broker_order_id="dangling-broker",
+        submitted_quantity=10,
+        submitted_limit_price=100.0,
+        status=ExecutionOrderStatus.WORKING,
+        remaining_quantity=10,
+        broker_identity_status=BrokerIdentityStatus.EXACT,
+        capital_reservation_id="closed-or-missing",
+        replaces_execution_order_id="cancelled-original",
+    )
+    closed = CapitalReservation(
+        reservation_id="closed-or-missing",
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        attempt_group_id="dangling",
+        requested_notional=1_000.0,
+        remaining_reserved_notional=0.0,
+        projected_open_risk=50.0,
+        remaining_projected_open_risk=0.0,
+        status=CapitalReservationStatus.RELEASED,
+    )
+
+    exposures = buyboard_runtime._portfolio_projected_exposures(
+        cards=(card,),
+        execution_orders=(order,),
+        active_reservations=((closed,) if include_closed_row else ()),
+    )
+    decision = PortfolioRiskManager(
+        PortfolioRiskLimits(
+            max_simultaneous_positions=30,
+            max_total_open_risk_fraction=0.20,
+            max_gross_notional_fraction=10.0,
+        )
+    ).evaluate_entry(
+        ProposedPortfolioEntry(
+            symbol="MSFT",
+            quantity=1,
+            reference_price=100.0,
+            stop_price=95.0,
+            strategy_id=STRATEGY_ID,
+            environment="PROD",
+            account_no="1",
+        ),
+        PortfolioRiskSnapshot(
+            account_equity_usd=10_000.0,
+            usable_buying_power_usd=10_000.0,
+            projected_exposures=exposures,
+            evaluated_at=datetime.now(timezone.utc),
+        ),
+    )
+
+    assert len(exposures) == 1
+    assert exposures[0].source == "PENDING_BUY_WITHOUT_ACTIVE_RESERVATION"
+    assert exposures[0].reservation_id == ""
+    assert exposures[0].gross_notional_usd == pytest.approx(1_000.0)
+    assert decision.approved is False
+    assert "no active capital reservation" in " ".join(decision.reasons)
+    assert decision.reservation_spec is not None
+    assert decision.reservation_spec.baseline_position_symbols == ("AAPL",)
+    assert decision.reservation_spec.baseline_gross_notional_usd == pytest.approx(
+        1_000.0
+    )
+    assert decision.reservation_spec.baseline_open_risk_usd == pytest.approx(50.0)
+
+
+def test_unowned_external_buy_uses_full_remaining_notional_as_open_risk():
+    card = _card(active_stop_price=95.0)
+    external = new_discovered_external_order(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        broker_order_id="external-1",
+        quantity_requested=10,
+        filled_quantity=4,
+        limit_price=100.0,
+    )
+
+    exposures = buyboard_runtime._portfolio_projected_exposures(
+        cards=(card,), external_orders=(external,)
+    )
+
+    assert len(exposures) == 1
+    assert exposures[0].source == "UNRESOLVED_EXTERNAL_BUY"
+    assert exposures[0].gross_notional_usd == pytest.approx(600.0)
+    assert exposures[0].open_risk_usd == pytest.approx(600.0)
 
 
 def _card(symbol: str = "AAPL", **overrides) -> TradeCardState:
@@ -110,6 +269,7 @@ def _make_runtime(
     database_writable_provider=None,
     emergency_journal=None,
     emergency_lease_allowance=None,
+    portfolio_risk_manager=None,
 ):
     _enable_guarded(monkeypatch)
     engine = create_engine(
@@ -146,6 +306,28 @@ def _make_runtime(
     runtime = buyboard_runtime.build_buyboard_runtime(
         buying_power_provider=lambda environment, account_no: buying_power,
         account_equity_provider=lambda environment, account_no: 100_000.0,
+        portfolio_cards_provider=lambda environment, account_no: trade_card_repository.list_trade_cards(
+            engine,
+            environment=environment,
+            account_no=account_no,
+            raise_on_error=True,
+        ),
+        portfolio_risk_manager=portfolio_risk_manager,
+        portfolio_orders_provider=lambda environment, account_no: execution_order_repository.list_execution_orders_for_account(
+            engine,
+            environment=environment,
+            account_no=account_no,
+        ),
+        portfolio_reservations_provider=lambda environment, account_no: capital_reservation_repository.list_active_reservations(
+            engine,
+            environment=environment,
+            account_no=account_no,
+        ),
+        portfolio_external_orders_provider=lambda environment, account_no: discovered_external_order_repository.list_discovered_external_orders_for_account(
+            engine,
+            environment=environment,
+            account_no=account_no,
+        ),
         card_lookup=lookup,
         broker=gateway,
         execution_lease=LEASE,
@@ -620,6 +802,41 @@ def test_insufficient_capital_rolls_back_the_atomic_submission(tmp_path, monkeyp
 
 
 @pytest.mark.usefixtures("trading_enabled")
+def test_canonical_portfolio_position_limit_rejects_entry_before_broker(
+    tmp_path, monkeypatch
+):
+    manager = PortfolioRiskManager(
+        PortfolioRiskLimits(max_simultaneous_positions=1)
+    )
+    runtime, broker, gateway, engine, market_data = _make_runtime(
+        tmp_path,
+        monkeypatch,
+        portfolio_risk_manager=manager,
+    )
+    entry = _persist_owned_card(engine, _card())
+    existing = _card(
+        symbol="MSFT",
+        board_status=BoardStatus.OPEN_POSITION,
+        entry_runtime_status=None,
+        broker_quantity=10,
+        orderable_quantity=10,
+        average_entry_price=100.0,
+        active_stop_price=90.0,
+    )
+    trade_card_repository.create_trade_card(engine, existing)
+    market_data.subscribe([entry.symbol])
+    market_data.poll_once()
+
+    runtime.trading_engine.run_heartbeat([entry, existing])
+
+    assert broker.submit_calls == []
+    assert capital_reservation_repository.list_active_reservations(
+        engine, environment="PROD", account_no="1"
+    ) == []
+    assert entry.entry_runtime_status == EntryRuntimeStatus.RETRY_COOLDOWN
+
+
+@pytest.mark.usefixtures("trading_enabled")
 def test_persisted_identity_survives_restart_and_unresolved_submit_is_not_retried(
     tmp_path, monkeypatch
 ):
@@ -758,8 +975,23 @@ def test_runtime_outage_cancels_completion_buy_then_submits_one_sell(
             attempt_number=1,
             lease=LEASE,
             source=ExecutionSource.KANBAN_BOARD,
-            strategy_instance_id=STRATEGY_ID,
-        )
+                strategy_instance_id=STRATEGY_ID,
+                pre_trade_risk_decision=PreTradeRiskDecision.approve(
+                    environment="PROD",
+                    account_no="1",
+                    symbol="AAPL",
+                    side=OrderSide.BUY,
+                    intent=OrderIntent.ENTRY,
+                    quantity=2,
+                    reference_price=100.0,
+                    exchange="NASD",
+                    execution_policy="REGULAR_LIMIT",
+                    strategy_id="ORB",
+                    plan_id="TEST:COMPLETION:AAPL",
+                ),
+                risk_strategy_id="ORB",
+                risk_plan_id="TEST:COMPLETION:AAPL",
+            )
     )
     assert runtime.trading_engine._entry_deadline_lookup.find_open_entry_order(card)
     market_data.subscribe([card.symbol])
@@ -972,9 +1204,18 @@ def test_ambiguous_cancel_preserves_id_and_blocks_additional_broker_calls(
 
 
 @pytest.mark.usefixtures("trading_enabled")
-def test_partial_sell_and_sell_all_reach_submit_guarded(tmp_path, monkeypatch):
+def test_entry_limits_do_not_block_exits_cancellation_reconciliation_or_recovery(
+    tmp_path, monkeypatch
+):
+    manager = PortfolioRiskManager(
+        PortfolioRiskLimits(
+            max_simultaneous_positions=1,
+            max_total_open_risk_fraction=0.0001,
+            max_gross_notional_fraction=0.0001,
+        )
+    )
     runtime, broker, gateway, engine, market_data = _make_runtime(
-        tmp_path, monkeypatch
+        tmp_path, monkeypatch, portfolio_risk_manager=manager
     )
     partial = _persist_owned_card(
         engine,
@@ -991,14 +1232,36 @@ def test_partial_sell_and_sell_all_reach_submit_guarded(tmp_path, monkeypatch):
         _card(
             "MSFT",
             board_status=BoardStatus.SELL_ALL,
+            position_runtime_status=PositionRuntimeStatus.LIQUIDATING,
             broker_quantity=10,
             orderable_quantity=10,
         ),
     )
-    market_data.subscribe(["AAPL", "MSFT"])
+    stop_loss = _persist_owned_card(
+        engine,
+        _card(
+            "NVDA",
+            board_status=BoardStatus.SELL_ALL,
+            broker_quantity=10,
+            orderable_quantity=10,
+        ),
+    )
+    recovery = _persist_owned_card(
+        engine,
+        _card(
+            "AMZN",
+            board_status=BoardStatus.SELL_ALL,
+            position_runtime_status=PositionRuntimeStatus.LIQUIDATING,
+            broker_quantity=10,
+            orderable_quantity=10,
+        ),
+    )
+    market_data.subscribe(["AAPL", "MSFT", "NVDA", "AMZN"])
     market_data.poll_once()
     broker.queue_acceptance(broker_order_id="B-PARTIAL")
     broker.queue_acceptance(broker_order_id="B-ALL")
+    broker.queue_acceptance(broker_order_id="B-STOP")
+    broker.queue_acceptance(broker_order_id="B-RECOVERY")
 
     partial_result = runtime.trading_engine._position_callbacks.submit_sell_order(
         environment="PROD",
@@ -1016,13 +1279,29 @@ def test_partial_sell_and_sell_all_reach_submit_guarded(tmp_path, monkeypatch):
         reason="sell_all_retry",
         trade_card=sell_all,
     )
+    stop_result = runtime.trading_engine._position_callbacks.submit_sell_order(
+        environment="PROD",
+        account_no="1",
+        symbol="NVDA",
+        quantity=10,
+        reason="stop_loss",
+        trade_card=stop_loss,
+    )
+    recovery_result = runtime.reconciliation_emergency_sell(recovery, 10)
+
+    broker.queue_cancel_confirmed()
+    cancelled_client_order_id = partial.exit_client_order_id
+    runtime.reconciliation_cancel_order(partial, cancelled_client_order_id)
 
     assert partial_result.status == UnifiedExecutionStatus.ACKNOWLEDGED
     assert all_result.status == UnifiedExecutionStatus.ACKNOWLEDGED
-    assert [call["side"] for call in broker.submit_calls] == [
-        OrderSide.SELL,
-        OrderSide.SELL,
-    ]
+    assert stop_result.status == UnifiedExecutionStatus.ACKNOWLEDGED
+    assert recovery_result.status == UnifiedExecutionStatus.ACKNOWLEDGED
+    assert fetch_execution_order(
+        engine, cancelled_client_order_id
+    ).status == ExecutionOrderStatus.CANCELLED
+    assert [call["side"] for call in broker.submit_calls] == [OrderSide.SELL] * 4
+    assert len(broker.cancel_calls) == 1
 
 
 @pytest.mark.usefixtures("trading_enabled")

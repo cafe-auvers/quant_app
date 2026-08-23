@@ -2286,7 +2286,9 @@ class MainWindow(
                     ),
                     "Historical data is not an execution requirement. The local "
                     "Kanban operational file itself could not be opened, so cards, "
-                    "commands, orders, and the device lease cannot be persisted.",
+                    "commands, orders, and the device lease cannot be persisted. "
+                    "App execution is locked: open Recovery Procedure on the Buy "
+                    "Board. Never duplicate an order between this app and KIS.",
                 )
             return BuyboardReadinessDisplay(
                 0,

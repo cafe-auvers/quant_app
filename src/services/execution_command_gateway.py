@@ -84,9 +84,12 @@ from src.core.order_state import (
 from src.infrastructure.database.coordination_engine import coordination_read_connection
 from src.services import trading_state
 from src.services.capital_reservation_repository import (
+    activate_prepared_replacement_reservation,
     ensure_capital_reservations_table,
     fetch_reservation,
     insert_reservation_if_available,
+    prepare_reservation_for_replacement,
+    restore_prepared_replacement_reservation,
     update_reservation,
 )
 from src.services.execution_command_repository import (
@@ -113,6 +116,19 @@ from src.services.discovered_external_order_repository import (
     require_no_active_unowned_external_order,
 )
 from src.services.mutation_budget_protocol import CommandType, MutationBudgetProtocol
+from src.services.controlled_live_policy import (
+    LiveExecutionEnvelopeError,
+    require_live_entry_allowed,
+    require_live_mutation_allowed,
+)
+from src.risk.pre_trade import (
+    PreTradeRiskRejectedError,
+    require_pre_trade_risk_approval,
+)
+from src.risk.portfolio import (
+    PortfolioRiskReservationSpecError,
+    require_portfolio_risk_reservation_spec,
+)
 from src.services.kis_request_boundary import (
     install_process_kis_request_scheduler,
     kis_request_scope,
@@ -387,6 +403,7 @@ class ExecutionCommandGateway:
         handoff_pending_provider: Optional[Callable[[], bool]] = None,
         critical_alert_sink: Optional[Callable[[str, str, str], None]] = None,
         schema_migration_manager: Optional[Any] = None,
+        projected_portfolio_risk_required: bool = False,
     ) -> None:
         self._real_broker: Broker = real_broker if real_broker is not None else KisBroker()
         self._engine = engine
@@ -415,6 +432,9 @@ class ExecutionCommandGateway:
         self._handoff_pending_provider = handoff_pending_provider or (lambda: False)
         self._critical_alert_sink = critical_alert_sink
         self._schema_migration_manager = schema_migration_manager
+        self._projected_portfolio_risk_required = bool(
+            projected_portfolio_risk_required
+        )
         self._last_verified_lease: Optional[ExecutionLease] = None
         self._last_database_writable_state: Optional[bool] = None
         self._emergency_records: Dict[str, ExecutionOrderRecord] = {}
@@ -477,6 +497,13 @@ class ExecutionCommandGateway:
                     "GUARDED_ENGINE mode requires submit_guarded(request=SubmitExecutionRequest(...)) "
                     "-- see the module docstring"
                 )
+            require_live_entry_allowed(
+                environment=environment,
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                limit_price=limit_price,
+            )
             if self._engine is not None:
                 self._require_ownership(
                     environment, account_no, symbol, source
@@ -519,6 +546,14 @@ class ExecutionCommandGateway:
                     "GUARDED_ENGINE mode requires cancel_guarded(request=CancelExecutionRequest(...)) "
                     "-- see the module docstring"
                 )
+            require_live_mutation_allowed(
+                environment=environment,
+                action=(
+                    f"order cancellation for {ownership_symbol}"
+                    if ownership_symbol
+                    else "order cancellation"
+                ),
+            )
             if self._engine is not None:
                 self._require_ownership(
                     environment, account_no, ownership_symbol, source
@@ -656,6 +691,13 @@ class ExecutionCommandGateway:
 
     def submit_guarded(self, request: SubmitExecutionRequest) -> ExecutionOrderRecord:
         self._require_guarded_mode()
+        require_live_entry_allowed(
+            environment=request.environment,
+            symbol=request.symbol,
+            side=request.side,
+            quantity=request.quantity,
+            limit_price=request.limit_price,
+        )
         key = _recovery_key(request.environment, request.account_no, request.symbol)
         with self._ownership.claim(key, request.source):
             if not self._canonical_database_is_writable():
@@ -664,6 +706,14 @@ class ExecutionCommandGateway:
 
     def cancel_guarded(self, request: CancelExecutionRequest) -> ExecutionOrderRecord:
         self._require_guarded_mode()
+        require_live_mutation_allowed(
+            environment=request.environment,
+            action=(
+                f"order cancellation for {request.symbol}"
+                if request.symbol
+                else "order cancellation"
+            ),
+        )
         if not self._canonical_database_is_writable():
             key = _recovery_key(request.environment, request.account_no, request.symbol)
             with self._ownership.claim(key, request.source):
@@ -704,6 +754,10 @@ class ExecutionCommandGateway:
         fighting it.
         """
         self._require_guarded_mode()
+        require_live_mutation_allowed(
+            environment=request.environment,
+            action="order replacement",
+        )
         engine = self._require_engine()
         mutation_budget = self._require_mutation_budget()
 
@@ -712,6 +766,12 @@ class ExecutionCommandGateway:
             raise OrderNotFoundForCancelError(f"No ExecutionOrderRecord for client_order_id={request.client_order_id!r}")
         key = _recovery_key(original.environment, original.account_no, original.symbol)
         with self._ownership.claim(key, request.source):
+            replacement_portfolio_spec = None
+            prepared_reservation = None
+            previous_reservation = None
+            replacement_notional = 0.0
+            replacement_open_risk = 0.0
+            replacement_buying_power = 0.0
             # 1. validate the replacement request completely -- before
             # anything is mutated or cancelled.
             if original.environment != request.environment or original.account_no != request.account_no:
@@ -739,6 +799,80 @@ class ExecutionCommandGateway:
                     f"new_client_order_id={request.new_client_order_id!r} already exists -- a replacement "
                     "must use a fresh identity, never reuse an existing order's"
                 )
+            if original.side == OrderSide.BUY and original.intent == OrderIntent.ENTRY:
+                trading_state.require_trading_enabled(
+                    original.environment, original.symbol
+                )
+                require_pre_trade_risk_approval(
+                    request.pre_trade_risk_decision,
+                    environment=original.environment,
+                    account_no=original.account_no,
+                    symbol=original.symbol,
+                    side=original.side,
+                    intent=original.intent,
+                    quantity=new_quantity,
+                    reference_price=new_limit_price,
+                    exchange=original.exchange,
+                    execution_policy=original.execution_policy,
+                    strategy_id=request.risk_strategy_id,
+                    plan_id=request.risk_plan_id,
+                )
+                risk_spec = getattr(
+                    request.pre_trade_risk_decision,
+                    "portfolio_risk_reservation",
+                    None,
+                )
+                if risk_spec is not None or self._projected_portfolio_risk_required:
+                    try:
+                        replacement_portfolio_spec = (
+                            require_portfolio_risk_reservation_spec(
+                                risk_spec,
+                                environment=original.environment,
+                                account_no=original.account_no,
+                                symbol=original.symbol,
+                                quantity=new_quantity,
+                                reference_price=new_limit_price,
+                                evaluated_at=(
+                                    request.pre_trade_risk_decision.evaluated_at
+                                ),
+                            )
+                        )
+                    except PortfolioRiskReservationSpecError as exc:
+                        raise PreTradeRiskRejectedError(str(exc)) from exc
+                require_live_entry_allowed(
+                    environment=original.environment,
+                    symbol=original.symbol,
+                    side=original.side,
+                    quantity=new_quantity,
+                    limit_price=new_limit_price,
+                )
+                if replacement_portfolio_spec is not None:
+                    if not original.capital_reservation_id:
+                        raise PreTradeRiskRejectedError(
+                            "ENTRY replacement requires the original order's durable "
+                            "capital reservation; the original order was not cancelled"
+                        )
+                    original_reservation = fetch_reservation(
+                        engine, original.capital_reservation_id
+                    )
+                    if (
+                        original_reservation is None
+                        or not original_reservation.is_open()
+                    ):
+                        raise PreTradeRiskRejectedError(
+                            "ENTRY replacement requires an open original reservation; "
+                            "the original order was not cancelled"
+                        )
+                    replacement_notional = new_quantity * new_limit_price
+                    replacement_open_risk = float(
+                        replacement_portfolio_spec.proposed_open_risk_usd
+                    )
+                    replacement_buying_power = float(
+                        self._require_buying_power_provider()(
+                            original.environment, original.account_no
+                        )
+                        or 0.0
+                    )
 
             # 2. verify replace ownership/permission.
             self._require_ownership(
@@ -807,6 +941,7 @@ class ExecutionCommandGateway:
             )
             ensure_execution_commands_table(engine)
             ensure_discovered_external_orders_table(engine)
+            ensure_capital_reservations_table(engine)
             with engine.begin() as conn:
                 require_no_active_unowned_external_order(
                     conn,
@@ -815,6 +950,20 @@ class ExecutionCommandGateway:
                     symbol=original.symbol,
                     allowed_adopted_client_order_id=original.client_order_id,
                 )
+                if replacement_portfolio_spec is not None:
+                    prepared_reservation, previous_reservation = (
+                        prepare_reservation_for_replacement(
+                            conn,
+                            original.capital_reservation_id,
+                            environment=original.environment,
+                            account_no=original.account_no,
+                            symbol=original.symbol,
+                            replacement_notional=replacement_notional,
+                            replacement_open_risk=replacement_open_risk,
+                            buying_power=replacement_buying_power,
+                            portfolio_risk_spec=replacement_portfolio_spec,
+                        )
+                    )
                 insert_command(conn, replace_command)
 
             # 6. cancel the original.
@@ -825,10 +974,72 @@ class ExecutionCommandGateway:
                 lease=request.lease, source=request.source,
                 strategy_instance_id=request.strategy_instance_id,
             )
-            self._do_cancel(cancel_request, record=original, permission_check=_cancellable_for_replace)
+            pre_cancel_filled_quantity = int(original.filled_quantity or 0)
+            try:
+                self._do_cancel(
+                    cancel_request,
+                    record=original,
+                    permission_check=_cancellable_for_replace,
+                    release_capital_reservation=(prepared_reservation is None),
+                )
+            except (
+                GuardedCancellationAmbiguousError,
+                AmbiguousPostBrokerPersistenceError,
+            ):
+                # The broker may have accepted the cancellation. Keep the
+                # larger transition hold until reconciliation resolves it.
+                raise
+            except Exception:
+                if (
+                    prepared_reservation is not None
+                    and previous_reservation is not None
+                ):
+                    with engine.begin() as conn:
+                        restore_prepared_replacement_reservation(
+                            conn,
+                            prepared_reservation,
+                            previous_reservation,
+                        )
+                raise
             cancelled = self._fetch_record(request.client_order_id)
+            if (
+                cancelled is not None
+                and cancelled.status == ExecutionOrderStatus.CANCELLED
+                and int(cancelled.filled_quantity or 0)
+                > pre_cancel_filled_quantity
+            ):
+                if prepared_reservation is not None:
+                    current_hold = fetch_reservation(
+                        engine, prepared_reservation.reservation_id
+                    )
+                    if current_hold is not None and current_hold.is_open():
+                        current_hold.release()
+                        with engine.begin() as conn:
+                            update_reservation(
+                                conn,
+                                current_hold,
+                                expected_version=current_hold.version,
+                            )
+                raise ReplaceNotSafeError(
+                    f"Cannot replace {request.client_order_id!r}: the cancel response "
+                    "reported a new fill after replacement risk was approved. Refresh "
+                    "the position and build a new net-risk decision before retrying."
+                )
             if cancelled is None or cancelled.status != ExecutionOrderStatus.CANCELLED:
                 status = cancelled.status.value if cancelled is not None else "MISSING"
+                if (
+                    cancelled is not None
+                    and cancelled.status == ExecutionOrderStatus.FILLED
+                    and prepared_reservation is not None
+                    and prepared_reservation.is_open()
+                ):
+                    prepared_reservation.release()
+                    with engine.begin() as conn:
+                        update_reservation(
+                            conn,
+                            prepared_reservation,
+                            expected_version=prepared_reservation.version,
+                        )
                 raise ReplaceNotSafeError(
                     f"Cannot replace {request.client_order_id!r}: cancellation did not reach a safe "
                     f"CANCELLED outcome (status={status}) -- a fill or an ambiguous cancel outcome must "
@@ -844,8 +1055,47 @@ class ExecutionCommandGateway:
                 attempt_group_id=cancelled.attempt_group_id, attempt_number=cancelled.attempt_number + 1,
                 lease=request.lease, source=request.source, strategy_instance_id=request.strategy_instance_id,
                 replaces_execution_order_id=request.client_order_id,
+                prepared_capital_reservation_id=(
+                    prepared_reservation.reservation_id
+                    if prepared_reservation is not None
+                    else ""
+                ),
+                prepared_capital_reservation_version=(
+                    prepared_reservation.version
+                    if prepared_reservation is not None
+                    else 0
+                ),
+                pre_trade_risk_decision=request.pre_trade_risk_decision,
+                risk_strategy_id=request.risk_strategy_id,
+                risk_plan_id=request.risk_plan_id,
             )
-            result = self._do_submit(submit_request)
+            try:
+                result = self._do_submit(submit_request)
+            except (
+                GuardedSubmissionAmbiguousError,
+                AmbiguousPostBrokerPersistenceError,
+            ):
+                raise
+            except Exception:
+                # If submission failed before its durable record/reservation
+                # transaction, the original is already confirmed cancelled
+                # and no exposure remains for the transition hold to cover.
+                if (
+                    prepared_reservation is not None
+                    and self._fetch_record(request.new_client_order_id) is None
+                ):
+                    current_hold = fetch_reservation(
+                        engine, prepared_reservation.reservation_id
+                    )
+                    if current_hold is not None and current_hold.is_open():
+                        current_hold.release()
+                        with engine.begin() as conn:
+                            update_reservation(
+                                conn,
+                                current_hold,
+                                expected_version=current_hold.version,
+                            )
+                raise
 
             # The parent replace command finalizes only on full success --
             # a replace that fails partway (e.g. the submit leg raises)
@@ -1304,6 +1554,13 @@ class ExecutionCommandGateway:
 
         try:
             with trading_state.allow_cached_emergency_authorization():
+                require_live_entry_allowed(
+                    environment=request.environment,
+                    symbol=request.symbol,
+                    side=request.side,
+                    quantity=quantity,
+                    limit_price=limit_price,
+                )
                 submission = self._execute_scheduled_mutation(
                     lambda: self._cross_broker_boundary(
                         lambda: self._real_broker.submit_order(
@@ -1442,6 +1699,10 @@ class ExecutionCommandGateway:
             raise EmergencyJournalUnavailableError(str(exc)) from exc
         try:
             with trading_state.allow_cached_emergency_authorization():
+                require_live_mutation_allowed(
+                    environment=request.environment,
+                    action=f"emergency order cancellation for {request.symbol}",
+                )
                 snapshot = self._execute_scheduled_mutation(
                     lambda: self._cross_broker_boundary(
                         lambda: self._real_broker.cancel_order(
@@ -1569,6 +1830,46 @@ class ExecutionCommandGateway:
             if not math.isfinite(limit_price) or limit_price <= 0:
                 raise ValueError(f"limit_price must be positive and finite, got {limit_price}")
 
+        def require_current_entry_risk_approval():
+            if request.side != OrderSide.BUY or request.intent != OrderIntent.ENTRY:
+                return None
+            require_pre_trade_risk_approval(
+                request.pre_trade_risk_decision,
+                environment=environment,
+                account_no=account_no,
+                symbol=symbol,
+                side=request.side,
+                intent=request.intent,
+                quantity=quantity,
+                reference_price=limit_price,
+                exchange=request.exchange,
+                execution_policy=request.execution_policy,
+                strategy_id=request.risk_strategy_id,
+                plan_id=request.risk_plan_id,
+            )
+            risk_spec = getattr(
+                request.pre_trade_risk_decision,
+                "portfolio_risk_reservation",
+                None,
+            )
+            if risk_spec is None and not self._projected_portfolio_risk_required:
+                return None
+            try:
+                return require_portfolio_risk_reservation_spec(
+                    risk_spec,
+                    environment=environment,
+                    account_no=account_no,
+                    symbol=symbol,
+                    quantity=quantity,
+                    reference_price=limit_price,
+                    evaluated_at=request.pre_trade_risk_decision.evaluated_at,
+                )
+            except PortfolioRiskReservationSpecError as exc:
+                raise PreTradeRiskRejectedError(str(exc)) from exc
+
+        # Approval must be valid before any command or capital row is written.
+        portfolio_risk_spec = require_current_entry_risk_approval()
+
         # 4. caller-stable idempotency key -- never generated in here.
         client_order_id = request.client_order_id
         if not client_order_id:
@@ -1589,11 +1890,61 @@ class ExecutionCommandGateway:
             else 0.0
         )
 
-        reservation = CapitalReservation.create(
-            environment=environment, account_no=account_no, symbol=symbol,
-            attempt_group_id=request.attempt_group_id or client_order_id,
-            requested_notional=requested_notional,
+        projected_open_risk = (
+            portfolio_risk_spec.proposed_open_risk_usd
+            if portfolio_risk_spec is not None
+            else 0.0
         )
+        prepared_reservation_id = str(
+            request.prepared_capital_reservation_id or ""
+        ).strip()
+        if prepared_reservation_id:
+            if not request.replaces_execution_order_id:
+                raise PreTradeRiskRejectedError(
+                    "A prepared capital reservation is valid only for a linked replacement"
+                )
+            replaced_record = self._fetch_record(
+                request.replaces_execution_order_id
+            )
+            if (
+                replaced_record is None
+                or replaced_record.status != ExecutionOrderStatus.CANCELLED
+                or replaced_record.capital_reservation_id
+                != prepared_reservation_id
+                or (
+                    replaced_record.environment,
+                    replaced_record.account_no,
+                    replaced_record.symbol,
+                    replaced_record.side,
+                    replaced_record.intent,
+                )
+                != (environment, account_no, symbol, request.side, request.intent)
+            ):
+                raise PreTradeRiskRejectedError(
+                    "The prepared reservation is not linked to the confirmed-cancelled "
+                    "order this submission replaces"
+                )
+            reservation = fetch_reservation(engine, prepared_reservation_id)
+            if (
+                reservation is None
+                or not reservation.is_open()
+                or (
+                    reservation.environment,
+                    reservation.account_no,
+                    reservation.symbol,
+                )
+                != (environment, account_no, symbol)
+            ):
+                raise PreTradeRiskRejectedError(
+                    "The prepared replacement reservation is missing, closed, or out of scope"
+                )
+        else:
+            reservation = CapitalReservation.create(
+                environment=environment, account_no=account_no, symbol=symbol,
+                attempt_group_id=request.attempt_group_id or client_order_id,
+                requested_notional=requested_notional,
+                projected_open_risk=projected_open_risk,
+            )
         command = ExecutionCommand(
             idempotency_key=idempotency_key, command_type="submit", environment=environment,
             account_no=account_no, symbol=symbol,
@@ -1628,9 +1979,26 @@ class ExecutionCommandGateway:
                 symbol=symbol,
             )
             insert_command(conn, command)
-            insert_reservation_if_available(
-                conn, reservation, buying_power=buying_power
-            )
+            if prepared_reservation_id:
+                reservation = activate_prepared_replacement_reservation(
+                    conn,
+                    prepared_reservation_id,
+                    expected_version=(
+                        request.prepared_capital_reservation_version
+                    ),
+                    environment=environment,
+                    account_no=account_no,
+                    symbol=symbol,
+                    requested_notional=requested_notional,
+                    projected_open_risk=projected_open_risk,
+                )
+            else:
+                insert_reservation_if_available(
+                    conn,
+                    reservation,
+                    buying_power=buying_power,
+                    portfolio_risk_spec=portfolio_risk_spec,
+                )
             insert_execution_order(conn, record)
 
         # 7 + 8. separate durable transaction: PREPARED -> SUBMITTING.
@@ -1658,6 +2026,16 @@ class ExecutionCommandGateway:
                 request.strategy_instance_id,
             )
             self._require_verified_lease(request.lease)
+            # Recheck at the last possible moment because lease/database work
+            # above may consume most of the approval's short TTL.
+            require_current_entry_risk_approval()
+            require_live_entry_allowed(
+                environment=environment,
+                symbol=symbol,
+                side=request.side,
+                quantity=quantity,
+                limit_price=limit_price,
+            )
             with coordination_read_connection(engine) as conn:
                 require_no_active_unowned_external_order(
                     conn,
@@ -1669,6 +2047,8 @@ class ExecutionCommandGateway:
             ExecutionOwnershipMismatchError,
             LeaseNotVerifiedError,
             ActiveExternalOrderFenceError,
+            PreTradeRiskRejectedError,
+            LiveExecutionEnvelopeError,
         ) as gate_error:
             # The broker boundary has definitely not been entered. Retire
             # every A1 artifact atomically so a final-gate race cannot look
@@ -1769,6 +2149,7 @@ class ExecutionCommandGateway:
     def _do_cancel(
         self, request: CancelExecutionRequest, *, record: ExecutionOrderRecord,
         permission_check: Callable[[ExecutionOrderRecord], bool],
+        release_capital_reservation: bool = True,
     ) -> ExecutionOrderRecord:
         # Cache before the first transition.  Every later mutation is applied
         # to this same object, including ambiguous outcomes that raise instead
@@ -1845,6 +2226,10 @@ class ExecutionCommandGateway:
                 request.source, request.strategy_instance_id,
             )
             self._require_verified_lease(request.lease)
+            require_live_mutation_allowed(
+                environment=record.environment,
+                action=f"order cancellation for {record.symbol}",
+            )
             with coordination_read_connection(engine) as conn:
                 require_no_active_unowned_external_order(
                     conn,
@@ -1857,6 +2242,7 @@ class ExecutionCommandGateway:
             ExecutionOwnershipMismatchError,
             LeaseNotVerifiedError,
             ActiveExternalOrderFenceError,
+            LiveExecutionEnvelopeError,
         ) as gate_error:
             # No cancel reached the broker. Restore the exact live status
             # captured before CANCEL_PENDING and retire this caller-owned
@@ -1953,7 +2339,7 @@ class ExecutionCommandGateway:
                 if record.status in (
                     ExecutionOrderStatus.CANCELLED,
                     ExecutionOrderStatus.FILLED,
-                ) and record.capital_reservation_id:
+                ) and record.capital_reservation_id and release_capital_reservation:
                     reservation = fetch_reservation(
                         engine, record.capital_reservation_id
                     )
@@ -2081,4 +2467,5 @@ def build_guarded_execution_gateway(
         handoff_pending_provider=handoff_pending_provider,
         critical_alert_sink=critical_alert_sink,
         schema_migration_manager=schema_migration_manager,
+        projected_portfolio_risk_required=True,
     )

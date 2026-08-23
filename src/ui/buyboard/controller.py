@@ -870,7 +870,9 @@ class BuyboardMixin:
         evaluator = TradeCardOrbEvaluator()
         verified_accounts, holdings = self._buyboard_recovery_holdings()
         restriction = (
-            "Kanban operational store unavailable; showing the last local snapshot read-only"
+            "Kanban operational store unavailable; showing the last local snapshot "
+            "read-only with app execution locked. Open Recovery Procedure for "
+            "safe protective-exit and restoration instructions"
         )
         projections = []
         projected_keys = set()

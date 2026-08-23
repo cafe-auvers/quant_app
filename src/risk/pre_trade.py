@@ -56,6 +56,7 @@ class PreTradeRiskDecision:
     evaluated_at: datetime
     expires_at: datetime
     reasons: Tuple[str, ...] = ()
+    portfolio_risk_reservation: Any = None
 
     @classmethod
     def create(
@@ -76,6 +77,7 @@ class PreTradeRiskDecision:
         reasons: Tuple[str, ...] = (),
         evaluated_at: Optional[datetime] = None,
         expires_at: Optional[datetime] = None,
+        portfolio_risk_reservation: Any = None,
     ) -> "PreTradeRiskDecision":
         if not isinstance(approved, bool):
             raise ValueError("Risk-decision approved flag must be a boolean")
@@ -106,6 +108,7 @@ class PreTradeRiskDecision:
             reasons=tuple(
                 str(reason).strip() for reason in reasons if str(reason).strip()
             ),
+            portfolio_risk_reservation=portfolio_risk_reservation,
         )
 
     @classmethod

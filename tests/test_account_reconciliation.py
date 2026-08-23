@@ -1511,6 +1511,214 @@ def test_every_terminal_c4_category_settles_its_linked_reservation(
     assert plan.reservation_updates[0].remaining_reserved_notional == 0
 
 
+def test_cancelled_replacement_predecessor_cannot_release_live_leaf_reservation():
+    reservation = _reservation("R-REPLACE")
+    reservation.requested_notional = 1_200.0
+    reservation.remaining_reserved_notional = 1_200.0
+    reservation.projected_open_risk = 60.0
+    reservation.remaining_projected_open_risk = 60.0
+    original = _order(
+        client_order_id="REPLACE-A",
+        broker_order_id="BROKER-A",
+        status=ExecutionOrderStatus.CANCELLED,
+        remaining_quantity=0,
+        capital_reservation_id=reservation.reservation_id,
+    )
+    replacement = _order(
+        client_order_id="REPLACE-B",
+        broker_order_id="BROKER-B",
+        submitted_quantity=12,
+        remaining_quantity=12,
+        capital_reservation_id=reservation.reservation_id,
+        replaces_execution_order_id=original.client_order_id,
+    )
+
+    plan = reduce_account_reconciliation(
+        _snapshot(
+            orders=(
+                BrokerOrderStatusSnapshot(
+                    environment="PROD",
+                    account_no="1",
+                    symbol="AAPL",
+                    broker_order_id="BROKER-A",
+                    side=OrderSide.BUY,
+                    status=OrderStatus.CANCELLED,
+                    quantity_requested=10,
+                ),
+                BrokerOrderStatusSnapshot(
+                    environment="PROD",
+                    account_no="1",
+                    symbol="AAPL",
+                    broker_order_id="BROKER-B",
+                    side=OrderSide.BUY,
+                    status=OrderStatus.WORKING,
+                    quantity_requested=12,
+                    remaining_quantity=12,
+                    limit_price=100.0,
+                ),
+            ),
+        ),
+        AccountLocalState(
+            execution_orders=(original, replacement),
+            capital_reservations=(reservation,),
+        ),
+    )
+
+    assert plan.reservation_updates == ()
+    assert not any(
+        alert.code == "CAPITAL_RESERVATION_REPLACEMENT_CHAIN_CONFLICT"
+        for alert in plan.alerts
+    )
+
+
+@pytest.mark.parametrize(
+    ("leaf_status", "broker_status", "expected_status"),
+    [
+        (ExecutionOrderStatus.WORKING, OrderStatus.FILLED, "CONSUMED"),
+        (ExecutionOrderStatus.WORKING, OrderStatus.CANCELLED, "RELEASED"),
+    ],
+)
+def test_replacement_leaf_terminal_settles_transferred_reservation_once(
+    leaf_status, broker_status, expected_status
+):
+    reservation = _reservation("R-REPLACE-TERMINAL")
+    original = _order(
+        client_order_id="REPLACE-A",
+        broker_order_id="BROKER-A",
+        status=ExecutionOrderStatus.CANCELLED,
+        remaining_quantity=0,
+        capital_reservation_id=reservation.reservation_id,
+    )
+    replacement = _order(
+        client_order_id="REPLACE-B",
+        broker_order_id="BROKER-B",
+        status=leaf_status,
+        capital_reservation_id=reservation.reservation_id,
+        replaces_execution_order_id=original.client_order_id,
+    )
+    filled = 10 if broker_status == OrderStatus.FILLED else 0
+
+    plan = reduce_account_reconciliation(
+        _snapshot(
+            orders=(
+                BrokerOrderStatusSnapshot(
+                    environment="PROD",
+                    account_no="1",
+                    symbol="AAPL",
+                    broker_order_id="BROKER-B",
+                    side=OrderSide.BUY,
+                    status=broker_status,
+                    quantity_requested=10,
+                    filled_quantity=filled,
+                    remaining_quantity=0,
+                    avg_fill_price=100.0 if filled else 0.0,
+                ),
+            ),
+        ),
+        AccountLocalState(
+            execution_orders=(original, replacement),
+            capital_reservations=(reservation,),
+        ),
+    )
+
+    assert len(plan.reservation_updates) == 1
+    assert plan.reservation_updates[0].status.value == expected_status
+    assert plan.reservation_updates[0].remaining_reserved_notional == 0.0
+    assert plan.reservation_updates[0].remaining_projected_open_risk == 0.0
+
+
+def test_replacement_chain_assigns_reservation_exposure_to_current_leaf():
+    reservation = _reservation("R-REPLACE-CHAIN")
+    reservation.projected_open_risk = 50.0
+    reservation.remaining_projected_open_risk = 50.0
+    first = _order(
+        client_order_id="REPLACE-A",
+        broker_order_id="BROKER-A",
+        status=ExecutionOrderStatus.CANCELLED,
+        remaining_quantity=0,
+        capital_reservation_id=reservation.reservation_id,
+    )
+    second = _order(
+        client_order_id="REPLACE-B",
+        broker_order_id="BROKER-B",
+        status=ExecutionOrderStatus.CANCELLED,
+        remaining_quantity=0,
+        capital_reservation_id=reservation.reservation_id,
+        replaces_execution_order_id=first.client_order_id,
+    )
+    leaf = _order(
+        client_order_id="REPLACE-C",
+        broker_order_id="BROKER-C",
+        status=ExecutionOrderStatus.PARTIALLY_FILLED,
+        filled_quantity=2,
+        remaining_quantity=8,
+        average_fill_price=100.0,
+        capital_reservation_id=reservation.reservation_id,
+        replaces_execution_order_id=second.client_order_id,
+    )
+
+    plan = reduce_account_reconciliation(
+        _snapshot(orders=(), completeness=_completeness(history_complete=False)),
+        AccountLocalState(
+            execution_orders=(first, second, leaf),
+            capital_reservations=(reservation,),
+        ),
+    )
+
+    assert len(plan.reservation_updates) == 1
+    updated = plan.reservation_updates[0]
+    assert updated.status.value == "PARTIALLY_CONSUMED"
+    assert updated.remaining_reserved_notional == pytest.approx(800.0)
+    assert updated.remaining_projected_open_risk == pytest.approx(40.0)
+
+
+def test_ambiguous_replacement_cancellation_preserves_transition_hold():
+    reservation = _reservation("R-REPLACE-AMBIGUOUS")
+    reservation.requested_notional = 1_200.0
+    reservation.remaining_reserved_notional = 1_200.0
+    reservation.projected_open_risk = 60.0
+    reservation.remaining_projected_open_risk = 60.0
+    cancelling = _order(
+        client_order_id="REPLACE-A",
+        status=ExecutionOrderStatus.CANCEL_PENDING,
+        submitted_quantity=10,
+        filled_quantity=4,
+        remaining_quantity=6,
+        average_fill_price=100.0,
+        capital_reservation_id=reservation.reservation_id,
+    )
+
+    plan = reduce_account_reconciliation(
+        _snapshot(orders=(), completeness=_completeness(history_complete=False)),
+        AccountLocalState(
+            execution_orders=(cancelling,),
+            capital_reservations=(reservation,),
+        ),
+    )
+
+    assert plan.reservation_updates == ()
+
+
+def test_live_buy_linked_to_closed_reservation_raises_critical_condition():
+    closed = _reservation("R-CLOSED")
+    closed.release()
+    order = _order(capital_reservation_id=closed.reservation_id)
+
+    plan = reduce_account_reconciliation(
+        _snapshot(orders=(), completeness=_completeness(history_complete=False)),
+        AccountLocalState(
+            execution_orders=(order,),
+            capital_reservations=(closed,),
+        ),
+    )
+
+    assert any(
+        alert.code == "LIVE_ORDER_WITHOUT_CAPITAL_RESERVATION"
+        and alert.severity.value == "CRITICAL"
+        for alert in plan.alerts
+    )
+
+
 def test_exact_terminal_disagreement_always_escalates():
     local = _order(
         status=ExecutionOrderStatus.FILLED,

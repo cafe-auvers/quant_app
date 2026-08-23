@@ -34,6 +34,8 @@ from typing import Dict, List
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("authorized_full_live")
+
 from src.brokers.execution_broker_protocol import BrokerSubmissionResult
 from src.core.execution_mode import ExecutionSource
 from src.core.order_state import BrokerOrderStatusSnapshot, OrderIntent, OrderSide, OrderStatus

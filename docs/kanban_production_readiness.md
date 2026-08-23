@@ -79,6 +79,15 @@ mutation spacing, and zero automatic mutation retries. It does not pass Gate
 2, authorize unattended operation, or relax broker reconciliation as the
 execution authority. See `docs/controlled_live_pilot_runbook.md`.
 
+Revision 3.6 closes the stale release-train ledger after PR8 merged. Workstream
+0 is in progress with credentialed read-only evidence, the deterministic Gate
+1 capstone is merged and passing, and a supervised controlled-live deployment
+may keep the guarded Buy Board engine enabled. Engine availability is not
+broker authorization: the shared trading switch, live-execution envelope,
+lease, ownership, reconciliation, market-data freshness, capital, and risk
+checks remain independent mandatory fences. The older "engine stays false for
+the entire program" wording below is therefore superseded for post-PR8 builds.
+
 ## How to use this document
 
 This is the frozen contract every workstream in this branch implements
@@ -100,11 +109,14 @@ Rules while this program is open:
    the originally-planned long-lived integration branch is deprecated; see
    the PR structure section)*, fully tested and reviewable on its own. None
    of them individually changes runtime behavior in production — every new
-   code path stays behind `BUYBOARD_ENGINE_ENABLED=false` and the relevant
-   feature flags until PR8's own Gate 1 run passes. No partial *activation*,
-   even though the PRs land on `master` incrementally.
-4. `BUYBOARD_ENGINE_ENABLED` stays `false` in production for the entire
-   duration of this program, regardless of how much of it is complete.
+   code path stayed behind `BUYBOARD_ENGINE_ENABLED=false` and the relevant
+   feature flags until PR8's own Gate 1 run passed. No pre-PR8 partial
+   *activation* was permitted even though the PRs landed incrementally.
+4. Post-PR8 deployments may keep `BUYBOARD_ENGINE_ENABLED=true`. That flag
+   selects the guarded runtime and must never be treated as permission to call
+   KIS. `KIS_LIVE_EXECUTION_MODE=DISABLED` remains a valid engine-running,
+   mutation-blocked state; every other broker-boundary fence still applies in
+   controlled/full live modes.
 5. **Workstream 0 gates production use and verified semantics of specific
    capability-dependent code, not all implementation work in Workstreams 2
    and 5** (narrowed in revisions 3.1 and 3.4 — see the "Workstream 0"
@@ -153,14 +165,14 @@ PR's behavior composes correctly, plus the Gate 1 run in full.
 
 | # | Workstream | Status |
 |---|---|---|
-| 0 | KIS protocol capability verification | NOT STARTED — capability-specific adapters remain gated; skeleton complete |
+| 0 | KIS protocol capability verification | IN PROGRESS — credentialed production/simulation evidence verifies U.S. symbol keys and the aggregate 41-registration limit; regular-session timestamps/sequence, execution notices, accepted mutation behavior, history latency/completeness, and broker-ID scope remain open. See `docs/kis_capability_matrix.md`. |
 | 1 | Freeze requirements and invariants (this document) | DONE — revision 3.1 signed off |
 | 2 | Durable order ownership and command ledger | PR1 IMPLEMENTED, not activated — merged to `master` (`5b50e1d`): schemas, all three state machines, durable repositories, command ledger. Excludes A4a's KIS-specific correlation-key adapter (stays gated on Workstream 0). |
 | 3 | One guarded execution gateway | PR2 IMPLEMENTED, not activated — `ExecutionCommandGateway` (`src/services/execution_command_gateway.py`): dual-mode, with genuinely separate call shapes per mode (`submit_order`/`cancel_order` for `LEGACY_COMPATIBILITY`; `submit_guarded`/`cancel_guarded`/`replace_guarded` taking explicit request models with caller-generated stable command identities for `GUARDED_ENGINE`). Full A1-A11/B1-B4 sequence, one authoritative atomic capital reservation with an in-transaction availability check, a real lease-epoch gate, H1 ownership enforcement, a mutation-budget seam for Workstream 10, and fail-closed guarded runtime composition. Runtime-level tests cover restart-restored caller identity, normalized results, full-context tracked cancellation, Partial Sell/Sell All, one-reservation entry, and unresolved post-broker persistence without retry. |
 | 4 | Account-level reconciliation engine | PR3 IMPLEMENTED, not activated — one immutable `AccountBrokerSnapshot` per account/pass, per-source `SnapshotCompleteness`, a pure `ReconciliationPlan` reducer, durable two-generation order/reservation absence evidence, lifecycle-linked behavioral C4 projection with terminal attempt-group retirement, execution-boundary and last-broker-boundary fencing for active unowned orders with definitive pre-broker aborts, guarded execution of reducer commands, safe external SELL exposure handling, atomic account-plan persistence plus strict allocator reservation CAS, failure-invalidated action readiness, and one startup/periodic runtime pass replacing the three ordered EOD sweeps. KIS submission-time mapping and production threshold calibration remain gated on Workstream 0; without verified broker submission time, A4a stays manual and unmatched broker orders remain separate `DiscoveredExternalOrder`s. |
 | 5 | Production KIS real-time market data | PR4 IMPLEMENTED and merged to `master` (`952179e`), not activated — approval-key/transport lifecycle, ACK/NACK and encrypted-notice framing, exact-event freshness/dedup validation, per-symbol channel readiness, lossless stop-version accumulator, channel-specific capacity, health metrics, market-session semantics, bounded emergency pricing, and tiered persisted outage state are implemented behind `BUYBOARD_ENGINE_ENABLED=false`, `KIS_WS_ENABLED=false`, and `KIS_WS_PROTOCOL_VERIFIED=false`. Live parsing/subscription activation remains blocked until Workstream 0 fills `docs/kis_capability_matrix.md` with credentialed evidence; no vendor-sample assumption is recorded as verified. |
 | 6 | Runtime readiness and device handoff | PR5 IMPLEMENTED and merged to `master` (`c5422b4`), not activated — durable epoch fencing across clean and stale handoff, generation-fenced `STANDBY_READY` takeover after final reconciliation, persist-before-open `ACTIVE`, strict E1 aggregate health, read-only successor standby, KANBAN/unknown-scoped legacy suppression, exposure-aware ordered shutdown with abort recovery, and stop-latch-preserving promotion are implemented. All execution and WebSocket activation flags remain false. |
-| 7 | Complete test program | PR8 DRAFT IMPLEMENTED on `agent/pr8-final-integration`, not activated — one deterministic manifest composes the prior F1/F2/F3/F4/L3 slices with PR8-only cross-workstream scenarios, evidence-derived fail-closed post-failure checks, adversarial seeded real-SUT exploration, a frozen required-node inventory, and a generated machine-readable Gate-1 report. |
+| 7 | Complete test program | DONE — PR8 merged to `master` (`b9895a9`); the deterministic manifest composes the prior F1/F2/F3/F4/L3 slices with PR8-only cross-workstream scenarios, evidence-derived fail-closed post-failure checks, adversarial seeded real-SUT exploration, a frozen required-node inventory, and a generated machine-readable Gate-1 report. Exact-head Gate 1 must still be regenerated for every release candidate. |
 | 8 | Migration and cutover | PR6 IMPLEMENTED and merged to `master` (`77005ce`), not activated — exact-live-lease-fenced backup/cutover/direct rollback, crash-resumable migration, post-mutation rollback refusal, and forward-only broker reconciliation plus compatibility transform. |
 | 9 | Legacy/Kanban ownership isolation | PR2 IMPLEMENTED, not activated — `ExecutionWorkflowService` is the one workflow service both the legacy Buy Dashboard's submission/cancellation entry points and the Kanban runtime (`buyboard_runtime.py`) now default to; an architecture test enforces no direct KIS-mutation call site outside the gateway/adapter. H1's persisted, multi-strategy `execution_owner` table (`src/core/execution_ownership.py` + `execution_ownership_repository.py`) is built and enforced at the gateway (B2) in `GUARDED_ENGINE` mode — `MANUAL` rejects every application source, `KANBAN` accepts only `KANBAN_BOARD`, unassigned defaults `LEGACY` (H2) and rejects `KANBAN_BOARD`. In-process mutual exclusion per `(environment, account_no, symbol)` is enforced additionally, regardless of mode, as a same-process race guard distinct from H1's durable assignment. |
 | 10 | Rate-limit and command-priority scheduling | PR6 IMPLEMENTED and merged to `master` (`77005ce`), not activated — strict priorities, per-account/endpoint budgets initialized only from explicit WS0 evidence, and typed pre-acceptance retry classification. |
@@ -1232,7 +1244,7 @@ Every row must have an explicit reducer branch and at least one fault-injection 
 | Gate | Proves | Invariants exercised |
 |---|---|---|
 | 1. Deterministic simulation | Replay, restart, fault-injection (F1/F3), protocol (F2), model-based (F4), and Kanban-parity (L3) tests all pass | All |
-| 2. Live KIS WebSocket, read-only (`BUYBOARD_ENGINE_ENABLED=false`, `TRADING_ENABLED=false`, `KIS_WS_ENABLED=true`) | Real feed, against the measurable criteria below | INV-9, INV-10, INV-11, INV-17, INV-20 |
+| 2. Live KIS WebSocket, read-only (`BUYBOARD_ENGINE_ENABLED=true`, `TRADING_ENABLED=false`, `KIS_LIVE_EXECUTION_MODE=DISABLED`, `KIS_WS_ENABLED=true`) | Real feed, against the measurable criteria below | INV-9, INV-10, INV-11, INV-17, INV-20 |
 | 3. Shadow execution | Real quotes, real decisions, broker mutations replaced with `WOULD_SUBMIT`/`WOULD_CANCEL`/`WOULD_SELL` audit entries, compared against live chart/account | All decision-path invariants |
 | 4. Controlled live | One account, one/two symbols, minimum size, supervised, external alerts on, legacy/Kanban ownership isolated | All |
 | 5. Unattended activation | No duplicate commands; no unresolved local/broker discrepancy; no stale quantity; no command after lease loss; successful reconnect+resubscribe; every stop decision uses fresh event data; every auto-cancel has exact ownership; startup/handoff converge without manual repair; external critical alerts confirmed reaching the user outside the app; the external heartbeat watchdog (K3) is actually running | All |
@@ -1261,10 +1273,11 @@ Unchanged from revision 2:
 | Receive-lag p99 | under 2 seconds |
 | Secret/approval-key leakage in logs | 0 |
 
-`BUYBOARD_ENGINE_ENABLED` stays `false` unless either Gate 2 has passed or an
-explicitly approved, continuously supervised revision-3.5 controlled-live
-pilot satisfies `controlled_live_pilot_runbook.md`. It stays `false` in
-unattended/automatic form until Gate 5 passes.
+Post-PR8, `BUYBOARD_ENGINE_ENABLED` stays `true` so Kanban, reconciliation,
+monitoring, and the guarded decision runtime remain available. Engine
+availability is not mutation authority. Gate 2 keeps `TRADING_ENABLED=false`
+and `KIS_LIVE_EXECUTION_MODE=DISABLED`; controlled/full-live promotion still
+requires its own independently verified envelope.
 
 ---
 

@@ -68,8 +68,35 @@ def test_health_snapshot_surfaces_stale_data_and_unknown_orders(monkeypatch):
     assert checks["Data mirror"].level == health.HealthLevel.WARNING
     assert checks["Reconciliation"].level == health.HealthLevel.CRITICAL
     assert "Event journal" in checks
+    assert "Portfolio entry limits" in checks
     assert "NVDA" in checks["Reconciliation"].detail
     assert snapshot.overall_level == health.HealthLevel.CRITICAL
+
+
+def test_health_displays_effective_runtime_portfolio_limits(monkeypatch):
+    monkeypatch.setattr(
+        health.execution_config,
+        "PORTFOLIO_MAX_SIMULTANEOUS_POSITIONS",
+        30,
+    )
+    monkeypatch.setattr(
+        health.execution_config,
+        "PORTFOLIO_MAX_TOTAL_OPEN_RISK_FRACTION",
+        0.20,
+    )
+    monkeypatch.setattr(
+        health.execution_config,
+        "PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION",
+        10.0,
+    )
+
+    check = health._portfolio_risk_configuration_check()
+
+    assert check.level == health.HealthLevel.HEALTHY
+    assert check.summary == (
+        "Effective: 30 positions, 20% open risk, 1000% gross notional"
+    )
+    assert "environment overrides" in check.detail
 
 
 def test_unreadable_order_ledger_is_critical():

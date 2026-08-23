@@ -26,6 +26,8 @@ from src.services.order_execution_service import submit_guarded_overseas_order
 from src.services.order_reconciliation import cancel_and_reconcile_order
 from fakes.fake_execution_broker import BrokerRejectionError, BrokerTimeoutError, FakeExecutionBroker
 
+pytestmark = pytest.mark.usefixtures("authorized_full_live")
+
 STRATEGY_ID = "TEST"
 PLAN_ID = "TEST:AAPL"
 

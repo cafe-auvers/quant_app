@@ -65,6 +65,8 @@ class CapitalReservation:
     attempt_group_id: str
     requested_notional: float
     remaining_reserved_notional: float
+    projected_open_risk: float = 0.0
+    remaining_projected_open_risk: float = 0.0
     status: CapitalReservationStatus = CapitalReservationStatus.RESERVED
     version: int = 1
     created_at: datetime = field(default_factory=_utc_now)
@@ -82,6 +84,10 @@ class CapitalReservation:
         self.requested_notional = float(self.requested_notional or 0.0)
         self.remaining_reserved_notional = float(
             self.remaining_reserved_notional or 0.0
+        )
+        self.projected_open_risk = max(0.0, float(self.projected_open_risk or 0.0))
+        self.remaining_projected_open_risk = max(
+            0.0, float(self.remaining_projected_open_risk or 0.0)
         )
         self.status = _enum_from_value(
             self.status, CapitalReservationStatus, CapitalReservationStatus.RESERVED
@@ -111,6 +117,7 @@ class CapitalReservation:
         symbol: str,
         attempt_group_id: str,
         requested_notional: float,
+        projected_open_risk: float = 0.0,
     ) -> "CapitalReservation":
         return cls(
             reservation_id=uuid4().hex,
@@ -120,6 +127,8 @@ class CapitalReservation:
             attempt_group_id=attempt_group_id,
             requested_notional=requested_notional,
             remaining_reserved_notional=requested_notional,
+            projected_open_risk=projected_open_risk,
+            remaining_projected_open_risk=projected_open_risk,
         )
 
     def is_open(self) -> bool:
@@ -128,10 +137,15 @@ class CapitalReservation:
     def consume(self, notional: float) -> None:
         """A fill consumed ``notional`` of this reservation (section 872-876)."""
         notional = max(0.0, float(notional or 0.0))
+        previous_notional = self.remaining_reserved_notional
         self.remaining_reserved_notional = max(
             0.0, self.remaining_reserved_notional - notional
         )
+        if previous_notional > 1e-9:
+            remaining_fraction = self.remaining_reserved_notional / previous_notional
+            self.remaining_projected_open_risk *= remaining_fraction
         if self.remaining_reserved_notional <= 1e-9:
+            self.remaining_projected_open_risk = 0.0
             self.status = CapitalReservationStatus.CONSUMED
         else:
             self.status = CapitalReservationStatus.PARTIALLY_CONSUMED
@@ -139,11 +153,13 @@ class CapitalReservation:
     def release(self) -> None:
         """Give back any unconsumed remainder (order cancelled/rejected)."""
         self.remaining_reserved_notional = 0.0
+        self.remaining_projected_open_risk = 0.0
         self.status = CapitalReservationStatus.RELEASED
         self.released_at = _utc_now()
 
     def expire(self) -> None:
         self.remaining_reserved_notional = 0.0
+        self.remaining_projected_open_risk = 0.0
         self.status = CapitalReservationStatus.EXPIRED
         self.released_at = _utc_now()
 
@@ -156,6 +172,8 @@ class CapitalReservation:
             "attempt_group_id": self.attempt_group_id,
             "requested_notional": self.requested_notional,
             "remaining_reserved_notional": self.remaining_reserved_notional,
+            "projected_open_risk": self.projected_open_risk,
+            "remaining_projected_open_risk": self.remaining_projected_open_risk,
             "status": self.status.value,
             "version": self.version,
             "created_at": self.created_at.isoformat(),
@@ -177,6 +195,10 @@ class CapitalReservation:
             requested_notional=float(data.get("requested_notional", 0.0) or 0.0),
             remaining_reserved_notional=float(
                 data.get("remaining_reserved_notional", 0.0) or 0.0
+            ),
+            projected_open_risk=float(data.get("projected_open_risk", 0.0) or 0.0),
+            remaining_projected_open_risk=float(
+                data.get("remaining_projected_open_risk", 0.0) or 0.0
             ),
             status=data.get("status", CapitalReservationStatus.RESERVED),
             version=int(data.get("version", 1) or 1),

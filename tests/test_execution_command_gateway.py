@@ -9,11 +9,19 @@ module's own docstring for why these are not interchangeable.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import sqlalchemy as sa
 import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.pool import NullPool
 
+from src.core import execution_config
+
+from src.core.account_broker_snapshot import (
+    AccountBrokerSnapshot,
+    SnapshotCompleteness,
+)
 from src.core.execution_mode import ExecutionLease, ExecutionMode, ExecutionSource
 from src.core.execution_ownership import ExecutionOwner, ExecutionOwnership
 from src.core.execution_order_record import AdoptedOrderPermission, ExecutionOrderStatus
@@ -24,7 +32,20 @@ from src.core.discovered_external_order import (
 )
 from src.core.execution_request import CancelExecutionRequest, ReplaceExecutionRequest, SubmitExecutionRequest
 from src.core.order_recovery_state import OrderRecoveryState
-from src.core.order_state import OrderIntent, OrderSide, OrderStatus
+from src.core.order_state import (
+    BrokerOrderStatusSnapshot,
+    OrderIntent,
+    OrderSide,
+    OrderStatus,
+)
+from src.risk.pre_trade import PreTradeRiskDecision, PreTradeRiskRejectedError
+from src.risk.portfolio import (
+    PortfolioProjectedExposure,
+    PortfolioRiskLimits,
+    PortfolioRiskManager,
+    PortfolioRiskSnapshot,
+    ProposedPortfolioEntry,
+)
 from src.services import execution_command_gateway as gw_module
 from src.services.execution_command_gateway import (
     AmbiguousPostBrokerPersistenceError,
@@ -51,6 +72,11 @@ from src.services.capital_reservation_repository import (
     fetch_reservation,
     list_active_reservations,
 )
+from src.services.account_reconciliation import (
+    AccountLocalState,
+    apply_reconciliation_plan,
+    reduce_account_reconciliation,
+)
 from src.services.execution_command_repository import (
     DuplicateCommandError,
     ExecutionCommand,
@@ -65,12 +91,15 @@ from src.services.execution_lease_protocol import (
 from src.services import state_sync
 from src.services.execution_order_repository import (
     _get_execution_orders_table,
+    ensure_execution_orders_table,
     fetch_execution_order,
+    list_execution_orders_for_account,
     record_execution_order,
     save_execution_order,
 )
 from src.services.execution_ownership_repository import assign_ownership
 from src.services.mutation_budget_protocol import AllowAllMutationBudget
+from src.services.controlled_live_policy import LiveExecutionEnvelopeError
 from src.services.discovered_external_order_repository import (
     ActiveExecutionOrderAdoptionConflictError,
     ActiveExternalOrderFenceError,
@@ -80,6 +109,8 @@ from src.services.discovered_external_order_repository import (
     save_discovered_external_order,
 )
 from fakes.fake_execution_broker import FakeExecutionBroker
+
+pytestmark = pytest.mark.usefixtures("authorized_full_live")
 
 
 def _make_engine(tmp_path):
@@ -108,6 +139,70 @@ def _guarded_gateway(tmp_path, *, lease_protocol=None, mutation_budget=None):
     return gateway, broker, engine
 
 
+def _production_guarded_gateway(tmp_path):
+    engine = _make_engine(tmp_path)
+    broker = FakeExecutionBroker()
+    protocol, _ = _lease()
+    gateway = build_guarded_execution_gateway(
+        engine=engine,
+        lease_protocol=protocol,
+        mutation_budget=AllowAllMutationBudget(),
+        buying_power_provider=lambda environment, account_no: 100_000.0,
+        real_broker=broker,
+    )
+    return gateway, broker, engine
+
+
+def _portfolio_approval(
+    *,
+    quantity,
+    price,
+    projected_exposures=(),
+    replaced_reservation_id="",
+):
+    evaluated_at = datetime.now(timezone.utc)
+    manager = PortfolioRiskManager(
+        PortfolioRiskLimits(
+            max_total_open_risk_fraction=0.10,
+            max_gross_notional_fraction=0.12,
+        )
+    )
+    portfolio = manager.evaluate_entry(
+        ProposedPortfolioEntry(
+            environment="PROD",
+            account_no="12345678-01",
+            symbol="AAPL",
+            quantity=quantity,
+            reference_price=price,
+            stop_price=95.0,
+            strategy_id="ORB",
+        ),
+        PortfolioRiskSnapshot(
+            account_equity_usd=10_000.0,
+            usable_buying_power_usd=100_000.0,
+            projected_exposures=tuple(projected_exposures),
+            evaluated_at=evaluated_at,
+        ),
+        replaced_reservation_id=replaced_reservation_id,
+    )
+    assert portfolio.approved is True
+    return PreTradeRiskDecision.approve(
+        environment="PROD",
+        account_no="12345678-01",
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        intent=OrderIntent.ENTRY,
+        quantity=quantity,
+        reference_price=price,
+        exchange="NASD",
+        execution_policy="REGULAR_LIMIT",
+        strategy_id="ORB",
+        plan_id="TEST:ORB:AAPL",
+        evaluated_at=evaluated_at,
+        portfolio_risk_reservation=portfolio.reservation_spec,
+    )
+
+
 def _all_order_rows(engine):
     table = _get_execution_orders_table(sa.MetaData())
     with engine.begin() as conn:
@@ -122,6 +217,25 @@ def _submit_request(**overrides):
         lease=lease, source=ExecutionSource.SYSTEM,
     )
     fields.update(overrides)
+    if fields["side"] == OrderSide.BUY and fields["intent"] == OrderIntent.ENTRY:
+        fields.setdefault("risk_strategy_id", "ORB")
+        fields.setdefault("risk_plan_id", "TEST:ORB:AAPL")
+        fields.setdefault(
+            "pre_trade_risk_decision",
+            PreTradeRiskDecision.approve(
+                environment=fields["environment"],
+                account_no=fields["account_no"],
+                symbol=fields["symbol"],
+                side=fields["side"],
+                intent=fields["intent"],
+                quantity=fields["quantity"],
+                reference_price=fields["limit_price"],
+                exchange=fields.get("exchange", "NASD"),
+                execution_policy=fields.get("execution_policy", "REGULAR_LIMIT"),
+                strategy_id=fields["risk_strategy_id"],
+                plan_id=fields["risk_plan_id"],
+            ),
+        )
     return SubmitExecutionRequest(**fields)
 
 
@@ -139,6 +253,69 @@ def _record_active_external_order(engine, *, broker_order_id="B-EXTERNAL"):
     )
 
 
+@pytest.mark.usefixtures("trading_enabled")
+def test_disabled_mode_blocks_legacy_gateway_when_engine_flag_is_false(monkeypatch):
+    monkeypatch.setattr(execution_config, "KIS_LIVE_EXECUTION_MODE", "DISABLED")
+    monkeypatch.setattr(execution_config, "is_buyboard_engine_enabled", lambda: False)
+    broker = FakeExecutionBroker()
+    gateway = ExecutionCommandGateway(real_broker=broker, mode_override=False)
+
+    with pytest.raises(LiveExecutionEnvelopeError, match="No broker mutation was sent"):
+        gateway.submit_order(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            side=OrderSide.SELL,
+            quantity=1,
+            limit_price=100.0,
+        )
+    with pytest.raises(LiveExecutionEnvelopeError, match="DISABLED"):
+        gateway.cancel_order(
+            environment="PROD",
+            account_no="1",
+            ownership_symbol="AAPL",
+            symbol="AAPL",
+            broker_order_id="B-1",
+            quantity=1,
+        )
+
+    assert broker.submit_calls == []
+    assert broker.cancel_calls == []
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_disabled_mode_blocks_guarded_gateway_before_persistence(tmp_path, monkeypatch):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    monkeypatch.setattr(execution_config, "KIS_LIVE_EXECUTION_MODE", "DISABLED")
+
+    with pytest.raises(LiveExecutionEnvelopeError, match="DISABLED"):
+        gateway.submit_guarded(_submit_request())
+
+    assert broker.submit_calls == []
+    ensure_execution_orders_table(engine)
+    assert _all_order_rows(engine) == []
+
+
+@pytest.mark.parametrize("mode", ["CONTROLLED_LIVE", "FULL_LIVE"])
+@pytest.mark.usefixtures("trading_enabled")
+def test_authorized_live_modes_permit_exact_guarded_buy(
+    tmp_path, monkeypatch, mode
+):
+    gateway, broker, _ = _guarded_gateway(tmp_path)
+    monkeypatch.setattr(execution_config, "KIS_LIVE_EXECUTION_MODE", mode)
+    monkeypatch.setattr(execution_config, "KIS_CONTROLLED_LIVE_SYMBOLS", ("AAPL",))
+    monkeypatch.setattr(
+        execution_config, "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL", 1_000.0
+    )
+    monkeypatch.setattr(execution_config, "KIS_MUTATION_MAX_CONFIRMED_ATTEMPTS", 1)
+    broker.queue_acceptance(broker_order_id=f"B-{mode}")
+
+    result = gateway.submit_guarded(_submit_request(quantity=1, limit_price=100.0))
+
+    assert result.broker_order_id == f"B-{mode}"
+    assert len(broker.submit_calls) == 1
+
+
 def _resolve_external_fence(engine, external_order):
     expected_version = external_order.version
     external_order.broker_status = ExecutionOrderStatus.CANCELLED
@@ -146,6 +323,58 @@ def _resolve_external_fence(engine, external_order):
     save_discovered_external_order(
         engine, external_order, expected_version=expected_version
     )
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_guarded_entry_requires_exact_pre_trade_approval_before_persistence(
+    tmp_path,
+):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+
+    with pytest.raises(PreTradeRiskRejectedError, match="explicit pre-trade"):
+        gateway.submit_guarded(
+            _submit_request(
+                pre_trade_risk_decision=None,
+                risk_strategy_id="",
+                risk_plan_id="",
+            )
+        )
+
+    assert broker.submit_calls == []
+    ensure_execution_orders_table(engine)
+    assert _all_order_rows(engine) == []
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_guarded_entry_rechecks_risk_immediately_before_broker_call(
+    tmp_path, monkeypatch
+):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    real_check = gw_module.require_pre_trade_risk_approval
+    checks = 0
+
+    def expire_on_final_check(*args, **kwargs):
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            raise PreTradeRiskRejectedError("approval expired at final fence")
+        return real_check(*args, **kwargs)
+
+    monkeypatch.setattr(
+        gw_module, "require_pre_trade_risk_approval", expire_on_final_check
+    )
+
+    with pytest.raises(
+        GuardedSubmissionPreBrokerAbortedError, match="expired at final fence"
+    ):
+        gateway.submit_guarded(_submit_request())
+
+    assert broker.submit_calls == []
+    record = fetch_execution_order(engine, "CID-1")
+    assert record.status == ExecutionOrderStatus.CANCELLED_LOCALLY
+    assert list_active_reservations(
+        engine, environment="PROD", account_no="12345678-01"
+    ) == []
 
 
 # --- mode selection / API split (findings 2) ---------------------------
@@ -193,16 +422,13 @@ def test_active_unowned_external_order_fences_guarded_cancel_and_replace(tmp_pat
         )
     with pytest.raises(ActiveExternalOrderFenceError):
         gateway.replace_guarded(
-            ReplaceExecutionRequest(
+            _replace_request(
                 client_order_id=owned.client_order_id,
                 replace_command_id="REPLACE-FENCED",
                 new_client_order_id="CID-REPLACEMENT",
                 new_quantity=5,
                 new_limit_price=99.0,
-                environment="PROD",
-                account_no="12345678-01",
                 lease=lease,
-                source=ExecutionSource.SYSTEM,
             )
         )
 
@@ -1196,6 +1422,24 @@ def _replace_request(**overrides):
         lease=lease, source=ExecutionSource.SYSTEM,
     )
     fields.update(overrides)
+    fields.setdefault("risk_strategy_id", "ORB")
+    fields.setdefault("risk_plan_id", "TEST:ORB:AAPL:REPLACE")
+    fields.setdefault(
+        "pre_trade_risk_decision",
+        PreTradeRiskDecision.approve(
+            environment=fields["environment"],
+            account_no=fields["account_no"],
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            intent=OrderIntent.ENTRY,
+            quantity=max(1, int(fields["new_quantity"] or 0)),
+            reference_price=max(0.01, float(fields["new_limit_price"] or 0.0)),
+            exchange="NASD",
+            execution_policy="REGULAR_LIMIT",
+            strategy_id=fields["risk_strategy_id"],
+            plan_id=fields["risk_plan_id"],
+        ),
+    )
     return ReplaceExecutionRequest(**fields)
 
 
@@ -1217,6 +1461,407 @@ def test_replace_preserves_the_original_order_and_creates_a_linked_new_record(tm
     assert new_record.status == ExecutionOrderStatus.ACKNOWLEDGED
     assert new_record.replaces_execution_order_id == "CID-1"
     assert new_record.submitted_quantity == 5
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_production_replace_rejects_missing_portfolio_reservation_before_cancel(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(
+        execution_config, "is_buyboard_engine_enabled", lambda: True
+    )
+    gateway, broker, engine = _production_guarded_gateway(tmp_path)
+    broker.queue_acceptance(broker_order_id="B-ORIGINAL")
+    original_approval = _portfolio_approval(quantity=10, price=100.0)
+    gateway.submit_guarded(
+        _submit_request(pre_trade_risk_decision=original_approval)
+    )
+
+    with pytest.raises(
+        PreTradeRiskRejectedError,
+        match="account-wide projected-risk reservation",
+    ):
+        gateway.replace_guarded(_replace_request(new_limit_price=100.0))
+
+    assert broker.cancel_calls == []
+    assert len(broker.submit_calls) == 1
+    assert fetch_execution_order(
+        engine, "CID-1"
+    ).status == ExecutionOrderStatus.ACKNOWLEDGED
+    assert fetch_execution_order(engine, "CID-1-REPLACEMENT") is None
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_production_replace_transfers_net_risk_before_cancelling_original(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(
+        execution_config, "is_buyboard_engine_enabled", lambda: True
+    )
+    gateway, broker, engine = _production_guarded_gateway(tmp_path)
+    broker.queue_acceptance(broker_order_id="B-ORIGINAL")
+    original_approval = _portfolio_approval(quantity=10, price=100.0)
+    original = gateway.submit_guarded(
+        _submit_request(pre_trade_risk_decision=original_approval)
+    )
+    original_reservation = fetch_reservation(
+        engine, original.capital_reservation_id
+    )
+    assert original_reservation is not None
+
+    pending_original = PortfolioProjectedExposure(
+        symbol="AAPL",
+        gross_notional_usd=1_000.0,
+        open_risk_usd=50.0,
+        source="PENDING_BUY",
+        reservation_id=original_reservation.reservation_id,
+    )
+    replacement_approval = _portfolio_approval(
+        quantity=12,
+        price=100.0,
+        projected_exposures=(pending_original,),
+        replaced_reservation_id=original_reservation.reservation_id,
+    )
+    broker.queue_cancel_confirmed()
+    broker.queue_acceptance(broker_order_id="B-REPLACEMENT")
+
+    replacement = gateway.replace_guarded(
+        _replace_request(
+            new_quantity=12,
+            new_limit_price=100.0,
+            pre_trade_risk_decision=replacement_approval,
+            risk_plan_id="TEST:ORB:AAPL",
+        )
+    )
+
+    assert replacement.status == ExecutionOrderStatus.ACKNOWLEDGED
+    assert replacement.replaces_execution_order_id == original.client_order_id
+    assert replacement.capital_reservation_id == original_reservation.reservation_id
+    assert fetch_execution_order(
+        engine, original.client_order_id
+    ).status == ExecutionOrderStatus.CANCELLED
+    reservations = list_active_reservations(
+        engine, environment="PROD", account_no="12345678-01"
+    )
+    assert len(reservations) == 1
+    assert reservations[0].remaining_reserved_notional == pytest.approx(1_200.0)
+    assert reservations[0].remaining_projected_open_risk == pytest.approx(60.0)
+    assert len(broker.cancel_calls) == 1
+    assert len(broker.submit_calls) == 2
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_successful_replacement_reconciliation_retains_then_settles_shared_hold(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(
+        execution_config, "is_buyboard_engine_enabled", lambda: True
+    )
+    gateway, broker, engine = _production_guarded_gateway(tmp_path)
+    broker.queue_acceptance(broker_order_id="B-ORIGINAL")
+    original = gateway.submit_guarded(
+        _submit_request(
+            pre_trade_risk_decision=_portfolio_approval(
+                quantity=10, price=100.0
+            )
+        )
+    )
+    reservation = fetch_reservation(engine, original.capital_reservation_id)
+    pending = PortfolioProjectedExposure(
+        symbol="AAPL",
+        gross_notional_usd=1_000.0,
+        open_risk_usd=50.0,
+        source="PENDING_BUY",
+        reservation_id=reservation.reservation_id,
+    )
+    broker.queue_cancel_confirmed()
+    broker.queue_acceptance(broker_order_id="B-REPLACEMENT")
+    replacement = gateway.replace_guarded(
+        _replace_request(
+            new_quantity=12,
+            new_limit_price=100.0,
+            pre_trade_risk_decision=_portfolio_approval(
+                quantity=12,
+                price=100.0,
+                projected_exposures=(pending,),
+                replaced_reservation_id=reservation.reservation_id,
+            ),
+            risk_plan_id="TEST:ORB:AAPL",
+        )
+    )
+    observed_at = datetime.now(timezone.utc)
+
+    working_snapshot = AccountBrokerSnapshot(
+        environment="PROD",
+        account_no="12345678-01",
+        completeness=SnapshotCompleteness(
+            holdings_complete=True,
+            open_orders_complete=True,
+            history_complete=True,
+            reserved_orders_complete=True,
+            account_balance_complete=True,
+        ),
+        observed_at=observed_at,
+        session_date=observed_at.date(),
+        snapshot_id="replacement-working",
+        orders=(
+            BrokerOrderStatusSnapshot(
+                environment="PROD",
+                account_no="12345678-01",
+                symbol="AAPL",
+                broker_order_id=original.broker_order_id,
+                side=OrderSide.BUY,
+                status=OrderStatus.CANCELLED,
+                quantity_requested=10,
+                remaining_quantity=0,
+            ),
+            BrokerOrderStatusSnapshot(
+                environment="PROD",
+                account_no="12345678-01",
+                symbol="AAPL",
+                broker_order_id=replacement.broker_order_id,
+                side=OrderSide.BUY,
+                status=OrderStatus.WORKING,
+                quantity_requested=12,
+                remaining_quantity=12,
+                limit_price=100.0,
+            ),
+        ),
+    )
+    working_plan = reduce_account_reconciliation(
+        working_snapshot,
+        AccountLocalState(
+            execution_orders=tuple(
+                list_execution_orders_for_account(
+                    engine,
+                    environment="PROD",
+                    account_no="12345678-01",
+                )
+            ),
+            capital_reservations=tuple(
+                list_active_reservations(
+                    engine,
+                    environment="PROD",
+                    account_no="12345678-01",
+                )
+            ),
+        ),
+    )
+    apply_reconciliation_plan(engine, working_plan)
+
+    retained = fetch_reservation(engine, reservation.reservation_id)
+    assert retained.is_open() is True
+    assert retained.remaining_reserved_notional == pytest.approx(1_200.0)
+    assert fetch_execution_order(
+        engine, replacement.client_order_id
+    ).status == ExecutionOrderStatus.WORKING
+
+    filled_at = datetime.now(timezone.utc)
+    filled_snapshot = AccountBrokerSnapshot(
+        environment="PROD",
+        account_no="12345678-01",
+        completeness=working_snapshot.completeness,
+        observed_at=filled_at,
+        session_date=filled_at.date(),
+        snapshot_id="replacement-filled",
+        orders=(
+            BrokerOrderStatusSnapshot(
+                environment="PROD",
+                account_no="12345678-01",
+                symbol="AAPL",
+                broker_order_id=replacement.broker_order_id,
+                side=OrderSide.BUY,
+                status=OrderStatus.FILLED,
+                quantity_requested=12,
+                filled_quantity=12,
+                remaining_quantity=0,
+                avg_fill_price=100.0,
+            ),
+        ),
+    )
+    filled_plan = reduce_account_reconciliation(
+        filled_snapshot,
+        AccountLocalState(
+            execution_orders=tuple(
+                list_execution_orders_for_account(
+                    engine,
+                    environment="PROD",
+                    account_no="12345678-01",
+                )
+            ),
+            capital_reservations=(retained,),
+        ),
+    )
+    assert len(filled_plan.reservation_updates) == 1
+    apply_reconciliation_plan(engine, filled_plan)
+
+    settled = fetch_reservation(engine, reservation.reservation_id)
+    assert settled.status.value == "CONSUMED"
+    assert settled.remaining_reserved_notional == 0.0
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_production_replace_restores_original_hold_after_cancel_rejection(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(
+        execution_config, "is_buyboard_engine_enabled", lambda: True
+    )
+    gateway, broker, engine = _production_guarded_gateway(tmp_path)
+    broker.queue_acceptance(broker_order_id="B-ORIGINAL")
+    original = gateway.submit_guarded(
+        _submit_request(
+            pre_trade_risk_decision=_portfolio_approval(
+                quantity=10, price=100.0
+            )
+        )
+    )
+    original_reservation = fetch_reservation(
+        engine, original.capital_reservation_id
+    )
+    pending = PortfolioProjectedExposure(
+        symbol="AAPL",
+        gross_notional_usd=1_000.0,
+        open_risk_usd=50.0,
+        source="PENDING_BUY",
+        reservation_id=original_reservation.reservation_id,
+    )
+    replacement_approval = _portfolio_approval(
+        quantity=12,
+        price=100.0,
+        projected_exposures=(pending,),
+        replaced_reservation_id=original_reservation.reservation_id,
+    )
+    broker.queue_cancel_rejected()
+
+    with pytest.raises(GuardedCancellationRejectedError):
+        gateway.replace_guarded(
+            _replace_request(
+                new_quantity=12,
+                new_limit_price=100.0,
+                pre_trade_risk_decision=replacement_approval,
+                risk_plan_id="TEST:ORB:AAPL",
+            )
+        )
+
+    restored = fetch_reservation(engine, original_reservation.reservation_id)
+    assert restored.remaining_reserved_notional == pytest.approx(1_000.0)
+    assert restored.remaining_projected_open_risk == pytest.approx(50.0)
+    assert fetch_execution_order(
+        engine, original.client_order_id
+    ).status == ExecutionOrderStatus.WORKING
+    assert len(broker.cancel_calls) == 1
+    assert len(broker.submit_calls) == 1
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_production_replace_checks_controlled_live_ceiling_before_cancel(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(
+        execution_config, "is_buyboard_engine_enabled", lambda: True
+    )
+    gateway, broker, engine = _production_guarded_gateway(tmp_path)
+    broker.queue_acceptance(broker_order_id="B-ORIGINAL")
+    original = gateway.submit_guarded(
+        _submit_request(
+            pre_trade_risk_decision=_portfolio_approval(
+                quantity=10, price=100.0
+            )
+        )
+    )
+    reservation = fetch_reservation(engine, original.capital_reservation_id)
+    pending = PortfolioProjectedExposure(
+        symbol="AAPL",
+        gross_notional_usd=1_000.0,
+        open_risk_usd=50.0,
+        source="PENDING_BUY",
+        reservation_id=reservation.reservation_id,
+    )
+    replacement_approval = _portfolio_approval(
+        quantity=12,
+        price=100.0,
+        projected_exposures=(pending,),
+        replaced_reservation_id=reservation.reservation_id,
+    )
+    monkeypatch.setattr(
+        execution_config, "KIS_LIVE_EXECUTION_MODE", "CONTROLLED_LIVE"
+    )
+    monkeypatch.setattr(
+        execution_config, "KIS_CONTROLLED_LIVE_SYMBOLS", ("AAPL",)
+    )
+    monkeypatch.setattr(
+        execution_config, "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL", 1_100.0
+    )
+    monkeypatch.setattr(
+        execution_config, "KIS_MUTATION_MAX_CONFIRMED_ATTEMPTS", 1
+    )
+
+    with pytest.raises(LiveExecutionEnvelopeError, match="maximum notional"):
+        gateway.replace_guarded(
+            _replace_request(
+                new_quantity=12,
+                new_limit_price=100.0,
+                pre_trade_risk_decision=replacement_approval,
+                risk_plan_id="TEST:ORB:AAPL",
+            )
+        )
+
+    assert broker.cancel_calls == []
+    assert fetch_execution_order(
+        engine, original.client_order_id
+    ).status == ExecutionOrderStatus.ACKNOWLEDGED
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_prepared_replacement_reservation_cannot_bypass_confirmed_cancel(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(
+        execution_config, "is_buyboard_engine_enabled", lambda: True
+    )
+    gateway, broker, engine = _production_guarded_gateway(tmp_path)
+    broker.queue_acceptance(broker_order_id="B-ORIGINAL")
+    original = gateway.submit_guarded(
+        _submit_request(
+            pre_trade_risk_decision=_portfolio_approval(
+                quantity=10, price=100.0
+            )
+        )
+    )
+    reservation = fetch_reservation(engine, original.capital_reservation_id)
+    pending = PortfolioProjectedExposure(
+        symbol="AAPL",
+        gross_notional_usd=1_000.0,
+        open_risk_usd=50.0,
+        source="PENDING_BUY",
+        reservation_id=reservation.reservation_id,
+    )
+    replacement_approval = _portfolio_approval(
+        quantity=12,
+        price=100.0,
+        projected_exposures=(pending,),
+        replaced_reservation_id=reservation.reservation_id,
+    )
+
+    with pytest.raises(
+        PreTradeRiskRejectedError,
+        match="confirmed-cancelled",
+    ):
+        gateway.submit_guarded(
+            _submit_request(
+                client_order_id="ILLEGAL-REPLACEMENT",
+                quantity=12,
+                limit_price=100.0,
+                replaces_execution_order_id=original.client_order_id,
+                prepared_capital_reservation_id=reservation.reservation_id,
+                prepared_capital_reservation_version=reservation.version,
+                pre_trade_risk_decision=replacement_approval,
+            )
+        )
+
+    assert len(broker.submit_calls) == 1
+    assert fetch_execution_order(engine, "ILLEGAL-REPLACEMENT") is None
 
 
 @pytest.mark.usefixtures("trading_enabled")

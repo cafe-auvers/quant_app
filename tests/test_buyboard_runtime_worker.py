@@ -3164,7 +3164,7 @@ class _AccountExecutionBroker(FakeExecutionBroker):
 
 @pytest.mark.usefixtures("trading_enabled")
 def test_runtime_executes_crossed_lower_trigger_orb_once_in_auto_mode(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, authorize_full_live
 ):
     broker = _AccountExecutionBroker()
     broker.positions["overseas"]["holdings"] = []
@@ -3175,9 +3175,7 @@ def test_runtime_executes_crossed_lower_trigger_orb_once_in_auto_mode(
     monkeypatch.setattr(
         "src.services.trading_engine.is_buyboard_engine_enabled", lambda: True
     )
-    monkeypatch.setattr(
-        execution_config, "KIS_LIVE_EXECUTION_MODE", "FULL_LIVE"
-    )
+    authorize_full_live()
     worker.runtime.trading_engine._market_is_open_fn = lambda: True
     session_date = _current_us_session_date()
     one_minute = OrbCandidate(
@@ -3371,12 +3369,15 @@ def test_external_buy_snapshot_fences_the_following_runtime_heartbeat(
 
 
 @pytest.mark.usefixtures("trading_enabled")
-def test_reconciliation_emergency_command_reaches_fake_broker(tmp_path, monkeypatch):
+def test_reconciliation_emergency_command_reaches_fake_broker(
+    tmp_path, monkeypatch, authorize_full_live
+):
     broker = _AccountExecutionBroker()
     broker.queue_acceptance(broker_order_id="B-EMERGENCY")
     worker, engine, _ = _guarded_reconciliation_worker(
         tmp_path, monkeypatch, broker
     )
+    authorize_full_live()
     _seed_card(
         engine,
         board_status=BoardStatus.SELL_ALL,
@@ -3393,7 +3394,9 @@ def test_reconciliation_emergency_command_reaches_fake_broker(tmp_path, monkeypa
 
 
 @pytest.mark.usefixtures("trading_enabled")
-def test_reconciliation_cancel_command_reaches_fake_broker(tmp_path, monkeypatch):
+def test_reconciliation_cancel_command_reaches_fake_broker(
+    tmp_path, monkeypatch, authorize_full_live
+):
     broker = _AccountExecutionBroker()
     broker.discovery = BrokerOrderDiscoveryResult(
         open_orders_complete=True,
@@ -3416,6 +3419,7 @@ def test_reconciliation_cancel_command_reaches_fake_broker(tmp_path, monkeypatch
     worker, engine, _ = _guarded_reconciliation_worker(
         tmp_path, monkeypatch, broker
     )
+    authorize_full_live()
     _seed_card(
         engine,
         board_status=BoardStatus.SELL_ALL,
@@ -3451,7 +3455,7 @@ def test_reconciliation_cancel_command_reaches_fake_broker(tmp_path, monkeypatch
 
 @pytest.mark.usefixtures("trading_enabled")
 def test_ambiguous_reconciliation_cancel_is_not_called_twice(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, authorize_full_live
 ):
     broker = _AccountExecutionBroker()
     broker.discovery = BrokerOrderDiscoveryResult(
@@ -3475,6 +3479,7 @@ def test_ambiguous_reconciliation_cancel_is_not_called_twice(
     worker, engine, _ = _guarded_reconciliation_worker(
         tmp_path, monkeypatch, broker
     )
+    authorize_full_live()
     _seed_card(
         engine,
         board_status=BoardStatus.SELL_ALL,
@@ -3514,13 +3519,14 @@ def test_ambiguous_reconciliation_cancel_is_not_called_twice(
 
 @pytest.mark.usefixtures("trading_enabled")
 def test_ambiguous_reconciliation_submission_is_not_called_twice(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, authorize_full_live
 ):
     broker = _AccountExecutionBroker()
     broker.queue_timeout()
     worker, engine, _ = _guarded_reconciliation_worker(
         tmp_path, monkeypatch, broker
     )
+    authorize_full_live()
     _seed_card(
         engine,
         board_status=BoardStatus.SELL_ALL,

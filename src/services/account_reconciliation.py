@@ -861,6 +861,7 @@ def _settle_capital_reservation(
     consumed_notional = max(0.0, order.filled_quantity * fill_price)
     if order.status in _TERMINAL_EXECUTION_STATUSES:
         reservation.remaining_reserved_notional = 0.0
+        reservation.remaining_projected_open_risk = 0.0
         reservation.status = (
             CapitalReservationStatus.CONSUMED
             if reservation.requested_notional > 0
@@ -874,14 +875,132 @@ def _settle_capital_reservation(
     target_remaining = max(
         0.0, reservation.requested_notional - consumed_notional
     )
-    if target_remaining == reservation.remaining_reserved_notional:
+    target_open_risk = (
+        reservation.projected_open_risk
+        * target_remaining
+        / reservation.requested_notional
+        if reservation.requested_notional > 0
+        else 0.0
+    )
+    if (
+        target_remaining == reservation.remaining_reserved_notional
+        and target_open_risk == reservation.remaining_projected_open_risk
+    ):
         return
     reservation.remaining_reserved_notional = target_remaining
+    reservation.remaining_projected_open_risk = target_open_risk
     reservation.status = (
         CapitalReservationStatus.CONSUMED
         if target_remaining <= 0
         else CapitalReservationStatus.PARTIALLY_CONSUMED
     )
+
+
+_RESERVATION_TRANSITION_HOLD_STATUSES = {
+    ExecutionOrderStatus.PREPARED,
+    ExecutionOrderStatus.SUBMITTING,
+    ExecutionOrderStatus.CANCEL_PENDING,
+    ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE,
+}
+
+
+def _settle_reservations_from_replacement_leaves(
+    *,
+    orders: Sequence[ExecutionOrderRecord],
+    reservation_by_id: Mapping[str, CapitalReservation],
+    observed_at: datetime,
+    alerts: list[ReconciliationAlert],
+) -> None:
+    """Settle each shared reservation from one current replacement leaf.
+
+    A successful replacement deliberately transfers the original order's
+    reservation ID to its descendant. A cancelled predecessor therefore
+    cannot release that row while a descendant is still live. Grouping by
+    reservation also makes settlement exactly once per reconciliation pass.
+    """
+
+    orders_by_reservation: dict[str, list[ExecutionOrderRecord]] = {}
+    for order in orders:
+        reservation_id = str(order.capital_reservation_id or "").strip()
+        if reservation_id:
+            orders_by_reservation.setdefault(reservation_id, []).append(order)
+
+    for reservation_id, linked_orders in orders_by_reservation.items():
+        reservation = reservation_by_id.get(reservation_id)
+        if reservation is None or not reservation.is_open():
+            continue
+
+        linked_client_ids = {order.client_order_id for order in linked_orders}
+        predecessor_ids = {
+            order.replaces_execution_order_id
+            for order in linked_orders
+            if order.replaces_execution_order_id in linked_client_ids
+        }
+        leaves = [
+            order
+            for order in linked_orders
+            if order.client_order_id not in predecessor_ids
+        ]
+        live_orders = [
+            order
+            for order in linked_orders
+            if order.status in _OPEN_EXECUTION_STATUSES
+        ]
+        live_leaves = [
+            order for order in leaves if order.status in _OPEN_EXECUTION_STATUSES
+        ]
+
+        if live_orders:
+            if len(live_orders) != 1 or len(live_leaves) != 1:
+                sample = live_orders[0]
+                alerts.append(
+                    ReconciliationAlert(
+                        "CAPITAL_RESERVATION_REPLACEMENT_CHAIN_CONFLICT",
+                        ReconciliationAlertSeverity.CRITICAL,
+                        (
+                            "One capital reservation has multiple or non-leaf live "
+                            "orders; its hold was preserved for manual reconciliation"
+                        ),
+                        sample.symbol,
+                        sample.client_order_id,
+                        sample.broker_order_id,
+                    )
+                )
+                continue
+            owner = live_leaves[0]
+            if owner.status in _RESERVATION_TRANSITION_HOLD_STATUSES:
+                # PREPARED/SUBMITTING and ambiguous cancellation/submission
+                # states retain the exact transition hold. Cumulative fill
+                # arithmetic from a predecessor must not shrink it.
+                continue
+            _settle_capital_reservation(
+                order=owner,
+                reservation=reservation,
+                observed_at=observed_at,
+            )
+            continue
+
+        if len(leaves) != 1:
+            sample = leaves[0] if leaves else linked_orders[0]
+            alerts.append(
+                ReconciliationAlert(
+                    "CAPITAL_RESERVATION_REPLACEMENT_CHAIN_CONFLICT",
+                    ReconciliationAlertSeverity.CRITICAL,
+                    (
+                        "Capital reservation replacement chain has no unique terminal "
+                        "leaf; its hold was preserved for manual reconciliation"
+                    ),
+                    sample.symbol,
+                    sample.client_order_id,
+                    sample.broker_order_id,
+                )
+            )
+            continue
+        _settle_capital_reservation(
+            order=leaves[0],
+            reservation=reservation,
+            observed_at=observed_at,
+        )
 
 
 def _clear_reservation_absence(reservation: CapitalReservation) -> None:
@@ -1235,11 +1354,6 @@ def reduce_account_reconciliation(
             position_manager=position_manager,
             alerts=alerts,
         )
-        _settle_capital_reservation(
-            order=exact,
-            reservation=reservation_by_id.get(exact.capital_reservation_id),
-            observed_at=snapshot.observed_at,
-        )
 
     # A4a conservative path.  A heuristic candidate consumes the broker
     # snapshot for classification only; it never grants ownership/exact ID.
@@ -1584,13 +1698,12 @@ def reduce_account_reconciliation(
         for order in orders
         if order.capital_reservation_id
     }
-    for order in orders:
-        if order.status in _TERMINAL_EXECUTION_STATUSES:
-            _settle_capital_reservation(
-                order=order,
-                reservation=reservation_by_id.get(order.capital_reservation_id),
-                observed_at=snapshot.observed_at,
-            )
+    _settle_reservations_from_replacement_leaves(
+        orders=orders,
+        reservation_by_id=reservation_by_id,
+        observed_at=snapshot.observed_at,
+        alerts=alerts,
+    )
     for reservation in reservations:
         if reservation.is_open() and reservation.reservation_id not in referenced_reservations:
             classifications.append(
@@ -1621,7 +1734,8 @@ def reduce_account_reconciliation(
         # not reserve buying power and must not be mislabeled as corrupt.
         if order.side != OrderSide.BUY or order.intent != OrderIntent.ENTRY:
             continue
-        if order.capital_reservation_id and order.capital_reservation_id in reservation_by_id:
+        linked_reservation = reservation_by_id.get(order.capital_reservation_id)
+        if linked_reservation is not None and linked_reservation.is_open():
             continue
         classifications.append(
             ReconciliationClassification(
@@ -1633,7 +1747,7 @@ def reduce_account_reconciliation(
             ReconciliationAlert(
                 "LIVE_ORDER_WITHOUT_CAPITAL_RESERVATION",
                 ReconciliationAlertSeverity.CRITICAL,
-                "Live order has no matching durable capital reservation",
+                "Live BUY order has no matching open durable capital reservation",
                 order.symbol,
                 order.client_order_id,
             )

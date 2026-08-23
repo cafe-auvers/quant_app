@@ -7,6 +7,8 @@ import os
 import random
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("authorized_full_live")
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
@@ -32,6 +34,7 @@ from src.core.kanban_transitions import (
 )
 from src.core.order_state import OrderIntent, OrderSide
 from src.core.trade_card_state import BoardStatus, EntryRuntimeStatus, TradeCardState
+from src.risk.pre_trade import PreTradeRiskDecision
 from src.services import buyboard_runtime
 from src.services import trade_card_repository as card_repo
 from src.services import trading_engine as trading_engine_module
@@ -188,7 +191,7 @@ def test_f4_seeded_adversarial_actions_drive_real_sut_and_converge(
             intent: OrderIntent = OrderIntent.STOP_LOSS,
             emergency: bool = True,
         ) -> SubmitExecutionRequest:
-            return SubmitExecutionRequest(
+            fields = dict(
                 client_order_id=client_order_id,
                 environment="PROD",
                 account_no=account_no,
@@ -204,6 +207,26 @@ def test_f4_seeded_adversarial_actions_drive_real_sut_and_converge(
                 attempt_group_id=f"group-{sequence_number}",
                 attempt_number=1,
             )
+            if side == OrderSide.BUY and intent == OrderIntent.ENTRY:
+                risk_plan_id = f"GATE1:F4:{symbol}"
+                fields.update(
+                    pre_trade_risk_decision=PreTradeRiskDecision.approve(
+                        environment="PROD",
+                        account_no=account_no,
+                        symbol=symbol,
+                        side=side,
+                        intent=intent,
+                        quantity=10,
+                        reference_price=100.0,
+                        exchange="NASD",
+                        execution_policy="REGULAR_LIMIT",
+                        strategy_id="ORB",
+                        plan_id=risk_plan_id,
+                    ),
+                    risk_strategy_id="ORB",
+                    risk_plan_id=risk_plan_id,
+                )
+            return SubmitExecutionRequest(**fields)
 
         if action == "stale_entry":
             now = datetime(2026, 8, 17, 14, 30, tzinfo=timezone.utc)
