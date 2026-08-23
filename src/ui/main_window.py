@@ -3442,6 +3442,7 @@ class MainWindow(
         *,
         timeout: float | None = None,
         supersede_pending: bool = False,
+        push_remote: bool = True,
     ) -> SaveResult:
         """Synchronously persist user-managed state."""
         return self._state_save_manager().save_now(
@@ -3450,6 +3451,7 @@ class MainWindow(
             append_log=getattr(self, "append_log", None),
             lock_timeout=timeout,
             supersede_pending=supersede_pending,
+            push_remote=push_remote,
         )
 
     def _load_chart_drawings(self) -> dict:
@@ -4727,7 +4729,14 @@ class MainWindow(
         queue_manager = self.__dict__.get("execution_queue_manager")
         if queue_manager is not None:
             self._save_execution_queue_state()
-        saved = self._save_state_now(timeout=5.0, supersede_pending=True)
+        saved = self._save_state_now(
+            timeout=5.0,
+            supersede_pending=True,
+            # The worker below publishes all four documents in one guarded
+            # transaction.  Per-document background pushes here can only
+            # create partial revisions or noisy conflicts before that step.
+            push_remote=False,
+        )
         if not saved.success:
             QMessageBox.warning(
                 self,

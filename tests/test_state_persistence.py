@@ -278,7 +278,15 @@ def test_shutdown_flush_uses_bounded_wait_and_sync_save():
             self.wait_timeout = timeout
             return True
 
-        def save_now(self, *args, save_lock=None, append_log=None, lock_timeout=None, supersede_pending=False):
+        def save_now(
+            self,
+            *args,
+            save_lock=None,
+            append_log=None,
+            lock_timeout=None,
+            supersede_pending=False,
+            push_remote=True,
+        ):
             self.save_timeout = lock_timeout
             self.supersede_pending = supersede_pending
             return SaveResult(

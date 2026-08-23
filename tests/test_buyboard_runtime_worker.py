@@ -24,6 +24,7 @@ from PyQt5.QtWidgets import QApplication
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
+from src.api.kis_account_snapshot_dual import KisTransientApiError
 from src.core import execution_config
 from src.core.account_broker_snapshot import AccountBrokerSnapshot, SnapshotCompleteness
 from src.core.board_workflow import (
@@ -2517,6 +2518,38 @@ def test_periodic_refresh_does_not_requery_before_its_interval(tmp_path, monkeyp
 
     worker._run_one_cycle()  # immediately after -- well within the refresh interval
     assert len(broker.get_positions_calls) == calls_after_first
+
+
+def test_periodic_refresh_transient_failure_uses_account_cooldown(
+    tmp_path, monkeypatch, caplog
+):
+    broker = _FakeBroker()
+    calls = []
+
+    def unavailable(*, environment, account_no=None):
+        calls.append(account_no)
+        raise KisTransientApiError("EGW00300 gateway routing failure")
+
+    monkeypatch.setattr(broker, "get_positions", unavailable)
+    worker, _engine = _worker(tmp_path, broker=broker)
+    worker.runtime = _build_test_runtime(
+        buying_power_provider=worker._buying_power_provider,
+        card_lookup=worker._card_lookup,
+        broker=worker._broker,
+        market_data=_dummy_market_data(),
+    )
+    now = dt.datetime.now(dt.timezone.utc)
+    worker._account_balance_refreshed_at["1"] = now - dt.timedelta(hours=1)
+    worker._account_reconciled_at["1"] = now
+
+    with caplog.at_level(logging.WARNING):
+        worker._refresh_account_state_if_due([])
+        worker._refresh_account_state_if_due([])
+
+    assert calls == ["1"]
+    assert worker._account_refresh_retry_not_before["1"] > now
+    assert "retry deferred for 30s" in caplog.text
+    assert "Traceback" not in caplog.text
 
 
 def test_periodic_refresh_requeries_once_the_interval_has_elapsed(tmp_path, monkeypatch):
