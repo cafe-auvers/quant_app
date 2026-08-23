@@ -73,6 +73,40 @@ def test_health_snapshot_surfaces_stale_data_and_unknown_orders(monkeypatch):
     assert snapshot.overall_level == health.HealthLevel.CRITICAL
 
 
+def test_mirror_health_uses_separate_daily_and_hourly_scopes(monkeypatch):
+    calls = {}
+    monkeypatch.setattr(
+        health, "expected_latest_market_data_date", lambda: dt.date(2026, 8, 21)
+    )
+    monkeypatch.setattr(
+        health,
+        "local_mirror_is_stale",
+        lambda _engine, _expected, *, tickers: calls.setdefault(
+            "daily", list(tickers)
+        )
+        and False,
+    )
+    monkeypatch.setattr(
+        health,
+        "local_mirror_hourly_is_stale",
+        lambda _engine, _expected, *, tickers: calls.setdefault(
+            "hourly", list(tickers)
+        )
+        and False,
+    )
+    context = health.HealthContext(
+        mirror_engine=object(),
+        mirror_tickers=["AAPL", "MSFT", "NVDA"],
+        mirror_hourly_tickers=["SPY", "AAPL"],
+    )
+
+    check = health._mirror_check(context)
+
+    assert check.level == health.HealthLevel.HEALTHY
+    assert calls["daily"] == ["AAPL", "MSFT", "NVDA"]
+    assert calls["hourly"] == ["SPY", "AAPL"]
+
+
 def test_health_displays_effective_runtime_portfolio_limits(monkeypatch):
     monkeypatch.setattr(
         health.execution_config,
