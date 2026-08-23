@@ -118,6 +118,29 @@ def test_projected_exposure_counts_partial_buy_once_with_linked_reservation():
     assert exposures[0].reservation_id == reservation.reservation_id
 
 
+def test_unresolved_external_buy_uses_remaining_quantity_and_effective_stop():
+    card = _card(active_stop_price=95.0)
+    external = new_discovered_external_order(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        broker_order_id="external-1",
+        quantity_requested=10,
+        filled_quantity=4,
+        limit_price=100.0,
+    )
+
+    exposures = buyboard_runtime._portfolio_projected_exposures(
+        cards=(card,), external_orders=(external,)
+    )
+
+    assert len(exposures) == 1
+    assert exposures[0].source == "UNRESOLVED_EXTERNAL_BUY"
+    assert exposures[0].gross_notional_usd == pytest.approx(600.0)
+    assert exposures[0].open_risk_usd == pytest.approx(30.0)
+
+
 def _card(symbol: str = "AAPL", **overrides) -> TradeCardState:
     values = dict(
         environment="PROD",
@@ -1096,7 +1119,9 @@ def test_ambiguous_cancel_preserves_id_and_blocks_additional_broker_calls(
 
 
 @pytest.mark.usefixtures("trading_enabled")
-def test_partial_sell_and_sell_all_reach_submit_guarded(tmp_path, monkeypatch):
+def test_entry_limits_do_not_block_exits_cancellation_reconciliation_or_recovery(
+    tmp_path, monkeypatch
+):
     manager = PortfolioRiskManager(
         PortfolioRiskLimits(
             max_simultaneous_positions=1,
@@ -1122,14 +1147,36 @@ def test_partial_sell_and_sell_all_reach_submit_guarded(tmp_path, monkeypatch):
         _card(
             "MSFT",
             board_status=BoardStatus.SELL_ALL,
+            position_runtime_status=PositionRuntimeStatus.LIQUIDATING,
             broker_quantity=10,
             orderable_quantity=10,
         ),
     )
-    market_data.subscribe(["AAPL", "MSFT"])
+    stop_loss = _persist_owned_card(
+        engine,
+        _card(
+            "NVDA",
+            board_status=BoardStatus.SELL_ALL,
+            broker_quantity=10,
+            orderable_quantity=10,
+        ),
+    )
+    recovery = _persist_owned_card(
+        engine,
+        _card(
+            "AMZN",
+            board_status=BoardStatus.SELL_ALL,
+            position_runtime_status=PositionRuntimeStatus.LIQUIDATING,
+            broker_quantity=10,
+            orderable_quantity=10,
+        ),
+    )
+    market_data.subscribe(["AAPL", "MSFT", "NVDA", "AMZN"])
     market_data.poll_once()
     broker.queue_acceptance(broker_order_id="B-PARTIAL")
     broker.queue_acceptance(broker_order_id="B-ALL")
+    broker.queue_acceptance(broker_order_id="B-STOP")
+    broker.queue_acceptance(broker_order_id="B-RECOVERY")
 
     partial_result = runtime.trading_engine._position_callbacks.submit_sell_order(
         environment="PROD",
@@ -1147,13 +1194,29 @@ def test_partial_sell_and_sell_all_reach_submit_guarded(tmp_path, monkeypatch):
         reason="sell_all_retry",
         trade_card=sell_all,
     )
+    stop_result = runtime.trading_engine._position_callbacks.submit_sell_order(
+        environment="PROD",
+        account_no="1",
+        symbol="NVDA",
+        quantity=10,
+        reason="stop_loss",
+        trade_card=stop_loss,
+    )
+    recovery_result = runtime.reconciliation_emergency_sell(recovery, 10)
+
+    broker.queue_cancel_confirmed()
+    cancelled_client_order_id = partial.exit_client_order_id
+    runtime.reconciliation_cancel_order(partial, cancelled_client_order_id)
 
     assert partial_result.status == UnifiedExecutionStatus.ACKNOWLEDGED
     assert all_result.status == UnifiedExecutionStatus.ACKNOWLEDGED
-    assert [call["side"] for call in broker.submit_calls] == [
-        OrderSide.SELL,
-        OrderSide.SELL,
-    ]
+    assert stop_result.status == UnifiedExecutionStatus.ACKNOWLEDGED
+    assert recovery_result.status == UnifiedExecutionStatus.ACKNOWLEDGED
+    assert fetch_execution_order(
+        engine, cancelled_client_order_id
+    ).status == ExecutionOrderStatus.CANCELLED
+    assert [call["side"] for call in broker.submit_calls] == [OrderSide.SELL] * 4
+    assert len(broker.cancel_calls) == 1
 
 
 @pytest.mark.usefixtures("trading_enabled")

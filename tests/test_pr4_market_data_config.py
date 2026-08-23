@@ -148,6 +148,9 @@ def test_pr4_market_data_configuration_is_present_and_fail_closed():
         "KIS_MUTATION_MIN_SPACING_SECONDS=0.2",
         "KIS_MUTATION_MAX_CONFIRMED_ATTEMPTS=1",
         "BUYBOARD_ENGINE_ENABLED=true",
+        "PORTFOLIO_MAX_SIMULTANEOUS_POSITIONS=30",
+        "PORTFOLIO_MAX_TOTAL_OPEN_RISK_FRACTION=0.10",
+        "PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION=10.0",
     ):
         assert name in env_example
     assert "websockets==17.0.1" in requirements

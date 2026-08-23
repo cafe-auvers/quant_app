@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from src.risk.portfolio import (
+    MAX_PORTFOLIO_POSITIONS,
     PortfolioPositionRisk,
     PortfolioProjectedExposure,
     PortfolioRiskLimits,
@@ -39,6 +42,126 @@ def _snapshot(**overrides) -> PortfolioRiskSnapshot:
     }
     values.update(overrides)
     return PortfolioRiskSnapshot(**values)
+
+
+def _projected(symbol: str, *, gross: float = 100.0, risk: float = 1.0):
+    return PortfolioProjectedExposure(
+        symbol=symbol,
+        gross_notional_usd=gross,
+        open_risk_usd=risk,
+        source="PENDING_BUY",
+    )
+
+
+def test_controlled_live_defaults_and_hard_position_ceiling():
+    limits = PortfolioRiskLimits()
+
+    assert limits.max_simultaneous_positions == 30
+    assert limits.max_total_open_risk_fraction == 0.10
+    assert limits.max_gross_notional_fraction == 10.0
+    assert MAX_PORTFOLIO_POSITIONS == 30
+    with pytest.raises(ValueError, match="between 1 and 30"):
+        PortfolioRiskLimits(max_simultaneous_positions=31)
+
+
+def test_thirtieth_unique_projected_position_is_permitted():
+    projected = tuple(_projected(f"SYM{index:02d}") for index in range(29))
+    manager = PortfolioRiskManager(PortfolioRiskLimits())
+
+    decision = manager.evaluate_entry(
+        _proposal(symbol="SYM29"),
+        _snapshot(projected_exposures=projected),
+    )
+
+    assert decision.approved is True
+    assert decision.position_count_after == 30
+
+
+def test_thirty_first_unique_projected_position_is_rejected():
+    projected = tuple(_projected(f"SYM{index:02d}") for index in range(30))
+    manager = PortfolioRiskManager(PortfolioRiskLimits())
+
+    decision = manager.evaluate_entry(
+        _proposal(symbol="SYM30"),
+        _snapshot(projected_exposures=projected),
+    )
+
+    assert decision.approved is False
+    assert decision.position_count_after == 31
+    assert any("simultaneous positions" in reason for reason in decision.reasons)
+
+
+def test_multiple_pending_orders_for_same_symbol_count_as_one_position():
+    projected = (
+        _projected("AAPL"),
+        _projected("aapl"),
+        *tuple(_projected(f"SYM{index:02d}") for index in range(28)),
+    )
+    manager = PortfolioRiskManager(PortfolioRiskLimits())
+
+    decision = manager.evaluate_entry(
+        _proposal(symbol="MSFT"),
+        _snapshot(projected_exposures=projected),
+    )
+
+    assert decision.approved is True
+    assert decision.position_count_after == 30
+    assert decision.gross_notional_after_usd == 4_000.0
+
+
+@pytest.mark.parametrize("open_risk_limit", [0.10, 0.20])
+def test_controlled_and_full_live_open_risk_boundaries(open_risk_limit):
+    equity = 10_000.0
+    proposed_open_risk = 50.0
+    manager = PortfolioRiskManager(
+        PortfolioRiskLimits(max_total_open_risk_fraction=open_risk_limit)
+    )
+    at_limit = _projected(
+        "AAPL",
+        gross=1_000.0,
+        risk=(equity * open_risk_limit) - proposed_open_risk,
+    )
+    above_limit = _projected(
+        "AAPL",
+        gross=1_000.0,
+        risk=(equity * open_risk_limit) - proposed_open_risk + 0.01,
+    )
+
+    permitted = manager.evaluate_entry(
+        _proposal(), _snapshot(projected_exposures=(at_limit,))
+    )
+    rejected = manager.evaluate_entry(
+        _proposal(), _snapshot(projected_exposures=(above_limit,))
+    )
+
+    assert permitted.approved is True
+    assert permitted.total_open_risk_after_usd == equity * open_risk_limit
+    assert rejected.approved is False
+    assert any("total open risk" in reason for reason in rejected.reasons)
+
+
+def test_one_thousand_percent_gross_notional_is_an_extreme_ceiling_only():
+    manager = PortfolioRiskManager(PortfolioRiskLimits())
+
+    below = manager.evaluate_entry(
+        _proposal(),
+        _snapshot(projected_exposures=(_projected("AAPL", gross=98_999.99),)),
+    )
+    at_limit = manager.evaluate_entry(
+        _proposal(),
+        _snapshot(projected_exposures=(_projected("AAPL", gross=99_000.0),)),
+    )
+    above = manager.evaluate_entry(
+        _proposal(),
+        _snapshot(projected_exposures=(_projected("AAPL", gross=99_000.01),)),
+    )
+
+    assert below.approved is True
+    assert below.reasons == ()
+    assert at_limit.approved is True
+    assert at_limit.gross_notional_after_usd == 100_000.0
+    assert above.approved is False
+    assert any("gross notional" in reason for reason in above.reasons)
 
 
 def test_approves_entry_within_all_aggregate_limits():

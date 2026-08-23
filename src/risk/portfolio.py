@@ -13,6 +13,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional, Tuple
 
 
+MAX_PORTFOLIO_POSITIONS = 30
+
+
 def _finite_nonnegative(value: float, name: str) -> float:
     number = float(value)
     if not math.isfinite(number) or number < 0:
@@ -28,9 +31,9 @@ def _normalized_text(value: str) -> str:
 class PortfolioRiskLimits:
     """Account-level limits; zero disables an optional advanced limit."""
 
-    max_simultaneous_positions: int = 20
+    max_simultaneous_positions: int = MAX_PORTFOLIO_POSITIONS
     max_total_open_risk_fraction: float = 0.10
-    max_gross_notional_fraction: float = 2.0
+    max_gross_notional_fraction: float = 10.0
     max_incremental_buying_power_fraction: float = 0.0
     max_daily_loss_fraction: float = 0.0
     max_drawdown_fraction: float = 0.0
@@ -41,8 +44,12 @@ class PortfolioRiskLimits:
     max_fx_age: timedelta = timedelta(minutes=5)
 
     def __post_init__(self) -> None:
-        if int(self.max_simultaneous_positions) <= 0:
-            raise ValueError("max_simultaneous_positions must be positive")
+        position_limit = int(self.max_simultaneous_positions)
+        if not 1 <= position_limit <= MAX_PORTFOLIO_POSITIONS:
+            raise ValueError(
+                "max_simultaneous_positions must be between 1 and "
+                f"{MAX_PORTFOLIO_POSITIONS}"
+            )
         for name in (
             "max_total_open_risk_fraction",
             "max_gross_notional_fraction",
@@ -246,8 +253,12 @@ class PortfolioRiskReservationSpec:
             raise ValueError("portfolio reservation scope is incomplete")
         if self.proposed_notional_usd <= 0:
             raise ValueError("portfolio reservation proposed notional must be positive")
-        if int(self.max_simultaneous_positions) <= 0:
-            raise ValueError("portfolio reservation position limit must be positive")
+        position_limit = int(self.max_simultaneous_positions)
+        if not 1 <= position_limit <= MAX_PORTFOLIO_POSITIONS:
+            raise ValueError(
+                "portfolio reservation position limit must be between 1 and "
+                f"{MAX_PORTFOLIO_POSITIONS}"
+            )
         _finite_nonnegative(
             self.max_total_open_risk_fraction,
             "max_total_open_risk_fraction",

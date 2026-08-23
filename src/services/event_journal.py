@@ -305,11 +305,7 @@ def load_recent_events(
         return []
     wanted_symbol = str(symbol or "").strip().upper()
     path = Path(path or EVENT_JOURNAL_FILE)
-    archives = sorted(
-        path.parent.glob(f"{path.stem}.*{path.suffix}"),
-        key=lambda candidate: candidate.stat().st_mtime,
-        reverse=True,
-    )
+    archives = _archive_paths(path)
     paths = [path, *archives]
     events: List[Dict[str, Any]] = []
     for candidate in paths:
