@@ -69,26 +69,24 @@ for the current formula.
 - The active runtime checks the compact card revision every three minutes and
   the standby every five minutes. A write made by the same process invalidates
   its cache immediately; ownership activation force-loads canonical cards.
-- A switch of Execution Owner is not allowed to wait for that minute: the
+- A switch of Execution Owner is not allowed to wait for that cadence: the
   target force-loads all cards and installs current quote subscriptions and
   stops before it can publish `ACTIVE`.
-- Protective offline ownership evidence is one bulk ownership read every ten
+- Protective offline ownership evidence is one bulk ownership read every thirty
   seconds while positions exist, not one query per card.
 - Unchanged runtime readiness uses one revision read plus one UPDATE; it no
   longer selects the same device row before and after every heartbeat.
-- Each running desktop publishes its compact `main.py` process heartbeat to
-  TiDB every 45 seconds. An existing heartbeat is one UPDATE, with no
-  SELECT-before-UPDATE or separate COMMIT statement. This is independent of
-  the PC MySQL probe, so a laptop remains an eligible Execution Owner while
-  the PC is off.
+- The guarded runtime's `runtime_device_state` row is also the canonical
+  `main.py` liveness proof. `app_runtime_status` remains only for lifecycle
+  and compatibility fallback when the guarded runtime is absent, eliminating
+  a second steady TiDB heartbeat from the same process.
 - An unchanged runtime-readiness heartbeat is likewise one atomic autocommit
   UPDATE. After the first full publication, stable readiness rewrites only
   `updated_at`; hostname, schema, and readiness JSON are sent again only when
   those details change. State transitions, handoffs, ownership changes,
   commands, orders, and broker evidence retain their explicit transactions.
-- A steady `main.py` process heartbeat similarly updates only `heartbeat_at`
-  when the exact PID is still active. A new PID, stopped row, or missing row
-  automatically takes the full lifecycle update/insert path.
+- A legacy/fallback `main.py` heartbeat updates only `heartbeat_at`. New-profile
+  runtimes do not run this duplicate steady writer.
 - Repository fetch/list helpers use the dedicated read-only AUTOCOMMIT pool.
   SQLAlchemy 2.0.43 or newer is required so closing those connections skips
   DBAPI rollback. Broker reconciliation and board projection reads therefore
@@ -99,7 +97,7 @@ for the current formula.
   order refreshes its durable audit timestamp at most hourly; an unchanged
   terminal order is not rewritten. The in-memory/account readiness proof
   remains on the normal reconciliation cadence.
-- A minute-triggered canonical Buy Board refresh performs one revision query
+- A three-minute canonical Buy Board refresh performs one revision query
   and one four-table projection only when that token changed. It no longer
   runs the local compatibility bootstrap, duplicates the TradeCard payload
   read, or repeats the revision query. Explicit local planning changes retain
@@ -107,12 +105,17 @@ for the current formula.
 - A recent successful runtime-readiness UPDATE is reused as the writable-store
   proof. The separate no-op writable transaction remains only as a startup,
   recovery, or missing-heartbeat fallback.
-- The external watchdog still receives its 30-second heartbeat, but successful
-  heartbeat audit rows are compacted to one every five minutes. Failure and
-  recovery status transitions are always recorded.
+- The external watchdog receives an asynchronous five-second HTTPS pulse,
+  independent of TiDB availability. The pulse itself performs no SQL.
+  Successful audit rows are compacted to one per hour; failure and recovery
+  status transitions are always recorded.
 - Empty alert-queue reads use non-committing connections. Runtime startup
   loads all relevant OPEN alert keys once, replacing four SELECT+COMMIT pairs
   per card, and an unchanged account-reconciliation plan opens no transaction.
+- Unchanged account-reconciliation comparison rows are served from process
+  memory. Canonical SQL writes invalidate them immediately and a 15-minute
+  TiDB refresh bounds exceptional external changes; broker truth still
+  refreshes every minute.
 - Planning/control state sync is once per three minutes. Publishing, operator commands,
   control-button actions, broker-boundary checks, and owner activation use
   their immediate paths and do not wait for that display-sync timer.
@@ -142,12 +145,14 @@ polls.
 | Protective ownership proof | 30 seconds, one bulk read only while positions exist |
 | Writable probe | 180-second fallback; normally satisfied by readiness write |
 | Runtime readiness heartbeat | 45 seconds per running device |
-| `main.py` process heartbeat | 45 seconds per running device |
+| `main.py` process heartbeat | Folded into runtime readiness; legacy fallback only |
+| External watchdog pulse | 5 seconds over HTTPS; no TiDB request |
 | Active/standby card revision checks | 180/300 seconds |
 | Buy Board and planning/control display sync | 180 seconds per running device |
 | Operator-command pickup outside regular session | 300 seconds |
-| Alert queue check | 90 seconds; successful DB audit every 5 minutes |
+| Alert queue check | 90 seconds; successful pulse audit every 60 minutes |
 | Stable pending-order snapshot | 2 seconds; unknown submissions stay at 1 second |
+| Reconciliation relational cache | 900 seconds; local writes invalidate immediately |
 
 ### Supported worst-case calculation
 
@@ -166,22 +171,22 @@ daily pattern:
 | --- | ---: |
 | Fallback writable probes (assumes every fallback fires) | 28,800 |
 | Two-device readiness revision + heartbeat UPDATE | 230,400 |
-| Two-device `main.py` process heartbeats | 115,200 |
+| Two-device `main.py` process heartbeats | 0 steady; lifecycle fallback only |
 | Active-owner lease proof | 129,600 |
 | Active/standby card revision checks | 23,040 |
 | Regular/off-hours operator-command checks | 32,664 |
 | Bulk protective ownership proof | 86,400 |
-| Alert queue plus compacted heartbeat audits | 74,880 |
+| Alert queue plus compacted heartbeat audits | 59,040 |
 | Two-device Buy Board revision checks | 28,800 |
 | Planning/control state sync | 72,000 |
-| Minute account-reconciliation relational reads, two accounts | 259,200 |
+| Cached account-reconciliation relational reads, two accounts | 17,280 |
 | Transaction COMMITs for fallback writable probes | 28,800 |
-| **Scheduled total** | **1,109,784** |
-| **With 25% reconnect/scheduling margin** | **1,387,230** |
+| **Scheduled total** | **736,824** |
+| **With 25% reconnect/scheduling margin** | **921,030** |
 
 For capacity planning, this project applies a conservative **8 RU per small
-scheduled statement**. The strict profile therefore budgets about **11.1
-million RUs/month**, or about **4.3 RU/s**, for scheduled work including a 25%
+scheduled statement**. The `external-pulse-v2` profile therefore budgets about
+**7.4 million RUs/month**, or about **2.84 RU/s**, for scheduled work including a 25%
 reconnect/scheduling margin. This leaves more than 100% headroom for real state
 transitions, bulk projection payloads, order journals, TiDB background jobs,
 and measurement error while keeping the cluster target at **7--9 RU/s**.
@@ -238,19 +243,20 @@ scope closed, so the previous COMMIT removal had only changed the
 transaction-control verb. Pool pre-pings also add network requests that do not
 appear as application SELECT digests. Routine coordination reads now use a
 dedicated AUTOCOMMIT pool with both pre-ping and autocommit rollback disabled,
-making each read exactly one SQL request. The strict `strict-7-9-v1` runtime
+making each read exactly one SQL request. The `external-pulse-v2` runtime
 profile also blocks startup beside a fresh peer that has not published the same
 profile, preventing one stale desktop process from silently preserving the old
 request rate. Its regular-session command floor is twenty seconds.
 
-The next SQL-statements capture isolated the remaining write and startup
+The previous SQL-statements capture isolated the remaining write and startup
 overhead: 95 runtime-readiness heartbeats averaged 6.70 RU, 98 `main.py`
 heartbeats averaged 5.85 RU, 803 standalone COMMITs were recorded, and the
 startup recoverable-alert sweep selected incidents 356 times (four alert
-classes across 89 cards). The steady heartbeats now use timestamp-only UPDATEs
-on a 45-second cadence while retaining the 60-second freshness fence. The
-alert sweep is one bulk read, read-only alert polling emits no COMMIT, and an
-unchanged reconciliation plan skips schema and transaction work entirely.
+classes across 89 cards). `external-pulse-v2` retains the one 45-second
+runtime-readiness UPDATE, retires the duplicate steady `main.py` UPDATE, and
+moves fast liveness to the five-second external HTTPS pulse. The alert sweep is
+one bulk read, read-only alert polling emits no COMMIT, and unchanged
+reconciliation state is served from the bounded process cache.
 
 TiDB states that SQL queries, bulk operations, and its own background jobs all
 consume RUs. `EXPLAIN ANALYZE` reports statement RU but excludes gateway egress;
@@ -267,7 +273,7 @@ projected_monthly_RU = observed_24_hour_RU * 30
 ```
 
 The operational acceptance target is a sustained **7--9 RU/s**, assessed using
-the TiDB Cloud one-minute average after both devices have run the strict profile
+the TiDB Cloud one-minute average after both devices have run `external-pulse-v2`
 for at least 15 minutes. Any minute above 9 RU/s during an otherwise idle
 interval fails acceptance; trading transitions and reconciliation spikes are
 recorded separately. Keep the spending limit at zero if a bill is never

@@ -12,6 +12,7 @@ from sqlalchemy.schema import CreateTable
 from src.services import app_state
 from src.services import runtime_status
 from src.services import state_sync as ss
+from src.core.execution_config import COORDINATION_RU_PROFILE
 from src.core.runtime_readiness import RuntimeDeviceState
 from src.services.runtime_device_state_repository import save_runtime_device_state
 import src.ui.main_window as main_window_module
@@ -829,6 +830,54 @@ def test_claim_main_device_if_stale_fails_when_heartbeat_fresh_again(tmp_path):
 
     assert not result.success
     assert ss.get_main_device(engine).main_device.device_id == "laptop-id"
+
+
+def test_current_profile_runtime_row_fences_takeover_without_duplicate_heartbeat(
+    tmp_path,
+):
+    engine = _make_engine(tmp_path)
+    laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    pc = ss.LocalDeviceRole("pc-id", "PC", False)
+    assert ss.claim_main_device(engine, laptop).success
+    save_runtime_device_state(
+        engine,
+        device_id=laptop.device_id,
+        hostname=laptop.hostname,
+        state=RuntimeDeviceState.ACTIVE,
+        details={
+            "main_py_alive": True,
+            "coordination_ru_profile": COORDINATION_RU_PROFILE,
+        },
+    )
+
+    fresh = ss.claim_main_device_if_stale(
+        engine,
+        pc,
+        expected_owner_device_id=laptop.device_id,
+        heartbeat_cutoff_seconds=60,
+    )
+    assert fresh.success is False
+
+    stale_at = dt.datetime.now(dt.timezone.utc).replace(
+        tzinfo=None
+    ) - dt.timedelta(minutes=5)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE runtime_device_state SET updated_at = :stale_at "
+                "WHERE device_id = :device_id"
+            ),
+            {"stale_at": stale_at, "device_id": laptop.device_id},
+        )
+    stale = ss.claim_main_device_if_stale(
+        engine,
+        pc,
+        expected_owner_device_id=laptop.device_id,
+        heartbeat_cutoff_seconds=60,
+    )
+
+    assert stale.success is True
+    assert ss.get_main_device(engine).main_device.device_id == pc.device_id
 
 
 def test_claim_main_device_if_stale_fails_when_ownership_released(tmp_path):

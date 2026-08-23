@@ -413,6 +413,9 @@ class ExternalAlertingService:
         self._last_heartbeat_published_at: Optional[datetime] = None
         self._last_heartbeat_audited_at: Optional[datetime] = None
         self._last_heartbeat_audit_status = ""
+        self._heartbeat_lock = threading.RLock()
+        self._heartbeat_in_flight = False
+        self._heartbeat_thread: Optional[threading.Thread] = None
         ensure_external_alert_tables(engine)
 
     @staticmethod
@@ -1062,7 +1065,8 @@ class ExternalAlertingService:
 
     def publish_heartbeat(self) -> bool:
         now = _as_utc(self._clock())
-        self._last_heartbeat_attempt_at = now
+        with self._heartbeat_lock:
+            self._last_heartbeat_attempt_at = now
         payload = {
             "device_id": self.device_id,
             "published_at": now.isoformat(),
@@ -1074,18 +1078,20 @@ class ExternalAlertingService:
             provider_id = str(self.provider.publish_heartbeat(payload) or "")
             status = "PUBLISHED"
             succeeded = True
-            self._last_heartbeat_published_at = now
+            with self._heartbeat_lock:
+                self._last_heartbeat_published_at = now
         except Exception as exc:
             status = "FAILED"
             error = str(exc)
             succeeded = False
-        audit_due = bool(
-            not self._last_heartbeat_audit_status
-            or status != self._last_heartbeat_audit_status
-            or self._last_heartbeat_audited_at is None
-            or (now - _as_utc(self._last_heartbeat_audited_at)).total_seconds()
-            >= self.heartbeat_audit_interval_seconds
-        )
+        with self._heartbeat_lock:
+            audit_due = bool(
+                not self._last_heartbeat_audit_status
+                or status != self._last_heartbeat_audit_status
+                or self._last_heartbeat_audited_at is None
+                or (now - _as_utc(self._last_heartbeat_audited_at)).total_seconds()
+                >= self.heartbeat_audit_interval_seconds
+            )
         if audit_due:
             table = _heartbeat_table(MetaData())
             try:
@@ -1110,43 +1116,56 @@ class ExternalAlertingService:
                         "error": error,
                     },
                 )
-            self._last_heartbeat_audited_at = now
-            self._last_heartbeat_audit_status = status
+            with self._heartbeat_lock:
+                self._last_heartbeat_audited_at = now
+                self._last_heartbeat_audit_status = status
         return succeeded
 
     def publish_heartbeat_if_due(self) -> bool:
-        table = _heartbeat_table(MetaData())
         now = _as_utc(self._clock())
-        # A successful publication in this process suppresses the durable
-        # lookup until the interval expires. Failures remain immediately
-        # retryable (the runtime itself applies a separate poll cadence).
-        if self._last_heartbeat_published_at is not None and (
-            now - _as_utc(self._last_heartbeat_published_at)
-        ).total_seconds() < self.heartbeat_interval_seconds:
-            return False
-        if self._last_heartbeat_attempt_at is not None:
-            # This process already owns the cadence. The external endpoint is
-            # the heartbeat authority; re-reading its TiDB audit row before
-            # every publication only adds quota cost and no safety.
-            return self.publish_heartbeat()
-        try:
-            with coordination_read_connection(self.engine) as conn:
-                last = conn.execute(
-                    select(table.c.attempted_at)
-                    .where(
-                        table.c.device_id == self.device_id,
-                        table.c.status == "PUBLISHED",
-                    )
-                    .order_by(table.c.attempted_at.desc())
-                    .limit(1)
-                ).scalar_one_or_none()
-        except Exception:
+        # The webhook is the heartbeat authority.  A process restart should
+        # publish immediately instead of spending a TiDB read to discover the
+        # previous process's last audit row.
+        with self._heartbeat_lock:
             last = self._last_heartbeat_published_at
-        if last is not None and (
-            now - _as_utc(last)
-        ).total_seconds() < self.heartbeat_interval_seconds:
-            return False
+            if last is not None and (
+                now - _as_utc(last)
+            ).total_seconds() < self.heartbeat_interval_seconds:
+                return False
         return self.publish_heartbeat()
+
+    def publish_heartbeat_async_if_due(self) -> bool:
+        """Schedule a due webhook pulse without blocking the trading loop."""
+
+        now = _as_utc(self._clock())
+        with self._heartbeat_lock:
+            if self._heartbeat_in_flight:
+                return False
+            # A failed endpoint is retried on the same fast cadence, not on
+            # every one-second engine tick.
+            last = self._last_heartbeat_published_at or self._last_heartbeat_attempt_at
+            if last is not None and (
+                now - _as_utc(last)
+            ).total_seconds() < self.heartbeat_interval_seconds:
+                return False
+            self._heartbeat_in_flight = True
+
+        def publish() -> None:
+            try:
+                self.publish_heartbeat()
+            finally:
+                with self._heartbeat_lock:
+                    self._heartbeat_in_flight = False
+
+        thread = threading.Thread(
+            target=publish,
+            name=f"external-heartbeat-{self.device_id}",
+            daemon=True,
+        )
+        with self._heartbeat_lock:
+            self._heartbeat_thread = thread
+        thread.start()
+        return True
 
     def delivery_attempts(self, incident_id: str) -> List[Dict[str, Any]]:
         table = _attempt_table(MetaData())
@@ -1185,4 +1204,16 @@ def build_external_alerting_service(
         heartbeat_url=heartbeat_url,
         bearer_token=os.getenv("EXTERNAL_ALERT_WEBHOOK_TOKEN", "").strip(),
     )
-    return ExternalAlertingService(engine, provider, device_id=device_id)
+    from src.core import execution_config
+
+    return ExternalAlertingService(
+        engine,
+        provider,
+        device_id=device_id,
+        heartbeat_interval_seconds=(
+            execution_config.EXTERNAL_WATCHDOG_HEARTBEAT_SECONDS
+        ),
+        heartbeat_audit_interval_seconds=(
+            execution_config.EXTERNAL_WATCHDOG_TIDB_AUDIT_SECONDS
+        ),
+    )

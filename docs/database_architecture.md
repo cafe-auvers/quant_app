@@ -195,7 +195,7 @@ provisions all 18 tables through `ensure_coordination_schema()`.
 | `execution_ownership` | `id`; unique `(environment, account_no, symbol)` | Per-symbol owner, strategy instance, assigning actor, and version | Assignment/adoption/handoff and ownership changes; also read at broker safety boundaries |
 | `operator_commands` | `command_id`; unique `idempotency_key` | Manual command request, payload, requester/executor, lifecycle timestamps, broker ID, and before/after hashes | Inserted immediately by the authorized operator; claimed and advanced by the Execution Owner |
 | `runtime_device_state` | `device_id` | Host/device readiness state, schema version, handoff generation/confirmation, details, and heartbeat time | Full write on readiness changes; stable heartbeat every 45 seconds per running device |
-| `app_runtime_status` | `(hostname, process_name)` | PID, active state, start time, and last heartbeat | `main.py` heartbeat every 45 seconds; lifecycle insert/update when process identity or active state changes |
+| `app_runtime_status` | `(hostname, process_name)` | Legacy/fallback PID and process lifecycle status | Lifecycle/fallback updates only while the guarded runtime's canonical `runtime_device_state` heartbeat is absent |
 | `execution_commands` | `id`; unique `idempotency_key` | Low-level broker command journal, lease proof, target order, status, redacted response, and response hash | Recorded immediately before/around broker mutation and updated with the response/outcome |
 | `execution_orders` | `id`; unique client/broker identity keys | Canonical order identity, status, origin, recovery state, version, payload, and timestamp | Immediate identity/status/fill/recovery changes; unchanged working-order audit rewrites are coalesced |
 | `capital_reservations` | `reservation_id` | Requested/remaining notional, status, version, release and absence evidence | Reserve/release/reconciliation events using versioned conditional writes |
@@ -204,7 +204,7 @@ provisions all 18 tables through `ensure_coordination_schema()`.
 | `external_alert_incidents` | `incident_id`; unique `(alert_type, dedupe_key)` | Deduplicated alert state, occurrence/attempt counts, escalation, acknowledgement, and retry timing | Created or version-updated on alert occurrence, retry, escalation, or acknowledgement |
 | `external_alert_delivery_attempts` | `id`; unique `(incident_id, attempt_number)` | Per-attempt delivery status, provider ID, error, and escalation level | Appended for every external alert delivery attempt |
 | `external_alert_spool_imports` | `pending_event_id` | Idempotency record connecting an imported offline alert event to its incident | Inserted when an outage-spooled alert is imported after database recovery |
-| `application_heartbeat_attempts` | `id` | External watchdog heartbeat delivery attempts by device | Failures and transitions are recorded immediately; successful evidence is compacted to roughly one row per five minutes |
+| `application_heartbeat_attempts` | `id` | Compact audit evidence for external watchdog delivery | Failures and transitions are recorded immediately; successful evidence is compacted to roughly one row per hour while the webhook receives a five-second pulse |
 | `execution_schema_migration` | `singleton_id` | Source/target schema versions, migration phase, backup/checksum, cutover lease, reconciliation flag, error, and version | Updated only during guarded execution-schema migration, cutover, reconciliation, or rollback |
 
 ## 6. How and when each database is updated
@@ -268,16 +268,18 @@ There is no PC relay. The principal steady-state database cadences are:
 
 | Coordination activity | Database cadence |
 | --- | ---: |
-| Operator-command pickup during the regular session | 3 seconds, active executor only |
+| Operator-command pickup during the regular session | 20 seconds, active executor only |
 | Lease proof | 20 seconds, active executor only |
 | Protective ownership proof | 30 seconds while positions exist; one bulk read |
 | Runtime-readiness heartbeat | 45 seconds per running device |
-| `main.py` process heartbeat | 45 seconds per running device |
-| Alert queue check | 90 seconds; successful external heartbeat audit compacted to about 5 minutes |
+| `main.py` process heartbeat | Folded into runtime readiness; `app_runtime_status` is a legacy fallback |
+| External watchdog pulse | 5 seconds over HTTPS; no TiDB request per pulse |
+| Alert queue check | 90 seconds; successful external heartbeat audit compacted to about 1 hour |
 | Active/standby card revision check | 180/300 seconds per running device |
 | Buy Board and planning/control display synchronization | 180 seconds per running device |
 | Operator-command pickup | 20 seconds in-session; 300 seconds outside the regular session |
 | Writable probe fallback | 180 seconds; normally satisfied by the readiness write |
+| Account-reconciliation relational comparison refresh | 900 seconds; canonical writes invalidate the process cache immediately |
 
 Event-driven writes do not wait for these timers. Plan publication, control
 changes, owner activation/handoff, command insertion/claim, order status/fill

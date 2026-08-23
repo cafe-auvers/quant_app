@@ -892,6 +892,19 @@ class BuyboardRuntimeWorker(QThread):
                         # durable-device cadence so handoff never relies on a
                         # startup-era snapshot without writing every tick.
                         self._publish_device_state_if_due(RuntimeDeviceState.ACTIVE)
+                    if self._external_alerting is not None:
+                        publish_async = getattr(
+                            self._external_alerting,
+                            "publish_heartbeat_async_if_due",
+                            None,
+                        )
+                        if callable(publish_async):
+                            publish_async()
+                        else:
+                            # Compatibility for focused test doubles and
+                            # older adapters. Production uses the nonblocking
+                            # publisher above.
+                            self._external_alerting.publish_heartbeat_if_due()
                     if database_writable and self._external_alerting is not None:
                         now = datetime.now(timezone.utc)
                         if (
@@ -900,7 +913,6 @@ class BuyboardRuntimeWorker(QThread):
                             >= execution_config.COORDINATION_ALERT_POLL_SECONDS
                         ):
                             self._last_alert_poll_at = now
-                            self._external_alerting.publish_heartbeat_if_due()
                             self._external_alerting.process_due()
                     if not allow_mutations:
                         self._advance_startup_readiness()

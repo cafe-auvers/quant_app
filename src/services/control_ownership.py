@@ -12,6 +12,7 @@ from src.infrastructure.database.coordination_engine import coordination_read_co
 from src.services.runtime_device_state_repository import (
     RuntimeDeviceRecord,
     get_runtime_device_state,
+    runtime_row_owns_process_liveness,
 )
 from src.services.runtime_status import (
     DEFAULT_HEARTBEAT_MAX_AGE_SECONDS,
@@ -76,19 +77,21 @@ def check_executor_readiness(
     if age < 0 or age > float(max_age_seconds):
         reasons.append(f"{record.hostname} readiness heartbeat is stale ({age:.1f}s).")
 
-    heartbeat = get_runtime_process_status(
-        engine,
-        record.hostname,
-        max_age_seconds=max(0, int(max_age_seconds)),
-    )
-    if not heartbeat.active:
-        if heartbeat.age_seconds is None:
-            reasons.append(f"{record.hostname} main.py heartbeat is missing.")
-        else:
-            reasons.append(
-                f"{record.hostname} main.py heartbeat is older than "
-                f"{max(0, int(max_age_seconds))} seconds."
-            )
+    if not runtime_row_owns_process_liveness(record):
+        heartbeat = get_runtime_process_status(
+            engine,
+            record.hostname,
+            max_age_seconds=max(0, int(max_age_seconds)),
+        )
+        if not heartbeat.active:
+            if heartbeat.age_seconds is None:
+                reasons.append(f"{record.hostname} main.py heartbeat is missing.")
+            else:
+                reasons.append(
+                    f"{record.hostname} main.py heartbeat is older than "
+                    f"{max(0, int(max_age_seconds))} seconds."
+                )
+
     if record.state != RuntimeDeviceState.STANDBY_READY:
         reasons.append(
             f"{record.hostname} runtime is {record.state.value}, not STANDBY_READY."

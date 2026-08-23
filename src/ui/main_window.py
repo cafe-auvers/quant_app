@@ -1302,14 +1302,15 @@ class MainWindow(
             f"(commands {execution_config.COORDINATION_OPERATOR_COMMAND_POLL_SECONDS:g}s, "
             f"lease {execution_config.COORDINATION_LEASE_POLL_SECONDS:g}s, "
             f"active cards {execution_config.COORDINATION_ACTIVE_CARD_POLL_SECONDS:g}s, "
-            f"standby cards {execution_config.COORDINATION_STANDBY_CARD_POLL_SECONDS:g}s)."
+            f"standby cards {execution_config.COORDINATION_STANDBY_CARD_POLL_SECONDS:g}s; "
+            f"external pulse {execution_config.EXTERNAL_WATCHDOG_HEARTBEAT_SECONDS:g}s)."
         )
         self._last_coordination_database_notice = ""
         self._start_state_sync()
         self._sync_buyboard_runtime_worker()
 
     def _start_coordination_runtime_heartbeat(self, *, force: bool = False) -> None:
-        """Refresh the shared process heartbeat independently of PC MySQL."""
+        """Refresh the legacy process heartbeat when no runtime pulse exists."""
 
         if self.__dict__.get("_database_shutting_down", False):
             return
@@ -1318,6 +1319,17 @@ class MainWindow(
         engine = self.__dict__.get("coordination_db_engine")
         role = self.__dict__.get("state_sync_role")
         if engine is None or role is None:
+            return
+        runtime = self.__dict__.get("_buyboard_runtime_worker")
+        if (
+            runtime is not None
+            and self._background_worker_running(runtime)
+            and str(getattr(runtime, "_device_id", "") or "") == role.device_id
+        ):
+            # runtime_device_state is the canonical cross-device liveness row.
+            # Keep app_runtime_status only as a compatibility fallback when
+            # the guarded runtime is not running; do not pay for two TiDB
+            # heartbeat UPDATEs from the same process.
             return
         worker = self.__dict__.get("_coordination_runtime_heartbeat_worker")
         if worker is not None:

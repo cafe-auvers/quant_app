@@ -90,7 +90,7 @@ ENGINE_HEARTBEAT_SECONDS = _env_int("ENGINE_HEARTBEAT_SECONDS", 1)
 # Published in runtime readiness so a newly deployed client refuses to share
 # the coordination store with a still-running pre-budget peer. This is a
 # protocol identity, not an operator-overridable setting.
-COORDINATION_RU_PROFILE = "strict-7-9-v1"
+COORDINATION_RU_PROFILE = "external-pulse-v2"
 # The market/ORB loop above stays at one second. These independent cadences
 # cap Internet coordination traffic without delaying broker-boundary fencing.
 COORDINATION_ACTIVE_CARD_POLL_SECONDS = max(
@@ -122,6 +122,17 @@ COORDINATION_OWNERSHIP_PROOF_SECONDS = max(
 )
 COORDINATION_ALERT_POLL_SECONDS = max(
     90.0, _env_float("COORDINATION_ALERT_POLL_SECONDS", 90.0)
+)
+# Liveness monitoring belongs to the external watchdog, not the SQL
+# coordination store.  The runtime checks this cadence from its local
+# one-second loop and publishes without waiting for the TiDB alert poll.
+# Successful webhook traffic is cheap enough to be frequent; only compact
+# audit evidence is written to TiDB, once per hour or on a status transition.
+EXTERNAL_WATCHDOG_HEARTBEAT_SECONDS = max(
+    1.0, _env_float("EXTERNAL_WATCHDOG_HEARTBEAT_SECONDS", 5.0)
+)
+EXTERNAL_WATCHDOG_TIDB_AUDIT_SECONDS = max(
+    3600.0, _env_float("EXTERNAL_WATCHDOG_TIDB_AUDIT_SECONDS", 3600.0)
 )
 # Operator commands are the hottest remaining coordination read while the US
 # regular session is open.  Production measurements near 20 RU/s were
@@ -155,6 +166,12 @@ UNKNOWN_ORDER_RECONCILIATION_SECONDS = max(
 ACTIVE_ACCOUNT_REFRESH_SECONDS = _env_int("ACTIVE_ACCOUNT_REFRESH_SECONDS", 5)
 IDLE_ACCOUNT_REFRESH_SECONDS = _env_int("IDLE_ACCOUNT_REFRESH_SECONDS", 20)
 FULL_RECONCILIATION_SECONDS = _env_int("FULL_RECONCILIATION_SECONDS", 60)
+# Broker truth still refreshes every minute. The relational comparison side
+# is process-local between canonical writes and is force-refreshed from TiDB
+# periodically, avoiding the same three unchanged table reads every minute.
+COORDINATION_RECONCILIATION_CACHE_SECONDS = max(
+    300.0, _env_float("COORDINATION_RECONCILIATION_CACHE_SECONDS", 900.0)
+)
 # Broker status/fill/recovery transitions are persisted immediately.  When an
 # exact working order is observed with no semantic change, its durable
 # last-seen audit timestamp is coalesced; terminal rows need no periodic touch.
