@@ -659,13 +659,15 @@ def _portfolio_projected_exposures(
                 f"Unresolved external BUY {order.broker_order_id} has no usable valuation price"
             )
         notional = quantity * price
-        stop = stop_for(order.symbol, price)
-        open_risk = quantity * (price - stop) if stop > 0 else notional
         exposures.append(
             PortfolioProjectedExposure(
                 symbol=order.symbol,
                 gross_notional_usd=notional,
-                open_risk_usd=open_risk,
+                # DISCOVERED_UNOWNED means no authoritative relationship
+                # exists between this broker order and a local Kanban stop.
+                # Treat the full remaining commitment as risk until explicit
+                # adoption and verified protection establish otherwise.
+                open_risk_usd=notional,
                 source="UNRESOLVED_EXTERNAL_BUY",
             )
         )

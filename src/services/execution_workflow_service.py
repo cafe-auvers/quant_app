@@ -376,6 +376,11 @@ def request_replace(
     broker-level replace today (confirmed by codebase survey); raises
     ``NotImplementedError`` in ``LEGACY_COMPATIBILITY`` mode, same as the
     gateway's own ``replace_guarded`` would if reached directly.
+
+    A production BUY/ENTRY replacement must carry a fresh portfolio decision
+    built with ``PortfolioRiskManager.evaluate_entry(...,
+    replaced_reservation_id=original.capital_reservation_id)``. The gateway
+    validates and transfers that reservation before cancelling the original.
     """
     resolved_gateway = gateway or get_default_execution_gateway()
     if _resolved_mode(resolved_gateway) != ExecutionMode.GUARDED_ENGINE:

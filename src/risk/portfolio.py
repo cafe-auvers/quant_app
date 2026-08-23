@@ -304,7 +304,16 @@ class PortfolioRiskManager:
         self,
         proposal: ProposedPortfolioEntry,
         snapshot: PortfolioRiskSnapshot,
+        *,
+        replaced_reservation_id: str = "",
     ) -> PortfolioRiskDecision:
+        """Evaluate an entry or the net target of a cancel/replace.
+
+        A replacement supplies the durable reservation ID belonging to the
+        original order. Its remaining pending exposure is removed before the
+        replacement target is added; filled position exposure remains in the
+        snapshot. This prevents both double-counting and a capacity gap.
+        """
         reasons: list[str] = []
         try:
             proposed = proposal.as_position()
@@ -324,7 +333,16 @@ class PortfolioRiskManager:
 
         equity = float(snapshot.account_equity_usd)
         buying_power = float(snapshot.usable_buying_power_usd)
-        existing = tuple(snapshot.positions) + tuple(snapshot.projected_exposures)
+        replaced_reservation_id = str(replaced_reservation_id or "").strip()
+        projected_exposures = tuple(
+            exposure
+            for exposure in snapshot.projected_exposures
+            if not (
+                replaced_reservation_id
+                and exposure.reservation_id == replaced_reservation_id
+            )
+        )
+        existing = tuple(snapshot.positions) + projected_exposures
         existing_symbols = {position.symbol for position in existing}
         position_count_after = len(existing_symbols | {proposed.symbol})
         total_open_risk = sum(position.open_risk for position in existing)
@@ -438,7 +456,7 @@ class PortfolioRiskManager:
 
         atomic_baseline = tuple(snapshot.positions) + tuple(
             exposure
-            for exposure in snapshot.projected_exposures
+            for exposure in projected_exposures
             if not exposure.reservation_id
         )
         reservation_spec = None

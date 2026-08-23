@@ -84,9 +84,12 @@ from src.core.order_state import (
 from src.infrastructure.database.coordination_engine import coordination_read_connection
 from src.services import trading_state
 from src.services.capital_reservation_repository import (
+    activate_prepared_replacement_reservation,
     ensure_capital_reservations_table,
     fetch_reservation,
     insert_reservation_if_available,
+    prepare_reservation_for_replacement,
+    restore_prepared_replacement_reservation,
     update_reservation,
 )
 from src.services.execution_command_repository import (
@@ -763,6 +766,12 @@ class ExecutionCommandGateway:
             raise OrderNotFoundForCancelError(f"No ExecutionOrderRecord for client_order_id={request.client_order_id!r}")
         key = _recovery_key(original.environment, original.account_no, original.symbol)
         with self._ownership.claim(key, request.source):
+            replacement_portfolio_spec = None
+            prepared_reservation = None
+            previous_reservation = None
+            replacement_notional = 0.0
+            replacement_open_risk = 0.0
+            replacement_buying_power = 0.0
             # 1. validate the replacement request completely -- before
             # anything is mutated or cancelled.
             if original.environment != request.environment or original.account_no != request.account_no:
@@ -791,6 +800,9 @@ class ExecutionCommandGateway:
                     "must use a fresh identity, never reuse an existing order's"
                 )
             if original.side == OrderSide.BUY and original.intent == OrderIntent.ENTRY:
+                trading_state.require_trading_enabled(
+                    original.environment, original.symbol
+                )
                 require_pre_trade_risk_approval(
                     request.pre_trade_risk_decision,
                     environment=original.environment,
@@ -805,6 +817,62 @@ class ExecutionCommandGateway:
                     strategy_id=request.risk_strategy_id,
                     plan_id=request.risk_plan_id,
                 )
+                risk_spec = getattr(
+                    request.pre_trade_risk_decision,
+                    "portfolio_risk_reservation",
+                    None,
+                )
+                if risk_spec is not None or self._projected_portfolio_risk_required:
+                    try:
+                        replacement_portfolio_spec = (
+                            require_portfolio_risk_reservation_spec(
+                                risk_spec,
+                                environment=original.environment,
+                                account_no=original.account_no,
+                                symbol=original.symbol,
+                                quantity=new_quantity,
+                                reference_price=new_limit_price,
+                                evaluated_at=(
+                                    request.pre_trade_risk_decision.evaluated_at
+                                ),
+                            )
+                        )
+                    except PortfolioRiskReservationSpecError as exc:
+                        raise PreTradeRiskRejectedError(str(exc)) from exc
+                require_live_entry_allowed(
+                    environment=original.environment,
+                    symbol=original.symbol,
+                    side=original.side,
+                    quantity=new_quantity,
+                    limit_price=new_limit_price,
+                )
+                if replacement_portfolio_spec is not None:
+                    if not original.capital_reservation_id:
+                        raise PreTradeRiskRejectedError(
+                            "ENTRY replacement requires the original order's durable "
+                            "capital reservation; the original order was not cancelled"
+                        )
+                    original_reservation = fetch_reservation(
+                        engine, original.capital_reservation_id
+                    )
+                    if (
+                        original_reservation is None
+                        or not original_reservation.is_open()
+                    ):
+                        raise PreTradeRiskRejectedError(
+                            "ENTRY replacement requires an open original reservation; "
+                            "the original order was not cancelled"
+                        )
+                    replacement_notional = new_quantity * new_limit_price
+                    replacement_open_risk = float(
+                        replacement_portfolio_spec.proposed_open_risk_usd
+                    )
+                    replacement_buying_power = float(
+                        self._require_buying_power_provider()(
+                            original.environment, original.account_no
+                        )
+                        or 0.0
+                    )
 
             # 2. verify replace ownership/permission.
             self._require_ownership(
@@ -873,6 +941,7 @@ class ExecutionCommandGateway:
             )
             ensure_execution_commands_table(engine)
             ensure_discovered_external_orders_table(engine)
+            ensure_capital_reservations_table(engine)
             with engine.begin() as conn:
                 require_no_active_unowned_external_order(
                     conn,
@@ -881,6 +950,20 @@ class ExecutionCommandGateway:
                     symbol=original.symbol,
                     allowed_adopted_client_order_id=original.client_order_id,
                 )
+                if replacement_portfolio_spec is not None:
+                    prepared_reservation, previous_reservation = (
+                        prepare_reservation_for_replacement(
+                            conn,
+                            original.capital_reservation_id,
+                            environment=original.environment,
+                            account_no=original.account_no,
+                            symbol=original.symbol,
+                            replacement_notional=replacement_notional,
+                            replacement_open_risk=replacement_open_risk,
+                            buying_power=replacement_buying_power,
+                            portfolio_risk_spec=replacement_portfolio_spec,
+                        )
+                    )
                 insert_command(conn, replace_command)
 
             # 6. cancel the original.
@@ -891,10 +974,72 @@ class ExecutionCommandGateway:
                 lease=request.lease, source=request.source,
                 strategy_instance_id=request.strategy_instance_id,
             )
-            self._do_cancel(cancel_request, record=original, permission_check=_cancellable_for_replace)
+            pre_cancel_filled_quantity = int(original.filled_quantity or 0)
+            try:
+                self._do_cancel(
+                    cancel_request,
+                    record=original,
+                    permission_check=_cancellable_for_replace,
+                    release_capital_reservation=(prepared_reservation is None),
+                )
+            except (
+                GuardedCancellationAmbiguousError,
+                AmbiguousPostBrokerPersistenceError,
+            ):
+                # The broker may have accepted the cancellation. Keep the
+                # larger transition hold until reconciliation resolves it.
+                raise
+            except Exception:
+                if (
+                    prepared_reservation is not None
+                    and previous_reservation is not None
+                ):
+                    with engine.begin() as conn:
+                        restore_prepared_replacement_reservation(
+                            conn,
+                            prepared_reservation,
+                            previous_reservation,
+                        )
+                raise
             cancelled = self._fetch_record(request.client_order_id)
+            if (
+                cancelled is not None
+                and cancelled.status == ExecutionOrderStatus.CANCELLED
+                and int(cancelled.filled_quantity or 0)
+                > pre_cancel_filled_quantity
+            ):
+                if prepared_reservation is not None:
+                    current_hold = fetch_reservation(
+                        engine, prepared_reservation.reservation_id
+                    )
+                    if current_hold is not None and current_hold.is_open():
+                        current_hold.release()
+                        with engine.begin() as conn:
+                            update_reservation(
+                                conn,
+                                current_hold,
+                                expected_version=current_hold.version,
+                            )
+                raise ReplaceNotSafeError(
+                    f"Cannot replace {request.client_order_id!r}: the cancel response "
+                    "reported a new fill after replacement risk was approved. Refresh "
+                    "the position and build a new net-risk decision before retrying."
+                )
             if cancelled is None or cancelled.status != ExecutionOrderStatus.CANCELLED:
                 status = cancelled.status.value if cancelled is not None else "MISSING"
+                if (
+                    cancelled is not None
+                    and cancelled.status == ExecutionOrderStatus.FILLED
+                    and prepared_reservation is not None
+                    and prepared_reservation.is_open()
+                ):
+                    prepared_reservation.release()
+                    with engine.begin() as conn:
+                        update_reservation(
+                            conn,
+                            prepared_reservation,
+                            expected_version=prepared_reservation.version,
+                        )
                 raise ReplaceNotSafeError(
                     f"Cannot replace {request.client_order_id!r}: cancellation did not reach a safe "
                     f"CANCELLED outcome (status={status}) -- a fill or an ambiguous cancel outcome must "
@@ -910,11 +1055,47 @@ class ExecutionCommandGateway:
                 attempt_group_id=cancelled.attempt_group_id, attempt_number=cancelled.attempt_number + 1,
                 lease=request.lease, source=request.source, strategy_instance_id=request.strategy_instance_id,
                 replaces_execution_order_id=request.client_order_id,
+                prepared_capital_reservation_id=(
+                    prepared_reservation.reservation_id
+                    if prepared_reservation is not None
+                    else ""
+                ),
+                prepared_capital_reservation_version=(
+                    prepared_reservation.version
+                    if prepared_reservation is not None
+                    else 0
+                ),
                 pre_trade_risk_decision=request.pre_trade_risk_decision,
                 risk_strategy_id=request.risk_strategy_id,
                 risk_plan_id=request.risk_plan_id,
             )
-            result = self._do_submit(submit_request)
+            try:
+                result = self._do_submit(submit_request)
+            except (
+                GuardedSubmissionAmbiguousError,
+                AmbiguousPostBrokerPersistenceError,
+            ):
+                raise
+            except Exception:
+                # If submission failed before its durable record/reservation
+                # transaction, the original is already confirmed cancelled
+                # and no exposure remains for the transition hold to cover.
+                if (
+                    prepared_reservation is not None
+                    and self._fetch_record(request.new_client_order_id) is None
+                ):
+                    current_hold = fetch_reservation(
+                        engine, prepared_reservation.reservation_id
+                    )
+                    if current_hold is not None and current_hold.is_open():
+                        current_hold.release()
+                        with engine.begin() as conn:
+                            update_reservation(
+                                conn,
+                                current_hold,
+                                expected_version=current_hold.version,
+                            )
+                raise
 
             # The parent replace command finalizes only on full success --
             # a replace that fails partway (e.g. the submit leg raises)
@@ -1709,16 +1890,61 @@ class ExecutionCommandGateway:
             else 0.0
         )
 
-        reservation = CapitalReservation.create(
-            environment=environment, account_no=account_no, symbol=symbol,
-            attempt_group_id=request.attempt_group_id or client_order_id,
-            requested_notional=requested_notional,
-            projected_open_risk=(
-                portfolio_risk_spec.proposed_open_risk_usd
-                if portfolio_risk_spec is not None
-                else 0.0
-            ),
+        projected_open_risk = (
+            portfolio_risk_spec.proposed_open_risk_usd
+            if portfolio_risk_spec is not None
+            else 0.0
         )
+        prepared_reservation_id = str(
+            request.prepared_capital_reservation_id or ""
+        ).strip()
+        if prepared_reservation_id:
+            if not request.replaces_execution_order_id:
+                raise PreTradeRiskRejectedError(
+                    "A prepared capital reservation is valid only for a linked replacement"
+                )
+            replaced_record = self._fetch_record(
+                request.replaces_execution_order_id
+            )
+            if (
+                replaced_record is None
+                or replaced_record.status != ExecutionOrderStatus.CANCELLED
+                or replaced_record.capital_reservation_id
+                != prepared_reservation_id
+                or (
+                    replaced_record.environment,
+                    replaced_record.account_no,
+                    replaced_record.symbol,
+                    replaced_record.side,
+                    replaced_record.intent,
+                )
+                != (environment, account_no, symbol, request.side, request.intent)
+            ):
+                raise PreTradeRiskRejectedError(
+                    "The prepared reservation is not linked to the confirmed-cancelled "
+                    "order this submission replaces"
+                )
+            reservation = fetch_reservation(engine, prepared_reservation_id)
+            if (
+                reservation is None
+                or not reservation.is_open()
+                or (
+                    reservation.environment,
+                    reservation.account_no,
+                    reservation.symbol,
+                )
+                != (environment, account_no, symbol)
+            ):
+                raise PreTradeRiskRejectedError(
+                    "The prepared replacement reservation is missing, closed, or out of scope"
+                )
+        else:
+            reservation = CapitalReservation.create(
+                environment=environment, account_no=account_no, symbol=symbol,
+                attempt_group_id=request.attempt_group_id or client_order_id,
+                requested_notional=requested_notional,
+                projected_open_risk=projected_open_risk,
+            )
         command = ExecutionCommand(
             idempotency_key=idempotency_key, command_type="submit", environment=environment,
             account_no=account_no, symbol=symbol,
@@ -1753,12 +1979,26 @@ class ExecutionCommandGateway:
                 symbol=symbol,
             )
             insert_command(conn, command)
-            insert_reservation_if_available(
-                conn,
-                reservation,
-                buying_power=buying_power,
-                portfolio_risk_spec=portfolio_risk_spec,
-            )
+            if prepared_reservation_id:
+                reservation = activate_prepared_replacement_reservation(
+                    conn,
+                    prepared_reservation_id,
+                    expected_version=(
+                        request.prepared_capital_reservation_version
+                    ),
+                    environment=environment,
+                    account_no=account_no,
+                    symbol=symbol,
+                    requested_notional=requested_notional,
+                    projected_open_risk=projected_open_risk,
+                )
+            else:
+                insert_reservation_if_available(
+                    conn,
+                    reservation,
+                    buying_power=buying_power,
+                    portfolio_risk_spec=portfolio_risk_spec,
+                )
             insert_execution_order(conn, record)
 
         # 7 + 8. separate durable transaction: PREPARED -> SUBMITTING.
@@ -1909,6 +2149,7 @@ class ExecutionCommandGateway:
     def _do_cancel(
         self, request: CancelExecutionRequest, *, record: ExecutionOrderRecord,
         permission_check: Callable[[ExecutionOrderRecord], bool],
+        release_capital_reservation: bool = True,
     ) -> ExecutionOrderRecord:
         # Cache before the first transition.  Every later mutation is applied
         # to this same object, including ambiguous outcomes that raise instead
@@ -2098,7 +2339,7 @@ class ExecutionCommandGateway:
                 if record.status in (
                     ExecutionOrderStatus.CANCELLED,
                     ExecutionOrderStatus.FILLED,
-                ) and record.capital_reservation_id:
+                ) and record.capital_reservation_id and release_capital_reservation:
                     reservation = fetch_reservation(
                         engine, record.capital_reservation_id
                     )

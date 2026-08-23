@@ -38,6 +38,10 @@ and `10.0` is 1,000% of fresh account equity. The only setting changed when
 moving from Controlled Live to this Full Live starting profile is
 `PORTFOLIO_MAX_TOTAL_OPEN_RISK_FRACTION=0.20`.
 
+The Health tab displays these effective runtime values after local environment
+overrides are loaded. This is configuration visibility only; it does not add a
+soft gross-notional warning or another trading blocker below the hard ceiling.
+
 Daily-loss, drawdown, sector, industry, correlation-group, strategy, and
 incremental-buying-power fractions remain `0` (disabled) until fresh,
 trustworthy canonical providers are connected. Missing optional analytical
@@ -68,8 +72,19 @@ Portfolio open-risk fraction
 ÷ fresh account equity
 ```
 
-When a safe effective stop cannot be established for unresolved exposure, the
-projection fails conservatively by treating its full remaining notional as
-open risk. All three limits apply only to exposure-increasing BUY entries. They
-never block SELL, partial SELL, SELL ALL, stop-loss execution, liquidation,
-cancellation, reconciliation, or recovery.
+A `DISCOVERED_UNOWNED` external BUY always contributes its full remaining
+notional as open risk. A same-symbol Kanban card does not prove that an
+external or manual order is protected by the card's stop. Stop-defined risk
+may replace that conservative treatment only after explicit adoption and an
+authoritative protective relationship are verified. All three limits apply
+only to exposure-increasing BUY entries. They never block SELL, partial SELL,
+SELL ALL, stop-loss execution, liquidation, cancellation, reconciliation, or
+recovery.
+
+For a BUY cancel/replace, the replacement's live-envelope, controlled-live,
+pre-trade, and portfolio approvals are validated before the original is
+cancelled. The account transaction evaluates the replacement as the net target
+by excluding the original pending reservation, retains the larger original or
+replacement hold through cancellation, and transfers that same durable
+reservation to the replacement. A definitive cancel rejection restores the
+original hold; an ambiguous cancel keeps the larger hold until reconciliation.

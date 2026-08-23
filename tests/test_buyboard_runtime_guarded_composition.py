@@ -118,7 +118,7 @@ def test_projected_exposure_counts_partial_buy_once_with_linked_reservation():
     assert exposures[0].reservation_id == reservation.reservation_id
 
 
-def test_unresolved_external_buy_uses_remaining_quantity_and_effective_stop():
+def test_unowned_external_buy_uses_full_remaining_notional_as_open_risk():
     card = _card(active_stop_price=95.0)
     external = new_discovered_external_order(
         environment="PROD",
@@ -138,7 +138,7 @@ def test_unresolved_external_buy_uses_remaining_quantity_and_effective_stop():
     assert len(exposures) == 1
     assert exposures[0].source == "UNRESOLVED_EXTERNAL_BUY"
     assert exposures[0].gross_notional_usd == pytest.approx(600.0)
-    assert exposures[0].open_risk_usd == pytest.approx(30.0)
+    assert exposures[0].open_risk_usd == pytest.approx(600.0)
 
 
 def _card(symbol: str = "AAPL", **overrides) -> TradeCardState:

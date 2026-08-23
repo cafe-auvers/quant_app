@@ -173,6 +173,10 @@ class SubmitExecutionRequest:
     lease: Optional[ExecutionLease] = None
     source: ExecutionSource = ExecutionSource.SYSTEM
     replaces_execution_order_id: str = ""
+    # Internal cancel/replace hand-off. The guarded gateway populates these
+    # only after atomically transferring the original entry reservation.
+    prepared_capital_reservation_id: str = ""
+    prepared_capital_reservation_version: int = 0
     # H1 (Workstream 9): required, non-blank whenever source is
     # KANBAN_BOARD and the symbol's persisted execution_owner is KANBAN --
     # the gateway checks this against ExecutionOwnership.strategy_instance_id
@@ -194,6 +198,16 @@ class SubmitExecutionRequest:
         object.__setattr__(self, "account_no", str(self.account_no or ""))
         object.__setattr__(self, "symbol", str(self.symbol or "").upper())
         object.__setattr__(self, "strategy_instance_id", str(self.strategy_instance_id or ""))
+        object.__setattr__(
+            self,
+            "prepared_capital_reservation_id",
+            str(self.prepared_capital_reservation_id or "").strip(),
+        )
+        object.__setattr__(
+            self,
+            "prepared_capital_reservation_version",
+            max(0, int(self.prepared_capital_reservation_version or 0)),
+        )
         object.__setattr__(self, "emergency", bool(self.emergency))
         object.__setattr__(self, "risk_strategy_id", str(self.risk_strategy_id or ""))
         object.__setattr__(self, "risk_plan_id", str(self.risk_plan_id or ""))

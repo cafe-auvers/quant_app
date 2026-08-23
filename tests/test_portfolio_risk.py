@@ -385,3 +385,38 @@ def test_atomic_spec_excludes_durable_reservations_but_keeps_external_exposure()
     assert spec.baseline_position_symbols == ("NVDA",)
     assert spec.baseline_gross_notional_usd == 500.0
     assert spec.baseline_open_risk_usd == 500.0
+
+
+def test_replacement_evaluates_net_exposure_without_dropping_filled_risk():
+    manager = PortfolioRiskManager(
+        PortfolioRiskLimits(
+            max_total_open_risk_fraction=0.10,
+            max_gross_notional_fraction=0.12,
+        )
+    )
+    filled = PortfolioPositionRisk("AAPL", 2, 100.0, 95.0, "ORB")
+    pending = PortfolioProjectedExposure(
+        symbol="AAPL",
+        gross_notional_usd=1_000.0,
+        open_risk_usd=50.0,
+        source="PENDING_BUY",
+        reservation_id="ORIGINAL-RESERVATION",
+    )
+
+    decision = manager.evaluate_entry(
+        _proposal(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            quantity=10,
+        ),
+        _snapshot(positions=(filled,), projected_exposures=(pending,)),
+        replaced_reservation_id="ORIGINAL-RESERVATION",
+    )
+
+    assert decision.approved is True
+    assert decision.position_count_after == 1
+    assert decision.gross_notional_after_usd == 1_200.0
+    assert decision.total_open_risk_after_usd == 60.0
+    assert decision.reservation_spec is not None
+    assert decision.reservation_spec.baseline_gross_notional_usd == 200.0

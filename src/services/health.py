@@ -13,6 +13,7 @@ from typing import Any, Iterable, List, Optional, Sequence
 from sqlalchemy import text
 
 from src.api.kis_account_snapshot_dual import KisEnvironment, load_config
+from src.core import execution_config
 from src.core.order_state import BrokerOrder, OrderStatus, is_open_status
 from src.infrastructure.database.mirror_freshness import (
     local_mirror_hourly_is_stale,
@@ -758,6 +759,25 @@ def _repository_check(status: Optional[RepositoryStatus]) -> HealthCheck:
     )
 
 
+def _portfolio_risk_configuration_check() -> HealthCheck:
+    """Expose effective, already-loaded entry limits without reading secrets."""
+
+    positions = int(execution_config.PORTFOLIO_MAX_SIMULTANEOUS_POSITIONS)
+    open_risk = float(
+        execution_config.PORTFOLIO_MAX_TOTAL_OPEN_RISK_FRACTION
+    )
+    gross = float(execution_config.PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION)
+    return HealthCheck(
+        "Portfolio entry limits",
+        HealthLevel.HEALTHY,
+        f"Effective: {positions} positions, {open_risk:.0%} open risk, "
+        f"{gross:.0%} gross notional",
+        "Read-only effective runtime values after environment overrides. "
+        "These limits apply only to exposure-increasing BUY entries; 10.0 "
+        "is displayed as 1,000%.",
+    )
+
+
 def collect_health_snapshot(context: HealthContext) -> HealthSnapshot:
     """Run read-only local probes and combine them with cached runtime state."""
     token_check, configured = inspect_kis_token()
@@ -772,6 +792,7 @@ def collect_health_snapshot(context: HealthContext) -> HealthSnapshot:
         )
     checks = [
         _repository_check(context.repository_status),
+        _portfolio_risk_configuration_check(),
         token_check,
         _kis_api_check(context, configured),
         _mysql_check(context),

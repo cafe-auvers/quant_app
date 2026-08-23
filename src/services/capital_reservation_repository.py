@@ -405,6 +405,235 @@ def insert_reservation_if_available(
     return insert_reservation(conn, reservation)
 
 
+def prepare_reservation_for_replacement(
+    conn: Connection,
+    original_reservation_id: str,
+    *,
+    environment: str,
+    account_no: str,
+    symbol: str,
+    replacement_notional: float,
+    replacement_open_risk: float,
+    buying_power: float,
+    portfolio_risk_spec,
+) -> tuple[CapitalReservation, CapitalReservation]:
+    """Atomically validate net replacement capacity and hold the larger leg.
+
+    The original and replacement orders are mutually exclusive at the broker,
+    so account capacity is evaluated after removing the original reservation
+    and adding the exact replacement target. Until cancellation is confirmed,
+    the durable reservation retains the larger of the original and replacement
+    commitments. The returned second value is the pre-transfer snapshot used
+    to restore a cleanly rejected/pre-broker-aborted cancellation.
+    """
+
+    scope = (
+        str(environment or "").upper(),
+        str(account_no or ""),
+        str(symbol or "").upper(),
+    )
+    replacement_notional = float(replacement_notional or 0.0)
+    replacement_open_risk = float(replacement_open_risk or 0.0)
+    buying_power = float(buying_power or 0.0)
+    if (
+        not original_reservation_id
+        or replacement_notional <= 0
+        or replacement_open_risk < 0
+        or not all(
+            math.isfinite(value)
+            for value in (
+                replacement_notional,
+                replacement_open_risk,
+                buying_power,
+            )
+        )
+    ):
+        raise ProjectedPortfolioRiskLimitError(
+            "Replacement blocked: a finite, positive transferred reservation is required. "
+            "The original order was not cancelled."
+        )
+
+    lock_scope = CapitalReservation.create(
+        environment=scope[0],
+        account_no=scope[1],
+        symbol=scope[2],
+        attempt_group_id="replacement-account-lock",
+        requested_notional=replacement_notional,
+        projected_open_risk=replacement_open_risk,
+    )
+    _lock_account_reservation_scope(conn, lock_scope)
+    table = _get_capital_reservations_table(MetaData())
+    rows = conn.execute(
+        select(table)
+        .where(
+            table.c.environment == scope[0],
+            table.c.account_no == scope[1],
+            table.c.status.in_(_ACTIVE_STATUS_VALUES),
+        )
+        .with_for_update()
+    ).fetchall()
+    original_row = next(
+        (
+            row
+            for row in rows
+            if str(row.reservation_id) == str(original_reservation_id)
+        ),
+        None,
+    )
+    if original_row is None:
+        raise ProjectedPortfolioRiskLimitError(
+            "Replacement blocked: the original entry reservation is missing or closed. "
+            "The original order was not cancelled."
+        )
+    original = _row_to_reservation(original_row)
+    if (original.environment, original.account_no, original.symbol) != scope:
+        raise ProjectedPortfolioRiskLimitError(
+            "Replacement blocked: the original reservation belongs to a different scope. "
+            "The original order was not cancelled."
+        )
+
+    other_rows = tuple(
+        row
+        for row in rows
+        if str(row.reservation_id) != str(original_reservation_id)
+    )
+    reserved_elsewhere = sum(
+        float(row.remaining_reserved_notional or 0.0) for row in other_rows
+    )
+    available = buying_power - reserved_elsewhere
+    if available + 1e-6 < replacement_notional:
+        raise InsufficientAvailableCapitalError(
+            f"Replacement reservation denied for {scope[0]}/{scope[1]}/{scope[2]}: "
+            f"requested {replacement_notional:.2f}, net available {available:.2f}. "
+            "The original order was not cancelled."
+        )
+
+    replacement = CapitalReservation.create(
+        environment=scope[0],
+        account_no=scope[1],
+        symbol=scope[2],
+        attempt_group_id=original.attempt_group_id,
+        requested_notional=replacement_notional,
+        projected_open_risk=replacement_open_risk,
+    )
+    _require_projected_portfolio_capacity(
+        reservation=replacement,
+        active_rows=other_rows,
+        spec=portfolio_risk_spec,
+    )
+
+    previous = CapitalReservation.from_dict(original.to_dict())
+    original_risk = float(original.remaining_projected_open_risk or 0.0)
+    if original_risk <= 0 and original.remaining_reserved_notional > 0:
+        original_risk = float(original.remaining_reserved_notional)
+    original.requested_notional = max(
+        float(original.remaining_reserved_notional), replacement_notional
+    )
+    original.remaining_reserved_notional = original.requested_notional
+    original.projected_open_risk = max(original_risk, replacement_open_risk)
+    original.remaining_projected_open_risk = original.projected_open_risk
+    update_reservation(conn, original, expected_version=original.version)
+    return original, previous
+
+
+def activate_prepared_replacement_reservation(
+    conn: Connection,
+    prepared_reservation_id: str,
+    *,
+    expected_version: int,
+    environment: str,
+    account_no: str,
+    symbol: str,
+    requested_notional: float,
+    projected_open_risk: float,
+) -> CapitalReservation:
+    """Convert a transition hold into the exact replacement reservation."""
+
+    table = _get_capital_reservations_table(MetaData())
+    scope = (
+        str(environment or "").upper(),
+        str(account_no or ""),
+        str(symbol or "").upper(),
+    )
+    lock_scope = CapitalReservation.create(
+        environment=scope[0],
+        account_no=scope[1],
+        symbol=scope[2],
+        attempt_group_id="replacement-account-lock",
+        requested_notional=max(0.0, float(requested_notional or 0.0)),
+        projected_open_risk=max(0.0, float(projected_open_risk or 0.0)),
+    )
+    _lock_account_reservation_scope(conn, lock_scope)
+    row = conn.execute(
+        select(table)
+        .where(table.c.reservation_id == str(prepared_reservation_id or ""))
+        .with_for_update()
+    ).first()
+    if row is None:
+        raise ProjectedPortfolioRiskLimitError(
+            "Replacement blocked: its prepared reservation no longer exists."
+        )
+    reservation = _row_to_reservation(row)
+    if (
+        not reservation.is_open()
+        or reservation.version != int(expected_version)
+        or (reservation.environment, reservation.account_no, reservation.symbol)
+        != scope
+    ):
+        raise ProjectedPortfolioRiskLimitError(
+            "Replacement blocked: its prepared reservation changed before submission."
+        )
+    requested_notional = float(requested_notional or 0.0)
+    projected_open_risk = float(projected_open_risk or 0.0)
+    if (
+        requested_notional <= 0
+        or projected_open_risk < 0
+        or requested_notional > reservation.remaining_reserved_notional + 1e-6
+        or projected_open_risk
+        > reservation.remaining_projected_open_risk + 1e-6
+    ):
+        raise ProjectedPortfolioRiskLimitError(
+            "Replacement blocked: its exact exposure exceeds the prepared transition hold."
+        )
+    reservation.requested_notional = requested_notional
+    reservation.remaining_reserved_notional = requested_notional
+    reservation.projected_open_risk = projected_open_risk
+    reservation.remaining_projected_open_risk = projected_open_risk
+    reservation.status = CapitalReservationStatus.RESERVED
+    reservation.released_at = None
+    update_reservation(conn, reservation, expected_version=reservation.version)
+    return reservation
+
+
+def restore_prepared_replacement_reservation(
+    conn: Connection,
+    prepared_reservation: CapitalReservation,
+    previous_reservation: CapitalReservation,
+) -> CapitalReservation:
+    """Restore the original hold after a definitive pre-cancel failure."""
+
+    table = _get_capital_reservations_table(MetaData())
+    _lock_account_reservation_scope(conn, previous_reservation)
+    row = conn.execute(
+        select(table)
+        .where(table.c.reservation_id == prepared_reservation.reservation_id)
+        .with_for_update()
+    ).first()
+    if row is None:
+        raise CapitalReservationVersionConflictError(
+            "Prepared replacement reservation disappeared before restoration"
+        )
+    current = _row_to_reservation(row)
+    if current.version != prepared_reservation.version:
+        raise CapitalReservationVersionConflictError(
+            "Prepared replacement reservation changed before restoration"
+        )
+    restored = CapitalReservation.from_dict(previous_reservation.to_dict())
+    restored.version = current.version
+    update_reservation(conn, restored, expected_version=current.version)
+    return restored
+
+
 def _lock_account_reservation_scope(
     conn: Connection, reservation: CapitalReservation
 ) -> None:
