@@ -252,9 +252,15 @@ class StateSaveManager:
         append_log: Callable[[str], None] | None = None,
         lock_timeout: float | None = None,
         supersede_pending: bool = False,
+        push_remote: bool = True,
         _scheduled_generation: int | None = None,
     ) -> SaveResult:
-        """Save app state synchronously and capture any failure."""
+        """Save app state synchronously and capture any failure.
+
+        ``push_remote=False`` is reserved for workflows such as full plan
+        publish that perform their own atomic multi-document remote write
+        immediately after the local files have been made durable.
+        """
         if supersede_pending:
             with self._pending_lock:
                 self._generation += 1
@@ -317,19 +323,20 @@ class StateSaveManager:
                     finished_at=datetime.now(timezone.utc),
                     files_written=files_written,
                 )
-                try:
-                    self._push_to_remote(
-                        watchlist_dict,
-                        buylist_dict,
-                        trade_manager_dict,
-                        append_log=append_log,
-                    )
-                except Exception:
-                    logger.debug("Remote state push failed", exc_info=True)
-                    _append_sync_message(
-                        append_log,
-                        "Remote state save failed; the local copy remains safe.",
-                    )
+                if push_remote:
+                    try:
+                        self._push_to_remote(
+                            watchlist_dict,
+                            buylist_dict,
+                            trade_manager_dict,
+                            append_log=append_log,
+                        )
+                    except Exception:
+                        logger.debug("Remote state push failed", exc_info=True)
+                        _append_sync_message(
+                            append_log,
+                            "Remote state save failed; the local copy remains safe.",
+                        )
                 try:
                     self._backup_to_cloud(append_log=append_log)
                 except Exception:
@@ -1435,26 +1442,34 @@ def publish_trading_plan(
         TRADE_PLANS_KEY: trade_plans_dict,
         EXECUTION_QUEUE_KEY: execution_queue_dict,
     }
+    # The local metadata records the last remote revision absorbed from the
+    # previously active coordination store.  It can legitimately outlive the
+    # remote rows themselves -- for example when moving coordination to a new
+    # TiDB database or restoring an empty branch.  Ordinary background saves
+    # must continue treating that as a conflict, but an explicit, market-closed
+    # full-plan publish by the Operator Control owner is the recovery boundary.
+    # Read the current compact revision projection so missing rows use an
+    # expected revision of zero.  If a peer recreates a row after this read,
+    # publish_planning_snapshot's locked comparison still rejects the write.
+    remote_revisions = get_synced_state_revisions(engine)
+    if set(remote_revisions) != set(SYNCED_STATE_KEYS):
+        return PlanPublishResult(
+            False,
+            error="Could not read the current shared planning revisions.",
+        )
     expected: Dict[str, int] = {}
     for state_key in SYNCED_STATE_KEYS:
         has_base, base_revision, _base_hash = _base_sync_values(
             sync_entries.get(state_key)
         )
+        current_revision = int(remote_revisions.get(state_key, 0) or 0)
+        if current_revision == 0:
+            expected[state_key] = 0
+            continue
         if has_base:
             expected[state_key] = base_revision
             continue
-        pulled = pull_state(engine, state_key)
-        if pulled.status == PULL_ERROR:
-            return PlanPublishResult(
-                False,
-                error=(
-                    f"Could not establish the current {state_key} revision: "
-                    f"{pulled.error or 'unknown database error'}"
-                ),
-            )
-        expected[state_key] = (
-            int(pulled.state.revision) if pulled.status == PULL_OK and pulled.state else 0
-        )
+        expected[state_key] = current_revision
 
     published = publish_planning_snapshot(
         engine,

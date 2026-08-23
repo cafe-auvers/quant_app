@@ -502,6 +502,111 @@ def test_save_manager_pushes_only_changed_synced_key(monkeypatch, tmp_path):
     assert after[ss.TRADE_PLANS_KEY] == before[ss.TRADE_PLANS_KEY]
 
 
+def test_save_manager_can_save_locally_without_partial_remote_push(
+    monkeypatch, tmp_path
+):
+    engine = _make_engine(tmp_path)
+    paths = _use_machine(monkeypatch, tmp_path / "laptop")
+    original = {"items": [{"symbol": "AAPL"}]}
+    buylist = {"items": []}
+    plans = {"plans": []}
+    _save_local_state(paths, original, buylist, plans)
+    role = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    app_state.reconcile_state_with_remote(engine, role)
+    remote_revision = _remote(engine, ss.WATCHLIST_KEY).revision
+
+    manager = app_state.StateSaveManager()
+    manager.set_engine(
+        engine,
+        device_id=role.device_id,
+        is_main_device=True,
+    )
+    local_update = {"items": [{"symbol": "MSFT"}]}
+    result = manager.save_now(
+        local_update,
+        buylist,
+        plans,
+        [],
+        {},
+        {},
+        push_remote=False,
+    )
+
+    assert result.success
+    assert app_state.load_json(paths["WATCHLIST_FILE"], {}) == local_update
+    assert _remote(engine, ss.WATCHLIST_KEY).payload == original
+    assert _remote(engine, ss.WATCHLIST_KEY).revision == remote_revision
+
+
+def test_publish_plan_click_saves_locally_without_per_document_remote_push(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(main_window_module, "is_regular_session_open", lambda: False)
+    monkeypatch.setattr(
+        main_window_module,
+        "load_json",
+        lambda *_args, **_kwargs: {"items": [{"symbol": "AAPL"}]},
+    )
+    workers = []
+
+    class Signal:
+        def connect(self, callback):
+            self.callback = callback
+
+    class Worker:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+            self.completed = Signal()
+            self.started = False
+            workers.append(self)
+
+        def isRunning(self):
+            return False
+
+        def start(self):
+            self.started = True
+
+    monkeypatch.setattr(main_window_module, "PlanPublishWorker", Worker)
+    window = MainWindow.__new__(MainWindow)
+    window.plan_publish_worker = None
+    window.execution_queue_manager = None
+    window.state_sync_role = ss.LocalDeviceRole("laptop-id", "LAPTOP", False)
+    window.publish_trading_plan_button = SimpleNamespace(
+        setEnabled=lambda _enabled: None,
+        setText=lambda _text: None,
+    )
+    window._execution_state_ready = lambda: True
+    window._execution_state_engine = lambda: object()
+    window._execution_state_metadata_path = lambda: tmp_path / "metadata.json"
+    window._state_save_payload = lambda: (
+        {"items": [{"symbol": "AAPL"}]},
+        {"items": []},
+        {"plans": []},
+    )
+    save_calls = []
+
+    def save_state_now(**kwargs):
+        save_calls.append(kwargs)
+        now = dt.datetime.now(dt.timezone.utc)
+        return app_state.SaveResult(True, now, now)
+
+    window._save_state_now = save_state_now
+    window._track_worker = lambda *_args: None
+
+    MainWindow._on_publish_trading_plan_clicked(window)
+
+    assert save_calls == [
+        {
+            "timeout": 5.0,
+            "supersede_pending": True,
+            "push_remote": False,
+        }
+    ]
+    assert len(workers) == 1
+    assert workers[0].started is True
+
+
 def test_main_device_periodic_poll_checks_ownership_without_touching_state(
     monkeypatch, tmp_path
 ):
@@ -1218,3 +1323,111 @@ def test_publish_handoff_snapshot_fails_when_database_unavailable(tmp_path):
     )
 
     assert published is False
+
+
+def test_explicit_plan_publish_recovers_rows_missing_from_new_remote_store(tmp_path):
+    engine = _make_engine(tmp_path)
+    pc = ss.LocalDeviceRole("pc-id", "TRADING-PC", True)
+    laptop = ss.LocalDeviceRole("laptop-id", "TRADING-LAPTOP", False)
+    assert ss.claim_main_device(engine, pc).success
+    assert ss.set_operator_control(engine, pc, laptop).success
+    metadata_path = tmp_path / "state_metadata.json"
+    app_state.save_json(
+        metadata_path,
+        {
+            "state_sync": {
+                key: {
+                    "revision": 108,
+                    "content_hash": f"old-store-{key}",
+                    "updated_at": "2026-08-20T00:00:00",
+                }
+                for key in ss.SYNCED_STATE_KEYS
+            }
+        },
+    )
+    payloads = {
+        ss.WATCHLIST_KEY: {"items": [{"symbol": "AAPL"}]},
+        ss.BUYLIST_KEY: {"items": [{"symbol": "AAPL"}]},
+        ss.TRADE_PLANS_KEY: {"plans": [{"symbol": "AAPL"}]},
+        ss.EXECUTION_QUEUE_KEY: {"items": [{"symbol": "AAPL"}]},
+    }
+
+    result = app_state.publish_trading_plan(
+        engine,
+        laptop,
+        payloads[ss.WATCHLIST_KEY],
+        payloads[ss.BUYLIST_KEY],
+        payloads[ss.TRADE_PLANS_KEY],
+        payloads[ss.EXECUTION_QUEUE_KEY],
+        market_is_open=False,
+        metadata_path=metadata_path,
+    )
+
+    assert result.success is True
+    assert result.revisions == {key: 1 for key in ss.SYNCED_STATE_KEYS}
+    for key, payload in payloads.items():
+        assert _remote(engine, key).payload == payload
+    entries = app_state._read_sync_entries(metadata_path)
+    assert {key: entry["revision"] for key, entry in entries.items()} == {
+        key: 1 for key in ss.SYNCED_STATE_KEYS
+    }
+
+
+def test_explicit_plan_publish_still_rejects_existing_newer_remote_revision(tmp_path):
+    engine = _make_engine(tmp_path)
+    pc = ss.LocalDeviceRole("pc-id", "TRADING-PC", True)
+    laptop = ss.LocalDeviceRole("laptop-id", "TRADING-LAPTOP", False)
+    assert ss.claim_main_device(engine, pc).success
+    assert ss.set_operator_control(engine, pc, laptop).success
+    initial = {
+        key: {"items": []} if key != ss.TRADE_PLANS_KEY else {"plans": []}
+        for key in ss.SYNCED_STATE_KEYS
+    }
+    first = ss.publish_planning_snapshot(
+        engine,
+        laptop,
+        initial,
+        expected_revisions={key: 0 for key in ss.SYNCED_STATE_KEYS},
+        market_is_open=False,
+    )
+    assert first.success
+    newer = ss.push_state(
+        engine,
+        ss.WATCHLIST_KEY,
+        {"items": [{"symbol": "REMOTE"}]},
+        device_id=pc.device_id,
+        expected_revision=1,
+    )
+    assert newer.status == ss.PUSH_WRITTEN
+    metadata_path = tmp_path / "state_metadata.json"
+    app_state.save_json(
+        metadata_path,
+        {
+            "state_sync": {
+                key: {
+                    "revision": 1,
+                    "content_hash": f"base-{key}",
+                    "updated_at": "2026-08-20T00:00:00",
+                }
+                for key in ss.SYNCED_STATE_KEYS
+            }
+        },
+    )
+
+    result = app_state.publish_trading_plan(
+        engine,
+        laptop,
+        {"items": [{"symbol": "LOCAL"}]},
+        {"items": []},
+        {"plans": []},
+        {"items": []},
+        market_is_open=False,
+        metadata_path=metadata_path,
+    )
+
+    assert result.success is False
+    assert "watchlist revision changed from 1 to 2" in result.error
+    assert _remote(engine, ss.WATCHLIST_KEY).payload == {
+        "items": [{"symbol": "REMOTE"}]
+    }
+    assert _remote(engine, ss.BUYLIST_KEY).revision == 1
