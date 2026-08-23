@@ -30,7 +30,10 @@ from sqlalchemy import (
 )
 from sqlalchemy.engine import Engine
 
-from src.infrastructure.database.coordination_engine import coordination_read_connection
+from src.infrastructure.database.coordination_engine import (
+    coordination_autocommit_connection,
+    coordination_read_connection,
+)
 from src.utils.config import DATA_DIR
 
 
@@ -121,6 +124,17 @@ class LocalAlertSpool:
             for line in self.path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
+
+    def events(self, event_type: str) -> List[Dict[str, Any]]:
+        """Return durable local events of one type for diagnostics/tests."""
+
+        normalized = str(event_type or "").upper()
+        with self._lock:
+            return [
+                dict(entry)
+                for entry in self._read_entries_locked()
+                if entry.get("event_type") == normalized
+            ]
 
     @staticmethod
     def _fold_pending_alerts(
@@ -411,7 +425,10 @@ class ExternalAlertingService:
         )
         self._last_heartbeat_attempt_at: Optional[datetime] = None
         self._last_heartbeat_published_at: Optional[datetime] = None
-        self._last_heartbeat_audited_at: Optional[datetime] = None
+        # The external watchdog is the live authority.  Delay the first
+        # centralized sample so startup does not open a TiDB transaction just
+        # to duplicate a webhook that the provider already received.
+        self._last_heartbeat_audited_at: Optional[datetime] = _as_utc(self._clock())
         self._last_heartbeat_audit_status = ""
         self._heartbeat_lock = threading.RLock()
         self._heartbeat_in_flight = False
@@ -1085,27 +1102,14 @@ class ExternalAlertingService:
             error = str(exc)
             succeeded = False
         with self._heartbeat_lock:
+            previous_status = self._last_heartbeat_audit_status
             audit_due = bool(
-                not self._last_heartbeat_audit_status
-                or status != self._last_heartbeat_audit_status
-                or self._last_heartbeat_audited_at is None
-                or (now - _as_utc(self._last_heartbeat_audited_at)).total_seconds()
+                self._last_heartbeat_audited_at is not None
+                and (now - _as_utc(self._last_heartbeat_audited_at)).total_seconds()
                 >= self.heartbeat_audit_interval_seconds
             )
-        if audit_due:
-            table = _heartbeat_table(MetaData())
+        if status != previous_status:
             try:
-                with self.engine.begin() as conn:
-                    conn.execute(
-                        table.insert().values(
-                            device_id=self.device_id,
-                            attempted_at=_db_datetime(now),
-                            status=status,
-                            provider_delivery_id=provider_id,
-                            error=error,
-                        )
-                    )
-            except Exception:
                 self.local_spool.append(
                     "HEARTBEAT_ATTEMPT",
                     {
@@ -1116,9 +1120,32 @@ class ExternalAlertingService:
                         "error": error,
                     },
                 )
+            except Exception:
+                # Heartbeat delivery remains independent of local audit-disk
+                # health.  The next status transition will try again.
+                pass
+        if audit_due:
+            table = _heartbeat_table(MetaData())
+            try:
+                # One deferred INSERT on the dedicated AUTOCOMMIT pool avoids
+                # the separate COMMIT that dominated the observed TiDB RU
+                # spikes during transient webhook failures.
+                with coordination_autocommit_connection(self.engine) as conn:
+                    conn.execute(
+                        table.insert().values(
+                            device_id=self.device_id,
+                            attempted_at=_db_datetime(now),
+                            status=status,
+                            provider_delivery_id=provider_id,
+                            error=error,
+                        )
+                    )
+            except Exception:
+                pass
             with self._heartbeat_lock:
                 self._last_heartbeat_audited_at = now
-                self._last_heartbeat_audit_status = status
+        with self._heartbeat_lock:
+            self._last_heartbeat_audit_status = status
         return succeeded
 
     def publish_heartbeat_if_due(self) -> bool:
@@ -1186,6 +1213,13 @@ class ExternalAlertingService:
                 .order_by(table.c.attempted_at, table.c.id)
             ).fetchall()
         return [dict(row._mapping) for row in rows]
+
+    def local_heartbeat_attempts(self) -> List[Dict[str, Any]]:
+        return [
+            entry
+            for entry in self.local_spool.events("HEARTBEAT_ATTEMPT")
+            if entry.get("device_id") == self.device_id
+        ]
 
 
 def build_external_alerting_service(

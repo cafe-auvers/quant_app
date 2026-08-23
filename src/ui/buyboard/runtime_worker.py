@@ -94,6 +94,7 @@ from src.services.schema_migration import (
 from src.utils.redaction import scrub_sensitive_text
 from src.utils.device_identity import detect_local_device_kind
 from src.services.runtime_device_state_repository import (
+    publish_runtime_device_state_transition,
     refresh_runtime_device_state,
     require_compatible_runtime_schema,
     save_runtime_device_state,
@@ -420,6 +421,18 @@ class BuyboardRuntimeWorker(QThread):
             self.device_state = state
             return
         details = self._runtime_readiness_details(state)
+        if state != RuntimeDeviceState.STANDBY_READY and not handoff_confirmed:
+            publish_runtime_device_state_transition(
+                self._db_engine,
+                device_id=self._device_id,
+                hostname=self._hostname,
+                state=state,
+                details=details,
+            )
+            self.device_state = state
+            self._last_device_state_published_at = datetime.now(timezone.utc)
+            self._last_device_state_details = details
+            return None
         record = save_runtime_device_state(
             self._db_engine,
             device_id=self._device_id,
@@ -472,7 +485,7 @@ class BuyboardRuntimeWorker(QThread):
         self.device_state = RuntimeDeviceState.STANDBY
         if not self._device_id:
             return
-        save_runtime_device_state(
+        publish_runtime_device_state_transition(
             self._db_engine,
             device_id=self._device_id,
             hostname=self._hostname,

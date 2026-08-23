@@ -17,6 +17,7 @@ from src.services.coordination_schema import ensure_coordination_schema
 from src.services.operator_commands import claim_next_operator_command
 from src.services.state_sync import LocalDeviceRole
 from src.services.runtime_device_state_repository import (
+    publish_runtime_device_state_transition,
     refresh_runtime_device_state,
     save_runtime_device_state,
 )
@@ -240,3 +241,42 @@ def test_unchanged_device_heartbeat_rewrites_only_freshness_timestamp(tmp_path):
     assert "HOSTNAME" not in updated_columns
     assert "DETAILS_JSON" not in updated_columns
     assert "SCHEMA_VERSION" not in updated_columns
+
+
+def test_unready_device_transition_is_one_autocommitted_update(tmp_path):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'coordination_transition.db'}", future=True
+    )
+    save_runtime_device_state(
+        engine,
+        device_id="laptop-id",
+        hostname="LAPTOP",
+        state=RuntimeDeviceState.STANDBY_READY,
+        handoff_confirmed=True,
+        details={"device_kind": "Laptop"},
+    )
+    statements = []
+    commits = []
+    event.listen(
+        engine,
+        "before_cursor_execute",
+        lambda _conn, _cursor, statement, _params, _context, _many: statements.append(
+            " ".join(statement.upper().split())
+        ),
+    )
+    event.listen(engine, "commit", lambda _connection: commits.append(True))
+
+    assert publish_runtime_device_state_transition(
+        engine,
+        device_id="laptop-id",
+        hostname="LAPTOP",
+        state=RuntimeDeviceState.STANDBY,
+        details={"device_kind": "Laptop"},
+    )
+
+    assert sum(
+        statement.startswith("UPDATE RUNTIME_DEVICE_STATE")
+        for statement in statements
+    ) == 1
+    assert not any(statement.startswith("SELECT") for statement in statements)
+    assert commits == []

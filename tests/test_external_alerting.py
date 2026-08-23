@@ -317,7 +317,11 @@ def test_successful_heartbeat_audit_is_compacted_while_webhook_stays_frequent(
     now[0] += timedelta(seconds=10)
     assert service.publish_heartbeat_if_due() is True
 
-    assert len(provider.heartbeats) == 2
+    assert len(service.heartbeat_attempts()) == 0
+    now[0] += timedelta(seconds=50)
+    assert service.publish_heartbeat_if_due() is True
+
+    assert len(provider.heartbeats) == 3
     assert len(service.heartbeat_attempts()) == 1
 
 
@@ -328,7 +332,38 @@ def test_heartbeat_publication_failure_is_durable_and_retried(tmp_path):
 
     assert service.publish_heartbeat_if_due() is False
     assert service.publish_heartbeat_if_due() is True
-    assert [row["status"] for row in service.heartbeat_attempts()] == [
+    assert [row["status"] for row in service.local_heartbeat_attempts()] == [
+        "FAILED",
+        "PUBLISHED",
+    ]
+
+
+def test_heartbeat_status_flaps_do_not_commit_to_database(tmp_path):
+    provider = FakeProvider()
+    provider.heartbeat_failures = 1
+    service, now = _service(
+        tmp_path,
+        provider=provider,
+        heartbeat_audit_interval_seconds=60,
+    )
+    statements = []
+    commits = []
+    event.listen(
+        service.engine,
+        "before_cursor_execute",
+        lambda _conn, _cursor, statement, _params, _context, _many: statements.append(
+            " ".join(statement.upper().split())
+        ),
+    )
+    event.listen(service.engine, "commit", lambda _connection: commits.append(True))
+
+    assert service.publish_heartbeat_if_due() is False
+    now[0] += timedelta(seconds=10)
+    assert service.publish_heartbeat_if_due() is True
+
+    assert not any("APPLICATION_HEARTBEAT_ATTEMPTS" in item for item in statements)
+    assert commits == []
+    assert [row["status"] for row in service.local_heartbeat_attempts()] == [
         "FAILED",
         "PUBLISHED",
     ]
