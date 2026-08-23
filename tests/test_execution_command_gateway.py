@@ -14,6 +14,8 @@ import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.pool import NullPool
 
+from src.core import execution_config
+
 from src.core.execution_mode import ExecutionLease, ExecutionMode, ExecutionSource
 from src.core.execution_ownership import ExecutionOwner, ExecutionOwnership
 from src.core.execution_order_record import AdoptedOrderPermission, ExecutionOrderStatus
@@ -73,6 +75,7 @@ from src.services.execution_order_repository import (
 )
 from src.services.execution_ownership_repository import assign_ownership
 from src.services.mutation_budget_protocol import AllowAllMutationBudget
+from src.services.controlled_live_policy import LiveExecutionEnvelopeError
 from src.services.discovered_external_order_repository import (
     ActiveExecutionOrderAdoptionConflictError,
     ActiveExternalOrderFenceError,
@@ -82,6 +85,8 @@ from src.services.discovered_external_order_repository import (
     save_discovered_external_order,
 )
 from fakes.fake_execution_broker import FakeExecutionBroker
+
+pytestmark = pytest.mark.usefixtures("authorized_full_live")
 
 
 def _make_engine(tmp_path):
@@ -158,6 +163,69 @@ def _record_active_external_order(engine, *, broker_order_id="B-EXTERNAL"):
             broker_status=ExecutionOrderStatus.WORKING,
         ),
     )
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_disabled_mode_blocks_legacy_gateway_when_engine_flag_is_false(monkeypatch):
+    monkeypatch.setattr(execution_config, "KIS_LIVE_EXECUTION_MODE", "DISABLED")
+    monkeypatch.setattr(execution_config, "is_buyboard_engine_enabled", lambda: False)
+    broker = FakeExecutionBroker()
+    gateway = ExecutionCommandGateway(real_broker=broker, mode_override=False)
+
+    with pytest.raises(LiveExecutionEnvelopeError, match="No broker mutation was sent"):
+        gateway.submit_order(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            side=OrderSide.SELL,
+            quantity=1,
+            limit_price=100.0,
+        )
+    with pytest.raises(LiveExecutionEnvelopeError, match="DISABLED"):
+        gateway.cancel_order(
+            environment="PROD",
+            account_no="1",
+            ownership_symbol="AAPL",
+            symbol="AAPL",
+            broker_order_id="B-1",
+            quantity=1,
+        )
+
+    assert broker.submit_calls == []
+    assert broker.cancel_calls == []
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_disabled_mode_blocks_guarded_gateway_before_persistence(tmp_path, monkeypatch):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    monkeypatch.setattr(execution_config, "KIS_LIVE_EXECUTION_MODE", "DISABLED")
+
+    with pytest.raises(LiveExecutionEnvelopeError, match="DISABLED"):
+        gateway.submit_guarded(_submit_request())
+
+    assert broker.submit_calls == []
+    ensure_execution_orders_table(engine)
+    assert _all_order_rows(engine) == []
+
+
+@pytest.mark.parametrize("mode", ["CONTROLLED_LIVE", "FULL_LIVE"])
+@pytest.mark.usefixtures("trading_enabled")
+def test_authorized_live_modes_permit_exact_guarded_buy(
+    tmp_path, monkeypatch, mode
+):
+    gateway, broker, _ = _guarded_gateway(tmp_path)
+    monkeypatch.setattr(execution_config, "KIS_LIVE_EXECUTION_MODE", mode)
+    monkeypatch.setattr(execution_config, "KIS_CONTROLLED_LIVE_SYMBOLS", ("AAPL",))
+    monkeypatch.setattr(
+        execution_config, "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL", 1_000.0
+    )
+    monkeypatch.setattr(execution_config, "KIS_MUTATION_MAX_CONFIRMED_ATTEMPTS", 1)
+    broker.queue_acceptance(broker_order_id=f"B-{mode}")
+
+    result = gateway.submit_guarded(_submit_request(quantity=1, limit_price=100.0))
+
+    assert result.broker_order_id == f"B-{mode}"
+    assert len(broker.submit_calls) == 1
 
 
 def _resolve_external_fence(engine, external_order):

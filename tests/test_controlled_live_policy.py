@@ -64,12 +64,17 @@ def test_buyboard_engine_defaults_enabled_but_accepts_explicit_recovery_disable(
     assert execution_config.is_buyboard_engine_enabled() is False
 
 
+@pytest.mark.parametrize("engine_enabled", [True, False])
 @pytest.mark.usefixtures("trading_enabled")
 def test_disabled_live_envelope_runs_engine_but_blocks_submit_sell_and_cancel(
-    monkeypatch,
+    monkeypatch, engine_enabled,
 ):
     monkeypatch.setattr(execution_config, "KIS_LIVE_EXECUTION_MODE", "DISABLED")
-    monkeypatch.setattr(execution_config, "is_buyboard_engine_enabled", lambda: True)
+    monkeypatch.setattr(
+        execution_config,
+        "is_buyboard_engine_enabled",
+        lambda: engine_enabled,
+    )
     calls = []
     monkeypatch.setattr(
         kis_order,

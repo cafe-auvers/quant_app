@@ -37,6 +37,7 @@ from src.services import (
     trade_card_repository,
     trading_state,
 )  # noqa: E402  (needs sys.path set up above)
+from src.core import execution_config  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -109,3 +110,18 @@ def trading_enabled():
     """Explicit opt-in for tests that must cross a submission boundary."""
     assert trading_state.set_trading_enabled(True) is True
     yield
+
+
+@pytest.fixture
+def authorized_full_live(monkeypatch):
+    """Explicit production-mutation opt-in for gateway characterization tests."""
+
+    monkeypatch.setattr(execution_config, "KIS_LIVE_EXECUTION_MODE", "FULL_LIVE")
+    monkeypatch.setattr(execution_config, "KIS_MUTATION_BUDGET_VERIFIED", True)
+    monkeypatch.setattr(execution_config, "KIS_SUBMIT_MUTATION_CAPACITY", 10)
+    monkeypatch.setattr(execution_config, "KIS_CANCEL_MUTATION_CAPACITY", 10)
+    monkeypatch.setattr(execution_config, "KIS_REPLACE_MUTATION_CAPACITY", 10)
+    monkeypatch.setattr(execution_config, "KIS_MUTATION_MIN_SPACING_SECONDS", 0.2)
+    monkeypatch.setattr(execution_config, "KIS_WS_ENABLED", True)
+    monkeypatch.setattr(execution_config, "KIS_WS_PROTOCOL_VERIFIED", True)
+    monkeypatch.setattr(execution_config, "KIS_MARKET_DATA_MODE", "WEBSOCKET")

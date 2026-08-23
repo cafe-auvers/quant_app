@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import threading
+from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -13,6 +14,7 @@ from src.core.capital_reservation import (
 )
 from src.services import capital_allocator as allocator
 from src.services import capital_reservation_repository
+from src.risk.portfolio import PortfolioRiskReservationSpec
 
 
 # --- CapitalReservation lifecycle -------------------------------------------
@@ -39,6 +41,22 @@ def test_partial_consume_transitions_to_partially_consumed():
     assert reservation.status == CapitalReservationStatus.PARTIALLY_CONSUMED
     assert reservation.remaining_reserved_notional == pytest.approx(700.0)
     assert reservation.is_open()
+
+
+def test_partial_consume_reduces_projected_open_risk_proportionally():
+    reservation = CapitalReservation.create(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        attempt_group_id="g",
+        requested_notional=1_000.0,
+        projected_open_risk=100.0,
+    )
+
+    reservation.consume(250.0)
+
+    assert reservation.remaining_reserved_notional == pytest.approx(750.0)
+    assert reservation.remaining_projected_open_risk == pytest.approx(75.0)
 
 
 def test_full_consume_transitions_to_consumed_and_closes():
@@ -211,6 +229,72 @@ def test_two_near_simultaneous_triggers_do_not_both_reserve_the_same_capital(tmp
     successes = [r for r in results if r is not None]
     assert len(successes) == 1
     assert len(allocator.load_reservations(path)) == 1
+
+
+def test_account_transaction_serializes_concurrent_projected_position_slots(tmp_path):
+    engine = _sqlite_engine(tmp_path)
+    capital_reservation_repository.ensure_capital_reservations_table(engine)
+    barrier = threading.Barrier(2)
+    successes = []
+    failures = []
+
+    def attempt(symbol: str) -> None:
+        reservation = CapitalReservation.create(
+            environment="PROD",
+            account_no="1",
+            symbol=symbol,
+            attempt_group_id=f"group-{symbol}",
+            requested_notional=1_000.0,
+            projected_open_risk=100.0,
+        )
+        spec = PortfolioRiskReservationSpec(
+            environment="PROD",
+            account_no="1",
+            symbol=symbol,
+            proposed_notional_usd=1_000.0,
+            proposed_open_risk_usd=100.0,
+            account_equity_usd=10_000.0,
+            baseline_position_symbols=(),
+            baseline_open_risk_usd=0.0,
+            baseline_gross_notional_usd=0.0,
+            max_simultaneous_positions=1,
+            max_total_open_risk_fraction=1.0,
+            max_gross_notional_fraction=1.0,
+            evaluated_at=datetime.now(timezone.utc),
+        )
+        barrier.wait(timeout=2)
+        try:
+            with engine.begin() as conn:
+                capital_reservation_repository.insert_reservation_if_available(
+                    conn,
+                    reservation,
+                    buying_power=10_000.0,
+                    portfolio_risk_spec=spec,
+                )
+            successes.append(symbol)
+        except Exception as exc:  # captured for exact post-thread assertion
+            failures.append(exc)
+
+    threads = [
+        threading.Thread(target=attempt, args=("AAPL",)),
+        threading.Thread(target=attempt, args=("MSFT",)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert isinstance(
+        failures[0],
+        capital_reservation_repository.ProjectedPortfolioRiskLimitError,
+    )
+    assert len(
+        capital_reservation_repository.list_active_reservations(
+            engine, environment="PROD", account_no="1"
+        )
+    ) == 1
 
 
 # --- P1-12: database-backed capital reservations (cross-device) ------------

@@ -6,6 +6,8 @@ import datetime as dt
 import pandas as pd
 import pytest
 
+pytestmark = pytest.mark.usefixtures("authorized_full_live")
+
 from src.core.order_state import (
     BrokerOrder,
     BrokerOrderDiscoveryResult,

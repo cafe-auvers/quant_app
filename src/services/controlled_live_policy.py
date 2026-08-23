@@ -1,7 +1,8 @@
 """Fail-closed supervised-live envelope for the Kanban execution runtime.
 
-This policy does not arm trading. It is an additional fence used only when
-the production Kanban engine is explicitly enabled. Controlled live and full
+This policy does not arm trading. It is an independent broker-authority fence
+for every production mutation, regardless of whether the guarded Kanban engine
+or legacy recovery composition reaches the gateway. Controlled live and full
 live use the same gateway/broker path; promotion changes configuration, not
 execution code.
 """
@@ -24,6 +25,14 @@ class LiveExecutionEnvelopeError(RuntimeError):
     """The configured live mode cannot authorize this production mutation."""
 
 
+def _configuration_error(reason: str) -> LiveExecutionEnvelopeError:
+    return LiveExecutionEnvelopeError(
+        f"Production activation blocked: {reason}. No broker mutation was sent. "
+        "Correct the reviewed live configuration, restart or refresh readiness, "
+        "then retry."
+    )
+
+
 def _mode() -> str:
     return str(execution_config.KIS_LIVE_EXECUTION_MODE or DISABLED).strip().upper()
 
@@ -44,7 +53,7 @@ def require_controlled_live_configuration(
     if mode == DISABLED:
         return
     if mode not in {CONTROLLED_LIVE, FULL_LIVE}:
-        raise LiveExecutionEnvelopeError(
+        raise _configuration_error(
             "KIS_LIVE_EXECUTION_MODE must be DISABLED, CONTROLLED_LIVE, or FULL_LIVE"
         )
     if not execution_config.KIS_MUTATION_BUDGET_VERIFIED or any(
@@ -55,14 +64,14 @@ def require_controlled_live_configuration(
             execution_config.KIS_REPLACE_MUTATION_CAPACITY,
         )
     ):
-        raise LiveExecutionEnvelopeError(
+        raise _configuration_error(
             "CONTROLLED_LIVE requires positive reviewed mutation budgets"
         )
     if (
         float(execution_config.KIS_MUTATION_MIN_SPACING_SECONDS)
         < MIN_CONTROLLED_LIVE_MUTATION_SPACING_SECONDS
     ):
-        raise LiveExecutionEnvelopeError(
+        raise _configuration_error(
             "CONTROLLED_LIVE mutation spacing must be at least 0.1 seconds"
         )
     if not (
@@ -70,22 +79,22 @@ def require_controlled_live_configuration(
         and execution_config.KIS_WS_PROTOCOL_VERIFIED
         and execution_config.KIS_MARKET_DATA_MODE == "WEBSOCKET"
     ):
-        raise LiveExecutionEnvelopeError(
+        raise _configuration_error(
             "CONTROLLED_LIVE requires the reviewed production WebSocket path"
         )
     if mode == CONTROLLED_LIVE:
         if not execution_config.KIS_CONTROLLED_LIVE_SYMBOLS:
-            raise LiveExecutionEnvelopeError(
+            raise _configuration_error(
                 "CONTROLLED_LIVE requires KIS_CONTROLLED_LIVE_SYMBOLS"
             )
         if not math.isfinite(
             execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL
         ) or execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL <= 0:
-            raise LiveExecutionEnvelopeError(
+            raise _configuration_error(
                 "CONTROLLED_LIVE requires a positive maximum entry notional"
             )
         if int(execution_config.KIS_MUTATION_MAX_CONFIRMED_ATTEMPTS) != 1:
-            raise LiveExecutionEnvelopeError(
+            raise _configuration_error(
                 "CONTROLLED_LIVE forbids automatic mutation retries"
             )
     if scheduler is not None:
@@ -94,11 +103,11 @@ def require_controlled_live_configuration(
         if spacing is None or float(spacing) < float(
             execution_config.KIS_MUTATION_MIN_SPACING_SECONDS
         ):
-            raise LiveExecutionEnvelopeError(
+            raise _configuration_error(
                 "runtime scheduler does not enforce the configured mutation spacing"
             )
         if mode == CONTROLLED_LIVE and attempts != 1:
-            raise LiveExecutionEnvelopeError(
+            raise _configuration_error(
                 "runtime scheduler permits an automatic mutation retry"
             )
 
@@ -110,13 +119,13 @@ def require_live_mutation_allowed(
 
     if str(environment or "").strip().upper() != "PROD":
         return
-    if not execution_config.is_buyboard_engine_enabled():
-        # Recovery-only legacy compatibility retains its existing fences.
-        return
     mode = _mode()
     if mode == DISABLED:
         raise LiveExecutionEnvelopeError(
-            f"KIS live execution is DISABLED; refused production {action}"
+            f"Blocked production {action}: KIS_LIVE_EXECUTION_MODE is DISABLED. "
+            "No broker mutation was sent. Retry only after the operator deliberately "
+            "selects CONTROLLED_LIVE or FULL_LIVE and the corresponding readiness "
+            "checks pass."
         )
     require_controlled_live_configuration(environment=environment)
 
@@ -138,8 +147,6 @@ def require_live_entry_allowed(
 
     if str(environment or "").strip().upper() != "PROD":
         return
-    if not execution_config.is_buyboard_engine_enabled():
-        return
     require_live_mutation_allowed(environment=environment, action="order submission")
     normalized_side = side if isinstance(side, OrderSide) else OrderSide(str(side).upper())
     if normalized_side != OrderSide.BUY or _mode() == FULL_LIVE:
@@ -147,16 +154,21 @@ def require_live_entry_allowed(
     normalized_symbol = str(symbol or "").strip().upper()
     if not live_entry_symbol_allowed(environment=environment, symbol=normalized_symbol):
         raise LiveExecutionEnvelopeError(
-            f"CONTROLLED_LIVE refuses entry for unapproved symbol {normalized_symbol}"
+            f"Blocked production BUY for unapproved symbol {normalized_symbol}: it is "
+            "outside KIS_CONTROLLED_LIVE_SYMBOLS. No broker mutation was sent. Add the symbol "
+            "to the reviewed allowlist and refresh readiness before retrying."
         )
     notional = int(quantity) * float(limit_price)
     if not math.isfinite(notional) or notional <= 0:
         raise LiveExecutionEnvelopeError(
-            "CONTROLLED_LIVE entry notional must be positive and finite"
+            "Blocked production BUY: CONTROLLED_LIVE entry notional must be positive "
+            "and finite. No broker mutation was sent. Correct the order and retry."
         )
     if notional > float(execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL):
         raise LiveExecutionEnvelopeError(
-            "CONTROLLED_LIVE entry exceeds the configured maximum notional"
+            "Blocked production BUY: the entry exceeds the CONTROLLED_LIVE maximum "
+            "notional. No broker mutation was sent. Reduce the order or deliberately "
+            "review the configured ceiling before retrying."
         )
 
 
@@ -170,8 +182,6 @@ def live_entry_symbol_allowed(*, environment: str, symbol: str) -> bool:
     """
 
     if str(environment or "").strip().upper() != "PROD":
-        return True
-    if not execution_config.is_buyboard_engine_enabled():
         return True
     if _mode() != CONTROLLED_LIVE:
         return True
@@ -192,6 +202,5 @@ def automatic_mutation_retry_permitted(*, environment: str) -> bool:
 
     return not (
         str(environment or "").strip().upper() == "PROD"
-        and execution_config.is_buyboard_engine_enabled()
         and _mode() == CONTROLLED_LIVE
     )

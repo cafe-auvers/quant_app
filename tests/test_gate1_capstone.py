@@ -14,6 +14,8 @@ import time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("authorized_full_live")
 from PyQt5.QtCore import QCoreApplication
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool

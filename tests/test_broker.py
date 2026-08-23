@@ -10,6 +10,8 @@ from types import SimpleNamespace
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("authorized_full_live")
+
 from src.api import kis_account_snapshot_dual, kis_order
 from src.core.order_state import (REGULAR_LIMIT_EXECUTION,
                                   RESERVED_MOO_EXECUTION,

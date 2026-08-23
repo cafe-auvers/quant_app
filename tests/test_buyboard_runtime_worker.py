@@ -24,6 +24,8 @@ from PyQt5.QtWidgets import QApplication
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
+pytestmark = pytest.mark.usefixtures("authorized_full_live")
+
 from src.core import execution_config
 from src.core.account_broker_snapshot import AccountBrokerSnapshot, SnapshotCompleteness
 from src.core.board_workflow import (

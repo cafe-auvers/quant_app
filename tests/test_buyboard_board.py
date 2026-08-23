@@ -1023,6 +1023,26 @@ def test_recovery_snapshot_rejects_board_mutation(monkeypatch):
     assert window.dispatched == []
     assert messages
     assert "read-only recovery snapshot" in messages[0][0][2]
+    assert "No broker order was sent" in messages[0][0][2]
+
+
+def test_recovery_procedure_is_explicit_about_safe_exit_and_no_buy(monkeypatch):
+    messages = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda *args, **kwargs: messages.append((args, kwargs)),
+    )
+
+    board_module._show_kanban_recovery_procedure(SimpleNamespace())
+
+    assert messages
+    guidance = messages[0][0][2]
+    assert "BUYBOARD_ENGINE_ENABLED=true" in guidance
+    assert "one protective SELL" in guidance
+    assert "Do not place a recovery BUY" in guidance
+    assert "never duplicate an order" in guidance
+    assert "wait for reconciliation" in guidance
 
 
 def test_dragging_sell_all_to_partial_sell_prompts_and_dispatches_reduction(

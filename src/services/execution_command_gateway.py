@@ -113,9 +113,18 @@ from src.services.discovered_external_order_repository import (
     require_no_active_unowned_external_order,
 )
 from src.services.mutation_budget_protocol import CommandType, MutationBudgetProtocol
+from src.services.controlled_live_policy import (
+    LiveExecutionEnvelopeError,
+    require_live_entry_allowed,
+    require_live_mutation_allowed,
+)
 from src.risk.pre_trade import (
     PreTradeRiskRejectedError,
     require_pre_trade_risk_approval,
+)
+from src.risk.portfolio import (
+    PortfolioRiskReservationSpecError,
+    require_portfolio_risk_reservation_spec,
 )
 from src.services.kis_request_boundary import (
     install_process_kis_request_scheduler,
@@ -391,6 +400,7 @@ class ExecutionCommandGateway:
         handoff_pending_provider: Optional[Callable[[], bool]] = None,
         critical_alert_sink: Optional[Callable[[str, str, str], None]] = None,
         schema_migration_manager: Optional[Any] = None,
+        projected_portfolio_risk_required: bool = False,
     ) -> None:
         self._real_broker: Broker = real_broker if real_broker is not None else KisBroker()
         self._engine = engine
@@ -419,6 +429,9 @@ class ExecutionCommandGateway:
         self._handoff_pending_provider = handoff_pending_provider or (lambda: False)
         self._critical_alert_sink = critical_alert_sink
         self._schema_migration_manager = schema_migration_manager
+        self._projected_portfolio_risk_required = bool(
+            projected_portfolio_risk_required
+        )
         self._last_verified_lease: Optional[ExecutionLease] = None
         self._last_database_writable_state: Optional[bool] = None
         self._emergency_records: Dict[str, ExecutionOrderRecord] = {}
@@ -481,6 +494,13 @@ class ExecutionCommandGateway:
                     "GUARDED_ENGINE mode requires submit_guarded(request=SubmitExecutionRequest(...)) "
                     "-- see the module docstring"
                 )
+            require_live_entry_allowed(
+                environment=environment,
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                limit_price=limit_price,
+            )
             if self._engine is not None:
                 self._require_ownership(
                     environment, account_no, symbol, source
@@ -523,6 +543,14 @@ class ExecutionCommandGateway:
                     "GUARDED_ENGINE mode requires cancel_guarded(request=CancelExecutionRequest(...)) "
                     "-- see the module docstring"
                 )
+            require_live_mutation_allowed(
+                environment=environment,
+                action=(
+                    f"order cancellation for {ownership_symbol}"
+                    if ownership_symbol
+                    else "order cancellation"
+                ),
+            )
             if self._engine is not None:
                 self._require_ownership(
                     environment, account_no, ownership_symbol, source
@@ -660,6 +688,13 @@ class ExecutionCommandGateway:
 
     def submit_guarded(self, request: SubmitExecutionRequest) -> ExecutionOrderRecord:
         self._require_guarded_mode()
+        require_live_entry_allowed(
+            environment=request.environment,
+            symbol=request.symbol,
+            side=request.side,
+            quantity=request.quantity,
+            limit_price=request.limit_price,
+        )
         key = _recovery_key(request.environment, request.account_no, request.symbol)
         with self._ownership.claim(key, request.source):
             if not self._canonical_database_is_writable():
@@ -668,6 +703,14 @@ class ExecutionCommandGateway:
 
     def cancel_guarded(self, request: CancelExecutionRequest) -> ExecutionOrderRecord:
         self._require_guarded_mode()
+        require_live_mutation_allowed(
+            environment=request.environment,
+            action=(
+                f"order cancellation for {request.symbol}"
+                if request.symbol
+                else "order cancellation"
+            ),
+        )
         if not self._canonical_database_is_writable():
             key = _recovery_key(request.environment, request.account_no, request.symbol)
             with self._ownership.claim(key, request.source):
@@ -708,6 +751,10 @@ class ExecutionCommandGateway:
         fighting it.
         """
         self._require_guarded_mode()
+        require_live_mutation_allowed(
+            environment=request.environment,
+            action="order replacement",
+        )
         engine = self._require_engine()
         mutation_budget = self._require_mutation_budget()
 
@@ -1326,6 +1373,13 @@ class ExecutionCommandGateway:
 
         try:
             with trading_state.allow_cached_emergency_authorization():
+                require_live_entry_allowed(
+                    environment=request.environment,
+                    symbol=request.symbol,
+                    side=request.side,
+                    quantity=quantity,
+                    limit_price=limit_price,
+                )
                 submission = self._execute_scheduled_mutation(
                     lambda: self._cross_broker_boundary(
                         lambda: self._real_broker.submit_order(
@@ -1464,6 +1518,10 @@ class ExecutionCommandGateway:
             raise EmergencyJournalUnavailableError(str(exc)) from exc
         try:
             with trading_state.allow_cached_emergency_authorization():
+                require_live_mutation_allowed(
+                    environment=request.environment,
+                    action=f"emergency order cancellation for {request.symbol}",
+                )
                 snapshot = self._execute_scheduled_mutation(
                     lambda: self._cross_broker_boundary(
                         lambda: self._real_broker.cancel_order(
@@ -1591,9 +1649,9 @@ class ExecutionCommandGateway:
             if not math.isfinite(limit_price) or limit_price <= 0:
                 raise ValueError(f"limit_price must be positive and finite, got {limit_price}")
 
-        def require_current_entry_risk_approval() -> None:
+        def require_current_entry_risk_approval():
             if request.side != OrderSide.BUY or request.intent != OrderIntent.ENTRY:
-                return
+                return None
             require_pre_trade_risk_approval(
                 request.pre_trade_risk_decision,
                 environment=environment,
@@ -1608,9 +1666,28 @@ class ExecutionCommandGateway:
                 strategy_id=request.risk_strategy_id,
                 plan_id=request.risk_plan_id,
             )
+            risk_spec = getattr(
+                request.pre_trade_risk_decision,
+                "portfolio_risk_reservation",
+                None,
+            )
+            if risk_spec is None and not self._projected_portfolio_risk_required:
+                return None
+            try:
+                return require_portfolio_risk_reservation_spec(
+                    risk_spec,
+                    environment=environment,
+                    account_no=account_no,
+                    symbol=symbol,
+                    quantity=quantity,
+                    reference_price=limit_price,
+                    evaluated_at=request.pre_trade_risk_decision.evaluated_at,
+                )
+            except PortfolioRiskReservationSpecError as exc:
+                raise PreTradeRiskRejectedError(str(exc)) from exc
 
         # Approval must be valid before any command or capital row is written.
-        require_current_entry_risk_approval()
+        portfolio_risk_spec = require_current_entry_risk_approval()
 
         # 4. caller-stable idempotency key -- never generated in here.
         client_order_id = request.client_order_id
@@ -1636,6 +1713,11 @@ class ExecutionCommandGateway:
             environment=environment, account_no=account_no, symbol=symbol,
             attempt_group_id=request.attempt_group_id or client_order_id,
             requested_notional=requested_notional,
+            projected_open_risk=(
+                portfolio_risk_spec.proposed_open_risk_usd
+                if portfolio_risk_spec is not None
+                else 0.0
+            ),
         )
         command = ExecutionCommand(
             idempotency_key=idempotency_key, command_type="submit", environment=environment,
@@ -1672,7 +1754,10 @@ class ExecutionCommandGateway:
             )
             insert_command(conn, command)
             insert_reservation_if_available(
-                conn, reservation, buying_power=buying_power
+                conn,
+                reservation,
+                buying_power=buying_power,
+                portfolio_risk_spec=portfolio_risk_spec,
             )
             insert_execution_order(conn, record)
 
@@ -1704,6 +1789,13 @@ class ExecutionCommandGateway:
             # Recheck at the last possible moment because lease/database work
             # above may consume most of the approval's short TTL.
             require_current_entry_risk_approval()
+            require_live_entry_allowed(
+                environment=environment,
+                symbol=symbol,
+                side=request.side,
+                quantity=quantity,
+                limit_price=limit_price,
+            )
             with coordination_read_connection(engine) as conn:
                 require_no_active_unowned_external_order(
                     conn,
@@ -1716,6 +1808,7 @@ class ExecutionCommandGateway:
             LeaseNotVerifiedError,
             ActiveExternalOrderFenceError,
             PreTradeRiskRejectedError,
+            LiveExecutionEnvelopeError,
         ) as gate_error:
             # The broker boundary has definitely not been entered. Retire
             # every A1 artifact atomically so a final-gate race cannot look
@@ -1892,6 +1985,10 @@ class ExecutionCommandGateway:
                 request.source, request.strategy_instance_id,
             )
             self._require_verified_lease(request.lease)
+            require_live_mutation_allowed(
+                environment=record.environment,
+                action=f"order cancellation for {record.symbol}",
+            )
             with coordination_read_connection(engine) as conn:
                 require_no_active_unowned_external_order(
                     conn,
@@ -1904,6 +2001,7 @@ class ExecutionCommandGateway:
             ExecutionOwnershipMismatchError,
             LeaseNotVerifiedError,
             ActiveExternalOrderFenceError,
+            LiveExecutionEnvelopeError,
         ) as gate_error:
             # No cancel reached the broker. Restore the exact live status
             # captured before CANCEL_PENDING and retire this caller-owned
@@ -2128,4 +2226,5 @@ def build_guarded_execution_gateway(
         handoff_pending_provider=handoff_pending_provider,
         critical_alert_sink=critical_alert_sink,
         schema_migration_manager=schema_migration_manager,
+        projected_portfolio_risk_required=True,
     )

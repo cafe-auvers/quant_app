@@ -126,7 +126,12 @@ from src.core.execution_request import (
     CancelIntent,
     derive_execution_client_order_id,
 )
-from src.core.execution_order_record import ExecutionOrderRecord, ExecutionOrderStatus
+from src.core.execution_order_record import (
+    TERMINAL_EXECUTION_ORDER_STATUSES,
+    ExecutionOrderRecord,
+    ExecutionOrderStatus,
+)
+from src.core.discovered_external_order import ExternalOrderDisposition
 from src.core.execution_result import broker_order_from_execution_record
 from src.core.order_state import (
     BrokerOrder,
@@ -139,6 +144,7 @@ from src.core.trade_card_state import TradeCardState
 from src.risk.orb_position import calculate_orb_position_values, is_orb_position_plan_valid
 from src.risk.portfolio import (
     PortfolioPositionRisk,
+    PortfolioProjectedExposure,
     PortfolioRiskLimits,
     PortfolioRiskManager,
     PortfolioRiskSnapshot,
@@ -537,6 +543,133 @@ def _portfolio_position_from_card(
     )
 
 
+def _portfolio_projected_exposures(
+    *,
+    cards,
+    execution_orders=(),
+    active_reservations=(),
+    external_orders=(),
+) -> tuple[PortfolioProjectedExposure, ...]:
+    """Project every durable, exposure-increasing account commitment once."""
+
+    cards_by_symbol = {
+        str(card.symbol or "").upper(): card for card in cards if card is not None
+    }
+    reservations = {
+        str(reservation.reservation_id): reservation
+        for reservation in active_reservations
+        if reservation is not None and reservation.is_open()
+    }
+    seen_reservation_ids: set[str] = set()
+    exposures: list[PortfolioProjectedExposure] = []
+
+    def stop_for(symbol: str, reference_price: float) -> float:
+        card = cards_by_symbol.get(str(symbol or "").upper())
+        for value in (
+            getattr(card, "entry_orb_low", None),
+            getattr(card, "active_stop_price", None),
+        ):
+            try:
+                stop = float(value or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(stop) and 0 < stop < reference_price:
+                return stop
+        return 0.0
+
+    for order in execution_orders:
+        if (
+            order.side != OrderSide.BUY
+            or order.intent != OrderIntent.ENTRY
+            or order.status in TERMINAL_EXECUTION_ORDER_STATUSES
+        ):
+            continue
+        quantity = max(0, int(order.remaining_quantity or 0))
+        if quantity <= 0:
+            continue
+        price = float(order.submitted_limit_price or 0.0)
+        if not math.isfinite(price) or price <= 0:
+            raise ValueError(
+                f"Pending BUY {order.client_order_id} has no usable valuation price"
+            )
+        reservation_id = str(order.capital_reservation_id or "")
+        if reservation_id and reservation_id in seen_reservation_ids:
+            continue
+        reservation = reservations.get(reservation_id)
+        pending_notional = quantity * price
+        gross_notional = max(
+            pending_notional,
+            float(getattr(reservation, "remaining_reserved_notional", 0.0) or 0.0),
+        )
+        stop = stop_for(order.symbol, price)
+        open_risk = quantity * (price - stop) if stop > 0 else gross_notional
+        open_risk = max(
+            open_risk,
+            float(
+                getattr(reservation, "remaining_projected_open_risk", 0.0)
+                or 0.0
+            ),
+        )
+        exposures.append(
+            PortfolioProjectedExposure(
+                symbol=order.symbol,
+                gross_notional_usd=gross_notional,
+                open_risk_usd=open_risk,
+                source="PENDING_BUY",
+                reservation_id=reservation_id,
+                strategy_id=RISK_STRATEGY_ID,
+            )
+        )
+        if reservation_id:
+            seen_reservation_ids.add(reservation_id)
+
+    for reservation_id, reservation in reservations.items():
+        if reservation_id in seen_reservation_ids:
+            continue
+        gross_notional = float(reservation.remaining_reserved_notional or 0.0)
+        if gross_notional <= 0:
+            continue
+        open_risk = float(reservation.remaining_projected_open_risk or 0.0)
+        exposures.append(
+            PortfolioProjectedExposure(
+                symbol=reservation.symbol,
+                gross_notional_usd=gross_notional,
+                open_risk_usd=open_risk if open_risk > 0 else gross_notional,
+                source="ACTIVE_CAPITAL_RESERVATION",
+                reservation_id=reservation_id,
+                strategy_id=RISK_STRATEGY_ID,
+            )
+        )
+
+    for order in external_orders:
+        if (
+            order.side != OrderSide.BUY
+            or order.disposition != ExternalOrderDisposition.DISCOVERED_UNOWNED
+            or order.broker_status in TERMINAL_EXECUTION_ORDER_STATUSES
+        ):
+            continue
+        quantity = max(
+            0, int(order.quantity_requested or 0) - int(order.filled_quantity or 0)
+        )
+        if quantity <= 0:
+            continue
+        price = float(order.limit_price or 0.0)
+        if not math.isfinite(price) or price <= 0:
+            raise ValueError(
+                f"Unresolved external BUY {order.broker_order_id} has no usable valuation price"
+            )
+        notional = quantity * price
+        exposures.append(
+            PortfolioProjectedExposure(
+                symbol=order.symbol,
+                gross_notional_usd=notional,
+                open_risk_usd=notional,
+                source="UNRESOLVED_EXTERNAL_BUY",
+            )
+        )
+    return tuple(exposures)
+
+
 @dataclass
 class BuyboardRuntime:
     """Holds the fully-wired engine + the card lookup this process needs to
@@ -563,6 +696,13 @@ def build_buyboard_runtime(
     account_equity_provider: Optional[Callable[[str, str], float]] = None,
     portfolio_cards_provider: Optional[
         Callable[[str, str], list[TradeCardState]]
+    ] = None,
+    portfolio_orders_provider: Optional[Callable[[str, str], list[Any]]] = None,
+    portfolio_reservations_provider: Optional[
+        Callable[[str, str], list[Any]]
+    ] = None,
+    portfolio_external_orders_provider: Optional[
+        Callable[[str, str], list[Any]]
     ] = None,
     portfolio_risk_manager: Optional[PortfolioRiskManager] = None,
     capital_reservation_engine: Optional[Engine] = None,
@@ -946,6 +1086,24 @@ def build_buyboard_runtime(
                     for position in [_portfolio_position_from_card(portfolio_card)]
                     if position is not None
                 )
+                projected_exposures = _portfolio_projected_exposures(
+                    cards=portfolio_cards,
+                    execution_orders=(
+                        portfolio_orders_provider(environment, account_no)
+                        if portfolio_orders_provider is not None
+                        else ()
+                    ),
+                    active_reservations=(
+                        portfolio_reservations_provider(environment, account_no)
+                        if portfolio_reservations_provider is not None
+                        else ()
+                    ),
+                    external_orders=(
+                        portfolio_external_orders_provider(environment, account_no)
+                        if portfolio_external_orders_provider is not None
+                        else ()
+                    ),
+                )
                 try:
                     usable_buying_power = float(
                         buying_power_provider(environment, account_no)
@@ -964,15 +1122,29 @@ def build_buyboard_runtime(
                         reference_price=limit_price,
                         stop_price=float(card.entry_orb_low or 0.0),
                         strategy_id=RISK_STRATEGY_ID,
+                        environment=environment,
+                        account_no=account_no,
                     ),
                     PortfolioRiskSnapshot(
                         account_equity_usd=account_equity,
                         usable_buying_power_usd=usable_buying_power,
                         positions=positions,
-                        evaluated_at=datetime.now(timezone.utc),
+                        projected_exposures=projected_exposures,
+                        evaluated_at=(
+                            decision.evaluated_at
+                            if decision is not None
+                            else datetime.now(timezone.utc)
+                        ),
                     ),
                 )
                 portfolio_reasons.extend(portfolio_decision.reasons)
+                if decision is not None:
+                    decision = replace(
+                        decision,
+                        portfolio_risk_reservation=(
+                            portfolio_decision.reservation_spec
+                        ),
+                    )
             except Exception as exc:
                 logger.exception(
                     "Portfolio risk snapshot failed for %s -- rejecting entry",

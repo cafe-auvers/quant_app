@@ -53,6 +53,9 @@ from src.core.trade_card_state import (
     TradeCardState,
 )
 from src.services import buyboard_runtime as buyboard_runtime_module
+from src.services import capital_reservation_repository
+from src.services import discovered_external_order_repository
+from src.services import execution_order_repository
 from src.services import trade_card_repository as repo
 from src.services.account_reconciliation import (
     AccountReconciliationResult,
@@ -750,6 +753,21 @@ class BuyboardRuntimeWorker(QThread):
                     environment=environment,
                     account_no=account_no,
                     raise_on_error=True,
+                ),
+                portfolio_orders_provider=lambda environment, account_no: execution_order_repository.list_execution_orders_for_account(
+                    self._db_engine,
+                    environment=environment,
+                    account_no=account_no,
+                ),
+                portfolio_reservations_provider=lambda environment, account_no: capital_reservation_repository.list_active_reservations(
+                    self._capital_reservation_engine,
+                    environment=environment,
+                    account_no=account_no,
+                ),
+                portfolio_external_orders_provider=lambda environment, account_no: discovered_external_order_repository.list_discovered_external_orders_for_account(
+                    self._db_engine,
+                    environment=environment,
+                    account_no=account_no,
                 ),
                 capital_reservation_engine=self._capital_reservation_engine,
                 execution_authority=self._execution_authority,

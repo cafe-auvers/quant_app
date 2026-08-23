@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 from src.risk.portfolio import (
     PortfolioPositionRisk,
+    PortfolioProjectedExposure,
     PortfolioRiskLimits,
     PortfolioRiskManager,
     PortfolioRiskSnapshot,
@@ -187,3 +188,77 @@ def test_non_usd_equity_rejects_missing_or_stale_fx():
     assert missing.approved is False
     assert stale.approved is False
     assert fresh.approved is True
+
+
+def test_pending_reserved_and_unresolved_buy_exposure_is_account_wide():
+    manager = PortfolioRiskManager(
+        PortfolioRiskLimits(
+            max_simultaneous_positions=2,
+            max_total_open_risk_fraction=0.08,
+            max_gross_notional_fraction=0.25,
+        )
+    )
+    projected = (
+        PortfolioProjectedExposure(
+            symbol="AAPL",
+            gross_notional_usd=1_000.0,
+            open_risk_usd=100.0,
+            source="PENDING_BUY",
+            reservation_id="RES-1",
+        ),
+        PortfolioProjectedExposure(
+            symbol="NVDA",
+            gross_notional_usd=1_000.0,
+            open_risk_usd=1_000.0,
+            source="UNRESOLVED_EXTERNAL_BUY",
+        ),
+    )
+
+    decision = manager.evaluate_entry(
+        _proposal(
+            environment="PROD",
+            account_no="1",
+            symbol="MSFT",
+            quantity=5,
+            reference_price=100.0,
+            stop_price=90.0,
+        ),
+        _snapshot(projected_exposures=projected),
+    )
+
+    assert decision.approved is False
+    assert decision.position_count_after == 3
+    assert decision.gross_notional_after_usd == 2_500.0
+    assert decision.total_open_risk_after_usd == 1_150.0
+    assert any("simultaneous positions" in reason for reason in decision.reasons)
+    assert any("total open risk" in reason for reason in decision.reasons)
+
+
+def test_atomic_spec_excludes_durable_reservations_but_keeps_external_exposure():
+    manager = PortfolioRiskManager(PortfolioRiskLimits(max_simultaneous_positions=5))
+    decision = manager.evaluate_entry(
+        _proposal(environment="PROD", account_no="1"),
+        _snapshot(
+            projected_exposures=(
+                PortfolioProjectedExposure(
+                    symbol="AAPL",
+                    gross_notional_usd=1_000.0,
+                    open_risk_usd=100.0,
+                    source="PENDING_BUY",
+                    reservation_id="RES-1",
+                ),
+                PortfolioProjectedExposure(
+                    symbol="NVDA",
+                    gross_notional_usd=500.0,
+                    open_risk_usd=500.0,
+                    source="UNRESOLVED_EXTERNAL_BUY",
+                ),
+            )
+        ),
+    )
+
+    spec = decision.reservation_spec
+    assert spec is not None
+    assert spec.baseline_position_symbols == ("NVDA",)
+    assert spec.baseline_gross_notional_usd == 500.0
+    assert spec.baseline_open_risk_usd == 500.0

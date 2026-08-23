@@ -222,6 +222,8 @@ def test_database_outage_reports_kis_recovery_instead_of_runtime_unavailable(
     assert "runtime worker unavailable" not in display.label
     assert "Historical data is not an execution requirement" in display.tooltip
     assert "local Kanban operational file itself could not be opened" in display.tooltip
+    assert "App execution is locked" in display.tooltip
+    assert "Never duplicate an order" in display.tooltip
 
 
 def test_routine_reconciliation_uses_debounced_operator_projection(monkeypatch):

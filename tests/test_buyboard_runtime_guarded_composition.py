@@ -4,6 +4,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("authorized_full_live")
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
 
@@ -18,6 +20,7 @@ from src.core.discovered_external_order import (
     ExternalOrderDisposition,
     new_discovered_external_order,
 )
+from src.core.capital_reservation import CapitalReservation
 from src.core.execution_mode import ExecutionLease, ExecutionSource
 from src.core.execution_order_record import (
     BrokerIdentityStatus,
@@ -43,7 +46,12 @@ from src.core.trade_card_state import (
     TradeCardState,
 )
 from src.risk.pre_trade import PreTradeRiskDecision
-from src.services import buyboard_runtime, capital_reservation_repository
+from src.services import (
+    buyboard_runtime,
+    capital_reservation_repository,
+    discovered_external_order_repository,
+    execution_order_repository,
+)
 from src.services import execution_command_gateway as gateway_module
 from src.services import trade_card_repository
 from src.services.execution_command_gateway import ExecutionCommandGateway
@@ -67,6 +75,47 @@ from src.services.account_reconciliation import (
 
 LEASE = ExecutionLease(device_id="device-1", lease_token="lease-1", lease_epoch=7)
 STRATEGY_ID = "orb-live-1"
+
+
+def test_projected_exposure_counts_partial_buy_once_with_linked_reservation():
+    card = _card()
+    reservation = CapitalReservation.create(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        attempt_group_id="attempt-1",
+        requested_notional=1_000.0,
+        projected_open_risk=50.0,
+    )
+    reservation.consume(600.0)
+    order = ExecutionOrderRecord(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        intent=OrderIntent.ENTRY,
+        client_order_id="entry-1",
+        broker_order_id="broker-1",
+        submitted_quantity=10,
+        submitted_limit_price=100.0,
+        status=ExecutionOrderStatus.PARTIALLY_FILLED,
+        filled_quantity=6,
+        remaining_quantity=4,
+        broker_identity_status=BrokerIdentityStatus.EXACT,
+        capital_reservation_id=reservation.reservation_id,
+    )
+
+    exposures = buyboard_runtime._portfolio_projected_exposures(
+        cards=(card,),
+        execution_orders=(order,),
+        active_reservations=(reservation,),
+    )
+
+    assert len(exposures) == 1
+    assert exposures[0].source == "PENDING_BUY"
+    assert exposures[0].gross_notional_usd == pytest.approx(400.0)
+    assert exposures[0].open_risk_usd == pytest.approx(20.0)
+    assert exposures[0].reservation_id == reservation.reservation_id
 
 
 def _card(symbol: str = "AAPL", **overrides) -> TradeCardState:
@@ -156,6 +205,21 @@ def _make_runtime(
             raise_on_error=True,
         ),
         portfolio_risk_manager=portfolio_risk_manager,
+        portfolio_orders_provider=lambda environment, account_no: execution_order_repository.list_execution_orders_for_account(
+            engine,
+            environment=environment,
+            account_no=account_no,
+        ),
+        portfolio_reservations_provider=lambda environment, account_no: capital_reservation_repository.list_active_reservations(
+            engine,
+            environment=environment,
+            account_no=account_no,
+        ),
+        portfolio_external_orders_provider=lambda environment, account_no: discovered_external_order_repository.list_discovered_external_orders_for_account(
+            engine,
+            environment=environment,
+            account_no=account_no,
+        ),
         card_lookup=lookup,
         broker=gateway,
         execution_lease=LEASE,
@@ -1033,8 +1097,15 @@ def test_ambiguous_cancel_preserves_id_and_blocks_additional_broker_calls(
 
 @pytest.mark.usefixtures("trading_enabled")
 def test_partial_sell_and_sell_all_reach_submit_guarded(tmp_path, monkeypatch):
+    manager = PortfolioRiskManager(
+        PortfolioRiskLimits(
+            max_simultaneous_positions=1,
+            max_total_open_risk_fraction=0.0001,
+            max_gross_notional_fraction=0.0001,
+        )
+    )
     runtime, broker, gateway, engine, market_data = _make_runtime(
-        tmp_path, monkeypatch
+        tmp_path, monkeypatch, portfolio_risk_manager=manager
     )
     partial = _persist_owned_card(
         engine,

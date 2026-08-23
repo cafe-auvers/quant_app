@@ -7,6 +7,8 @@ import os
 import random
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("authorized_full_live")
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 

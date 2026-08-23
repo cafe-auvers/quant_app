@@ -6,6 +6,8 @@ from types import SimpleNamespace
 import pytest
 import requests
 
+pytestmark = pytest.mark.usefixtures("authorized_full_live")
+
 import src.ui.buylist.actions as buylist_actions_module
 import src.ui.buylist.constants as buylist_constants
 import src.ui.buylist.orders as buylist_orders_module

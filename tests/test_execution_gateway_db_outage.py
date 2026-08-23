@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import create_engine
 
+from src.core import execution_config
 from fakes.fake_execution_broker import FakeExecutionBroker
 from src.core.execution_mode import ExecutionLease, ExecutionSource
 from src.core.execution_ownership import ExecutionOwner, ExecutionOwnership
@@ -23,7 +24,10 @@ from src.services.execution_ownership_repository import assign_ownership
 from src.services import trade_card_repository
 from src.services import trading_state
 from src.services.mutation_budget_protocol import AllowAllMutationBudget
+from src.services.controlled_live_policy import LiveExecutionEnvelopeError
 from src.risk.pre_trade import PreTradeRiskDecision
+
+pytestmark = pytest.mark.usefixtures("authorized_full_live")
 
 
 def _request(lease: ExecutionLease, **overrides) -> SubmitExecutionRequest:
@@ -101,6 +105,39 @@ def _gateway(tmp_path, *, allowance=None, journal=None):
     )
     writable[0] = False
     return gateway, broker, lease, writable
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_disabled_mode_blocks_emergency_recovery_submit_and_cancel(
+    tmp_path, monkeypatch
+):
+    journal = EmergencyJournal(tmp_path / "disabled-emergency.jsonl")
+    gateway, broker, lease, _ = _gateway(tmp_path, journal=journal)
+    monkeypatch.setattr(execution_config, "KIS_LIVE_EXECUTION_MODE", "DISABLED")
+
+    with pytest.raises(LiveExecutionEnvelopeError, match="DISABLED"):
+        gateway.submit_guarded(_request(lease))
+    with pytest.raises(LiveExecutionEnvelopeError, match="DISABLED"):
+        gateway.cancel_guarded(
+            CancelExecutionRequest(
+                client_order_id="RECOVERY-CANCEL-1",
+                cancel_command_id="RECOVERY-CANCEL-CMD-1",
+                environment="PROD",
+                account_no="12345678-01",
+                lease=lease,
+                source=ExecutionSource.KANBAN_BOARD,
+                strategy_instance_id="strategy-1",
+                emergency=True,
+                symbol="AAPL",
+                broker_order_id="B-EXACT",
+                quantity=1,
+                side="SELL",
+            )
+        )
+
+    assert broker.submit_calls == []
+    assert broker.cancel_calls == []
+    assert journal.load_entries() == []
 
 
 @pytest.mark.usefixtures("trading_enabled")

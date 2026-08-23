@@ -98,12 +98,61 @@ class PortfolioPositionRisk:
 
 
 @dataclass(frozen=True)
+class PortfolioProjectedExposure:
+    """Exposure not yet represented by a filled position.
+
+    ``reservation_id`` is populated when the durable capital-reservation row
+    already represents this exposure.  The final gateway transaction excludes
+    those rows from its baseline and re-reads them under the account lock, so a
+    second symbol cannot pass using a stale pre-trade snapshot.
+    """
+
+    symbol: str
+    gross_notional_usd: float
+    open_risk_usd: float
+    source: str
+    reservation_id: str = ""
+    strategy_id: str = ""
+    sector: str = ""
+    industry: str = ""
+    correlation_group: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "symbol", _normalized_text(self.symbol))
+        object.__setattr__(self, "source", _normalized_text(self.source))
+        object.__setattr__(self, "reservation_id", str(self.reservation_id or "").strip())
+        object.__setattr__(self, "strategy_id", _normalized_text(self.strategy_id))
+        object.__setattr__(self, "sector", _normalized_text(self.sector))
+        object.__setattr__(self, "industry", _normalized_text(self.industry))
+        object.__setattr__(
+            self, "correlation_group", _normalized_text(self.correlation_group)
+        )
+        if not self.symbol:
+            raise ValueError("projected exposure symbol is required")
+        if not self.source:
+            raise ValueError("projected exposure source is required")
+        if _finite_nonnegative(self.gross_notional_usd, "gross_notional_usd") <= 0:
+            raise ValueError("projected gross notional must be positive")
+        _finite_nonnegative(self.open_risk_usd, "open_risk_usd")
+
+    @property
+    def notional(self) -> float:
+        return float(self.gross_notional_usd)
+
+    @property
+    def open_risk(self) -> float:
+        return float(self.open_risk_usd)
+
+
+@dataclass(frozen=True)
 class ProposedPortfolioEntry:
     symbol: str
     quantity: int
     reference_price: float
     stop_price: float
     strategy_id: str
+    environment: str = ""
+    account_no: str = ""
     sector: str = ""
     industry: str = ""
     correlation_group: str = ""
@@ -126,6 +175,7 @@ class PortfolioRiskSnapshot:
     account_equity_usd: float
     usable_buying_power_usd: float
     positions: Tuple[PortfolioPositionRisk, ...] = ()
+    projected_exposures: Tuple[PortfolioProjectedExposure, ...] = ()
     daily_realized_pnl_usd: Optional[float] = None
     daily_unrealized_pnl_usd: Optional[float] = None
     high_water_equity_usd: Optional[float] = None
@@ -141,10 +191,73 @@ class PortfolioRiskSnapshot:
         )
         object.__setattr__(self, "positions", tuple(self.positions))
         object.__setattr__(
+            self, "projected_exposures", tuple(self.projected_exposures)
+        )
+        object.__setattr__(
             self, "equity_source_currency", _normalized_text(self.equity_source_currency)
         )
         if self.evaluated_at.tzinfo is None:
             raise ValueError("evaluated_at must be timezone-aware")
+
+
+@dataclass(frozen=True)
+class PortfolioRiskReservationSpec:
+    """Immutable inputs for the gateway's atomic projected-risk reservation."""
+
+    environment: str
+    account_no: str
+    symbol: str
+    proposed_notional_usd: float
+    proposed_open_risk_usd: float
+    account_equity_usd: float
+    baseline_position_symbols: Tuple[str, ...]
+    baseline_open_risk_usd: float
+    baseline_gross_notional_usd: float
+    max_simultaneous_positions: int
+    max_total_open_risk_fraction: float
+    max_gross_notional_fraction: float
+    evaluated_at: datetime
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "environment", _normalized_text(self.environment))
+        object.__setattr__(self, "account_no", str(self.account_no or "").strip())
+        object.__setattr__(self, "symbol", _normalized_text(self.symbol))
+        object.__setattr__(
+            self,
+            "baseline_position_symbols",
+            tuple(
+                sorted(
+                    {
+                        _normalized_text(symbol)
+                        for symbol in self.baseline_position_symbols
+                        if _normalized_text(symbol)
+                    }
+                )
+            ),
+        )
+        _finite_nonnegative(self.proposed_notional_usd, "proposed_notional_usd")
+        _finite_nonnegative(self.proposed_open_risk_usd, "proposed_open_risk_usd")
+        _finite_nonnegative(self.account_equity_usd, "account_equity_usd")
+        _finite_nonnegative(self.baseline_open_risk_usd, "baseline_open_risk_usd")
+        _finite_nonnegative(
+            self.baseline_gross_notional_usd, "baseline_gross_notional_usd"
+        )
+        if not self.environment or not self.account_no or not self.symbol:
+            raise ValueError("portfolio reservation scope is incomplete")
+        if self.proposed_notional_usd <= 0:
+            raise ValueError("portfolio reservation proposed notional must be positive")
+        if int(self.max_simultaneous_positions) <= 0:
+            raise ValueError("portfolio reservation position limit must be positive")
+        _finite_nonnegative(
+            self.max_total_open_risk_fraction,
+            "max_total_open_risk_fraction",
+        )
+        _finite_nonnegative(
+            self.max_gross_notional_fraction,
+            "max_gross_notional_fraction",
+        )
+        if self.evaluated_at.tzinfo is None:
+            raise ValueError("portfolio reservation evaluated_at must be timezone-aware")
 
 
 @dataclass(frozen=True)
@@ -155,6 +268,7 @@ class PortfolioRiskDecision:
     total_open_risk_after_usd: float
     gross_notional_after_usd: float
     proposed_notional_usd: float
+    reservation_spec: Optional[PortfolioRiskReservationSpec] = None
 
 
 def _group_notional(
@@ -199,7 +313,7 @@ class PortfolioRiskManager:
 
         equity = float(snapshot.account_equity_usd)
         buying_power = float(snapshot.usable_buying_power_usd)
-        existing = tuple(snapshot.positions)
+        existing = tuple(snapshot.positions) + tuple(snapshot.projected_exposures)
         existing_symbols = {position.symbol for position in existing}
         position_count_after = len(existing_symbols | {proposed.symbol})
         total_open_risk = sum(position.open_risk for position in existing)
@@ -311,6 +425,36 @@ class PortfolioRiskManager:
             ):
                 reasons.append("FX rate used for account equity is missing or stale")
 
+        atomic_baseline = tuple(snapshot.positions) + tuple(
+            exposure
+            for exposure in snapshot.projected_exposures
+            if not exposure.reservation_id
+        )
+        reservation_spec = None
+        if str(proposal.environment or "").strip() and str(
+            proposal.account_no or ""
+        ).strip():
+            reservation_spec = PortfolioRiskReservationSpec(
+                environment=proposal.environment,
+                account_no=proposal.account_no,
+                symbol=proposed.symbol,
+                proposed_notional_usd=proposed.notional,
+                proposed_open_risk_usd=proposed.open_risk,
+                account_equity_usd=equity,
+                baseline_position_symbols=tuple(
+                    position.symbol for position in atomic_baseline
+                ),
+                baseline_open_risk_usd=sum(
+                    position.open_risk for position in atomic_baseline
+                ),
+                baseline_gross_notional_usd=sum(
+                    position.notional for position in atomic_baseline
+                ),
+                max_simultaneous_positions=self.limits.max_simultaneous_positions,
+                max_total_open_risk_fraction=self.limits.max_total_open_risk_fraction,
+                max_gross_notional_fraction=self.limits.max_gross_notional_fraction,
+                evaluated_at=snapshot.evaluated_at,
+            )
         return PortfolioRiskDecision(
             approved=not reasons,
             reasons=tuple(dict.fromkeys(reasons)),
@@ -318,6 +462,7 @@ class PortfolioRiskManager:
             total_open_risk_after_usd=total_open_risk_after,
             gross_notional_after_usd=gross_notional_after,
             proposed_notional_usd=proposed.notional,
+            reservation_spec=reservation_spec,
         )
 
     @staticmethod
@@ -346,3 +491,61 @@ class PortfolioRiskManager:
                 f"Maximum {label} concentration would be exceeded "
                 f"({fraction:.2%}>{limit:.2%})"
             )
+
+
+class PortfolioRiskReservationSpecError(ValueError):
+    """A projected-risk reservation is stale or does not match its order."""
+
+
+def require_portfolio_risk_reservation_spec(
+    spec: object,
+    *,
+    environment: str,
+    account_no: str,
+    symbol: str,
+    quantity: int,
+    reference_price: float,
+    evaluated_at: datetime,
+) -> PortfolioRiskReservationSpec:
+    """Validate that an atomic reservation spec belongs to this exact entry."""
+
+    if not isinstance(spec, PortfolioRiskReservationSpec):
+        raise PortfolioRiskReservationSpecError(
+            "ENTRY order requires an account-wide projected-risk reservation"
+        )
+    expected_scope = (
+        _normalized_text(environment),
+        str(account_no or "").strip(),
+        _normalized_text(symbol),
+    )
+    if (spec.environment, spec.account_no, spec.symbol) != expected_scope:
+        raise PortfolioRiskReservationSpecError(
+            "Projected-risk reservation belongs to a different account or symbol"
+        )
+    expected_notional = int(quantity) * float(reference_price)
+    if not math.isclose(
+        spec.proposed_notional_usd,
+        expected_notional,
+        rel_tol=0.0,
+        abs_tol=1e-6,
+    ):
+        raise PortfolioRiskReservationSpecError(
+            "Projected-risk reservation does not match the requested quantity and price"
+        )
+    if spec.proposed_open_risk_usd < 0 or spec.proposed_open_risk_usd > (
+        spec.proposed_notional_usd + 1e-6
+    ):
+        raise PortfolioRiskReservationSpecError(
+            "Projected open risk is outside the exact entry notional"
+        )
+    if spec.account_equity_usd <= 0:
+        raise PortfolioRiskReservationSpecError(
+            "Projected-risk reservation requires fresh positive account equity"
+        )
+    if spec.evaluated_at.astimezone(timezone.utc) != evaluated_at.astimezone(
+        timezone.utc
+    ):
+        raise PortfolioRiskReservationSpecError(
+            "Projected-risk reservation is not from the current pre-trade decision"
+        )
+    return spec
