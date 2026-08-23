@@ -27,6 +27,7 @@ from sqlalchemy.engine import Engine
 
 from src.core.runtime_readiness import RuntimeDeviceState
 from src.core.schema_version import CURRENT_EXECUTION_SCHEMA_VERSION
+from src.core.execution_config import COORDINATION_RU_PROFILE
 from src.infrastructure.database.coordination_engine import (
     coordination_autocommit_connection,
     coordination_read_connection,
@@ -51,6 +52,25 @@ class RuntimeDeviceRecord:
     updated_at: datetime
     schema_version: int
     details: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RuntimeDeviceLiveness:
+    device_id: str
+    observed: bool
+    active: bool
+    age_seconds: Optional[float] = None
+    record: Optional[RuntimeDeviceRecord] = None
+
+
+def runtime_row_owns_process_liveness(record: RuntimeDeviceRecord) -> bool:
+    """Whether a row uses the post-migration single-heartbeat protocol."""
+
+    return bool(
+        "main_py_alive" in record.details
+        and str(record.details.get("coordination_ru_profile") or "")
+        == COORDINATION_RU_PROFILE
+    )
 
 
 def _table(metadata: MetaData):
@@ -407,6 +427,104 @@ def get_runtime_device_state(
             select(table).where(table.c.device_id == str(device_id or ""))
         ).first()
     return _record(row) if row is not None else None
+
+
+def get_runtime_device_liveness(
+    engine: Engine,
+    *,
+    device_id: str,
+    max_age_seconds: float = 60.0,
+) -> RuntimeDeviceLiveness:
+    """Read the canonical runtime row and its server-clock age in one query.
+
+    New runtimes publish ``main_py_alive`` in this row, so a second
+    ``app_runtime_status`` heartbeat is unnecessary. Older rows without that
+    field retain the legacy process-status fallback during rolling upgrades.
+    """
+
+    normalized_device_id = str(device_id or "").strip()
+    if not normalized_device_id:
+        return RuntimeDeviceLiveness(normalized_device_id, False, False)
+    table = ensure_runtime_device_state_table(engine)
+    with coordination_read_connection(engine) as conn:
+        row = conn.execute(
+            select(table, _server_now(engine).label("server_now")).where(
+                table.c.device_id == normalized_device_id
+            )
+        ).first()
+    if row is None:
+        return RuntimeDeviceLiveness(normalized_device_id, False, False)
+    record = _record(row)
+    reference = row.server_now or datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    else:
+        reference = reference.astimezone(timezone.utc)
+    age = max(0.0, (reference - record.updated_at).total_seconds())
+    if not runtime_row_owns_process_liveness(record):
+        legacy = get_runtime_process_status(
+            engine,
+            record.hostname,
+            max_age_seconds=max(0, int(max_age_seconds)),
+        )
+        return RuntimeDeviceLiveness(
+            normalized_device_id,
+            True,
+            bool(legacy.active),
+            legacy.age_seconds,
+            record,
+        )
+    stopped_states = {
+        RuntimeDeviceState.STOPPED,
+        RuntimeDeviceState.FAILED,
+    }
+    active = bool(
+        0.0 <= age <= float(max_age_seconds)
+        and bool(record.details.get("main_py_alive"))
+        and record.state not in stopped_states
+    )
+    return RuntimeDeviceLiveness(
+        normalized_device_id,
+        True,
+        active,
+        age,
+        record,
+    )
+
+
+def runtime_device_row_is_stale(
+    conn: Connection,
+    engine: Engine,
+    *,
+    device_id: str,
+    max_age_seconds: float = 60.0,
+) -> Optional[bool]:
+    """Return fenced runtime staleness, or ``None`` for a legacy fallback."""
+
+    table = ensure_runtime_device_state_table(engine)
+    row = conn.execute(
+        select(table)
+        .where(table.c.device_id == str(device_id or ""))
+        .with_for_update()
+    ).first()
+    if row is None:
+        return None
+    record = _record(row)
+    if not runtime_row_owns_process_liveness(record):
+        return None
+    reference = conn.execute(select(_server_now(engine))).scalar()
+    if reference is None:
+        return True
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    else:
+        reference = reference.astimezone(timezone.utc)
+    age = max(0.0, (reference - record.updated_at).total_seconds())
+    return bool(
+        age > float(max_age_seconds)
+        or not bool(record.details.get("main_py_alive"))
+        or record.state in {RuntimeDeviceState.STOPPED, RuntimeDeviceState.FAILED}
+    )
 
 
 def list_runtime_device_states(engine: Engine) -> list[RuntimeDeviceRecord]:

@@ -47,6 +47,7 @@ from src.services.account_reconciliation import (
     classify_execution_order,
     decide_emergency_sell,
     fetch_account_broker_snapshot,
+    load_account_local_state,
     reduce_account_reconciliation,
     run_account_reconciliation_pass,
 )
@@ -67,6 +68,90 @@ def test_unchanged_reconciliation_plan_emits_no_commit(tmp_path):
     )
 
     assert commits == []
+
+
+def test_unchanged_relational_reconciliation_state_uses_process_cache(
+    tmp_path, monkeypatch
+):
+    from src.services import execution_order_repository
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'local-state-cache.db'}", future=True)
+    selects = []
+    monotonic = [100.0]
+    monkeypatch.setattr(
+        reconciliation_module.time,
+        "monotonic",
+        lambda: monotonic[0],
+    )
+
+    def capture(_conn, _cursor, statement, _params, _context, _many):
+        normalized = " ".join(statement.lower().split())
+        if normalized.startswith("select"):
+            selects.append(normalized)
+
+    event.listen(engine, "before_cursor_execute", capture)
+    first = load_account_local_state(
+        engine,
+        environment="PROD",
+        account_no="1",
+        cards=(),
+    )
+    first_relational_reads = sum(
+        any(table in statement for table in (
+            "execution_orders",
+            "capital_reservations",
+            "discovered_external_orders",
+        ))
+        for statement in selects
+    )
+    second = load_account_local_state(
+        engine,
+        environment="PROD",
+        account_no="1",
+        cards=(),
+    )
+    second_relational_reads = sum(
+        any(table in statement for table in (
+            "execution_orders",
+            "capital_reservations",
+            "discovered_external_orders",
+        ))
+        for statement in selects
+    )
+
+    assert first == second
+    assert first_relational_reads == 3
+    assert second_relational_reads == first_relational_reads
+
+    monotonic[0] += 901.0
+    load_account_local_state(
+        engine,
+        environment="PROD",
+        account_no="1",
+        cards=(),
+    )
+    refreshed_relational_reads = sum(
+        any(
+            table in statement
+            for table in (
+                "execution_orders",
+                "capital_reservations",
+                "discovered_external_orders",
+            )
+        )
+        for statement in selects
+    )
+    assert refreshed_relational_reads == first_relational_reads + 3
+
+    execution_order_repository.record_execution_order(engine, _order())
+    refreshed = load_account_local_state(
+        engine,
+        environment="PROD",
+        account_no="1",
+        cards=(),
+    )
+
+    assert [order.client_order_id for order in refreshed.execution_orders] == ["C-1"]
 
 
 def _completeness(**overrides) -> SnapshotCompleteness:

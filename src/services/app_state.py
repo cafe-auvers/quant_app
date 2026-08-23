@@ -1193,6 +1193,24 @@ def should_auto_claim_main(
     if main_device.device_id == role.device_id:
         # Defensive: shouldn't happen if role.is_main was accurate.
         return False, "", ""
+    from src.services.runtime_device_state_repository import (
+        get_runtime_device_liveness,
+    )
+
+    device_liveness = get_runtime_device_liveness(
+        engine,
+        device_id=main_device.device_id,
+        max_age_seconds=max_heartbeat_age_seconds,
+    )
+    if device_liveness.observed:
+        if not device_liveness.active:
+            age = (
+                f"{device_liveness.age_seconds:.0f}s"
+                if device_liveness.age_seconds is not None
+                else "unknown"
+            )
+            return True, main_device.device_id, f"stale heartbeat ({age})"
+        return False, "", ""
     status = get_runtime_process_status(
         engine,
         main_device.hostname or other_hostname,

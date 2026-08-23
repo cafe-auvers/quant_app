@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -276,6 +277,30 @@ def test_heartbeat_is_published_on_the_expected_cadence(tmp_path):
     assert service.publish_heartbeat_if_due() is True
     assert len(provider.heartbeats) == 2
     assert service.watchdog_is_external is True
+
+
+def test_async_heartbeat_is_nonblocking_and_uses_local_cadence(tmp_path):
+    published = threading.Event()
+
+    class BlockingProvider(FakeProvider):
+        def publish_heartbeat(self, payload):
+            self.heartbeats.append(payload)
+            published.set()
+            return "async-heartbeat"
+
+    provider = BlockingProvider()
+    service, now = _service(tmp_path, provider=provider)
+
+    assert service.publish_heartbeat_async_if_due() is True
+    assert published.wait(1.0)
+    service._heartbeat_thread.join(1.0)
+    assert service.publish_heartbeat_async_if_due() is False
+    now[0] += timedelta(seconds=10)
+    published.clear()
+    assert service.publish_heartbeat_async_if_due() is True
+    assert published.wait(1.0)
+    service._heartbeat_thread.join(1.0)
+    assert len(provider.heartbeats) == 2
 
 
 def test_successful_heartbeat_audit_is_compacted_while_webhook_stays_frequent(
@@ -769,3 +794,5 @@ def test_enabled_runtime_composition_requires_real_external_provider_urls(
     )
     service = build_external_alerting_service(engine, device_id="pc-main")
     assert isinstance(service.provider, WebhookAlertDeliveryProvider)
+    assert service.heartbeat_interval_seconds == 5.0
+    assert service.heartbeat_audit_interval_seconds == 3600.0

@@ -272,6 +272,33 @@ def test_coordination_heartbeat_uses_online_store_and_hard_cadence(monkeypatch):
     assert len(_CoordinationHeartbeatWorkerStub.instances) == 2
 
 
+def test_guarded_runtime_retires_duplicate_coordination_process_heartbeat(
+    monkeypatch,
+):
+    import src.ui.main_window as main_window
+
+    _CoordinationHeartbeatWorkerStub.instances = []
+    monkeypatch.setattr(
+        main_window,
+        "CoordinationRuntimeHeartbeatWorker",
+        _CoordinationHeartbeatWorkerStub,
+    )
+    window = MainWindow.__new__(MainWindow)
+    window._database_shutting_down = False
+    window._coordination_database_ready = True
+    window.coordination_db_engine = object()
+    window.state_sync_role = SimpleNamespace(
+        device_id="laptop-id",
+        hostname="LAPTOP",
+    )
+    window._buyboard_runtime_worker = SimpleNamespace(_device_id="laptop-id")
+    window._background_worker_running = lambda _worker: True
+
+    window._start_coordination_runtime_heartbeat(force=True)
+
+    assert _CoordinationHeartbeatWorkerStub.instances == []
+
+
 def test_pc_status_poll_does_not_wait_for_local_database_initialization(monkeypatch):
     import src.ui.main_window as main_window
 

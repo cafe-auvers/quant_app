@@ -34,12 +34,15 @@ def test_cloud_coordination_poll_floors_preserve_monthly_budget():
     assert execution_config.COORDINATION_OFF_HOURS_POLL_SECONDS >= 300.0
     assert execution_config.COORDINATION_STATE_SYNC_SECONDS >= 180.0
     assert execution_config.COORDINATION_BOARD_PROJECTION_SECONDS >= 180.0
+    assert execution_config.COORDINATION_RECONCILIATION_CACHE_SECONDS >= 900.0
+    assert execution_config.EXTERNAL_WATCHDOG_HEARTBEAT_SECONDS <= 5.0
+    assert execution_config.EXTERNAL_WATCHDOG_TIDB_AUDIT_SECONDS >= 3600.0
     assert execution_config.PENDING_ORDER_RECONCILIATION_SECONDS >= 2
     assert execution_config.UNKNOWN_ORDER_RECONCILIATION_SECONDS >= 1
     assert execution_config.DURABLE_ORDER_OBSERVATION_SECONDS >= 3600
 
 
-def test_strict_profile_has_two_x_headroom_below_nine_ru_per_second():
+def test_external_pulse_profile_has_two_x_headroom_below_nine_ru_per_second():
     """Lock the documented two-device scheduled-request envelope."""
 
     month_seconds = 30 * 24 * 60 * 60
@@ -54,9 +57,8 @@ def test_strict_profile_has_two_x_headroom_below_nine_ru_per_second():
             # Two devices: revision read plus readiness UPDATE.
             4 * month_seconds
             / execution_config.COORDINATION_DEVICE_HEARTBEAT_SECONDS,
-            # Two main.py process heartbeat UPDATEs.
-            2 * month_seconds
-            / execution_config.COORDINATION_DEVICE_HEARTBEAT_SECONDS,
+            # app_runtime_status is lifecycle-only while the guarded runtime
+            # publishes the canonical runtime_device_state heartbeat.
             month_seconds / execution_config.COORDINATION_LEASE_POLL_SECONDS,
             month_seconds
             / execution_config.COORDINATION_ACTIVE_CARD_POLL_SECONDS,
@@ -68,25 +70,31 @@ def test_strict_profile_has_two_x_headroom_below_nine_ru_per_second():
             / execution_config.COORDINATION_OFF_HOURS_POLL_SECONDS,
             month_seconds
             / execution_config.COORDINATION_OWNERSHIP_PROOF_SECONDS,
-            # Two alert consumers plus two five-minute audit heartbeats.
+            # Two alert consumers plus hourly TiDB evidence for the fast
+            # external-webhook pulses.
             2 * month_seconds
             / execution_config.COORDINATION_ALERT_POLL_SECONDS,
-            2 * month_seconds / 300.0,
+            2
+            * month_seconds
+            / execution_config.EXTERNAL_WATCHDOG_TIDB_AUDIT_SECONDS,
             2 * month_seconds
             / execution_config.COORDINATION_BOARD_PROJECTION_SECONDS,
             # Current display synchronization has five compact request slots.
             5 * month_seconds
             / execution_config.COORDINATION_STATE_SYNC_SECONDS,
-            # Three relational reads per minute for each of two accounts.
-            6 * month_seconds / 60.0,
+            # Broker truth remains minutely; unchanged relational comparison
+            # state is served from the process cache between TiDB refreshes.
+            6
+            * month_seconds
+            / execution_config.COORDINATION_RECONCILIATION_CACHE_SECONDS,
         )
     )
     conservative_ru_per_second = (
         scheduled_requests * 1.25 * 8.0 / month_seconds
     )
 
-    assert scheduled_requests <= 1_110_000
-    assert conservative_ru_per_second <= 4.3
+    assert scheduled_requests <= 750_000
+    assert conservative_ru_per_second <= 2.9
 
 
 def test_idle_operator_command_poll_uses_covering_index_without_commit(tmp_path):

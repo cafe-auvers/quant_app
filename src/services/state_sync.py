@@ -1005,10 +1005,13 @@ def publish_planning_snapshot(
         owner = ownership.main_device if ownership.success else None
         heartbeat_fresh = False
         if owner is not None:
-            from src.services.runtime_status import get_runtime_process_status
+            from src.services.runtime_device_state_repository import (
+                get_runtime_device_liveness,
+            )
 
-            heartbeat_fresh = get_runtime_process_status(
-                engine, owner.hostname
+            heartbeat_fresh = get_runtime_device_liveness(
+                engine,
+                device_id=owner.device_id,
             ).active
         return PlanPublishResult(
             True,
@@ -1239,13 +1242,25 @@ def claim_main_device_if_stale(
                         f"(now {current_owner.device_id!r}, expected {expected_owner_device_id!r})."
                     ),
                 )
-            if not heartbeat_row_is_stale(
+            from src.services.runtime_device_state_repository import (
+                runtime_device_row_is_stale,
+            )
+
+            runtime_stale = runtime_device_row_is_stale(
                 conn,
                 engine,
-                current_owner.hostname,
-                process_name=MAIN_APP_PROCESS,
+                device_id=current_owner.device_id,
                 max_age_seconds=heartbeat_cutoff_seconds,
-            ):
+            )
+            if runtime_stale is None:
+                runtime_stale = heartbeat_row_is_stale(
+                    conn,
+                    engine,
+                    current_owner.hostname,
+                    process_name=MAIN_APP_PROCESS,
+                    max_age_seconds=heartbeat_cutoff_seconds,
+                )
+            if not runtime_stale:
                 return OwnershipResult(
                     False,
                     error="Previous owner's heartbeat is fresh again; not claiming.",

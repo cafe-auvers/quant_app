@@ -9,12 +9,16 @@ from __future__ import annotations
 
 import copy
 import logging
+import threading
+import time
+import weakref
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Callable, Iterable, Mapping, Optional, Sequence, Tuple
 from uuid import NAMESPACE_URL, uuid5
 
+from sqlalchemy import event
 from sqlalchemy.engine import Engine
 
 from src.core import execution_config
@@ -65,6 +69,63 @@ from src.services.position_manager import PositionManager
 from src.utils.market_calendar import US_MARKET_ZONE, previous_nyse_trading_day
 
 logger = logging.getLogger(__name__)
+
+
+_local_state_cache: (
+    "weakref.WeakKeyDictionary["
+    "Engine, dict[tuple[str, str], _CachedAccountRelationalState]]"
+) = weakref.WeakKeyDictionary()
+_local_write_generations: "weakref.WeakKeyDictionary[Engine, int]" = (
+    weakref.WeakKeyDictionary()
+)
+_tracked_engines: "weakref.WeakSet[Engine]" = weakref.WeakSet()
+_local_state_cache_lock = threading.RLock()
+
+
+def _statement_is_write(clauseelement) -> bool:
+    if bool(getattr(clauseelement, "is_dml", False)):
+        return True
+    statement = (
+        str(clauseelement) if clauseelement is not None else ""
+    ).lstrip().split(None, 1)
+    return bool(statement and statement[0].upper() in {"INSERT", "UPDATE", "DELETE"})
+
+
+def _track_local_coordination_writes(engine: Engine) -> None:
+    with _local_state_cache_lock:
+        if engine in _tracked_engines:
+            return
+
+        engine_ref = weakref.ref(engine)
+
+        def after_execute(
+            connection,
+            clauseelement,
+            multiparams,
+            params,
+            execution_options,
+            result,
+        ) -> None:
+            del connection, multiparams, params, execution_options, result
+            if not _statement_is_write(clauseelement):
+                return
+            tracked_engine = engine_ref()
+            if tracked_engine is None:
+                return
+            with _local_state_cache_lock:
+                _local_write_generations[tracked_engine] = (
+                    int(_local_write_generations.get(tracked_engine, 0)) + 1
+                )
+
+        event.listen(engine, "after_execute", after_execute)
+        _tracked_engines.add(engine)
+        _local_write_generations.setdefault(engine, 0)
+
+
+def _local_write_generation(engine: Engine) -> int:
+    _track_local_coordination_writes(engine)
+    with _local_state_cache_lock:
+        return int(_local_write_generations.get(engine, 0))
 
 
 class ReconciliationCategory(str, Enum):
@@ -127,6 +188,13 @@ class AccountLocalState:
     execution_orders: Tuple[ExecutionOrderRecord, ...] = ()
     capital_reservations: Tuple[CapitalReservation, ...] = ()
     external_orders: Tuple[DiscoveredExternalOrder, ...] = ()
+
+
+@dataclass(frozen=True)
+class _CachedAccountRelationalState:
+    generation: int
+    loaded_at: float
+    state: AccountLocalState
 
 
 @dataclass(frozen=True)
@@ -1850,7 +1918,14 @@ def load_account_local_state(
     account_no: str,
     cards: Sequence[TradeCardState],
 ) -> AccountLocalState:
-    """Load every local source once for the same account-scoped pass."""
+    """Load account state, reusing unchanged relational rows in-process.
+
+    The active executor is the only normal writer for orders, reservations,
+    and discovered external orders. Every SQL write through this process's
+    engine invalidates the cache immediately; a periodic canonical refresh
+    bounds visibility for exceptional out-of-process maintenance writes.
+    Cards are always supplied by the runtime's independently revisioned cache.
+    """
     from src.services.capital_reservation_repository import list_active_reservations
     from src.services.discovered_external_order_repository import (
         list_discovered_external_orders_for_account,
@@ -1859,28 +1934,69 @@ def load_account_local_state(
         list_execution_orders_for_account,
     )
 
-    return AccountLocalState(
-        cards=tuple(
-            card
-            for card in cards
-            if card.environment == str(environment or "").upper()
-            and card.account_no == str(account_no or "")
-        ),
+    normalized_environment = str(environment or "").upper()
+    normalized_account = str(account_no or "")
+    account_cards = tuple(
+        card
+        for card in cards
+        if card.environment == normalized_environment
+        and card.account_no == normalized_account
+    )
+    cache_key = (normalized_environment, normalized_account)
+    generation = _local_write_generation(engine)
+    now = time.monotonic()
+    with _local_state_cache_lock:
+        cached = _local_state_cache.get(engine, {}).get(cache_key)
+    if (
+        cached is not None
+        and cached.generation == generation
+        and now - cached.loaded_at
+        < execution_config.COORDINATION_RECONCILIATION_CACHE_SECONDS
+    ):
+        relational = copy.deepcopy(cached.state)
+        return AccountLocalState(
+            cards=account_cards,
+            execution_orders=relational.execution_orders,
+            capital_reservations=relational.capital_reservations,
+            external_orders=relational.external_orders,
+        )
+
+    relational = AccountLocalState(
         execution_orders=tuple(
             list_execution_orders_for_account(
-                engine, environment=environment, account_no=account_no
+                engine,
+                environment=normalized_environment,
+                account_no=normalized_account,
             )
         ),
         capital_reservations=tuple(
             list_active_reservations(
-                engine, environment=environment, account_no=account_no
+                engine,
+                environment=normalized_environment,
+                account_no=normalized_account,
             )
         ),
         external_orders=tuple(
             list_discovered_external_orders_for_account(
-                engine, environment=environment, account_no=account_no
+                engine,
+                environment=normalized_environment,
+                account_no=normalized_account,
             )
         ),
+    )
+    if _local_write_generation(engine) == generation:
+        with _local_state_cache_lock:
+            per_engine = _local_state_cache.setdefault(engine, {})
+            per_engine[cache_key] = _CachedAccountRelationalState(
+                generation=generation,
+                loaded_at=now,
+                state=copy.deepcopy(relational),
+            )
+    return AccountLocalState(
+        cards=account_cards,
+        execution_orders=relational.execution_orders,
+        capital_reservations=relational.capital_reservations,
+        external_orders=relational.external_orders,
     )
 
 

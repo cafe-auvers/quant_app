@@ -433,6 +433,31 @@ def test_execution_switch_fails_when_laptop_main_heartbeat_is_stale(engine, role
     assert get_main_device(engine).main_device.device_id == pc.device_id
 
 
+def test_execution_switch_uses_current_profile_runtime_row_without_duplicate_heartbeat(
+    engine, roles
+):
+    from src.core.execution_config import COORDINATION_RU_PROFILE
+
+    pc, laptop = roles
+    claim_main_device(engine, pc)
+    details = _details()
+    details["coordination_ru_profile"] = COORDINATION_RU_PROFILE
+    save_runtime_device_state(
+        engine,
+        device_id=laptop.device_id,
+        hostname=laptop.hostname,
+        state=RuntimeDeviceState.STANDBY_READY,
+        details=details,
+    )
+
+    result = switch_execution_owner(
+        engine, initiated_by=pc, target_device_id=laptop.device_id
+    )
+
+    assert result.success is True
+    assert get_main_device(engine).main_device.device_id == laptop.device_id
+
+
 def test_execution_switch_fails_when_kis_session_not_ready(engine, roles):
     pc, laptop = roles
     claim_main_device(engine, pc)
