@@ -1,11 +1,14 @@
 """Small always-on listener for remote PC control over Tailscale.
 
 Runs on the always-on PC (launched by pc_morning_routine.ps1, alongside
-main.py). Accepts two plaintext commands over TCP, one per line:
+main.py). Accepts three plaintext commands over TCP, one per line:
 
-  PING              -> replies PONG. Unauthenticated -- reveals nothing
-                       beyond "this listener is running," used by the
-                       laptop's dashboard to show the PC on/off status.
+  PING              -> replies PONG v2 plus a non-secret change token. Used
+                       by the laptop dashboard for status and to trigger one
+                       TiDB reconcile only after PC state actually changes.
+  CHANGE <token> <event-id>
+                    -> records a local-file token for main.py; it performs no
+                       database I/O. Used by the laptop after its TiDB write.
   SHUTDOWN <token>  -> if <token> matches REMOTE_CONTROL_TOKEN from .env,
                        triggers Invoke-GuardedShutdown.ps1 (the same safety
                        guard the scheduled 10:00 shutdown uses -- won't kill
@@ -22,6 +25,7 @@ isn't sufficient to shut this PC down.
 from __future__ import annotations
 
 import datetime as dt
+import hmac
 import os
 import socketserver
 import subprocess
@@ -33,6 +37,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from dotenv import load_dotenv
+
+from src.services.coordination_change_pulse import (
+    read_outbound_change_pulse,
+    record_inbound_change_pulse,
+)
 
 load_dotenv(REPO_ROOT / ".env")
 
@@ -56,14 +65,29 @@ def _log(message: str) -> None:
 class _Handler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
         try:
-            line = self.rfile.readline(256).decode("utf-8", errors="replace").strip()
+            line = self.rfile.readline(512).decode("utf-8", errors="replace").strip()
         except OSError:
             return
 
         peer = self.client_address[0]
 
         if line == "PING":
-            self.wfile.write(b"PONG\n")
+            event_id = read_outbound_change_pulse() or "-"
+            self.wfile.write(f"PONG v2 {event_id}\n".encode("utf-8"))
+            return
+
+        if line.startswith("CHANGE "):
+            parts = line.split(" ", 2)
+            supplied = parts[1].strip() if len(parts) > 1 else ""
+            event_id = parts[2].strip() if len(parts) > 2 else ""
+            if not TOKEN or not hmac.compare_digest(supplied, TOKEN):
+                _log(f"CHANGE request from {peer} denied: token mismatch.")
+                self.wfile.write(b"DENIED\n")
+                return
+            if not record_inbound_change_pulse(event_id):
+                self.wfile.write(b"INVALID\n")
+                return
+            self.wfile.write(b"OK\n")
             return
 
         if line.startswith("SHUTDOWN "):

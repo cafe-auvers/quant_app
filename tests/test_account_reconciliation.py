@@ -5,7 +5,7 @@ from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, text
 
 from src.core.account_broker_snapshot import (
     AccountBrokerSnapshot,
@@ -152,6 +152,60 @@ def test_unchanged_relational_reconciliation_state_uses_process_cache(
     )
 
     assert [order.client_order_id for order in refreshed.execution_orders] == ["C-1"]
+
+
+def test_change_pulse_cache_ignores_age_and_unrelated_heartbeat_writes(
+    tmp_path, monkeypatch
+):
+    from src.services import coordination_change_pulse
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'pulse-state-cache.db'}", future=True)
+    selects = []
+    monotonic = [100.0]
+    monkeypatch.setattr(
+        reconciliation_module.time,
+        "monotonic",
+        lambda: monotonic[0],
+    )
+    coordination_change_pulse.set_change_notifications_available(engine, True)
+
+    def capture(_conn, _cursor, statement, _params, _context, _many):
+        normalized = " ".join(statement.lower().split())
+        if normalized.startswith("select") and any(
+            table in normalized
+            for table in (
+                "execution_orders",
+                "capital_reservations",
+                "discovered_external_orders",
+            )
+        ):
+            selects.append(normalized)
+
+    event.listen(engine, "before_cursor_execute", capture)
+    load_account_local_state(
+        engine, environment="PROD", account_no="1", cards=()
+    )
+    assert len(selects) == 3
+
+    monotonic[0] += 86_400.0
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE TABLE runtime_device_state "
+                "(device_id TEXT PRIMARY KEY, updated_at TEXT)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO runtime_device_state (device_id, updated_at) "
+                "VALUES ('pc', 'now')"
+            )
+        )
+    load_account_local_state(
+        engine, environment="PROD", account_no="1", cards=()
+    )
+
+    assert len(selects) == 3
 
 
 def _completeness(**overrides) -> SnapshotCompleteness:

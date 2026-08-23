@@ -1,7 +1,8 @@
 """Client for the always-on PC's remote-control listener (see
 scripts/pc_remote_control_listener.py), reached over Tailscale.
 
-Two operations only:
+The listener supports status, guarded shutdown, and a database-free change
+token used by the internal coordination pulse:
   - check_pc_status(): is the listener reachable right now ("PING" -> "PONG").
     This reports only the listener, not the PC's physical power, database, or
     main.py state. Callers must display those signals separately.
@@ -44,6 +45,17 @@ class PcServiceStatus:
     database_hostname: str = ""
     main_app_active: Optional[bool] = None
     main_app_last_seen_seconds: Optional[float] = None
+    coordination_change_event_id: str = ""
+    coordination_change_pulse_supported: bool = False
+    coordination_notification_event_id: str = ""
+    coordination_notification_delivered: bool = False
+
+
+@dataclass(frozen=True)
+class PcListenerStatus:
+    status: PcStatus
+    coordination_change_event_id: str = ""
+    coordination_change_pulse_supported: bool = False
 
 
 def _pc_host() -> Optional[str]:
@@ -59,19 +71,64 @@ def _token() -> str:
     return get_env_value("REMOTE_CONTROL_TOKEN", "") or ""
 
 
-def check_pc_status(timeout: float = CONNECT_TIMEOUT_SECONDS) -> PcStatus:
-    """Ping the listener; OFF means only that this listener is unavailable."""
+def check_pc_listener(timeout: float = CONNECT_TIMEOUT_SECONDS) -> PcListenerStatus:
+    """Ping the listener and read its optional database-free change token."""
+
     host = _pc_host()
     if not host:
-        return PcStatus.OFF
+        return PcListenerStatus(PcStatus.OFF)
     try:
         with socket.create_connection((host, _pc_port()), timeout=timeout) as conn:
             conn.settimeout(timeout)
             conn.sendall(b"PING\n")
+            reply = conn.recv(256).decode("utf-8", errors="replace").strip()
+    except OSError:
+        return PcListenerStatus(PcStatus.OFF)
+    if reply == "PONG":
+        # Backward-compatible response from a listener that predates change
+        # pulses. Callers retain their TiDB fallback polling in this case.
+        return PcListenerStatus(PcStatus.ON)
+    if reply.startswith("PONG v2"):
+        parts = reply.split(" ", 2)
+        event_id = "" if len(parts) < 3 or parts[2] == "-" else parts[2]
+        return PcListenerStatus(
+            PcStatus.ON,
+            coordination_change_event_id=event_id,
+            coordination_change_pulse_supported=True,
+        )
+    return PcListenerStatus(PcStatus.UNKNOWN)
+
+
+def check_pc_status(timeout: float = CONNECT_TIMEOUT_SECONDS) -> PcStatus:
+    """Compatibility status-only view of :func:`check_pc_listener`."""
+
+    return check_pc_listener(timeout=timeout).status
+
+
+def notify_pc_coordination_change(
+    event_id: str, *, timeout: float = CONNECT_TIMEOUT_SECONDS
+) -> bool:
+    """Tell the PC listener that TiDB state has already changed.
+
+    This request writes only a local JSON token on the PC. The PC's internal
+    Python pulse notices it and performs the one canonical reconciliation.
+    """
+
+    host = _pc_host()
+    token = _token()
+    event_id = str(event_id or "").strip()
+    if not host or not token or not event_id:
+        return False
+    try:
+        with socket.create_connection((host, _pc_port()), timeout=timeout) as conn:
+            conn.settimeout(timeout)
+            conn.sendall(
+                f"CHANGE {token} {event_id}\n".encode("utf-8")
+            )
             reply = conn.recv(64).decode("utf-8", errors="replace").strip()
     except OSError:
-        return PcStatus.OFF
-    return PcStatus.ON if reply == "PONG" else PcStatus.UNKNOWN
+        return False
+    return reply == "OK"
 
 
 def send_shutdown_signal(timeout: float = CONNECT_TIMEOUT_SECONDS) -> "ShutdownResult":

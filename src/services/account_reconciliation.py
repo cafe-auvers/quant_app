@@ -83,12 +83,38 @@ _local_state_cache_lock = threading.RLock()
 
 
 def _statement_is_write(clauseelement) -> bool:
-    if bool(getattr(clauseelement, "is_dml", False)):
-        return True
-    statement = (
-        str(clauseelement) if clauseelement is not None else ""
-    ).lstrip().split(None, 1)
-    return bool(statement and statement[0].upper() in {"INSERT", "UPDATE", "DELETE"})
+    if not bool(getattr(clauseelement, "is_dml", False)):
+        statement = (
+            str(clauseelement) if clauseelement is not None else ""
+        ).lstrip().split(None, 2)
+        if not statement or statement[0].upper() not in {
+            "INSERT",
+            "UPDATE",
+            "DELETE",
+        }:
+            return False
+    table = getattr(getattr(clauseelement, "table", None), "name", "")
+    if not table:
+        rendered = (
+            str(clauseelement) if clauseelement is not None else ""
+        ).lower().replace("`", "")
+        table = next(
+            (
+                candidate
+                for candidate in (
+                    "execution_orders",
+                    "capital_reservations",
+                    "discovered_external_orders",
+                )
+                if candidate in rendered
+            ),
+            "",
+        )
+    return str(table or "").lower() in {
+        "execution_orders",
+        "capital_reservations",
+        "discovered_external_orders",
+    }
 
 
 def _track_local_coordination_writes(engine: Engine) -> None:
@@ -192,7 +218,7 @@ class AccountLocalState:
 
 @dataclass(frozen=True)
 class _CachedAccountRelationalState:
-    generation: int
+    generation: tuple[object, ...]
     loaded_at: float
     state: AccountLocalState
 
@@ -1943,15 +1969,33 @@ def load_account_local_state(
         and card.account_no == normalized_account
     )
     cache_key = (normalized_environment, normalized_account)
-    generation = _local_write_generation(engine)
+    from src.services.coordination_change_pulse import (
+        change_notifications_available,
+        coordination_table_change_generation,
+    )
+
+    generation = (
+        _local_write_generation(engine),
+        coordination_table_change_generation(
+            engine,
+            {
+                "execution_orders",
+                "capital_reservations",
+                "discovered_external_orders",
+            },
+        ),
+    )
     now = time.monotonic()
     with _local_state_cache_lock:
         cached = _local_state_cache.get(engine, {}).get(cache_key)
     if (
         cached is not None
         and cached.generation == generation
-        and now - cached.loaded_at
-        < execution_config.COORDINATION_RECONCILIATION_CACHE_SECONDS
+        and (
+            change_notifications_available(engine)
+            or now - cached.loaded_at
+            < execution_config.COORDINATION_RECONCILIATION_CACHE_SECONDS
+        )
     ):
         relational = copy.deepcopy(cached.state)
         return AccountLocalState(
@@ -1984,7 +2028,18 @@ def load_account_local_state(
             )
         ),
     )
-    if _local_write_generation(engine) == generation:
+    current_generation = (
+        _local_write_generation(engine),
+        coordination_table_change_generation(
+            engine,
+            {
+                "execution_orders",
+                "capital_reservations",
+                "discovered_external_orders",
+            },
+        ),
+    )
+    if current_generation == generation:
         with _local_state_cache_lock:
             per_engine = _local_state_cache.setdefault(engine, {})
             per_engine[cache_key] = _CachedAccountRelationalState(

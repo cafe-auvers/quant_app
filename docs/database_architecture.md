@@ -268,18 +268,18 @@ There is no PC relay. The principal steady-state database cadences are:
 
 | Coordination activity | Database cadence |
 | --- | ---: |
-| Operator-command pickup during the regular session | 20 seconds, active executor only |
-| Lease proof | 20 seconds, active executor only |
+| Operator-command pickup during the regular session | Internal/Tailscale change token; 20-second legacy or 3600-second v2 fallback |
+| Lease proof | Change token and every broker mutation; 20-second legacy or 3600-second v2 fallback |
 | Protective ownership proof | 30 seconds while positions exist; one bulk read |
 | Runtime-readiness heartbeat | 45 seconds per running device |
 | `main.py` process heartbeat | Folded into runtime readiness; `app_runtime_status` is a legacy fallback |
 | External watchdog pulse | 5 seconds over HTTPS; no TiDB request per pulse |
 | Alert queue check | 90 seconds; successful external heartbeat audit compacted to about 1 hour |
-| Active/standby card revision check | 180/300 seconds per running device |
-| Buy Board and planning/control display synchronization | 180 seconds per running device |
-| Operator-command pickup | 20 seconds in-session; 300 seconds outside the regular session |
+| Active/standby card revision check | Change token; 180/300-second legacy or 3600-second v2 fallback |
+| Buy Board and planning/control display synchronization | Change token; 3600-second v2 fallback |
+| Operator-command pickup | Change token; legacy 20 seconds in-session/300 seconds off-hours |
 | Writable probe fallback | 180 seconds; normally satisfied by the readiness write |
-| Account-reconciliation relational comparison refresh | 900 seconds; canonical writes invalidate the process cache immediately |
+| Account-reconciliation relational comparison refresh | Relevant DML token; 900-second fallback without token delivery |
 
 Event-driven writes do not wait for these timers. Plan publication, control
 changes, owner activation/handoff, command insertion/claim, order status/fill

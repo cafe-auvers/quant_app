@@ -61,14 +61,18 @@ for the current formula.
 - A price-only change stays in memory. A TradeCard JSON row is written only
   when a plan, lifecycle, order, stop, warning, or other durable decision
   changes.
-- The Buy Board performs one four-table revision statement per minute. If the
-  token is unchanged it transfers no card JSON and does not rebuild the UI.
+- The Buy Board is refreshed by an internal dirty generation. The existing
+  Tailscale PC listener carries a non-secret change token between devices, so
+  an unchanged local tick performs no SQL. A one-hour fallback remains for a
+  missed token after the listener confirms protocol v2.
 - After a change, the whole projection is four bulk reads: cards, ownership,
   owned orders, and external orders. It is **four reads for 89 cards**, not
   three reads per card. The current 89-card recovery snapshot is about 230 KiB.
-- The active runtime checks the compact card revision every three minutes and
-  the standby every five minutes. A write made by the same process invalidates
-  its cache immediately; ownership activation force-loads canonical cards.
+- The active and standby runtimes check the compact card revision only after
+  the internal/Tailscale change generation advances. With an old or unavailable
+  listener they retain the previous 180/300-second fallbacks; with protocol v2
+  the missed-notification fallback is one hour. Ownership activation always
+  force-loads canonical cards.
 - A switch of Execution Owner is not allowed to wait for that cadence: the
   target force-loads all cards and installs current quote subscriptions and
   stops before it can publish `ACTIVE`.
@@ -97,8 +101,8 @@ for the current formula.
   order refreshes its durable audit timestamp at most hourly; an unchanged
   terminal order is not rewritten. The in-memory/account readiness proof
   remains on the normal reconciliation cadence.
-- A three-minute canonical Buy Board refresh performs one revision query
-  and one four-table projection only when that token changed. It no longer
+- A change-pulse Buy Board refresh performs one revision query and one
+  four-table projection only when that token changed. It no longer
   runs the local compatibility bootstrap, duplicates the TradeCard payload
   read, or repeats the revision query. Explicit local planning changes retain
   the bootstrap path.
@@ -113,21 +117,21 @@ for the current formula.
   loads all relevant OPEN alert keys once, replacing four SELECT+COMMIT pairs
   per card, and an unchanged account-reconciliation plan opens no transaction.
 - Unchanged account-reconciliation comparison rows are served from process
-  memory. Canonical SQL writes invalidate them immediately and a 15-minute
-  TiDB refresh bounds exceptional external changes; broker truth still
-  refreshes every minute.
-- Planning/control state sync is once per three minutes. Publishing, operator commands,
-  control-button actions, broker-boundary checks, and owner activation use
-  their immediate paths and do not wait for that display-sync timer.
-- Each three-minute live-control, Operator Control, and planning-revision display
+  memory. Only execution-order, reservation, discovered-order, or remote change
+  pulses invalidate them; readiness and alert writes no longer defeat the
+  cache every minute. The 15-minute refresh remains only when change-token
+  delivery is unavailable. Broker truth still refreshes every minute.
+- Planning/control state sync is internal/Tailscale change-driven with a
+  one-hour recovery fallback. Publishing, operator commands, control-button
+  actions, broker-boundary checks, and owner activation retain immediate paths.
+- Each change-driven live-control, Operator Control, and planning-revision display
   refresh is one conditional SELECT. It returns payload text only for the two
   tiny control rows; the larger planning documents contribute revision numbers
   only. This replaces at least one separate control query per device per minute.
-- The regular-session operator-command pickup uses a twenty-second hard floor,
-  and its empty/oldest-pending lookup is backed by one covering
-  `(status, created_at, command_id)` index. This is the only cloud cadence
-  relaxed in response to the second production RU sample; local quote, stop,
-  and broker-boundary lease checks are unchanged.
+- The regular-session operator-command pickup runs immediately after a remote
+  change token; its empty/oldest-pending lookup remains backed by one covering
+  `(status, created_at, command_id)` index. An old/unavailable listener retains
+  the twenty-second fallback; protocol v2 uses a one-hour recovery fallback.
 - Guarded pending-order lookups share one canonical snapshot for two seconds
   across all heartbeat stages. This removes repeated list-then-fetch reads of
   the same order while the one-second quote/stop loop keeps running. An
@@ -140,19 +144,19 @@ polls.
 | Coordination work | Hard cadence |
 | --- | ---: |
 | Local quote/ORB/stop evaluation | 1 second, no TiDB request |
-| Operator-command pickup, regular session | 20 seconds, active executor only |
-| Lease proof | 20 seconds, active executor only |
+| Operator-command pickup, regular session | On change token; 20-second legacy or 3600-second v2 fallback |
+| Lease proof | On change token and every broker mutation; 20-second legacy or 3600-second v2 fallback |
 | Protective ownership proof | 30 seconds, one bulk read only while positions exist |
 | Writable probe | 180-second fallback; normally satisfied by readiness write |
 | Runtime readiness heartbeat | 45 seconds per running device |
 | `main.py` process heartbeat | Folded into runtime readiness; legacy fallback only |
 | External watchdog pulse | 5 seconds over HTTPS; no TiDB request |
-| Active/standby card revision checks | 180/300 seconds |
-| Buy Board and planning/control display sync | 180 seconds per running device |
-| Operator-command pickup outside regular session | 300 seconds |
+| Active/standby card revision checks | On change token; 180/300-second legacy or 3600-second v2 fallback |
+| Buy Board and planning/control display sync | On change token; 3600-second v2 fallback |
+| Operator-command pickup outside regular session | On change token; 300-second legacy or 3600-second v2 fallback |
 | Alert queue check | 90 seconds; successful pulse audit every 60 minutes |
 | Stable pending-order snapshot | 2 seconds; unknown submissions stay at 1 second |
-| Reconciliation relational cache | 900 seconds; local writes invalidate immediately |
+| Reconciliation relational cache | Until relevant DML pulse; 900-second fallback without token delivery |
 
 ### Supported worst-case calculation
 
@@ -169,24 +173,20 @@ daily pattern:
 
 | Background source | SQL statements/month |
 | --- | ---: |
-| Fallback writable probes (assumes every fallback fires) | 28,800 |
+| Fallback writable probes plus their commits | 57,600 |
 | Two-device readiness revision + heartbeat UPDATE | 230,400 |
 | Two-device `main.py` process heartbeats | 0 steady; lifecycle fallback only |
-| Active-owner lease proof | 129,600 |
-| Active/standby card revision checks | 23,040 |
-| Regular/off-hours operator-command checks | 32,664 |
+| Lease/card/operator missed-token recovery fallbacks | 2,880 |
 | Bulk protective ownership proof | 86,400 |
 | Alert queue plus compacted heartbeat audits | 59,040 |
-| Two-device Buy Board revision checks | 28,800 |
-| Planning/control state sync | 72,000 |
-| Cached account-reconciliation relational reads, two accounts | 17,280 |
-| Transaction COMMITs for fallback writable probes | 28,800 |
-| **Scheduled total** | **736,824** |
-| **With 25% reconnect/scheduling margin** | **921,030** |
+| Buy Board plus planning/control recovery fallbacks | 5,040 |
+| Cached account-reconciliation relational reads | 0 steady; relevant changes only |
+| **Scheduled total** | **441,360** |
+| **With 25% reconnect/scheduling margin** | **551,700** |
 
 For capacity planning, this project applies a conservative **8 RU per small
-scheduled statement**. The `external-pulse-v2` profile therefore budgets about
-**7.4 million RUs/month**, or about **2.84 RU/s**, for scheduled work including a 25%
+scheduled statement**. The `internal-change-pulse-v3` profile therefore budgets about
+**4.42 million RUs/month**, or about **1.70 RU/s**, for scheduled work including a 25%
 reconnect/scheduling margin. This leaves more than 100% headroom for real state
 transitions, bulk projection payloads, order journals, TiDB background jobs,
 and measurement error while keeping the cluster target at **7--9 RU/s**.
@@ -258,6 +258,20 @@ moves fast liveness to the five-second external HTTPS pulse. The alert sweep is
 one bulk read, read-only alert polling emits no COMMIT, and unchanged
 reconciliation state is served from the bounded process cache.
 
+A read-only 30-minute statement-history sample on 2026-08-23 then recorded
+1,497 SQL executions and about 1,849 statement RUs, or roughly **1.03
+statement RU/s**, while the cluster dashboard still showed about 15--18 RU/s.
+That proves the displayed remainder is not explained by application SQL alone.
+The same capture did reveal avoidable unchanged traffic: card/projection reads,
+state revisions, and the three reconciliation tables were still recurring.
+`internal-change-pulse-v3` replaces those timers with an in-process dirty
+generation and sends only a non-secret change token over the existing Tailscale
+PC listener. The receiving process performs one canonical reconciliation after
+the token changes. Listener protocol v1 (plain `PONG`) is detected explicitly
+and keeps the old conservative polling behavior until the listener restarts.
+The 45-second readiness row remains because it is the transactional crash and
+handoff fence; in that sample its UPDATEs consumed about 0.08 RU/s.
+
 TiDB states that SQL queries, bulk operations, and its own background jobs all
 consume RUs. `EXPLAIN ANALYZE` reports statement RU but excludes gateway egress;
 the authoritative total is the cluster **Usage this month** pane, and the
@@ -273,8 +287,9 @@ projected_monthly_RU = observed_24_hour_RU * 30
 ```
 
 The operational acceptance target is a sustained **7--9 RU/s**, assessed using
-the TiDB Cloud one-minute average after both devices have run `external-pulse-v2`
-for at least 15 minutes. Any minute above 9 RU/s during an otherwise idle
+the TiDB Cloud one-minute average after both devices and the PC listener have
+run `internal-change-pulse-v3` for at least 15 minutes. Any minute above 9 RU/s
+during an otherwise idle
 interval fails acceptance; trading transitions and reconciliation spikes are
 recorded separately. Keep the spending limit at zero if a bill is never
 acceptable, but understand the safety trade-off: TiDB documents that quota

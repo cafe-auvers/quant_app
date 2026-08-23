@@ -34,6 +34,7 @@ def test_cloud_coordination_poll_floors_preserve_monthly_budget():
     assert execution_config.COORDINATION_OFF_HOURS_POLL_SECONDS >= 300.0
     assert execution_config.COORDINATION_STATE_SYNC_SECONDS >= 180.0
     assert execution_config.COORDINATION_BOARD_PROJECTION_SECONDS >= 180.0
+    assert execution_config.COORDINATION_REMOTE_FALLBACK_SECONDS >= 3600.0
     assert execution_config.COORDINATION_RECONCILIATION_CACHE_SECONDS >= 900.0
     assert execution_config.EXTERNAL_WATCHDOG_HEARTBEAT_SECONDS <= 5.0
     assert execution_config.EXTERNAL_WATCHDOG_TIDB_AUDIT_SECONDS >= 3600.0
@@ -42,12 +43,10 @@ def test_cloud_coordination_poll_floors_preserve_monthly_budget():
     assert execution_config.DURABLE_ORDER_OBSERVATION_SECONDS >= 3600
 
 
-def test_external_pulse_profile_has_two_x_headroom_below_nine_ru_per_second():
+def test_internal_change_pulse_profile_has_large_headroom_below_nine_ru_per_second():
     """Lock the documented two-device scheduled-request envelope."""
 
     month_seconds = 30 * 24 * 60 * 60
-    regular_session_seconds = 22 * 6.5 * 60 * 60
-    off_hours_seconds = month_seconds - regular_session_seconds
 
     scheduled_requests = sum(
         (
@@ -57,17 +56,12 @@ def test_external_pulse_profile_has_two_x_headroom_below_nine_ru_per_second():
             # Two devices: revision read plus readiness UPDATE.
             4 * month_seconds
             / execution_config.COORDINATION_DEVICE_HEARTBEAT_SECONDS,
-            # app_runtime_status is lifecycle-only while the guarded runtime
-            # publishes the canonical runtime_device_state heartbeat.
-            month_seconds / execution_config.COORDINATION_LEASE_POLL_SECONDS,
-            month_seconds
-            / execution_config.COORDINATION_ACTIVE_CARD_POLL_SECONDS,
-            month_seconds
-            / execution_config.COORDINATION_STANDBY_CARD_POLL_SECONDS,
-            regular_session_seconds
-            / execution_config.COORDINATION_OPERATOR_COMMAND_POLL_SECONDS,
-            off_hours_seconds
-            / execution_config.COORDINATION_OFF_HOURS_POLL_SECONDS,
+            # Lease, active/standby cards, and operator commands are woken by
+            # the local/Tailscale dirty pulse. These four slots are only the
+            # hourly missed-notification recovery fallback.
+            4
+            * month_seconds
+            / execution_config.COORDINATION_REMOTE_FALLBACK_SECONDS,
             month_seconds
             / execution_config.COORDINATION_OWNERSHIP_PROOF_SECONDS,
             # Two alert consumers plus hourly TiDB evidence for the fast
@@ -77,24 +71,21 @@ def test_external_pulse_profile_has_two_x_headroom_below_nine_ru_per_second():
             2
             * month_seconds
             / execution_config.EXTERNAL_WATCHDOG_TIDB_AUDIT_SECONDS,
-            2 * month_seconds
-            / execution_config.COORDINATION_BOARD_PROJECTION_SECONDS,
-            # Current display synchronization has five compact request slots.
-            5 * month_seconds
-            / execution_config.COORDINATION_STATE_SYNC_SECONDS,
-            # Broker truth remains minutely; unchanged relational comparison
-            # state is served from the process cache between TiDB refreshes.
-            6
+            # Two board projections plus five compact state-sync request
+            # slots use the same missed-notification recovery fallback.
+            7
             * month_seconds
-            / execution_config.COORDINATION_RECONCILIATION_CACHE_SECONDS,
+            / execution_config.COORDINATION_REMOTE_FALLBACK_SECONDS,
+            # Broker truth remains minutely, but unchanged relational rows
+            # remain in process until an actual local/remote DML pulse.
         )
     )
     conservative_ru_per_second = (
         scheduled_requests * 1.25 * 8.0 / month_seconds
     )
 
-    assert scheduled_requests <= 750_000
-    assert conservative_ru_per_second <= 2.9
+    assert scheduled_requests <= 500_000
+    assert conservative_ru_per_second <= 1.8
 
 
 def test_idle_operator_command_poll_uses_covering_index_without_commit(tmp_path):

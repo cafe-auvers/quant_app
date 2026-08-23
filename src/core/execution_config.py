@@ -90,7 +90,7 @@ ENGINE_HEARTBEAT_SECONDS = _env_int("ENGINE_HEARTBEAT_SECONDS", 1)
 # Published in runtime readiness so a newly deployed client refuses to share
 # the coordination store with a still-running pre-budget peer. This is a
 # protocol identity, not an operator-overridable setting.
-COORDINATION_RU_PROFILE = "external-pulse-v2"
+COORDINATION_RU_PROFILE = "internal-change-pulse-v3"
 # The market/ORB loop above stays at one second. These independent cadences
 # cap Internet coordination traffic without delaying broker-boundary fencing.
 COORDINATION_ACTIVE_CARD_POLL_SECONDS = max(
@@ -156,6 +156,12 @@ COORDINATION_STATE_SYNC_SECONDS = max(
 )
 COORDINATION_BOARD_PROJECTION_SECONDS = max(
     180.0, _env_float("COORDINATION_BOARD_PROJECTION_SECONDS", 180.0)
+)
+# When the existing Tailscale listener confirms change-pulse protocol v2,
+# unchanged display/card/command reads use this disaster-recovery fallback.
+# Normal cross-device changes arrive as local tokens and reconcile at once.
+COORDINATION_REMOTE_FALLBACK_SECONDS = max(
+    3600.0, _env_float("COORDINATION_REMOTE_FALLBACK_SECONDS", 3600.0)
 )
 PENDING_ORDER_RECONCILIATION_SECONDS = max(
     2, _env_int("PENDING_ORDER_RECONCILIATION_SECONDS", 2)

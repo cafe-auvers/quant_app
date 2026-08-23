@@ -181,6 +181,11 @@ def init_coordination_engine(
             "engine_disposed",
             lambda _engine: read_engine.dispose(),
         )
+        from src.services.coordination_change_pulse import (
+            install_coordination_change_tracking,
+        )
+
+        install_coordination_change_tracking(engine)
         with coordination_read_connection(engine) as conn:
             conn.execute(text("SELECT 1"))
         if ensure_schema:
