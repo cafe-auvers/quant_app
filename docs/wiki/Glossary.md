@@ -13,6 +13,7 @@
 | Gate 2 | Credentialed read-only KIS soak/evidence stage |
 | KIS | Korea Investment & Securities API/broker integration |
 | Live Trading | Canonical administrative permission; one gate among many |
+| Local trading lock | Per-machine `TRADING_ENABLED` permission; never synchronized |
 | Local mirror | Pull-only laptop SQLite market-data copy |
 | Mutation budget | Submit/cancel/replace capacity and spacing control |
 | Operator Control | Device allowed to issue the next human command |
@@ -20,6 +21,6 @@
 | Reconciliation | Applying broker order/position evidence conservatively |
 | Revision fence | Rejects a command based on stale canonical state |
 | RS/TI65 | Relative-strength and trend indicators used by charts/scanner |
-| Standby ready | Dependencies are healthy, but this runtime is not active owner |
+| Standby ready | Dependencies are healthy and handoff-ready, but this runtime is not the active owner |
 | Unknown submission state | Broker outcome is ambiguous; never safe to retry blindly |
 | Watchlist | Passive persisted planning stage; no dedicated tab |

@@ -63,6 +63,16 @@ large enough, Leadership remains unavailable and Market RS is not reweighted.
 Only the displayed score is rounded (half up). Labels use the centralized
 boundaries: 80-100 Strong, 60-79 Moderate, and 0-59 Weak.
 
+The number in the large badge is therefore a **Leadership percentile score**,
+not a combined trade score and not a measure of how far the stock is above or
+below SPY. A high value can coexist with a negative price-relative-to-SPY
+display because those values may use different lookback windows and units.
+It only says the stock ranked well on the inputs above for that completed
+snapshot. It does not say the stock is rising now, that market context is
+known, or that an entry is safe. Open **Details** and require a current as-of
+date, a non-N/A Market RS, a non-N/A Industry Peer RS, at least five peers,
+and the expected peer basis before treating the label as meaningful.
+
 ## Classification and proxies
 
 The hierarchy is Market -> Segment -> Sector -> Industry -> Stock. The batch
@@ -142,4 +152,6 @@ or guarantees of profitability. They do not authorize or block orders.
 Thresholds and weights should be validated later against historical signals
 and outcomes. Known limitations include non-point-in-time classifications,
 unavailable context where Market Pulse lacks a matching proxy/history, and no
-historical score playback in this version.
+historical score playback in this version. Until that outcome validation
+exists, **Strong** means "strong relative rank under this formula," not
+"reliable buy" or "likely profitable."

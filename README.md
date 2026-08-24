@@ -2,6 +2,12 @@
 
 A desktop trading dashboard for US-market swing trading with scanner workflows, Buy Board ORB planning, chart review, KIS account visibility, and guarded KIS order submission.
 
+New to the project? Open the large-picture
+[Project Tour](docs/project_tour.html), or use its
+[plain-language text version](docs/project_tour.md). It explains what the two
+computers do, what is synchronized, and why an enabled-looking screen still
+cannot place an order unless every safety gate agrees.
+
 ## Current Capabilities
 
 - KIS production account snapshots with account selection.

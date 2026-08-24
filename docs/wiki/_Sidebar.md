@@ -1,6 +1,7 @@
 ## Quant App
 
 - [Home](Home)
+- [Project Tour](https://github.com/cafe-auvers/quant_app/blob/master/docs/project_tour.md)
 - [Quick Start](Quick-Start)
 - [System Overview](System-Overview)
 - [Architecture](Architecture)

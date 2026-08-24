@@ -31,8 +31,10 @@ read-only as appropriate.
 ## First-session checklist
 
 - Confirm the toolbar Live Trading control is off.
-- Confirm the Buy Board engine reports off/read-only unless you are following a
-  deliberate controlled-live runbook.
+- The Buy Board runtime may be available, but confirm
+  `KIS_LIVE_EXECUTION_MODE=DISABLED`, Live Trading is locked/off, and broker
+  mutations remain blocked unless you are following the controlled-live
+  runbook.
 - Open Health and review MySQL, KIS age, mirror freshness, reconciliation,
   journal health, and free-space checks.
 - Use Scanner, Watchlist, Buylist, and charts before configuring execution.

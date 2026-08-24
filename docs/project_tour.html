@@ -1,0 +1,692 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="A large-picture, plain-language tour of Quant App.">
+  <title>Quant App — Big Picture Tour</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --ink: #f7f8fc;
+      --muted: #a9b5ca;
+      --night: #07101f;
+      --panel: #101d32;
+      --line: #2b3b55;
+      --cyan: #4dd8ff;
+      --mint: #66efc1;
+      --amber: #ffcb66;
+      --coral: #ff7187;
+      --violet: #a894ff;
+      --max: 1180px;
+    }
+
+    * { box-sizing: border-box; }
+
+    html {
+      scroll-behavior: smooth;
+      scroll-snap-type: y mandatory;
+      background: var(--night);
+    }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 18% 8%, rgba(77, 216, 255, .10), transparent 31rem),
+        radial-gradient(circle at 80% 42%, rgba(168, 148, 255, .10), transparent 34rem),
+        var(--night);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 18px;
+      line-height: 1.45;
+    }
+
+    a { color: inherit; }
+
+    .skip {
+      position: fixed;
+      z-index: 20;
+      top: .7rem;
+      left: .7rem;
+      padding: .6rem 1rem;
+      border-radius: 999px;
+      color: var(--night);
+      background: var(--mint);
+      transform: translateY(-180%);
+    }
+
+    .skip:focus { transform: translateY(0); }
+
+    .topbar {
+      position: fixed;
+      z-index: 10;
+      inset: 0 0 auto 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      padding: .85rem clamp(1rem, 4vw, 3rem);
+      color: var(--muted);
+      background: linear-gradient(180deg, rgba(7, 16, 31, .96), rgba(7, 16, 31, 0));
+      pointer-events: none;
+    }
+
+    .brand {
+      color: var(--ink);
+      font-size: .8rem;
+      font-weight: 850;
+      letter-spacing: .18em;
+      text-transform: uppercase;
+    }
+
+    .dots {
+      display: flex;
+      gap: .48rem;
+      pointer-events: auto;
+    }
+
+    .dots a {
+      width: .58rem;
+      height: .58rem;
+      border: 1px solid #71809a;
+      border-radius: 50%;
+      background: rgba(255,255,255,.06);
+      text-indent: -9999px;
+      transition: transform .2s ease, background .2s ease;
+    }
+
+    .dots a:hover,
+    .dots a:focus-visible {
+      background: var(--cyan);
+      transform: scale(1.5);
+      outline: none;
+    }
+
+    .screen {
+      position: relative;
+      min-height: 100svh;
+      scroll-snap-align: start;
+      display: grid;
+      place-items: center;
+      padding: clamp(4.5rem, 8vw, 7rem) clamp(1rem, 5vw, 4rem) clamp(2rem, 5vw, 4rem);
+      overflow: hidden;
+      isolation: isolate;
+    }
+
+    .screen::before {
+      content: "";
+      position: absolute;
+      z-index: -1;
+      width: 28rem;
+      aspect-ratio: 1;
+      right: -12rem;
+      bottom: -14rem;
+      border-radius: 50%;
+      background: var(--glow, var(--cyan));
+      filter: blur(130px);
+      opacity: .10;
+    }
+
+    .wrap {
+      width: min(100%, var(--max));
+      margin-inline: auto;
+    }
+
+    .wrap,
+    .hero-grid,
+    .two-col,
+    .hero-grid > *,
+    .two-col > * { min-width: 0; }
+
+    .eyebrow {
+      margin: 0 0 .6rem;
+      color: var(--accent, var(--cyan));
+      font-size: clamp(.72rem, 1.3vw, .9rem);
+      font-weight: 850;
+      letter-spacing: .18em;
+      text-transform: uppercase;
+    }
+
+    h1, h2, p { margin-top: 0; }
+
+    h1, h2 {
+      max-width: 14ch;
+      margin-bottom: clamp(1rem, 2.2vw, 1.5rem);
+      font-size: clamp(2.7rem, 7.4vw, 6.8rem);
+      line-height: .94;
+      letter-spacing: -.065em;
+      text-wrap: balance;
+    }
+
+    h2 { font-size: clamp(2.35rem, 5.6vw, 5.1rem); }
+
+    .lede {
+      max-width: 34rem;
+      margin-bottom: 0;
+      color: var(--muted);
+      font-size: clamp(1.02rem, 2vw, 1.35rem);
+      overflow-wrap: anywhere;
+      text-wrap: balance;
+    }
+
+    .hero-grid,
+    .two-col {
+      display: grid;
+      grid-template-columns: minmax(0, .8fr) minmax(320px, 1.2fr);
+      align-items: center;
+      gap: clamp(2rem, 7vw, 6rem);
+    }
+
+    .art {
+      width: 100%;
+      max-width: 100%;
+      max-height: min(64svh, 660px);
+      overflow: visible;
+      filter: drop-shadow(0 28px 54px rgba(0,0,0,.35));
+    }
+
+    .mini {
+      color: var(--muted);
+      font-size: .86rem;
+      letter-spacing: .02em;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(7, minmax(96px, 1fr));
+      align-items: stretch;
+      gap: .65rem;
+      margin-top: clamp(2rem, 6vw, 5rem);
+    }
+
+    .step {
+      position: relative;
+      display: grid;
+      place-items: center;
+      min-height: 180px;
+      padding: 1rem .6rem;
+      border: 1px solid var(--line);
+      border-radius: 1.6rem;
+      background: linear-gradient(145deg, rgba(255,255,255,.07), rgba(255,255,255,.018));
+      text-align: center;
+    }
+
+    .step:not(:last-child)::after {
+      content: "›";
+      position: absolute;
+      z-index: 2;
+      right: -.75rem;
+      color: var(--cyan);
+      font-size: 2rem;
+      font-weight: 900;
+    }
+
+    .step svg { width: 52px; height: 52px; margin-bottom: .6rem; }
+    .step b { display: block; font-size: .96rem; }
+    .step small { display: block; margin-top: .25rem; color: var(--muted); font-size: .69rem; }
+
+    .gate-stack {
+      display: grid;
+      gap: .72rem;
+      width: min(100%, 600px);
+      margin-inline: auto;
+    }
+
+    .gate {
+      display: grid;
+      grid-template-columns: 3rem 1fr auto;
+      align-items: center;
+      gap: .8rem;
+      padding: .8rem 1rem;
+      border: 1px solid var(--line);
+      border-radius: 1rem;
+      background: rgba(16,29,50,.86);
+    }
+
+    .gate .num {
+      display: grid;
+      place-items: center;
+      width: 2.4rem;
+      aspect-ratio: 1;
+      border-radius: .75rem;
+      color: var(--night);
+      background: var(--mint);
+      font-weight: 900;
+    }
+
+    .gate b { font-size: 1rem; }
+    .gate span:last-child { color: var(--mint); font-size: .72rem; font-weight: 850; letter-spacing: .1em; }
+
+    .not-equal {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: clamp(.8rem, 3vw, 2.2rem);
+      margin-top: 1.2rem;
+      color: var(--coral);
+      font-size: clamp(1.45rem, 3.8vw, 3.4rem);
+      font-weight: 900;
+      letter-spacing: -.04em;
+    }
+
+    .sync-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: clamp(1rem, 3vw, 2rem);
+      margin-top: 2.4rem;
+    }
+
+    .sync-card {
+      min-height: 410px;
+      padding: clamp(1.2rem, 3vw, 2.2rem);
+      border: 1px solid var(--line);
+      border-radius: 2rem;
+      background: linear-gradient(160deg, rgba(255,255,255,.065), rgba(255,255,255,.018));
+    }
+
+    .sync-card h3 { margin: 0 0 1.3rem; font-size: clamp(1.35rem, 2.5vw, 2rem); }
+
+    .pill-list { display: flex; flex-wrap: wrap; gap: .68rem; }
+    .pill {
+      padding: .62rem .82rem;
+      border: 1px solid color-mix(in srgb, var(--pill) 55%, transparent);
+      border-radius: 999px;
+      color: var(--pill);
+      background: color-mix(in srgb, var(--pill) 10%, transparent);
+      font-size: .84rem;
+      font-weight: 780;
+    }
+
+    .local-figure {
+      display: grid;
+      place-items: center;
+      margin: 1.6rem 0;
+      color: var(--violet);
+    }
+
+    .local-figure svg { width: min(100%, 340px); }
+
+    .truth-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 1rem;
+      margin-top: 2.2rem;
+    }
+
+    .truth {
+      min-height: 360px;
+      padding: 1.4rem;
+      border: 1px solid var(--line);
+      border-radius: 1.7rem;
+      background: rgba(16,29,50,.72);
+    }
+
+    .truth .big {
+      display: grid;
+      place-items: center;
+      height: 155px;
+      margin-bottom: 1rem;
+      border-radius: 1.25rem;
+      color: var(--accent, var(--cyan));
+      background: color-mix(in srgb, var(--accent, var(--cyan)) 8%, transparent);
+      font-size: clamp(2.2rem, 4.5vw, 4.3rem);
+      font-weight: 950;
+      letter-spacing: -.06em;
+    }
+
+    .truth h3 { margin: 0 0 .45rem; font-size: 1.25rem; }
+    .truth p { margin: 0; color: var(--muted); font-size: .88rem; }
+
+    .score-board {
+      display: grid;
+      grid-template-columns: minmax(260px, .8fr) minmax(300px, 1.2fr);
+      align-items: center;
+      gap: clamp(2rem, 7vw, 6rem);
+      margin-top: 1.5rem;
+    }
+
+    .score-ring {
+      display: grid;
+      place-items: center;
+      width: min(72vw, 390px);
+      aspect-ratio: 1;
+      margin-inline: auto;
+      border: clamp(14px, 2vw, 24px) solid rgba(102,239,193,.18);
+      border-top-color: var(--mint);
+      border-right-color: var(--mint);
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(102,239,193,.11), transparent 68%);
+      box-shadow: 0 0 80px rgba(102,239,193,.12);
+    }
+
+    .score-ring strong { font-size: clamp(5rem, 12vw, 9rem); line-height: .8; letter-spacing: -.1em; }
+    .score-ring span { display: block; margin-top: .7rem; color: var(--mint); text-align: center; font-weight: 850; letter-spacing: .12em; }
+
+    .formula {
+      display: grid;
+      gap: .9rem;
+    }
+
+    .formula-row {
+      display: grid;
+      grid-template-columns: 4.2rem 1fr;
+      align-items: center;
+      gap: 1rem;
+      padding: 1rem;
+      border-radius: 1rem;
+      background: rgba(255,255,255,.045);
+    }
+
+    .formula-row strong { color: var(--cyan); font-size: 1.55rem; }
+    .formula-row span { color: var(--muted); }
+    .unknown { color: var(--amber) !important; }
+
+    .check-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: .9rem;
+      margin-top: 2rem;
+    }
+
+    .check {
+      min-height: 150px;
+      padding: 1rem;
+      border: 1px solid var(--line);
+      border-radius: 1.2rem;
+      background: rgba(16,29,50,.72);
+    }
+
+    .check b { display: block; margin-top: .9rem; font-size: .92rem; }
+    .tick { color: var(--mint); font-size: 1.5rem; font-weight: 900; }
+
+    .stopline {
+      margin: 1.2rem 0 0;
+      color: var(--coral);
+      font-size: clamp(1.3rem, 3vw, 2.4rem);
+      font-weight: 900;
+      text-align: center;
+    }
+
+    .footer-links {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: .7rem;
+      margin-top: 1.3rem;
+    }
+
+    .footer-links a {
+      padding: .55rem .8rem;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      text-decoration: none;
+      font-size: .77rem;
+    }
+
+    .footer-links a:hover,
+    .footer-links a:focus-visible { color: var(--ink); border-color: var(--cyan); }
+
+    @media (max-width: 930px) {
+      html { scroll-snap-type: none; }
+      .screen { min-height: auto; padding-block: 6rem 4rem; }
+      .hero-grid, .two-col, .score-board { grid-template-columns: 1fr; }
+      .art { max-height: 460px; }
+      .flow { grid-template-columns: repeat(2, 1fr); }
+      .step:not(:last-child)::after { display: none; }
+      .truth-grid { grid-template-columns: 1fr; }
+      .truth { min-height: auto; }
+      .check-grid { grid-template-columns: repeat(2, 1fr); }
+    }
+
+    @media (max-width: 600px) {
+      body { font-size: 16px; }
+      .dots { display: none; }
+      .sync-grid, .check-grid { grid-template-columns: 1fr; }
+      .flow { grid-template-columns: 1fr 1fr; }
+      .step { min-height: 130px; }
+      .sync-card { min-height: auto; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; scroll-snap-type: none; }
+      *, *::before, *::after { transition: none !important; animation: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip" href="#start">Skip to the tour</a>
+  <header class="topbar" aria-label="Tour navigation">
+    <span class="brand">Quant App / Big Picture</span>
+    <nav class="dots" aria-label="Jump to a picture">
+      <a href="#start">Start</a><a href="#devices">Devices</a><a href="#journey">Journey</a>
+      <a href="#gates">Gates</a><a href="#sync">Sync</a><a href="#fixes">Fixes</a>
+      <a href="#score">Score</a><a href="#tonight">Tonight</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="screen" id="start" style="--accent:var(--cyan);--glow:var(--cyan)">
+      <div class="wrap hero-grid">
+        <div>
+          <p class="eyebrow">The whole project</p>
+          <h1>See. Plan. Protect.</h1>
+          <p class="lede">Find a stock. Build a plan. Trade only when every lock opens.</p>
+        </div>
+        <svg class="art" viewBox="0 0 720 620" role="img" aria-label="Market data flows through a scanner and chart to a safety lock before KIS">
+          <defs>
+            <linearGradient id="screenGlow" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#4dd8ff"/><stop offset="1" stop-color="#a894ff"/></linearGradient>
+            <filter id="soft"><feGaussianBlur stdDeviation="16"/></filter>
+          </defs>
+          <circle cx="360" cy="310" r="270" fill="none" stroke="#1e304c" stroke-width="2"/>
+          <circle cx="360" cy="310" r="214" fill="none" stroke="#1e304c" stroke-width="2" stroke-dasharray="8 14"/>
+          <path d="M108 314 C190 166 276 134 360 134 C470 134 556 214 612 308" fill="none" stroke="url(#screenGlow)" stroke-width="14" stroke-linecap="round"/>
+          <path d="M612 308 C554 448 468 494 360 494 C246 494 158 426 108 314" fill="none" stroke="#66efc1" stroke-width="14" stroke-linecap="round" opacity=".65"/>
+          <g transform="translate(70 260)">
+            <rect width="120" height="108" rx="28" fill="#101d32" stroke="#4dd8ff" stroke-width="3"/>
+            <path d="M27 73 45 52 62 62 92 28" fill="none" stroke="#4dd8ff" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+            <text x="60" y="94" text-anchor="middle" fill="#a9b5ca" font-size="15" font-weight="700">MARKET</text>
+          </g>
+          <g transform="translate(300 72)">
+            <rect width="120" height="108" rx="28" fill="#101d32" stroke="#a894ff" stroke-width="3"/>
+            <circle cx="53" cy="48" r="25" fill="none" stroke="#a894ff" stroke-width="7"/>
+            <path d="m74 68 22 22" stroke="#a894ff" stroke-width="8" stroke-linecap="round"/>
+            <text x="60" y="98" text-anchor="middle" fill="#a9b5ca" font-size="15" font-weight="700">FIND</text>
+          </g>
+          <g transform="translate(530 260)">
+            <rect width="120" height="108" rx="28" fill="#101d32" stroke="#ffcb66" stroke-width="3"/>
+            <path d="M31 70V43a29 29 0 0 1 58 0v27" fill="none" stroke="#ffcb66" stroke-width="8"/>
+            <rect x="22" y="50" width="76" height="38" rx="12" fill="#ffcb66"/>
+            <circle cx="60" cy="69" r="7" fill="#07101f"/>
+            <text x="60" y="104" text-anchor="middle" fill="#a9b5ca" font-size="15" font-weight="700">PROTECT</text>
+          </g>
+          <g transform="translate(300 440)">
+            <rect width="120" height="108" rx="28" fill="#101d32" stroke="#66efc1" stroke-width="3"/>
+            <path d="M28 74h64M34 46h52M43 24h34" stroke="#66efc1" stroke-width="8" stroke-linecap="round"/>
+            <text x="60" y="99" text-anchor="middle" fill="#a9b5ca" font-size="15" font-weight="700">KIS</text>
+          </g>
+          <circle cx="360" cy="310" r="88" fill="#101d32" stroke="url(#screenGlow)" stroke-width="4"/>
+          <text x="360" y="300" text-anchor="middle" fill="#f7f8fc" font-size="34" font-weight="900">ONE</text>
+          <text x="360" y="340" text-anchor="middle" fill="#66efc1" font-size="22" font-weight="800">SAFE FLOW</text>
+        </svg>
+      </div>
+    </section>
+
+    <section class="screen" id="devices" style="--accent:var(--violet);--glow:var(--violet)">
+      <div class="wrap two-col">
+        <svg class="art" viewBox="0 0 700 600" role="img" aria-label="PC and laptop share coordination, but only one holds the execution key">
+          <defs><linearGradient id="cloud" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#a894ff"/><stop offset="1" stop-color="#4dd8ff"/></linearGradient></defs>
+          <path d="M120 406 C230 312 470 312 580 406" fill="none" stroke="#2b3b55" stroke-width="6" stroke-dasharray="10 14"/>
+          <g transform="translate(46 330)">
+            <rect x="0" y="0" width="220" height="140" rx="18" fill="#101d32" stroke="#4dd8ff" stroke-width="4"/>
+            <rect x="22" y="22" width="176" height="88" rx="8" fill="#0b1527"/>
+            <path d="M-18 150h256l-30 28H12z" fill="#263954"/>
+            <text x="110" y="78" text-anchor="middle" fill="#4dd8ff" font-size="30" font-weight="900">LAPTOP</text>
+            <text x="110" y="104" text-anchor="middle" fill="#a9b5ca" font-size="14">safety mirror</text>
+          </g>
+          <g transform="translate(444 320)">
+            <rect width="210" height="155" rx="18" fill="#101d32" stroke="#66efc1" stroke-width="4"/>
+            <rect x="20" y="20" width="170" height="105" rx="8" fill="#0b1527"/>
+            <path d="M82 155v35m46-35v35M58 190h94" stroke="#2b3b55" stroke-width="12" stroke-linecap="round"/>
+            <text x="105" y="78" text-anchor="middle" fill="#66efc1" font-size="34" font-weight="900">PC</text>
+            <text x="105" y="104" text-anchor="middle" fill="#a9b5ca" font-size="14">market-data home</text>
+          </g>
+          <g transform="translate(190 56)">
+            <path d="M97 182h235c58 0 83-73 34-106-4-71-102-90-135-33-49-47-132-8-122 59-55 4-63 80-12 80z" fill="#101d32" stroke="url(#cloud)" stroke-width="5"/>
+            <text x="230" y="120" text-anchor="middle" fill="#f7f8fc" font-size="27" font-weight="900">SHARED TRUTH</text>
+            <text x="230" y="151" text-anchor="middle" fill="#a9b5ca" font-size="16">plans · controls · orders</text>
+          </g>
+          <path d="M172 326 292 232M538 316 408 232" stroke="#a894ff" stroke-width="7" stroke-linecap="round"/>
+          <g transform="translate(292 245)">
+            <circle cx="60" cy="60" r="55" fill="#ffcb66" opacity=".12"/>
+            <circle cx="60" cy="60" r="35" fill="none" stroke="#ffcb66" stroke-width="12"/>
+            <path d="M95 60h76m-20 0v32m-28-32v22" stroke="#ffcb66" stroke-width="14" stroke-linecap="round"/>
+            <text x="86" y="135" text-anchor="middle" fill="#ffcb66" font-size="16" font-weight="800">ONE EXECUTION KEY</text>
+          </g>
+        </svg>
+        <div>
+          <p class="eyebrow">Two computers</p>
+          <h2>One shared truth.</h2>
+          <p class="lede">Both can watch. Only the <strong>Execution Owner</strong> can act.</p>
+          <p class="mini" style="margin-top:1.4rem">Operator Control = who may send the next human command.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="screen" id="journey" style="--accent:var(--mint);--glow:var(--mint)">
+      <div class="wrap">
+        <p class="eyebrow">A stock idea</p>
+        <h2>Moves one way.</h2>
+        <div class="flow" aria-label="Stock journey from scanner to closed position">
+          <div class="step"><svg viewBox="0 0 64 64" aria-hidden="true"><circle cx="28" cy="28" r="18" fill="none" stroke="#4dd8ff" stroke-width="6"/><path d="m41 41 14 14" stroke="#4dd8ff" stroke-width="7" stroke-linecap="round"/></svg><b>Scanner</b><small>find</small></div>
+          <div class="step"><svg viewBox="0 0 64 64" aria-hidden="true"><path d="m32 7 8 16 18 3-13 13 3 18-16-9-16 9 3-18L6 26l18-3z" fill="none" stroke="#a894ff" stroke-width="5"/></svg><b>Watchlist</b><small>notice</small></div>
+          <div class="step"><svg viewBox="0 0 64 64" aria-hidden="true"><rect x="10" y="8" width="44" height="48" rx="8" fill="none" stroke="#a894ff" stroke-width="5"/><path d="M20 23h24M20 34h24M20 45h15" stroke="#a894ff" stroke-width="5" stroke-linecap="round"/></svg><b>Buylist</b><small>plan</small></div>
+          <div class="step"><svg viewBox="0 0 64 64" aria-hidden="true"><circle cx="32" cy="32" r="23" fill="none" stroke="#ffcb66" stroke-width="5"/><path d="M32 44V19m0 0-10 10m10-10 10 10" stroke="#ffcb66" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/></svg><b>Buy Today</b><small>monitor</small></div>
+          <div class="step"><svg viewBox="0 0 64 64" aria-hidden="true"><path d="M12 32h40M32 12v40" stroke="#ff7187" stroke-width="7" stroke-linecap="round"/><circle cx="32" cy="32" r="25" fill="none" stroke="#ff7187" stroke-width="4"/></svg><b>Pending</b><small>reconcile</small></div>
+          <div class="step"><svg viewBox="0 0 64 64" aria-hidden="true"><path d="M8 50 23 35l11 9 22-28" fill="none" stroke="#66efc1" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/></svg><b>Position</b><small>protect</small></div>
+          <div class="step"><svg viewBox="0 0 64 64" aria-hidden="true"><circle cx="32" cy="32" r="24" fill="none" stroke="#66efc1" stroke-width="5"/><path d="m20 33 8 8 17-19" fill="none" stroke="#66efc1" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/></svg><b>Closed</b><small>broker truth</small></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="screen" id="gates" style="--accent:var(--amber);--glow:var(--amber)">
+      <div class="wrap two-col">
+        <div>
+          <p class="eyebrow">Safety</p>
+          <h2>A green button is not permission.</h2>
+          <div class="not-equal"><span>ENABLED</span><span>≠</span><span>ORDER</span></div>
+        </div>
+        <div class="gate-stack" aria-label="Independent order safety gates">
+          <div class="gate"><span class="num">1</span><b>Exact reviewed commit</b><span>CHECK</span></div>
+          <div class="gate"><span class="num">2</span><b>Local + shared Live Trading</b><span>CHECK</span></div>
+          <div class="gate"><span class="num">3</span><b>Execution Owner + lease</b><span>CHECK</span></div>
+          <div class="gate"><span class="num">4</span><b>Fresh KIS truth + quote</b><span>CHECK</span></div>
+          <div class="gate"><span class="num">5</span><b>Plan + capital + risk</b><span>CHECK</span></div>
+          <div class="gate"><span class="num">6</span><b>No ambiguous order</b><span>CHECK</span></div>
+          <div class="gate" style="border-color:#66efc1"><span class="num">✓</span><b>Only then: broker request</b><span>KIS</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="screen" id="sync" style="--accent:var(--cyan);--glow:var(--cyan)">
+      <div class="wrap">
+        <p class="eyebrow">Laptop + PC</p>
+        <h2>What actually syncs?</h2>
+        <div class="sync-grid">
+          <article class="sync-card">
+            <h3 style="color:var(--mint)">Shared now</h3>
+            <div class="pill-list" style="--pill:var(--mint)">
+              <span class="pill">Watchlist</span><span class="pill">Buylist</span>
+              <span class="pill">trade plans</span><span class="pill">execution queue</span>
+              <span class="pill">Execution Owner</span><span class="pill">Operator Control</span>
+              <span class="pill">Live switch</span><span class="pill">cards</span>
+              <span class="pill">commands</span><span class="pill">orders</span>
+            </div>
+            <div class="local-figure" aria-hidden="true">
+              <svg viewBox="0 0 340 120"><circle cx="60" cy="60" r="38" fill="none" stroke="#66efc1" stroke-width="8"/><circle cx="280" cy="60" r="38" fill="none" stroke="#66efc1" stroke-width="8"/><path d="M104 44h130l-18-18m18 18-18 18M236 78H106l18-18m-18 18 18 18" fill="none" stroke="#66efc1" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </div>
+            <p class="mini">One coordination database.</p>
+          </article>
+          <article class="sync-card">
+            <h3 style="color:var(--violet)">Stays local</h3>
+            <div class="pill-list" style="--pill:var(--violet)">
+              <span class="pill">.env locks</span><span class="pill">device identity</span>
+              <span class="pill">chart drawings</span><span class="pill">private credentials</span>
+            </div>
+            <div class="local-figure" aria-hidden="true">
+              <svg viewBox="0 0 340 160"><rect x="35" y="22" width="116" height="86" rx="12" fill="none" stroke="#a894ff" stroke-width="7"/><rect x="189" y="22" width="116" height="86" rx="12" fill="none" stroke="#a894ff" stroke-width="7"/><path d="M58 81 82 56l19 14 28-29M212 76l24-12 18 15 28-39" fill="none" stroke="#a894ff" stroke-width="6" stroke-linecap="round"/><path d="M30 132h126M184 132h126" stroke="#2b3b55" stroke-width="9" stroke-linecap="round"/></svg>
+            </div>
+            <p class="mini">1D ↔ 1H means panes in one app—not two computers.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="screen" id="fixes" style="--accent:var(--coral);--glow:var(--coral)">
+      <div class="wrap">
+        <p class="eyebrow">Recent confusing cases</p>
+        <h2>Three simple truths.</h2>
+        <div class="truth-grid">
+          <article class="truth" style="--accent:var(--violet)">
+            <div class="big">W ≠ 🗑</div>
+            <h3>HLP stays safe</h3>
+            <p>Remove Watchlist membership. Keep the Buylist card, stop, order, and position evidence.</p>
+          </article>
+          <article class="truth" style="--accent:var(--cyan)">
+            <div class="big">1H ↔ 1D</div>
+            <h3>One logical line</h3>
+            <p>A weekend 1H endpoint appears on the next daily bar. Its real timestamp stays stored.</p>
+          </article>
+          <article class="truth" style="--accent:var(--amber)">
+            <div class="big">7 / 7</div>
+            <h3>Ready, not owner</h3>
+            <p>Fresh STANDBY_READY can switch. PC, DB, listener, and main.py lights alone cannot.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="screen" id="score" style="--accent:var(--mint);--glow:var(--mint)">
+      <div class="wrap">
+        <p class="eyebrow">TradingView badge</p>
+        <h2>97 is leadership. Not a buy signal.</h2>
+        <div class="score-board">
+          <div class="score-ring" aria-label="Example leadership score 97, strong"><div><strong>97</strong><span>STRONG RANK</span></div></div>
+          <div class="formula">
+            <div class="formula-row"><strong>60%</strong><span>Market RS percentile</span></div>
+            <div class="formula-row"><strong>40%</strong><span>Industry-peer percentile</span></div>
+            <div class="formula-row"><strong class="unknown">?</strong><span><b>Context UNKNOWN</b><br>Missing data stays missing.</span></div>
+            <div class="formula-row"><strong style="color:var(--coral)">≠</strong><span>Raw “vs SPY” % · forecast · permission</span></div>
+          </div>
+        </div>
+        <p class="stopline">STRONG = strong rank. Nothing more.</p>
+      </div>
+    </section>
+
+    <section class="screen" id="tonight" style="--accent:var(--mint);--glow:var(--mint)">
+      <div class="wrap">
+        <p class="eyebrow">Before tonight</p>
+        <h2>Eight checks. One answer.</h2>
+        <div class="check-grid" aria-label="Live session checklist">
+          <div class="check"><span class="tick">01</span><b>Clean reviewed commit</b></div>
+          <div class="check"><span class="tick">02</span><b>Manifest + SHA match</b></div>
+          <div class="check"><span class="tick">03</span><b>7/7 standby → ACTIVE</b></div>
+          <div class="check"><span class="tick">04</span><b>Operator Control set</b></div>
+          <div class="check"><span class="tick">05</span><b>Local + shared Live ON</b></div>
+          <div class="check"><span class="tick">06</span><b>Symbol + cap allowed</b></div>
+          <div class="check"><span class="tick">07</span><b>KIS + quote + risk fresh</b></div>
+          <div class="check"><span class="tick">08</span><b>No unresolved order</b></div>
+        </div>
+        <p class="stopline">One red check = no order.</p>
+        <nav class="footer-links" aria-label="Detailed documentation">
+          <a href="project_tour.md">Text tour</a>
+          <a href="execution_operator_control.md">Owner & control</a>
+          <a href="controlled_live_pilot_runbook.md">Controlled-live runbook</a>
+          <a href="market_alignment.md">Score details</a>
+          <a href="../README.md">README</a>
+        </nav>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

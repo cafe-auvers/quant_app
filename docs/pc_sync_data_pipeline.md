@@ -200,10 +200,14 @@ and from a mobile hotspot genuinely off the home network.
 The dashboard reports three independent runtime signals. `PC: On` means
 either MySQL or the listener responded; `DB` reports whether shared data is
 usable; `Listener` reports remote-shutdown availability. Each running
-`main.py` also writes a short heartbeat to MySQL, so the laptop can report the
-database PC's `main.py` state even when the listener is stopped. A missing
-heartbeat is `Unknown`; an explicit stop or a heartbeat older than 60 seconds
-is `Off`.
+`main.py` also has a legacy/fallback process heartbeat, so the laptop can
+report the database PC's `main.py` state even when the listener is stopped. A
+missing fallback heartbeat is `Unknown`; an explicit stop or a fallback row
+older than 60 seconds is `Off`. When the guarded Buy Board runtime is running,
+its canonical `runtime_device_state` row replaces that duplicate steady
+writer: it publishes every 240 seconds and remains fresh for 300 seconds.
+Neither `PC: On`, `DB: On`, nor `Listener: On` proves that the PC has a fresh
+eligible `STANDBY_READY` row in the shared coordination database.
 
 ## Remote log access from the laptop (WinRM over Tailscale)
 

@@ -20,6 +20,10 @@ not interchangeable with local planning labels.
 ## Safe movement
 
 - Watchlist to Buylist is a versioned planning action.
+- Watchlist membership is independent of Buylist membership and execution
+  evidence. **Remove from Watchlist** (or `W`) may clear the passive Watchlist
+  flag on a Buylist card without deleting the Buylist card, stop, order, or
+  position evidence.
 - Buylist to Buy Today requires an actionable ORB plan and current authority.
 - Demotion after an entry identity exists can become a cancellation request;
   it is not an unconditional local move.
