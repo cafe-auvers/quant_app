@@ -186,6 +186,119 @@ def test_missing_critical_symbol_key_blocks_readiness_without_starving_other_fee
     assert metrics.critical_quote_channels_missing == ("CDNA",)
 
 
+def test_intraday_symbol_key_addition_subscribes_without_restarting_or_disrupting_existing(
+    tmp_path,
+):
+    from src.services.kis_ws_symbol_keys import (
+        KisWsSymbolKeyStore,
+        update_symbol_keys_file,
+        write_symbol_keys_file,
+    )
+
+    path = tmp_path / "kis_ws_symbol_keys.json"
+    write_symbol_keys_file({"AAPL": "DAAPL"}, path)
+    store = KisWsSymbolKeyStore(path, legacy_json="{}")
+    service, transport = _service(
+        symbol_key_resolver=lambda symbol, _channel: store.resolve(symbol)
+    )
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": 1, "MSFT": 2},
+        quote_priorities={"AAPL": 1, "MSFT": 2},
+    )
+    _ack(service, "AAPL", "HDFSCNT0")
+    _ack(service, "AAPL", "HDFSASP0")
+    assert service.symbol_state("MSFT").trade_configuration_error
+
+    update_symbol_keys_file(set_values={"MSFT": "DMSFT"}, path=path)
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": 1, "MSFT": 2},
+        quote_priorities={"AAPL": 1, "MSFT": 2},
+    )
+
+    assert {item.symbol for item in transport.subscribed} == {"AAPL", "MSFT"}
+    assert transport.unsubscribed == []
+    assert service.symbol_state("MSFT").trade_configuration_error == ""
+    assert service.symbol_state("MSFT").quote_configuration_error == ""
+
+
+def test_intraday_removal_does_not_tear_down_an_acked_active_symbol(tmp_path):
+    from src.services.kis_ws_symbol_keys import (
+        KisWsSymbolKeyStore,
+        write_symbol_keys_file,
+    )
+
+    path = tmp_path / "kis_ws_symbol_keys.json"
+    write_symbol_keys_file({"AAPL": "DAAPL"}, path)
+    store = KisWsSymbolKeyStore(path, legacy_json="{}")
+    service, transport = _service(
+        symbol_key_resolver=lambda symbol, _channel: store.resolve(symbol)
+    )
+    desired = {"AAPL": SubscriptionPriority.OPEN_POSITION}
+    service.configure_desired_channels(
+        trade_priorities=desired,
+        quote_priorities=desired,
+    )
+    _ack(service, "AAPL", "HDFSCNT0")
+    _ack(service, "AAPL", "HDFSASP0")
+
+    write_symbol_keys_file({}, path)
+    service.configure_desired_channels(
+        trade_priorities=desired,
+        quote_priorities=desired,
+    )
+
+    assert transport.unsubscribed == []
+    assert service.symbol_state("AAPL").trade_acked
+    assert service.symbol_state("AAPL").quote_acked
+    assert len(service._deferred_subscription_key_updates) == 2
+
+
+def test_intraday_active_key_change_waits_until_symbol_leaves_board(tmp_path):
+    from src.services.kis_ws_symbol_keys import (
+        KisWsSymbolKeyStore,
+        write_symbol_keys_file,
+    )
+
+    path = tmp_path / "kis_ws_symbol_keys.json"
+    write_symbol_keys_file({"AAPL": "DAAPL"}, path)
+    store = KisWsSymbolKeyStore(path, legacy_json="{}")
+    service, transport = _service(
+        trade_capacity=2,
+        quote_capacity=0,
+        total_capacity=2,
+        symbol_key_resolver=lambda symbol, _channel: store.resolve(symbol),
+    )
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": 1},
+        quote_priorities={},
+    )
+    _ack(service, "AAPL", "HDFSCNT0")
+
+    write_symbol_keys_file({"AAPL": "DNEW"}, path)
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": 1},
+        quote_priorities={},
+    )
+    assert transport.unsubscribed == []
+    assert transport.subscribed[-1].tr_key == "DAAPL"
+
+    service.configure_desired_channels(trade_priorities={}, quote_priorities={})
+    assert transport.unsubscribed[-1].tr_key == "DAAPL"
+    service._on_ack(
+        KisWsSystemFrame(
+            tr_id="HDFSCNT0",
+            tr_key="DAAPL",
+            accepted=True,
+            message="UNSUBSCRIBE SUCCESS",
+        )
+    )
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": 1},
+        quote_priorities={},
+    )
+    assert transport.subscribed[-1].tr_key == "DNEW"
+
+
 def test_repeated_price_at_a_distinct_trade_is_not_rejected_as_a_duplicate():
     service, _ = _service()
     assert service.ingest_trade(_event(price=100, trade_id="1", fingerprint="one"))

@@ -60,6 +60,7 @@ from src.services.kis_realtime_market_data import (  # noqa: E402
     TRADE_COLUMNS,
     TRADE_TR_ID,
 )
+from src.services.kis_ws_symbol_keys import KisWsSymbolKeyStore  # noqa: E402
 
 
 def _iso(value: datetime) -> str:
@@ -111,17 +112,10 @@ def _require_external_output(path: Path) -> Path:
 
 
 def _symbol_keys() -> dict[str, str]:
-    try:
-        raw = json.loads(os.getenv("KIS_WS_SYMBOL_KEYS_JSON", "{}") or "{}")
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("KIS_WS_SYMBOL_KEYS_JSON is not valid JSON") from exc
-    if not isinstance(raw, dict):
-        raise RuntimeError("KIS_WS_SYMBOL_KEYS_JSON must be a JSON object")
-    return {
-        str(symbol).strip().upper(): str(key or "").strip()
-        for symbol, key in raw.items()
-        if str(symbol).strip() and str(key or "").strip()
-    }
+    snapshot = KisWsSymbolKeyStore().snapshot()
+    if snapshot.last_error:
+        raise RuntimeError(snapshot.last_error)
+    return dict(snapshot.keys)
 
 
 def _split_records(frame: KisWsDataFrame, columns: Sequence[str]) -> list[dict[str, str]]:

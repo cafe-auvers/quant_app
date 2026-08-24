@@ -133,6 +133,7 @@ Only enable KIS intraday after the endpoint, TR ID, request parameters, output f
   reservation.
 - Use `data/orders.json` as the durable local order ledger for idempotency and restart protection.
 - Use the Health tab next to TradingView Chart to inspect current MySQL connectivity, KIS response age, mirror/reconciliation state, journal write health/free space, and the newest `data/event_journal.jsonl` lifecycle events. Health refreshes do not place orders or call KIS.
+- Maintain verified WebSocket symbol keys with `python scripts/manage_kis_ws_symbol_keys.py`; the gitignored `data/kis_ws_symbol_keys.json` hot-reloads independently of the preserved environment files. See [KIS WebSocket Symbol Keys](docs/kis_ws_symbol_keys.md).
 - Keep `data/legacy_non_prod_*.json`; these files preserve filtered paper-trading state without making it actionable.
 - Keep local JSON `.bak` files and `data/state_metadata.json` with the rest of local runtime state.
 - Do not bypass reconciliation when updating buylist position state after order submission.

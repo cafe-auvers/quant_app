@@ -419,6 +419,7 @@ Most workers live in `src/ui/workers.py`; KIS order submission/query/cancel and 
 | `src/services/intraday_provider.py` | Provider-neutral request/result contracts and OHLCV normalization/resampling helpers |
 | `src/services/intraday_data_service.py` | KIS-first intraday orchestration, yfinance fallback, and best-source cache loading |
 | `src/services/kis_intraday_provider.py` | KIS intraday provider wrapper using production account config |
+| `src/services/kis_ws_symbol_keys.py` | Gitignored, atomically updated KIS WebSocket symbol-key store with strict validation, legacy environment migration, last-known-good recovery, and intraday hot reload |
 | `src/services/yfinance_intraday_provider.py` | yfinance intraday fallback provider preserving existing retry behavior |
 | `src/services/order_ledger.py` | Persistent local order ledger stored at `data/orders.json` |
 | `src/services/trading_state.py` | Process projection of Live Trading: `TRADING_ENABLED` is the per-machine administrative lock, while the desktop attaches a fail-closed provider for the durable shared ON/OFF control at broker boundaries |
@@ -502,7 +503,7 @@ The live execution queue calls `ORBStrategy.evaluate()` and requires its generic
 
 ## Data and Persistence
 
-Local JSON state is read/written through `src/utils/storage.py` and service helpers. Writes use a temp file followed by atomic replace. When an existing JSON file is overwritten, `save_json()` first keeps a rolling `.bak` copy; `load_json()` falls back to that backup if the main file is missing or malformed.
+Local JSON state is read/written through `src/utils/storage.py` and service helpers. Writes use a temp file followed by atomic replace. When an existing JSON file is overwritten, `save_json()` first keeps a rolling `.bak` copy; `load_json()` falls back to that backup if the main file is missing or malformed. The frequently changing KIS WebSocket symbol map is separate from `.env` at `data/kis_ws_symbol_keys.json`; its runtime reader deliberately retains the in-memory last-known-good map rather than switching feeds during a malformed or interrupted intraday edit.
 
 | File | Purpose |
 |---|---|

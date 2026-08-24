@@ -154,6 +154,8 @@ def test_pr4_market_data_configuration_is_present_and_fail_closed():
         "PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION=10.0",
     ):
         assert name in env_example
+    assert "KIS_WS_SYMBOL_KEYS_JSON=" not in env_example
+    assert "data/kis_ws_symbol_keys.json" in env_example
     assert "websockets==17.0.1" in requirements
 
 
@@ -215,16 +217,22 @@ def test_live_factory_requires_both_enable_and_protocol_verification(monkeypatch
 
 
 def test_live_factory_uses_only_aggregate_pool_and_wires_verified_sequences(
-    monkeypatch,
+    tmp_path, monkeypatch,
 ):
+    from src.services.kis_ws_symbol_keys import (
+        KisWsSymbolKeyStore,
+        write_symbol_keys_file,
+    )
+
     monkeypatch.setattr(execution_config, "KIS_WS_ENABLED", True)
     monkeypatch.setattr(execution_config, "KIS_WS_PROTOCOL_VERIFIED", True)
     monkeypatch.setattr(execution_config, "KIS_WS_TOTAL_SUBSCRIPTION_CAPACITY", 3)
     monkeypatch.setattr(execution_config, "KIS_WS_TRADE_CHANNEL_CAPACITY", 0)
     monkeypatch.setattr(execution_config, "KIS_WS_QUOTE_CHANNEL_CAPACITY", 0)
-    monkeypatch.setenv(
-        "KIS_WS_SYMBOL_KEYS_JSON",
-        json.dumps({"AAPL": "DNASAAPL", "MSFT": "DNASMSFT", "NVDA": "DNASNVDA"}),
+    key_path = tmp_path / "kis_ws_symbol_keys.json"
+    write_symbol_keys_file(
+        {"AAPL": "DNASAAPL", "MSFT": "DNASMSFT", "NVDA": "DNASNVDA"},
+        key_path,
     )
 
     service = build_kis_realtime_market_data_from_environment(
@@ -232,6 +240,7 @@ def test_live_factory_uses_only_aggregate_pool_and_wires_verified_sequences(
         sequence_field_by_channel={"HDFSCNT0": "EVOL"},
         sequence_reset_by_channel={"HDFSCNT0": "RESET_ON_RECONNECT"},
         qualification_mode=True,
+        symbol_key_store=KisWsSymbolKeyStore(key_path, legacy_json="{}"),
     )
     service.configure_desired_channels(
         trade_priorities={"AAPL": 0, "MSFT": 0, "NVDA": 0},
@@ -247,6 +256,11 @@ def test_live_factory_uses_only_aggregate_pool_and_wires_verified_sequences(
 def test_normal_live_factory_loads_exact_pinned_reviewed_capabilities(
     tmp_path, monkeypatch
 ):
+    from src.services.kis_ws_symbol_keys import (
+        KisWsSymbolKeyStore,
+        write_symbol_keys_file,
+    )
+
     commit = "a" * 40
     manifest_path = _write_runtime_capability_manifest(tmp_path, commit=commit)
     manifest_digest = sha256_file(manifest_path)
@@ -254,12 +268,14 @@ def test_normal_live_factory_loads_exact_pinned_reviewed_capabilities(
     monkeypatch.setattr(execution_config, "KIS_WS_PROTOCOL_VERIFIED", True)
     monkeypatch.setattr(execution_config, "KIS_WS_TOTAL_SUBSCRIPTION_CAPACITY", 3)
     monkeypatch.setenv("KIS_WS_HTS_ID", "reviewed-user")
-    monkeypatch.setenv("KIS_WS_SYMBOL_KEYS_JSON", '{"AAPL":"DNASAAPL"}')
+    key_path = tmp_path / "kis_ws_symbol_keys.json"
+    write_symbol_keys_file({"AAPL": "DNASAAPL"}, key_path)
 
     service = build_kis_realtime_market_data_from_environment(
         capability_manifest_path=manifest_path,
         capability_manifest_sha256=manifest_digest,
         runtime_commit_sha=commit,
+        symbol_key_store=KisWsSymbolKeyStore(key_path, legacy_json="{}"),
     )
 
     assert service._confirmed_sequence_channels == {"HDFSCNT0"}

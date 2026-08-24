@@ -57,6 +57,7 @@ STATE_BACKUP_FILENAMES = (
     "settings.json",
     "orders.json",
     "execution_queue.json",
+    "kis_ws_symbol_keys.json",
     "legacy_non_prod_buylist.json",
     "legacy_non_prod_execution_queue.json",
 )
