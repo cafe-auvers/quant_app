@@ -1,5 +1,5 @@
 from src.core.board_workflow import BoardCardProjection, MoveToWatchlist
-from src.core.trade_card_state import BoardStatus, TradeCardState
+from src.core.trade_card_state import BoardStatus, StopType, TradeCardState
 from src.core.watchlist import BuylistManager, Watchlist
 from src.ui.mixins.watchlist_actions_mixin import WatchlistActionsMixin
 from src.ui.planning_membership_worker import (
@@ -145,6 +145,25 @@ def test_tradingview_watchlist_button_toggles_for_buylist_symbol():
     window._update_tradingview_watchlist_btn()
 
     assert window.tradingview_add_watchlist_button.text == "Add to Watchlist (W)"
+    assert window.tradingview_add_watchlist_button.enabled is True
+
+
+def test_tradingview_watchlist_button_can_remove_buylist_with_execution_evidence():
+    window = _Window()
+    window.watchlist = Watchlist()
+    window.tradingview_add_watchlist_button = _Button()
+    window.tradingview_symbol_combo = type(
+        "Combo", (), {"currentText": lambda self: "WEX"}
+    )()
+    card = _card(BoardStatus.BUYLIST)
+    card.watchlist_member = True
+    card.stop_type = StopType.MANUAL_PRICE
+    card.active_stop_price = 24.0
+    window._chart_buyboard_projection = lambda _symbol: BoardCardProjection(card=card)
+
+    window._update_tradingview_watchlist_btn()
+
+    assert window.tradingview_add_watchlist_button.text == "Remove from Watchlist (W)"
     assert window.tradingview_add_watchlist_button.enabled is True
 
 

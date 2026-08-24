@@ -1,8 +1,41 @@
 """Shared JavaScript helpers for chart drawing timeframe synchronization."""
 
+from bisect import bisect_left
+
+
+def snap_daily_drawing_date(value: object, available_dates: list[str]) -> str:
+    """Return an axis-backed daily date, advancing closed-market dates."""
+    day = str(value or "")[:10]
+    if not available_dates:
+        return day
+    index = bisect_left(available_dates, day)
+    return available_dates[min(index, len(available_dates) - 1)]
+
+
 DRAWING_TIMEFRAME_SYNC_JS = r"""
+                function snapDailyDrawingTimeToAxis(value, prefer) {
+                    const day = normalizeTimeForSave(value).slice(0, 10);
+                    const availableTimes = candles.concat(futureWhitespace)
+                        .map(candle => candle.time)
+                        .filter(time => time != null);
+                    if (availableTimes.length === 0) return null;
+                    const dayMatches = availableTimes.filter(
+                        time => normalizeTimeForSave(time).slice(0, 10) === day
+                    );
+                    if (dayMatches.length > 0) {
+                        return prefer === 'last'
+                            ? dayMatches[dayMatches.length - 1]
+                            : dayMatches[0];
+                    }
+                    const nextTime = availableTimes.find(
+                        time => normalizeTimeForSave(time).slice(0, 10) >= day
+                    );
+                    if (nextTime != null) return nextTime;
+                    return availableTimes[availableTimes.length - 1];
+                }
+
                 function incomingDrawingTime(value, prefer) {
-                    if (!usesIntradayTime) return String(value || '').slice(0, 10);
+                    if (!usesIntradayTime) return snapDailyDrawingTimeToAxis(value, prefer);
                     if (typeof value === 'number') return value;
                     const text = String(value || '');
                     const day = text.slice(0, 10);

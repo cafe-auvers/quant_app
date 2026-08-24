@@ -395,10 +395,13 @@ def remove_watchlist_candidate(
             engine, normalized_symbol, account_no
         )
         if current is not None:
-            if not is_passive_planning_card(current) or current.board_status not in {
+            if current.board_status not in {
                 BoardStatus.WATCHLIST,
                 BoardStatus.BUYLIST,
-            }:
+            } or (
+                current.board_status == BoardStatus.WATCHLIST
+                and not is_passive_planning_card(current)
+            ):
                 raise PlanningMembershipError(
                     f"{normalized_symbol} is not a passive Watchlist candidate"
                 )
@@ -411,7 +414,8 @@ def remove_watchlist_candidate(
                 archived.board_status_updated_at = datetime.now(timezone.utc)
             else:
                 # W removes only the independent Watchlist membership. The
-                # Buylist card and all passive planning metadata survive.
+                # Buylist card and all planning/execution metadata survive, so
+                # durable evidence must not block this independent toggle.
                 archived.buylist_member = True
             stored = trade_card_repository.update_trade_card(
                 engine, archived, expected_version=current.version

@@ -298,6 +298,40 @@ def test_lightweight_split_html_supports_direct_state_and_crosshair_sync():
     assert "chart.setCrosshairPosition" in chart_html
 
 
+def test_hourly_weekend_endpoint_snaps_to_next_daily_axis_bar():
+    history = pd.DataFrame(
+        {
+            "Open": [10.0, 10.5],
+            "High": [11.0, 11.5],
+            "Low": [9.5, 10.0],
+            "Close": [10.5, 11.0],
+            "Volume": [1000, 1200],
+        },
+        index=pd.to_datetime(["2026-08-20", "2026-08-21"]),
+    )
+    drawing = {
+        "id": "pbf-weekend-line",
+        "type": "line",
+        "start_date": "2026-08-21 19:30:00",
+        "start_price": 58.89,
+        "end_date": "2026-08-22 03:30:00",
+        "end_price": 70.72,
+        "timeframe": "1H",
+    }
+
+    chart_html = ChartLightweightRenderMixin._generate_tradingview_lightweight_chart_html(
+        "PBF",
+        history,
+        options={"timeframe": "1D"},
+        drawings=[drawing],
+    )
+
+    assert '"id": "pbf-weekend-line"' in chart_html
+    assert '"start": {"time": "2026-08-21"' in chart_html
+    assert '"end": {"time": "2026-08-24"' in chart_html
+    assert "if (!usesIntradayTime) return snapDailyDrawingTimeToAxis(value, prefer);" in chart_html
+
+
 def test_hourly_initial_range_counts_same_81_sessions_as_daily():
     sessions = pd.bdate_range("2026-01-01", periods=100)
     timestamps = [

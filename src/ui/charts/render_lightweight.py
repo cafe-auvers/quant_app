@@ -23,7 +23,7 @@ except ImportError:
     QWebChannel = None
 
 from .render_assets import _lightweight_charts_script_tag
-from .render_drawing_assets import DRAWING_TIMEFRAME_SYNC_JS
+from .render_drawing_assets import DRAWING_TIMEFRAME_SYNC_JS, snap_daily_drawing_date
 from .render_earnings_assets import EARNINGS_CHART_CSS, EARNINGS_EVENT_RUNTIME_JS
 from .render_measurement_assets import (
     RIGHT_DRAG_MEASUREMENT_CSS,
@@ -194,6 +194,7 @@ class ChartLightweightRenderMixin:
         volumes_json = json.dumps(volumes)
         future_values = future_time_values()
         future_whitespace_json = json.dumps([{"time": value} for value in future_values])
+        daily_axis_dates = date_labels + [str(value)[:10] for value in future_values]
 
         first_chart_date = chart_index[0].date()
         last_chart_date = chart_index[-1].date()
@@ -226,8 +227,8 @@ class ChartLightweightRenderMixin:
                 start_date = str(drawing["start_date"])
                 end_date = str(drawing["end_date"])
                 if not uses_intraday_time:
-                    start_date = start_date[:10]
-                    end_date = end_date[:10]
+                    start_date = snap_daily_drawing_date(start_date, daily_axis_dates)
+                    end_date = snap_daily_drawing_date(end_date, daily_axis_dates)
                 else:
                     start_date = drawing_time_value(start_date, prefer="first")
                     end_date = drawing_time_value(end_date, prefer="last")

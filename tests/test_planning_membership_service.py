@@ -214,6 +214,41 @@ def test_watchlist_toggle_on_buylist_preserves_buylist_plan(engine):
     assert stored.buylist_member is True
 
 
+def test_watchlist_toggle_on_buylist_preserves_durable_execution_evidence(engine):
+    watchlist = Watchlist()
+    watchlist.add("AAPL", "Apple").breakout_price = 101.0
+    trade_card_repository.create_trade_card(
+        engine,
+        TradeCardState(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            board_status=BoardStatus.BUYLIST,
+            watchlist_member=True,
+            buylist_member=True,
+            breakout_price=101.0,
+            stop_type=StopType.MANUAL_PRICE,
+            active_stop_price=99.0,
+        ),
+    )
+
+    removed = remove_watchlist_candidate(
+        watchlist,
+        "AAPL",
+        engine=engine,
+        default_account_no="1",
+    )
+
+    stored = trade_card_repository.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert removed.action == "removed_from_watchlist"
+    assert watchlist.get("AAPL") is None
+    assert stored.board_status == BoardStatus.BUYLIST
+    assert stored.watchlist_member is False
+    assert stored.buylist_member is True
+    assert stored.stop_type == StopType.MANUAL_PRICE
+    assert stored.active_stop_price == 99.0
+
+
 def test_promotion_does_not_rewrite_an_advanced_canonical_lifecycle(engine):
     watchlist = Watchlist()
     watchlist.add("AAPL", "Apple")
