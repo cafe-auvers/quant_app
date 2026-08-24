@@ -132,13 +132,21 @@ class WatchlistActionsMixin:
         projection = self._chart_buyboard_projection(symbol) if symbol else None
         card = projection.card if projection is not None else None
         in_watchlist = self._tradingview_symbol_in_watchlist(symbol)
-        supports_watchlist_toggle = bool(
-            card is None
-            or (
+        if card is None:
+            supports_watchlist_toggle = True
+        elif in_watchlist:
+            supports_watchlist_toggle = bool(
+                card.board_status == BoardStatus.BUYLIST
+                or (
+                    card.board_status == BoardStatus.WATCHLIST
+                    and is_passive_planning_card(card)
+                )
+            )
+        else:
+            supports_watchlist_toggle = bool(
                 card.board_status in {BoardStatus.WATCHLIST, BoardStatus.BUYLIST}
                 and is_passive_planning_card(card)
             )
-        )
         if in_watchlist:
             button.setText("Remove from Watchlist (W)")
         elif not supports_watchlist_toggle:

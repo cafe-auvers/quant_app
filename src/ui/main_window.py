@@ -716,7 +716,11 @@ def _control_runtime_identity_available(
         updated_at = updated_at.replace(tzinfo=dt.timezone.utc)
     reference = now or dt.datetime.now(dt.timezone.utc)
     age_seconds = (reference - updated_at.astimezone(dt.timezone.utc)).total_seconds()
-    return -5.0 <= age_seconds <= 120.0
+    return (
+        -5.0
+        <= age_seconds
+        <= execution_config.COORDINATION_DEVICE_HEARTBEAT_MAX_AGE_SECONDS
+    )
 
 
 def _control_target_role_from_records(
@@ -767,21 +771,33 @@ class ControlOwnerWorker(QThread):
                     list_runtime_device_states,
                 )
 
+                records = list_runtime_device_states(self.engine)
                 target = _control_target_role_from_records(
-                    list_runtime_device_states(self.engine),
+                    records,
                     self.target_label,
                 )
                 if target is None:
+                    identity_exists = any(
+                        runtime_device_kind(record.hostname, record.details)
+                        == self.target_label
+                        for record in records
+                    )
+                    error = (
+                        f"The {self.target_label} runtime is registered, but its "
+                        "heartbeat is stale or its process state is not eligible. "
+                        "Keep main.py running and verify Buy Board readiness."
+                        if identity_exists
+                        else (
+                            f"No {self.target_label} runtime identity is registered "
+                            "in shared coordination. Start main.py on that device."
+                        )
+                    )
                     self.completed.emit(
                         ControlOwnerUpdate(
                             control=self.control,
                             success=False,
                             target_label=self.target_label,
-                            error=(
-                                f"No {self.target_label} runtime is registered in "
-                                "shared coordination. Start or restart main.py on "
-                                "that device."
-                            ),
+                            error=error,
                         )
                     )
                     return

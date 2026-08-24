@@ -9,6 +9,7 @@ from sqlalchemy.dialects import mysql
 from sqlalchemy.pool import NullPool
 from sqlalchemy.schema import CreateTable
 
+from src.core import execution_config
 from src.core.board_workflow import ActivateForToday, RequestPartialSell
 from src.core.runtime_readiness import RuntimeDeviceState
 from src.core.trade_card_state import (
@@ -50,7 +51,11 @@ from src.services.state_sync import (
     set_live_trading_control,
     set_operator_control,
 )
-from src.ui.main_window import ControlOwnerWorker, MainWindow
+from src.ui.main_window import (
+    ControlOwnerWorker,
+    MainWindow,
+    _control_runtime_identity_available,
+)
 from src.utils.device_identity import (
     DEVICE_KIND_LAPTOP,
     DEVICE_KIND_PC,
@@ -147,6 +152,25 @@ def test_laptop_owner_target_uses_published_device_kind():
     assert target.hostname == laptop.hostname
 
 
+def test_owner_target_stays_available_for_the_configured_heartbeat_window():
+    now = datetime(2026, 8, 24, 8, 51, tzinfo=timezone.utc)
+    normal_heartbeat_age = (
+        execution_config.COORDINATION_DEVICE_HEARTBEAT_SECONDS - 1.0
+    )
+    pc = SimpleNamespace(
+        state=RuntimeDeviceState.STANDBY_READY,
+        updated_at=now - timedelta(seconds=normal_heartbeat_age),
+    )
+
+    assert _control_runtime_identity_available(pc, now=now)
+
+    pc.updated_at = now - timedelta(
+        seconds=execution_config.COORDINATION_DEVICE_HEARTBEAT_MAX_AGE_SECONDS
+        + 1.0
+    )
+    assert not _control_runtime_identity_available(pc, now=now)
+
+
 def test_owner_worker_refreshes_a_missing_cached_target_from_shared_db(engine, roles):
     pc, laptop = roles
     record_runtime_heartbeat(engine, hostname=laptop.hostname, pid=17)
@@ -217,6 +241,35 @@ def test_stopped_historical_identity_is_not_an_owner_target(monkeypatch):
     )
 
     assert window._control_target_role("PC") is None
+
+
+def test_owner_worker_reports_an_ineligible_registered_identity(engine, roles):
+    _pc, laptop = roles
+    save_runtime_device_state(
+        engine,
+        device_id="stopped-pc-id",
+        hostname="TRADING-PC",
+        state=RuntimeDeviceState.STOPPED,
+        details=_details(device_kind="PC"),
+    )
+    completed = []
+    worker = ControlOwnerWorker(
+        engine,
+        laptop,
+        control="execution",
+        target=None,
+        target_label="PC",
+    )
+    worker.completed.connect(completed.append)
+
+    worker.run()
+
+    assert completed[0].success is False
+    assert "PC runtime is registered" in completed[0].error
+    assert (
+        "heartbeat is stale or its process state is not eligible"
+        in completed[0].error
+    )
 
 
 def test_online_coordination_store_survives_pc_historical_outage():
