@@ -465,10 +465,9 @@ class BuyboardRuntimeWorker(QThread):
 
         now = datetime.now(timezone.utc)
         last = self._last_device_state_published_at
-        if last is not None and (
+        if state == self.device_state and last is not None and (
             now - last
         ).total_seconds() < execution_config.COORDINATION_DEVICE_HEARTBEAT_SECONDS:
-            self.device_state = state
             return
         details = self._runtime_readiness_details(state)
         heartbeat_only = bool(

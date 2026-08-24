@@ -1577,6 +1577,24 @@ def test_pull_only_successor_reaches_standby_ready_but_never_active(
     assert worker.device_state == RuntimeDeviceState.STANDBY_READY
 
 
+def test_standby_ready_transition_is_not_deferred_by_recent_heartbeat(tmp_path):
+    worker, engine = _worker(tmp_path, standby_only=True, device_id="successor")
+    worker._set_device_state(RuntimeDeviceState.STANDBY)
+    prior_generation = worker.readiness_generation
+
+    # Readiness can complete immediately after the preceding STANDBY write.
+    # A state transition must still be durable before the UI exposes it; only
+    # an unchanged heartbeat may be rate-limited.
+    worker._publish_device_state_if_due(RuntimeDeviceState.STANDBY_READY)
+
+    record = get_runtime_device_state(engine, device_id="successor")
+    assert record is not None
+    assert record.state == RuntimeDeviceState.STANDBY_READY
+    assert record.readiness_generation == prior_generation + 1
+    assert worker.device_state == RuntimeDeviceState.STANDBY_READY
+    assert worker.readiness_generation == record.readiness_generation
+
+
 def test_unchanged_runtime_readiness_uses_timestamp_only_heartbeat(
     tmp_path, monkeypatch
 ):
