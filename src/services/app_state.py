@@ -882,6 +882,7 @@ class StateReconcileResult:
     conflict_keys: set[str] = field(default_factory=set)
     errors: list[str] = field(default_factory=list)
     is_main_device: bool = False
+    main_device_id: str = ""
     main_device_hostname: str = ""
     local_role: LocalDeviceRole | None = None
     # Populated whenever ``is_main_device`` is True -- the current
@@ -982,6 +983,7 @@ def reconcile_state_with_remote(
                 role = LocalDeviceRole(role.device_id, role.hostname, is_main)
         result.local_role = role
         result.is_main_device = is_main
+        result.main_device_id = main_device.device_id if main_device else ""
         result.main_device_hostname = main_device.hostname if main_device else ""
         result.lease_token = (
             main_device.lease_token if is_main and main_device else ""
@@ -1161,6 +1163,7 @@ def activate_device_as_main(
         return StateReconcileResult(
             errors=[f"Main ownership changed, but the local role could not be saved: {exc}"],
             is_main_device=True,
+            main_device_id=role.device_id,
             main_device_hostname=role.hostname,
             local_role=LocalDeviceRole(role.device_id, role.hostname, True),
         )
@@ -1304,6 +1307,7 @@ def auto_claim_main_device_if_stale(
         return StateReconcileResult(
             errors=[f"Main ownership changed, but the local role could not be saved: {exc}"],
             is_main_device=True,
+            main_device_id=role.device_id,
             main_device_hostname=role.hostname,
             lease_token=ownership.main_device.lease_token if ownership.main_device else "",
             lease_epoch=ownership.main_device.lease_epoch if ownership.main_device else 0,

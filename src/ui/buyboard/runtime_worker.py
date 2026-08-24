@@ -38,7 +38,10 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
-from src.api.kis_account_snapshot_dual import KisTransientApiError
+from src.api.kis_account_snapshot_dual import (
+    KisRateLimitError,
+    KisTransientApiError,
+)
 from src.core import execution_config
 from src.core.account_broker_snapshot import AccountBrokerSnapshot, ReconciliationAction
 from src.core.board_workflow import BoardActionContext
@@ -205,6 +208,7 @@ class BuyboardRuntimeWorker(QThread):
         strategy_instance_id: str = "",
         journal_flush: Optional[Callable[[], None]] = None,
         standby_only: bool = False,
+        cross_device_operator_sync: bool = True,
         device_id: str = "",
         hostname: str = "",
         external_alerting: Optional[ExternalAlertingService] = None,
@@ -222,6 +226,9 @@ class BuyboardRuntimeWorker(QThread):
         self.request_scheduler = request_scheduler or KisRequestScheduler(
             max_confirmed_mutation_attempts=(
                 execution_config.KIS_MUTATION_MAX_CONFIRMED_ATTEMPTS
+            ),
+            min_request_spacing_seconds=(
+                execution_config.KIS_REQUEST_MIN_SPACING_SECONDS
             ),
             min_mutation_spacing_seconds=(
                 execution_config.KIS_MUTATION_MIN_SPACING_SECONDS
@@ -246,6 +253,7 @@ class BuyboardRuntimeWorker(QThread):
         self._strategy_instance_id = str(strategy_instance_id or "")
         self._journal_flush = journal_flush or self._flush_execution_journal
         self._standby_only = bool(standby_only)
+        self._cross_device_operator_sync = bool(cross_device_operator_sync)
         self._device_id = str(
             device_id or getattr(execution_lease, "device_id", "") or ""
         )
@@ -1148,6 +1156,20 @@ class BuyboardRuntimeWorker(QThread):
         if callable(stop_market_data):
             stop_market_data()
 
+    def set_cross_device_operator_sync(self, enabled: bool) -> None:
+        """Switch the remote plan/command consumer without restarting runtime."""
+
+        enabled = bool(enabled)
+        if enabled == self._cross_device_operator_sync:
+            return
+        self._cross_device_operator_sync = enabled
+        if enabled:
+            # Make the next one-second runtime cycle perform the first split-
+            # role check immediately; later checks use the fixed five-second
+            # cadence.
+            self._last_card_revision_checked_at = None
+            self._last_operator_command_poll_at = None
+
     def _lease_still_current(self, *, force: bool = False) -> bool:
         """Review finding P0-1: "Stop the worker immediately on lease
         loss." Every order submission already re-checks the lease at the
@@ -1422,6 +1444,22 @@ class BuyboardRuntimeWorker(QThread):
                         self._execute_reconciliation_commands(result)
                     )
                 self._handle_reconciliation_result(result)
+            except (KisRateLimitError, KisTransientApiError) as exc:
+                # Read-only KIS outages are expected to clear.  Preserve the
+                # fail-closed reconciliation fence without rendering a full
+                # traceback as though the runtime itself crashed.
+                logger.warning(
+                    "Startup reconciliation temporarily unavailable for account "
+                    "%s: %s",
+                    account_no,
+                    exc,
+                )
+                self._invalidate_account_reconciliation(
+                    account_no,
+                    str(exc),
+                    confirm_for_operator=True,
+                )
+                continue
             except SQLAlchemyError as exc:
                 # A canonical outage is an expected infrastructure failure,
                 # not a Python crash. Keep it concise; readiness still fails
@@ -1530,13 +1568,14 @@ class BuyboardRuntimeWorker(QThread):
         from src.services.coordination_change_pulse import (
             change_notifications_available,
             coordination_table_change_generation,
-            remote_peer_confirmed_off,
         )
 
         pulse_generation = coordination_table_change_generation(
             self._db_engine, {"trade_cards"}
         )
-        if change_notifications_available(self._db_engine):
+        if self._cross_device_operator_sync:
+            interval = execution_config.COORDINATION_SPLIT_ROLE_SYNC_SECONDS
+        elif change_notifications_available(self._db_engine):
             interval = execution_config.COORDINATION_REMOTE_FALLBACK_SECONDS
         else:
             interval = (
@@ -1548,10 +1587,13 @@ class BuyboardRuntimeWorker(QThread):
             not force
             and self._card_cache_initialized
             and local_generation == self._local_card_change_generation
-            and pulse_generation == self._last_card_change_pulse_generation
+            and (
+                not self._cross_device_operator_sync
+                or pulse_generation == self._last_card_change_pulse_generation
+            )
             and self._last_card_revision_checked_at is not None
             and (
-                remote_peer_confirmed_off(self._db_engine)
+                not self._cross_device_operator_sync
                 or (now - self._last_card_revision_checked_at).total_seconds()
                 < interval
             )
@@ -1801,32 +1843,23 @@ class BuyboardRuntimeWorker(QThread):
     def _process_operator_commands(self, *, limit: int = 20) -> bool:
         """Apply live human requests only while this runtime owns execution."""
 
+        if not self._cross_device_operator_sync:
+            return False
+
         now = datetime.now(timezone.utc)
         from src.services.coordination_change_pulse import (
-            change_notifications_available,
             coordination_table_change_generation,
-            remote_peer_confirmed_off,
         )
 
         pulse_generation = coordination_table_change_generation(
             self._db_engine, {"operator_commands"}
         )
-        if change_notifications_available(self._db_engine):
-            interval = execution_config.COORDINATION_REMOTE_FALLBACK_SECONDS
-        else:
-            interval = (
-                execution_config.COORDINATION_OPERATOR_COMMAND_POLL_SECONDS
-                if self._regular_session_open()
-                else execution_config.COORDINATION_OFF_HOURS_POLL_SECONDS
-            )
+        interval = execution_config.COORDINATION_SPLIT_ROLE_SYNC_SECONDS
         if (
             pulse_generation == self._last_operator_change_pulse_generation
             and self._last_operator_command_poll_at is not None
-            and (
-                remote_peer_confirmed_off(self._db_engine)
-                or (now - self._last_operator_command_poll_at).total_seconds()
-                < interval
-            )
+            and (now - self._last_operator_command_poll_at).total_seconds()
+            < interval
         ):
             return False
         self._last_operator_command_poll_at = now
@@ -2161,7 +2194,7 @@ class BuyboardRuntimeWorker(QThread):
                     )
                 except Exception as exc:
                     self._defer_account_refresh(account_no, now)
-                    if isinstance(exc, KisTransientApiError):
+                    if isinstance(exc, (KisRateLimitError, KisTransientApiError)):
                         logger.warning(
                             "Periodic account reconciliation temporarily unavailable "
                             "for account %s; retry deferred for %.0fs: %s",
@@ -2232,7 +2265,7 @@ class BuyboardRuntimeWorker(QThread):
                 )
             except Exception as exc:
                 self._defer_account_refresh(account_no, now)
-                if isinstance(exc, KisTransientApiError):
+                if isinstance(exc, (KisRateLimitError, KisTransientApiError)):
                     logger.warning(
                         "Periodic account refresh temporarily unavailable for account "
                         "%s; retry deferred for %.0fs: %s",

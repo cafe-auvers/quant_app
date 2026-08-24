@@ -40,6 +40,17 @@ def _get_price_history_table(metadata: MetaData) -> Table:
     # primary key starts with symbol, so it cannot serve that query without a
     # full cache scan.
     Index("ix_price_history_interval_date", table.c.interval, table.c.date)
+    # Interactive chart navigation filters one symbol+interval and requests
+    # the newest rows.  The global freshness index above led SQLite to scan
+    # nearly every daily row before applying the symbol predicate on large
+    # local mirrors.  Keep the exact access path explicit for SQLite and
+    # MySQL so changing stocks remains a bounded index lookup.
+    Index(
+        "ix_price_history_symbol_interval_date",
+        table.c.symbol,
+        table.c.interval,
+        table.c.date,
+    )
     return table
 
 

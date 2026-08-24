@@ -37,6 +37,7 @@ def test_cloud_coordination_poll_floors_preserve_monthly_budget():
     assert execution_config.COORDINATION_ALERT_POLL_SECONDS >= 90.0
     assert execution_config.COORDINATION_OPERATOR_COMMAND_POLL_SECONDS >= 20.0
     assert execution_config.COORDINATION_OFF_HOURS_POLL_SECONDS >= 300.0
+    assert execution_config.COORDINATION_SPLIT_ROLE_SYNC_SECONDS == 5.0
     assert execution_config.COORDINATION_STATE_SYNC_SECONDS >= 180.0
     assert execution_config.COORDINATION_BOARD_PROJECTION_SECONDS >= 180.0
     assert execution_config.COORDINATION_REMOTE_FALLBACK_SECONDS >= 3600.0

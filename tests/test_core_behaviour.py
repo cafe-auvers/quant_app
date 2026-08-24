@@ -1842,6 +1842,36 @@ def test_tradingview_step_uses_sidebar_symbol_order():
     assert window.sidebar_stock_list.current_row == 1
 
 
+def test_tradingview_navigation_load_discards_stale_symbol(monkeypatch):
+    from src.ui.charts import controller_navigation
+
+    callbacks = []
+    monkeypatch.setattr(
+        controller_navigation.QTimer,
+        "singleShot",
+        lambda _delay, callback: callbacks.append(callback),
+    )
+
+    class Combo:
+        current = "AAPL"
+
+        def currentText(self):
+            return self.current
+
+    window = MainWindow.__new__(MainWindow)
+    window.tradingview_symbol_combo = Combo()
+    loads = []
+    window.load_tradingview_chart = lambda **kwargs: loads.append(kwargs)
+
+    window._schedule_tradingview_navigation_load()
+    window.tradingview_symbol_combo.current = "MSFT"
+    window._schedule_tradingview_navigation_load()
+    callbacks[0]()
+    callbacks[1]()
+
+    assert loads == [{"force": True}]
+
+
 def test_tradingview_activate_dispatches_buyboard_command_without_legacy_monitor():
     from src.core.board_workflow import BoardCardProjection
     from src.core.trade_card_state import BoardStatus, TradeCardState

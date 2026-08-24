@@ -503,7 +503,7 @@ class ChartsLayoutMixin:
         )
         self.populate_tradingview_watchlist_symbols()
         self.tradingview_symbol_combo.activated.connect(
-            lambda _index: self.load_tradingview_chart(force=True)
+            lambda _index: self._schedule_tradingview_navigation_load()
         )
 
         previous_button = QPushButton("Previous")

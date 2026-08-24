@@ -146,6 +146,7 @@ def test_local_operational_metadata_does_not_reuse_shared_db_revisions(
     assert result.errors == []
     assert result.conflict_keys == set()
     assert result.is_main_device is True
+    assert result.main_device_id == "laptop-id"
     assert _remote(engine, app_state.WATCHLIST_KEY).payload == local_payload
     assert local_metadata.exists()
 

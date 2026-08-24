@@ -57,6 +57,22 @@ def has_kis_request_scheduler() -> bool:
     )
 
 
+def defer_kis_requests(seconds: float) -> bool:
+    """Apply a broker-wide cooldown to the active process scheduler."""
+
+    context = _context.get()
+    scheduler = (
+        context.scheduler
+        if context is not None and context.scheduler is not None
+        else get_process_kis_request_scheduler()
+    )
+    defer = getattr(scheduler, "defer_requests", None)
+    if not callable(defer):
+        return False
+    defer(seconds)
+    return True
+
+
 @contextmanager
 def kis_request_scope(
     *,

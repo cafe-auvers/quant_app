@@ -181,6 +181,76 @@ def test_process_wide_mutation_spacing_applies_across_endpoint_buckets():
     assert sleeps == pytest.approx([0.2])
 
 
+def test_process_wide_request_spacing_applies_across_reads_and_mutations():
+    now = [10.0]
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    scheduler = _scheduler(
+        max_confirmed_mutation_attempts=1,
+        min_request_spacing_seconds=0.1,
+        monotonic=lambda: now[0],
+        sleeper=sleep,
+    )
+    scheduler.synchronize_budget(
+        kind=RequestKind.MUTATION,
+        account_no="acct",
+        endpoint="cancel_order",
+        remaining=1,
+    )
+    starts = []
+    scheduler.execute_read(
+        lambda: starts.append(now[0]),
+        account_no="acct",
+        endpoint="balance",
+    )
+    scheduler.execute_mutation(
+        lambda: starts.append(now[0]),
+        command_type=CommandType.CANCEL,
+        account_no="acct",
+        endpoint="cancel_order",
+        priority=RequestPriority.EMERGENCY_EXIT,
+    )
+
+    assert starts == pytest.approx([10.0, 10.1])
+    assert sleeps == pytest.approx([0.1])
+
+
+def test_retry_after_failure_pauses_every_request_class():
+    now = [10.0]
+    sleeps = []
+    calls = []
+
+    class RateLimited(RuntimeError):
+        retry_after_seconds = 1.0
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    scheduler = _scheduler(
+        monotonic=lambda: now[0],
+        sleeper=sleep,
+    )
+
+    def read():
+        calls.append(now[0])
+        if len(calls) == 1:
+            raise RateLimited("broker-wide rate limit")
+        return "ok"
+
+    assert scheduler.execute_read(
+        read,
+        account_no="acct",
+        endpoint="balance",
+    ) == "ok"
+    assert calls == pytest.approx([10.0, 11.0])
+    assert sleeps == pytest.approx([0.25, 0.75])
+
+
 def test_exit_requests_are_never_starved_by_display_refresh_backlog():
     scheduler = _scheduler()
     first_started = threading.Event()

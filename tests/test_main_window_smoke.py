@@ -98,9 +98,13 @@ def test_main_window_constructs_and_closes_offscreen_without_external_io(monkeyp
     tab_labels = [window.tabs.tabText(index) for index in range(window.tabs.count())]
     scanner_index = tab_labels.index("Scanner")
     assert tab_labels[scanner_index + 1] == "Market Pulse"
-    tradingview_index = tab_labels.index("TradingView Chart")
-    assert tab_labels[tradingview_index + 1] == "Health"
-    assert "Buy Board" in tab_labels
+    tradingview_index = tab_labels.index("TradingView")
+    assert tab_labels[tradingview_index : tradingview_index + 3] == [
+        "TradingView",
+        "Buy Board",
+        "Health",
+    ]
+    assert "TradingView Chart" not in tab_labels
     assert "Charts" not in tab_labels
     assert "Watchlist" not in tab_labels
     assert "Buy Dashboard" not in tab_labels

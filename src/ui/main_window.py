@@ -2031,6 +2031,7 @@ class MainWindow(
                 and not auto_claim
                 and self.state_sync_role.is_main
                 and self._initial_state_sync_complete
+                and not self._operator_executor_sync_required()
             ),
             generation=self._execution_state_generation(),
             auto_claim=auto_claim,
@@ -2124,10 +2125,10 @@ class MainWindow(
             if result.is_main_device
             else 0
         )
-        self._sync_buyboard_runtime_worker()
         if result.main_device_hostname:
             self._last_main_device_hostname = result.main_device_hostname
         self._refresh_control_ownership_status(result)
+        self._sync_buyboard_runtime_worker()
 
         action = getattr(self, "_state_sync_action", "reconcile")
         was_auto_claim = bool(self._state_sync_auto_claim)
@@ -2864,7 +2865,16 @@ class MainWindow(
             standby_only = not (
                 role.is_main and bool(self.__dict__.get("_current_lease_token"))
             )
+            cross_device_operator_sync = self._operator_executor_sync_mode() not in {
+                "same",
+                "locked",
+            }
             if worker is not None and worker.isRunning():
+                configure_sync = getattr(
+                    worker, "set_cross_device_operator_sync", None
+                )
+                if callable(configure_sync):
+                    configure_sync(cross_device_operator_sync)
                 if bool(getattr(worker, "_standby_only", False)) == standby_only:
                     return  # already running in the correct role
                 # Role changed: retain the same market-data service so an
@@ -2913,6 +2923,7 @@ class MainWindow(
                 strategy_instance_id=execution_config.KANBAN_STRATEGY_INSTANCE_ID,
                 market_data=self.__dict__.get("_buyboard_market_data_handoff"),
                 standby_only=standby_only,
+                cross_device_operator_sync=cross_device_operator_sync,
                 device_id=role.device_id,
                 hostname=role.hostname,
                 external_alerting=external_alerting,
@@ -2958,7 +2969,11 @@ class MainWindow(
             role.is_main and getattr(manager, "_is_main_device", role.is_main)
         )
         coordination_stale = False
-        if allowed:
+        periodic_sync_required = self._operator_executor_sync_mode() not in {
+            "same",
+            "locked",
+        }
+        if allowed and periodic_sync_required:
             last_reconcile = self.__dict__.get("_last_successful_reconcile_at")
             if last_reconcile is None:
                 allowed = False
@@ -4114,6 +4129,11 @@ class MainWindow(
         )
         self._build_market_pulse_tab()
 
+        self.tradingview_widget = QWidget()
+        self._add_configured_tab("tradingview", self.tradingview_widget, "TradingView")
+        self._build_tradingview_tab()
+        self._install_tradingview_watchlist_controls()
+
         # The Buy Board is the sole operator-facing execution surface. The
         # persisted buylist/execution-queue models remain compatibility inputs
         # for ORB calculation and state migration, but no legacy dashboard is
@@ -4126,13 +4146,6 @@ class MainWindow(
         # on at startup, rather than waiting for the next state-sync pass.
         # A no-op whenever BUYBOARD_ENGINE_ENABLED is unset (the default).
         self._sync_buyboard_runtime_worker()
-
-        self.tradingview_widget = QWidget()
-        self._add_configured_tab(
-            "tradingview", self.tradingview_widget, "TradingView Chart"
-        )
-        self._build_tradingview_tab()
-        self._install_tradingview_watchlist_controls()
 
         self.health_widget = QWidget()
         self._add_configured_tab("health", self.health_widget, "Health")
@@ -4806,21 +4819,132 @@ class MainWindow(
             and str(getattr(role, "device_id", "") or "").strip()
         )
 
+    def _operator_executor_sync_mode(self) -> str:
+        """Return ``split``, ``same``, ``locked``, or ``unknown``.
+
+        ``same`` and ``locked`` both disable the periodic remote
+        planning/command check.  Safety-critical lease proof remains a
+        separate broker-boundary concern.
+        """
+
+        control = self.__dict__.get(
+            "_operator_executor_sync_control",
+            self.__dict__.get("_cached_operator_control"),
+        )
+        if control is None:
+            return "unknown"
+        if bool(getattr(control, "locked", True)):
+            return "locked"
+        operator_device_id = str(
+            getattr(control, "device_id", "") or ""
+        ).strip()
+        executor_device_id = str(
+            self.__dict__.get("_cached_execution_owner_device_id", "") or ""
+        ).strip()
+        if not operator_device_id or not executor_device_id:
+            return "unknown"
+        return (
+            "split"
+            if operator_device_id != executor_device_id
+            else "same"
+        )
+
+    def _operator_executor_sync_required(self) -> bool:
+        return self._operator_executor_sync_mode() == "split"
+
+    def _apply_operator_executor_sync_cadence(self) -> None:
+        """Apply the ownership-driven TiDB planning/command poll policy."""
+
+        mode = self._operator_executor_sync_mode()
+        if mode == "unknown":
+            return
+        timers = (
+            self.__dict__.get("state_sync_timer"),
+            self.__dict__.get("_buyboard_projection_timer"),
+        )
+        if mode != "split":
+            for timer in timers:
+                if timer is not None:
+                    timer.stop()
+        else:
+            interval_ms = int(
+                execution_config.COORDINATION_SPLIT_ROLE_SYNC_SECONDS * 1000
+            )
+            for timer in timers:
+                if timer is None:
+                    continue
+                current_interval = getattr(timer, "interval", None)
+                current_interval = (
+                    current_interval() if callable(current_interval) else None
+                )
+                if current_interval != interval_ms:
+                    timer.setInterval(interval_ms)
+                is_active = getattr(timer, "isActive", None)
+                if not callable(is_active) or not is_active():
+                    timer.start()
+
+        runtime = self.__dict__.get("_buyboard_runtime_worker")
+        configure_runtime = getattr(
+            runtime, "set_cross_device_operator_sync", None
+        )
+        if callable(configure_runtime):
+            configure_runtime(mode == "split")
+
     def _refresh_control_ownership_status(self, result: StateReconcileResult) -> None:
         # ORB planning actions are synchronous UI gestures.  They must never
         # issue a blocking ownership query on the UI thread, so retain the
         # latest result from the background state-sync worker and fail closed
         # whenever that result was unavailable.
+        operator_control_error = str(
+            getattr(result, "operator_control_error", "") or ""
+        ).strip()
         self._cached_operator_control = (
-            result.operator_control
-            if not str(getattr(result, "operator_control_error", "") or "").strip()
-            else None
+            result.operator_control if not operator_control_error else None
         )
+        if not operator_control_error:
+            # Poll policy follows the last successfully verified assignment.
+            # Keep it across a transient read error while direct operator
+            # authorization above still fails closed for that pass.
+            self._operator_executor_sync_control = result.operator_control
         self._cached_operator_control_verified_at = result.last_verified_at
+        self._runtime_device_records = tuple(result.runtime_devices or ())
+        executor_device_id = str(
+            getattr(result, "main_device_id", "") or ""
+        ).strip()
+        if not executor_device_id and bool(getattr(result, "is_main_device", False)):
+            role = self.__dict__.get("state_sync_role")
+            executor_device_id = str(
+                getattr(role, "device_id", "") or ""
+            ).strip()
+        if not executor_device_id:
+            executor_hostname = str(
+                getattr(result, "main_device_hostname", "") or ""
+            ).strip().lower()
+            matching_records = [
+                record
+                for record in self._runtime_device_records
+                if executor_hostname
+                and str(getattr(record, "hostname", "") or "").strip().lower()
+                == executor_hostname
+            ]
+            if matching_records:
+                newest = max(
+                    matching_records,
+                    key=lambda item: getattr(
+                        item,
+                        "updated_at",
+                        dt.datetime.min.replace(tzinfo=dt.timezone.utc),
+                    ),
+                )
+                executor_device_id = str(
+                    getattr(newest, "device_id", "") or ""
+                ).strip()
+        if executor_device_id or not list(getattr(result, "errors", ()) or ()):
+            self._cached_execution_owner_device_id = executor_device_id
+        self._apply_operator_executor_sync_cadence()
         label = self.__dict__.get("control_ownership_status")
         if label is None:
             return
-        self._runtime_device_records = tuple(result.runtime_devices or ())
         execution_host = result.main_device_hostname or "Unassigned"
         execution_label = (
             self._control_identity_kind(hostname=execution_host)
@@ -4863,9 +4987,19 @@ class MainWindow(
             command_text = f"{newest.command_type.value}:{newest.status.value}"
         else:
             command_text = "None"
+        sync_mode = self._operator_executor_sync_mode()
+        sync_text = {
+            "split": (
+                f"Every {execution_config.COORDINATION_SPLIT_ROLE_SYNC_SECONDS:g}s"
+            ),
+            "same": "Local (remote polling stopped)",
+            "locked": "Locked (polling stopped)",
+            "unknown": "Verifying",
+        }[sync_mode]
         text_value = (
             f"Current Execution Owner: {execution_label} | "
             f"Current Operator Control: {operator_label} | "
+            f"Operator Sync: {sync_text} | "
             f"PC Executor Ready: {readiness['PC']} | "
             f"Laptop Executor Ready: {readiness['Laptop']} | "
             f"Live Trading: {live_text} | "
@@ -5391,6 +5525,15 @@ class MainWindow(
     ) -> None:
         """Back off or pause TiDB display polls based on peer reachability."""
 
+        # Known Operator/Executor ownership is authoritative for planning and
+        # live-command synchronization.  Split control always gets the fixed
+        # five-second cadence; locked or same-device control stops the loop.
+        # Peer reachability only selects a legacy fallback while ownership is
+        # not yet known (normally the brief startup/error window).
+        if self._operator_executor_sync_mode() != "unknown":
+            self._apply_operator_executor_sync_cadence()
+            return
+
         state_timer = self.__dict__.get("state_sync_timer")
         board_timer = self.__dict__.get("_buyboard_projection_timer")
         state_seconds = (
@@ -5465,6 +5608,15 @@ class MainWindow(
             return
         tables = {str(table or "").lower() for table in changed_tables if table}
         broad_fallback = not tables
+        sync_mode = self._operator_executor_sync_mode()
+        if sync_mode in {"same", "locked"}:
+            # Inactive remote-sync modes ignore card/runtime/command chatter.
+            # An app_state_sync token is still meaningful because it may be
+            # the Operator Control assignment that changes this very policy.
+            if not broad_fallback and "app_state_sync" not in tables:
+                return
+            tables = {"app_state_sync"}
+            broad_fallback = False
         if broad_fallback or tables & {
             "app_state_sync",
             "runtime_device_state",

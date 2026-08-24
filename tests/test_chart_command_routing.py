@@ -12,7 +12,10 @@ from src.core.board_workflow import (
     SetBreakoutPrice,
 )
 from src.core.trade_card_state import BoardStatus, TradeCardState
-from src.ui.buyboard.controller import _action_context
+from src.ui.buyboard.controller import (
+    _action_context,
+    _route_live_command_via_operator_queue,
+)
 from src.ui.mixins.chart_command_routing_mixin import ChartCommandRoutingMixin
 
 
@@ -232,6 +235,33 @@ def test_action_context_propagates_cached_operator_control_without_runtime():
 
     assert context.local_operator_control is True
     assert context.action_ready is False
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        ("same", False),
+        ("split", True),
+        ("locked", True),
+        ("unknown", True),
+    ],
+)
+def test_live_command_queue_follows_operator_executor_topology(mode, expected):
+    window = SimpleNamespace(
+        _operator_executor_sync_mode=lambda: mode,
+        _has_cached_local_operator_control=lambda: mode == "same",
+    )
+
+    assert _route_live_command_via_operator_queue(window) is expected
+
+
+def test_same_device_command_stays_queued_without_fresh_operator_proof():
+    window = SimpleNamespace(
+        _operator_executor_sync_mode=lambda: "same",
+        _has_cached_local_operator_control=lambda: False,
+    )
+
+    assert _route_live_command_via_operator_queue(window) is True
 
 
 class _CompletionProbe:

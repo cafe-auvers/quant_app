@@ -604,7 +604,13 @@ class SidebarMixin:
                 hasattr(self, "tradingview_symbol_combo")
                 and not self.__dict__.get("_suppress_sidebar_tradingview_load", False)
             ):
-                self.load_tradingview_chart(force=True)
+                schedule_load = getattr(
+                    self, "_schedule_tradingview_navigation_load", None
+                )
+                if callable(schedule_load):
+                    schedule_load()
+                else:
+                    self.load_tradingview_chart(force=True)
         elif current_widget is self.scanner_widget:
             self.scanner_selection_label.setText(f"Selected symbol: {symbol}")
             self.update_scanner_preview_chart(symbol)

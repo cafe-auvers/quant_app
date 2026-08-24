@@ -64,6 +64,7 @@ except ModuleNotFoundError:  # Keep direct script execution usable.
     from src.utils.config import DEFAULT_KIS_TOKEN_CACHE, ENV_FILE, resolve_repo_path
 
 from src.services.kis_request_boundary import (
+    defer_kis_requests,
     execute_kis_request,
     has_kis_request_scheduler,
 )
@@ -109,6 +110,12 @@ RATE_LIMIT_MSG_CODES = {
 }
 TRANSIENT_SERVER_MSG_CODES = {
     "EGW00300",  # gateway routing failure
+}
+# KIS sometimes returns a successful HTTP response with a non-zero ``rt_cd``
+# for a temporary balance lookup failure.  Keep this endpoint-scoped: the same
+# code must never make an order mutation look safe to retry.
+TRANSIENT_DOMESTIC_BALANCE_MSG_CODES = {
+    "APBK1350",  # "Query error. Please try again."
 }
 MAX_RATE_LIMIT_RETRIES = 3
 RATE_LIMIT_BACKOFF_SECONDS = (1.0, 2.0, 4.0)
@@ -265,6 +272,17 @@ class KisApiError(RuntimeError):
 
 class KisRateLimitError(KisApiError):
     """Raised when KIS reports a per-second request limit error."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_seconds: float = RATE_LIMIT_BACKOFF_SECONDS[0],
+    ) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = max(
+            0.0, float(retry_after_seconds or 0.0)
+        )
 
 
 class KisTransientApiError(KisApiError):
@@ -740,7 +758,17 @@ class KisAccountClient:
                     self._parse_response(response, endpoint=endpoint),
                     response.headers,
                 )
-            except (KisRateLimitError, KisTransientApiError) as exc:
+            except KisRateLimitError as exc:
+                last_error = exc
+                if attempt >= MAX_RATE_LIMIT_RETRIES:
+                    break
+                delay = RATE_LIMIT_BACKOFF_SECONDS[
+                    min(attempt, len(RATE_LIMIT_BACKOFF_SECONDS) - 1)
+                ]
+                exc.retry_after_seconds = max(exc.retry_after_seconds, delay)
+                if not defer_kis_requests(delay):
+                    time.sleep(delay)
+            except KisTransientApiError as exc:
                 last_error = exc
                 if attempt >= MAX_RATE_LIMIT_RETRIES:
                     break
@@ -830,12 +858,20 @@ class KisAccountClient:
                 "KIS rejected the account number/product code. "
                 "Verify the selected KIS account and product code in .env."
             )
-        if msg_cd in TRANSIENT_SERVER_MSG_CODES or response.status_code in {
-            500,
-            502,
-            503,
-            504,
-        }:
+        transient_domestic_balance_error = bool(
+            endpoint == DOMESTIC_BALANCE_ENDPOINT
+            and msg_cd in TRANSIENT_DOMESTIC_BALANCE_MSG_CODES
+        )
+        if (
+            msg_cd in TRANSIENT_SERVER_MSG_CODES
+            or transient_domestic_balance_error
+            or response.status_code in {
+                500,
+                502,
+                503,
+                504,
+            }
+        ):
             raise KisTransientApiError(
                 f"KIS service temporarily unavailable at {endpoint}: "
                 f"HTTP {response.status_code}: {msg_cd} {msg1}"

@@ -90,7 +90,7 @@ ENGINE_HEARTBEAT_SECONDS = _env_int("ENGINE_HEARTBEAT_SECONDS", 1)
 # Published in runtime readiness so a newly deployed client refuses to share
 # the coordination store with a still-running pre-budget peer. This is a
 # protocol identity, not an operator-overridable setting.
-COORDINATION_RU_PROFILE = "typed-change-pulse-v6"
+COORDINATION_RU_PROFILE = "operator-executor-sync-v7"
 # The market/ORB loop above stays at one second. These independent cadences
 # cap Internet coordination traffic without delaying broker-boundary fencing.
 COORDINATION_ACTIVE_CARD_POLL_SECONDS = max(
@@ -164,6 +164,14 @@ COORDINATION_OPERATOR_COMMAND_POLL_SECONDS = max(
 COORDINATION_OFF_HOURS_POLL_SECONDS = max(
     300.0, _env_float("COORDINATION_OFF_HOURS_POLL_SECONDS", 300.0)
 )
+
+# Manual planning/command synchronization follows the control topology rather
+# than the market clock.  When Operator Control and Execution Ownership are on
+# different devices, both sides check the shared canonical revisions at this
+# cadence.  The hot loop is stopped when control is locked or both roles are on
+# the same device.  Keep this protocol value exact so two deployed peers agree
+# about the maximum command-delivery delay.
+COORDINATION_SPLIT_ROLE_SYNC_SECONDS = 5.0
 
 # UI projection/display polling is not an execution boundary. Local changes
 # invalidate immediately and owner activation force-loads canonical state.
@@ -318,6 +326,12 @@ KIS_REPLACE_MUTATION_CAPACITY = _env_int(
 )
 KIS_MUTATION_BUDGET_WINDOW_SECONDS = _env_float(
     "KIS_MUTATION_BUDGET_WINDOW_SECONDS", 1.0
+)
+# KIS applies a shared per-second transaction allowance across endpoints. Keep
+# headroom below the nominal bucket totals for token, account, order-history,
+# display, and mutation traffic sharing this process.
+KIS_REQUEST_MIN_SPACING_SECONDS = max(
+    0.0, _env_float("KIS_REQUEST_MIN_SPACING_SECONDS", 0.1)
 )
 # Process-wide spacing is an independent upper bound across endpoint buckets.
 # The controlled-live default is deliberately slower than the bucket totals;

@@ -528,6 +528,18 @@ def _claims_kanban_ownership(command: AnyBoardCommand) -> bool:
     )
 
 
+def _route_live_command_via_operator_queue(main_window) -> bool:
+    """Use direct execution only for a verified same-device topology."""
+
+    sync_mode = getattr(
+        main_window, "_operator_executor_sync_mode", lambda: "unknown"
+    )()
+    local_operator = getattr(
+        main_window, "_has_cached_local_operator_control", lambda: False
+    )()
+    return not (sync_mode == "same" and bool(local_operator))
+
+
 class BuyboardMixin:
     """Build the board and route all gestures through the workflow service."""
 
@@ -1329,7 +1341,12 @@ class BuyboardMixin:
             )
 
             if operator_command_type_for_board_command(command) is not None:
-                route_via_operator_queue = True
+                # Same-device Operator/Executor actions can be applied through
+                # the direct canonical workflow.  A split or not-yet-verified
+                # topology remains fail-closed through the durable queue.
+                route_via_operator_queue = _route_live_command_via_operator_queue(
+                    self
+                )
             elif not bool(getattr(role, "is_main", False)):
                 from PyQt5.QtWidgets import QMessageBox
 
