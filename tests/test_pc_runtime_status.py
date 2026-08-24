@@ -2,6 +2,7 @@ import datetime as dt
 import threading
 from types import SimpleNamespace
 
+import pytest
 from sqlalchemy import create_engine, event, text
 
 from src.core import execution_config
@@ -608,6 +609,81 @@ def test_peer_offline_pauses_tidb_projection_fallback_timers():
     assert window.state_sync_timer.interval() == expected
     assert window._buyboard_projection_timer.active is True
     assert window._buyboard_projection_timer.interval() == expected
+
+
+def test_split_operator_executor_uses_five_second_tidb_sync():
+    window = MainWindow.__new__(MainWindow)
+    window.state_sync_timer = _TimerStub()
+    window._buyboard_projection_timer = _TimerStub()
+    window._cached_execution_owner_device_id = "pc-id"
+    window._cached_operator_control = SimpleNamespace(
+        device_id="laptop-id",
+        locked=False,
+    )
+
+    window._apply_operator_executor_sync_cadence()
+
+    expected = int(execution_config.COORDINATION_SPLIT_ROLE_SYNC_SECONDS * 1000)
+    assert window._operator_executor_sync_mode() == "split"
+    assert window.state_sync_timer.active is True
+    assert window.state_sync_timer.interval() == expected
+    assert window._buyboard_projection_timer.active is True
+    assert window._buyboard_projection_timer.interval() == expected
+
+
+def test_same_device_or_locked_operator_stops_tidb_sync():
+    window = MainWindow.__new__(MainWindow)
+    window.state_sync_timer = _TimerStub()
+    window._buyboard_projection_timer = _TimerStub()
+    window._cached_execution_owner_device_id = "pc-id"
+    window._cached_operator_control = SimpleNamespace(
+        device_id="pc-id",
+        locked=False,
+    )
+
+    window._apply_operator_executor_sync_cadence()
+
+    assert window._operator_executor_sync_mode() == "same"
+    assert window.state_sync_timer.active is False
+    assert window._buyboard_projection_timer.active is False
+
+    window.state_sync_timer.start()
+    window._buyboard_projection_timer.start()
+    window._cached_operator_control = SimpleNamespace(
+        device_id="",
+        locked=True,
+    )
+    window._apply_operator_executor_sync_cadence()
+
+    assert window._operator_executor_sync_mode() == "locked"
+    assert window.state_sync_timer.active is False
+    assert window._buyboard_projection_timer.active is False
+
+
+@pytest.mark.parametrize("mode", ["same", "locked"])
+def test_inactive_operator_sync_ignores_non_ownership_remote_chatter(mode):
+    window = MainWindow.__new__(MainWindow)
+    window._database_shutting_down = False
+    window._remote_coordination_sync_pending = False
+    window._operator_executor_sync_mode = lambda: mode
+    drained = []
+    refreshed = []
+    window._drain_remote_coordination_sync = lambda: drained.append(True)
+    window.refresh_buyboard = lambda **_kwargs: refreshed.append(True)
+
+    window._on_remote_coordination_change(
+        ("runtime_device_state", "operator_commands", "trade_cards")
+    )
+
+    assert window._remote_coordination_sync_pending is False
+    assert drained == []
+    assert refreshed == []
+
+    window._on_remote_coordination_change(("app_state_sync",))
+
+    assert window._remote_coordination_sync_pending is True
+    assert drained == [True]
+    assert refreshed == []
 
 
 def test_runtime_pc_database_loss_switches_to_local_mirror_and_detaches_state_sync(

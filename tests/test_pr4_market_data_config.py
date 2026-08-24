@@ -145,6 +145,7 @@ def test_pr4_market_data_configuration_is_present_and_fail_closed():
         "KIS_WS_TOTAL_SUBSCRIPTION_CAPACITY=0",
         "KIS_WS_RAW_CAPTURE_ENABLED=false",
         "KIS_LIVE_EXECUTION_MODE=DISABLED",
+        "KIS_REQUEST_MIN_SPACING_SECONDS=0.1",
         "KIS_MUTATION_MIN_SPACING_SECONDS=0.2",
         "KIS_MUTATION_MAX_CONFIRMED_ATTEMPTS=1",
         "BUYBOARD_ENGINE_ENABLED=true",

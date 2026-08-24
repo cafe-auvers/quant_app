@@ -5,8 +5,55 @@ from __future__ import annotations
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import QMessageBox
 
+TRADINGVIEW_NAVIGATION_DEBOUNCE_MS = 125
+
 
 class ChartsNavigationMixin:
+    def _schedule_tradingview_navigation_load(self) -> None:
+        """Coalesce rapid symbol changes before rebuilding the chart.
+
+        Sidebar keyboard navigation can emit several selection changes in one
+        short burst.  Loading every intermediate symbol used to queue the same
+        database/chart work repeatedly on Qt's event loop.
+        """
+
+        combo = self.__dict__.get("tradingview_symbol_combo")
+        if combo is None:
+            return
+        symbol = combo.currentText().strip().upper()
+        if not symbol:
+            return
+        generation = int(
+            self.__dict__.get("_tradingview_navigation_generation", 0) or 0
+        ) + 1
+        self._tradingview_navigation_generation = generation
+        QTimer.singleShot(
+            TRADINGVIEW_NAVIGATION_DEBOUNCE_MS,
+            lambda: self._run_scheduled_tradingview_navigation_load(
+                generation, symbol
+            ),
+        )
+
+    def _run_scheduled_tradingview_navigation_load(
+        self, generation: int, symbol: str
+    ) -> None:
+        if generation != int(
+            self.__dict__.get("_tradingview_navigation_generation", 0) or 0
+        ):
+            return
+        combo = self.__dict__.get("tradingview_symbol_combo")
+        if combo is None or combo.currentText().strip().upper() != symbol:
+            return
+        tabs = self.__dict__.get("tabs")
+        target = self.__dict__.get("tradingview_widget")
+        if (
+            tabs is not None
+            and target is not None
+            and tabs.currentWidget() is not target
+        ):
+            return
+        self.load_tradingview_chart(force=True)
+
     def _refresh_active_chart_for_symbol(self, symbol: str) -> None:
         """Force-refresh the current chart view if it matches symbol."""
         symbol = symbol.strip().upper()
@@ -219,7 +266,7 @@ class ChartsNavigationMixin:
                         break
         finally:
             self._suppress_sidebar_tradingview_load = False
-        self.load_tradingview_chart(force=True)
+        self._schedule_tradingview_navigation_load()
 
     def _set_tradingview_symbol(self, symbol: str) -> None:
         if not hasattr(self, "tradingview_symbol_combo"):

@@ -123,6 +123,7 @@ class KisRequestScheduler:
         uncertain_protective_reserve: int = 2,
         max_read_attempts: int = 3,
         max_confirmed_mutation_attempts: int = 2,
+        min_request_spacing_seconds: float = 0.0,
         min_mutation_spacing_seconds: float = 0.0,
         backoff_seconds: float = 0.25,
         monotonic: Callable[[], float] = time.monotonic,
@@ -139,6 +140,9 @@ class KisRequestScheduler:
         self._max_confirmed_mutation_attempts = max(
             1, int(max_confirmed_mutation_attempts)
         )
+        self._min_request_spacing_seconds = max(
+            0.0, float(min_request_spacing_seconds)
+        )
         self._min_mutation_spacing_seconds = max(
             0.0, float(min_mutation_spacing_seconds)
         )
@@ -149,13 +153,19 @@ class KisRequestScheduler:
         self._queue: list[tuple[int, int, _Waiter]] = []
         self._sequence = 0
         self._active = False
+        self._last_request_started_at: Optional[float] = None
         self._last_mutation_started_at: Optional[float] = None
+        self._requests_not_before_at = 0.0
         self._buckets: Dict[tuple[RequestKind, str, str], _BudgetBucket] = {}
         self._metrics = SchedulerMetrics()
 
     @property
     def max_confirmed_mutation_attempts(self) -> int:
         return self._max_confirmed_mutation_attempts
+
+    @property
+    def min_request_spacing_seconds(self) -> float:
+        return self._min_request_spacing_seconds
 
     @property
     def min_mutation_spacing_seconds(self) -> float:
@@ -357,27 +367,57 @@ class KisRequestScheduler:
             self._refresh_queue_metrics_locked()
             self._condition.notify_all()
 
-    def _wait_for_mutation_spacing(self) -> None:
-        """Enforce one process-wide floor between actual mutation attempts."""
+    def defer_requests(self, seconds: float) -> None:
+        """Pause every request class after a broker-wide throttle refusal."""
+
+        delay = max(0.0, float(seconds or 0.0))
+        if delay <= 0:
+            return
+        with self._condition:
+            self._requests_not_before_at = max(
+                self._requests_not_before_at,
+                self._monotonic() + delay,
+            )
+
+    def _defer_for_exception(self, exc: BaseException) -> float:
+        try:
+            retry_after = max(
+                0.0,
+                float(getattr(exc, "retry_after_seconds", 0.0) or 0.0),
+            )
+        except (TypeError, ValueError):
+            retry_after = 0.0
+        if retry_after > 0:
+            self.defer_requests(retry_after)
+        return retry_after
+
+    def _wait_for_request_spacing(self, kind: RequestKind) -> None:
+        """Enforce shared KIS pacing plus the stricter mutation-only floor."""
 
         now = self._monotonic()
-        previous = self._last_mutation_started_at
-        delay = (
-            0.0
-            if previous is None
-            else max(0.0, previous + self._min_mutation_spacing_seconds - now)
-        )
+        required_at = self._requests_not_before_at
+        previous_request = self._last_request_started_at
+        if previous_request is not None:
+            required_at = max(
+                required_at,
+                previous_request + self._min_request_spacing_seconds,
+            )
+        previous_mutation = self._last_mutation_started_at
+        if kind == RequestKind.MUTATION and previous_mutation is not None:
+            required_at = max(
+                required_at,
+                previous_mutation + self._min_mutation_spacing_seconds,
+            )
+        delay = max(0.0, required_at - now)
         if delay > 0:
             self._sleeper(delay)
         # A deterministic test sleeper need not advance its fake clock. Keep
         # the logical start monotonic while a real sleeper records real time.
         observed = self._monotonic()
-        self._last_mutation_started_at = max(
-            observed,
-            (previous + self._min_mutation_spacing_seconds)
-            if previous is not None
-            else observed,
-        )
+        logical_start = max(observed, required_at)
+        self._last_request_started_at = logical_start
+        if kind == RequestKind.MUTATION:
+            self._last_mutation_started_at = logical_start
 
     def _refresh_queue_metrics_locked(self) -> None:
         highest = self._queue[0][0] if self._queue else 0
@@ -411,8 +451,10 @@ class KisRequestScheduler:
                             f"No read budget remains for {account_no}/{endpoint}"
                         )
                     bucket.remaining -= 1
+                self._wait_for_request_spacing(RequestKind.READ)
                 result = operation()
             except Exception as exc:
+                self._defer_for_exception(exc)
                 if attempt >= self._max_read_attempts or not retry_if(exc):
                     raise
                 self._metrics = replace(
@@ -461,9 +503,10 @@ class KisRequestScheduler:
                     is_new_entry=is_new_entry,
                     consume=True,
                 )
-                self._wait_for_mutation_spacing()
+                self._wait_for_request_spacing(RequestKind.MUTATION)
                 result = operation()
             except Exception as exc:
+                retry_after = self._defer_for_exception(exc)
                 confirmed = False
                 try:
                     confirmed = bool(classifier(exc))
@@ -484,9 +527,6 @@ class KisRequestScheduler:
                     confirmed_mutation_retries=(
                         self._metrics.confirmed_mutation_retries + 1
                     ),
-                )
-                retry_after = max(
-                    0.0, float(getattr(exc, "retry_after_seconds", 0.0) or 0.0)
                 )
                 delay = max(
                     retry_after, self._backoff_seconds * (2 ** (attempt - 1))

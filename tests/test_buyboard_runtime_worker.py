@@ -24,7 +24,10 @@ from PyQt5.QtWidgets import QApplication
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
-from src.api.kis_account_snapshot_dual import KisTransientApiError
+from src.api.kis_account_snapshot_dual import (
+    KisRateLimitError,
+    KisTransientApiError,
+)
 from src.core import execution_config
 from src.core.account_broker_snapshot import AccountBrokerSnapshot, SnapshotCompleteness
 from src.core.board_workflow import (
@@ -398,7 +401,7 @@ def test_card_cache_downloads_payload_only_when_revision_changes(
     assert len(calls) == 2
 
 
-def test_confirmed_off_peer_disables_elapsed_card_fallback(
+def test_same_device_mode_disables_elapsed_card_fallback(
     tmp_path, monkeypatch
 ):
     from src.services import coordination_change_pulse
@@ -418,6 +421,7 @@ def test_confirmed_off_peer_disables_elapsed_card_fallback(
         counted_revision,
     )
     worker._load_cards_if_changed()
+    worker.set_cross_device_operator_sync(False)
     coordination_change_pulse.set_remote_peer_confirmed_off(engine, True)
     worker._last_card_revision_checked_at = dt.datetime.now(
         dt.timezone.utc
@@ -472,9 +476,15 @@ def test_operator_command_lookup_runs_only_after_internal_change_pulse(
     coordination_change_pulse.set_remote_peer_confirmed_off(engine, True)
     worker._last_operator_command_poll_at = dt.datetime.now(
         dt.timezone.utc
-    ) - dt.timedelta(days=2)
+    ) - dt.timedelta(seconds=4)
     assert worker._process_operator_commands() is False
     assert len(calls) == 1
+
+    worker._last_operator_command_poll_at = dt.datetime.now(
+        dt.timezone.utc
+    ) - dt.timedelta(seconds=6)
+    assert worker._process_operator_commands() is False
+    assert len(calls) == 2
 
     assert coordination_change_pulse.mark_remote_coordination_change(
         engine,
@@ -482,7 +492,7 @@ def test_operator_command_lookup_runs_only_after_internal_change_pulse(
         tables=("trade_cards",),
     )
     assert worker._process_operator_commands() is False
-    assert len(calls) == 1
+    assert len(calls) == 2
 
     assert coordination_change_pulse.mark_remote_coordination_change(
         engine,
@@ -490,7 +500,31 @@ def test_operator_command_lookup_runs_only_after_internal_change_pulse(
         tables=("operator_commands",),
     )
     assert worker._process_operator_commands() is False
-    assert len(calls) == 2
+    assert len(calls) == 3
+
+
+def test_locked_or_same_device_runtime_skips_operator_command_sync(
+    tmp_path, monkeypatch
+):
+    from src.services import operator_command_service
+
+    worker, _engine = _worker(
+        tmp_path,
+        cross_device_operator_sync=False,
+    )
+    calls = []
+    monkeypatch.setattr(
+        operator_command_service,
+        "process_next_board_operator_command",
+        lambda *args, **kwargs: calls.append(True) or None,
+    )
+
+    assert worker._process_operator_commands() is False
+    worker._last_operator_command_poll_at = dt.datetime.now(
+        dt.timezone.utc
+    ) - dt.timedelta(days=2)
+    assert worker._process_operator_commands() is False
+    assert calls == []
 
 
 def test_readiness_revisions_are_cached_until_app_state_changes(
@@ -537,11 +571,13 @@ def test_readiness_revisions_are_cached_until_app_state_changes(
 def test_default_worker_scheduler_uses_production_spacing_and_no_retry(
     tmp_path, monkeypatch
 ):
+    monkeypatch.setattr(execution_config, "KIS_REQUEST_MIN_SPACING_SECONDS", 0.125)
     monkeypatch.setattr(execution_config, "KIS_MUTATION_MIN_SPACING_SECONDS", 0.25)
     monkeypatch.setattr(execution_config, "KIS_MUTATION_MAX_CONFIRMED_ATTEMPTS", 1)
 
     worker, _ = _worker(tmp_path)
 
+    assert worker.request_scheduler.min_request_spacing_seconds == 0.125
     assert worker.request_scheduler.min_mutation_spacing_seconds == 0.25
     assert worker.request_scheduler.max_confirmed_mutation_attempts == 1
 
@@ -2079,6 +2115,38 @@ def test_startup_reconciliation_marks_incomplete_when_one_account_fails(tmp_path
     assert "2" not in worker._account_reconciled_at
 
 
+def test_startup_transient_kis_failure_is_fail_closed_without_traceback(
+    tmp_path, caplog, monkeypatch
+):
+    import src.ui.buyboard.runtime_worker as worker_module
+
+    def unavailable(**kwargs):
+        raise KisTransientApiError("APBK1350 temporary balance query failure")
+
+    monkeypatch.setattr(worker_module, "run_account_reconciliation_pass", unavailable)
+    broker = _FakeBroker()
+    worker, engine = _worker(tmp_path, broker=broker, account_no="1")
+    worker.runtime = _build_test_runtime(
+        buying_power_provider=worker._buying_power_provider,
+        card_lookup=worker._card_lookup,
+        broker=worker._broker,
+    )
+    _seed_card(
+        engine,
+        account_no="1",
+        symbol="AAPL",
+        board_status=BoardStatus.WATCHLIST,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        worker._run_startup_reconciliation()
+
+    assert worker.startup_reconciliation_complete is False
+    assert "1" in worker.startup_reconciliation_errors
+    assert "temporarily unavailable" in caplog.text
+    assert "Traceback" not in caplog.text
+
+
 def test_startup_reconciliation_does_not_cross_account_boundaries(tmp_path):
     """Review finding P0: "startup order reconciliation is still not
     account-scoped" -- account 1's own reconciliation must not even look
@@ -2549,6 +2617,41 @@ def test_periodic_refresh_transient_failure_uses_account_cooldown(
     assert calls == ["1"]
     assert worker._account_refresh_retry_not_before["1"] > now
     assert "retry deferred for 30s" in caplog.text
+    assert "Traceback" not in caplog.text
+
+
+def test_periodic_refresh_rate_limit_uses_account_cooldown_without_traceback(
+    tmp_path, monkeypatch, caplog
+):
+    broker = _FakeBroker()
+    calls = []
+
+    def unavailable(*, environment, account_no=None):
+        calls.append(account_no)
+        raise KisRateLimitError(
+            "KIS rate limit exceeded (EGW00215): per-second limit exceeded"
+        )
+
+    monkeypatch.setattr(broker, "get_positions", unavailable)
+    worker, _engine = _worker(tmp_path, broker=broker)
+    worker.runtime = _build_test_runtime(
+        buying_power_provider=worker._buying_power_provider,
+        card_lookup=worker._card_lookup,
+        broker=worker._broker,
+        market_data=_dummy_market_data(),
+    )
+    now = dt.datetime.now(dt.timezone.utc)
+    worker._account_balance_refreshed_at["1"] = now - dt.timedelta(hours=1)
+    worker._account_reconciled_at["1"] = now
+
+    with caplog.at_level(logging.WARNING):
+        worker._refresh_account_state_if_due([])
+        worker._refresh_account_state_if_due([])
+
+    assert calls == ["1"]
+    assert worker._account_refresh_retry_not_before["1"] > now
+    assert "retry deferred for 30s" in caplog.text
+    assert "EGW00215" in caplog.text
     assert "Traceback" not in caplog.text
 
 

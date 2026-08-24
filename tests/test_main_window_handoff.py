@@ -208,6 +208,70 @@ def test_order_submission_blocked_when_reconcile_stale(monkeypatch):
     assert any("stale" in message.lower() for message in window._logs)
 
 
+@pytest.mark.parametrize("locked", [False, True])
+def test_same_device_or_locked_control_uses_broker_boundary_lease_proof(locked):
+    window = _base_window(is_main=True, lease_token="tok-1")
+    window.state_sync_role = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    window.state_save_manager = SimpleNamespace(_is_main_device=True)
+    window._last_successful_reconcile_at = dt.datetime.now(
+        dt.timezone.utc
+    ) - dt.timedelta(seconds=200)
+    window._cached_execution_owner_device_id = "laptop-id"
+    window._operator_executor_sync_control = SimpleNamespace(
+        device_id="" if locked else "laptop-id",
+        locked=locked,
+    )
+
+    assert MainWindow._state_sync_allows_order_submission(window) is True
+
+
+@pytest.mark.parametrize(
+    ("operator_device_id", "ownership_only"),
+    [("pc-id", False), ("laptop-id", True)],
+)
+def test_main_state_sync_pulls_plans_only_when_operator_is_remote(
+    monkeypatch,
+    operator_device_id,
+    ownership_only,
+):
+    created = []
+
+    class _StateSyncWorkerStub:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+            self.completed = _SignalStub()
+            self.started = False
+            created.append(self)
+
+        def start(self):
+            self.started = True
+
+        @staticmethod
+        def isRunning():
+            return False
+
+    monkeypatch.setattr(main_window_module, "StateSyncWorker", _StateSyncWorkerStub)
+    window = _base_window(is_main=True, lease_token="tok-1", pc_engine=object())
+    window._database_shutting_down = False
+    window._database_transition_generation = 0
+    window._initial_state_sync_complete = True
+    window._cached_execution_owner_device_id = "laptop-id"
+    window._operator_executor_sync_control = SimpleNamespace(
+        device_id=operator_device_id,
+        locked=False,
+    )
+    window._ensure_save_lock = lambda: object()
+    window._execution_state_metadata_path = lambda: None
+    window._track_worker = lambda *_args: None
+
+    MainWindow._start_state_sync(window)
+
+    assert len(created) == 1
+    assert created[0].kwargs["ownership_only_when_main"] is ownership_only
+    assert created[0].started is True
+
+
 def test_order_submission_blocked_when_never_reconciled(monkeypatch):
     window = _base_window(is_main=True, lease_token="tok-1")
     window.state_sync_role = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
