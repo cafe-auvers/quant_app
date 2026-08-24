@@ -33,6 +33,7 @@ from src.services.kis_realtime_market_data import (
     SubscriptionPriority,
     build_kis_realtime_market_data_from_environment,
 )
+from src.services.kis_ws_symbol_keys import KisWsSymbolKeyStore
 from src.api.kis_websocket import KisWsProtocolOperation
 from src.services.realtime_market_data import QuoteSnapshot
 from src.services.trading_state import is_trading_enabled
@@ -1089,12 +1090,11 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
             f"Gate-2 requests {requested_slots} registrations but aggregate "
             f"capacity is {execution_config.KIS_WS_TOTAL_SUBSCRIPTION_CAPACITY}"
         )
-    keys = {
-        str(symbol).upper(): str(key)
-        for symbol, key in json.loads(
-            os.getenv("KIS_WS_SYMBOL_KEYS_JSON", "{}") or "{}"
-        ).items()
-    }
+    symbol_key_store = KisWsSymbolKeyStore()
+    symbol_key_snapshot = symbol_key_store.snapshot()
+    if symbol_key_snapshot.last_error:
+        raise RuntimeError(symbol_key_snapshot.last_error)
+    keys = dict(symbol_key_snapshot.keys)
     missing = sorted(set(symbols) - set(keys))
     if missing:
         raise RuntimeError(f"missing verified subscription keys: {', '.join(missing)}")
@@ -1232,6 +1232,7 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
         ),
         qualification_mode=True,
         sensitive_value_audit=audit_approval_key,
+        symbol_key_store=symbol_key_store,
     )
     priority = {symbol: int(SubscriptionPriority.CRITICAL_EXIT) for symbol in symbols}
     service.configure_desired_channels(trade_priorities=priority, quote_priorities=priority)

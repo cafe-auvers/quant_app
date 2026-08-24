@@ -7,7 +7,6 @@ broker reconciliation remains authoritative.
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import math
 import os
@@ -41,6 +40,7 @@ from src.services.realtime_market_data import (
     QuoteSnapshot,
     RealtimeMarketDataService,
 )
+from src.services.kis_ws_symbol_keys import KisWsSymbolKeyStore
 from src.utils.market_calendar import is_regular_session_open
 
 logger = logging.getLogger(__name__)
@@ -530,6 +530,7 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         *,
         transport: KisWebSocketClient,
         symbol_key_resolver: Callable[[str, FeedChannel], str],
+        symbol_key_store: Optional[KisWsSymbolKeyStore] = None,
         trade_capacity: int,
         quote_capacity: int,
         total_capacity: Optional[int] = None,
@@ -548,6 +549,7 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
     ) -> None:
         self._transport = transport
         self._symbol_key_resolver = symbol_key_resolver
+        self.symbol_key_store = symbol_key_store
         self._trade_capacity = max(0, int(trade_capacity))
         self._quote_capacity = max(0, int(quote_capacity))
         # KIS enforces one aggregate session budget across every realtime TR,
@@ -591,6 +593,7 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         self._trade_priorities: Dict[str, int] = {}
         self._quote_priorities: Dict[str, int] = {}
         self._subscription_resolution_errors: Dict[tuple[str, str], str] = {}
+        self._deferred_subscription_key_updates: Dict[tuple[str, str], str] = {}
         self._target_subscriptions: Dict[tuple[str, str], KisWsSubscription] = {}
         # Subscriptions retained by the transport as deterministic reconnect
         # intent. This is not the same thing as an ACKed KIS session slot.
@@ -747,6 +750,23 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
     def _rebalance_subscriptions(self) -> None:
         channel_candidates = []
         resolution_errors: Dict[tuple[str, str], str] = {}
+        deferred_key_updates: Dict[tuple[str, str], str] = {}
+        # Intraday configuration edits must never break a healthy existing
+        # feed.  Pin only subscriptions that the current KIS connection has
+        # ACKed (or every reconnect intent while disconnected).  A missing or
+        # corrected key for an unsubscribed/NACKed channel can activate on the
+        # next cycle without restarting the process.
+        with self._state_lock:
+            prior_by_symbol_channel = {
+                (sub.symbol, sub.channel): sub
+                for key, sub in self._active_subscriptions.items()
+                if sub.symbol
+                and (
+                    not self._connected
+                    or self._session_status.get(key)
+                    == SubscriptionSessionStatus.ACTIVE
+                )
+            }
         channel_inputs = (
             (self._trade_priorities, self._trade_capacity, 0, FeedChannel.TRADE),
             (self._quote_priorities, self._quote_capacity, 1, FeedChannel.QUOTE),
@@ -756,6 +776,7 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
             for symbol, priority in sorted(
                 priorities.items(), key=lambda item: (item[1], item[0])
             ):
+                prior = prior_by_symbol_channel.get((symbol, channel.value))
                 try:
                     key = str(self._symbol_key_resolver(symbol, channel) or "").strip()
                     if not key:
@@ -765,8 +786,23 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
                     tr_id = TRADE_TR_ID if channel == FeedChannel.TRADE else QUOTE_TR_ID
                     sub = KisWsSubscription(tr_id, key, symbol, channel.value)
                 except Exception as exc:  # one symbol must not starve every feed
-                    resolution_errors[(symbol, channel.value)] = str(exc) or type(exc).__name__
-                    continue
+                    message = str(exc) or type(exc).__name__
+                    if prior is None:
+                        resolution_errors[(symbol, channel.value)] = message
+                        continue
+                    sub = prior
+                    deferred_key_updates[(symbol, channel.value)] = (
+                        f"{message}; retaining the currently ACKed key until "
+                        "this channel is no longer desired"
+                    )
+                else:
+                    if prior is not None and prior.tr_key != sub.tr_key:
+                        deferred_key_updates[(symbol, channel.value)] = (
+                            "verified key change deferred while the existing "
+                            "channel remains ACKed; remove the symbol from the "
+                            "active board before retiring its current feed"
+                        )
+                        sub = prior
                 resolved.append((priority, symbol, channel_order, channel, sub))
             channel_candidates.extend(resolved[: max(0, int(capacity))])
 
@@ -833,6 +869,22 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         for key in sorted(set(previous_errors) - set(resolution_errors)):
             logger.info(
                 "KIS WebSocket %s subscription configuration recovered for %s",
+                key[1],
+                key[0],
+            )
+        previous_deferred = self._deferred_subscription_key_updates
+        self._deferred_subscription_key_updates = deferred_key_updates
+        for key, message in sorted(deferred_key_updates.items()):
+            if previous_deferred.get(key) != message:
+                logger.warning(
+                    "KIS WebSocket %s key update deferred for %s: %s",
+                    key[1],
+                    key[0],
+                    message,
+                )
+        for key in sorted(set(previous_deferred) - set(deferred_key_updates)):
+            logger.info(
+                "KIS WebSocket %s deferred key update cleared for %s",
                 key[1],
                 key[0],
             )
@@ -1746,6 +1798,7 @@ def build_kis_realtime_market_data_from_environment(
     capability_manifest_path: Optional[Path] = None,
     capability_manifest_sha256: str = "",
     runtime_commit_sha: str = "",
+    symbol_key_store: Optional[KisWsSymbolKeyStore] = None,
 ) -> KisRealtimeMarketDataService:
     """Compose the live service without starting it.
 
@@ -1857,23 +1910,11 @@ def build_kis_realtime_market_data_from_environment(
     ws_url = os.getenv(f"{prefix}_WS_URL", "").strip()
     app_key = os.getenv(f"{prefix}_APP_KEY", "").strip()
     app_secret = os.getenv(f"{prefix}_APP_SECRET", "").strip()
-    try:
-        symbol_keys = {
-            str(symbol).upper(): str(key).strip()
-            for symbol, key in json.loads(
-                os.getenv("KIS_WS_SYMBOL_KEYS_JSON", "{}") or "{}"
-            ).items()
-        }
-    except (ValueError, AttributeError) as exc:
-        raise ValueError("KIS_WS_SYMBOL_KEYS_JSON must be a JSON object") from exc
+    key_store = symbol_key_store or KisWsSymbolKeyStore()
 
     def resolve_key(symbol: str, channel: FeedChannel) -> str:
-        key = symbol_keys.get(symbol.upper(), "")
-        if not key:
-            raise RuntimeError(
-                f"No live-verified KIS WebSocket subscription key configured for {symbol}"
-            )
-        return key
+        del channel  # KIS uses the same verified key for trade and quote TRs.
+        return key_store.resolve(symbol)
 
     approval_keys = KisWsApprovalKeyProvider(
         base_url=base_url,
@@ -1906,6 +1947,7 @@ def build_kis_realtime_market_data_from_environment(
     service = KisRealtimeMarketDataService(
         transport=transport,
         symbol_key_resolver=resolve_key,
+        symbol_key_store=key_store,
         total_capacity=execution_config.KIS_WS_TOTAL_SUBSCRIPTION_CAPACITY,
         # Credentialed WS0 evidence proved one aggregate pool. The legacy
         # per-channel values remain available only to directly constructed

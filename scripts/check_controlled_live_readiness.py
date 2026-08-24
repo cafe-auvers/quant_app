@@ -15,7 +15,6 @@ reaches ACTIVE with fresh broker/market-data readiness.
 """
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 import subprocess
@@ -49,6 +48,9 @@ from src.services.kis_realtime_market_data import (  # noqa: E402
     build_kis_realtime_market_data_from_environment,
 )
 from src.services.kis_request_scheduler import KisRequestScheduler  # noqa: E402
+from src.services.kis_ws_symbol_keys import (  # noqa: E402
+    KisWsSymbolKeyStore,
+)
 from src.services.trading_state import is_trading_locked_disabled  # noqa: E402
 from src.infrastructure.database.engine import init_mysql_engine  # noqa: E402
 
@@ -178,13 +180,10 @@ def main() -> int:
     )
 
     def _check_symbol_map() -> None:
-        payload = json.loads(os.getenv("KIS_WS_SYMBOL_KEYS_JSON", "{}") or "{}")
-        if not isinstance(payload, dict):
-            raise RuntimeError("KIS_WS_SYMBOL_KEYS_JSON must be a JSON object")
-        normalized = {
-            str(symbol).upper(): str(key or "").strip()
-            for symbol, key in payload.items()
-        }
+        snapshot = KisWsSymbolKeyStore().snapshot()
+        if snapshot.last_error:
+            raise RuntimeError(snapshot.last_error)
+        normalized = dict(snapshot.keys)
         missing = [
             symbol
             for symbol in execution_config.KIS_CONTROLLED_LIVE_SYMBOLS
@@ -193,6 +192,11 @@ def main() -> int:
         if missing:
             raise RuntimeError(
                 "missing verified WebSocket keys for: " + ", ".join(sorted(missing))
+            )
+        if snapshot.source == "LEGACY_ENV":
+            result.warn(
+                "WebSocket symbol keys still use the deprecated environment fallback; "
+                "run scripts/manage_kis_ws_symbol_keys.py migrate-env"
             )
 
     result.guarded("controlled symbol WebSocket keys", _check_symbol_map)
