@@ -3,8 +3,8 @@
 ## Purpose
 
 The exact KIS trade/quote subscription key for a symbol is operational state,
-not a credential and not a process-lifetime environment setting. The runtime
-reads the gitignored file:
+not a credential and not a process-lifetime environment setting. Do not put
+the symbol map in `.env` or `.env.pc`. The runtime reads the gitignored file:
 
 ```text
 data/kis_ws_symbol_keys.json
@@ -58,7 +58,7 @@ The Controlled Live entry allowlist is a separate authorization boundary.
 Adding a WebSocket key makes market data available; it does not by itself add
 the symbol to `KIS_CONTROLLED_LIVE_SYMBOLS` or authorize a BUY.
 
-## One-time migration
+## Legacy checkout migration
 
 On a checkout that still has the legacy environment value, run:
 
@@ -68,14 +68,14 @@ python scripts/manage_kis_ws_symbol_keys.py validate
 ```
 
 Migration copies the complete legacy map into the separate file and refuses
-to overwrite a conflicting reviewed key. It deliberately leaves `.env` and
-`.env.pc` untouched so the running old process and rollback commit remain
-safe.
+to overwrite a conflicting reviewed key. The command deliberately leaves
+`.env` and `.env.pc` untouched; remove the legacy line from both files after
+validation because the file-based map is the only supported steady state.
 
-After the new code has passed preflight and one controlled restart, remove the
-legacy `KIS_WS_SYMBOL_KEYS_JSON` line from `.env` and `.env.pc` once. The
-tracked `.env.example` no longer contains that setting, so startup environment
-synchronization will not add it again.
+The tracked `.env.example` does not contain the legacy setting, so startup
+environment synchronization will not add it again. Normal intraday changes
+must use the `set` and `remove` commands above and must never rewrite either
+environment file.
 
 Older commits require the legacy environment value. Preserve an encrypted
 environment backup until the new runtime has been accepted if rollback to an

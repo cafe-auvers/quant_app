@@ -196,6 +196,11 @@ For every row, the discovery-phase **proposed default is exactly the value in �
 | FILTER-012 | `scanner.episodic_gap_profile` | Documented episodic-pivot gap rules | 17 | UNCLEAR | not machine-enforced; rulebook says gap>=10%, first15–30min volume, first red5m candle | percent/minutes/bars | prose-only thresholds | none until decided | null | null | null | null | UNKNOWN/BUSINESS_RULE | null | requires gap, catalyst and intraday-volume definitions | cannot share ordinary breakout rules without setup type | product decision; backtest/version | rulebook only | no consumer found | exact-setup rulebook | LIVE=SAME | false eligibility control or overfit rule | `rulebooks/QULLAMAGGIE_EXACT_SETUPS.md:140-152,188,252-270` | HIGH | investigate; do not expose |
 | FILTER-013 | `scanner.momentum_setup_profile` | Documented momentum/parabolic setup thresholds | 17 | UNCLEAR | not machine-enforced; 30–100% over1–3 months, top1–2%, stair-step20–50%, parabolic50–100%/300–1000%, 3–5 up days | percent/days/months/rank | prose-only ranges | none until decided | null | null | null | null | UNKNOWN/BUSINESS_RULE | null | setup/cap-size/timeframe definitions unresolved | overlaps runtime parabolic flag but uses different semantics | product decision; backtest/version | rulebook only | no consumer found | exact-setup rulebook | LIVE=SAME | operator may assume unsupported strategy automation | `rulebooks/QULLAMAGGIE_EXACT_SETUPS.md:12-18,101-117,252-258,310-311` | HIGH | investigate; do not expose |
 
+For BROKER-006, `.env` and `.env.pc` retain only the stable WebSocket profile.
+The per-symbol map is exclusively local JSON operational state in
+`data/kis_ws_symbol_keys.json` and must be changed through the atomic management
+command, including during a live session.
+
 ## 3. Occurrence-level appendix
 
 `Role` is one of authoritative (`AUTH`), duplicated (`DUP`), derived (`DERIVED`), fallback-only (`FALLBACK`), test-only (`TEST`), mock-only (`MOCK`), dead code (`DEAD`), documentation-only (`DOC`), or current local override (`LOCAL`). “Reached” names the production path; test-only scenario data that does not define or assert behavior is deliberately not listed because it cannot control runtime.

@@ -96,6 +96,8 @@ LOCAL_RECEIVE_STALE_SECONDS=2
   contract includes execution-notice encryption/mapping verification.
 - [ ] Gitignored `data/kis_ws_symbol_keys.json` contains only WS0-verified
   keys and passes `python scripts/manage_kis_ws_symbol_keys.py validate`.
+- [ ] Neither `.env` nor `.env.pc` contains `KIS_WS_SYMBOL_KEYS_JSON`; intraday
+  key changes use only the atomic symbol-key management command.
 - [ ] The runtime startup log records `production_activation_authorized=false`.
 - [ ] No process with the same app key holds a second WebSocket session.
 
