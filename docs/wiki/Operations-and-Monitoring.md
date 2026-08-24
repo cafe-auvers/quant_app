@@ -29,6 +29,12 @@ local state, strictly publish required state, demote writer bindings, and only
 then release ownership. If any required step fails, ownership is retained or
 the next device must use stale-heartbeat fenced takeover and reconciliation.
 
+For a normal explicit owner switch, the target must be visible in the shared
+coordination store and show fresh `STANDBY_READY` with 7/7 readiness. The
+steady readiness heartbeat is 240 seconds and the default freshness fence is
+300 seconds. `PC`, `DB`, `Listener`, and `main.py` indicators describe
+different paths; seeing them ON does not replace the shared readiness proof.
+
 ## Performance
 
 The maintained synthetic audit covers sidebar projection and cache watermark

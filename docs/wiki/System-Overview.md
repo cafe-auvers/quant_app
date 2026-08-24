@@ -30,6 +30,8 @@ flowchart LR
 - TradingView Lightweight Charts with drawings, ORB markers, fundamentals,
   earnings, Leadership, and Market Context overlays.
 - Cross-device planning and execution ownership controls.
+- Buy Board runtime availability by default, with broker mutations still
+  blocked by independent live-execution, ownership, readiness, and risk gates.
 - Durable order/card/command state, conservative reconciliation, event journal,
   Health tab, and guarded KIS integration.
 
@@ -42,6 +44,5 @@ flowchart LR
 ## Disabled by default
 
 - Live Trading administrative permission.
-- Buy Board execution engine.
 - Controlled/full-live broker mutation envelopes.
 - KIS intraday mappings until the capability is verified.

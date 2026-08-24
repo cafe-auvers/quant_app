@@ -194,7 +194,7 @@ provisions all 18 tables through `ensure_coordination_schema()`.
 | `trade_cards` | `id`; unique `(environment, account_no, symbol)` | Canonical Kanban card status, versioned JSON payload, and update time | Written for durable plan/lifecycle/order/stop/warning changes; price-only display changes stay in memory |
 | `execution_ownership` | `id`; unique `(environment, account_no, symbol)` | Per-symbol owner, strategy instance, assigning actor, and version | Assignment/adoption/handoff and ownership changes; also read at broker safety boundaries |
 | `operator_commands` | `command_id`; unique `idempotency_key` | Manual command request, payload, requester/executor, lifecycle timestamps, broker ID, and before/after hashes | Inserted immediately by the authorized operator; claimed and advanced by the Execution Owner |
-| `runtime_device_state` | `device_id` | Host/device readiness state, schema version, handoff generation/confirmation, details, and heartbeat time | Full write on readiness changes; stable heartbeat every 45 seconds per running device |
+| `runtime_device_state` | `device_id` | Host/device readiness state, schema version, handoff generation/confirmation, details, and heartbeat time | Full write on readiness changes; stable heartbeat every 240 seconds per running device, with a 300-second freshness fence |
 | `app_runtime_status` | `(hostname, process_name)` | Legacy/fallback PID and process lifecycle status | Lifecycle/fallback updates only while the guarded runtime's canonical `runtime_device_state` heartbeat is absent |
 | `execution_commands` | `id`; unique `idempotency_key` | Low-level broker command journal, lease proof, target order, status, redacted response, and response hash | Recorded immediately before/around broker mutation and updated with the response/outcome |
 | `execution_orders` | `id`; unique client/broker identity keys | Canonical order identity, status, origin, recovery state, version, payload, and timestamp | Immediate identity/status/fill/recovery changes; unchanged working-order audit rewrites are coalesced |
@@ -271,7 +271,7 @@ There is no PC relay. The principal steady-state database cadences are:
 | Operator-command pickup during the regular session | Typed `operator_commands` token; 20-second legacy or 3600-second pulse fallback |
 | Lease proof | Typed `app_state_sync` token and every broker mutation; 20-second legacy or 3600-second pulse fallback |
 | Protective ownership proof | 30 seconds while positions exist; one bulk read |
-| Runtime-readiness heartbeat | 45 seconds per running device |
+| Runtime-readiness heartbeat | 240 seconds per running device; stale after 300 seconds by default |
 | `main.py` process heartbeat | Folded into runtime readiness; `app_runtime_status` is a legacy fallback |
 | External watchdog pulse | 5 seconds over HTTPS; no TiDB request per pulse |
 | Alert queue check | 90 seconds; successful external heartbeat audit compacted to about 1 hour |

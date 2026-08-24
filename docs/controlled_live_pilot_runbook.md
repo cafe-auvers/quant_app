@@ -65,6 +65,38 @@ workflow after reconciliation, never an inline retry.
 Missing, malformed, unreviewed, or mismatched values prevent the active
 runtime or WebSocket service from composing.
 
+### What `KIS_RUNTIME_COMMIT_SHA` means
+
+This value is the complete 40-character Git identity of the exact checkout
+that will run `main.py`. On each deployment device, from the repository root:
+
+```powershell
+git status --short
+git rev-parse HEAD
+```
+
+The first command must print nothing. Copy the second command's full output
+into `KIS_RUNTIME_COMMIT_SHA` in the local, gitignored `.env`. Do not use a
+short hash, pull-request number, branch name, manifest digest, or the SHA of an
+older reviewed build.
+
+The runtime SHA must agree with the current Git `HEAD`, the reviewed
+capability manifest's commit, and the exact-head Gate-1 evidence. Any new
+commit changes `HEAD`—including a documentation-only merge—and invalidates an
+older exact-commit approval until a new manifest/evidence bundle is generated
+and independently approved. This is deliberate: the app must never silently
+reinterpret evidence created for a different checkout.
+
+After setting the reviewed values, run the read-only preflight:
+
+```powershell
+python scripts/check_controlled_live_readiness.py
+```
+
+Changing `.env` to make this check green is not a substitute for producing
+the matching reviewed evidence. Never commit `.env` or an unredacted
+capability bundle.
+
 Placing a card in Buy Today does not expand this pilot envelope. A Buy Today
 symbol outside `KIS_CONTROLLED_LIVE_SYMBOLS` remains planning-only, and a
 planned entry above `KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL` remains blocked

@@ -62,6 +62,14 @@ other Buy Today cards are planning-only and that an order above the displayed
 cap will not be submitted. `Live Trading: Enabled` is not sufficient by
 itself; confirm the mode, symbol scope, and cap shown beside it.
 
+Live Trading has two layers. `TRADING_ENABLED` in each machine's private
+`.env` is a one-way local administrative lock. If it is false on the laptop,
+that laptop must show **LOCKED OFF** even when the shared switch is ON. If it
+is true on the PC, the PC may display the shared switch, but it still cannot
+submit unless it is the Execution Owner and every runtime/broker gate passes.
+The durable ON/OFF switch itself is shared; the local `.env` locks are
+intentionally not synchronized.
+
 ## Buy Today: pre-market versus market-open
 
 Pre-market publishing and live Buy Today activation are separate paths:
@@ -142,6 +150,18 @@ An execution switch is rejected unless the target publishes a fresh
 market data, command consumer, order reconciliation, synchronized revisions,
 and awake/sleep-safety state. Operator Control never changes implicitly during
 an execution switch.
+
+The selector resolves the target from the shared coordination database at
+click time. With the default production profile, a stable runtime publishes
+every 240 seconds and its identity/readiness row remains fresh for 300 seconds.
+Therefore a continuously running target showing **7/7 — STANDBY_READY** should
+be eligible for an explicit transfer throughout its normal heartbeat window.
+`PC: On`, `DB: On`, and `Listener: On` are separate connectivity indicators;
+none substitutes for that shared readiness row. If the selector says no
+runtime is registered, verify that both processes use the same `COORD_DB_*`
+store and that the target is running a current build. If it says the runtime
+is registered but stale/ineligible, keep `main.py` running and inspect the Buy
+Board readiness tooltip.
 
 A `PENDING` operator command may safely follow a completed owner transfer,
 because only the new owner can claim it. Once a command is `ACCEPTED`,

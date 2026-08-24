@@ -1209,7 +1209,7 @@ that broker truth, not the gesture, completes the lifecycle:
 
 | WS13 scenario | Regression coverage |
 |---|---|
-| Buylist â†’ Buy Today, revision-aware activation | `test_buylist_to_buy_today_is_a_revision_aware_workflow_request` |
+| Buylist → Buy Today, revision-aware activation | `test_buylist_to_buy_today_is_a_revision_aware_workflow_request` |
 | Entry pending/fill/cancel/EOD return | `test_entry_pending_card_moves_to_open_position_on_full_fill_at_deadline`, `test_entry_pending_zero_fill_cancels_releases_capital_and_returns_to_buylist` |
 | Ambiguous entry and duplicate UI actions | `test_ambiguous_entry_blocks_user_cancel_until_reconciliation`, `test_two_sell_all_gestures_record_one_intent_and_never_declare_flat` |
 | Partial Sell request/fill/reconciliation | `test_partial_sell_uses_broker_orderable_quantity_and_stays_pending`, `test_partial_sell_fill_moves_stop_to_breakeven_and_returns_to_open_position` |

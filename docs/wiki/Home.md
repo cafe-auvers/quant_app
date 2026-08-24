@@ -12,6 +12,7 @@ control remain independent gates.
 
 ## Start here
 
+- Completely new: [plain-language Project Tour](https://github.com/cafe-auvers/quant_app/blob/master/docs/project_tour.md) and its [large-picture HTML view](https://github.com/cafe-auvers/quant_app/blob/master/docs/project_tour.html)
 - New operator: [Quick Start](Quick-Start) and [User Workflow](User-Workflow)
 - Installation: [Installation and Environment Setup](Installation-and-Environment-Setup)
 - Maintainer: [System Overview](System-Overview) and [Architecture](Architecture)

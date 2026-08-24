@@ -135,7 +135,7 @@ for the current formula.
   `(status, created_at, command_id)` index. An old/unavailable listener retains
   the twenty-second fallback; pulse protocols v2/v3 use a one-hour recovery fallback.
 - Runtime readiness reuses its last verified `app_state_sync` revisions until
-  a typed planning/control token arrives. The 45-second heartbeat therefore
+  a typed planning/control token arrives. The 240-second heartbeat therefore
   emits only its required readiness UPDATE, not an extra revision SELECT.
 - Successfully delivered but unacknowledged alerts remain open and visible,
   but reminder delivery backs off to six hours instead of writing another
@@ -156,7 +156,7 @@ polls.
 | Lease proof | On typed planning/owner token and every broker mutation; 20-second legacy or 3600-second pulse fallback |
 | Protective ownership proof | 30 seconds, one bulk read only while positions exist |
 | Writable probe | 180-second fallback; normally satisfied by readiness write |
-| Runtime readiness heartbeat | 45 seconds per running device |
+| Runtime readiness heartbeat | 240 seconds per running device; 300-second freshness fence |
 | `main.py` process heartbeat | Folded into runtime readiness; legacy fallback only |
 | External watchdog pulse | 5 seconds over HTTPS; no TiDB request |
 | Active/standby card revision checks | On typed card token; 180/300-second legacy or 3600-second pulse fallback |
@@ -182,20 +182,20 @@ daily pattern:
 | Background source | SQL statements/month |
 | --- | ---: |
 | Fallback writable probes plus their commits | 0 steady; startup/recovery only |
-| Two-device readiness heartbeat UPDATE | 115,200 |
+| Two-device readiness heartbeat UPDATE | 21,600 |
 | Two-device `main.py` process heartbeats | 0 steady; lifecycle fallback only |
 | Lease/card/operator missed-token recovery fallbacks | 2,880 |
 | Bulk protective ownership proof | 86,400 |
 | Alert queue plus compacted heartbeat audits | 59,040 |
 | Buy Board plus planning/control recovery fallbacks | 5,040 |
 | Cached account-reconciliation relational reads | 0 steady; relevant changes only |
-| **Scheduled total** | **268,560** |
-| **With 25% reconnect/scheduling margin** | **335,700** |
+| **Scheduled total** | **174,960** |
+| **With 25% reconnect/scheduling margin** | **218,700** |
 
 For capacity planning, this project applies a conservative **8 RU per small
 scheduled statement**. The `typed-change-pulse-v4` profile therefore budgets about
-**2.69 million RUs/month**, or about **1.04 RU/s**, for scheduled work including a 25%
-reconnect/scheduling margin. This leaves more than 100% headroom for real state
+**1.75 million RUs/month**, or about **0.68 RU/s**, for scheduled work including a 25%
+reconnect/scheduling margin. This leaves wide headroom for real state
 transitions, bulk projection payloads, order journals, TiDB background jobs,
 and measurement error while keeping the cluster target at **5--9 RU/s**.
 Ten thousand separately rendered
@@ -260,9 +260,9 @@ The previous SQL-statements capture isolated the remaining write and startup
 overhead: 95 runtime-readiness heartbeats averaged 6.70 RU, 98 `main.py`
 heartbeats averaged 5.85 RU, 803 standalone COMMITs were recorded, and the
 startup recoverable-alert sweep selected incidents 356 times (four alert
-classes across 89 cards). `external-pulse-v2` retains the one 45-second
-runtime-readiness UPDATE, retires the duplicate steady `main.py` UPDATE, and
-moves fast liveness to the five-second external HTTPS pulse. The alert sweep is
+classes across 89 cards). At that stage, `external-pulse-v2` retained one
+45-second runtime-readiness UPDATE, retired the duplicate steady `main.py`
+UPDATE, and moved fast liveness to the five-second external HTTPS pulse. The alert sweep is
 one bulk read, read-only alert polling emits no COMMIT, and unchanged
 reconciliation state is served from the bounded process cache.
 
@@ -277,8 +277,12 @@ generation and sends only a non-secret change token over the existing Tailscale
 PC listener. The receiving process performs one canonical reconciliation after
 the token changes. Listener protocol v1 (plain `PONG`) is detected explicitly
 and keeps the old conservative polling behavior until the listener restarts.
-The 45-second readiness row remains because it is the transactional crash and
-handoff fence; in that sample its UPDATEs consumed about 0.08 RU/s.
+The then-current 45-second readiness row remained because it was the
+transactional crash and handoff fence; in that sample its UPDATEs consumed
+about 0.08 RU/s. The later `operator-executor-sync-v7` profile increased the
+steady cadence to 240 seconds and the freshness fence to 300 seconds; state
+changes and safety-critical actions still publish or prove authority
+immediately.
 
 A five-minute capture after that deployment contained about **151.68 SQL
 statement RUs**, or **0.51 statement RU/s**, while the cluster metric remained

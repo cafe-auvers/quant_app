@@ -25,9 +25,16 @@ canonical MySQL. Copy workers use checkpoints/watermarks and tolerate restarts.
 
 ## Planning and execution state
 
-Watchlist, Buylist, trade plans, execution queue, device role, operator control,
-and Live Trading control are revision/fence aware. Writer ownership is explicit;
-stale devices remain pull-only.
+Watchlist, Buylist, trade plans, execution queue, Execution Owner, Operator
+Control, Live Trading control, TradeCards, commands, and orders use shared,
+revision/fence-aware operational state. Writer ownership is explicit; stale
+devices remain pull-only.
+
+Machine identity and local permission are intentionally not synchronized.
+`data/device_role.json`, each machine's `.env` (including its
+`TRADING_ENABLED` lock), and chart drawings remain local files. The 1D/1H
+"drawing sync" means the two split panes inside one running app share the same
+drawing; it is not laptop-to-PC drawing replication.
 
 ## Handoff
 

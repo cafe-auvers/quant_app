@@ -23,6 +23,11 @@ Multiple PROD accounts can use `KIS_PROD_ACCOUNTS` or numbered
 `KIS_PROD_ACCOUNT_NO_1` through `_20`. Do not put real account numbers in
 documentation, tests, or committed fixtures.
 
+`TRADING_ENABLED` is a per-machine one-way administrative lock, so it can be
+false on the laptop and true on the PC without a synchronization fault. The
+durable Live Trading on/off control is shared. Even with both enabled, only the
+current execution owner can act, and every readiness and safety gate must pass.
+
 Changing a feature flag never bypasses lease, ownership, reconciliation, risk,
 market-data, mutation-budget, or broker-boundary checks. See
 [Risk and Safety Controls](Risk-and-Safety-Controls).

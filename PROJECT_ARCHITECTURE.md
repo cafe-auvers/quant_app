@@ -421,7 +421,7 @@ Most workers live in `src/ui/workers.py`; KIS order submission/query/cancel and 
 | `src/services/kis_intraday_provider.py` | KIS intraday provider wrapper using production account config |
 | `src/services/yfinance_intraday_provider.py` | yfinance intraday fallback provider preserving existing retry behavior |
 | `src/services/order_ledger.py` | Persistent local order ledger stored at `data/orders.json` |
-| `src/services/trading_state.py` | In-memory `TRADING_ENABLED` kill switch -- disabled by default on every launch, no persistence; blank, falsy, or malformed configured values lock it off, while a truthy value only permits the per-session UI toggle |
+| `src/services/trading_state.py` | Process projection of Live Trading: `TRADING_ENABLED` is the per-machine administrative lock, while the desktop attaches a fail-closed provider for the durable shared ON/OFF control at broker boundaries |
 | `src/services/broker.py` | `Broker` protocol (`submit_order`/`cancel_order`/`get_order`/`get_positions`/ambiguous-error classification), normalized `BrokerSubmissionResult`, and `KisBroker`; all KIS response-field parsing stays at this adapter boundary |
 | `src/services/order_execution_service.py` | Broker-neutral guarded order submission with durable idempotency before and after API calls; gated by `trading_state`, an entry-only `PreTradeRiskDecision`, and an injectable `Broker` (defaults to `KisBroker`) |
 | `src/services/order_reconciliation.py` | Conservative account-snapshot reconciliation plus injectable broker order query/cancel for accepted/working orders |
@@ -440,8 +440,8 @@ Most workers live in `src/ui/workers.py`; KIS order submission/query/cancel and 
 | `src/services/event_journal.py` | Append-only JSONL trading audit events with cross-thread/process locking, account/free-text/secret redaction, runtime write-error telemetry, 25 MB rotation with the newest 20 archives retained, and a best-effort execution adapter |
 | `src/services/health.py` | Framework-neutral read-only health model for KIS configuration/token metadata and response age, a current MySQL `SELECT 1`, journal storage/write health, local-mirror freshness, and unresolved-order reconciliation state |
 | `src/services/historical_refresh_control.py` | Launches, polls, and terminates the standalone `historical.py` subprocess; owns its status-file schema and PID liveness checks |
-| `src/services/state_sync.py` | Conflict-safe cross-machine sync of user-managed state (watchlist/buylist/trade plans) through a revision-tracked MySQL table; only the `main` device pushes, others pull-only |
-| `src/services/runtime_status.py` | Database-backed runtime heartbeats so any device can see whether `main.py` is currently running elsewhere |
+| `src/services/state_sync.py` | Conflict-safe cross-machine sync of user-managed state (watchlist/buylist/trade plans) plus the revisioned, durable Live Trading control and its audit trail; only the planning `main` device pushes planning collections |
+| `src/services/runtime_status.py` | Legacy/fallback database process lifecycle rows; the guarded runtime's canonical `runtime_device_state` readiness heartbeat supplies steady `main.py` visibility when available |
 | `src/services/pc_remote_control.py` | Tailscale-reached client for the always-on PC's remote-control listener: status ping and shared-secret-authenticated shutdown request |
 | `src/services/cloud_backup.py` | Best-effort offsite backup of gitignored `data/*.json` state files to a local Google Drive for Desktop folder (current + rolling daily snapshots) |
 | `src/services/env_backup.py` | Passphrase-encrypted (PBKDF2 + Fernet) offsite backup/restore of `.env` secrets, kept separate from the automatic JSON backup cycle |
@@ -506,7 +506,7 @@ Local JSON state is read/written through `src/utils/storage.py` and service help
 
 | File | Purpose |
 |---|---|
-| `data/watchlist.json` | User-managed passive Watchlist membership and planning metadata, synchronized between devices; there is no dedicated Watchlist tab |
+| `data/watchlist.json` | User-managed passive Watchlist membership and planning metadata, synchronized between devices; removing membership does not delete an independent Buylist card, stop, order, or position, and there is no dedicated Watchlist tab |
 | `data/buylist.json` | Buy dashboard and monitoring items |
 | `data/execution_queue.json` | Dynamic ORB execution queue items, selected candidates, status, and warnings |
 | `data/trade_cards.json` | Atomic local recovery snapshot of canonical Kanban trade cards; not authoritative while the database is reachable |
@@ -537,7 +537,7 @@ The production-only migration archives legacy non-production buylist and executi
 
 ## Production Observability
 
-The Health tab is registered immediately after TradingView Chart. Opening it starts a background, read-only probe and hides the stock-selection sidebar. It reports KIS token metadata (never the token), age of the last verified KIS account response (warning after 15 minutes), a current MySQL `SELECT 1` result, daily/hourly local-mirror freshness, unresolved or unknown broker orders, event-journal writability/write errors/lock state/file sizes/archive count/free space/latest event, and an application heartbeat. Mirror SQL, the MySQL probe, journal inspection, and universe loading run in the worker; the Qt event loop is not blocked. A health refresh deliberately does not authenticate with KIS, submit/cancel an order, or mutate database state.
+The Health tab is registered immediately after TradingView Chart. Opening it starts a background, read-only probe and hides the stock-selection sidebar. It reports KIS token metadata (never the token), age of the last verified KIS account response (warning after 15 minutes), a current MySQL `SELECT 1` result, daily/hourly local-mirror freshness, unresolved or unknown broker orders, event-journal writability/write errors/lock state/file sizes/archive count/free space/latest event, and an application heartbeat. Daily mirror health uses the full configured stock universe; hourly health uses the separate relevant-symbol scope shared with the selective hourly copy. Mirror SQL, the MySQL probe, journal inspection, and universe loading run in the worker; the Qt event loop is not blocked. A health refresh deliberately does not contact KIS, place/cancel orders, or mutate database state.
 
 Live execution emits correlated lifecycle records from `SIGNAL_CREATED`, `RISK_APPROVED`/`RISK_REJECTED`, and `ORDER_INTENT_CREATED` through durable reservation/submission/acceptance, reconciliation, confirmed fills, and position updates/closure. Strategy signal outcome and risk outcome remain separate events. Every record has a UTC timestamp and event ID; order, broker-order, signal/plan, symbol, strategy, price, and quantity fields make a trade reconstructable. Full account numbers are scrubbed from every field (including client order IDs), secret-like payload keys and string values are redacted, free-text reasons are scrubbed, and raw broker responses are never journaled. `record_event()` is best effort, and the guarded order service also isolates an injected recorder exception, so an unavailable journal cannot change an order outcome or provoke a retry. After `ORDER_SUBMISSION_STARTED` is durably written, the service performs one final kill-switch and short-lived risk-approval check immediately before calling the broker.
 
@@ -573,7 +573,7 @@ Database behavior is split by responsibility under `src/infrastructure/database/
   progressively enriched with Yahoo sector/industry metadata.
 - `earnings_events` and `fundamental_sync_state` for cached chart earnings and
   positive/negative provider freshness state.
-- `init_local_mirror_engine()` / `sync_local_mirror_from_pc_checkpointed()` and related helpers manage `data/local_mirror.db`, its checkpointed top-up from PC MySQL, and staleness checks (`local_mirror_is_stale`, `local_mirror_hourly_is_stale`).
+- `init_local_mirror_engine()` / `sync_local_mirror_from_pc_checkpointed()` and related helpers manage `data/local_mirror.db`, its checkpointed top-up from PC MySQL, and staleness checks (`local_mirror_is_stale`, `local_mirror_hourly_is_stale`). Daily reconciliation covers the full universe; hourly reconciliation is limited to symbols relevant to current Scanner, Watchlist, and Buylist work.
 
 The app can run without MySQL. When MySQL is configured (whether local or the always-on PC's canonical instance), refresh and scanner workflows use cached tables for speed and freshness checks; see [Two-Machine Data Pipeline](#two-machine-data-pipeline-pc-sync) for the multi-device case.
 
@@ -601,11 +601,11 @@ main.py "Update 1D/1H Data" action or scripts/run_daily_refresh.py
 
 ## Two-Machine Data Pipeline (PC Sync)
 
-An optional second machine -- an always-on PC reachable over LAN or Tailscale -- can host the single canonical MySQL database while a laptop does development and live trading. This is fully documented in [docs/pc_sync_data_pipeline.md](docs/pc_sync_data_pipeline.md); summary:
+An optional second machine -- an always-on PC reachable over LAN or Tailscale -- can host the single canonical MySQL database while both desktops share planning/control state and the laptop keeps an offline mirror. This is fully documented in [docs/pc_sync_data_pipeline.md](docs/pc_sync_data_pipeline.md); summary:
 
-- **Roles**: the always-on PC only hosts MySQL and runs `historical.py` on a schedule (BIOS wake -> auto-login -> `scripts/pc_morning_routine.ps1` -> freshness-gated refresh -> auto-shutdown). The laptop is where development and trading happen; `data/local_mirror.db` is its offline safety copy, not a peer database.
-- **Device identity**: `data/device_role.json` (device id, hostname, `is_main`) determines which device is allowed to push cross-machine app state; other devices are pull-only. `src/services/state_sync.py` syncs watchlist/buylist/trade-plan state through a revision-tracked MySQL table so a stale device can't clobber a newer remote copy.
-- **Runtime visibility**: `src/services/runtime_status.py` writes a heartbeat to MySQL from every running `main.py`; combined with `src/services/pc_remote_control.py` (status ping / shared-secret shutdown over Tailscale to `scripts/pc_remote_control_listener.py`), the dashboard shows independent `PC` / `DB` / `Listener` signals.
+- **Roles**: the PC hosts canonical MySQL and runs `historical.py` on a schedule (BIOS wake -> auto-login -> `scripts/pc_morning_routine.ps1` -> freshness-gated refresh -> auto-shutdown). Either desktop may be the guarded Execution Owner when it is fresh and fully ready; exactly one owner can cross the broker boundary. `data/local_mirror.db` is the laptop's offline safety copy, not a peer database.
+- **Device identity**: `data/device_role.json` (device id, hostname, `is_main`) determines which device may push compatibility planning collections; it does not grant execution ownership. `src/services/state_sync.py` syncs watchlist/buylist/trade-plan state through a revision-tracked MySQL table so a stale device cannot clobber a newer remote copy.
+- **Runtime visibility**: the guarded runtime publishes canonical readiness to `runtime_device_state` every 240 seconds with a 300-second freshness fence; `src/services/runtime_status.py` remains the process-lifecycle fallback. Together with `src/services/pc_remote_control.py`, the dashboard reports independent `PC` / `DB` / `Listener` / `main.py` signals. These lights do not replace a fresh `STANDBY_READY` identity for owner transfer.
 - **Fallback behavior**: connection to MySQL is checked once at startup/reconnect; a success routes reads/writes to MySQL immediately, a failure routes to the local SQLite mirror with cross-machine sync and heartbeats disabled. The mirror top-up afterward is incremental and checkpointed (row-count/revision signatures first, full comparison only on mismatch).
 - **Automation scripts** live in `scripts/` (`pc_morning_routine.ps1`, `run_daily_refresh.py`, `sync_local_mirror_from_pc.py`, `setup_pc_autologin.ps1`, `setup_pc_morning_task.ps1`, `setup_mysql_lan_access.ps1`, `setup_mysql_tailscale_access.ps1`, `pc_remote_control_listener.py`, `Configure-AutomaticShutdown.ps1`, WinRM setup/log-tailing scripts, and the one-time `backfill_hourly_history_200d_once.py` repair).
 
@@ -663,6 +663,12 @@ KIS_PROD_ACCOUNT_NO
 ```
 
 Multiple accounts can be configured with numbered variables such as `KIS_PROD_ACCOUNT_NO_2`. Token caches are local runtime files and are ignored by git.
+
+Read-only account/profile requests use bounded retries for explicitly
+classified transient network, gateway, rate-limit, and domestic-balance
+`APBK1350` failures. Permanent client/protocol errors fail immediately.
+Submit/cancel/replace mutations do not inherit this retry path: an ambiguous
+mutation must be reconciled and is never repeated inline as a new order.
 
 KIS intraday activation keys:
 
@@ -733,11 +739,18 @@ The chart experience is generated by `MainWindow` and coordinated with `ChartBri
 - Controllers inject normalized shortcut and pan settings into both renderers; renderer functions do not read settings persistence and are deterministic for their arguments.
 - `QWebEngineView` is used when PyQtWebEngine is installed.
 - Fallback text is shown when WebEngine is unavailable.
-- Chart drawings are saved through `QWebChannel` into `data/chart_drawings.json`.
+- Chart drawings are saved through `QWebChannel` into the machine-local
+  `data/chart_drawings.json`. The 1D and 1H split panes share one logical
+  drawing scope inside a running app. Hourly timestamps remain authoritative;
+  an off-session endpoint snaps to the next available daily-axis bar only for
+  the daily display.
 - Breakout prices are user-entered daily structural levels persisted on canonical trade cards. Chart Set/Clear actions are Operator-Control-authorized, version-fenced commands; stale legacy or execution-queue values cannot overwrite or resurrect the canonical target.
 - ORB entry validation uses `entry_trigger = max(orb_high, breakout_price * (1 + buffer_pct))`; profit management uses rule-based exits rather than fixed take-profit targets.
 - Daily, hourly, and intraday views use normalized OHLCV DataFrames.
 - RS/TI65 and growth overlays load from MySQL indicators when available, with local fallbacks.
+- Leadership is a descriptive percentile score: 60% market-relative rank and
+  40% industry-peer rank. It is independent of Market Context and the raw
+  relative-to-SPY display, and it has not been validated as a profit forecast.
 
 ## Scanner Flow
 
@@ -795,7 +808,7 @@ Runtime configuration is environment-driven:
 | Key family | Used by | Purpose |
 |---|---|---|
 | `MYSQL_*` | `src/utils/config.py`, `src/infrastructure/database/` | MySQL connection; optional for a single machine, canonical for the two-machine setup |
-| `TRADING_ENABLED` | `src/services/trading_state.py` | Administrative order-submission lock; false/blank/invalid locks off, true only permits the separately confirmed in-app session toggle |
+| `TRADING_ENABLED` | `src/services/trading_state.py` | Per-machine administrative order-submission lock; false/blank/invalid locks that machine off, while true only permits the separately confirmed durable shared Live Trading control |
 | `BUYBOARD_ENGINE_ENABLED`, `KANBAN_STRATEGY_INSTANCE_ID` | `src/core/execution_config.py`, Buy Board UI/runtime | Fail-closed Kanban cutover and stable strategy ownership identity; the flag does not bypass any other readiness or trading gate |
 | `KIS_LIVE_EXECUTION_MODE`, `KIS_CONTROLLED_LIVE_*` | Controlled-live policy and execution gateway | Additional disabled/controlled/full-live envelope; controlled live restricts allowed entry symbols and per-entry notional |
 | `KIS_WS_*`, `KIS_MARKET_DATA_*`, `ORB_FORMATION_SOURCE` | Kanban real-time market-data composition | Verified protocol/capability manifest, subscription keys/capacity, freshness, and execution-grade quote/ORB-source gates |
@@ -829,7 +842,13 @@ Kanban coverage includes pure transitions and card serialization, optimistic rep
 ## Production Safety Notes
 
 - Keep secrets out of source. `.env` and `.kis_token_cache*.json` are local runtime files.
-- Guarded order submission is gated behind the `TRADING_ENABLED` kill switch (`src/services/trading_state.py`, toolbar toggle top-right of the main window). It starts disabled on every launch with no persistence; enabling requires an explicit click-through confirmation in the UI. Blank, falsy, or malformed configured values lock it off, and truthy configuration only permits the UI toggle. The service checks before ledger creation, after reservation, and immediately before the broker call after synchronous journal I/O; `KisBroker` and the low-level KIS POST boundary also re-check defensively.
+- Guarded order submission is gated by two Live Trading layers. The local
+  `TRADING_ENABLED` value is a per-machine one-way lock; blank, falsy, or
+  malformed values lock that machine off. A truthy value only permits the
+  click-through UI control, whose revisioned ON/OFF state is durable and shared
+  across the coordination database. Broker boundaries re-read that canonical
+  control and fail closed if it is unavailable. Neither layer bypasses the
+  Execution Owner, lease, readiness, reconciliation, or risk gates.
 - Kanban is independently fail-closed behind `BUYBOARD_ENGINE_ENABLED`, live-execution policy, verified KIS WebSocket/subscription capacity, verified mutation budgets, the active execution lease/device role, writable canonical state, fresh action-specific account reconciliation, and current market-data health. A rendered card or persisted intent does not imply that execution is ready.
 - Do not manually force cards into `ENTRY_PENDING` or `CLOSED`. Those columns reflect broker lifecycle evidence and are owned by reconciliation/system transitions.
 - Do not bypass `ExecutionWorkflowService` or `ExecutionCommandGateway` from Buy Board code. A durable `KANBAN` ownership assignment and matching `KANBAN_STRATEGY_INSTANCE_ID` are required for Kanban mutation; `LEGACY`/`MANUAL` ownership remains observation-only.

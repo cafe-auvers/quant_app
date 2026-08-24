@@ -35,3 +35,9 @@ The `(interval, date)` price-history index supports global freshness
 watermarks. Database reads return empty/unavailable results conservatively when
 the optional cache cannot be reached; execution workflows have stricter
 fail-closed database requirements.
+
+Mirror Health deliberately evaluates two scopes. Daily coverage uses the full
+configured stock universe. Hourly coverage uses only symbols currently relevant
+to Scanner, Watchlist, and Buylist workflows, matching the selective hourly
+copy policy. A symbol outside that hourly scope does not make the mirror look
+unhealthy.

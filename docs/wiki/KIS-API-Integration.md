@@ -26,9 +26,12 @@ quote evidence.
 - Never log app secrets, tokens, full accounts, or raw sensitive responses.
 - A successful placement response is broker acceptance, not a fill.
 - Pagination must be complete; malformed continuations fail closed.
+- Read-only account requests use bounded retries for classified transient
+  network, gateway, rate-limit, and domestic-balance `APBK1350` failures.
+  Permanent client/protocol errors are not retried.
 - Submit/cancel/replace calls use shared mutation budgets and spacing.
 - Ambiguous submission state must reconcile; it must never be retried as a new
-  logical order.
+  logical order. The read retry policy never applies to broker mutations.
 
 Vendor capability evidence and unresolved qualifications are maintained in
 the repository KIS capability matrix and Gate 2 checklist.
