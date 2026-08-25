@@ -119,6 +119,34 @@ def test_buy_today_can_be_planned_before_runtime_worker_exists(tmp_path):
     assert window.refresh_count == 1
 
 
+def test_premarket_buy_today_captures_local_verified_symbol_key(
+    tmp_path, monkeypatch
+):
+    from src.services import kis_ws_symbol_keys
+
+    class _LocalKeys:
+        def resolve(self, symbol):
+            assert symbol == "AAPL"
+            return "DNASAAPL"
+
+    monkeypatch.setattr(kis_ws_symbol_keys, "KisWsSymbolKeyStore", _LocalKeys)
+    engine = _engine(tmp_path)
+    card = _seed_buylist(engine)
+
+    result = execution_workflow_service.request_board_action(
+        engine,
+        _command(card),
+        claim_kanban_ownership=True,
+    )
+
+    assert result.card.board_status == BoardStatus.BUY_TODAY
+    assert result.card.kis_ws_symbol_key == "DNASAAPL"
+    stored = card_repo.get_trade_card(
+        engine, "PROD", "12345678-01", "AAPL"
+    )
+    assert stored.kis_ws_symbol_key == "DNASAAPL"
+
+
 def test_buy_today_target_allocation_waits_for_current_session_orb(tmp_path):
     engine = _engine(tmp_path)
     card = card_repo.create_trade_card(

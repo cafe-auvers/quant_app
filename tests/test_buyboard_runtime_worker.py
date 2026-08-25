@@ -3340,6 +3340,43 @@ def test_sync_quote_subscriptions_excludes_inactive_board_cards(tmp_path):
     }
 
 
+def test_sync_quote_subscriptions_adopts_keys_only_for_active_cards(tmp_path):
+    worker, _ = _worker(tmp_path)
+    adopted = []
+    configured = {}
+
+    class _MarketData:
+        def adopt_canonical_symbol_keys(self, keys):
+            adopted.append(dict(keys))
+
+        def configure_desired_channels(self, **kwargs):
+            configured.update(kwargs)
+
+    worker.runtime = SimpleNamespace(market_data=_MarketData())
+    cards = [
+        TradeCardState(
+            environment="PROD",
+            account_no="1",
+            symbol="LUNG",
+            board_status=BoardStatus.BUY_TODAY,
+            kis_ws_symbol_key="DLUNG",
+        ),
+        TradeCardState(
+            environment="PROD",
+            account_no="1",
+            symbol="OLD",
+            board_status=BoardStatus.BUYLIST,
+            kis_ws_symbol_key="DOLD",
+        ),
+    ]
+
+    worker._sync_quote_subscriptions(cards)
+
+    assert adopted == [{"LUNG": "DLUNG"}]
+    assert "LUNG" in configured["trade_priorities"]
+    assert "OLD" not in configured["trade_priorities"]
+
+
 def test_controlled_live_planning_cards_are_display_only_and_not_executable(
     tmp_path, monkeypatch
 ):

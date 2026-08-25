@@ -107,8 +107,10 @@ The market-open command sequence is:
 3. The executor revalidates the card version, duplicate active state,
    ownership, account, plan, and runtime facts.
 4. A valid request moves the canonical card into Buy Today. The active
-   runtime then monitors it and the normal entry engine decides whether an
-   order may be submitted.
+   runtime adopts any missing verified symbol mapping carried by the request,
+   subscribes to the symbol, and then the normal entry engine decides whether
+   an order may be submitted. A conflicting reviewed executor mapping is never
+   overwritten and remains feed-unready for operator review.
 
 The executor checks this command queue immediately when the database-free
 Tailscale change token advances. An old listener retains the 20-second poll;
@@ -223,7 +225,10 @@ For an intraday Buy Today instruction:
    intended notional.
 4. Activate the card and verify the latest command becomes `COMPLETED`, not
    merely `PENDING` or `REJECTED`.
-5. Verify the card is in Buy Today and inspect its badge. `EXECUTE_READY`
+5. Verify the card is in Buy Today and that its quote/trade subscriptions are
+   available on the Execution Owner. A newly activated symbol's verified
+   mapping is handed over automatically; no `.env` edit or restart is needed.
+6. Inspect its badge. `EXECUTE_READY`
    means the plan is ready; an actual BUY still requires a qualifying fresh
    quote, trigger clearance, current reconciliation/buying power, the shared
    live switch, and every final broker-boundary fence.

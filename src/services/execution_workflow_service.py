@@ -428,6 +428,40 @@ def _move_board_card(card, target_status) -> None:
     card.board_status = target_status
 
 
+def _activation_symbol_key(command, card) -> str:
+    """Resolve and validate metadata carried by a Buy Today activation.
+
+    Explicit command metadata wins because it is the exact verified mapping
+    selected by the Operator Control device.  A same-device pre-market action
+    can fill the value from its local hot-reloadable store.  Missing metadata
+    leaves the card active but feed-unready, preserving the existing safe
+    failure mode without turning planning into a new operational blocker.
+    """
+
+    key = str(getattr(command, "kis_ws_symbol_key", "") or "").strip()
+    if not key:
+        from src.services.kis_ws_symbol_keys import KisWsSymbolKeyStore
+
+        try:
+            key = KisWsSymbolKeyStore().resolve(command.symbol)
+        except (OSError, RuntimeError):
+            key = ""
+    if not key:
+        return str(getattr(card, "kis_ws_symbol_key", "") or "").strip()
+
+    from src.services.kis_ws_symbol_keys import (
+        KisWsSymbolKeysError,
+        normalize_symbol_keys,
+    )
+
+    try:
+        return normalize_symbol_keys({command.symbol: key})[command.symbol]
+    except KisWsSymbolKeysError as exc:
+        raise BoardCommandRejectedError(
+            f"The KIS realtime mapping for {command.symbol} is invalid"
+        ) from exc
+
+
 def _board_action_name(command, card) -> str:
     types = _load_board_types()
     if isinstance(command, types.ActivateForToday):
@@ -1124,6 +1158,7 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
             card.entry_attempt_count = 0
     elif isinstance(command, types.ActivateForToday):
         card.buy_today_note = ""
+        card.kis_ws_symbol_key = _activation_symbol_key(command, card)
         if context is not None and context.session_date is not None:
             card.session_date = context.session_date
         else:

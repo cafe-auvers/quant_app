@@ -79,7 +79,19 @@ class MoveToBuylist(BoardCommand):
 
 @dataclass(frozen=True)
 class ActivateForToday(BoardCommand):
-    pass
+    # The KIS realtime key is operational symbol metadata, not a credential.
+    # Carrying the verified value with the durable activation lets a split
+    # Operator/Execution topology subscribe on the executor without copying a
+    # workstation-local file for every new Buy Today symbol.
+    kis_ws_symbol_key: str = ""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        object.__setattr__(
+            self,
+            "kis_ws_symbol_key",
+            str(self.kis_ws_symbol_key or "").strip(),
+        )
 
 
 @dataclass(frozen=True)

@@ -40,7 +40,12 @@ from src.services.realtime_market_data import (
     QuoteSnapshot,
     RealtimeMarketDataService,
 )
-from src.services.kis_ws_symbol_keys import KisWsSymbolKeyStore
+from src.services.kis_ws_symbol_keys import (
+    KisWsSymbolKeyStore,
+    KisWsSymbolKeysError,
+    normalize_symbol_keys,
+    update_symbol_keys_file,
+)
 from src.utils.market_calendar import is_regular_session_open
 
 logger = logging.getLogger(__name__)
@@ -550,6 +555,7 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         self._transport = transport
         self._symbol_key_resolver = symbol_key_resolver
         self.symbol_key_store = symbol_key_store
+        self._canonical_symbol_key_conflicts: Dict[str, str] = {}
         self._trade_capacity = max(0, int(trade_capacity))
         self._quote_capacity = max(0, int(quote_capacity))
         # KIS enforces one aggregate session budget across every realtime TR,
@@ -635,6 +641,98 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         if callable(on_operation):
             on_operation(self._on_protocol_operation)
         self._rebalance_subscriptions()
+
+    def adopt_canonical_symbol_keys(self, keys: Mapping[str, str]) -> None:
+        """Materialize missing verified card mappings in the executor file.
+
+        Canonical Buy Today intent may arrive from another device.  Add only
+        missing mappings; a conflicting local reviewed value is never silently
+        overwritten.  The normal subscription rebalance then discovers the
+        atomic file update in the same runtime cycle.
+        """
+
+        store = self.symbol_key_store
+        if store is None:
+            return
+        if not keys:
+            self._canonical_symbol_key_conflicts = {}
+            return
+
+        normalized: Dict[str, str] = {}
+        key_owners: Dict[str, str] = {}
+        conflicts: Dict[str, str] = {}
+        for raw_symbol, raw_key in keys.items():
+            symbol = str(raw_symbol or "").strip().upper()
+            try:
+                pair = normalize_symbol_keys({symbol: raw_key})
+            except KisWsSymbolKeysError as exc:
+                conflicts[symbol or "<missing>"] = str(exc)
+                continue
+            symbol, key = next(iter(pair.items()))
+            prior_owner = key_owners.get(key)
+            if prior_owner is not None and prior_owner != symbol:
+                conflicts[prior_owner] = "canonical key is assigned to another symbol"
+                conflicts[symbol] = "canonical key is assigned to another symbol"
+                normalized.pop(prior_owner, None)
+                continue
+            normalized[symbol] = key
+            key_owners[key] = symbol
+
+        snapshot = store.snapshot()
+        conflicts.update(
+            {
+                symbol: "canonical mapping conflicts with the local reviewed key"
+                for symbol, key in normalized.items()
+                if symbol in snapshot.keys and snapshot.keys[symbol] != key
+            }
+        )
+        additions = {
+            symbol: key
+            for symbol, key in normalized.items()
+            if symbol not in conflicts
+            and (
+                snapshot.source != "FILE"
+                or snapshot.keys.get(symbol) != key
+            )
+        }
+        if additions:
+            try:
+                update_symbol_keys_file(
+                    set_values=additions,
+                    path=store.path,
+                    refuse_conflicts=True,
+                )
+                store.refresh_if_changed()
+            except (KisWsSymbolKeysError, OSError, TimeoutError):
+                # A concurrent conflict for one symbol must not prevent other
+                # new Buy Today mappings from arriving on the executor.
+                for symbol, key in additions.items():
+                    try:
+                        update_symbol_keys_file(
+                            set_values={symbol: key},
+                            path=store.path,
+                            refuse_conflicts=True,
+                        )
+                    except (KisWsSymbolKeysError, OSError, TimeoutError) as item_exc:
+                        conflicts[symbol] = (
+                            f"could not adopt canonical mapping: {item_exc}"
+                        )
+                store.refresh_if_changed()
+
+        previous = self._canonical_symbol_key_conflicts
+        self._canonical_symbol_key_conflicts = conflicts
+        for symbol, message in sorted(conflicts.items()):
+            if previous.get(symbol) != message:
+                logger.warning(
+                    "KIS WebSocket canonical symbol-key handoff paused for %s: %s",
+                    symbol,
+                    message,
+                )
+        for symbol in sorted(set(previous) - set(conflicts)):
+            logger.info(
+                "KIS WebSocket canonical symbol-key handoff recovered for %s",
+                symbol,
+            )
 
     @staticmethod
     def _parse_us_event_time(
