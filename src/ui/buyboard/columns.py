@@ -289,11 +289,13 @@ class BoardColumnList(QListWidget):
                         if account_equity_lookup is not None
                         else None
                     )
-                    widget.update_live_metrics(
+                    metrics_changed = widget.update_live_metrics(
                         card_state,
                         current_price,
                         account_equity,
                     )
+                    if metrics_changed:
+                        self._set_item_widget_size(item, widget)
             return False
 
         self.clear()
@@ -419,5 +421,6 @@ class BoardColumnList(QListWidget):
                 else None
             )
             if widget.update_live_metrics(card, current_price, account_equity):
+                self._set_item_widget_size(item, widget)
                 updated += 1
         return updated

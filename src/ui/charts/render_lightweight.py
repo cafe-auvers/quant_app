@@ -23,7 +23,12 @@ except ImportError:
     QWebChannel = None
 
 from .render_assets import _lightweight_charts_script_tag
-from .render_drawing_assets import DRAWING_TIMEFRAME_SYNC_JS, snap_daily_drawing_date
+from .render_drawing_assets import (
+    DRAWING_TIMEFRAME_SYNC_JS,
+    build_future_chart_times,
+    snap_daily_drawing_date,
+    snap_intraday_drawing_time,
+)
 from .render_earnings_assets import EARNINGS_CHART_CSS, EARNINGS_EVENT_RUNTIME_JS
 from .render_measurement_assets import (
     RIGHT_DRAG_MEASUREMENT_CSS,
@@ -111,56 +116,12 @@ class ChartLightweightRenderMixin:
                 return int(timestamp.timestamp())
             return timestamp.strftime("%Y-%m-%d")
 
-        chart_times_by_date = {}
-        for date_label, time_value in zip(date_labels, chart_times):
-            chart_times_by_date.setdefault(date_label, []).append(time_value)
-        chart_time_lookup = {
-            date_label: values[-1]
-            for date_label, values in chart_times_by_date.items()
-        }
         normalized_chart_index = (
             chart_index.tz_convert(None)
             if chart_index.tz is not None
             else chart_index.tz_localize(None)
         )
         chart_time_by_timestamp = dict(zip(normalized_chart_index, chart_times))
-        first_chart_time = chart_times[0]
-
-        def drawing_time_value(value, prefer: str = "first") -> str | int:
-            text = str(value)
-            if uses_intraday_time and len(text) <= 10:
-                day_matches = chart_times_by_date.get(text[:10], ())
-                if day_matches:
-                    return day_matches[-1] if prefer == "last" else day_matches[0]
-                date_keys = sorted(chart_time_lookup.keys())
-                if date_keys and text[:10] <= date_keys[0]:
-                    return first_chart_time
-                if date_keys and text[:10] >= date_keys[-1]:
-                    return chart_time_value(text[:10])
-            return chart_time_value(value)
-
-        def future_time_values() -> List[str | int]:
-            last_timestamp = chart_index[-1]
-            if uses_intraday_time:
-                if chart_timeframe == "1H":
-                    step = pd.Timedelta(hours=1)
-                elif chart_timeframe.endswith("M") and chart_timeframe[:-1].isdigit():
-                    step = pd.Timedelta(minutes=int(chart_timeframe[:-1]))
-                else:
-                    step = pd.Timedelta(hours=1)
-                return [
-                    chart_time_value(last_timestamp + step * offset)
-                    for offset in range(1, 501)
-                ]
-
-            values = []
-            current = last_timestamp
-            while len(values) < 120:
-                current += pd.Timedelta(days=1)
-                if current.weekday() >= 5:
-                    continue
-                values.append(chart_time_value(current))
-            return values
 
         price_columns = chart_history[["Open", "High", "Low", "Close", "Volume"]]
         for time_value, row in zip(
@@ -192,9 +153,24 @@ class ChartLightweightRenderMixin:
         adr_chips = ChartRenderMetricsMixin._format_chart_adr_metrics(chart_history, options)
         candles_json = json.dumps(candles)
         volumes_json = json.dumps(volumes)
-        future_values = future_time_values()
+        future_values = build_future_chart_times(
+            chart_index,
+            chart_timeframe,
+            uses_intraday_time,
+            chart_time_value,
+        )
         future_whitespace_json = json.dumps([{"time": value} for value in future_values])
         daily_axis_dates = date_labels + [str(value)[:10] for value in future_values]
+
+        drawing_axis_times = chart_times + future_values
+        def drawing_time_value(value, prefer: str = "first") -> str | int:
+            if not uses_intraday_time:
+                return chart_time_value(value)
+            return snap_intraday_drawing_time(
+                value,
+                drawing_axis_times,
+                prefer=prefer,
+            )
 
         first_chart_date = chart_index[0].date()
         last_chart_date = chart_index[-1].date()

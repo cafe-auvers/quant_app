@@ -420,6 +420,44 @@ def test_live_metric_refresh_reuses_widget_and_never_rebuilds_column():
     ) == 0
 
 
+def test_live_metric_refresh_expands_buy_today_item_for_full_description():
+    _ensure_app()
+    from src.ui.buyboard.columns import BoardColumnList
+
+    card = TradeCardState(
+        environment="PROD",
+        account_no="1",
+        symbol="CDNA",
+        name="CDNA",
+        board_status=BoardStatus.BUY_TODAY,
+        breakout_price=47.99,
+        planned_quantity=44,
+        risk_percent=0.005,
+    )
+    column = BoardColumnList(
+        BoardStatus.BUY_TODAY,
+        on_card_dropped=lambda payload, target: None,
+    )
+    column.resize(340, 500)
+    column.set_cards(
+        [card],
+        quote_lookup=lambda _symbol: 48.44,
+        account_equity_lookup=lambda _environment, _account: None,
+    )
+    item = column.item(0)
+    widget = column.itemWidget(item)
+    initial_height = item.sizeHint().height()
+
+    assert column.refresh_live_metrics(
+        quote_lookup=lambda _symbol: 48.44,
+        account_equity_lookup=lambda _environment, _account: 100_000.0,
+    ) == 1
+
+    assert "Risk Budget" in _widget_text(widget)
+    assert item.sizeHint().height() > initial_height
+    assert item.sizeHint().height() >= widget.sizeHint().height()
+
+
 # --- P1-8: column rendering respects kanban_priority ------------------------
 
 

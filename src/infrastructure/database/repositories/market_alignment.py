@@ -9,6 +9,7 @@ from typing import Iterable, Mapping, Optional
 
 from sqlalchemy import MetaData, and_, func, select
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 
 from src.core.market_alignment import ContextState, MarketAlignmentSnapshot
 from src.infrastructure.database.schema import (
@@ -16,11 +17,12 @@ from src.infrastructure.database.schema import (
     _get_market_alignment_batches_table,
     _get_stock_market_alignment_daily_table,
 )
-from src.infrastructure.database.sql_helpers import _execute_bulk_upsert
+from src.infrastructure.database.sql_helpers import _execute_bulk_upsert, _record_chunks
 from src.infrastructure.database.time_utils import _utcnow_naive
 
 
 PUBLISHED_STATUS = "published"
+MARKET_ALIGNMENT_WRITE_CHUNK_SIZE = 250
 
 
 class MarketAlignmentRepository:
@@ -90,23 +92,34 @@ class MarketAlignmentRepository:
             "published_at": now,
             "updated_at": now,
         }
-        with self.engine.begin() as conn:
-            # One transaction is the publication boundary. A failed row chunk
-            # or manifest write rolls the entire attempted replacement back.
-            _execute_bulk_upsert(
-                conn,
-                snapshot_table,
-                records,
-                ("symbol", "as_of_date", "feature_version"),
-                self.engine.dialect.name,
-            )
-            _execute_bulk_upsert(
-                conn,
-                batch_table,
-                [manifest],
-                ("as_of_date", "feature_version"),
-                self.engine.dialect.name,
-            )
+        try:
+            with self.engine.begin() as conn:
+                # One transaction is the publication boundary. Keep each SQL
+                # statement below the PC driver's timeout/packet thresholds;
+                # a failed row chunk or manifest still rolls back everything.
+                for chunk in _record_chunks(
+                    records, MARKET_ALIGNMENT_WRITE_CHUNK_SIZE
+                ):
+                    _execute_bulk_upsert(
+                        conn,
+                        snapshot_table,
+                        chunk,
+                        ("symbol", "as_of_date", "feature_version"),
+                        self.engine.dialect.name,
+                    )
+                _execute_bulk_upsert(
+                    conn,
+                    batch_table,
+                    [manifest],
+                    ("as_of_date", "feature_version"),
+                    self.engine.dialect.name,
+                )
+        except SQLAlchemyError as exc:
+            original = getattr(exc, "orig", None)
+            detail = str(original or type(exc).__name__)
+            raise RuntimeError(
+                f"Unable to publish market-alignment batch: {detail}"
+            ) from None
         return len(records)
 
     def get_latest_market_alignment(

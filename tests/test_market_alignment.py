@@ -8,6 +8,7 @@ from dataclasses import replace
 import pandas as pd
 import pytest
 from sqlalchemy import MetaData, create_engine, func, select
+from sqlalchemy.exc import OperationalError
 
 from src.core.chart_fundamentals import ProfileStatus, StockProfile
 from src.core.market_alignment import (
@@ -327,6 +328,54 @@ def test_repository_upsert_is_idempotent_and_lookup_requires_published_manifest(
     table = _get_stock_market_alignment_daily_table(MetaData())
     with engine.connect() as conn:
         assert conn.execute(select(func.count()).select_from(table)).scalar_one() == 1
+
+
+def test_repository_chunks_wide_market_alignment_publications(monkeypatch):
+    engine = create_engine("sqlite:///:memory:", future=True)
+    repository = MarketAlignmentRepository(engine)
+    snapshots = [
+        replace(
+            _snapshot(symbol=f"S{index}"),
+            calculation_details={"payload": "x" * 2_500},
+        )
+        for index in range(501)
+    ]
+    real_upsert = alignment_repo_module._execute_bulk_upsert
+    snapshot_chunk_sizes = []
+
+    def recording_upsert(conn, table, records, keys, dialect):
+        if table.name == "stock_market_alignment_daily":
+            snapshot_chunk_sizes.append(len(records))
+        return real_upsert(conn, table, records, keys, dialect)
+
+    monkeypatch.setattr(
+        alignment_repo_module, "_execute_bulk_upsert", recording_upsert
+    )
+
+    assert repository.publish_batch(
+        snapshots, input_fingerprint="wide", stats={}
+    ) == len(snapshots)
+    assert snapshot_chunk_sizes == [250, 250, 1]
+
+
+def test_repository_hides_large_sql_payload_when_publication_fails(monkeypatch):
+    engine = create_engine("sqlite:///:memory:", future=True)
+    repository = MarketAlignmentRepository(engine)
+
+    def fail_upsert(_conn, _table, _records, _keys, _dialect):
+        raise OperationalError(
+            "INSERT INTO stock_market_alignment_daily ...",
+            {"calculation_details_json": "sensitive-large-payload"},
+            RuntimeError("write timed out"),
+        )
+
+    monkeypatch.setattr(alignment_repo_module, "_execute_bulk_upsert", fail_upsert)
+
+    with pytest.raises(RuntimeError, match="write timed out") as caught:
+        repository.publish_batch([_snapshot()], input_fingerprint="x", stats={})
+
+    assert "sensitive-large-payload" not in str(caught.value)
+    assert caught.value.__cause__ is None
 
 
 def test_chart_lookup_treats_unprovisioned_optional_schema_as_missing_data(caplog):

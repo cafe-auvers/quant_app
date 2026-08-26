@@ -1271,6 +1271,10 @@ def test_entry_limits_do_not_block_exits_cancellation_reconciliation_or_recovery
         reason="partial_sell",
         trade_card=partial,
     )
+    # Keep this portfolio-risk regression independent of execution-quote age.
+    # A guarded submission can take long enough on a loaded CI worker for the
+    # next symbol's one-second quote to expire.
+    market_data.poll_once()
     all_result = runtime.trading_engine._position_callbacks.submit_sell_order(
         environment="PROD",
         account_no="1",
@@ -1279,6 +1283,7 @@ def test_entry_limits_do_not_block_exits_cancellation_reconciliation_or_recovery
         reason="sell_all_retry",
         trade_card=sell_all,
     )
+    market_data.poll_once()
     stop_result = runtime.trading_engine._position_callbacks.submit_sell_order(
         environment="PROD",
         account_no="1",
@@ -1287,6 +1292,7 @@ def test_entry_limits_do_not_block_exits_cancellation_reconciliation_or_recovery
         reason="stop_loss",
         trade_card=stop_loss,
     )
+    market_data.poll_once()
     recovery_result = runtime.reconciliation_emergency_sell(recovery, 10)
 
     broker.queue_cancel_confirmed()

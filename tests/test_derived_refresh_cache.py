@@ -84,6 +84,72 @@ def test_price_history_watermarks_use_bounded_symbol_batches(engine, monkeypatch
     assert all(len(parameters) <= 3 for _, parameters in queries)
 
 
+def test_hourly_history_watermarks_use_small_bounded_symbol_batches(
+    engine, monkeypatch
+):
+    symbols = ["SPY", "AAA", "BBB", "CCC", "DDD"]
+    dates = pd.to_datetime(["2026-01-05 14:30", "2026-01-05 15:30"])
+    for offset, symbol in enumerate(symbols):
+        assert db_loader.save_hourly_history_to_db(
+            symbol, _history(dates, 100 + offset), engine, source="test"
+        )
+
+    monkeypatch.setattr(
+        market_watermarks, "HOURLY_CACHE_QUERY_SYMBOL_CHUNK_SIZE", 2
+    )
+    captured, listener = _capture_selects(engine)
+    try:
+        watermarks = db_loader.get_latest_hourly_price_history_timestamps(
+            engine, symbols, source="test", strict=True
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", listener)
+
+    queries = [
+        item
+        for item in captured
+        if " from hourly_price_history " in item[0] and " group by " in item[0]
+    ]
+    assert set(watermarks) == set(symbols)
+    assert len(queries) == 3
+    assert all(len(parameters) <= 3 for _, parameters in queries)
+
+
+def test_hourly_history_watermarks_retry_one_failed_chunk(engine, monkeypatch):
+    dates = pd.to_datetime(["2026-01-05 14:30", "2026-01-05 15:30"])
+    assert db_loader.save_hourly_history_to_db(
+        "AAPL", _history(dates), engine, source="test"
+    )
+    monkeypatch.setattr(
+        market_watermarks, "HOURLY_CACHE_QUERY_SYMBOL_CHUNK_SIZE", 2
+    )
+    attempts = 0
+
+    def fail_first_hourly_select(
+        _conn, _cursor, statement, _parameters, _context, _executemany
+    ):
+        nonlocal attempts
+        normalized = " ".join(statement.lower().split())
+        if " from hourly_price_history " not in normalized or " group by " not in normalized:
+            return
+        attempts += 1
+        if attempts == 1:
+            raise OperationalError(
+                statement, {}, RuntimeError("transient read timeout")
+            )
+
+    event.listen(engine, "before_cursor_execute", fail_first_hourly_select)
+    try:
+        watermarks = db_loader.get_latest_hourly_price_history_timestamps(
+            engine, ["AAPL"], source="test", strict=True
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", fail_first_hourly_select)
+
+    assert attempts == 2
+    assert watermarks["AAPL"] == dt.datetime(2026, 1, 5, 15, 30)
+
+
 def test_complete_chart_cache_uses_manifest_without_indicator_scan(
     engine, monkeypatch
 ):
