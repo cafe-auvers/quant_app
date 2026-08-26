@@ -85,6 +85,24 @@ def test_premarket_successor_stays_ready_without_global_quote_flicker():
     assert "execution waits" not in display.label
 
 
+def test_single_session_handoff_is_shown_as_ready_without_claiming_execution():
+    display = _buyboard_readiness_display(
+        _readiness(
+            websocket_connected=False,
+            critical_trade_subscriptions_acked=False,
+            critical_quote_subscriptions_acked=False,
+        ),
+        device_state=RuntimeDeviceState.STANDBY_READY,
+        single_session_handoff_ready=True,
+    )
+
+    assert display.completed == 7
+    assert display.total == 7
+    assert "STANDBY_READY" in display.label
+    assert "KIS WebSocket transfers" in display.label
+    assert "execution-closed" in display.tooltip
+
+
 def test_premarket_main_is_ready_with_per_symbol_quote_guards():
     display = _buyboard_readiness_display(
         _readiness(critical_quotes_fresh=False),

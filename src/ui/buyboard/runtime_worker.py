@@ -465,15 +465,22 @@ class BuyboardRuntimeWorker(QThread):
 
         now = datetime.now(timezone.utc)
         last = self._last_device_state_published_at
-        if state == self.device_state and last is not None and (
-            now - last
-        ).total_seconds() < execution_config.COORDINATION_DEVICE_HEARTBEAT_SECONDS:
-            return
         details = self._runtime_readiness_details(state)
+        details_unchanged = bool(
+            self._last_device_state_details is not None
+            and details == self._last_device_state_details
+        )
+        if (
+            state == self.device_state
+            and details_unchanged
+            and last is not None
+            and (now - last).total_seconds()
+            < execution_config.COORDINATION_DEVICE_HEARTBEAT_SECONDS
+        ):
+            return
         heartbeat_only = bool(
             state == self.device_state
-            and self._last_device_state_details is not None
-            and details == self._last_device_state_details
+            and details_unchanged
         )
         if state == self.device_state and refresh_runtime_device_state(
             self._db_engine,
@@ -522,6 +529,12 @@ class BuyboardRuntimeWorker(QThread):
                 readiness.accumulator_draining_within_budget,
             )
         )
+        single_session_handoff = self._single_session_market_data_handoff_ready(
+            readiness
+        )
+        handoff_ready = bool(
+            readiness.standby_ready or single_session_handoff
+        )
         reconciliation_ready = bool(
             readiness.startup_reconciliation_complete
             and readiness.account_reconciliation_fresh
@@ -562,6 +575,10 @@ class BuyboardRuntimeWorker(QThread):
                 self._environment in {"PROD", "PAPER"} and reconciliation_ready
             ),
             "market_data_ready": stable_market_data,
+            "market_data_handoff_ready": bool(
+                stable_market_data or single_session_handoff
+            ),
+            "market_data_session_conflict": single_session_handoff,
             "command_consumer_ready": command_consumer_ready,
             "order_reconciliation_ready": reconciliation_ready,
             "latest_watchlist_revision": int(revisions.get("watchlist", 0) or 0),
@@ -586,13 +603,47 @@ class BuyboardRuntimeWorker(QThread):
                 RuntimeDeviceState.FAILED,
             },
             "executor_ready": executor_ready,
+            "handoff_ready": handoff_ready,
             "executor_not_ready_reason": (
                 ""
                 if executor_ready
-                else ", ".join(readiness.standby_blockers)
-                or f"runtime state is {state.value}"
+                else (
+                    "KIS WebSocket session is held by the active executor; "
+                    "ready for fenced handoff"
+                    if single_session_handoff
+                    else ", ".join(readiness.standby_blockers)
+                    or f"runtime state is {state.value}"
+                )
             ),
         }
+
+    def _single_session_market_data_handoff_ready(
+        self, readiness: EngineReadiness
+    ) -> bool:
+        """Allow only the known KIS one-app-key standby conflict.
+
+        Database access and broker reconciliation stay strict. The new owner
+        remains closed after the lease transfer until its own WebSocket is
+        connected and every critical subscription is ACKed.
+        """
+
+        if not self._standby_only or self.runtime is None:
+            return False
+        conflict = getattr(
+            self.runtime.market_data,
+            "single_session_handoff_conflict_active",
+            None,
+        )
+        if not callable(conflict) or not bool(conflict()):
+            return False
+        return all(
+            (
+                readiness.startup_reconciliation_complete,
+                readiness.account_reconciliation_fresh,
+                readiness.accumulator_draining_within_budget,
+                readiness.database_writable,
+            )
+        )
 
     def _readiness_state_revisions(self) -> Dict[str, int]:
         """Reuse canonical plan revisions until ``app_state_sync`` changes."""
@@ -1036,6 +1087,14 @@ class BuyboardRuntimeWorker(QThread):
         if not required_ready:
             if self.device_state == RuntimeDeviceState.STANDBY_READY:
                 self._demote_standby_readiness()
+            elif (
+                self.device_state == RuntimeDeviceState.STANDBY
+                and self._last_device_state_published_at is not None
+            ):
+                # A blocked standby is still a live control target. Publish
+                # its current blocker and keep its identity fresh instead of
+                # leaving the initial STANDBY row to age out forever.
+                self._publish_device_state_if_due(RuntimeDeviceState.STANDBY)
             return
         if self._standby_only:
             if self.device_state != RuntimeDeviceState.STANDBY_READY:
@@ -1092,7 +1151,10 @@ class BuyboardRuntimeWorker(QThread):
         """
 
         current = readiness or self.engine_readiness(include_device_state=False)
-        return current.standby_ready
+        return bool(
+            current.standby_ready
+            or self._single_session_market_data_handoff_ready(current)
+        )
 
     def _refresh_observation_after_final_reconciliation(self) -> None:
         """Refresh the local feed-drain timestamp after a blocking REST pass."""

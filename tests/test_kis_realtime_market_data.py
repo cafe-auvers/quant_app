@@ -1148,6 +1148,33 @@ def test_subscription_nack_blocks_symbol_and_alerts():
     assert alerts and "AAPL" in alerts[0]
 
 
+def test_single_session_nack_is_exposed_only_as_recent_handoff_evidence():
+    service, _ = _service()
+    service._on_ack(
+        KisWsSystemFrame(
+            tr_id="(null)",
+            accepted=False,
+            message_code="OPSP8996",
+            message="ALREADY IN USE appkey",
+        )
+    )
+
+    assert service.single_session_handoff_conflict_active(now=NOW)
+    assert not service.single_session_handoff_conflict_active(
+        now=NOW + dt.timedelta(seconds=91)
+    )
+
+    service._on_ack(
+        KisWsSystemFrame(
+            tr_id="HDFSCNT0",
+            tr_key="unused",
+            accepted=True,
+            message="SUBSCRIBE SUCCESS",
+        )
+    )
+    assert not service.single_session_handoff_conflict_active(now=NOW)
+
+
 def test_subscription_ack_timeout_blocks_only_that_symbol_and_alerts(monkeypatch):
     alerts = []
     service, _ = _service(alert=alerts.append)

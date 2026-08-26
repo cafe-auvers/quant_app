@@ -215,6 +215,7 @@ def _buyboard_readiness_display(
     seconds_until_open: Optional[float] = None,
     auto_claim_enabled: bool = False,
     is_main_device: bool = False,
+    single_session_handoff_ready: bool = False,
 ) -> BuyboardReadinessDisplay:
     """Project the authoritative readiness predicate into operator language."""
 
@@ -246,6 +247,17 @@ def _buyboard_readiness_display(
             f"Buy Board readiness {total}/{total} — ACTIVE; "
             "broker mutations remain guarded by Live Trading",
             " | ".join(tooltip_parts),
+        )
+    elif single_session_handoff_ready:
+        return BuyboardReadinessDisplay(
+            total,
+            total,
+            f"Buy Board readiness {total}/{total} â€” STANDBY_READY; "
+            "KIS WebSocket transfers with Execution Owner",
+            "KIS permits one realtime socket for this app key. The current "
+            "ACTIVE executor still has a healthy feed; this device has passed "
+            "database and broker reconciliation and will remain execution-closed "
+            "until its own socket connects after the fenced owner transfer.",
         )
     elif reconciliation_accounts:
         accounts = ", ".join(reconciliation_accounts)
@@ -2458,6 +2470,13 @@ class MainWindow(
                         "is_main",
                         False,
                     )
+                ),
+                single_session_handoff_ready=bool(
+                    getattr(worker, "device_state", None)
+                    == RuntimeDeviceState.STANDBY_READY
+                    and not readiness.standby_ready
+                    and callable(getattr(worker, "lease_handoff_ready", None))
+                    and worker.lease_handoff_ready(readiness)
                 ),
             )
         except Exception:
@@ -4984,7 +5003,13 @@ class MainWindow(
             if current is None or record.updated_at > current.updated_at:
                 newest_by_kind[kind] = record
         for kind, record in newest_by_kind.items():
-            ready = bool(record.details.get("executor_ready", False))
+            ready = bool(
+                record.details.get("executor_ready", False)
+                or (
+                    record.state == RuntimeDeviceState.STANDBY_READY
+                    and record.details.get("handoff_ready", False)
+                )
+            )
             readiness[kind] = "Yes" if ready else "No"
             if not ready:
                 readiness_reason[kind] = str(

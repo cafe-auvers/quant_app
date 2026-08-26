@@ -1627,6 +1627,33 @@ def test_unchanged_runtime_readiness_uses_timestamp_only_heartbeat(
     assert calls[0]["heartbeat_only"] is True
 
 
+def test_changed_runtime_readiness_publishes_before_heartbeat_interval(
+    tmp_path, monkeypatch
+):
+    import src.ui.buyboard.runtime_worker as runtime_worker_module
+
+    worker, _ = _worker(tmp_path, device_id="standby-device", standby_only=True)
+    worker.device_state = RuntimeDeviceState.STANDBY
+    worker._last_device_state_details = {"executor_ready": False}
+    worker._last_device_state_published_at = dt.datetime.now(dt.timezone.utc)
+    calls = []
+    monkeypatch.setattr(
+        worker,
+        "_runtime_readiness_details",
+        lambda _state: {"executor_ready": False, "handoff_ready": True},
+    )
+    monkeypatch.setattr(
+        runtime_worker_module,
+        "refresh_runtime_device_state",
+        lambda *args, **kwargs: calls.append(kwargs) or True,
+    )
+
+    worker._publish_device_state_if_due(RuntimeDeviceState.STANDBY)
+
+    assert len(calls) == 1
+    assert calls[0]["heartbeat_only"] is False
+
+
 def test_peer_off_alert_retry_poll_rides_on_four_minute_heartbeat(tmp_path):
     from src.services import coordination_change_pulse
 
@@ -1708,6 +1735,80 @@ def test_pull_only_successor_is_handoff_ready_before_market_open_without_quotes(
     assert transitions == [RuntimeDeviceState.STANDBY_READY]
     assert final_passes == [{"execute_commands": False}]
     assert worker._accepting_commands is False
+
+
+def test_pull_only_successor_can_handoff_when_active_owner_holds_kis_socket(
+    tmp_path, monkeypatch
+):
+    worker, _ = _worker(
+        tmp_path,
+        standby_only=True,
+        device_id="successor",
+    )
+    worker._accepting_commands = False
+    worker.device_state = RuntimeDeviceState.STANDBY
+
+    class _MarketData:
+        @staticmethod
+        def single_session_handoff_conflict_active():
+            return True
+
+    worker.runtime = SimpleNamespace(market_data=_MarketData())
+    conflicted = _ready_runtime_state(
+        websocket_connected=False,
+        critical_trade_subscriptions_acked=False,
+        critical_quote_subscriptions_acked=False,
+    )
+    monkeypatch.setattr(worker, "engine_readiness", lambda **kwargs: conflicted)
+    monkeypatch.setattr(
+        worker,
+        "_run_startup_reconciliation",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        worker,
+        "_refresh_observation_after_final_reconciliation",
+        lambda: None,
+    )
+
+    transitions = []
+
+    def record_state(state, **kwargs):
+        transitions.append(state)
+        worker.device_state = state
+
+    monkeypatch.setattr(worker, "_set_device_state", record_state)
+
+    worker._advance_startup_readiness()
+
+    assert worker.lease_handoff_ready(conflicted) is True
+    assert transitions == [RuntimeDeviceState.STANDBY_READY]
+    assert worker._accepting_commands is False
+
+
+def test_blocked_standby_keeps_its_runtime_identity_fresh(tmp_path, monkeypatch):
+    worker, _ = _worker(
+        tmp_path,
+        standby_only=True,
+        device_id="successor",
+    )
+    worker.device_state = RuntimeDeviceState.STANDBY
+    worker._last_device_state_published_at = dt.datetime.now(dt.timezone.utc)
+    monkeypatch.setattr(
+        worker,
+        "engine_readiness",
+        lambda **kwargs: _ready_runtime_state(websocket_connected=False),
+    )
+    published = []
+    monkeypatch.setattr(
+        worker,
+        "_publish_device_state_if_due",
+        published.append,
+    )
+
+    worker._advance_startup_readiness()
+
+    assert published == [RuntimeDeviceState.STANDBY]
 
 
 def test_pull_only_successor_keeps_stale_quotes_symbol_scoped_during_regular_session(
