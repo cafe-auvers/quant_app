@@ -508,22 +508,47 @@ class KisWebSocketClient:
                     if self._reconnect_generation > 1:
                         self.reconnect_count += 1
                     attempts = 0
-                    # Desired, not merely previously ACKed, subscriptions are
-                    # restored after every reconnect.
-                    await self._send_subscriptions(
-                        self.desired_subscriptions(), tr_type="1"
+                    # KIS can reject the first replayed subscription and close
+                    # the socket before a larger desired set has finished
+                    # sending. Start the reader first so that session-level
+                    # NACKs (notably OPSP8996) cannot remain unread behind the
+                    # subscription replay that triggered them.
+                    receive_task = asyncio.create_task(
+                        self._receive_frames(socket)
                     )
-                    # Observers see the new session only after every desired
-                    # subscription request has crossed the socket boundary.
-                    self._notify_connection(True, "", self._reconnect_generation)
-                    async for raw in socket:
-                        await self._handle_raw(raw)
-                    if not self._stop_event.is_set():
-                        self._notify_connection(
-                            False,
-                            "KIS WebSocket stream ended",
-                            self._reconnect_generation,
+                    announced_connected = False
+                    try:
+                        # Desired, not merely previously ACKed, subscriptions
+                        # are restored after every reconnect.
+                        await self._send_subscriptions(
+                            self.desired_subscriptions(), tr_type="1"
                         )
+                        # Observers see the new session only after every
+                        # desired request has crossed the socket boundary.
+                        self._notify_connection(
+                            True, "", self._reconnect_generation
+                        )
+                        announced_connected = True
+                        await receive_task
+                        if not self._stop_event.is_set():
+                            self._notify_connection(
+                                False,
+                                "KIS WebSocket stream ended",
+                                self._reconnect_generation,
+                            )
+                    finally:
+                        if not receive_task.done():
+                            receive_task.cancel()
+                        try:
+                            await receive_task
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception:
+                            # The outer reconnect handler owns transport
+                            # failures. Avoid losing the original send error
+                            # while still collecting the reader task here.
+                            if announced_connected:
+                                raise
             except KisWsAuthError as exc:
                 self._critical_alert(str(exc))
                 self._notify_connection(False, str(exc), self._reconnect_generation)
@@ -542,6 +567,10 @@ class KisWebSocketClient:
                 self._connected = False
                 self._socket = None
         self._loop = None
+
+    async def _receive_frames(self, socket) -> None:
+        async for raw in socket:
+            await self._handle_raw(raw)
 
     async def _handle_raw(self, raw: str) -> None:
         try:
