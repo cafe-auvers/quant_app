@@ -47,6 +47,26 @@ _BOARD_TO_OPERATOR_TYPE = {
 _BOARD_COMMAND_TYPES = {item.__name__: item for item in _BOARD_TO_OPERATOR_TYPE}
 
 
+def _attach_local_activation_symbol_key(
+    command: AnyBoardCommand,
+) -> AnyBoardCommand:
+    """Attach a locally verified key without making activation depend on it.
+
+    Missing realtime metadata must remain visible as a feed-readiness problem;
+    it must not prevent the trader from publishing durable Buy Today intent.
+    """
+
+    if not isinstance(command, ActivateForToday) or command.kis_ws_symbol_key:
+        return command
+    from src.services.kis_ws_symbol_keys import KisWsSymbolKeyStore
+
+    try:
+        key = KisWsSymbolKeyStore().resolve(command.symbol)
+    except (OSError, RuntimeError):
+        return command
+    return replace(command, kis_ws_symbol_key=key)
+
+
 def operator_command_type_for_board_command(
     command: AnyBoardCommand,
 ) -> Optional[OperatorCommandType]:
@@ -60,6 +80,7 @@ def _json_value(value: Any) -> Any:
 
 
 def serialize_board_command(command: AnyBoardCommand) -> Dict[str, Any]:
+    command = _attach_local_activation_symbol_key(command)
     return {
         "board_command_type": type(command).__name__,
         "board_command": {

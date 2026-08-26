@@ -3123,6 +3123,29 @@ class BuyboardRuntimeWorker(QThread):
 
     def _sync_quote_subscriptions(self, cards: List[TradeCardState]) -> None:
         market_data = self.runtime.market_data
+        adopt_keys = getattr(market_data, "adopt_canonical_symbol_keys", None)
+        if callable(adopt_keys):
+            canonical_keys: Dict[str, str] = {}
+            conflicting_symbols: set[str] = set()
+            for card in cards:
+                if card.board_status not in _QUOTE_SUBSCRIBED_STATUSES:
+                    continue
+                key = str(getattr(card, "kis_ws_symbol_key", "") or "").strip()
+                if not key:
+                    continue
+                prior = canonical_keys.get(card.symbol)
+                if prior is not None and prior != key:
+                    conflicting_symbols.add(card.symbol)
+                    canonical_keys.pop(card.symbol, None)
+                    continue
+                if card.symbol not in conflicting_symbols:
+                    canonical_keys[card.symbol] = key
+            try:
+                adopt_keys(canonical_keys)
+            except Exception:
+                # A file-system/configuration problem must not tear down
+                # already healthy feeds for other symbols.
+                logger.exception("Could not adopt canonical KIS WebSocket symbol keys")
         configure = getattr(market_data, "configure_desired_channels", None)
         if callable(configure):
             trade_priorities: Dict[str, int] = {}

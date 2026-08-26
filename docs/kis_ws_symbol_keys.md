@@ -4,7 +4,8 @@
 
 The exact KIS trade/quote subscription key for a symbol is operational state,
 not a credential and not a process-lifetime environment setting. Do not put
-the symbol map in `.env` or `.env.pc`. The runtime reads the gitignored file:
+the symbol map in `.env` or `.env.pc`. Each runtime reads its gitignored local
+file:
 
 ```text
 data/kis_ws_symbol_keys.json
@@ -20,6 +21,28 @@ The file is a plain JSON object:
 
 Only live-verified keys belong in this file. The application never guesses an
 exchange prefix.
+
+## Cross-device Buy Today handoff
+
+Activating a card for Buy Today captures that symbol's locally verified key
+and persists it with the canonical card. During a split Laptop Operator
+Control / PC Execution Owner session, the same value travels inside the
+durable `ADD_BUY_TODAY` command. Before requesting the quote/trade channels,
+the executor atomically adds a missing canonical mapping to its own local
+file. Therefore a newly selected Buy Today symbol does not require a second
+manual edit or an application restart on the execution PC.
+
+This handoff does not weaken the local review boundary:
+
+- A missing key does not prevent the Buy Today plan from being saved, but the
+  symbol remains feed-unready and cannot authorize a BUY.
+- A canonical value never silently overwrites a different local reviewed
+  value. The conflict stays visible and the existing healthy mapping remains
+  unchanged.
+- Adding the mapping does not alter Controlled Live authorization, position
+  sizing, portfolio risk, or the shared live-trading switch.
+- Existing active cards created before this handoff field was deployed need
+  one initial validated executor file or a later remove/reactivate cycle.
 
 ## Safe commands
 
@@ -41,6 +64,8 @@ KIS and do not edit `.env` or `.env.pc`.
 - Adding a key, or correcting a key for a channel that is currently missing
   or rejected, is discovered by the next Buy Board runtime cycle. No process
   restart is required.
+- A verified key arriving with a newly activated canonical Buy Today card is
+  adopted on that same cycle before subscription selection.
 - A malformed, partially written, unreadable, or temporarily missing file
   never clears the running map. The process retains its last-known-good keys
   and reports the configuration error.

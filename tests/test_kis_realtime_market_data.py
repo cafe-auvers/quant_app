@@ -70,6 +70,7 @@ def _service(
     alert=lambda message: None,
     qualification_mode=False,
     symbol_key_resolver=None,
+    symbol_key_store=None,
 ):
     transport = _Transport()
     service = KisRealtimeMarketDataService(
@@ -77,6 +78,7 @@ def _service(
         symbol_key_resolver=(
             symbol_key_resolver or (lambda symbol, channel: f"D{symbol}")
         ),
+        symbol_key_store=symbol_key_store,
         trade_capacity=trade_capacity,
         quote_capacity=quote_capacity,
         total_capacity=total_capacity,
@@ -219,6 +221,57 @@ def test_intraday_symbol_key_addition_subscribes_without_restarting_or_disruptin
     assert transport.unsubscribed == []
     assert service.symbol_state("MSFT").trade_configuration_error == ""
     assert service.symbol_state("MSFT").quote_configuration_error == ""
+
+
+def test_canonical_buy_today_key_handoff_materializes_missing_executor_file(tmp_path):
+    from src.services.kis_ws_symbol_keys import (
+        KisWsSymbolKeyStore,
+        read_symbol_keys_file,
+    )
+
+    path = tmp_path / "kis_ws_symbol_keys.json"
+    store = KisWsSymbolKeyStore(path, legacy_json="{}")
+    service, transport = _service(
+        symbol_key_resolver=lambda symbol, _channel: store.resolve(symbol),
+        symbol_key_store=store,
+    )
+
+    service.adopt_canonical_symbol_keys({"LUNG": "DLUNG"})
+    service.configure_desired_channels(
+        trade_priorities={"LUNG": 1},
+        quote_priorities={"LUNG": 1},
+    )
+
+    assert read_symbol_keys_file(path) == {"LUNG": "DLUNG"}
+    assert {item.symbol for item in transport.subscribed} == {"LUNG"}
+    assert service.symbol_state("LUNG").trade_configuration_error == ""
+    assert service.symbol_state("LUNG").quote_configuration_error == ""
+
+
+def test_canonical_buy_today_key_handoff_never_overwrites_local_conflict(tmp_path):
+    from src.services.kis_ws_symbol_keys import (
+        KisWsSymbolKeyStore,
+        read_symbol_keys_file,
+        write_symbol_keys_file,
+    )
+
+    path = tmp_path / "kis_ws_symbol_keys.json"
+    write_symbol_keys_file({"LUNG": "LOCAL_REVIEWED"}, path)
+    store = KisWsSymbolKeyStore(path, legacy_json="{}")
+    service, _ = _service(
+        symbol_key_resolver=lambda symbol, _channel: store.resolve(symbol),
+        symbol_key_store=store,
+    )
+
+    service.adopt_canonical_symbol_keys(
+        {"LUNG": "REMOTE_DIFFERENT", "MCS": "DMCS"}
+    )
+
+    assert read_symbol_keys_file(path) == {
+        "LUNG": "LOCAL_REVIEWED",
+        "MCS": "DMCS",
+    }
+    assert "LUNG" in service._canonical_symbol_key_conflicts
 
 
 def test_intraday_removal_does_not_tear_down_an_acked_active_symbol(tmp_path):

@@ -168,6 +168,10 @@ class TradeCardState:
     buy_today_note: str = ""
 
     # Entry plan
+    # Verified symbol-level KIS realtime metadata captured when Buy Today is
+    # activated.  This is deliberately separate from process environment and
+    # allows the execution owner to materialize a missing local key safely.
+    kis_ws_symbol_key: str = ""
     breakout_price: Optional[float] = None
     selected_orb_window: Optional[str] = None
     buffer_pct: float = 0.001
@@ -306,6 +310,7 @@ class TradeCardState:
         self.buylist_member = bool(self.buylist_member)
         self.return_to_buylist_after_close = bool(self.return_to_buylist_after_close)
         self.buy_today_note = str(self.buy_today_note or "")
+        self.kis_ws_symbol_key = str(self.kis_ws_symbol_key or "").strip()
         self.breakout_price = _finite_float(self.breakout_price)
         self.selected_orb_window = (
             str(self.selected_orb_window).strip() if self.selected_orb_window else None
@@ -450,6 +455,7 @@ class TradeCardState:
             "buylist_member": self.buylist_member,
             "return_to_buylist_after_close": self.return_to_buylist_after_close,
             "buy_today_note": self.buy_today_note,
+            "kis_ws_symbol_key": self.kis_ws_symbol_key,
             "breakout_price": self.breakout_price,
             "selected_orb_window": self.selected_orb_window,
             "buffer_pct": self.buffer_pct,
@@ -553,6 +559,7 @@ class TradeCardState:
                 data.get("return_to_buylist_after_close", False)
             ),
             buy_today_note=str(data.get("buy_today_note", "")),
+            kis_ws_symbol_key=str(data.get("kis_ws_symbol_key", "")),
             breakout_price=data.get("breakout_price"),
             selected_orb_window=data.get("selected_orb_window"),
             buffer_pct=data.get("buffer_pct", 0.001),

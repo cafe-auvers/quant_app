@@ -757,7 +757,15 @@ def test_add_buy_today_rejects_same_symbol_active_in_another_account(
     assert "another account" in outcome.error_message
 
 
-def test_add_buy_today_is_applied_by_the_execution_owner(engine, roles):
+def test_add_buy_today_is_applied_by_the_execution_owner(engine, roles, monkeypatch):
+    from src.services import kis_ws_symbol_keys
+
+    class _LocalKeys:
+        def resolve(self, symbol):
+            assert symbol == "AAPL"
+            return "DNASAAPL"
+
+    monkeypatch.setattr(kis_ws_symbol_keys, "KisWsSymbolKeyStore", _LocalKeys)
     pc, laptop = roles
     claim_main_device(engine, pc)
     set_operator_control(engine, pc, laptop)
@@ -787,6 +795,8 @@ def test_add_buy_today_is_applied_by_the_execution_owner(engine, roles):
     assert outcome.command_id == queued.command.command_id
     assert outcome.status == OperatorCommandStatus.COMPLETED
     assert stored.board_status == BoardStatus.BUY_TODAY
+    assert queued.command.payload["board_command"]["kis_ws_symbol_key"] == "DNASAAPL"
+    assert stored.kis_ws_symbol_key == "DNASAAPL"
 
 
 def test_partial_fill_lifecycle_is_durable(engine, roles):
