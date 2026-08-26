@@ -95,6 +95,25 @@ def test_forming_candidate_status_maps_to_orb_forming():
     assert card.entry_runtime_status == EntryRuntimeStatus.ORB_FORMING
 
 
+def test_unavailable_candidate_status_maps_to_data_unavailable_with_reason():
+    card = _card()
+    item = _queue_item(
+        _candidate(
+            status=OrbCandidateStatus.NOT_AVAILABLE,
+            valid=False,
+            shares=0,
+            reason="09:30 opening bar is unavailable",
+            source_session_date="2026-08-19",
+        )
+    )
+
+    now = datetime(2026, 8, 19, 14, 0, tzinfo=timezone.utc)  # 10:00 ET
+    TradeCardOrbEvaluator(clock=lambda: now).update_card(card, item)
+
+    assert card.entry_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE
+    assert card.entry_block_reason == "09:30 opening bar is unavailable"
+
+
 def test_waiting_breakout_status_maps_correctly():
     card = _card()
     item = _queue_item(_candidate(status=OrbCandidateStatus.WAITING_BREAKOUT))

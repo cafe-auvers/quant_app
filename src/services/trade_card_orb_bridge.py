@@ -48,7 +48,7 @@ from src.utils.market_calendar import (
 _ORB_ACTIVE_STATUSES = {BoardStatus.BUY_TODAY}
 
 _CANDIDATE_STATUS_TO_ENTRY_RUNTIME_STATUS = {
-    OrbCandidateStatus.NOT_AVAILABLE: EntryRuntimeStatus.ORB_FORMING,
+    OrbCandidateStatus.NOT_AVAILABLE: EntryRuntimeStatus.DATA_UNAVAILABLE,
     OrbCandidateStatus.FORMING: EntryRuntimeStatus.ORB_FORMING,
     OrbCandidateStatus.WAITING_BREAKOUT: EntryRuntimeStatus.WAITING_BREAKOUT,
     OrbCandidateStatus.RISK_INVALID: EntryRuntimeStatus.RISK_INVALID,
@@ -61,7 +61,11 @@ _CANDIDATE_STATUS_TO_ENTRY_RUNTIME_STATUS = {
 # surface as the card's entry_block_reason -- anything else (FORMING,
 # WAITING_BREAKOUT, VALID, EXECUTE_READY) is a normal in-progress state, not
 # a block worth explaining.
-_BLOCKED_CANDIDATE_STATUSES = {OrbCandidateStatus.RISK_INVALID, OrbCandidateStatus.REJECTED}
+_BLOCKED_CANDIDATE_STATUSES = {
+    OrbCandidateStatus.NOT_AVAILABLE,
+    OrbCandidateStatus.RISK_INVALID,
+    OrbCandidateStatus.REJECTED,
+}
 
 _LIVE_SELECTION_CARD_STATUSES = {
     EntryRuntimeStatus.ORB_FORMING,
@@ -277,8 +281,8 @@ def _display_candidate(
     can execute immediately. Before the trigger, however, the board still
     needs to show the operator which risk-valid ORB plan is waiting. A manual
     selection always wins; automatic display otherwise prefers a completed,
-    risk-valid plan, then a still-forming plan, and only shows an invalid plan
-    after no viable/forming alternative remains.
+    risk-valid plan, then a still-forming plan, then unavailable data, and only
+    shows an invalid plan after no viable/forming alternative remains.
     """
 
     excluded = {str(window or "").strip() for window in excluded_windows}
@@ -321,6 +325,15 @@ def _display_candidate(
     if forming:
         order = {"1m": 0, "5m": 1, "30m": 2}
         return min(forming, key=lambda candidate: order.get(candidate.window, 99))
+
+    unavailable = [
+        candidate
+        for candidate in candidates.values()
+        if candidate.status == OrbCandidateStatus.NOT_AVAILABLE
+    ]
+    if unavailable:
+        order = {"1m": 0, "5m": 1, "30m": 2}
+        return min(unavailable, key=lambda candidate: order.get(candidate.window, 99))
 
     invalid = [
         candidate

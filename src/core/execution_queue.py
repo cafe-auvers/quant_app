@@ -586,6 +586,54 @@ def _intraday_source_session_date(intraday: pd.DataFrame) -> Optional[str]:
         return None
 
 
+def _missing_orb_range_state(
+    intraday: pd.DataFrame,
+    window: str,
+) -> tuple[OrbCandidateStatus, str]:
+    """Explain why a supported ORB range could not be calculated.
+
+    A completed window with later current-session bars but no 09:30 bar is a
+    data failure, not a window that is still forming.  Keeping those cases
+    separate prevents a missing opening bar from leaving the 1m plan in
+    ``FORMING`` for the rest of the session.
+    """
+
+    window_minutes = {"1m": 1, "5m": 5, "30m": 30}.get(window)
+    if window_minutes is None:
+        return OrbCandidateStatus.NOT_AVAILABLE, f"unsupported ORB window {window}"
+    if "High" not in intraday.columns or "Low" not in intraday.columns:
+        return (
+            OrbCandidateStatus.NOT_AVAILABLE,
+            f"{window} ORB high/low market data is unavailable",
+        )
+
+    try:
+        local_index = market_local_index(intraday.sort_index().index)
+        if local_index is None or local_index.empty:
+            raise ValueError("invalid intraday timestamp index")
+        session_start = local_index[-1].normalize() + pd.Timedelta(
+            hours=9, minutes=30
+        )
+        session_index = local_index[
+            local_index.normalize() == session_start.normalize()
+        ]
+        window_end = session_start + pd.Timedelta(minutes=window_minutes)
+    except (AttributeError, TypeError, ValueError):
+        return OrbCandidateStatus.NOT_AVAILABLE, "intraday timestamps are invalid"
+
+    if session_index.empty or session_index[-1] < window_end:
+        return OrbCandidateStatus.FORMING, "ORB window has not completed"
+    if not (session_index == session_start).any():
+        return (
+            OrbCandidateStatus.NOT_AVAILABLE,
+            f"09:30 opening bar is unavailable for the completed {window} ORB window",
+        )
+    return (
+        OrbCandidateStatus.NOT_AVAILABLE,
+        f"completed {window} ORB window contains invalid high/low market data",
+    )
+
+
 def calculate_position_values(
     account_size: float,
     risk_percent: float,
@@ -666,11 +714,12 @@ def build_orb_candidate(
     )
     orb_range = strategy_evaluation.orb_range
     if orb_range is None:
+        status, reason = _missing_orb_range_state(intraday, window)
         return _candidate_unavailable(
             symbol,
             window,
-            OrbCandidateStatus.FORMING,
-            "ORB window has not completed",
+            status,
+            reason,
             source_session_date=source_session_date,
         )
 

@@ -630,6 +630,26 @@ def test_queue_status_orb_forming_when_windows_not_completed():
     assert item.status == ExecutionQueueStatus.ORB_FORMING
 
 
+def test_completed_orb_window_with_missing_opening_bar_is_not_available():
+    intraday = _intraday(minutes=4)
+    intraday = intraday.iloc[1:]
+
+    candidate = build_orb_candidate(
+        symbol="AAPL",
+        window="1m",
+        intraday=intraday,
+        breakout_price=100.0,
+        current_price=101.0,
+        account_size=100000.0,
+        risk_percent=0.005,
+        adr_percent=5.0,
+    )
+
+    assert candidate.status == OrbCandidateStatus.NOT_AVAILABLE
+    assert candidate.source_session_date == "2026-07-01"
+    assert "09:30 opening bar is unavailable" in candidate.reason
+
+
 def test_stop_adr_validation_follows_existing_thresholds():
     too_tight = build_orb_candidate(
         symbol="AAPL",
