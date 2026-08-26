@@ -21,6 +21,7 @@ from src.core.market_pulse import (
     MarketPulseInstrument,
     MarketPulseRow,
     MarketPulseSnapshot,
+    calculate_intraday_return,
     calculate_market_pulse_metrics,
     rank_symbols_by_relative_strength,
     latest_valid_session_date,
@@ -75,6 +76,13 @@ class MarketPulseComponentsBatch:
     source: str
 
 
+@dataclass(frozen=True)
+class MarketPulseIntradayBatch:
+    histories: Mapping[str, pd.DataFrame]
+    failures: Mapping[str, str]
+    source: str
+
+
 class MarketPulseHistoryProvider(Protocol):
     def fetch(
         self,
@@ -86,7 +94,7 @@ class MarketPulseHistoryProvider(Protocol):
 
 
 class YFinanceMarketPulseProvider:
-    """Narrow, replaceable EOD provider using the existing batch loader."""
+    """Replaceable yfinance provider for EOD and intraday awareness data."""
 
     source = "yfinance_adjusted"
 
@@ -151,6 +159,44 @@ class YFinanceMarketPulseProvider:
             else:
                 histories[symbol] = frame
         return MarketPulseHistoryBatch(histories, failures, self.source, raw)
+
+    def fetch_intraday(
+        self,
+        tickers: Sequence[str],
+    ) -> MarketPulseIntradayBatch:
+        """Fetch recent 5-minute bars in one batch for current-session moves."""
+
+        symbols = list(dict.fromkeys(str(value).strip().upper() for value in tickers))
+        try:
+            raw = download_price_history(
+                symbols,
+                period="5d",
+                interval="5m",
+                max_symbols=None,
+                chunk_size=self.chunk_size,
+                threads=8,
+                batch_sleep=0.5,
+                max_retries=self.max_retries,
+                fallback_to_single=False,
+                chart_fallback=False,
+                timeout_seconds=self.timeout_seconds,
+            )
+        except Exception as exc:
+            logger.exception("Market Pulse yfinance intraday batch failed")
+            reason = f"Intraday provider request failed: {exc}"
+            return MarketPulseIntradayBatch(
+                {}, {symbol: reason for symbol in symbols}, "yfinance_5m"
+            )
+
+        histories = {}
+        failures = {}
+        for symbol in symbols:
+            frame = _extract_symbol_history(raw, symbol)
+            if frame is None or frame.empty:
+                failures[symbol] = "No usable intraday history returned"
+            else:
+                histories[symbol] = frame
+        return MarketPulseIntradayBatch(histories, failures, "yfinance_5m")
 
     @staticmethod
     def _company_name_tokens(value: object) -> set[str]:
@@ -462,6 +508,91 @@ class MarketPulseService:
                 )
         return histories
 
+    def refresh_intraday(self) -> MarketPulseSnapshot:
+        """Refresh only yfinance intraday returns on the latest snapshot."""
+
+        if not self._refresh_lock.acquire(blocking=False):
+            raise MarketPulseRefreshInProgress(
+                "A Market Pulse refresh is already running"
+            )
+        started = time.monotonic()
+        try:
+            snapshot = self.load_cached_snapshot()
+            if snapshot is None:
+                raise MarketPulseRefreshError(
+                    "No Market Pulse snapshot is available. Run Refresh first."
+                )
+            fetch_intraday = getattr(self.provider, "fetch_intraday", None)
+            if not callable(fetch_intraday):
+                raise MarketPulseRefreshError(
+                    "The configured Market Pulse provider does not support intraday refresh."
+                )
+
+            tickers = list(dict.fromkeys(row.ticker for row in snapshot.rows))
+            logger.info(
+                "Market Pulse intraday-only refresh started",
+                extra={"ticker_count": len(tickers)},
+            )
+            intraday_batch = fetch_intraday(tickers)
+            if intraday_batch.failures:
+                logger.warning(
+                    "Market Pulse intraday-only provider returned partial failures",
+                    extra={"failures": dict(intraday_batch.failures)},
+                )
+            if not intraday_batch.histories:
+                reasons = sorted(set(intraday_batch.failures.values()))
+                detail = (
+                    reasons[0]
+                    if reasons
+                    else "Intraday provider returned an empty response"
+                )
+                raise MarketPulseRefreshError(detail)
+
+            rows = tuple(
+                replace(
+                    row,
+                    intraday_return=calculate_intraday_return(
+                        intraday_batch.histories.get(row.ticker, pd.DataFrame()),
+                        row.close,
+                    ),
+                )
+                for row in snapshot.rows
+            )
+            refreshed = replace(
+                snapshot,
+                refreshed_at=dt.datetime.now(dt.timezone.utc),
+                rows=rows,
+            )
+
+            if self.engine is not None:
+                try:
+                    MarketPulseSnapshotRepository(self.engine).upsert_snapshot(
+                        refreshed, self.instruments
+                    )
+                except Exception:
+                    logger.warning(
+                        "Market Pulse intraday-only SQL snapshot upsert failed",
+                        exc_info=True,
+                    )
+            save_json(self.cache_path, snapshot_to_dict(refreshed))
+            logger.info(
+                "Market Pulse intraday-only refresh completed",
+                extra={
+                    "duration_seconds": round(time.monotonic() - started, 3),
+                    "row_count": len(refreshed.rows),
+                    "updated_ticker_count": len(intraday_batch.histories),
+                },
+            )
+            return refreshed
+        except Exception:
+            logger.exception(
+                "Market Pulse intraday-only refresh failed",
+                extra={"duration_seconds": round(time.monotonic() - started, 3)},
+            )
+            raise
+        finally:
+            self._refresh_lock.release()
+
     def refresh(
         self,
         *,
@@ -519,6 +650,23 @@ class MarketPulseService:
 
             histories = self._merge_histories(cached_histories, batch.histories)
             as_of_date = self._resolve_common_as_of_date(histories, tickers, expected_date)
+            intraday_histories: Mapping[str, pd.DataFrame] = {}
+            fetch_intraday = getattr(self.provider, "fetch_intraday", None)
+            if callable(fetch_intraday):
+                try:
+                    intraday_batch = fetch_intraday(tickers)
+                    intraday_histories = intraday_batch.histories
+                    if intraday_batch.failures:
+                        logger.warning(
+                            "Market Pulse intraday provider returned partial failures",
+                            extra={"failures": dict(intraday_batch.failures)},
+                        )
+                except Exception:
+                    # Intraday awareness is additive; completed-session metrics
+                    # remain usable when Yahoo's minute feed is unavailable.
+                    logger.warning(
+                        "Market Pulse intraday refresh failed", exc_info=True
+                    )
             components: Mapping[str, tuple[str, ...]] = {}
             fetch_components = getattr(self.provider, "fetch_components", None)
             if callable(fetch_components):
@@ -597,6 +745,10 @@ class MarketPulseService:
                         display_order=item.display_order,
                         rank=0,
                         close=metrics.close,
+                        intraday_return=calculate_intraday_return(
+                            intraday_histories.get(item.ticker, pd.DataFrame()),
+                            metrics.close,
+                        ),
                         daily_return=metrics.daily_return,
                         weekly_return=metrics.weekly_return,
                         monthly_return=metrics.monthly_return,

@@ -16,7 +16,11 @@ To add an ETF, add a unique `(section, ticker)` record and choose its display or
 
 ## Data and metric conventions
 
-Refresh uses the application's existing batched yfinance daily-history loader through a replaceable provider interface. The loader requests two years of history in batches, applies a 15-second request timeout and two bounded retries, and does not use per-row fallback requests. Its `auto_adjust=True` series is used consistently as the reference series; the existing `price_history` table stores it through the established daily OHLCV path, including `adj_close`.
+Refresh uses the application's existing batched yfinance history loader through a replaceable provider interface. The completed-session path requests two years of daily history in batches, applies a 15-second request timeout and two bounded retries, and does not use per-row fallback requests. Its `auto_adjust=True` series is used consistently as the reference series; the existing `price_history` table stores it through the established daily OHLCV path, including `adj_close`.
+
+`Intraday %` is additive and comes from a second batched yfinance request for recent 5-minute bars. It compares the latest usable 5-minute close with the latest completed-session close. If minute data is unavailable, the cell remains `N/A` while the completed-session metrics remain usable and unchanged.
+
+The `Refresh` button runs the full completed-session, holdings, relative-strength, and intraday workflow. `Refresh Intraday` calls only the yfinance 5-minute path against the latest cached completed-session closes; it preserves daily, weekly, monthly, 52-week, component, status, and rank values exactly as stored. Both actions share one refresh lock, so they cannot overlap.
 
 Only dates at or before the latest expected completed US session are considered. Daily session dates remain exchange calendar dates and are not shifted through Korea time. Duplicate dates are coalesced deterministically. For a reference price `p[t]`, returns are stored as decimals:
 
@@ -24,6 +28,7 @@ Only dates at or before the latest expected completed US session are considered.
 daily          = p[t] / p[t-1]  - 1
 weekly         = p[t] / p[t-5]  - 1
 monthly        = p[t] / p[t-21] - 1
+intraday       = latest 5-minute close / completed-session close - 1
 above 52W low  = p[t] / min(last 252 sessions) - 1
 below 52W high = p[t] / max(last 252 sessions) - 1
 ```
@@ -37,10 +42,10 @@ Daily rank is calculated independently inside each section, descending by daily 
 The tab loads `data/market_pulse_snapshot.json` immediately. This small atomic local projection allows cached rendering before optional MySQL initialization or network access. Refresh then runs on a dedicated `QThread`:
 
 1. Load active configuration and any available raw daily history from `price_history` in one universe query.
-2. Request all unique ETF tickers through the batched provider.
+2. Request all unique ETF tickers through the batched daily provider and the batched yfinance 5-minute provider.
 3. Resolve the modal latest completed session across returned instruments. A small number of lagging symbols are marked stale/unavailable instead of moving the whole dashboard backward.
 4. Calculate every row and daily rank off the UI thread.
-5. Upsert raw bars into the existing `price_history` table, then upsert metric snapshots.
+5. Upsert raw daily bars into the existing `price_history` table, then upsert metric snapshots including `intraday_return`.
 6. Atomically replace the local display cache and finally swap the visible table models.
 
 Only one refresh may run at a time. A second rapid click is suppressed. The previous snapshot remains visible throughout loading and after a timeout, empty response, total provider failure, or database error. Partial ticker failures retain valid rows and show concise row/status warnings; detailed exceptions and row counts go to application logs. There is no polling loop.

@@ -214,6 +214,36 @@ def test_hourly_line_creation_pushes_to_both_split_views(monkeypatch):
         assert ', "AAPL")' in view.page().scripts[0]
 
 
+def test_daily_line_creation_pushes_to_both_split_views(monkeypatch):
+    window = _split_window(monkeypatch)
+    window.chart_drawings = {}
+    window.tradingview_line_tool_active = True
+    window._save_state = lambda: None
+    window.append_log = lambda message: None
+
+    window.save_chart_drawing(
+        "AAPL",
+        json.dumps(
+            {
+                "id": "daily-shared-line",
+                "start_date": "2026-08-20",
+                "start_price": 11.1,
+                "end_date": "2026-09-23",
+                "end_price": 13.2,
+                "timeframe": "1D",
+            }
+        ),
+    )
+
+    for view in (
+        window.tradingview_chart_view,
+        window.tradingview_split_chart_view,
+    ):
+        assert len(view.page().scripts) == 1
+        assert "window.upsertSyncedDrawing" in view.page().scripts[0]
+        assert '"timeframe":"1D"' in view.page().scripts[0]
+
+
 def test_finished_sibling_page_reconciles_drawings_missed_while_loading(monkeypatch):
     window = _split_window(monkeypatch)
     window.chart_drawings = {
@@ -330,6 +360,48 @@ def test_hourly_weekend_endpoint_snaps_to_next_daily_axis_bar():
     assert '"start": {"time": "2026-08-21"' in chart_html
     assert '"end": {"time": "2026-08-24"' in chart_html
     assert "if (!usesIntradayTime) return snapDailyDrawingTimeToAxis(value, prefer);" in chart_html
+
+
+def test_daily_future_endpoint_uses_an_hourly_axis_backed_time():
+    history = pd.DataFrame(
+        {
+            "Open": [10.0, 10.5, 11.0, 11.5],
+            "High": [11.0, 11.5, 12.0, 12.5],
+            "Low": [9.5, 10.0, 10.5, 11.0],
+            "Close": [10.5, 11.0, 11.5, 12.0],
+            "Volume": [1000, 1200, 1100, 1300],
+        },
+        index=pd.to_datetime(
+            [
+                "2026-08-20 14:30",
+                "2026-08-20 15:30",
+                "2026-08-21 14:30",
+                "2026-08-21 15:30",
+            ],
+            utc=True,
+        ),
+    )
+    drawing = {
+        "id": "daily-future-line",
+        "type": "line",
+        "start_date": "2026-08-20",
+        "start_price": 10.0,
+        "end_date": "2026-09-23",
+        "end_price": 13.0,
+        "timeframe": "1D",
+    }
+
+    chart_html = ChartLightweightRenderMixin._generate_tradingview_lightweight_chart_html(
+        "AAPL",
+        history,
+        options={"timeframe": "1H"},
+        drawings=[drawing],
+    )
+
+    hourly_axis_time = int(pd.Timestamp("2026-09-23 15:30", tz="UTC").timestamp())
+    assert f'"end": {{"time": {hourly_axis_time}' in chart_html
+    assert f'{{"time": {hourly_axis_time}}}' in chart_html
+    assert "return nextTime != null" in chart_html
 
 
 def test_hourly_initial_range_counts_same_81_sessions_as_daily():

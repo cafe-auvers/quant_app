@@ -15,13 +15,17 @@ from src.core.market_pulse import (
     MarketPulseSnapshot,
     rank_market_pulse_rows,
 )
-from src.ui.market_pulse import MarketPulseMixin, MarketPulseTableModel
+from src.ui.market_pulse import (
+    MarketPulseIntradayRefreshWorker,
+    MarketPulseMixin,
+    MarketPulseTableModel,
+)
 
 
 _APP = None
 
 
-def _row(section, ticker, daily, rank=0):
+def _row(section, ticker, daily, rank=0, intraday=None):
     return MarketPulseRow(
         section=section,
         display_name=ticker,
@@ -29,6 +33,7 @@ def _row(section, ticker, daily, rank=0):
         display_order=1,
         rank=rank,
         close=100.0,
+        intraday_return=intraday,
         daily_return=daily,
         weekly_return=daily,
         monthly_return=daily,
@@ -59,6 +64,7 @@ class _Service:
     def __init__(self, snapshot):
         self.snapshot = snapshot
         self.refresh_calls = 0
+        self.intraday_refresh_calls = 0
         self.engine = None
 
     def load_cached_snapshot(self):
@@ -69,6 +75,10 @@ class _Service:
 
     def refresh(self):
         self.refresh_calls += 1
+        return self.snapshot
+
+    def refresh_intraday(self):
+        self.intraday_refresh_calls += 1
         return self.snapshot
 
 
@@ -92,10 +102,15 @@ class _Host(MarketPulseMixin, QWidget):
 
 def test_table_model_formats_percentage_once_and_keeps_missing_last():
     model = MarketPulseTableModel(
-        [_row(SECTORS, "BBB", None, rank=2), _row(SECTORS, "AAA", 0.0127, rank=1)]
+        [
+            _row(SECTORS, "BBB", None, rank=2),
+            _row(SECTORS, "AAA", 0.0127, rank=1, intraday=0.023),
+        ]
     )
 
-    assert model.data(model.index(0, 4), Qt.DisplayRole) == "+1.3%"
+    assert model.headerData(4, Qt.Horizontal, Qt.DisplayRole) == "Intraday %"
+    assert model.data(model.index(0, 4), Qt.DisplayRole) == "+2.3%"
+    assert model.data(model.index(0, 5), Qt.DisplayRole) == "+1.3%"
     assert model.rows[-1].ticker == "BBB"
     model.sort(3, Qt.AscendingOrder)
     assert {row.ticker: row.rank for row in model.rows} == {"AAA": 1, "BBB": 2}
@@ -123,7 +138,7 @@ def test_component_columns_open_the_in_app_tradingview_chart():
     )
     host.load_tradingview_chart = lambda **kwargs: loaded.append(kwargs)
 
-    host._open_market_pulse_component_chart(model.index(0, 9))
+    host._open_market_pulse_component_chart(model.index(0, 10))
 
     assert state == {"sidebar_symbol": "AEM", "chart_symbol": "AEM"}
     assert host.tabs.currentWidget() is host.tradingview_widget
@@ -146,10 +161,32 @@ def test_market_pulse_page_loads_cache_and_renders_all_sections():
     }
     assert all(model.rowCount() == 1 for model in host.market_pulse_models.values())
     assert host.market_pulse_refresh_button.isEnabled()
+    assert host.market_pulse_intraday_refresh_button.text() == "Refresh Intraday"
+    assert host.market_pulse_intraday_refresh_button.isEnabled()
     host._set_market_pulse_loading(True)
     assert host.market_pulse_loading_bar.isVisible()
     assert not host.market_pulse_refresh_button.isEnabled()
+    assert not host.market_pulse_intraday_refresh_button.isEnabled()
     host._on_market_pulse_refresh_error("offline")
     assert "last successful snapshot remains displayed" in host.market_pulse_message_label.text()
+    host._set_market_pulse_loading(True, intraday_only=True)
+    assert host.market_pulse_refresh_button.text() == "Refresh"
+    assert host.market_pulse_intraday_refresh_button.text() == "Refreshing…"
+    host._on_market_pulse_intraday_refresh_error("intraday offline")
+    assert "Intraday refresh failed" in host.market_pulse_message_label.text()
+    assert host.market_pulse_intraday_refresh_button.isEnabled()
     assert all(model.rowCount() == 1 for model in host.market_pulse_models.values())
     host.close()
+
+
+def test_intraday_refresh_worker_calls_only_intraday_service_path():
+    service = _Service(_snapshot())
+    worker = MarketPulseIntradayRefreshWorker(service)
+    snapshots = []
+    worker.snapshot_ready.connect(snapshots.append)
+
+    worker.run()
+
+    assert service.intraday_refresh_calls == 1
+    assert service.refresh_calls == 0
+    assert snapshots == [service.snapshot]

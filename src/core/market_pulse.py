@@ -57,6 +57,7 @@ class MarketPulseRow:
     monthly_return: Optional[float]
     pct_above_52w_low: Optional[float]
     pct_below_52w_high: Optional[float]
+    intraday_return: Optional[float] = None
     stock1: Optional[str] = None
     stock2: Optional[str] = None
     stock3: Optional[str] = None
@@ -227,6 +228,26 @@ def calculate_market_pulse_metrics(
     )
 
 
+def calculate_intraday_return(
+    history: pd.DataFrame,
+    prior_close: Optional[float],
+) -> Optional[float]:
+    """Return the latest intraday close versus the completed-session close."""
+
+    baseline = _finite_number(prior_close)
+    if baseline is None or baseline <= 0 or history is None or history.empty:
+        return None
+    if "Close" not in history.columns:
+        return None
+    closes = pd.to_numeric(history["Close"], errors="coerce").dropna()
+    if closes.empty:
+        return None
+    latest = _finite_number(closes.iloc[-1])
+    if latest is None or latest <= 0:
+        return None
+    return latest / baseline - 1.0
+
+
 def latest_valid_session_date(
     history: pd.DataFrame,
     not_after: dt.date,
@@ -355,7 +376,7 @@ def rank_market_pulse_rows(rows: Iterable[MarketPulseRow]) -> tuple[MarketPulseR
 
 def snapshot_to_dict(snapshot: MarketPulseSnapshot) -> dict:
     return {
-        "version": 3,
+        "version": 4,
         "as_of_date": snapshot.as_of_date.isoformat(),
         "refreshed_at": snapshot.refreshed_at.isoformat(),
         "source": snapshot.source,
@@ -370,6 +391,7 @@ def snapshot_to_dict(snapshot: MarketPulseSnapshot) -> dict:
                 "display_order": row.display_order,
                 "rank": row.rank,
                 "close": row.close,
+                "intraday_return": row.intraday_return,
                 "daily_return": row.daily_return,
                 "weekly_return": row.weekly_return,
                 "monthly_return": row.monthly_return,
@@ -406,6 +428,7 @@ def snapshot_from_dict(payload: Mapping) -> Optional[MarketPulseSnapshot]:
                 display_order=int(raw.get("display_order", 0)),
                 rank=int(raw.get("rank", 0)),
                 close=_finite_number(raw.get("close")),
+                intraday_return=_finite_number(raw.get("intraday_return")),
                 daily_return=_finite_number(raw.get("daily_return")),
                 weekly_return=_finite_number(raw.get("weekly_return")),
                 monthly_return=_finite_number(raw.get("monthly_return")),

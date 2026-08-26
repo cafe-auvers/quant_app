@@ -49,6 +49,7 @@ class MarketPulseTableModel(QAbstractTableModel):
         ("Name", "display_name"),
         ("Ticker", "ticker"),
         ("Close", "close"),
+        ("Intraday %", "intraday_return"),
         ("Daily %", "daily_return"),
         ("Weekly %", "weekly_return"),
         ("Monthly %", "monthly_return"),
@@ -64,6 +65,7 @@ class MarketPulseTableModel(QAbstractTableModel):
         "Configured market segment, sector, industry, or theme name.",
         "ETF proxy ticker.",
         "Latest completed-session closing price.",
+        "Latest yfinance 5-minute close / latest completed-session close - 1.",
         "Reference price / prior session - 1.",
         "Reference price / five sessions earlier - 1.",
         "Reference price / 21 sessions earlier - 1.",
@@ -78,7 +80,7 @@ class MarketPulseTableModel(QAbstractTableModel):
     def __init__(self, rows: Sequence[MarketPulseRow] = (), parent=None) -> None:
         super().__init__(parent)
         self._rows = list(rows)
-        self.sort_column = 4
+        self.sort_column = 5
         self.sort_order = Qt.DescendingOrder
         self.sort(self.sort_column, self.sort_order)
 
@@ -116,9 +118,9 @@ class MarketPulseTableModel(QAbstractTableModel):
             return str(int(value))
         if column == 3:
             return f"{float(value):,.2f}"
-        if column in (4, 5, 6):
+        if column in (4, 5, 6, 7):
             return f"{float(value):+.1%}"
-        if column in (7, 8):
+        if column in (8, 9):
             return f"{float(value):+.2%}"
         return str(value)
 
@@ -139,7 +141,7 @@ class MarketPulseTableModel(QAbstractTableModel):
         if role == Qt.ForegroundRole:
             if row.status not in {"available", "cached"}:
                 return QColor("#8b91a1")
-            if index.column() in (4, 5, 6) and value is not None:
+            if index.column() in (4, 5, 6, 7) and value is not None:
                 number = float(value)
                 if number > 0.0005:
                     return QColor("#137333")
@@ -148,10 +150,10 @@ class MarketPulseTableModel(QAbstractTableModel):
         if role == Qt.FontRole and index.column() >= 2:
             font = QFont("Consolas")
             font.setStyleHint(QFont.Monospace)
-            if index.column() >= 9 and value:
+            if index.column() >= 10 and value:
                 font.setUnderline(True)
             return font
-        if role == Qt.ForegroundRole and index.column() >= 9 and value:
+        if role == Qt.ForegroundRole and index.column() >= 10 and value:
             return QColor("#1565c0")
         if role in (Qt.ToolTipRole, Qt.AccessibleDescriptionRole):
             metric_help = self.HEADER_TOOLTIPS[index.column()]
@@ -183,7 +185,7 @@ class MarketPulseTableModel(QAbstractTableModel):
             else:
                 available.append(row)
 
-        numeric = column in (0, 3, 4, 5, 6, 7, 8)
+        numeric = column in (0, 3, 4, 5, 6, 7, 8, 9)
         if numeric:
             if order == Qt.DescendingOrder:
                 available.sort(key=lambda row: (-float(getattr(row, field)), row.ticker))
@@ -218,12 +220,12 @@ class MarketPulseMetricDelegate(QStyledItemDelegate):
             painter.save()
             painter.fillRect(option.rect.adjusted(2, 2, -2, -2), color)
             painter.restore()
-        elif index.column() in (7, 8) and value is not None:
+        elif index.column() in (8, 9) and value is not None:
             number = float(value)
-            magnitude = max(0.0, number) if index.column() == 7 else abs(min(0.0, number))
+            magnitude = max(0.0, number) if index.column() == 8 else abs(min(0.0, number))
             width = min(1.0, magnitude) * max(0, option.rect.width() - 8)
             if width > 0:
-                bar_color = QColor(46, 160, 67, 58) if index.column() == 7 else QColor(214, 39, 40, 55)
+                bar_color = QColor(46, 160, 67, 58) if index.column() == 8 else QColor(214, 39, 40, 55)
                 painter.save()
                 painter.setPen(Qt.NoPen)
                 painter.setBrush(bar_color)
@@ -247,6 +249,23 @@ class MarketPulseRefreshWorker(QThread):
     def run(self) -> None:
         try:
             self.snapshot_ready.emit(self.service.refresh())
+        except MarketPulseRefreshInProgress as exc:
+            self.error_occurred.emit(str(exc))
+        except Exception as exc:
+            self.error_occurred.emit(str(exc) or type(exc).__name__)
+
+
+class MarketPulseIntradayRefreshWorker(QThread):
+    snapshot_ready = pyqtSignal(object)
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, service: MarketPulseService, parent=None) -> None:
+        super().__init__(parent)
+        self.service = service
+
+    def run(self) -> None:
+        try:
+            self.snapshot_ready.emit(self.service.refresh_intraday())
         except MarketPulseRefreshInProgress as exc:
             self.error_occurred.emit(str(exc))
         except Exception as exc:
@@ -288,12 +307,25 @@ class MarketPulseMixin:
         self.market_pulse_refresh_button = QPushButton("Refresh")
         self.market_pulse_refresh_button.setObjectName("marketPulseRefreshButton")
         self.market_pulse_refresh_button.setToolTip(
-            "Refresh ETF proxies, eligible holdings, and their relative-strength order."
+            "Refresh completed-session metrics, ETF holdings, relative-strength order, and intraday values."
         )
         self.market_pulse_refresh_button.clicked.connect(self.refresh_market_pulse)
+        self.market_pulse_intraday_refresh_button = QPushButton("Refresh Intraday")
+        self.market_pulse_intraday_refresh_button.setObjectName(
+            "marketPulseIntradayRefreshButton"
+        )
+        self.market_pulse_intraday_refresh_button.setToolTip(
+            "Refresh only Intraday % from yfinance; keep daily, weekly, monthly, and rank unchanged."
+        )
+        self.market_pulse_intraday_refresh_button.clicked.connect(
+            self.refresh_market_pulse_intraday
+        )
         status_box.addWidget(self.market_pulse_as_of_label, 0, Qt.AlignRight)
         status_box.addWidget(self.market_pulse_updated_label, 0, Qt.AlignRight)
         status_box.addWidget(self.market_pulse_refresh_button, 0, Qt.AlignRight)
+        status_box.addWidget(
+            self.market_pulse_intraday_refresh_button, 0, Qt.AlignRight
+        )
         header.addLayout(status_box)
         root_layout.addLayout(header)
 
@@ -361,7 +393,7 @@ class MarketPulseMixin:
         table.setModel(model)
         table.setItemDelegate(MarketPulseMetricDelegate(table))
         table.setSortingEnabled(True)
-        table.horizontalHeader().setSortIndicator(4, Qt.DescendingOrder)
+        table.horizontalHeader().setSortIndicator(5, Qt.DescendingOrder)
         table.horizontalHeader().setSortIndicatorShown(True)
         table.horizontalHeader().setSectionsClickable(True)
         table.verticalHeader().setVisible(False)
@@ -381,18 +413,18 @@ class MarketPulseMixin:
             "font-weight: 600; border: none; border-right: 1px solid #e0e3eb; "
             "border-bottom: 1px solid #d1d4dc; padding: 7px 5px; }"
         )
-        widths = (56, 230, 78, 92, 92, 92, 92, 175, 175, 76, 76, 76, 76)
+        widths = (56, 230, 78, 92, 92, 92, 92, 92, 175, 175, 76, 76, 76, 76)
         header = table.horizontalHeader()
         for column, width in enumerate(widths):
             header.setSectionResizeMode(column, QHeaderView.Fixed)
             table.setColumnWidth(column, width)
         header.setSectionResizeMode(1, QHeaderView.Stretch)
-        table.setMinimumWidth(1150)
+        table.setMinimumWidth(1240)
         self._resize_market_pulse_table(table, 0)
         return table
 
     def _open_market_pulse_component_chart(self, index: QModelIndex) -> None:
-        if not index.isValid() or index.column() < 9:
+        if not index.isValid() or index.column() < 10:
             return
         symbol = str(index.data(Qt.UserRole) or "").strip().upper()
         if not symbol:
@@ -440,7 +472,9 @@ class MarketPulseMixin:
         worker.error_occurred.connect(self._on_market_pulse_refresh_error)
         self._set_market_pulse_loading(True)
         if hasattr(self, "append_log"):
-            self.append_log("Market Pulse refresh started (batched EOD data).")
+            self.append_log(
+                "Market Pulse refresh started (completed-session and intraday data)."
+            )
         track_worker = getattr(self, "_track_worker", None)
         if callable(track_worker):
             track_worker("market_pulse_worker", worker)
@@ -448,10 +482,48 @@ class MarketPulseMixin:
             worker.finished.connect(lambda: setattr(self, "market_pulse_worker", None))
         worker.start()
 
-    def _set_market_pulse_loading(self, loading: bool) -> None:
+    def refresh_market_pulse_intraday(self, *_args) -> None:
+        worker = self.__dict__.get("market_pulse_worker")
+        if worker is not None and worker.isRunning():
+            self._show_market_pulse_message(
+                "A Market Pulse refresh is already running.", "info"
+            )
+            return
+        self.market_pulse_service.set_engine(self.__dict__.get("db_engine"))
+        worker = MarketPulseIntradayRefreshWorker(self.market_pulse_service)
+        self.market_pulse_worker = worker
+        worker.snapshot_ready.connect(
+            self._on_market_pulse_intraday_refresh_ready
+        )
+        worker.error_occurred.connect(
+            self._on_market_pulse_intraday_refresh_error
+        )
+        self._set_market_pulse_loading(True, intraday_only=True)
+        if hasattr(self, "append_log"):
+            self.append_log("Market Pulse intraday-only refresh started.")
+        track_worker = getattr(self, "_track_worker", None)
+        if callable(track_worker):
+            track_worker("market_pulse_worker", worker)
+        else:
+            worker.finished.connect(
+                lambda: setattr(self, "market_pulse_worker", None)
+            )
+        worker.start()
+
+    def _set_market_pulse_loading(
+        self, loading: bool, *, intraday_only: bool = False
+    ) -> None:
         self.market_pulse_loading_bar.setVisible(loading)
         self.market_pulse_refresh_button.setEnabled(not loading)
-        self.market_pulse_refresh_button.setText("Refreshing…" if loading else "Refresh")
+        self.market_pulse_intraday_refresh_button.setEnabled(not loading)
+        self.market_pulse_refresh_button.setText(
+            "Refreshing…" if loading and not intraday_only else "Refresh"
+        )
+        self.market_pulse_intraday_refresh_button.setText(
+            "Refreshing…"
+            if loading and intraday_only
+            else "Refresh Intraday"
+        )
 
     def _on_market_pulse_refresh_ready(self, snapshot: MarketPulseSnapshot) -> None:
         self._render_market_pulse_snapshot(snapshot)
@@ -471,6 +543,28 @@ class MarketPulseMixin:
         )
         if hasattr(self, "append_log"):
             self.append_log(f"Market Pulse refresh failed: {message}")
+
+    def _on_market_pulse_intraday_refresh_ready(
+        self, snapshot: MarketPulseSnapshot
+    ) -> None:
+        self._render_market_pulse_snapshot(snapshot)
+        self._set_market_pulse_loading(False)
+        updated = sum(row.intraday_return is not None for row in snapshot.rows)
+        if hasattr(self, "append_log"):
+            self.append_log(
+                f"Market Pulse intraday-only refresh complete: "
+                f"{updated}/{len(snapshot.rows)} rows updated."
+            )
+
+    def _on_market_pulse_intraday_refresh_error(self, message: str) -> None:
+        self._set_market_pulse_loading(False)
+        self._show_market_pulse_message(
+            "Intraday refresh failed; the last successful snapshot remains "
+            f"displayed. {message}",
+            "error",
+        )
+        if hasattr(self, "append_log"):
+            self.append_log(f"Market Pulse intraday-only refresh failed: {message}")
 
     def _render_market_pulse_snapshot(self, snapshot: MarketPulseSnapshot) -> None:
         self.market_pulse_snapshot = snapshot

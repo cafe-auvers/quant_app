@@ -947,8 +947,12 @@ def test_tradingview_intraday_chart_keeps_future_date_drawings_in_future():
         storage_symbol="AAPL",
     )
 
-    start_epoch = int(pd.Timestamp("2026-01-05").tz_localize("UTC").timestamp())
-    end_epoch = int(pd.Timestamp("2026-01-06").tz_localize("UTC").timestamp())
+    start_epoch = int(
+        pd.Timestamp("2026-01-05 14:30").tz_localize("UTC").timestamp()
+    )
+    end_epoch = int(
+        pd.Timestamp("2026-01-06 15:30").tz_localize("UTC").timestamp()
+    )
     assert '"future-line"' in chart_html
     assert f'"start": {{"time": {start_epoch}' in chart_html
     assert f'"end": {{"time": {end_epoch}' in chart_html

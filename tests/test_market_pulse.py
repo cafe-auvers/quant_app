@@ -14,6 +14,7 @@ from src.core.market_pulse import (
     MarketPulseInstrument,
     MarketPulseRow,
     MarketPulseSnapshot,
+    calculate_intraday_return,
     calculate_market_pulse_metrics,
     calculate_relative_strength_vs_benchmark,
     rank_symbols_by_relative_strength,
@@ -30,6 +31,7 @@ from src.infrastructure.database.schema import (
 from src.services.market_pulse import (
     MarketPulseComponentsBatch,
     MarketPulseHistoryBatch,
+    MarketPulseIntradayBatch,
     MarketPulseRefreshError,
     MarketPulseRefreshInProgress,
     MarketPulseService,
@@ -110,6 +112,17 @@ def test_calculates_session_returns_and_52_week_distances_as_decimals():
     # Internally 1.27% is 0.0127; there is no presentation-layer x100 here.
     scaled = calculate_market_pulse_metrics(_history([100.0, 101.27]), AS_OF)
     assert scaled.daily_return == pytest.approx(0.0127)
+
+
+def test_intraday_return_uses_latest_minute_close_and_completed_close():
+    intraday = pd.DataFrame(
+        {"Close": [100.5, None, 102.0]},
+        index=pd.date_range("2026-08-24 09:30", periods=3, freq="5min"),
+    )
+
+    assert calculate_intraday_return(intraday, 100.0) == pytest.approx(0.02)
+    assert calculate_intraday_return(intraday, None) is None
+    assert calculate_intraday_return(pd.DataFrame(), 100.0) is None
 
 
 def test_calculates_negative_returns_and_prefers_adjusted_close():
@@ -253,7 +266,14 @@ def test_sql_repository_seeds_same_ticker_in_sections_and_upserts_idempotently()
 
     updated = _snapshot(
         [
-            _row(SECTORS, "GDX", 0.05, stock1="AEM", stock2="NEM"),
+            _row(
+                SECTORS,
+                "GDX",
+                0.05,
+                intraday_return=0.025,
+                stock1="AEM",
+                stock2="NEM",
+            ),
             _row(
                 INDUSTRIES_THEMES,
                 "GDX",
@@ -268,6 +288,7 @@ def test_sql_repository_seeds_same_ticker_in_sections_and_upserts_idempotently()
     assert cached is not None
     assert len(cached.rows) == 2
     assert all(row.daily_return == pytest.approx(0.05) for row in cached.rows)
+    assert next(row for row in cached.rows if row.section == SECTORS).intraday_return == pytest.approx(0.025)
     assert all((row.stock1, row.stock2) == ("AEM", "NEM") for row in cached.rows)
 
     with pytest.raises(IntegrityError):
@@ -336,6 +357,107 @@ def test_successful_refresh_is_batched_ranked_and_cached(tmp_path):
     assert snapshot.as_of_date == AS_OF
     assert [row.rank for row in snapshot.rows] == [1, 2]
     assert service.load_cached_snapshot() is not None
+
+
+def test_refresh_adds_yfinance_intraday_return_without_changing_daily_metrics(
+    tmp_path,
+):
+    class _IntradayProvider(_FakeProvider):
+        def fetch_intraday(self, tickers):
+            assert list(tickers) == ["AAA"]
+            return MarketPulseIntradayBatch(
+                {"AAA": pd.DataFrame({"Close": [355.0]})},
+                {},
+                "yfinance_5m",
+            )
+
+    history = _history(range(100, 352))
+    service = _service(
+        tmp_path,
+        _IntradayProvider({"AAA": history}),
+        (MarketPulseInstrument(MARKET_SEGMENTS, "Alpha", "AAA", 1),),
+    )
+
+    snapshot = service.refresh(
+        now=dt.datetime(2026, 8, 22, 8, 0, tzinfo=dt.timezone(dt.timedelta(hours=9)))
+    )
+
+    row = snapshot.rows[0]
+    assert row.intraday_return == pytest.approx(355.0 / 351.0 - 1.0)
+    assert row.daily_return == pytest.approx(351.0 / 350.0 - 1.0)
+
+
+def test_intraday_only_refresh_preserves_completed_session_metrics_and_rank(
+    tmp_path,
+):
+    class _IntradayOnlyProvider(_FakeProvider):
+        def __init__(self):
+            super().__init__({})
+            self.intraday_calls = []
+
+        def fetch_intraday(self, tickers):
+            self.intraday_calls.append(list(tickers))
+            return MarketPulseIntradayBatch(
+                {"AAA": pd.DataFrame({"Close": [105.0]})},
+                {},
+                "yfinance_5m",
+            )
+
+    provider = _IntradayOnlyProvider()
+    service = _service(
+        tmp_path,
+        provider,
+        (MarketPulseInstrument(MARKET_SEGMENTS, "Alpha", "AAA", 1),),
+    )
+    prior = _snapshot(
+        [
+            _row(
+                MARKET_SEGMENTS,
+                "AAA",
+                0.02,
+                intraday_return=0.01,
+                weekly_return=0.03,
+                monthly_return=0.04,
+                stock1="ONE",
+            )
+        ]
+    )
+    service.cache_path.write_text(
+        json.dumps(snapshot_to_dict(prior)), encoding="utf-8"
+    )
+
+    refreshed = service.refresh_intraday()
+
+    row = refreshed.rows[0]
+    assert provider.calls == []
+    assert provider.intraday_calls == [["AAA"]]
+    assert refreshed.as_of_date == prior.as_of_date
+    assert refreshed.source == prior.source
+    assert row.intraday_return == pytest.approx(0.05)
+    assert row.daily_return == pytest.approx(0.02)
+    assert row.weekly_return == pytest.approx(0.03)
+    assert row.monthly_return == pytest.approx(0.04)
+    assert row.rank == prior.rows[0].rank
+    assert row.stock1 == "ONE"
+    assert refreshed.refreshed_at > prior.refreshed_at
+    assert service.load_cached_snapshot().rows[0].intraday_return == pytest.approx(
+        0.05
+    )
+
+
+def test_intraday_only_refresh_requires_an_existing_snapshot(tmp_path):
+    class _IntradayProvider(_FakeProvider):
+        def fetch_intraday(self, tickers):  # pragma: no cover - must not run
+            raise AssertionError(tickers)
+
+    service = _service(
+        tmp_path,
+        _IntradayProvider({}),
+        (MarketPulseInstrument(MARKET_SEGMENTS, "Alpha", "AAA", 1),),
+    )
+
+    with pytest.raises(MarketPulseRefreshError, match="Run Refresh first"):
+        service.refresh_intraday()
 
 
 def test_refresh_attaches_only_daily_universe_components(tmp_path, monkeypatch):
@@ -483,6 +605,8 @@ def test_concurrent_refresh_is_suppressed(tmp_path):
     assert entered.wait(5)
     with pytest.raises(MarketPulseRefreshInProgress):
         service.refresh()
+    with pytest.raises(MarketPulseRefreshInProgress):
+        service.refresh_intraday()
     release.set()
     thread.join(5)
     assert not failure
@@ -564,6 +688,31 @@ def test_yfinance_provider_uses_one_batch_loader_call(monkeypatch):
     assert calls[0][0] == ["AAA", "BBB"]
     assert calls[0][1]["fallback_to_single"] is False
     assert calls[0][1]["timeout_seconds"] == 15.0
+    assert set(result.histories) == {"AAA", "BBB"}
+
+
+def test_yfinance_provider_fetches_intraday_in_one_five_minute_batch(monkeypatch):
+    calls = []
+    columns = pd.MultiIndex.from_product(
+        [["AAA", "BBB"], ["Open", "High", "Low", "Close", "Volume"]]
+    )
+    raw = pd.DataFrame(
+        [[100.0, 102.0, 99.0, 101.0, 1000.0, 200.0, 203.0, 199.0, 202.0, 2000.0]],
+        index=pd.to_datetime(["2026-08-24 09:35"]),
+        columns=columns,
+    )
+
+    def fake_download(tickers, **kwargs):
+        calls.append((list(tickers), kwargs))
+        return raw
+
+    monkeypatch.setattr("src.services.market_pulse.download_price_history", fake_download)
+
+    result = YFinanceMarketPulseProvider().fetch_intraday(["AAA", "BBB"])
+
+    assert len(calls) == 1
+    assert calls[0][1]["period"] == "5d"
+    assert calls[0][1]["interval"] == "5m"
     assert set(result.histories) == {"AAA", "BBB"}
 
 

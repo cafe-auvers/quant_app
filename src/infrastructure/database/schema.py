@@ -575,6 +575,7 @@ def _get_market_pulse_snapshots_table(metadata: MetaData) -> Table:
         ),
         Column("as_of_date", Date, nullable=False),
         Column("close", Float),
+        Column("intraday_return", Float),
         Column("daily_return", Float),
         Column("weekly_return", Float),
         Column("monthly_return", Float),
@@ -610,7 +611,7 @@ def _ensure_market_pulse_tables(engine: Engine) -> tuple[Table, Table]:
 
 
 def _ensure_market_pulse_component_columns(engine: Engine) -> None:
-    """Idempotently extend older Market Pulse caches with holding symbols."""
+    """Idempotently extend older Market Pulse snapshot caches."""
 
     try:
         inspector = inspect(engine)
@@ -620,24 +621,22 @@ def _ensure_market_pulse_component_columns(engine: Engine) -> None:
             column["name"]
             for column in inspector.get_columns("market_pulse_snapshots")
         }
-        missing = [
-            name
-            for name in (
-                "stock1",
-                "stock2",
-                "stock3",
-                "stock4",
-                "component_rank_method",
-            )
-            if name not in columns
-        ]
+        definitions = {
+            "intraday_return": "FLOAT",
+            "stock1": "VARCHAR(20)",
+            "stock2": "VARCHAR(20)",
+            "stock3": "VARCHAR(20)",
+            "stock4": "VARCHAR(20)",
+            "component_rank_method": "VARCHAR(40)",
+        }
+        missing = [name for name in definitions if name not in columns]
         if missing:
             with engine.begin() as conn:
                 for name in missing:
                     conn.execute(
                         text(
                             "ALTER TABLE market_pulse_snapshots ADD COLUMN "
-                            f"{name} VARCHAR({40 if name == 'component_rank_method' else 20})"
+                            f"{name} {definitions[name]}"
                         )
                     )
     except SQLAlchemyError:

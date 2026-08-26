@@ -125,23 +125,35 @@ def get_latest_hourly_price_history_timestamps(
     metadata = MetaData()
     hourly_history = _get_hourly_price_history_table(metadata)
     rows = []
+    conn = None
     try:
         _ensure_hourly_price_history_table(engine)
-        with engine.connect() as conn:
-            for chunk in _record_chunks(
-                cleaned_symbols, HOURLY_CACHE_QUERY_SYMBOL_CHUNK_SIZE
-            ):
-                stmt = select(
-                    hourly_history.c.symbol,
-                    func.max(hourly_history.c.timestamp).label("latest_timestamp"),
-                ).where(hourly_history.c.symbol.in_(chunk))
-                if source:
-                    stmt = stmt.where(hourly_history.c.source == source)
-                stmt = stmt.group_by(hourly_history.c.symbol)
+        conn = engine.connect()
+        for chunk in _record_chunks(
+            cleaned_symbols, HOURLY_CACHE_QUERY_SYMBOL_CHUNK_SIZE
+        ):
+            stmt = select(
+                hourly_history.c.symbol,
+                func.max(hourly_history.c.timestamp).label("latest_timestamp"),
+            ).where(hourly_history.c.symbol.in_(chunk))
+            if source:
+                stmt = stmt.where(hourly_history.c.source == source)
+            stmt = stmt.group_by(hourly_history.c.symbol)
+            try:
+                rows.extend(conn.execute(stmt).all())
+            except SQLAlchemyError:
+                # A large PC cache can briefly outlive the driver's read
+                # timeout while MySQL finishes another refresh statement.
+                # Retry this small chunk once on a fresh pooled connection.
+                conn.close()
+                conn = engine.connect()
                 rows.extend(conn.execute(stmt).all())
     except SQLAlchemyError as exc:
         if strict:
             raise RuntimeError("Unable to verify latest hourly-history timestamps") from exc
         return {}
+    finally:
+        if conn is not None:
+            conn.close()
 
     return {str(row.symbol).upper(): row.latest_timestamp for row in rows if row.latest_timestamp is not None}
