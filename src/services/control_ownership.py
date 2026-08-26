@@ -98,6 +98,36 @@ def check_executor_readiness(
         )
 
     details = record.details
+    single_session_handoff = False
+    if bool(
+        details.get("handoff_ready")
+        and details.get("market_data_handoff_ready")
+        and details.get("market_data_session_conflict")
+    ):
+        ownership = get_main_device(engine)
+        owner = ownership.main_device if ownership.success else None
+        owner_record = (
+            get_runtime_device_state(engine, device_id=owner.device_id)
+            if owner is not None and owner.device_id != record.device_id
+            else None
+        )
+        if owner_record is not None:
+            owner_age = (reference - owner_record.updated_at).total_seconds()
+            owner_details = owner_record.details
+            same_environment = bool(
+                not details.get("environment")
+                or not owner_details.get("environment")
+                or details.get("environment") == owner_details.get("environment")
+            )
+            single_session_handoff = bool(
+                0.0 <= owner_age <= float(max_age_seconds)
+                and owner_record.state == RuntimeDeviceState.ACTIVE
+                and owner_details.get("main_py_alive")
+                and owner_details.get("market_data_ready")
+                and owner_details.get("executor_ready")
+                and owner_details.get("order_reconciliation_ready")
+                and same_environment
+            )
     if not details:
         reasons.append(f"{record.hostname} has not published executor readiness details.")
     checks = (
@@ -113,7 +143,15 @@ def check_executor_readiness(
         ("executor_ready", "executor readiness aggregate is false"),
     )
     for key, message in checks:
-        if details and not bool(details.get(key, False)):
+        satisfied_by_fenced_handoff = bool(
+            single_session_handoff
+            and key in {"market_data_ready", "executor_ready"}
+        )
+        if (
+            details
+            and not satisfied_by_fenced_handoff
+            and not bool(details.get(key, False))
+        ):
             reasons.append(f"{record.hostname}: {message}.")
 
     remote_revisions = get_synced_state_revisions(engine)

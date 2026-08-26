@@ -160,6 +160,7 @@ class KisWsSystemFrame:
     tr_id: str
     tr_key: str = ""
     accepted: bool = False
+    message_code: str = ""
     message: str = ""
     is_ping: bool = False
     is_unsubscribe: bool = False
@@ -235,6 +236,7 @@ def parse_kis_ws_frame(raw: str, *, received_at: Optional[datetime] = None):
         tr_id=tr_id,
         tr_key=str(header.get("tr_key") or ""),
         accepted=str(body.get("rt_cd") or "") == "0",
+        message_code=str(body.get("msg_cd") or ""),
         message=message,
         is_unsubscribe=message.upper().startswith("UNSUB"),
         encrypt=str(header.get("encrypt") or ""),
@@ -557,6 +559,20 @@ class KisWebSocketClient:
                     )
                 for callback in list(self._ack_callbacks):
                     callback(frame)
+                # KIS permits only one realtime socket for this app key. A
+                # standby device therefore receives this session-level NACK
+                # while the active executor owns the feed. Close the rejected
+                # socket so the normal bounded reconnect loop keeps publishing
+                # fresh conflict evidence and can acquire the slot promptly
+                # after an execution-owner handoff.
+                if (
+                    not frame.accepted
+                    and frame.message_code.upper() == "OPSP8996"
+                    and "ALREADY IN USE" in frame.message.upper()
+                ):
+                    if self._socket is not None:
+                        await self._socket.close()
+                    return
                 if not frame.accepted and any(
                     token in frame.message.lower()
                     for token in ("approval", "auth", "token", "인증")

@@ -57,6 +57,35 @@ def test_parse_ack_nack_and_ping():
     assert isinstance(ping, KisWsSystemFrame) and ping.is_ping
 
 
+def test_single_session_nack_preserves_code_and_closes_rejected_socket():
+    client = KisWebSocketClient(url="ws://example", approval_keys=_Keys())
+
+    class _Socket:
+        closed = False
+
+        async def close(self):
+            self.closed = True
+
+    socket = _Socket()
+    client._socket = socket
+    raw = json.dumps(
+        {
+            "header": {"tr_id": "(null)", "tr_key": ""},
+            "body": {
+                "rt_cd": "9",
+                "msg_cd": "OPSP8996",
+                "msg1": "ALREADY IN USE appkey",
+            },
+        }
+    )
+
+    _run_async(client._handle_raw(raw))
+
+    frame = parse_kis_ws_frame(raw)
+    assert frame.message_code == "OPSP8996"
+    assert socket.closed is True
+
+
 @pytest.mark.parametrize("raw", ["", "0|HDFSCNT0|bad|x", "{not-json"])
 def test_malformed_frames_are_rejected_individually(raw):
     with pytest.raises(KisWsFrameError):

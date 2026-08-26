@@ -153,6 +153,15 @@ market data, command consumer, order reconciliation, synchronized revisions,
 and awake/sleep-safety state. Operator Control never changes implicitly during
 an execution switch.
 
+KIS allows only one realtime socket for an app key. When the current
+Execution Owner is fresh, `ACTIVE`, reconciled, and has a healthy feed, the
+standby may publish a fenced single-session `STANDBY_READY` state after KIS
+explicitly returns `OPSP8996 ALREADY IN USE appkey`. This is a handoff-only
+exception to simultaneous socket readiness, not execution readiness. The
+lease transfer fences the old owner immediately; the new owner stays closed
+until it reconnects its own WebSocket, receives the critical subscription
+ACKs, and completes the normal post-claim reconciliation.
+
 The selector resolves the target from the shared coordination database at
 click time. With the default production profile, a stable runtime publishes
 every 240 seconds and its identity/readiness row remains fresh for 300 seconds.

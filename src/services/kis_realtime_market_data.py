@@ -632,6 +632,8 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         self._duplicate_event_count = 0
         self._connected = False
         self._reconnect_generation = 0
+        self._single_session_conflict_observed_at: Optional[datetime] = None
+        self._single_session_conflict_reason = ""
         self.nack_count = 0
         self.dropped_event_count = 0
         self._transport.on_data(self._on_data_frame)
@@ -759,6 +761,23 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
 
     def is_connected(self) -> bool:
         return self._connected and self._transport.is_connected()
+
+    def single_session_handoff_conflict_active(
+        self, *, now: Optional[datetime] = None
+    ) -> bool:
+        """Whether KIS is currently reserving this app key for another socket.
+
+        The transport reconnects after the session-level NACK, so this proof
+        must remain recent. It is used only for a fenced standby handoff; an
+        ACTIVE executor still requires a fully connected, ACKed feed.
+        """
+
+        observed_at = self._single_session_conflict_observed_at
+        if observed_at is None:
+            return False
+        reference = now or self._clock()
+        age = (reference - observed_at).total_seconds()
+        return bool(0.0 <= age <= 90.0 and self._single_session_conflict_reason)
 
     def on_quote(self, callback: QuoteCallback) -> None:
         self._quote_callbacks.append(callback)
@@ -1417,6 +1436,16 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
                 logger.exception("KIS WebSocket session audit callback failed")
 
     def _on_ack(self, frame: KisWsSystemFrame) -> None:
+        if (
+            not frame.accepted
+            and str(frame.message_code or "").upper() == "OPSP8996"
+            and "ALREADY IN USE" in str(frame.message or "").upper()
+        ):
+            self._single_session_conflict_observed_at = self._clock()
+            self._single_session_conflict_reason = frame.message
+        elif frame.accepted:
+            self._single_session_conflict_observed_at = None
+            self._single_session_conflict_reason = ""
         key = (frame.tr_id, frame.tr_key)
         with self._state_lock:
             sub = self._session_subscriptions.get(key)
