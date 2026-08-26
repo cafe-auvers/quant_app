@@ -303,3 +303,84 @@ def test_reconnect_resubscribes_every_desired_subscription():
         (1, "SUBSCRIBE"),
         (2, "SUBSCRIBE"),
     ]
+
+
+def test_reader_captures_session_nack_while_subscription_replay_is_sending():
+    client = None
+    nack = json.dumps(
+        {
+            "header": {"tr_id": "(null)", "tr_key": ""},
+            "body": {
+                "rt_cd": "9",
+                "msg_cd": "OPSP8996",
+                "msg1": "ALREADY IN USE appkey",
+            },
+        }
+    )
+
+    class _Socket:
+        def __init__(self):
+            self.sent = []
+            self.first_send = asyncio.Event()
+            self.nack_delivered = False
+            self.closed_by_server = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await self.first_send.wait()
+            if self.nack_delivered:
+                raise StopAsyncIteration
+            self.nack_delivered = True
+            return nack
+
+        async def send(self, payload):
+            if self.closed_by_server:
+                raise ConnectionError("server closed during subscription replay")
+            self.sent.append(json.loads(payload))
+            self.first_send.set()
+            # Model KIS closing immediately after rejecting the first replayed
+            # subscription. The reader must already be active to preserve the
+            # NACK before the next send observes that close.
+            await asyncio.sleep(0)
+            self.closed_by_server = True
+
+        async def close(self):
+            self.closed_by_server = True
+            client._stop_event.set()
+
+    socket = _Socket()
+
+    def connect(url, **kwargs):
+        return socket
+
+    client = KisWebSocketClient(
+        url="ws://example",
+        approval_keys=_Keys(),
+        connect_factory=connect,
+        reconnect_initial_seconds=0,
+        reconnect_max_seconds=0,
+        reconnect_jitter_seconds=0,
+    )
+    client.subscribe(
+        [
+            KisWsSubscription("HDFSCNT0", "DNASAAPL", "AAPL", "TRADE"),
+            KisWsSubscription("HDFSASP0", "DNASAAPL", "AAPL", "QUOTE"),
+        ]
+    )
+    frames = []
+    client.on_ack(frames.append)
+
+    _run_async(client.run_forever())
+
+    assert len(socket.sent) == 1
+    assert len(frames) == 1
+    assert frames[0].message_code == "OPSP8996"
+    assert frames[0].message == "ALREADY IN USE appkey"
