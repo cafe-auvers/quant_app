@@ -651,6 +651,7 @@ class TradingEngine:
                         and self._market_data.entry_quote_ready(card.symbol, now=now)
                     ):
                         card.entry_runtime_status = EntryRuntimeStatus.EXECUTE_READY
+                        card.entry_block_reason = ""
                         changed.append(card)
             except Exception:
                 # Review finding P1-5: one problematic card must never stop
@@ -736,8 +737,16 @@ class TradingEngine:
                     # Section 826, 839: a stale/missing execution-grade quote
                     # blocks the attempt outright -- never guess with the
                     # last known price.
-                    if card.entry_runtime_status != EntryRuntimeStatus.DATA_UNAVAILABLE:
+                    reason = (
+                        "Fresh KIS WebSocket trade and quote events are required "
+                        "before an automatic entry"
+                    )
+                    if (
+                        card.entry_runtime_status != EntryRuntimeStatus.DATA_UNAVAILABLE
+                        or card.entry_block_reason != reason
+                    ):
                         card.entry_runtime_status = EntryRuntimeStatus.DATA_UNAVAILABLE
+                        card.entry_block_reason = reason
                         changed.append(card)
                     continue
                 entry_trigger = card.entry_trigger

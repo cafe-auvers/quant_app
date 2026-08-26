@@ -196,6 +196,7 @@ def test_stale_quote_blocks_entry_and_flags_data_unavailable(tmp_path):
     assert changed == [card]
     assert card.entry_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE
     assert card.board_status == BoardStatus.BUY_TODAY  # never attempted
+    assert "Fresh KIS WebSocket trade and quote events" in card.entry_block_reason
 
 
 def test_fresh_quote_allows_entry_submission_and_moves_to_entry_pending(tmp_path):
@@ -871,6 +872,7 @@ def test_recovers_waiting_for_capital_card_every_tick(tmp_path):
 def test_recovers_data_unavailable_card_once_quote_is_fresh_again(tmp_path):
     engine = _make_engine(tmp_path)
     card = _buy_today_card(entry_runtime_status=EntryRuntimeStatus.DATA_UNAVAILABLE)
+    card.entry_block_reason = "Fresh KIS WebSocket trade and quote events are required"
 
     engine.run_heartbeat([card])
     assert card.entry_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE
@@ -881,6 +883,7 @@ def test_recovers_data_unavailable_card_once_quote_is_fresh_again(tmp_path):
 
     assert card in changed
     assert card.board_status == BoardStatus.ENTRY_PENDING
+    assert card.entry_block_reason == ""
 
 
 # --- P0-3: Partial Sell is actually submitted and reconciled ---------------
