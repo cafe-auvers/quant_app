@@ -196,6 +196,12 @@ class KisBroker:
     # KIS HTTP request does that independently in ``src.api``.
     schedules_at_request_boundary = True
 
+    def __init__(self, *, live_entry_engine: Any | None = None) -> None:
+        # The canonical Trade Card database is re-read immediately before a
+        # controlled-live BUY. Read-only broker uses do not need an engine;
+        # a production BUY without one fails closed in the policy.
+        self._live_entry_engine = live_entry_engine
+
     def submit_order(
         self,
         *,
@@ -220,6 +226,7 @@ class KisBroker:
             side=side,
             quantity=quantity,
             limit_price=limit_price,
+            engine=self._live_entry_engine,
         )
         if execution_policy == RESERVED_MOO_EXECUTION:
             response = kis_order.place_overseas_reserved_market_on_open_sell(

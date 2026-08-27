@@ -6,7 +6,7 @@
 | Breakout price | Persisted daily structural breakout level |
 | Buy Today | Pre-entry card with a selected/published plan for the session |
 | Canonical state | Authoritative persisted state, not a transient widget |
-| Controlled live | Restricted live envelope for allowed symbols/notional |
+| Controlled live | Restricted live envelope for canonical active Trade Cards and entry notional |
 | Entry Pending | System-owned state for a durable unresolved/submitted entry |
 | Execution Owner | Device/process allowed to hold the fenced execution lease |
 | Gate 1 | Deterministic simulation certification |

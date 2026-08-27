@@ -224,6 +224,30 @@ def get_trade_card_in_transaction(
     return _row_to_card(row) if row is not None else None
 
 
+def list_trade_cards_for_symbol_in_transaction(
+    conn,
+    environment: str,
+    symbol: str,
+    *,
+    for_update: bool = False,
+) -> List[TradeCardState]:
+    """Read every account row for one symbol under a caller transaction.
+
+    Activation uses ``for_update=True`` so two devices cannot concurrently
+    authorize the same symbol for different accounts after both passed an
+    earlier read-only check.
+    """
+
+    table = _get_trade_cards_table(MetaData())
+    statement = select(table).where(
+        table.c.environment == str(environment or "").upper(),
+        table.c.symbol == str(symbol or "").strip().upper(),
+    )
+    if for_update:
+        statement = statement.with_for_update()
+    return [_row_to_card(row) for row in conn.execute(statement).fetchall()]
+
+
 def list_trade_cards(
     engine: Optional[Engine],
     *,

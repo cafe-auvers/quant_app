@@ -54,7 +54,8 @@ TRADING_ENABLED=true
 
 `TRADING_ENABLED=true` only permits the in-app session toggle. Trading still
 starts disarmed after every process launch. `CONTROLLED_LIVE` additionally
-blocks production BUYs outside the allowlist or above the per-entry cap.
+blocks production BUYs without an exact active canonical Trade Card or above
+the per-entry cap.
 Protective SELLs are not blocked by the entry cap. The shared scheduler
 enforces process-wide spacing across endpoints and performs one mutation
 attempt only. The low-level KIS token-expiry branches also do not repeat a
@@ -96,10 +97,14 @@ Changing `.env` to make this check green is not a substitute for producing
 the matching reviewed evidence. Never commit `.env` or an unredacted
 capability bundle.
 
-The persisted Trade Card list is the symbol boundary; symbols never belong in
-`.env`. Deliberately placing a reviewed card in Buy Today authorizes that card
-for controlled-live entry, and Entry Pending remains authorized while its
-durable order is tracked. A planned entry above
+The shared operational Trade Card database is the symbol boundary; symbols
+never belong in `.env`. `data/trade_cards.json` is only a local recovery
+snapshot and cannot authorize a broker order. Deliberately placing a reviewed
+card in Buy Today authorizes that exact environment/account/symbol for
+controlled-live entry. Entry Pending remains authorized while its durable
+order is tracked, and an Open Position may buy only the recorded remainder of
+an `ENTRY_COMPLETING` partial entry. Ordinary open positions and any exit in
+progress do not authorize additional buying. A planned entry above
 `KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL` remains blocked at the final broker
 adapter. The dashboard header displays the mode, active cards, and cap; verify
 that full text rather than relying on "Live Trading: Enabled."

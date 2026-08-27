@@ -3,12 +3,18 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.pool import NullPool
 
 from src.api import kis_order
 from src.api.kis_account_snapshot_dual import KisTokenError
 from src.core import execution_config
 from src.core.order_state import OrderSide
-from src.core.trade_card_state import BoardStatus, TradeCardState
+from src.core.trade_card_state import (
+    BoardStatus,
+    PositionRuntimeStatus,
+    TradeCardState,
+)
 from src.services import controlled_live_policy
 from src.services import trade_card_repository
 from src.services.broker import KisBroker
@@ -24,11 +30,6 @@ from src.services.kis_request_scheduler import KisRequestScheduler
 def _configure_controlled_live(monkeypatch) -> None:
     monkeypatch.setattr(execution_config, "KIS_LIVE_EXECUTION_MODE", "CONTROLLED_LIVE")
     monkeypatch.setattr(
-        controlled_live_policy,
-        "controlled_live_symbols",
-        lambda **_kwargs: ("AAPL",),
-    )
-    monkeypatch.setattr(
         execution_config, "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL", 500.0
     )
     monkeypatch.setattr(execution_config, "KIS_MUTATION_BUDGET_VERIFIED", True)
@@ -43,10 +44,35 @@ def _configure_controlled_live(monkeypatch) -> None:
     monkeypatch.setattr(execution_config, "is_buyboard_engine_enabled", lambda: True)
 
 
-def test_controlled_live_symbols_come_from_persisted_active_trade_cards(
+def _engine(tmp_path):
+    return create_engine(
+        f"sqlite:///{tmp_path / 'controlled-live.db'}",
+        future=True,
+        poolclass=NullPool,
+    )
+
+
+def _persist_card(engine, *, account_no="1", symbol="AAPL", **overrides):
+    fields = {
+        "environment": "PROD",
+        "account_no": account_no,
+        "symbol": symbol,
+        "board_status": BoardStatus.BUY_TODAY,
+    }
+    fields.update(overrides)
+    return trade_card_repository.create_trade_card(
+        engine,
+        TradeCardState(**fields),
+    )
+
+
+def test_canonical_cards_not_recovery_snapshot_authorize_controlled_live(
     tmp_path, monkeypatch
 ):
+    engine = _engine(tmp_path)
     path = tmp_path / "trade_cards.json"
+    _persist_card(engine, symbol="AAPL", board_status=BoardStatus.ENTRY_PENDING)
+    _persist_card(engine, symbol="MSFT", board_status=BoardStatus.BUYLIST)
     trade_card_repository.save_local_trade_cards_snapshot(
         [
             TradeCardState(
@@ -55,31 +81,97 @@ def test_controlled_live_symbols_come_from_persisted_active_trade_cards(
                 symbol="RNG",
                 board_status=BoardStatus.BUY_TODAY,
             ),
-            TradeCardState(
-                environment="PROD",
-                account_no="1",
-                symbol="AAPL",
-                board_status=BoardStatus.ENTRY_PENDING,
-            ),
-            TradeCardState(
-                environment="PROD",
-                account_no="1",
-                symbol="MSFT",
-                board_status=BoardStatus.BUYLIST,
-            ),
         ],
         path=path,
     )
     monkeypatch.setattr(trade_card_repository, "LOCAL_TRADE_CARDS_FILE", path)
     monkeypatch.setattr(execution_config, "KIS_LIVE_EXECUTION_MODE", "CONTROLLED_LIVE")
 
-    assert controlled_live_symbols() == ("AAPL", "RNG")
-    assert controlled_live_symbols(account_no="1") == ("AAPL", "RNG")
+    # Engine-less reporting may show the recovery snapshot, but final
+    # authority comes only from the exact canonical database row.
+    assert controlled_live_symbols() == ("RNG",)
+    assert controlled_live_symbols(engine=engine, account_no="1") == ("AAPL",)
     assert live_entry_symbol_allowed(
-        environment="PROD", account_no="1", symbol="RNG"
+        environment="PROD", account_no="1", symbol="AAPL", engine=engine
     )
     assert not live_entry_symbol_allowed(
-        environment="PROD", account_no="1", symbol="MSFT"
+        environment="PROD", account_no="1", symbol="RNG", engine=engine
+    )
+    assert not live_entry_symbol_allowed(
+        environment="PROD", account_no="2", symbol="AAPL", engine=engine
+    )
+    assert not live_entry_symbol_allowed(
+        environment="PROD", account_no="1", symbol="AAPL"
+    )
+
+
+def test_controlled_live_allows_only_narrow_entry_completing_position(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(execution_config, "KIS_LIVE_EXECUTION_MODE", "CONTROLLED_LIVE")
+    _persist_card(
+        engine,
+        symbol="RNG",
+        board_status=BoardStatus.OPEN_POSITION,
+        position_runtime_status=PositionRuntimeStatus.ENTRY_COMPLETING,
+        entry_remaining_target_quantity=4,
+    )
+    _persist_card(
+        engine,
+        symbol="OPEN",
+        board_status=BoardStatus.OPEN_POSITION,
+        position_runtime_status=PositionRuntimeStatus.OPEN,
+        entry_remaining_target_quantity=4,
+    )
+    _persist_card(
+        engine,
+        symbol="EXIT",
+        board_status=BoardStatus.OPEN_POSITION,
+        position_runtime_status=PositionRuntimeStatus.ENTRY_COMPLETING,
+        entry_remaining_target_quantity=4,
+        exit_all_required=True,
+    )
+
+    assert controlled_live_symbols(engine=engine) == ("RNG",)
+    assert live_entry_symbol_allowed(
+        environment="PROD", account_no="1", symbol="RNG", engine=engine
+    )
+    assert not live_entry_symbol_allowed(
+        environment="PROD", account_no="1", symbol="OPEN", engine=engine
+    )
+    assert not live_entry_symbol_allowed(
+        environment="PROD", account_no="1", symbol="EXIT", engine=engine
+    )
+
+
+def test_controlled_live_fails_closed_when_canonical_lookup_fails(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(execution_config, "KIS_LIVE_EXECUTION_MODE", "CONTROLLED_LIVE")
+    _persist_card(engine)
+    monkeypatch.setattr(
+        trade_card_repository,
+        "get_trade_card",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("offline")),
+    )
+
+    assert not live_entry_symbol_allowed(
+        environment="PROD", account_no="1", symbol="AAPL", engine=engine
+    )
+
+    monkeypatch.setattr(
+        trade_card_repository,
+        "get_trade_card",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            board_status=BoardStatus.OPEN_POSITION,
+            position_runtime_status=PositionRuntimeStatus.ENTRY_COMPLETING,
+            entry_remaining_target_quantity="malformed",
+        ),
+    )
+    assert not live_entry_symbol_allowed(
+        environment="PROD", account_no="1", symbol="AAPL", engine=engine
     )
 
 
@@ -163,9 +255,11 @@ def test_disabled_live_envelope_runs_engine_but_blocks_submit_sell_and_cancel(
 
 @pytest.mark.usefixtures("trading_enabled")
 def test_controlled_live_entry_envelope_blocks_unlisted_or_oversized_buy(
-    monkeypatch,
+    tmp_path, monkeypatch,
 ):
     _configure_controlled_live(monkeypatch)
+    engine = _engine(tmp_path)
+    _persist_card(engine)
     calls = []
     monkeypatch.setattr(
         kis_order,
@@ -173,7 +267,7 @@ def test_controlled_live_entry_envelope_blocks_unlisted_or_oversized_buy(
         lambda **kwargs: calls.append(kwargs)
         or {"rt_cd": "0", "output": {"ODNO": "B-1"}},
     )
-    broker = KisBroker()
+    broker = KisBroker(live_entry_engine=engine)
 
     accepted = broker.submit_order(
         environment="PROD",

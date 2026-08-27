@@ -178,14 +178,14 @@ def _format_readiness_eta(seconds: float) -> str:
     return f"{prefix}{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
-def _live_execution_status_text(enabled: bool) -> str:
+def _live_execution_status_text(enabled: bool, *, engine=None) -> str:
     """Describe both the shared switch and the configured broker envelope."""
 
     switch = "Enabled" if bool(enabled) else "Disabled"
     mode = str(execution_config.KIS_LIVE_EXECUTION_MODE or "DISABLED").upper()
     if mode != "CONTROLLED_LIVE":
         return f"{switch} ({mode})"
-    symbols = ",".join(controlled_live_symbols()) or "none"
+    symbols = ",".join(controlled_live_symbols(engine=engine)) or "none"
     cap = float(execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL or 0.0)
     return (
         f"{switch} (CONTROLLED_LIVE active cards: {symbols}, "
@@ -5165,7 +5165,10 @@ class MainWindow(
             verified_text = verified.astimezone(KST_ZONE).strftime("%H:%M:%S KST")
         else:
             verified_text = "-"
-        live_text = _live_execution_status_text(result.live_trading_enabled)
+        live_text = _live_execution_status_text(
+            result.live_trading_enabled,
+            engine=self._execution_state_engine(),
+        )
         commands = list(result.operator_commands or ())
         if commands:
             newest = commands[0]

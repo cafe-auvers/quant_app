@@ -36,6 +36,8 @@ rulebooks.
 
 ## Controlled-live posture
 
-Controlled live restricts allowed entry symbols and maximum per-entry notional.
-It is an additional envelope, not a bypass. Follow the supervised pilot
-runbook and KIS evidence checklist; default remains disabled.
+Controlled live restricts entry to exact active canonical Trade Cards and a
+maximum per-entry notional. Symbols are database state, never `.env` values,
+and the local JSON recovery snapshot is not broker authority. It is an
+additional envelope, not a bypass. Follow the supervised pilot runbook and KIS
+evidence checklist; default remains disabled.

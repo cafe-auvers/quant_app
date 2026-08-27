@@ -109,7 +109,7 @@ def test_kis_order_mutation_functions_are_called_only_from_broker_py():
 
 
 def test_kisbroker_is_constructed_only_from_the_allowlist():
-    pattern = re.compile(r"\bKisBroker\(\)")
+    pattern = re.compile(r"\bKisBroker\(")
     violations: Dict[str, int] = {}
     for rel, path in _iter_src_files():
         if rel in _KIS_BROKER_CONSTRUCTION_ALLOWLIST:
@@ -119,7 +119,7 @@ def test_kisbroker_is_constructed_only_from_the_allowlist():
         if count:
             violations[rel] = count
     assert violations == {}, (
-        f"KisBroker() constructed outside the allowlist {sorted(_KIS_BROKER_CONSTRUCTION_ALLOWLIST)}: "
+        f"KisBroker constructed outside the allowlist {sorted(_KIS_BROKER_CONSTRUCTION_ALLOWLIST)}: "
         f"{violations}"
     )
 
@@ -128,12 +128,12 @@ def test_every_allowlisted_construction_site_still_exists_and_is_used():
     """Guards the allowlist itself against rot -- if a file is removed or
     stops constructing KisBroker, its allowlist entry should be removed
     too, not silently widen coverage for something else."""
-    pattern = re.compile(r"\bKisBroker\(\)")
+    pattern = re.compile(r"\bKisBroker\(")
     for rel in _KIS_BROKER_CONSTRUCTION_ALLOWLIST:
         path = SRC_ROOT.parent / rel
         assert path.exists(), f"Allowlisted file no longer exists: {rel}"
         code = _strip_comments_and_strings_roughly(path.read_text(encoding="utf-8"))
-        assert pattern.search(code), f"Allowlisted file no longer constructs KisBroker(): {rel}"
+        assert pattern.search(code), f"Allowlisted file no longer constructs KisBroker: {rel}"
 
 
 # --- runtime wiring proof ----------------------------------------------------
