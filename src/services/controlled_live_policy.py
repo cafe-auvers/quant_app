@@ -13,12 +13,20 @@ from typing import Any
 
 from src.core import execution_config
 from src.core.order_state import OrderSide
+from src.core.trade_card_state import BoardStatus
+from src.services import trade_card_repository
 
 
 CONTROLLED_LIVE = "CONTROLLED_LIVE"
 FULL_LIVE = "FULL_LIVE"
 DISABLED = "DISABLED"
 MIN_CONTROLLED_LIVE_MUTATION_SPACING_SECONDS = 0.1
+_ACTIVE_ENTRY_STATUSES = frozenset(
+    {
+        BoardStatus.BUY_TODAY,
+        BoardStatus.ENTRY_PENDING,
+    }
+)
 
 
 class LiveExecutionEnvelopeError(RuntimeError):
@@ -83,10 +91,6 @@ def require_controlled_live_configuration(
             "CONTROLLED_LIVE requires the reviewed production WebSocket path"
         )
     if mode == CONTROLLED_LIVE:
-        if not execution_config.KIS_CONTROLLED_LIVE_SYMBOLS:
-            raise _configuration_error(
-                "CONTROLLED_LIVE requires KIS_CONTROLLED_LIVE_SYMBOLS"
-            )
         if not math.isfinite(
             execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL
         ) or execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL <= 0:
@@ -133,6 +137,7 @@ def require_live_mutation_allowed(
 def require_live_entry_allowed(
     *,
     environment: str,
+    account_no: str = "",
     symbol: str,
     side: OrderSide | str,
     quantity: int,
@@ -152,11 +157,15 @@ def require_live_entry_allowed(
     if normalized_side != OrderSide.BUY or _mode() == FULL_LIVE:
         return
     normalized_symbol = str(symbol or "").strip().upper()
-    if not live_entry_symbol_allowed(environment=environment, symbol=normalized_symbol):
+    if not live_entry_symbol_allowed(
+        environment=environment,
+        account_no=account_no,
+        symbol=normalized_symbol,
+    ):
         raise LiveExecutionEnvelopeError(
             f"Blocked production BUY for unapproved symbol {normalized_symbol}: it is "
-            "outside KIS_CONTROLLED_LIVE_SYMBOLS. No broker mutation was sent. Add the symbol "
-            "to the reviewed allowlist and refresh readiness before retrying."
+            "not backed by an active persisted Trade Card. No broker mutation was sent. "
+            "Move the reviewed plan to Buy Today and refresh readiness before retrying."
         )
     notional = int(quantity) * float(limit_price)
     if not math.isfinite(notional) or notional <= 0:
@@ -172,14 +181,57 @@ def require_live_entry_allowed(
         )
 
 
-def live_entry_symbol_allowed(*, environment: str, symbol: str) -> bool:
-    """Return whether the current live envelope includes an entry symbol.
+def controlled_live_symbols(
+    *, environment: str = "PROD", account_no: str = ""
+) -> tuple[str, ...]:
+    """Return the persisted live-entry stock list for controlled-live mode.
 
-    This is a scope helper, not an execution authorization.  Runtime callers
-    use it to keep planning-only cards out of quote/readiness and mutation
-    sets during a controlled pilot.  The final broker boundary still calls
-    :func:`require_live_entry_allowed` with quantity and price.
+    Trade Cards are the canonical user-owned plan state. Moving a reviewed
+    card to Buy Today is the explicit authorization event; Entry Pending stays
+    authorized while its durable order is being tracked. Missing, malformed,
+    or unavailable local recovery state yields an empty list and therefore
+    fails closed at the broker boundary.
     """
+
+    normalized_environment = str(environment or "").strip().upper()
+    normalized_account = str(account_no or "").strip()
+    try:
+        cards = trade_card_repository.load_local_trade_cards_snapshot(
+            path=trade_card_repository.LOCAL_TRADE_CARDS_FILE
+        )
+    except Exception:
+        return ()
+    symbols = {
+        str(card.symbol or "").strip().upper()
+        for card in cards
+        if str(card.environment or "").strip().upper() == normalized_environment
+        and (
+            not normalized_account
+            or str(card.account_no or "").strip() == normalized_account
+        )
+        and card.board_status in _ACTIVE_ENTRY_STATUSES
+        and str(card.symbol or "").strip()
+    }
+    return tuple(sorted(symbols))
+
+
+def live_entry_card_allowed(card: Any) -> bool:
+    """Authorize execution scope directly from an authoritative loaded card."""
+
+    if str(getattr(card, "environment", "") or "").strip().upper() != "PROD":
+        return True
+    if _mode() != CONTROLLED_LIVE:
+        return True
+    return bool(
+        str(getattr(card, "symbol", "") or "").strip()
+        and getattr(card, "board_status", None) in _ACTIVE_ENTRY_STATUSES
+    )
+
+
+def live_entry_symbol_allowed(
+    *, environment: str, symbol: str, account_no: str = ""
+) -> bool:
+    """Return whether persisted active-card state authorizes an entry symbol."""
 
     if str(environment or "").strip().upper() != "PROD":
         return True
@@ -188,7 +240,13 @@ def live_entry_symbol_allowed(*, environment: str, symbol: str) -> bool:
     normalized_symbol = str(symbol or "").strip().upper()
     return bool(
         normalized_symbol
-        and normalized_symbol in set(execution_config.KIS_CONTROLLED_LIVE_SYMBOLS)
+        and normalized_symbol
+        in set(
+            controlled_live_symbols(
+                environment=environment,
+                account_no=account_no,
+            )
+        )
     )
 
 

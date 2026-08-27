@@ -3478,7 +3478,7 @@ def test_sync_quote_subscriptions_adopts_keys_only_for_active_cards(tmp_path):
     assert "OLD" not in configured["trade_priorities"]
 
 
-def test_controlled_live_planning_cards_are_display_only_and_not_executable(
+def test_controlled_live_buy_today_cards_are_active_and_executable(
     tmp_path, monkeypatch
 ):
     worker, _ = _worker(tmp_path)
@@ -3493,7 +3493,6 @@ def test_controlled_live_planning_cards_are_display_only_and_not_executable(
         execution_config, "is_buyboard_engine_enabled", lambda: True
     )
     monkeypatch.setattr(execution_config, "KIS_LIVE_EXECUTION_MODE", "CONTROLLED_LIVE")
-    monkeypatch.setattr(execution_config, "KIS_CONTROLLED_LIVE_SYMBOLS", ("STIM",))
     planning = TradeCardState(
         environment="PROD",
         account_no="1",
@@ -3511,18 +3510,18 @@ def test_controlled_live_planning_cards_are_display_only_and_not_executable(
     worker._sync_quote_subscriptions([planning, position])
 
     assert configured["trade_priorities"] == {
-        "CDNA": int(SubscriptionPriority.DISPLAY_ONLY),
+        "CDNA": int(SubscriptionPriority.BUY_TODAY),
         "STIM": int(SubscriptionPriority.OPEN_POSITION),
     }
     assert configured["quote_priorities"] == {
-        "CDNA": int(SubscriptionPriority.DISPLAY_ONLY),
+        "CDNA": int(SubscriptionPriority.BUY_TODAY),
         "STIM": int(SubscriptionPriority.CRITICAL_EXIT),
     }
-    assert worker._card_in_execution_scope(planning) is False
+    assert worker._card_in_execution_scope(planning) is True
     assert worker._card_in_execution_scope(position) is True
 
 
-def test_controlled_live_allowlisted_buy_today_remains_execution_critical(
+def test_controlled_live_buy_today_subscription_remains_execution_critical(
     tmp_path, monkeypatch
 ):
     worker, _ = _worker(tmp_path)
@@ -3537,7 +3536,6 @@ def test_controlled_live_allowlisted_buy_today_remains_execution_critical(
         execution_config, "is_buyboard_engine_enabled", lambda: True
     )
     monkeypatch.setattr(execution_config, "KIS_LIVE_EXECUTION_MODE", "CONTROLLED_LIVE")
-    monkeypatch.setattr(execution_config, "KIS_CONTROLLED_LIVE_SYMBOLS", ("STIM",))
     candidate = TradeCardState(
         environment="PROD",
         account_no="1",

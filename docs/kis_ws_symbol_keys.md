@@ -89,9 +89,9 @@ KIS and do not edit `.env` or `.env.pc`.
 These rules make intraday additions safe without turning a configuration typo
 into a market-data outage for an open position.
 
-The Controlled Live entry allowlist is a separate authorization boundary.
-Adding a WebSocket key makes market data available; it does not by itself add
-the symbol to `KIS_CONTROLLED_LIVE_SYMBOLS` or authorize a BUY.
+The persisted active Trade Card list is a separate authorization boundary.
+Adding a WebSocket key makes market data available; it does not by itself move
+a reviewed plan to Buy Today or authorize a BUY.
 
 ## Legacy checkout migration
 

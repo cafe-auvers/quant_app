@@ -215,6 +215,7 @@ class KisBroker:
         trading_state.require_trading_enabled(environment, symbol)
         require_live_entry_allowed(
             environment=environment,
+            account_no=account_no,
             symbol=symbol,
             side=side,
             quantity=quantity,

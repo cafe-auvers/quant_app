@@ -65,6 +65,7 @@ from src.services.app_state import (EXECUTION_QUEUE_FILE, SETTINGS_FILE,
                                     save_app_state, should_auto_claim_main)
 from src.services.cloud_backup import (restore_state_directory,
                                        restore_state_files)
+from src.services.controlled_live_policy import controlled_live_symbols
 from src.services.execution_authority import ExecutionAuthority, LeaseHandle
 from src.services.handoff_reconciliation import reset_runtime_only_order_flags
 from src.services.historical_refresh_control import (MODE_1D, MODE_1H,
@@ -184,9 +185,12 @@ def _live_execution_status_text(enabled: bool) -> str:
     mode = str(execution_config.KIS_LIVE_EXECUTION_MODE or "DISABLED").upper()
     if mode != "CONTROLLED_LIVE":
         return f"{switch} ({mode})"
-    symbols = ",".join(execution_config.KIS_CONTROLLED_LIVE_SYMBOLS) or "none"
+    symbols = ",".join(controlled_live_symbols()) or "none"
     cap = float(execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL or 0.0)
-    return f"{switch} (CONTROLLED_LIVE: {symbols}, max ${cap:,.2f}/entry)"
+    return (
+        f"{switch} (CONTROLLED_LIVE active cards: {symbols}, "
+        f"max ${cap:,.2f}/entry)"
+    )
 
 
 def _per_symbol_quote_guard_detail(

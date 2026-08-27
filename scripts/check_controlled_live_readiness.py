@@ -41,6 +41,7 @@ _load_repo_env()
 from src.core import execution_config  # noqa: E402
 from src.services.controlled_live_policy import (  # noqa: E402
     CONTROLLED_LIVE,
+    controlled_live_symbols,
     require_controlled_live_configuration,
 )
 from src.services.kis_realtime_market_data import (  # noqa: E402
@@ -168,11 +169,12 @@ def main() -> int:
         int(execution_config.KIS_WS_TOTAL_SUBSCRIPTION_CAPACITY) > 0,
         "KIS_WS_TOTAL_SUBSCRIPTION_CAPACITY must be positive",
     )
-    result.check(
-        "controlled symbols",
-        bool(execution_config.KIS_CONTROLLED_LIVE_SYMBOLS),
-        "KIS_CONTROLLED_LIVE_SYMBOLS is empty",
-    )
+    live_symbols = controlled_live_symbols()
+    if not live_symbols:
+        result.warn(
+            "No persisted Buy Today/Entry Pending cards are active; controlled-live "
+            "entry remains fail-closed until a reviewed plan is activated."
+        )
     result.check(
         "entry notional cap",
         float(execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL) > 0,
@@ -186,7 +188,7 @@ def main() -> int:
         normalized = dict(snapshot.keys)
         missing = [
             symbol
-            for symbol in execution_config.KIS_CONTROLLED_LIVE_SYMBOLS
+            for symbol in live_symbols
             if not normalized.get(symbol)
         ]
         if missing:
@@ -222,14 +224,14 @@ def main() -> int:
         )
         priority = {
             symbol: int(SubscriptionPriority.CRITICAL_EXIT)
-            for symbol in execution_config.KIS_CONTROLLED_LIVE_SYMBOLS
+            for symbol in live_symbols
         }
         service.configure_desired_channels(
             trade_priorities=priority,
             quote_priorities=priority,
         )
         capacity = service.subscription_capacity_snapshot()
-        if capacity.reconnect_replay_count <= 0:
+        if live_symbols and capacity.reconnect_replay_count <= 0:
             raise RuntimeError("no controlled-live WebSocket registrations were composed")
         if capacity.reconnect_replay_count > capacity.total_capacity:
             raise RuntimeError("configured WebSocket registrations exceed total capacity")

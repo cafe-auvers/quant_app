@@ -526,7 +526,7 @@ production submit/sell/cancel calls are rejected at the broker boundary.
 Production mutation additionally depends on, among other configuration and runtime evidence:
 
 - the administrative/session trading switch;
-- `KIS_LIVE_EXECUTION_MODE` and controlled-live symbol/notional limits when applicable;
+- `KIS_LIVE_EXECUTION_MODE`, persisted active Trade Cards, and the controlled-live notional limit when applicable;
 - a nonblank `KANBAN_STRATEGY_INSTANCE_ID`;
 - verified KIS WebSocket protocol manifest, symbol keys, and measured subscription capacity;
 - verified submit/cancel/replace mutation budgets and spacing;

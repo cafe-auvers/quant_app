@@ -83,7 +83,7 @@ from src.services.execution_lease_protocol import DefaultExecutionLeaseProtocol
 from src.services.kis_request_scheduler import KisRequestScheduler
 from src.services.kis_request_boundary import install_process_kis_request_scheduler
 from src.services.controlled_live_policy import (
-    live_entry_symbol_allowed,
+    live_entry_card_allowed,
     require_controlled_live_configuration,
 )
 from src.utils.market_calendar import is_regular_session_open
@@ -2520,10 +2520,7 @@ class BuyboardRuntimeWorker(QThread):
 
         if card.board_status != BoardStatus.BUY_TODAY:
             return True
-        return live_entry_symbol_allowed(
-            environment=card.environment,
-            symbol=card.symbol,
-        )
+        return live_entry_card_allowed(card)
 
     def account_action_ready(
         self, account_no: str, symbol: str, action: str
