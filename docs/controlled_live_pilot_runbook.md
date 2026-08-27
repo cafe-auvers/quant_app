@@ -35,7 +35,6 @@ KIS_CAPABILITY_MANIFEST_SHA256=<reviewed manifest digest>
 KIS_RUNTIME_COMMIT_SHA=<exact deployed 40-character commit>
 
 KIS_LIVE_EXECUTION_MODE=CONTROLLED_LIVE
-KIS_CONTROLLED_LIVE_SYMBOLS=<one or two approved symbols>
 KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL=<minimum practical per-entry cap>
 
 KIS_MUTATION_BUDGET_VERIFIED=true
@@ -97,17 +96,19 @@ Changing `.env` to make this check green is not a substitute for producing
 the matching reviewed evidence. Never commit `.env` or an unredacted
 capability bundle.
 
-Placing a card in Buy Today does not expand this pilot envelope. A Buy Today
-symbol outside `KIS_CONTROLLED_LIVE_SYMBOLS` remains planning-only, and a
-planned entry above `KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL` remains blocked
-at the final broker adapter. The dashboard header displays the mode, symbols,
-and cap; verify that full text rather than relying on "Live Trading: Enabled."
+The persisted Trade Card list is the symbol boundary; symbols never belong in
+`.env`. Deliberately placing a reviewed card in Buy Today authorizes that card
+for controlled-live entry, and Entry Pending remains authorized while its
+durable order is tracked. A planned entry above
+`KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL` remains blocked at the final broker
+adapter. The dashboard header displays the mode, active cards, and cap; verify
+that full text rather than relying on "Live Trading: Enabled."
 Promotion to `FULL_LIVE` is a separate financial-scope decision and must not
 be inferred from an ownership or Operator Control change.
 
 The runtime prioritizes WebSocket capacity among symbols already inside this
-envelope: `EXECUTE_READY` first, then armed/waiting-breakout, then still-forming
-Buy Today plans. This priority does not authorize an unlisted symbol and cannot
+active-card set: `EXECUTE_READY` first, then armed/waiting-breakout, then
+still-forming Buy Today plans. This priority cannot
 replace a missing live-verified symbol subscription key. A card whose 1m, 5m,
 and 30m plans are all terminal-invalid returns to Buylist and releases its Buy
 Today feed capacity.

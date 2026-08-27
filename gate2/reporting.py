@@ -26,6 +26,7 @@ from src.core.runtime_safety_audit import (
 # Importing the sole real broker adapter registers its instrumented boundary.
 # Gate 2 never constructs it or any execution workflow.
 from src.services import broker as _broker_audit_boundary  # noqa: F401
+from src.services.controlled_live_policy import controlled_live_symbols
 from src.services.kis_realtime_market_data import (
     FeedChannel,
     KisRealtimeMarketDataService,
@@ -66,7 +67,6 @@ SAFE_RUNTIME_EXPECTATIONS = {
     "KIS_CANCEL_MUTATION_CAPACITY": 0,
     "KIS_REPLACE_MUTATION_CAPACITY": 0,
     "KIS_LIVE_EXECUTION_MODE": "DISABLED",
-    "KIS_CONTROLLED_LIVE_SYMBOLS": [],
     "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL": 0.0,
 }
 
@@ -113,9 +113,7 @@ def runtime_activation_snapshot() -> dict[str, bool | int | float | str | list[s
         "KIS_LIVE_EXECUTION_MODE": str(
             execution_config.KIS_LIVE_EXECUTION_MODE
         ),
-        "KIS_CONTROLLED_LIVE_SYMBOLS": list(
-            execution_config.KIS_CONTROLLED_LIVE_SYMBOLS
-        ),
+        "CONTROLLED_LIVE_ACTIVE_CARD_SYMBOLS": list(controlled_live_symbols()),
         "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL": float(
             execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL
         ),

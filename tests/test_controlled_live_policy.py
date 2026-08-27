@@ -8,9 +8,14 @@ from src.api import kis_order
 from src.api.kis_account_snapshot_dual import KisTokenError
 from src.core import execution_config
 from src.core.order_state import OrderSide
+from src.core.trade_card_state import BoardStatus, TradeCardState
+from src.services import controlled_live_policy
+from src.services import trade_card_repository
 from src.services.broker import KisBroker
 from src.services.controlled_live_policy import (
     LiveExecutionEnvelopeError,
+    controlled_live_symbols,
+    live_entry_symbol_allowed,
     require_controlled_live_configuration,
 )
 from src.services.kis_request_scheduler import KisRequestScheduler
@@ -18,7 +23,11 @@ from src.services.kis_request_scheduler import KisRequestScheduler
 
 def _configure_controlled_live(monkeypatch) -> None:
     monkeypatch.setattr(execution_config, "KIS_LIVE_EXECUTION_MODE", "CONTROLLED_LIVE")
-    monkeypatch.setattr(execution_config, "KIS_CONTROLLED_LIVE_SYMBOLS", ("AAPL",))
+    monkeypatch.setattr(
+        controlled_live_policy,
+        "controlled_live_symbols",
+        lambda **_kwargs: ("AAPL",),
+    )
     monkeypatch.setattr(
         execution_config, "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL", 500.0
     )
@@ -32,6 +41,46 @@ def _configure_controlled_live(monkeypatch) -> None:
     monkeypatch.setattr(execution_config, "KIS_WS_PROTOCOL_VERIFIED", True)
     monkeypatch.setattr(execution_config, "KIS_MARKET_DATA_MODE", "WEBSOCKET")
     monkeypatch.setattr(execution_config, "is_buyboard_engine_enabled", lambda: True)
+
+
+def test_controlled_live_symbols_come_from_persisted_active_trade_cards(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "trade_cards.json"
+    trade_card_repository.save_local_trade_cards_snapshot(
+        [
+            TradeCardState(
+                environment="PROD",
+                account_no="1",
+                symbol="RNG",
+                board_status=BoardStatus.BUY_TODAY,
+            ),
+            TradeCardState(
+                environment="PROD",
+                account_no="1",
+                symbol="AAPL",
+                board_status=BoardStatus.ENTRY_PENDING,
+            ),
+            TradeCardState(
+                environment="PROD",
+                account_no="1",
+                symbol="MSFT",
+                board_status=BoardStatus.BUYLIST,
+            ),
+        ],
+        path=path,
+    )
+    monkeypatch.setattr(trade_card_repository, "LOCAL_TRADE_CARDS_FILE", path)
+    monkeypatch.setattr(execution_config, "KIS_LIVE_EXECUTION_MODE", "CONTROLLED_LIVE")
+
+    assert controlled_live_symbols() == ("AAPL", "RNG")
+    assert controlled_live_symbols(account_no="1") == ("AAPL", "RNG")
+    assert live_entry_symbol_allowed(
+        environment="PROD", account_no="1", symbol="RNG"
+    )
+    assert not live_entry_symbol_allowed(
+        environment="PROD", account_no="1", symbol="MSFT"
+    )
 
 
 def test_controlled_live_configuration_requires_no_retry_spacing_and_budgets(

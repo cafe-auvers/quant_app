@@ -34,11 +34,7 @@ def test_live_execution_status_names_the_controlled_scope(monkeypatch):
         "KIS_LIVE_EXECUTION_MODE",
         "CONTROLLED_LIVE",
     )
-    monkeypatch.setattr(
-        main_window_module.execution_config,
-        "KIS_CONTROLLED_LIVE_SYMBOLS",
-        ("STIM",),
-    )
+    monkeypatch.setattr(main_window_module, "controlled_live_symbols", lambda: ("STIM",))
     monkeypatch.setattr(
         main_window_module.execution_config,
         "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL",
@@ -46,7 +42,7 @@ def test_live_execution_status_names_the_controlled_scope(monkeypatch):
     )
 
     assert _live_execution_status_text(True) == (
-        "Enabled (CONTROLLED_LIVE: STIM, max $0.01/entry)"
+        "Enabled (CONTROLLED_LIVE active cards: STIM, max $0.01/entry)"
     )
 
 

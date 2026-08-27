@@ -47,6 +47,7 @@ from src.risk.portfolio import (
     ProposedPortfolioEntry,
 )
 from src.services import execution_command_gateway as gw_module
+from src.services import controlled_live_policy
 from src.services.execution_command_gateway import (
     AmbiguousPostBrokerPersistenceError,
     CancelNotPermittedError,
@@ -303,7 +304,11 @@ def test_authorized_live_modes_permit_exact_guarded_buy(
 ):
     gateway, broker, _ = _guarded_gateway(tmp_path)
     monkeypatch.setattr(execution_config, "KIS_LIVE_EXECUTION_MODE", mode)
-    monkeypatch.setattr(execution_config, "KIS_CONTROLLED_LIVE_SYMBOLS", ("AAPL",))
+    monkeypatch.setattr(
+        controlled_live_policy,
+        "controlled_live_symbols",
+        lambda **_kwargs: ("AAPL",),
+    )
     monkeypatch.setattr(
         execution_config, "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL", 1_000.0
     )
@@ -1788,7 +1793,9 @@ def test_production_replace_checks_controlled_live_ceiling_before_cancel(
         execution_config, "KIS_LIVE_EXECUTION_MODE", "CONTROLLED_LIVE"
     )
     monkeypatch.setattr(
-        execution_config, "KIS_CONTROLLED_LIVE_SYMBOLS", ("AAPL",)
+        controlled_live_policy,
+        "controlled_live_symbols",
+        lambda **_kwargs: ("AAPL",),
     )
     monkeypatch.setattr(
         execution_config, "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL", 1_100.0

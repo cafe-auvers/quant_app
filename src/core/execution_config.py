@@ -348,20 +348,15 @@ KIS_MUTATION_MAX_CONFIRMED_ATTEMPTS = _env_int(
 
 # Supervised production envelope. DISABLED is an additional one-way fence on
 # the Kanban engine even when the administrative and in-session trading
-# switches are both armed. CONTROLLED_LIVE permits only explicitly listed BUY
-# symbols and caps each entry command's notional. Protective SELL/cancel paths
-# are not constrained by the entry cap. FULL_LIVE is a later explicit
-# operational promotion, not a code-path change.
+# switches are both armed. CONTROLLED_LIVE permits BUY entries only for
+# persisted active Trade Cards and caps each entry command's notional.
+# Protective SELL/cancel paths are not constrained by the entry cap. FULL_LIVE
+# is a later explicit operational promotion, not a code-path change. Symbols
+# deliberately do not live in environment configuration; Buy Today is the
+# operator-owned persisted live-stock list.
 KIS_LIVE_EXECUTION_MODE = _env_text(
     "KIS_LIVE_EXECUTION_MODE", "DISABLED"
 ).upper()
-KIS_CONTROLLED_LIVE_SYMBOLS = tuple(
-    dict.fromkeys(
-        symbol.strip().upper()
-        for symbol in _env_text("KIS_CONTROLLED_LIVE_SYMBOLS", "").split(",")
-        if symbol.strip()
-    )
-)
 KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL = _env_float(
     "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL", 0.0
 )

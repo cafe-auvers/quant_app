@@ -499,6 +499,7 @@ class ExecutionCommandGateway:
                 )
             require_live_entry_allowed(
                 environment=environment,
+                account_no=account_no,
                 symbol=symbol,
                 side=side,
                 quantity=quantity,
@@ -693,6 +694,7 @@ class ExecutionCommandGateway:
         self._require_guarded_mode()
         require_live_entry_allowed(
             environment=request.environment,
+            account_no=request.account_no,
             symbol=request.symbol,
             side=request.side,
             quantity=request.quantity,
@@ -841,6 +843,7 @@ class ExecutionCommandGateway:
                         raise PreTradeRiskRejectedError(str(exc)) from exc
                 require_live_entry_allowed(
                     environment=original.environment,
+                    account_no=original.account_no,
                     symbol=original.symbol,
                     side=original.side,
                     quantity=new_quantity,
@@ -1556,6 +1559,7 @@ class ExecutionCommandGateway:
             with trading_state.allow_cached_emergency_authorization():
                 require_live_entry_allowed(
                     environment=request.environment,
+                    account_no=request.account_no,
                     symbol=request.symbol,
                     side=request.side,
                     quantity=quantity,
@@ -2031,6 +2035,7 @@ class ExecutionCommandGateway:
             require_current_entry_risk_approval()
             require_live_entry_allowed(
                 environment=environment,
+                account_no=account_no,
                 symbol=symbol,
                 side=request.side,
                 quantity=quantity,
