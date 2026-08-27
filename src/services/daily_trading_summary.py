@@ -13,7 +13,7 @@ import json
 import logging
 import threading
 import weakref
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Iterable, Optional, Sequence
 from zoneinfo import ZoneInfo
 
@@ -43,6 +43,9 @@ logger = logging.getLogger(__name__)
 EVENT_PLAN_PUBLISHED = "PLAN_PUBLISHED"
 EVENT_BUY_TODAY_ADDED = "BUY_TODAY_ADDED"
 EVENT_CARD_SNAPSHOT = "CARD_SNAPSHOT"
+PLAN_ORIGIN_TODAYS_PLAN = "TODAY'S PLAN"
+PLAN_ORIGIN_ADDED_INTRADAY = "ADDED INTRADAY"
+PLAN_ORIGIN_UNKNOWN = "RECOVERED / UNKNOWN"
 NY_ZONE = ZoneInfo("America/New_York")
 
 _ensured_engines: "weakref.WeakSet[Engine]" = weakref.WeakSet()
@@ -59,6 +62,13 @@ class DailyPlanItem:
     outcome: str
     reason_category: str
     reason: str
+    origin: str = PLAN_ORIGIN_UNKNOWN
+    orb_window: str = ""
+    orb_high: Optional[float] = None
+    orb_low: Optional[float] = None
+    entry_trigger: Optional[float] = None
+    stop_adr: Optional[float] = None
+    orb_detail_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -98,6 +108,10 @@ class DailyRejectedOrbCombination:
     capital_percent: float
     stop_adr: Optional[float]
     reason: str
+    account_no: str = ""
+    source: str = ""
+    origin: str = PLAN_ORIGIN_UNKNOWN
+    selected: bool = False
 
 
 @dataclass(frozen=True)
@@ -108,6 +122,7 @@ class DailyTradingSummary:
     positions: tuple[DailyPositionItem, ...]
     activities: tuple[DailyOrderActivity, ...]
     rejected_orb_combinations: tuple[DailyRejectedOrbCombination, ...] = ()
+    orb_details: tuple[DailyRejectedOrbCombination, ...] = ()
     note: str = ""
 
 
@@ -200,6 +215,13 @@ def _card_plan_payload(card: TradeCardState) -> dict[str, Any]:
         "planned_quantity": int(card.planned_quantity or card.target_position_quantity or 0),
         "position_percent": float(card.position_percent or 0.0),
         "selected_orb_window": card.selected_orb_window,
+        "risk_percent": float(card.risk_percent or 0.0),
+        "buffer_pct": float(card.buffer_pct or 0.0),
+        "entry_orb_window": card.entry_orb_window,
+        "entry_orb_high": card.entry_orb_high,
+        "entry_orb_low": card.entry_orb_low,
+        "entry_trigger": card.entry_trigger,
+        "stop_adr": card.stop_adr,
     }
 
 
@@ -269,6 +291,9 @@ _SNAPSHOT_FIELDS = (
     "rejected_orb_snapshot",
     "buy_today_note",
     "breakout_price",
+    "risk_percent",
+    "buffer_pct",
+    "position_percent",
     "selected_orb_window",
     "planned_quantity",
     "target_position_quantity",
@@ -429,6 +454,103 @@ def _comparable_utc(value: Optional[dt.datetime]) -> dt.datetime:
     return value.astimezone(dt.timezone.utc)
 
 
+def _publication_origin(
+    occurred_at: Optional[dt.datetime], session_date: dt.date
+) -> str:
+    """Classify a verified publication without promoting live revisions.
+
+    A publication verified by the regular 09:30 New York open is part of the
+    day's planned list. A new symbol first published after the open is an
+    intraday addition. Existing planned symbols keep their original origin
+    when the plan is republished later.
+    """
+
+    market_open = dt.datetime.combine(
+        session_date,
+        dt.time(9, 30),
+        tzinfo=NY_ZONE,
+    )
+    return (
+        PLAN_ORIGIN_TODAYS_PLAN
+        if _comparable_utc(occurred_at) <= market_open.astimezone(dt.timezone.utc)
+        else PLAN_ORIGIN_ADDED_INTRADAY
+    )
+
+
+def _is_orb_rejection(snapshot: dict[str, Any]) -> bool:
+    note = str(snapshot.get("buy_today_note") or "").strip().lower()
+    return bool(snapshot.get("rejected_orb_snapshot")) or (
+        "buy today rejected" in note and "orb" in note
+    )
+
+
+def _card_rejection_session(card: TradeCardState) -> Optional[dt.date]:
+    """Recover the session for legacy ORB rejections missing new metadata."""
+
+    if card.last_buy_today_session_date is not None:
+        return card.last_buy_today_session_date
+    if (
+        card.board_status == BoardStatus.BUYLIST
+        and card.previous_board_status == BoardStatus.BUY_TODAY
+        and _is_orb_rejection(_card_snapshot_payload(card))
+    ):
+        return market_session_date(card.board_status_updated_at or card.updated_at)
+    return None
+
+
+def _queue_items_for_session(
+    engine: Engine, session_date: dt.date
+) -> dict[tuple[str, str], Any]:
+    """Load matching current-session ORB geometry for ledger recovery.
+
+    The queue is mutable, so it is used only when its own timestamp belongs to
+    the selected session. Frozen rejected snapshots remain authoritative once
+    available.
+    """
+
+    try:
+        from src.core.execution_queue import ExecutionQueueManager
+        from src.services.state_sync import EXECUTION_QUEUE_KEY, PULL_OK, pull_state
+
+        pulled = pull_state(engine, EXECUTION_QUEUE_KEY)
+        if pulled.status != PULL_OK or pulled.state is None:
+            return {}
+        manager = ExecutionQueueManager.from_dict(pulled.state.payload)
+    except Exception:
+        logger.exception("Could not load ORB queue details for daily summary")
+        return {}
+    items: dict[tuple[str, str], Any] = {}
+    for item in manager.items.values():
+        if market_session_date(item.last_updated) != session_date:
+            continue
+        key = (
+            str(item.account_no or ""),
+            str(item.symbol or "").strip().upper(),
+        )
+        items[key] = item
+    return items
+
+
+def _frozen_orb_snapshot(queue_item: Any, *, buffer_pct: float) -> dict[str, Any]:
+    from src.core.orb_combinations import build_orb_position_combinations
+
+    combinations = build_orb_position_combinations(
+        queue_item,
+        account_equity=0.0,
+        buffer_pct=buffer_pct,
+    )
+    serialized = []
+    for combination in combinations:
+        payload = asdict(combination)
+        payload["status"] = combination.status.value
+        serialized.append(payload)
+    return {
+        "buffer_pct": float(buffer_pct),
+        "queue_item": queue_item.to_dict(),
+        "combinations": serialized,
+    }
+
+
 def _reason_category(reason: str) -> str:
     text = str(reason or "").lower()
     if not text:
@@ -499,6 +621,12 @@ def _entry_outcome(snapshot: dict[str, Any], entry_orders: Sequence[Any]) -> tup
         BoardStatus.SELL_ALL.value,
     }:
         return "OPEN POSITION", "", reason
+    if _is_orb_rejection(snapshot):
+        return (
+            "ORB REJECTED",
+            "ORB NOT MET",
+            reason or "Every supported ORB window was rejected.",
+        )
     if runtime == EntryRuntimeStatus.WAITING_BREAKOUT.value:
         trigger = snapshot.get("entry_trigger") or snapshot.get("breakout_price")
         reason = reason or (
@@ -553,31 +681,62 @@ def build_daily_trading_summary(
     orders = list_execution_orders(engine, environment="PROD")
     day_orders = [order for order in orders if _order_session(order) == session_date]
 
-    plan_events = [event for event in day_events if event["event_type"] == EVENT_PLAN_PUBLISHED]
+    plan_events = [
+        event
+        for event in day_events
+        if event["event_type"] == EVENT_PLAN_PUBLISHED
+    ]
     publication = plan_events[-1] if plan_events else None
     published_at = _display_time(publication["occurred_at"]) if publication else ""
-    plan_rows: list[tuple[str, dict[str, Any]]] = []
-    published_keys: set[tuple[str, str]] = set()
-    publication_time = publication["occurred_at"] if publication else None
-    if publication:
-        for payload in publication["payload"].get("cards", []):
-            key = (str(payload.get("account_no") or ""), str(payload.get("symbol") or "").upper())
-            published_keys.add(key)
-            plan_rows.append(("PUBLISHED PLAN", payload))
+    plan_rows: list[tuple[str, str, dict[str, Any]]] = []
+    plan_row_indexes: dict[tuple[str, str], int] = {}
 
-    for event in day_events:
-        if event["event_type"] != EVENT_BUY_TODAY_ADDED:
-            continue
-        if publication_time is not None and event["occurred_at"] <= publication_time:
-            continue
-        payload = event["payload"]
-        key = (str(payload.get("account_no") or ""), str(payload.get("symbol") or "").upper())
-        if key in published_keys or any(
-            (str(row.get("account_no") or ""), str(row.get("symbol") or "").upper()) == key
-            for _, row in plan_rows
+    def upsert_plan_row(
+        source: str, origin: str, payload: dict[str, Any]
+    ) -> None:
+        key = (
+            str(payload.get("account_no") or ""),
+            str(payload.get("symbol") or "").upper(),
+        )
+        if not key[1]:
+            return
+        existing = plan_row_indexes.get(key)
+        if existing is None:
+            plan_row_indexes[key] = len(plan_rows)
+            plan_rows.append((source, origin, payload))
+            return
+        original_source, original_origin, _old_payload = plan_rows[existing]
+        priority = {
+            PLAN_ORIGIN_UNKNOWN: 0,
+            PLAN_ORIGIN_ADDED_INTRADAY: 1,
+            PLAN_ORIGIN_TODAYS_PLAN: 2,
+        }
+        if priority.get(origin, 0) > priority.get(original_origin, 0):
+            original_source = source
+            original_origin = origin
+        elif (
+            origin == original_origin == PLAN_ORIGIN_ADDED_INTRADAY
+            and source == "ADDED LATER"
         ):
-            continue
-        plan_rows.append(("ADDED LATER", payload))
+            # An explicit activation is the clearest source when a later
+            # live plan revision also happens to contain the same symbol.
+            original_source = source
+        plan_rows[existing] = (original_source, original_origin, payload)
+
+    # A republish is a revision, not a replacement of history. Preserve the
+    # union so an early pre-plan that was ORB-rejected before a later publish
+    # remains visible in the day's review.
+    for event in day_events:
+        if event["event_type"] == EVENT_PLAN_PUBLISHED:
+            origin = _publication_origin(event["occurred_at"], session_date)
+            for payload in event["payload"].get("cards", []):
+                upsert_plan_row("PUBLISHED PLAN", origin, payload)
+        elif event["event_type"] == EVENT_BUY_TODAY_ADDED:
+            upsert_plan_row(
+                "ADDED LATER",
+                PLAN_ORIGIN_ADDED_INTRADAY,
+                event["payload"],
+            )
 
     snapshots_for_day: dict[tuple[str, str], dict[str, Any]] = {}
     position_snapshots: dict[
@@ -591,51 +750,77 @@ def build_daily_trading_summary(
         if event["session_date"] == session_date:
             snapshots_for_day[key] = event["payload"]
 
-    if current_cards is None and session_date == market_session_date():
+    if current_cards is None:
         current_cards = list_trade_cards(engine, environment="PROD", raise_on_error=True)
     current_cards = list(current_cards or [])
-    if session_date == market_session_date():
-        for card in current_cards:
-            key = (card.account_no, card.symbol)
-            payload = _card_snapshot_payload(card)
-            if card.session_date == session_date or card.last_buy_today_session_date == session_date:
-                snapshots_for_day[key] = payload
-            if card.broker_quantity > 0 or card.board_status in {
+    queue_items = _queue_items_for_session(engine, session_date)
+    current_session = market_session_date()
+    now = dt.datetime.now(dt.timezone.utc)
+    recovered: list[tuple[TradeCardState, str]] = []
+    for card in current_cards:
+        key = (card.account_no, card.symbol)
+        payload = _card_snapshot_payload(card)
+        rejection_session = _card_rejection_session(card)
+        belongs_to_plan = bool(
+            card.session_date == session_date
+            or card.last_buy_today_session_date == session_date
+            or rejection_session == session_date
+        )
+        queue_item = queue_items.get(key)
+        if (
+            belongs_to_plan
+            and _is_orb_rejection(payload)
+            and not payload.get("rejected_orb_snapshot")
+            and queue_item is not None
+        ):
+            payload["rejected_orb_snapshot"] = _frozen_orb_snapshot(
+                queue_item,
+                buffer_pct=float(card.buffer_pct or 0.0),
+            )
+        if belongs_to_plan:
+            snapshots_for_day[key] = payload
+
+        if session_date == current_session:
+            # Current canonical reconciliation is the authority for today's
+            # position list, including explicit zero quantities. This clears
+            # stale legacy BUY fills that have no matching sell-order row.
+            position_snapshots[key] = (payload, now)
+        elif card.board_status == BoardStatus.CLOSED:
+            closed_at = card.board_status_updated_at or card.updated_at
+            if market_session_date(closed_at) <= session_date:
+                position_snapshots[key] = (payload, closed_at)
+
+        if (
+            card.session_date == session_date
+            and card.board_status
+            in {
+                BoardStatus.BUY_TODAY,
+                BoardStatus.ENTRY_PENDING,
                 BoardStatus.OPEN_POSITION,
-                BoardStatus.PARTIAL_SELL,
-                BoardStatus.SELL_ALL,
-            }:
-                position_snapshots[key] = (
-                    payload,
-                    dt.datetime.now(dt.timezone.utc),
-                )
-        if not plan_rows:
-            recovered = [
-                card
-                for card in current_cards
-                if (
-                    card.session_date == session_date
-                    and card.board_status
-                    in {
-                        BoardStatus.BUY_TODAY,
-                        BoardStatus.ENTRY_PENDING,
-                        BoardStatus.OPEN_POSITION,
-                    }
-                )
-                or (
-                    card.last_buy_today_session_date == session_date
-                    and bool(card.rejected_orb_snapshot)
-                )
-            ]
-            for card in sorted(recovered, key=lambda item: (item.kanban_priority, item.symbol)):
-                plan_rows.append(("RECOVERED SNAPSHOT", _card_plan_payload(card)))
+            }
+        ):
+            recovered.append((card, "RECOVERED SNAPSHOT"))
+        elif rejection_session == session_date:
+            recovered.append((card, "RECOVERED ORB REJECTION"))
+
+    for card, source in sorted(
+        recovered,
+        key=lambda item: (item[0].kanban_priority, item[0].symbol),
+    ):
+        upsert_plan_row(
+            source,
+            PLAN_ORIGIN_UNKNOWN,
+            _card_plan_payload(card),
+        )
 
     plan_items: list[DailyPlanItem] = []
     rejected_orb_combinations: list[DailyRejectedOrbCombination] = []
-    for source, payload in plan_rows:
+    orb_details: list[DailyRejectedOrbCombination] = []
+    for source, origin, payload in plan_rows:
         account = str(payload.get("account_no") or "")
         symbol = str(payload.get("symbol") or "").upper()
         key = (account, symbol)
+        snapshot = snapshots_for_day.get(key, {})
         entry_orders = [
             order
             for order in day_orders
@@ -644,61 +829,162 @@ def build_daily_trading_summary(
             and order.side == OrderSide.BUY
             and order.intent == OrderIntent.ENTRY
         ]
-        outcome, category, reason = _entry_outcome(snapshots_for_day.get(key, {}), entry_orders)
+        outcome, category, reason = _entry_outcome(snapshot, entry_orders)
+        rejected_snapshot = dict(snapshot.get("rejected_orb_snapshot") or {})
+        from src.core.execution_queue import OrbCandidateStatus
+        from src.core.orb_combinations import (
+            build_orb_position_combinations,
+            orb_position_combinations_from_snapshot,
+        )
+
+        combinations = []
+        if rejected_snapshot:
+            combinations = orb_position_combinations_from_snapshot(
+                rejected_snapshot
+            )
+        elif key in queue_items:
+            combinations = build_orb_position_combinations(
+                queue_items[key],
+                account_equity=0.0,
+                buffer_pct=float(
+                    snapshot.get("buffer_pct")
+                    or payload.get("buffer_pct")
+                    or 0.0
+                ),
+            )
+
+        selected_window = str(
+            snapshot.get("entry_orb_window")
+            or snapshot.get("selected_orb_window")
+            or payload.get("entry_orb_window")
+            or payload.get("selected_orb_window")
+            or ""
+        )
+        try:
+            selected_risk = float(
+                snapshot.get("risk_percent")
+                or payload.get("risk_percent")
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            selected_risk = 0.0
+        detail_start = len(orb_details)
+        for combination in combinations:
+            if combination.valid:
+                classification = "VALID"
+            elif combination.status in {
+                OrbCandidateStatus.FORMING,
+                OrbCandidateStatus.NOT_AVAILABLE,
+            }:
+                classification = "FORMING"
+            else:
+                classification = "INVALID"
+            detail = DailyRejectedOrbCombination(
+                symbol=symbol,
+                risk_percent=combination.risk_percent,
+                window=combination.window,
+                classification=classification,
+                status=combination.status.value,
+                orb_high=combination.orb_high,
+                breakout_price=combination.breakout_price,
+                breakout_trigger=combination.breakout_trigger,
+                entry_trigger=combination.entry_trigger,
+                stop_price=combination.stop_price,
+                shares=combination.shares,
+                capital_percent=combination.capital_percent,
+                stop_adr=combination.stop_adr,
+                reason=combination.reason,
+                account_no=account,
+                source=source,
+                origin=origin,
+                selected=bool(
+                    selected_window
+                    and combination.window == selected_window
+                    and selected_risk > 0
+                    and abs(combination.risk_percent - selected_risk) < 1e-9
+                ),
+            )
+            orb_details.append(detail)
+            if rejected_snapshot:
+                rejected_orb_combinations.append(detail)
+
+        if not combinations and selected_window:
+            # Historical active cards may predate full queue snapshots. Keep
+            # their selected executable geometry inspectable rather than
+            # showing a blank ORB-details panel.
+            orb_details.append(
+                DailyRejectedOrbCombination(
+                    symbol=symbol,
+                    risk_percent=selected_risk,
+                    window=selected_window,
+                    classification="SELECTED",
+                    status=str(snapshot.get("entry_runtime_status") or "SELECTED"),
+                    orb_high=snapshot.get("entry_orb_high"),
+                    breakout_price=(
+                        snapshot.get("breakout_price")
+                        or payload.get("breakout_price")
+                    ),
+                    breakout_trigger=None,
+                    entry_trigger=snapshot.get("entry_trigger"),
+                    stop_price=snapshot.get("entry_orb_low"),
+                    shares=int(
+                        snapshot.get("planned_quantity")
+                        or payload.get("planned_quantity")
+                        or 0
+                    ),
+                    capital_percent=float(
+                        snapshot.get("position_percent")
+                        or payload.get("position_percent")
+                        or 0.0
+                    ),
+                    stop_adr=snapshot.get("stop_adr"),
+                    reason=reason,
+                    account_no=account,
+                    source=source,
+                    origin=origin,
+                    selected=True,
+                )
+            )
+
+        detail_count = len(orb_details) - detail_start
         plan_items.append(
             DailyPlanItem(
                 source=source,
                 symbol=symbol,
                 account_no=account,
-                breakout_price=payload.get("breakout_price"),
-                planned_quantity=int(payload.get("planned_quantity") or 0),
+                breakout_price=(
+                    snapshot.get("breakout_price")
+                    or payload.get("breakout_price")
+                ),
+                planned_quantity=int(
+                    snapshot.get("planned_quantity")
+                    or payload.get("planned_quantity")
+                    or 0
+                ),
                 outcome=outcome,
                 reason_category=category,
                 reason=reason,
+                origin=origin,
+                orb_window=(
+                    selected_window
+                    or ("1m / 5m / 30m" if _is_orb_rejection(snapshot) else "")
+                ),
+                orb_high=snapshot.get("entry_orb_high"),
+                orb_low=snapshot.get("entry_orb_low"),
+                entry_trigger=snapshot.get("entry_trigger"),
+                stop_adr=snapshot.get("stop_adr"),
+                orb_detail_count=detail_count,
             )
         )
-        rejected_snapshot = dict(
-            snapshots_for_day.get(key, {}).get("rejected_orb_snapshot") or {}
-        )
-        if rejected_snapshot:
-            from src.core.execution_queue import OrbCandidateStatus
-            from src.core.orb_combinations import (
-                orb_position_combinations_from_snapshot,
-            )
-
-            for combination in orb_position_combinations_from_snapshot(
-                rejected_snapshot
-            ):
-                if combination.valid:
-                    classification = "VALID"
-                elif combination.status in {
-                    OrbCandidateStatus.FORMING,
-                    OrbCandidateStatus.NOT_AVAILABLE,
-                }:
-                    classification = "FORMING"
-                else:
-                    classification = "INVALID"
-                rejected_orb_combinations.append(
-                    DailyRejectedOrbCombination(
-                        symbol=symbol,
-                        risk_percent=combination.risk_percent,
-                        window=combination.window,
-                        classification=classification,
-                        status=combination.status.value,
-                        orb_high=combination.orb_high,
-                        breakout_price=combination.breakout_price,
-                        breakout_trigger=combination.breakout_trigger,
-                        entry_trigger=combination.entry_trigger,
-                        stop_price=combination.stop_price,
-                        shares=combination.shares,
-                        capital_percent=combination.capital_percent,
-                        stop_adr=combination.stop_adr,
-                        reason=combination.reason,
-                    )
-                )
 
     net_fills: dict[tuple[str, str], dict[str, Any]] = {}
     for order in orders:
+        # Legacy imported orders without a durable market-session identity are
+        # suitable activity evidence but not a complete position ledger. A
+        # lone old BUY (STIM was the concrete production example) must not be
+        # carried forward forever when an external/manual close is absent.
+        if not order.market_session_date:
+            continue
         order_day = _order_session(order)
         if order_day is None or order_day > session_date or int(order.filled_quantity or 0) <= 0:
             continue
@@ -772,7 +1058,7 @@ def build_daily_trading_summary(
     )
 
     if publication:
-        note = f"Verified plan published at {published_at}."
+        note = f"Latest verified plan revision published at {published_at}."
     elif plan_rows:
         note = "Publication happened before this ledger was installed; current canonical cards are shown as a recovered snapshot."
     elif day_orders:
@@ -786,5 +1072,6 @@ def build_daily_trading_summary(
         positions=tuple(positions),
         activities=activities,
         rejected_orb_combinations=tuple(rejected_orb_combinations),
+        orb_details=tuple(orb_details),
         note=note,
     )

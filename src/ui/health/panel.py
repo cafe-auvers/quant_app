@@ -35,6 +35,9 @@ except ImportError:  # pragma: no cover - PyQtWebEngine is a hard requirement,
 from src.core.exit_policy import market_session_date
 from src.services.daily_trading_summary import (
     DailyTradingSummary,
+    PLAN_ORIGIN_ADDED_INTRADAY,
+    PLAN_ORIGIN_TODAYS_PLAN,
+    PLAN_ORIGIN_UNKNOWN,
     build_daily_trading_summary,
 )
 from src.services.health import (
@@ -201,10 +204,17 @@ class HealthPanelMixin:
         health_layout.addWidget(self.health_checks_table)
         layout.addWidget(health_group, 2)
 
-        self.health_tabs = QTabWidget()
-        self.health_tabs.addTab(self._build_daily_summary_tab(), "Daily Summary")
-        self.health_tabs.addTab(self._build_pnl_dashboard_tab(), "P&L Dashboard")
-        layout.addWidget(self.health_tabs, 3)
+        pnl_group = QGroupBox("P&L Dashboard")
+        pnl_layout = QVBoxLayout(pnl_group)
+        pnl_layout.addWidget(self._build_pnl_dashboard_tab())
+        layout.addWidget(pnl_group, 3)
+
+    def _build_daily_summary_main_tab(self) -> None:
+        layout = QVBoxLayout(self.daily_summary_widget)
+        title = QLabel("Daily Trading Summary")
+        title.setStyleSheet("font-size: 18px; font-weight: 600;")
+        layout.addWidget(title)
+        layout.addWidget(self._build_daily_summary_tab())
 
     def _build_daily_summary_tab(self) -> QWidget:
         summary_tab = QWidget()
@@ -222,6 +232,32 @@ class HealthPanelMixin:
         self.health_daily_today_button = QPushButton("Today")
         self.health_daily_today_button.clicked.connect(self._select_daily_summary_today)
         controls.addWidget(self.health_daily_today_button)
+        self.health_daily_refresh_button = QPushButton("Refresh Summary")
+        self.health_daily_refresh_button.clicked.connect(self._refresh_daily_summary)
+        controls.addWidget(self.health_daily_refresh_button)
+        controls.addWidget(QLabel("Origin:"))
+        self.health_daily_origin_filter = QComboBox()
+        self.health_daily_origin_filter.addItem("All origins", "")
+        self.health_daily_origin_filter.addItem(
+            "Today's plan", PLAN_ORIGIN_TODAYS_PLAN
+        )
+        self.health_daily_origin_filter.addItem(
+            "Added intraday", PLAN_ORIGIN_ADDED_INTRADAY
+        )
+        self.health_daily_origin_filter.addItem(
+            "Recovered / unknown", PLAN_ORIGIN_UNKNOWN
+        )
+        self.health_daily_origin_filter.currentIndexChanged.connect(
+            self._on_daily_origin_filter_changed
+        )
+        controls.addWidget(self.health_daily_origin_filter)
+        controls.addWidget(QLabel("Plan:"))
+        self.health_daily_plan_filter = QComboBox()
+        self.health_daily_plan_filter.addItem("All plans", "")
+        self.health_daily_plan_filter.currentIndexChanged.connect(
+            self._apply_daily_summary_filters
+        )
+        controls.addWidget(self.health_daily_plan_filter)
         controls.addStretch()
         self.health_daily_status_label = QLabel("Loading daily trading summary...")
         self.health_daily_status_label.setWordWrap(True)
@@ -230,11 +266,21 @@ class HealthPanelMixin:
 
         self.health_daily_tabs = QTabWidget()
 
-        self.health_daily_plan_table = QTableWidget(0, 6)
+        self.health_daily_plan_table = QTableWidget(0, 12)
         self.health_daily_plan_table.setHorizontalHeaderLabels(
-            ["Plan source", "Symbol", "Breakout", "Planned qty", "Outcome", "Why / detail"]
+            [
+                "Plan origin", "Plan source", "Symbol", "Breakout", "Planned qty",
+                "ORB window", "ORB high", "ORB low / stop", "Entry trigger",
+                "Outcome", "ORB rows", "Why / detail",
+            ]
         )
-        self._configure_daily_table(self.health_daily_plan_table, stretch_column=5)
+        self._configure_daily_table(self.health_daily_plan_table, stretch_column=11)
+        self.health_daily_plan_table.setToolTip(
+            "Double-click a plan to open its ORB details."
+        )
+        self.health_daily_plan_table.cellDoubleClicked.connect(
+            self._show_daily_plan_orb_details
+        )
         self.health_daily_tabs.addTab(self.health_daily_plan_table, "Buy Today plan")
 
         self.health_daily_positions_table = QTableWidget(0, 4)
@@ -251,19 +297,20 @@ class HealthPanelMixin:
         self._configure_daily_table(self.health_daily_activity_table, stretch_column=5)
         self.health_daily_tabs.addTab(self.health_daily_activity_table, "Orders & sells")
 
-        self.health_daily_orb_rejections_table = QTableWidget(0, 14)
-        self.health_daily_orb_rejections_table.setHorizontalHeaderLabels(
+        self.health_daily_orb_details_table = QTableWidget(0, 17)
+        self.health_daily_orb_details_table.setHorizontalHeaderLabels(
             [
-                "Symbol", "Risk %", "Window", "Result", "ORB status",
+                "Plan origin", "Plan source", "Symbol", "Selected", "Risk %", "Window",
+                "Result", "ORB status",
                 "ORB high", "Breakout", "Buffered breakout", "Entry trigger",
-                "Stop / ORB low", "Shares", "Capital %", "Stop / ADR", "Why rejected",
+                "Stop / ORB low", "Shares", "Capital %", "Stop / ADR", "Why / detail",
             ]
         )
         self._configure_daily_table(
-            self.health_daily_orb_rejections_table, stretch_column=13
+            self.health_daily_orb_details_table, stretch_column=16
         )
         self.health_daily_tabs.addTab(
-            self.health_daily_orb_rejections_table, "Rejected ORB combinations"
+            self.health_daily_orb_details_table, "ORB details"
         )
         layout.addWidget(self.health_daily_tabs)
         return summary_tab
@@ -681,7 +728,6 @@ class HealthPanelMixin:
             worker.repository_checked.connect(apply_repository_status)
         self._track_worker("_health_probe_worker", worker)
         worker.start()
-        self._refresh_daily_summary()
 
     def _on_health_probe_completed(
         self,
@@ -719,7 +765,6 @@ class HealthPanelMixin:
                 self.health_checks_table.setItem(row, column, item)
         self._pnl_snapshots = pnl_snapshots
         self._refresh_pnl_dashboard_view()
-        self._refresh_daily_summary()
 
     def _on_health_probe_failed(self, message: str) -> None:
         self.health_refresh_button.setEnabled(True)
@@ -772,13 +817,11 @@ class HealthPanelMixin:
             self._daily_summary_refresh_pending = True
             return
         self.health_daily_status_label.setText(summary.note)
-        self._populate_daily_plan(summary)
+        self._daily_summary_last_summary = summary
         self._populate_daily_positions(summary)
         self._populate_daily_activity(summary)
-        self._populate_daily_orb_rejections(summary)
-        self.health_daily_tabs.setTabText(
-            0, f"Buy Today plan ({len(summary.plan_items)})"
-        )
+        self._rebuild_daily_plan_filter(summary)
+        self._apply_daily_summary_filters()
         self.health_daily_tabs.setTabText(
             1, f"Open positions ({len(summary.positions)})"
         )
@@ -787,11 +830,6 @@ class HealthPanelMixin:
         )
         self.health_daily_tabs.setTabText(
             2, f"Orders & sells ({sell_count} sells)"
-        )
-        self.health_daily_tabs.setTabText(
-            3,
-            "Rejected ORB combinations "
-            f"({len(summary.rejected_orb_combinations)})",
         )
 
     def _on_daily_summary_failed(self, message: str) -> None:
@@ -803,10 +841,97 @@ class HealthPanelMixin:
             self._refresh_daily_summary()
 
     def _clear_daily_summary_tables(self) -> None:
+        self._daily_summary_last_summary = None
         self.health_daily_plan_table.setRowCount(0)
         self.health_daily_positions_table.setRowCount(0)
         self.health_daily_activity_table.setRowCount(0)
-        self.health_daily_orb_rejections_table.setRowCount(0)
+        self.health_daily_orb_details_table.setRowCount(0)
+        self.health_daily_plan_filter.blockSignals(True)
+        self.health_daily_plan_filter.clear()
+        self.health_daily_plan_filter.addItem("All plans", "")
+        self.health_daily_plan_filter.blockSignals(False)
+
+    @staticmethod
+    def _daily_plan_key(account_no: str, symbol: str) -> str:
+        return f"{str(account_no or '').strip()}|{str(symbol or '').strip().upper()}"
+
+    def _rebuild_daily_plan_filter(self, summary: DailyTradingSummary) -> None:
+        selected_key = str(self.health_daily_plan_filter.currentData() or "")
+        selected_origin = str(self.health_daily_origin_filter.currentData() or "")
+        choices = [
+            item
+            for item in summary.plan_items
+            if not selected_origin or item.origin == selected_origin
+        ]
+        self.health_daily_plan_filter.blockSignals(True)
+        self.health_daily_plan_filter.clear()
+        self.health_daily_plan_filter.addItem("All plans", "")
+        for item in choices:
+            key = self._daily_plan_key(item.account_no, item.symbol)
+            label = item.symbol
+            if item.account_no:
+                label = f"{label} · {item.account_no}"
+            self.health_daily_plan_filter.addItem(label, key)
+        selected_index = self.health_daily_plan_filter.findData(selected_key)
+        self.health_daily_plan_filter.setCurrentIndex(max(0, selected_index))
+        self.health_daily_plan_filter.blockSignals(False)
+
+    def _on_daily_origin_filter_changed(self, *_args) -> None:
+        summary = self.__dict__.get("_daily_summary_last_summary")
+        if summary is None:
+            return
+        self._rebuild_daily_plan_filter(summary)
+        self._apply_daily_summary_filters()
+
+    def _apply_daily_summary_filters(self, *_args) -> None:
+        summary = self.__dict__.get("_daily_summary_last_summary")
+        if summary is None:
+            return
+        selected_origin = str(self.health_daily_origin_filter.currentData() or "")
+        selected_plan = str(self.health_daily_plan_filter.currentData() or "")
+
+        def visible(account_no: str, symbol: str, origin: str) -> bool:
+            if selected_origin and origin != selected_origin:
+                return False
+            return not selected_plan or self._daily_plan_key(
+                account_no, symbol
+            ) == selected_plan
+
+        filtered = replace(
+            summary,
+            plan_items=tuple(
+                item
+                for item in summary.plan_items
+                if visible(item.account_no, item.symbol, item.origin)
+            ),
+            orb_details=tuple(
+                item
+                for item in summary.orb_details
+                if visible(item.account_no, item.symbol, item.origin)
+            ),
+        )
+        self._populate_daily_plan(filtered)
+        self._populate_daily_orb_details(filtered)
+        plan_count = len(filtered.plan_items)
+        plan_total = len(summary.plan_items)
+        detail_count = len(filtered.orb_details)
+        detail_total = len(summary.orb_details)
+        self.health_daily_tabs.setTabText(
+            0,
+            (
+                f"Buy Today plan ({plan_count})"
+                if plan_count == plan_total
+                else f"Buy Today plan ({plan_count}/{plan_total})"
+            ),
+        )
+        self.health_daily_tabs.setTabText(
+            3,
+            (
+                f"ORB details ({detail_count})"
+                if detail_count == detail_total
+                else f"ORB details ({detail_count}/{detail_total})"
+            ),
+        )
 
     @staticmethod
     def _set_daily_cell(table: QTableWidget, row: int, column: int, value) -> None:
@@ -823,15 +948,27 @@ class HealthPanelMixin:
                 part for part in (item.reason_category, item.reason) if part
             )
             values = (
+                item.origin,
                 item.source,
                 item.symbol,
                 f"${item.breakout_price:,.2f}" if item.breakout_price else "—",
                 item.planned_quantity or "—",
+                item.orb_window or "—",
+                f"${item.orb_high:,.2f}" if item.orb_high else "—",
+                f"${item.orb_low:,.2f}" if item.orb_low else "—",
+                f"${item.entry_trigger:,.2f}" if item.entry_trigger else "—",
                 item.outcome,
+                item.orb_detail_count or "—",
                 why or "—",
             )
             for column, value in enumerate(values):
                 self._set_daily_cell(table, row, column, value)
+            symbol_cell = table.item(row, 2)
+            if symbol_cell is not None:
+                symbol_cell.setData(
+                    Qt.UserRole,
+                    self._daily_plan_key(item.account_no, item.symbol),
+                )
 
     def _populate_daily_positions(self, summary: DailyTradingSummary) -> None:
         table = self.health_daily_positions_table
@@ -861,11 +998,31 @@ class HealthPanelMixin:
             for column, value in enumerate(values):
                 self._set_daily_cell(table, row, column, value)
 
-    def _populate_daily_orb_rejections(
+    def _show_daily_plan_orb_details(self, row: int, _column: int) -> None:
+        symbol_item = self.health_daily_plan_table.item(row, 2)
+        if symbol_item is None:
+            return
+        plan_key = str(symbol_item.data(Qt.UserRole) or "")
+        plan_index = self.health_daily_plan_filter.findData(plan_key)
+        if plan_index >= 0:
+            self.health_daily_plan_filter.setCurrentIndex(plan_index)
+        table = self.health_daily_orb_details_table
+        for detail_row in range(table.rowCount()):
+            detail_symbol = table.item(detail_row, 2)
+            if (
+                detail_symbol is not None
+                and str(detail_symbol.data(Qt.UserRole) or "") == plan_key
+            ):
+                self.health_daily_tabs.setCurrentIndex(3)
+                table.selectRow(detail_row)
+                table.scrollToItem(detail_symbol)
+                return
+
+    def _populate_daily_orb_details(
         self, summary: DailyTradingSummary
     ) -> None:
-        table = self.health_daily_orb_rejections_table
-        rows = summary.rejected_orb_combinations
+        table = self.health_daily_orb_details_table
+        rows = summary.orb_details
         table.setRowCount(len(rows))
 
         def price(value) -> str:
@@ -876,7 +1033,10 @@ class HealthPanelMixin:
 
         for row, item in enumerate(rows):
             values = (
+                item.origin,
+                item.source,
                 item.symbol,
+                "YES" if item.selected else "",
                 f"{item.risk_percent * 100.0:.2f}%",
                 item.window,
                 item.classification,
@@ -893,3 +1053,9 @@ class HealthPanelMixin:
             )
             for column, value in enumerate(values):
                 self._set_daily_cell(table, row, column, value)
+            symbol_cell = table.item(row, 2)
+            if symbol_cell is not None:
+                symbol_cell.setData(
+                    Qt.UserRole,
+                    self._daily_plan_key(item.account_no, item.symbol),
+                )

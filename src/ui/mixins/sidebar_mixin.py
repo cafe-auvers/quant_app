@@ -184,6 +184,10 @@ class SidebarMixin:
             refresh_health = getattr(self, "refresh_health_panel", None)
             if callable(refresh_health):
                 refresh_health()
+        if current_widget is self.__dict__.get("daily_summary_widget"):
+            refresh_summary = getattr(self, "_refresh_daily_summary", None)
+            if callable(refresh_summary):
+                refresh_summary()
         if current_widget is self.__dict__.get("intraday_charts_widget"):
             self._set_sidebar_source_to_buylist()
         self.apply_sidebar_selection_to_current_tab()

@@ -105,6 +105,7 @@ DEFAULT_TAB_OPTIONS = {
     "dashboard": True,
     "scanner": True,
     "market_pulse": True,
+    "daily_summary": True,
     "buyboard": True,
     "tradingview": True,
     "health": True,
