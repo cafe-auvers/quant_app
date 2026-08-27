@@ -1,23 +1,22 @@
-"""Separate production-health tab: system checks, event journal, P&L dashboard."""
+"""Production health, daily trading summary, and P&L dashboard."""
 
 from __future__ import annotations
 
 import datetime as dt
-import json
 import logging
 from dataclasses import replace
 from typing import List, Optional
 
-from PyQt5.QtCore import QThread, Qt, QUrl, pyqtSignal
+from PyQt5.QtCore import QDate, QThread, Qt, QUrl, pyqtSignal
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QComboBox,
+    QDateEdit,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
-    QLineEdit,
     QPushButton,
     QStackedWidget,
     QTableWidget,
@@ -33,7 +32,11 @@ try:
 except ImportError:  # pragma: no cover - PyQtWebEngine is a hard requirement,
     QWebEngineView = None  # but every other chart tab guards this the same way.
 
-from src.services.event_journal import load_recent_events
+from src.core.exit_policy import market_session_date
+from src.services.daily_trading_summary import (
+    DailyTradingSummary,
+    build_daily_trading_summary,
+)
 from src.services.health import (
     HealthContext,
     HealthLevel,
@@ -75,7 +78,6 @@ class HealthProbeWorker(QThread):
     def __init__(
         self,
         context: HealthContext,
-        journal_symbol: str = "",
         *,
         unrealized_usd_today: float = 0.0,
         fx_rate_today: Optional[float] = None,
@@ -84,7 +86,6 @@ class HealthProbeWorker(QThread):
     ) -> None:
         super().__init__()
         self.context = context
-        self.journal_symbol = journal_symbol
         self.unrealized_usd_today = unrealized_usd_today
         self.fx_rate_today = fx_rate_today
         self.capital_base_usd_today = capital_base_usd_today
@@ -102,7 +103,6 @@ class HealthProbeWorker(QThread):
             self.repository_checked.emit(repository_status)
             context = replace(context, repository_status=repository_status)
             snapshot = collect_health_snapshot(context)
-            events = load_recent_events(limit=300, symbol=self.journal_symbol)
             pnl_snapshots: List[PnlDailySnapshot] = []
             try:
                 pnl_snapshots = record_daily_pnl_snapshot(
@@ -114,8 +114,27 @@ class HealthProbeWorker(QThread):
                 )
             except Exception:
                 logger.exception("Failed to build daily P&L snapshot history")
-            self.completed.emit(snapshot, events, pnl_snapshots)
+            self.completed.emit(snapshot, [], pnl_snapshots)
         except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class DailySummaryWorker(QThread):
+    completed = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, engine, session_date: dt.date) -> None:
+        super().__init__()
+        self.engine = engine
+        self.session_date = session_date
+
+    def run(self) -> None:
+        try:
+            self.completed.emit(
+                build_daily_trading_summary(self.engine, self.session_date)
+            )
+        except Exception as exc:
+            logger.exception("Failed to build daily trading summary")
             self.failed.emit(str(exc))
 
 
@@ -183,49 +202,81 @@ class HealthPanelMixin:
         layout.addWidget(health_group, 2)
 
         self.health_tabs = QTabWidget()
-        self.health_tabs.addTab(self._build_journal_tab(), "Event Journal")
+        self.health_tabs.addTab(self._build_daily_summary_tab(), "Daily Summary")
         self.health_tabs.addTab(self._build_pnl_dashboard_tab(), "P&L Dashboard")
         layout.addWidget(self.health_tabs, 3)
 
-    def _build_journal_tab(self) -> QWidget:
-        journal_tab = QWidget()
-        journal_layout = QVBoxLayout(journal_tab)
-        journal_controls = QHBoxLayout()
-        journal_controls.addWidget(QLabel("Symbol:"))
-        self.health_journal_symbol_input = QLineEdit()
-        self.health_journal_symbol_input.setPlaceholderText("All symbols")
-        self.health_journal_symbol_input.setMaximumWidth(180)
-        self.health_journal_symbol_input.returnPressed.connect(
-            self.refresh_health_panel
-        )
-        journal_controls.addWidget(self.health_journal_symbol_input)
-        journal_controls.addStretch()
-        journal_controls.addWidget(
-            QLabel("Newest first; accounts are masked and secrets are redacted.")
-        )
-        journal_layout.addLayout(journal_controls)
+    def _build_daily_summary_tab(self) -> QWidget:
+        summary_tab = QWidget()
+        layout = QVBoxLayout(summary_tab)
 
-        self.health_journal_table = QTableWidget(0, 7)
-        self.health_journal_table.setHorizontalHeaderLabels(
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Trading date:"))
+        self.health_daily_date_edit = QDateEdit()
+        self.health_daily_date_edit.setCalendarPopup(True)
+        self.health_daily_date_edit.setDisplayFormat("yyyy-MM-dd")
+        today = market_session_date()
+        self.health_daily_date_edit.setDate(QDate(today.year, today.month, today.day))
+        self.health_daily_date_edit.dateChanged.connect(self._refresh_daily_summary)
+        controls.addWidget(self.health_daily_date_edit)
+        self.health_daily_today_button = QPushButton("Today")
+        self.health_daily_today_button.clicked.connect(self._select_daily_summary_today)
+        controls.addWidget(self.health_daily_today_button)
+        controls.addStretch()
+        self.health_daily_status_label = QLabel("Loading daily trading summary...")
+        self.health_daily_status_label.setWordWrap(True)
+        controls.addWidget(self.health_daily_status_label, 1)
+        layout.addLayout(controls)
+
+        self.health_daily_tabs = QTabWidget()
+
+        self.health_daily_plan_table = QTableWidget(0, 6)
+        self.health_daily_plan_table.setHorizontalHeaderLabels(
+            ["Plan source", "Symbol", "Breakout", "Planned qty", "Outcome", "Why / detail"]
+        )
+        self._configure_daily_table(self.health_daily_plan_table, stretch_column=5)
+        self.health_daily_tabs.addTab(self.health_daily_plan_table, "Buy Today plan")
+
+        self.health_daily_positions_table = QTableWidget(0, 4)
+        self.health_daily_positions_table.setHorizontalHeaderLabels(
+            ["Symbol", "Quantity", "Average entry", "Status"]
+        )
+        self._configure_daily_table(self.health_daily_positions_table, stretch_column=3)
+        self.health_daily_tabs.addTab(self.health_daily_positions_table, "Open positions")
+
+        self.health_daily_activity_table = QTableWidget(0, 6)
+        self.health_daily_activity_table.setHorizontalHeaderLabels(
+            ["Time", "Symbol", "Activity", "Quantity", "Price", "Status / reason"]
+        )
+        self._configure_daily_table(self.health_daily_activity_table, stretch_column=5)
+        self.health_daily_tabs.addTab(self.health_daily_activity_table, "Orders & sells")
+
+        self.health_daily_orb_rejections_table = QTableWidget(0, 14)
+        self.health_daily_orb_rejections_table.setHorizontalHeaderLabels(
             [
-                "Time",
-                "Event",
-                "Symbol",
-                "Strategy",
-                "Account",
-                "Qty / Price",
-                "Reason / Payload",
+                "Symbol", "Risk %", "Window", "Result", "ORB status",
+                "ORB high", "Breakout", "Buffered breakout", "Entry trigger",
+                "Stop / ORB low", "Shares", "Capital %", "Stop / ADR", "Why rejected",
             ]
         )
-        self.health_journal_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.health_journal_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.health_journal_table.setAlternatingRowColors(True)
-        journal_header = self.health_journal_table.horizontalHeader()
-        for column in range(6):
-            journal_header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
-        journal_header.setSectionResizeMode(6, QHeaderView.Stretch)
-        journal_layout.addWidget(self.health_journal_table)
-        return journal_tab
+        self._configure_daily_table(
+            self.health_daily_orb_rejections_table, stretch_column=13
+        )
+        self.health_daily_tabs.addTab(
+            self.health_daily_orb_rejections_table, "Rejected ORB combinations"
+        )
+        layout.addWidget(self.health_daily_tabs)
+        return summary_tab
+
+    @staticmethod
+    def _configure_daily_table(table: QTableWidget, *, stretch_column: int) -> None:
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setAlternatingRowColors(True)
+        header = table.horizontalHeader()
+        for column in range(table.columnCount()):
+            header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(stretch_column, QHeaderView.Stretch)
 
     def _build_pnl_dashboard_tab(self) -> QWidget:
         pnl_tab = QWidget()
@@ -609,7 +660,6 @@ class HealthPanelMixin:
             return
         self.health_refresh_button.setEnabled(False)
         self.health_checked_at_label.setText("Checking...")
-        symbol = self.health_journal_symbol_input.text().strip().upper()
         (
             unrealized_usd_today,
             fx_rate_today,
@@ -618,7 +668,6 @@ class HealthPanelMixin:
         ) = self._pnl_inputs()
         worker = HealthProbeWorker(
             self._health_context(),
-            symbol,
             unrealized_usd_today=unrealized_usd_today,
             fx_rate_today=fx_rate_today,
             capital_base_usd_today=capital_base_usd_today,
@@ -632,6 +681,7 @@ class HealthPanelMixin:
             worker.repository_checked.connect(apply_repository_status)
         self._track_worker("_health_probe_worker", worker)
         worker.start()
+        self._refresh_daily_summary()
 
     def _on_health_probe_completed(
         self,
@@ -667,9 +717,9 @@ class HealthPanelMixin:
                     item.setBackground(self._HEALTH_COLORS[check.level])
                     item.setTextAlignment(Qt.AlignCenter)
                 self.health_checks_table.setItem(row, column, item)
-        self._populate_health_journal(events)
         self._pnl_snapshots = pnl_snapshots
         self._refresh_pnl_dashboard_view()
+        self._refresh_daily_summary()
 
     def _on_health_probe_failed(self, message: str) -> None:
         self.health_refresh_button.setEnabled(True)
@@ -678,36 +728,168 @@ class HealthPanelMixin:
             f"The read-only health probe failed: {message}"
         )
 
-    def _populate_health_journal(self, events: List[dict]) -> None:
-        self.health_journal_table.setRowCount(len(events))
-        for row, event in enumerate(events):
-            quantity = event.get("quantity")
-            price = event.get("price")
-            qty_price = " / ".join(
-                part
-                for part in (
-                    f"{quantity} sh" if quantity is not None else "",
-                    f"{price}" if price is not None else "",
-                )
-                if part
+    def _selected_daily_summary_date(self) -> dt.date:
+        selected = self.health_daily_date_edit.date()
+        return dt.date(selected.year(), selected.month(), selected.day())
+
+    def _select_daily_summary_today(self) -> None:
+        today = market_session_date()
+        self.health_daily_date_edit.setDate(QDate(today.year, today.month, today.day))
+        self._refresh_daily_summary()
+
+    def _refresh_daily_summary(self, *_args) -> None:
+        if not hasattr(self, "health_daily_date_edit"):
+            return
+        worker = self.__dict__.get("_daily_summary_worker")
+        if worker is not None and worker.isRunning():
+            self._daily_summary_refresh_pending = True
+            return
+        engine_reader = getattr(self, "_execution_state_engine", None)
+        engine = engine_reader() if callable(engine_reader) else self.__dict__.get(
+            "operational_db_engine"
+        )
+        if engine is None:
+            self.health_daily_status_label.setText(
+                "Daily summary unavailable: the shared Kanban database is offline."
             )
-            detail = str(event.get("reason") or "")
-            payload = event.get("payload")
-            if payload:
-                payload_text = json.dumps(
-                    payload, ensure_ascii=False, sort_keys=True, separators=(", ", ": ")
-                )
-                detail = f"{detail} | {payload_text}" if detail else payload_text
-            values = [
-                event.get("timestamp", ""),
-                event.get("event_type", ""),
-                event.get("symbol", ""),
-                event.get("strategy_id", ""),
-                event.get("account", ""),
-                qty_price,
-                detail,
-            ]
+            self._clear_daily_summary_tables()
+            return
+        selected_date = self._selected_daily_summary_date()
+        self.health_daily_status_label.setText(
+            f"Loading {selected_date.isoformat()} from the shared trading ledger..."
+        )
+        worker = DailySummaryWorker(engine, selected_date)
+        self._daily_summary_worker = worker
+        self._daily_summary_refresh_pending = False
+        worker.completed.connect(self._on_daily_summary_completed)
+        worker.failed.connect(self._on_daily_summary_failed)
+        worker.finished.connect(self._on_daily_summary_worker_finished)
+        self._track_worker("_daily_summary_worker", worker)
+        worker.start()
+
+    def _on_daily_summary_completed(self, summary: DailyTradingSummary) -> None:
+        if summary.session_date != self._selected_daily_summary_date():
+            self._daily_summary_refresh_pending = True
+            return
+        self.health_daily_status_label.setText(summary.note)
+        self._populate_daily_plan(summary)
+        self._populate_daily_positions(summary)
+        self._populate_daily_activity(summary)
+        self._populate_daily_orb_rejections(summary)
+        self.health_daily_tabs.setTabText(
+            0, f"Buy Today plan ({len(summary.plan_items)})"
+        )
+        self.health_daily_tabs.setTabText(
+            1, f"Open positions ({len(summary.positions)})"
+        )
+        sell_count = sum(
+            "SELL" in activity.activity for activity in summary.activities
+        )
+        self.health_daily_tabs.setTabText(
+            2, f"Orders & sells ({sell_count} sells)"
+        )
+        self.health_daily_tabs.setTabText(
+            3,
+            "Rejected ORB combinations "
+            f"({len(summary.rejected_orb_combinations)})",
+        )
+
+    def _on_daily_summary_failed(self, message: str) -> None:
+        self.health_daily_status_label.setText(f"Daily summary failed: {message}")
+        self._clear_daily_summary_tables()
+
+    def _on_daily_summary_worker_finished(self) -> None:
+        if self.__dict__.pop("_daily_summary_refresh_pending", False):
+            self._refresh_daily_summary()
+
+    def _clear_daily_summary_tables(self) -> None:
+        self.health_daily_plan_table.setRowCount(0)
+        self.health_daily_positions_table.setRowCount(0)
+        self.health_daily_activity_table.setRowCount(0)
+        self.health_daily_orb_rejections_table.setRowCount(0)
+
+    @staticmethod
+    def _set_daily_cell(table: QTableWidget, row: int, column: int, value) -> None:
+        text = str(value if value not in (None, "") else "—")
+        item = QTableWidgetItem(text)
+        item.setToolTip(text)
+        table.setItem(row, column, item)
+
+    def _populate_daily_plan(self, summary: DailyTradingSummary) -> None:
+        table = self.health_daily_plan_table
+        table.setRowCount(len(summary.plan_items))
+        for row, item in enumerate(summary.plan_items):
+            why = " — ".join(
+                part for part in (item.reason_category, item.reason) if part
+            )
+            values = (
+                item.source,
+                item.symbol,
+                f"${item.breakout_price:,.2f}" if item.breakout_price else "—",
+                item.planned_quantity or "—",
+                item.outcome,
+                why or "—",
+            )
             for column, value in enumerate(values):
-                item = QTableWidgetItem(str(value or ""))
-                item.setToolTip(str(value or ""))
-                self.health_journal_table.setItem(row, column, item)
+                self._set_daily_cell(table, row, column, value)
+
+    def _populate_daily_positions(self, summary: DailyTradingSummary) -> None:
+        table = self.health_daily_positions_table
+        table.setRowCount(len(summary.positions))
+        for row, item in enumerate(summary.positions):
+            values = (
+                item.symbol,
+                item.quantity,
+                f"${item.average_price:,.2f}" if item.average_price else "—",
+                item.status,
+            )
+            for column, value in enumerate(values):
+                self._set_daily_cell(table, row, column, value)
+
+    def _populate_daily_activity(self, summary: DailyTradingSummary) -> None:
+        table = self.health_daily_activity_table
+        table.setRowCount(len(summary.activities))
+        for row, item in enumerate(summary.activities):
+            values = (
+                item.occurred_at,
+                item.symbol,
+                item.activity,
+                item.quantity,
+                f"${item.price:,.2f}" if item.price else "—",
+                " — ".join(part for part in (item.status, item.reason) if part),
+            )
+            for column, value in enumerate(values):
+                self._set_daily_cell(table, row, column, value)
+
+    def _populate_daily_orb_rejections(
+        self, summary: DailyTradingSummary
+    ) -> None:
+        table = self.health_daily_orb_rejections_table
+        rows = summary.rejected_orb_combinations
+        table.setRowCount(len(rows))
+
+        def price(value) -> str:
+            return f"${value:,.2f}" if value is not None else "—"
+
+        def percent(value) -> str:
+            return f"{value:.2f}%" if value is not None else "—"
+
+        for row, item in enumerate(rows):
+            values = (
+                item.symbol,
+                f"{item.risk_percent * 100.0:.2f}%",
+                item.window,
+                item.classification,
+                item.status.replace("_", " "),
+                price(item.orb_high),
+                price(item.breakout_price),
+                price(item.breakout_trigger),
+                price(item.entry_trigger),
+                price(item.stop_price),
+                item.shares or "—",
+                percent(item.capital_percent),
+                percent(item.stop_adr),
+                item.reason,
+            )
+            for column, value in enumerate(values):
+                self._set_daily_cell(table, row, column, value)

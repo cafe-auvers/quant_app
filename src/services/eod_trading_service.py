@@ -234,6 +234,35 @@ class EodTradingService:
             return True
         if not allow_no_order_reset:
             return False
+        # Preserve the final, trader-facing outcome before clearing the
+        # transient runtime fields. This is the explanation shown in the
+        # date-based Health summary for the original session.
+        completed_session = card.session_date or market_session_date()
+        runtime_status = card.entry_runtime_status
+        runtime_reason = str(card.entry_block_reason or "").strip()
+        trigger = card.entry_trigger or card.breakout_price
+        if runtime_status == EntryRuntimeStatus.WAITING_BREAKOUT:
+            if trigger:
+                final_note = (
+                    "Session ended before price cleared the entry trigger "
+                    f"${float(trigger):,.2f}."
+                )
+            else:
+                final_note = "Session ended before the breakout trigger was reached."
+        elif runtime_status == EntryRuntimeStatus.ORB_FORMING:
+            final_note = "Session ended before a valid ORB plan completed."
+        elif runtime_status == EntryRuntimeStatus.RISK_INVALID:
+            final_note = runtime_reason or "Entry rejected because the risk plan was invalid."
+        elif runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE:
+            final_note = runtime_reason or "Entry was blocked by a market-data or system issue."
+        elif runtime_status == EntryRuntimeStatus.WAITING_FOR_CAPITAL:
+            final_note = runtime_reason or "Entry was blocked because capital was unavailable."
+        elif runtime_status == EntryRuntimeStatus.RETRY_COOLDOWN:
+            final_note = runtime_reason or "Session ended while the entry was waiting to retry."
+        else:
+            final_note = runtime_reason or "Session ended without an entry."
+        card.buy_today_note = final_note
+        card.last_buy_today_session_date = completed_session
         monitoring_command = build_entry_monitoring_command(
             environment=card.environment,
             account_no=card.account_no,

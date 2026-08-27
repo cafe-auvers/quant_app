@@ -457,6 +457,11 @@ def create_trade_card(
     with engine.begin() as conn:
         insert_trade_card(conn, card)
     _upsert_local_snapshot_card(card, path=local_snapshot_path)
+    from src.services.daily_trading_summary import (
+        record_trade_card_snapshot_best_effort,
+    )
+
+    record_trade_card_snapshot_best_effort(engine, card)
     return card
 
 
@@ -478,6 +483,11 @@ def update_trade_card(
             conn, card, expected_version=expected_version
         )
     _upsert_local_snapshot_card(card, path=local_snapshot_path)
+    from src.services.daily_trading_summary import (
+        record_trade_card_snapshot_best_effort,
+    )
+
+    record_trade_card_snapshot_best_effort(engine, card)
     return card
 
 

@@ -1520,6 +1520,35 @@ def publish_trading_plan(
             pulled.state.updated_at,
         )
     _update_sync_entries(updates, path)
+    # Only a fully verified read-back is a published plan. Record the exact
+    # canonical Buy Today membership after that boundary so later additions
+    # can be distinguished from the original plan.
+    try:
+        from src.core.trade_card_state import BoardStatus
+        from src.services.daily_trading_summary import (
+            record_plan_published_best_effort,
+        )
+        from src.services.trade_card_repository import list_trade_cards
+        from src.utils.market_calendar import current_or_next_nyse_session_date
+
+        plan_session = current_or_next_nyse_session_date()
+        plan_cards = [
+            card
+            for card in list_trade_cards(
+                engine, environment="PROD", raise_on_error=True
+            )
+            if card.board_status == BoardStatus.BUY_TODAY
+            and (card.session_date is None or card.session_date == plan_session)
+        ]
+        record_plan_published_best_effort(
+            engine,
+            session_date=plan_session,
+            cards=plan_cards,
+            revisions=published.revisions,
+            occurred_at=published.verified_at,
+        )
+    except Exception:
+        logger.exception("Could not prepare the verified plan for daily summary")
     return published
 
 

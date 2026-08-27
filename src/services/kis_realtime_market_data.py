@@ -2037,7 +2037,7 @@ def build_kis_realtime_market_data_from_environment(
     ws_url = os.getenv(f"{prefix}_WS_URL", "").strip()
     app_key = os.getenv(f"{prefix}_APP_KEY", "").strip()
     app_secret = os.getenv(f"{prefix}_APP_SECRET", "").strip()
-    key_store = symbol_key_store or KisWsSymbolKeyStore()
+    key_store = symbol_key_store or KisWsSymbolKeyStore(auto_provision=True)
 
     def resolve_key(symbol: str, channel: FeedChannel) -> str:
         del channel  # KIS uses the same verified key for trade and quote TRs.

@@ -2225,6 +2225,14 @@ def apply_reconciliation_plan(engine: Engine, plan: ReconciliationPlan) -> None:
             logger.exception(
                 "Failed to refresh local card snapshot after atomic account plan"
             )
+        try:
+            from src.services.daily_trading_summary import (
+                record_trade_card_snapshot_best_effort,
+            )
+
+            record_trade_card_snapshot_best_effort(engine, card)
+        except Exception:
+            logger.exception("Failed to record reconciled card in daily summary")
 
 
 def run_account_reconciliation_pass(

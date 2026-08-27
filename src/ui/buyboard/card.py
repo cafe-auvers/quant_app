@@ -461,6 +461,16 @@ class TradeCardWidget(QFrame):
                 memo.setStyleSheet("color: #8a5a00; font-size: 11px;")
                 memo.setWordWrap(True)
                 layout.addWidget(memo)
+            if card.rejected_orb_snapshot:
+                orb_details = QLabel(
+                    "ORB rejection matrix saved — right-click this card and "
+                    "open Rejected ORB Combinations."
+                )
+                orb_details.setStyleSheet(
+                    "color: #b71c1c; font-size: 11px; font-weight: bold;"
+                )
+                orb_details.setWordWrap(True)
+                layout.addWidget(orb_details)
             return
 
         if card.pending_stop_command_id and card.pending_stop_price:

@@ -58,12 +58,22 @@ def _attach_local_activation_symbol_key(
 
     if not isinstance(command, ActivateForToday) or command.kis_ws_symbol_key:
         return command
-    from src.services.kis_ws_symbol_keys import KisWsSymbolKeyStore
+    from src.services.kis_ws_symbol_keys import (
+        KisWsSymbolKeyStore,
+        derive_symbol_key_from_kis_master,
+    )
 
     try:
         key = KisWsSymbolKeyStore().resolve(command.symbol)
     except (OSError, RuntimeError):
-        return command
+        try:
+            # The operator only needs to carry the authoritative mapping in
+            # the command. The executor materializes it after the command is
+            # accepted, so a rejected/duplicate request does not edit local
+            # subscription state.
+            key = derive_symbol_key_from_kis_master(command.symbol)
+        except (OSError, RuntimeError):
+            return command
     return replace(command, kis_ws_symbol_key=key)
 
 

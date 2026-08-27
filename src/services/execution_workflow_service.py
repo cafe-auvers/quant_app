@@ -1158,6 +1158,8 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
             card.entry_attempt_count = 0
     elif isinstance(command, types.ActivateForToday):
         card.buy_today_note = ""
+        card.last_buy_today_session_date = None
+        card.rejected_orb_snapshot = {}
         card.kis_ws_symbol_key = _activation_symbol_key(command, card)
         if context is not None and context.session_date is not None:
             card.session_date = context.session_date
@@ -1472,6 +1474,21 @@ def request_board_action(
         if stop_change_coordinator is not None:
             stop_change_coordinator.record_durable(updated)
     trade_card_repository.sync_trade_card_local_snapshot(updated)
+    from src.services.daily_trading_summary import (
+        record_buy_today_added_best_effort,
+        record_trade_card_snapshot_best_effort,
+    )
+
+    record_trade_card_snapshot_best_effort(
+        engine, updated, occurred_at=getattr(command, "requested_at", None)
+    )
+    if isinstance(command, ActivateForToday):
+        record_buy_today_added_best_effort(
+            engine,
+            updated,
+            command_id=command.command_id,
+            occurred_at=command.requested_at,
+        )
     return BoardWorkflowResult(card=updated, command_id=command.command_id)
 
 

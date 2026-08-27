@@ -223,6 +223,54 @@ def test_intraday_symbol_key_addition_subscribes_without_restarting_or_disruptin
     assert service.symbol_state("MSFT").quote_configuration_error == ""
 
 
+def test_intraday_plan_addition_provisions_key_from_kis_master_and_subscribes(
+    tmp_path,
+):
+    from src.services.kis_ws_symbol_keys import (
+        KisWsSymbolKeyStore,
+        read_symbol_keys_file,
+        write_symbol_keys_file,
+    )
+
+    key_path = tmp_path / "kis_ws_symbol_keys.json"
+    master_path = tmp_path / "us_kis_tickers.csv"
+    write_symbol_keys_file({"AAPL": "DAAPL"}, key_path)
+    master_path.write_text(
+        "Symbol,KisSymbol,Exchange,Name,KoreanName,Currency\n"
+        "RNG,RNG,NYS,RINGCENTRAL INC,,USD\n",
+        encoding="utf-8",
+    )
+    store = KisWsSymbolKeyStore(
+        key_path,
+        legacy_json="{}",
+        universe_path=master_path,
+        auto_provision=True,
+    )
+    service, transport = _service(
+        symbol_key_resolver=lambda symbol, _channel: store.resolve(symbol)
+    )
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": 1},
+        quote_priorities={"AAPL": 1},
+    )
+    _ack(service, "AAPL", "HDFSCNT0")
+    _ack(service, "AAPL", "HDFSASP0")
+
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": 1, "RNG": 2},
+        quote_priorities={"AAPL": 1, "RNG": 2},
+    )
+
+    assert read_symbol_keys_file(key_path) == {
+        "AAPL": "DAAPL",
+        "RNG": "DNYSRNG",
+    }
+    assert {item.symbol for item in transport.subscribed} == {"AAPL", "RNG"}
+    assert transport.unsubscribed == []
+    assert service.symbol_state("RNG").trade_configuration_error == ""
+    assert service.symbol_state("RNG").quote_configuration_error == ""
+
+
 def test_canonical_buy_today_key_handoff_materializes_missing_executor_file(tmp_path):
     from src.services.kis_ws_symbol_keys import (
         KisWsSymbolKeyStore,

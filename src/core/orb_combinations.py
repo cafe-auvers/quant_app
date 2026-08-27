@@ -7,7 +7,7 @@ second selection or execution path.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 import math
 from typing import Iterable, Optional, Tuple
 
@@ -59,6 +59,25 @@ class OrbPositionCombination:
     capital_percent: float
     stop_loss_percent: float
     stop_adr: Optional[float]
+
+
+def orb_position_combinations_from_snapshot(
+    snapshot: dict,
+) -> list[OrbPositionCombination]:
+    """Restore the exact combinations frozen at terminal ORB rejection."""
+
+    allowed = {item.name for item in fields(OrbPositionCombination)}
+    restored: list[OrbPositionCombination] = []
+    for raw in list(dict(snapshot or {}).get("combinations") or []):
+        if not isinstance(raw, dict):
+            continue
+        payload = {key: value for key, value in raw.items() if key in allowed}
+        try:
+            payload["status"] = _status(payload.get("status"))
+            restored.append(OrbPositionCombination(**payload))
+        except (TypeError, ValueError):
+            continue
+    return restored
 
 
 def _finite(value) -> Optional[float]:
