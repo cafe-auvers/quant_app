@@ -9,10 +9,61 @@ from scripts.manage_kis_ws_symbol_keys import main as manage_main
 from src.services.kis_ws_symbol_keys import (
     KisWsSymbolKeyStore,
     KisWsSymbolKeysError,
+    derive_symbol_key_from_kis_master,
     read_symbol_keys_file,
     update_symbol_keys_file,
     write_symbol_keys_file,
 )
+
+
+def _write_kis_master(path, rows):
+    path.write_text(
+        "Symbol,KisSymbol,Exchange,Name,KoreanName,Currency\n"
+        + "".join(
+            f"{symbol},{kis_symbol},{exchange},Example,,USD\n"
+            for symbol, kis_symbol, exchange in rows
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_missing_key_is_atomically_provisioned_from_kis_master(tmp_path):
+    key_path = tmp_path / "kis_ws_symbol_keys.json"
+    master_path = tmp_path / "us_kis_tickers.csv"
+    write_symbol_keys_file({"AAPL": "DNASAAPL"}, key_path)
+    _write_kis_master(master_path, [("RNG", "RNG", "NYS")])
+    store = KisWsSymbolKeyStore(
+        key_path,
+        legacy_json="{}",
+        universe_path=master_path,
+        auto_provision=True,
+    )
+
+    assert store.resolve("rng") == "DNYSRNG"
+    assert read_symbol_keys_file(key_path) == {
+        "AAPL": "DNASAAPL",
+        "RNG": "DNYSRNG",
+    }
+    assert key_path.with_suffix(".json.bak").is_file()
+
+
+def test_master_provisioning_uses_kis_native_symbol_spelling(tmp_path):
+    master_path = tmp_path / "us_kis_tickers.csv"
+    _write_kis_master(master_path, [("BRK-B", "BRK/B", "NYS")])
+
+    assert derive_symbol_key_from_kis_master("BRK-B", master_path) == "DNYSBRK/B"
+
+
+def test_master_provisioning_fails_closed_for_unknown_or_unsupported_exchange(
+    tmp_path,
+):
+    master_path = tmp_path / "us_kis_tickers.csv"
+    _write_kis_master(master_path, [("SHOP", "SHOP", "TSE")])
+
+    with pytest.raises(KisWsSymbolKeysError, match="no supported US exchange"):
+        derive_symbol_key_from_kis_master("SHOP", master_path)
+    with pytest.raises(KisWsSymbolKeysError, match="not present"):
+        derive_symbol_key_from_kis_master("MISSING", master_path)
 
 
 def test_file_replaces_legacy_env_and_hot_reloads_additions(tmp_path):

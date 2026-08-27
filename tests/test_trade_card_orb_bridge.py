@@ -346,10 +346,22 @@ def test_all_three_terminal_invalid_orb_plans_return_card_to_buylist_with_note()
     assert card.planned_quantity == 0
     assert card.session_date is None
     assert card.buylist_member is True
+    assert card.last_buy_today_session_date == date(2026, 8, 19)
     assert "all ORB plans invalid" in card.buy_today_note
     assert "1m: ORB high did not clear breakout" in card.buy_today_note
     assert "5m: stop is too wide" in card.buy_today_note
     assert "30m: ORB strategy rejected" in card.buy_today_note
+    assert card.rejected_orb_snapshot["session_date"] == "2026-08-19"
+    assert len(card.rejected_orb_snapshot["combinations"]) == 24
+    assert set(card.rejected_orb_snapshot["queue_item"]["candidates"]) == {
+        "1m",
+        "5m",
+        "30m",
+    }
+    assert all(
+        combination["status"] in {"REJECTED", "RISK_INVALID"}
+        for combination in card.rejected_orb_snapshot["combinations"]
+    )
 
 
 def test_forming_window_prevents_automatic_return_to_buylist():

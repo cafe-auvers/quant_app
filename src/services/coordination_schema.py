@@ -16,6 +16,7 @@ def ensure_coordination_schema(engine: Engine) -> None:
     from src.services.discovered_external_order_repository import (
         ensure_discovered_external_orders_table,
     )
+    from src.services.daily_trading_summary import ensure_daily_trading_events_table
     from src.services.emergency_journal import ensure_emergency_reconciliation_table
     from src.services.execution_command_repository import ensure_execution_commands_table
     from src.services.execution_order_repository import ensure_execution_orders_table
@@ -38,6 +39,7 @@ def ensure_coordination_schema(engine: Engine) -> None:
     ensure_runtime_status_table(engine)
     ensure_execution_commands_table(engine)
     ensure_execution_orders_table(engine)
+    ensure_daily_trading_events_table(engine)
     ensure_capital_reservations_table(engine)
     ensure_discovered_external_orders_table(engine)
     ensure_emergency_reconciliation_table(engine)

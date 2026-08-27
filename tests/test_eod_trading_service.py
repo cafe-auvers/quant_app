@@ -103,7 +103,28 @@ def test_buy_today_with_no_order_returns_to_buylist_and_clears_runtime_values(tm
     assert card.entry_orb_low is None
     assert card.entry_trigger is None
     assert card.capital_reservation_id == ""
+    assert card.last_buy_today_session_date == date(2026, 8, 19)
+    assert card.buy_today_note == "Session ended without an entry."
     assert cancelled == []  # nothing to cancel -- no order exists
+
+
+def test_buy_today_eod_preserves_breakout_not_reached_reason(tmp_path):
+    service, _, _ = _service(tmp_path)
+    card = _card(
+        board_status=BoardStatus.BUY_TODAY,
+        session_date=date(2026, 8, 19),
+        entry_runtime_status=EntryRuntimeStatus.WAITING_BREAKOUT,
+        entry_trigger=106.0,
+    )
+
+    service.run_eod_cleanup(
+        [card], market_closed=True, current_session_date=date(2026, 8, 19)
+    )
+
+    assert card.last_buy_today_session_date == date(2026, 8, 19)
+    assert card.buy_today_note == (
+        "Session ended before price cleared the entry trigger $106.00."
+    )
 
 
 def test_buy_today_with_no_order_does_not_reset_before_market_close(tmp_path):

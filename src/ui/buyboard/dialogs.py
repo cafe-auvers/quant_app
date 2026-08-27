@@ -359,11 +359,13 @@ def show_orb_combinations_dialog(
     combinations: list[OrbPositionCombination],
     *,
     buffer_pct: float,
+    snapshot_label: str = "",
 ) -> None:
     """Show every risk/window sizing option without changing plan selection."""
 
     dialog = QDialog(parent)
-    dialog.setWindowTitle(f"ORB Combinations - {queue_item.symbol} [PROD]")
+    title_prefix = "Rejected ORB Combinations" if snapshot_label else "ORB Combinations"
+    dialog.setWindowTitle(f"{title_prefix} - {queue_item.symbol} [PROD]")
     dialog.setMinimumWidth(1200)
     dialog.setMinimumHeight(520)
     layout = QVBoxLayout(dialog)
@@ -385,9 +387,14 @@ def show_orb_combinations_dialog(
     layout.addWidget(summary)
 
     explanation = QLabel(
-        "Read-only comparison of all 0.25%-2.00% risk cases across 1m, 5m, "
-        "and 30m ORBs. Use the separate ORB Plans dialog to select or lock "
-        "the optimized plan."
+        (
+            f"Frozen rejection snapshot: {snapshot_label}. These are the exact "
+            "0.25%-2.00% risk cases evaluated before the card returned to Buylist."
+            if snapshot_label
+            else "Read-only comparison of all 0.25%-2.00% risk cases across 1m, "
+            "5m, and 30m ORBs. Use the separate ORB Plans dialog to select or "
+            "lock the optimized plan."
+        )
     )
     explanation.setWordWrap(True)
     layout.addWidget(explanation)

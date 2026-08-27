@@ -162,6 +162,7 @@ def test_buylist_card_shows_buy_today_rejection_memo():
             "Buy Today rejected - all ORB plans invalid. "
             "1m: stop is too wide; 5m: breakout not cleared; 30m: risk invalid"
         ),
+        rejected_orb_snapshot={"combinations": [{"window": "1m"}]},
     )
 
     text = _widget_text(TradeCardWidget(card))
@@ -169,6 +170,7 @@ def test_buylist_card_shows_buy_today_rejection_memo():
     assert "Memo:" in text
     assert "all ORB plans invalid" in text
     assert "1m: stop is too wide" in text
+    assert "Rejected ORB Combinations" in text
 
 
 def test_buy_today_card_shows_live_breakout_distance_and_planned_stop_result():

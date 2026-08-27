@@ -425,10 +425,32 @@ def _return_rejected_card_to_buylist(
     reference = now
     if reference.tzinfo is None:
         reference = reference.replace(tzinfo=timezone.utc)
+    rejected_session = card.session_date or reference.astimezone(_US_MARKET_ZONE).date()
+    from dataclasses import asdict
+    from src.core.orb_combinations import build_orb_position_combinations
+
+    combinations = build_orb_position_combinations(
+        execution_queue_item,
+        account_equity=0.0,
+        buffer_pct=card.buffer_pct,
+    )
+    serialized_combinations = []
+    for combination in combinations:
+        payload = asdict(combination)
+        payload["status"] = combination.status.value
+        serialized_combinations.append(payload)
+    card.rejected_orb_snapshot = {
+        "captured_at": reference.astimezone(timezone.utc).isoformat(),
+        "session_date": rejected_session.isoformat(),
+        "buffer_pct": float(card.buffer_pct),
+        "queue_item": execution_queue_item.to_dict(),
+        "combinations": serialized_combinations,
+    }
     card.previous_board_status = card.board_status
     card.board_status = BoardStatus.BUYLIST
     card.board_status_updated_at = reference.astimezone(timezone.utc)
     card.session_date = None
+    card.last_buy_today_session_date = rejected_session
     card.buylist_member = True
     card.buy_today_note = _orb_rejection_note(execution_queue_item)
     _clear_entry_plan(card)

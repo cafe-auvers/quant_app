@@ -28,7 +28,11 @@ from PyQt5.QtWidgets import (
 )
 
 from src.core.execution_config import is_buyboard_engine_enabled
-from src.core.orb_combinations import build_orb_position_combinations
+from src.core.execution_queue import ExecutionQueueItem
+from src.core.orb_combinations import (
+    build_orb_position_combinations,
+    orb_position_combinations_from_snapshot,
+)
 from src.core.board_workflow import (
     BoardCardProjection,
     BoardExecutionOrderProjection,
@@ -1052,6 +1056,46 @@ def _show_orb_combinations(main_window, card: TradeCardState) -> None:
     )
 
 
+def _show_rejected_orb_combinations(main_window, card: TradeCardState) -> None:
+    """Show the immutable ORB matrix that caused automatic rejection."""
+
+    snapshot = dict(card.rejected_orb_snapshot or {})
+    combinations = orb_position_combinations_from_snapshot(snapshot)
+    queue_payload = snapshot.get("queue_item")
+    if not combinations or not isinstance(queue_payload, dict):
+        QMessageBox.warning(
+            main_window,
+            "Rejected ORB Combinations",
+            f"No frozen rejection combinations are available for {card.symbol}.",
+        )
+        return
+    try:
+        queue_item = ExecutionQueueItem.from_dict(queue_payload)
+        buffer_pct = float(snapshot.get("buffer_pct", card.buffer_pct))
+    except (TypeError, ValueError):
+        QMessageBox.warning(
+            main_window,
+            "Rejected ORB Combinations",
+            f"The saved ORB rejection snapshot for {card.symbol} is unreadable.",
+        )
+        return
+    label = " / ".join(
+        part
+        for part in (
+            str(snapshot.get("session_date") or ""),
+            str(snapshot.get("captured_at") or ""),
+        )
+        if part
+    )
+    dialogs.show_orb_combinations_dialog(
+        main_window,
+        queue_item,
+        combinations,
+        buffer_pct=buffer_pct,
+        snapshot_label=label or "terminal ORB rejection",
+    )
+
+
 def _open_card_in_tradingview(main_window, symbol: str) -> None:
     select_unfiltered_symbol = getattr(
         main_window, "_select_sidebar_universe_symbol", None
@@ -1104,6 +1148,10 @@ def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
     actions = {}
     if card.board_status == BoardStatus.BUYLIST:
         actions["activate"] = menu.addAction("Activate for Buy Today")
+        if card.rejected_orb_snapshot:
+            actions["rejected_orb_combinations"] = menu.addAction(
+                "Rejected ORB Combinations..."
+            )
         actions["move_watchlist"] = menu.addAction("Move to Watchlist")
         menu.addSeparator()
     elif card.board_status == BoardStatus.BUY_TODAY:
@@ -1153,6 +1201,8 @@ def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
         main_window._buyboard_dispatch_command(
             command, interaction_fingerprint=interaction_fingerprint
         )
+    elif chosen is actions.get("rejected_orb_combinations"):
+        _show_rejected_orb_combinations(main_window, card)
     elif chosen is actions.get("move_watchlist"):
         command = MoveToWatchlist(**common)
         main_window._buyboard_dispatch_command(

@@ -19,8 +19,12 @@ The file is a plain JSON object:
 }
 ```
 
-Only live-verified keys belong in this file. The application never guesses an
-exchange prefix.
+Keys in this file either come from a reviewed manual entry or are provisioned
+from the local official KIS US symbol master. Automatic provisioning uses the
+master's exact `KisSymbol` and its `NAS`/`NYS`/`AMS` exchange together with the
+live-verified regular-session prefix for that exchange. Missing, ambiguous, or
+unsupported master rows fail closed; the application never guesses an
+exchange.
 
 ## Cross-device Buy Today handoff
 
@@ -31,6 +35,12 @@ durable `ADD_BUY_TODAY` command. Before requesting the quote/trade channels,
 the executor atomically adds a missing canonical mapping to its own local
 file. Therefore a newly selected Buy Today symbol does not require a second
 manual edit or an application restart on the execution PC.
+
+When a newly added symbol is not already in the local key file, activation or
+the next subscription rebalance provisions it atomically from
+`data/us_kis_tickers.csv`. This also repairs an already-active Buy Today card
+whose earlier activation persisted an empty key. The hot-reload and canonical
+handoff behavior below then applies without restarting either process.
 
 This handoff does not weaken the local review boundary:
 

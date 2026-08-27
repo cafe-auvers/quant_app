@@ -9,6 +9,7 @@ from src.core.execution_queue import (
 from src.core.orb_combinations import (
     ORB_RISK_CASES,
     build_orb_position_combinations,
+    orb_position_combinations_from_snapshot,
 )
 
 
@@ -187,3 +188,21 @@ def test_only_stale_source_windows_are_never_shown_green():
         for item in one_minute
     )
     assert any(item.valid for item in other_windows)
+
+
+def test_frozen_combinations_round_trip_from_rejection_snapshot():
+    combinations = build_orb_position_combinations(
+        _queue(status=OrbCandidateStatus.REJECTED, reason="terminal rejection"),
+        account_equity=100_000.0,
+    )
+    payloads = []
+    for combination in combinations:
+        payload = dict(combination.__dict__)
+        payload["status"] = combination.status.value
+        payloads.append(payload)
+
+    restored = orb_position_combinations_from_snapshot(
+        {"combinations": payloads}
+    )
+
+    assert restored == combinations

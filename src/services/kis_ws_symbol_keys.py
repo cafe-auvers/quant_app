@@ -11,6 +11,7 @@ running process never falls back to a later environment value.
 """
 from __future__ import annotations
 
+import csv
 from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
@@ -30,10 +31,20 @@ from src.utils.storage import save_json
 logger = logging.getLogger(__name__)
 
 DEFAULT_KIS_WS_SYMBOL_KEYS_FILE = DATA_DIR / "kis_ws_symbol_keys.json"
+DEFAULT_KIS_US_TICKERS_FILE = DATA_DIR / "us_kis_tickers.csv"
 LEGACY_SYMBOL_KEYS_ENV = "KIS_WS_SYMBOL_KEYS_JSON"
 MAX_SYMBOL_KEYS_FILE_BYTES = 1024 * 1024
 
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,31}$")
+_REGULAR_SESSION_PREFIX_BY_EXCHANGE = {
+    "AMS": "DAMS",
+    "AMEX": "DAMS",
+    "NAS": "DNAS",
+    "NASD": "DNAS",
+    "NASDAQ": "DNAS",
+    "NYS": "DNYS",
+    "NYSE": "DNYS",
+}
 _WRITE_LOCK_TIMEOUT_SECONDS = 5.0
 _STALE_WRITE_LOCK_SECONDS = 30.0
 
@@ -100,6 +111,75 @@ def parse_legacy_symbol_keys(raw_json: str) -> Dict[str, str]:
     return normalize_symbol_keys(raw)
 
 
+def derive_symbol_key_from_kis_master(
+    symbol: str,
+    path: Path = DEFAULT_KIS_US_TICKERS_FILE,
+) -> str:
+    """Build one regular-session key from the official KIS symbol master.
+
+    The exchange prefixes are protocol-level values verified for all three
+    supported US exchanges. The symbol suffix comes from ``KisSymbol``
+    rather than the Yahoo/display spelling, which keeps class-share and other
+    broker-specific symbols exact. Ambiguous, missing, or unsupported master
+    rows fail closed instead of guessing an exchange.
+    """
+
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not _SYMBOL_PATTERN.fullmatch(normalized_symbol):
+        raise KisWsSymbolKeysError(f"invalid KIS WebSocket symbol: {symbol!r}")
+    lookup_symbol = normalized_symbol.replace("/", "-").replace(".", "-")
+    target = Path(path)
+    try:
+        handle = target.open("r", encoding="utf-8-sig", newline="")
+    except OSError as exc:
+        raise KisWsSymbolKeysError(
+            f"KIS US symbol master cannot be read: {target}"
+        ) from exc
+
+    matches: set[str] = set()
+    matched_rows = 0
+    with handle:
+        reader = csv.DictReader(handle)
+        required = {"Symbol", "KisSymbol", "Exchange"}
+        if not required.issubset(set(reader.fieldnames or ())):
+            raise KisWsSymbolKeysError(
+                f"KIS US symbol master is missing required columns: {target}"
+            )
+        for row in reader:
+            row_symbol = str(row.get("Symbol") or "").strip().upper()
+            row_lookup = row_symbol.replace("/", "-").replace(".", "-")
+            if row_lookup != lookup_symbol:
+                continue
+            matched_rows += 1
+            kis_symbol = str(row.get("KisSymbol") or "").strip().upper()
+            exchange = str(row.get("Exchange") or "").strip().upper()
+            prefix = _REGULAR_SESSION_PREFIX_BY_EXCHANGE.get(exchange)
+            if not kis_symbol or prefix is None:
+                continue
+            candidate = f"{prefix}{kis_symbol}"
+            matches.add(
+                normalize_symbol_keys({normalized_symbol: candidate})[
+                    normalized_symbol
+                ]
+            )
+
+    if len(matches) == 1:
+        return next(iter(matches))
+    if len(matches) > 1:
+        raise KisWsSymbolKeysError(
+            "KIS US symbol master has conflicting exchange mappings for "
+            f"{normalized_symbol}"
+        )
+    if matched_rows:
+        raise KisWsSymbolKeysError(
+            "KIS US symbol master has no supported US exchange mapping for "
+            f"{normalized_symbol}"
+        )
+    raise KisWsSymbolKeysError(
+        f"{normalized_symbol} is not present in the KIS US symbol master: {target}"
+    )
+
+
 def read_symbol_keys_file(path: Path = DEFAULT_KIS_WS_SYMBOL_KEYS_FILE) -> Dict[str, str]:
     """Strictly read the local mapping; never silently substitute a backup."""
 
@@ -141,10 +221,14 @@ class KisWsSymbolKeyStore:
         path: Path = DEFAULT_KIS_WS_SYMBOL_KEYS_FILE,
         *,
         legacy_json: Optional[str] = None,
+        universe_path: Path = DEFAULT_KIS_US_TICKERS_FILE,
+        auto_provision: bool = False,
     ) -> None:
         import threading
 
         self.path = Path(path)
+        self.universe_path = Path(universe_path)
+        self._auto_provision = bool(auto_provision)
         self._legacy_json = (
             os.getenv(LEGACY_SYMBOL_KEYS_ENV, "{}")
             if legacy_json is None
@@ -282,15 +366,48 @@ class KisWsSymbolKeyStore:
 
     def resolve(self, symbol: str) -> str:
         normalized = str(symbol or "").strip().upper()
-        snapshot = self.refresh_if_changed()
-        key = str(snapshot.keys.get(normalized, "") or "").strip()
-        if not key:
-            detail = f" ({snapshot.last_error})" if snapshot.last_error else ""
-            raise RuntimeError(
-                "No live-verified KIS WebSocket subscription key configured for "
-                f"{normalized} in {snapshot.path}{detail}"
-            )
-        return key
+        with self._lock:
+            snapshot = self.refresh_if_changed()
+            key = str(snapshot.keys.get(normalized, "") or "").strip()
+            provision_error = ""
+            if not key and self._auto_provision and not snapshot.last_error:
+                try:
+                    key = derive_symbol_key_from_kis_master(
+                        normalized,
+                        self.universe_path,
+                    )
+                    # A missing file may still be serving a legacy environment
+                    # snapshot. Seed every known value so provisioning one
+                    # symbol never discards that last-known-good map.
+                    additions = dict(snapshot.keys) if not self.path.exists() else {}
+                    additions[normalized] = key
+                    update_symbol_keys_file(
+                        set_values=additions,
+                        path=self.path,
+                        refuse_conflicts=True,
+                    )
+                    refreshed = self.refresh_if_changed()
+                    key = str(refreshed.keys.get(normalized, "") or "").strip()
+                    if not key:
+                        raise KisWsSymbolKeysError(
+                            "the atomically updated symbol-key file did not reload"
+                        )
+                    logger.info(
+                        "Provisioned KIS WebSocket symbol key for %s from %s",
+                        normalized,
+                        self.universe_path,
+                    )
+                except (KisWsSymbolKeysError, OSError, TimeoutError) as exc:
+                    key = ""
+                    provision_error = f"; KIS-master provisioning failed: {exc}"
+            if not key:
+                detail = f" ({snapshot.last_error})" if snapshot.last_error else ""
+                raise RuntimeError(
+                    "No live-verified or KIS-master-derived WebSocket subscription "
+                    "key configured for "
+                    f"{normalized} in {snapshot.path}{detail}{provision_error}"
+                )
+            return key
 
 
 @contextmanager

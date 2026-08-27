@@ -64,6 +64,10 @@ def test_to_dict_from_dict_round_trip():
         pending_stop_requested_at=datetime(2026, 8, 17, tzinfo=timezone.utc),
         exit_all_required=False,
         buy_today_note="All ORB plans were invalid.",
+        rejected_orb_snapshot={
+            "session_date": "2026-08-17",
+            "combinations": [{"window": "1m", "reason": "rejected"}],
+        },
         kis_ws_symbol_key="DNASAAPL",
         warnings=["migrated_from_buylist"],
     )
@@ -76,6 +80,7 @@ def test_to_dict_from_dict_round_trip():
     assert restored.pending_stop_type == StopType.MANUAL_PRICE
     assert restored.pending_stop_command_id == "STOP-1"
     assert restored.buy_today_note == "All ORB plans were invalid."
+    assert restored.rejected_orb_snapshot == card.rejected_orb_snapshot
     assert restored.kis_ws_symbol_key == "DNASAAPL"
 
 

@@ -166,6 +166,14 @@ class TradeCardState:
     # ``entry_block_reason``: planning cards hide live-runtime diagnostics,
     # while this note must remain visible until the trader tries again.
     buy_today_note: str = ""
+    # Session that produced ``buy_today_note``. ``session_date`` is cleared
+    # when Buy Today returns to Buylist, but the daily ledger still needs to
+    # attach the final no-entry explanation to the session it describes.
+    last_buy_today_session_date: Optional[date] = None
+    # Frozen 1m/5m/30m ORB candidates and all risk/window combinations from
+    # the exact evaluation that automatically returned this card to Buylist.
+    # This must not depend on the mutable execution queue after rejection.
+    rejected_orb_snapshot: Dict[str, Any] = field(default_factory=dict)
 
     # Entry plan
     # Verified symbol-level KIS realtime metadata captured when Buy Today is
@@ -306,10 +314,14 @@ class TradeCardState:
             )
         self.board_status_updated_at = _parse_timestamp(self.board_status_updated_at)
         self.session_date = _parse_optional_date(self.session_date)
+        self.last_buy_today_session_date = _parse_optional_date(
+            self.last_buy_today_session_date
+        )
         self.watchlist_member = bool(self.watchlist_member)
         self.buylist_member = bool(self.buylist_member)
         self.return_to_buylist_after_close = bool(self.return_to_buylist_after_close)
         self.buy_today_note = str(self.buy_today_note or "")
+        self.rejected_orb_snapshot = dict(self.rejected_orb_snapshot or {})
         self.kis_ws_symbol_key = str(self.kis_ws_symbol_key or "").strip()
         self.breakout_price = _finite_float(self.breakout_price)
         self.selected_orb_window = (
@@ -455,6 +467,12 @@ class TradeCardState:
             "buylist_member": self.buylist_member,
             "return_to_buylist_after_close": self.return_to_buylist_after_close,
             "buy_today_note": self.buy_today_note,
+            "last_buy_today_session_date": (
+                self.last_buy_today_session_date.isoformat()
+                if self.last_buy_today_session_date
+                else None
+            ),
+            "rejected_orb_snapshot": self.rejected_orb_snapshot,
             "kis_ws_symbol_key": self.kis_ws_symbol_key,
             "breakout_price": self.breakout_price,
             "selected_orb_window": self.selected_orb_window,
@@ -559,6 +577,8 @@ class TradeCardState:
                 data.get("return_to_buylist_after_close", False)
             ),
             buy_today_note=str(data.get("buy_today_note", "")),
+            last_buy_today_session_date=data.get("last_buy_today_session_date"),
+            rejected_orb_snapshot=dict(data.get("rejected_orb_snapshot") or {}),
             kis_ws_symbol_key=str(data.get("kis_ws_symbol_key", "")),
             breakout_price=data.get("breakout_price"),
             selected_orb_window=data.get("selected_orb_window"),
