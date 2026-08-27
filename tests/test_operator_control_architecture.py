@@ -795,8 +795,18 @@ def test_add_buy_today_rejects_duplicate_active_symbol(engine, roles):
     assert "already has an active" in outcome.error_message
 
 
+@pytest.mark.parametrize(
+    "active_status",
+    [
+        BoardStatus.BUY_TODAY,
+        BoardStatus.ENTRY_PENDING,
+        BoardStatus.OPEN_POSITION,
+        BoardStatus.PARTIAL_SELL,
+        BoardStatus.SELL_ALL,
+    ],
+)
 def test_add_buy_today_rejects_same_symbol_active_in_another_account(
-    engine, roles
+    engine, roles, active_status
 ):
     pc, laptop = roles
     claim_main_device(engine, pc)
@@ -807,7 +817,7 @@ def test_add_buy_today_rejects_same_symbol_active_in_another_account(
             environment="PROD",
             account_no="1",
             symbol="AAPL",
-            board_status=BoardStatus.BUY_TODAY,
+            board_status=active_status,
         ),
     )
     second = card_repo.create_trade_card(
@@ -835,6 +845,53 @@ def test_add_buy_today_rejects_same_symbol_active_in_another_account(
     assert outcome.command_id == queued.command.command_id
     assert outcome.status == OperatorCommandStatus.REJECTED
     assert "another account" in outcome.error_message
+
+
+def test_add_buy_today_rechecks_other_accounts_inside_commit_transaction(
+    engine, roles, monkeypatch
+):
+    pc, laptop = roles
+    claim_main_device(engine, pc)
+    set_operator_control(engine, pc, laptop)
+    card_repo.create_trade_card(
+        engine,
+        TradeCardState(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            board_status=BoardStatus.ENTRY_PENDING,
+        ),
+    )
+    second = card_repo.create_trade_card(
+        engine,
+        TradeCardState(
+            environment="PROD",
+            account_no="2",
+            symbol="AAPL",
+            board_status=BoardStatus.BUYLIST,
+        ),
+    )
+    queued = enqueue_board_operator_command(
+        engine,
+        laptop,
+        ActivateForToday(
+            environment="PROD",
+            account_no="2",
+            symbol="AAPL",
+            expected_card_version=second.version,
+        ),
+    )
+    # Simulate both optimistic pre-checks observing stale data. The locked
+    # in-transaction query remains authoritative and must still reject.
+    monkeypatch.setattr(card_repo, "list_trade_cards", lambda *_a, **_k: [])
+
+    outcome = process_next_board_operator_command(engine, pc)
+
+    assert outcome.command_id == queued.command.command_id
+    assert outcome.status == OperatorCommandStatus.REJECTED
+    assert "another account" in outcome.error_message
+    stored = card_repo.get_trade_card(engine, "PROD", "2", "AAPL")
+    assert stored.board_status == BoardStatus.BUYLIST
 
 
 def test_add_buy_today_is_applied_by_the_execution_owner(engine, roles, monkeypatch):

@@ -170,6 +170,8 @@ def _validate_broker_confirmed_board_state(engine, command: AnyBoardCommand) -> 
             f"{command.symbol} already has an active Buy Today, entry, or position state."
         )
     if isinstance(command, ActivateForToday):
+        from src.core.trade_card_state import SYMBOL_EXECUTION_ACTIVE_STATUSES
+
         for other in trade_card_repository.list_trade_cards(
             engine,
             environment=command.environment,
@@ -180,10 +182,10 @@ def _validate_broker_confirmed_board_state(engine, command: AnyBoardCommand) -> 
                 == str(command.symbol or "").strip().upper()
                 and str(other.account_no or "").strip()
                 != str(command.account_no or "").strip()
-                and other.board_status == BoardStatus.BUY_TODAY
+                and other.board_status in SYMBOL_EXECUTION_ACTIVE_STATUSES
             ):
                 raise execution_workflow_service.BoardCommandRejectedError(
-                    f"{command.symbol} is already active in Buy Today for "
+                    f"{command.symbol} already has an active entry or position for "
                     "another account. The ORB queue is symbol-scoped, so "
                     "only one account can activate that symbol at a time."
                 )

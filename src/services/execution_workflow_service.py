@@ -1335,6 +1335,8 @@ def request_board_action(
         )
 
     if isinstance(command, ActivateForToday):
+        from src.core.trade_card_state import SYMBOL_EXECUTION_ACTIVE_STATUSES
+
         for other in trade_card_repository.list_trade_cards(
             engine,
             environment=command.environment,
@@ -1345,10 +1347,10 @@ def request_board_action(
                 == str(command.symbol or "").strip().upper()
                 and str(other.account_no or "").strip()
                 != str(command.account_no or "").strip()
-                and other.board_status == BoardStatus.BUY_TODAY
+                and other.board_status in SYMBOL_EXECUTION_ACTIVE_STATUSES
             ):
                 raise BoardCommandRejectedError(
-                    f"{command.symbol} is already active in Buy Today for "
+                    f"{command.symbol} already has an active entry or position for "
                     "another account. The ORB queue is symbol-scoped, so "
                     "only one account can activate that symbol at a time."
                 )
@@ -1384,6 +1386,26 @@ def request_board_action(
     # the newly durable request.
     with stop_change_scope:
         with engine.begin() as conn:
+            if isinstance(command, ActivateForToday):
+                # Repeat the cross-account check while locking every row for
+                # this symbol. The earlier check gives fast feedback; this
+                # one is the race-safe authority immediately before commit.
+                for other in trade_card_repository.list_trade_cards_for_symbol_in_transaction(
+                    conn,
+                    command.environment,
+                    command.symbol,
+                    for_update=True,
+                ):
+                    if (
+                        str(other.account_no or "").strip()
+                        != str(command.account_no or "").strip()
+                        and other.board_status in SYMBOL_EXECUTION_ACTIVE_STATUSES
+                    ):
+                        raise BoardCommandRejectedError(
+                            f"{command.symbol} already has an active entry or position for "
+                            "another account. The ORB queue is symbol-scoped, so "
+                            "only one account can activate that symbol at a time."
+                        )
             current = trade_card_repository.get_trade_card_in_transaction(
                 conn,
                 command.environment,

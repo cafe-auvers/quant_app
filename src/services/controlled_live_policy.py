@@ -11,9 +11,11 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from sqlalchemy.engine import Engine
+
 from src.core import execution_config
 from src.core.order_state import OrderSide
-from src.core.trade_card_state import BoardStatus
+from src.core.trade_card_state import BoardStatus, PositionRuntimeStatus
 from src.services import trade_card_repository
 
 
@@ -27,6 +29,30 @@ _ACTIVE_ENTRY_STATUSES = frozenset(
         BoardStatus.ENTRY_PENDING,
     }
 )
+
+
+def _card_authorizes_entry(card: Any) -> bool:
+    """Return whether one canonical card currently permits another BUY.
+
+    A partial first fill moves the card to ``OPEN_POSITION`` before the
+    remaining target is submitted.  That narrow ``ENTRY_COMPLETING`` state
+    is still part of the original reviewed entry; ordinary open positions
+    must never become a general permission to add shares.
+    """
+
+    board_status = getattr(card, "board_status", None)
+    if board_status in _ACTIVE_ENTRY_STATUSES:
+        return True
+    return bool(
+        board_status == BoardStatus.OPEN_POSITION
+        and getattr(card, "position_runtime_status", None)
+        == PositionRuntimeStatus.ENTRY_COMPLETING
+        and int(getattr(card, "entry_remaining_target_quantity", 0) or 0) > 0
+        and not bool(getattr(card, "entry_submission_unresolved", False))
+        and not bool(getattr(card, "entry_cancel_in_flight", False))
+        and not bool(getattr(card, "exit_all_required", False))
+        and not bool(getattr(card, "sell_all_at_market_open", False))
+    )
 
 
 class LiveExecutionEnvelopeError(RuntimeError):
@@ -142,6 +168,7 @@ def require_live_entry_allowed(
     side: OrderSide | str,
     quantity: int,
     limit_price: float,
+    engine: Engine | None = None,
 ) -> None:
     """Fence a real production BUY at the final broker adapter boundary.
 
@@ -161,6 +188,7 @@ def require_live_entry_allowed(
         environment=environment,
         account_no=account_no,
         symbol=normalized_symbol,
+        engine=engine,
     ):
         raise LiveExecutionEnvelopeError(
             f"Blocked production BUY for unapproved symbol {normalized_symbol}: it is "
@@ -182,36 +210,53 @@ def require_live_entry_allowed(
 
 
 def controlled_live_symbols(
-    *, environment: str = "PROD", account_no: str = ""
+    *,
+    environment: str = "PROD",
+    account_no: str = "",
+    engine: Engine | None = None,
 ) -> tuple[str, ...]:
-    """Return the persisted live-entry stock list for controlled-live mode.
+    """Return the persisted live-entry stock list for status reporting.
 
     Trade Cards are the canonical user-owned plan state. Moving a reviewed
     card to Buy Today is the explicit authorization event; Entry Pending stays
-    authorized while its durable order is being tracked. Missing, malformed,
-    or unavailable local recovery state yields an empty list and therefore
-    fails closed at the broker boundary.
+    authorized while its durable order is being tracked, and a narrowly
+    defined Entry Completing position may finish its original target. When an
+    engine is supplied the canonical database is read. Without one, the local
+    recovery snapshot is used for non-authoritative UI/preflight reporting
+    only. The broker boundary never relies on that snapshot.
     """
 
     normalized_environment = str(environment or "").strip().upper()
     normalized_account = str(account_no or "").strip()
     try:
-        cards = trade_card_repository.load_local_trade_cards_snapshot(
-            path=trade_card_repository.LOCAL_TRADE_CARDS_FILE
-        )
+        if engine is not None:
+            cards = trade_card_repository.list_trade_cards(
+                engine,
+                environment=normalized_environment,
+                account_no=normalized_account or None,
+                raise_on_error=True,
+            )
+        else:
+            cards = trade_card_repository.load_local_trade_cards_snapshot(
+                path=trade_card_repository.LOCAL_TRADE_CARDS_FILE
+            )
     except Exception:
         return ()
-    symbols = {
-        str(card.symbol or "").strip().upper()
-        for card in cards
-        if str(card.environment or "").strip().upper() == normalized_environment
-        and (
-            not normalized_account
-            or str(card.account_no or "").strip() == normalized_account
-        )
-        and card.board_status in _ACTIVE_ENTRY_STATUSES
-        and str(card.symbol or "").strip()
-    }
+    try:
+        symbols = {
+            str(card.symbol or "").strip().upper()
+            for card in cards
+            if str(card.environment or "").strip().upper()
+            == normalized_environment
+            and (
+                not normalized_account
+                or str(card.account_no or "").strip() == normalized_account
+            )
+            and _card_authorizes_entry(card)
+            and str(card.symbol or "").strip()
+        }
+    except Exception:
+        return ()
     return tuple(sorted(symbols))
 
 
@@ -222,32 +267,48 @@ def live_entry_card_allowed(card: Any) -> bool:
         return True
     if _mode() != CONTROLLED_LIVE:
         return True
-    return bool(
-        str(getattr(card, "symbol", "") or "").strip()
-        and getattr(card, "board_status", None) in _ACTIVE_ENTRY_STATUSES
-    )
+    try:
+        return bool(
+            str(getattr(card, "symbol", "") or "").strip()
+            and _card_authorizes_entry(card)
+        )
+    except Exception:
+        return False
 
 
 def live_entry_symbol_allowed(
-    *, environment: str, symbol: str, account_no: str = ""
+    *,
+    environment: str,
+    symbol: str,
+    account_no: str = "",
+    engine: Engine | None = None,
 ) -> bool:
-    """Return whether persisted active-card state authorizes an entry symbol."""
+    """Check exact canonical card state for final controlled-live authority.
+
+    An unavailable database, missing engine, malformed row, account mismatch,
+    or inactive card all fail closed. The local JSON recovery snapshot is
+    deliberately excluded from this broker-authority decision.
+    """
 
     if str(environment or "").strip().upper() != "PROD":
         return True
     if _mode() != CONTROLLED_LIVE:
         return True
     normalized_symbol = str(symbol or "").strip().upper()
-    return bool(
-        normalized_symbol
-        and normalized_symbol
-        in set(
-            controlled_live_symbols(
-                environment=environment,
-                account_no=account_no,
-            )
+    normalized_account = str(account_no or "").strip()
+    if not normalized_symbol or not normalized_account or engine is None:
+        return False
+    try:
+        card = trade_card_repository.get_trade_card(
+            engine,
+            str(environment or "").strip().upper(),
+            normalized_account,
+            normalized_symbol,
+            raise_on_error=True,
         )
-    )
+        return bool(card is not None and _card_authorizes_entry(card))
+    except Exception:
+        return False
 
 
 def automatic_mutation_retry_permitted(*, environment: str) -> bool:

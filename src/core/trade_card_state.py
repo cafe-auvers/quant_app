@@ -82,6 +82,20 @@ class BoardStatus(str, Enum):
     CLOSED = "CLOSED"
 
 
+# A symbol-scoped entry queue cannot safely activate the same stock for a
+# second account while the first account still owns an entry or position
+# lifecycle. Watchlist/Buylist are planning-only; Closed is terminal.
+SYMBOL_EXECUTION_ACTIVE_STATUSES = frozenset(
+    {
+        BoardStatus.BUY_TODAY,
+        BoardStatus.ENTRY_PENDING,
+        BoardStatus.OPEN_POSITION,
+        BoardStatus.PARTIAL_SELL,
+        BoardStatus.SELL_ALL,
+    }
+)
+
+
 class EntryRuntimeStatus(str, Enum):
     """Badge/internal substate for a card in BUY_TODAY. Section 3.
 

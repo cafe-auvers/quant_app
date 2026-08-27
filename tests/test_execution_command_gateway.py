@@ -38,6 +38,7 @@ from src.core.order_state import (
     OrderSide,
     OrderStatus,
 )
+from src.core.trade_card_state import BoardStatus, TradeCardState
 from src.risk.pre_trade import PreTradeRiskDecision, PreTradeRiskRejectedError
 from src.risk.portfolio import (
     PortfolioProjectedExposure,
@@ -47,7 +48,7 @@ from src.risk.portfolio import (
     ProposedPortfolioEntry,
 )
 from src.services import execution_command_gateway as gw_module
-from src.services import controlled_live_policy
+from src.services import trade_card_repository
 from src.services.execution_command_gateway import (
     AmbiguousPostBrokerPersistenceError,
     CancelNotPermittedError,
@@ -302,12 +303,16 @@ def test_disabled_mode_blocks_guarded_gateway_before_persistence(tmp_path, monke
 def test_authorized_live_modes_permit_exact_guarded_buy(
     tmp_path, monkeypatch, mode
 ):
-    gateway, broker, _ = _guarded_gateway(tmp_path)
+    gateway, broker, engine = _guarded_gateway(tmp_path)
     monkeypatch.setattr(execution_config, "KIS_LIVE_EXECUTION_MODE", mode)
-    monkeypatch.setattr(
-        controlled_live_policy,
-        "controlled_live_symbols",
-        lambda **_kwargs: ("AAPL",),
+    trade_card_repository.create_trade_card(
+        engine,
+        TradeCardState(
+            environment="PROD",
+            account_no="12345678-01",
+            symbol="AAPL",
+            board_status=BoardStatus.BUY_TODAY,
+        ),
     )
     monkeypatch.setattr(
         execution_config, "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL", 1_000.0
@@ -1792,10 +1797,14 @@ def test_production_replace_checks_controlled_live_ceiling_before_cancel(
     monkeypatch.setattr(
         execution_config, "KIS_LIVE_EXECUTION_MODE", "CONTROLLED_LIVE"
     )
-    monkeypatch.setattr(
-        controlled_live_policy,
-        "controlled_live_symbols",
-        lambda **_kwargs: ("AAPL",),
+    trade_card_repository.create_trade_card(
+        engine,
+        TradeCardState(
+            environment="PROD",
+            account_no="12345678-01",
+            symbol="AAPL",
+            board_status=BoardStatus.ENTRY_PENDING,
+        ),
     )
     monkeypatch.setattr(
         execution_config, "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL", 1_100.0

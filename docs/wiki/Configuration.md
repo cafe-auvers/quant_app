@@ -12,7 +12,7 @@ catalog and safe-default reference.
 | `BUYBOARD_ENGINE_ENABLED` | Guarded Kanban runtime availability | `true`; not broker authorization |
 | `KANBAN_STRATEGY_INSTANCE_ID` | Stable Kanban ownership identity | Must be deliberate |
 | `KIS_LIVE_EXECUTION_MODE` | Disabled/controlled/full-live envelope | Disabled |
-| `KIS_CONTROLLED_LIVE_*` | Symbol/notional pilot fences | Empty/zero |
+| `KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL` | Controlled-live per-entry cap | Zero blocks entry |
 | `KIS_WS_*`, `KIS_MARKET_DATA_*` | Verified real-time capability | Fail-closed |
 | `KIS_MUTATION_*` | Shared request budgets and spacing | Unknown/zero blocks entry |
 | `EXTERNAL_ALERT_*` | Critical out-of-process alerting | Optional |
@@ -22,6 +22,11 @@ catalog and safe-default reference.
 Multiple PROD accounts can use `KIS_PROD_ACCOUNTS` or numbered
 `KIS_PROD_ACCOUNT_NO_1` through `_20`. Do not put real account numbers in
 documentation, tests, or committed fixtures.
+
+Stock symbols are never environment configuration. Controlled-live symbol
+authority comes from exact active Trade Card rows in the shared operational
+database; `data/trade_cards.json` is recovery-only and cannot authorize an
+order.
 
 `TRADING_ENABLED` is a per-machine one-way administrative lock, so it can be
 false on the laptop and true on the PC without a synchronization fault. The

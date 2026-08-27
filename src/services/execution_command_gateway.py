@@ -405,8 +405,12 @@ class ExecutionCommandGateway:
         schema_migration_manager: Optional[Any] = None,
         projected_portfolio_risk_required: bool = False,
     ) -> None:
-        self._real_broker: Broker = real_broker if real_broker is not None else KisBroker()
         self._engine = engine
+        self._real_broker: Broker = (
+            real_broker
+            if real_broker is not None
+            else KisBroker(live_entry_engine=engine)
+        )
         self._lease_protocol: ExecutionLeaseProtocol = lease_protocol or DefaultExecutionLeaseProtocol(
             engine=engine
         )
@@ -504,6 +508,7 @@ class ExecutionCommandGateway:
                 side=side,
                 quantity=quantity,
                 limit_price=limit_price,
+                engine=self._engine,
             )
             if self._engine is not None:
                 self._require_ownership(
@@ -699,6 +704,7 @@ class ExecutionCommandGateway:
             side=request.side,
             quantity=request.quantity,
             limit_price=request.limit_price,
+            engine=self._engine,
         )
         key = _recovery_key(request.environment, request.account_no, request.symbol)
         with self._ownership.claim(key, request.source):
@@ -848,6 +854,7 @@ class ExecutionCommandGateway:
                     side=original.side,
                     quantity=new_quantity,
                     limit_price=new_limit_price,
+                    engine=self._engine,
                 )
                 if replacement_portfolio_spec is not None:
                     if not original.capital_reservation_id:
@@ -1564,6 +1571,7 @@ class ExecutionCommandGateway:
                     side=request.side,
                     quantity=quantity,
                     limit_price=limit_price,
+                    engine=self._engine,
                 )
                 submission = self._execute_scheduled_mutation(
                     lambda: self._cross_broker_boundary(
@@ -2040,6 +2048,7 @@ class ExecutionCommandGateway:
                 side=request.side,
                 quantity=quantity,
                 limit_price=limit_price,
+                engine=self._engine,
             )
             with coordination_read_connection(engine) as conn:
                 require_no_active_unowned_external_order(
@@ -2393,7 +2402,6 @@ def get_default_execution_gateway() -> ExecutionCommandGateway:
         with _default_gateway_lock:
             if _default_gateway is None:
                 _default_gateway = ExecutionCommandGateway(
-                    real_broker=KisBroker(),
                     mode_override=False,
                 )
     return _default_gateway
@@ -2413,7 +2421,6 @@ def get_legacy_execution_gateway(engine: Engine) -> ExecutionCommandGateway:
         gateway = _legacy_gateways_by_engine.get(engine)
         if gateway is None:
             gateway = ExecutionCommandGateway(
-                real_broker=KisBroker(),
                 engine=engine,
                 mode_override=False,
             )
@@ -2461,7 +2468,7 @@ def build_guarded_execution_gateway(
             "build_guarded_execution_gateway requires buying_power_provider"
         )
     return ExecutionCommandGateway(
-        real_broker=real_broker if real_broker is not None else KisBroker(),
+        real_broker=real_broker,
         engine=engine,
         lease_protocol=lease_protocol,
         request_scheduler=scheduler,
