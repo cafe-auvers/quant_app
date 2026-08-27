@@ -989,6 +989,43 @@ def test_exact_entry_cancellation_with_zero_fill_returns_card_to_buylist():
     assert plan.order_updates[0].status == ExecutionOrderStatus.CANCELLED
 
 
+def test_definitive_entry_rejection_without_broker_id_clears_pending_card():
+    card = _card(
+        entry_client_order_id="C-1",
+        entry_pending_attempt_number=1,
+        entry_submission_unresolved=True,
+        entry_runtime_status="DATA_UNAVAILABLE",
+    )
+    rejected = _order(
+        broker_order_id="",
+        status=ExecutionOrderStatus.REJECTED,
+        broker_identity_status=BrokerIdentityStatus.NO_BROKER_ORDER_CONFIRMED,
+        remaining_quantity=0,
+    )
+
+    plan = reduce_account_reconciliation(
+        _snapshot(
+            completeness=_completeness(
+                open_orders_complete=False,
+                history_complete=False,
+            )
+        ),
+        AccountLocalState(cards=(card,), execution_orders=(rejected,)),
+    )
+
+    repaired = plan.card_updates[0]
+    assert repaired.board_status == BoardStatus.BUYLIST
+    assert repaired.entry_runtime_status is None
+    assert repaired.entry_client_order_id == ""
+    assert repaired.entry_attempt_group_id == ""
+    assert repaired.entry_pending_attempt_number == 0
+    assert repaired.entry_submission_unresolved is False
+    assert repaired.entry_orb_high is None
+    assert repaired.entry_trigger is None
+    assert repaired.planned_quantity == 0
+    assert repaired.buy_today_note == "Entry rejected by broker"
+
+
 def test_old_exact_terminal_order_does_not_project_onto_current_buylist_cycle():
     current_card = _card(
         board_status=BoardStatus.BUYLIST,

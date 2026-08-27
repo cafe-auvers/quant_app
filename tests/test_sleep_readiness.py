@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from src.core.order_state import OrderStatus
 from src.services.sleep_readiness import build_sleep_readiness_snapshot
 
 
@@ -85,3 +86,23 @@ def test_sim_items_never_count_as_in_flight():
 
     assert snapshot["in_flight_prod_symbol_count"] == 0
     assert snapshot["safe_to_sleep"] is True
+
+
+def test_stale_sim_open_order_does_not_block_prod_sleep_readiness():
+    sim_order = SimpleNamespace(environment="SIM", status=OrderStatus.WORKING)
+    window = _window(is_main=True, open_orders=[sim_order])
+
+    snapshot = build_sleep_readiness_snapshot(window)
+
+    assert snapshot["has_open_broker_orders"] is False
+    assert snapshot["safe_to_sleep"] is True
+
+
+def test_prod_open_order_still_blocks_sleep_readiness():
+    prod_order = SimpleNamespace(environment="PROD", status=OrderStatus.WORKING)
+    window = _window(is_main=True, open_orders=[prod_order])
+
+    snapshot = build_sleep_readiness_snapshot(window)
+
+    assert snapshot["has_open_broker_orders"] is True
+    assert snapshot["safe_to_sleep"] is False

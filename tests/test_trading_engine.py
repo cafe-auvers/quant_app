@@ -16,6 +16,7 @@ from src.core.trade_card_state import (
     TradeCardState,
 )
 from src.services.entry_attempt_manager import EntryAttemptManager
+from src.services.execution_command_gateway import GuardedSubmissionRejectedError
 from src.services.position_manager import PositionActionCallbacks, PositionManager
 from src.services.realtime_market_data import QuoteSnapshot, RestPollingMarketDataService
 from src.services.trading_engine import (
@@ -210,6 +211,36 @@ def test_fresh_quote_allows_entry_submission_and_moves_to_entry_pending(tmp_path
     assert changed == [card]
     assert card.board_status == BoardStatus.ENTRY_PENDING
     assert card.entry_runtime_status == EntryRuntimeStatus.ORDER_PENDING
+
+
+def test_definitive_broker_rejection_returns_entry_to_clean_buylist(tmp_path):
+    def reject(**kwargs):
+        raise GuardedSubmissionRejectedError("security is suspended")
+
+    engine = _make_engine(tmp_path, submit_order=reject)
+    engine._market_data.subscribe(["AAPL"])
+    engine._market_data.poll_once()
+    card = _buy_today_card(
+        session_date=dt.date(2026, 8, 26),
+        entry_attempt_group_id="G-1",
+        entry_client_order_id="C-1",
+        entry_pending_attempt_number=1,
+    )
+
+    changed = engine.run_heartbeat([card])
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.BUYLIST
+    assert card.entry_runtime_status is None
+    assert card.session_date is None
+    assert card.entry_client_order_id == ""
+    assert card.entry_attempt_group_id == ""
+    assert card.entry_pending_attempt_number == 0
+    assert card.entry_submission_unresolved is False
+    assert card.entry_orb_high is None
+    assert card.entry_trigger is None
+    assert card.planned_quantity == 0
+    assert "security is suspended" in card.buy_today_note
 
 
 def test_target_allocation_cannot_execute_without_complete_orb_plan(tmp_path):

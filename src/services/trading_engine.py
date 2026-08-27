@@ -692,6 +692,61 @@ class TradingEngine:
         planned = max(0, int(card.planned_quantity or 0))
         return planned if entry_price > 0 else 0
 
+    def _apply_definitive_entry_rejection(
+        self,
+        card: TradeCardState,
+        *,
+        detail: str,
+    ) -> None:
+        """Retire an entry after the broker definitively declined it.
+
+        Ambiguous submissions keep their durable identity and remain fenced.
+        A guarded broker rejection is the opposite: the gateway has confirmed
+        that no working order exists, so leaving the card in Entry Pending (or
+        retrying the same rejected security every cooldown) is incorrect.
+        """
+
+        card.entry_runtime_status = None
+        card.entry_block_reason = ""
+        card.next_retry_at = None
+        card.entry_attempt_group_id = ""
+        card.entry_attempt_count = 0
+        card.entry_client_order_id = ""
+        card.entry_pending_attempt_number = 0
+        card.entry_submission_unresolved = False
+        card.entry_cancel_in_flight = False
+        card.entry_cancel_reason = ""
+        card.entry_cancel_command_id = ""
+        card.entry_remaining_target_quantity = 0
+        card.capital_reservation_id = ""
+        self._entry_attempt_manager.reset_symbol(
+            card.environment,
+            card.account_no,
+            card.symbol,
+        )
+
+        if card.broker_quantity > 0:
+            card.board_status = BoardStatus.OPEN_POSITION
+            if not card.exit_all_required:
+                card.position_runtime_status = PositionRuntimeStatus.OPEN
+            return
+
+        card.board_status = BoardStatus.BUYLIST
+        card.session_date = None
+        card.buylist_member = True
+        card.buy_today_note = (
+            f"Entry rejected by broker: {detail}" if detail else "Entry rejected by broker"
+        )
+        card.selected_orb_window = None
+        card.position_percent = 0.0
+        card.planned_quantity = 0
+        card.target_position_quantity = 0
+        card.entry_orb_window = None
+        card.entry_orb_high = None
+        card.entry_orb_low = None
+        card.entry_trigger = None
+        card.stop_adr = None
+
     # -- BUY_TODAY -> entry attempts -------------------------------------
 
     def _evaluate_buy_today(
@@ -811,6 +866,11 @@ class TradingEngine:
                         card.entry_client_order_id = result.submission.client_order_id
                         card.capital_reservation_id = result.submission.capital_reservation_id
                     card.next_retry_at = None
+                elif result.outcome == AttemptOutcome.BROKER_REJECTED:
+                    self._apply_definitive_entry_rejection(
+                        card,
+                        detail=result.detail,
+                    )
                 elif result.outcome == AttemptOutcome.SYMBOL_LOCKED:
                     continue  # transient, another in-process attempt is running
                 else:
@@ -1256,6 +1316,11 @@ class TradingEngine:
                         card.entry_client_order_id = result.submission.client_order_id
                         card.capital_reservation_id = result.submission.capital_reservation_id
                     card.next_retry_at = None
+                elif result.outcome == AttemptOutcome.BROKER_REJECTED:
+                    self._apply_definitive_entry_rejection(
+                        card,
+                        detail=result.detail,
+                    )
                 else:
                     card.entry_runtime_status = _OUTCOME_TO_ENTRY_RUNTIME_STATUS.get(
                         result.outcome, card.entry_runtime_status
