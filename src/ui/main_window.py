@@ -2156,7 +2156,6 @@ class MainWindow(
         if result.main_device_hostname:
             self._last_main_device_hostname = result.main_device_hostname
         self._refresh_control_ownership_status(result)
-        self._sync_buyboard_runtime_worker()
 
         action = getattr(self, "_state_sync_action", "reconcile")
         was_auto_claim = bool(self._state_sync_auto_claim)
@@ -2197,6 +2196,13 @@ class MainWindow(
             self.__dict__.pop("execution_queue_manager", None)
             if hasattr(self, "populate_buylist_dashboard"):
                 self.populate_buylist_dashboard()
+            # The runtime worker captures a lookup bound to the queue-manager
+            # instance that existed when the worker was constructed. Merely
+            # dropping the UI cache leaves an active executor evaluating the
+            # previous queue forever even though its revision heartbeat says
+            # the new document is current. Preserve the live market-data
+            # service and restart the worker so it binds the verified queue.
+            self._restart_buyboard_runtime_after_queue_reload()
         if updated_keys.intersection({"watchlist", "buylist", "execution_queue"}):
             # Planning state is normalized into canonical trade-card rows by
             # an explicit projection refresh.  Do it on the actual sync event
@@ -2214,6 +2220,12 @@ class MainWindow(
                 refresh_sidebar = getattr(self, "refresh_sidebar_sources", None)
                 if callable(refresh_sidebar):
                     refresh_sidebar()
+
+        # Run this after pulled documents have replaced their in-memory
+        # projections. A queue-triggered stop finishes asynchronously and its
+        # tracked-worker callback invokes this method again to construct the
+        # replacement with the freshly loaded manager.
+        self._sync_buyboard_runtime_worker()
 
         notices = []
         if result.conflict_keys:
@@ -2927,7 +2939,7 @@ class MainWindow(
             if role.is_main and lease_kwargs.get("execution_authority") is None:
                 return  # not actually main by the time we got here -- do not start
 
-            queue_manager = self.__dict__.get("execution_queue_manager")
+            queue_manager = self._ensure_execution_queue_manager()
             execution_engine = self._execution_state_engine()
             external_alerting = build_external_alerting_service(
                 execution_engine, device_id=role.device_id
@@ -2986,6 +2998,25 @@ class MainWindow(
         market_data = getattr(runtime, "market_data", None)
         if market_data is not None:
             self._buyboard_market_data_handoff = market_data
+
+    def _restart_buyboard_runtime_after_queue_reload(self) -> None:
+        """Rebind the ORB worker after a remote execution-queue pull."""
+
+        worker = self.__dict__.get("_buyboard_runtime_worker")
+        if worker is None:
+            return
+        try:
+            running = bool(worker.isRunning())
+        except RuntimeError:
+            running = False
+        if not running:
+            if self.__dict__.get("_buyboard_runtime_worker") is worker:
+                self._buyboard_runtime_worker = None
+            return
+        self._capture_buyboard_market_data_for_restart(worker)
+        self._buyboard_runtime_restart_requested = True
+        worker.request_stop()
+        worker.requestInterruption()
 
     def _state_sync_allows_order_submission(self) -> bool:
         """Allow broker submissions only from the recently-confirmed Execution Owner."""

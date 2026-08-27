@@ -598,6 +598,73 @@ def test_state_sync_watchlist_reload_refreshes_lightweight_sidebar():
     assert chart_symbols_refreshed == [True]
 
 
+def test_state_sync_queue_pull_restarts_runtime_after_dropping_stale_manager():
+    window = _sync_completed_window(auto_claim_enabled=False)
+    window._start_state_sync = lambda **_kwargs: None
+    stale_manager = object()
+    window.execution_queue_manager = stale_manager
+    calls = []
+    window.populate_buylist_dashboard = lambda: calls.append(
+        ("populate", "execution_queue_manager" in window.__dict__)
+    )
+    window.refresh_buyboard = lambda: calls.append(("refresh", None))
+    window._restart_buyboard_runtime_after_queue_reload = lambda: calls.append(
+        (
+            "restart",
+            window.__dict__.get("execution_queue_manager"),
+        )
+    )
+    window._sync_buyboard_runtime_worker = lambda: calls.append(("sync", None))
+
+    MainWindow._on_state_sync_completed(
+        window,
+        StateReconcileResult(
+            is_main_device=False,
+            local_role=window.state_sync_role,
+            updated_keys=("execution_queue",),
+        ),
+        0,
+    )
+
+    assert "execution_queue_manager" not in window.__dict__
+    assert calls == [
+        ("populate", False),
+        ("restart", None),
+        ("refresh", None),
+        ("sync", None),
+    ]
+
+
+def test_queue_reload_restart_preserves_market_data_and_stops_worker():
+    calls = []
+    market_data = object()
+
+    class Worker:
+        runtime = SimpleNamespace(market_data=market_data)
+
+        @staticmethod
+        def isRunning():
+            return True
+
+        @staticmethod
+        def request_stop():
+            calls.append("stop")
+
+        @staticmethod
+        def requestInterruption():
+            calls.append("interrupt")
+
+    window = MainWindow.__new__(MainWindow)
+    window._buyboard_runtime_worker = Worker()
+    window._buyboard_runtime_restart_requested = False
+
+    MainWindow._restart_buyboard_runtime_after_queue_reload(window)
+
+    assert window._buyboard_market_data_handoff is market_data
+    assert window._buyboard_runtime_restart_requested is True
+    assert calls == ["stop", "interrupt"]
+
+
 def test_auto_claim_triggered_when_enabled_and_should_claim_says_yes(monkeypatch):
     window = _sync_completed_window(auto_claim_enabled=True)
     monkeypatch.setattr(
