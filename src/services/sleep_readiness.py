@@ -52,7 +52,13 @@ def build_sleep_readiness_snapshot(main_window: Any) -> Dict[str, Any]:
         getattr(main_window, "buylist_manager", None)
     )
     try:
-        open_orders = find_open_orders(getattr(main_window, "order_ledger", None) or [])
+        # The legacy ledger intentionally retains SIM/test orders for audit.
+        # Only a real PROD order can make the active execution device unsafe
+        # to sleep.
+        open_orders = find_open_orders(
+            getattr(main_window, "order_ledger", None) or [],
+            environment="PROD",
+        )
     except Exception:
         # A ledger read problem must not make sleep look artificially safe.
         open_orders = [True]

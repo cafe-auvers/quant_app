@@ -889,6 +889,51 @@ def _clear_entry_card_tracking(
         card.entry_attempt_group_id = ""
 
 
+def _apply_definitive_entry_nonacceptance(
+    card: TradeCardState,
+    order: ExecutionOrderRecord,
+    *,
+    observed_at: datetime,
+) -> None:
+    """Project durable proof that the broker never accepted an entry.
+
+    These terminal records have no broker order ID, so they cannot appear in
+    the exact broker-snapshot loop.  The durable negative identity is already
+    sufficient evidence to clear pending state; waiting for a broker row that
+    cannot exist leaves the card stuck forever.
+    """
+
+    _clear_entry_card_tracking(card, retire_attempt_group=True)
+    card.entry_attempt_count = 0
+    card.entry_remaining_target_quantity = 0
+    card.capital_reservation_id = ""
+    card.entry_runtime_status = None
+    card.entry_block_reason = ""
+    card.next_retry_at = None
+
+    if card.broker_quantity > 0:
+        card.board_status = BoardStatus.OPEN_POSITION
+        if not card.exit_all_required:
+            card.position_runtime_status = PositionRuntimeStatus.OPEN
+        return
+
+    card.previous_board_status = card.board_status
+    card.board_status = BoardStatus.BUYLIST
+    card.board_status_updated_at = observed_at
+    card.session_date = None
+    card.buylist_member = True
+    card.buy_today_note = "Entry rejected by broker"
+    card.selected_orb_window = None
+    card.position_percent = 0.0
+    card.planned_quantity = 0
+    card.target_position_quantity = 0
+    card.entry_orb_window = None
+    card.entry_orb_high = None
+    card.entry_orb_low = None
+    card.entry_trigger = None
+    card.stop_adr = None
+
+
 def _clear_exit_card_tracking(
     card: TradeCardState, *, retire_attempt_group: bool = False
 ) -> None:
@@ -1394,6 +1439,30 @@ def reduce_account_reconciliation(
         classifications.append(
             ReconciliationClassification(category, order.client_order_id)
         )
+        if (
+            card is not None
+            and _card_tracks_order(card, order)
+            and order.side == OrderSide.BUY
+            and order.intent == OrderIntent.ENTRY
+            and order.status
+            in {
+                ExecutionOrderStatus.REJECTED,
+                ExecutionOrderStatus.NOT_ACCEPTED_CONFIRMED,
+            }
+            and order.broker_identity_status
+            == BrokerIdentityStatus.NO_BROKER_ORDER_CONFIRMED
+            and card.board_status
+            in {
+                BoardStatus.BUY_TODAY,
+                BoardStatus.ENTRY_PENDING,
+                BoardStatus.OPEN_POSITION,
+            }
+        ):
+            _apply_definitive_entry_nonacceptance(
+                card,
+                order,
+                observed_at=snapshot.observed_at,
+            )
         if (
             card is not None
             and _card_tracks_order(card, order)

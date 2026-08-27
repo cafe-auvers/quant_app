@@ -16,6 +16,7 @@ from src.services.entry_attempt_manager import (
     EntryTrigger,
     decide_attempt_deadline_action,
 )
+from src.services.execution_command_gateway import GuardedSubmissionRejectedError
 from src.services.order_execution_service import DuplicateOpenOrderError
 
 RISK_STRATEGY_ID = "TEST"
@@ -161,6 +162,19 @@ def test_rejected_order_enters_cooldown_and_releases_capital(tmp_path):
 
     reservations = capital_allocator.load_reservations(path)
     assert all(not r.is_open() for r in reservations)
+
+
+def test_definitive_guarded_broker_rejection_is_not_marked_retryable(tmp_path):
+    def fake_submit(**kwargs):
+        raise GuardedSubmissionRejectedError("security is suspended")
+
+    manager, path = _manager(tmp_path, fake_submit)
+    result = manager.attempt_entry(_trigger())
+
+    assert result.outcome == AttemptOutcome.BROKER_REJECTED
+    assert result.retry_at is None
+    assert result.attempt_count == 1
+    assert all(not reservation.is_open() for reservation in capital_allocator.load_reservations(path))
 
 
 def test_rate_limit_after_max_attempts_per_minute(tmp_path):

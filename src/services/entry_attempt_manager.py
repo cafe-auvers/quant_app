@@ -48,6 +48,7 @@ from src.services.execution_command_gateway import (
     AmbiguousPostBrokerPersistenceError,
     GuardedSubmissionPreBrokerAbortedError,
     GuardedSubmissionAmbiguousError,
+    GuardedSubmissionRejectedError,
 )
 from src.services.execution_command_repository import DuplicateCommandError
 from src.services.order_execution_service import (
@@ -115,6 +116,7 @@ class AttemptOutcome(str, Enum):
     COOLDOWN = "COOLDOWN"
     RATE_LIMITED = "RATE_LIMITED"
     REJECTED = "REJECTED"
+    BROKER_REJECTED = "BROKER_REJECTED"
     UNRESOLVED = "UNRESOLVED"
 
 
@@ -465,6 +467,27 @@ class EntryAttemptManager:
                 attempt_group_id=attempt_group_id,
                 attempt_count=state.attempt_count,
                 retry_at=state.cooldown_until,
+                detail=str(exc),
+            )
+        except GuardedSubmissionRejectedError as exc:
+            # The guarded gateway reached a definitive broker rejection and
+            # durably recorded that no working order remains.  This is not a
+            # transient submission failure: retire the consumed attempt and
+            # let the caller return the card to a clean non-pending state.
+            if reservation is not None:
+                capital_allocator.release_reservation(
+                    reservation.reservation_id,
+                    path=self._reservations_path,
+                    engine=self._capital_reservation_engine,
+                )
+            state.attempt_count = max(state.attempt_count, attempt_number)
+            state.attempt_timestamps.append(now)
+            return AttemptResult(
+                trigger,
+                AttemptOutcome.BROKER_REJECTED,
+                reservation_id=reservation.reservation_id if reservation else "",
+                attempt_group_id=attempt_group_id,
+                attempt_count=state.attempt_count,
                 detail=str(exc),
             )
         except Exception as exc:  # noqa: BLE001 - surfaced via AttemptResult
