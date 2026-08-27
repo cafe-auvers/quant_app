@@ -4755,6 +4755,109 @@ class MainWindow(
         self.append_log(f"{label} changed to {update.target_label}.")
         self._start_state_sync()
 
+    def _refresh_today_queue_before_plan_publish(self) -> tuple[bool, str]:
+        """Rebuild every Buy Today queue target before publishing the plan.
+
+        Buy Today card commands are persisted independently from the local
+        execution-queue snapshot.  Publishing the files without this refresh
+        can pair a new canonical breakout with yesterday's queue breakout.
+        The runtime correctly fences that mismatch, but the resulting plan is
+        unusable.  Refresh from canonical cards and fail the publish unless
+        every target was rebuilt and agrees with its card.
+        """
+
+        cards_by_environment: Dict[str, Dict[str, Any]] = {}
+        for projection in tuple(
+            self.__dict__.get("_buyboard_current_projections", ()) or ()
+        ):
+            card = getattr(projection, "card", projection)
+            status = str(
+                getattr(getattr(card, "board_status", ""), "value", None)
+                or getattr(card, "board_status", "")
+            ).upper()
+            if status != "BUY_TODAY":
+                continue
+            environment = str(
+                getattr(card, "environment", "") or "PROD"
+            ).strip().upper()
+            symbol = str(getattr(card, "symbol", "") or "").strip().upper()
+            if symbol:
+                cards_by_environment.setdefault(environment, {})[symbol] = card
+
+        if not cards_by_environment:
+            if self.__dict__.get("execution_queue_manager") is not None:
+                self._save_execution_queue_state()
+            return True, ""
+        refresher = getattr(self, "refresh_execution_queue", None)
+        if not callable(refresher):
+            return False, "Execution-queue refresh is unavailable."
+
+        failures: List[str] = []
+        for environment, cards_by_symbol in sorted(cards_by_environment.items()):
+            symbols = sorted(cards_by_symbol)
+            refresher(
+                environment,
+                show_log=False,
+                symbols=symbols,
+                create_missing=False,
+            )
+            result = self.__dict__.get("_last_execution_queue_refresh_result")
+            if result is None:
+                failures.append(f"{environment}: queue refresh returned no result")
+                continue
+            missing = list(getattr(result, "missing_symbols", ()) or ())
+            refresh_failures = list(getattr(result, "failures", ()) or ())
+            refreshed = int(getattr(result, "refreshed", 0) or 0)
+            target_count = int(getattr(result, "target_count", 0) or 0)
+            if missing:
+                failures.append(
+                    f"{environment}: missing queue targets for {', '.join(missing)}"
+                )
+            failures.extend(str(item) for item in refresh_failures if str(item))
+            if target_count != len(symbols) or refreshed != len(symbols):
+                failures.append(
+                    f"{environment}: refreshed {refreshed}/{len(symbols)} Buy Today targets"
+                )
+
+            manager = self.__dict__.get("execution_queue_manager")
+            getter = getattr(manager, "get_item", None)
+            if not callable(getter):
+                failures.append(f"{environment}: execution queue is unavailable")
+                continue
+            for symbol, card in cards_by_symbol.items():
+                queue_item = getter(symbol, environment)
+                if queue_item is None:
+                    failures.append(f"{symbol}: execution queue item is missing")
+                    continue
+                try:
+                    card_breakout = float(getattr(card, "breakout_price", 0.0) or 0.0)
+                    queue_breakout = float(
+                        getattr(queue_item, "breakout_price", 0.0) or 0.0
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    failures.append(f"{symbol}: breakout target is invalid")
+                    continue
+                if not (
+                    math.isfinite(card_breakout)
+                    and card_breakout > 0.0
+                    and math.isfinite(queue_breakout)
+                    and math.isclose(
+                        card_breakout,
+                        queue_breakout,
+                        rel_tol=1e-9,
+                        abs_tol=1e-9,
+                    )
+                ):
+                    failures.append(
+                        f"{symbol}: queue breakout {queue_breakout:g} does not match "
+                        f"canonical target {card_breakout:g}"
+                    )
+
+        if failures:
+            return False, "; ".join(dict.fromkeys(failures))
+        self._save_execution_queue_state()
+        return True, ""
+
     def _on_publish_trading_plan_clicked(self) -> None:
         if is_regular_session_open():
             QMessageBox.information(
@@ -4774,9 +4877,15 @@ class MainWindow(
         worker = self.__dict__.get("plan_publish_worker")
         if worker is not None and worker.isRunning():
             return
-        queue_manager = self.__dict__.get("execution_queue_manager")
-        if queue_manager is not None:
-            self._save_execution_queue_state()
+        queue_ready, queue_error = self._refresh_today_queue_before_plan_publish()
+        if not queue_ready:
+            message = (
+                "Today's plan was not published because its execution queue "
+                f"could not be verified: {queue_error}"
+            )
+            QMessageBox.warning(self, "Publish paused", message)
+            self.append_log(message)
+            return
         saved = self._save_state_now(
             timeout=5.0,
             supersede_pending=True,

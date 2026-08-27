@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime as dt
 from types import SimpleNamespace
 
+import pytest
 from sqlalchemy import MetaData, create_engine, event, text
 from sqlalchemy.dialects import mysql
 from sqlalchemy.pool import NullPool
@@ -14,6 +15,7 @@ from src.services import runtime_status
 from src.services import state_sync as ss
 from src.core.execution_config import COORDINATION_RU_PROFILE
 from src.core.runtime_readiness import RuntimeDeviceState
+from src.core.trade_card_state import BoardStatus
 from src.services.runtime_device_state_repository import save_runtime_device_state
 import src.ui.main_window as main_window_module
 from src.ui.main_window import MainWindow
@@ -606,6 +608,102 @@ def test_publish_plan_click_saves_locally_without_per_document_remote_push(
     ]
     assert len(workers) == 1
     assert workers[0].started is True
+
+
+def test_plan_publish_refreshes_every_buy_today_queue_target():
+    window = MainWindow.__new__(MainWindow)
+    cards = (
+        SimpleNamespace(
+            board_status=BoardStatus.BUY_TODAY,
+            environment="PROD",
+            symbol="AAPL",
+            breakout_price=201.25,
+        ),
+        SimpleNamespace(
+            board_status=BoardStatus.BUY_TODAY,
+            environment="PROD",
+            symbol="MSFT",
+            breakout_price=411.5,
+        ),
+        SimpleNamespace(
+            board_status=BoardStatus.BUYLIST,
+            environment="PROD",
+            symbol="IGNORED",
+            breakout_price=1.0,
+        ),
+    )
+    window._buyboard_current_projections = tuple(
+        SimpleNamespace(card=card) for card in cards
+    )
+    queue_items = {
+        "AAPL": SimpleNamespace(breakout_price=201.25),
+        "MSFT": SimpleNamespace(breakout_price=411.5),
+    }
+    window.execution_queue_manager = SimpleNamespace(
+        get_item=lambda symbol, _environment: queue_items.get(symbol)
+    )
+    refreshes = []
+
+    def refresh(environment, **kwargs):
+        refreshes.append((environment, kwargs))
+        window._last_execution_queue_refresh_result = SimpleNamespace(
+            missing_symbols=[], failures=[], refreshed=2, target_count=2
+        )
+
+    window.refresh_execution_queue = refresh
+    saves = []
+    window._save_execution_queue_state = lambda: saves.append(True)
+
+    ready, error = MainWindow._refresh_today_queue_before_plan_publish(window)
+
+    assert ready is True
+    assert error == ""
+    assert refreshes == [
+        (
+            "PROD",
+            {
+                "show_log": False,
+                "symbols": ["AAPL", "MSFT"],
+                "create_missing": False,
+            },
+        )
+    ]
+    assert saves == [True]
+
+
+def test_plan_publish_refuses_a_stale_queue_breakout():
+    window = MainWindow.__new__(MainWindow)
+    window._buyboard_current_projections = (
+        SimpleNamespace(
+            card=SimpleNamespace(
+                board_status=BoardStatus.BUY_TODAY,
+                environment="PROD",
+                symbol="AAPL",
+                breakout_price=201.25,
+            )
+        ),
+    )
+    window.execution_queue_manager = SimpleNamespace(
+        get_item=lambda _symbol, _environment: SimpleNamespace(
+            breakout_price=199.0
+        )
+    )
+
+    def refresh(_environment, **_kwargs):
+        window._last_execution_queue_refresh_result = SimpleNamespace(
+            missing_symbols=[], failures=[], refreshed=1, target_count=1
+        )
+
+    window.refresh_execution_queue = refresh
+    window._save_execution_queue_state = lambda: pytest.fail(
+        "a mismatched queue must not be saved for publish"
+    )
+
+    ready, error = MainWindow._refresh_today_queue_before_plan_publish(window)
+
+    assert ready is False
+    assert "queue breakout 199" in error
+    assert "canonical target 201.25" in error
 
 
 def test_main_device_periodic_poll_checks_ownership_without_touching_state(
