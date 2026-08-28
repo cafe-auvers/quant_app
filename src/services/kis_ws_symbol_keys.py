@@ -41,12 +41,38 @@ _REGULAR_SESSION_PREFIX_BY_EXCHANGE = {
     "NYS": "DNYS",
     "NYSE": "DNYS",
 }
+_ORDER_EXCHANGE_BY_REGULAR_SESSION_PREFIX = {
+    "DAMS": "AMEX",
+    "DNAS": "NASD",
+    "DNYS": "NYSE",
+}
 _WRITE_LOCK_TIMEOUT_SECONDS = 5.0
 _STALE_WRITE_LOCK_SECONDS = 30.0
 
 
 class KisWsSymbolKeysError(RuntimeError):
     """The local symbol-key configuration is unreadable or invalid."""
+
+
+def order_exchange_from_symbol_key(symbol_key: str) -> str:
+    """Return the KIS order venue encoded by a regular-session feed key.
+
+    Order submission uses ``NASD``/``NYSE``/``AMEX`` while the verified
+    WebSocket keys use ``DNAS``/``DNYS``/``DAMS`` prefixes.  Keeping this
+    translation beside the key protocol prevents execution from silently
+    defaulting every US symbol to NASDAQ.  Unknown, daytime, and malformed
+    keys fail closed instead of guessing a broker venue.
+    """
+
+    key = str(symbol_key or "").strip().upper()
+    prefix = key[:4]
+    exchange = _ORDER_EXCHANGE_BY_REGULAR_SESSION_PREFIX.get(prefix)
+    if exchange is None or len(key) <= len(prefix):
+        raise KisWsSymbolKeysError(
+            "A verified regular-session KIS symbol key is required to resolve "
+            f"the order exchange: {symbol_key!r}"
+        )
+    return exchange
 
 
 @dataclass(frozen=True)

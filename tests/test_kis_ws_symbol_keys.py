@@ -6,6 +6,7 @@ from src.services.kis_ws_symbol_keys import (
     KisWsSymbolKeyStore,
     KisWsSymbolKeysError,
     derive_symbol_key_from_kis_master,
+    order_exchange_from_symbol_key,
     read_symbol_keys_file,
     update_symbol_keys_file,
     write_symbol_keys_file,
@@ -21,6 +22,26 @@ def _write_kis_master(path, rows):
         ),
         encoding="utf-8",
     )
+
+
+@pytest.mark.parametrize(
+    ("symbol_key", "expected_exchange"),
+    [
+        ("DNASAAPL", "NASD"),
+        ("DNYSRNG", "NYSE"),
+        ("DAMSXYZ", "AMEX"),
+    ],
+)
+def test_order_exchange_is_derived_from_regular_session_symbol_key(
+    symbol_key, expected_exchange
+):
+    assert order_exchange_from_symbol_key(symbol_key) == expected_exchange
+
+
+@pytest.mark.parametrize("symbol_key", ["", "DNYS", "RBAQAAPL", "UNKNOWN"])
+def test_order_exchange_resolution_fails_closed_for_unusable_keys(symbol_key):
+    with pytest.raises(KisWsSymbolKeysError, match="regular-session"):
+        order_exchange_from_symbol_key(symbol_key)
 
 
 def test_missing_key_is_atomically_provisioned_from_kis_master(tmp_path):

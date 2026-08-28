@@ -179,6 +179,7 @@ from src.services.intraday_provider import IntradayInterval, IntradayRequest
 from src.services.kis_realtime_market_data import (
     build_kis_realtime_market_data_from_environment,
 )
+from src.services.kis_ws_symbol_keys import order_exchange_from_symbol_key
 from src.services.position_manager import (
     BrokerHolding,
     PositionActionCallbacks,
@@ -211,6 +212,36 @@ _SELL_REASON_TO_INTENT = {
     "sell_all_retry": OrderIntent.MANUAL_EXIT,
     "stop_loss": OrderIntent.STOP_LOSS,
 }
+
+
+def _execution_exchange_for_card(
+    card: Optional[TradeCardState],
+    market_data: RealtimeMarketDataService,
+    *,
+    compatibility_fallback: str = "",
+) -> str:
+    """Resolve a card's broker venue from its verified KIS subscription key.
+
+    Canonical card state wins.  Newly activated cards can briefly lack that
+    field while the laptop's approved local key store has already provisioned
+    the symbol, so the live store is the second source.  The explicit fallback
+    exists only for legacy/test compositions without a WebSocket key store;
+    production WebSocket execution never guesses NASDAQ.
+    """
+
+    if card is not None:
+        symbol_key = str(card.kis_ws_symbol_key or "").strip()
+        if not symbol_key:
+            key_store = getattr(market_data, "symbol_key_store", None)
+            if key_store is not None:
+                symbol_key = str(key_store.resolve(card.symbol) or "").strip()
+        if symbol_key:
+            return order_exchange_from_symbol_key(symbol_key)
+
+    fallback = str(compatibility_fallback or "").strip().upper()
+    if fallback in {"NASD", "NYSE", "AMEX"}:
+        return fallback
+    raise RuntimeError("A verified KIS order exchange could not be resolved")
 
 
 def _entry_plan_id(card: TradeCardState) -> str:
@@ -1029,6 +1060,11 @@ def build_buyboard_runtime(
 
         quantity = kwargs["quantity"]
         limit_price = kwargs["limit_price"]
+        exchange = _execution_exchange_for_card(
+            card,
+            resolved_market_data,
+            compatibility_fallback=kwargs.get("exchange", ""),
+        )
         try:
             account_equity = float(
                 resolved_equity_provider(environment, account_no)
@@ -1076,7 +1112,7 @@ def build_buyboard_runtime(
                 card,
                 quantity=quantity,
                 limit_price=limit_price,
-                exchange=kwargs.get("exchange", "NASD"),
+                exchange=exchange,
                 account_size=account_equity,
             )
             if card is not None
@@ -1178,6 +1214,7 @@ def build_buyboard_runtime(
         plan_id = _entry_plan_id(card) if card is not None else f"{environment}:{symbol}"
         submit_kwargs = dict(kwargs)
         submit_kwargs["quantity"] = quantity
+        submit_kwargs["exchange"] = exchange
         if guarded_mode and not submit_kwargs.get("client_order_id"):
             if card is None:
                 raise RuntimeError(
@@ -1378,7 +1415,11 @@ def build_buyboard_runtime(
             submit_kwargs.get("account_no", ""),
             symbol,
         )
-        exchange = submit_kwargs.pop("exchange", "NASD")
+        exchange = _execution_exchange_for_card(
+            card,
+            resolved_market_data,
+            compatibility_fallback=submit_kwargs.pop("exchange", "NASD"),
+        )
         # Use the engine's exact session oracle so a board decision and the
         # shared exit command cannot disagree at the same boundary.
         regular_session_open = trading_engine._market_is_open()
