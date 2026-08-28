@@ -489,6 +489,62 @@ def _is_breakout_plan_command(command) -> bool:
     return isinstance(command, (types.SetBreakoutPrice, types.ClearBreakoutPrice))
 
 
+def _closed_card_cycle_blockers(card) -> tuple[str, ...]:
+    """Return unresolved state that prevents a CLOSED card from being reused.
+
+    CLOSED is the durable end of one trade cycle, not a permanent tombstone
+    for the symbol.  A later breakout-price edit may start a fresh BUYLIST
+    cycle, but only when the aggregate is still broker-flat and no unresolved
+    order/stop/exit operation remains.  Historical price, stop, correlation,
+    and terminal-order evidence intentionally is not a blocker; the restart
+    mutation retires those completed-cycle fields.
+    """
+
+    from src.core.trade_card_state import PositionRuntimeStatus
+
+    blockers = []
+    if max(0, int(card.broker_quantity or 0)) > 0:
+        blockers.append("broker quantity is not flat")
+    if max(0, int(card.orderable_quantity or 0)) > 0:
+        blockers.append("orderable quantity is not flat")
+    if card.position_runtime_status not in {
+        PositionRuntimeStatus.NONE,
+        PositionRuntimeStatus.CLOSED,
+    }:
+        blockers.append("position reconciliation is not terminal")
+    if (
+        card.next_retry_at is not None
+        or card.entry_submission_unresolved
+        or card.entry_cancel_in_flight
+        or card.entry_cancel_command_id
+        or card.entry_remaining_target_quantity
+    ):
+        blockers.append("entry reconciliation is not terminal")
+    if (
+        card.pending_stop_type is not None
+        or card.pending_stop_price is not None
+        or card.pending_stop_quantity
+        or card.pending_stop_command_id
+        or card.pending_stop_requested_at is not None
+    ):
+        blockers.append("stop state is still active")
+    if (
+        card.exit_all_required
+        or card.sell_all_at_market_open
+        or card.pending_partial_sell_quantity
+        or card.reserved_sell_quantity
+        or card.next_exit_retry_at is not None
+        or card.exit_submission_unresolved
+        or card.exit_cancel_in_flight
+        or card.exit_cancel_requested_at is not None
+        or card.exit_cancel_command_id
+    ):
+        blockers.append("exit reconciliation is not terminal")
+    if card.capital_reservation_id:
+        blockers.append("capital remains reserved")
+    return tuple(blockers)
+
+
 def _require_breakout_plan_mutation_policy(command, card, context) -> None:
     """Authorize canonical breakout edits independently of executor state.
 
@@ -541,7 +597,10 @@ def _require_breakout_plan_mutation_policy(command, card, context) -> None:
         BoardStatus.BUY_TODAY,
     }
     if isinstance(command, types.SetBreakoutPrice):
-        allowed.add(BoardStatus.ENTRY_PENDING)
+        # A price edit on a safely-flat CLOSED card starts a new BUYLIST
+        # planning cycle.  ClearBreakoutPrice remains meaningless on CLOSED
+        # and therefore stays rejected.
+        allowed.update({BoardStatus.ENTRY_PENDING, BoardStatus.CLOSED})
     if card.board_status not in allowed:
         raise BoardCommandRejectedError(
             f"Cannot change breakout planning from {card.board_status.value}"
@@ -742,6 +801,27 @@ def _require_board_action_not_conflicted(engine, command, card) -> List[Executio
         )
 
     if isinstance(command, types.SetBreakoutPrice):
+        if card.board_status == BoardStatus.CLOSED:
+            blockers = _closed_card_cycle_blockers(card)
+            if blockers:
+                raise BoardCommandRejectedError(
+                    "Cannot start a new breakout plan from CLOSED while "
+                    + "; ".join(blockers)
+                )
+            if active_orders:
+                raise BoardCommandRejectedError(
+                    "Cannot start a new breakout plan from CLOSED while an "
+                    "owned order is still active"
+                )
+            if _active_external_orders(engine, card):
+                raise BoardCommandRejectedError(
+                    "Cannot start a new breakout plan from CLOSED while an "
+                    "unowned broker order is still active"
+                )
+            # Terminal fills belong to the completed cycle and remain in the
+            # immutable order ledger.  They must not make the symbol
+            # impossible to plan again after broker-confirmed flatness.
+            return active_orders
         if has_confirmed_fill_or_position_evidence():
             raise BoardCommandRejectedError(
                 "Breakout price cannot change after a fill or position is confirmed"
@@ -919,16 +999,64 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         card.market_data_outage_started_at = None
         card.market_data_outage_risk_tier = ""
 
+    def restart_closed_cycle() -> None:
+        """Retire completed-cycle projection fields and reopen BUYLIST."""
+
+        previous = card.board_status
+        clear_executable_entry_plan()
+        card.previous_board_status = previous
+        card.board_status = BoardStatus.BUYLIST
+        card.board_status_updated_at = command.requested_at
+        card.session_date = None
+        card.last_buy_today_session_date = None
+        card.rejected_orb_snapshot = {}
+        card.buy_today_note = ""
+        card.entry_runtime_status = None
+        card.position_runtime_status = PositionRuntimeStatus.NONE
+        card.broker_quantity = 0
+        card.orderable_quantity = 0
+        card.average_entry_price = 0.0
+        card.stop_type = None
+        card.active_stop_price = None
+        card.stop_quantity = 0
+        card.pending_stop_type = None
+        card.pending_stop_price = None
+        card.pending_stop_quantity = 0
+        card.pending_stop_command_id = ""
+        card.pending_stop_requested_at = None
+        card.exit_all_required = False
+        card.sell_all_at_market_open = False
+        card.pending_partial_sell_quantity = 0
+        card.reserved_sell_quantity = 0
+        card.next_exit_retry_at = None
+        card.exit_attempt_count = 0
+        card.exit_attempt_group_id = ""
+        card.exit_client_order_id = ""
+        card.exit_pending_attempt_number = 0
+        card.exit_submission_unresolved = False
+        card.last_exit_error = ""
+        card.exit_cancel_in_flight = False
+        card.exit_cancel_requested_at = None
+        card.exit_cancel_command_id = ""
+        card.return_to_buylist_after_close = False
+        card.warnings = []
+
     if isinstance(command, types.SetBreakoutPrice):
+        restarting_closed_cycle = card.board_status == BoardStatus.CLOSED
+        if restarting_closed_cycle:
+            restart_closed_cycle()
         try:
             previous_breakout = float(card.breakout_price or 0.0)
         except (TypeError, ValueError, OverflowError):
             previous_breakout = 0.0
         had_canonical_target = bool(
-            math.isfinite(previous_breakout) and previous_breakout > 0
+            not restarting_closed_cycle
+            and math.isfinite(previous_breakout)
+            and previous_breakout > 0
         )
         preserve_unfilled_execution = bool(
-            active_orders or has_durable_execution_evidence(card)
+            not restarting_closed_cycle
+            and (active_orders or has_durable_execution_evidence(card))
         )
         if not preserve_unfilled_execution:
             clear_executable_entry_plan()
