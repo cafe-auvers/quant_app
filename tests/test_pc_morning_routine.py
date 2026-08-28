@@ -34,3 +34,36 @@ def test_git_updated_routine_relaunches_once_before_maintenance():
     assert relaunch < listener_call
     assert '$env:QUANT_MORNING_ROUTINE_RELAUNCHED -eq "1"' in text
     assert "exit $childExitCode" in text
+
+
+def test_existing_main_is_detected_before_git_or_dependency_mutation():
+    text = _routine_text()
+
+    inspection = text.index(
+        "$MainProcessesAtStart = @(Get-QuantMainProcesses -MainScriptPath $MainScriptPath)"
+    )
+    git_sync = text.index("$fetchOutput = git fetch origin")
+    dependency_sync = text.index("-m pip install -q --require-hashes")
+
+    assert inspection < git_sync < dependency_sync
+    assert "refusing maintenance or a possible duplicate launch" in text
+    assert "(?:\\.\\\\)?main\\.py" in text
+
+
+def test_resume_mode_refreshes_without_git_env_pip_or_duplicate_main():
+    text = _routine_text()
+
+    assert '$ResumeMode = $MainProcessesAtStart.Count -gt 0' in text
+    assert "entering refresh-only resume mode" in text
+    assert "Resume mode: skipping Git sync" in text
+    assert "Resume mode: skipping environment migration" in text
+    assert "Resume mode: skipping dependency sync" in text
+    assert "Resume mode: existing main.py retained; no duplicate process was launched" in text
+
+    refresh = text.index('"scripts\\run_daily_refresh.py"')
+    duplicate_guard = text.index(
+        "Resume mode: existing main.py retained; no duplicate process was launched"
+    )
+    launch = text.index("$proc = Start-Process -FilePath $PythonExe")
+
+    assert refresh < duplicate_guard < launch
