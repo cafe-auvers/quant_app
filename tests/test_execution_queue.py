@@ -171,7 +171,7 @@ def test_missing_manual_breakout_price_prevents_execute_ready():
     assert "Manual breakout price" in candidate.reason
 
 
-def test_current_price_below_entry_trigger_is_armed_not_execute_ready():
+def test_valid_completed_orb_is_execute_ready_before_price_reaches_orb_high():
     manager = ExecutionQueueManager()
     waiting = build_orb_candidate(
         symbol="AAPL",
@@ -185,8 +185,9 @@ def test_current_price_below_entry_trigger_is_armed_not_execute_ready():
     )
     item = manager.upsert_item(symbol="AAPL", candidates={"1m": waiting})
 
-    assert waiting.status == OrbCandidateStatus.WAITING_BREAKOUT
-    assert item.status == ExecutionQueueStatus.ARMED
+    assert waiting.status == OrbCandidateStatus.EXECUTE_READY
+    assert waiting.entry_trigger == pytest.approx(waiting.orb_high)
+    assert item.status == ExecutionQueueStatus.EXECUTE_READY
 
 
 def test_current_price_above_entry_trigger_with_valid_risk_is_execute_ready():

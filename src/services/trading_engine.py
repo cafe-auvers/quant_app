@@ -33,13 +33,12 @@ methods for the exact finding each one addresses):
   for the rest of the session.
 - P0-5: a partially-filled entry's remaining target quantity is actually
   retried, not just recorded.
-- P0-6/P0-7: any working entry order is reconciled every heartbeat tick
-  (not only at its 15s deadline), fills are protected the instant they're
-  observed, and a cancel request is never treated as a completed
-  cancellation until the broker confirms it.
-- P0-9: a retried/completion entry price is checked against the live quote
-  so it stays marketable instead of only ever using the original ORB
-  trigger price.
+- P0-6/P0-7: any working entry order is reconciled every heartbeat tick,
+  fills are protected the instant they're observed, and a cancel request
+  is never treated as a completed cancellation until the broker confirms
+  it.
+- Entry submissions and completion attempts use the exact ORB-high trigger
+  as a resting limit; a live quote never raises the approved entry price.
 - P1-6: an existing position whose feed disconnects or loses its structural
   subscription health is flagged independently of the new-entry freshness
   gate.
@@ -683,29 +682,18 @@ class TradingEngine:
                 logger.exception("_recover_retryable_cards failed for %s", card.symbol)
         return changed
 
-    # -- Marketable price (review finding P0-9) ---------------------------
+    # -- Approved ORB-high price ------------------------------------------
 
-    def _marketable_entry_price(
-        self, card: TradeCardState, quote: Optional[QuoteSnapshot]
-    ) -> Optional[float]:
-        """Section 819-822: an entry submission needs a live KIS quote, and
-        that quote should actually inform the submitted price -- resending
-        only the original ORB trigger price can leave a limit order
-        sitting unmarketable below a market that has since moved up.
-        Reviewed finding P0-9's fix: take the more aggressive (higher, for
-        a BUY) of the ORB trigger, the current ask, and the current last
-        price.
-        """
-        entry_trigger = card.entry_trigger
-        if not entry_trigger:
+    @staticmethod
+    def _orb_high_entry_limit(card: TradeCardState) -> Optional[float]:
+        """Return the exact, pre-approved ORB-high limit price."""
+        try:
+            entry_trigger = float(card.entry_trigger or 0.0)
+        except (TypeError, ValueError, OverflowError):
             return None
-        candidates = [entry_trigger]
-        if quote is not None:
-            if quote.ask:
-                candidates.append(quote.ask)
-            if quote.last_price:
-                candidates.append(quote.last_price)
-        return max(candidates)
+        if not math.isfinite(entry_trigger) or entry_trigger <= 0:
+            return None
+        return entry_trigger
 
     def _target_plan_quantity(
         self, card: TradeCardState, *, entry_price: float
@@ -793,7 +781,11 @@ class TradingEngine:
         for card in cards:
             if card.board_status != BoardStatus.BUY_TODAY:
                 continue
-            if card.entry_runtime_status != EntryRuntimeStatus.EXECUTE_READY:
+            if card.entry_runtime_status not in {
+                EntryRuntimeStatus.WAITING_BREAKOUT,
+                EntryRuntimeStatus.ARMED,
+                EntryRuntimeStatus.EXECUTE_READY,
+            }:
                 continue
             try:
                 if not _complete_orb_entry_plan(card):
@@ -827,10 +819,7 @@ class TradingEngine:
                         card.entry_block_reason = reason
                         changed.append(card)
                     continue
-                entry_trigger = card.entry_trigger
-                if entry_trigger and quote.last_price < entry_trigger:
-                    continue
-                price = self._marketable_entry_price(card, quote)
+                price = self._orb_high_entry_limit(card)
                 if not price:
                     continue
                 planned_quantity = self._target_plan_quantity(
@@ -1291,7 +1280,7 @@ class TradingEngine:
                 quote = self._market_data.latest_quote(card.symbol)
                 if not self._market_data.entry_quote_ready(card.symbol, now=now):
                     continue  # cannot safely re-attempt without fresh execution-grade data
-                price = self._marketable_entry_price(card, quote)
+                price = self._orb_high_entry_limit(card)
                 if not price:
                     continue
                 self._prepare_entry_attempt(card)

@@ -3107,7 +3107,7 @@ def test_one_cycle_persists_engine_changes(tmp_path, monkeypatch):
     )
     # Keep this retry-state test independent of the real NYSE clock. The
     # production runtime performs its EOD cleanup after the closing bell.
-    worker.runtime.trading_engine._market_is_open_fn = lambda: True
+    worker.runtime.trading_engine._market_is_open_fn = lambda: False
     worker.runtime.trading_engine._eod_window_reached_fn = lambda: False
     card = _seed_card(
         engine,

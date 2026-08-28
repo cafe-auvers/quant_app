@@ -102,6 +102,7 @@ def test_successful_attempt_submits_and_reserves_capital(tmp_path):
         assert kwargs["attempt_group_id"]
         assert kwargs["attempt_number"] == 1
         assert kwargs["capital_reservation_id"]
+        assert kwargs["attempt_deadline_at"] is None
         return _order(status=OrderStatus.ACCEPTED)
 
     manager, _ = _manager(tmp_path, fake_submit)

@@ -379,11 +379,11 @@ def test_fresh_representative_maximum_triggers_exactly_one_entry(tmp_path):
     engine.evaluate_entry_quote([card], fresh_maximum)
 
     assert len(submitted) == 1
-    assert submitted[0]["limit_price"] == 105.0
+    assert submitted[0]["limit_price"] == 104.0
     assert card.board_status == BoardStatus.ENTRY_PENDING
 
 
-def test_waiting_breakout_executes_immediately_on_brief_fresh_orh_crossing(tmp_path):
+def test_valid_waiting_orb_submits_resting_limit_before_price_reaches_orb_high(tmp_path):
     now = dt.datetime(2026, 8, 16, 14, 30, tzinfo=dt.timezone.utc)
     submitted = []
     engine = _entry_event_engine(tmp_path, now, submitted)
@@ -391,21 +391,22 @@ def test_waiting_breakout_executes_immediately_on_brief_fresh_orh_crossing(tmp_p
         entry_runtime_status=EntryRuntimeStatus.WAITING_BREAKOUT,
         entry_trigger=104.0,
     )
-    crossing = QuoteSnapshot(
+    below_orb_high = QuoteSnapshot(
         symbol="AAPL",
-        last_price=105.0,
-        bid=104.9,
-        ask=105.0,
+        last_price=103.0,
+        bid=102.9,
+        ask=103.1,
         broker_event_at=now,
         received_at=now,
         processed_at=now,
     )
 
-    changed = engine.evaluate_entry_quote([card], crossing)
+    changed = engine.evaluate_entry_quote([card], below_orb_high)
 
     assert card in changed
     assert len(submitted) == 1
     assert submitted[0]["quantity"] == 10
+    assert submitted[0]["limit_price"] == 104.0
     assert card.board_status == BoardStatus.ENTRY_PENDING
 
 
@@ -426,9 +427,10 @@ def test_waiting_breakout_with_corrupt_orb_geometry_cannot_execute(tmp_path):
         processed_at=now,
     )
 
-    assert engine.evaluate_entry_quote([card], crossing) == []
+    assert engine.evaluate_entry_quote([card], crossing) == [card]
     assert submitted == []
-    assert card.entry_runtime_status == EntryRuntimeStatus.WAITING_BREAKOUT
+    assert card.entry_runtime_status == EntryRuntimeStatus.ORB_FORMING
+    assert "complete current-session ORB entry plan" in card.entry_block_reason
 
 
 def test_live_cross_cannot_bypass_retry_cooldown(tmp_path):
@@ -592,6 +594,37 @@ def test_entry_pending_card_before_deadline_is_untouched(tmp_path):
 
     assert engine.run_heartbeat([card]) == []
     assert card.board_status == BoardStatus.ENTRY_PENDING
+
+
+def test_resting_orb_entry_without_deadline_remains_pending_until_fill_or_cancel(tmp_path):
+    order = BrokerOrder.create(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        intent=OrderIntent.ENTRY,
+        quantity_requested=10,
+        limit_price=100.0,
+        status=OrderStatus.ACCEPTED,
+        attempt_deadline_at=None,
+    )
+    tracker = _StatefulOrderTracker(order)
+    engine = _make_engine(
+        tmp_path,
+        find_order=tracker.find,
+        reconcile_order=tracker.reconcile,
+    )
+    engine._position_callbacks.cancel_order = tracker.cancel_order
+    card = _open_card(
+        board_status=BoardStatus.ENTRY_PENDING,
+        broker_quantity=0,
+        orderable_quantity=0,
+    )
+
+    assert engine.run_heartbeat([card]) == []
+    assert card.board_status == BoardStatus.ENTRY_PENDING
+    assert card.entry_cancel_in_flight is False
+    assert tracker.cancel_calls == []
 
 
 def test_unknown_submission_state_blocks_only_that_symbol_and_keeps_capital(tmp_path):
@@ -1070,10 +1103,10 @@ def test_entry_completion_does_not_retry_while_an_order_is_already_working(tmp_p
     assert submitted == []
 
 
-# --- P0-9: marketable price uses the live quote -----------------------------
+# --- Entry limit remains the exact ORB high ----------------------------------
 
 
-def test_marketable_entry_price_uses_higher_of_trigger_and_live_quote(tmp_path):
+def test_entry_limit_does_not_chase_live_quote_above_orb_high(tmp_path):
     submitted = []
 
     def fake_submit(**kwargs):
@@ -1095,7 +1128,7 @@ def test_marketable_entry_price_uses_higher_of_trigger_and_live_quote(tmp_path):
     engine.run_heartbeat([card])
 
     assert len(submitted) == 1
-    assert submitted[0]["limit_price"] == pytest.approx(105.1)
+    assert submitted[0]["limit_price"] == pytest.approx(100.0)
 
 
 # --- P1-6: stale-quote protection for existing positions --------------------
