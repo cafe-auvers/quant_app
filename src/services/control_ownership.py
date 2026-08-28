@@ -99,6 +99,12 @@ def check_executor_readiness(
 
     details = record.details
     single_session_handoff = False
+    deferred_market_data_handoff = bool(
+        details.get("handoff_ready")
+        and details.get("market_data_handoff_ready")
+        and details.get("market_data_deferred_until_owner")
+        and not details.get("market_data_ready")
+    )
     if bool(
         details.get("handoff_ready")
         and details.get("market_data_handoff_ready")
@@ -144,7 +150,7 @@ def check_executor_readiness(
     )
     for key, message in checks:
         satisfied_by_fenced_handoff = bool(
-            single_session_handoff
+            (single_session_handoff or deferred_market_data_handoff)
             and key in {"market_data_ready", "executor_ready"}
         )
         if (

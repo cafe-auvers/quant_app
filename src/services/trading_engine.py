@@ -37,8 +37,9 @@ methods for the exact finding each one addresses):
   fills are protected the instant they're observed, and a cancel request
   is never treated as a completed cancellation until the broker confirms
   it.
-- Entry submissions and completion attempts use the exact ORB-high trigger
-  as a resting limit; a live quote never raises the approved entry price.
+- Entry submissions and completion attempts use the ORB-high trigger as a
+  resting limit; when the high is between legal U.S. price ticks, the order
+  uses the first legal tick above it. A live quote never raises that price.
 - P1-6: an existing position whose feed disconnects or loses its structural
   subscription health is flagged independently of the new-entry freshness
   gate.
@@ -51,13 +52,14 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, replace
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional
 
 from src.core import execution_config
 from src.core.execution_config import is_buyboard_engine_enabled
 from src.core.execution_result import UnifiedExecutionStatus
-from src.core.order_state import BrokerOrder, OrderIntent, OrderStatus
+from src.core.order_state import BrokerOrder, OrderIntent
 from src.core.trade_card_state import (
     BoardStatus,
     EntryRuntimeStatus,
@@ -99,6 +101,7 @@ _OUTCOME_TO_ENTRY_RUNTIME_STATUS = {
     AttemptOutcome.COOLDOWN: EntryRuntimeStatus.RETRY_COOLDOWN,
     AttemptOutcome.RATE_LIMITED: EntryRuntimeStatus.RETRY_COOLDOWN,
     AttemptOutcome.REJECTED: EntryRuntimeStatus.RETRY_COOLDOWN,
+    AttemptOutcome.BROKER_ROUTING_REJECTED: EntryRuntimeStatus.RETRY_COOLDOWN,
     AttemptOutcome.DUPLICATE_ORDER: EntryRuntimeStatus.ORDER_PENDING,
     AttemptOutcome.UNRESOLVED: EntryRuntimeStatus.ORDER_PENDING,
 }
@@ -686,14 +689,22 @@ class TradingEngine:
 
     @staticmethod
     def _orb_high_entry_limit(card: TradeCardState) -> Optional[float]:
-        """Return the exact, pre-approved ORB-high limit price."""
+        """Return the broker-legal BUY limit at or immediately above ORB high.
+
+        U.S. orders at or above $1 use one-cent ticks; sub-dollar orders use
+        four-decimal ticks in the KIS adapter. Rounding a BUY down would put
+        the resting order below the strategy's ORB-high price, so the risk
+        check and persisted command both receive the first legal tick at or
+        above the approved trigger.
+        """
         try:
-            entry_trigger = float(card.entry_trigger or 0.0)
-        except (TypeError, ValueError, OverflowError):
+            trigger = Decimal(str(card.entry_trigger or 0.0))
+        except (InvalidOperation, TypeError, ValueError, OverflowError):
             return None
-        if not math.isfinite(entry_trigger) or entry_trigger <= 0:
+        if not trigger.is_finite() or trigger <= 0:
             return None
-        return entry_trigger
+        tick = Decimal("0.0001") if trigger < Decimal("1") else Decimal("0.01")
+        return float(trigger.quantize(tick, rounding=ROUND_CEILING))
 
     def _target_plan_quantity(
         self, card: TradeCardState, *, entry_price: float
@@ -874,6 +885,8 @@ class TradingEngine:
                     card.entry_submission_unresolved = (
                         result.outcome != AttemptOutcome.SUBMITTED
                     )
+                    if result.outcome == AttemptOutcome.SUBMITTED:
+                        card.entry_block_reason = ""
                     if result.submission is not None:
                         card.entry_client_order_id = result.submission.client_order_id
                         card.capital_reservation_id = result.submission.capital_reservation_id
@@ -889,10 +902,19 @@ class TradingEngine:
                     card.entry_runtime_status = _OUTCOME_TO_ENTRY_RUNTIME_STATUS.get(
                         result.outcome, card.entry_runtime_status
                     )
+                    if result.outcome == AttemptOutcome.BROKER_ROUTING_REJECTED:
+                        card.entry_block_reason = (
+                            "KIS rejected the verified exchange route (APBK0656); "
+                            "the plan remains in Buy Today for a corrected retry"
+                        )
+                        card.buy_today_note = card.entry_block_reason
                     card.entry_attempt_group_id = result.attempt_group_id
                     card.entry_attempt_count = result.attempt_count
                     card.next_retry_at = result.retry_at  # P0-4: persist so a restart doesn't lose it
-                    if result.outcome == AttemptOutcome.REJECTED:
+                    if result.outcome in {
+                        AttemptOutcome.REJECTED,
+                        AttemptOutcome.BROKER_ROUTING_REJECTED,
+                    }:
                         card.entry_client_order_id = ""
                         card.entry_pending_attempt_number = 0
                         card.entry_submission_unresolved = False
@@ -1277,7 +1299,6 @@ class TradingEngine:
             try:
                 if self._entry_deadline_lookup.find_open_entry_order(card) is not None:
                     continue  # already retrying, handled by _reconcile_entry_orders
-                quote = self._market_data.latest_quote(card.symbol)
                 if not self._market_data.entry_quote_ready(card.symbol, now=now):
                     continue  # cannot safely re-attempt without fresh execution-grade data
                 price = self._orb_high_entry_limit(card)
@@ -1324,6 +1345,8 @@ class TradingEngine:
                     card.entry_submission_unresolved = (
                         result.outcome != AttemptOutcome.SUBMITTED
                     )
+                    if result.outcome == AttemptOutcome.SUBMITTED:
+                        card.entry_block_reason = ""
                     if result.submission is not None:
                         card.entry_client_order_id = result.submission.client_order_id
                         card.capital_reservation_id = result.submission.capital_reservation_id
@@ -1337,8 +1360,17 @@ class TradingEngine:
                     card.entry_runtime_status = _OUTCOME_TO_ENTRY_RUNTIME_STATUS.get(
                         result.outcome, card.entry_runtime_status
                     )
+                    if result.outcome == AttemptOutcome.BROKER_ROUTING_REJECTED:
+                        card.entry_block_reason = (
+                            "KIS rejected the verified exchange route (APBK0656); "
+                            "the plan remains in Buy Today for a corrected retry"
+                        )
+                        card.buy_today_note = card.entry_block_reason
                     card.next_retry_at = result.retry_at
-                    if result.outcome == AttemptOutcome.REJECTED:
+                    if result.outcome in {
+                        AttemptOutcome.REJECTED,
+                        AttemptOutcome.BROKER_ROUTING_REJECTED,
+                    }:
                         card.entry_client_order_id = ""
                         card.entry_pending_attempt_number = 0
                         card.entry_submission_unresolved = False

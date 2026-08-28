@@ -140,7 +140,7 @@ from src.core.order_state import (
     REGULAR_LIMIT_EXECUTION,
     is_open_status,
 )
-from src.core.trade_card_state import TradeCardState
+from src.core.trade_card_state import BoardStatus, TradeCardState
 from src.risk.orb_position import calculate_orb_position_values, is_orb_position_plan_valid
 from src.risk.portfolio import (
     PortfolioPositionRisk,
@@ -179,7 +179,10 @@ from src.services.intraday_provider import IntradayInterval, IntradayRequest
 from src.services.kis_realtime_market_data import (
     build_kis_realtime_market_data_from_environment,
 )
-from src.services.kis_ws_symbol_keys import order_exchange_from_symbol_key
+from src.services.kis_ws_symbol_keys import (
+    derive_symbol_key_from_kis_master,
+    order_exchange_from_symbol_key,
+)
 from src.services.position_manager import (
     BrokerHolding,
     PositionActionCallbacks,
@@ -231,10 +234,32 @@ def _execution_exchange_for_card(
 
     if card is not None:
         symbol_key = str(card.kis_ws_symbol_key or "").strip()
-        if not symbol_key:
-            key_store = getattr(market_data, "symbol_key_store", None)
-            if key_store is not None:
-                symbol_key = str(key_store.resolve(card.symbol) or "").strip()
+        key_store = getattr(market_data, "symbol_key_store", None)
+        store_key = ""
+        if key_store is not None:
+            store_key = str(key_store.resolve(card.symbol) or "").strip()
+            if symbol_key and symbol_key.upper() != store_key.upper():
+                raise RuntimeError(
+                    f"The canonical and local KIS symbol keys disagree for {card.symbol}"
+                )
+            symbol_key = symbol_key or store_key
+            # Revalidate the venue at the last pre-broker boundary against
+            # the official local KIS symbol master.  This is intentionally
+            # per submission (not per one-second feed cycle): a stale or
+            # corrupted persisted key must fail closed instead of recreating
+            # ESTC's APBK0656 wrong-exchange rejection.
+            universe_path = getattr(key_store, "universe_path", None)
+            if universe_path is not None:
+                master_key = derive_symbol_key_from_kis_master(
+                    card.symbol,
+                    universe_path,
+                )
+                if symbol_key.upper() != master_key.upper():
+                    raise RuntimeError(
+                        f"The verified KIS order venue is stale for {card.symbol}; "
+                        "refresh the symbol master before retrying"
+                    )
+                symbol_key = master_key
         if symbol_key:
             return order_exchange_from_symbol_key(symbol_key)
 
@@ -866,7 +891,7 @@ def build_buyboard_runtime(
     resolved_portfolio_risk_manager = (
         portfolio_risk_manager or _default_portfolio_risk_manager()
     )
-    guarded_record_cache: Dict[str, ExecutionOrderRecord] = {}
+    guarded_record_cache: dict[str, ExecutionOrderRecord] = {}
     guarded_record_cached_at: dict[str, float] = {}
     guarded_card_record_cache: dict[
         tuple[str, str, str],

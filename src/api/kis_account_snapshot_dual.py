@@ -668,7 +668,11 @@ class KisAccountClient:
         }
 
     def get_account_snapshot(
-        self, include_domestic: bool, include_overseas: bool
+        self,
+        include_domestic: bool,
+        include_overseas: bool,
+        *,
+        include_realized_pnl: bool = True,
     ) -> Dict[str, Any]:
         """Authenticate and fetch requested account sections."""
         self.authenticate()
@@ -686,17 +690,18 @@ class KisAccountClient:
             snapshot["domestic"] = self.get_domestic_balance()
         if include_overseas:
             overseas = self.get_overseas_balance()
-            try:
-                # The period-profit endpoint is read-only but independent of
-                # balance.  Keep a balance snapshot usable if this optional
-                # P/L query is unavailable or not enabled for an account.
-                time.sleep(0.3)
-                overseas["realized_pnl"] = self.get_overseas_period_profit()
-            except Exception as exc:
-                overseas["realized_pnl"] = {
-                    "complete": False,
-                    "error": str(exc),
-                }
+            if include_realized_pnl:
+                try:
+                    # The period-profit endpoint is read-only but independent
+                    # of balance. Keep a dashboard snapshot usable if this
+                    # optional P/L query is unavailable for an account.
+                    time.sleep(0.3)
+                    overseas["realized_pnl"] = self.get_overseas_period_profit()
+                except Exception as exc:
+                    overseas["realized_pnl"] = {
+                        "complete": False,
+                        "error": str(exc),
+                    }
             snapshot["overseas"] = overseas
         return snapshot
 
@@ -1353,6 +1358,8 @@ def fetch_account_snapshot(
     include_overseas: bool = False,
     force_token: bool = False,
     account_no: Optional[str] = None,
+    *,
+    include_realized_pnl: bool = True,
 ) -> Dict[str, Any]:
     """Load config, authenticate, and fetch a read-only account snapshot."""
     env = (
@@ -1366,6 +1373,7 @@ def fetch_account_snapshot(
     return client.get_account_snapshot(
         include_domestic=include_domestic,
         include_overseas=include_overseas,
+        include_realized_pnl=include_realized_pnl,
     )
 
 

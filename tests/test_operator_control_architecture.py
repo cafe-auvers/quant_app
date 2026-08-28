@@ -570,6 +570,34 @@ def test_execution_switch_accepts_fenced_kis_single_session_handoff(engine, role
     assert get_main_device(engine).main_device.device_id == laptop.device_id
 
 
+def test_execution_switch_accepts_feed_deferred_until_fenced_owner(engine, roles):
+    from src.core.execution_config import COORDINATION_RU_PROFILE
+
+    pc, laptop = roles
+    save_runtime_device_state(
+        engine,
+        device_id=laptop.device_id,
+        hostname=laptop.hostname,
+        state=RuntimeDeviceState.STANDBY_READY,
+        details=_details(
+            coordination_ru_profile=COORDINATION_RU_PROFILE,
+            environment="PROD",
+            market_data_ready=False,
+            executor_ready=False,
+            market_data_handoff_ready=True,
+            market_data_deferred_until_owner=True,
+            handoff_ready=True,
+        ),
+    )
+
+    result = switch_execution_owner(
+        engine, initiated_by=laptop, target_device_id=laptop.device_id
+    )
+
+    assert result.success is True
+    assert get_main_device(engine).main_device.device_id == laptop.device_id
+
+
 def test_single_session_handoff_requires_a_healthy_active_owner(engine, roles):
     from src.core.execution_config import COORDINATION_RU_PROFILE
 

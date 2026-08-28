@@ -243,6 +243,37 @@ def test_definitive_broker_rejection_returns_entry_to_clean_buylist(tmp_path):
     assert "security is suspended" in card.buy_today_note
 
 
+def test_kis_exchange_routing_rejection_keeps_plan_in_buy_today(tmp_path):
+    def reject(**kwargs):
+        raise GuardedSubmissionRejectedError(
+            "KIS API error from order: APBK0656 invalid exchange"
+        )
+
+    engine = _make_engine(tmp_path, submit_order=reject)
+    engine._market_data.subscribe(["AAPL"])
+    engine._market_data.poll_once()
+    card = _buy_today_card(
+        session_date=dt.date(2026, 8, 26),
+        entry_attempt_group_id="G-1",
+        entry_client_order_id="C-1",
+        entry_pending_attempt_number=1,
+    )
+
+    changed = engine.run_heartbeat([card])
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.BUY_TODAY
+    assert card.entry_runtime_status == EntryRuntimeStatus.RETRY_COOLDOWN
+    assert card.session_date == dt.date(2026, 8, 26)
+    assert card.entry_client_order_id == ""
+    assert card.entry_pending_attempt_number == 0
+    assert card.next_retry_at is not None
+    assert "APBK0656" in card.entry_block_reason
+    assert card.entry_orb_high is not None
+    assert card.entry_trigger is not None
+    assert card.planned_quantity > 0
+
+
 def test_target_allocation_cannot_execute_without_complete_orb_plan(tmp_path):
     submitted = []
 
@@ -1103,7 +1134,7 @@ def test_entry_completion_does_not_retry_while_an_order_is_already_working(tmp_p
     assert submitted == []
 
 
-# --- Entry limit remains the exact ORB high ----------------------------------
+# --- Entry limit remains at the ORB high -------------------------------------
 
 
 def test_entry_limit_does_not_chase_live_quote_above_orb_high(tmp_path):
@@ -1129,6 +1160,42 @@ def test_entry_limit_does_not_chase_live_quote_above_orb_high(tmp_path):
 
     assert len(submitted) == 1
     assert submitted[0]["limit_price"] == pytest.approx(100.0)
+
+
+def test_fractional_cent_orb_high_uses_first_legal_buy_tick(tmp_path):
+    submitted = []
+
+    def fake_submit(**kwargs):
+        submitted.append(kwargs)
+        return BrokerOrder.create(
+            environment=kwargs["environment"],
+            account_no=kwargs["account_no"],
+            symbol=kwargs["symbol"],
+            side=OrderSide.BUY,
+            intent=OrderIntent.ENTRY,
+            quantity_requested=kwargs["quantity"],
+            limit_price=kwargs["limit_price"],
+            status=OrderStatus.ACCEPTED,
+        )
+
+    engine = _make_engine(tmp_path, submit_order=fake_submit)
+    engine._market_data = RestPollingMarketDataService(
+        quote_fetcher=lambda symbol: QuoteSnapshot(
+            symbol=symbol,
+            last_price=99.0,
+            bid=98.9,
+            ask=99.1,
+        )
+    )
+    engine._market_data.subscribe(["AAPL"])
+    engine._market_data.poll_once()
+    card = _buy_today_card(entry_trigger=100.005)
+
+    engine.run_heartbeat([card])
+
+    assert len(submitted) == 1
+    assert submitted[0]["limit_price"] == pytest.approx(100.01)
+    assert card.board_status == BoardStatus.ENTRY_PENDING
 
 
 # --- P1-6: stale-quote protection for existing positions --------------------

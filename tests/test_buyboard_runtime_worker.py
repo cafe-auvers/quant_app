@@ -1786,6 +1786,41 @@ def test_pull_only_successor_can_handoff_when_active_owner_holds_kis_socket(
     assert worker._accepting_commands is False
 
 
+def test_pull_only_successor_defers_the_single_kis_socket_until_owner_transfer(
+    tmp_path, monkeypatch
+):
+    worker, _ = _worker(
+        tmp_path,
+        standby_only=True,
+        device_id="successor",
+    )
+    worker.runtime = SimpleNamespace(market_data=SimpleNamespace())
+    readiness = _ready_runtime_state(
+        websocket_connected=False,
+        critical_trade_subscriptions_acked=False,
+        critical_quote_subscriptions_acked=False,
+    )
+
+    assert worker._deferred_market_data_handoff_ready(readiness) is True
+    assert worker.lease_handoff_ready(readiness) is True
+
+
+def test_only_execution_owner_worker_starts_kis_market_data(tmp_path, monkeypatch):
+    monkeypatch.setattr(execution_config, "KIS_WS_ENABLED", True)
+    starts = []
+    market_data = SimpleNamespace(start=lambda: starts.append(True))
+
+    standby, _ = _worker(tmp_path, standby_only=True, device_id="standby")
+    standby.runtime = SimpleNamespace(market_data=market_data)
+    standby._start_market_data_if_owner()
+    assert starts == []
+
+    owner, _ = _worker(tmp_path, standby_only=False, device_id="owner")
+    owner.runtime = SimpleNamespace(market_data=market_data)
+    owner._start_market_data_if_owner()
+    assert starts == [True]
+
+
 def test_blocked_standby_keeps_its_runtime_identity_fresh(tmp_path, monkeypatch):
     worker, _ = _worker(
         tmp_path,
@@ -1797,7 +1832,7 @@ def test_blocked_standby_keeps_its_runtime_identity_fresh(tmp_path, monkeypatch)
     monkeypatch.setattr(
         worker,
         "engine_readiness",
-        lambda **kwargs: _ready_runtime_state(websocket_connected=False),
+        lambda **kwargs: _ready_runtime_state(database_writable=False),
     )
     published = []
     monkeypatch.setattr(
@@ -1891,6 +1926,32 @@ def test_main_lease_holder_activates_with_per_symbol_quote_guards(
     assert worker._accepting_commands is True
 
 
+def test_main_lease_holder_cannot_activate_before_its_feed_is_ready(
+    tmp_path, monkeypatch
+):
+    worker, _ = _worker(
+        tmp_path,
+        device_id="main-device",
+        regular_session_open=lambda: False,
+    )
+    worker._accepting_commands = False
+    worker.device_state = RuntimeDeviceState.STANDBY
+    monkeypatch.setattr(
+        worker,
+        "engine_readiness",
+        lambda **kwargs: _ready_runtime_state(
+            websocket_connected=False,
+            critical_trade_subscriptions_acked=False,
+            critical_quote_subscriptions_acked=False,
+        ),
+    )
+
+    worker._advance_startup_readiness()
+
+    assert worker.device_state == RuntimeDeviceState.STANDBY
+    assert worker._accepting_commands is False
+
+
 def test_handoff_does_not_need_session_lookup_when_stable_gates_are_ready(tmp_path):
     def unavailable():
         raise RuntimeError("calendar unavailable")
@@ -1913,7 +1974,7 @@ def test_standby_readiness_loss_demotes_immediately(tmp_path, monkeypatch):
     monkeypatch.setattr(
         worker,
         "engine_readiness",
-        lambda **kwargs: _ready_runtime_state(websocket_connected=False),
+        lambda **kwargs: _ready_runtime_state(account_reconciliation_fresh=False),
     )
 
     worker._advance_startup_readiness()

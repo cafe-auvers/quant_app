@@ -346,6 +346,7 @@ def test_get_positions_delegates_to_full_reconciliation_snapshot(monkeypatch):
         "environment": "SIM",
         "include_domestic": True,
         "include_overseas": True,
+        "include_realized_pnl": False,
         "account_no": "12345678",
     }
 
