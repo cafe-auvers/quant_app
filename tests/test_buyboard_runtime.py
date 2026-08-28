@@ -443,6 +443,52 @@ def test_submit_order_wrapper_supplies_a_fresh_risk_decision(monkeypatch):
     assert captured["broker"]._gateway is broker
 
 
+def test_submit_order_uses_verified_nyse_key_instead_of_nasdaq_default(monkeypatch):
+    broker = _FakeBroker()
+    card = _card(symbol="ESTC", kis_ws_symbol_key="DNYSESTC")
+    captured = {}
+
+    def fake_submit_guarded(**kwargs):
+        captured.update(kwargs)
+        return BrokerOrder.create(
+            environment=kwargs["environment"],
+            account_no=kwargs["account_no"],
+            symbol=kwargs["symbol"],
+            side=OrderSide.BUY,
+            intent=OrderIntent.ENTRY,
+            quantity_requested=kwargs["quantity"],
+            limit_price=kwargs["limit_price"],
+            status=OrderStatus.ACCEPTED,
+        )
+
+    monkeypatch.setattr(
+        workflow_module, "submit_guarded_overseas_order", fake_submit_guarded
+    )
+    runtime = runtime_module.build_buyboard_runtime(
+        buying_power_provider=lambda _env, _acct: 10_000.0,
+        card_lookup=lambda _env, _acct, _symbol: card,
+        broker=broker,
+    )
+
+    runtime.entry_attempt_manager._submit_order(
+        environment="PROD",
+        account_no="1",
+        symbol="ESTC",
+        side=OrderSide.BUY,
+        intent=OrderIntent.ENTRY,
+        quantity=20,
+        limit_price=100.0,
+        exchange="NASD",
+        attempt_group_id="g1",
+        attempt_number=1,
+        attempt_deadline_at=None,
+        capital_reservation_id="",
+    )
+
+    assert captured["exchange"] == "NYSE"
+    assert captured["pre_trade_risk_decision"].exchange == "NYSE"
+
+
 def test_submit_order_revalidates_capital_percent_against_equity_not_cash(
     monkeypatch,
 ):
@@ -793,6 +839,47 @@ def test_submit_sell_order_maps_partial_sell_reason_and_prices_from_live_bid(mon
     )  # uses the live bid with the configured bounded collar
     assert captured["quantity"] == 50
     assert "reason" not in captured  # never forwarded to submit_guarded_overseas_order
+
+
+def test_submit_sell_order_uses_verified_nyse_key(monkeypatch):
+    broker = _FakeBroker()
+    card = _card(symbol="RNG", kis_ws_symbol_key="DNYSRNG")
+    captured = {}
+
+    def fake_submit_guarded(**kwargs):
+        captured.update(kwargs)
+        return BrokerOrder.create(
+            environment=kwargs["environment"],
+            account_no=kwargs["account_no"],
+            symbol=kwargs["symbol"],
+            side=kwargs["side"],
+            intent=kwargs["intent"],
+            quantity_requested=kwargs["quantity"],
+            limit_price=kwargs["limit_price"],
+            status=OrderStatus.ACCEPTED,
+        )
+
+    monkeypatch.setattr(
+        workflow_module, "submit_guarded_overseas_order", fake_submit_guarded
+    )
+    market_data = _market_data_with_quote("RNG", bid=69.5)
+    runtime = runtime_module.build_buyboard_runtime(
+        buying_power_provider=lambda _env, _acct: 100_000.0,
+        card_lookup=lambda _env, _acct, _symbol: card,
+        broker=broker,
+        market_data=market_data,
+    )
+    runtime.trading_engine._market_is_open_fn = lambda: True
+
+    runtime.trading_engine._position_callbacks.submit_sell_order(
+        environment="PROD",
+        account_no="1",
+        symbol="RNG",
+        quantity=10,
+        reason="sell_all",
+    )
+
+    assert captured["exchange"] == "NYSE"
 
 
 def test_emergency_sell_without_fresh_bid_uses_bounded_reprice_collars():
