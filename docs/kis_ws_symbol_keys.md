@@ -98,4 +98,13 @@ a reviewed plan to Buy Today or authorize a BUY.
 The runtime never reads symbols from process environment values. Normal
 intraday changes must use the `set` and `remove` commands above against
 `data/kis_ws_symbol_keys.json`; neither `.env` nor `.env.pc` is a supported
-symbol source or migration path.
+symbol source.
+
+For upgrade safety only, the startup environment synchronizer recognizes the
+retired `KIS_WS_SYMBOL_KEYS_JSON` key from older checkouts. It validates and
+conflict-checks the complete map, atomically merges it into
+`data/kis_ws_symbol_keys.json`, keeps a rolling backup when replacing an
+existing file, and only then removes the retired line from `.env` and
+regenerates `.env.pc`. Invalid or conflicting legacy data aborts without
+stripping the source value. This is a one-time file migration; application
+runtime and intraday subscription selection never consult the environment.

@@ -206,3 +206,171 @@ def test_runtime_migration_is_persisted_before_legacy_env_is_stripped(
 
     assert "RUNTIME_LIMIT=7" in env.read_text(encoding="utf-8")
     assert not pc_env.exists()
+
+
+def test_sync_moves_legacy_symbol_map_out_of_env_without_overwriting_file(tmp_path):
+    template = tmp_path / ".env.example"
+    env = tmp_path / ".env"
+    pc_env = tmp_path / ".env.pc"
+    defaults = tmp_path / "config" / "runtime.json"
+    local = tmp_path / "config" / "runtime.local.json"
+    symbol_keys = tmp_path / "data" / "kis_ws_symbol_keys.json"
+    defaults.parent.mkdir()
+    symbol_keys.parent.mkdir()
+    template.write_text("API_TOKEN=\n", encoding="utf-8")
+    defaults.write_text("{}\n", encoding="utf-8")
+    env.write_text(
+        'API_TOKEN=private\nKIS_WS_SYMBOL_KEYS_JSON={"rng":"DNYSRNG"}\n',
+        encoding="utf-8",
+    )
+    symbol_keys.write_text('{"AAPL":"DNASAAPL"}\n', encoding="utf-8")
+
+    result = synchronize_environment_files(
+        template,
+        env,
+        pc_env,
+        defaults,
+        local,
+        symbol_keys,
+    )
+
+    assert result.symbol_keys_changed is True
+    assert result.migrated_symbol_keys == ("RNG",)
+    assert _values(env) == {"API_TOKEN": "private"}
+    assert "KIS_WS_SYMBOL_KEYS_JSON" not in pc_env.read_text(encoding="utf-8")
+    assert json.loads(symbol_keys.read_text(encoding="utf-8")) == {
+        "AAPL": "DNASAAPL",
+        "RNG": "DNYSRNG",
+    }
+    assert json.loads(
+        symbol_keys.with_suffix(".json.bak").read_text(encoding="utf-8")
+    ) == {"AAPL": "DNASAAPL"}
+
+
+def test_legacy_symbol_migration_is_idempotent(tmp_path):
+    template = tmp_path / ".env.example"
+    env = tmp_path / ".env"
+    pc_env = tmp_path / ".env.pc"
+    defaults = tmp_path / "config" / "runtime.json"
+    local = tmp_path / "config" / "runtime.local.json"
+    symbol_keys = tmp_path / "data" / "kis_ws_symbol_keys.json"
+    defaults.parent.mkdir()
+    template.write_text("API_TOKEN=\n", encoding="utf-8")
+    defaults.write_text("{}\n", encoding="utf-8")
+    env.write_text(
+        'API_TOKEN=private\nKIS_WS_SYMBOL_KEYS_JSON={"RNG":"DNYSRNG"}\n',
+        encoding="utf-8",
+    )
+
+    first = synchronize_environment_files(
+        template, env, pc_env, defaults, local, symbol_keys
+    )
+    second = synchronize_environment_files(
+        template, env, pc_env, defaults, local, symbol_keys
+    )
+
+    assert first.migrated_symbol_keys == ("RNG",)
+    assert second.migrated_symbol_keys == ()
+    assert second.symbol_keys_changed is False
+    assert json.loads(symbol_keys.read_text(encoding="utf-8")) == {
+        "RNG": "DNYSRNG"
+    }
+
+
+def test_legacy_symbol_migration_refuses_conflict_and_keeps_env(tmp_path):
+    template = tmp_path / ".env.example"
+    env = tmp_path / ".env"
+    pc_env = tmp_path / ".env.pc"
+    defaults = tmp_path / "config" / "runtime.json"
+    local = tmp_path / "config" / "runtime.local.json"
+    symbol_keys = tmp_path / "data" / "kis_ws_symbol_keys.json"
+    defaults.parent.mkdir()
+    symbol_keys.parent.mkdir()
+    template.write_text("API_TOKEN=\n", encoding="utf-8")
+    defaults.write_text("{}\n", encoding="utf-8")
+    original_env = (
+        'API_TOKEN=private\nKIS_WS_SYMBOL_KEYS_JSON={"RNG":"DNASRNG"}\n'
+    )
+    env.write_text(original_env, encoding="utf-8")
+    original_symbols = '{"RNG":"DNYSRNG"}\n'
+    symbol_keys.write_text(original_symbols, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="refuses to overwrite conflicting"):
+        synchronize_environment_files(
+            template, env, pc_env, defaults, local, symbol_keys
+        )
+
+    assert env.read_text(encoding="utf-8") == original_env
+    assert symbol_keys.read_text(encoding="utf-8") == original_symbols
+    assert not pc_env.exists()
+
+
+@pytest.mark.parametrize(
+    "legacy_value",
+    (
+        "not-json",
+        "[]",
+        '{"bad symbol":"DNASBAD"}',
+        '{"RNG":"contains space"}',
+    ),
+)
+def test_invalid_legacy_symbol_map_fails_without_stripping_source(
+    tmp_path,
+    legacy_value,
+):
+    template = tmp_path / ".env.example"
+    env = tmp_path / ".env"
+    pc_env = tmp_path / ".env.pc"
+    defaults = tmp_path / "config" / "runtime.json"
+    local = tmp_path / "config" / "runtime.local.json"
+    symbol_keys = tmp_path / "data" / "kis_ws_symbol_keys.json"
+    defaults.parent.mkdir()
+    template.write_text("API_TOKEN=\n", encoding="utf-8")
+    defaults.write_text("{}\n", encoding="utf-8")
+    original = f"API_TOKEN=private\nKIS_WS_SYMBOL_KEYS_JSON={legacy_value}\n"
+    env.write_text(original, encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        synchronize_environment_files(
+            template, env, pc_env, defaults, local, symbol_keys
+        )
+
+    assert env.read_text(encoding="utf-8") == original
+    assert not symbol_keys.exists()
+    assert not pc_env.exists()
+
+
+def test_symbol_destination_write_failure_keeps_legacy_env_source(
+    tmp_path,
+    monkeypatch,
+):
+    template = tmp_path / ".env.example"
+    env = tmp_path / ".env"
+    pc_env = tmp_path / ".env.pc"
+    defaults = tmp_path / "config" / "runtime.json"
+    local = tmp_path / "config" / "runtime.local.json"
+    symbol_keys = tmp_path / "data" / "kis_ws_symbol_keys.json"
+    defaults.parent.mkdir()
+    template.write_text("API_TOKEN=\n", encoding="utf-8")
+    defaults.write_text("{}\n", encoding="utf-8")
+    original = (
+        'API_TOKEN=private\nKIS_WS_SYMBOL_KEYS_JSON={"RNG":"DNYSRNG"}\n'
+    )
+    env.write_text(original, encoding="utf-8")
+    real_writer = env_sync_module._write_if_changed
+
+    def fail_symbol_write(path, content):
+        if Path(path) == symbol_keys.resolve():
+            raise OSError("simulated symbol destination failure")
+        return real_writer(path, content)
+
+    monkeypatch.setattr(env_sync_module, "_write_if_changed", fail_symbol_write)
+
+    with pytest.raises(OSError, match="simulated symbol destination failure"):
+        synchronize_environment_files(
+            template, env, pc_env, defaults, local, symbol_keys
+        )
+
+    assert env.read_text(encoding="utf-8") == original
+    assert not symbol_keys.exists()
+    assert not pc_env.exists()

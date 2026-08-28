@@ -89,7 +89,8 @@ if ($listenerRunning) {
         try {
             Start-Process -FilePath $pythonExe -ArgumentList "`"$listenerScript`"" -WorkingDirectory $RepoRoot `
                 -RedirectStandardOutput (Join-Path $LogDir "pc_remote_control_listener_stdout.log") `
-                -RedirectStandardError (Join-Path $LogDir "pc_remote_control_listener_stderr.log")
+                -RedirectStandardError (Join-Path $LogDir "pc_remote_control_listener_stderr.log") `
+                -WindowStyle Hidden
             Write-Log "Relaunched pc_remote_control_listener.py."
         } catch {
             Write-Log "Failed to relaunch pc_remote_control_listener.py: $($_.Exception.Message)"

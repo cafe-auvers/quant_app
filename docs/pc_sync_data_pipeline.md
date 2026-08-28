@@ -141,12 +141,17 @@ replaced.
   captured separately to `data/logs/main_py_stdout.log` /
   `main_py_stderr.log`. The routine sets `QUANT_LOCAL_MIRROR_ENABLED=0` so a
   MySQL outage fails visibly on the authoritative PC instead of being masked
-  by a machine-local fallback there.
+  by a machine-local fallback there. If Git updates the routine script
+  itself, it detects the changed digest and relaunches the new version exactly
+  once within the same task run, so an upgrade does not require a second
+  reboot.
 - `scripts/sync_env_files.py` — reconciles each machine's private `.env`
   against the credential-only `.env.example`, migrates recognized non-secret
   values to gitignored `config/runtime.local.json`, then regenerates `.env.pc`
-  with blank `MYSQL_*` credentials. The morning routine invokes it before any
-  configuration consumer.
+  with blank `MYSQL_*` credentials. A retired environment symbol map is
+  conflict-safely moved into `data/kis_ws_symbol_keys.json` during upgrade;
+  steady-state runtime never reads symbols from the environment. The morning
+  routine invokes synchronization before any configuration consumer.
 - `scripts/run_daily_refresh.py` — the DB-freshness gate.
 - `scripts/sync_local_mirror_from_pc.py` — repeatable PC-to-laptop mirror
   top-up and before/after report. The dashboard also runs this sync quietly

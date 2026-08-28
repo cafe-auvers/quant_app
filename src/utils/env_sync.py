@@ -11,15 +11,21 @@ import json
 import os
 import re
 import stat
+import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 
 _ASSIGNMENT_RE = re.compile(
     r"^(\s*(?:export\s+)?)([A-Za-z_][A-Za-z0-9_]*)(\s*)=(.*)$"
 )
+_LEGACY_SYMBOL_KEYS_ENV = "KIS_WS_SYMBOL_KEYS_JSON"
+_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,31}$")
+_SYMBOL_WRITE_LOCK_TIMEOUT_SECONDS = 5.0
+_STALE_SYMBOL_WRITE_LOCK_SECONDS = 30.0
 
 _PC_HEADER = (
     "# Generated from the credential-only .env file.",
@@ -41,6 +47,8 @@ class EnvironmentSyncResult:
     mysql_values_blanked: int
     runtime_local_changed: bool = False
     migrated_runtime_keys: tuple[str, ...] = ()
+    symbol_keys_changed: bool = False
+    migrated_symbol_keys: tuple[str, ...] = ()
 
 
 def _read_text(path: Path) -> str:
@@ -77,6 +85,7 @@ def _render_env(
     current_text: str | None,
     *,
     runtime_keys: set[str] | None = None,
+    legacy_migration_keys: set[str] | None = None,
 ) -> tuple[str, tuple[str, ...]]:
     """Render credentials on the latest template and remove runtime keys."""
 
@@ -104,7 +113,7 @@ def _render_env(
             added_keys.append(key)
         rendered.append(f"{match.group(1)}{key}{match.group(3)}={value}")
 
-    migrated_keys = runtime_keys or set()
+    migrated_keys = (runtime_keys or set()) | (legacy_migration_keys or set())
     # The credential template and runtime schema jointly own every file-backed
     # key. Refuse an unclassified extra rather than silently leaving an
     # operational setting in .env or deleting a possible secret.
@@ -137,6 +146,139 @@ def _env_value_text(raw: str) -> str:
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
         return value[1:-1]
     return value
+
+
+def _normalize_symbol_keys(raw: object, *, source: str) -> dict[str, str]:
+    """Validate the legacy map without importing application dependencies."""
+
+    if not isinstance(raw, dict):
+        raise ValueError(f"{source} must contain a JSON object")
+    normalized: dict[str, str] = {}
+    key_owners: dict[str, str] = {}
+    for raw_symbol, raw_key in raw.items():
+        symbol = str(raw_symbol or "").strip().upper()
+        key = str(raw_key or "").strip()
+        if not _SYMBOL_PATTERN.fullmatch(symbol):
+            raise ValueError(f"{source} contains an invalid symbol")
+        if (
+            not key
+            or len(key) > 128
+            or any(char.isspace() or ord(char) < 32 for char in key)
+        ):
+            raise ValueError(f"{source} contains an invalid key for {symbol}")
+        existing = normalized.get(symbol)
+        if existing is not None and existing != key:
+            raise ValueError(f"{source} contains conflicting values for {symbol}")
+        prior_owner = key_owners.get(key)
+        if prior_owner is not None and prior_owner != symbol:
+            raise ValueError(
+                f"{source} assigns one WebSocket key to multiple symbols"
+            )
+        normalized[symbol] = key
+        key_owners[key] = symbol
+    return dict(sorted(normalized.items()))
+
+
+def _legacy_symbol_keys(raw: str) -> dict[str, str]:
+    rendered = _env_value_text(raw)
+    if not rendered:
+        return {}
+    try:
+        payload = json.loads(rendered)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"{_LEGACY_SYMBOL_KEYS_ENV} is not valid JSON; the source .env was left unchanged"
+        ) from exc
+    return _normalize_symbol_keys(payload, source=_LEGACY_SYMBOL_KEYS_ENV)
+
+
+@contextmanager
+def _exclusive_symbol_write_lock(path: Path) -> Iterator[None]:
+    """Serialize the one-time migration with normal symbol-file writers."""
+
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + _SYMBOL_WRITE_LOCK_TIMEOUT_SECONDS
+    descriptor: int | None = None
+    while descriptor is None:
+        try:
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(descriptor, f"{os.getpid()} {time.time()}".encode("ascii"))
+        except FileExistsError:
+            try:
+                stale = (
+                    time.time() - lock_path.stat().st_mtime
+                    > _STALE_SYMBOL_WRITE_LOCK_SECONDS
+                )
+            except OSError:
+                stale = False
+            if stale:
+                try:
+                    lock_path.unlink()
+                except OSError:
+                    pass
+                continue
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Timed out waiting for symbol-key migration lock: {lock_path}"
+                )
+            time.sleep(0.05)
+    try:
+        yield
+    finally:
+        os.close(descriptor)
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
+
+
+def _migrate_legacy_symbol_keys(
+    current_env_values: dict[str, str],
+    path: Path,
+) -> tuple[bool, tuple[str, ...]]:
+    """Move the retired environment map into its canonical local JSON file."""
+
+    if _LEGACY_SYMBOL_KEYS_ENV not in current_env_values:
+        return False, ()
+    legacy = _legacy_symbol_keys(current_env_values[_LEGACY_SYMBOL_KEYS_ENV])
+    with _exclusive_symbol_write_lock(path):
+        if path.is_file():
+            try:
+                existing_payload = json.loads(_read_text(path))
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Existing symbol-key file is not valid JSON: {path}"
+                ) from exc
+            existing = _normalize_symbol_keys(
+                existing_payload,
+                source="Existing symbol-key file",
+            )
+        else:
+            existing = {}
+        conflicts = sorted(
+            symbol
+            for symbol, key in legacy.items()
+            if symbol in existing and existing[symbol] != key
+        )
+        if conflicts:
+            raise ValueError(
+                "Legacy symbol-key migration refuses to overwrite conflicting "
+                "reviewed value(s): " + ", ".join(conflicts)
+            )
+        merged = dict(existing)
+        merged.update(legacy)
+        rendered = json.dumps(dict(sorted(merged.items())), indent=2) + "\n"
+        encoded = rendered.encode("utf-8")
+        if path.is_file() and path.read_bytes() == encoded:
+            return False, tuple(sorted(legacy))
+        if path.is_file():
+            _write_if_changed(
+                path.with_suffix(path.suffix + ".bak"),
+                _read_text(path),
+            )
+        changed = _write_if_changed(path, rendered)
+    return changed, tuple(sorted(legacy))
 
 
 def _render_runtime_local(
@@ -207,6 +349,7 @@ def synchronize_environment_files(
     pc_env_path: str | Path,
     runtime_defaults_path: str | Path | None = None,
     runtime_local_path: str | Path | None = None,
+    symbol_keys_path: str | Path | None = None,
 ) -> EnvironmentSyncResult:
     """Synchronize secret files and migrate known runtime keys atomically."""
 
@@ -220,6 +363,10 @@ def synchronize_environment_files(
     runtime_local = Path(
         runtime_local_path
         or runtime_defaults.with_name("runtime.local.json")
+    ).resolve()
+    symbol_keys = Path(
+        symbol_keys_path
+        or template.parent / "data" / "kis_ws_symbol_keys.json"
     ).resolve()
     if not template.is_file():
         raise FileNotFoundError(f"Environment template does not exist: {template}")
@@ -253,9 +400,14 @@ def synchronize_environment_files(
         template_text,
         current_text,
         runtime_keys=set(runtime_values),
+        legacy_migration_keys={_LEGACY_SYMBOL_KEYS_ENV},
     )
-    # Persist the migration destination first. If that write fails, leave the
-    # legacy source values in .env so an operational setting is never lost.
+    # Persist every migration destination first. If either write fails, leave
+    # the legacy source values in .env so operational state is never lost.
+    symbol_keys_changed, migrated_symbol_keys = _migrate_legacy_symbol_keys(
+        current_values,
+        symbol_keys,
+    )
     runtime_local_changed = (
         _write_if_changed(runtime_local, rendered_runtime)
         if rendered_runtime is not None
@@ -274,4 +426,6 @@ def synchronize_environment_files(
         mysql_values_blanked=redacted_count,
         runtime_local_changed=runtime_local_changed,
         migrated_runtime_keys=migrated_keys,
+        symbol_keys_changed=symbol_keys_changed,
+        migrated_symbol_keys=migrated_symbol_keys,
     )
