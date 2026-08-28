@@ -23,6 +23,7 @@ _ASSIGNMENT_RE = re.compile(
     r"^(\s*(?:export\s+)?)([A-Za-z_][A-Za-z0-9_]*)(\s*)=(.*)$"
 )
 _LEGACY_SYMBOL_KEYS_ENV = "KIS_WS_SYMBOL_KEYS_JSON"
+_RETIRED_CONTROLLED_LIVE_SYMBOLS_ENV = "KIS_CONTROLLED_LIVE_SYMBOLS"
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,31}$")
 _SYMBOL_WRITE_LOCK_TIMEOUT_SECONDS = 5.0
 _STALE_SYMBOL_WRITE_LOCK_SECONDS = 30.0
@@ -49,6 +50,8 @@ class EnvironmentSyncResult:
     migrated_runtime_keys: tuple[str, ...] = ()
     symbol_keys_changed: bool = False
     migrated_symbol_keys: tuple[str, ...] = ()
+    retired_symbols_archive_changed: bool = False
+    archived_retired_symbols: tuple[str, ...] = ()
 
 
 def _read_text(path: Path) -> str:
@@ -192,6 +195,42 @@ def _legacy_symbol_keys(raw: str) -> dict[str, str]:
     return _normalize_symbol_keys(payload, source=_LEGACY_SYMBOL_KEYS_ENV)
 
 
+def _normalized_symbol_list(raw: object, *, source: str) -> tuple[str, ...]:
+    if not isinstance(raw, list):
+        raise ValueError(f"{source} must contain a symbol list")
+    normalized: set[str] = set()
+    for raw_symbol in raw:
+        symbol = str(raw_symbol or "").strip().upper()
+        if not _SYMBOL_PATTERN.fullmatch(symbol):
+            raise ValueError(f"{source} contains an invalid symbol")
+        normalized.add(symbol)
+    return tuple(sorted(normalized))
+
+
+def _retired_controlled_live_symbols(raw: str) -> tuple[str, ...]:
+    """Parse the old allowlist only for non-authorizing archival."""
+
+    rendered = _env_value_text(raw)
+    if not rendered:
+        return ()
+    if rendered.lstrip().startswith("["):
+        try:
+            payload = json.loads(rendered)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"{_RETIRED_CONTROLLED_LIVE_SYMBOLS_ENV} is not valid JSON; "
+                "the source .env was left unchanged"
+            ) from exc
+        return _normalized_symbol_list(
+            payload,
+            source=_RETIRED_CONTROLLED_LIVE_SYMBOLS_ENV,
+        )
+    return _normalized_symbol_list(
+        [item for item in re.split(r"[,;\s]+", rendered) if item],
+        source=_RETIRED_CONTROLLED_LIVE_SYMBOLS_ENV,
+    )
+
+
 @contextmanager
 def _exclusive_symbol_write_lock(path: Path) -> Iterator[None]:
     """Serialize the one-time migration with normal symbol-file writers."""
@@ -281,6 +320,64 @@ def _migrate_legacy_symbol_keys(
     return changed, tuple(sorted(legacy))
 
 
+def _archive_retired_controlled_live_symbols(
+    current_env_values: dict[str, str],
+    path: Path,
+) -> tuple[bool, tuple[str, ...]]:
+    """Preserve the retired allowlist as audit-only, never authorization."""
+
+    if _RETIRED_CONTROLLED_LIVE_SYMBOLS_ENV not in current_env_values:
+        return False, ()
+    retired = _retired_controlled_live_symbols(
+        current_env_values[_RETIRED_CONTROLLED_LIVE_SYMBOLS_ENV]
+    )
+    if not retired:
+        return False, ()
+    with _exclusive_symbol_write_lock(path):
+        existing_symbols: tuple[str, ...] = ()
+        if path.is_file():
+            try:
+                existing_payload = json.loads(_read_text(path))
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Retired-symbol archive is not valid JSON: {path}"
+                ) from exc
+            if (
+                not isinstance(existing_payload, dict)
+                or existing_payload.get("schema_version") != 1
+                or existing_payload.get("source")
+                != _RETIRED_CONTROLLED_LIVE_SYMBOLS_ENV
+                or existing_payload.get("retired") is not True
+                or existing_payload.get("authorization_effect") is not False
+            ):
+                raise ValueError(
+                    f"Retired-symbol archive has an unexpected schema: {path}"
+                )
+            existing_symbols = _normalized_symbol_list(
+                existing_payload.get("symbols"),
+                source="Retired-symbol archive",
+            )
+        merged = tuple(sorted(set(existing_symbols) | set(retired)))
+        archive = {
+            "schema_version": 1,
+            "source": _RETIRED_CONTROLLED_LIVE_SYMBOLS_ENV,
+            "retired": True,
+            "authorization_effect": False,
+            "symbols": list(merged),
+        }
+        rendered = json.dumps(archive, indent=2) + "\n"
+        encoded = rendered.encode("utf-8")
+        if path.is_file() and path.read_bytes() == encoded:
+            return False, retired
+        if path.is_file():
+            _write_if_changed(
+                path.with_suffix(path.suffix + ".bak"),
+                _read_text(path),
+            )
+        changed = _write_if_changed(path, rendered)
+    return changed, retired
+
+
 def _render_runtime_local(
     defaults: dict[str, object],
     existing: dict[str, object],
@@ -350,6 +447,7 @@ def synchronize_environment_files(
     runtime_defaults_path: str | Path | None = None,
     runtime_local_path: str | Path | None = None,
     symbol_keys_path: str | Path | None = None,
+    retired_symbols_archive_path: str | Path | None = None,
 ) -> EnvironmentSyncResult:
     """Synchronize secret files and migrate known runtime keys atomically."""
 
@@ -367,6 +465,10 @@ def synchronize_environment_files(
     symbol_keys = Path(
         symbol_keys_path
         or template.parent / "data" / "kis_ws_symbol_keys.json"
+    ).resolve()
+    retired_symbols_archive = Path(
+        retired_symbols_archive_path
+        or template.parent / "data" / "retired_controlled_live_symbols.json"
     ).resolve()
     if not template.is_file():
         raise FileNotFoundError(f"Environment template does not exist: {template}")
@@ -400,10 +502,19 @@ def synchronize_environment_files(
         template_text,
         current_text,
         runtime_keys=set(runtime_values),
-        legacy_migration_keys={_LEGACY_SYMBOL_KEYS_ENV},
+        legacy_migration_keys={
+            _LEGACY_SYMBOL_KEYS_ENV,
+            _RETIRED_CONTROLLED_LIVE_SYMBOLS_ENV,
+        },
     )
     # Persist every migration destination first. If either write fails, leave
     # the legacy source values in .env so operational state is never lost.
+    retired_symbols_archive_changed, archived_retired_symbols = (
+        _archive_retired_controlled_live_symbols(
+            current_values,
+            retired_symbols_archive,
+        )
+    )
     symbol_keys_changed, migrated_symbol_keys = _migrate_legacy_symbol_keys(
         current_values,
         symbol_keys,
@@ -428,4 +539,6 @@ def synchronize_environment_files(
         migrated_runtime_keys=migrated_keys,
         symbol_keys_changed=symbol_keys_changed,
         migrated_symbol_keys=migrated_symbol_keys,
+        retired_symbols_archive_changed=retired_symbols_archive_changed,
+        archived_retired_symbols=archived_retired_symbols,
     )

@@ -38,6 +38,11 @@ def main() -> int:
         type=Path,
         default=REPO_ROOT / "data" / "kis_ws_symbol_keys.json",
     )
+    parser.add_argument(
+        "--retired-symbols-archive",
+        type=Path,
+        default=REPO_ROOT / "data" / "retired_controlled_live_symbols.json",
+    )
     args = parser.parse_args()
 
     try:
@@ -48,6 +53,7 @@ def main() -> int:
             args.runtime_defaults,
             args.runtime_local,
             args.symbol_keys,
+            args.retired_symbols_archive,
         )
     except (OSError, TimeoutError, ValueError) as exc:
         print(f"Environment synchronization failed: {exc}", file=sys.stderr)
@@ -61,6 +67,7 @@ def main() -> int:
         f"{len(result.added_env_keys)} added to .env; "
         f"{len(result.migrated_runtime_keys)} runtime keys migrated; "
         f"{len(result.migrated_symbol_keys)} legacy symbol keys migrated; "
+        f"{len(result.archived_retired_symbols)} retired live symbols archived; "
         "runtime.local.json "
         f"{'updated' if result.runtime_local_changed else 'current'}; "
         f"{result.mysql_values_blanked} MYSQL_* credentials blanked in .env.pc."
