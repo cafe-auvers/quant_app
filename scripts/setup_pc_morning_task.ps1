@@ -13,8 +13,10 @@ Configure-AutomaticSleep.ps1 / Configure-MarketHoursWake.ps1), this also
 registers a second, Daily @ 08:00 trigger with WakeToRun enabled -- a normal
 S3 resume does NOT fire AtLogOn (the interactive session was never logged
 out, just suspended), so without this second trigger the 08:00 morning data
-refresh would stop firing on every day except after a genuine reboot.
-AtLogOn is kept as a defensive fallback for exactly that reboot case.
+refresh would stop firing on every day except after a genuine reboot. When
+main.py survived S3, the routine automatically uses refresh-only resume mode:
+no Git/venv mutation and no duplicate app launch. AtLogOn is kept as a
+defensive fallback for a genuine reboot, where the full update path is safe.
 
 Usage:
     .\scripts\setup_pc_morning_task.ps1
@@ -39,9 +41,9 @@ $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoi
 
 Register-ScheduledTask -TaskName $TaskName -Action $action `
     -Trigger @($atLogonTrigger, $dailyWakeTrigger) -Settings $settings `
-    -Description ("Runs pc_morning_routine.ps1 (git sync, data refresh, launch main.py) " +
-        "at logon AND daily at 08:00 (WakeToRun, for the normal S3-resume case where " +
-        "AtLogOn does not fire).") -Force | Out-Null
+    -Description ("Runs pc_morning_routine.ps1 at logon AND daily at 08:00. " +
+        "Cold boot: git/env/dependencies, refresh, launch. S3 resume with main.py " +
+        "already running: refresh only, with no checkout mutation or duplicate launch.") -Force | Out-Null
 
 Write-Host "Registered task '$TaskName' -- fires at logon for $env:COMPUTERNAME\$env:USERNAME, and daily at 08:00 (wakes the PC if asleep)."
 Write-Host ""
