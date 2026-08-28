@@ -498,6 +498,47 @@ def _card_rejection_session(card: TradeCardState) -> Optional[dt.date]:
     return None
 
 
+def _snapshot_is_recoverable_plan(
+    snapshot: dict[str, Any], session_date: dt.date
+) -> bool:
+    """Recover legacy plans after their current-card feedback is cleared.
+
+    Older installations did not always record a publication/addition event.
+    Their card snapshots are still durable session history, so the summary
+    must not depend on stale feedback remaining on today's canonical card.
+    """
+
+    def snapshot_date(value: Any) -> Optional[dt.date]:
+        if isinstance(value, str):
+            try:
+                # These fields are market-session dates. Parsing YYYY-MM-DD
+                # as midnight KST would shift them to the prior New York day.
+                return dt.date.fromisoformat(value.strip())
+            except ValueError:
+                pass
+        return market_session_date_from_value(value)
+
+    board_status = str(snapshot.get("board_status") or "")
+    card_session = snapshot_date(snapshot.get("session_date"))
+    feedback_session = snapshot_date(
+        snapshot.get("last_buy_today_session_date")
+    )
+    entry_lifecycle = {
+        BoardStatus.BUY_TODAY.value,
+        BoardStatus.ENTRY_PENDING.value,
+        BoardStatus.OPEN_POSITION.value,
+        BoardStatus.PARTIAL_SELL.value,
+        BoardStatus.SELL_ALL.value,
+        BoardStatus.CLOSED.value,
+    }
+    return bool(
+        (card_session == session_date and board_status in entry_lifecycle)
+        or feedback_session == session_date
+        or snapshot.get("buy_today_note")
+        or _is_orb_rejection(snapshot)
+    )
+
+
 def _queue_items_for_session(
     engine: Engine, session_date: dt.date
 ) -> dict[tuple[str, str], Any]:
@@ -811,6 +852,34 @@ def build_daily_trading_summary(
             source,
             PLAN_ORIGIN_UNKNOWN,
             _card_plan_payload(card),
+        )
+
+    # Legacy plans may have no explicit publication/addition event. Their
+    # session snapshots remain the durable history after the canonical card
+    # is cleaned for a later session. Rebuild a plan row from that ledger so
+    # removing yesterday's Buylist feedback never erases Daily Summary.
+    for key, payload in sorted(snapshots_for_day.items()):
+        if not _snapshot_is_recoverable_plan(payload, session_date):
+            continue
+        if (
+            _is_orb_rejection(payload)
+            and not payload.get("rejected_orb_snapshot")
+            and key in queue_items
+        ):
+            payload = dict(payload)
+            payload["rejected_orb_snapshot"] = _frozen_orb_snapshot(
+                queue_items[key],
+                buffer_pct=float(payload.get("buffer_pct") or 0.0),
+            )
+            snapshots_for_day[key] = payload
+        upsert_plan_row(
+            (
+                "RECOVERED ORB REJECTION"
+                if _is_orb_rejection(payload)
+                else "RECOVERED SNAPSHOT"
+            ),
+            PLAN_ORIGIN_UNKNOWN,
+            payload,
         )
 
     plan_items: list[DailyPlanItem] = []

@@ -278,6 +278,77 @@ def test_daily_summary_keeps_all_rejected_orb_combinations_and_metrics():
     assert "failed the plan" in first.reason
 
 
+def test_legacy_rejection_survives_current_card_feedback_cleanup():
+    engine = _engine()
+    card = _card(
+        "LPSN",
+        board_status=BoardStatus.BUYLIST,
+        previous_board_status=BoardStatus.BUY_TODAY,
+        session_date=None,
+        last_buy_today_session_date=SESSION,
+        entry_runtime_status=None,
+        buy_today_note="Buy Today rejected - all ORB plans invalid.",
+    )
+    record_trade_card_snapshot(
+        engine,
+        card,
+        occurred_at=datetime(2026, 8, 25, 15, 0, tzinfo=timezone.utc),
+    )
+    card.buy_today_note = ""
+    card.last_buy_today_session_date = None
+    card.rejected_orb_snapshot = {}
+    record_trade_card_snapshot(
+        engine,
+        card,
+        occurred_at=datetime(2026, 8, 26, 15, 0, tzinfo=timezone.utc),
+    )
+
+    summary = build_daily_trading_summary(
+        engine,
+        SESSION,
+        current_cards=[card],
+    )
+
+    assert [(row.symbol, row.source, row.outcome) for row in summary.plan_items] == [
+        ("LPSN", "RECOVERED ORB REJECTION", "ORB REJECTED")
+    ]
+
+
+def test_snapshot_only_buy_today_plan_survives_later_board_cleanup():
+    engine = _engine()
+    card = _card(
+        "RNG",
+        entry_runtime_status=EntryRuntimeStatus.WAITING_BREAKOUT,
+        entry_trigger=69.75,
+        entry_block_reason="Waiting for price to clear the entry trigger",
+    )
+    record_trade_card_snapshot(
+        engine,
+        card,
+        occurred_at=datetime(2026, 8, 25, 15, 0, tzinfo=timezone.utc),
+    )
+    card.board_status = BoardStatus.BUYLIST
+    card.session_date = None
+    card.entry_runtime_status = None
+    card.entry_trigger = None
+    card.entry_block_reason = ""
+    record_trade_card_snapshot(
+        engine,
+        card,
+        occurred_at=datetime(2026, 8, 26, 15, 0, tzinfo=timezone.utc),
+    )
+
+    summary = build_daily_trading_summary(
+        engine,
+        SESSION,
+        current_cards=[card],
+    )
+
+    assert [(row.symbol, row.source, row.outcome) for row in summary.plan_items] == [
+        ("RNG", "RECOVERED SNAPSHOT", "WAITING BREAKOUT")
+    ]
+
+
 def test_republished_plan_keeps_symbols_from_earlier_verified_revision():
     engine = _engine()
     athm = _card("ATHM")
