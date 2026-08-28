@@ -441,7 +441,7 @@ Most workers live in `src/ui/workers.py`; KIS order submission/query/cancel and 
 | `src/services/event_journal.py` | Append-only JSONL trading audit events with cross-thread/process locking, account/free-text/secret redaction, runtime write-error telemetry, 25 MB rotation with the newest 20 archives retained, and a best-effort execution adapter |
 | `src/services/health.py` | Framework-neutral read-only health model for KIS configuration/token metadata and response age, a current MySQL `SELECT 1`, journal storage/write health, local-mirror freshness, and unresolved-order reconciliation state |
 | `src/services/historical_refresh_control.py` | Launches, polls, and terminates the standalone `historical.py` subprocess; owns its status-file schema and PID liveness checks |
-| `src/services/state_sync.py` | Conflict-safe cross-machine sync of user-managed state (watchlist/buylist/trade plans) plus the revisioned, durable Live Trading control and its audit trail; only the planning `main` device pushes planning collections |
+| `src/services/state_sync.py` | Conflict-safe cross-machine sync of the complete planning snapshot (watchlist, buylist, trade plans, execution queue, scanner setups, and settings) plus the revisioned, durable Live Trading control and its audit trail; only the planning `main` device pushes planning collections |
 | `src/services/runtime_status.py` | Legacy/fallback database process lifecycle rows; the guarded runtime's canonical `runtime_device_state` readiness heartbeat supplies steady `main.py` visibility when available |
 | `src/services/pc_remote_control.py` | Tailscale-reached client for the always-on PC's remote-control listener: status ping and shared-secret-authenticated shutdown request |
 | `src/services/cloud_backup.py` | Best-effort offsite backup of gitignored `data/*.json` state files to a local Google Drive for Desktop folder (current + rolling daily snapshots) |
@@ -514,7 +514,7 @@ Local JSON state is read/written through `src/utils/storage.py` and service help
 | `data/legacy_non_prod_buylist.json` | One-time archive of non-production buylist rows removed from actionable state |
 | `data/legacy_non_prod_execution_queue.json` | One-time archive of non-production execution queue rows removed from actionable state |
 | `data/trade_plans.json` | Saved trade plans |
-| `data/scanner_setups.json` | Named scanner rule presets |
+| `data/scanner_setups.json` | Named scanner rule presets; revision-synchronized and included in atomic full-plan publishes |
 | `data/chart_drawings.json` | Saved chart line drawings; authoritative breakout targets live on canonical trade cards, including passive Watchlist cards |
 | `data/tab_options.json` | Tab visibility settings |
 | `data/orders.json` | Local broker-order ledger, created when the first order is recorded |
@@ -528,7 +528,10 @@ Local JSON state is read/written through `src/utils/storage.py` and service help
 | `data/refresh_status_1d.json`, `data/refresh_status_1h.json` | Live status of the standalone `historical.py` refresh subprocess (see [Historical Data Refresh](#historical-data-refresh)) |
 | `data/refresh_lock_1d.lock`, `data/refresh_lock_1h.lock` | Lock files preventing overlapping `historical.py` runs per mode |
 
-`data/settings.json` may be created when settings or shortcuts are saved.
+`data/settings.json` may be created when settings or shortcuts are saved. It is
+revision-synchronized and included in atomic full-plan publishes so both
+devices use the same ORB bounds and buffer; the file contains preferences only,
+never credentials.
 
 Critical local state files keep one rolling `.bak` backup beside the JSON file, including watchlist, buylist, trade plans, orders, and execution queue state. The app does not wrap existing JSON payloads in a schema envelope, so legacy loaders keep their current formats.
 
@@ -605,7 +608,7 @@ main.py "Update 1D/1H Data" action or scripts/run_daily_refresh.py
 An optional second machine -- an always-on PC reachable over LAN or Tailscale -- can host the single canonical MySQL database while both desktops share planning/control state and the laptop keeps an offline mirror. This is fully documented in [docs/pc_sync_data_pipeline.md](docs/pc_sync_data_pipeline.md); summary:
 
 - **Roles**: the PC hosts canonical MySQL and runs `historical.py` on a schedule (BIOS wake -> auto-login -> `scripts/pc_morning_routine.ps1` -> freshness-gated refresh -> auto-shutdown). Either desktop may be the guarded Execution Owner when it is fresh and fully ready; exactly one owner can cross the broker boundary. `data/local_mirror.db` is the laptop's offline safety copy, not a peer database.
-- **Device identity**: `data/device_role.json` (device id, hostname, `is_main`) determines which device may push compatibility planning collections; it does not grant execution ownership. `src/services/state_sync.py` syncs watchlist/buylist/trade-plan state through a revision-tracked MySQL table so a stale device cannot clobber a newer remote copy.
+- **Device identity**: `data/device_role.json` (device id, hostname, `is_main`) determines which device may push compatibility planning collections; it does not grant execution ownership. `src/services/state_sync.py` syncs watchlist, buylist, trade plans, the execution queue, scanner setups, and settings through a revision-tracked MySQL table so a stale device cannot clobber a newer remote copy.
 - **Runtime visibility**: the guarded runtime publishes canonical readiness to `runtime_device_state` every 240 seconds with a 300-second freshness fence; `src/services/runtime_status.py` remains the process-lifecycle fallback. Together with `src/services/pc_remote_control.py`, the dashboard reports independent `PC` / `DB` / `Listener` / `main.py` signals. These lights do not replace a fresh `STANDBY_READY` identity for owner transfer.
 - **Fallback behavior**: connection to MySQL is checked once at startup/reconnect; a success routes reads/writes to MySQL immediately, a failure routes to the local SQLite mirror with cross-machine sync and heartbeats disabled. The mirror top-up afterward is incremental and checkpointed (row-count/revision signatures first, full comparison only on mismatch).
 - **Automation scripts** live in `scripts/` (`pc_morning_routine.ps1`, `run_daily_refresh.py`, `sync_local_mirror_from_pc.py`, `setup_pc_autologin.ps1`, `setup_pc_morning_task.ps1`, `setup_mysql_lan_access.ps1`, `setup_mysql_tailscale_access.ps1`, `pc_remote_control_listener.py`, `Configure-AutomaticShutdown.ps1`, WinRM setup/log-tailing scripts, and the one-time `backfill_hourly_history_200d_once.py` repair).

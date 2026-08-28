@@ -4,6 +4,32 @@ Audit date: 2026-08-24
 Scope: repository and local effective non-secret configuration present on the audited workstation
 Phase: discovery and classification only
 
+## Remediation status (2026-08-28)
+
+The executable correctness findings from this audit have now been addressed:
+
+- Trade Cards persist an explicit `risk_unit=fraction`; their default is
+  `0.01`, legacy Buylist percentage points are converted at the migration
+  boundary, and unmarked already-persisted cards receive a one-time compatible
+  conversion.
+- the Buy Board position header reads the enforced portfolio position limit;
+- the gross-notional fallback/example is 2.0 (200%), matching the reviewed
+  deployment value;
+- `settings.json` and `scanner_setups.json` join revisioned cross-device sync
+  and the atomic full-plan snapshot under coordination profile
+  `operator-executor-sync-v8`;
+- outage stop distance recovers dollar ADR from frozen ORB geometry instead of
+  dividing dollars by the stored stop/ADR percentage; and
+- numeric/Boolean environment overrides reject non-finite, malformed, and
+  out-of-range values into visible Health diagnostics. Invalid portfolio-entry
+  overrides fail closed for BUYs while SELL/cancel/reconciliation remain
+  available.
+
+The numbered findings below are retained as the original audit evidence. Items
+requiring a product decision (partial-exit fraction, selected EMA behavior, and
+scanner formula definitions) remain intentionally unresolved rather than being
+changed by inference.
+
 This report distinguishes a **code fallback** from the **current effective value**. The latter includes non-secret overrides in the gitignored `.env`, `.env.pc`, `data/settings.json`, and `data/scanner_setups.json`. Secret values were never read into this report. Arbitrary prices, symbols, quantities, and timestamps used only as test scenarios are not tunable defaults; tests that assert a default, boundary, or conflicting semantic are included. Illustrative worked examples in documentation are likewise excluded unless their wording establishes a rule or exposes a conflict with executable behavior. Current per-symbol orders/candidates in `data/execution_queue.json` and other state snapshots are records of user intent/market observations, not global defaults; their schemas/defaulting code is audited, but personal position rows are not reproduced.
 
 ## 1. Executive summary

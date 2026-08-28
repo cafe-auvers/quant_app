@@ -84,6 +84,8 @@ from src.services.runtime_status import (
 from src.services.sleep_readiness import write_sleep_readiness_snapshot
 from src.services.state_sync import (
     LocalDeviceRole,
+    SCANNER_SETUPS_KEY,
+    SETTINGS_KEY,
     get_coordination_status_snapshot,
     get_live_trading_control,
     load_local_device_role,
@@ -2197,6 +2199,31 @@ class MainWindow(
             self.populate_buylist_dashboard()
         if "trade_plans" in updated_keys:
             self.trade_manager = self._load_trade_plans()
+        if SETTINGS_KEY in updated_keys:
+            self.settings = load_json(SETTINGS_FILE, DEFAULT_SETTINGS)
+            orb_settings = configure_orb_settings(
+                self.settings.get("orb_settings")
+            )
+            self.settings["orb_settings"] = orb_settings.to_dict()
+            apply_shortcuts = getattr(self, "_apply_shortcuts", None)
+            if callable(apply_shortcuts):
+                apply_shortcuts()
+            buffer_input = self.__dict__.get(
+                "buyboard_orb_buffer_pct_input"
+            )
+            if buffer_input is not None:
+                try:
+                    buffer_percent = float(
+                        self.settings.get("orb_buffer_percent", 0.10)
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    buffer_percent = 0.10
+                buffer_input.setText(f"{buffer_percent:g}")
+        if SCANNER_SETUPS_KEY in updated_keys:
+            self.scanner_setups = self._load_scanner_setups()
+            populate_setups = getattr(self, "populate_scanner_setup_combo", None)
+            if callable(populate_setups):
+                populate_setups()
         if "execution_queue" in updated_keys:
             # Lazily reloaded on next access (_ensure_execution_queue_manager
             # caches on self.execution_queue_manager) -- just drop the stale
@@ -6211,6 +6238,7 @@ class MainWindow(
         if dialog.exec_() == QDialog.Accepted:
             self.settings = dialog.settings
             self._apply_shortcuts()
+            self._save_state()
             self.append_log("Settings updated and shortcuts applied.")
 
     def show_orb_settings_dialog(self) -> None:
@@ -6248,6 +6276,12 @@ class MainWindow(
                 self.append_log(
                     "ORB settings saved; queued plans will update on their next refresh."
                 )
+        # Refresh persists execution_queue.json before StateSaveManager reads
+        # it. Save again when there were no queued symbols or refresh failed,
+        # so the settings themselves are still durable and synchronized.
+        save_state = getattr(self, "_save_state", None)
+        if callable(save_state):
+            save_state()
         refresh_board = getattr(self, "refresh_buyboard", None)
         if callable(refresh_board):
             refresh_board()

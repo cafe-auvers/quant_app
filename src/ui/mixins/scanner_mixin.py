@@ -733,6 +733,9 @@ class ScannerMixin:
 
         self.scanner_setups[setup_name] = self.get_current_scanner_setup_values()
         save_json(SCANNER_SETUPS_FILE, {"setups": self.scanner_setups})
+        save_state = getattr(self, "_save_state", None)
+        if callable(save_state):
+            save_state()
         self.populate_scanner_setup_combo(selected_name=setup_name)
         if hasattr(self, "sidebar_source_combo"):
             self.refresh_sidebar_sources(
@@ -754,6 +757,9 @@ class ScannerMixin:
         del self.scanner_setups[setup_name]
         self.scanner_results_by_setup.pop(setup_name, None)
         save_json(SCANNER_SETUPS_FILE, {"setups": self.scanner_setups})
+        save_state = getattr(self, "_save_state", None)
+        if callable(save_state):
+            save_state()
         self.populate_scanner_setup_combo()
         if hasattr(self, "sidebar_source_combo"):
             self.refresh_sidebar_sources()

@@ -33,7 +33,7 @@ class PortfolioRiskLimits:
 
     max_simultaneous_positions: int = MAX_PORTFOLIO_POSITIONS
     max_total_open_risk_fraction: float = 0.10
-    max_gross_notional_fraction: float = 10.0
+    max_gross_notional_fraction: float = 2.0
     max_incremental_buying_power_fraction: float = 0.0
     max_daily_loss_fraction: float = 0.0
     max_drawdown_fraction: float = 0.0

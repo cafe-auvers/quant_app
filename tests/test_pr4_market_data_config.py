@@ -151,7 +151,7 @@ def test_pr4_market_data_configuration_is_present_and_fail_closed():
         "BUYBOARD_ENGINE_ENABLED=true",
         "PORTFOLIO_MAX_SIMULTANEOUS_POSITIONS=30",
         "PORTFOLIO_MAX_TOTAL_OPEN_RISK_FRACTION=0.10",
-        "PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION=10.0",
+        "PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION=2.0",
     ):
         assert name in env_example
     assert "KIS_WS_SYMBOL_KEYS_JSON=" not in env_example

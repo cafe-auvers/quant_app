@@ -176,8 +176,11 @@ class BuylistOrdersMixin:
     def _save_buylist_state(self) -> None:
         save_state = getattr(self, "_save_state", None)
         if callable(save_state):
-            save_state()
+            # StateSaveManager reads execution_queue.json while assembling the
+            # cross-device payload. Persist the queue first so the published
+            # Buylist/queue pair comes from the same completed refresh.
             self._save_execution_queue_state()
+            save_state()
             return
 
         manager_save = getattr(getattr(self, "buylist_manager", None), "save", None)

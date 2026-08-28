@@ -282,7 +282,9 @@ transactional crash and handoff fence; in that sample its UPDATEs consumed
 about 0.08 RU/s. The later `operator-executor-sync-v7` profile increased the
 steady cadence to 240 seconds and the freshness fence to 300 seconds; state
 changes and safety-critical actions still publish or prove authority
-immediately.
+immediately. `operator-executor-sync-v8` keeps those cadences and versions the
+expanded key set: ordinary saves remain revision-protected, while atomic
+full-plan publishes now include scanner setups and strategy settings.
 
 A five-minute capture after that deployment contained about **151.68 SQL
 statement RUs**, or **0.51 statement RU/s**, while the cluster metric remained

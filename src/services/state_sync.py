@@ -57,11 +57,23 @@ TRADE_PLANS_KEY = "trade_plans"
 # is never trusted directly -- the handoff-reconciliation path re-validates
 # it against fresh intraday data before resuming auto-submission.
 EXECUTION_QUEUE_KEY = "execution_queue"
+# Strategy inputs must travel with the plan.  Without these rows the laptop
+# and PC can evaluate the same frozen watch/buy/queue documents under different
+# ORB bounds or scanner definitions.
+SCANNER_SETUPS_KEY = "scanner_setups"
+SETTINGS_KEY = "settings"
 MAIN_DEVICE_KEY = "__main_device__"
 OPERATOR_CONTROL_KEY = "__operator_control__"
 LIVE_TRADING_CONTROL_KEY = "__live_trading_control__"
 
-SYNCED_STATE_KEYS = (WATCHLIST_KEY, BUYLIST_KEY, TRADE_PLANS_KEY, EXECUTION_QUEUE_KEY)
+SYNCED_STATE_KEYS = (
+    WATCHLIST_KEY,
+    BUYLIST_KEY,
+    TRADE_PLANS_KEY,
+    EXECUTION_QUEUE_KEY,
+    SCANNER_SETUPS_KEY,
+    SETTINGS_KEY,
+)
 LOCAL_DEVICE_ROLE_FILE = DATA_DIR / "device_role.json"
 
 PULL_OK = "ok"
@@ -882,7 +894,7 @@ def publish_planning_snapshot(
     expected_revisions: Dict[str, int],
     market_is_open: bool,
 ) -> PlanPublishResult:
-    """Atomically publish the four pre-market planning documents.
+    """Atomically publish the complete pre-market plan and strategy inputs.
 
     This is the narrow exception that lets the Operator Control owner prepare
     tomorrow's plan while the PC remains Execution Owner.  It is disabled
@@ -902,7 +914,10 @@ def publish_planning_snapshot(
     if set(payloads) != set(SYNCED_STATE_KEYS):
         return PlanPublishResult(
             False,
-            error="A full plan publish requires watchlist, buylist, trade_plans, and execution_queue.",
+            error=(
+                "A full plan publish requires watchlist, buylist, trade_plans, "
+                "execution_queue, scanner_setups, and settings."
+            ),
         )
     try:
         encoded = {

@@ -633,6 +633,9 @@ class BuyboardMixin:
             return
         settings["orb_buffer_percent"] = percent
         save_json(SETTINGS_FILE, settings)
+        save_state = getattr(self, "_save_state", None)
+        if callable(save_state):
+            save_state()
         append_log = getattr(self, "append_log", None)
         if callable(append_log):
             append_log(

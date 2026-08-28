@@ -30,6 +30,8 @@ from src.services.state_sync import (
     PUSH_CONFLICT,
     PUSH_NOT_MAIN,
     PUSH_WRITTEN,
+    SCANNER_SETUPS_KEY,
+    SETTINGS_KEY,
     SYNCED_STATE_KEYS,
     TRADE_PLANS_KEY,
     WATCHLIST_KEY,
@@ -329,6 +331,7 @@ class StateSaveManager:
                             watchlist_dict,
                             buylist_dict,
                             trade_manager_dict,
+                            scanner_setups_copy,
                             append_log=append_log,
                         )
                     except Exception:
@@ -355,6 +358,7 @@ class StateSaveManager:
         watchlist_dict: Dict[str, Any],
         buylist_dict: Dict[str, Any],
         trade_manager_dict: Dict[str, Any],
+        scanner_setups_copy: Any,
         *,
         append_log: Callable[[str], None] | None = None,
     ) -> None:
@@ -373,12 +377,11 @@ class StateSaveManager:
             WATCHLIST_KEY: watchlist_dict,
             BUYLIST_KEY: buylist_dict,
             TRADE_PLANS_KEY: trade_manager_dict,
-            # Not one of this method's explicit params (execution_queue.json
-            # is saved independently by _save_execution_queue_state, not
-            # through StateSaveManager) -- read fresh from disk here instead
-            # of widening this method's signature and every one of its
-            # call sites just to thread one more dict through.
+            # execution_queue.json is saved independently by
+            # _save_execution_queue_state, so read it fresh from disk here.
             EXECUTION_QUEUE_KEY: load_json(EXECUTION_QUEUE_FILE, {}),
+            SCANNER_SETUPS_KEY: {"setups": scanner_setups_copy},
+            SETTINGS_KEY: load_json(SETTINGS_FILE, {}),
         }
         sync_entries = _read_sync_entries(self._metadata_path())
         written_entries: Dict[str, Dict[str, Any]] = {}
@@ -873,6 +876,8 @@ def _synced_key_to_file() -> Dict[str, Path]:
         BUYLIST_KEY: BUYLIST_FILE,
         TRADE_PLANS_KEY: TRADE_PLANS_FILE,
         EXECUTION_QUEUE_KEY: EXECUTION_QUEUE_FILE,
+        SCANNER_SETUPS_KEY: SCANNER_SETUPS_FILE,
+        SETTINGS_KEY: SETTINGS_FILE,
     }
 
 
@@ -1445,6 +1450,8 @@ def publish_trading_plan(
         BUYLIST_KEY: buylist_dict,
         TRADE_PLANS_KEY: trade_plans_dict,
         EXECUTION_QUEUE_KEY: execution_queue_dict,
+        SCANNER_SETUPS_KEY: load_json(SCANNER_SETUPS_FILE, {}),
+        SETTINGS_KEY: load_json(SETTINGS_FILE, {}),
     }
     # The local metadata records the last remote revision absorbed from the
     # previously active coordination store.  It can legitimately outlive the

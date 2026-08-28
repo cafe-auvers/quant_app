@@ -58,7 +58,7 @@ def test_controlled_live_defaults_and_hard_position_ceiling():
 
     assert limits.max_simultaneous_positions == 30
     assert limits.max_total_open_risk_fraction == 0.10
-    assert limits.max_gross_notional_fraction == 10.0
+    assert limits.max_gross_notional_fraction == 2.0
     assert MAX_PORTFOLIO_POSITIONS == 30
     with pytest.raises(ValueError, match="between 1 and 30"):
         PortfolioRiskLimits(max_simultaneous_positions=31)
@@ -140,26 +140,26 @@ def test_controlled_and_full_live_open_risk_boundaries(open_risk_limit):
     assert any("total open risk" in reason for reason in rejected.reasons)
 
 
-def test_one_thousand_percent_gross_notional_is_an_extreme_ceiling_only():
+def test_two_hundred_percent_gross_notional_is_an_extreme_ceiling_only():
     manager = PortfolioRiskManager(PortfolioRiskLimits())
 
     below = manager.evaluate_entry(
         _proposal(),
-        _snapshot(projected_exposures=(_projected("AAPL", gross=98_999.99),)),
+        _snapshot(projected_exposures=(_projected("AAPL", gross=18_999.99),)),
     )
     at_limit = manager.evaluate_entry(
         _proposal(),
-        _snapshot(projected_exposures=(_projected("AAPL", gross=99_000.0),)),
+        _snapshot(projected_exposures=(_projected("AAPL", gross=19_000.0),)),
     )
     above = manager.evaluate_entry(
         _proposal(),
-        _snapshot(projected_exposures=(_projected("AAPL", gross=99_000.01),)),
+        _snapshot(projected_exposures=(_projected("AAPL", gross=19_000.01),)),
     )
 
     assert below.approved is True
     assert below.reasons == ()
     assert at_limit.approved is True
-    assert at_limit.gross_notional_after_usd == 100_000.0
+    assert at_limit.gross_notional_after_usd == 20_000.0
     assert above.approved is False
     assert any("gross notional" in reason for reason in above.reasons)
 
