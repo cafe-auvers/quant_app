@@ -406,5 +406,10 @@ class KisBroker:
             environment,
             include_domestic=True,
             include_overseas=True,
+            # Position/order reconciliation runs every few seconds.  The
+            # year-to-date realized-P/L endpoint is unrelated to holdings,
+            # buying power, or order safety and can paginate for minutes;
+            # dashboard/report snapshots keep the default that includes it.
+            include_realized_pnl=False,
             account_no=account_no,
         )

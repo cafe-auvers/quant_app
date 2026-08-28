@@ -178,6 +178,24 @@ def test_definitive_guarded_broker_rejection_is_not_marked_retryable(tmp_path):
     assert all(not reservation.is_open() for reservation in capital_allocator.load_reservations(path))
 
 
+def test_kis_exchange_routing_rejection_preserves_a_cooldown_retry(tmp_path):
+    def fake_submit(**kwargs):
+        raise GuardedSubmissionRejectedError(
+            "KIS API error from order: APBK0656 invalid exchange"
+        )
+
+    manager, path = _manager(tmp_path, fake_submit)
+    result = manager.attempt_entry(_trigger())
+
+    assert result.outcome == AttemptOutcome.BROKER_ROUTING_REJECTED
+    assert result.retry_at is not None
+    assert result.attempt_count == 1
+    assert all(
+        not reservation.is_open()
+        for reservation in capital_allocator.load_reservations(path)
+    )
+
+
 def test_rate_limit_after_max_attempts_per_minute(tmp_path):
     clock_time = dt.datetime(2026, 1, 5, 14, 30, tzinfo=dt.timezone.utc)
 

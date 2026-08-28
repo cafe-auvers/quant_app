@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -487,6 +488,43 @@ def test_submit_order_uses_verified_nyse_key_instead_of_nasdaq_default(monkeypat
 
     assert captured["exchange"] == "NYSE"
     assert captured["pre_trade_risk_decision"].exchange == "NYSE"
+
+
+def test_execution_exchange_revalidates_estc_against_kis_master(tmp_path):
+    master = tmp_path / "us_kis_tickers.csv"
+    master.write_text(
+        "Symbol,KisSymbol,Exchange\nESTC,ESTC,NYS\n",
+        encoding="utf-8",
+    )
+    store = SimpleNamespace(
+        universe_path=master,
+        resolve=lambda _symbol: "DNYSESTC",
+    )
+    market_data = SimpleNamespace(symbol_key_store=store)
+
+    assert runtime_module._execution_exchange_for_card(
+        _card(symbol="ESTC", kis_ws_symbol_key="DNYSESTC"),
+        market_data,
+    ) == "NYSE"
+
+
+def test_execution_exchange_fails_closed_on_stale_estc_venue(tmp_path):
+    master = tmp_path / "us_kis_tickers.csv"
+    master.write_text(
+        "Symbol,KisSymbol,Exchange\nESTC,ESTC,NYS\n",
+        encoding="utf-8",
+    )
+    store = SimpleNamespace(
+        universe_path=master,
+        resolve=lambda _symbol: "DNASESTC",
+    )
+    market_data = SimpleNamespace(symbol_key_store=store)
+
+    with pytest.raises(RuntimeError, match="venue is stale"):
+        runtime_module._execution_exchange_for_card(
+            _card(symbol="ESTC", kis_ws_symbol_key="DNASESTC"),
+            market_data,
+        )
 
 
 def test_submit_order_revalidates_capital_percent_against_equity_not_cash(

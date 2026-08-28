@@ -582,8 +582,13 @@ class BuyboardRuntimeWorker(QThread):
         single_session_handoff = self._single_session_market_data_handoff_ready(
             readiness
         )
+        deferred_market_data_handoff = (
+            self._deferred_market_data_handoff_ready(readiness)
+        )
         handoff_ready = bool(
-            readiness.standby_ready or single_session_handoff
+            readiness.standby_ready
+            or single_session_handoff
+            or deferred_market_data_handoff
         )
         reconciliation_ready = bool(
             readiness.startup_reconciliation_complete
@@ -626,9 +631,12 @@ class BuyboardRuntimeWorker(QThread):
             ),
             "market_data_ready": stable_market_data,
             "market_data_handoff_ready": bool(
-                stable_market_data or single_session_handoff
+                stable_market_data
+                or single_session_handoff
+                or deferred_market_data_handoff
             ),
             "market_data_session_conflict": single_session_handoff,
+            "market_data_deferred_until_owner": deferred_market_data_handoff,
             "command_consumer_ready": command_consumer_ready,
             "order_reconciliation_ready": reconciliation_ready,
             "latest_watchlist_revision": int(revisions.get("watchlist", 0) or 0),
@@ -661,11 +669,42 @@ class BuyboardRuntimeWorker(QThread):
                     "KIS WebSocket session is held by the active executor; "
                     "ready for fenced handoff"
                     if single_session_handoff
-                    else ", ".join(readiness.standby_blockers)
-                    or f"runtime state is {state.value}"
+                    else (
+                        "KIS WebSocket starts after the fenced execution-owner "
+                        "transfer; standby infrastructure is ready"
+                        if deferred_market_data_handoff
+                        else ", ".join(readiness.standby_blockers)
+                        or f"runtime state is {state.value}"
+                    )
                 )
             ),
         }
+
+    def _deferred_market_data_handoff_ready(
+        self, readiness: EngineReadiness
+    ) -> bool:
+        """Prove a standby can be fenced before it opens the one KIS socket.
+
+        KIS permits one realtime session per app key.  Letting every standby
+        connect before ownership is known lets a non-owner occupy that slot;
+        after a clean lease release the intended successor can then neither
+        become feed-ready nor acquire the lease.  A standby therefore proves
+        the stable dependencies here and defers the socket until after the
+        atomic ownership transfer.  The promoted worker still cannot become
+        ACTIVE (or submit an order) until the normal full WebSocket/ACK gates
+        pass.
+        """
+
+        if not self._standby_only or self.runtime is None:
+            return False
+        return all(
+            (
+                readiness.startup_reconciliation_complete,
+                readiness.account_reconciliation_fresh,
+                readiness.accumulator_draining_within_budget,
+                readiness.database_writable,
+            )
+        )
 
     def _single_session_market_data_handoff_ready(
         self, readiness: EngineReadiness
@@ -943,10 +982,12 @@ class BuyboardRuntimeWorker(QThread):
                 persist_card_before_execution=self._persist_execution_identity,
                 observation_only=self._standby_only,
             )
-            if execution_config.KIS_WS_ENABLED:
-                start_market_data = getattr(self.runtime.market_data, "start", None)
-                if callable(start_market_data):
-                    start_market_data()
+            # KIS permits only one realtime socket for an app key.  A
+            # read-only standby proves every stable handoff dependency but
+            # deliberately defers opening the socket until it owns the
+            # execution lease.  This prevents two unowned standbys from
+            # deadlocking by letting the wrong machine occupy the feed.
+            self._start_market_data_if_owner()
             # Establish the exact database/lease proof before caching cards
             # for outage protection. If MySQL disappears during startup
             # reconciliation, those last-known cards and ownership proofs
@@ -1196,14 +1237,17 @@ class BuyboardRuntimeWorker(QThread):
         Stable global infrastructure is mandatory in every session.  Volatile
         quote freshness is enforced for the exact symbol at each execution
         boundary, so one quiet symbol cannot demote the entire successor.
-        Broker reconciliation, subscription ACKs, queue health, and canonical
-        database access all remain fail-closed.
+        A standby deliberately defers the one-per-app-key KIS socket; after
+        transfer, the owner must pass the normal connection/subscription ACK
+        gates before ACTIVE. Broker reconciliation, queue health, and
+        canonical database access remain fail-closed throughout.
         """
 
         current = readiness or self.engine_readiness(include_device_state=False)
         return bool(
             current.standby_ready
             or self._single_session_market_data_handoff_ready(current)
+            or self._deferred_market_data_handoff_ready(current)
         )
 
     def _refresh_observation_after_final_reconciliation(self) -> None:
@@ -1266,6 +1310,19 @@ class BuyboardRuntimeWorker(QThread):
         stop_market_data = getattr(market_data, "stop", None)
         if callable(stop_market_data):
             stop_market_data()
+
+    def _start_market_data_if_owner(self) -> None:
+        """Open KIS realtime only for the fenced execution-owner worker."""
+
+        if (
+            not execution_config.KIS_WS_ENABLED
+            or self._standby_only
+            or self.runtime is None
+        ):
+            return
+        start_market_data = getattr(self.runtime.market_data, "start", None)
+        if callable(start_market_data):
+            start_market_data()
 
     def set_cross_device_operator_sync(self, enabled: bool) -> None:
         """Switch the remote plan/command consumer without restarting runtime."""

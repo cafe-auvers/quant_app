@@ -117,6 +117,7 @@ class AttemptOutcome(str, Enum):
     RATE_LIMITED = "RATE_LIMITED"
     REJECTED = "REJECTED"
     BROKER_REJECTED = "BROKER_REJECTED"
+    BROKER_ROUTING_REJECTED = "BROKER_ROUTING_REJECTED"
     UNRESOLVED = "UNRESOLVED"
 
 
@@ -485,13 +486,34 @@ class EntryAttemptManager:
                 )
             state.attempt_count = max(state.attempt_count, attempt_number)
             state.attempt_timestamps.append(now)
+            detail = str(exc)
+            if "APBK0656" in detail.upper():
+                # KIS has definitively rejected this exact command, so no
+                # order is live, but APBK0656 is an exchange-routing/config
+                # failure rather than a strategy rejection. Preserve the
+                # Buy Today objective and retry later with a newly consumed
+                # stable identity after the verified venue is refreshed.
+                state.cooldown_until = now + timedelta(
+                    seconds=execution_config.ENTRY_RETRY_COOLDOWN_SECONDS
+                )
+                return AttemptResult(
+                    trigger,
+                    AttemptOutcome.BROKER_ROUTING_REJECTED,
+                    reservation_id=(
+                        reservation.reservation_id if reservation else ""
+                    ),
+                    attempt_group_id=attempt_group_id,
+                    attempt_count=state.attempt_count,
+                    retry_at=state.cooldown_until,
+                    detail=detail,
+                )
             return AttemptResult(
                 trigger,
                 AttemptOutcome.BROKER_REJECTED,
                 reservation_id=reservation.reservation_id if reservation else "",
                 attempt_group_id=attempt_group_id,
                 attempt_count=state.attempt_count,
-                detail=str(exc),
+                detail=detail,
             )
         except Exception as exc:  # noqa: BLE001 - surfaced via AttemptResult
             if reservation is not None:
