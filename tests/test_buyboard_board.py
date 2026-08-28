@@ -940,6 +940,26 @@ def test_portfolio_header_shows_filtered_and_entire_board_pnl():
     assert window._buyboard_pnl_label.text() == "P&L: +$100 (-$100)"
 
 
+def test_portfolio_header_uses_enforced_configured_position_limit(monkeypatch):
+    _ensure_app()
+    monkeypatch.setattr(
+        board_module.execution_config,
+        "PORTFOLIO_MAX_SIMULTANEOUS_POSITIONS",
+        7,
+    )
+    window = SimpleNamespace(_buyboard_positions_label=QLabel())
+
+    board_module._update_portfolio_summary(
+        window,
+        [],
+        [],
+        lambda _symbol: None,
+        lambda _environment, _account_no: None,
+    )
+
+    assert window._buyboard_positions_label.text() == "Positions: 0 / 7"
+
+
 def test_dragging_partial_sell_to_open_dispatches_partial_withdrawal(tmp_path, monkeypatch):
     engine = _make_engine(tmp_path)
     card = repo.create_trade_card(

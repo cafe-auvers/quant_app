@@ -42,6 +42,8 @@ def test_defaults():
     assert card.stop_type is None
     assert card.exit_all_required is False
     assert card.card_key == "PROD:12345678-01:AAPL"
+    assert card.risk_percent == pytest.approx(0.01)
+    assert card.to_dict()["risk_unit"] == "fraction"
 
 
 def test_to_dict_from_dict_round_trip():
@@ -95,3 +97,32 @@ def test_unknown_enum_strings_fall_back_to_default_on_load():
     data["board_status"] = "NOT_A_REAL_STATUS"
     restored = TradeCardState.from_dict(data)
     assert restored.board_status == BoardStatus.WATCHLIST
+
+
+def test_unmarked_legacy_risk_percentage_points_migrate_once_to_fraction():
+    legacy = _make_card().to_dict()
+    legacy.pop("risk_unit")
+    legacy["risk_percent"] = 1.0
+
+    restored = TradeCardState.from_dict(legacy)
+
+    assert restored.risk_percent == pytest.approx(0.01)
+    assert restored.to_dict()["risk_unit"] == "fraction"
+    assert TradeCardState.from_dict(restored.to_dict()).risk_percent == pytest.approx(
+        0.01
+    )
+
+
+def test_marked_canonical_risk_fraction_is_never_double_converted():
+    payload = _make_card(risk_percent=0.4).to_dict()
+
+    assert TradeCardState.from_dict(payload).risk_percent == pytest.approx(0.4)
+
+
+@pytest.mark.parametrize("risk", [-0.01, 1.01, float("nan"), float("inf")])
+def test_trade_card_rejects_or_repairs_invalid_risk_fraction(risk):
+    if risk != risk or risk == float("inf"):
+        assert _make_card(risk_percent=risk).risk_percent == pytest.approx(0.01)
+    else:
+        with pytest.raises(ValueError, match="account-risk fraction"):
+            _make_card(risk_percent=risk)

@@ -2162,6 +2162,50 @@ def test_tier_classification_considers_account_level_risk_factors(monkeypatch):
     assert tier == execution_config.MarketDataOutageRiskTier.HIGH
 
 
+def test_outage_stop_distance_uses_dollar_adr_recovered_from_orb_geometry(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        execution_config, "MARKET_DATA_OUTAGE_STOP_DISTANCE_ATR", 0.5
+    )
+    card = _open_card(
+        broker_quantity=1,
+        active_stop_price=99.0,
+        average_entry_price=100.0,
+        entry_trigger=100.0,
+        entry_orb_low=95.0,
+        stop_adr=50.0,
+    )
+
+    # A $5 ORB stop at 50% of ADR implies a $10 dollar ADR.  Price is $6
+    # above the active stop, or 0.6 ATR: LOW.  Dividing dollars by the stored
+    # percentage value (the old bug) incorrectly produced 0.12 and HIGH.
+    tier = classify_market_data_outage_risk(card, trusted_price=105.0)
+
+    assert tier == execution_config.MarketDataOutageRiskTier.LOW
+
+
+def test_outage_stop_distance_skips_optional_atr_signal_without_orb_geometry(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        execution_config, "MARKET_DATA_OUTAGE_STOP_DISTANCE_ATR", 0.5
+    )
+    card = _open_card(
+        broker_quantity=1,
+        active_stop_price=99.0,
+        average_entry_price=100.0,
+        entry_trigger=None,
+        entry_orb_low=None,
+        stop_adr=50.0,
+    )
+
+    assert (
+        classify_market_data_outage_risk(card, trusted_price=105.0)
+        == execution_config.MarketDataOutageRiskTier.LOW
+    )
+
+
 def test_rest_display_fallback_blocks_automatic_entries(tmp_path):
     engine = _make_engine(tmp_path)
     engine._market_data = RestPollingMarketDataService(

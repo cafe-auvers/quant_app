@@ -1293,7 +1293,7 @@ def test_ambiguous_buy_submission_keeps_queue_and_buylist_blocked(monkeypatch):
     assert recorded == [order]
     assert "UNKNOWN" in logs[-1]
     assert "Reconcile KIS account/orders before retry" in logs[-1]
-    assert save_calls == ["state", "queue", "queue"]
+    assert save_calls == ["queue", "state", "queue"]
 
 
 def test_ambiguous_buy_order_error_keeps_duplicate_protection_active(monkeypatch):
@@ -1338,7 +1338,7 @@ def test_ambiguous_buy_order_error_keeps_duplicate_protection_active(monkeypatch
     assert item._buy_order_pending is True
     assert manager.mark_calls == [("AAPL", "", "UNKNOWN_SUBMISSION_STATE", "SIM")]
     assert any("submission result UNKNOWN" in message for message in logs)
-    assert save_calls == ["queue", "state", "queue"]
+    assert save_calls == ["queue", "queue", "state"]
 
 
 def test_sell_acceptance_does_not_reduce_position_or_move_stop(monkeypatch):

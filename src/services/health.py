@@ -775,8 +775,35 @@ def _portfolio_risk_configuration_check() -> HealthCheck:
         f"Effective: {positions} positions, {open_risk:.0%} open risk, "
         f"{gross:.0%} gross notional",
         "Read-only effective runtime values after environment overrides. "
-        "These limits apply only to exposure-increasing BUY entries; 10.0 "
-        "is displayed as 1,000%.",
+        "These limits apply only to exposure-increasing BUY entries; values "
+        "are decimal fractions (for example, 2.0 is displayed as 200%).",
+    )
+
+
+def _execution_configuration_check() -> HealthCheck:
+    """Make malformed typed overrides visible instead of silently defaulting."""
+
+    issues = execution_config.configuration_issues()
+    if not issues:
+        return HealthCheck(
+            "Execution configuration",
+            HealthLevel.HEALTHY,
+            "Typed execution overrides are valid",
+            "Numeric overrides are finite and within their enforced ranges.",
+        )
+    entry_issues = execution_config.entry_configuration_issues()
+    entry_names = {item.split(":", 1)[0] for item in entry_issues}
+    detail = "; ".join(issues)
+    if entry_names:
+        detail += (
+            ". Exposure-increasing BUY entries fail closed until these "
+            "overrides are corrected; SELL/cancel/reconciliation remain available."
+        )
+    return HealthCheck(
+        "Execution configuration",
+        HealthLevel.CRITICAL if entry_names else HealthLevel.WARNING,
+        "Invalid execution environment override(s)",
+        detail,
     )
 
 
@@ -795,6 +822,7 @@ def collect_health_snapshot(context: HealthContext) -> HealthSnapshot:
     checks = [
         _repository_check(context.repository_status),
         _portfolio_risk_configuration_check(),
+        _execution_configuration_check(),
         token_check,
         _kis_api_check(context, configured),
         _mysql_check(context),

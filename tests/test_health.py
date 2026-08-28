@@ -133,6 +133,25 @@ def test_health_displays_effective_runtime_portfolio_limits(monkeypatch):
     assert "environment overrides" in check.detail
 
 
+def test_health_surfaces_invalid_entry_configuration_as_critical(monkeypatch):
+    monkeypatch.setattr(
+        health.execution_config,
+        "configuration_issues",
+        lambda: ("PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION: must be finite",),
+    )
+    monkeypatch.setattr(
+        health.execution_config,
+        "entry_configuration_issues",
+        lambda: ("PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION: must be finite",),
+    )
+
+    check = health._execution_configuration_check()
+
+    assert check.level == health.HealthLevel.CRITICAL
+    assert "BUY entries fail closed" in check.detail
+    assert "SELL/cancel/reconciliation remain available" in check.detail
+
+
 def test_unreadable_order_ledger_is_critical():
     check = health._reconciliation_check(
         health.HealthContext(order_ledger_error="orders.json is malformed")

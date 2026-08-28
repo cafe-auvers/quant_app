@@ -21,6 +21,7 @@ submit or cancel any broker order.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import weakref
 from dataclasses import dataclass, field
@@ -60,6 +61,18 @@ from src.utils.storage import load_json, save_json
 logger = logging.getLogger(__name__)
 
 LOCAL_TRADE_CARDS_FILE = DATA_DIR / "trade_cards.json"
+
+
+def _legacy_buylist_risk_fraction(item: Any) -> float:
+    """Convert Buylist percentage points to the Trade Card fraction unit."""
+
+    try:
+        percent_points = float(getattr(item, "risk_percent", 1.0) or 1.0)
+    except (TypeError, ValueError, OverflowError):
+        percent_points = 1.0
+    if not math.isfinite(percent_points) or percent_points <= 0.0:
+        percent_points = 1.0
+    return min(percent_points / 100.0, 1.0)
 
 _ensured_engines: "weakref.WeakSet[Engine]" = weakref.WeakSet()
 _ensure_lock = threading.Lock()
@@ -659,7 +672,7 @@ def build_trade_card_migration(
                 if getattr(item, "buffer_pct", None) in (None, "")
                 else getattr(item, "buffer_pct")
             ),
-            risk_percent=float(getattr(item, "risk_percent", 1.0) or 1.0),
+            risk_percent=_legacy_buylist_risk_fraction(item),
             position_percent=float(
                 getattr(item, "position_percent", 0.0) or 0.0
             ),

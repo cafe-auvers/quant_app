@@ -181,7 +181,15 @@ def require_live_entry_allowed(
         return
     require_live_mutation_allowed(environment=environment, action="order submission")
     normalized_side = side if isinstance(side, OrderSide) else OrderSide(str(side).upper())
-    if normalized_side != OrderSide.BUY or _mode() == FULL_LIVE:
+    if normalized_side != OrderSide.BUY:
+        return
+    invalid_entry_configuration = execution_config.entry_configuration_issues()
+    if invalid_entry_configuration:
+        names = ", ".join(item.split(":", 1)[0] for item in invalid_entry_configuration)
+        raise _configuration_error(
+            f"invalid entry-risk environment override(s): {names}"
+        )
+    if _mode() == FULL_LIVE:
         return
     normalized_symbol = str(symbol or "").strip().upper()
     if not live_entry_symbol_allowed(

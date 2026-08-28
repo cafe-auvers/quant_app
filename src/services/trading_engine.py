@@ -199,8 +199,31 @@ def classify_market_data_outage_risk(
             or risk_to_stop >= execution_config.MARKET_DATA_OUTAGE_ACCOUNT_RISK_PCT
         ):
             return execution_config.MarketDataOutageRiskTier.HIGH
-    if stop and card.stop_adr and card.stop_adr > 0:
-        distance_in_atr = max(0.0, price - stop) / float(card.stop_adr)
+    # ``card.stop_adr`` is a percentage of ADR, not a dollar ATR value.  The
+    # frozen entry geometry lets us recover the original dollar ADR without
+    # introducing mutable market history into an outage decision:
+    #
+    #   stop_adr = (entry - ORB low) / ADR dollars * 100
+    #
+    # If an older/manual card lacks that geometry, omit this optional signal;
+    # the stop buffer, loss, concentration, account-risk, and liquidity checks
+    # above remain active.
+    entry = float(card.entry_trigger or 0.0)
+    entry_stop = float(card.entry_orb_low or 0.0)
+    stop_adr_percent = float(card.stop_adr or 0.0)
+    adr_price = (
+        (entry - entry_stop) * 100.0 / stop_adr_percent
+        if (
+            math.isfinite(entry)
+            and math.isfinite(entry_stop)
+            and math.isfinite(stop_adr_percent)
+            and entry > entry_stop > 0.0
+            and stop_adr_percent > 0.0
+        )
+        else 0.0
+    )
+    if stop and adr_price > 0.0:
+        distance_in_atr = max(0.0, price - stop) / adr_price
         if distance_in_atr <= execution_config.MARKET_DATA_OUTAGE_STOP_DISTANCE_ATR:
             return execution_config.MarketDataOutageRiskTier.HIGH
     if str(liquidity_tier or "").upper() in {"ILLIQUID", "HIGH_SPREAD"}:

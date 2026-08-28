@@ -231,7 +231,20 @@ def test_migration_dry_run_does_not_touch_database(tmp_path):
 
     assert len(report.creates) == 1
     assert report.creates[0].card.board_status == BoardStatus.BUYLIST
+    assert report.creates[0].card.risk_percent == pytest.approx(0.01)
     assert repo.list_trade_cards(engine) == []
+
+
+def test_migration_converts_buylist_percentage_points_to_card_fraction(tmp_path):
+    engine = _make_engine(tmp_path)
+    manager = BuylistManager()
+    manager.add(_buylist_item(risk_percent=0.5))
+
+    report = repo.migrate_buylist_to_trade_cards(
+        engine, buylist_manager=manager, apply=False
+    )
+
+    assert report.creates[0].card.risk_percent == pytest.approx(0.005)
 
 
 def test_migration_apply_persists_and_is_idempotent(tmp_path):

@@ -23,6 +23,7 @@ from src.services.controlled_live_policy import (
     controlled_live_symbols,
     live_entry_symbol_allowed,
     require_controlled_live_configuration,
+    require_live_entry_allowed,
 )
 from src.services.kis_request_scheduler import KisRequestScheduler
 
@@ -192,6 +193,33 @@ def test_controlled_live_configuration_requires_no_retry_spacing_and_budgets(
     with pytest.raises(LiveExecutionEnvelopeError, match="forbids automatic"):
         require_controlled_live_configuration(
             environment="PROD", scheduler=scheduler
+        )
+
+
+def test_invalid_entry_risk_override_blocks_buy_but_not_protective_sell(
+    monkeypatch,
+):
+    _configure_controlled_live(monkeypatch)
+    monkeypatch.setattr(
+        execution_config,
+        "entry_configuration_issues",
+        lambda: ("PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION: invalid",),
+    )
+
+    require_live_entry_allowed(
+        environment="PROD",
+        symbol="AAPL",
+        side=OrderSide.SELL,
+        quantity=1,
+        limit_price=100.0,
+    )
+    with pytest.raises(LiveExecutionEnvelopeError, match="entry-risk"):
+        require_live_entry_allowed(
+            environment="PROD",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            quantity=1,
+            limit_price=100.0,
         )
 
 

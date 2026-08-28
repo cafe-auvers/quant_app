@@ -27,6 +27,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from src.core import execution_config
 from src.core.execution_config import is_buyboard_engine_enabled
 from src.core.execution_queue import ExecutionQueueItem
 from src.core.orb_combinations import (
@@ -75,7 +76,6 @@ _ENGINE_GATED_TARGET_COLUMNS = {
     BoardStatus.SELL_ALL,
 }
 
-_POSITION_LIMIT = 30
 _POSITION_BOARD_STATUSES = {
     BoardStatus.ENTRY_PENDING,
     BoardStatus.OPEN_POSITION,
@@ -83,6 +83,22 @@ _POSITION_BOARD_STATUSES = {
     BoardStatus.SELL_ALL,
 }
 _DEFAULT_ORB_BUFFER_PERCENT = 0.10
+
+
+def _position_limit() -> int:
+    """Return the same enforced portfolio limit shown by the Buy Board."""
+
+    try:
+        return max(
+            1,
+            min(
+                30,
+                int(execution_config.PORTFOLIO_MAX_SIMULTANEOUS_POSITIONS),
+            ),
+        )
+    except (TypeError, ValueError, OverflowError):
+        return 30
+
 
 _KANBAN_RECOVERY_GUIDANCE = """The Kanban operational store is unavailable.
 
@@ -141,7 +157,7 @@ def build_buyboard_widget(main_window) -> None:
     header.addWidget(title)
     header.addSpacing(12)
 
-    positions_label = QLabel(f"Positions: 0 / {_POSITION_LIMIT}")
+    positions_label = QLabel(f"Positions: 0 / {_position_limit()}")
     positions_label.setStyleSheet("font-weight: bold; color: #2e7d32;")
     capital_label = QLabel("Capital: -")
     pnl_label = QLabel("P&L: -")
@@ -420,12 +436,13 @@ def _update_portfolio_summary(
 
     positions_label = getattr(main_window, "_buyboard_positions_label", None)
     if positions_label is not None:
+        position_limit = _position_limit()
         positions_label.setText(
-            f"Positions: {summary.positions} / {_POSITION_LIMIT}"
+            f"Positions: {summary.positions} / {position_limit}"
         )
         positions_label.setStyleSheet(
             "font-weight: bold; color: "
-            + ("#c62828;" if summary.positions >= _POSITION_LIMIT else "#2e7d32;")
+            + ("#c62828;" if summary.positions >= position_limit else "#2e7d32;")
         )
     capital_label = getattr(main_window, "_buyboard_capital_label", None)
     if capital_label is not None:

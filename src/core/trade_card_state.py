@@ -24,6 +24,13 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 PRODUCTION_ENVIRONMENT = "PROD"
+RISK_UNIT_FRACTION = "fraction"
+# The Buy Board's supported ORB cases currently top out at 2% account risk.
+# Older Trade Card payloads did not record a unit and could contain the
+# legacy Buylist representation (percentage points, where ``1.0`` means 1%).
+# Values above this boundary in an unmarked payload are therefore migrated
+# once to the canonical fraction representation.
+MAX_CANONICAL_ORB_RISK_FRACTION = 0.02
 
 
 def _utc_now() -> datetime:
@@ -55,9 +62,26 @@ def _finite_float(value: Any, default: Optional[float] = None) -> Optional[float
         return default
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
     return number if math.isfinite(number) else default
+
+
+def _persisted_risk_fraction(data: Dict[str, Any]) -> float:
+    """Load a Trade Card risk value, migrating old percentage-point rows.
+
+    New payloads always carry ``risk_unit=fraction``.  The origin-aware
+    migration in :mod:`src.services.trade_card_repository` handles legacy
+    Buylist objects directly; this fallback repairs already-persisted Trade
+    Cards created before the unit marker existed.
+    """
+
+    raw = _finite_float(data.get("risk_percent"), 0.01)
+    risk = float(raw if raw is not None else 0.01)
+    unit = str(data.get("risk_unit") or "").strip().lower()
+    if not unit and risk > MAX_CANONICAL_ORB_RISK_FRACTION:
+        risk /= 100.0
+    return risk
 
 
 def _enum_from_value(value: Any, enum_cls: type[Enum], default: Enum) -> Enum:
@@ -197,7 +221,9 @@ class TradeCardState:
     breakout_price: Optional[float] = None
     selected_orb_window: Optional[str] = None
     buffer_pct: float = 0.001
-    risk_percent: float = 1.0
+    # Canonical account-risk *fraction*: 0.01 means 1%.  The historical name
+    # remains for JSON/database compatibility.
+    risk_percent: float = 0.01
     # Allocation used by target-price entries when no ORB sizing result is
     # available. This is persisted operational intent, not market history.
     position_percent: float = 0.0
@@ -342,7 +368,9 @@ class TradeCardState:
             str(self.selected_orb_window).strip() if self.selected_orb_window else None
         )
         self.buffer_pct = float(_finite_float(self.buffer_pct, 0.001))
-        self.risk_percent = float(_finite_float(self.risk_percent, 1.0))
+        self.risk_percent = float(_finite_float(self.risk_percent, 0.01))
+        if not 0.0 <= self.risk_percent <= 1.0:
+            raise ValueError("risk_percent must be an account-risk fraction from 0 to 1")
         self.position_percent = max(
             0.0, float(_finite_float(self.position_percent, 0.0))
         )
@@ -492,6 +520,7 @@ class TradeCardState:
             "selected_orb_window": self.selected_orb_window,
             "buffer_pct": self.buffer_pct,
             "risk_percent": self.risk_percent,
+            "risk_unit": RISK_UNIT_FRACTION,
             "position_percent": self.position_percent,
             "planned_quantity": self.planned_quantity,
             "target_position_quantity": self.target_position_quantity,
@@ -597,7 +626,7 @@ class TradeCardState:
             breakout_price=data.get("breakout_price"),
             selected_orb_window=data.get("selected_orb_window"),
             buffer_pct=data.get("buffer_pct", 0.001),
-            risk_percent=data.get("risk_percent", 1.0),
+            risk_percent=_persisted_risk_fraction(data),
             position_percent=data.get("position_percent", 0.0),
             planned_quantity=int(data.get("planned_quantity", 0) or 0),
             target_position_quantity=int(

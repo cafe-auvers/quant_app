@@ -68,6 +68,7 @@ def _use_machine(monkeypatch, root):
         "EXECUTION_QUEUE_FILE": root / "execution_queue.json",
         "STATE_METADATA_FILE": root / "state_metadata.json",
         "SCANNER_SETUPS_FILE": root / "scanner_setups.json",
+        "SETTINGS_FILE": root / "settings.json",
         "CHART_DRAWINGS_FILE": root / "chart_drawings.json",
         "TAB_OPTIONS_FILE": root / "tab_options.json",
     }
@@ -323,6 +324,8 @@ def test_pull_only_pc_cannot_seed_or_overwrite_first_sync(monkeypatch, tmp_path)
         "buylist",
         "trade_plans",
         "execution_queue",
+        "scanner_setups",
+        "settings",
     }
     assert app_state.load_json(pc_paths["WATCHLIST_FILE"], {}) == current
 
@@ -463,6 +466,7 @@ def test_save_manager_pushes_only_changed_synced_key(monkeypatch, tmp_path):
     buylist = {"items": []}
     plans = {"plans": []}
     _save_local_state(paths, watchlist, buylist, plans)
+    app_state.save_json(paths["SCANNER_SETUPS_FILE"], {"setups": []})
     role = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
     app_state.reconcile_state_with_remote(engine, role)
     before = {

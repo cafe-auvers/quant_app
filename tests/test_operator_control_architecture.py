@@ -717,6 +717,8 @@ def test_premarket_operator_publish_updates_all_revisions_without_owner_change(
         "buylist": {"items": [{"symbol": "AAPL"}]},
         "trade_plans": {"plans": []},
         "execution_queue": {"items": [{"symbol": "AAPL"}]},
+        "scanner_setups": {"setups": {}},
+        "settings": {"orb_settings": {}},
     }
 
     result = publish_planning_snapshot(
