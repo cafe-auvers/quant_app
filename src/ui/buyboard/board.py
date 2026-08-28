@@ -47,7 +47,11 @@ from src.services.trade_card_orb_bridge import (
 from src.utils.market_calendar import is_regular_session_open
 
 from . import dialogs
-from .card import board_interaction_fingerprint, card_drag_payload
+from .card import (
+    board_interaction_fingerprint,
+    buy_today_feedback_is_current,
+    card_drag_payload,
+)
 from .columns import BOARD_COLUMN_ORDER, BOARD_COLUMN_TITLES, BoardColumnList
 from .drag_commands import (
     ActivateForToday,
@@ -1165,7 +1169,10 @@ def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
     actions = {}
     if card.board_status == BoardStatus.BUYLIST:
         actions["activate"] = menu.addAction("Activate for Buy Today")
-        if card.rejected_orb_snapshot:
+        if (
+            card.rejected_orb_snapshot
+            and buy_today_feedback_is_current(card)
+        ):
             actions["rejected_orb_combinations"] = menu.addAction(
                 "Rejected ORB Combinations..."
             )

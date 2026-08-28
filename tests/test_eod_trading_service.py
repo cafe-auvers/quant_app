@@ -223,6 +223,28 @@ def test_buy_today_from_prior_session_expires_after_offline_restart(tmp_path):
     assert card.session_date is None
 
 
+def test_legacy_buy_today_without_session_uses_activation_time_for_rollover(tmp_path):
+    service, _, _ = _service(tmp_path)
+    card = _card(
+        board_status=BoardStatus.BUY_TODAY,
+        session_date=None,
+        board_status_updated_at=datetime(
+            2026, 8, 19, 15, 0, tzinfo=timezone.utc
+        ),
+        entry_runtime_status=EntryRuntimeStatus.WAITING_BREAKOUT,
+    )
+
+    changed = service.expire_buy_today_cards(
+        [card],
+        market_closed=False,
+        current_session_date=date(2026, 8, 20),
+    )
+
+    assert changed == [card]
+    assert card.board_status == BoardStatus.BUYLIST
+    assert card.last_buy_today_session_date == date(2026, 8, 19)
+
+
 def test_legacy_session_complete_card_expires_without_session_date(tmp_path):
     service, _, _ = _service(tmp_path)
     card = _card(

@@ -3375,6 +3375,24 @@ def test_sync_orb_plans_skips_planning_only_cards(tmp_path):
     assert called == []
 
 
+def test_sync_orb_plans_skips_prior_session_buy_today(tmp_path):
+    worker, engine = _worker(tmp_path)
+    stale = _seed_card(
+        engine,
+        symbol="OLD",
+        board_status=BoardStatus.BUY_TODAY,
+        session_date=dt.date(2000, 1, 3),
+    )
+    called = []
+    worker._execution_queue_item_lookup = (
+        lambda symbol, env: called.append((symbol, env)) or None
+    )
+
+    assert worker._sync_orb_plans([stale]) == []
+    assert worker._card_in_execution_scope(stale) is False
+    assert called == []
+
+
 # --- Quote subscription sync -------------------------------------------------
 
 
@@ -3476,6 +3494,69 @@ def test_sync_quote_subscriptions_adopts_keys_only_for_active_cards(tmp_path):
     assert adopted == [{"LUNG": "DLUNG"}]
     assert "LUNG" in configured["trade_priorities"]
     assert "OLD" not in configured["trade_priorities"]
+
+
+def test_sync_quote_subscriptions_excludes_prior_session_buy_today(tmp_path):
+    worker, _ = _worker(tmp_path)
+    adopted = []
+    configured = {}
+
+    class _MarketData:
+        def adopt_canonical_symbol_keys(self, keys):
+            adopted.append(dict(keys))
+
+        def configure_desired_channels(self, **kwargs):
+            configured.update(kwargs)
+
+    worker.runtime = SimpleNamespace(market_data=_MarketData())
+    stale = TradeCardState(
+        environment="PROD",
+        account_no="1",
+        symbol="OLD",
+        board_status=BoardStatus.BUY_TODAY,
+        session_date=dt.date(2000, 1, 3),
+        kis_ws_symbol_key="DOLD",
+    )
+    position = TradeCardState(
+        environment="PROD",
+        account_no="1",
+        symbol="LIVE",
+        board_status=BoardStatus.OPEN_POSITION,
+        kis_ws_symbol_key="DLIVE",
+        broker_quantity=10,
+    )
+
+    worker._sync_quote_subscriptions([stale, position])
+
+    assert adopted == [{"LIVE": "DLIVE"}]
+    assert "OLD" not in configured["trade_priorities"]
+    assert "OLD" not in configured["quote_priorities"]
+    assert "LIVE" in configured["trade_priorities"]
+
+
+def test_prior_session_buy_today_with_order_identity_stays_subscribed(tmp_path):
+    worker, _ = _worker(tmp_path)
+    configured = {}
+
+    class _MarketData:
+        def configure_desired_channels(self, **kwargs):
+            configured.update(kwargs)
+
+    worker.runtime = SimpleNamespace(market_data=_MarketData())
+    unresolved = TradeCardState(
+        environment="PROD",
+        account_no="1",
+        symbol="ORDERED",
+        board_status=BoardStatus.BUY_TODAY,
+        session_date=dt.date(2000, 1, 3),
+        entry_client_order_id="durable-buy-id",
+    )
+
+    worker._sync_quote_subscriptions([unresolved])
+
+    assert "ORDERED" in configured["trade_priorities"]
+    assert "ORDERED" in configured["quote_priorities"]
+    assert worker._card_in_execution_scope(unresolved) is True
 
 
 def test_controlled_live_buy_today_cards_are_active_and_executable(

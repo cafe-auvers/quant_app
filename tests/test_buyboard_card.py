@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from datetime import date
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -10,6 +11,7 @@ from PyQt5.QtWidgets import QApplication
 from PyQt5.QtWidgets import QLabel
 
 from src.core.board_workflow import BoardCardProjection
+from src.core.exit_policy import market_session_date
 from src.core.trade_card_state import (
     BoardStatus,
     EntryRuntimeStatus,
@@ -18,6 +20,7 @@ from src.core.trade_card_state import (
 )
 from src.ui.buyboard.card import (
     TradeCardWidget,
+    buy_today_feedback_is_current,
     _card_metric_rows,
     _card_status_text,
     _pnl_percent,
@@ -162,6 +165,7 @@ def test_buylist_card_shows_buy_today_rejection_memo():
             "Buy Today rejected - all ORB plans invalid. "
             "1m: stop is too wide; 5m: breakout not cleared; 30m: risk invalid"
         ),
+        last_buy_today_session_date=market_session_date(),
         rejected_orb_snapshot={"combinations": [{"window": "1m"}]},
     )
 
@@ -171,6 +175,31 @@ def test_buylist_card_shows_buy_today_rejection_memo():
     assert "all ORB plans invalid" in text
     assert "1m: stop is too wide" in text
     assert "Rejected ORB Combinations" in text
+
+
+def test_buylist_card_hides_prior_session_rejection_feedback():
+    _ensure_app()
+    card = TradeCardState(
+        environment="PROD",
+        account_no="1",
+        symbol="WEX",
+        board_status=BoardStatus.BUYLIST,
+        buy_today_note="Buy Today rejected - all ORB plans invalid.",
+        last_buy_today_session_date=date(2000, 1, 3),
+        rejected_orb_snapshot={
+            "session_date": "2000-01-03",
+            "combinations": [{"window": "1m"}],
+        },
+    )
+
+    assert buy_today_feedback_is_current(
+        card,
+        current_session_date=date(2000, 1, 4),
+    ) is False
+    text = _widget_text(TradeCardWidget(card))
+    assert "Memo:" not in text
+    assert "all ORB plans invalid" not in text
+    assert "Rejected ORB Combinations" not in text
 
 
 def test_buy_today_card_shows_live_breakout_distance_and_planned_stop_result():
