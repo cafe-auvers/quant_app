@@ -122,9 +122,14 @@ class EodTradingService:
             if card.board_status == BoardStatus.BUY_TODAY:
                 # Always restore correlation to an already-durable order;
                 # only the no-order reset itself waits for the closing bell.
+                scheduled_session = card.session_date
+                if scheduled_session is None and card.board_status_updated_at:
+                    scheduled_session = market_session_date(
+                        card.board_status_updated_at
+                    )
                 scheduled_session_due = bool(
-                    card.session_date is None
-                    or card.session_date <= session_today
+                    scheduled_session is None
+                    or scheduled_session <= session_today
                 )
                 if self._reset_buy_today_with_no_order(
                     card,
@@ -174,15 +179,22 @@ class EodTradingService:
                 if card.entry_runtime_status == EntryRuntimeStatus.SESSION_COMPLETE:
                     card.entry_runtime_status = EntryRuntimeStatus.ORB_FORMING
                     card.entry_block_reason = ""
+            scheduled_session = card.session_date
+            if scheduled_session is None and card.board_status_updated_at:
+                scheduled_session = market_session_date(
+                    card.board_status_updated_at
+                )
             prior_session = bool(
-                card.session_date is not None and card.session_date < session_today
+                scheduled_session is not None
+                and scheduled_session < session_today
             )
             scheduled_session_due = bool(
-                card.session_date is None
-                or card.session_date <= session_today
+                scheduled_session is None
+                or scheduled_session <= session_today
             )
             if (
                 not scheduled_session_due
+                and card.session_date is not None
                 and card.entry_runtime_status == EntryRuntimeStatus.SESSION_COMPLETE
             ):
                 # Older builds could mark a post-close activation complete
@@ -237,7 +249,9 @@ class EodTradingService:
         # Preserve the final, trader-facing outcome before clearing the
         # transient runtime fields. This is the explanation shown in the
         # date-based Health summary for the original session.
-        completed_session = card.session_date or market_session_date()
+        completed_session = card.session_date or market_session_date(
+            card.board_status_updated_at
+        )
         runtime_status = card.entry_runtime_status
         runtime_reason = str(card.entry_block_reason or "").strip()
         trigger = card.entry_trigger or card.breakout_price

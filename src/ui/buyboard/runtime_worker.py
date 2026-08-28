@@ -47,6 +47,7 @@ from src.core.account_broker_snapshot import AccountBrokerSnapshot, Reconciliati
 from src.core.board_workflow import BoardActionContext
 from src.core.execution_config import is_buyboard_engine_enabled
 from src.core.execution_mode import ExecutionLease, ExecutionSource
+from src.core.exit_policy import market_session_date
 from src.core.runtime_readiness import EngineReadiness, RuntimeDeviceState
 from src.core.execution_order_record import ExecutionOrderStatus
 from src.core.order_state import OrderSide
@@ -55,6 +56,7 @@ from src.core.trade_card_state import (
     EntryRuntimeStatus,
     PositionRuntimeStatus,
     TradeCardState,
+    has_durable_execution_evidence,
 )
 from src.services import buyboard_runtime as buyboard_runtime_module
 from src.services import capital_reservation_repository
@@ -133,6 +135,51 @@ _QUOTE_SUBSCRIBED_STATUSES = {
 _ORB_SYNCED_STATUSES = {BoardStatus.BUY_TODAY}
 
 
+def _buy_today_session_is_current(
+    card: TradeCardState,
+    *,
+    current_session_date=None,
+) -> bool:
+    """Keep prior-session entry intent out of current feed/readiness gates.
+
+    The active executor owns the durable Buy Today -> Buylist rollover.  A
+    newly booted standby must nevertheless be able to become ready before it
+    owns that mutation.  Treating a known prior-session card as a critical
+    subscription creates a deadlock when its old activation predates durable
+    symbol-key capture: readiness waits for an ACK that cannot arrive, while
+    rollover waits for readiness/ownership.  Missing session dates remain
+    fail-closed and subscribed for legacy cards whose intended day is unknown.
+    """
+
+    if card.board_status != BoardStatus.BUY_TODAY:
+        return True
+    # A stale-looking card that already consumed an order identity remains
+    # execution-critical until broker/order reconciliation moves it to the
+    # correct lifecycle. Session rollover must never hide a working BUY.
+    if has_durable_execution_evidence(card):
+        return True
+    session = card.session_date
+    if session is None and card.board_status_updated_at is not None:
+        session = market_session_date(card.board_status_updated_at)
+    if session is None:
+        return True
+    today = current_session_date or market_session_date()
+    return session >= today
+
+
+def _card_requires_quote_subscription(
+    card: TradeCardState,
+    *,
+    current_session_date=None,
+) -> bool:
+    if card.board_status not in _QUOTE_SUBSCRIBED_STATUSES:
+        return False
+    return _buy_today_session_is_current(
+        card,
+        current_session_date=current_session_date,
+    )
+
+
 def _ambiguous_buy_today_orb_keys(
     cards: List[TradeCardState],
 ) -> set[tuple[str, str]]:
@@ -140,7 +187,10 @@ def _ambiguous_buy_today_orb_keys(
 
     accounts_by_symbol: Dict[tuple[str, str], set[str]] = {}
     for card in cards:
-        if card.board_status != BoardStatus.BUY_TODAY:
+        if (
+            card.board_status != BoardStatus.BUY_TODAY
+            or not _buy_today_session_is_current(card)
+        ):
             continue
         key = (
             str(card.environment or "").strip().upper(),
@@ -1763,7 +1813,7 @@ class BuyboardRuntimeWorker(QThread):
             not in ambiguous_orb_keys
         ]
         observation_cards = [
-            card for card in cards if card.board_status in _QUOTE_SUBSCRIBED_STATUSES
+            card for card in cards if _card_requires_quote_subscription(card)
         ]
         # Installing a durable stop request into the local market-data rule
         # set is not a broker mutation.  The exact Main lease must be able to
@@ -2520,7 +2570,10 @@ class BuyboardRuntimeWorker(QThread):
 
         if card.board_status != BoardStatus.BUY_TODAY:
             return True
-        return live_entry_card_allowed(card)
+        return bool(
+            _buy_today_session_is_current(card)
+            and live_entry_card_allowed(card)
+        )
 
     def account_action_ready(
         self, account_no: str, symbol: str, action: str
@@ -3067,7 +3120,10 @@ class BuyboardRuntimeWorker(QThread):
             else set(ambiguous_orb_keys)
         )
         for card in cards:
-            if card.board_status not in _ORB_SYNCED_STATUSES:
+            if (
+                card.board_status not in _ORB_SYNCED_STATUSES
+                or not _buy_today_session_is_current(card)
+            ):
                 continue
             symbol_key = (
                 str(card.environment or "").strip().upper(),
@@ -3187,7 +3243,7 @@ class BuyboardRuntimeWorker(QThread):
             canonical_keys: Dict[str, str] = {}
             conflicting_symbols: set[str] = set()
             for card in cards:
-                if card.board_status not in _QUOTE_SUBSCRIBED_STATUSES:
+                if not _card_requires_quote_subscription(card):
                     continue
                 key = str(getattr(card, "kis_ws_symbol_key", "") or "").strip()
                 if not key:
@@ -3215,7 +3271,7 @@ class BuyboardRuntimeWorker(QThread):
                 # capacity.  Passing them as DISPLAY_ONLY still makes the
                 # coordinator resolve both channels before it applies its
                 # capacity limits.
-                if card.board_status not in _QUOTE_SUBSCRIBED_STATUSES:
+                if not _card_requires_quote_subscription(card):
                     continue
                 symbol = card.symbol
                 if card.board_status in {BoardStatus.SELL_ALL, BoardStatus.PARTIAL_SELL} or card.exit_all_required:
@@ -3263,7 +3319,11 @@ class BuyboardRuntimeWorker(QThread):
         subscribed = getattr(market_data, "subscribed_symbols", None)
         if not callable(subscribed):
             return  # backend does not expose its current subscription set
-        desired = {card.symbol for card in cards if card.board_status in _QUOTE_SUBSCRIBED_STATUSES}
+        desired = {
+            card.symbol
+            for card in cards
+            if _card_requires_quote_subscription(card)
+        }
         current = set(subscribed())
         to_add = desired - current
         to_remove = current - desired
