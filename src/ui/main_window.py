@@ -1364,6 +1364,10 @@ class MainWindow(
         self._last_coordination_database_notice = ""
         self._start_state_sync()
         self._sync_buyboard_runtime_worker()
+        if self.tabs.currentWidget() is self.__dict__.get(
+            "daily_summary_widget"
+        ):
+            self._refresh_daily_summary()
 
     def _start_coordination_runtime_heartbeat(self, *, force: bool = False) -> None:
         """Refresh the legacy process heartbeat when no runtime pulse exists."""
@@ -4203,6 +4207,14 @@ class MainWindow(
         self._add_configured_tab("tradingview", self.tradingview_widget, "TradingView")
         self._build_tradingview_tab()
         self._install_tradingview_watchlist_controls()
+
+        self.daily_summary_widget = QWidget()
+        self._add_configured_tab(
+            "daily_summary",
+            self.daily_summary_widget,
+            "Daily Summary",
+        )
+        self._build_daily_summary_main_tab()
 
         # The Buy Board is the sole operator-facing execution surface. The
         # persisted buylist/execution-queue models remain compatibility inputs

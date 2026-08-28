@@ -99,8 +99,9 @@ def test_main_window_constructs_and_closes_offscreen_without_external_io(monkeyp
     scanner_index = tab_labels.index("Scanner")
     assert tab_labels[scanner_index + 1] == "Market Pulse"
     tradingview_index = tab_labels.index("TradingView")
-    assert tab_labels[tradingview_index : tradingview_index + 3] == [
+    assert tab_labels[tradingview_index : tradingview_index + 4] == [
         "TradingView",
+        "Daily Summary",
         "Buy Board",
         "Health",
     ]
@@ -108,6 +109,10 @@ def test_main_window_constructs_and_closes_offscreen_without_external_io(monkeyp
     assert "Charts" not in tab_labels
     assert "Watchlist" not in tab_labels
     assert "Buy Dashboard" not in tab_labels
+    daily_summary_index = tab_labels.index("Daily Summary")
+    assert tab_labels[daily_summary_index + 1] == "Buy Board"
+    assert window.daily_summary_widget.isAncestorOf(window.health_daily_plan_table)
+    assert not window.health_widget.isAncestorOf(window.health_daily_plan_table)
     assert not hasattr(window, "main_device_button")
     assert not hasattr(window, "buylist_widget")
     assert not hasattr(window, "watchlist_widget")

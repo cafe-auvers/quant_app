@@ -556,6 +556,7 @@ def test_tab_options_normalization_excludes_retired_watchlist_chart_tab():
     options = MainWindow._normalize_tab_options({})
 
     assert options["tradingview"] is True
+    assert options["daily_summary"] is True
     assert "charts" not in options
     assert "intraday_charts" not in options
 
