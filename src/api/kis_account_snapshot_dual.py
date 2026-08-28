@@ -16,7 +16,7 @@ Required .env variables:
     KIS_PROD_APP_SECRET=your_prod_app_secret
     KIS_PROD_ACCOUNT_NO=87654321-01
 
-Optional .env variables:
+Optional non-secret ``config/runtime.local.json`` settings:
 
     KIS_PROD_BASE_URL=https://openapi.koreainvestment.com:9443
 
@@ -56,12 +56,20 @@ from urllib.parse import urlsplit
 import requests
 
 try:
-    from src.utils.config import DEFAULT_KIS_TOKEN_CACHE, ENV_FILE, resolve_repo_path
+    from src.utils.config import (
+        DEFAULT_KIS_TOKEN_CACHE,
+        ENV_FILE,
+        resolve_repo_path,
+    )
 except ModuleNotFoundError:  # Keep direct script execution usable.
     repository_root = Path(__file__).resolve().parents[2]
     if str(repository_root) not in sys.path:
         sys.path.insert(0, str(repository_root))
-    from src.utils.config import DEFAULT_KIS_TOKEN_CACHE, ENV_FILE, resolve_repo_path
+    from src.utils.config import (
+        DEFAULT_KIS_TOKEN_CACHE,
+        ENV_FILE,
+        resolve_repo_path,
+    )
 
 from src.services.kis_request_boundary import (
     defer_kis_requests,
@@ -856,7 +864,7 @@ class KisAccountClient:
         if "INVALID_CHECK_ACNO" in msg1:
             raise KisInvalidAccountError(
                 "KIS rejected the account number/product code. "
-                "Verify the selected KIS account and product code in .env."
+                "Verify the selected KIS account in .env and product code in runtime config."
             )
         transient_domestic_balance_error = bool(
             endpoint == DOMESTIC_BALANCE_ENDPOINT

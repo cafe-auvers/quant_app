@@ -146,7 +146,8 @@ class RestoreBackupDialog(QDialog):
             layout.addWidget(QLabel(
                 "No synced Google Drive folder was found on this machine.\n\n"
                 "Install Google Drive for Desktop and sign in (see "
-                "docs/cloud_backup.md), or set QUANT_BACKUP_DIR in .env to an "
+                "docs/cloud_backup.md), or set QUANT_BACKUP_DIR in "
+                "config/runtime.local.json to an "
                 "explicit path, then reopen this dialog."
             ))
             close_btn = QPushButton("Close")
@@ -611,5 +612,4 @@ class AddFilterDialog(QDialog):
             return
         self.selected_attribute = key
         self.accept()
-
 

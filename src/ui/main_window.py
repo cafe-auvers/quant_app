@@ -1041,11 +1041,11 @@ class MainWindow(
             self._read_authoritative_live_trading_control
         )
 
-        # Automatic cross-machine handoff (laptop <-> PC). Both env flags
+        # Automatic cross-machine handoff (laptop <-> PC). Both runtime flags
         # default OFF -- only the unattended device (the PC, per the deployed
-        # .env) should ever set AUTO_CLAIM_MAIN_ON_HANDOFF, and only after
+        # override) should ever set AUTO_CLAIM_MAIN_ON_HANDOFF, and only after
         # EXPECTED_AUTO_CLAIM_HOSTNAME confirms this is that specific
-        # machine, so a copied .env can't silently arm this elsewhere. The
+        # machine, so a copied config can't silently arm this elsewhere. The
         # laptop deliberately never auto-reclaims on startup. Execution
         # ownership can still be transferred explicitly with the owner controls.
         self._auto_claim_main_enabled = self._handoff_env_flag_true(
@@ -2294,7 +2294,7 @@ class MainWindow(
             return
 
         # Automatic handoff detection: only ever runs on a device explicitly
-        # configured for it (PC's .env only, hostname-guarded), only on a
+        # configured for it (PC runtime override only, hostname-guarded), only on a
         # plain reconcile tick (never re-entering while an activation is
         # already in flight), and never while this device is already main.
         if (
@@ -2721,7 +2721,7 @@ class MainWindow(
 
     @staticmethod
     def _expected_auto_claim_hostname_matches() -> bool:
-        """Cheap insurance against a copy-pasted .env arming this elsewhere.
+        """Cheap insurance against copied runtime config arming this elsewhere.
 
         No ``EXPECTED_AUTO_CLAIM_HOSTNAME`` configured means "not set up for
         auto-claim on this machine" -- fails closed, not open.
@@ -4483,7 +4483,7 @@ class MainWindow(
                 button.setText("LIVE TRADING ● LOCKED OFF")
                 button.setToolTip(
                     "TRADING_ENABLED is blank, false, or invalid in "
-                    ".env/environment; this machine is administratively locked."
+                    "runtime configuration/OS override; this machine is administratively locked."
                 )
                 button.setEnabled(False)
                 button.setStyleSheet(

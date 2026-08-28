@@ -120,7 +120,7 @@ def test_main_loads_repository_env_before_runtime_imports(monkeypatch):
     monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(
         config_module,
-        "load_env_file",
+        "repository_configuration_values",
         lambda: {key: "loaded-before-runtime-import"},
     )
 
@@ -134,7 +134,7 @@ def test_main_does_not_override_explicit_machine_environment(monkeypatch):
     monkeypatch.setenv(key, "machine-value")
     monkeypatch.setattr(
         config_module,
-        "load_env_file",
+        "repository_configuration_values",
         lambda: {key: "file-value"},
     )
 

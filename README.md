@@ -71,7 +71,7 @@ The **Buy Board** is the operator surface for planning and execution. Its cards 
 ## Setup
 
 1. Install the tested dependency graph: `python -m pip install --require-hashes -r requirements.lock`
-2. Configure local database and KIS credentials in `.env` when needed.
+2. Configure private database/KIS credentials in `.env` and non-secret local overrides in `config/runtime.local.json` when needed.
 3. Run the app: `python main.py`
 4. Run tests: `pytest -q`
 
@@ -96,24 +96,24 @@ For live control, handoff, Buy Today publishing, and the distinction between
 
 ## Configuration
 
-Database and API credentials are local-only and belong in `.env` (gitignored, never commit it). See `.env.example` for the full list of variables to fill in, covering MySQL connection settings, KIS broker API credentials, and optional integration keys.
+Database/API credentials and private tokens are local-only and belong in `.env` (gitignored, never commit it). Non-secret hosts, ports, feature flags, limits, timing, and paths live in tracked `config/runtime.json`; workstation-specific overrides belong in gitignored `config/runtime.local.json`.
 
-Every `python main.py` startup synchronizes `.env` with the latest tracked
-`.env.example` before configuration is loaded. Existing private values always
-win, new keys receive their template defaults, template comments/order are
-refreshed, and machine-local extra keys are retained. The same pass regenerates
-`.env.pc`, preserving every non-MySQL value from `.env` and blanking every
-`MYSQL_*` value for manual PC configuration. Run
+Every `python main.py` startup synchronizes `.env` with the credential-only
+`.env.example` before configuration is loaded. Existing private values win,
+new credential keys are added, and recognized legacy runtime keys are moved
+without value changes to `config/runtime.local.json`. The same pass regenerates
+the credential-only `.env.pc` and blanks every `MYSQL_*` credential for manual
+PC configuration. Run
 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\sync_pc_env.ps1`
 when you want to apply the synchronization immediately without starting the
 app.
 
 The PC morning routine runs this synchronization immediately after its Git
-update, so a newly pulled `.env.example` is applied before refresh or app
-startup. Both `.env` and `.env.pc` remain gitignored: Git carries only the
-non-secret template, never private values. The application reads `.env`; use
-`.env.pc` only as the initial PC setup copy, then keep the PC's configured
-`.env` in place.
+update, so newly pulled credential and runtime schemas are applied before
+refresh or app startup. `.env`, `.env.pc`, and `config/runtime.local.json`
+remain gitignored. The application combines private credentials with tracked
+runtime defaults and local runtime overrides; use `.env.pc` only as the initial
+PC credential setup copy.
 
 Only enable KIS intraday after the endpoint, TR ID, request parameters, output field, and raw OHLCV field mappings have been verified.
 

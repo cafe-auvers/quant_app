@@ -34,8 +34,22 @@ def load_env_defaults(path: Path) -> dict[str, str]:
     return values
 
 
+def load_runtime_defaults(path: Path) -> dict[str, str]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("runtime defaults must be a JSON object")
+    return {
+        str(key): ("true" if value is True else "false" if value is False else str(value))
+        for key, value in payload.items()
+    }
+
+
 def activation_snapshot(path: Path) -> dict[str, str]:
-    values = load_env_defaults(path)
+    values = (
+        load_runtime_defaults(path)
+        if path.suffix.lower() == ".json"
+        else load_env_defaults(path)
+    )
     return {key: values.get(key, "<missing>") for key in ACTIVATION_DEFAULTS}
 
 
@@ -205,7 +219,7 @@ def run_gate1(*, root: Path, output: Path, model_seed: int) -> int:
         completed = subprocess.run(command, cwd=root, env=env, check=False)
         scenarios, test_violations = parse_junit(junit_path)
 
-    activation = activation_snapshot(root / ".env.example")
+    activation = activation_snapshot(root / "config" / "runtime.json")
     report = build_report(
         commit_sha=_git_sha(root),
         model_seed=model_seed,

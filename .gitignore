@@ -50,6 +50,7 @@ wheels/
 *.token
 .secrets/
 config/kis_config.py
+config/runtime.local.json
 .kis_token_cache*.json
 
 # Data

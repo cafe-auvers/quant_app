@@ -13,13 +13,11 @@ if str(ROOT) not in sys.path:
 
 from src.services.kis_ws_symbol_keys import (  # noqa: E402
     DEFAULT_KIS_WS_SYMBOL_KEYS_FILE,
-    LEGACY_SYMBOL_KEYS_ENV,
     KisWsSymbolKeyStore,
     KisWsSymbolKeysError,
     read_symbol_keys_file,
     update_symbol_keys_file,
 )
-from src.utils.config import get_env_value  # noqa: E402
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -46,18 +44,11 @@ def _parser() -> argparse.ArgumentParser:
     remove_parser = commands.add_parser("remove", help="remove one symbol mapping")
     remove_parser.add_argument("symbol")
 
-    commands.add_parser(
-        "migrate-env",
-        help=(
-            f"copy {LEGACY_SYMBOL_KEYS_ENV} into the separate file without "
-            "modifying either environment file"
-        ),
-    )
     return parser
 
 
 def _summary(path: Path, keys: dict[str, str]) -> str:
-    snapshot = KisWsSymbolKeyStore(path, legacy_json="{}").snapshot()
+    snapshot = KisWsSymbolKeyStore(path).snapshot()
     return (
         f"{len(keys)} symbol key(s); file={path.resolve()}; "
         f"sha256={snapshot.sha256}"
@@ -93,26 +84,6 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 "A currently ACKed channel keeps its last-known-good key until the "
                 "symbol leaves the active board."
-            )
-            return 0
-        if args.command == "migrate-env":
-            from src.services.kis_ws_symbol_keys import parse_legacy_symbol_keys
-
-            legacy = parse_legacy_symbol_keys(
-                str(get_env_value(LEGACY_SYMBOL_KEYS_ENV, "{}") or "{}")
-            )
-            if not legacy:
-                raise KisWsSymbolKeysError(
-                    f"{LEGACY_SYMBOL_KEYS_ENV} is empty; nothing to migrate"
-                )
-            keys = update_symbol_keys_file(
-                set_values=legacy,
-                path=path,
-                refuse_conflicts=True,
-            )
-            print(_summary(path, keys))
-            print(
-                f"Migration copied {len(legacy)} key(s). .env and .env.pc were not modified."
             )
             return 0
     except (FileNotFoundError, KisWsSymbolKeysError, OSError, TimeoutError) as exc:

@@ -199,7 +199,7 @@ def test_intraday_symbol_key_addition_subscribes_without_restarting_or_disruptin
 
     path = tmp_path / "kis_ws_symbol_keys.json"
     write_symbol_keys_file({"AAPL": "DAAPL"}, path)
-    store = KisWsSymbolKeyStore(path, legacy_json="{}")
+    store = KisWsSymbolKeyStore(path)
     service, transport = _service(
         symbol_key_resolver=lambda symbol, _channel: store.resolve(symbol)
     )
@@ -242,7 +242,6 @@ def test_intraday_plan_addition_provisions_key_from_kis_master_and_subscribes(
     )
     store = KisWsSymbolKeyStore(
         key_path,
-        legacy_json="{}",
         universe_path=master_path,
         auto_provision=True,
     )
@@ -278,7 +277,7 @@ def test_canonical_buy_today_key_handoff_materializes_missing_executor_file(tmp_
     )
 
     path = tmp_path / "kis_ws_symbol_keys.json"
-    store = KisWsSymbolKeyStore(path, legacy_json="{}")
+    store = KisWsSymbolKeyStore(path)
     service, transport = _service(
         symbol_key_resolver=lambda symbol, _channel: store.resolve(symbol),
         symbol_key_store=store,
@@ -305,7 +304,7 @@ def test_canonical_buy_today_key_handoff_never_overwrites_local_conflict(tmp_pat
 
     path = tmp_path / "kis_ws_symbol_keys.json"
     write_symbol_keys_file({"LUNG": "LOCAL_REVIEWED"}, path)
-    store = KisWsSymbolKeyStore(path, legacy_json="{}")
+    store = KisWsSymbolKeyStore(path)
     service, _ = _service(
         symbol_key_resolver=lambda symbol, _channel: store.resolve(symbol),
         symbol_key_store=store,
@@ -330,7 +329,7 @@ def test_intraday_removal_does_not_tear_down_an_acked_active_symbol(tmp_path):
 
     path = tmp_path / "kis_ws_symbol_keys.json"
     write_symbol_keys_file({"AAPL": "DAAPL"}, path)
-    store = KisWsSymbolKeyStore(path, legacy_json="{}")
+    store = KisWsSymbolKeyStore(path)
     service, transport = _service(
         symbol_key_resolver=lambda symbol, _channel: store.resolve(symbol)
     )
@@ -362,7 +361,7 @@ def test_intraday_active_key_change_waits_until_symbol_leaves_board(tmp_path):
 
     path = tmp_path / "kis_ws_symbol_keys.json"
     write_symbol_keys_file({"AAPL": "DAAPL"}, path)
-    store = KisWsSymbolKeyStore(path, legacy_json="{}")
+    store = KisWsSymbolKeyStore(path)
     service, transport = _service(
         trade_capacity=2,
         quote_capacity=0,

@@ -99,8 +99,8 @@ git rev-parse HEAD
 It must describe the clean checkout actually running on the device and match
 the reviewed capability manifest and exact-head Gate-1 evidence. A new commit,
 even documentation-only, creates a new SHA and makes an older exact-commit
-approval inapplicable. Never commit `.env` or capability evidence containing
-private data.
+approval inapplicable. Never commit `config/runtime.local.json` or capability
+evidence containing private data.
 
 ## Before a live session
 

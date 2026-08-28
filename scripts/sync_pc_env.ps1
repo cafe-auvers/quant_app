@@ -2,7 +2,9 @@
 param(
     [string]$SourceEnv,
     [string]$DestinationEnv,
-    [string]$TemplateEnv
+    [string]$TemplateEnv,
+    [string]$RuntimeDefaults,
+    [string]$RuntimeLocal
 )
 
 Set-StrictMode -Version Latest
@@ -18,10 +20,18 @@ if ([string]::IsNullOrWhiteSpace($DestinationEnv)) {
 if ([string]::IsNullOrWhiteSpace($TemplateEnv)) {
     $TemplateEnv = Join-Path $repoRoot ".env.example"
 }
+if ([string]::IsNullOrWhiteSpace($RuntimeDefaults)) {
+    $RuntimeDefaults = Join-Path $repoRoot "config\runtime.json"
+}
+if ([string]::IsNullOrWhiteSpace($RuntimeLocal)) {
+    $RuntimeLocal = Join-Path $repoRoot "config\runtime.local.json"
+}
 
 $sourcePath = [System.IO.Path]::GetFullPath($SourceEnv)
 $destinationPath = [System.IO.Path]::GetFullPath($DestinationEnv)
 $templatePath = [System.IO.Path]::GetFullPath($TemplateEnv)
+$runtimeDefaultsPath = [System.IO.Path]::GetFullPath($RuntimeDefaults)
+$runtimeLocalPath = [System.IO.Path]::GetFullPath($RuntimeLocal)
 
 if ([string]::Equals($sourcePath, $destinationPath, [System.StringComparison]::OrdinalIgnoreCase)) {
     throw "SourceEnv and DestinationEnv must be different files."
@@ -42,7 +52,8 @@ if (Test-Path -LiteralPath $venvPython -PathType Leaf) {
 }
 
 $syncScript = Join-Path $repoRoot "scripts\sync_env_files.py"
-& $pythonExe $syncScript --template $templatePath --env $sourcePath --pc-env $destinationPath
+& $pythonExe $syncScript --template $templatePath --env $sourcePath --pc-env $destinationPath `
+    --runtime-defaults $runtimeDefaultsPath --runtime-local $runtimeLocalPath
 if ($LASTEXITCODE -ne 0) {
     throw "Environment synchronization exited with code $LASTEXITCODE."
 }

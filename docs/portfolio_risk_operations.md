@@ -23,8 +23,8 @@ and [FINRA brokerage-account guidance](https://www.finra.org/investors/investing
 
 ## Operating profiles
 
-These profiles use the existing environment settings and are **not** written to
-`.env` or `.env.pc` by the application. Existing operator values always win;
+These profiles use non-secret runtime settings in `config/runtime.json` plus
+the workstation's `config/runtime.local.json`. Existing operator overrides win;
 promotion is an explicit configuration decision, never a silent migration.
 
 | Setting | Controlled Live pilot | Full Live starting profile |

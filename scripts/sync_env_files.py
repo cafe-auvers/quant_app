@@ -1,8 +1,8 @@
-"""Synchronize gitignored environment files with ``.env.example``.
+"""Synchronize private credentials and non-secret runtime configuration.
 
-Existing values in ``.env`` are preserved.  Missing settings receive the
-tracked template defaults, and ``.env.pc`` is regenerated with blank
-``MYSQL_*`` values.
+Known operational settings are migrated from legacy ``.env`` files to
+``config/runtime.local.json`` without changing their values. ``.env.pc`` is
+regenerated from the credential-only ``.env`` with blank ``MYSQL_*`` values.
 """
 from __future__ import annotations
 
@@ -23,10 +23,26 @@ def main() -> int:
     parser.add_argument("--template", type=Path, default=REPO_ROOT / ".env.example")
     parser.add_argument("--env", type=Path, default=REPO_ROOT / ".env")
     parser.add_argument("--pc-env", type=Path, default=REPO_ROOT / ".env.pc")
+    parser.add_argument(
+        "--runtime-defaults",
+        type=Path,
+        default=REPO_ROOT / "config" / "runtime.json",
+    )
+    parser.add_argument(
+        "--runtime-local",
+        type=Path,
+        default=REPO_ROOT / "config" / "runtime.local.json",
+    )
     args = parser.parse_args()
 
     try:
-        result = synchronize_environment_files(args.template, args.env, args.pc_env)
+        result = synchronize_environment_files(
+            args.template,
+            args.env,
+            args.pc_env,
+            args.runtime_defaults,
+            args.runtime_local,
+        )
     except (OSError, ValueError) as exc:
         print(f"Environment synchronization failed: {exc}", file=sys.stderr)
         return 1
@@ -37,7 +53,10 @@ def main() -> int:
         f"Environment sync complete: .env {env_status}; .env.pc {pc_status}; "
         f"{result.template_key_count} template keys; "
         f"{len(result.added_env_keys)} added to .env; "
-        f"{result.mysql_values_blanked} MYSQL_* values blanked in .env.pc."
+        f"{len(result.migrated_runtime_keys)} runtime keys migrated; "
+        "runtime.local.json "
+        f"{'updated' if result.runtime_local_changed else 'current'}; "
+        f"{result.mysql_values_blanked} MYSQL_* credentials blanked in .env.pc."
     )
     return 0
 

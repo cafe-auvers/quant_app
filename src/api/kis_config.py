@@ -6,26 +6,16 @@ scripts working without storing API credentials in source code.
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import Optional
+
+from src.utils.config import install_repository_configuration
 
 
 DEFAULT_KIS_BASE_URL = "https://openapi.koreainvestment.com:9443"
 
 
 def _load_dotenv_file() -> None:
-    env_path = Path(__file__).resolve().parents[2] / ".env"
-    if not env_path.exists():
-        return
-
-    for line in env_path.read_text(encoding="utf-8-sig").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        os.environ.setdefault(key, value)
+    install_repository_configuration()
 
 
 def _env(name: str, fallback_name: Optional[str] = None, default: str = "") -> str:

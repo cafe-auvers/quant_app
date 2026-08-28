@@ -130,7 +130,7 @@ def test_health_displays_effective_runtime_portfolio_limits(monkeypatch):
     assert check.summary == (
         "Effective: 30 positions, 20% open risk, 1000% gross notional"
     )
-    assert "environment overrides" in check.detail
+    assert "runtime configuration overrides" in check.detail
 
 
 def test_health_surfaces_invalid_entry_configuration_as_critical(monkeypatch):

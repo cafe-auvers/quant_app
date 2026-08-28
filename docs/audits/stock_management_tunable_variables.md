@@ -8,6 +8,10 @@ Phase: discovery and classification only
 
 The executable correctness findings from this audit have now been addressed:
 
+- non-secret operational settings were moved from `.env`/`.env.pc` to tracked
+  `config/runtime.json` plus gitignored `config/runtime.local.json`; environment
+  files are credential-only, and WebSocket symbols have no environment fallback;
+
 - Trade Cards persist an explicit `risk_unit=fraction`; their default is
   `0.01`, legacy Buylist percentage points are converted at the migration
   boundary, and unmarked already-persisted cards receive a one-time compatible

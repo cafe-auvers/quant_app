@@ -190,7 +190,8 @@ flowchart LR
         direction TB
         Json[(data/*.json\nstate, queue, legacy order ledger, drawings,\ntrade-card recovery snapshot)]
         Rulebooks[rulebooks/*.md]
-        Env[.env\nlocal secrets and settings]
+        Env[.env\nlocal credentials only]
+        RuntimeConfig[config/runtime.json + runtime.local.json\nnon-secret operational settings]
         Mirror[(data/local_mirror.db\noffline SQLite mirror)]
         DeviceRole[data/device_role.json\ndevice id and main/pull-only role]
         Historical[historical.py\nstandalone 1D/1H refresh process]
@@ -214,6 +215,7 @@ flowchart LR
     Services <--> Json
     Core --> Rulebooks
     Utils --> Env
+    Utils --> RuntimeConfig
     Utils <--> Mirror
     Services --> DeviceRole
     Services -. launches/monitors .-> Historical
@@ -419,7 +421,7 @@ Most workers live in `src/ui/workers.py`; KIS order submission/query/cancel and 
 | `src/services/intraday_provider.py` | Provider-neutral request/result contracts and OHLCV normalization/resampling helpers |
 | `src/services/intraday_data_service.py` | KIS-first intraday orchestration, yfinance fallback, and best-source cache loading |
 | `src/services/kis_intraday_provider.py` | KIS intraday provider wrapper using production account config |
-| `src/services/kis_ws_symbol_keys.py` | Gitignored, atomically updated KIS WebSocket symbol-key store with strict validation, read-only legacy environment import, last-known-good recovery, and intraday hot reload; normal operation never stores the map in `.env` or `.env.pc` |
+| `src/services/kis_ws_symbol_keys.py` | Gitignored, atomically updated KIS WebSocket symbol-key store with strict validation, last-known-good recovery, and intraday hot reload; process environment values are never consulted for symbols |
 | `src/services/yfinance_intraday_provider.py` | yfinance intraday fallback provider preserving existing retry behavior |
 | `src/services/order_ledger.py` | Persistent local order ledger stored at `data/orders.json` |
 | `src/services/trading_state.py` | Process projection of Live Trading: `TRADING_ENABLED` is the per-machine administrative lock, while the desktop attaches a fail-closed provider for the durable shared ON/OFF control at broker boundaries |
@@ -643,7 +645,7 @@ Source priority for cached ORB/chart reads:
 2. `source="yfinance"`
 3. legacy/unfiltered rows for backward compatibility
 
-KIS intraday is disabled by default. `src/api/kis_intraday.py` does not hardcode unverified endpoint paths, TR IDs, raw output names, or raw OHLCV field names. Enabling it requires explicit `.env` endpoint/TR ID/field mappings verified from official KIS documentation or a successful manual API test.
+KIS intraday is disabled by default. `src/api/kis_intraday.py` does not hardcode unverified endpoint paths, TR IDs, raw output names, or raw OHLCV field names. Enabling it requires explicit `config/runtime.local.json` endpoint/TR ID/field mappings verified from official KIS documentation or a successful manual API test.
 
 `src/strategy/orb/` remains source-agnostic. It consumes normalized `Open`, `High`, `Low`, `Close`, `Volume` DataFrames for the existing 1m, 5m, and 30m live windows. `src/core/orb.py` retains compatible imports and resampling helpers for existing callers.
 
@@ -656,7 +658,7 @@ KIS intraday is disabled by default. `src/api/kis_intraday.py` does not hardcode
 | `src/api/kis_intraday.py` | Configuration-gated KIS intraday adapter and raw-row normalization |
 | `src/api/kis_order.py` | Overseas regular-order and broker-held reservation submission/query/cancel wrappers |
 | `src/api/kis_order_status.py` | Explicit placeholders for direct order status/cancel endpoints until verified TR IDs are implemented |
-| `src/api/kis_config.py` | Compatibility loader for legacy PROD env variable access |
+| `src/api/kis_config.py` | Compatibility loader that combines private PROD credentials with non-secret runtime configuration |
 
 KIS credentials are loaded from `.env`, for example:
 
@@ -824,7 +826,7 @@ Runtime configuration is environment-driven:
 | `QUANT_BACKUP_DIR` | `src/services/cloud_backup.py`, `src/services/env_backup.py` | Optional offsite backup target folder (see [Cloud Backup](#cloud-backup)) |
 | `OPENAI_API_KEY` | `src/core/scoring.py` | Legacy/non-UI scoring integration |
 
-The `.env` file is local-only and ignored by git. See `.env.example` for the full list of variables with placeholder values. `config/template_config.py` remains a non-secret example configuration file for the legacy `kis_config.py` loader.
+The `.env` file is local-only, ignored by Git, and credential-only. See `.env.example` for its private keys. Tracked `config/runtime.json` contains fail-closed non-secret defaults; gitignored `config/runtime.local.json` holds workstation overrides and is populated automatically from recognized legacy `.env` settings.
 
 ## Tests
 
@@ -845,7 +847,7 @@ Kanban coverage includes pure transitions and card serialization, optimistic rep
 
 ## Production Safety Notes
 
-- Keep secrets out of source. `.env` and `.kis_token_cache*.json` are local runtime files.
+- Keep secrets out of source. `.env` contains credentials only; `.kis_token_cache*.json` and `config/runtime.local.json` are also local runtime files.
 - Guarded order submission is gated by two Live Trading layers. The local
   `TRADING_ENABLED` value is a per-machine one-way lock; blank, falsy, or
   malformed values lock that machine off. A truthy value only permits the
