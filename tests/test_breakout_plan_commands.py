@@ -235,6 +235,147 @@ def test_passive_buylist_target_can_be_planned_during_market_hours(engine):
     assert result.card.entry_runtime_status is None
 
 
+@pytest.mark.parametrize(
+    "closed_runtime_status",
+    [PositionRuntimeStatus.CLOSED, PositionRuntimeStatus.NONE],
+)
+def test_flat_closed_card_breakout_starts_a_fresh_buylist_cycle(
+    engine, closed_runtime_status
+):
+    card = _seed(
+        engine,
+        board_status=BoardStatus.CLOSED,
+        breakout_price=100.0,
+        buffer_pct=0.002,
+        position_runtime_status=closed_runtime_status,
+        average_entry_price=98.5,
+        stop_type="MANUAL_PRICE",
+        active_stop_price=90.0,
+        stop_quantity=5,
+        entry_attempt_group_id="completed-entry-group",
+        entry_attempt_count=1,
+        entry_client_order_id="completed-cycle-entry",
+        return_to_buylist_after_close=True,
+        warnings=["STOP_REQUIRED"],
+    )
+    record_execution_order(
+        engine,
+        ExecutionOrderRecord(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            intent=OrderIntent.ENTRY,
+            client_order_id="completed-cycle-entry",
+            broker_order_id="completed-cycle-broker-order",
+            broker_identity_status=BrokerIdentityStatus.EXACT,
+            status=ExecutionOrderStatus.FILLED,
+            submitted_quantity=5,
+            filled_quantity=5,
+            remaining_quantity=0,
+            average_fill_price=98.5,
+        ),
+    )
+
+    result = request_board_action(
+        engine,
+        _set(card, price=102.0, buffer_pct=0.01),
+        context=_context(market_open=True),
+    )
+
+    assert result.card.board_status == BoardStatus.BUYLIST
+    assert result.card.previous_board_status == BoardStatus.CLOSED
+    assert result.card.breakout_price == 102.0
+    assert result.card.buffer_pct == pytest.approx(0.01)
+    assert result.card.buylist_member is True
+    assert result.card.position_runtime_status == PositionRuntimeStatus.NONE
+    assert result.card.broker_quantity == 0
+    assert result.card.orderable_quantity == 0
+    assert result.card.average_entry_price == 0.0
+    assert result.card.stop_type is None
+    assert result.card.active_stop_price is None
+    assert result.card.stop_quantity == 0
+    assert result.card.entry_attempt_group_id == ""
+    assert result.card.entry_client_order_id == ""
+    assert result.card.return_to_buylist_after_close is False
+    assert result.card.warnings == []
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        {"broker_quantity": 1},
+        {"orderable_quantity": 1},
+        {"position_runtime_status": PositionRuntimeStatus.OPEN},
+        {"entry_submission_unresolved": True},
+        {"entry_cancel_in_flight": True},
+        {"entry_remaining_target_quantity": 1},
+        {"pending_stop_price": 90.0},
+        {"exit_submission_unresolved": True},
+        {"exit_cancel_in_flight": True},
+        {"capital_reservation_id": "reservation-1"},
+    ],
+)
+def test_closed_card_with_unresolved_cycle_state_cannot_restart(engine, evidence):
+    card = _seed(
+        engine,
+        board_status=BoardStatus.CLOSED,
+        breakout_price=100.0,
+        **evidence,
+    )
+
+    with pytest.raises(BoardCommandRejectedError, match="from CLOSED while"):
+        request_board_action(
+            engine,
+            _set(card, price=102.0),
+            context=_context(),
+        )
+
+    stored = card_repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert stored.board_status == BoardStatus.CLOSED
+    assert stored.breakout_price == 100.0
+
+
+def test_closed_card_with_active_owned_order_cannot_restart(engine):
+    card = _seed(
+        engine,
+        board_status=BoardStatus.CLOSED,
+        breakout_price=100.0,
+    )
+    record_execution_order(
+        engine,
+        ExecutionOrderRecord(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            intent=OrderIntent.ENTRY,
+            client_order_id="still-working-entry",
+            submitted_quantity=5,
+            filled_quantity=0,
+            remaining_quantity=5,
+        ),
+    )
+
+    with pytest.raises(BoardCommandRejectedError, match="order is still active"):
+        request_board_action(
+            engine,
+            _set(card, price=102.0),
+            context=_context(),
+        )
+
+
+def test_closed_card_breakout_clear_remains_rejected(engine):
+    card = _seed(
+        engine,
+        board_status=BoardStatus.CLOSED,
+        breakout_price=100.0,
+    )
+
+    with pytest.raises(BoardCommandRejectedError, match="from CLOSED"):
+        request_board_action(engine, _clear(card), context=_context())
+
+
 def test_buy_today_breakout_can_be_revised_during_market_hours(engine):
     card = _seed(
         engine,
