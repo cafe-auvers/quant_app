@@ -151,7 +151,7 @@ def test_live_execution_queue_uses_strategy_plugin_not_legacy_orb_helpers():
     assert "ORBStrategy(" in source
 
 
-def test_live_queue_fails_closed_when_strategy_emits_no_entry_signal(monkeypatch):
+def test_live_queue_waits_for_event_breakout_instead_of_snapshot_signal(monkeypatch):
     class MissingSignalORBStrategy(ORBStrategy):
         def evaluate(self, market, portfolio):
             evaluation = super().evaluate(market, portfolio)
@@ -173,6 +173,6 @@ def test_live_queue_fails_closed_when_strategy_emits_no_entry_signal(monkeypatch
         stop_loss=99.0,
     )
 
-    assert candidate.valid is False
-    assert candidate.status == execution_queue.OrbCandidateStatus.REJECTED
-    assert candidate.reason == "ORB strategy did not emit an entry signal"
+    assert candidate.valid is True
+    assert candidate.status == execution_queue.OrbCandidateStatus.WAITING_BREAKOUT
+    assert candidate.breakout_confirmed is False

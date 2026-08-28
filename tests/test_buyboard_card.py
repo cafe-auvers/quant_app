@@ -63,6 +63,18 @@ def test_pnl_percent_zero_when_no_average_entry_price():
     assert _pnl_percent(card, 150.0) == 0.0
 
 
+def test_open_position_exposes_actual_risk_from_filled_generation_orl():
+    card = _open_card(
+        average_entry_price=102.0,
+        broker_quantity=10,
+        entry_orb_low=96.0,
+    )
+
+    rows = dict(_card_metric_rows(card, 103.0))
+
+    assert rows["Actual Risk"] == "$60"
+
+
 def test_card_widget_renders_without_crashing_with_a_live_price():
     _ensure_app()
     card = _open_card()

@@ -85,7 +85,7 @@ def test_1m_candidate_becomes_available_first_and_is_selected():
     )
 
     assert item.selected_window == "1m"
-    assert item.status == ExecutionQueueStatus.EXECUTE_READY
+    assert item.status == ExecutionQueueStatus.ARMED
 
 
 def test_5m_candidate_replaces_1m_when_score_improves_by_margin():
@@ -171,7 +171,7 @@ def test_missing_manual_breakout_price_prevents_execute_ready():
     assert "Manual breakout price" in candidate.reason
 
 
-def test_valid_completed_orb_is_execute_ready_before_price_reaches_orb_high():
+def test_valid_completed_orb_waits_for_reliable_breakout_event():
     manager = ExecutionQueueManager()
     waiting = build_orb_candidate(
         symbol="AAPL",
@@ -185,12 +185,12 @@ def test_valid_completed_orb_is_execute_ready_before_price_reaches_orb_high():
     )
     item = manager.upsert_item(symbol="AAPL", candidates={"1m": waiting})
 
-    assert waiting.status == OrbCandidateStatus.EXECUTE_READY
+    assert waiting.status == OrbCandidateStatus.WAITING_BREAKOUT
     assert waiting.entry_trigger == pytest.approx(waiting.orb_high)
-    assert item.status == ExecutionQueueStatus.EXECUTE_READY
+    assert item.status == ExecutionQueueStatus.ARMED
 
 
-def test_current_price_above_entry_trigger_with_valid_risk_is_execute_ready():
+def test_snapshot_current_price_does_not_infer_breakout_confirmation():
     candidate = build_orb_candidate(
         symbol="AAPL",
         window="1m",
@@ -202,7 +202,7 @@ def test_current_price_above_entry_trigger_with_valid_risk_is_execute_ready():
         adr_percent=5.0,
     )
 
-    assert candidate.status == OrbCandidateStatus.EXECUTE_READY
+    assert candidate.status == OrbCandidateStatus.WAITING_BREAKOUT
     assert candidate.valid is True
     assert candidate.shares >= 1
     assert candidate.source_session_date == "2026-07-01"
@@ -248,7 +248,7 @@ def test_terminal_rejection_proof_survives_queue_round_trip():
     assert restored.get_item("AAPL", "PROD").candidates["1m"].terminal_rejection
 
 
-def test_orb_high_must_clear_buffered_breakout_trigger():
+def test_breakout_buffer_does_not_change_finalized_passive_zone():
     candidate = build_orb_candidate(
         symbol="AAPL",
         window="1m",
@@ -260,9 +260,11 @@ def test_orb_high_must_clear_buffered_breakout_trigger():
         adr_percent=5.0,
     )
 
-    assert candidate.status == OrbCandidateStatus.REJECTED
-    assert candidate.valid is False
-    assert "has not cleared breakout trigger" in candidate.reason
+    assert candidate.status == OrbCandidateStatus.WAITING_BREAKOUT
+    assert candidate.valid is True
+    assert candidate.breakout_trigger == pytest.approx(
+        max(candidate.breakout_price, candidate.orb_high)
+    )
 
 
 def test_after_order_submission_selected_window_is_locked():
@@ -395,7 +397,7 @@ def test_order_failure_unlocks_selected_candidate_for_retry():
     assert item.locked is False
     assert item.order_status == "REJECTED"
     assert item.selected_window == "1m"
-    assert item.status == ExecutionQueueStatus.EXECUTE_READY
+    assert item.status == ExecutionQueueStatus.ARMED
 
 
 def test_execution_queue_serializes_enum_values_round_trip():
@@ -508,9 +510,9 @@ def test_duplicate_pending_or_submitted_orders_are_prevented():
 
     assert manager.has_pending_or_submitted_order("AAPL") is True
     assert manager.has_pending_or_submitted_order("AAPL", environment="PROD") is True
-    assert duplicate_candidate.status == OrbCandidateStatus.REJECTED
+    assert duplicate_candidate.status == OrbCandidateStatus.WAITING_BREAKOUT
     assert duplicate_candidate.terminal_rejection is False
-    assert "Duplicate" in duplicate_candidate.reason
+    assert duplicate_candidate.valid is True
 
 
 @pytest.mark.parametrize("account_size", [None, 0.0, float("nan")])
@@ -530,7 +532,7 @@ def test_missing_or_zero_sizing_equity_never_proves_terminal_rejection(account_s
     assert candidate.terminal_rejection is False
 
 
-def test_missing_current_price_never_proves_terminal_rejection():
+def test_missing_current_price_keeps_structural_candidate_waiting():
     candidate = build_orb_candidate(
         symbol="AAPL",
         window="1m",
@@ -542,7 +544,7 @@ def test_missing_current_price_never_proves_terminal_rejection():
         adr_percent=5.0,
     )
 
-    assert candidate.status == OrbCandidateStatus.RISK_INVALID
+    assert candidate.status == OrbCandidateStatus.WAITING_BREAKOUT
     assert candidate.terminal_rejection is False
 
 
@@ -684,7 +686,7 @@ def test_stop_adr_validation_follows_existing_thresholds():
     )
 
     assert too_tight.status == OrbCandidateStatus.RISK_INVALID
-    assert valid.status == OrbCandidateStatus.EXECUTE_READY
+    assert valid.status == OrbCandidateStatus.WAITING_BREAKOUT
     assert too_wide.status == OrbCandidateStatus.RISK_INVALID
 
 
@@ -720,9 +722,9 @@ def test_capital_allocation_auto_selects_valid_supported_risk_case():
         adr_percent=5.0,
     )
 
-    assert too_low.status == OrbCandidateStatus.EXECUTE_READY
-    assert valid.status == OrbCandidateStatus.EXECUTE_READY
-    assert too_high.status == OrbCandidateStatus.EXECUTE_READY
+    assert too_low.status == OrbCandidateStatus.WAITING_BREAKOUT
+    assert valid.status == OrbCandidateStatus.WAITING_BREAKOUT
+    assert too_high.status == OrbCandidateStatus.WAITING_BREAKOUT
     assert 0.0025 <= too_low.risk_percent <= 0.02
     assert 0.0025 <= valid.risk_percent <= 0.02
     assert 0.0025 <= too_high.risk_percent <= 0.02

@@ -35,6 +35,12 @@ from src.core.execution_queue import (
     ExecutionQueueItem,
     OrbCandidateStatus,
 )
+from src.core.orb_entry_logic import (
+    ORB_SCORE_VERSION,
+    is_later_timeframe,
+    passive_entry_prices,
+    score_strictly_higher,
+)
 from src.core.trade_card_state import BoardStatus, EntryRuntimeStatus, TradeCardState
 from src.utils.market_calendar import (
     is_nyse_trading_day,
@@ -88,6 +94,18 @@ def _positive_float(value) -> float | None:
     return number if math.isfinite(number) and number > 0 else None
 
 
+def _optional_utc_datetime(value) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _complete_candidate_for_card(
     card: TradeCardState,
     execution_queue_item: ExecutionQueueItem,
@@ -96,30 +114,40 @@ def _complete_candidate_for_card(
     """Validate one persisted candidate before a live event can select it."""
 
     window = str(getattr(candidate, "window", "") or "").strip()
+    execution_price = _positive_float(
+        getattr(candidate, "execution_price", None)
+        or getattr(candidate, "entry_trigger", None)
+    )
+    orb_high = _positive_float(getattr(candidate, "orb_high", None))
+    orb_low = _positive_float(getattr(candidate, "orb_low", None))
+    candidate_breakout = _positive_float(
+        getattr(candidate, "breakout_price", None)
+    )
+    queue_breakout = _positive_float(execution_queue_item.breakout_price)
+    card_breakout = _positive_float(card.breakout_price)
+    if None in {
+        execution_price,
+        orb_high,
+        orb_low,
+        candidate_breakout,
+        queue_breakout,
+        card_breakout,
+    }:
+        return False
     try:
-        trigger = float(getattr(candidate, "entry_trigger", None))
-        orb_high = float(getattr(candidate, "orb_high", None))
-        orb_low = float(getattr(candidate, "orb_low", None))
-        candidate_breakout = float(getattr(candidate, "breakout_price", None))
-        queue_breakout = float(getattr(execution_queue_item, "breakout_price", None))
-        card_breakout = float(card.breakout_price)
-        buffer_pct = float(card.buffer_pct)
         shares = int(getattr(candidate, "shares", 0) or 0)
     except (TypeError, ValueError, OverflowError):
         return False
-    if not all(
-        math.isfinite(value)
-        for value in (
-            trigger,
-            orb_high,
-            orb_low,
-            candidate_breakout,
-            queue_breakout,
-            card_breakout,
-            buffer_pct,
-        )
-    ):
-        return False
+    assert execution_price is not None
+    assert orb_high is not None and orb_low is not None
+    assert candidate_breakout is not None
+    assert queue_breakout is not None and card_breakout is not None
+    floor, breakout_trigger, normalized_execution, reason = passive_entry_prices(
+        breakout_price=candidate_breakout,
+        orb_high=orb_high,
+        orb_low=orb_low,
+        execution_price=execution_price,
+    )
     return bool(
         window in SUPPORTED_ORB_WINDOWS
         and getattr(candidate, "status", None)
@@ -128,14 +156,16 @@ def _complete_candidate_for_card(
             OrbCandidateStatus.VALID,
             OrbCandidateStatus.EXECUTE_READY,
         }
-        and trigger > 0
+        and execution_price > 0
         and orb_high > 0
         and orb_low > 0
         and candidate_breakout > 0
         and queue_breakout > 0
         and card_breakout > 0
-        and 0.0 <= buffer_pct <= 1.0
-        and math.isclose(trigger, orb_high, rel_tol=1e-9, abs_tol=1e-6)
+        and not reason
+        and floor is not None
+        and breakout_trigger is not None
+        and normalized_execution is not None
         and math.isclose(
             candidate_breakout,
             queue_breakout,
@@ -148,8 +178,7 @@ def _complete_candidate_for_card(
             rel_tol=1e-9,
             abs_tol=1e-6,
         )
-        and orb_high > card_breakout * (1.0 + buffer_pct)
-        and orb_low < trigger
+        and bool(getattr(candidate, "range_closed_at", None))
         and shares > 0
     )
 
@@ -177,6 +206,19 @@ def _clear_entry_plan(
     card.entry_orb_high = None
     card.entry_orb_low = None
     card.entry_trigger = None
+    card.entry_execution_price = None
+    card.entry_execution_price_manual = False
+    card.entry_floor_price = None
+    card.entry_breakout_trigger = None
+    card.entry_orb_score = None
+    card.entry_score_version = ""
+    card.entry_range_closed_at = None
+    card.entry_breakout_confirmed_at = None
+    card.entry_candidate_created_at = None
+    card.orb_candidate_states = {}
+    card.pending_entry_replacement = {}
+    card.entry_order_generation = 0
+    card.entry_parent_intent_id = ""
     card.stop_adr = None
     if clear_quantity:
         card.planned_quantity = 0
@@ -490,7 +532,26 @@ class TradeCardOrbEvaluator:
         )
         card.entry_orb_high = candidate.orb_high
         card.entry_orb_low = candidate.orb_low
-        card.entry_trigger = candidate.entry_trigger
+        card.entry_execution_price = (
+            candidate.execution_price or candidate.entry_trigger or candidate.orb_high
+        )
+        card.entry_trigger = card.entry_execution_price
+        card.entry_execution_price_manual = bool(candidate.execution_price_manual)
+        card.entry_floor_price = candidate.floor_price
+        card.entry_breakout_trigger = candidate.breakout_trigger or max(
+            float(candidate.breakout_price or 0.0),
+            float(candidate.orb_high or 0.0),
+        )
+        card.entry_orb_score = candidate.score
+        card.entry_score_version = candidate.score_version or ORB_SCORE_VERSION
+        card.entry_range_closed_at = _optional_utc_datetime(candidate.range_closed_at)
+        card.entry_breakout_confirmed_at = _optional_utc_datetime(
+            candidate.breakout_confirmed_at
+        )
+        card.entry_candidate_created_at = _optional_utc_datetime(
+            candidate.candidate_created_at
+        )
+        card.orb_candidate_states[candidate.window] = candidate.to_dict()
         card.stop_adr = candidate.stop_adr
         if candidate.risk_percent:
             card.risk_percent = candidate.risk_percent
@@ -571,7 +632,17 @@ class TradeCardOrbEvaluator:
                 )
             ):
                 continue
-            if event_price >= float(candidate.entry_trigger):
+            breakout_trigger = float(
+                candidate.breakout_trigger
+                or max(candidate.breakout_price or 0.0, candidate.orb_high or 0.0)
+            )
+            if candidate.breakout_confirmed:
+                crossed.append(candidate)
+            elif event_price > breakout_trigger:
+                candidate.breakout_confirmed = True
+                candidate.breakout_confirmed_at = now.astimezone(timezone.utc).isoformat()
+                candidate.status = OrbCandidateStatus.EXECUTE_READY
+                candidate.reason = "Breakout confirmed; passive entry is ready"
                 crossed.append(candidate)
         if not crossed:
             return False
@@ -611,6 +682,195 @@ class TradeCardOrbEvaluator:
             card.entry_block_reason,
         )
         return before != after
+
+    @staticmethod
+    def _record_replacement_history(
+        card: TradeCardState,
+        *,
+        state: str,
+        reason: str,
+        candidate=None,
+        occurred_at: datetime,
+    ) -> None:
+        item = {
+            "occurred_at": occurred_at.astimezone(timezone.utc).isoformat(),
+            "state": state,
+            "reason": reason,
+            "old_generation": int(card.entry_order_generation or 1),
+            "old_timeframe": card.entry_orb_window or card.selected_orb_window,
+            "old_score": card.entry_orb_score,
+            "old_orh": card.entry_orb_high,
+            "old_orl": card.entry_orb_low,
+            "old_execution_price": (
+                card.entry_execution_price or card.entry_trigger
+            ),
+            "new_timeframe": getattr(candidate, "window", None),
+            "new_score": getattr(candidate, "score", None),
+            "new_orh": getattr(candidate, "orb_high", None),
+            "new_orl": getattr(candidate, "orb_low", None),
+            "new_execution_price": getattr(candidate, "execution_price", None),
+            "quantity": int(card.target_position_quantity or card.planned_quantity or 0),
+        }
+        signature = (state, reason, item["new_timeframe"], item["new_score"])
+        if card.entry_replacement_history:
+            prior = card.entry_replacement_history[-1]
+            if signature == (
+                prior.get("state"),
+                prior.get("reason"),
+                prior.get("new_timeframe"),
+                prior.get("new_score"),
+            ):
+                return
+        card.entry_replacement_history.append(item)
+
+    def select_replacement_candidate(
+        self,
+        card: TradeCardState,
+        execution_queue_item: ExecutionQueueItem,
+        *,
+        last_price: float,
+        best_ask_price: float | None,
+    ) -> bool:
+        """Persist the best fully-qualified later candidate without
+        changing the active broker generation.
+
+        The trading engine performs order-state/risk/capital checks and the
+        guarded cancel-replace. This bridge owns only ORB qualification.
+        """
+
+        if card.board_status != BoardStatus.ENTRY_PENDING:
+            return False
+        if card.pending_entry_replacement.get("state") in {
+            "REPLACE_PENDING",
+            "CANCEL_PENDING",
+        }:
+            return False
+        active_window = str(
+            card.entry_orb_window or card.selected_orb_window or ""
+        ).strip()
+        active_score_version = str(card.entry_score_version or "").strip()
+        if not active_window or card.entry_orb_score is None or not active_score_version:
+            return False
+        queue_account = str(execution_queue_item.account_no or "").strip()
+        if queue_account != str(card.account_no or "").strip():
+            return False
+        try:
+            trade = float(last_price)
+            ask = float(best_ask_price) if best_ask_price is not None else 0.0
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not all(math.isfinite(value) and value > 0 for value in (trade, ask)):
+            return False
+
+        now = self._clock()
+        qualified = []
+        changed = False
+        for candidate in dict(execution_queue_item.candidates or {}).values():
+            if (
+                not is_later_timeframe(candidate.window, active_window)
+                or orb_candidate_stale_for_current_session(
+                    execution_queue_item, candidate, now=now
+                )
+                or not _complete_candidate_for_card(card, execution_queue_item, candidate)
+            ):
+                continue
+            breakout_trigger = float(
+                candidate.breakout_trigger
+                or max(candidate.breakout_price or 0.0, candidate.orb_high or 0.0)
+            )
+            if not candidate.breakout_confirmed:
+                if trade <= breakout_trigger:
+                    continue
+                candidate.breakout_confirmed = True
+                candidate.breakout_confirmed_at = now.astimezone(timezone.utc).isoformat()
+                candidate.status = OrbCandidateStatus.EXECUTE_READY
+                changed = True
+            card.orb_candidate_states[candidate.window] = candidate.to_dict()
+            if str(candidate.score_version or "") != active_score_version:
+                self._record_replacement_history(
+                    card,
+                    state="UPGRADE_REJECTED",
+                    reason="Replacement score version does not match the active generation",
+                    candidate=candidate,
+                    occurred_at=now,
+                )
+                changed = True
+                continue
+            if not score_strictly_higher(candidate.score, card.entry_orb_score):
+                continue
+            configured_execution = (
+                card.entry_execution_price
+                if card.entry_execution_price_manual
+                else candidate.execution_price or candidate.entry_trigger
+            )
+            floor, trigger, execution, reason = passive_entry_prices(
+                breakout_price=candidate.breakout_price,
+                orb_high=candidate.orb_high,
+                orb_low=candidate.orb_low,
+                execution_price=configured_execution,
+            )
+            if reason:
+                self._record_replacement_history(
+                    card,
+                    state="UPGRADE_REJECTED",
+                    reason=(
+                        "Manual execution price is incompatible with the replacement candidate"
+                        if card.entry_execution_price_manual
+                        else reason
+                    ),
+                    candidate=candidate,
+                    occurred_at=now,
+                )
+                changed = True
+                continue
+            assert floor is not None and trigger is not None and execution is not None
+            if trade <= float(execution) or ask <= float(execution):
+                self._record_replacement_history(
+                    card,
+                    state="UPGRADE_REJECTED",
+                    reason="EXECUTION_LEVEL_ALREADY_REACHED",
+                    candidate=candidate,
+                    occurred_at=now,
+                )
+                changed = True
+                continue
+            qualified.append((candidate, float(floor), float(trigger), float(execution)))
+
+        if not qualified:
+            return changed
+        candidate, floor_price, breakout_trigger, execution_price = max(
+            qualified,
+            key=lambda item: (
+                float(item[0].score or 0.0),
+                SUPPORTED_ORB_WINDOWS.index(item[0].window),
+            ),
+        )
+        pending = candidate.to_dict()
+        pending.update(
+            {
+                "state": "QUALIFIED",
+                "reason": (
+                    f"Replacing {active_window} ORB order with higher-scoring "
+                    f"{candidate.window} ORB"
+                ),
+                "execution_price": execution_price,
+                "entry_trigger": execution_price,
+                "floor_price": floor_price,
+                "breakout_trigger": breakout_trigger,
+                "execution_price_manual": card.entry_execution_price_manual,
+                "quantity": int(
+                    card.target_position_quantity or card.planned_quantity or 0
+                ),
+                "old_client_order_id": card.entry_client_order_id,
+                "old_generation": int(card.entry_order_generation or 1),
+                "new_generation": int(card.entry_order_generation or 1) + 1,
+                "qualified_at": now.astimezone(timezone.utc).isoformat(),
+            }
+        )
+        if card.pending_entry_replacement != pending:
+            card.pending_entry_replacement = pending
+            changed = True
+        return changed
 
     def update_card(
         self,

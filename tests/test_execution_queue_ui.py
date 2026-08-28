@@ -202,7 +202,7 @@ def test_intentional_selected_symbol_creates_one_buylist_queue_item(
     assert len(window.buylist_manager.items) == 1
     item = window.buylist_manager.get("AAPL", "PROD")
     assert item is not None
-    assert item.monitoring_status == "EXECUTE_READY"
+    assert item.monitoring_status == "ARMED"
     assert item.breakout_method == "execution_queue:1m"
     assert item.entry_price == pytest.approx(101.01)
     assert not hasattr(item, "_planned_shares")
@@ -218,7 +218,7 @@ def test_intentional_selected_symbol_creates_one_buylist_queue_item(
     result = window._last_execution_queue_refresh_result
     assert result.refreshed == 1
     assert result.missing_symbols == []
-    assert result.status_counts == {"EXECUTE_READY": 1}
+    assert result.status_counts == {"ARMED": 1}
 
 
 def test_explicit_buy_today_refresh_builds_queue_from_canonical_card_without_mirror(
@@ -433,7 +433,7 @@ def test_existing_queue_row_keeps_published_buffer_when_header_changes(
         create_missing=True,
     )
     queue_item = window.execution_queue_manager.get_item("AAPL", "PROD")
-    assert queue_item.candidates["1m"].breakout_trigger == pytest.approx(100.1)
+    assert queue_item.candidates["1m"].breakout_trigger == pytest.approx(101.01)
 
     window._buyboard_orb_buffer_pct = lambda: 0.02
     buylist_item = window.buylist_manager.get("AAPL", "PROD")
@@ -464,8 +464,8 @@ def test_existing_queue_row_keeps_published_buffer_when_header_changes(
     queue_item = window.execution_queue_manager.get_item("AAPL", "PROD")
     buylist_item = window.buylist_manager.get("AAPL", "PROD")
     assert refreshed == 1
-    assert queue_item.candidates["1m"].breakout_trigger == pytest.approx(100.1)
-    assert queue_item.candidates["5m"].breakout_trigger == pytest.approx(100.1)
+    assert queue_item.candidates["1m"].breakout_trigger == pytest.approx(101.01)
+    assert queue_item.candidates["5m"].breakout_trigger == pytest.approx(101.01)
     assert buylist_item.buffer_pct == pytest.approx(0.001)
 
 
@@ -542,7 +542,7 @@ def test_legacy_watchlist_orb_plan_is_imported_once_with_canonical_buffer(
     assert queue_item.selected_window == "5m"
     assert candidate is queue_item.candidates["5m"]
     assert candidate.risk_percent == pytest.approx(0.005)
-    assert candidate.breakout_trigger == pytest.approx(100.1)
+    assert candidate.breakout_trigger == pytest.approx(101.01)
     assert buylist_item.buffer_pct == pytest.approx(0.001)
 
 
@@ -675,7 +675,9 @@ def test_missing_selected_symbol_is_returned_in_refresh_result(monkeypatch, tmp_
     assert result.status_counts == {}
 
 
-def test_duplicate_pending_order_rejects_queue_candidates(monkeypatch, tmp_path):
+def test_duplicate_pending_order_still_builds_later_replacement_candidates(
+    monkeypatch, tmp_path
+):
     window = _build_queue_window(monkeypatch, tmp_path)
     window._has_duplicate_open_order = lambda *args, **kwargs: True
 
@@ -689,17 +691,14 @@ def test_duplicate_pending_order_rejects_queue_candidates(monkeypatch, tmp_path)
 
     queue_item = window.execution_queue_manager.items[queue_key("AAPL", "PROD")]
     assert refreshed == 1
-    assert queue_item.status == ExecutionQueueStatus.REJECTED
-    assert queue_item.selected_candidate is None
+    assert queue_item.status == ExecutionQueueStatus.ARMED
+    assert queue_item.selected_candidate is not None
     assert queue_item.candidates
     assert all(
-        candidate.status == OrbCandidateStatus.REJECTED
+        candidate.status == OrbCandidateStatus.WAITING_BREAKOUT
         for candidate in queue_item.candidates.values()
     )
-    assert all(
-        "Duplicate" in candidate.reason for candidate in queue_item.candidates.values()
-    )
-    assert window._last_execution_queue_refresh_result.status_counts == {"REJECTED": 1}
+    assert window._last_execution_queue_refresh_result.status_counts == {"ARMED": 1}
 
 
 def test_refresh_result_status_counts_are_correct(monkeypatch, tmp_path):
@@ -715,7 +714,7 @@ def test_refresh_result_status_counts_are_correct(monkeypatch, tmp_path):
 
     result = window._last_execution_queue_refresh_result
     assert result.scope == "selected"
-    assert result.status_counts == {"EXECUTE_READY": 1}
+    assert result.status_counts == {"ARMED": 1}
 
 
 def test_buy_dashboard_status_uses_execution_queue_status(monkeypatch, tmp_path):

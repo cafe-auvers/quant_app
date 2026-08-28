@@ -16,11 +16,17 @@ from src.core.trade_card_state import (
     TradeCardState,
 )
 from src.services.entry_attempt_manager import EntryAttemptManager
-from src.services.execution_command_gateway import GuardedSubmissionRejectedError
+from src.services.execution_command_gateway import (
+    GuardedCancellationRejectedError,
+    GuardedSubmissionRejectedError,
+    ReplacementCancelConfirmationPendingError,
+    ReplaceNotSafeError,
+)
 from src.services.position_manager import PositionActionCallbacks, PositionManager
 from src.services.realtime_market_data import QuoteSnapshot, RestPollingMarketDataService
 from src.services.trading_engine import (
     EntryDeadlineLookup,
+    EntryReplacementCallbacks,
     TradingEngine,
     classify_market_data_outage_risk,
 )
@@ -70,6 +76,17 @@ def _buy_today_card(**overrides):
     fields.update(overrides)
     if "entry_orb_high" not in overrides and "entry_trigger" in overrides:
         fields["entry_orb_high"] = overrides["entry_trigger"]
+    if "entry_execution_price" not in overrides:
+        fields["entry_execution_price"] = fields.get("entry_trigger")
+    if "entry_breakout_trigger" not in overrides:
+        fields["entry_breakout_trigger"] = max(
+            float(fields.get("breakout_price") or 0.0),
+            float(fields.get("entry_orb_high") or 0.0),
+        )
+    if "entry_breakout_confirmed_at" not in overrides:
+        fields["entry_breakout_confirmed_at"] = dt.datetime.now(dt.timezone.utc)
+    fields.setdefault("entry_range_closed_at", dt.datetime.now(dt.timezone.utc))
+    fields.setdefault("entry_candidate_created_at", dt.datetime.now(dt.timezone.utc))
     return TradeCardState(**fields)
 
 
@@ -81,6 +98,8 @@ def _make_engine(
     account_equity=0.0,
     find_order=None,
     reconcile_order=None,
+    replace_entry_order=None,
+    resume_entry_replacement=None,
 ):
     raw_submit = submit_order or (lambda **kw: BrokerOrder.create(
         environment=kw["environment"], account_no=kw["account_no"], symbol=kw["symbol"],
@@ -103,7 +122,11 @@ def _make_engine(
         reservations_path=tmp_path / "reservations.json",
     )
     position_manager = PositionManager()
-    market_data = RestPollingMarketDataService(quote_fetcher=lambda s: QuoteSnapshot(symbol=s, last_price=100.0))
+    market_data = RestPollingMarketDataService(
+        quote_fetcher=lambda s: QuoteSnapshot(
+            symbol=s, last_price=101.0, bid=100.9, ask=101.1
+        )
+    )
     callbacks = PositionActionCallbacks(
         cancel_order=lambda cid: None,
         submit_sell_order=lambda **kw: None,
@@ -119,6 +142,15 @@ def _make_engine(
         market_data=market_data,
         position_callbacks=callbacks,
         entry_deadline_lookup=lookup,
+        entry_replacement_callbacks=(
+            EntryReplacementCallbacks(
+                replace_entry_order=replace_entry_order or (lambda *_args: None),
+                resume_entry_replacement=resume_entry_replacement,
+            )
+            if replace_entry_order is not None
+            or resume_entry_replacement is not None
+            else None
+        ),
         account_equity_provider=lambda _environment, _account_no: account_equity,
     )
 
@@ -414,7 +446,72 @@ def test_fresh_representative_maximum_triggers_exactly_one_entry(tmp_path):
     assert card.board_status == BoardStatus.ENTRY_PENDING
 
 
-def test_valid_waiting_orb_submits_resting_limit_before_price_reaches_orb_high(tmp_path):
+@pytest.mark.parametrize("last_price", [105.0, 150.0])
+def test_confirmed_breakout_submits_passive_limit_below_orh_even_far_above(
+    tmp_path, last_price
+):
+    now = dt.datetime(2026, 8, 16, 14, 30, tzinfo=dt.timezone.utc)
+    submitted = []
+    engine = _entry_event_engine(tmp_path, now, submitted)
+    card = _buy_today_card(
+        entry_orb_high=104.0,
+        entry_orb_low=95.0,
+        entry_execution_price=100.0,
+        entry_trigger=100.0,
+        entry_floor_price=99.0,
+        entry_breakout_trigger=104.0,
+    )
+    quote = QuoteSnapshot(
+        symbol="AAPL",
+        last_price=last_price,
+        bid=last_price - 0.1,
+        ask=last_price + 0.1,
+        broker_event_at=now,
+        received_at=now,
+        processed_at=now,
+    )
+
+    engine.evaluate_entry_quote([card], quote)
+
+    assert len(submitted) == 1
+    assert submitted[0]["limit_price"] == 100.0
+    assert card.board_status == BoardStatus.ENTRY_PENDING
+    assert card.broker_quantity == 0
+
+
+@pytest.mark.parametrize(
+    ("last_price", "best_ask"),
+    [(100.0, 101.0), (101.0, 100.0)],
+)
+def test_passive_submission_blocks_when_trade_or_ask_reaches_execution_limit(
+    tmp_path, last_price, best_ask
+):
+    now = dt.datetime(2026, 8, 16, 14, 30, tzinfo=dt.timezone.utc)
+    submitted = []
+    engine = _entry_event_engine(tmp_path, now, submitted)
+    card = _buy_today_card(
+        entry_orb_high=100.0,
+        entry_execution_price=100.0,
+        entry_trigger=100.0,
+        entry_breakout_trigger=100.0,
+    )
+    quote = QuoteSnapshot(
+        symbol="AAPL",
+        last_price=last_price,
+        bid=99.9,
+        ask=best_ask,
+        broker_event_at=now,
+        received_at=now,
+        processed_at=now,
+    )
+
+    engine.evaluate_entry_quote([card], quote)
+
+    assert submitted == []
+    assert card.entry_block_reason == "EXECUTION_LEVEL_ALREADY_REACHED"
+
+
+def test_waiting_orb_does_not_submit_before_confirmed_breakout(tmp_path):
     now = dt.datetime(2026, 8, 16, 14, 30, tzinfo=dt.timezone.utc)
     submitted = []
     engine = _entry_event_engine(tmp_path, now, submitted)
@@ -434,11 +531,9 @@ def test_valid_waiting_orb_submits_resting_limit_before_price_reaches_orb_high(t
 
     changed = engine.evaluate_entry_quote([card], below_orb_high)
 
-    assert card in changed
-    assert len(submitted) == 1
-    assert submitted[0]["quantity"] == 10
-    assert submitted[0]["limit_price"] == 104.0
-    assert card.board_status == BoardStatus.ENTRY_PENDING
+    assert changed == []
+    assert submitted == []
+    assert card.board_status == BoardStatus.BUY_TODAY
 
 
 def test_waiting_breakout_with_corrupt_orb_geometry_cannot_execute(tmp_path):
@@ -458,10 +553,9 @@ def test_waiting_breakout_with_corrupt_orb_geometry_cannot_execute(tmp_path):
         processed_at=now,
     )
 
-    assert engine.evaluate_entry_quote([card], crossing) == [card]
+    assert engine.evaluate_entry_quote([card], crossing) == []
     assert submitted == []
-    assert card.entry_runtime_status == EntryRuntimeStatus.ORB_FORMING
-    assert "complete current-session ORB entry plan" in card.entry_block_reason
+    assert card.entry_runtime_status == EntryRuntimeStatus.WAITING_BREAKOUT
 
 
 def test_live_cross_cannot_bypass_retry_cooldown(tmp_path):
@@ -528,6 +622,349 @@ def _pending_order(*, status, filled=0, avg_fill_price=0.0, deadline_seconds_ago
     order.filled_quantity = filled
     order.avg_fill_price = avg_fill_price
     return order
+
+
+def _replacement_card(**overrides):
+    fields = dict(
+        board_status=BoardStatus.ENTRY_PENDING,
+        entry_runtime_status=EntryRuntimeStatus.ORDER_PENDING,
+        selected_orb_window="1m",
+        entry_orb_window="1m",
+        entry_orb_high=100.0,
+        entry_orb_low=95.0,
+        entry_trigger=100.0,
+        entry_execution_price=100.0,
+        entry_floor_price=99.0,
+        entry_breakout_trigger=100.0,
+        entry_orb_score=50.0,
+        entry_score_version="ORB_POSITION_SCORE_V1",
+        entry_order_generation=1,
+        entry_client_order_id="OLD-1",
+        pending_entry_replacement={
+            "state": "QUALIFIED",
+            "reason": "Replacing 1m with 5m",
+            "window": "5m",
+            "orb_high": 102.0,
+            "orb_low": 96.0,
+            "breakout_price": 99.0,
+            "breakout_trigger": 102.0,
+            "floor_price": 99.0,
+            "execution_price": 102.0,
+            "score": 60.0,
+            "score_version": "ORB_POSITION_SCORE_V1",
+            "range_closed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "breakout_confirmed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "candidate_created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "stop_adr": 40.0,
+            "quantity": 10,
+            "old_client_order_id": "OLD-1",
+            "old_generation": 1,
+            "new_generation": 2,
+        },
+    )
+    fields.update(overrides)
+    return _buy_today_card(**fields)
+
+
+def _replacement_quote_engine(tmp_path, order, callback, now):
+    engine = _make_engine(
+        tmp_path,
+        find_order=lambda _card: order,
+        reconcile_order=lambda current: current,
+        replace_entry_order=callback,
+    )
+    engine._clock = lambda: now
+    engine._market_data = RestPollingMarketDataService(
+        quote_fetcher=lambda symbol: QuoteSnapshot(
+            symbol=symbol,
+            last_price=105.0,
+            bid=104.9,
+            ask=105.1,
+            broker_event_at=now,
+            received_at=now,
+            processed_at=now,
+        ),
+        clock=lambda: now,
+    )
+    engine._market_data.subscribe(["AAPL"])
+    engine._market_data.poll_once()
+    return engine
+
+
+def test_successful_replacement_promotes_complete_new_generation(tmp_path):
+    now = dt.datetime(2026, 8, 28, 14, 0, tzinfo=dt.timezone.utc)
+    old = _pending_order(status=OrderStatus.WORKING)
+    calls = []
+
+    def replace_order(card, order, candidate):
+        calls.append((order.client_order_id, dict(candidate)))
+        replacement = _pending_order(status=OrderStatus.WORKING)
+        replacement.client_order_id = "NEW-2"
+        replacement.limit_price = 102.0
+        replacement.attempt_number = 2
+        return replacement
+
+    engine = _replacement_quote_engine(tmp_path, old, replace_order, now)
+    card = _replacement_card(entry_client_order_id=old.client_order_id)
+    quote = engine._market_data.latest_quote("AAPL")
+
+    changed = engine.evaluate_entry_quote([card], quote)
+
+    assert changed == [card]
+    assert len(calls) == 1
+    assert card.entry_client_order_id == "NEW-2"
+    assert card.entry_order_generation == 2
+    assert card.entry_orb_window == "5m"
+    assert card.entry_orb_high == 102.0
+    assert card.entry_orb_low == 96.0
+    assert card.entry_execution_price == 102.0
+    assert card.planned_quantity == old.quantity_requested == 10
+    assert card.pending_entry_replacement == {}
+    assert card.entry_replacement_history[-1]["state"] == "REPLACED"
+
+
+def test_any_old_order_fill_aborts_replacement_and_keeps_old_orl(tmp_path):
+    now = dt.datetime(2026, 8, 28, 14, 0, tzinfo=dt.timezone.utc)
+    old = _pending_order(status=OrderStatus.WORKING, filled=1, avg_fill_price=100.0)
+    old.remaining_quantity = 9
+    calls = []
+    engine = _replacement_quote_engine(
+        tmp_path, old, lambda *args: calls.append(args), now
+    )
+    card = _replacement_card(entry_client_order_id=old.client_order_id)
+    quote = engine._market_data.latest_quote("AAPL")
+
+    engine.evaluate_entry_quote([card], quote)
+
+    assert calls == []
+    assert card.pending_entry_replacement["state"] == (
+        "REPLACEMENT_ABORTED_OLD_ORDER_FILLED"
+    )
+    assert card.entry_orb_window == "1m"
+    assert card.entry_orb_low == 95.0
+
+
+def test_replacement_precheck_failure_keeps_old_generation_active(tmp_path):
+    now = dt.datetime(2026, 8, 28, 14, 0, tzinfo=dt.timezone.utc)
+    old = _pending_order(status=OrderStatus.WORKING)
+
+    def reject(*_args):
+        raise RuntimeError("replacement capital unavailable")
+
+    engine = _replacement_quote_engine(tmp_path, old, reject, now)
+    card = _replacement_card(entry_client_order_id=old.client_order_id)
+
+    engine.evaluate_entry_quote([card], engine._market_data.latest_quote("AAPL"))
+
+    assert card.pending_entry_replacement["state"] == "UPGRADE_REJECTED"
+    assert card.entry_client_order_id == old.client_order_id
+    assert card.entry_order_generation == 1
+    assert card.entry_orb_window == "1m"
+
+
+def test_replacement_cancel_rejection_keeps_old_order_and_raises_warning(tmp_path):
+    now = dt.datetime(2026, 8, 28, 14, 0, tzinfo=dt.timezone.utc)
+    old = _pending_order(status=OrderStatus.WORKING)
+
+    def reject(*_args):
+        raise GuardedCancellationRejectedError("broker status=REJECTED")
+
+    engine = _replacement_quote_engine(tmp_path, old, reject, now)
+    card = _replacement_card(entry_client_order_id=old.client_order_id)
+
+    engine.evaluate_entry_quote([card], engine._market_data.latest_quote("AAPL"))
+
+    assert card.pending_entry_replacement["state"] == "UPGRADE_REJECTED"
+    assert card.entry_client_order_id == old.client_order_id
+    assert "ENTRY_REPLACEMENT_CANCEL_UNCERTAIN" in card.warnings
+
+
+def test_replace_guard_detecting_cancel_race_classifies_old_fill(tmp_path):
+    now = dt.datetime(2026, 8, 28, 14, 0, tzinfo=dt.timezone.utc)
+    old = _pending_order(status=OrderStatus.WORKING)
+
+    def reject(*_args):
+        raise ReplaceNotSafeError("cancel response reported a new fill")
+
+    engine = _replacement_quote_engine(tmp_path, old, reject, now)
+    card = _replacement_card(entry_client_order_id=old.client_order_id)
+
+    engine.evaluate_entry_quote([card], engine._market_data.latest_quote("AAPL"))
+
+    assert card.pending_entry_replacement["state"] == (
+        "REPLACEMENT_ABORTED_OLD_ORDER_FILLED"
+    )
+    assert card.entry_client_order_id == old.client_order_id
+
+
+def test_repeated_qualified_event_invokes_replacement_only_once(tmp_path):
+    now = dt.datetime(2026, 8, 28, 14, 0, tzinfo=dt.timezone.utc)
+    old = _pending_order(status=OrderStatus.WORKING)
+    calls = []
+
+    def replace_order(*_args):
+        calls.append(True)
+        replacement = _pending_order(status=OrderStatus.WORKING)
+        replacement.client_order_id = "NEW-2"
+        return replacement
+
+    engine = _replacement_quote_engine(tmp_path, old, replace_order, now)
+    card = _replacement_card(entry_client_order_id=old.client_order_id)
+    quote = engine._market_data.latest_quote("AAPL")
+
+    engine.evaluate_entry_quote([card], quote)
+    engine.evaluate_entry_quote([card], quote)
+
+    assert calls == [True]
+
+
+def test_restart_during_cancel_pending_reconciles_without_duplicate_mutation(tmp_path):
+    old = _pending_order(status=OrderStatus.CANCELLED)
+    mutations = []
+    engine = _make_engine(
+        tmp_path,
+        find_order=lambda _card: None,
+        reconcile_order=lambda current: current,
+        replace_entry_order=lambda *args: mutations.append(args),
+    )
+    engine._entry_deadline_lookup.find_entry_order_by_id = lambda _client_id: old
+    card = _replacement_card(
+        entry_client_order_id=old.client_order_id,
+        pending_entry_replacement={
+            **_replacement_card().pending_entry_replacement,
+            "state": "CANCEL_PENDING",
+            "old_client_order_id": old.client_order_id,
+        },
+        entry_cancel_in_flight=True,
+    )
+
+    changed = engine.run_heartbeat([card])
+
+    assert changed == [card]
+    assert mutations == []
+    assert card.pending_entry_replacement["state"] == (
+        "REPLACEMENT_ABORTED_AFTER_CANCEL"
+    )
+    assert card.entry_cancel_in_flight is False
+
+
+def test_restart_after_confirmed_cancel_resumes_only_replacement_submit(tmp_path):
+    old = _pending_order(status=OrderStatus.CANCELLED)
+    replacement = _pending_order(status=OrderStatus.WORKING)
+    replacement.client_order_id = "NEW-2"
+    replacement.broker_order_id = "BROKER-2"
+    cancelled_again = []
+    resumed = []
+    engine = _make_engine(
+        tmp_path,
+        find_order=lambda _card: None,
+        reconcile_order=lambda current: current,
+        replace_entry_order=lambda *args: cancelled_again.append(args),
+        resume_entry_replacement=lambda _card, pending: (
+            resumed.append(dict(pending)) or replacement
+        ),
+    )
+    engine._entry_deadline_lookup.find_entry_order_by_id = lambda _client_id: old
+    card = _replacement_card(
+        entry_client_order_id=old.client_order_id,
+        pending_entry_replacement={
+            **_replacement_card().pending_entry_replacement,
+            "state": "CANCEL_PENDING",
+            "old_client_order_id": old.client_order_id,
+            "replace_command_id": "REPLACE-1",
+            "new_client_order_id": replacement.client_order_id,
+        },
+        entry_cancel_in_flight=True,
+    )
+
+    changed = engine.run_heartbeat([card])
+
+    assert changed == [card]
+    assert cancelled_again == []
+    assert len(resumed) == 1
+    assert card.entry_client_order_id == replacement.client_order_id
+    assert card.entry_orb_window == "5m"
+    assert card.entry_orb_low == 96.0
+    assert card.entry_order_generation == 2
+    assert card.pending_entry_replacement == {}
+
+
+def test_restart_waits_for_authoritative_cancel_before_resuming_replacement(tmp_path):
+    old = _pending_order(status=OrderStatus.CANCELLED)
+    resume_calls = []
+
+    def resume(_card, pending):
+        resume_calls.append(dict(pending))
+        raise ReplacementCancelConfirmationPendingError(
+            "Replacement recovery requires an authoritatively confirmed-cancelled "
+            "zero-fill old order"
+        )
+
+    engine = _make_engine(
+        tmp_path,
+        find_order=lambda _card: None,
+        reconcile_order=lambda current: current,
+        replace_entry_order=lambda *_args: pytest.fail(
+            "restart recovery must not issue a second cancellation"
+        ),
+        resume_entry_replacement=resume,
+    )
+    engine._entry_deadline_lookup.find_entry_order_by_id = lambda _client_id: old
+    card = _replacement_card(
+        entry_client_order_id=old.client_order_id,
+        pending_entry_replacement={
+            **_replacement_card().pending_entry_replacement,
+            "state": "CANCEL_PENDING",
+            "old_client_order_id": old.client_order_id,
+            "replace_command_id": "REPLACE-1",
+            "new_client_order_id": "NEW-2",
+        },
+        entry_cancel_in_flight=True,
+    )
+
+    changed = engine.run_heartbeat([card])
+
+    assert changed == [card]
+    assert len(resume_calls) == 1
+    assert card.pending_entry_replacement["state"] == "CANCEL_PENDING"
+    assert card.entry_runtime_status == EntryRuntimeStatus.CANCEL_PENDING
+    assert card.entry_cancel_in_flight is True
+    assert "ENTRY_REPLACEMENT_CANCEL_UNCERTAIN" in card.warnings
+
+
+def test_fill_observed_during_cancel_pending_uses_old_generation_stop(tmp_path):
+    old = _pending_order(
+        status=OrderStatus.CANCEL_REQUESTED,
+        filled=1,
+        avg_fill_price=100.0,
+    )
+    old.remaining_quantity = 9
+    engine = _make_engine(
+        tmp_path,
+        find_order=lambda _card: old,
+        reconcile_order=lambda current: current,
+        replace_entry_order=lambda *_args: pytest.fail(
+            "replacement must not submit after an old-order fill"
+        ),
+    )
+    card = _replacement_card(
+        entry_client_order_id=old.client_order_id,
+        pending_entry_replacement={
+            **_replacement_card().pending_entry_replacement,
+            "state": "CANCEL_PENDING",
+            "old_client_order_id": old.client_order_id,
+        },
+        entry_cancel_in_flight=True,
+    )
+
+    engine.run_heartbeat([card])
+
+    assert card.pending_entry_replacement["state"] == (
+        "REPLACEMENT_ABORTED_OLD_ORDER_FILLED"
+    )
+    assert card.broker_quantity == 1
+    assert card.active_stop_price == 95.0
+    assert card.stop_quantity == 1
 
 
 def test_entry_pending_card_moves_to_open_position_on_full_fill_at_deadline(tmp_path):
@@ -1162,7 +1599,7 @@ def test_entry_limit_does_not_chase_live_quote_above_orb_high(tmp_path):
     assert submitted[0]["limit_price"] == pytest.approx(100.0)
 
 
-def test_fractional_cent_orb_high_uses_first_legal_buy_tick(tmp_path):
+def test_fractional_cent_execution_price_is_rejected_instead_of_changed(tmp_path):
     submitted = []
 
     def fake_submit(**kwargs):
@@ -1193,9 +1630,9 @@ def test_fractional_cent_orb_high_uses_first_legal_buy_tick(tmp_path):
 
     engine.run_heartbeat([card])
 
-    assert len(submitted) == 1
-    assert submitted[0]["limit_price"] == pytest.approx(100.01)
-    assert card.board_status == BoardStatus.ENTRY_PENDING
+    assert submitted == []
+    assert card.entry_runtime_status == EntryRuntimeStatus.RISK_INVALID
+    assert card.board_status == BoardStatus.BUY_TODAY
 
 
 # --- P1-6: stale-quote protection for existing positions --------------------
@@ -2024,6 +2461,9 @@ def test_evaluate_quote_one_accounts_failure_does_not_block_the_other(tmp_path):
 def _seed_then_disconnect(engine, symbol="AAPL"):
     engine._market_data.subscribe([symbol])
     engine._market_data.poll_once()
+    engine._market_data._cache.update(
+        QuoteSnapshot(symbol=symbol, last_price=100.0, bid=99.9, ask=100.1)
+    )
     engine._market_data._connected = False
 
 

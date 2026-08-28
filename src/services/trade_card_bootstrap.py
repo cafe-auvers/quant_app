@@ -258,6 +258,7 @@ def bootstrap_trade_cards_from_current_state(
                     revived.entry_orb_high = None
                     revived.entry_orb_low = None
                     revived.entry_trigger = None
+                    revived.clear_orb_generation_metadata()
                     revived.stop_adr = None
                     revived.entry_runtime_status = None
                     revived.entry_block_reason = ""

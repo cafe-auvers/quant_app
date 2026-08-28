@@ -292,6 +292,7 @@ class EodTradingService:
         card.entry_orb_low = None
         card.entry_orb_window = None
         card.entry_trigger = None
+        card.clear_orb_generation_metadata()
         card.entry_attempt_group_id = ""
         card.entry_attempt_count = 0
         card.entry_client_order_id = ""

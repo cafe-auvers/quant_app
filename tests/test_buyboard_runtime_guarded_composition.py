@@ -238,6 +238,11 @@ def _card(symbol: str = "AAPL", **overrides) -> TradeCardState:
         # production requires before TradingEngine may cross the broker gate.
         breakout_price=99.0,
         entry_trigger=100.0,
+        entry_execution_price=100.0,
+        entry_floor_price=99.0,
+        entry_breakout_trigger=100.0,
+        entry_breakout_confirmed_at=datetime.now(timezone.utc),
+        entry_range_closed_at=datetime.now(timezone.utc),
         entry_orb_high=100.0,
         entry_orb_low=95.0,
         entry_orb_window="5m",
@@ -300,7 +305,7 @@ def _make_runtime(
 
     market_data = RestPollingMarketDataService(
         quote_fetcher=lambda symbol: QuoteSnapshot(
-            symbol=symbol, last_price=100.0, bid=99.5, ask=100.0
+            symbol=symbol, last_price=101.0, bid=100.9, ask=101.1
         )
     )
     runtime = buyboard_runtime.build_buyboard_runtime(
@@ -849,7 +854,7 @@ def test_persisted_identity_survives_restart_and_unresolved_submit_is_not_retrie
     market_data.subscribe([card.symbol])
     market_data.poll_once()
 
-    changed = runtime.trading_engine.run_heartbeat([card])
+    runtime.trading_engine.run_heartbeat([card])
     trade_card_repository.update_trade_card(
         engine, card, expected_version=card.version
     )

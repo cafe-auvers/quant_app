@@ -37,9 +37,8 @@ methods for the exact finding each one addresses):
   fills are protected the instant they're observed, and a cancel request
   is never treated as a completed cancellation until the broker confirms
   it.
-- Entry submissions and completion attempts use the ORB-high trigger as a
-  resting limit; when the high is between legal U.S. price ticks, the order
-  uses the first legal tick above it. A live quote never raises that price.
+- Entry submissions use the candidate's explicit, tick-valid passive limit
+  only after a post-range breakout; a live quote never changes that price.
 - P1-6: an existing position whose feed disconnects or loses its structural
   subscription health is flagged independently of the new-entry freshness
   gate.
@@ -52,14 +51,15 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, replace
-from decimal import Decimal, InvalidOperation, ROUND_CEILING
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from src.core import execution_config
 from src.core.execution_config import is_buyboard_engine_enabled
 from src.core.execution_result import UnifiedExecutionStatus
-from src.core.order_state import BrokerOrder, OrderIntent
+from src.core.order_state import BrokerOrder, OrderIntent, OrderStatus
+from src.core.orb_entry_logic import passive_entry_prices
 from src.core.trade_card_state import (
     BoardStatus,
     EntryRuntimeStatus,
@@ -75,8 +75,11 @@ from src.services.entry_attempt_manager import (
 )
 from src.services.execution_command_gateway import (
     AmbiguousPostBrokerPersistenceError,
+    GuardedCancellationAmbiguousError,
     GuardedCancellationRejectedError,
     GuardedSubmissionAmbiguousError,
+    ReplacementCancelConfirmationPendingError,
+    ReplaceNotSafeError,
 )
 from src.services.execution_command_repository import DuplicateCommandError
 from src.services.eod_trading_service import EodTradingService
@@ -115,6 +118,7 @@ _TRADING_HALT_EXIT_WARNING = "TRADING_HALT_EXIT_PENDING"
 # _DATA_STALE_WARNING already is, so a liquidation cancel that the broker
 # will not confirm is visible on the board, not just in the log.
 _EXIT_CANCEL_STALLED_WARNING = "EXIT_CANCEL_STALLED"
+_ENTRY_REPLACEMENT_CANCEL_UNCERTAIN_WARNING = "ENTRY_REPLACEMENT_CANCEL_UNCERTAIN"
 _SUPPORTED_ORB_WINDOWS = {"1m", "5m", "30m"}
 _LIVE_ORB_SELECTION_STATUSES = {
     EntryRuntimeStatus.ORB_FORMING,
@@ -135,31 +139,36 @@ def _complete_orb_entry_plan(card: TradeCardState) -> bool:
 
     window = str(card.selected_orb_window or card.entry_orb_window or "").strip()
     try:
-        trigger = float(card.entry_trigger or 0.0)
+        execution_price = float(
+            card.entry_execution_price or card.entry_trigger or card.entry_orb_high or 0.0
+        )
         orb_high = float(card.entry_orb_high or 0.0)
         orb_low = float(card.entry_orb_low or 0.0)
         breakout = float(card.breakout_price or 0.0)
-        buffer_pct = float(card.buffer_pct)
         quantity = int(card.planned_quantity or 0)
     except (TypeError, ValueError, OverflowError):
         return False
     if not all(
         math.isfinite(value)
-        for value in (trigger, orb_high, orb_low, breakout, buffer_pct)
+        for value in (execution_price, orb_high, orb_low, breakout)
     ):
         return False
-    buffered_breakout = breakout * (1.0 + buffer_pct)
+    floor, breakout_trigger, execution, reason = passive_entry_prices(
+        breakout_price=breakout,
+        orb_high=orb_high,
+        orb_low=orb_low,
+        execution_price=execution_price,
+    )
     return bool(
         window in _SUPPORTED_ORB_WINDOWS
-        and trigger > 0
+        and execution_price > 0
         and orb_high > 0
         and orb_low > 0
         and breakout > 0
-        and 0.0 <= buffer_pct <= 1.0
-        and math.isclose(trigger, orb_high, rel_tol=1e-9, abs_tol=1e-6)
-        and orb_high > buffered_breakout
-        and orb_low < trigger
-        and orb_low <= orb_high
+        and not reason
+        and floor is not None
+        and breakout_trigger is not None
+        and execution is not None
         and quantity > 0
     )
 
@@ -239,6 +248,18 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _optional_utc_datetime(value) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 @dataclass
 class EntryDeadlineLookup:
     """How the engine finds and refreshes the working entry order for an
@@ -267,6 +288,19 @@ class EntryDeadlineLookup:
     # whenever ``refresh_broker_position`` is wired (the preferred path,
     # which never touches ``applied_filled_quantity``).
     persist_order: Optional[Callable[[BrokerOrder], None]] = None
+    find_entry_order_by_id: Optional[Callable[[str], Optional[BrokerOrder]]] = None
+
+
+@dataclass
+class EntryReplacementCallbacks:
+    """Guarded cancel-replace seam supplied by the production composition."""
+
+    replace_entry_order: Callable[
+        [TradeCardState, BrokerOrder, Dict[str, Any]], BrokerOrder
+    ]
+    resume_entry_replacement: Optional[
+        Callable[[TradeCardState, Dict[str, Any]], BrokerOrder]
+    ] = None
 
 
 class TradingEngine:
@@ -278,6 +312,7 @@ class TradingEngine:
         market_data: RealtimeMarketDataService,
         position_callbacks: PositionActionCallbacks,
         entry_deadline_lookup: EntryDeadlineLookup,
+        entry_replacement_callbacks: Optional[EntryReplacementCallbacks] = None,
         eod_service: Optional[EodTradingService] = None,
         market_is_open: Optional[Callable[[], bool]] = None,
         eod_window_reached: Optional[Callable[[], bool]] = None,
@@ -296,6 +331,7 @@ class TradingEngine:
         self._market_data = market_data
         self._position_callbacks = position_callbacks
         self._entry_deadline_lookup = entry_deadline_lookup
+        self._entry_replacement_callbacks = entry_replacement_callbacks
         self._eod_service = eod_service
         # Review finding P0-8: these were previously hardcoded
         # always-True/always-False methods with no way for a production
@@ -394,13 +430,26 @@ class TradingEngine:
         matching = [
             card
             for card in cards
-            if card.symbol == symbol and card.board_status == BoardStatus.BUY_TODAY
+            if card.symbol == symbol
+            and card.board_status in {BoardStatus.BUY_TODAY, BoardStatus.ENTRY_PENDING}
         ]
         if not matching:
             return []
         prepared: List[TradeCardState] = []
         if prepare_entry_plan is not None:
             for card in matching:
+                if card.board_status == BoardStatus.ENTRY_PENDING:
+                    try:
+                        if prepare_entry_plan(card, quote):
+                            prepared.append(card)
+                    except Exception:
+                        logger.exception(
+                            "Live ORB replacement selection failed for %s (%s:%s)",
+                            card.symbol,
+                            card.environment,
+                            card.account_no,
+                        )
+                    continue
                 # A live event may choose among current ORB windows, but it
                 # must never erase an attempt manager's cooldown/capital/
                 # order state and thereby manufacture an early retry.
@@ -418,6 +467,8 @@ class TradingEngine:
                     )
         promoted: List[TradeCardState] = []
         for card in matching:
+            if card.board_status != BoardStatus.BUY_TODAY:
+                continue
             if card.entry_runtime_status not in {
                 EntryRuntimeStatus.WAITING_BREAKOUT,
                 EntryRuntimeStatus.ARMED,
@@ -425,19 +476,25 @@ class TradingEngine:
                 continue
             if not _complete_orb_entry_plan(card):
                 continue
-            if quote.last_price < float(card.entry_trigger):
+            breakout_trigger = float(card.entry_breakout_trigger or 0.0)
+            if breakout_trigger <= 0 or quote.last_price <= breakout_trigger:
                 continue
+            card.entry_breakout_confirmed_at = quote.broker_event_at
             card.entry_runtime_status = EntryRuntimeStatus.EXECUTE_READY
             card.entry_block_reason = ""
             promoted.append(card)
 
         evaluated = self._evaluate_buy_today(
-            matching,
+            [card for card in matching if card.board_status == BoardStatus.BUY_TODAY],
+            quote_overrides={symbol: quote},
+        )
+        replacements = self._evaluate_entry_replacements(
+            [card for card in matching if card.board_status == BoardStatus.ENTRY_PENDING],
             quote_overrides={symbol: quote},
         )
         changed: List[TradeCardState] = []
         seen: set[int] = set()
-        for card in [*prepared, *promoted, *evaluated]:
+        for card in [*prepared, *promoted, *evaluated, *replacements]:
             if id(card) in seen:
                 continue
             seen.add(id(card))
@@ -689,22 +746,24 @@ class TradingEngine:
 
     @staticmethod
     def _orb_high_entry_limit(card: TradeCardState) -> Optional[float]:
-        """Return the broker-legal BUY limit at or immediately above ORB high.
-
-        U.S. orders at or above $1 use one-cent ticks; sub-dollar orders use
-        four-decimal ticks in the KIS adapter. Rounding a BUY down would put
-        the resting order below the strategy's ORB-high price, so the risk
-        check and persisted command both receive the first legal tick at or
-        above the approved trigger.
-        """
+        """Return the already-validated configured passive execution price."""
         try:
-            trigger = Decimal(str(card.entry_trigger or 0.0))
+            trigger = Decimal(
+                str(
+                    card.entry_execution_price
+                    or card.entry_trigger
+                    or card.entry_orb_high
+                    or 0.0
+                )
+            )
         except (InvalidOperation, TypeError, ValueError, OverflowError):
             return None
         if not trigger.is_finite() or trigger <= 0:
             return None
         tick = Decimal("0.0001") if trigger < Decimal("1") else Decimal("0.01")
-        return float(trigger.quantize(tick, rounding=ROUND_CEILING))
+        if trigger != trigger.quantize(tick):
+            return None
+        return float(trigger)
 
     def _target_plan_quantity(
         self, card: TradeCardState, *, entry_price: float
@@ -767,6 +826,7 @@ class TradingEngine:
         card.entry_orb_high = None
         card.entry_orb_low = None
         card.entry_trigger = None
+        card.clear_orb_generation_metadata()
         card.stop_adr = None
 
     # -- BUY_TODAY -> entry attempts -------------------------------------
@@ -792,17 +852,25 @@ class TradingEngine:
         for card in cards:
             if card.board_status != BoardStatus.BUY_TODAY:
                 continue
-            if card.entry_runtime_status not in {
-                EntryRuntimeStatus.WAITING_BREAKOUT,
-                EntryRuntimeStatus.ARMED,
-                EntryRuntimeStatus.EXECUTE_READY,
-            }:
+            if card.entry_runtime_status != EntryRuntimeStatus.EXECUTE_READY:
                 continue
             try:
                 if not _complete_orb_entry_plan(card):
-                    card.entry_runtime_status = EntryRuntimeStatus.ORB_FORMING
+                    has_candidate_geometry = bool(
+                        card.entry_orb_high
+                        and card.entry_orb_low
+                        and (card.entry_execution_price or card.entry_trigger)
+                        and card.breakout_price
+                    )
+                    card.entry_runtime_status = (
+                        EntryRuntimeStatus.RISK_INVALID
+                        if has_candidate_geometry
+                        else EntryRuntimeStatus.ORB_FORMING
+                    )
                     card.entry_block_reason = (
-                        "A complete current-session ORB entry plan is required"
+                        "ORB execution price or passive-pullback zone is invalid"
+                        if has_candidate_geometry
+                        else "A complete current-session ORB entry plan is required"
                     )
                     if card not in changed:
                         changed.append(card)
@@ -830,8 +898,30 @@ class TradingEngine:
                         card.entry_block_reason = reason
                         changed.append(card)
                     continue
+                if card.entry_breakout_confirmed_at is None:
+                    card.entry_runtime_status = EntryRuntimeStatus.WAITING_BREAKOUT
+                    card.entry_block_reason = "A post-range breakout trade has not been confirmed"
+                    changed.append(card)
+                    continue
                 price = self._orb_high_entry_limit(card)
                 if not price:
+                    card.entry_runtime_status = EntryRuntimeStatus.RISK_INVALID
+                    card.entry_block_reason = "Configured execution price is invalid"
+                    changed.append(card)
+                    continue
+                best_ask = quote.ask if quote is not None else None
+                if best_ask is None:
+                    latest_quote = self._market_data.latest_quote(card.symbol)
+                    best_ask = latest_quote.ask if latest_quote is not None else None
+                if (
+                    quote is None
+                    or quote.last_price <= price
+                    or best_ask is None
+                    or float(best_ask) <= price
+                ):
+                    card.entry_runtime_status = EntryRuntimeStatus.ARMED
+                    card.entry_block_reason = "EXECUTION_LEVEL_ALREADY_REACHED"
+                    changed.append(card)
                     continue
                 planned_quantity = self._target_plan_quantity(
                     card, entry_price=price
@@ -885,6 +975,15 @@ class TradingEngine:
                     card.entry_submission_unresolved = (
                         result.outcome != AttemptOutcome.SUBMITTED
                     )
+                    card.entry_orb_window = (
+                        card.entry_orb_window or card.selected_orb_window
+                    )
+                    card.entry_order_generation = max(
+                        1, int(card.entry_order_generation or 0)
+                    )
+                    card.entry_parent_intent_id = (
+                        card.entry_parent_intent_id or result.attempt_group_id
+                    )
                     if result.outcome == AttemptOutcome.SUBMITTED:
                         card.entry_block_reason = ""
                     if result.submission is not None:
@@ -923,6 +1022,361 @@ class TradingEngine:
                 logger.exception("_evaluate_buy_today failed to apply a result for %s", card.symbol)
         return changed
 
+    @staticmethod
+    def _append_replacement_audit(
+        card: TradeCardState,
+        pending: Dict[str, Any],
+        *,
+        state: str,
+        reason: str,
+        occurred_at: datetime,
+        new_client_order_id: str = "",
+        new_broker_order_id: str = "",
+    ) -> None:
+        card.entry_replacement_history.append(
+            {
+                "occurred_at": occurred_at.astimezone(timezone.utc).isoformat(),
+                "state": state,
+                "reason": reason,
+                "parent_intent_id": card.entry_parent_intent_id
+                or card.entry_attempt_group_id,
+                "old_client_order_id": pending.get("old_client_order_id")
+                or card.entry_client_order_id,
+                "new_client_order_id": new_client_order_id,
+                "old_broker_order_id": pending.get("old_broker_order_id"),
+                "new_broker_order_id": new_broker_order_id,
+                "replace_command_id": pending.get("replace_command_id"),
+                "cancellation_result": pending.get("cancellation_result"),
+                "old_generation": pending.get("old_generation")
+                or card.entry_order_generation,
+                "new_generation": pending.get("new_generation"),
+                "old_timeframe": card.entry_orb_window,
+                "new_timeframe": pending.get("window"),
+                "old_score": card.entry_orb_score,
+                "new_score": pending.get("score"),
+                "old_orh": card.entry_orb_high,
+                "old_orl": card.entry_orb_low,
+                "new_orh": pending.get("orb_high"),
+                "new_orl": pending.get("orb_low"),
+                "old_execution_price": card.entry_execution_price
+                or card.entry_trigger,
+                "new_execution_price": pending.get("execution_price"),
+                "quantity": pending.get("quantity"),
+            }
+        )
+
+    def _promote_replacement_generation(
+        self,
+        card: TradeCardState,
+        pending: Dict[str, Any],
+        result: BrokerOrder,
+        *,
+        quantity: int,
+        occurred_at: datetime,
+    ) -> None:
+        """Make the later ORB generation active only after submit success."""
+
+        new_client_order_id = str(getattr(result, "client_order_id", "") or "")
+        new_broker_order_id = str(getattr(result, "broker_order_id", "") or "")
+        pending["cancellation_result"] = "CONFIRMED_CANCELLED_ZERO_FILL"
+        pending["replacement_submitted_at"] = occurred_at.astimezone(
+            timezone.utc
+        ).isoformat()
+        card.entry_client_order_id = new_client_order_id
+        card.entry_orb_window = str(pending.get("window") or "")
+        card.selected_orb_window = card.entry_orb_window
+        card.entry_orb_high = float(pending.get("orb_high") or 0.0)
+        card.entry_orb_low = float(pending.get("orb_low") or 0.0)
+        execution_price = float(pending.get("execution_price") or 0.0)
+        card.entry_execution_price = execution_price
+        card.entry_trigger = execution_price
+        card.entry_execution_price_manual = bool(
+            pending.get("execution_price_manual", False)
+        )
+        card.entry_floor_price = float(pending.get("floor_price") or 0.0)
+        card.entry_breakout_trigger = float(
+            pending.get("breakout_trigger") or 0.0
+        )
+        card.entry_orb_score = float(pending.get("score") or 0.0)
+        card.entry_score_version = str(pending.get("score_version") or "")
+        card.entry_range_closed_at = _optional_utc_datetime(
+            pending.get("range_closed_at")
+        )
+        card.entry_breakout_confirmed_at = _optional_utc_datetime(
+            pending.get("breakout_confirmed_at")
+        )
+        card.entry_candidate_created_at = _optional_utc_datetime(
+            pending.get("candidate_created_at")
+        )
+        card.stop_adr = pending.get("stop_adr")
+        card.planned_quantity = quantity
+        card.target_position_quantity = quantity
+        card.entry_order_generation = int(
+            pending.get("new_generation")
+            or int(card.entry_order_generation or 1) + 1
+        )
+        self._append_replacement_audit(
+            card,
+            pending,
+            state="REPLACED",
+            reason=str(pending.get("reason") or "Higher ORB score"),
+            occurred_at=occurred_at,
+            new_client_order_id=new_client_order_id,
+            new_broker_order_id=new_broker_order_id,
+        )
+        card.pending_entry_replacement = {}
+        card.entry_runtime_status = EntryRuntimeStatus.ORDER_PENDING
+        card.entry_block_reason = ""
+        card.entry_cancel_in_flight = False
+        if _ENTRY_REPLACEMENT_CANCEL_UNCERTAIN_WARNING in card.warnings:
+            card.warnings = [
+                warning
+                for warning in card.warnings
+                if warning != _ENTRY_REPLACEMENT_CANCEL_UNCERTAIN_WARNING
+            ]
+
+    def _evaluate_entry_replacements(
+        self,
+        cards: List[TradeCardState],
+        *,
+        quote_overrides: Optional[Dict[str, QuoteSnapshot]] = None,
+    ) -> List[TradeCardState]:
+        """Run one qualified upgrade through the guarded cancel-replace seam."""
+
+        if self._entry_replacement_callbacks is None or not self._market_is_open():
+            return []
+        now = self._clock()
+        changed: List[TradeCardState] = []
+        for card in cards:
+            pending = dict(card.pending_entry_replacement or {})
+            if pending.get("state") != "QUALIFIED":
+                continue
+            try:
+                quote = (quote_overrides or {}).get(card.symbol)
+                if quote is None:
+                    quote = self._market_data.latest_quote(card.symbol)
+                execution_price = float(pending.get("execution_price") or 0.0)
+                best_ask = quote.ask if quote is not None else None
+                if best_ask is None:
+                    latest_quote = self._market_data.latest_quote(card.symbol)
+                    best_ask = latest_quote.ask if latest_quote is not None else None
+                if (
+                    quote is None
+                    or not quote.regular_session
+                    or not quote.entry_trigger_eligible
+                    or not quote.is_execution_fresh(now=now)
+                    or not self._market_data.entry_quote_ready(card.symbol, now=now)
+                    or quote.last_price <= execution_price
+                    or best_ask is None
+                    or float(best_ask) <= execution_price
+                ):
+                    pending["state"] = "UPGRADE_REJECTED"
+                    pending["reason"] = "EXECUTION_LEVEL_ALREADY_REACHED"
+                    card.pending_entry_replacement = pending
+                    self._append_replacement_audit(
+                        card,
+                        pending,
+                        state="UPGRADE_REJECTED",
+                        reason=str(pending["reason"]),
+                        occurred_at=now,
+                    )
+                    changed.append(card)
+                    continue
+                order = self._entry_deadline_lookup.find_open_entry_order(card)
+                if order is None:
+                    continue
+                refreshed = self._entry_deadline_lookup.reconcile_order(order)
+                if (
+                    refreshed.status != OrderStatus.WORKING
+                    or int(refreshed.filled_quantity or 0) != 0
+                    or int(refreshed.remaining_quantity or 0)
+                    != int(refreshed.quantity_requested or 0)
+                ):
+                    # Any fill remains attached to the old active generation;
+                    # normal reconciliation below creates its old-ORL stop.
+                    if int(refreshed.filled_quantity or 0) > 0:
+                        pending["state"] = "REPLACEMENT_ABORTED_OLD_ORDER_FILLED"
+                        pending["reason"] = "REPLACEMENT_ABORTED_OLD_ORDER_FILLED"
+                        card.pending_entry_replacement = pending
+                        self._append_replacement_audit(
+                            card,
+                            pending,
+                            state=str(pending["state"]),
+                            reason=str(pending["reason"]),
+                            occurred_at=now,
+                        )
+                        changed.append(card)
+                    continue
+                quantity = int(refreshed.quantity_requested or 0)
+                if quantity <= 0 or quantity != int(pending.get("quantity") or 0):
+                    pending["state"] = "UPGRADE_REJECTED"
+                    pending["reason"] = "Replacement quantity must equal the original order quantity"
+                    card.pending_entry_replacement = pending
+                    self._append_replacement_audit(
+                        card,
+                        pending,
+                        state="UPGRADE_REJECTED",
+                        reason=str(pending["reason"]),
+                        occurred_at=now,
+                    )
+                    changed.append(card)
+                    continue
+
+                pending["state"] = "REPLACE_PENDING"
+                pending["replace_started_at"] = now.astimezone(timezone.utc).isoformat()
+                pending["old_broker_order_id"] = refreshed.broker_order_id
+                pending["cancellation_requested_at"] = pending["replace_started_at"]
+                card.pending_entry_replacement = pending
+                card.entry_runtime_status = EntryRuntimeStatus.REPLACE_PENDING
+                card.entry_block_reason = str(pending.get("reason") or "Replacing ORB order")
+                result = self._entry_replacement_callbacks.replace_entry_order(
+                    card, refreshed, pending
+                )
+                self._promote_replacement_generation(
+                    card,
+                    pending,
+                    result,
+                    quantity=quantity,
+                    occurred_at=now,
+                )
+                changed.append(card)
+            except GuardedCancellationAmbiguousError as exc:
+                pending["state"] = "CANCEL_PENDING"
+                pending["reason"] = str(exc)
+                card.pending_entry_replacement = pending
+                card.entry_runtime_status = EntryRuntimeStatus.CANCEL_PENDING
+                card.entry_block_reason = str(exc)
+                card.entry_cancel_in_flight = True
+                if _ENTRY_REPLACEMENT_CANCEL_UNCERTAIN_WARNING not in card.warnings:
+                    card.warnings = [
+                        *card.warnings,
+                        _ENTRY_REPLACEMENT_CANCEL_UNCERTAIN_WARNING,
+                    ]
+                self._append_replacement_audit(
+                    card,
+                    pending,
+                    state="CANCEL_PENDING",
+                    reason=str(exc),
+                    occurred_at=now,
+                )
+                changed.append(card)
+            except GuardedCancellationRejectedError as exc:
+                pending["state"] = "UPGRADE_REJECTED"
+                pending["reason"] = f"Cancellation rejected: {exc}"
+                card.pending_entry_replacement = pending
+                card.entry_runtime_status = EntryRuntimeStatus.ORDER_PENDING
+                card.entry_block_reason = str(pending["reason"])
+                if _ENTRY_REPLACEMENT_CANCEL_UNCERTAIN_WARNING not in card.warnings:
+                    card.warnings = [
+                        *card.warnings,
+                        _ENTRY_REPLACEMENT_CANCEL_UNCERTAIN_WARNING,
+                    ]
+                self._append_replacement_audit(
+                    card,
+                    pending,
+                    state="UPGRADE_REJECTED",
+                    reason=str(pending["reason"]),
+                    occurred_at=now,
+                )
+                changed.append(card)
+            except AmbiguousPostBrokerPersistenceError as exc:
+                cancellation_uncertain = "cancel" in str(exc).lower()
+                state = (
+                    "CANCEL_PENDING"
+                    if cancellation_uncertain
+                    else "REPLACEMENT_SUBMISSION_UNRESOLVED"
+                )
+                pending["state"] = state
+                pending["reason"] = str(exc)
+                card.pending_entry_replacement = pending
+                card.entry_runtime_status = (
+                    EntryRuntimeStatus.CANCEL_PENDING
+                    if cancellation_uncertain
+                    else EntryRuntimeStatus.ORDER_PENDING
+                )
+                card.entry_cancel_in_flight = cancellation_uncertain
+                card.entry_submission_unresolved = not cancellation_uncertain
+                card.entry_block_reason = str(exc)
+                warning = (
+                    _ENTRY_REPLACEMENT_CANCEL_UNCERTAIN_WARNING
+                    if cancellation_uncertain
+                    else "UNKNOWN_SUBMISSION_STATE"
+                )
+                if warning not in card.warnings:
+                    card.warnings = [*card.warnings, warning]
+                self._append_replacement_audit(
+                    card,
+                    pending,
+                    state=state,
+                    reason=str(exc),
+                    occurred_at=now,
+                )
+                changed.append(card)
+            except GuardedSubmissionAmbiguousError as exc:
+                pending["state"] = "REPLACEMENT_SUBMISSION_UNRESOLVED"
+                pending["reason"] = str(exc)
+                card.pending_entry_replacement = pending
+                card.entry_runtime_status = EntryRuntimeStatus.ORDER_PENDING
+                card.entry_submission_unresolved = True
+                card.entry_block_reason = str(exc)
+                if "UNKNOWN_SUBMISSION_STATE" not in card.warnings:
+                    card.warnings = [*card.warnings, "UNKNOWN_SUBMISSION_STATE"]
+                self._append_replacement_audit(
+                    card,
+                    pending,
+                    state="REPLACEMENT_SUBMISSION_UNRESOLVED",
+                    reason=str(exc),
+                    occurred_at=now,
+                )
+                changed.append(card)
+            except ReplaceNotSafeError as exc:
+                reason = str(exc)
+                normalized_reason = reason.lower()
+                if "new fill" in normalized_reason or "status=filled" in normalized_reason:
+                    state = "REPLACEMENT_ABORTED_OLD_ORDER_FILLED"
+                    runtime_status = EntryRuntimeStatus.ORDER_PENDING
+                elif "after cancel" in normalized_reason:
+                    state = "REPLACEMENT_ABORTED_AFTER_CANCEL"
+                    runtime_status = EntryRuntimeStatus.RISK_INVALID
+                else:
+                    state = "CANCEL_PENDING"
+                    runtime_status = EntryRuntimeStatus.CANCEL_PENDING
+                    card.entry_cancel_in_flight = True
+                    if _ENTRY_REPLACEMENT_CANCEL_UNCERTAIN_WARNING not in card.warnings:
+                        card.warnings = [
+                            *card.warnings,
+                            _ENTRY_REPLACEMENT_CANCEL_UNCERTAIN_WARNING,
+                        ]
+                pending["state"] = state
+                pending["reason"] = reason
+                card.pending_entry_replacement = pending
+                card.entry_runtime_status = runtime_status
+                card.entry_block_reason = reason
+                self._append_replacement_audit(
+                    card,
+                    pending,
+                    state=state,
+                    reason=reason,
+                    occurred_at=now,
+                )
+                changed.append(card)
+            except Exception as exc:
+                state = "UPGRADE_REJECTED"
+                pending["state"] = state
+                pending["reason"] = str(exc)
+                card.pending_entry_replacement = pending
+                card.entry_runtime_status = EntryRuntimeStatus.ORDER_PENDING
+                card.entry_block_reason = str(exc)
+                self._append_replacement_audit(
+                    card,
+                    pending,
+                    state=state,
+                    reason=str(exc),
+                    occurred_at=now,
+                )
+                changed.append(card)
+        return changed
+
     # -- Continuous entry-order reconciliation (review findings P0-6/P0-7) --
 
     def _entry_tracking_scope(self, cards: List[TradeCardState]) -> List[TradeCardState]:
@@ -958,6 +1412,21 @@ class TradingEngine:
         for card in self._entry_tracking_scope(cards):
             try:
                 order = self._entry_deadline_lookup.find_open_entry_order(card)
+                pending_replacement = dict(card.pending_entry_replacement or {})
+                if (
+                    order is None
+                    and pending_replacement
+                    and self._entry_deadline_lookup.find_entry_order_by_id is not None
+                ):
+                    old_client_order_id = str(
+                        pending_replacement.get("old_client_order_id")
+                        or card.entry_client_order_id
+                        or ""
+                    )
+                    if old_client_order_id:
+                        order = self._entry_deadline_lookup.find_entry_order_by_id(
+                            old_client_order_id
+                        )
                 if order is None:
                     continue
                 refreshed = self._entry_deadline_lookup.reconcile_order(order)
@@ -966,6 +1435,138 @@ class TradingEngine:
                 if refreshed.filled_quantity > card.broker_quantity:
                     self._protect_new_fill(card, refreshed)
                     fill_protected = True
+
+                replacement_state = str(
+                    pending_replacement.get("state") or ""
+                )
+                if replacement_state in {
+                    "REPLACE_PENDING",
+                    "CANCEL_PENDING",
+                    "REPLACEMENT_SUBMISSION_UNRESOLVED",
+                }:
+                    if int(refreshed.filled_quantity or 0) > 0:
+                        pending_replacement["state"] = (
+                            "REPLACEMENT_ABORTED_OLD_ORDER_FILLED"
+                        )
+                        pending_replacement["reason"] = (
+                            "REPLACEMENT_ABORTED_OLD_ORDER_FILLED"
+                        )
+                        card.entry_cancel_in_flight = False
+                        card.entry_runtime_status = EntryRuntimeStatus.ORDER_PENDING
+                    elif refreshed.status == OrderStatus.CANCEL_REQUESTED:
+                        pending_replacement["state"] = "CANCEL_PENDING"
+                        card.entry_cancel_in_flight = True
+                        card.entry_runtime_status = EntryRuntimeStatus.CANCEL_PENDING
+                    elif refreshed.status == OrderStatus.CANCELLED:
+                        resume = (
+                            self._entry_replacement_callbacks.resume_entry_replacement
+                            if self._entry_replacement_callbacks is not None
+                            else None
+                        )
+                        if resume is not None:
+                            try:
+                                result = resume(card, pending_replacement)
+                                quantity = int(
+                                    pending_replacement.get("quantity") or 0
+                                )
+                                self._promote_replacement_generation(
+                                    card,
+                                    pending_replacement,
+                                    result,
+                                    quantity=quantity,
+                                    occurred_at=now,
+                                )
+                                if card not in changed:
+                                    changed.append(card)
+                                continue
+                            except GuardedSubmissionAmbiguousError as exc:
+                                pending_replacement["state"] = (
+                                    "REPLACEMENT_SUBMISSION_UNRESOLVED"
+                                )
+                                pending_replacement["reason"] = str(exc)
+                                card.entry_submission_unresolved = True
+                                card.entry_cancel_in_flight = False
+                                card.entry_runtime_status = (
+                                    EntryRuntimeStatus.ORDER_PENDING
+                                )
+                                card.entry_block_reason = str(exc)
+                                if "UNKNOWN_SUBMISSION_STATE" not in card.warnings:
+                                    card.warnings = [
+                                        *card.warnings,
+                                        "UNKNOWN_SUBMISSION_STATE",
+                                    ]
+                                self._append_replacement_audit(
+                                    card,
+                                    pending_replacement,
+                                    state="REPLACEMENT_SUBMISSION_UNRESOLVED",
+                                    reason=str(exc),
+                                    occurred_at=now,
+                                )
+                            except ReplacementCancelConfirmationPendingError as exc:
+                                pending_replacement["state"] = "CANCEL_PENDING"
+                                pending_replacement["reason"] = str(exc)
+                                card.entry_cancel_in_flight = True
+                                card.entry_runtime_status = (
+                                    EntryRuntimeStatus.CANCEL_PENDING
+                                )
+                                card.entry_block_reason = str(exc)
+                                if (
+                                    _ENTRY_REPLACEMENT_CANCEL_UNCERTAIN_WARNING
+                                    not in card.warnings
+                                ):
+                                    card.warnings = [
+                                        *card.warnings,
+                                        _ENTRY_REPLACEMENT_CANCEL_UNCERTAIN_WARNING,
+                                    ]
+                                self._append_replacement_audit(
+                                    card,
+                                    pending_replacement,
+                                    state="CANCEL_PENDING",
+                                    reason=str(exc),
+                                    occurred_at=now,
+                                )
+                            except Exception as exc:
+                                pending_replacement["state"] = (
+                                    "REPLACEMENT_ABORTED_AFTER_CANCEL"
+                                )
+                                pending_replacement["reason"] = str(exc)
+                                card.entry_cancel_in_flight = False
+                                card.entry_runtime_status = (
+                                    EntryRuntimeStatus.RISK_INVALID
+                                )
+                                card.entry_block_reason = str(exc)
+                                self._append_replacement_audit(
+                                    card,
+                                    pending_replacement,
+                                    state="REPLACEMENT_ABORTED_AFTER_CANCEL",
+                                    reason=str(exc),
+                                    occurred_at=now,
+                                )
+                        else:
+                            pending_replacement["state"] = (
+                                "REPLACEMENT_ABORTED_AFTER_CANCEL"
+                            )
+                            pending_replacement["reason"] = (
+                                "Replacement recovery found the old order cancelled; "
+                                "no guarded resume callback is available"
+                            )
+                            card.entry_cancel_in_flight = False
+                            card.entry_runtime_status = EntryRuntimeStatus.RISK_INVALID
+                            card.entry_block_reason = str(
+                                pending_replacement["reason"]
+                            )
+                    elif refreshed.status == OrderStatus.WORKING:
+                        pending_replacement["state"] = "UPGRADE_REJECTED"
+                        pending_replacement["reason"] = (
+                            "Replacement cancellation was not confirmed; the old order remains working"
+                        )
+                        card.entry_cancel_in_flight = False
+                        card.entry_runtime_status = EntryRuntimeStatus.ORDER_PENDING
+                        card.entry_block_reason = str(pending_replacement["reason"])
+                    card.pending_entry_replacement = pending_replacement
+                    if fill_protected or card not in changed:
+                        changed.append(card)
+                    continue
 
                 cancel_requested = card.entry_block_reason in (
                     "cancel_requested",

@@ -108,7 +108,9 @@ def _dummy_market_data() -> RestPollingMarketDataService:
     cycle and corrupts any test asserting on refresh-interval timing.
     """
     return RestPollingMarketDataService(
-        quote_fetcher=lambda symbol: QuoteSnapshot(symbol=symbol, last_price=100.0)
+        quote_fetcher=lambda symbol: QuoteSnapshot(
+            symbol=symbol, last_price=100.0, bid=99.9, ask=100.1
+        )
     )
 
 
@@ -3798,10 +3800,13 @@ def test_runtime_executes_crossed_lower_trigger_orb_once_in_auto_mode(
         orb_high=99.0,
         orb_low=95.0,
         breakout_price=97.0,
-        breakout_trigger=97.097,
+        breakout_trigger=99.0,
         entry_trigger=99.0,
+        execution_price=99.0,
+        floor_price=97.0,
         current_price=100.0,
         source_session_date=session_date,
+        range_closed_at=dt.datetime.now(dt.timezone.utc).isoformat(),
         shares=200,
         risk_percent=0.01,
         score=10.0,
@@ -3813,10 +3818,13 @@ def test_runtime_executes_crossed_lower_trigger_orb_once_in_auto_mode(
         orb_high=101.0,
         orb_low=96.0,
         breakout_price=97.0,
-        breakout_trigger=97.097,
+        breakout_trigger=101.0,
         entry_trigger=101.0,
+        execution_price=101.0,
+        floor_price=97.0,
         current_price=100.0,
         source_session_date=session_date,
+        range_closed_at=dt.datetime.now(dt.timezone.utc).isoformat(),
         shares=200,
         risk_percent=0.01,
         score=20.0,

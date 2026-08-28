@@ -30,11 +30,10 @@ import inspect
 import math
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
 from src.brokers.execution_broker_protocol import (
-    Broker,
     BrokerOrderStatusSnapshot,
     BrokerSubmissionResult,
 )
@@ -58,7 +57,6 @@ from src.core.execution_request import (
 from src.core.execution_result import ExecutionSubmissionResult
 from src.core.order_state import (
     REGULAR_LIMIT_EXECUTION,
-    BrokerOrder,
     BrokerOrderDiscoveryResult,
     OrderIntent,
     OrderSide,
@@ -371,6 +369,7 @@ def request_replace(
     pre_trade_risk_decision: Any = None,
     risk_strategy_id: str = "",
     risk_plan_id: str = "",
+    post_cancel_revalidate: Optional[Callable[[], None]] = None,
 ) -> ExecutionOrderRecord:
     """``GUARDED_ENGINE`` only -- no legacy or Kanban call site performs a
     broker-level replace today (confirmed by codebase survey); raises
@@ -399,7 +398,56 @@ def request_replace(
         risk_strategy_id=risk_strategy_id,
         risk_plan_id=risk_plan_id,
     )
-    return resolved_gateway.replace_guarded(request)
+    return resolved_gateway.replace_guarded(
+        request,
+        post_cancel_revalidate=post_cancel_revalidate,
+    )
+
+
+def resume_replace(
+    *,
+    source: ExecutionSource,
+    client_order_id: str,
+    new_quantity: int,
+    new_limit_price: float,
+    gateway: ExecutionCommandGateway,
+    replace_command_id: str,
+    new_client_order_id: str,
+    post_cancel_revalidate: Callable[[], None],
+    lease: Optional[ExecutionLease] = None,
+    environment: str,
+    account_no: str,
+    strategy_instance_id: str = "",
+    pre_trade_risk_decision: Any = None,
+    risk_strategy_id: str = "",
+    risk_plan_id: str = "",
+) -> ExecutionOrderRecord:
+    """Resume a persisted replacement after authoritative cancellation.
+
+    This never issues a second cancel; the guarded gateway verifies the
+    durable parent command, cancelled old order, shared reservation, and
+    stable replacement identity before allowing the submit leg.
+    """
+
+    request = ReplaceExecutionRequest(
+        client_order_id=client_order_id,
+        replace_command_id=replace_command_id,
+        new_client_order_id=new_client_order_id,
+        new_quantity=new_quantity,
+        new_limit_price=new_limit_price,
+        environment=environment,
+        account_no=account_no,
+        lease=lease,
+        source=source,
+        strategy_instance_id=strategy_instance_id,
+        pre_trade_risk_decision=pre_trade_risk_decision,
+        risk_strategy_id=risk_strategy_id,
+        risk_plan_id=risk_plan_id,
+    )
+    return gateway.resume_replace_guarded(
+        request,
+        post_cancel_revalidate=post_cancel_revalidate,
+    )
 
 
 # -- Kanban workflow/projection boundary (Workstream 13 / INV-21) ---------
@@ -981,6 +1029,7 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         card.entry_orb_high = None
         card.entry_orb_low = None
         card.entry_trigger = None
+        card.clear_orb_generation_metadata()
         card.stop_adr = None
         card.entry_block_reason = ""
         card.next_retry_at = None
@@ -1343,7 +1392,6 @@ def request_board_action(
         CancelQueuedSellAll,
         RequestPartialSell,
         RequestSellAll,
-        ClearBreakoutPrice,
         SetBreakevenStop,
         SetBreakoutPrice,
         SetManualStop,

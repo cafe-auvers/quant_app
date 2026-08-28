@@ -48,6 +48,7 @@ from __future__ import annotations
 import logging
 import math
 import threading
+import time
 import weakref
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -69,7 +70,11 @@ from src.core.execution_order_record import (
     is_cancellable,
     validate_consistency,
 )
-from src.core.execution_ownership import ExecutionOwner, ExecutionOwnershipProof
+from src.core.execution_ownership import (
+    ExecutionOwner,
+    ExecutionOwnership,
+    ExecutionOwnershipProof,
+)
 from src.core.execution_request import CancelExecutionRequest, ReplaceExecutionRequest, SubmitExecutionRequest
 from src.core.order_recovery_state import OrderRecoveryState, validate_recovery_transition
 from src.core.order_state import (
@@ -95,6 +100,7 @@ from src.services.capital_reservation_repository import (
 from src.services.execution_command_repository import (
     ExecutionCommand,
     ensure_execution_commands_table,
+    get_command_by_idempotency_key,
     insert_command,
     update_command_response,
 )
@@ -136,7 +142,6 @@ from src.services.kis_request_boundary import (
 from src.services.kis_request_scheduler import RequestKind, RequestPriority
 from src.services.emergency_journal import (
     EmergencyJournal,
-    EmergencyJournalError,
     EmergencyLeaseAllowance,
     EmergencyLeaseAllowanceError,
 )
@@ -256,6 +261,16 @@ class ReplaceNotSafeError(GuardedExecutionError):
     """``replace_guarded``'s cancel-then-resubmit could not establish a
     safe (``CANCELLED``) outcome for the order being replaced -- the new
     order is never submitted in this case."""
+
+
+class ReplacementCancelConfirmationPendingError(ReplaceNotSafeError):
+    """Replacement recovery is waiting for authoritative cancellation proof.
+
+    The broker may already describe the old order as cancelled, but the
+    gateway's exact-order inquiry has not yet cleared its discovery hold. The
+    caller must not submit or cancel again until reconciliation establishes a
+    terminal zero-fill snapshot.
+    """
 
 
 class OrderNotFoundForCancelError(GuardedExecutionError):
@@ -735,7 +750,12 @@ class ExecutionCommandGateway:
         with self._ownership.claim(key, request.source):
             return self._do_cancel(request, record=record, permission_check=is_cancellable)
 
-    def replace_guarded(self, request: ReplaceExecutionRequest) -> ExecutionOrderRecord:
+    def replace_guarded(
+        self,
+        request: ReplaceExecutionRequest,
+        *,
+        post_cancel_revalidate: Optional[Callable[[], None]] = None,
+    ) -> ExecutionOrderRecord:
         """Composed, never a synthetic first-class broker status: validate
         the *entire* replacement request first (review finding 6, third
         pass -- an invalid or duplicate replacement request must make
@@ -1015,6 +1035,30 @@ class ExecutionCommandGateway:
             if (
                 cancelled is not None
                 and cancelled.status == ExecutionOrderStatus.CANCELLED
+                and cancelled.recovery_state == OrderRecoveryState.NONE
+            ):
+                expected_version = cancelled.version
+                _transition_recovery_state(
+                    cancelled, OrderRecoveryState.DISCOVERING
+                )
+                with engine.begin() as conn:
+                    update_execution_order(
+                        conn,
+                        cancelled,
+                        expected_version=expected_version,
+                    )
+            if (
+                cancelled is not None
+                and cancelled.status
+                in {
+                    ExecutionOrderStatus.CANCEL_PENDING,
+                    ExecutionOrderStatus.CANCELLED,
+                }
+            ):
+                cancelled = self._wait_for_authoritative_cancel_terminal(cancelled)
+            if (
+                cancelled is not None
+                and cancelled.status == ExecutionOrderStatus.CANCELLED
                 and int(cancelled.filled_quantity or 0)
                 > pre_cancel_filled_quantity
             ):
@@ -1035,7 +1079,11 @@ class ExecutionCommandGateway:
                     "reported a new fill after replacement risk was approved. Refresh "
                     "the position and build a new net-risk decision before retrying."
                 )
-            if cancelled is None or cancelled.status != ExecutionOrderStatus.CANCELLED:
+            if (
+                cancelled is None
+                or cancelled.status != ExecutionOrderStatus.CANCELLED
+                or cancelled.recovery_state != OrderRecoveryState.NONE
+            ):
                 status = cancelled.status.value if cancelled is not None else "MISSING"
                 if (
                     cancelled is not None
@@ -1052,9 +1100,35 @@ class ExecutionCommandGateway:
                         )
                 raise ReplaceNotSafeError(
                     f"Cannot replace {request.client_order_id!r}: cancellation did not reach a safe "
-                    f"CANCELLED outcome (status={status}) -- a fill or an ambiguous cancel outcome must "
+                    f"CANCELLED outcome (status={status}) from authoritative inquiry -- "
+                    "a fill or an ambiguous cancel outcome must "
                     "be resolved before a replace can proceed"
                 )
+
+            # The broker cancellation can take long enough for the passive
+            # marketability, session, or risk inputs to change. Re-run the
+            # caller's full fresh gate only after authoritative cancellation
+            # and before the replacement POST. A failure must release the
+            # prepared transition hold and never recreate the old order.
+            if post_cancel_revalidate is not None:
+                try:
+                    post_cancel_revalidate()
+                except Exception as exc:
+                    if prepared_reservation is not None:
+                        current_hold = fetch_reservation(
+                            engine, prepared_reservation.reservation_id
+                        )
+                        if current_hold is not None and current_hold.is_open():
+                            current_hold.release()
+                            with engine.begin() as conn:
+                                update_reservation(
+                                    conn,
+                                    current_hold,
+                                    expected_version=current_hold.version,
+                                )
+                    raise ReplaceNotSafeError(
+                        f"Replacement aborted after cancel: {exc}"
+                    ) from exc
 
             # 7. submit the linked replacement.
             submit_request = SubmitExecutionRequest(
@@ -1118,6 +1192,296 @@ class ExecutionCommandGateway:
                     conn, replace_idempotency_key, status="COMPLETED", broker_response={}
                 )
             return result
+
+    def resume_replace_guarded(
+        self,
+        request: ReplaceExecutionRequest,
+        *,
+        post_cancel_revalidate: Callable[[], None],
+    ) -> ExecutionOrderRecord:
+        """Resume only the submit leg of a durably journaled replacement.
+
+        This recovery entry point is intentionally narrower than
+        :meth:`replace_guarded`: it never issues another cancel. It is valid
+        only when the parent replace command already exists, the old order is
+        authoritatively ``CANCELLED`` with zero fills, and the original shared
+        reservation is still open.
+        """
+
+        self._require_guarded_mode()
+        engine = self._require_engine()
+        original = self._fetch_record(request.client_order_id)
+        if original is None:
+            raise ReplaceNotSafeError("Replacement recovery cannot find the old order")
+        key = _recovery_key(
+            original.environment, original.account_no, original.symbol
+        )
+        with self._ownership.claim(key, request.source):
+            if (
+                original.environment != request.environment
+                or original.account_no != request.account_no
+            ):
+                raise ReplaceNotSafeError("Replacement recovery scope does not match")
+            if (
+                original.status != ExecutionOrderStatus.CANCELLED
+                or int(original.filled_quantity or 0) != 0
+                or original.recovery_state != OrderRecoveryState.NONE
+            ):
+                raise ReplacementCancelConfirmationPendingError(
+                    "Replacement recovery requires an authoritatively confirmed-cancelled "
+                    "zero-fill old order"
+                )
+            if int(request.new_quantity or 0) != int(
+                original.submitted_quantity or 0
+            ):
+                raise ReplaceNotSafeError(
+                    "Replacement recovery quantity must equal the old order quantity"
+                )
+            replace_idempotency_key = f"REPLACE:{request.replace_command_id}"
+            parent = get_command_by_idempotency_key(engine, replace_idempotency_key)
+            if (
+                parent is None
+                or parent.command_type != "replace"
+                or parent.environment != original.environment
+                or parent.account_no != original.account_no
+                or parent.symbol != original.symbol
+                or not self._same_broker_order_id(
+                    parent.target_broker_order_id, original.broker_order_id
+                )
+                or parent.status not in {"REQUESTED", "COMPLETED"}
+            ):
+                raise ReplaceNotSafeError(
+                    "Replacement recovery has no matching durable parent command"
+                )
+            self._require_ownership(
+                original.environment,
+                original.account_no,
+                original.symbol,
+                request.source,
+                request.strategy_instance_id,
+            )
+            self._require_verified_lease(request.lease)
+
+            existing = self._fetch_record(request.new_client_order_id)
+            if parent.status == "COMPLETED" and existing is None:
+                raise GuardedSubmissionAmbiguousError(
+                    "Completed replacement command has no durable new-order record"
+                )
+            completed_statuses = {
+                ExecutionOrderStatus.ACKNOWLEDGED,
+                ExecutionOrderStatus.WORKING,
+                ExecutionOrderStatus.PARTIALLY_FILLED,
+                ExecutionOrderStatus.FILLED,
+            }
+            if existing is not None:
+                if (
+                    existing.replaces_execution_order_id
+                    != original.client_order_id
+                    or existing.capital_reservation_id
+                    != original.capital_reservation_id
+                ):
+                    raise ReplaceNotSafeError(
+                        "Replacement recovery found a conflicting new order identity"
+                    )
+                if existing.status in completed_statuses:
+                    result = existing
+                elif existing.status in {
+                    ExecutionOrderStatus.PREPARED,
+                    ExecutionOrderStatus.SUBMITTING,
+                    ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE,
+                }:
+                    raise GuardedSubmissionAmbiguousError(
+                        "Replacement submission already exists in an unresolved state"
+                    )
+                else:
+                    raise ReplaceNotSafeError(
+                        f"Replacement submission is terminally unusable ({existing.status.value})"
+                    )
+            else:
+                reservation = fetch_reservation(
+                    engine, original.capital_reservation_id
+                )
+                if reservation is None or not reservation.is_open():
+                    raise ReplaceNotSafeError(
+                        "Replacement recovery shared reservation is missing or closed"
+                    )
+                try:
+                    post_cancel_revalidate()
+                except Exception as exc:
+                    reservation.release()
+                    with engine.begin() as conn:
+                        update_reservation(
+                            conn,
+                            reservation,
+                            expected_version=reservation.version,
+                        )
+                    raise ReplaceNotSafeError(
+                        f"Replacement aborted after cancel: {exc}"
+                    ) from exc
+                submit_request = SubmitExecutionRequest(
+                    client_order_id=request.new_client_order_id,
+                    environment=original.environment,
+                    account_no=original.account_no,
+                    symbol=original.symbol,
+                    side=original.side,
+                    intent=original.intent,
+                    quantity=int(request.new_quantity),
+                    limit_price=float(request.new_limit_price),
+                    exchange=original.exchange,
+                    execution_policy=original.execution_policy,
+                    attempt_group_id=original.attempt_group_id,
+                    attempt_number=original.attempt_number + 1,
+                    lease=request.lease,
+                    source=request.source,
+                    strategy_instance_id=request.strategy_instance_id,
+                    replaces_execution_order_id=original.client_order_id,
+                    prepared_capital_reservation_id=reservation.reservation_id,
+                    prepared_capital_reservation_version=reservation.version,
+                    pre_trade_risk_decision=request.pre_trade_risk_decision,
+                    risk_strategy_id=request.risk_strategy_id,
+                    risk_plan_id=request.risk_plan_id,
+                )
+                try:
+                    result = self._do_submit(submit_request)
+                except (
+                    GuardedSubmissionAmbiguousError,
+                    AmbiguousPostBrokerPersistenceError,
+                ):
+                    raise
+                except Exception:
+                    if self._fetch_record(request.new_client_order_id) is None:
+                        current_hold = fetch_reservation(
+                            engine, reservation.reservation_id
+                        )
+                        if current_hold is not None and current_hold.is_open():
+                            current_hold.release()
+                            with engine.begin() as conn:
+                                update_reservation(
+                                    conn,
+                                    current_hold,
+                                    expected_version=current_hold.version,
+                                )
+                    raise
+
+            if parent.status == "REQUESTED":
+                with engine.begin() as conn:
+                    update_command_response(
+                        conn,
+                        replace_idempotency_key,
+                        status="COMPLETED",
+                        broker_response={"resumed_after_cancel_confirmation": True},
+                        expected_version=parent.version,
+                    )
+            return result
+
+    @staticmethod
+    def _same_broker_order_id(left: object, right: object) -> bool:
+        left_value = str(left or "").strip()
+        right_value = str(right or "").strip()
+        return bool(
+            left_value
+            and right_value
+            and (
+                left_value == right_value
+                or left_value.lstrip("0") == right_value.lstrip("0")
+            )
+        )
+
+    def _apply_authoritative_cancel_snapshot(
+        self,
+        record: ExecutionOrderRecord,
+        snapshot: BrokerOrderStatusSnapshot,
+    ) -> bool:
+        """Persist exact terminal/fill evidence observed after a cancel ACK."""
+
+        target = {
+            OrderStatus.CANCELLED: ExecutionOrderStatus.CANCELLED,
+            OrderStatus.FILLED: ExecutionOrderStatus.FILLED,
+            OrderStatus.PARTIALLY_FILLED: ExecutionOrderStatus.PARTIALLY_FILLED,
+            OrderStatus.REJECTED: ExecutionOrderStatus.REJECTED,
+            OrderStatus.EXPIRED: ExecutionOrderStatus.EXPIRED,
+        }.get(snapshot.status)
+        if target is None:
+            return False
+        expected_version = record.version
+        record.filled_quantity = max(
+            int(record.filled_quantity or 0), int(snapshot.filled_quantity or 0)
+        )
+        if snapshot.avg_fill_price:
+            record.average_fill_price = float(snapshot.avg_fill_price)
+        if target in {
+            ExecutionOrderStatus.CANCELLED,
+            ExecutionOrderStatus.FILLED,
+            ExecutionOrderStatus.REJECTED,
+            ExecutionOrderStatus.EXPIRED,
+        }:
+            record.remaining_quantity = 0
+        else:
+            record.remaining_quantity = max(
+                0,
+                int(snapshot.remaining_quantity or 0)
+                or int(record.submitted_quantity or 0)
+                - int(record.filled_quantity or 0),
+            )
+        if target != record.status:
+            if target not in allowed_status_transitions(record.status):
+                return False
+            apply_status_transition(record, target)
+        if record.recovery_state == OrderRecoveryState.DISCOVERING:
+            _transition_recovery_state(record, OrderRecoveryState.NONE)
+        with self._require_engine().begin() as conn:
+            update_execution_order(conn, record, expected_version=expected_version)
+        self._recent_execution_records[record.client_order_id] = record
+        return True
+
+    def _wait_for_authoritative_cancel_terminal(
+        self, record: ExecutionOrderRecord
+    ) -> ExecutionOrderRecord:
+        """Poll exact KIS order truth after a non-terminal cancel response.
+
+        The cancel endpoint's acknowledgement is deliberately insufficient.
+        Replacement can continue only after the order/history inquiry reports
+        a terminal cancellation (or exposes a fill race).
+        """
+
+        timeout = max(
+            1.0, float(execution_config.EXIT_CANCEL_CONFIRMATION_TIMEOUT_SECONDS)
+        )
+        deadline = time.monotonic() + timeout
+        delay = 0.0
+        while True:
+            if delay:
+                time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
+            try:
+                snapshots = self.get_order(
+                    environment=record.environment,
+                    account_no=record.account_no,
+                    is_reserved=(record.execution_policy == RESERVED_MOO_EXECUTION),
+                    symbol=record.symbol,
+                    broker_order_id=record.broker_order_id,
+                    client_order_id=record.client_order_id,
+                    side=record.side.value,
+                    exchange=record.exchange or "NASD",
+                )
+            except Exception:
+                snapshots = []
+            exact = next(
+                (
+                    snapshot
+                    for snapshot in snapshots
+                    if self._same_broker_order_id(
+                        snapshot.broker_order_id, record.broker_order_id
+                    )
+                ),
+                None,
+            )
+            if exact is not None and self._apply_authoritative_cancel_snapshot(
+                record, exact
+            ):
+                return record
+            if time.monotonic() >= deadline:
+                return record
+            delay = min(2.0, 0.5 if delay <= 0 else delay * 2.0)
 
     # --- internal guards ---------------------------------------------------
 

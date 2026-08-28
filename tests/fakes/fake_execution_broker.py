@@ -61,8 +61,11 @@ class FakeExecutionBroker:
 
     submit_calls: List[Dict[str, Any]] = field(default_factory=list)
     cancel_calls: List[Dict[str, Any]] = field(default_factory=list)
+    get_order_calls: List[Dict[str, Any]] = field(default_factory=list)
     _submit_queue: List[Callable[[], BrokerSubmissionResult]] = field(default_factory=list)
     _cancel_queue: List[Callable[[], BrokerOrderStatusSnapshot]] = field(default_factory=list)
+    _get_order_queue: List[List[BrokerOrderStatusSnapshot]] = field(default_factory=list)
+    _last_cancel_snapshot: Optional[BrokerOrderStatusSnapshot] = None
 
     # --- scripting: submission -------------------------------------------------
 
@@ -104,6 +107,21 @@ class FakeExecutionBroker:
             )
 
         self._cancel_queue.append(_make)
+
+    def queue_cancel_acknowledged(self) -> None:
+        def _make() -> BrokerOrderStatusSnapshot:
+            return BrokerOrderStatusSnapshot(
+                environment="",
+                account_no="",
+                symbol="",
+                status=OrderStatus.CANCEL_REQUESTED,
+                raw_response={"status": "cancel_requested"},
+            )
+
+        self._cancel_queue.append(_make)
+
+    def queue_order_snapshot(self, snapshot: BrokerOrderStatusSnapshot) -> None:
+        self._get_order_queue.append([snapshot])
 
     def queue_cancel_rejected(
         self, *, message: str = "cancel rejected -- order already progressed",
@@ -162,7 +180,9 @@ class FakeExecutionBroker:
                 "call queue_cancel_confirmed()/queue_cancel_rejected()/queue_cancel_timeout()/"
                 "queue_cancel_fill_race() before exercising the caller under test"
             )
-        return self._cancel_queue.pop(0)()
+        result = self._cancel_queue.pop(0)()
+        self._last_cancel_snapshot = result
+        return result
 
     def is_ambiguous_cancellation_error(self, error: BaseException) -> bool:
         """Not part of the base ``Broker`` protocol (legacy cancellation has
@@ -172,6 +192,19 @@ class FakeExecutionBroker:
         return isinstance(error, (BrokerTimeoutError, BrokerTransportError))
 
     def get_order(self, **kwargs: Any) -> List[BrokerOrderStatusSnapshot]:
+        self.get_order_calls.append(dict(kwargs))
+        if self._get_order_queue:
+            return self._get_order_queue.pop(0)
+        if self._last_cancel_snapshot is not None:
+            snapshot = self._last_cancel_snapshot
+            snapshot.environment = str(kwargs.get("environment") or "")
+            snapshot.account_no = str(kwargs.get("account_no") or "")
+            snapshot.symbol = str(kwargs.get("symbol") or "")
+            snapshot.broker_order_id = str(kwargs.get("broker_order_id") or "")
+            snapshot.client_order_id = str(kwargs.get("client_order_id") or "")
+            if snapshot.quantity_requested <= 0:
+                snapshot.quantity_requested = int(kwargs.get("quantity") or 0)
+            return [snapshot]
         return []
 
     def discover_orders(self, **kwargs: Any) -> BrokerOrderDiscoveryResult:

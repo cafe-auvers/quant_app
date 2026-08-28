@@ -81,10 +81,7 @@ from src.services.account_reconciliation import (
 )
 from src.services.execution_command_repository import (
     DuplicateCommandError,
-    ExecutionCommand,
-    ensure_execution_commands_table,
     get_command_by_idempotency_key,
-    insert_command,
 )
 from src.services.execution_lease_protocol import (
     DefaultExecutionLeaseProtocol,
@@ -592,7 +589,6 @@ def test_guarded_engine_submit_without_a_mutation_budget_raises(tmp_path):
 
 
 def test_build_guarded_execution_gateway_requires_every_dependency(tmp_path):
-    engine = _make_engine(tmp_path)
     protocol, _ = _lease()
     with pytest.raises(TypeError):
         build_guarded_execution_gateway()  # missing everything
@@ -1474,6 +1470,28 @@ def test_replace_preserves_the_original_order_and_creates_a_linked_new_record(tm
 
 
 @pytest.mark.usefixtures("trading_enabled")
+def test_replace_revalidates_after_confirmed_cancel_before_new_submit(tmp_path):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    _submit_and_acknowledge(gateway, broker)
+    broker.queue_cancel_confirmed()
+
+    with pytest.raises(ReplaceNotSafeError, match="aborted after cancel"):
+        gateway.replace_guarded(
+            _replace_request(),
+            post_cancel_revalidate=lambda: (_ for _ in ()).throw(
+                RuntimeError("best ask reached the passive limit")
+            ),
+        )
+
+    assert len(broker.cancel_calls) == 1
+    assert len(broker.submit_calls) == 1  # original only
+    assert fetch_execution_order(engine, "CID-1").status == (
+        ExecutionOrderStatus.CANCELLED
+    )
+    assert fetch_execution_order(engine, "CID-1-REPLACEMENT") is None
+
+
+@pytest.mark.usefixtures("trading_enabled")
 def test_production_replace_rejects_missing_portfolio_reservation_before_cancel(
     tmp_path, monkeypatch,
 ):
@@ -1558,6 +1576,75 @@ def test_production_replace_transfers_net_risk_before_cancelling_original(
     assert reservations[0].remaining_projected_open_risk == pytest.approx(60.0)
     assert len(broker.cancel_calls) == 1
     assert len(broker.submit_calls) == 2
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_restart_after_confirmed_cancel_resumes_submit_without_second_cancel(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        execution_config, "is_buyboard_engine_enabled", lambda: True
+    )
+    gateway, broker, engine = _production_guarded_gateway(tmp_path)
+    broker.queue_acceptance(broker_order_id="B-ORIGINAL")
+    original_approval = _portfolio_approval(quantity=10, price=100.0)
+    original = gateway.submit_guarded(
+        _submit_request(pre_trade_risk_decision=original_approval)
+    )
+    reservation = fetch_reservation(engine, original.capital_reservation_id)
+    assert reservation is not None
+    pending_original = PortfolioProjectedExposure(
+        symbol="AAPL",
+        gross_notional_usd=1_000.0,
+        open_risk_usd=50.0,
+        source="PENDING_BUY",
+        reservation_id=reservation.reservation_id,
+    )
+    replacement_approval = _portfolio_approval(
+        quantity=10,
+        price=100.0,
+        projected_exposures=(pending_original,),
+        replaced_reservation_id=reservation.reservation_id,
+    )
+    request = _replace_request(
+        new_quantity=10,
+        new_limit_price=100.0,
+        pre_trade_risk_decision=replacement_approval,
+        risk_plan_id="TEST:ORB:AAPL",
+    )
+    broker.queue_cancel_confirmed()
+    real_do_submit = gateway._do_submit
+
+    def simulate_process_exit(_request):
+        raise SystemExit("simulated restart after confirmed cancellation")
+
+    monkeypatch.setattr(gateway, "_do_submit", simulate_process_exit)
+    with pytest.raises(SystemExit):
+        gateway.replace_guarded(request)
+
+    assert fetch_execution_order(engine, original.client_order_id).status == (
+        ExecutionOrderStatus.CANCELLED
+    )
+    assert len(broker.cancel_calls) == 1
+    assert get_command_by_idempotency_key(
+        engine, "REPLACE:REPLACE-1"
+    ).status == "REQUESTED"
+
+    monkeypatch.setattr(gateway, "_do_submit", real_do_submit)
+    broker.queue_acceptance(broker_order_id="B-REPLACEMENT")
+    replacement = gateway.resume_replace_guarded(
+        request,
+        post_cancel_revalidate=lambda: None,
+    )
+
+    assert replacement.broker_order_id == "B-REPLACEMENT"
+    assert replacement.replaces_execution_order_id == original.client_order_id
+    assert replacement.capital_reservation_id == reservation.reservation_id
+    assert len(broker.cancel_calls) == 1
+    assert len(broker.submit_calls) == 2
+    assert get_command_by_idempotency_key(
+        engine, "REPLACE:REPLACE-1"
+    ).status == "COMPLETED"
 
 
 @pytest.mark.usefixtures("trading_enabled")
@@ -1900,6 +1987,67 @@ def test_replace_persists_a_durable_parent_command_that_finalizes_on_success(tmp
     # The linked sub-commands are independently visible too.
     assert get_command_by_idempotency_key(engine, "CANCEL:REPLACE-1:CANCEL") is not None
     assert get_command_by_idempotency_key(engine, "SUBMIT:CID-1-REPLACEMENT") is not None
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_replace_waits_for_authoritative_cancel_inquiry_before_submit(tmp_path):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    _submit_and_acknowledge(gateway, broker)
+    broker.queue_cancel_acknowledged()
+    broker.queue_order_snapshot(
+        BrokerOrderStatusSnapshot(
+            environment="PROD",
+            account_no="12345678-01",
+            symbol="AAPL",
+            broker_order_id="B-1",
+            side=OrderSide.BUY,
+            status=OrderStatus.CANCELLED,
+            quantity_requested=5,
+            filled_quantity=0,
+            remaining_quantity=0,
+        )
+    )
+    broker.queue_acceptance(broker_order_id="B-2")
+
+    replacement = gateway.replace_guarded(_replace_request())
+
+    assert replacement.broker_order_id == "B-2"
+    assert len(broker.get_order_calls) == 1
+    assert len(broker.cancel_calls) == 1
+    assert len(broker.submit_calls) == 2
+    assert fetch_execution_order(engine, "CID-1").status == (
+        ExecutionOrderStatus.CANCELLED
+    )
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_authoritative_cancel_inquiry_fill_race_never_submits_replacement(tmp_path):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    _submit_and_acknowledge(gateway, broker)
+    broker.queue_cancel_acknowledged()
+    broker.queue_order_snapshot(
+        BrokerOrderStatusSnapshot(
+            environment="PROD",
+            account_no="12345678-01",
+            symbol="AAPL",
+            broker_order_id="B-1",
+            side=OrderSide.BUY,
+            status=OrderStatus.PARTIALLY_FILLED,
+            quantity_requested=5,
+            filled_quantity=1,
+            remaining_quantity=4,
+            avg_fill_price=100.0,
+        )
+    )
+
+    with pytest.raises(ReplaceNotSafeError):
+        gateway.replace_guarded(_replace_request())
+
+    assert len(broker.cancel_calls) == 1
+    assert len(broker.submit_calls) == 1
+    original = fetch_execution_order(engine, "CID-1")
+    assert original.status == ExecutionOrderStatus.PARTIALLY_FILLED
+    assert original.filled_quantity == 1
 
 
 @pytest.mark.usefixtures("trading_enabled")

@@ -125,6 +125,7 @@ def _clear_executable_geometry(card: TradeCardState) -> None:
     card.entry_orb_high = None
     card.entry_orb_low = None
     card.entry_trigger = None
+    card.clear_orb_generation_metadata()
     card.stop_adr = None
     card.entry_runtime_status = None
     card.entry_block_reason = ""
