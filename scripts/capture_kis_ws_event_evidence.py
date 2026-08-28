@@ -39,10 +39,9 @@ if str(ROOT) not in sys.path:
 
 
 def _load_repo_env() -> None:
-    from src.utils.config import load_env_file
+    from src.utils.config import install_repository_configuration
 
-    for key, value in load_env_file().items():
-        os.environ.setdefault(key, value)
+    install_repository_configuration()
 
 
 _load_repo_env()

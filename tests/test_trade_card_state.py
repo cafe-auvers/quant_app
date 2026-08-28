@@ -113,6 +113,29 @@ def test_unmarked_legacy_risk_percentage_points_migrate_once_to_fraction():
     )
 
 
+def test_unmarked_custom_orb_risk_above_standard_grid_remains_canonical():
+    payload = _make_card(
+        risk_percent=0.03,
+        selected_orb_window="5m",
+        entry_orb_high=101.0,
+        entry_orb_low=99.0,
+        entry_trigger=101.1,
+    ).to_dict()
+    payload.pop("risk_unit")
+
+    restored = TradeCardState.from_dict(payload)
+
+    assert restored.risk_percent == pytest.approx(0.03)
+    assert restored.to_dict()["risk_unit"] == "fraction"
+
+
+def test_unmarked_passive_buylist_risk_above_standard_grid_migrates():
+    payload = _make_card(risk_percent=0.5).to_dict()
+    payload.pop("risk_unit")
+
+    assert TradeCardState.from_dict(payload).risk_percent == pytest.approx(0.005)
+
+
 def test_marked_canonical_risk_fraction_is_never_double_converted():
     payload = _make_card(risk_percent=0.4).to_dict()
 

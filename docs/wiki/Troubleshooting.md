@@ -2,7 +2,7 @@
 
 ## App opens without database data
 
-- Check Health and `MYSQL_*` values in local `.env`.
+- Check Health, MySQL credentials in `.env`, and MySQL connection settings in `config/runtime.local.json`.
 - Confirm network/Tailscale reachability and MySQL grants/TLS policy.
 - On a laptop, confirm `data/local_mirror.db` exists and mirror freshness is
   acceptable.
@@ -41,7 +41,7 @@ The normal row cadence is 240 seconds with a 300-second freshness fence.
 ## Live Trading differs between laptop and PC
 
 The shared ON/OFF switch is synchronized. Each machine also has a private
-`TRADING_ENABLED` administrative lock in `.env`. A laptop with that value
+`TRADING_ENABLED` administrative lock in `config/runtime.local.json`. A laptop with that value
 false stays **LOCKED OFF** even if the shared switch is ON. A PC with it true
 still does nothing unless it is the Execution Owner and every final gate
 passes. Environment files are deliberately not synchronized.
@@ -60,7 +60,7 @@ Do not submit again. Query/reconcile the existing durable client/broker
 identity, review account-wide open/history/reserved orders and positions, and
 keep the card pending until evidence is unambiguous.
 
-## Environment changes are missing
+## Credential or runtime changes are missing
 
 Run:
 
@@ -68,8 +68,8 @@ Run:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\sync_pc_env.ps1
 ```
 
-Existing `.env` values win. Generated `.env.pc` intentionally blanks all
-`MYSQL_*` values.
+Credential `.env` values and runtime-local overrides win. Generated `.env.pc`
+intentionally blanks all `MYSQL_*` credentials.
 
 ## Qt/WebEngine rendering problems
 

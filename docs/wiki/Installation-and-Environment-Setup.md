@@ -20,12 +20,13 @@ python -m pip check
 `requirements.txt` is the supported direct dependency range; the hash-locked
 file is the reproducible installation input.
 
-## Environment files
+## Credential and runtime configuration
 
-`.env.example` is tracked and contains no private values. `.env` and `.env.pc`
-are local and ignored. Every normal startup merges new template keys into
-`.env` while preserving existing values, then regenerates `.env.pc` with
-`MYSQL_*` values blank for manual PC setup.
+`.env.example` is the tracked credential-only schema. `.env` and `.env.pc` are
+local and ignored. Non-secret settings live in tracked `config/runtime.json`;
+machine overrides live in ignored `config/runtime.local.json`. Startup migrates
+recognized legacy runtime values out of `.env` without changing them, then
+regenerates credential-only `.env.pc` with `MYSQL_*` credentials blank.
 
 Manual synchronization:
 
@@ -33,15 +34,15 @@ Manual synchronization:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\sync_pc_env.ps1
 ```
 
-Never commit `.env`, `.env.pc`, KIS token caches, certificates with private
+Never commit `.env`, `.env.pc`, `config/runtime.local.json`, KIS token caches, certificates with private
 keys, account state, database files, or `data/*.json` runtime state.
 
 ## Optional services
 
-- MySQL: configure `MYSQL_*`; the single-machine app can run without it.
-- Coordination SQL: configure `COORD_DB_*` with TLS verification.
+- MySQL: put username/password in `.env` and host/port/database in runtime config.
+- Coordination SQL: put username/password in `.env` and host/port/TLS path in runtime config.
 - KIS: configure only the required `KIS_PROD_*` values locally.
-- Cloud backup: configure `QUANT_BACKUP_DIR` or use supported Google Drive
+- Cloud backup: configure `QUANT_BACKUP_DIR` in runtime config or use supported Google Drive
   auto-detection.
 
 Proceed to [Configuration](Configuration).

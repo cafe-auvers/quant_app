@@ -66,7 +66,9 @@ def test_gate1_report_fails_when_a_production_default_opens():
 
 def test_repository_activation_snapshot_matches_gate1_contract():
     root = Path(__file__).resolve().parents[1]
-    assert activation_snapshot(root / ".env.example") == dict(ACTIVATION_DEFAULTS)
+    assert activation_snapshot(root / "config" / "runtime.json") == dict(
+        ACTIVATION_DEFAULTS
+    )
 
 
 def test_gate1_report_fails_when_a_selected_scenario_is_skipped(tmp_path):

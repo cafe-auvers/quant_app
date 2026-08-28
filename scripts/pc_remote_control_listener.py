@@ -37,14 +37,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from dotenv import load_dotenv
-
 from src.services.coordination_change_pulse import (
     read_outbound_change_event,
     record_inbound_change_pulse,
 )
+from src.utils.config import install_repository_configuration
 
-load_dotenv(REPO_ROOT / ".env")
+install_repository_configuration()
 
 DEFAULT_PORT = 47821
 PORT = int(os.getenv("REMOTE_CONTROL_PORT", str(DEFAULT_PORT)))

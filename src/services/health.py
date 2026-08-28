@@ -774,7 +774,7 @@ def _portfolio_risk_configuration_check() -> HealthCheck:
         HealthLevel.HEALTHY,
         f"Effective: {positions} positions, {open_risk:.0%} open risk, "
         f"{gross:.0%} gross notional",
-        "Read-only effective runtime values after environment overrides. "
+        "Read-only effective values after runtime configuration overrides. "
         "These limits apply only to exposure-increasing BUY entries; values "
         "are decimal fractions (for example, 2.0 is displayed as 200%).",
     )
@@ -802,7 +802,7 @@ def _execution_configuration_check() -> HealthCheck:
     return HealthCheck(
         "Execution configuration",
         HealthLevel.CRITICAL if entry_names else HealthLevel.WARNING,
-        "Invalid execution environment override(s)",
+        "Invalid execution runtime override(s)",
         detail,
     )
 

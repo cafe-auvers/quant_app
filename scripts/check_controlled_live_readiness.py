@@ -30,10 +30,9 @@ if str(ROOT) not in sys.path:
 
 
 def _load_repo_env() -> None:
-    from src.utils.config import load_env_file
+    from src.utils.config import install_repository_configuration
 
-    for key, value in load_env_file().items():
-        os.environ.setdefault(key, value)
+    install_repository_configuration()
 
 
 _load_repo_env()
@@ -195,12 +194,6 @@ def main() -> int:
             raise RuntimeError(
                 "missing verified WebSocket keys for: " + ", ".join(sorted(missing))
             )
-        if snapshot.source == "LEGACY_ENV":
-            result.warn(
-                "WebSocket symbol keys still use the deprecated environment fallback; "
-                "run scripts/manage_kis_ws_symbol_keys.py migrate-env"
-            )
-
     result.guarded("controlled symbol WebSocket keys", _check_symbol_map)
 
     scheduler = KisRequestScheduler(

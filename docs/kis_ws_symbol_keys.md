@@ -93,25 +93,9 @@ The persisted active Trade Card list is a separate authorization boundary.
 Adding a WebSocket key makes market data available; it does not by itself move
 a reviewed plan to Buy Today or authorize a BUY.
 
-## Legacy checkout migration
+## Environment isolation
 
-On a checkout that still has the legacy environment value, run:
-
-```powershell
-python scripts/manage_kis_ws_symbol_keys.py migrate-env
-python scripts/manage_kis_ws_symbol_keys.py validate
-```
-
-Migration copies the complete legacy map into the separate file and refuses
-to overwrite a conflicting reviewed key. The command deliberately leaves
-`.env` and `.env.pc` untouched; remove the legacy line from both files after
-validation because the file-based map is the only supported steady state.
-
-The tracked `.env.example` does not contain the legacy setting, so startup
-environment synchronization will not add it again. Normal intraday changes
-must use the `set` and `remove` commands above and must never rewrite either
-environment file.
-
-Older commits require the legacy environment value. Preserve an encrypted
-environment backup until the new runtime has been accepted if rollback to an
-older commit must remain possible.
+The runtime never reads symbols from process environment values. Normal
+intraday changes must use the `set` and `remove` commands above against
+`data/kis_ws_symbol_keys.json`; neither `.env` nor `.env.pc` is a supported
+symbol source or migration path.

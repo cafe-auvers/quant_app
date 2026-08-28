@@ -521,7 +521,7 @@ class DashboardMixin:
         except Exception as exc:
             self.kis_account_status_label.setText(
                 f"{environment} profile not configured: {exc}. "
-                "Add the KIS_* values to .env before refreshing."
+                "Add private KIS credentials to .env and non-secret connection settings to runtime config before refreshing."
             )
             return
 
@@ -782,7 +782,7 @@ class DashboardMixin:
         ):
             return (
                 "KIS rejected the selected account number/product code. "
-                "Check the PROD account number and product code in .env."
+                "Check the PROD account number in .env and product code in runtime config."
             )
         return error_message
 

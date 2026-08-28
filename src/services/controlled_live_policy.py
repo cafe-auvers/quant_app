@@ -187,7 +187,7 @@ def require_live_entry_allowed(
     if invalid_entry_configuration:
         names = ", ".join(item.split(":", 1)[0] for item in invalid_entry_configuration)
         raise _configuration_error(
-            f"invalid entry-risk environment override(s): {names}"
+            f"invalid entry-risk runtime override(s): {names}"
         )
     if _mode() == FULL_LIVE:
         return

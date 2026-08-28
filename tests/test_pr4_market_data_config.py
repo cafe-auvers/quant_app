@@ -128,35 +128,65 @@ def _write_runtime_capability_manifest(
 
 def test_pr4_market_data_configuration_is_present_and_fail_closed():
     env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    runtime_config = json.loads(
+        (ROOT / "config" / "runtime.json").read_text(encoding="utf-8")
+    )
     requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
-    for name in (
-        "KIS_PROD_WS_URL",
-        "KIS_SIM_WS_URL",
-        "KIS_WS_ENABLED=false",
-        "KIS_WS_PROTOCOL_VERIFIED=false",
-        "KIS_CAPABILITY_MANIFEST_PATH=",
-        "KIS_CAPABILITY_MANIFEST_SHA256=",
-        "KIS_RUNTIME_COMMIT_SHA=",
-        "KIS_WS_HTS_ID",
-        "KIS_MARKET_DATA_MODE=REST_DISPLAY_ONLY",
-        "BROKER_EVENT_STALE_SECONDS",
-        "LOCAL_RECEIVE_STALE_SECONDS",
-        "MAX_MARKET_DATA_QUEUE_DELAY_SECONDS",
-        "KIS_WS_TOTAL_SUBSCRIPTION_CAPACITY=0",
-        "KIS_WS_RAW_CAPTURE_ENABLED=false",
-        "KIS_LIVE_EXECUTION_MODE=DISABLED",
-        "KIS_REQUEST_MIN_SPACING_SECONDS=0.1",
-        "KIS_MUTATION_MIN_SPACING_SECONDS=0.2",
-        "KIS_MUTATION_MAX_CONFIRMED_ATTEMPTS=1",
-        "BUYBOARD_ENGINE_ENABLED=true",
-        "PORTFOLIO_MAX_SIMULTANEOUS_POSITIONS=30",
-        "PORTFOLIO_MAX_TOTAL_OPEN_RISK_FRACTION=0.10",
-        "PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION=2.0",
-    ):
-        assert name in env_example
+    assert runtime_config["KIS_PROD_WS_URL"]
+    assert runtime_config["KIS_SIM_WS_URL"]
+    assert runtime_config["KIS_WS_ENABLED"] == "false"
+    assert runtime_config["KIS_WS_PROTOCOL_VERIFIED"] == "false"
+    assert runtime_config["KIS_CAPABILITY_MANIFEST_PATH"] == ""
+    assert runtime_config["KIS_CAPABILITY_MANIFEST_SHA256"] == ""
+    assert runtime_config["KIS_RUNTIME_COMMIT_SHA"] == ""
+    assert "KIS_WS_HTS_ID=" in env_example
+    assert runtime_config["KIS_MARKET_DATA_MODE"] == "REST_DISPLAY_ONLY"
+    assert runtime_config["BROKER_EVENT_STALE_SECONDS"] == "3"
+    assert runtime_config["LOCAL_RECEIVE_STALE_SECONDS"] == "3"
+    assert runtime_config["MAX_MARKET_DATA_QUEUE_DELAY_SECONDS"] == "1"
+    assert runtime_config["KIS_WS_TOTAL_SUBSCRIPTION_CAPACITY"] == "0"
+    assert runtime_config["KIS_WS_RAW_CAPTURE_ENABLED"] == "false"
+    assert runtime_config["KIS_LIVE_EXECUTION_MODE"] == "DISABLED"
+    assert runtime_config["KIS_REQUEST_MIN_SPACING_SECONDS"] == "0.1"
+    assert runtime_config["KIS_MUTATION_MIN_SPACING_SECONDS"] == "0.2"
+    assert runtime_config["KIS_MUTATION_MAX_CONFIRMED_ATTEMPTS"] == "1"
+    assert runtime_config["BUYBOARD_ENGINE_ENABLED"] == "true"
+    assert runtime_config["PORTFOLIO_MAX_SIMULTANEOUS_POSITIONS"] == "30"
+    assert runtime_config["PORTFOLIO_MAX_TOTAL_OPEN_RISK_FRACTION"] == "0.10"
+    assert runtime_config["PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION"] == "2.0"
     assert "KIS_WS_SYMBOL_KEYS_JSON=" not in env_example
-    assert "data/kis_ws_symbol_keys.json" in env_example
     assert "websockets==17.0.1" in requirements
+
+
+def test_environment_template_is_credential_only_and_runtime_has_no_symbols():
+    env_keys = {
+        line.split("=", 1)[0].strip()
+        for line in (ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#") and "=" in line
+    }
+    assert env_keys == {
+        "MYSQL_USER",
+        "MYSQL_PASSWORD",
+        "COORD_DB_USER",
+        "COORD_DB_PASSWORD",
+        "KIS_PROD_APP_KEY",
+        "KIS_PROD_APP_SECRET",
+        "KIS_PROD_ACCOUNT_NO",
+        "KIS_SIM_APP_KEY",
+        "KIS_SIM_APP_SECRET",
+        "KIS_SIM_ACCOUNT_NO",
+        "KIS_WS_HTS_ID",
+        "EXTERNAL_ALERT_WEBHOOK_URL",
+        "EXTERNAL_HEARTBEAT_WEBHOOK_URL",
+        "EXTERNAL_ALERT_WEBHOOK_TOKEN",
+        "PC_WAKE_URL",
+        "REMOTE_CONTROL_TOKEN",
+        "OPENAI_API_KEY",
+    }
+    runtime = json.loads(
+        (ROOT / "config" / "runtime.json").read_text(encoding="utf-8")
+    )
+    assert all("SYMBOL" not in key for key in runtime)
 
 
 def test_early_close_is_used_for_market_session_decisions():
@@ -240,7 +270,7 @@ def test_live_factory_uses_only_aggregate_pool_and_wires_verified_sequences(
         sequence_field_by_channel={"HDFSCNT0": "EVOL"},
         sequence_reset_by_channel={"HDFSCNT0": "RESET_ON_RECONNECT"},
         qualification_mode=True,
-        symbol_key_store=KisWsSymbolKeyStore(key_path, legacy_json="{}"),
+        symbol_key_store=KisWsSymbolKeyStore(key_path),
     )
     service.configure_desired_channels(
         trade_priorities={"AAPL": 0, "MSFT": 0, "NVDA": 0},
@@ -275,7 +305,7 @@ def test_normal_live_factory_loads_exact_pinned_reviewed_capabilities(
         capability_manifest_path=manifest_path,
         capability_manifest_sha256=manifest_digest,
         runtime_commit_sha=commit,
-        symbol_key_store=KisWsSymbolKeyStore(key_path, legacy_json="{}"),
+        symbol_key_store=KisWsSymbolKeyStore(key_path),
     )
 
     assert service._confirmed_sequence_channels == {"HDFSCNT0"}

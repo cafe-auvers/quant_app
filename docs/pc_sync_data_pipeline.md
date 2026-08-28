@@ -5,7 +5,7 @@ BIOS-wake → auto-login → morning-routine → auto-shutdown cycle, and remote
 access confirmed from a mobile hotspot (genuinely off the home network).
 
 > **Placeholders used in this doc** (real values live only in each machine's
-> local `.env`/OS config, never in git): `<LAPTOP-HOSTNAME>`, `<PC-HOSTNAME>`
+> local runtime/OS config, never in git): `<LAPTOP-HOSTNAME>`, `<PC-HOSTNAME>`
 > for the two Windows machine names; `192.168.x.x` / `192.168.x.%` for the
 > home LAN address/subnet; `100.x.x.x` for Tailscale addresses (always in
 > that CGNAT range, so the shape alone isn't identifying); `<tailscale-account-email>`
@@ -99,9 +99,9 @@ flowchart LR
            -> Windows auto-login (registry AutoAdminLogon)
            -> Task Scheduler "QuantApp_MorningRoutine" (AtLogOn trigger) runs pc_morning_routine.ps1:
                 1. git fetch + reset --hard origin/master
-                2. merge the newly pulled .env.example schema into the PC's
-                   gitignored .env without replacing configured values, then
-                   regenerate its gitignored .env.pc
+                2. synchronize the credential-only .env schema, migrate legacy
+                   non-secret settings to config/runtime.local.json, then
+                   regenerate the credential-only gitignored .env.pc
                 3. venv python -m pip install --require-hashes -r
                    requirements.lock (keeps
                    dependencies in sync with the laptop, not just code)
@@ -143,9 +143,10 @@ replaced.
   MySQL outage fails visibly on the authoritative PC instead of being masked
   by a machine-local fallback there.
 - `scripts/sync_env_files.py` — reconciles each machine's private `.env`
-  against the tracked `.env.example` schema without replacing configured
-  values, then regenerates `.env.pc` with blank `MYSQL_*` values. The morning
-  routine invokes it after Git sync and before any configuration consumer.
+  against the credential-only `.env.example`, migrates recognized non-secret
+  values to gitignored `config/runtime.local.json`, then regenerates `.env.pc`
+  with blank `MYSQL_*` credentials. The morning routine invokes it before any
+  configuration consumer.
 - `scripts/run_daily_refresh.py` — the DB-freshness gate.
 - `scripts/sync_local_mirror_from_pc.py` — repeatable PC-to-laptop mirror
   top-up and before/after report. The dashboard also runs this sync quietly
@@ -193,7 +194,7 @@ the public internet. **Key expiry is disabled** on both machines in the
 Tailscale admin console (default is 6 months, which would otherwise
 silently break the connection).
 
-`.env`'s `MYSQL_HOST` is set to the Tailscale address permanently (not
+`config/runtime.local.json`'s `MYSQL_HOST` is set to the Tailscale address permanently (not
 switched depending on location) -- confirmed working both on the home LAN
 and from a mobile hotspot genuinely off the home network.
 
@@ -287,11 +288,10 @@ environment schema, and `pip install --require-hashes -r requirements.lock`
    reset, not a merge/pull, since the PC's clone is a deployment target
    (nobody edits code on it), so this guarantees an exact, reproducible copy
    of GitHub rather than risking a stuck merge conflict in an unattended run.
-3. It immediately applies the newly pulled `.env.example` to the PC's local
-   `.env` and `.env.pc`. Existing private `.env` values are preserved, newly
-   added settings receive safe template defaults, and all generated
-   `.env.pc` `MYSQL_*` values remain blank. The active application reads the
-   PC's `.env`.
+3. It immediately applies the newly pulled credential and runtime schemas.
+   Private `.env` values are preserved, legacy runtime values move to
+   `config/runtime.local.json`, newly added settings use fail-closed tracked
+   defaults, and generated `.env.pc` `MYSQL_*` credentials remain blank.
 4. It then runs `pip install --require-hashes -r requirements.lock` against the venv, so a
    dependency added on the laptop (like `tzdata` above) shows up on the PC
    the very next morning too, not just code changes.
@@ -299,10 +299,10 @@ environment schema, and `pip install --require-hashes -r requirements.lock`
    Manager signed in once, cached via Windows Credential Manager) -- a
    scheduled task has no one there to answer a login prompt.
 
-Only `.env.example` travels through Git. The synchronization deliberately
-does not transmit laptop secrets or laptop-specific values to the PC. For an
-intentional credential/value change, update the PC's private `.env` directly
-or provision it once from `.env.pc`; subsequent template changes are automatic.
+`.env.example` and `config/runtime.json` travel through Git. Synchronization
+does not transmit laptop secrets or laptop-specific overrides to the PC. Edit
+the PC's private `.env` for credentials and `config/runtime.local.json` for
+non-secret overrides; `.env.pc` is only an initial credential setup copy.
 
 ## What happens if the PC doesn't work one day?
 
@@ -444,11 +444,11 @@ either machine.
 - **No handoff auto-arm**: `_auto_arm_trading_kill_switch` is now a
   compatibility hook that only refreshes the displayed canonical switch.
   Handoff never turns Live Trading on or off. The shared switch remains under
-  operator control, and `TRADING_ENABLED`'s environment hard-lock always wins.
+  operator control, and `TRADING_ENABLED`'s per-machine runtime hard-lock always wins.
 - **Health tab**: a new "Main-device handoff" check shows lease age,
   pull-only owner, reconciliation-in-progress, and any blocked symbols.
 
-### `.env` flags (PC only -- never set these on the laptop)
+### Runtime settings (PC only -- never set these on the laptop)
 
 ```
 AUTO_CLAIM_MAIN_ON_HANDOFF=0
@@ -457,7 +457,7 @@ EXPECTED_AUTO_CLAIM_HOSTNAME=<the PC's exact hostname>
 
 `EXPECTED_AUTO_CLAIM_HOSTNAME` must match `platform.node()` exactly on the
 PC or auto-claim silently stays off -- cheap insurance against an
-accidentally copy-pasted `.env`. The laptop deliberately never auto-reclaims
+accidentally copied runtime override. The laptop deliberately never auto-reclaims
 on startup; assign it explicitly with the **Execution Owner: Laptop** control
 when required. Keep auto-claim at `0` until the physical S3/wake and post-resume
 MySQL/KIS checks below pass. Dry runs must keep the shared Live Trading switch
@@ -505,7 +505,7 @@ the wake time itself is harmless idle time either way.
    .\scripts\setup_pc_morning_task.ps1        # re-run to add the Daily 08:00 WakeToRun trigger
    .\scripts\Configure-AutomaticShutdown.ps1 -DisableTask   # keep the old task registered but inert
    ```
-5. Set the two `.env` values above on the PC only, leaving auto-claim disabled
+5. Set the two `config/runtime.local.json` values above on the PC only, leaving auto-claim disabled
    until the checklist is complete.
 
 ### Verification checklist (do this before trusting it with a live position)

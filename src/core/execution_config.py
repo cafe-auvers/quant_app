@@ -2,11 +2,11 @@
 section 28.
 
 Single source of truth for the new Kanban entry/position/EOD engine's timing
-constants, instead of scattering literals across UI files the way the
-legacy Buy Dashboard does today (e.g. ``buylist/constants.py``'s
-``STOP_LOSS_SELL_LIMIT_DISCOUNT_PCT``). Every value is env-var overridable
-the same way that module already does it, for paper/controlled-live tuning
-without a code change.
+constants, instead of scattering literals across UI files. Non-secret values
+come from ``config/runtime.json`` plus ``config/runtime.local.json``; startup
+installs them into the process before this module resolves its typed values.
+Explicit OS-level variables remain useful for isolated tests and emergency
+deployment overrides without putting operational configuration in ``.env``.
 """
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ def _record_configuration_issue(
     *,
     entry_boundary: bool,
 ) -> None:
-    # Never retain the raw environment value: even though the settings parsed
+    # Never retain the raw override value: even though the settings parsed
     # in this module are non-secret, diagnostics should remain safe to display.
     _configuration_issues[name] = reason
     if entry_boundary:

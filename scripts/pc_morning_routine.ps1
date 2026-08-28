@@ -7,8 +7,8 @@ setup_pc_morning_task.ps1). Chains, in order:
      deployment target, not a dev workspace: nobody should be editing code
      here, so discarding local state is intentional and safe (see
      docs/pc_sync_data_pipeline.md).
-  2. Merge the latest tracked .env.example schema into the PC's private .env
-     without replacing configured values, then regenerate .env.pc.
+  2. Synchronize the credential-only .env schema, migrate legacy non-secret
+     settings to config/runtime.local.json, then regenerate .env.pc.
   3. scripts/run_daily_refresh.py -- gates on whether the database's actual
      latest stored date is behind what's expected (same check the dashboard
      itself shows as "Needs refresh"), and if so, runs historical.py
@@ -87,10 +87,10 @@ try {
 }
 
 # --- 1.25. Environment schema sync -----------------------------------------
-# .env and .env.pc remain gitignored.  Only the non-secret schema/defaults in
-# .env.example arrive through Git; this step preserves every configured local
-# .env value and adds newly documented settings before any Python process
-# reads configuration.
+# .env, .env.pc, and config/runtime.local.json remain gitignored. Tracked
+# .env.example contains credential names only; config/runtime.json contains
+# non-secret defaults. This step preserves existing effective values and
+# migrates legacy runtime keys before any Python process reads configuration.
 
 try {
     $envSyncOutput = & $PythonExe (Join-Path $RepoRoot "scripts\sync_env_files.py") 2>&1

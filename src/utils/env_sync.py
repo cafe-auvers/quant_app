@@ -1,12 +1,13 @@
-"""Keep private environment files aligned with the tracked template.
+"""Keep credential files aligned and migrate runtime settings to JSON.
 
-The template owns the set and order of supported settings.  Existing values
-in the gitignored ``.env`` remain machine-local and always win over template
-defaults.  ``.env.pc`` is then regenerated from ``.env`` with every
-``MYSQL_*`` value blanked so it is safe to use as the PC setup copy.
+``.env.example`` owns the credential-only schema. Non-secret operational
+settings live in tracked ``config/runtime.json`` defaults plus a gitignored
+``config/runtime.local.json`` override. Existing runtime values are migrated
+out of legacy ``.env`` files without changing their effective values.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import stat
@@ -21,8 +22,9 @@ _ASSIGNMENT_RE = re.compile(
 )
 
 _PC_HEADER = (
-    "# Generated from .env by the repository environment synchronizer.",
-    "# All non-MySQL values match .env; fill the blank MYSQL_* values manually on the PC.",
+    "# Generated from the credential-only .env file.",
+    "# Fill blank MYSQL_* credentials manually on the PC.",
+    "# Runtime settings are not stored here; see config/runtime.json.",
     "# The file is gitignored and is refreshed automatically when the application starts.",
     "",
 )
@@ -37,6 +39,8 @@ class EnvironmentSyncResult:
     env_changed: bool
     pc_env_changed: bool
     mysql_values_blanked: int
+    runtime_local_changed: bool = False
+    migrated_runtime_keys: tuple[str, ...] = ()
 
 
 def _read_text(path: Path) -> str:
@@ -68,8 +72,13 @@ def _assignments(lines: Iterable[str]) -> tuple[dict[str, str], list[str]]:
     return values, order
 
 
-def _render_env(template_text: str, current_text: str | None) -> tuple[str, tuple[str, ...]]:
-    """Render the current file on the latest template without changing values."""
+def _render_env(
+    template_text: str,
+    current_text: str | None,
+    *,
+    runtime_keys: set[str] | None = None,
+) -> tuple[str, tuple[str, ...]]:
+    """Render credentials on the latest template and remove runtime keys."""
 
     template_lines = template_text.splitlines()
     current_lines = [] if current_text is None else current_text.splitlines()
@@ -95,22 +104,61 @@ def _render_env(template_text: str, current_text: str | None) -> tuple[str, tupl
             added_keys.append(key)
         rendered.append(f"{match.group(1)}{key}{match.group(3)}={value}")
 
-    # Never delete a machine-local setting merely because it is not (or is no
-    # longer) documented by the template.  Keeping it visible at the end also
-    # makes cleanup a deliberate operator action.
-    extra_keys = [key for key in current_order if key not in template_keys]
+    migrated_keys = runtime_keys or set()
+    # The credential template and runtime schema jointly own every file-backed
+    # key. Refuse an unclassified extra rather than silently leaving an
+    # operational setting in .env or deleting a possible secret.
+    extra_keys = [
+        key
+        for key in current_order
+        if key not in template_keys and key not in migrated_keys
+    ]
     if extra_keys:
-        if rendered and rendered[-1] != "":
-            rendered.append("")
-        rendered.extend(
-            (
-                "# --- Machine-local settings not present in .env.example ---",
-                *[f"{key}={current_values[key]}" for key in extra_keys],
-            )
+        raise ValueError(
+            "Unclassified .env key(s); add credentials to .env.example or "
+            "runtime settings to config/runtime.json: " + ", ".join(extra_keys)
         )
 
     newline = _newline_for(template_text)
     return newline.join(rendered) + newline, tuple(added_keys)
+
+
+def _json_object(path: Path) -> dict[str, object]:
+    if not path.is_file():
+        return {}
+    payload = json.loads(_read_text(path))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Runtime configuration must be a JSON object: {path}")
+    return {str(key): value for key, value in payload.items()}
+
+
+def _env_value_text(raw: str) -> str:
+    value = str(raw).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        return value[1:-1]
+    return value
+
+
+def _render_runtime_local(
+    defaults: dict[str, object],
+    existing: dict[str, object],
+    current_env_values: dict[str, str],
+) -> tuple[str | None, tuple[str, ...]]:
+    unknown = sorted(set(existing) - set(defaults))
+    if unknown:
+        raise ValueError(
+            "Unknown local runtime configuration key(s): " + ", ".join(unknown)
+        )
+    merged = dict(existing)
+    migrated: list[str] = []
+    for key in defaults:
+        if key not in current_env_values:
+            continue
+        merged[key] = _env_value_text(current_env_values[key])
+        migrated.append(key)
+    if not merged:
+        return None, tuple(migrated)
+    return json.dumps(merged, indent=2, sort_keys=True) + "\n", tuple(migrated)
 
 
 def _render_pc_env(env_text: str) -> tuple[str, int]:
@@ -157,25 +205,62 @@ def synchronize_environment_files(
     template_path: str | Path,
     env_path: str | Path,
     pc_env_path: str | Path,
+    runtime_defaults_path: str | Path | None = None,
+    runtime_local_path: str | Path | None = None,
 ) -> EnvironmentSyncResult:
-    """Synchronize ``.env`` and regenerate ``.env.pc`` atomically.
-
-    Existing values in ``env_path`` are never replaced by template defaults.
-    The template controls comments and ordering, and undocumented local keys
-    are retained in a clearly marked final section.
-    """
+    """Synchronize secret files and migrate known runtime keys atomically."""
 
     template = Path(template_path).resolve()
     env = Path(env_path).resolve()
     pc_env = Path(pc_env_path).resolve()
+    runtime_defaults = Path(
+        runtime_defaults_path
+        or template.parent / "config" / "runtime.json"
+    ).resolve()
+    runtime_local = Path(
+        runtime_local_path
+        or runtime_defaults.with_name("runtime.local.json")
+    ).resolve()
     if not template.is_file():
         raise FileNotFoundError(f"Environment template does not exist: {template}")
+    if not runtime_defaults.is_file():
+        raise FileNotFoundError(
+            f"Runtime configuration defaults do not exist: {runtime_defaults}"
+        )
     if env == pc_env:
         raise ValueError("env_path and pc_env_path must be different files")
 
     template_text = _read_text(template)
     current_text = _read_text(env) if env.is_file() else None
-    rendered_env, added_keys = _render_env(template_text, current_text)
+    current_values, _ = _assignments(
+        [] if current_text is None else current_text.splitlines()
+    )
+    runtime_values = _json_object(runtime_defaults)
+    runtime_local_values = _json_object(runtime_local)
+    secret_values, _ = _assignments(template_text.splitlines())
+    overlap = sorted(set(runtime_values) & set(secret_values))
+    if overlap:
+        raise ValueError(
+            "Configuration keys cannot be both secret and runtime settings: "
+            + ", ".join(overlap)
+        )
+    rendered_runtime, migrated_keys = _render_runtime_local(
+        runtime_values,
+        runtime_local_values,
+        current_values,
+    )
+    rendered_env, added_keys = _render_env(
+        template_text,
+        current_text,
+        runtime_keys=set(runtime_values),
+    )
+    # Persist the migration destination first. If that write fails, leave the
+    # legacy source values in .env so an operational setting is never lost.
+    runtime_local_changed = (
+        _write_if_changed(runtime_local, rendered_runtime)
+        if rendered_runtime is not None
+        else False
+    )
     env_changed = _write_if_changed(env, rendered_env)
 
     rendered_pc_env, redacted_count = _render_pc_env(rendered_env)
@@ -187,4 +272,6 @@ def synchronize_environment_files(
         env_changed=env_changed,
         pc_env_changed=pc_env_changed,
         mysql_values_blanked=redacted_count,
+        runtime_local_changed=runtime_local_changed,
+        migrated_runtime_keys=migrated_keys,
     )

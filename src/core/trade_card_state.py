@@ -25,11 +25,10 @@ from typing import Any, Dict, List, Optional
 
 PRODUCTION_ENVIRONMENT = "PROD"
 RISK_UNIT_FRACTION = "fraction"
-# The Buy Board's supported ORB cases currently top out at 2% account risk.
-# Older Trade Card payloads did not record a unit and could contain the
-# legacy Buylist representation (percentage points, where ``1.0`` means 1%).
-# Values above this boundary in an unmarked payload are therefore migrated
-# once to the canonical fraction representation.
+# The standard ORB grid tops out at 2%, but the UI also supports custom risks
+# above that boundary.  This value is therefore only a legacy hint; ORB
+# geometry is used to distinguish an already-canonical custom selection from
+# an unselected legacy Buylist percentage-point value.
 MAX_CANONICAL_ORB_RISK_FRACTION = 0.02
 
 
@@ -79,7 +78,16 @@ def _persisted_risk_fraction(data: Dict[str, Any]) -> float:
     raw = _finite_float(data.get("risk_percent"), 0.01)
     risk = float(raw if raw is not None else 0.01)
     unit = str(data.get("risk_unit") or "").strip().lower()
-    if not unit and risk > MAX_CANONICAL_ORB_RISK_FRACTION:
+    has_orb_geometry = bool(str(data.get("selected_orb_window") or "").strip()) and (
+        _finite_float(data.get("entry_orb_high")) is not None
+        or _finite_float(data.get("entry_orb_low")) is not None
+        or _finite_float(data.get("entry_trigger")) is not None
+    )
+    if (
+        not unit
+        and risk > MAX_CANONICAL_ORB_RISK_FRACTION
+        and (risk > 1.0 or not has_orb_geometry)
+    ):
         risk /= 100.0
     return risk
 

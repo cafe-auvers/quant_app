@@ -1,11 +1,7 @@
 from __future__ import annotations
 
-import json
-import os
-
 import pytest
 
-from scripts.manage_kis_ws_symbol_keys import main as manage_main
 from src.services.kis_ws_symbol_keys import (
     KisWsSymbolKeyStore,
     KisWsSymbolKeysError,
@@ -34,7 +30,6 @@ def test_missing_key_is_atomically_provisioned_from_kis_master(tmp_path):
     _write_kis_master(master_path, [("RNG", "RNG", "NYS")])
     store = KisWsSymbolKeyStore(
         key_path,
-        legacy_json="{}",
         universe_path=master_path,
         auto_provision=True,
     )
@@ -66,10 +61,13 @@ def test_master_provisioning_fails_closed_for_unknown_or_unsupported_exchange(
         derive_symbol_key_from_kis_master("MISSING", master_path)
 
 
-def test_file_replaces_legacy_env_and_hot_reloads_additions(tmp_path):
+def test_file_ignores_process_symbol_value_and_hot_reloads_additions(
+    tmp_path, monkeypatch
+):
     path = tmp_path / "kis_ws_symbol_keys.json"
+    monkeypatch.setenv("KIS_WS_SYMBOL_KEYS_JSON", '{"OLD":"DNASOLD"}')
     write_symbol_keys_file({"AAPL": "DNASAAPL"}, path)
-    store = KisWsSymbolKeyStore(path, legacy_json='{"OLD":"DNASOLD"}')
+    store = KisWsSymbolKeyStore(path)
 
     first = store.snapshot()
     assert dict(first.keys) == {"AAPL": "DNASAAPL"}
@@ -82,20 +80,23 @@ def test_file_replaces_legacy_env_and_hot_reloads_additions(tmp_path):
     assert "OLD" not in store.snapshot().keys
 
 
-def test_legacy_env_is_only_a_missing_file_migration_fallback(tmp_path):
+def test_process_environment_is_never_a_missing_file_fallback(tmp_path, monkeypatch):
     path = tmp_path / "kis_ws_symbol_keys.json"
-    store = KisWsSymbolKeyStore(path, legacy_json='{"AAPL":"DNASAAPL"}')
+    monkeypatch.setenv("KIS_WS_SYMBOL_KEYS_JSON", '{"AAPL":"DNASAAPL"}')
+    store = KisWsSymbolKeyStore(path)
 
     snapshot = store.snapshot()
 
-    assert snapshot.source == "LEGACY_ENV"
-    assert store.resolve("AAPL") == "DNASAAPL"
+    assert snapshot.source == "EMPTY"
+    assert snapshot.keys == {}
+    with pytest.raises(RuntimeError, match="No live-verified"):
+        store.resolve("AAPL")
 
 
-def test_invalid_initial_file_does_not_hide_behind_legacy_env(tmp_path):
+def test_invalid_initial_file_fails_closed(tmp_path):
     path = tmp_path / "kis_ws_symbol_keys.json"
     path.write_text("{", encoding="utf-8")
-    store = KisWsSymbolKeyStore(path, legacy_json='{"AAPL":"DNASAAPL"}')
+    store = KisWsSymbolKeyStore(path)
 
     snapshot = store.snapshot()
 
@@ -108,7 +109,7 @@ def test_invalid_initial_file_does_not_hide_behind_legacy_env(tmp_path):
 def test_malformed_or_missing_intraday_file_retains_last_known_good_map(tmp_path):
     path = tmp_path / "kis_ws_symbol_keys.json"
     write_symbol_keys_file({"AAPL": "DNASAAPL"}, path)
-    store = KisWsSymbolKeyStore(path, legacy_json="{}")
+    store = KisWsSymbolKeyStore(path)
     assert store.resolve("AAPL") == "DNASAAPL"
 
     path.write_text("{", encoding="utf-8")
@@ -152,21 +153,6 @@ def test_migration_refuses_to_overwrite_a_conflicting_reviewed_key(tmp_path):
         )
 
     assert read_symbol_keys_file(path) == {"AAPL": "OLDKEY"}
-
-
-def test_cli_migrates_without_modifying_environment_value(tmp_path, monkeypatch, capsys):
-    path = tmp_path / "kis_ws_symbol_keys.json"
-    original = json.dumps({"AAPL": "DNASAAPL", "MSFT": "DNASMSFT"})
-    monkeypatch.setenv("KIS_WS_SYMBOL_KEYS_JSON", original)
-
-    assert manage_main(["--file", str(path), "migrate-env"]) == 0
-
-    assert read_symbol_keys_file(path) == {
-        "AAPL": "DNASAAPL",
-        "MSFT": "DNASMSFT",
-    }
-    assert os.environ["KIS_WS_SYMBOL_KEYS_JSON"] == original
-    assert "were not modified" in capsys.readouterr().out
 
 
 def test_symbol_key_file_is_in_the_existing_offsite_state_backup_allowlist():

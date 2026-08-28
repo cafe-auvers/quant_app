@@ -76,7 +76,8 @@ git rev-parse HEAD
 ```
 
 The first command must print nothing. Copy the second command's full output
-into `KIS_RUNTIME_COMMIT_SHA` in the local, gitignored `.env`. Do not use a
+into `KIS_RUNTIME_COMMIT_SHA` in local, gitignored
+`config/runtime.local.json`. Do not use a
 short hash, pull-request number, branch name, manifest digest, or the SHA of an
 older reviewed build.
 
@@ -93,9 +94,9 @@ After setting the reviewed values, run the read-only preflight:
 python scripts/check_controlled_live_readiness.py
 ```
 
-Changing `.env` to make this check green is not a substitute for producing
-the matching reviewed evidence. Never commit `.env` or an unredacted
-capability bundle.
+Changing runtime configuration to make this check green is not a substitute
+for producing matching reviewed evidence. Never commit
+`config/runtime.local.json` or an unredacted capability bundle.
 
 The shared operational Trade Card database is the symbol boundary; symbols
 never belong in `.env`. `data/trade_cards.json` is only a local recovery

@@ -9,26 +9,35 @@ import traceback
 
 
 def _synchronize_repository_environment() -> None:
-    """Apply the latest tracked environment schema before loading values."""
+    """Apply credential schema and migrate non-secret runtime settings."""
 
-    from src.utils.config import ENV_FILE, ROOT_DIR
+    from src.utils.config import (
+        ENV_FILE,
+        ROOT_DIR,
+        RUNTIME_CONFIG_FILE,
+        RUNTIME_LOCAL_CONFIG_FILE,
+    )
     from src.utils.env_sync import synchronize_environment_files
 
     result = synchronize_environment_files(
         ROOT_DIR / ".env.example",
         ENV_FILE,
         ROOT_DIR / ".env.pc",
+        RUNTIME_CONFIG_FILE,
+        RUNTIME_LOCAL_CONFIG_FILE,
     )
-    if result.env_changed or result.pc_env_changed:
+    if result.env_changed or result.pc_env_changed or result.runtime_local_changed:
         sys.stderr.write(
-            "Environment files synchronized from .env.example "
+            "Credential/runtime configuration synchronized "
             f"(.env={'updated' if result.env_changed else 'current'}, "
-            f".env.pc={'updated' if result.pc_env_changed else 'current'}).\n"
+            f".env.pc={'updated' if result.pc_env_changed else 'current'}, "
+            "runtime.local.json="
+            f"{'updated' if result.runtime_local_changed else 'current'}).\n"
         )
 
 
 def _load_repository_environment() -> None:
-    """Load gitignored ``.env`` values before application modules import.
+    """Load credentials and runtime JSON before application modules import.
 
     ``src.core.execution_config`` intentionally resolves fail-closed feature
     flags at import time.  The legacy KIS compatibility loader used to load
@@ -39,10 +48,9 @@ def _load_repository_environment() -> None:
     the OS still win; the file only fills values that are not already present.
     """
 
-    from src.utils.config import load_env_file
+    from src.utils.config import install_repository_configuration
 
-    for key, value in load_env_file().items():
-        os.environ.setdefault(key, value)
+    install_repository_configuration()
 
 
 def _configure_qt_rendering_environment(platform: str | None = None) -> None:

@@ -29,6 +29,10 @@ REPO_ROOT = Path(__file__).resolve().parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from src.utils.config import install_repository_configuration
+
+install_repository_configuration()
+
 from src.services.historical_refresh_control import (
     MODE_1D, MODE_1H, is_derived_data_complete, lock_path, status_path,
 )

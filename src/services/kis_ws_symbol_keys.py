@@ -1,13 +1,10 @@
 """Hot-reloadable, local KIS WebSocket subscription-key configuration.
 
 The symbol-to-key map changes with the operator's active trading universe, so
-it is runtime state rather than process environment.  The canonical file is
-gitignored and updated atomically.  Readers retain the last-known-good map
-when a manual edit is incomplete, malformed, or temporarily unavailable.
-
-``KIS_WS_SYMBOL_KEYS_JSON`` remains a read-only migration fallback when the
-new file does not yet exist.  Once the file has loaded successfully, the
-running process never falls back to a later environment value.
+it is runtime state rather than process environment. The canonical file is
+gitignored and updated atomically. Readers retain the last-known-good map when
+a manual edit is incomplete, malformed, or temporarily unavailable. Process
+environment values are deliberately never consulted for symbols.
 """
 from __future__ import annotations
 
@@ -32,7 +29,6 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_KIS_WS_SYMBOL_KEYS_FILE = DATA_DIR / "kis_ws_symbol_keys.json"
 DEFAULT_KIS_US_TICKERS_FILE = DATA_DIR / "us_kis_tickers.csv"
-LEGACY_SYMBOL_KEYS_ENV = "KIS_WS_SYMBOL_KEYS_JSON"
 MAX_SYMBOL_KEYS_FILE_BYTES = 1024 * 1024
 
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,31}$")
@@ -97,18 +93,6 @@ def normalize_symbol_keys(raw: object) -> Dict[str, str]:
         normalized[symbol] = key
         key_owners[key] = symbol
     return dict(sorted(normalized.items()))
-
-
-def parse_legacy_symbol_keys(raw_json: str) -> Dict[str, str]:
-    """Parse the deprecated environment value for one-time migration."""
-
-    try:
-        raw = json.loads(str(raw_json or "{}") or "{}")
-    except json.JSONDecodeError as exc:
-        raise KisWsSymbolKeysError(
-            f"{LEGACY_SYMBOL_KEYS_ENV} is not valid JSON"
-        ) from exc
-    return normalize_symbol_keys(raw)
 
 
 def derive_symbol_key_from_kis_master(
@@ -220,7 +204,6 @@ class KisWsSymbolKeyStore:
         self,
         path: Path = DEFAULT_KIS_WS_SYMBOL_KEYS_FILE,
         *,
-        legacy_json: Optional[str] = None,
         universe_path: Path = DEFAULT_KIS_US_TICKERS_FILE,
         auto_provision: bool = False,
     ) -> None:
@@ -229,11 +212,6 @@ class KisWsSymbolKeyStore:
         self.path = Path(path)
         self.universe_path = Path(universe_path)
         self._auto_provision = bool(auto_provision)
-        self._legacy_json = (
-            os.getenv(LEGACY_SYMBOL_KEYS_ENV, "{}")
-            if legacy_json is None
-            else str(legacy_json)
-        )
         self._lock = threading.RLock()
         self._keys: Dict[str, str] = {}
         self._source = "UNINITIALIZED"
@@ -297,21 +275,7 @@ class KisWsSymbolKeyStore:
 
             if signature is None:
                 if not self._initialized:
-                    try:
-                        legacy = parse_legacy_symbol_keys(self._legacy_json)
-                    except KisWsSymbolKeysError as exc:
-                        self._note_error(str(exc), None)
-                    else:
-                        self._install(
-                            legacy,
-                            source=("LEGACY_ENV" if legacy else "EMPTY"),
-                        )
-                        if legacy:
-                            logger.warning(
-                                "%s is deprecated; migrate it to %s",
-                                LEGACY_SYMBOL_KEYS_ENV,
-                                self.path,
-                            )
+                    self._install({}, source="EMPTY")
                 elif self._source == "FILE" and not self._missing_after_file_load:
                     self._missing_after_file_load = True
                     self._note_error(
