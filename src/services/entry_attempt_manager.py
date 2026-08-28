@@ -1,5 +1,5 @@
-"""Entry-attempt engine: per-symbol locking, capital reservation, the
-15-second attempt lifetime, and the retry/cooldown state machine.
+"""Entry-attempt engine: per-symbol locking, capital reservation, and the
+retry/cooldown state machine.
 ``buydashboard_to_kanban.md`` sections 9-11.
 
 This module does not recompute or reinterpret the ORB/breakout/risk rules --
@@ -22,7 +22,7 @@ a cancel request is never treated as a completed cancellation. Capital is
 only settled and a retry cooldown only starts once the broker has actually
 confirmed a terminal status (FILLED/CANCELLED/REJECTED) --
 :func:`resolve_entry_order` is called every heartbeat tick for any working
-order (not only at the 15s deadline), so a fill is protected the moment it
+order, so a fill is protected the moment it
 is observed and a cancel-in-flight order is never resubmitted against or
 assumed gone.
 """
@@ -389,7 +389,6 @@ class EntryAttemptManager:
                 detail="Capital not currently available",
             )
 
-        deadline = now + timedelta(seconds=execution_config.ENTRY_ATTEMPT_TTL_SECONDS)
         try:
             submission = self._submit_order(
                 environment=trigger.environment,
@@ -402,7 +401,11 @@ class EntryAttemptManager:
                 exchange=trigger.exchange,
                 attempt_group_id=attempt_group_id,
                 attempt_number=attempt_number,
-                attempt_deadline_at=deadline.isoformat(),
+                # A valid ORB entry is a resting limit at the exact ORB
+                # high.  It remains working until fill, explicit cancel,
+                # or the EOD service cancels it; do not stamp the legacy
+                # 15-second cancel/reprice deadline on new attempts.
+                attempt_deadline_at=None,
                 capital_reservation_id=(reservation.reservation_id if reservation else ""),
                 client_order_id=trigger.client_order_id or None,
                 **submit_kwargs,

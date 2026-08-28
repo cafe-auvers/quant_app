@@ -245,7 +245,7 @@ def test_submit_callback_reaches_the_guarded_gateway_not_wrongmode(
     assert len(fake_broker.submit_calls) == 1
 
 
-def test_guarded_runtime_consumes_upward_extreme_before_latest_trade(
+def test_guarded_runtime_submits_exact_orb_high_once_on_fresh_trade_drain(
     tmp_path, trading_enabled, monkeypatch, authorize_full_live
 ):
     from sqlalchemy import create_engine
@@ -400,7 +400,7 @@ def test_guarded_runtime_consumes_upward_extreme_before_latest_trade(
         runtime.trading_engine.evaluate_entry_quote([card], event)
 
     assert card.entry_runtime_status == EntryRuntimeStatus.ORDER_PENDING
-    assert [call["limit_price"] for call in broker.submit_calls] == [105.0]
+    assert [call["limit_price"] for call in broker.submit_calls] == [104.0]
     assert card.board_status == BoardStatus.ENTRY_PENDING
 
 

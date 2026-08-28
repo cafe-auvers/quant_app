@@ -1088,11 +1088,8 @@ def build_buyboard_runtime(
             and card.risk_percent
             and card.risk_percent > 0
         ):
-            # Review finding P1-9: planned_quantity/target_position_quantity
-            # were sized off the original ORB trigger price, but the entry
-            # engine may submit at a higher, more-marketable live price
-            # (P0-9) -- resize down (never up) to what's actually safe at
-            # the price really being submitted, using the same
+            # Recheck the approved quantity against the exact submitted
+            # ORB-high price, using the same
             # calculate_orb_position_values the legacy dashboard's sizing
             # already uses, rather than trusting a share count computed
             # against a since-moved price.

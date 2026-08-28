@@ -890,32 +890,12 @@ def build_orb_candidate(
             reason="; ".join(warnings),
         )
 
-    if not entry_signal.allow_entry:
-        reason = "Waiting for price to clear entry trigger"
-        return OrbCandidate(
-            symbol=symbol,
-            window=window,
-            orb_high=orb_high,
-            orb_low=orb_low,
-            breakout_price=breakout,
-            breakout_trigger=breakout_trigger,
-            entry_trigger=entry_trigger,
-            current_price=price,
-            source_session_date=source_session_date,
-            stop_loss=candidate_stop,
-            shares=int(sizing["shares"]),
-            capital_percent=float(sizing["capital_percent"]),
-            stop_loss_percent=float(sizing["stop_loss_percent"]),
-            stop_adr=sizing.get("sl_adr"),
-            risk_percent=risk_percent,
-            score=score,
-            status=OrbCandidateStatus.WAITING_BREAKOUT,
-            valid=False,
-            warnings=[],
-            reason=reason,
-        )
-
-    if strategy_evaluation.signal is None:
+    # Below ORB high, the strategy intentionally has no actionable Signal:
+    # the queue now uses the structurally valid plan to place a resting
+    # limit at that high.  Once price is already above the high, however,
+    # allow_entry and the emitted Signal must agree; fail closed if an
+    # internal strategy fault produces only half of that decision.
+    if entry_signal.allow_entry and strategy_evaluation.signal is None:
         return OrbCandidate(
             symbol=symbol,
             window=window,
@@ -959,7 +939,7 @@ def build_orb_candidate(
         status=OrbCandidateStatus.EXECUTE_READY,
         valid=True,
         warnings=[],
-        reason="Ready to execute",
+        reason="Ready to place resting limit at ORB high",
     )
 
 
