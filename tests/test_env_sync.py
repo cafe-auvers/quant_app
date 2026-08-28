@@ -374,3 +374,190 @@ def test_symbol_destination_write_failure_keeps_legacy_env_source(
     assert env.read_text(encoding="utf-8") == original
     assert not symbol_keys.exists()
     assert not pc_env.exists()
+
+
+@pytest.mark.parametrize(
+    ("legacy_value", "expected"),
+    (
+        ("RNG, AAPL;MSFT", ["AAPL", "MSFT", "RNG"]),
+        ('["rng", "AAPL", "RNG"]', ["AAPL", "RNG"]),
+    ),
+)
+def test_sync_archives_retired_controlled_live_symbols_without_authorizing(
+    tmp_path,
+    legacy_value,
+    expected,
+):
+    template = tmp_path / ".env.example"
+    env = tmp_path / ".env"
+    pc_env = tmp_path / ".env.pc"
+    defaults = tmp_path / "config" / "runtime.json"
+    local = tmp_path / "config" / "runtime.local.json"
+    symbol_keys = tmp_path / "data" / "kis_ws_symbol_keys.json"
+    retired_archive = tmp_path / "data" / "retired_controlled_live_symbols.json"
+    defaults.parent.mkdir()
+    template.write_text("API_TOKEN=\n", encoding="utf-8")
+    defaults.write_text("{}\n", encoding="utf-8")
+    env.write_text(
+        f"API_TOKEN=private\nKIS_CONTROLLED_LIVE_SYMBOLS={legacy_value}\n",
+        encoding="utf-8",
+    )
+
+    result = synchronize_environment_files(
+        template,
+        env,
+        pc_env,
+        defaults,
+        local,
+        symbol_keys,
+        retired_archive,
+    )
+
+    assert result.retired_symbols_archive_changed is True
+    assert result.archived_retired_symbols == tuple(expected)
+    assert _values(env) == {"API_TOKEN": "private"}
+    assert "KIS_CONTROLLED_LIVE_SYMBOLS" not in pc_env.read_text(encoding="utf-8")
+    assert not symbol_keys.exists()
+    assert json.loads(retired_archive.read_text(encoding="utf-8")) == {
+        "schema_version": 1,
+        "source": "KIS_CONTROLLED_LIVE_SYMBOLS",
+        "retired": True,
+        "authorization_effect": False,
+        "symbols": expected,
+    }
+
+
+def test_retired_controlled_live_symbol_archive_merges_and_is_idempotent(tmp_path):
+    template = tmp_path / ".env.example"
+    env = tmp_path / ".env"
+    pc_env = tmp_path / ".env.pc"
+    defaults = tmp_path / "config" / "runtime.json"
+    local = tmp_path / "config" / "runtime.local.json"
+    symbol_keys = tmp_path / "data" / "kis_ws_symbol_keys.json"
+    retired_archive = tmp_path / "data" / "retired_controlled_live_symbols.json"
+    defaults.parent.mkdir()
+    retired_archive.parent.mkdir()
+    template.write_text("API_TOKEN=\n", encoding="utf-8")
+    defaults.write_text("{}\n", encoding="utf-8")
+    env.write_text(
+        "API_TOKEN=private\nKIS_CONTROLLED_LIVE_SYMBOLS=RNG,AAPL\n",
+        encoding="utf-8",
+    )
+    retired_archive.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "source": "KIS_CONTROLLED_LIVE_SYMBOLS",
+                "retired": True,
+                "authorization_effect": False,
+                "symbols": ["MSFT"],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    first = synchronize_environment_files(
+        template,
+        env,
+        pc_env,
+        defaults,
+        local,
+        symbol_keys,
+        retired_archive,
+    )
+    second = synchronize_environment_files(
+        template,
+        env,
+        pc_env,
+        defaults,
+        local,
+        symbol_keys,
+        retired_archive,
+    )
+
+    assert first.archived_retired_symbols == ("AAPL", "RNG")
+    assert json.loads(retired_archive.read_text(encoding="utf-8"))["symbols"] == [
+        "AAPL",
+        "MSFT",
+        "RNG",
+    ]
+    assert json.loads(
+        retired_archive.with_suffix(".json.bak").read_text(encoding="utf-8")
+    )["symbols"] == ["MSFT"]
+    assert second.archived_retired_symbols == ()
+    assert second.retired_symbols_archive_changed is False
+
+
+@pytest.mark.parametrize("legacy_value", ("[", '["bad symbol"]', "{}"))
+def test_invalid_retired_controlled_live_symbols_keep_env_source(
+    tmp_path,
+    legacy_value,
+):
+    template = tmp_path / ".env.example"
+    env = tmp_path / ".env"
+    pc_env = tmp_path / ".env.pc"
+    defaults = tmp_path / "config" / "runtime.json"
+    local = tmp_path / "config" / "runtime.local.json"
+    symbol_keys = tmp_path / "data" / "kis_ws_symbol_keys.json"
+    retired_archive = tmp_path / "data" / "retired_controlled_live_symbols.json"
+    defaults.parent.mkdir()
+    template.write_text("API_TOKEN=\n", encoding="utf-8")
+    defaults.write_text("{}\n", encoding="utf-8")
+    original = (
+        f"API_TOKEN=private\nKIS_CONTROLLED_LIVE_SYMBOLS={legacy_value}\n"
+    )
+    env.write_text(original, encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        synchronize_environment_files(
+            template,
+            env,
+            pc_env,
+            defaults,
+            local,
+            symbol_keys,
+            retired_archive,
+        )
+
+    assert env.read_text(encoding="utf-8") == original
+    assert not retired_archive.exists()
+    assert not pc_env.exists()
+
+
+def test_retired_symbol_archive_write_failure_keeps_env_source(tmp_path, monkeypatch):
+    template = tmp_path / ".env.example"
+    env = tmp_path / ".env"
+    pc_env = tmp_path / ".env.pc"
+    defaults = tmp_path / "config" / "runtime.json"
+    local = tmp_path / "config" / "runtime.local.json"
+    symbol_keys = tmp_path / "data" / "kis_ws_symbol_keys.json"
+    retired_archive = tmp_path / "data" / "retired_controlled_live_symbols.json"
+    defaults.parent.mkdir()
+    template.write_text("API_TOKEN=\n", encoding="utf-8")
+    defaults.write_text("{}\n", encoding="utf-8")
+    original = "API_TOKEN=private\nKIS_CONTROLLED_LIVE_SYMBOLS=RNG\n"
+    env.write_text(original, encoding="utf-8")
+    real_writer = env_sync_module._write_if_changed
+
+    def fail_archive_write(path, content):
+        if Path(path) == retired_archive.resolve():
+            raise OSError("simulated retired-symbol archive failure")
+        return real_writer(path, content)
+
+    monkeypatch.setattr(env_sync_module, "_write_if_changed", fail_archive_write)
+
+    with pytest.raises(OSError, match="simulated retired-symbol archive failure"):
+        synchronize_environment_files(
+            template,
+            env,
+            pc_env,
+            defaults,
+            local,
+            symbol_keys,
+            retired_archive,
+        )
+
+    assert env.read_text(encoding="utf-8") == original
+    assert not retired_archive.exists()
+    assert not pc_env.exists()

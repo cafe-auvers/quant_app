@@ -108,3 +108,10 @@ existing file, and only then removes the retired line from `.env` and
 regenerates `.env.pc`. Invalid or conflicting legacy data aborts without
 stripping the source value. This is a one-time file migration; application
 runtime and intraday subscription selection never consult the environment.
+
+The synchronizer also recognizes the retired `KIS_CONTROLLED_LIVE_SYMBOLS`
+allowlist found on some older machines. That list no longer authorizes
+anything: controlled-live scope comes only from persisted active Trade Cards.
+For lossless cleanup, the synchronizer validates the old list, records it in
+gitignored `data/retired_controlled_live_symbols.json` with
+`authorization_effect: false`, and only then removes the environment line.
