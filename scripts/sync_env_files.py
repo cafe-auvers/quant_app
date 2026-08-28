@@ -33,6 +33,11 @@ def main() -> int:
         type=Path,
         default=REPO_ROOT / "config" / "runtime.local.json",
     )
+    parser.add_argument(
+        "--symbol-keys",
+        type=Path,
+        default=REPO_ROOT / "data" / "kis_ws_symbol_keys.json",
+    )
     args = parser.parse_args()
 
     try:
@@ -42,8 +47,9 @@ def main() -> int:
             args.pc_env,
             args.runtime_defaults,
             args.runtime_local,
+            args.symbol_keys,
         )
-    except (OSError, ValueError) as exc:
+    except (OSError, TimeoutError, ValueError) as exc:
         print(f"Environment synchronization failed: {exc}", file=sys.stderr)
         return 1
 
@@ -54,6 +60,7 @@ def main() -> int:
         f"{result.template_key_count} template keys; "
         f"{len(result.added_env_keys)} added to .env; "
         f"{len(result.migrated_runtime_keys)} runtime keys migrated; "
+        f"{len(result.migrated_symbol_keys)} legacy symbol keys migrated; "
         "runtime.local.json "
         f"{'updated' if result.runtime_local_changed else 'current'}; "
         f"{result.mysql_values_blanked} MYSQL_* credentials blanked in .env.pc."

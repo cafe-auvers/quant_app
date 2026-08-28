@@ -7,24 +7,30 @@ setup_pc_morning_task.ps1). Chains, in order:
      deployment target, not a dev workspace: nobody should be editing code
      here, so discarding local state is intentional and safe (see
      docs/pc_sync_data_pipeline.md).
-  2. Synchronize the credential-only .env schema, migrate legacy non-secret
+  2. Start the restricted remote-control listener so an environment or
+     dependency failure remains diagnosable from the laptop.
+  3. Synchronize the credential-only .env schema, migrate legacy non-secret
      settings to config/runtime.local.json, then regenerate .env.pc.
-  3. scripts/run_daily_refresh.py -- gates on whether the database's actual
+  4. scripts/run_daily_refresh.py -- gates on whether the database's actual
      latest stored date is behind what's expected (same check the dashboard
      itself shows as "Needs refresh"), and if so, runs historical.py
      --mode 1d then --mode 1h. This self-heals multi-day gaps, not just
      "yesterday."
-  4. Launches main.py (detached) so the dashboard is visible if you check
+  5. Launches main.py (detached) so the dashboard is visible if you check
      in during the PC's short on-window.
 
-Each step's outcome is logged; a failure in one step doesn't block the next
-(e.g. a git-sync hiccup shouldn't prevent main.py from at least opening
-against whatever data is already cached).
+Each step's outcome is logged. Git and data-refresh failures retain the last
+known-good checkout/data and continue toward the dashboard. Environment
+migration or dependency failures stop before main.py because running a
+partially migrated or untested dependency set would be unsafe; the restricted
+listener is already running so that failure remains remotely visible.
 #>
 
 $ErrorActionPreference = "Continue"
 
 $RepoRoot = (Resolve-Path "$PSScriptRoot\..").Path
+$RoutineScriptPath = (Resolve-Path -LiteralPath $MyInvocation.MyCommand.Path).Path
+$RoutineHashBeforeSync = (Get-FileHash -LiteralPath $RoutineScriptPath -Algorithm SHA256).Hash
 $LogDir = Join-Path $RepoRoot "data\logs"
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
 $LogPath = Join-Path $LogDir "pc_morning_routine.log"
@@ -34,6 +40,55 @@ function Write-Log {
     $line = "[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message
     Add-Content -Path $LogPath -Value $line
     Write-Host $line
+}
+
+function Start-RemoteControlListener {
+    param(
+        [string]$PythonPath,
+        [string]$RepositoryRoot,
+        [string]$LogsDirectory
+    )
+
+    $listenerScript = Join-Path $RepositoryRoot "scripts\pc_remote_control_listener.py"
+    if (-not (Test-Path -LiteralPath $listenerScript)) {
+        Write-Log "ERROR: remote-control listener script is missing: $listenerScript"
+        return $false
+    }
+    $resolvedListener = (Resolve-Path -LiteralPath $listenerScript).Path
+    try {
+        $existing = @(
+            Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+                $_.Name -match '^python(w)?\.exe$' -and
+                $_.CommandLine -and
+                $_.CommandLine.Contains($resolvedListener)
+            }
+        )
+    } catch {
+        Write-Log "WARN: could not inspect the remote-control listener process: $($_.Exception.Message)"
+        $existing = @()
+    }
+    if ($existing.Count -gt 0) {
+        Write-Log "Remote-control listener is already running; keeping the existing process."
+        return $true
+    }
+
+    $listenerOutLog = Join-Path $LogsDirectory "pc_remote_control_listener_stdout.log"
+    $listenerErrLog = Join-Path $LogsDirectory "pc_remote_control_listener_stderr.log"
+    try {
+        $listenerProc = Start-Process -FilePath $PythonPath -ArgumentList "`"$resolvedListener`"" `
+            -WorkingDirectory $RepositoryRoot -RedirectStandardOutput $listenerOutLog `
+            -RedirectStandardError $listenerErrLog -WindowStyle Hidden -PassThru
+        Start-Sleep -Seconds 2
+        if ($listenerProc.HasExited) {
+            Write-Log "ERROR: remote-control listener exited immediately (code $($listenerProc.ExitCode)) -- see $listenerErrLog"
+            return $false
+        }
+        Write-Log "Remote-control listener launched (PID $($listenerProc.Id))."
+        return $true
+    } catch {
+        Write-Log "ERROR: could not launch remote-control listener: $($_.Exception.Message)"
+        return $false
+    }
 }
 
 # Prefer this repo's own venv over a bare "python" on PATH. Task Scheduler
@@ -86,7 +141,37 @@ try {
     Pop-Location
 }
 
-# --- 1.25. Environment schema sync -----------------------------------------
+# PowerShell parses this file before executing it. If Git replaced the routine
+# itself, continuing here would run the old in-memory instructions against the
+# new Python files. Relaunch exactly once so this same scheduled invocation
+# uses the newly deployed routine and its matching migration/order semantics.
+try {
+    $routineHashAfterSync = (Get-FileHash -LiteralPath $RoutineScriptPath -Algorithm SHA256).Hash
+    if ($routineHashAfterSync -ne $RoutineHashBeforeSync) {
+        if ($env:QUANT_MORNING_ROUTINE_RELAUNCHED -eq "1") {
+            Write-Log "WARN: morning routine changed again after its guarded relaunch; continuing without a loop."
+        } else {
+            Write-Log "Morning routine was updated by Git; relaunching the new version in this same task run."
+            $env:QUANT_MORNING_ROUTINE_RELAUNCHED = "1"
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $RoutineScriptPath
+            $childExitCode = $LASTEXITCODE
+            Write-Log "Updated morning routine completed with exit code $childExitCode."
+            exit $childExitCode
+        }
+    }
+} catch {
+    Write-Log "WARN: could not verify/relaunch the updated morning routine: $($_.Exception.Message)"
+}
+
+# --- 1.25. Keep diagnostics reachable before abort-prone maintenance -------
+
+$listenerReady = Start-RemoteControlListener -PythonPath $PythonExe `
+    -RepositoryRoot $RepoRoot -LogsDirectory $LogDir
+if (-not $listenerReady) {
+    Write-Log "WARN: remote diagnostics are unavailable; continuing the local routine."
+}
+
+# --- 1.5. Environment schema sync ------------------------------------------
 # .env, .env.pc, and config/runtime.local.json remain gitignored. Tracked
 # .env.example contains credential names only; config/runtime.json contains
 # non-secret defaults. This step preserves existing effective values and
@@ -104,7 +189,7 @@ try {
     exit 1
 }
 
-# --- 1.5. Keep the venv's packages on the tested dependency graph ----------
+# --- 1.75. Keep the venv's packages on the tested dependency graph ---------
 # Cheap/idempotent when nothing changed; catches cases like this one where a
 # dependency (e.g. tzdata) got added on the laptop after the venv here was
 # first created, so a code-only git sync would otherwise leave it missing.
@@ -156,29 +241,6 @@ try {
     }
 } catch {
     Write-Log "ERROR: could not launch main.py: $($_.Exception.Message)"
-}
-
-# --- 4. Launch the remote-control listener (detached) -----------------------
-# Lets the laptop check "is the PC on" and send an authenticated remote
-# shutdown signal over Tailscale (see pc_remote_control_listener.py). Started
-# fresh on every logon, same as main.py -- if a prior instance is somehow
-# still around, the new one will fail to bind the port and exit; that's
-# surfaced in its own log rather than blocking anything here.
-
-$ListenerOutLog = Join-Path $LogDir "pc_remote_control_listener_stdout.log"
-$ListenerErrLog = Join-Path $LogDir "pc_remote_control_listener_stderr.log"
-
-try {
-    $listenerProc = Start-Process -FilePath $PythonExe -ArgumentList (Join-Path $RepoRoot "scripts\pc_remote_control_listener.py") `
-        -WorkingDirectory $RepoRoot -RedirectStandardOutput $ListenerOutLog -RedirectStandardError $ListenerErrLog -PassThru
-    Start-Sleep -Seconds 2
-    if ($listenerProc.HasExited) {
-        Write-Log "ERROR: remote control listener exited almost immediately (code $($listenerProc.ExitCode)) -- see $ListenerErrLog"
-    } else {
-        Write-Log "Remote control listener launched (PID $($listenerProc.Id))."
-    }
-} catch {
-    Write-Log "ERROR: could not launch remote control listener: $($_.Exception.Message)"
 }
 
 Write-Log "=== Morning routine finished ==="
