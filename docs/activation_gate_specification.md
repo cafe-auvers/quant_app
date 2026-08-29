@@ -1,6 +1,6 @@
 # Activation Gate Specification
 
-Status: **CANONICAL — offline gate foundations implemented; exact-commit and live evidence are next**
+Status: **CANONICAL — Gate 1 closed on protected master; Gate 2 live qualification is next**
 
 This document is the authoritative definition of the five production
 activation gates. It separates three questions that must not be conflated:
@@ -16,28 +16,26 @@ and an explicit operator promotion answers the third.
 
 ## Current qualification status
 
-The latest completed exact-head Gate-1 evidence belongs to
-`0d3c5e406b4a0e40948480bb77ad78de56b2843e` and reports 722 passed scenarios,
-zero invariant violations, and `production_activation_authorized=false`.
-That evidence remains the historical accepted baseline for that commit.
-
-The documentation changes that introduced this specification create a new
-source tree. Therefore, the next release candidate must generate a new
-exact-head Gate-1 report before Gate 2 or any later gate can pass.
+Gate 1 was closed on protected `master` on 2026-08-29 with 731 deterministic
+scenarios and exact-commit Python 3.11/3.12 CI evidence. Because editing a
+tracked status file creates a new commit, this document does not hard-code its
+own final SHA. The live source of truth is the successful protected
+`Gate 1 deterministic simulation` check and its `gate1-report-<full SHA>`
+artifact for the current `master` commit. Any later commit invalidates that
+commit's qualification until the same exact-SHA check passes again.
 
 | Gate | Current disposition | What remains |
 |---|---|---|
-| 1. Deterministic simulation | **PASSED for `0d3c5e4`; current working tree is not certified** | Commit the reviewed offline changes, obtain Python 3.11/3.12 CI evidence for that exact commit, and regenerate the clean-tree report. |
+| 1. Deterministic simulation | **CLOSED / PASSED for the current protected `master` exact-SHA report** | Re-run the protected Python 3.11/3.12 matrix and Gate-1 report after every later commit. |
 | 2. Live KIS read-only protocol qualification | **BLOCKED / NOT PASSED** | Close the live capability evidence and complete one full-session evidence bundle. |
 | 3. Shadow execution | **OFFLINE BOUNDARY, STORE, AND VALIDATOR IMPLEMENTED / NOT QUALIFIED** | Complete Gate 2, compose the final shadow runner against isolated state, then collect one real-quote session plus captured-live branch coverage and review. |
 | 4. Controlled live | **GUARDRAILS AND FAIL-CLOSED REPORT VALIDATOR IMPLEMENTED / NOT QUALIFIED** | Complete execution-capability evidence and at least three supervised regular-session dates. |
 | 5. Unattended qualification | **FAIL-CLOSED REPORT/PROMOTION VALIDATORS IMPLEMENTED / NOT QUALIFIED** | After Gate 4, complete five consecutive NYSE sessions, all required drills, alert/watchdog proof, independent review, and a separate operator promotion decision. |
 
-The currently qualified level is Gate 1 for the historical baseline. Four
-higher gates remain, and Gate 1 must also be recertified for the next release
-candidate. No statement in this document authorizes live trading.
+The currently qualified level is Gate 1. Four higher gates remain. No statement
+in this document authorizes live trading.
 
-### Offline remediation completed in the current working tree
+### Offline remediation completed and certified
 
 The following items can be implemented and verified without contacting KIS,
 and are now present in code:
@@ -64,17 +62,17 @@ and are now present in code:
 - Gate qualification and operator promotion are separate Python decisions.
   Neither validator edits activation state.
 
-These changes do **not** pass a gate while they are uncommitted, do not replace
-live evidence, and do not authorize a KIS mutation.
+Code presence alone does not pass a gate. Gate 1 is closed only by its
+exact-commit protected report; these offline changes do not replace live
+evidence and do not authorize a KIS mutation.
 
 ### Next project step
 
 ```text
-complete and merge the reviewed handoff
-  -> exact-commit Python 3.11 + 3.12 CI evidence
-  -> regenerate clean Gate 1
-  -> resolve Gate-2 live KIS blockers
+resolve Gate-2 live KIS protocol blockers
+  -> review the exact-commit capability manifest and evidence digests
   -> run the full read-only Gate-2 session
+  -> independently review and validate the Gate-2 evidence bundle
 ```
 
 Gate 2 is now the first unavoidable live-environment step. Gates 3, 4, and 5
@@ -422,17 +420,18 @@ must apply an approved decision separately.
 
 ## Workstream 14 — Activation Gate Closure
 
-This is the active project milestone. Its offline implementation is present in
-the current working tree; exact-commit certification and live qualification
-remain. It does not itself pass Gate 2 or authorize trading.
+This is the active project milestone. Its offline implementation and Gate-1
+exact-commit certification are complete; live qualification remains. It does
+not itself pass Gate 2 or authorize trading.
 
 ### Delivery order
 
 1. **Implemented offline:** Normalize gate terminology, ordering, status, and cross-references across
    the repository. Keep remediation **phases** distinct from activation
    **gates**.
-2. **Implemented offline; recertification pending:** Harden Gate-1 evidence with clean-tree, tracked-tree, dependency-lock, and
-   CI-matrix identity; regenerate it on the final Workstream-14 commit.
+2. **Implemented and certified:** Harden Gate-1 evidence with clean-tree,
+   tracked-tree, dependency-lock, and CI-matrix identity; regenerate it on
+   every later release-candidate commit.
 3. **Implemented offline:** Freeze and implement the final ORH pullback plus higher-timeframe
    replacement strategy behavior, with deterministic characterization tests.
 4. **Core implemented offline; final runner/live coverage pending:** Implement a final-boundary shadow adapter, isolated shadow store,
@@ -445,8 +444,9 @@ remain. It does not itself pass Gate 2 or authorize trading.
 7. **Implemented offline:** Add tests proving that missing evidence, skipped coverage, dirty source,
    digest mismatch, out-of-sequence promotion, and pilot-exception evidence all
    fail closed.
-8. **Local suite complete; clean exact-head run pending:** Run compile checks, targeted tests, the full test suite, and a new exact-head
-   Gate-1 certification on the final commit.
+8. **Complete for current master:** Run compile checks, targeted tests, the
+   full test suite, and a clean exact-head Gate-1 certification. Repeat this
+   step after every later tracked change.
 
 ### Definition of done
 
