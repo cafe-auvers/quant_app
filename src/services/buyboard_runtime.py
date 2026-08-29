@@ -162,7 +162,9 @@ from src.services.execution_command_gateway import (
 from src.services.execution_workflow_service import (
     request_cancel_intent,
     request_exit_submit,
+    request_replace,
     request_submit,
+    resume_replace,
 )
 from src.services.execution_order_repository import (
     fetch_execution_order,
@@ -194,7 +196,11 @@ from src.services.realtime_market_data import (
     RealtimeMarketDataService,
     RestPollingMarketDataService,
 )
-from src.services.trading_engine import EntryDeadlineLookup, TradingEngine
+from src.services.trading_engine import (
+    EntryDeadlineLookup,
+    EntryReplacementCallbacks,
+    TradingEngine,
+)
 from src.utils.market_calendar import (
     is_nyse_trading_day,
     is_regular_session_open,
@@ -1406,6 +1412,20 @@ def build_buyboard_runtime(
                 guarded_record_cache[order.client_order_id] = record
         return broker_order_from_execution_record(record) if record is not None else order
 
+    def find_runtime_entry_order_by_id(client_order_id: str) -> Optional[BrokerOrder]:
+        if not guarded_mode or not isinstance(resolved_broker, ExecutionCommandGateway):
+            return None
+        engine = resolved_broker.database_engine
+        if engine is None:
+            return None
+        record = fetch_execution_order(engine, client_order_id)
+        if record is None:
+            record = resolved_broker.cached_execution_record(client_order_id)
+        if record is None:
+            return None
+        remember_guarded_record(record)
+        return broker_order_from_execution_record(record)
+
     entry_deadline_lookup = EntryDeadlineLookup(
         find_open_entry_order=lambda card: find_runtime_order(
             card, side=OrderSide.BUY, intent=OrderIntent.ENTRY
@@ -1413,7 +1433,381 @@ def build_buyboard_runtime(
         reconcile_order=reconcile_runtime_order,
         refresh_broker_position=lambda card: _refresh_broker_position(card, broker=resolved_broker),
         persist_order=order_ledger.upsert_order,
+        find_entry_order_by_id=find_runtime_entry_order_by_id,
     )
+
+    def build_replacement_risk_decision(
+        candidate_card: TradeCardState,
+        *,
+        quantity: int,
+        limit_price: float,
+        exchange: str,
+        replaced_reservation_id: str,
+    ) -> PreTradeRiskDecision:
+        try:
+            account_equity = float(
+                resolved_equity_provider(
+                    candidate_card.environment, candidate_card.account_no
+                )
+            )
+        except (TypeError, ValueError, OverflowError):
+            account_equity = 0.0
+        if not math.isfinite(account_equity) or account_equity <= 0:
+            account_equity = 0.0
+        decision = _revalidate_and_approve(
+            candidate_card,
+            quantity=quantity,
+            limit_price=limit_price,
+            exchange=exchange,
+            account_size=account_equity,
+        )
+        assert decision is not None
+        reasons: list[str] = []
+        try:
+            portfolio_cards = (
+                portfolio_cards_provider(
+                    candidate_card.environment, candidate_card.account_no
+                )
+                if portfolio_cards_provider is not None
+                else [candidate_card]
+            )
+            # Replace the active card only in this immutable risk snapshot;
+            # durable card state remains on the old generation until success.
+            portfolio_cards = [
+                candidate_card if item.card_key == candidate_card.card_key else item
+                for item in portfolio_cards
+            ]
+            positions = tuple(
+                position
+                for item in portfolio_cards
+                for position in [_portfolio_position_from_card(item)]
+                if position is not None
+            )
+            orders = (
+                portfolio_orders_provider(
+                    candidate_card.environment, candidate_card.account_no
+                )
+                if portfolio_orders_provider is not None
+                else ()
+            )
+            reservations = (
+                portfolio_reservations_provider(
+                    candidate_card.environment, candidate_card.account_no
+                )
+                if portfolio_reservations_provider is not None
+                else ()
+            )
+            external_orders = (
+                portfolio_external_orders_provider(
+                    candidate_card.environment, candidate_card.account_no
+                )
+                if portfolio_external_orders_provider is not None
+                else ()
+            )
+            projected = _portfolio_projected_exposures(
+                cards=portfolio_cards,
+                execution_orders=orders,
+                active_reservations=reservations,
+                external_orders=external_orders,
+            )
+            try:
+                buying_power = float(
+                    buying_power_provider(
+                        candidate_card.environment, candidate_card.account_no
+                    )
+                )
+            except (TypeError, ValueError, OverflowError):
+                buying_power = 0.0
+            if not math.isfinite(buying_power) or buying_power <= 0:
+                buying_power = 0.0
+            portfolio_decision = resolved_portfolio_risk_manager.evaluate_entry(
+                ProposedPortfolioEntry(
+                    symbol=candidate_card.symbol,
+                    quantity=quantity,
+                    reference_price=limit_price,
+                    stop_price=float(candidate_card.entry_orb_low or 0.0),
+                    strategy_id=RISK_STRATEGY_ID,
+                    environment=candidate_card.environment,
+                    account_no=candidate_card.account_no,
+                ),
+                PortfolioRiskSnapshot(
+                    account_equity_usd=account_equity,
+                    usable_buying_power_usd=buying_power,
+                    positions=positions,
+                    projected_exposures=projected,
+                    evaluated_at=decision.evaluated_at,
+                ),
+                replaced_reservation_id=replaced_reservation_id,
+            )
+            reasons.extend(portfolio_decision.reasons)
+            decision = replace(
+                decision,
+                portfolio_risk_reservation=portfolio_decision.reservation_spec,
+            )
+        except Exception as exc:
+            logger.exception(
+                "Replacement portfolio risk snapshot failed for %s",
+                candidate_card.symbol,
+            )
+            reasons.append(f"Portfolio risk snapshot unavailable: {exc}")
+        if reasons:
+            decision = replace(
+                decision,
+                approved=False,
+                reasons=tuple(dict.fromkeys((*decision.reasons, *reasons))),
+            )
+        return decision
+
+    def replace_runtime_entry_order(
+        card: TradeCardState,
+        order: BrokerOrder,
+        pending: dict[str, Any],
+    ) -> BrokerOrder:
+        if not guarded_mode or not isinstance(resolved_broker, ExecutionCommandGateway):
+            raise RuntimeError("Automatic ORB replacement requires GUARDED_ENGINE mode")
+        engine = resolved_broker.database_engine
+        if engine is None:
+            raise RuntimeError("Automatic ORB replacement requires the canonical database")
+        market_data_service = resolved_market_data
+        if market_data_service is None:
+            raise RuntimeError("Automatic ORB replacement requires market data")
+        original = fetch_execution_order(engine, order.client_order_id)
+        if original is None:
+            raise RuntimeError("The active execution order could not be loaded")
+        if (
+            original.status != ExecutionOrderStatus.WORKING
+            or int(original.filled_quantity or 0) != 0
+            or int(original.remaining_quantity or 0)
+            != int(original.submitted_quantity or 0)
+        ):
+            raise RuntimeError("The active order is no longer completely unfilled and WORKING")
+        quantity = int(original.submitted_quantity or 0)
+        execution_price = float(pending.get("execution_price") or 0.0)
+        candidate_card = replace(
+            card,
+            selected_orb_window=str(pending.get("window") or ""),
+            entry_orb_window=str(pending.get("window") or ""),
+            entry_orb_high=float(pending.get("orb_high") or 0.0),
+            entry_orb_low=float(pending.get("orb_low") or 0.0),
+            entry_trigger=execution_price,
+            entry_execution_price=execution_price,
+            entry_floor_price=float(pending.get("floor_price") or 0.0),
+            entry_breakout_trigger=float(pending.get("breakout_trigger") or 0.0),
+            entry_orb_score=float(pending.get("score") or 0.0),
+            entry_score_version=str(pending.get("score_version") or ""),
+            stop_adr=pending.get("stop_adr"),
+            planned_quantity=quantity,
+            target_position_quantity=quantity,
+        )
+        exchange = _execution_exchange_for_card(candidate_card, market_data_service)
+        decision = build_replacement_risk_decision(
+            candidate_card,
+            quantity=quantity,
+            limit_price=execution_price,
+            exchange=exchange,
+            replaced_reservation_id=original.capital_reservation_id,
+        )
+        if not decision.approved:
+            raise RuntimeError("; ".join(decision.reasons) or "Replacement risk rejected")
+
+        new_generation = int(pending.get("new_generation") or original.attempt_number + 1)
+        replace_command_id = str(
+            pending.get("replace_command_id")
+            or f"{original.client_order_id}:ORB:{new_generation}:{candidate_card.entry_orb_window}"
+        )
+        new_client_order_id = str(
+            pending.get("new_client_order_id")
+            or derive_execution_client_order_id(
+                attempt_group_id=original.attempt_group_id,
+                attempt_number=original.attempt_number + 1,
+                environment=original.environment,
+                account_no=original.account_no,
+                symbol=original.symbol,
+                intent=OrderIntent.ENTRY,
+            )
+        )
+        pending.update(
+            {
+                "state": "REPLACE_PENDING",
+                "replace_command_id": replace_command_id,
+                "new_client_order_id": new_client_order_id,
+            }
+        )
+        card.pending_entry_replacement = dict(pending)
+        persist_execution_identity(card)
+
+        def post_cancel_revalidate() -> None:
+            assert market_data_service is not None
+            quote = market_data_service.latest_quote(card.symbol)
+            now = datetime.now(timezone.utc)
+            if (
+                quote is None
+                or not trading_engine._market_is_open()
+                or not quote.regular_session
+                or not quote.entry_trigger_eligible
+                or not quote.is_execution_fresh(now=now)
+                or not market_data_service.entry_quote_ready(card.symbol, now=now)
+                or quote.last_price <= execution_price
+                or quote.ask is None
+                or float(quote.ask) <= execution_price
+            ):
+                raise RuntimeError("passive market/quote conditions changed")
+            refreshed_decision = build_replacement_risk_decision(
+                candidate_card,
+                quantity=quantity,
+                limit_price=execution_price,
+                exchange=exchange,
+                replaced_reservation_id=original.capital_reservation_id,
+            )
+            if not refreshed_decision.approved:
+                raise RuntimeError(
+                    "; ".join(refreshed_decision.reasons)
+                    or "replacement risk changed"
+                )
+
+        try:
+            result = request_replace(
+                source=ExecutionSource.KANBAN_BOARD,
+                client_order_id=original.client_order_id,
+                new_quantity=quantity,
+                new_limit_price=execution_price,
+                gateway=resolved_broker,
+                replace_command_id=replace_command_id,
+                new_client_order_id=new_client_order_id,
+                lease=guarded_lease,
+                environment=original.environment,
+                account_no=original.account_no,
+                strategy_instance_id=strategy_instance_id,
+                pre_trade_risk_decision=decision,
+                risk_strategy_id=RISK_STRATEGY_ID,
+                risk_plan_id=_entry_plan_id(candidate_card),
+                post_cancel_revalidate=post_cancel_revalidate,
+            )
+        finally:
+            cache_recent_guarded_record(original.client_order_id)
+            cache_recent_guarded_record(new_client_order_id)
+        remember_guarded_record(result)
+        return broker_order_from_execution_record(result)
+
+    def resume_runtime_entry_replacement(
+        card: TradeCardState,
+        pending: dict[str, Any],
+    ) -> BrokerOrder:
+        """Resume only a persisted post-cancel replacement submit leg."""
+
+        if not guarded_mode or not isinstance(
+            resolved_broker, ExecutionCommandGateway
+        ):
+            raise RuntimeError("ORB replacement recovery requires GUARDED_ENGINE mode")
+        engine = resolved_broker.database_engine
+        if engine is None:
+            raise RuntimeError("ORB replacement recovery requires the canonical database")
+        market_data_service = resolved_market_data
+        if market_data_service is None:
+            raise RuntimeError("ORB replacement recovery requires market data")
+        old_client_order_id = str(
+            pending.get("old_client_order_id") or card.entry_client_order_id or ""
+        )
+        original = fetch_execution_order(engine, old_client_order_id)
+        if original is None:
+            raise RuntimeError("The cancelled replacement source order is unavailable")
+        if (
+            original.status != ExecutionOrderStatus.CANCELLED
+            or int(original.filled_quantity or 0) != 0
+        ):
+            raise RuntimeError(
+                "Replacement recovery requires a confirmed-cancelled zero-fill old order"
+            )
+        quantity = int(pending.get("quantity") or 0)
+        if quantity <= 0 or quantity != int(original.submitted_quantity or 0):
+            raise RuntimeError("Replacement recovery quantity no longer matches")
+        execution_price = float(pending.get("execution_price") or 0.0)
+        candidate_card = replace(
+            card,
+            selected_orb_window=str(pending.get("window") or ""),
+            entry_orb_window=str(pending.get("window") or ""),
+            entry_orb_high=float(pending.get("orb_high") or 0.0),
+            entry_orb_low=float(pending.get("orb_low") or 0.0),
+            entry_trigger=execution_price,
+            entry_execution_price=execution_price,
+            entry_floor_price=float(pending.get("floor_price") or 0.0),
+            entry_breakout_trigger=float(
+                pending.get("breakout_trigger") or 0.0
+            ),
+            entry_orb_score=float(pending.get("score") or 0.0),
+            entry_score_version=str(pending.get("score_version") or ""),
+            stop_adr=pending.get("stop_adr"),
+            planned_quantity=quantity,
+            target_position_quantity=quantity,
+        )
+        exchange = _execution_exchange_for_card(candidate_card, market_data_service)
+
+        def fresh_revalidate() -> None:
+            assert market_data_service is not None
+            quote = market_data_service.latest_quote(card.symbol)
+            now = datetime.now(timezone.utc)
+            if (
+                quote is None
+                or not trading_engine._market_is_open()
+                or not quote.regular_session
+                or not quote.entry_trigger_eligible
+                or not quote.is_execution_fresh(now=now)
+                or not market_data_service.entry_quote_ready(card.symbol, now=now)
+                or quote.last_price <= execution_price
+                or quote.ask is None
+                or float(quote.ask) <= execution_price
+            ):
+                raise RuntimeError("passive market/quote conditions changed")
+            refreshed = build_replacement_risk_decision(
+                candidate_card,
+                quantity=quantity,
+                limit_price=execution_price,
+                exchange=exchange,
+                replaced_reservation_id=original.capital_reservation_id,
+            )
+            if not refreshed.approved:
+                raise RuntimeError(
+                    "; ".join(refreshed.reasons) or "replacement risk changed"
+                )
+
+        decision = build_replacement_risk_decision(
+            candidate_card,
+            quantity=quantity,
+            limit_price=execution_price,
+            exchange=exchange,
+            replaced_reservation_id=original.capital_reservation_id,
+        )
+        if not decision.approved:
+            raise RuntimeError(
+                "; ".join(decision.reasons) or "Replacement recovery risk rejected"
+            )
+        replace_command_id = str(pending.get("replace_command_id") or "")
+        new_client_order_id = str(pending.get("new_client_order_id") or "")
+        if not replace_command_id or not new_client_order_id:
+            raise RuntimeError("Replacement recovery identities are incomplete")
+        try:
+            result = resume_replace(
+                source=ExecutionSource.KANBAN_BOARD,
+                client_order_id=original.client_order_id,
+                new_quantity=quantity,
+                new_limit_price=execution_price,
+                gateway=resolved_broker,
+                replace_command_id=replace_command_id,
+                new_client_order_id=new_client_order_id,
+                post_cancel_revalidate=fresh_revalidate,
+                lease=guarded_lease,
+                environment=original.environment,
+                account_no=original.account_no,
+                strategy_instance_id=strategy_instance_id,
+                pre_trade_risk_decision=decision,
+                risk_strategy_id=RISK_STRATEGY_ID,
+                risk_plan_id=_entry_plan_id(candidate_card),
+            )
+        finally:
+            cache_recent_guarded_record(original.client_order_id)
+            cache_recent_guarded_record(new_client_order_id)
+        remember_guarded_record(result)
+        return broker_order_from_execution_record(result)
 
     def submit_sell_order(**kwargs):
         """Adapter for trading_engine.py's submit_sell_order(...) calls
@@ -1602,6 +1996,14 @@ def build_buyboard_runtime(
         market_data=resolved_market_data,
         position_callbacks=position_callbacks,
         entry_deadline_lookup=entry_deadline_lookup,
+        entry_replacement_callbacks=(
+            EntryReplacementCallbacks(
+                replace_entry_order=replace_runtime_entry_order,
+                resume_entry_replacement=resume_runtime_entry_replacement,
+            )
+            if guarded_mode
+            else None
+        ),
         eod_service=eod_service,
         # Review finding P0-8: real, holiday-aware NYSE session hooks
         # instead of TradingEngine's always-open/never-EOD test defaults --

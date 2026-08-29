@@ -931,6 +931,7 @@ def _apply_definitive_entry_nonacceptance(
     card.entry_orb_high = None
     card.entry_orb_low = None
     card.entry_trigger = None
+    card.clear_orb_generation_metadata()
     card.stop_adr = None
 
 

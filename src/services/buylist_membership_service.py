@@ -164,6 +164,7 @@ def reconcile_buylist_item(
             promoted.entry_orb_high = None
             promoted.entry_orb_low = None
             promoted.entry_trigger = None
+            promoted.clear_orb_generation_metadata()
             promoted.stop_adr = None
             promoted.entry_runtime_status = None
             promoted.entry_block_reason = ""

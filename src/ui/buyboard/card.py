@@ -170,6 +170,11 @@ def _card_status_text(
             return f"{status} - ORB {window}"
         return status
     if card.board_status == BoardStatus.ENTRY_PENDING:
+        replacement_state = str(
+            (card.pending_entry_replacement or {}).get("state") or ""
+        )
+        if replacement_state in {"REPLACE_PENDING", "CANCEL_PENDING"}:
+            return _humanize(replacement_state)
         if card.entry_cancel_in_flight:
             return "CANCELLING ENTRY"
         return "ENTRY - ORDER PENDING" if (
@@ -288,6 +293,59 @@ def _card_metric_rows(
     ]
     if status in (BoardStatus.BUY_TODAY, BoardStatus.ENTRY_PENDING):
         rows.append(("Breakout", f"${_fmt_price(card.breakout_price)}"))
+        if card.entry_orb_window or card.selected_orb_window:
+            score = (
+                f"{float(card.entry_orb_score):.1f}"
+                if card.entry_orb_score is not None
+                else "--"
+            )
+            rows.extend(
+                [
+                    (
+                        "Active ORB",
+                        f"{card.entry_orb_window or card.selected_orb_window} / score {score}",
+                    ),
+                    ("ORH / ORL", f"${_fmt_price(card.entry_orb_high)} / ${_fmt_price(card.entry_orb_low)}"),
+                    (
+                        "Execution",
+                        f"${_fmt_price(card.entry_execution_price or card.entry_trigger)}",
+                    ),
+                    ("Floor", f"${_fmt_price(card.entry_floor_price)}"),
+                    ("Breakout Trigger", f"${_fmt_price(card.entry_breakout_trigger)}"),
+                ]
+            )
+            if card.entry_order_generation:
+                rows.append(("Order Generation", str(card.entry_order_generation)))
+            if card.entry_breakout_confirmed_at is not None:
+                rows.append(
+                    (
+                        "Breakout Confirmed",
+                        card.entry_breakout_confirmed_at.astimezone().strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        ),
+                    )
+                )
+            execution = _positive_float(
+                card.entry_execution_price or card.entry_trigger
+            )
+            stop = _positive_float(card.entry_orb_low)
+            planned = max(0, int(card.target_position_quantity or card.planned_quantity or 0))
+            if execution is not None and stop is not None and execution > stop and planned:
+                rows.append(
+                    ("Planned Risk", _fmt_money((execution - stop) * planned))
+                )
+            pending = card.pending_entry_replacement or {}
+            if pending:
+                pending_window = str(pending.get("window") or "--")
+                pending_score = pending.get("score")
+                pending_text = (
+                    f"{pending_window} / score {float(pending_score):.1f}"
+                    if pending_score is not None
+                    else pending_window
+                )
+                rows.append(("Pending Replacement", pending_text))
+                if pending.get("reason"):
+                    rows.append(("Replacement", str(pending["reason"])))
 
     if status == BoardStatus.BUY_TODAY:
         current = effective_current_price
@@ -338,6 +396,16 @@ def _card_metric_rows(
             ]
         )
         if filled:
+            actual_stop = _positive_float(card.entry_orb_low)
+            actual_entry = _positive_float(card.average_entry_price)
+            if (
+                actual_stop is not None
+                and actual_entry is not None
+                and actual_entry > actual_stop
+            ):
+                rows.append(
+                    ("Actual Risk", _fmt_money((actual_entry - actual_stop) * filled))
+                )
             stop_pnl = _stop_pnl(
                 card,
                 quantity=filled,
@@ -374,6 +442,21 @@ def _card_metric_rows(
         )
         rows.append(("Selling All", f"{selling:,} sh" if selling else "--"))
     rows.append(("P&L", _pnl_result(card, current_price)))
+    actual_stop = _positive_float(card.entry_orb_low)
+    actual_entry = _positive_float(card.average_entry_price)
+    actual_quantity = max(0, int(card.broker_quantity or 0))
+    if (
+        actual_stop is not None
+        and actual_entry is not None
+        and actual_entry > actual_stop
+        and actual_quantity
+    ):
+        rows.append(
+            (
+                "Actual Risk",
+                _fmt_money((actual_entry - actual_stop) * actual_quantity),
+            )
+        )
     stop_pnl = _stop_pnl(
         card,
         quantity=max(0, int(card.broker_quantity or 0)),

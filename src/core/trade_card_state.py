@@ -143,6 +143,8 @@ class EntryRuntimeStatus(str, Enum):
     WAITING_FOR_CAPITAL = "WAITING_FOR_CAPITAL"
     RETRY_COOLDOWN = "RETRY_COOLDOWN"
     ORDER_PENDING = "ORDER_PENDING"
+    REPLACE_PENDING = "REPLACE_PENDING"
+    CANCEL_PENDING = "CANCEL_PENDING"
     DATA_UNAVAILABLE = "DATA_UNAVAILABLE"
     SESSION_COMPLETE = "SESSION_COMPLETE"
 
@@ -244,6 +246,22 @@ class TradeCardState:
     entry_orb_high: Optional[float] = None
     entry_orb_low: Optional[float] = None
     entry_trigger: Optional[float] = None
+    entry_execution_price: Optional[float] = None
+    entry_execution_price_manual: bool = False
+    entry_floor_price: Optional[float] = None
+    entry_breakout_trigger: Optional[float] = None
+    entry_orb_score: Optional[float] = None
+    entry_score_version: str = ""
+    entry_range_closed_at: Optional[datetime] = None
+    entry_breakout_confirmed_at: Optional[datetime] = None
+    entry_candidate_created_at: Optional[datetime] = None
+    # Every successful broker submit advances this generation. Candidate
+    # state for a not-yet-successful upgrade remains separate below.
+    entry_order_generation: int = 0
+    entry_parent_intent_id: str = ""
+    orb_candidate_states: Dict[str, Any] = field(default_factory=dict)
+    pending_entry_replacement: Dict[str, Any] = field(default_factory=dict)
+    entry_replacement_history: List[Dict[str, Any]] = field(default_factory=list)
     stop_adr: Optional[float] = None
 
     # Entry runtime (Buy Today substate badge, section 3)
@@ -390,6 +408,39 @@ class TradeCardState:
         self.entry_orb_high = _finite_float(self.entry_orb_high)
         self.entry_orb_low = _finite_float(self.entry_orb_low)
         self.entry_trigger = _finite_float(self.entry_trigger)
+        self.entry_execution_price = _finite_float(
+            self.entry_execution_price,
+            self.entry_trigger or self.entry_orb_high,
+        )
+        self.entry_execution_price_manual = bool(self.entry_execution_price_manual)
+        self.entry_floor_price = _finite_float(self.entry_floor_price)
+        self.entry_breakout_trigger = _finite_float(self.entry_breakout_trigger)
+        self.entry_orb_score = _finite_float(self.entry_orb_score)
+        self.entry_score_version = str(self.entry_score_version or "")
+        self.entry_range_closed_at = (
+            _parse_timestamp(self.entry_range_closed_at)
+            if self.entry_range_closed_at
+            else None
+        )
+        self.entry_breakout_confirmed_at = (
+            _parse_timestamp(self.entry_breakout_confirmed_at)
+            if self.entry_breakout_confirmed_at
+            else None
+        )
+        self.entry_candidate_created_at = (
+            _parse_timestamp(self.entry_candidate_created_at)
+            if self.entry_candidate_created_at
+            else None
+        )
+        self.entry_order_generation = max(0, int(self.entry_order_generation or 0))
+        self.entry_parent_intent_id = str(self.entry_parent_intent_id or "")
+        self.orb_candidate_states = dict(self.orb_candidate_states or {})
+        self.pending_entry_replacement = dict(self.pending_entry_replacement or {})
+        self.entry_replacement_history = [
+            dict(item)
+            for item in (self.entry_replacement_history or [])
+            if isinstance(item, dict)
+        ]
         self.stop_adr = _finite_float(self.stop_adr)
         if self.entry_runtime_status is not None:
             self.entry_runtime_status = _enum_from_value(
@@ -495,6 +546,23 @@ class TradeCardState:
         self.pending_stop_requested_at = None
         return True
 
+    def clear_orb_generation_metadata(self) -> None:
+        """Clear non-planning ORB execution state while retaining audit history."""
+
+        self.entry_execution_price = None
+        self.entry_execution_price_manual = False
+        self.entry_floor_price = None
+        self.entry_breakout_trigger = None
+        self.entry_orb_score = None
+        self.entry_score_version = ""
+        self.entry_range_closed_at = None
+        self.entry_breakout_confirmed_at = None
+        self.entry_candidate_created_at = None
+        self.entry_order_generation = 0
+        self.entry_parent_intent_id = ""
+        self.orb_candidate_states = {}
+        self.pending_entry_replacement = {}
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "environment": self.environment,
@@ -536,6 +604,32 @@ class TradeCardState:
             "entry_orb_high": self.entry_orb_high,
             "entry_orb_low": self.entry_orb_low,
             "entry_trigger": self.entry_trigger,
+            "entry_execution_price": self.entry_execution_price,
+            "entry_execution_price_manual": self.entry_execution_price_manual,
+            "entry_floor_price": self.entry_floor_price,
+            "entry_breakout_trigger": self.entry_breakout_trigger,
+            "entry_orb_score": self.entry_orb_score,
+            "entry_score_version": self.entry_score_version,
+            "entry_range_closed_at": (
+                self.entry_range_closed_at.isoformat()
+                if self.entry_range_closed_at
+                else None
+            ),
+            "entry_breakout_confirmed_at": (
+                self.entry_breakout_confirmed_at.isoformat()
+                if self.entry_breakout_confirmed_at
+                else None
+            ),
+            "entry_candidate_created_at": (
+                self.entry_candidate_created_at.isoformat()
+                if self.entry_candidate_created_at
+                else None
+            ),
+            "entry_order_generation": self.entry_order_generation,
+            "entry_parent_intent_id": self.entry_parent_intent_id,
+            "orb_candidate_states": self.orb_candidate_states,
+            "pending_entry_replacement": self.pending_entry_replacement,
+            "entry_replacement_history": self.entry_replacement_history,
             "stop_adr": self.stop_adr,
             "entry_runtime_status": (
                 self.entry_runtime_status.value
@@ -644,6 +738,26 @@ class TradeCardState:
             entry_orb_high=data.get("entry_orb_high"),
             entry_orb_low=data.get("entry_orb_low"),
             entry_trigger=data.get("entry_trigger"),
+            entry_execution_price=data.get("entry_execution_price"),
+            entry_execution_price_manual=bool(
+                data.get("entry_execution_price_manual", False)
+            ),
+            entry_floor_price=data.get("entry_floor_price"),
+            entry_breakout_trigger=data.get("entry_breakout_trigger"),
+            entry_orb_score=data.get("entry_orb_score"),
+            entry_score_version=str(data.get("entry_score_version", "")),
+            entry_range_closed_at=data.get("entry_range_closed_at"),
+            entry_breakout_confirmed_at=data.get("entry_breakout_confirmed_at"),
+            entry_candidate_created_at=data.get("entry_candidate_created_at"),
+            entry_order_generation=int(data.get("entry_order_generation", 0) or 0),
+            entry_parent_intent_id=str(data.get("entry_parent_intent_id", "")),
+            orb_candidate_states=dict(data.get("orb_candidate_states") or {}),
+            pending_entry_replacement=dict(
+                data.get("pending_entry_replacement") or {}
+            ),
+            entry_replacement_history=list(
+                data.get("entry_replacement_history") or []
+            ),
             stop_adr=data.get("stop_adr"),
             entry_runtime_status=data.get("entry_runtime_status"),
             entry_block_reason=str(data.get("entry_block_reason", "")),
@@ -729,6 +843,7 @@ def has_durable_execution_evidence(card: TradeCardState) -> bool:
         or card.entry_cancel_in_flight
         or card.entry_cancel_reason
         or card.entry_cancel_command_id
+        or card.pending_entry_replacement
         or card.position_runtime_status != PositionRuntimeStatus.NONE
         or card.broker_quantity
         or card.orderable_quantity

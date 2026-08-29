@@ -33,6 +33,7 @@ def _candidate(**overrides):
         breakout_price=101.5,
         entry_trigger=101.6,
         source_session_date=datetime.now(ZoneInfo("America/New_York")).date().isoformat(),
+        range_closed_at=datetime.now(timezone.utc).isoformat(),
         stop_adr=45.0,
         shares=20,
         risk_percent=0.01,

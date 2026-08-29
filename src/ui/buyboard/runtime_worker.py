@@ -47,6 +47,7 @@ from src.core.account_broker_snapshot import AccountBrokerSnapshot, Reconciliati
 from src.core.board_workflow import BoardActionContext
 from src.core.execution_config import is_buyboard_engine_enabled
 from src.core.execution_mode import ExecutionLease, ExecutionSource
+from src.core.execution_queue import ExecutionQueueItem
 from src.core.exit_policy import market_session_date
 from src.core.runtime_readiness import EngineReadiness, RuntimeDeviceState
 from src.core.execution_order_record import ExecutionOrderStatus
@@ -252,7 +253,9 @@ class BuyboardRuntimeWorker(QThread):
         execution_lease: Optional[LeaseHandle] = None,
         lease_engine: Optional[Engine] = None,
         capital_reservation_engine: Optional[Engine] = None,
-        execution_queue_item_lookup: Optional[Callable[[str, str], object]] = None,
+        execution_queue_item_lookup: Optional[
+            Callable[[str, str], Optional[ExecutionQueueItem]]
+        ] = None,
         heartbeat_seconds: Optional[float] = None,
         account_discovery: Optional[Callable[[], List[str]]] = None,
         strategy_instance_id: str = "",
@@ -2073,6 +2076,9 @@ class BuyboardRuntimeWorker(QThread):
         return changed
 
     _EXIT_CANCEL_STALLED_WARNING = "EXIT_CANCEL_STALLED"
+    _ENTRY_REPLACEMENT_CANCEL_UNCERTAIN_WARNING = (
+        "ENTRY_REPLACEMENT_CANCEL_UNCERTAIN"
+    )
     _UNRECONCILED_BROKER_ORDER_WARNING = "UNRECONCILED_BROKER_ORDER"
     _TRADING_HALT_EXIT_WARNING = "TRADING_HALT_EXIT_PENDING"
     _DATA_STALE_WARNING = "DATA_STALE"
@@ -2122,6 +2128,15 @@ class BuyboardRuntimeWorker(QThread):
             ),
         ),
         (
+            _ENTRY_REPLACEMENT_CANCEL_UNCERTAIN_WARNING,
+            lambda card: (
+                f"CRITICAL: entry replacement cancellation for {card.symbol} "
+                f"({card.environment}:{card.account_no}) was rejected or remains "
+                "uncertain. The old order is still being reconciled and no "
+                "replacement order was submitted."
+            ),
+        ),
+        (
             _TRADING_HALT_EXIT_WARNING,
             lambda card: (
                 f"CRITICAL: liquidation for {card.symbol} "
@@ -2147,6 +2162,10 @@ class BuyboardRuntimeWorker(QThread):
     _RECOVERABLE_CARD_ALERTS = (
         (
             _EXIT_CANCEL_STALLED_WARNING,
+            CriticalAlertType.CANCEL_CONFIRMATION_TIMEOUT,
+        ),
+        (
+            _ENTRY_REPLACEMENT_CANCEL_UNCERTAIN_WARNING,
             CriticalAlertType.CANCEL_CONFIRMATION_TIMEOUT,
         ),
         (_DATA_STALE_WARNING, CriticalAlertType.STALE_CRITICAL_SYMBOL),
@@ -3153,6 +3172,7 @@ class BuyboardRuntimeWorker(QThread):
             card.entry_trigger = None
             card.entry_orb_high = None
             card.entry_orb_low = None
+            card.clear_orb_generation_metadata()
             card.stop_adr = None
             card.planned_quantity = 0
             card.target_position_quantity = 0
@@ -3264,7 +3284,7 @@ class BuyboardRuntimeWorker(QThread):
         return changed
 
     def _prepare_crossed_orb_entry_plan(self, card, quote) -> bool:
-        """Select any crossed current-session ORB before immediate entry."""
+        """Latch an initial breakout or qualify a later ORB replacement."""
 
         if self._execution_queue_item_lookup is None:
             return False
@@ -3278,6 +3298,17 @@ class BuyboardRuntimeWorker(QThread):
             return False
         if item is None:
             return False
+        if card.board_status == BoardStatus.ENTRY_PENDING:
+            best_ask = quote.ask
+            if best_ask is None and self.runtime is not None:
+                latest = self.runtime.market_data.latest_quote(card.symbol)
+                best_ask = latest.ask if latest is not None else None
+            return self._orb_evaluator.select_replacement_candidate(
+                card,
+                item,
+                last_price=quote.last_price,
+                best_ask_price=best_ask,
+            )
         if queue_has_execution_order_lock(item):
             reason = "ORB execution blocked: the queue has an active order lock"
             changed = (

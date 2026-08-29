@@ -341,8 +341,14 @@ def test_guarded_runtime_submits_exact_orb_high_once_on_fresh_trade_drain(
     )
     card = _card(
         entry_trigger=104.0,
+        entry_execution_price=104.0,
         entry_orb_high=104.0,
         breakout_price=100.0,
+        entry_breakout_trigger=104.0,
+        entry_range_closed_at=observed_at - dt.timedelta(minutes=1),
+        entry_candidate_created_at=observed_at - dt.timedelta(minutes=1),
+        entry_orb_score=50.0,
+        entry_score_version="ORB_POSITION_SCORE_V1",
         planned_quantity=10,
         entry_runtime_status=EntryRuntimeStatus.WAITING_BREAKOUT,
     )
@@ -368,9 +374,9 @@ def test_guarded_runtime_submits_exact_orb_high_once_on_fresh_trade_drain(
     assert market_data.ingest_quote(
         QuoteSnapshot(
             symbol="AAPL",
-            last_price=101.0,
-            bid=100.9,
-            ask=101.1,
+                last_price=105.0,
+                bid=104.9,
+                ask=105.1,
             broker_event_at=observed_at,
             received_at=observed_at,
             channel=QUOTE_TR_ID,

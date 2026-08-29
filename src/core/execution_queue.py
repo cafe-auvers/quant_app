@@ -22,6 +22,7 @@ from src.risk.orb_position import (
     score_orb_position_recommendation,
     validate_orb_position_values,
 )
+from src.core.orb_entry_logic import ORB_SCORE_VERSION, passive_entry_prices
 from src.strategy import MarketSnapshot, PortfolioSnapshot
 from src.strategy.orb import ORBStrategy, ORBStrategyConfig, market_local_index
 
@@ -213,6 +214,10 @@ class OrbCandidate:
     breakout_price: Optional[float] = None
     breakout_trigger: Optional[float] = None
     entry_trigger: Optional[float] = None
+    # ``entry_trigger`` remains the backward-compatible name consumed by
+    # older UI code. ``execution_price`` is the explicit passive BUY limit.
+    execution_price: Optional[float] = None
+    floor_price: Optional[float] = None
     current_price: Optional[float] = None
     # Calendar date of the newest source bar in America/New_York.  Queue
     # refresh time cannot prove that cached minute bars belong to today's
@@ -225,6 +230,12 @@ class OrbCandidate:
     stop_adr: Optional[float] = None
     risk_percent: float = 0.0
     score: float = 0.0
+    score_version: str = ORB_SCORE_VERSION
+    range_closed_at: Optional[str] = None
+    breakout_confirmed: bool = False
+    breakout_confirmed_at: Optional[str] = None
+    candidate_created_at: str = field(default_factory=lambda: _utc_now().isoformat())
+    execution_price_manual: bool = False
     status: OrbCandidateStatus = OrbCandidateStatus.NOT_AVAILABLE
     valid: bool = False
     # Explicit proof that this window is permanently unusable for the current
@@ -251,6 +262,12 @@ class OrbCandidate:
             OrbCandidateStatus.NOT_AVAILABLE,
         )
         payload["warnings"] = list(payload.get("warnings", []))
+        # Rows written before explicit execution prices used ORH through
+        # ``entry_trigger``. Preserve that behavior without changing price.
+        if payload.get("execution_price") is None:
+            payload["execution_price"] = payload.get("entry_trigger") or payload.get("orb_high")
+        if payload.get("entry_trigger") is None:
+            payload["entry_trigger"] = payload.get("execution_price")
         return cls(**payload)
 
 
@@ -682,6 +699,8 @@ def build_orb_candidate(
     buffer_pct: float = DEFAULT_ORB_BUFFER_PCT,
     duplicate_pending_order: bool = False,
     lock_risk_percent: bool = False,
+    execution_price: Optional[float] = None,
+    execution_price_manual: bool = False,
 ) -> OrbCandidate:
     symbol = str(symbol or "").upper()
     has_sizing_equity = _has_known_positive_sizing_equity(account_size)
@@ -727,6 +746,7 @@ def build_orb_candidate(
     orb_low = float(orb_range.low)
     candidate_stop = _optional_float(stop_loss) or orb_low
     warnings: List[str] = []
+    range_closed_at = orb_range.end.isoformat()
 
     if breakout is None or breakout <= 0:
         warnings.append("Manual breakout price is required")
@@ -738,8 +758,10 @@ def build_orb_candidate(
             breakout_price=breakout,
             breakout_trigger=None,
             entry_trigger=orb_high,
+            execution_price=orb_high,
             current_price=price,
             source_session_date=source_session_date,
+            range_closed_at=range_closed_at,
             stop_loss=candidate_stop,
             status=OrbCandidateStatus.REJECTED,
             valid=False,
@@ -747,43 +769,30 @@ def build_orb_candidate(
             reason=warnings[0],
         )
 
-    if duplicate_pending_order:
-        warnings.append("Duplicate pending/submitted order exists for symbol")
-        return OrbCandidate(
-            symbol=symbol,
-            window=window,
+    # A working earlier generation must not suppress later-window candidate
+    # calculation. The order lock still prevents duplicate initial submits;
+    # these candidates exist only so guarded upgrades can be evaluated.
+    del duplicate_pending_order
+
+    floor, precise_breakout_trigger, precise_execution, price_reason = (
+        passive_entry_prices(
+            breakout_price=breakout,
             orb_high=orb_high,
             orb_low=orb_low,
-            breakout_price=breakout,
-            current_price=price,
-            source_session_date=source_session_date,
-            stop_loss=candidate_stop,
-            status=OrbCandidateStatus.REJECTED,
-            valid=False,
-            warnings=warnings,
-            reason=warnings[0],
+            execution_price=execution_price,
         )
-
-    if price is None or price <= 0:
-        warnings.append("Current price is unavailable")
-
-    entry_signal = strategy_evaluation.entry
-    if entry_signal is None:
-        return _candidate_unavailable(
-            symbol,
-            window,
-            OrbCandidateStatus.FORMING,
-            "ORB window has not completed",
-            source_session_date=source_session_date,
-        )
-    breakout_trigger = float(entry_signal.breakout_trigger)
-    entry_trigger = float(entry_signal.entry_trigger)
-
-    if entry_signal.signal == "orb_high_below_breakout_trigger":
-        reason = (
-            f"ORB high {orb_high:.2f} has not cleared breakout trigger "
-            f"{breakout_trigger:.2f}"
-        )
+    )
+    breakout_trigger = (
+        float(precise_breakout_trigger)
+        if precise_breakout_trigger is not None
+        else None
+    )
+    resolved_execution = (
+        float(precise_execution) if precise_execution is not None else None
+    )
+    floor_price = float(floor) if floor is not None else None
+    if price_reason:
+        reason = price_reason
         return OrbCandidate(
             symbol=symbol,
             window=window,
@@ -791,21 +800,26 @@ def build_orb_candidate(
             orb_low=orb_low,
             breakout_price=breakout,
             breakout_trigger=breakout_trigger,
-            entry_trigger=entry_trigger,
+            entry_trigger=resolved_execution,
+            execution_price=resolved_execution,
+            floor_price=floor_price,
             current_price=price,
             source_session_date=source_session_date,
+            range_closed_at=range_closed_at,
+            execution_price_manual=execution_price_manual,
             stop_loss=candidate_stop,
             status=OrbCandidateStatus.REJECTED,
             valid=False,
             terminal_rejection=(
-                has_sizing_equity and price is not None and price > 0
+                has_sizing_equity
             ),
             warnings=[reason],
             reason=reason,
         )
 
-    if candidate_stop <= 0 or candidate_stop >= entry_trigger:
-        warnings.append("Stop loss must be below entry trigger")
+    assert resolved_execution is not None
+    if candidate_stop <= 0 or candidate_stop >= resolved_execution:
+        warnings.append("Stop loss must be below execution price")
 
     # Auto-select the best valid risk% (same cases as watchlist scoreboard),
     # so execution queue sizing matches what the watchlist displays.
@@ -834,7 +848,7 @@ def build_orb_candidate(
             _s = calculate_position_values(
                 account_size=account_size,
                 risk_percent=_rc,
-                entry_price=entry_trigger,
+                entry_price=resolved_execution,
                 stop_price=candidate_stop,
                 adr_percent=adr_percent,
             )
@@ -851,7 +865,7 @@ def build_orb_candidate(
         else calculate_position_values(
             account_size=account_size,
             risk_percent=risk_percent,
-            entry_price=entry_trigger,
+            entry_price=resolved_execution,
             stop_price=candidate_stop,
             adr_percent=adr_percent,
         )
@@ -863,8 +877,6 @@ def build_orb_candidate(
     if warnings:
         terminal_rejection = (
             has_sizing_equity
-            and price is not None
-            and price > 0
         )
         return OrbCandidate(
             symbol=symbol,
@@ -873,9 +885,13 @@ def build_orb_candidate(
             orb_low=orb_low,
             breakout_price=breakout,
             breakout_trigger=breakout_trigger,
-            entry_trigger=entry_trigger,
+            entry_trigger=resolved_execution,
+            execution_price=resolved_execution,
+            floor_price=floor_price,
             current_price=price,
             source_session_date=source_session_date,
+            range_closed_at=range_closed_at,
+            execution_price_manual=execution_price_manual,
             stop_loss=candidate_stop,
             shares=int(sizing.get("shares", 0) or 0),
             capital_percent=float(sizing.get("capital_percent", 0.0) or 0.0),
@@ -890,35 +906,6 @@ def build_orb_candidate(
             reason="; ".join(warnings),
         )
 
-    # Below ORB high, the strategy intentionally has no actionable Signal:
-    # the queue now uses the structurally valid plan to place a resting
-    # limit at that high.  Once price is already above the high, however,
-    # allow_entry and the emitted Signal must agree; fail closed if an
-    # internal strategy fault produces only half of that decision.
-    if entry_signal.allow_entry and strategy_evaluation.signal is None:
-        return OrbCandidate(
-            symbol=symbol,
-            window=window,
-            orb_high=orb_high,
-            orb_low=orb_low,
-            breakout_price=breakout,
-            breakout_trigger=breakout_trigger,
-            entry_trigger=entry_trigger,
-            current_price=price,
-            source_session_date=source_session_date,
-            stop_loss=candidate_stop,
-            shares=int(sizing["shares"]),
-            capital_percent=float(sizing["capital_percent"]),
-            stop_loss_percent=float(sizing["stop_loss_percent"]),
-            stop_adr=sizing.get("sl_adr"),
-            risk_percent=risk_percent,
-            score=score,
-            status=OrbCandidateStatus.REJECTED,
-            valid=False,
-            warnings=["ORB strategy did not emit an entry signal"],
-            reason="ORB strategy did not emit an entry signal",
-        )
-
     return OrbCandidate(
         symbol=symbol,
         window=window,
@@ -926,9 +913,13 @@ def build_orb_candidate(
         orb_low=orb_low,
         breakout_price=breakout,
         breakout_trigger=breakout_trigger,
-        entry_trigger=entry_trigger,
+        entry_trigger=resolved_execution,
+        execution_price=resolved_execution,
+        floor_price=floor_price,
         current_price=price,
         source_session_date=source_session_date,
+        range_closed_at=range_closed_at,
+        execution_price_manual=execution_price_manual,
         stop_loss=candidate_stop,
         shares=int(sizing["shares"]),
         capital_percent=float(sizing["capital_percent"]),
@@ -936,10 +927,10 @@ def build_orb_candidate(
         stop_adr=sizing.get("sl_adr"),
         risk_percent=risk_percent,
         score=score,
-        status=OrbCandidateStatus.EXECUTE_READY,
+        status=OrbCandidateStatus.WAITING_BREAKOUT,
         valid=True,
         warnings=[],
-        reason="Ready to place resting limit at ORB high",
+        reason="Opening range finalized; waiting for a confirmed breakout",
     )
 
 
@@ -1006,7 +997,11 @@ def resolve_queue_status(
     if not candidates:
         return ExecutionQueueStatus.WATCHING
     if selected_candidate is not None and selected_candidate.valid:
-        return ExecutionQueueStatus.EXECUTE_READY
+        return (
+            ExecutionQueueStatus.EXECUTE_READY
+            if selected_candidate.breakout_confirmed
+            else ExecutionQueueStatus.ARMED
+        )
 
     statuses = {candidate.status for candidate in candidates.values()}
     # Only block on ORB_FORMING when non-1m windows are still forming.
@@ -1120,11 +1115,35 @@ class ExecutionQueueManager:
         existing.breakout_price = breakout_price
         existing.current_price = current_price
         if candidates is not None:
-            existing.candidates = {
+            refreshed_candidates = {
                 key: value
                 for key, value in candidates.items()
                 if key in SUPPORTED_ORB_WINDOWS
             }
+            for window, refreshed in refreshed_candidates.items():
+                prior = existing.candidates.get(window)
+                if prior is None:
+                    continue
+                same_generation = all(
+                    getattr(prior, field_name, None)
+                    == getattr(refreshed, field_name, None)
+                    for field_name in (
+                        "source_session_date",
+                        "orb_high",
+                        "orb_low",
+                        "breakout_price",
+                        "execution_price",
+                        "score_version",
+                    )
+                )
+                if not same_generation:
+                    continue
+                refreshed.candidate_created_at = prior.candidate_created_at
+                if prior.breakout_confirmed:
+                    refreshed.breakout_confirmed = True
+                    refreshed.breakout_confirmed_at = prior.breakout_confirmed_at
+                    refreshed.status = OrbCandidateStatus.EXECUTE_READY
+            existing.candidates = refreshed_candidates
         existing.warnings = list(warnings or [])
         existing.last_updated = _utc_now()
 
