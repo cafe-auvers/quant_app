@@ -12,6 +12,10 @@ process may act?" Operator Control answers "which device may send the next
 human instruction?" Neither role, by itself, arms live trading or bypasses
 per-symbol market-data, account, risk, order-identity, or broker checks.
 
+Roles also do not change strategy semantics. The exact confirmed-breakout
+passive-limit and higher-score cancel-then-replace behavior is documented in
+[Current Order Logic](current_order_logic.md).
+
 The roles are stored in the shared coordination database as `__main_device__`
 and `__operator_control__`. When `COORD_DB_*` is configured, that authority is
 the TLS-connected TiDB Cloud SQL database; otherwise the legacy deployment

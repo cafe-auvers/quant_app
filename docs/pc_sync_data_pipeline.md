@@ -55,7 +55,9 @@ or can be Locked. Locking Operator Control does not stop already-authorized
 Buy Today monitoring or position protection. Pre-market full-plan publish and
 market-open operator commands are different workflows. See
 [Execution Owner and Operator Control](execution_operator_control.md) for the
-exact handoff, retry, and Buy Today rules.
+exact handoff and publishing rules, and
+[Current Order Logic](current_order_logic.md) for Buy Today submission,
+Entry Pending, and ORB replacement behavior.
 
 These execution roles do not move storage roles. With TiDB coordination
 configured on both devices, powering off the PC removes only the historical

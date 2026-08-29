@@ -60,6 +60,50 @@ Do not submit again. Query/reconcile the existing durable client/broker
 identity, review account-wide open/history/reserved orders and positions, and
 keep the card pending until evidence is unambiguous.
 
+## A confirmed breakout did not move to Entry Pending
+
+Breakout confirmation alone is not sufficient. Check the card memo and
+readiness tooltip, then verify all of the following:
+
+- the ORB range is complete, current-session, and based on fresh KIS evidence;
+- a fresh KIS trade printed strictly above
+  `max(breakout_price, orb_high)`;
+- the fresh last trade and best ask are still strictly above the passive limit
+  when submission is attempted;
+- the limit satisfies
+  `max(breakout_price, orb_low) < execution_price <= orb_high`;
+- the regular session is open and ownership, reconciliation, risk, capital,
+  quote-freshness, route, mutation-budget, and Live Trading gates pass.
+
+If last trade or best ask has already reached the passive limit, the card stays
+armed with `EXECUTION_LEVEL_ALREADY_REACHED`; the engine deliberately does not
+convert the order to market, stop, or a marketable limit. See
+[Current Order Logic](https://github.com/cafe-auvers/quant_app/blob/master/docs/current_order_logic.md).
+
+## KIS rejected an entry with APBK0656
+
+`APBK0656` is a routing/configuration rejection, not an ORB-strategy rejection.
+The rejected broker identity is cleared and the plan should remain in Buy Today
+during its retry cooldown. Verify the exchange route/account configuration and
+wait for a fresh gated retry. It must not be moved to Buylist merely because of
+this code. A different definitive broker rejection can return a zero-position
+card to Buylist with its rejection memo.
+
+## A higher-score ORB did not replace a working order
+
+Replacement is intentionally strict. It is allowed only from 1m to 5m/30m or
+from 5m to 30m, with the same score-model version and a strictly higher score at
+0.1 precision. The old order must be exactly working, completely unfilled, and
+have its full original quantity remaining. The later range, breakout, passive
+price zone, session, quote, ownership, risk, capital, and broker gates must all
+be valid. Any fill, equal/lower score, ambiguous state, or failed gate keeps or
+fences the current generation.
+
+Never manually submit the proposed replacement. The engine must first obtain
+authoritative KIS cancellation with zero fills, revalidate, and then submit one
+linked order for the same quantity. If cancellation is uncertain, the card
+stays `CANCEL_PENDING` and no new BUY is authorized.
+
 ## Credential or runtime changes are missing
 
 Run:

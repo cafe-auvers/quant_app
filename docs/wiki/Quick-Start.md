@@ -41,3 +41,5 @@ read-only as appropriate.
 - Never use real credentials to run tests.
 
 See [Configuration](Configuration) before enabling optional services.
+Before operating Buy Today or Entry Pending, read
+[Current Order Logic](https://github.com/cafe-auvers/quant_app/blob/master/docs/current_order_logic.md).

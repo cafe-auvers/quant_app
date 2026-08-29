@@ -24,7 +24,9 @@ not interchangeable with local planning labels.
   evidence. **Remove from Watchlist** (or `W`) may clear the passive Watchlist
   flag on a Buylist card without deleting the Buylist card, stop, order, or
   position evidence.
-- Buylist to Buy Today requires an actionable ORB plan and current authority.
+- Buylist to Buy Today publishes one-session monitoring intent. The runtime
+  still requires a completed current-session ORB, fresh breakout confirmation,
+  passive execution conditions, and every safety gate before submission.
 - Demotion after an entry identity exists can become a cancellation request;
   it is not an unconditional local move.
 - A filled position cannot be created by editing JSON or dragging a card.

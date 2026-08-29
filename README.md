@@ -19,7 +19,8 @@ cannot place an order unless every safety gate agrees.
 - A persisted, cross-device Watchlist planning stage available from the stock sidebar, Scanner, and TradingView; the former full Watchlist tab is not built.
 - Chart-based `breakout_price` planning and Buy Board ORB execution, with an explicit Watchlist -> Buylist -> Buy Today progression.
 - A read-only Buy Today `ORB Combinations...` comparison covering all 24 risk/window cases, kept separate from the optimized pre-market `Refresh / Select ORB Plans...` selector; the optimized view is read-only during regular market hours.
-- ORB planning where entry is valid only after price clears both ORB high and the persisted buffered breakout price.
+- Confirmed-breakout passive-pullback entries: after a fresh post-range trade clears both the structural breakout and ORB high, submit a resting BUY limit at the candidate's configured execution price (ORB high by default).
+- Strict zero-fill ORB upgrades: a later, strictly higher-scoring 5m/30m candidate can replace an earlier working order only after authoritative cancellation and full post-cancel revalidation.
 - A strategy-neutral `MarketSnapshot -> Strategy -> Signal` interface, with the existing ORB behavior as the first plugin.
 - An append-only, redacted trading event journal and a read-only Health tab for KIS, MySQL, mirror freshness, and reconciliation status.
 - Buy Board monitoring with partial-exit and EMA-close exit workflow support.
@@ -34,7 +35,10 @@ cannot place an order unless every safety gate agrees.
 The app does not use fixed profit targets or R/R-based take-profit levels for the active ORB workflow.
 
 - `breakout_price` is the user-entered daily structural breakout level.
-- ORB entry trigger is `max(orb_high, breakout_price * (1 + buffer_pct))`.
+- Breakout confirmation is a fresh post-range trade strictly above `max(orb_high, breakout_price)`.
+- Passive execution must satisfy `max(breakout_price, orb_low) < execution_price <= orb_high`; automatic plans use `execution_price = orb_high`.
+- The breakout submits the resting limit immediately while both last trade and best ask remain above the limit. It does not mean the order filled.
+- New passive entry orders do not use the legacy 15-second cancel/reprice deadline. They remain Entry Pending until broker fill/cancel/expiry/rejection, safe ORB replacement, or EOD cleanup.
 - Legacy saved JSON that contains `target_price` and no `breakout_price` is migrated into `breakout_price`.
 - Profit management is rule based: first partial exit after 3-5 days if the trade has worked, then hold remaining shares while momentum continues, with final exit on a close below the selected EMA, usually 10 EMA or 20 EMA.
 
@@ -66,7 +70,7 @@ md_archive/                     Historical implementation notes and completed pl
 
 UI mixins keep PyQt tab construction, widget callbacks, table refreshes, and log/state-save side effects close to the widgets. `src/ui/controllers/` owns workflows that are easier to unit test outside the full `MainWindow`, including KIS account sync, scanner orchestration, chart data loading, and execution-queue refresh/submission coordination.
 
-The **Buy Board** is the operator surface for planning and execution. Its cards are read-only projections of canonical trade-card, ownership, and order state. Board gestures are revision-aware requests; they never call KIS directly or mark an order filled. See [Buy Board ORB Planning](docs/orb_buyboard_planning.md) for the planning controls and [Kanban Logic and Architecture](docs/kanban_architecture.md) for the lifecycle, runtime flow, component boundaries, and safety gates.
+The **Buy Board** is the operator surface for planning and execution. Its cards are read-only projections of canonical trade-card, ownership, and order state. Board gestures are revision-aware requests; they never call KIS directly or mark an order filled. See [Current Order Logic](docs/current_order_logic.md) for the exact entry/replacement rules, [Buy Board ORB Planning](docs/orb_buyboard_planning.md) for the planning controls, and [Kanban Logic and Architecture](docs/kanban_architecture.md) for the lifecycle, runtime flow, component boundaries, and safety gates.
 
 ## Setup
 
@@ -141,6 +145,7 @@ Only enable KIS intraday after the endpoint, TR ID, request parameters, output f
 ## Documentation
 
 - `PROJECT_ARCHITECTURE.md` is the canonical architecture and maintenance map.
+- `docs/current_order_logic.md` is the canonical implemented entry, Entry Pending, cancel-replace, fill, rejection, and EOD behavior.
 - `docs/kanban_architecture.md` explains the Kanban state machine, command/runtime flow, persistence, safety boundaries, and component architecture.
 - `docs/orb_buyboard_planning.md` explains Buffer %, the 24-case read-only comparison, Operator-Control-only pre-market ORB selection, market-hours read-only behavior, and published-plan immutability.
 - `docs/kanban_production_readiness.md` records the detailed production invariants and rollout evidence requirements.

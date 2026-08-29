@@ -2,7 +2,7 @@
 
 This document explains the implemented Kanban Buy Board: what a card represents, how cards move, how a UI request becomes durable intent, how the background runtime reaches the broker, and which boundaries keep the workflow fail-closed.
 
-For the application-wide maintenance map, see [PROJECT_ARCHITECTURE.md](../PROJECT_ARCHITECTURE.md). For exhaustive rollout invariants and production evidence requirements, see [kanban_production_readiness.md](kanban_production_readiness.md).
+For the application-wide maintenance map, see [PROJECT_ARCHITECTURE.md](../PROJECT_ARCHITECTURE.md). For the exact implemented entry and replacement rules, see [Current Order Logic](current_order_logic.md). For exhaustive rollout invariants and production evidence requirements, see [kanban_production_readiness.md](kanban_production_readiness.md).
 
 ## Design Summary
 
@@ -70,8 +70,8 @@ stateDiagram-v2
     BUY_TODAY --> BUYLIST: user removes before an order identity exists
     BUY_TODAY --> ENTRY_PENDING: runtime submits or finds unresolved BUY
     ENTRY_PENDING --> OPEN_POSITION: reconciliation confirms any fill
-    ENTRY_PENDING --> BUY_TODAY: TTL cancel/rejection confirmed; retry after cooldown
     ENTRY_PENDING --> BUYLIST: user/EOD cancellation confirmed with zero fill
+    ENTRY_PENDING --> ENTRY_PENDING: safe higher-score ORB generation replacement
     OPEN_POSITION --> PARTIAL_SELL: user requests a smaller partial exit
     PARTIAL_SELL --> OPEN_POSITION: exit reconciliation completes, shares remain
     OPEN_POSITION --> SELL_ALL: user requests liquidation or stop fires
@@ -154,8 +154,8 @@ flowchart TB
     T -->|EOD window; no durable order| B
 
     P -->|any confirmed fill; initial ORB-low stop installed| O
-    P -->|15s TTL, cancel confirmed zero<br/>automatic reprice path + 3s cooldown| T
     P -->|user/EOD cancel confirmed zero| B
+    P -->|later ORB strictly higher score<br/>cancel confirmed zero, then linked replacement| P
     P -->|ambiguous or cancel unconfirmed| P
 
     O -->|request quantity below orderable shares| PS
@@ -174,8 +174,8 @@ flowchart TB
 |---|---|---|---|---|
 | `WATCHLIST` (hidden from board) | User adds a Scanner, sidebar, or TradingView candidate; a passive Buylist card may also be moved back here | Appears in the lightweight Watchlist sidebar. It never subscribes the symbol for execution quotes and cannot place an order. | The user explicitly moves it to Buylist. | No automatic expiry; membership persists and synchronizes until promoted or removed. |
 | `BUYLIST` | User move, safe entry withdrawal, all-window ORB rejection, zero-fill user/EOD cancellation, migration | Does not subscribe the symbol for Buy Today execution and never attempts an entry. An automatic ORB rejection return displays a durable memo with each window's reason. | User activates it for today or explicitly removes it from the queue. | No automatic expiry. |
-| `BUY_TODAY` | `ActivateForToday`, or return from a rejected/TTL-cancelled zero-fill attempt | Subscribes live quotes, syncs an account-matched ORB candidate whose source bars identify the current New York session, recovers retry/capital/data states, and attempts a BUY only when `EXECUTE_READY`, the regular session is open, the quote is fresh and over the trigger, and all ownership/risk/capital/readiness gates pass. The same symbol cannot be active here in two accounts because the compatibility ORB queue is symbol-scoped. | Submission/duplicate/ambiguous result moves it to Entry Pending; a pre-identity user removal or EOD cleanup moves it to Buylist. If all 1m, 5m, and 30m plans are conclusively `REJECTED`/`RISK_INVALID`, a card with no BUY identity automatically returns to Buylist. | Today's authorization ends in the EOD window, **60 seconds before regular close by default**. With no durable order it resets to Buylist. If a durable order exists, it becomes Entry Pending instead of being discarded. |
-| `ENTRY_PENDING` | A submitted, duplicate, discovered, or ambiguous BUY identity | Reconciles the tracked entry every heartbeat. Any fill is immediately projected and protected; the engine never waits for the TTL before applying a fill. It blocks a second BUY while identity/status is unresolved. | Any fill moves the visible card to Open Position; confirmed zero-fill user/EOD cancel moves to Buylist; automatic TTL cancel or rejection returns a zero-fill card to Buy Today for cooldown/retry. | Entry attempt deadline is **15 seconds** by default. Deadline passage requests cancellation; it does **not** mark the order canceled. The card can remain pending without a maximum duration while broker identity or cancel confirmation is unresolved. |
+| `BUY_TODAY` | `ActivateForToday`, or an eligible routing/configuration retry | Subscribes live quotes, syncs account-matched current-session ORB candidates, latches a fresh trade strictly above both ORB high and breakout, and submits a passive limit only while last trade and ask remain above its execution price and every ownership/risk/capital/readiness gate passes. The same symbol cannot be active here in two accounts because the compatibility ORB queue is symbol-scoped. | Submission/duplicate/ambiguous result moves it to Entry Pending; a pre-identity user removal, ordinary definitive rejection, all-window ORB rejection, or EOD cleanup moves it to Buylist. `APBK0656` stays Buy Today for corrected-route retry. | Today's authorization ends in the EOD window, **60 seconds before regular close by default**. With no durable order it resets to Buylist. If a durable order exists, it becomes Entry Pending instead of being discarded. |
+| `ENTRY_PENDING` | A submitted, duplicate, discovered, or ambiguous BUY identity | Reconciles the tracked entry every heartbeat, applies/protects fills, and blocks a second BUY while identity/status is unresolved. A completely unfilled `WORKING` order may upgrade to a later, strictly higher-scoring ORB only through confirmed cancel-then-replace with full pre/post-cancel revalidation. | Any fill moves the visible card to Open Position; confirmed zero-fill user/EOD cancel moves to Buylist; a successful replacement remains Entry Pending under the new generation. | New passive entry orders have **no 15-second auto-cancel/reprice deadline**. They remain pending until broker fill/cancel/expiry/rejection, safe replacement, or EOD cleanup; ambiguous state has no invented local expiry. |
 | `OPEN_POSITION` | Any confirmed entry fill or broker holding discovery | Keeps broker quantity/orderable quantity reconciled, evaluates the active stop on execution-grade regular-session events, flags stale/outage data, and may retry an incomplete entry target while safe. | User requests Partial Sell/Sell All; stop or outage policy initiates Sell All; broker reconciliation can update lifecycle facts. | No position expiry. At EOD the engine stops trying to complete any remaining entry target, but the existing position and protection remain open. |
 | `PARTIAL_SELL` | User requests a positive quantity below current orderable shares | Submits one partial SELL when no conflicting sell is working, reconciles it each heartbeat, and escalates to cancel after its attempt deadline. A stop cancels/supersedes the partial path before full liquidation. | Terminal reconciliation returns to Open Position with refreshed shares; stop/liquidation moves to Sell All. | Each partial-exit attempt has a **10-second** deadline. The deadline requests cancel; it does not assume completion. Rejected/error submissions wait **5 seconds** before retry. |
 | `SELL_ALL` | User request, stop breach, data-outage policy, or escalation from Partial Sell | Cancels conflicting entry completion, refreshes sellable quantity, submits/reconciles SELL attempts, and continues cancel/reprice/retry until broker quantity is zero. | Broker-confirmed flat moves to Closed. A queued premarket Sell All can return to Open Position only before an execution identity/order exists. | Each Sell All attempt has a **5-second** deadline. Rejected/error submissions wait **5 seconds** before retry. There is no overall liquidation expiry; intent remains until flat or explicit operator resolution. |
@@ -187,8 +187,8 @@ flowchart TB
 |---|---:|---|
 | `ENGINE_HEARTBEAT_SECONDS` | 1 s | Delay after one runtime cycle; not a hard wall-clock scheduling guarantee |
 | Buy Board projection refresh | 3 s | Read-only UI refresh; does not drive trading |
-| `ENTRY_ATTEMPT_TTL_SECONDS` | 15 s | Working BUY deadline before automatic cancel/reprice escalation |
-| `ENTRY_RETRY_COOLDOWN_SECONDS` | 3 s | Retry delay after eligible entry rejection or confirmed automatic TTL cancellation |
+| `ENTRY_ATTEMPT_TTL_SECONDS` | 15 s | Legacy compatibility setting; new confirmed-breakout passive entries persist `attempt_deadline_at=None` and do not use it |
+| `ENTRY_RETRY_COOLDOWN_SECONDS` | 3 s | Retry delay after a retryable pre-broker failure or KIS routing/configuration rejection such as `APBK0656` |
 | `MAX_ENTRY_ATTEMPTS_PER_SYMBOL_PER_MINUTE` | 4 | Per-symbol entry-attempt cap; the fifth waits until the oldest attempt leaves the one-minute window |
 | `PARTIAL_EXIT_ATTEMPT_TTL_SECONDS` | 10 s | Working partial SELL deadline before cancel escalation |
 | `SELL_ALL_ATTEMPT_TTL_SECONDS` | 5 s | Working liquidation SELL deadline before cancel/reprice escalation |
@@ -212,9 +212,15 @@ flowchart TB
 
 The implementation has no blanket “card expires after N seconds” rule. It does not use `board_status_updated_at` to time out a column. Hidden compatibility, Buylist, Open Position, and Closed cards persist until a command or reconciled fact changes them.
 
-Order-attempt deadlines are stored as `attempt_deadline_at`. Retry timing is stored separately in `next_retry_at` or `next_exit_retry_at`; cancellation tracking uses explicit in-flight flags and request timestamps. This separation survives restart and prevents a UI column timestamp from being mistaken for broker evidence.
+Where a lifecycle uses an order-attempt deadline, it is stored as
+`attempt_deadline_at`. New passive entry generations deliberately store no
+deadline; exit attempts still use their configured deadlines. Retry timing is
+stored separately in `next_retry_at` or `next_exit_retry_at`; cancellation and
+replacement tracking use explicit in-flight flags, generation identities, and
+request timestamps. This separation survives restart and prevents a UI column
+timestamp from being mistaken for broker evidence.
 
-When an attempt deadline passes:
+When an applicable exit/legacy attempt deadline passes:
 
 1. The next eligible heartbeat requests cancellation exactly once.
 2. The card/order remains unresolved while cancellation is in flight.
@@ -422,16 +428,23 @@ Each stage isolates failures per card and the outer heartbeat isolates failures 
 ## Entry Logic
 
 1. `ActivateForToday` moves a safe Buylist card to `BUY_TODAY` and records monitoring intent.
-2. `TradeCardOrbEvaluator` copies the existing execution queue candidate into the card. Candidate status maps to badges such as `ORB_FORMING`, `WAITING_BREAKOUT`, `ARMED`, `EXECUTE_READY`, or `RISK_INVALID`.
-3. Once all three supported windows are present and terminal-invalid, a pre-identity card returns to Buylist, clears its live entry plan, releases its execution feed subscription, and records one rejection memo. Missing, unavailable, or forming data cannot trigger this return.
-4. Ready entries receive the highest new-entry subscription priority; armed/waiting-breakout entries rank next; still-forming Buy Today plans rank after them. Working orders, open positions, and protective exits always remain ahead of new entries.
-5. The runtime attempts an entry only during the regular session when the card is `EXECUTE_READY`, the execution-grade quote is connected/fresh, and price clears the persisted entry trigger.
-6. The live marketable price and current account equity/buying power are used for final sizing. A fresh `PreTradeRiskDecision` must match the complete submitted order fingerprint.
-7. Attempt group, attempt number, client order ID, and capital reservation correlation are persisted before crossing the broker boundary.
-8. `EntryAttemptManager` serializes the symbol, applies capital and mutation-budget controls, and submits through the shared gateway.
-9. Submitted, duplicate, or ambiguous outcomes move the card to `ENTRY_PENDING`; ambiguous state blocks resubmission until reconciled.
-10. Reconciliation applies cumulative fill evidence. The first confirmed fill moves the card to `OPEN_POSITION`, freezes entry ORB facts, and installs initial protection. Remaining target quantity may be retried under the entry-completion policy.
-11. A broker-confirmed zero-fill cancellation/expiry returns the card to `BUYLIST`. A UI cancel request alone does not.
+2. `TradeCardOrbEvaluator` copies complete current-session 1m/5m/30m queue candidates into the card. Candidate status maps to badges such as `ORB_FORMING`, `WAITING_BREAKOUT`, `ARMED`, `EXECUTE_READY`, or `RISK_INVALID`.
+3. A candidate is executable only when `max(breakout_price, orb_low) < execution_price <= orb_high`; automatic plans use ORB high, while a compatible manual execution price is preserved exactly.
+4. After that range closes, a fresh KIS trade strictly above `max(breakout_price, orb_high)` latches breakout confirmation. Automatic mode selects the highest-scoring crossed candidate; an equal score favors the earlier timeframe, and a manual window lock stays exact.
+5. Once all three supported windows are present and terminal-invalid, a pre-identity card returns to Buylist, clears its live entry plan, releases its execution feed subscription, and records one rejection memo. Missing, unavailable, stale, or forming data cannot trigger this return.
+6. Ready entries receive the highest new-entry subscription priority; armed/waiting-breakout entries rank next; still-forming Buy Today plans rank after them. Working orders, open positions, and protective exits always remain ahead of new entries.
+7. The runtime submits during the regular session only while the execution-grade trade and ask are both fresh and strictly above the configured execution price. The resulting BUY limit is placed at that exact price below the current market; reaching the breakout does not mean fill.
+8. Current account equity/buying power and the frozen planned quantity feed a fresh `PreTradeRiskDecision` matching the complete submitted order fingerprint.
+9. Attempt group, attempt number, client order ID, parent intent, generation, and capital reservation correlation are persisted before crossing the broker boundary.
+10. `EntryAttemptManager` serializes the symbol, applies capital and mutation-budget controls, and submits through the shared gateway without the legacy 15-second entry deadline.
+11. Submitted, duplicate, or ambiguous outcomes move the card to `ENTRY_PENDING`; ambiguous state blocks resubmission until reconciled. An ordinary definitive rejection returns a zero-position card to Buylist. `APBK0656` keeps it in Buy Today under retry cooldown because the failure is routing/configuration, not strategy.
+12. While Entry Pending, a later timeframe with the same score version and a strictly higher score may qualify only if the active order is `WORKING`, completely unfilled, unchanged in quantity, and every quote/risk/capital gate passes. The gateway persists the replace intent, cancels the old order, waits for authoritative zero-fill cancellation, revalidates, and only then submits one linked replacement generation.
+13. Any old-order fill, rejected/uncertain cancellation, or failed post-cancel revalidation blocks the replacement. Restart recovery resumes only a proven post-cancel submit leg and never overlaps two BUY orders.
+14. Reconciliation applies cumulative fill evidence. The first confirmed fill moves the card to `OPEN_POSITION`, freezes the filling generation's ORB facts, and installs its ORB-low protection. Remaining target quantity may continue only under the guarded entry-completion policy.
+15. A broker-confirmed zero-fill user/EOD cancellation returns the card to `BUYLIST`. A cancellation request or local timeout alone never does.
+
+See [Current Order Logic](current_order_logic.md) for formulas, examples, and
+the complete replacement failure matrix.
 
 ## Position, Stop, and Exit Logic
 

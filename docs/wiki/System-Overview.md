@@ -34,6 +34,8 @@ flowchart LR
   blocked by independent live-execution, ownership, readiness, and risk gates.
 - Durable order/card/command state, conservative reconciliation, event journal,
   Health tab, and guarded KIS integration.
+- Confirmed-breakout passive BUY limits and strict zero-fill, higher-score ORB
+  cancel-then-replace generations.
 
 ## Optional
 

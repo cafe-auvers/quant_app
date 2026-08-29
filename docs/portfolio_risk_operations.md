@@ -95,3 +95,8 @@ reservation is missing or closed remains fully present in the final atomic risk
 baseline, raises a critical reconciliation alert, and blocks only additional
 BUY exposure until repaired; exits, cancellation, liquidation, reconciliation,
 and recovery remain available.
+
+ORB upgrades additionally require a later timeframe, a strictly higher score,
+zero fills, unchanged quantity, current passive quote conditions, and
+authoritative cancellation before the linked submit. See
+[Current Order Logic](current_order_logic.md).

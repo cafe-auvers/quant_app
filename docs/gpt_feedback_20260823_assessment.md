@@ -1,5 +1,11 @@
 # Assessment of `gpt_feedback_20260823.md`
 
+> Follow-up status (2026-08-29): the systematic release-hardening work and
+> finalized passive ORB entry/replacement logic have since landed. This file
+> remains the dated assessment of the August 23 feedback; use
+> [Current Order Logic](current_order_logic.md) and the controlled-live runbook
+> for current behavior and deployment gates.
+
 Reviewed against the accepted working commit
 `1785b69da1e7890afbb9a9a796683fa738ccdcd8` on 2026-08-23. That exact commit is
 preserved by the separate annotated tag `safety-backup-accepted-20260823`;

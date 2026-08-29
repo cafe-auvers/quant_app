@@ -21,6 +21,24 @@ false.
 6. Confirm the exact account, open orders, holdings, orderable quantities, and
    live-mode authorization before making another change.
 
+## Entry replacement recovery
+
+If a card shows `REPLACE_PENDING`, `CANCEL_PENDING`, or
+`REPLACEMENT_SUBMISSION_UNRESOLVED`, do not create a manual replacement in the
+app or KIS. Reconcile the exact old and new client/broker order identities.
+
+- A working or uncertain old order blocks a replacement submission.
+- Any old-order fill aborts replacement and must use the old generation's ORB
+  low for protection.
+- A confirmed-cancelled zero-fill old order may resume only the already
+  journaled replacement submit leg with its persisted stable identity.
+- A post-cancel market/risk failure leaves the old order cancelled and submits
+  nothing; the runtime does not silently recreate it.
+- An ambiguous replacement POST remains fenced and must be reconciled, never
+  retried with a new identity.
+
+See [Current Order Logic](current_order_logic.md) for the full state sequence.
+
 ## Protective action while the store is unavailable
 
 An already-active runtime may use the guarded emergency path only for an exact

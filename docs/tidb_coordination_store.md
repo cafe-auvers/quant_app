@@ -15,6 +15,11 @@ historical data stay in PC MySQL and the laptop SQLite mirror. The one-second
 quote, ORB, stop, and order-reconciliation loop also remains local. TiDB is a
 coordination authority, not a market-data transport.
 
+It persists the parent intent, generation identities, commands, orders, and
+reservations needed by the strict cancel-then-replace sequence, but the local
+runtime still evaluates the market event and safety gates described in
+[Current Order Logic](current_order_logic.md).
+
 At the time of this design, TiDB Cloud Starter includes 5 GiB row storage,
 5 GiB columnar storage, and 50 million RUs per month. Keep the spending limit
 at zero so quota exhaustion rejects or throttles work instead of creating a

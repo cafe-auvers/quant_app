@@ -30,8 +30,18 @@ quote evidence.
   network, gateway, rate-limit, and domestic-balance `APBK1350` failures.
   Permanent client/protocol errors are not retried.
 - Submit/cancel/replace calls use shared mutation budgets and spacing.
+- ORB replacement is never an in-place price edit: the gateway fully
+  prevalidates, cancels the exact zero-fill order, confirms terminal
+  cancellation, revalidates, and submits one linked generation.
 - Ambiguous submission state must reconcile; it must never be retried as a new
   logical order. The read retry policy never applies to broker mutations.
+- A definitive `APBK0656` order rejection is classified as exchange-routing/
+  configuration failure. It does not create Entry Pending and does not demote
+  the strategy as rejected; the Buy Today plan clears that identity and waits
+  for a corrected-route retry.
 
 Vendor capability evidence and unresolved qualifications are maintained in
 the repository KIS capability matrix and Gate 2 checklist.
+
+See [Current Order Logic](https://github.com/cafe-auvers/quant_app/blob/master/docs/current_order_logic.md)
+for the complete entry and replacement sequence.

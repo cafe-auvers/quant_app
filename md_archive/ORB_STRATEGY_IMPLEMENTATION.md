@@ -1,5 +1,9 @@
 # ORB Strategy Implementation Plan
 
+> Historical plan only. It predates the current Buy Board state machine and
+> must not be used to infer live order behavior. See
+> [Current Order Logic](../docs/current_order_logic.md).
+
 ## Goal
 
 Add an Opening Range Breakout workflow for the watchlist. The app should fetch intraday data every 5 minutes during the U.S. regular session, calculate opening-range high/low for configurable windows, and flag symbols that break the range or meet saved target prices.

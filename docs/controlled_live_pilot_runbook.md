@@ -8,6 +8,12 @@ The pilot and later full-live mode use the same WebSocket, runtime, gateway,
 broker, database, reconciliation, stop, and handoff code. Promotion changes
 only the risk-envelope configuration.
 
+Before supervising an entry, read [Current Order Logic](current_order_logic.md).
+The pilot does not alter the strategy: breakout confirmation submits a passive
+BUY limit below the market, Entry Pending is not a fill, and a later ORB may
+replace a working order only through zero-fill cancel confirmation followed by
+one linked submission.
+
 ## Evidence required before configuration
 
 - A Gate-1 report must pass on the exact deployed commit after every code
@@ -145,6 +151,10 @@ Today feed capacity.
    broker.
 5. Compare every submit, partial fill, fill, cancel, Partial Sell, Sell All,
    position quantity, stop, and card projection against KIS truth.
+   For a passive entry, confirm the order was submitted at the frozen execution
+   price while trade/ask were above it. If an ORB upgrade occurs, verify the old
+   order is terminally cancelled with zero fills before the replacement appears
+   and that the replacement quantity is unchanged.
 6. Disarm the session switch and prove another mutation cannot cross the
    broker boundary.
 7. Stop on any ambiguity, stale feed, reconciliation mismatch, lease loss,

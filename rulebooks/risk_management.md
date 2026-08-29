@@ -280,15 +280,22 @@ Do not use a target price as a take-profit level.
 
 Entry validation:
   - Breakout price is the user-entered daily structural breakout level.
-  - ORB entry is valid only when price clears both ORB high and the buffered breakout price.
+  - A finalized ORB requires a fresh post-range trade strictly above both ORB high and breakout price.
+  - That confirmation submits a passive BUY limit at ORB high by default; it is not a fill.
+  - Passive execution must satisfy max(breakout price, ORB low) < execution price <= ORB high.
   - Stop distance must fit the selected setup and ADR constraint.
   - Position size must fit account risk and max-position limits.
+  - A later ORB may replace a zero-fill working order only when its score is strictly higher; cancel must be confirmed before the same-quantity replacement is submitted.
+  - The filled generation's ORB low is the stop reference.
 
 Exit management:
   - First partial exit: sell 1/3 to 1/2 after 3-5 days if the trade has worked.
   - Hold remaining shares while momentum continues.
   - Final exit: sell when price closes below the selected EMA, usually 10 EMA or 20 EMA.
 ```
+
+The operational state machine and failure cases are defined in
+[Current Order Logic](../docs/current_order_logic.md).
 
 ---
 ## Position Size Examples
@@ -530,4 +537,3 @@ Every trade gets logged. Every decision gets audited.
 │                                                          │
 └─────────────────────────────────────────────────────────┘
 ```
-

@@ -51,6 +51,9 @@ This handoff does not weaken the local review boundary:
   unchanged.
 - Adding the mapping does not alter Controlled Live authorization, position
   sizing, portfolio risk, or the shared live-trading switch.
+- A valid key only enables the feed. Breakout confirmation and passive entry
+  still require fresh trade plus quote evidence and every rule in
+  [Current Order Logic](current_order_logic.md).
 - Existing active cards created before this handoff field was deployed need
   one initial validated executor file or a later remove/reactivate cycle.
 

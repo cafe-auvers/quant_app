@@ -10,7 +10,24 @@
 - Inspect unresolved/ambiguous/open orders before any retry or ownership
   transfer.
 - Verify the Buy Board readiness label and action-specific blockers.
+- For each Buy Today plan, inspect the 1m/5m/30m ORB details, confirmation
+  source/time, selected generation, passive limit, broker identity, and memo.
+- Treat `Entry Pending` as accepted or unresolved broker work, not as a fill;
+  confirm fills and positions from broker reconciliation.
+- Review higher-score replacements as one cancel-then-replace chain. Require an
+  authoritative zero-fill cancellation before any new generation appears.
 - Keep execution disabled during code/dependency/environment updates.
+
+New passive entries do not have a 15-second auto-cancel/reprice timer. A working
+order can remain pending until fill, explicit/EOD cancellation, broker
+expiry/rejection, or a safe higher-score ORB replacement. A passive-limit touch
+is not proof of fill.
+
+At the end of the regular session, confirm that unsubmitted Buy Today plans
+returned to Buylist, all-window invalid plans retained an `ORB Rejected`
+diagnostic for Daily Summary, and Entry Pending orders completed the two-phase
+cancel/reconcile flow. An uncertain cancellation remains pending and blocks
+duplicate submission.
 
 ## Logs and evidence
 
@@ -40,3 +57,7 @@ different paths; seeing them ON does not replace the shared readiness proof.
 The maintained synthetic audit covers sidebar projection and cache watermark
 latency. Production chart/SQL latency needs sanitized local instrumentation;
 never log sensitive broker identifiers while profiling.
+
+The complete state and failure semantics are in
+[Current Order Logic](https://github.com/cafe-auvers/quant_app/blob/master/docs/current_order_logic.md)
+and [Order Lifecycle](Order-Lifecycle).

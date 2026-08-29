@@ -80,6 +80,13 @@ Must satisfy all of these:
 - Verify there is no bad news catalyst or other disqualifier
 - Add the ticker to the watchlist if the setup is clean
 
+Publishing a reviewed setup to Buy Today delegates the mechanical ORB entry to
+the implemented confirmed-breakout passive-pullback state machine. The runtime
+submits at the configured execution price after confirmation and relies on
+broker evidence for fills; a later, strictly higher-scoring ORB can replace
+only a completely unfilled order through strict cancel-then-replace. See
+[Current Order Logic](../docs/current_order_logic.md).
+
 ### Breakout Stop Rules
 - Initial stop = most recent intraday support low (daily low or consolidation low)
 - Do not place stop wider than the 20-day ADR

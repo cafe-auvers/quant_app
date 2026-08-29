@@ -9,6 +9,7 @@ stateDiagram-v2
     WATCHLIST --> BUYLIST: promote
     BUYLIST --> BUY_TODAY: activate plan
     BUY_TODAY --> ENTRY_PENDING: system sees durable submitted entry
+    ENTRY_PENDING --> ENTRY_PENDING: safe later-ORB cancel/replace
     ENTRY_PENDING --> OPEN_POSITION: broker-confirmed fill
     ENTRY_PENDING --> BUYLIST: reconciled cancel/no fill
     OPEN_POSITION --> PARTIAL_SELL: request partial exit
@@ -37,3 +38,19 @@ No drag calls KIS directly.
 
 The engine remains read-only when disabled, when this device lacks the lease,
 or when any action-specific readiness gate fails.
+
+## Buy Today and Entry Pending
+
+Buy Today is monitoring intent, not an order. After a current-session ORB
+closes, a fresh KIS trade strictly above both ORB high and breakout confirms the
+candidate. The system then submits a passive BUY limit at ORB high by default
+while last trade and ask remain above that limit.
+
+Entry Pending means a durable submitted/discovered/ambiguous BUY identity
+exists. It does not mean filled. New passive entries have no 15-second
+auto-cancel/reprice deadline. A zero-fill working order may upgrade to a later,
+strictly higher-scoring ORB only by cancelling and authoritatively confirming
+the old order before submitting the linked replacement. Any fill blocks the
+upgrade and moves broker-confirmed quantity to Open Position.
+
+See [Current Order Logic](https://github.com/cafe-auvers/quant_app/blob/master/docs/current_order_logic.md).
