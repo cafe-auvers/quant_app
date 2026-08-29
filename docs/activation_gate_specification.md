@@ -468,6 +468,7 @@ Workstream 14 is complete only when:
 
 ## Related documents
 
+- [Activation gate handoff](activation_gate_handoff.md)
 - [Kanban production readiness](kanban_production_readiness.md)
 - [Gate-2 readiness checklist](gate2_readiness_checklist.md)
 - [KIS capability matrix](kis_capability_matrix.md)

@@ -11,6 +11,8 @@ cannot place an order unless every safety gate agrees.
 The five cumulative qualification gates, their exact pass predicates, and the
 current closure sequence are defined in the
 [Activation Gate Specification](docs/activation_gate_specification.md).
+For workstation pickup, exact Gate 1 closure evidence, and the next live step,
+use the [Activation Gate Handoff](docs/activation_gate_handoff.md).
 
 ## Current Capabilities
 
