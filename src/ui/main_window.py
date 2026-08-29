@@ -88,6 +88,8 @@ from src.services.state_sync import (
     SETTINGS_KEY,
     get_coordination_status_snapshot,
     get_live_trading_control,
+    live_trading_control_block_reason,
+    live_trading_control_is_effective,
     load_local_device_role,
     set_operator_control,
     set_live_trading_control,
@@ -646,7 +648,9 @@ class StateSyncWorker(QThread):
         coordination_status = get_coordination_status_snapshot(self.engine)
         control_result = coordination_status.live_trading
         if control_result.success and control_result.control is not None:
-            result.live_trading_enabled = control_result.control.enabled
+            result.live_trading_enabled = live_trading_control_is_effective(
+                control_result.control
+            )
             result.live_trading_revision = control_result.control.revision
         else:
             result.live_trading_error = (
@@ -4448,7 +4452,7 @@ class MainWindow(
             raise RuntimeError(
                 result.error or "Kanban live-trading control is unavailable"
             )
-        return bool(result.control.enabled)
+        return live_trading_control_is_effective(result.control)
 
     def _refresh_trading_enabled_widget(self) -> None:
         """Project the durable Kanban kill switch into the toolbar."""
@@ -4539,7 +4543,8 @@ class MainWindow(
                 self,
                 "Enable Live Trading",
                 "This turns guarded KIS order submission ON for this Kanban "
-                "operational store. Only its current Execution Owner can execute. "
+                "operational store for the current/next NYSE session and this "
+                "approved release. Only its current Execution Owner can execute. "
                 "Continue?",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
@@ -4589,7 +4594,8 @@ class MainWindow(
             )
             return
 
-        trading_state.set_trading_enabled(result.control.enabled)
+        effective = live_trading_control_is_effective(result.control)
+        trading_state.set_trading_enabled(effective)
         self._shared_live_trading_available = bool(
             self._execution_state_engine() is not None
             and self._execution_state_ready()
@@ -4597,11 +4603,18 @@ class MainWindow(
         self._shared_live_trading_revision = result.control.revision
 
         self._refresh_trading_enabled_widget()
-        effective = trading_state.is_trading_enabled()
+        reason = live_trading_control_block_reason(result.control)
+        session_text = (
+            result.control.session_date.isoformat()
+            if result.control.session_date is not None
+            else "unscoped"
+        )
         self.append_log(
             f"Live trading {'ENABLED' if effective else 'DISABLED'} "
             f"in the Kanban store by {self.state_sync_role.hostname} "
+            f"for NYSE session {session_text} "
             f"(revision {result.control.revision})."
+            + (f" Reason: {reason}." if reason else "")
         )
 
     def _build_status_log(self, parent_layout: QVBoxLayout) -> None:

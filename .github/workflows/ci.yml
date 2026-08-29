@@ -40,12 +40,33 @@ jobs:
       - name: Compile check
         run: python -m compileall main.py src tests -q
 
+      - name: Parse PC automation scripts
+        shell: pwsh
+        run: |
+          $parseFailed = $false
+          Get-ChildItem scripts -Filter *.ps1 | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName,
+              [ref]$tokens,
+              [ref]$errors
+            ) | Out-Null
+            if ($errors.Count -gt 0) {
+              $parseFailed = $true
+              $errors | ForEach-Object { Write-Error "$($_.Extent): $($_.Message)" }
+            }
+          }
+          if ($parseFailed) { exit 1 }
+
       - name: Run tests
         run: python -m pytest -q
 
   gate1:
     name: Gate 1 deterministic simulation
-    needs: test
+    # Gate 1 is a protected-branch check, so these dependencies make
+    # repository hygiene and dependency audit transitively release-blocking.
+    needs: [test, repository-hygiene, dependency-audit]
     runs-on: windows-latest
     timeout-minutes: 30
 

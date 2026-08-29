@@ -118,6 +118,31 @@ def test_balance_query_code_is_not_retryable_for_a_mutation_endpoint() -> None:
         )
 
     assert not isinstance(caught.value, kis_snapshot.KisTransientApiError)
+    assert caught.value.broker_code == "APBK1350"
+    assert caught.value.endpoint == "/uapi/overseas-stock/v1/trading/order"
+    assert caught.value.broker_message == "Query error. Please try again."
+    assert caught.value.http_status == 200
+
+
+def test_broker_error_message_omits_raw_response_payload() -> None:
+    response = _Response(
+        200,
+        {
+            "rt_cd": "1",
+            "msg_cd": "APBK0656",
+            "msg1": "Invalid exchange route",
+            "output": {"sensitive_internal_field": "do-not-persist"},
+        },
+    )
+
+    with pytest.raises(kis_snapshot.KisApiError) as caught:
+        kis_snapshot.KisAccountClient._parse_response(
+            response,
+            endpoint="/uapi/overseas-stock/v1/trading/order",
+        )
+
+    assert caught.value.broker_code == "APBK0656"
+    assert "do-not-persist" not in str(caught.value)
 
 
 def test_read_retries_gateway_routing_error_then_returns_success(monkeypatch) -> None:

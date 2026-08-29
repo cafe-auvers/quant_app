@@ -278,6 +278,40 @@ def _seed_card(engine, **overrides):
     return repo.create_trade_card(engine, TradeCardState(**fields))
 
 
+def test_controlled_runtime_fails_before_composition_without_approved_release(
+    tmp_path, monkeypatch
+):
+    import src.ui.buyboard.runtime_worker as runtime_worker_module
+
+    worker, _ = _worker(tmp_path)
+    errors = []
+    worker.error_occurred.connect(errors.append)
+    monkeypatch.setattr(
+        execution_config, "is_buyboard_engine_enabled", lambda: True
+    )
+    monkeypatch.setattr(
+        runtime_worker_module, "is_buyboard_engine_enabled", lambda: True
+    )
+    monkeypatch.setattr(
+        execution_config, "KIS_LIVE_EXECUTION_MODE", "CONTROLLED_LIVE"
+    )
+
+    def reject_release():
+        raise RuntimeError("release not approved")
+
+    monkeypatch.setattr(
+        runtime_worker_module,
+        "require_approved_release_identity",
+        reject_release,
+    )
+
+    worker.run()
+
+    assert worker.runtime is None
+    assert worker.device_state == RuntimeDeviceState.FAILED
+    assert any("release not approved" in message for message in errors)
+
+
 def _current_us_session_date() -> str:
     return dt.datetime.now(ZoneInfo("America/New_York")).date().isoformat()
 

@@ -15,7 +15,7 @@ import threading
 import uuid
 import weakref
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -41,7 +41,8 @@ from src.core.execution_config import (
 )
 from src.infrastructure.database.coordination_engine import coordination_read_connection
 from src.services.runtime_status import MAIN_APP_PROCESS, heartbeat_row_is_stale
-from src.utils.config import DATA_DIR
+from src.utils.config import DATA_DIR, get_env_value
+from src.utils.market_calendar import current_or_next_nyse_session_date
 from src.utils.storage import load_json, save_json
 
 logger = logging.getLogger(__name__)
@@ -146,6 +147,8 @@ class LiveTradingControl:
     updated_at: datetime
     updated_by_host: str = ""
     updated_by_device: str = ""
+    session_date: Optional[date] = None
+    runtime_commit_sha: str = ""
 
 
 @dataclass(frozen=True)
@@ -153,6 +156,75 @@ class LiveTradingControlResult:
     success: bool
     control: Optional[LiveTradingControl] = None
     error: str = ""
+
+
+def _live_trading_control_from_state(state: RemoteState) -> LiveTradingControl:
+    enabled = state.payload.get("enabled")
+    if not isinstance(enabled, bool):
+        raise ValueError(
+            "Shared live-trading control has an invalid enabled value."
+        )
+    raw_session_date = str(state.payload.get("session_date") or "").strip()
+    session_date = None
+    if raw_session_date:
+        try:
+            session_date = date.fromisoformat(raw_session_date)
+        except ValueError as exc:
+            raise ValueError(
+                "Shared live-trading control has an invalid session date."
+            ) from exc
+    return LiveTradingControl(
+        enabled=enabled,
+        revision=state.revision,
+        updated_at=state.updated_at,
+        updated_by_host=state.updated_by_host,
+        updated_by_device=state.updated_by_device,
+        session_date=session_date,
+        runtime_commit_sha=str(
+            state.payload.get("runtime_commit_sha") or ""
+        ).strip().lower(),
+    )
+
+
+def live_trading_control_block_reason(
+    control: LiveTradingControl,
+    *,
+    now: Optional[datetime] = None,
+    runtime_commit_sha: Optional[str] = None,
+) -> str:
+    """Explain why a durable live switch is ineffective for this session."""
+
+    if not control.enabled:
+        return "shared live-trading control is disabled"
+    expected_session = current_or_next_nyse_session_date(now)
+    if control.session_date is None:
+        return "shared live-trading control predates session-scoped arming"
+    if control.session_date != expected_session:
+        return (
+            f"shared live-trading control is armed for {control.session_date}, "
+            f"not {expected_session}"
+        )
+    expected_commit = str(
+        runtime_commit_sha
+        if runtime_commit_sha is not None
+        else get_env_value("KIS_RUNTIME_COMMIT_SHA", "") or ""
+    ).strip().lower()
+    if expected_commit and control.runtime_commit_sha != expected_commit:
+        return "shared live-trading control was armed for a different release"
+    return ""
+
+
+def live_trading_control_is_effective(
+    control: LiveTradingControl,
+    *,
+    now: Optional[datetime] = None,
+    runtime_commit_sha: Optional[str] = None,
+) -> bool:
+    return not live_trading_control_block_reason(
+        control,
+        now=now,
+        runtime_commit_sha=runtime_commit_sha,
+    )
 
 
 @dataclass(frozen=True)
@@ -446,28 +518,23 @@ def get_live_trading_control(
             False,
             error=pulled.error or "Could not read shared live-trading control.",
         )
-    enabled = pulled.state.payload.get("enabled")
-    if not isinstance(enabled, bool):
+    try:
+        control = _live_trading_control_from_state(pulled.state)
+    except ValueError as exc:
         return LiveTradingControlResult(
             False,
-            error="Shared live-trading control has an invalid enabled value.",
+            error=str(exc),
         )
-    return LiveTradingControlResult(
-        True,
-        LiveTradingControl(
-            enabled=enabled,
-            revision=pulled.state.revision,
-            updated_at=pulled.state.updated_at,
-            updated_by_host=pulled.state.updated_by_host,
-            updated_by_device=pulled.state.updated_by_device,
-        ),
-    )
+    return LiveTradingControlResult(True, control)
 
 
 def set_live_trading_control(
     engine: Optional[Engine],
     role: LocalDeviceRole,
     enabled: bool,
+    *,
+    session_date: Optional[date] = None,
+    runtime_commit_sha: Optional[str] = None,
 ) -> LiveTradingControlResult:
     """Atomically set the global kill switch from either registered device.
 
@@ -500,9 +567,24 @@ def set_live_trading_control(
                     ).get("enabled", False)
                 )
             revision = int(row.revision or 0) + 1 if row is not None else 1
+            armed_session = (
+                session_date or current_or_next_nyse_session_date()
+            ) if enabled else None
+            armed_commit = str(
+                runtime_commit_sha
+                if runtime_commit_sha is not None
+                else get_env_value("KIS_RUNTIME_COMMIT_SHA", "") or ""
+            ).strip().lower() if enabled else ""
+            payload = {
+                "enabled": bool(enabled),
+                "session_date": (
+                    armed_session.isoformat() if armed_session else ""
+                ),
+                "runtime_commit_sha": armed_commit,
+            }
             values = {
                 "payload": json.dumps(
-                    {"enabled": bool(enabled)},
+                    payload,
                     separators=(",", ":"),
                 ),
                 "revision": revision,
@@ -543,13 +625,7 @@ def set_live_trading_control(
         state = _remote_state_from_row(written_row, LIVE_TRADING_CONTROL_KEY)
         return LiveTradingControlResult(
             True,
-            LiveTradingControl(
-                enabled=bool(state.payload.get("enabled")),
-                revision=state.revision,
-                updated_at=state.updated_at,
-                updated_by_host=state.updated_by_host,
-                updated_by_device=state.updated_by_device,
-            ),
+            _live_trading_control_from_state(state),
         )
     except (SQLAlchemyError, ValueError, TypeError) as exc:
         logger.info("Could not update shared live-trading control: %s", exc)
@@ -840,20 +916,9 @@ def get_coordination_status_snapshot(
                 updated_by_host=live_row.updated_by_host or "",
                 updated_by_device=live_row.updated_by_device or "",
             )
-            enabled = live_state.payload.get("enabled")
-            if not isinstance(enabled, bool):
-                raise ValueError(
-                    "Shared live-trading control has an invalid enabled value."
-                )
             live_result = LiveTradingControlResult(
                 True,
-                LiveTradingControl(
-                    enabled=enabled,
-                    revision=live_state.revision,
-                    updated_at=live_state.updated_at,
-                    updated_by_host=live_state.updated_by_host,
-                    updated_by_device=live_state.updated_by_device,
-                ),
+                _live_trading_control_from_state(live_state),
             )
         except (TypeError, ValueError) as exc:
             live_result = LiveTradingControlResult(False, error=str(exc))

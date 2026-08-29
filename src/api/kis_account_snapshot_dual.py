@@ -277,6 +277,21 @@ class KisEnvironment(str, Enum):
 class KisApiError(RuntimeError):
     """Raised when KIS returns an HTTP/API error."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        endpoint: str = "",
+        broker_code: str = "",
+        broker_message: str = "",
+        http_status: Optional[int] = None,
+    ) -> None:
+        super().__init__(message)
+        self.endpoint = str(endpoint or "")
+        self.broker_code = str(broker_code or "").strip().upper()
+        self.broker_message = str(broker_message or "").strip()
+        self.http_status = int(http_status) if http_status is not None else None
+
 
 class KisRateLimitError(KisApiError):
     """Raised when KIS reports a per-second request limit error."""
@@ -286,8 +301,18 @@ class KisRateLimitError(KisApiError):
         message: str,
         *,
         retry_after_seconds: float = RATE_LIMIT_BACKOFF_SECONDS[0],
+        endpoint: str = "",
+        broker_code: str = "",
+        broker_message: str = "",
+        http_status: Optional[int] = None,
     ) -> None:
-        super().__init__(message)
+        super().__init__(
+            message,
+            endpoint=endpoint,
+            broker_code=broker_code,
+            broker_message=broker_message,
+            http_status=http_status,
+        )
         self.retry_after_seconds = max(
             0.0, float(retry_after_seconds or 0.0)
         )
@@ -855,21 +880,37 @@ class KisAccountClient:
         except ValueError as exc:
             raise KisApiError(
                 f"KIS returned non-JSON response from {endpoint}. "
-                f"HTTP {response.status_code}: {response.text[:300]}"
+                f"HTTP {response.status_code}",
+                endpoint=endpoint,
+                http_status=response.status_code,
             ) from exc
 
         msg_cd = str(data.get("msg_cd") or data.get("error_code") or "")
         msg1 = str(data.get("msg1") or data.get("error_description") or "")
         if msg_cd in RATE_LIMIT_MSG_CODES:
-            raise KisRateLimitError(f"KIS rate limit exceeded ({msg_cd}): {msg1}")
+            raise KisRateLimitError(
+                f"KIS rate limit exceeded ({msg_cd}): {msg1}",
+                endpoint=endpoint,
+                broker_code=msg_cd,
+                broker_message=msg1,
+                http_status=response.status_code,
+            )
         if "token" in msg1.lower():
             raise KisTokenError(
-                f"KIS token rejected by {endpoint}: {msg_cd} {msg1}. Raw={data}"
+                f"KIS token rejected by {endpoint}: {msg_cd} {msg1}",
+                endpoint=endpoint,
+                broker_code=msg_cd,
+                broker_message=msg1,
+                http_status=response.status_code,
             )
         if "INVALID_CHECK_ACNO" in msg1:
             raise KisInvalidAccountError(
                 "KIS rejected the account number/product code. "
-                "Verify the selected KIS account in .env and product code in runtime config."
+                "Verify the selected KIS account in .env and product code in runtime config.",
+                endpoint=endpoint,
+                broker_code=msg_cd,
+                broker_message=msg1,
+                http_status=response.status_code,
             )
         transient_domestic_balance_error = bool(
             endpoint == DOMESTIC_BALANCE_ENDPOINT
@@ -887,17 +928,30 @@ class KisAccountClient:
         ):
             raise KisTransientApiError(
                 f"KIS service temporarily unavailable at {endpoint}: "
-                f"HTTP {response.status_code}: {msg_cd} {msg1}"
+                f"HTTP {response.status_code}: {msg_cd} {msg1}",
+                endpoint=endpoint,
+                broker_code=msg_cd,
+                broker_message=msg1,
+                http_status=response.status_code,
             )
 
         if response.status_code >= 400:
             raise KisApiError(
-                f"KIS HTTP error from {endpoint}: HTTP {response.status_code}: {data}"
+                f"KIS HTTP error from {endpoint}: HTTP {response.status_code}: "
+                f"{msg_cd} {msg1}",
+                endpoint=endpoint,
+                broker_code=msg_cd,
+                broker_message=msg1,
+                http_status=response.status_code,
             )
 
         if check_rt_cd and str(data.get("rt_cd", "0")) != "0":
             raise KisApiError(
-                f"KIS API error from {endpoint}: {msg_cd} {msg1}. Raw={data}"
+                f"KIS API error from {endpoint}: {msg_cd} {msg1}",
+                endpoint=endpoint,
+                broker_code=msg_cd,
+                broker_message=msg1,
+                http_status=response.status_code,
             )
 
         return data

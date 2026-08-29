@@ -604,6 +604,7 @@ def require_compatible_runtime_schema(
     device_id: str,
     schema_version: int = CURRENT_EXECUTION_SCHEMA_VERSION,
     required_coordination_profile: str = "",
+    required_release_id: str = "",
     lease_engine: Optional[Engine] = None,
     max_age_seconds: float = COORDINATION_DEVICE_HEARTBEAT_MAX_AGE_SECONDS,
     now: Optional[datetime] = None,
@@ -636,7 +637,7 @@ def require_compatible_runtime_schema(
         table.c.device_id != str(device_id or ""),
         table.c.state.in_(live_states),
     ]
-    if not required_coordination_profile:
+    if not required_coordination_profile and not required_release_id:
         predicates.append(table.c.schema_version != int(schema_version))
     with coordination_read_connection(engine) as conn:
         conflicting_rows = conn.execute(
@@ -685,6 +686,19 @@ def require_compatible_runtime_schema(
                 f"{conflicting.device_id} is a {authority} without "
                 f"{required_coordination_profile!r}. Stop it, deploy the same "
                 "version to both devices, and restart before using TiDB."
+            )
+        if required_release_id and str(
+            conflicting.details.get("release_id") or ""
+        ) != str(required_release_id):
+            peer_release = str(
+                conflicting.details.get("release_id") or "unpublished"
+            )
+            raise RuntimeError(
+                "Runtime release mismatch: device "
+                f"{conflicting.device_id} is a {authority} on release "
+                f"{peer_release!r}, while this runtime requires "
+                f"{required_release_id!r}. Stop it, deploy and approve the "
+                "same exact release on both devices, then restart."
             )
 
 

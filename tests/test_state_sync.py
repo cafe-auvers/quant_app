@@ -248,6 +248,59 @@ def test_live_trading_control_survives_restart_and_main_handoff(tmp_path):
     assert ss.get_main_device(engine).main_device.device_id == "pc-id"
 
 
+def test_live_trading_control_is_scoped_to_session_and_release(tmp_path):
+    engine = _make_engine(tmp_path)
+    laptop = ss.LocalDeviceRole("laptop-id", "LAPTOP", True)
+    session_date = dt.date(2026, 8, 31)
+    release_sha = "a" * 40
+
+    written = ss.set_live_trading_control(
+        engine,
+        laptop,
+        True,
+        session_date=session_date,
+        runtime_commit_sha=release_sha,
+    )
+
+    assert written.success is True
+    assert written.control.session_date == session_date
+    assert written.control.runtime_commit_sha == release_sha
+    during_session = dt.datetime(2026, 8, 31, 14, 0, tzinfo=dt.timezone.utc)
+    assert ss.live_trading_control_is_effective(
+        written.control,
+        now=during_session,
+        runtime_commit_sha=release_sha,
+    )
+    assert not ss.live_trading_control_is_effective(
+        written.control,
+        now=during_session,
+        runtime_commit_sha="b" * 40,
+    )
+    after_close = dt.datetime(2026, 8, 31, 21, 0, tzinfo=dt.timezone.utc)
+    assert not ss.live_trading_control_is_effective(
+        written.control,
+        now=after_close,
+        runtime_commit_sha=release_sha,
+    )
+
+
+def test_legacy_unscoped_live_control_fails_closed():
+    legacy = ss.LiveTradingControl(
+        enabled=True,
+        revision=7,
+        updated_at=dt.datetime.now(dt.timezone.utc),
+    )
+
+    assert not ss.live_trading_control_is_effective(
+        legacy,
+        runtime_commit_sha="",
+    )
+    assert "predates session-scoped" in ss.live_trading_control_block_reason(
+        legacy,
+        runtime_commit_sha="",
+    )
+
+
 def test_live_trading_control_database_failure_is_not_treated_as_off(tmp_path):
     result = ss.get_live_trading_control(None)
 
