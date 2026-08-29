@@ -7,6 +7,10 @@ row may be treated as verified only when its finding is supported by either a
 credentialed observation against the real API or a current first-party KIS
 statement, with any account data and credentials redacted.
 
+This matrix establishes protocol capability, not strategy behavior. The
+implemented order sequence that consumes verified capability is documented in
+[Current Order Logic](current_order_logic.md).
+
 The provisional D1/D3/D11 adapter may be implemented inactive, but no row in
 this matrix authorizes broker execution. Until the WebSocket/read-only subset
 is verified, the WebSocket flags and capacities remain disabled. Until full

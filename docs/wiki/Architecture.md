@@ -44,3 +44,8 @@ OS variables, configures logging/Qt handling, creates `QApplication`, imports
 Slow external work normally belongs in QThread or background workers. The
 remaining chart UI-thread limitation is documented in
 [Performance Audit](https://github.com/cafe-auvers/quant_app/blob/master/docs/performance-audit.md).
+
+The active broker path uses immutable ORB order generations: a fresh confirmed
+breakout submits a passive limit, and a later higher-score generation can be
+submitted only after the prior zero-fill order is authoritatively cancelled.
+See [Current Order Logic](https://github.com/cafe-auvers/quant_app/blob/master/docs/current_order_logic.md).

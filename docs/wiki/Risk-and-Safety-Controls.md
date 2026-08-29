@@ -26,6 +26,13 @@ requires the applicable combination of:
 - Handoff does not auto-arm Live Trading.
 - Unknown submission/persistence outcomes are not automatically retried.
 - External orders remain unowned until deliberately adopted.
+- A passive BUY is submitted only while both fresh last trade and best ask are
+  above its exact limit; reaching the limit before submission blocks ordinary
+  entry instead of converting it to a marketable order.
+- ORB replacement requires a later strictly higher score, zero fills, unchanged
+  quantity, authoritative old-order cancellation, and post-cancel revalidation.
+- The stop always uses the ORB low belonging to the generation that actually
+  filled.
 
 ## Strategy/risk behavior
 
@@ -41,3 +48,6 @@ maximum per-entry notional. Symbols are database state, never `.env` values,
 and the local JSON recovery snapshot is not broker authority. It is an
 additional envelope, not a bypass. Follow the supervised pilot runbook and KIS
 evidence checklist; default remains disabled.
+
+See [Current Order Logic](https://github.com/cafe-auvers/quant_app/blob/master/docs/current_order_logic.md)
+for the exact entry and replacement invariants.

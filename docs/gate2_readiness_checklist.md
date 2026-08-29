@@ -10,6 +10,12 @@ Gate 2 validates live market data only; it does not authorize broker
 mutations, shadow execution, or live trading. The guarded Kanban runtime may
 remain available because its live-execution envelope stays disabled.
 
+When a later controlled-live execution qualification is approved, its expected
+entry/cancel/replace observations must match
+[Current Order Logic](current_order_logic.md): passive submission after
+confirmation, no 15-second entry expiry, and zero-fill authoritative
+cancel-then-replace for a higher-scoring later ORB.
+
 A separately approved supervised controlled-live pilot has its own stricter
 risk envelope and does not make this checklist pass. See
 [`controlled_live_pilot_runbook.md`](controlled_live_pilot_runbook.md). Normal

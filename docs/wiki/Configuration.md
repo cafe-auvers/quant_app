@@ -1,7 +1,10 @@
 # Configuration
 
-Configuration is environment-driven. `.env.example` is the authoritative key
-catalog and safe-default reference.
+Configuration is split by sensitivity. `.env` contains credentials only, while
+non-secret hosts, ports, flags, limits, and timing values belong in
+`config/runtime.json` or the gitignored `config/runtime.local.json` override.
+`.env.example` is the authoritative credential schema and safe-default
+reference; startup migrates recognized legacy runtime keys out of `.env`.
 
 | Family | Purpose | Default posture |
 |---|---|---|
@@ -19,6 +22,12 @@ catalog and safe-default reference.
 | `QUANT_BACKUP_DIR` | Offsite local-state backup target | Optional |
 | `AUTO_CLAIM_MAIN_ON_HANDOFF` | PC ownership auto-claim | `0` |
 
+`Buffer %` is persisted Trade Card planning/compatibility metadata. It does not
+raise the active passive-order trigger: live confirmation uses
+`max(breakout_price, orb_high)`, and automatic execution uses ORB high. The
+legacy `ENTRY_ATTEMPT_TTL_SECONDS` setting remains readable for compatibility,
+but new passive entries have no 15-second auto-cancel/reprice deadline.
+
 Multiple PROD accounts can use `KIS_PROD_ACCOUNTS` or numbered
 `KIS_PROD_ACCOUNT_NO_1` through `_20`. Do not put real account numbers in
 documentation, tests, or committed fixtures.
@@ -35,4 +44,5 @@ current execution owner can act, and every readiness and safety gate must pass.
 
 Changing a feature flag never bypasses lease, ownership, reconciliation, risk,
 market-data, mutation-budget, or broker-boundary checks. See
-[Risk and Safety Controls](Risk-and-Safety-Controls).
+[Risk and Safety Controls](Risk-and-Safety-Controls) and
+[Current Order Logic](https://github.com/cafe-auvers/quant_app/blob/master/docs/current_order_logic.md).

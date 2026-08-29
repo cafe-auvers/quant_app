@@ -51,6 +51,30 @@ capital, risk approval, mutation budget, and no ambiguous prior order.
 So yes: if the laptop is Execution Owner, the PC cannot execute an order merely
 because its screen says Live Trading is enabled.
 
+## How an entry actually works
+
+The current strategy confirms a breakout first, then places a passive order
+below the market:
+
+```text
+1m/5m/30m opening range closes
+  -> fresh KIS trade moves above both ORB high and breakout price
+  -> submit BUY limit at the selected execution price (ORB high by default)
+  -> card moves to Entry Pending
+  -> wait for a broker-confirmed pullback fill
+  -> card moves to Open Position and uses that order generation's ORB low
+```
+
+The breakout event submits the resting limit; it does not fill the order. New
+passive entries are not cancelled after 15 seconds. If a later ORB closes,
+confirms, and has a strictly higher score, a completely unfilled working order
+can upgrade only by cancelling the old order, confirming zero fills, and then
+submitting one linked replacement with the same quantity. Any fill or uncertain
+cancel stops the replacement.
+
+The formula and edge-case reference is
+[Current Order Logic](current_order_logic.md).
+
 ## Three easily confused features
 
 ### Watchlist removal
@@ -120,6 +144,7 @@ If one required check is missing, the correct outcome is no order.
 ## Where to go next
 
 - [Execution Owner and Operator Control](execution_operator_control.md)
+- [Current Order Logic](current_order_logic.md)
 - [Leadership and Market Context](market_alignment.md)
 - [Supervised Controlled-Live Pilot](controlled_live_pilot_runbook.md)
 - [TiDB Cloud Coordination Store](tidb_coordination_store.md)

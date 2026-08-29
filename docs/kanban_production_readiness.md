@@ -1,5 +1,11 @@
 # Kanban Production Readiness — Requirements & Invariants
 
+> Current implementation note (2026-08-29): this remains the detailed
+> historical requirements/evidence record. The finalized automatic entry,
+> passive-limit, higher-score ORB cancel-then-replace, rejection, fill, and EOD
+> behavior is maintained in [Current Order Logic](current_order_logic.md) and
+> supersedes older attempt-lifetime/reprice examples in this document.
+
 Status: **SIGNED OFF — Workstream 1 complete; revision 3.5 pilot amendment recorded**
 Branch: PR1 merged to `master` (commit `5b50e1d`, PR #4). PR2 onward branch
 directly off `master` (revision 3.3 — see rule 3 / [PR structure](#pr-structure-revision-3)).

@@ -37,12 +37,20 @@ snapshot date, both rank inputs, peer count/basis, and context components; see
 
 ## ORB planning
 
-`breakout_price` is the daily structural level. Entry requires:
+`breakout_price` is the daily structural level. The active broker path requires
+a completed current-session ORB and a fresh KIS trade strictly above:
 
 ```text
-max(orb_high, breakout_price * (1 + buffer_pct))
+max(orb_high, breakout_price)
 ```
+
+That confirmation submits a passive limit at ORB high by default; it does not
+mean fill. A manual execution price is valid only when
+`max(breakout_price, orb_low) < execution_price <= orb_high`.
 
 The 24-case comparison is read-only. The optimized pre-market selector can
 publish one plan when authority and timing rules permit; regular-session
 published plans remain immutable.
+
+See [Current Order Logic](https://github.com/cafe-auvers/quant_app/blob/master/docs/current_order_logic.md)
+for order submission and higher-score ORB replacement.

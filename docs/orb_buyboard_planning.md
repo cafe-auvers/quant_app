@@ -6,6 +6,10 @@ matrix are not part of the active UI. Watchlist membership itself remains a
 lightweight, passive planning workflow in the stock sidebar, Scanner, and
 TradingView.
 
+This page explains planning controls. [Current Order Logic](current_order_logic.md)
+is authoritative for breakout confirmation, passive limit submission,
+Entry Pending, higher-score replacement, fills, rejections, and EOD behavior.
+
 ## Passive Watchlist workflow
 
 - In **Scanner**, select a result and click **Add selected to Watchlist**.
@@ -43,8 +47,8 @@ live control:
 - a manual ORB-window lock keeps the persisted buffer;
 - switching Execution Owner cannot substitute the new device's local header
   value; and
-- published plans therefore evaluate the same buffered breakout on laptop and
-  PC.
+- published planning views therefore evaluate the same persisted buffer on
+  laptop and PC.
 
 The active UI does not provide an in-place buffer replacement for an existing
 queued or Buy Today plan. **Remove from Today** changes the card lifecycle but
@@ -54,6 +58,13 @@ the persisted buffer is wrong, do not publish or execute that plan on the
 assumption that removing and re-activating it applied the new header value.
 Changing the header alone is not a planning mutation and is not handed to the
 executor.
+
+The active broker path does not use the old
+`max(orb_high, breakout_price * (1 + buffer_pct))` formula. Its finalized
+passive zone uses the raw canonical breakout price as documented in
+[Current Order Logic](current_order_logic.md). Buffer remains persisted
+planning metadata and may affect compatibility planning displays; it must not
+be interpreted as the broker limit or live confirmation price.
 
 After a symbol is added to Watchlist, drawing its first target creates or
 updates the passive canonical Watchlist plan and snapshots the current header
@@ -143,12 +154,21 @@ never restore the old target or submit against it.
 ## Execution boundary
 
 Once a current-session, risk-valid ORB is `WAITING_BREAKOUT`/armed, a fresh
-execution-grade live trade crossing its frozen ORH promotes the best eligible
-crossed candidate and enters the guarded submission path immediately; it does
-not wait for the one-minute planning refresh. Automatic mode checks every
-eligible 1m/5m/30m candidate, while a manual window lock remains exact. A
-daily-breakout level by itself, or a missing current-session ORB, never arms an
-entry.
+execution-grade KIS trade strictly above
+`max(orb_high, breakout_price)` latches that candidate's breakout. Automatic
+mode chooses the highest-scoring eligible crossed 1m/5m/30m candidate; an equal
+score favors the earlier timeframe, while a manual window lock remains exact.
+The runtime immediately submits a passive BUY limit at the configured
+execution price (ORB high by default) only while both last trade and best ask
+remain above that limit. It does not wait for a pullback before submission, and
+it never treats the breakout event as a fill. A daily-breakout level by itself,
+or a missing current-session ORB, never arms an entry.
+
+After submission, a zero-fill working order stays Entry Pending. It has no
+legacy 15-second auto-cancel/reprice deadline. A later timeframe may replace it
+only if its range and breakout qualify, its score is strictly higher, every
+risk/capital/quote gate passes, and KIS authoritatively confirms the old order
+cancelled with zero fills before the new generation is submitted.
 
 Neither dialog submits an order. The execution runtime still requires the
 published Buy Today card, current-session ORB data, account-matched sizing, a

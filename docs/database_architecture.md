@@ -13,6 +13,11 @@ JSON state, log files, broker/provider internals, Git synchronization, and UI
 architecture are outside this document except where a database workflow needs
 one short boundary note.
 
+The coordination tables persist the command/order generations required by the
+strict passive-entry and cancel-then-replace lifecycle; database authority does
+not itself authorize a broker mutation. See
+[Current Order Logic](current_order_logic.md).
+
 The inventory below was checked against both the current table definitions and
 a read-only inspection of the configured PC MySQL database, the configured TiDB
 database, and the two SQLite files in `data/`. No schema or row was changed by

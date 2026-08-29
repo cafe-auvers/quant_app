@@ -15,6 +15,21 @@ Focused main behavior regression:
 pytest tests/test_core_behaviour.py -q
 ```
 
+Focused finalized-order regression:
+
+```powershell
+pytest tests/test_passive_pullback_orb.py tests/test_execution_queue.py tests/test_trade_card_orb_bridge.py -q
+pytest tests/test_trading_engine.py tests/test_execution_command_gateway.py tests/test_entry_attempt_manager.py -q
+pytest tests/test_buyboard_runtime_worker.py tests/test_eod_trading_service.py -q
+```
+
+These suites cover the raw breakout/ORB-high passive zone, current-session
+candidate validity, fresh-KIS breakout latching, immediate passive submission,
+broker-result handling, durable identity/reconciliation, strict
+cancel-then-replace upgrades, restart behavior, fill-linked stops, and EOD
+cleanup. Keep the behavior assertions synchronized with
+[Current Order Logic](https://github.com/cafe-auvers/quant_app/blob/master/docs/current_order_logic.md).
+
 Synthetic performance checks:
 
 ```powershell

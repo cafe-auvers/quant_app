@@ -14,6 +14,7 @@
 - [Market Data and Database](Market-Data-and-Database)
 - [Synchronization](Synchronization)
 - [KIS API Integration](KIS-API-Integration)
+- [Current Order Logic](https://github.com/cafe-auvers/quant_app/blob/master/docs/current_order_logic.md)
 - [Order Lifecycle](Order-Lifecycle)
 - [Risk and Safety Controls](Risk-and-Safety-Controls)
 - [Background Jobs and Automation](Background-Jobs-and-Automation)
