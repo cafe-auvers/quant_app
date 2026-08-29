@@ -48,6 +48,7 @@ def test_orb_strategy_matches_existing_entry_signal_for_fixed_market():
         orb_low=orb_range.low,
         breakout_price=100.0,
         current_price=102.0,
+        execution_price=100.5,
         buffer_pct=0.001,
     )
 
@@ -57,7 +58,7 @@ def test_orb_strategy_matches_existing_entry_signal_for_fixed_market():
             symbol="aapl",
             current_price=102.0,
             bars=bars,
-            metadata={"breakout_price": 100.0},
+            metadata={"breakout_price": 100.0, "execution_price": 100.5},
         ),
         PortfolioSnapshot(cash=50_000.0, equity=100_000.0),
     )
@@ -70,7 +71,7 @@ def test_orb_strategy_matches_existing_entry_signal_for_fixed_market():
     assert generated.kind == SignalKind.ENTRY
     assert generated.reason == direct.signal
     assert generated.trigger_price == direct.entry_trigger
-    assert generated.reference_price == direct.entry_trigger
+    assert generated.reference_price == direct.execution_price
     assert generated.stop_price == direct.orb_low
     assert generated.metadata["breakout_trigger"] == direct.breakout_trigger
     assert generated.metadata["size_multiplier"] == direct.suggested_size_multiplier
@@ -82,7 +83,7 @@ def test_orb_strategy_emits_no_actionable_signal_before_trigger():
             symbol="AAPL",
             current_price=100.5,
             bars=_completed_session(),
-            metadata={"breakout_price": 100.0},
+            metadata={"breakout_price": 100.0, "execution_price": 100.5},
         ),
         PortfolioSnapshot(),
     )
@@ -166,6 +167,7 @@ def test_live_queue_waits_for_event_breakout_instead_of_snapshot_signal(monkeypa
         window="5m",
         intraday=_completed_session(),
         breakout_price=100.0,
+        execution_price=100.5,
         current_price=102.0,
         account_size=100_000.0,
         risk_percent=0.005,

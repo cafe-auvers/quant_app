@@ -727,7 +727,10 @@ def build_orb_candidate(
             symbol=symbol,
             current_price=price,
             bars=intraday,
-            metadata={"breakout_price": breakout},
+            metadata={
+                "breakout_price": breakout,
+                "execution_price": execution_price,
+            },
         ),
         PortfolioSnapshot(equity=account_size),
     )

@@ -96,6 +96,9 @@ def _normalize_selected_orb_plan(value: Any) -> Optional[Dict[str, Any]]:
     float_keys = {
         "risk_percent",
         "entry_trigger",
+        "entry_floor",
+        "floor_price",
+        "execution_price",
         "stop_price",
         "breakout_price",
         "buffer_pct",
@@ -420,7 +423,9 @@ class BuylistItem:
         None  # optional full-confirmation level above breakout
     )
     breakout_method: str = ""  # e.g. "manual_trendline", "manual_pivot_high"
-    buffer_pct: float = 0.001  # 0.1% buffer applied above breakout_price
+    # Legacy planning metadata; PASSIVE_PULLBACK_V1 does not use it to alter
+    # the confirmation trigger or execution price.
+    buffer_pct: float = 0.001
     auto_order_block_reason: str = ""
     orb_monitor_enabled: bool = (
         False  # user explicitly activated monitoring for this queue item

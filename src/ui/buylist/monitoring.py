@@ -234,6 +234,23 @@ class BuylistMonitoringMixin:
         active_attr = f"_buylist_{env.lower()}_monitor_active"
         if not getattr(self, active_attr, False):
             return
+        # The legacy 60-second monitor has no execution-grade best-ask
+        # stream, so it cannot prove the strict passive-pullback predicate
+        # (fresh last > execution price AND fresh ask > execution price).
+        # Automatic entries therefore belong exclusively to the guarded Buy
+        # Board engine.  Keeping this path observation-only is fail-closed and
+        # prevents the old entry-trigger price from becoming a live order.
+        if not is_buyboard_engine_enabled():
+            if not self.__dict__.get(
+                "_legacy_passive_entry_block_notice_logged", False
+            ):
+                self._legacy_passive_entry_block_notice_logged = True
+                self.append_log(
+                    f"[Buylist/{env}] Legacy automatic BUY is disabled: "
+                    "the passive pullback contract requires fresh WebSocket "
+                    "last/ask data from the guarded Buy Board engine."
+                )
+            return
         if not hasattr(self, "buylist_manager"):
             return
         items = [it for it in self.buylist_manager.items if it.environment == env]

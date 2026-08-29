@@ -20,6 +20,10 @@ required, those checks are transitively release-blocking without adding more
 hosted check names. Keep that dependency relationship intact when editing the
 workflow.
 
+The check must also produce the exact-commit Python 3.11/3.12 evidence required
+by the normative
+[Activation Gate Specification](../docs/activation_gate_specification.md).
+
 Branch protection is GitHub-hosted state and cannot be enforced by
 `.github/workflows/ci.yml` itself. Re-check this rule if the workflow/job name
 or Python matrix changes, because required-check names must match exactly.

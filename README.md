@@ -8,6 +8,10 @@ New to the project? Open the large-picture
 computers do, what is synchronized, and why an enabled-looking screen still
 cannot place an order unless every safety gate agrees.
 
+The five cumulative qualification gates, their exact pass predicates, and the
+current closure sequence are defined in the
+[Activation Gate Specification](docs/activation_gate_specification.md).
+
 ## Current Capabilities
 
 - KIS production account snapshots with account selection.
@@ -146,6 +150,7 @@ Only enable KIS intraday after the endpoint, TR ID, request parameters, output f
 
 - `PROJECT_ARCHITECTURE.md` is the canonical architecture and maintenance map.
 - `docs/current_order_logic.md` is the canonical implemented entry, Entry Pending, cancel-replace, fill, rejection, and EOD behavior.
+- `docs/activation_gate_specification.md` is the single normative definition of Gates 1-5, evidence identity, invalidation, and promotion.
 - `docs/kanban_architecture.md` explains the Kanban state machine, command/runtime flow, persistence, safety boundaries, and component architecture.
 - `docs/orb_buyboard_planning.md` explains Buffer %, the 24-case read-only comparison, Operator-Control-only pre-market ORB selection, market-hours read-only behavior, and published-plan immutability.
 - `docs/kanban_production_readiness.md` records the detailed production invariants and rollout evidence requirements.

@@ -1183,18 +1183,22 @@ class BuylistViewMixin:
 
         account_no = self._first_account_no_for_environment(env) or "<not selected>"
         entry_trigger = float(candidate.entry_trigger or 0.0)
+        execution_price = float(candidate.execution_price or 0.0)
         shares = int(candidate.shares or 0)
         stop_loss = float(candidate.stop_loss or 0.0)
-        estimated_amount = entry_trigger * shares
-        risk_amount = max(0.0, entry_trigger - stop_loss) * shares
+        estimated_amount = execution_price * shares
+        risk_amount = max(0.0, execution_price - stop_loss) * shares
         warnings = list(getattr(candidate, "warnings", []) or []) + list(
             getattr(queue_item, "warnings", []) or []
         )
         warning_text = "; ".join(dict.fromkeys(warnings)) if warnings else "None"
         status_line = (
-            "Status: ARMED — waiting for price to cross entry trigger (auto-buy on next monitor cycle)"
+            "Status: ARMED — waiting for a post-range trade strictly above the confirmation trigger"
             if pending_trigger
-            else "Status: EXECUTE_READY — will auto-buy on next monitor cycle"
+            else (
+                "Status: EXECUTE_READY — exact passive limit is eligible on the next "
+                "monitor cycle only while fresh last/ask remain strictly above it"
+            )
         )
         return "\n".join(
             [
@@ -1205,7 +1209,8 @@ class BuylistViewMixin:
                 f"Symbol: {item.symbol}",
                 f"Selected ORB: {candidate.window}",
                 "Side: BUY",
-                f"Limit price: {self._format_queue_price(entry_trigger)}",
+                f"Limit price: {self._format_queue_price(execution_price)}",
+                f"Breakout confirmation: > {self._format_queue_price(entry_trigger)}",
                 f"Quantity: {shares}",
                 f"Estimated amount: {self._format_queue_price(estimated_amount)}",
                 f"ORB high: {self._format_queue_price(candidate.orb_high)}",

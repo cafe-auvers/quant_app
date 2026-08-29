@@ -17,13 +17,18 @@ from __future__ import annotations
 import argparse
 import collections
 import datetime as dt
-import msvcrt
 import os
 import sys
 import time
 import uuid
 from pathlib import Path
 from typing import Deque, Dict, List, Optional
+
+try:  # Windows production path.
+    import msvcrt
+except ImportError:  # POSIX test/development path.
+    msvcrt = None
+    import fcntl
 
 REPO_ROOT = Path(__file__).resolve().parent
 if str(REPO_ROOT) not in sys.path:
@@ -158,7 +163,7 @@ class RunState:
 
 
 class _ModeLock:
-    """Exclusive per-mode lock via msvcrt; the OS releases it even on a hard kill."""
+    """Exclusive per-mode OS lock released automatically after a hard kill."""
 
     def __init__(self, mode: str):
         self._path = lock_path(mode)
@@ -168,7 +173,10 @@ class _ModeLock:
     def acquire(self) -> bool:
         self._file = open(self._path, "a+b")
         try:
-            msvcrt.locking(self._file.fileno(), msvcrt.LK_NBLCK, 1)
+            if msvcrt is not None:
+                msvcrt.locking(self._file.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             self._file.close()
             self._file = None
@@ -180,7 +188,10 @@ class _ModeLock:
             return
         try:
             self._file.seek(0)
-            msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)
+            if msvcrt is not None:
+                msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
         except OSError:
             pass
         finally:

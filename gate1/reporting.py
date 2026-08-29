@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 from datetime import datetime, timezone
 import json
 import os
@@ -122,10 +123,73 @@ def build_report(
     scenarios: Sequence[Mapping[str, str]],
     test_violations: Sequence[Mapping[str, str]],
     pytest_exit_code: int,
+    source_identity: Mapping[str, object],
+    ci_matrix: Sequence[Mapping[str, object]],
     required_scenario_ids: Sequence[str] = tuple(REQUIRED_SCENARIO_IDS),
     required_group_minimums: Mapping[str, int] = REQUIRED_GROUP_MINIMUMS,
 ) -> dict:
     violations = [*activation_violations(activation), *test_violations]
+    commit_sha = str(commit_sha or "").strip().lower()
+    if len(commit_sha) not in {40, 64} or any(
+        char not in "0123456789abcdef" for char in commit_sha
+    ):
+        violations.append(
+            {
+                "property": "exact_source_identity",
+                "detail": "report commit is not a complete Git SHA",
+            }
+        )
+    identity_commit = str(source_identity.get("commit_sha") or "").strip().lower()
+    if identity_commit != commit_sha:
+        violations.append(
+            {
+                "property": "exact_source_identity",
+                "detail": "source identity commit does not match report commit",
+            }
+        )
+    if source_identity.get("worktree_clean") is not True:
+        violations.append(
+            {
+                "property": "exact_source_identity",
+                "detail": "Git worktree contains tracked or untracked changes",
+            }
+        )
+    for key in ("tracked_tree_sha256", "dependency_lock_sha256"):
+        digest = str(source_identity.get(key) or "").strip().lower()
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            violations.append(
+                {
+                    "property": "exact_source_identity",
+                    "detail": f"{key} is missing or is not a SHA-256 digest",
+                }
+            )
+
+    required_python_versions = ("3.11", "3.12")
+    ci_by_version = {
+        str(item.get("python_version") or "").strip(): item for item in ci_matrix
+    }
+    for version in required_python_versions:
+        evidence = ci_by_version.get(version)
+        if evidence is None:
+            violations.append(
+                {
+                    "property": "supported_python_ci_matrix_passed",
+                    "detail": f"Python {version} CI evidence is absent",
+                }
+            )
+            continue
+        if (
+            str(evidence.get("result") or "").upper() != "PASSED"
+            or str(evidence.get("commit_sha") or "").strip().lower() != commit_sha
+        ):
+            violations.append(
+                {
+                    "property": "supported_python_ci_matrix_passed",
+                    "detail": (
+                        f"Python {version} CI did not pass for exact commit {commit_sha}"
+                    ),
+                }
+            )
     if pytest_exit_code != 0 and not test_violations:
         violations.append(
             {
@@ -166,10 +230,13 @@ def build_report(
                 }
             )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "gate": "GATE_1_DETERMINISTIC_SIMULATION",
         "result": "PASSED" if not violations and pytest_exit_code == 0 else "FAILED",
         "commit_sha": commit_sha,
+        "source_identity": dict(source_identity),
+        "supported_python_versions": list(required_python_versions),
+        "ci_matrix": [dict(item) for item in ci_matrix],
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "python_version": platform.python_version(),
         "model_seeds": [int(model_seed)],
@@ -197,7 +264,86 @@ def _git_sha(root: Path) -> str:
     return result.stdout.strip()
 
 
-def run_gate1(*, root: Path, output: Path, model_seed: int) -> int:
+def _git_tree_sha(root: Path) -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD^{tree}"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def _git_worktree_clean(root: Path) -> bool:
+    result = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return not bool(result.stdout.strip())
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _tracked_tree_sha256(root: Path) -> str:
+    """Hash current bytes and paths for every Git-tracked file."""
+
+    result = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    digest = hashlib.sha256()
+    for raw_path in sorted(filter(None, result.stdout.split(b"\0"))):
+        relative_path = raw_path.decode("utf-8", errors="surrogateescape")
+        path = root / relative_path
+        content = path.read_bytes()
+        digest.update(len(raw_path).to_bytes(8, "big"))
+        digest.update(raw_path)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
+
+
+def source_identity(root: Path) -> dict[str, object]:
+    lock_path = root / "requirements.lock"
+    return {
+        "commit_sha": _git_sha(root),
+        "head_tree_sha": _git_tree_sha(root),
+        "worktree_clean": _git_worktree_clean(root),
+        "tracked_tree_sha256": _tracked_tree_sha256(root),
+        "dependency_lock_path": "requirements.lock",
+        "dependency_lock_sha256": _sha256_file(lock_path),
+    }
+
+
+def load_ci_matrix(path: Path | None) -> list[dict[str, object]]:
+    if path is None:
+        return []
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    records = payload.get("ci_matrix") if isinstance(payload, dict) else payload
+    if not isinstance(records, list) or not all(isinstance(item, dict) for item in records):
+        raise ValueError("CI evidence must be a list or an object containing ci_matrix")
+    return [dict(item) for item in records]
+
+
+def run_gate1(
+    *,
+    root: Path,
+    output: Path,
+    model_seed: int,
+    ci_evidence: Path | None = None,
+) -> int:
     env = os.environ.copy()
     env.update(
         {
@@ -220,13 +366,16 @@ def run_gate1(*, root: Path, output: Path, model_seed: int) -> int:
         scenarios, test_violations = parse_junit(junit_path)
 
     activation = activation_snapshot(root / "config" / "runtime.json")
+    identity = source_identity(root)
     report = build_report(
-        commit_sha=_git_sha(root),
+        commit_sha=str(identity["commit_sha"]),
         model_seed=model_seed,
         activation=activation,
         scenarios=scenarios,
         test_violations=test_violations,
         pytest_exit_code=completed.returncode,
+        source_identity=identity,
+        ci_matrix=load_ci_matrix(ci_evidence),
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary_output = output.with_suffix(output.suffix + ".tmp")
@@ -249,10 +398,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=Path("artifacts/gate1_report.json"),
     )
     parser.add_argument("--seed", type=int, default=DEFAULT_MODEL_SEED)
+    parser.add_argument(
+        "--ci-evidence",
+        type=Path,
+        help="JSON evidence for passing Python 3.11 and 3.12 CI jobs",
+    )
     args = parser.parse_args(argv)
     root = Path(__file__).resolve().parents[1]
     output = args.output if args.output.is_absolute() else root / args.output
-    return run_gate1(root=root, output=output, model_seed=args.seed)
+    ci_evidence = args.ci_evidence
+    if ci_evidence is not None and not ci_evidence.is_absolute():
+        ci_evidence = root / ci_evidence
+    return run_gate1(
+        root=root,
+        output=output,
+        model_seed=args.seed,
+        ci_evidence=ci_evidence,
+    )
 
 
 if __name__ == "__main__":

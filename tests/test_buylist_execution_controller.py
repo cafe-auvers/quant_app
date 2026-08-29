@@ -26,6 +26,8 @@ def _candidate():
     return SimpleNamespace(
         window="1m",
         entry_trigger=100.1,
+        execution_price=99.5,
+        breakout_confirmed=True,
         orb_high=100.0,
         stop_loss=98.0,
         shares=10,
@@ -444,6 +446,7 @@ def test_submit_selected_queue_order_uses_queue_candidate_not_buylist_mirrors(
     )
     prod_queue_item = _queue_item()
     prod_queue_item.selected_candidate.entry_trigger = 123.45
+    prod_queue_item.selected_candidate.execution_price = 122.0
     prod_queue_item.selected_candidate.stop_loss = 120.0
     prod_queue_item.selected_candidate.shares = 7
     submissions = []
@@ -463,6 +466,15 @@ def test_submit_selected_queue_order_uses_queue_candidate_not_buylist_mirrors(
             self.items[(environment, symbol)].status = "ORDER_PENDING"
 
     manager = Manager()
+    quote = SimpleNamespace(
+        last_price=123.0,
+        ask=123.1,
+        is_execution_fresh=lambda **kwargs: True,
+    )
+    market_data = SimpleNamespace(
+        latest_quote=lambda symbol: quote,
+        entry_quote_ready=lambda symbol, **kwargs: True,
+    )
     window = SimpleNamespace(
         _buylist_selected_item=lambda env: item,
         _queue_item_for_buylist_item=lambda selected: manager.get_item(
@@ -480,6 +492,9 @@ def test_submit_selected_queue_order_uses_queue_candidate_not_buylist_mirrors(
         _submit_kis_buy_order=lambda selected, **kwargs: submissions.append(
             (selected, kwargs)
         ),
+        _buyboard_runtime_worker=SimpleNamespace(
+            runtime=SimpleNamespace(market_data=market_data)
+        ),
     )
     monkeypatch.setattr(
         controller_module.QMessageBox,
@@ -490,7 +505,7 @@ def test_submit_selected_queue_order_uses_queue_candidate_not_buylist_mirrors(
     BuylistExecutionController(window).submit_selected_queue_order("PROD")
 
     assert manager.mark_calls == [("AAPL", "", "PENDING", "PROD")]
-    assert submissions == [(item, {"quantity": 7, "order_price": 123.45})]
+    assert submissions == [(item, {"quantity": 7, "order_price": 122.0})]
     assert item.entry_price == 1.23
     assert item.stop_loss == 0.45
     assert item.monitoring_status == "ORDER_PENDING"

@@ -2,13 +2,18 @@
 
 Current disposition: **NOT READY / DO NOT START THE SOAK**
 
-Gate-1-certified safety-backup baseline:
-`master@b0422e7a92d8324e73469d286d2710ef32776ffc` (local tag
-`safety-backup-20260823`; 676 Gate-1 tests passed on that exact commit).
-Any later code change requires a new exact-head Gate-1 report before Gate 2.
-Gate 2 validates live market data only; it does not authorize broker
-mutations, shadow execution, or live trading. The guarded Kanban runtime may
-remain available because its live-execution envelope stays disabled.
+The normative Gate-2 predicate, activation snapshot, metrics, and evidence
+identity are defined in the
+[Activation Gate Specification](activation_gate_specification.md). This file
+is the operational checklist for satisfying that contract; it does not define
+an alternative pass rule.
+
+Gate 2 requires a current exact-head Gate-1 pass. It qualifies the live
+read-only KIS protocol path: trade and quote semantics, reconnect behavior,
+freshness/capacity, and encrypted execution-notice interpretation. It does not
+authorize broker mutations, shadow qualification, or live trading. The guarded
+Kanban runtime may remain available because its live-execution envelope stays
+disabled.
 
 When a later controlled-live execution qualification is approved, its expected
 entry/cancel/replace observations must match

@@ -4,6 +4,9 @@ This document describes the current architecture of the PyQt5 trading dashboard 
 
 For the exact automatic-entry, Entry Pending, ORB replacement, fill, rejection,
 and end-of-day rules, see [Current Order Logic](docs/current_order_logic.md).
+For the cumulative production qualification logic and current closure status,
+see the normative
+[Activation Gate Specification](docs/activation_gate_specification.md).
 
 ## Product Scope
 

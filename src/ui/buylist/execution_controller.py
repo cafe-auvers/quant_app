@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from PyQt5.QtWidgets import QMessageBox
@@ -10,6 +11,7 @@ from src.core.execution_queue import build_queue_display_state
 from src.core.order_state import OrderIntent, OrderSide
 from src.core.watchlist import BuylistItem
 from src.ui.controllers.base import WindowController
+from src.strategy.orb.entry_policy import passive_limit_submission_ready
 
 
 @dataclass
@@ -376,18 +378,46 @@ class BuylistExecutionController(WindowController):
             return
         try:
             shares_value = float(candidate.shares)
-            entry_trigger = float(candidate.entry_trigger)
+            execution_price = float(candidate.execution_price)
         except (TypeError, ValueError, OverflowError):
             shares_value = 0.0
-            entry_trigger = 0.0
+            execution_price = 0.0
         if (
             not math.isfinite(shares_value)
             or not shares_value.is_integer()
             or shares_value < 1
-            or not math.isfinite(entry_trigger)
-            or entry_trigger <= 0
+            or not math.isfinite(execution_price)
+            or execution_price <= 0
+            or not bool(getattr(candidate, "breakout_confirmed", False))
         ):
-            QMessageBox.warning(self.window, "Invalid order", f"{item.symbol} has invalid quantity or entry trigger.")
+            QMessageBox.warning(
+                self.window,
+                "Invalid order",
+                f"{item.symbol} lacks a confirmed passive execution plan.",
+            )
+            return
+        worker = getattr(self.window, "_buyboard_runtime_worker", None)
+        runtime = getattr(worker, "runtime", None)
+        market_data = getattr(runtime, "market_data", None)
+        now = datetime.now(timezone.utc)
+        quote = market_data.latest_quote(item.symbol) if market_data is not None else None
+        if (
+            market_data is None
+            or quote is None
+            or not market_data.entry_quote_ready(item.symbol, now=now)
+            or not quote.is_execution_fresh(now=now)
+            or not passive_limit_submission_ready(
+                last_trade=quote.last_price,
+                best_ask=quote.ask,
+                execution_price=execution_price,
+            )
+        ):
+            QMessageBox.warning(
+                self.window,
+                "Passive entry not ready",
+                "A fresh WebSocket last trade and best ask must both be strictly "
+                "above the exact execution price.",
+            )
             return
         if self._buylist_auto_order_blocked(item):
             QMessageBox.warning(
@@ -462,5 +492,5 @@ class BuylistExecutionController(WindowController):
         self._submit_kis_buy_order(
             item,
             quantity=int(shares_value),
-            order_price=entry_trigger,
+            order_price=execution_price,
         )

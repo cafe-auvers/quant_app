@@ -7,6 +7,24 @@ from gate1.contract import ACTIVATION_DEFAULTS
 from gate1.reporting import activation_snapshot, build_report, parse_junit
 
 
+def _source_identity(commit_sha: str, *, clean: bool = True) -> dict:
+    return {
+        "commit_sha": commit_sha,
+        "head_tree_sha": "e" * 40,
+        "worktree_clean": clean,
+        "tracked_tree_sha256": "1" * 64,
+        "dependency_lock_path": "requirements.lock",
+        "dependency_lock_sha256": "2" * 64,
+    }
+
+
+def _ci_matrix(commit_sha: str) -> list[dict]:
+    return [
+        {"python_version": version, "result": "PASSED", "commit_sha": commit_sha}
+        for version in ("3.11", "3.12")
+    ]
+
+
 def test_gate1_report_records_scenarios_seed_commit_and_closed_activation(tmp_path):
     junit = tmp_path / "junit.xml"
     junit.write_text(
@@ -23,6 +41,8 @@ def test_gate1_report_records_scenarios_seed_commit_and_closed_activation(tmp_pa
         scenarios=scenarios,
         test_violations=violations,
         pytest_exit_code=0,
+        source_identity=_source_identity("a" * 40),
+        ci_matrix=_ci_matrix("a" * 40),
         required_scenario_ids=(
             "tests.test_gate1_capstone::test_a",
             "tests.test_kis_websocket::test_b",
@@ -54,6 +74,8 @@ def test_gate1_report_fails_when_a_production_default_opens():
         scenarios=[],
         test_violations=[],
         pytest_exit_code=0,
+        source_identity=_source_identity("b" * 40),
+        ci_matrix=_ci_matrix("b" * 40),
         required_scenario_ids=(),
         required_group_minimums={},
     )
@@ -85,6 +107,8 @@ def test_gate1_report_fails_when_a_selected_scenario_is_skipped(tmp_path):
         scenarios=scenarios,
         test_violations=violations,
         pytest_exit_code=0,
+        source_identity=_source_identity("c" * 40),
+        ci_matrix=_ci_matrix("c" * 40),
         required_scenario_ids=(
             "tests.test_gate1_capstone::test_required",
         ),
@@ -113,6 +137,8 @@ def test_gate1_report_fails_for_unclassified_or_missing_required_scenarios():
         ),
         test_violations=(),
         pytest_exit_code=0,
+        source_identity=_source_identity("d" * 40),
+        ci_matrix=_ci_matrix("d" * 40),
         required_scenario_ids=("tests.test_required::test_absent",),
         required_group_minimums={"F4_MODEL_EXPLORATION": 1},
     )
@@ -124,3 +150,24 @@ def test_gate1_report_fails_for_unclassified_or_missing_required_scenarios():
     assert any("unclassified" in detail for detail in details)
     assert any("required scenario is absent" in detail for detail in details)
     assert any("F4_MODEL_EXPLORATION contains 0" in detail for detail in details)
+
+
+def test_gate1_report_fails_for_dirty_tree_or_incomplete_ci_matrix():
+    commit = "f" * 40
+    report = build_report(
+        commit_sha=commit,
+        model_seed=1,
+        activation=ACTIVATION_DEFAULTS,
+        scenarios=(),
+        test_violations=(),
+        pytest_exit_code=0,
+        source_identity=_source_identity(commit, clean=False),
+        ci_matrix=_ci_matrix(commit)[:1],
+        required_scenario_ids=(),
+        required_group_minimums={},
+    )
+
+    properties = {item["property"] for item in report["invariant_violations"]}
+    assert report["result"] == "FAILED"
+    assert "exact_source_identity" in properties
+    assert "supported_python_ci_matrix_passed" in properties

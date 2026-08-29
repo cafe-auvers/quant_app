@@ -20,8 +20,10 @@ def _candidate(window: str, **overrides) -> OrbCandidate:
         orb_high=100.0,
         orb_low=98.0,
         breakout_price=99.0,
-        breakout_trigger=99.099,
+        floor_price=99.0,
+        breakout_trigger=100.0,
         entry_trigger=100.0,
+        execution_price=100.0,
         stop_loss=98.0,
         stop_loss_percent=2.0,
         stop_adr=50.0,
@@ -35,6 +37,7 @@ def _candidate(window: str, **overrides) -> OrbCandidate:
 def _queue(**candidate_overrides) -> ExecutionQueueItem:
     return ExecutionQueueItem(
         symbol="AAPL",
+        breakout_price=99.0,
         candidates={
             window: _candidate(window, **candidate_overrides)
             for window in SUPPORTED_ORB_WINDOWS
@@ -86,7 +89,7 @@ def test_combination_validity_uses_canonical_capital_and_stop_adr_rules():
     assert "Capital allocation" in too_large.reason
 
 
-def test_buffered_breakout_failure_keeps_all_affected_options_visible_invalid():
+def test_invalid_passive_geometry_keeps_all_affected_options_visible_invalid():
     queue = _queue(orb_high=99.05, entry_trigger=99.05)
 
     combinations = build_orb_position_combinations(
@@ -96,7 +99,7 @@ def test_buffered_breakout_failure_keeps_all_affected_options_visible_invalid():
     assert len(combinations) == 24
     assert not any(item.valid for item in combinations)
     assert all(
-        "buffered breakout" in item.reason
+        "Passive entry" in item.reason
         for item in combinations
     )
 
@@ -142,16 +145,17 @@ def test_rejected_runtime_candidate_never_appears_as_a_valid_combination():
     assert all("did not emit" in item.reason for item in combinations)
 
 
-def test_explicit_published_buffer_recalculates_every_combination_consistently():
+def test_legacy_buffer_metadata_cannot_change_finalized_trigger_or_validity():
     combinations = build_orb_position_combinations(
         _queue(),
         account_equity=100_000.0,
         buffer_pct=0.02,
     )
 
-    assert not any(item.valid for item in combinations)
+    assert any(item.valid for item in combinations)
     assert {item.buffer_pct for item in combinations} == {0.02}
-    assert {item.breakout_trigger for item in combinations} == {100.98}
+    assert {item.breakout_trigger for item in combinations} == {100.0}
+    assert {item.execution_price for item in combinations} == {100.0}
 
 
 def test_stale_queue_snapshot_is_diagnostic_only_and_never_green():

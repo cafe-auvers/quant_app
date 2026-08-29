@@ -344,13 +344,14 @@ def test_orb_best_recommendation_prefers_higher_score_then_lower_risk():
 # evaluate_orb_entry_signal — all four signal states + edge cases
 # ---------------------------------------------------------------------------
 
-def test_orb_entry_signal_confirmed_when_price_above_entry_trigger():
-    """Price clears both ORB high and buffered breakout price -> confirmed breakout."""
+def test_orb_entry_signal_confirmed_when_trade_strictly_clears_trigger():
+    """A trade above max(breakout price, ORH) confirms the frozen plan."""
     result = evaluate_orb_entry_signal(
         orb_high=103.0,
         orb_low=95.0,
         breakout_price=102.0,
         current_price=104.0,
+        execution_price=102.5,
         buffer_pct=0.001,
     )
 
@@ -359,53 +360,51 @@ def test_orb_entry_signal_confirmed_when_price_above_entry_trigger():
     assert result.allow_entry is True
     assert result.allow_full_size is True
     assert result.suggested_size_multiplier == 1.0
-    assert round(result.breakout_trigger, 4) == round(102.0 * 1.001, 4)
+    assert result.entry_floor == 102.0
+    assert result.breakout_trigger == 103.0
     assert result.entry_trigger == 103.0
+    assert result.execution_price == 102.5
 
 
-def test_orb_entry_signal_rejects_orb_high_below_breakout_trigger():
-    """A completed ORB below the buffered breakout is not tradable."""
+def test_orb_entry_signal_rejects_geometry_when_breakout_is_above_orb_high():
+    """No execution can be above the floor and at or below ORH in this shape."""
     result = evaluate_orb_entry_signal(
         orb_high=100.0,
         orb_low=95.0,
         breakout_price=105.0,
         current_price=106.0,
+        execution_price=105.5,
         buffer_pct=0.001,
     )
 
-    assert result.signal == "orb_high_below_breakout_trigger"
+    assert result.signal == "invalid_pullback_geometry"
+    assert result.entry_floor == 105.0
+    assert result.breakout_trigger == 105.0
     assert result.allow_entry is False
     assert result.allow_full_size is False
     assert result.suggested_size_multiplier == 0.0
 
 
-def test_orb_entry_signal_probe_when_above_breakout_but_below_confirmation():
-    """Probe mode: price above breakout_trigger but below entry_trigger and confirmation_price.
-
-    For the probe branch to be reachable, entry_trigger must be > breakout_trigger.
-    This happens when orb_high > breakout_trigger.  We set orb_high=110 and
-    breakout_price=102 so that:
-      breakout_trigger = 102 * 1.001 = 102.102
-      entry_trigger    = max(110, 102.102) = 110
-    A price of 105 is above breakout_trigger but below both entry_trigger and
-    confirmation_price, so the probe signal fires.
-    """
+def test_orb_entry_signal_probe_flag_cannot_bypass_strict_confirmation():
+    """Legacy probe arguments cannot turn a pre-confirmation trade into an entry."""
     result = evaluate_orb_entry_signal(
         orb_high=110.0,
         orb_low=95.0,
         breakout_price=102.0,
-        current_price=105.0,   # > breakout_trigger (102.102), < entry_trigger (110), < confirmation (115)
+        current_price=105.0,
+        execution_price=105.0,
         buffer_pct=0.001,
         confirmation_price=115.0,
         allow_probe=True,
     )
 
-    assert round(result.breakout_trigger, 4) == round(102.0 * 1.001, 4)
+    assert result.entry_floor == 102.0
+    assert result.breakout_trigger == 110.0
     assert result.entry_trigger == 110.0
-    assert result.signal == "structural_breakout_not_fully_confirmed"
-    assert result.allow_entry is True
+    assert result.signal == "no_entry"
+    assert result.allow_entry is False
     assert result.allow_full_size is False
-    assert result.suggested_size_multiplier == 0.5
+    assert result.suggested_size_multiplier == 0.0
 
 
 def test_orb_entry_signal_no_entry_when_price_below_orb_high():
@@ -415,6 +414,7 @@ def test_orb_entry_signal_no_entry_when_price_below_orb_high():
         orb_low=95.0,
         breakout_price=98.0,
         current_price=97.0,    # below both orb_high and breakout_price
+        execution_price=99.0,
         buffer_pct=0.001,
     )
 
@@ -434,39 +434,43 @@ def test_orb_entry_signal_no_breakout_price_blocks_entry():
     )
 
     assert result.breakout_trigger == 0.0
-    assert result.entry_trigger == 100.0
+    assert result.entry_trigger == 0.0
     assert result.signal == "missing_breakout_price"
     assert result.allow_entry is False
 
 
-def test_orb_entry_signal_entry_trigger_stays_orb_high_when_orb_high_is_lower():
-    """ORB high below the buffered breakout invalidates that ORB window."""
+def test_orb_entry_signal_trigger_is_max_even_when_geometry_is_invalid():
+    """Diagnostics retain max(breakout price, ORH) on an invalid plan."""
     result = evaluate_orb_entry_signal(
         orb_high=98.0,
         orb_low=94.0,
         breakout_price=105.0,
         current_price=97.0,    # below both
+        execution_price=97.0,
         buffer_pct=0.001,
     )
 
-    assert result.entry_trigger == 98.0
-    assert result.signal == "orb_high_below_breakout_trigger"
+    assert result.entry_floor == 105.0
+    assert result.entry_trigger == 105.0
+    assert result.signal == "invalid_pullback_geometry"
     assert result.allow_entry is False
 
 
-def test_orb_entry_signal_buffer_applied_correctly():
-    """Verify buffer_pct is applied before deciding whether the ORB is tradable."""
+def test_orb_entry_signal_legacy_buffer_does_not_change_finalized_trigger():
+    """The finalized contract ignores the retired percentage buffer."""
     result = evaluate_orb_entry_signal(
-        orb_high=100.0,
+        orb_high=101.0,
         orb_low=95.0,
         breakout_price=100.0,
-        current_price=100.05,  # above orb_high but inside the 0.1% buffer window
-        buffer_pct=0.001,      # breakout_trigger = 100.1
+        current_price=101.0,
+        execution_price=100.5,
+        buffer_pct=0.50,
     )
 
-    assert result.breakout_trigger == 100.1
-    assert result.entry_trigger == 100.0
-    assert result.signal == "orb_high_below_breakout_trigger"
+    assert result.breakout_trigger == 101.0
+    assert result.entry_trigger == 101.0
+    assert result.signal == "no_entry"
+    assert result.allow_entry is False
 
 
 def test_extract_latest_opening_bar_returns_first_bar_of_latest_session():
@@ -2288,7 +2292,9 @@ def test_orb_range_and_signal_use_opening_window():
     )
 
     orb_range = calculate_orb_range("AAPL", intraday, "5m")
-    signal = evaluate_orb_signal("AAPL", intraday, "5m", target_price=14.0)
+    signal = evaluate_orb_signal(
+        "AAPL", intraday, "5m", target_price=14.0, execution_price=14.5
+    )
 
     assert orb_range is not None
     assert orb_range.high == 15

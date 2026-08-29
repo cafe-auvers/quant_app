@@ -377,7 +377,7 @@ def show_orb_combinations_dialog(
     )
     summary = QLabel(
         f"{len(combinations)} combinations | {valid_count} valid | "
-        f"Plan buffer: {float(buffer_pct) * 100.0:.4g}% | "
+        f"Legacy buffer metadata: {float(buffer_pct) * 100.0:.4g}% | "
         f"Queue sizing equity: ${sizing_equity:,.2f}"
     )
     summary.setStyleSheet(
@@ -410,12 +410,13 @@ def show_orb_combinations_dialog(
         ("Window", lambda item: item.window),
         ("Recommendation", lambda item: f"{item.score:.1f}"),
         ("ORB High", lambda item: _format_optional_price(item.orb_high)),
+        ("ORB Low", lambda item: _format_optional_price(item.orb_low)),
         (
             "Breakout Price",
             lambda item: _format_optional_price(item.breakout_price),
         ),
         (
-            "Buffer %",
+            "Legacy Buffer %",
             lambda item: (
                 f"{item.buffer_pct * 100.0:.4g}%"
                 if item.buffer_pct is not None
@@ -423,10 +424,11 @@ def show_orb_combinations_dialog(
             ),
         ),
         (
-            "Buffered Breakout",
+            "Confirmation Trigger",
             lambda item: _format_optional_price(item.breakout_trigger),
         ),
-        ("Entry Trigger", lambda item: _format_optional_price(item.entry_trigger)),
+        ("Entry Floor", lambda item: _format_optional_price(item.entry_floor)),
+        ("Execution Price", lambda item: _format_optional_price(item.execution_price)),
         ("Stop Price", lambda item: _format_optional_price(item.stop_price)),
         ("Risk / Share", lambda item: f"${item.risk_per_share:.2f}"),
         ("Shares", lambda item: f"{item.shares:,}"),
