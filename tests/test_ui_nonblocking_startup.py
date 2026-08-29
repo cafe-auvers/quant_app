@@ -471,9 +471,12 @@ def test_database_outage_renders_local_snapshot_read_only_instead_of_emptying_bo
         orb_high=13.40,
         orb_low=13.00,
         breakout_price=13.28,
-        breakout_trigger=13.29328,
+        floor_price=13.28,
+        breakout_trigger=13.40,
         entry_trigger=13.40,
+        execution_price=13.30,
         current_price=13.46,
+        breakout_confirmed=False,
         source_session_date=datetime.now(
             ZoneInfo("America/New_York")
         ).date().isoformat(),

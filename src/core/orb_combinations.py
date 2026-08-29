@@ -22,6 +22,7 @@ from src.risk.orb_position import (
     score_orb_position_recommendation,
     validate_orb_position_values,
 )
+from src.strategy.orb.entry_policy import build_passive_pullback_plan
 
 
 ORB_RISK_CASES: Tuple[float, ...] = (
@@ -59,6 +60,11 @@ class OrbPositionCombination:
     capital_percent: float
     stop_loss_percent: float
     stop_adr: Optional[float]
+    # Added at the end so old frozen rejection snapshots without these
+    # fields remain readable.  New snapshots expose the exact passive plan.
+    orb_low: Optional[float] = None
+    entry_floor: Optional[float] = None
+    execution_price: Optional[float] = None
 
 
 def orb_position_combinations_from_snapshot(
@@ -123,20 +129,28 @@ def _persisted_account_equity(candidates: dict) -> float:
     for window in SUPPORTED_ORB_WINDOWS:
         candidate = candidates.get(window)
         shares = _finite(getattr(candidate, "shares", None))
-        entry_trigger = _finite(getattr(candidate, "entry_trigger", None))
+        execution_price = _finite(
+            getattr(candidate, "execution_price", None)
+        )
+        # Legacy snapshots predate the explicit passive execution field.
+        # Recovering their equity is diagnostic only; current candidates are
+        # independently required to carry execution_price before execution.
+        entry_price = execution_price or _finite(
+            getattr(candidate, "entry_trigger", None)
+        )
         capital_percent = _finite(
             getattr(candidate, "capital_percent", None)
         )
         if (
             shares is None
             or shares <= 0
-            or entry_trigger is None
-            or entry_trigger <= 0
+            or entry_price is None
+            or entry_price <= 0
             or capital_percent is None
             or capital_percent <= 0
         ):
             continue
-        equity = shares * entry_trigger / (capital_percent / 100.0)
+        equity = shares * entry_price / (capital_percent / 100.0)
         if math.isfinite(equity) and equity > 0:
             return equity
     return 0.0
@@ -152,11 +166,11 @@ def build_orb_position_combinations(
 ) -> list[OrbPositionCombination]:
     """Expand the queue's three ORB structures into all 24 sizing choices.
 
-    A combination is *valid* when the ORB structure clears the buffered daily
-    breakout and its position sizing satisfies the same canonical capital and
-    stop/ADR checks used by execution.  Current-price readiness remains an
-    observation in ``status``/``reason``; it does not erase an otherwise valid
-    position plan.
+    A combination is *valid* when it satisfies the same frozen passive-entry
+    geometry and canonical position checks used by execution.  The persisted
+    buffer is retained as legacy plan metadata but cannot alter the finalized
+    trigger. Current-price readiness remains an observation in
+    ``status``/``reason``; it does not erase an otherwise valid position plan.
     """
 
     candidates = dict(getattr(queue_item, "candidates", {}) or {})
@@ -205,50 +219,60 @@ def build_orb_position_combinations(
                         capital_percent=0.0,
                         stop_loss_percent=0.0,
                         stop_adr=None,
+                        orb_low=None,
+                        entry_floor=None,
+                        execution_price=None,
                     )
                 )
                 continue
 
             status = _status(getattr(candidate, "status", None))
             orb_high = _finite(getattr(candidate, "orb_high", None))
+            orb_low = _finite(getattr(candidate, "orb_low", None))
             breakout_price = _finite(
                 getattr(candidate, "breakout_price", None)
             )
             persisted_breakout_trigger = _finite(
                 getattr(candidate, "breakout_trigger", None)
             )
-            candidate_buffer = requested_buffer
-            if (
-                candidate_buffer is None
-                and breakout_price is not None
-                and breakout_price > 0
-                and persisted_breakout_trigger is not None
-            ):
-                candidate_buffer = (
-                    persisted_breakout_trigger / breakout_price - 1.0
-                )
-                if (
-                    not math.isfinite(candidate_buffer)
-                    or candidate_buffer < 0.0
-                    or candidate_buffer > 1.0
-                ):
-                    candidate_buffer = None
-            breakout_trigger = (
-                breakout_price * (1.0 + candidate_buffer)
-                if breakout_price is not None
-                and breakout_price > 0
-                and candidate_buffer is not None
-                else None
+            persisted_entry_floor = _finite(
+                getattr(candidate, "floor_price", None)
+                if getattr(candidate, "floor_price", None) is not None
+                else getattr(candidate, "entry_floor", None)
             )
-            entry_trigger = _finite(
+            persisted_entry_trigger = _finite(
                 getattr(candidate, "entry_trigger", None)
             )
+            execution_price = _finite(
+                getattr(candidate, "execution_price", None)
+            )
+            plan = build_passive_pullback_plan(
+                orb_high=orb_high,
+                orb_low=orb_low,
+                breakout_price=breakout_price,
+                execution_price=execution_price,
+            )
+            candidate_buffer = requested_buffer
+            breakout_trigger = plan.breakout_trigger if plan else (
+                max(breakout_price, orb_high)
+                if breakout_price is not None and orb_high is not None
+                else None
+            )
+            entry_floor = plan.floor_price if plan else (
+                max(breakout_price, orb_low)
+                if breakout_price is not None and orb_low is not None
+                else None
+            )
+            # Retained only for old snapshot readers. In current candidates,
+            # ``entry_trigger`` is the exact execution limit, while
+            # ``breakout_trigger`` is the separate confirmation level.
+            entry_trigger = execution_price
             stop_price = _finite(getattr(candidate, "stop_loss", None))
             adr_percent = _candidate_adr_percent(candidate)
             sizing = calculate_orb_position_values(
                 account_size=equity,
                 risk_percent=risk_percent,
-                entry_price=entry_trigger or 0.0,
+                entry_price=execution_price or 0.0,
                 stop_price=stop_price or 0.0,
                 adr_percent=adr_percent,
             )
@@ -272,25 +296,56 @@ def build_orb_position_combinations(
                 invalid_reasons.append(
                     str(getattr(candidate, "reason", "") or "ORB plan was rejected")
                 )
+            elif status == OrbCandidateStatus.RISK_INVALID:
+                invalid_reasons.append(
+                    str(getattr(candidate, "reason", "") or "ORB risk plan is invalid")
+                )
             if breakout_price is None or breakout_price <= 0:
                 invalid_reasons.append("Daily breakout price is missing")
-            if candidate_buffer is None:
-                invalid_reasons.append("ORB buffer is missing or invalid")
-            if (
-                orb_high is None
-                or breakout_trigger is None
-                or orb_high <= breakout_trigger
-            ):
+            if plan is None:
                 invalid_reasons.append(
-                    "ORB high does not clear the buffered breakout"
+                    "Passive entry must satisfy max(breakout price, ORL) "
+                    "< execution price <= ORH"
                 )
+            else:
+                if (
+                    persisted_breakout_trigger is None
+                    or not math.isclose(
+                        persisted_breakout_trigger,
+                        plan.breakout_trigger,
+                        rel_tol=1e-9,
+                        abs_tol=1e-6,
+                    )
+                    or persisted_entry_trigger is None
+                    or not math.isclose(
+                        persisted_entry_trigger,
+                        plan.execution_price,
+                        rel_tol=1e-9,
+                        abs_tol=1e-6,
+                    )
+                ):
+                    invalid_reasons.append(
+                        "Persisted execution trigger does not match the finalized policy"
+                    )
+                if (
+                    persisted_entry_floor is None
+                    or not math.isclose(
+                        persisted_entry_floor,
+                        plan.floor_price,
+                        rel_tol=1e-9,
+                        abs_tol=1e-6,
+                    )
+                ):
+                    invalid_reasons.append(
+                        "Persisted entry floor does not match the finalized policy"
+                    )
             if (
-                entry_trigger is None
+                execution_price is None
                 or stop_price is None
                 or stop_price <= 0
-                or stop_price >= entry_trigger
+                or stop_price >= execution_price
             ):
-                invalid_reasons.append("Entry/stop geometry is invalid")
+                invalid_reasons.append("Execution/stop geometry is invalid")
             invalid_reasons.extend(
                 validate_orb_position_values(sizing, adr_percent)
             )
@@ -341,6 +396,9 @@ def build_orb_position_combinations(
                         if sizing.get("sl_adr") is not None
                         else None
                     ),
+                    orb_low=orb_low,
+                    entry_floor=entry_floor,
+                    execution_price=execution_price,
                 )
             )
 

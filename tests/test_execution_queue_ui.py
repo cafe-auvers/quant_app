@@ -911,13 +911,15 @@ def test_queue_order_review_uses_selected_candidate_values(monkeypatch, tmp_path
     item.entry_price = 1.23
     queue_item = window.execution_queue_manager.items[queue_key("AAPL", "PROD")]
     queue_item.selected_candidate.entry_trigger = 123.45
+    queue_item.selected_candidate.execution_price = 122.34
     queue_item.selected_candidate.shares = 7
 
     review = MainWindow._format_execution_queue_order_review(
         window, "PROD", item, queue_item
     )
 
-    assert "Limit price: $123.45" in review
+    assert "Limit price: $122.34" in review
+    assert "Breakout confirmation: > $123.45" in review
     assert "Quantity: 7" in review
     assert "Limit price: $1.23" not in review
 

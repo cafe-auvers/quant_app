@@ -322,10 +322,13 @@ def launch_refresh(
 
         log_file = log_path(mode)
         log_file.parent.mkdir(parents=True, exist_ok=True)
+        # These flags exist only on Windows. A zero value keeps import and
+        # deterministic process-control tests portable without changing the
+        # production Windows launch behavior.
         creationflags = (
-            subprocess.CREATE_NEW_PROCESS_GROUP
-            | subprocess.DETACHED_PROCESS
-            | subprocess.CREATE_NO_WINDOW
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
         )
         try:
             with log_file.open("w", encoding="utf-8") as log_fh:

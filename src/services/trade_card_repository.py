@@ -680,6 +680,16 @@ def build_trade_card_migration(
             target_position_quantity=shares_held or int(plan.get("shares", 0) or 0),
             entry_orb_window=plan.get("window"),
             entry_trigger=plan.get("entry_trigger"),
+            entry_floor_price=(
+                plan.get("floor_price")
+                if plan.get("floor_price") is not None
+                else plan.get("entry_floor")
+            ),
+            entry_execution_price=(
+                plan.get("execution_price")
+                if plan.get("execution_price") is not None
+                else getattr(item, "entry_price", None)
+            ),
             stop_adr=plan.get("stop_adr"),
             position_runtime_status=(
                 PositionRuntimeStatus.OPEN

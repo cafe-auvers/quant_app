@@ -185,6 +185,7 @@ PR's behavior composes correctly, plus the Gate 1 run in full.
 | 11 | Database-outage behavior | PR6 IMPLEMENTED and merged to `master` (`77005ce`), not activated — bounded last-verified emergency lease, versioned ownership proof, fsynced local journal, protective completion-BUY cancellation, card-correlation recovery, and mandatory post-recovery broker reconciliation. |
 | 12 | External-alert delivery | PR6 IMPLEMENTED and merged to `master` (`77005ce`), not activated — durable incident retry/dedupe/ack/escalation, HTTPS provider wiring, DB-independent local alert spool/direct delivery, and external-watchdog heartbeat publication. |
 | 13 | Kanban feature parity and UI projection | PR7 IMPLEMENTED and merged to `master` (`cda99b3`), not activated — typed domain-owned board requests now enter only through `ExecutionWorkflowService`; real legacy and Kanban entry-monitoring, stop-change, and exit paths construct the same frontend-neutral commands (including broker-held premarket `RESERVED_MOO` exits); stop changes remain pending until the runtime atomically installs the new feed rule and evaluates the detached generation; card/ownership/readiness revisions are fenced; and active adopted-but-unlinked broker orders remain a final gateway fence until terminal reconciliation. All production activation flags and verified capacities remain closed. |
+| 14 | Activation gate closure | ACTIVE — offline evidence schemas, fail-closed validators, passive-entry consolidation, and promotion separation are implemented. The next release action is exact-commit Gate-1 certification; Gates 2-5 remain cumulative live qualifications. See `docs/activation_gate_specification.md`. |
 
 ---
 
@@ -1246,6 +1247,11 @@ Every row must have an explicit reducer branch and at least one fault-injection 
 - [x] Live order with no capital reservation
 
 ## Activation gates (recap, owning invariants noted)
+
+This table is a non-normative architecture recap. The exact predicates,
+minimum observations, evidence-chain rules, invalidation rules, and current
+status are owned by the
+[Activation Gate Specification](activation_gate_specification.md).
 
 | Gate | Proves | Invariants exercised |
 |---|---|---|

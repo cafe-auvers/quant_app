@@ -42,6 +42,7 @@ def evaluate_orb_signal(
     intraday: pd.DataFrame,
     window: str,
     breakout_price: Optional[float] = None,
+    execution_price: Optional[float] = None,
     target_price: Optional[float] = None,
     buffer_pct: float = 0.001,
     market_open: time = time(9, 30),
@@ -77,6 +78,7 @@ def evaluate_orb_signal(
         orb_low=orb_range.low,
         breakout_price=breakout_price,
         current_price=latest_price,
+        execution_price=execution_price,
         buffer_pct=buffer_pct,
     )
     breakout_confirmed = entry_signal.allow_entry
@@ -148,6 +150,7 @@ def evaluate_watchlist_orb_signals(
             intraday=intraday_by_symbol.get(symbol, pd.DataFrame()),
             window=window,
             breakout_price=getattr(item, "breakout_price", None),
+            execution_price=getattr(item, "entry_price", None),
         )
         if signal is not None:
             signals.append(signal)

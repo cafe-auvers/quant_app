@@ -24,6 +24,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Test the same immutable source identity certified by Gate 1, not
+          # GitHub's synthetic pull-request merge ref.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -62,6 +66,26 @@ jobs:
       - name: Run tests
         run: python -m pytest -q
 
+      - name: Write exact-commit matrix evidence
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          @{
+            schema_version = 1
+            python_version = "${{ matrix.python-version }}"
+            result = "PASSED"
+            commit_sha = "${{ github.event.pull_request.head.sha || github.sha }}"
+            workflow_run_id = "${{ github.run_id }}"
+          } | ConvertTo-Json | Set-Content "artifacts/gate1-ci-${{ matrix.python-version }}.json"
+
+      - name: Upload exact-commit matrix evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gate1-ci-python-${{ matrix.python-version }}
+          path: artifacts/gate1-ci-${{ matrix.python-version }}.json
+          if-no-files-found: error
+          retention-days: 30
+
   gate1:
     name: Gate 1 deterministic simulation
     # Gate 1 is a protected-branch check, so these dependencies make
@@ -91,8 +115,36 @@ jobs:
       - name: Compile check
         run: python -m compileall main.py src gate1 scripts/run_gate1.py tests -q
 
+      - name: Download Python 3.11 and 3.12 evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: gate1-ci-python-*
+          path: artifacts/gate1-ci
+          merge-multiple: true
+
+      - name: Assemble exact-commit CI matrix
+        shell: pwsh
+        run: |
+          $records = @(
+            Get-ChildItem artifacts/gate1-ci -Filter *.json |
+              ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json } |
+              Sort-Object python_version
+          )
+          if ($records.Count -ne 2) {
+            throw "Expected exactly two Python matrix records; found $($records.Count)."
+          }
+          $versions = @($records | ForEach-Object { $_.python_version })
+          if (($versions -join ',') -ne '3.11,3.12') {
+            throw "Expected Python 3.11 and 3.12 evidence; found $($versions -join ',')."
+          }
+          @{ ci_matrix = $records } | ConvertTo-Json -Depth 5 |
+            Set-Content artifacts/gate1_ci_matrix.json
+
       - name: Run Gate 1 capstone
-        run: python scripts/run_gate1.py --output artifacts/gate1_report.json
+        run: >-
+          python scripts/run_gate1.py
+          --ci-evidence artifacts/gate1_ci_matrix.json
+          --output artifacts/gate1_report.json
 
       - name: Upload Gate 1 certification report
         if: always()

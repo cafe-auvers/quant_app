@@ -22,6 +22,7 @@ from src.strategy.base import (
 )
 
 from .config import ORB_WINDOWS, US_MARKET_TIMEZONE, ORBStrategyConfig
+from .entry_policy import breakout_trade_confirms, build_passive_pullback_plan
 from .signals import OrbEntrySignal, OrbRange, OrbStrategyEvaluation
 
 
@@ -124,128 +125,98 @@ def evaluate_orb_entry_signal(
     orb_low: float,
     breakout_price: Optional[float],
     current_price: float,
+    execution_price: Optional[float] = None,
     buffer_pct: float = 0.001,
     confirmation_price: Optional[float] = None,
     allow_probe: bool = False,
 ) -> OrbEntrySignal:
-    """Classify an ORB entry with the existing fail-closed trigger rules."""
+    """Classify an ORB entry using the approved passive-pullback rules.
+
+    ``buffer_pct``, ``confirmation_price``, and ``allow_probe`` remain in the
+    compatibility signature, but do not alter the finalized contract.  A
+    breakout is confirmed only by a trade strictly above
+    ``max(breakout_price, ORH)``; order submission is evaluated separately
+    against a fresh quote and the exact ``execution_price``.
+    """
+    del buffer_pct, confirmation_price, allow_probe
     high = finite_float(orb_high)
     low = finite_float(orb_low)
     price = finite_float(current_price)
     bp = finite_float(breakout_price)
-    buffer = finite_float(buffer_pct)
+    execution = finite_float(execution_price)
+
+    def _result(
+        *,
+        signal: str,
+        floor: float = 0.0,
+        trigger: float = 0.0,
+        confirmed: bool = False,
+        effective_execution: Optional[float] = None,
+        safe_high: Optional[float] = None,
+        safe_low: Optional[float] = None,
+    ) -> OrbEntrySignal:
+        return OrbEntrySignal(
+            orb_high=(
+                safe_high
+                if safe_high is not None
+                else (high if high is not None and high > 0 else 0.0)
+            ),
+            orb_low=(
+                safe_low
+                if safe_low is not None
+                else (low if low is not None and low > 0 else 0.0)
+            ),
+            breakout_price=breakout_price,
+            entry_floor=floor,
+            breakout_trigger=trigger,
+            entry_trigger=trigger,
+            execution_price=(
+                effective_execution
+                if effective_execution is not None and effective_execution > 0
+                else (execution if execution is not None and execution > 0 else None)
+            ),
+            current_price=price if price is not None and price > 0 else 0.0,
+            breakout_confirmed=confirmed,
+            signal=signal,
+            allow_entry=confirmed,
+            allow_full_size=confirmed,
+            suggested_size_multiplier=1.0 if confirmed else 0.0,
+        )
 
     if high is None or low is None or high <= 0 or low <= 0 or low > high:
-        high = high if high is not None and high > 0 else 0.0
-        low = low if low is not None and low > 0 else 0.0
-        safe_price = price if price is not None and price > 0 else 0.0
-        return OrbEntrySignal(
-            orb_high=high,
-            orb_low=low,
-            breakout_price=breakout_price,
-            breakout_trigger=0.0,
-            entry_trigger=high,
-            current_price=safe_price,
-            signal="invalid_orb_range",
-            allow_entry=False,
-            allow_full_size=False,
-            suggested_size_multiplier=0.0,
-        )
-    if buffer is None or buffer < 0:
-        return OrbEntrySignal(
-            orb_high=high,
-            orb_low=low,
-            breakout_price=breakout_price,
-            breakout_trigger=0.0,
-            entry_trigger=high,
-            current_price=price if price is not None and price > 0 else 0.0,
-            signal="invalid_buffer_pct",
-            allow_entry=False,
-            allow_full_size=False,
-            suggested_size_multiplier=0.0,
-        )
+        return _result(signal="invalid_orb_range")
     if bp is None or bp <= 0:
-        return OrbEntrySignal(
-            orb_high=high,
-            orb_low=low,
-            breakout_price=breakout_price,
-            breakout_trigger=0.0,
-            entry_trigger=high,
-            current_price=price if price is not None and price > 0 else 0.0,
-            signal="missing_breakout_price",
-            allow_entry=False,
-            allow_full_size=False,
-            suggested_size_multiplier=0.0,
-        )
-
-    breakout_trigger = bp * (1.0 + buffer)
-    if not math.isfinite(breakout_trigger) or breakout_trigger <= 0:
-        return OrbEntrySignal(
-            orb_high=high,
-            orb_low=low,
-            breakout_price=breakout_price,
-            breakout_trigger=0.0,
-            entry_trigger=high,
-            current_price=price if price is not None and price > 0 else 0.0,
-            signal="invalid_buffer_pct",
-            allow_entry=False,
-            allow_full_size=False,
-            suggested_size_multiplier=0.0,
-        )
-    if price is None or price <= 0:
-        return OrbEntrySignal(
-            orb_high=high,
-            orb_low=low,
-            breakout_price=breakout_price,
-            breakout_trigger=breakout_trigger,
-            entry_trigger=high,
-            current_price=0.0,
-            signal="invalid_current_price",
-            allow_entry=False,
-            allow_full_size=False,
-            suggested_size_multiplier=0.0,
-        )
-
-    entry_trigger = high
-    if high <= breakout_trigger:
-        signal_key = "orb_high_below_breakout_trigger"
-        allow_entry = False
-        allow_full_size = False
-        size_multiplier = 0.0
-    elif price > entry_trigger:
-        signal_key = "confirmed_orb_breakout"
-        allow_entry = True
-        allow_full_size = True
-        size_multiplier = 1.0
-    else:
-        confirmation = finite_float(confirmation_price)
-        if (
-            allow_probe
-            and price > breakout_trigger
-            and confirmation is not None
-            and price <= confirmation
-        ):
-            signal_key = "structural_breakout_not_fully_confirmed"
-            allow_entry = True
-            allow_full_size = False
-            size_multiplier = 0.5
-        else:
-            signal_key = "no_entry"
-            allow_entry = False
-            allow_full_size = False
-            size_multiplier = 0.0
-
-    return OrbEntrySignal(
+        return _result(signal="missing_breakout_price")
+    plan = build_passive_pullback_plan(
         orb_high=high,
         orb_low=low,
-        breakout_price=breakout_price,
-        breakout_trigger=breakout_trigger,
-        entry_trigger=entry_trigger,
-        current_price=price,
-        signal=signal_key,
-        allow_entry=allow_entry,
-        allow_full_size=allow_full_size,
-        suggested_size_multiplier=size_multiplier,
+        breakout_price=bp,
+        execution_price=execution,
+    )
+    if plan is None:
+        return _result(
+            signal="invalid_pullback_geometry",
+            floor=max(bp, low),
+            trigger=max(bp, high),
+        )
+    if price is None or price <= 0:
+        return _result(
+            signal="invalid_current_price",
+            floor=plan.floor_price,
+            trigger=plan.breakout_trigger,
+            effective_execution=plan.execution_price,
+        )
+
+    confirmed = breakout_trade_confirms(
+        trade_price=price,
+        breakout_trigger=plan.breakout_trigger,
+    )
+    return _result(
+        signal="confirmed_orb_breakout" if confirmed else "no_entry",
+        floor=plan.floor_price,
+        trigger=plan.breakout_trigger,
+        confirmed=confirmed,
+        effective_execution=plan.execution_price,
     )
 
 
@@ -284,6 +255,7 @@ class ORBStrategy:
             orb_low=orb_range.low,
             breakout_price=market.metadata.get("breakout_price"),
             current_price=market.current_price or 0.0,
+            execution_price=market.metadata.get("execution_price"),
             buffer_pct=self.config.buffer_pct,
             confirmation_price=self.config.confirmation_price,
             allow_probe=self.config.allow_probe,
@@ -295,8 +267,8 @@ class ORBStrategy:
                 symbol=market.symbol,
                 direction=SignalDirection.LONG,
                 kind=SignalKind.ENTRY,
-                reference_price=entry.entry_trigger,
-                trigger_price=entry.entry_trigger,
+                reference_price=float(entry.execution_price or 0.0),
+                trigger_price=entry.breakout_trigger,
                 stop_price=orb_range.low,
                 reason=entry.signal,
                 generated_at=market.as_of,
@@ -306,6 +278,9 @@ class ORBStrategy:
                     "orb_low": entry.orb_low,
                     "breakout_price": entry.breakout_price,
                     "breakout_trigger": entry.breakout_trigger,
+                    "entry_floor": entry.entry_floor,
+                    "execution_price": entry.execution_price,
+                    "breakout_confirmed": entry.breakout_confirmed,
                     "market_price": entry.current_price,
                     "allow_full_size": entry.allow_full_size,
                     "size_multiplier": entry.suggested_size_multiplier,

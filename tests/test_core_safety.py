@@ -136,19 +136,21 @@ def test_trade_reviewer_uses_rules_when_optional_ai_adapter_is_unimplemented(tmp
 
 
 @pytest.mark.parametrize("buffer_pct", [-0.001, float("nan"), float("inf")])
-def test_orb_rejects_non_finite_or_negative_breakout_buffer(buffer_pct):
+def test_orb_legacy_buffer_cannot_change_finalized_policy(buffer_pct):
     signal = evaluate_orb_entry_signal(
         orb_high=103.0,
         orb_low=95.0,
         breakout_price=102.0,
         current_price=104.0,
+        execution_price=102.5,
         buffer_pct=buffer_pct,
     )
 
-    assert signal.signal == "invalid_buffer_pct"
-    assert signal.allow_entry is False
-    assert signal.allow_full_size is False
-    assert signal.suggested_size_multiplier == 0.0
+    assert signal.breakout_trigger == 103.0
+    assert signal.signal == "confirmed_orb_breakout"
+    assert signal.allow_entry is True
+    assert signal.allow_full_size is True
+    assert signal.suggested_size_multiplier == 1.0
 
 
 def test_orb_range_uses_latest_market_session_not_oldest_cached_session():

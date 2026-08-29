@@ -27,9 +27,12 @@ class OrbEntrySignal:
     orb_high: float
     orb_low: float
     breakout_price: Optional[float]
+    entry_floor: float
     breakout_trigger: float
     entry_trigger: float
+    execution_price: Optional[float]
     current_price: float
+    breakout_confirmed: bool
     signal: str
     allow_entry: bool
     allow_full_size: bool

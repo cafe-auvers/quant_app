@@ -225,11 +225,13 @@ def test_daily_summary_keeps_all_rejected_orb_combinations_and_metrics():
         candidates[window] = OrbCandidate(
             symbol="PAY",
             window=window,
-            orb_high=101.0,
-            orb_low=98.0,
-            breakout_price=100.0,
-            breakout_trigger=100.1,
-            entry_trigger=101.0,
+                orb_high=101.0,
+                orb_low=98.0,
+                breakout_price=100.0,
+                floor_price=100.0,
+                breakout_trigger=101.0,
+                entry_trigger=101.0,
+                execution_price=101.0,
             source_session_date=SESSION.isoformat(),
             stop_loss=98.0,
             shares=100,
@@ -273,7 +275,7 @@ def test_daily_summary_keeps_all_rejected_orb_combinations_and_metrics():
     first = summary.rejected_orb_combinations[0]
     assert first.classification == "INVALID"
     assert first.orb_high == 101.0
-    assert first.breakout_trigger == 100.1
+    assert first.breakout_trigger == 101.0
     assert first.stop_price == 98.0
     assert "failed the plan" in first.reason
 
