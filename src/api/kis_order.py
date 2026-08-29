@@ -23,6 +23,7 @@ from src.core.order_state import (
 
 from .kis_account_snapshot_dual import (
     KisAccountClient,
+    KisApiError,
     KisEnvironment,
     KisInvalidAccountError,
     KisRateLimitError,
@@ -223,6 +224,8 @@ def is_ambiguous_order_submission_error(exc_or_message: Any) -> bool:
     ):
         return True
     if isinstance(exc_or_message, (ValueError, KisTokenError, KisInvalidAccountError)):
+        return False
+    if isinstance(exc_or_message, KisApiError) and exc_or_message.broker_code:
         return False
 
     if any(fragment in lowered for fragment in _AMBIGUOUS_ORDER_ERROR_FRAGMENTS):

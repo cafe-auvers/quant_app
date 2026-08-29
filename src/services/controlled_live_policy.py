@@ -23,6 +23,9 @@ CONTROLLED_LIVE = "CONTROLLED_LIVE"
 FULL_LIVE = "FULL_LIVE"
 DISABLED = "DISABLED"
 MIN_CONTROLLED_LIVE_MUTATION_SPACING_SECONDS = 0.1
+CONTROLLED_LIVE_MAX_SIMULTANEOUS_POSITIONS = 30
+CONTROLLED_LIVE_MAX_TOTAL_OPEN_RISK_FRACTION = 0.10
+CONTROLLED_LIVE_MAX_GROSS_NOTIONAL_FRACTION = 2.0
 _ACTIVE_ENTRY_STATUSES = frozenset(
     {
         BoardStatus.BUY_TODAY,
@@ -127,6 +130,42 @@ def require_controlled_live_configuration(
             raise _configuration_error(
                 "CONTROLLED_LIVE forbids automatic mutation retries"
             )
+        try:
+            controlled_profile_limits = (
+                (
+                    "PORTFOLIO_MAX_SIMULTANEOUS_POSITIONS",
+                    int(execution_config.PORTFOLIO_MAX_SIMULTANEOUS_POSITIONS),
+                    CONTROLLED_LIVE_MAX_SIMULTANEOUS_POSITIONS,
+                ),
+                (
+                    "PORTFOLIO_MAX_TOTAL_OPEN_RISK_FRACTION",
+                    float(
+                        execution_config.PORTFOLIO_MAX_TOTAL_OPEN_RISK_FRACTION
+                    ),
+                    CONTROLLED_LIVE_MAX_TOTAL_OPEN_RISK_FRACTION,
+                ),
+                (
+                    "PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION",
+                    float(
+                        execution_config.PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION
+                    ),
+                    CONTROLLED_LIVE_MAX_GROSS_NOTIONAL_FRACTION,
+                ),
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise _configuration_error(
+                "CONTROLLED_LIVE portfolio limits must be valid finite numbers"
+            ) from exc
+        for name, configured, reviewed_maximum in controlled_profile_limits:
+            if (
+                not math.isfinite(float(configured))
+                or float(configured) <= 0
+                or float(configured) > float(reviewed_maximum)
+            ):
+                raise _configuration_error(
+                    f"{name}={configured} is outside the reviewed CONTROLLED_LIVE "
+                    f"range (0, {reviewed_maximum}]"
+                )
     if scheduler is not None:
         spacing = getattr(scheduler, "min_mutation_spacing_seconds", None)
         attempts = getattr(scheduler, "max_confirmed_mutation_attempts", None)

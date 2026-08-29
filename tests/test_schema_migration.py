@@ -602,6 +602,51 @@ def test_fresh_peer_with_matching_strict_ru_profile_allows_startup(tmp_path):
     )
 
 
+def test_fresh_peer_on_different_release_blocks_controlled_startup(tmp_path):
+    engine = _engine(tmp_path)
+    save_runtime_device_state(
+        engine,
+        device_id="peer",
+        hostname="peer",
+        state=RuntimeDeviceState.STANDBY_READY,
+        schema_version=CURRENT_EXECUTION_SCHEMA_VERSION,
+        details={
+            "coordination_ru_profile": "strict-7-9-v1",
+            "release_id": "old-release",
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="Runtime release mismatch"):
+        require_compatible_runtime_schema(
+            engine,
+            device_id="new-client",
+            required_coordination_profile="strict-7-9-v1",
+            required_release_id="approved-release",
+        )
+
+
+def test_fresh_peer_on_same_release_allows_controlled_startup(tmp_path):
+    engine = _engine(tmp_path)
+    save_runtime_device_state(
+        engine,
+        device_id="peer",
+        hostname="peer",
+        state=RuntimeDeviceState.STANDBY_READY,
+        schema_version=CURRENT_EXECUTION_SCHEMA_VERSION,
+        details={
+            "coordination_ru_profile": "strict-7-9-v1",
+            "release_id": "approved-release",
+        },
+    )
+
+    require_compatible_runtime_schema(
+        engine,
+        device_id="new-client",
+        required_coordination_profile="strict-7-9-v1",
+        required_release_id="approved-release",
+    )
+
+
 def test_cutover_rechecks_live_lease_before_migration_mutation(tmp_path, monkeypatch):
     protocol = FakeExecutionLeaseProtocol(
         current=ExecutionLease("pc-main", "token-8", 8)

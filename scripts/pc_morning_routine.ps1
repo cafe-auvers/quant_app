@@ -13,12 +13,15 @@ On a cold boot/logon, when main.py is not already running, it chains:
      dependency failure remains diagnosable from the laptop.
   3. Synchronize the credential-only .env schema, migrate legacy non-secret
      settings to config/runtime.local.json, then regenerate .env.pc.
-  4. scripts/run_daily_refresh.py -- gates on whether the database's actual
+  4. Runs the controlled-live readiness preflight and records a machine-
+     readable result. A failure leaves the dashboard available for diagnosis,
+     while the Python runtime's independent broker gate remains fail-closed.
+  5. scripts/run_daily_refresh.py -- gates on whether the database's actual
      latest stored date is behind what's expected (same check the dashboard
      itself shows as "Needs refresh"), and if so, runs historical.py
      --mode 1d then --mode 1h. This self-heals multi-day gaps, not just
      "yesterday."
-  5. Launches main.py (detached) so the dashboard is visible if you check
+  6. Launches main.py (detached) so the dashboard is visible if you check
      in during the PC's short on-window.
 
 On a normal S3 resume, main.py is already running. In that case this routine
@@ -266,6 +269,37 @@ if ($ResumeMode) {
     } catch {
         Write-Log "ERROR: dependency sync failed ($($_.Exception.Message)); aborting before data refresh."
         exit 1
+    }
+}
+
+# --- 1.9. Controlled-live release/configuration preflight -----------------
+
+$PreflightPath = Join-Path $LogDir "controlled_live_preflight.json"
+if ($ResumeMode) {
+    Write-Log "Resume mode: skipping startup preflight because the running dashboard retains its already-loaded release and configuration."
+} else {
+    $preflightScript = Join-Path $RepoRoot "scripts\check_controlled_live_readiness.py"
+    if (Test-Path -LiteralPath $preflightScript) {
+        $preflightOutput = @(& $PythonExe $preflightScript 2>&1)
+        $preflightExitCode = $LASTEXITCODE
+    } else {
+        $preflightOutput = @("Preflight script is missing: $preflightScript")
+        $preflightExitCode = 1
+    }
+    $preflightOutput | ForEach-Object { Write-Log "[preflight] $_" }
+    $preflightRecord = [ordered]@{
+        checked_at = (Get-Date).ToUniversalTime().ToString("o")
+        repository = $RepoRoot
+        exit_code = $preflightExitCode
+        ready = ($preflightExitCode -eq 0)
+        output = @($preflightOutput | ForEach-Object { "$_" })
+    }
+    $preflightRecord | ConvertTo-Json -Depth 4 | Set-Content `
+        -LiteralPath $PreflightPath -Encoding UTF8
+    if ($preflightExitCode -eq 0) {
+        Write-Log "Controlled-live preflight PASSED; evidence saved to $PreflightPath."
+    } else {
+        Write-Log "WARN: controlled-live preflight FAILED (exit code $preflightExitCode). The dashboard will launch for diagnosis, but production broker mutations remain fail-closed. Evidence: $PreflightPath"
     }
 }
 

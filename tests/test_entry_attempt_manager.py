@@ -5,6 +5,7 @@ import datetime as dt
 
 import pytest
 
+from src.api.kis_account_snapshot_dual import KisApiError
 from src.core.order_state import BrokerOrder, OrderIntent, OrderSide, OrderStatus
 from src.core.execution_result import ExecutionSubmissionResult, UnifiedExecutionStatus
 from src.risk.pre_trade import PreTradeRiskDecision
@@ -181,7 +182,9 @@ def test_definitive_guarded_broker_rejection_is_not_marked_retryable(tmp_path):
 def test_kis_exchange_routing_rejection_preserves_a_cooldown_retry(tmp_path):
     def fake_submit(**kwargs):
         raise GuardedSubmissionRejectedError(
-            "KIS API error from order: APBK0656 invalid exchange"
+            "Localized broker message without the error code",
+            broker_code="APBK0656",
+            broker_endpoint="/uapi/overseas-stock/v1/trading/order",
         )
 
     manager, path = _manager(tmp_path, fake_submit)
@@ -193,6 +196,36 @@ def test_kis_exchange_routing_rejection_preserves_a_cooldown_retry(tmp_path):
     assert all(
         not reservation.is_open()
         for reservation in capital_allocator.load_reservations(path)
+    )
+
+
+def test_guarded_rejection_preserves_structured_broker_metadata():
+    source = KisApiError(
+        "localized rejection",
+        endpoint="/uapi/overseas-stock/v1/trading/order",
+        broker_code="APBK0656",
+        broker_message="invalid route",
+        http_status=200,
+    )
+
+    wrapped = GuardedSubmissionRejectedError.from_broker_error(source)
+
+    assert wrapped.broker_code == "APBK0656"
+    assert wrapped.broker_endpoint.endswith("/trading/order")
+    assert wrapped.broker_message == "invalid route"
+
+
+def test_legacy_exchange_routing_message_remains_compatible(tmp_path):
+    def fake_submit(**kwargs):
+        raise GuardedSubmissionRejectedError(
+            "KIS API error from order: APBK0656 invalid exchange"
+        )
+
+    manager, _ = _manager(tmp_path, fake_submit)
+
+    assert (
+        manager.attempt_entry(_trigger()).outcome
+        == AttemptOutcome.BROKER_ROUTING_REJECTED
     )
 
 

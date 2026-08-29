@@ -38,6 +38,7 @@ def _load_repo_env() -> None:
 _load_repo_env()
 
 from src.core import execution_config  # noqa: E402
+from src.core.release_identity import current_release_identity  # noqa: E402
 from src.services.controlled_live_policy import (  # noqa: E402
     CONTROLLED_LIVE,
     controlled_live_symbols,
@@ -128,6 +129,13 @@ def main() -> int:
         "runtime SHA pin",
         bool(head) and os.getenv("KIS_RUNTIME_COMMIT_SHA", "").strip().lower() == head,
         "KIS_RUNTIME_COMMIT_SHA must equal the current git HEAD",
+    )
+    release_identity = current_release_identity()
+    result.check(
+        "approved exact-release identity",
+        not release_identity.issues,
+        "; ".join(release_identity.issues)
+        or "release identity could not be verified",
     )
 
     for name in (

@@ -42,6 +42,15 @@ def _configure_controlled_live(monkeypatch) -> None:
     monkeypatch.setattr(execution_config, "KIS_WS_ENABLED", True)
     monkeypatch.setattr(execution_config, "KIS_WS_PROTOCOL_VERIFIED", True)
     monkeypatch.setattr(execution_config, "KIS_MARKET_DATA_MODE", "WEBSOCKET")
+    monkeypatch.setattr(
+        execution_config, "PORTFOLIO_MAX_SIMULTANEOUS_POSITIONS", 30
+    )
+    monkeypatch.setattr(
+        execution_config, "PORTFOLIO_MAX_TOTAL_OPEN_RISK_FRACTION", 0.10
+    )
+    monkeypatch.setattr(
+        execution_config, "PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION", 2.0
+    )
     monkeypatch.setattr(execution_config, "is_buyboard_engine_enabled", lambda: True)
 
 
@@ -194,6 +203,34 @@ def test_controlled_live_configuration_requires_no_retry_spacing_and_budgets(
         require_controlled_live_configuration(
             environment="PROD", scheduler=scheduler
         )
+
+
+@pytest.mark.parametrize(
+    ("setting", "unsafe_value"),
+    (
+        ("PORTFOLIO_MAX_SIMULTANEOUS_POSITIONS", 31),
+        ("PORTFOLIO_MAX_TOTAL_OPEN_RISK_FRACTION", 0.11),
+        ("PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION", 2.01),
+    ),
+)
+def test_controlled_live_rejects_risk_limits_above_reviewed_profile(
+    monkeypatch, setting, unsafe_value
+):
+    _configure_controlled_live(monkeypatch)
+    monkeypatch.setattr(execution_config, setting, unsafe_value)
+
+    with pytest.raises(LiveExecutionEnvelopeError, match=setting):
+        require_controlled_live_configuration(environment="PROD")
+
+
+def test_controlled_live_rejects_malformed_risk_profile(monkeypatch):
+    _configure_controlled_live(monkeypatch)
+    monkeypatch.setattr(
+        execution_config, "PORTFOLIO_MAX_SIMULTANEOUS_POSITIONS", "invalid"
+    )
+
+    with pytest.raises(LiveExecutionEnvelopeError, match="valid finite"):
+        require_controlled_live_configuration(environment="PROD")
 
 
 def test_invalid_entry_risk_override_blocks_buy_but_not_protective_sell(

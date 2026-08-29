@@ -67,3 +67,15 @@ def test_resume_mode_refreshes_without_git_env_pip_or_duplicate_main():
     launch = text.index("$proc = Start-Process -FilePath $PythonExe")
 
     assert refresh < duplicate_guard < launch
+
+
+def test_cold_start_records_preflight_before_refresh_and_dashboard_launch():
+    text = _routine_text()
+
+    preflight = text.index('"scripts\\check_controlled_live_readiness.py"')
+    refresh = text.index('"scripts\\run_daily_refresh.py"')
+    launch = text.index("$proc = Start-Process -FilePath $PythonExe")
+
+    assert preflight < refresh < launch
+    assert '"controlled_live_preflight.json"' in text
+    assert "production broker mutations remain fail-closed" in text

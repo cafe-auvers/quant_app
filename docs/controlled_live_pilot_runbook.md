@@ -22,8 +22,10 @@ only the risk-envelope configuration.
 - Trade and quote subscription keys, aggregate capacity, buying power, startup
   reconciliation, lease ownership, and external alert delivery must be
   verified for the pilot account and symbols.
-- The PC is the sole KIS WebSocket owner. The laptop remains pull-only and does
-  not open a second session with the app key.
+- The current Execution Owner is the sole KIS WebSocket owner. The other
+  device remains pull-only and does not open a second session with the app
+  key. Both devices must publish the same approved release identity before a
+  controlled-live runtime can start.
 
 ## Fail-closed controlled-live configuration
 
@@ -45,6 +47,10 @@ KIS_MUTATION_BUDGET_WINDOW_SECONDS=1
 KIS_MUTATION_MIN_SPACING_SECONDS=0.2
 KIS_MUTATION_MAX_CONFIRMED_ATTEMPTS=1
 
+PORTFOLIO_MAX_SIMULTANEOUS_POSITIONS<=30
+PORTFOLIO_MAX_TOTAL_OPEN_RISK_FRACTION<=0.10
+PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION<=2.0
+
 KIS_MARKET_DATA_MODE=WEBSOCKET
 KIS_WS_ENABLED=true
 KIS_WS_PROTOCOL_VERIFIED=true
@@ -53,7 +59,11 @@ TRADING_ENABLED=true
 ```
 
 `TRADING_ENABLED=true` only permits the in-app session toggle. Trading still
-starts disarmed after every process launch. `CONTROLLED_LIVE` additionally
+starts disarmed after every process launch. Each ON action is bound to the
+current/next NYSE session and the approved runtime commit; it becomes
+ineffective at that session's close or after a release change and must be
+confirmed again. A legacy unscoped ON row fails closed. `CONTROLLED_LIVE`
+additionally
 blocks production BUYs without an exact active canonical Trade Card or above
 the per-entry cap.
 Protective SELLs are not blocked by the entry cap. The shared scheduler
@@ -97,6 +107,10 @@ python scripts/check_controlled_live_readiness.py
 Changing runtime configuration to make this check green is not a substitute
 for producing matching reviewed evidence. Never commit
 `config/runtime.local.json` or an unredacted capability bundle.
+The PC morning routine runs the same preflight before data refresh and writes
+its result to `data/logs/controlled_live_preflight.json`. A failed preflight
+does not hide the diagnostic dashboard, but the runtime and broker boundary
+remain closed.
 
 The shared operational Trade Card database is the symbol boundary; symbols
 never belong in `.env`. `data/trade_cards.json` is only a local recovery

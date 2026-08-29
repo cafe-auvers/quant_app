@@ -52,6 +52,10 @@ from src.core.exit_policy import market_session_date
 from src.core.runtime_readiness import EngineReadiness, RuntimeDeviceState
 from src.core.execution_order_record import ExecutionOrderStatus
 from src.core.order_state import OrderSide
+from src.core.release_identity import (
+    current_release_identity,
+    require_approved_release_identity,
+)
 from src.core.trade_card_state import (
     BoardStatus,
     EntryRuntimeStatus,
@@ -315,6 +319,7 @@ class BuyboardRuntimeWorker(QThread):
         self._external_alerting = external_alerting
         self._schema_migration_manager = schema_migration_manager
         self._regular_session_open = regular_session_open or is_regular_session_open
+        self._release_identity = current_release_identity()
         # How this worker finds the legacy execution queue's already-computed
         # ORB candidate for a symbol (review finding P0-2) -- typically
         # ``lambda symbol, env: main_window.execution_queue_manager.get_item(symbol, env)``.
@@ -628,6 +633,11 @@ class BuyboardRuntimeWorker(QThread):
             "kis_ready": reconciliation_ready,
             "broker_account": str(self._account_no or "all configured accounts"),
             "environment": self._environment,
+            "release_id": self._release_identity.release_id,
+            "repository_commit_sha": self._release_identity.repository_head,
+            "capability_manifest_sha256": (
+                self._release_identity.actual_manifest_sha256
+            ),
             "coordination_ru_profile": execution_config.COORDINATION_RU_PROFILE,
             "account_environment_ready": bool(
                 self._environment in {"PROD", "PAPER"} and reconciliation_ready
@@ -885,12 +895,25 @@ class BuyboardRuntimeWorker(QThread):
             return
         try:
             self._accepting_commands = False
+            controlled_release_required = bool(
+                str(self._environment or "").strip().upper() == "PROD"
+                and str(
+                    execution_config.KIS_LIVE_EXECUTION_MODE or "DISABLED"
+                ).strip().upper() in {"CONTROLLED_LIVE", "FULL_LIVE"}
+            )
+            if controlled_release_required:
+                self._release_identity = require_approved_release_identity()
             require_compatible_runtime_schema(
                 self._db_engine,
                 device_id=self._device_id,
                 lease_engine=self._lease_engine or self._db_engine,
                 required_coordination_profile=(
                     execution_config.COORDINATION_RU_PROFILE
+                ),
+                required_release_id=(
+                    self._release_identity.release_id
+                    if controlled_release_required
+                    else ""
                 ),
             )
             migration_manager = (

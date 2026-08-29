@@ -200,6 +200,32 @@ class GuardedSubmissionRejectedError(GuardedExecutionError):
     """The broker explicitly rejected the submission (a clean, pre-
     acceptance rejection) -- never treated as a reason to retry."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        broker_code: str = "",
+        broker_endpoint: str = "",
+        broker_message: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.broker_code = str(broker_code or "").strip().upper()
+        self.broker_endpoint = str(broker_endpoint or "").strip()
+        self.broker_message = str(broker_message or "").strip()
+
+    @classmethod
+    def from_broker_error(
+        cls, error: BaseException
+    ) -> "GuardedSubmissionRejectedError":
+        return cls(
+            str(error),
+            broker_code=str(getattr(error, "broker_code", "") or ""),
+            broker_endpoint=str(getattr(error, "endpoint", "") or ""),
+            broker_message=str(
+                getattr(error, "broker_message", "") or ""
+            ),
+        )
+
 
 class GuardedSubmissionPreBrokerAbortedError(GuardedSubmissionRejectedError):
     """A journaled submission was definitively aborted by a final mutable
@@ -1969,7 +1995,7 @@ class ExecutionCommandGateway:
             )
             if ambiguous:
                 raise GuardedSubmissionAmbiguousError(str(exc)) from exc
-            raise GuardedSubmissionRejectedError(str(exc)) from exc
+            raise GuardedSubmissionRejectedError.from_broker_error(exc) from exc
 
         self._append_emergency_outcome(
             request_entry=requested,
@@ -2503,7 +2529,7 @@ class ExecutionCommandGateway:
             )
             if ambiguous:
                 raise GuardedSubmissionAmbiguousError(error_message) from exc
-            raise GuardedSubmissionRejectedError(error_message) from exc
+            raise GuardedSubmissionRejectedError.from_broker_error(exc) from exc
 
         # 10. success -- ACKNOWLEDGED with exact identity.
         record.remaining_quantity = record.submitted_quantity

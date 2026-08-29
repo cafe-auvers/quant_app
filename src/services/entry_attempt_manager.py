@@ -487,7 +487,12 @@ class EntryAttemptManager:
             state.attempt_count = max(state.attempt_count, attempt_number)
             state.attempt_timestamps.append(now)
             detail = str(exc)
-            if "APBK0656" in detail.upper():
+            broker_code = str(
+                getattr(exc, "broker_code", "") or ""
+            ).strip().upper()
+            if broker_code == "APBK0656" or (
+                not broker_code and "APBK0656" in detail.upper()
+            ):
                 # KIS has definitively rejected this exact command, so no
                 # order is live, but APBK0656 is an exchange-routing/config
                 # failure rather than a strategy rejection. Preserve the

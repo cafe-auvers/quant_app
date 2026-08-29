@@ -14,10 +14,11 @@ legacy UI) targeting `master` with these required status checks:
 - `Gate 1 deterministic simulation`
 
 For this single-maintainer repository, requiring a pull request is optional.
-The repository-hygiene, secret-scan, dependency-review, and dependency-audit
-jobs in `ci.yml` are additional release evidence. Add them to the hosted
-required-check set only after their first successful run on `master`; requiring
-a check name before GitHub has registered it can deadlock every pull request.
+`Gate 1 deterministic simulation` depends on both the repository-hygiene job
+(including the secret scan) and the locked dependency audit. Because Gate 1 is
+required, those checks are transitively release-blocking without adding more
+hosted check names. Keep that dependency relationship intact when editing the
+workflow.
 
 Branch protection is GitHub-hosted state and cannot be enforced by
 `.github/workflows/ci.yml` itself. Re-check this rule if the workflow/job name
