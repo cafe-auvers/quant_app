@@ -239,17 +239,27 @@ Setup (once):
 2. On the laptop (as Administrator): `.\scripts\setup_laptop_winrm_trust.ps1`
    — adds the PC's Tailscale IP to the laptop's WinRM `TrustedHosts` (NTLM
    auth, since the two machines aren't in a shared Windows domain).
+3. Close the Administrator window. From the normal laptop Windows account:
+   `.\scripts\save_laptop_pc_winrm_credential.ps1`
+   — verifies the PC login and stores it under `%LOCALAPPDATA%\quant_app`
+   using Windows DPAPI encryption. The credential can be decrypted only by
+   that same Windows user on that same laptop and is never stored in the
+   repository or `.env`.
 
 Usage from the laptop:
 ```powershell
 .\scripts\tail_pc_log.ps1                              # tails data\logs\quant_app.log
 .\scripts\tail_pc_log.ps1 -LogName pc_morning_routine.log
 ```
-Or directly, for anything beyond log tailing:
+For anything beyond log tailing, use the saved-credential wrapper:
 ```powershell
-$cred = Get-Credential <PC-HOSTNAME>\<pc-username>
-Invoke-Command -ComputerName 100.x.x.x -Credential $cred -ScriptBlock { ... }
+.\scripts\invoke_pc_command.ps1 -ScriptBlock { $env:COMPUTERNAME }
 ```
+
+Re-run `save_laptop_pc_winrm_credential.ps1` after changing the PC account
+password. If the laptop Windows account or laptop itself changes, save the
+credential again from the new account/machine; the encrypted file is not
+portable by design.
 
 WinRM traffic is plain HTTP (port 5985); that's acceptable here because
 Tailscale already encrypts everything on that adapter (WireGuard) — same

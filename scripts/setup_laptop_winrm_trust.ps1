@@ -15,7 +15,7 @@ them.
 
 Usage:
     .\scripts\setup_laptop_winrm_trust.ps1
-    .\scripts\setup_laptop_winrm_trust.ps1 -PcTailscaleIp 100.x.x.x   # override .env's PC_REMOTE_CONTROL_HOST
+    .\scripts\setup_laptop_winrm_trust.ps1 -PcTailscaleIp 100.x.x.x   # override runtime config's PC_REMOTE_CONTROL_HOST
 #>
 
 param(
@@ -30,6 +30,24 @@ if (-not $IsElevated) {
     throw "Run this from an elevated (Administrator) PowerShell window -- changing the WinRM client TrustedHosts list requires it. Right-click PowerShell -> Run as administrator, then re-run this command."
 }
 
+if (-not $PcTailscaleIp) {
+    $RepoRoot = Split-Path -Parent $PSScriptRoot
+    foreach ($ConfigName in @("runtime.local.json", "runtime.json")) {
+        $ConfigFile = Join-Path $RepoRoot "config\$ConfigName"
+        if (Test-Path $ConfigFile) {
+            try {
+                $RuntimeConfig = Get-Content $ConfigFile -Raw | ConvertFrom-Json
+                $Candidate = [string]$RuntimeConfig.PC_REMOTE_CONTROL_HOST
+                if ($Candidate.Trim()) {
+                    $PcTailscaleIp = $Candidate.Trim()
+                    break
+                }
+            } catch {
+                throw "Couldn't parse ${ConfigFile}: $($_.Exception.Message)"
+            }
+        }
+    }
+}
 if (-not $PcTailscaleIp) {
     $RepoRoot = Split-Path -Parent $PSScriptRoot
     $EnvFile = Join-Path $RepoRoot ".env"
@@ -61,9 +79,11 @@ if ($hosts -contains $PcTailscaleIp -or $hosts -contains "*") {
 }
 
 Write-Host ""
-Write-Host "Test the connection (replace the account with the one printed by setup_pc_winrm_tailscale_access.ps1):"
-Write-Host "    `$cred = Get-Credential <PC-HOSTNAME>\<pc-username>"
-Write-Host "    Invoke-Command -ComputerName $PcTailscaleIp -Credential `$cred -ScriptBlock { `$env:COMPUTERNAME }"
+Write-Host "TrustedHosts setup is complete. Close this Administrator window."
 Write-Host ""
-Write-Host "Once that works, tail a PC log live with:"
-Write-Host "    .\scripts\tail_pc_log.ps1 -LogName quant_app.log -Credential `$cred"
+Write-Host "Then, from the laptop's normal (non-elevated) PowerShell window, save and verify the PC credential once:"
+Write-Host "    .\scripts\save_laptop_pc_winrm_credential.ps1 -PcTailscaleIp $PcTailscaleIp"
+Write-Host ""
+Write-Host "After that, access the PC without another password prompt:"
+Write-Host "    .\scripts\tail_pc_log.ps1 -LogName quant_app.log"
+Write-Host "    .\scripts\invoke_pc_command.ps1 -ScriptBlock { `$env:COMPUTERNAME }"

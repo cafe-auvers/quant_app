@@ -1,26 +1,18 @@
 <#
-Run this on the LAPTOP, any time after setup_pc_winrm_tailscale_access.ps1
-and setup_laptop_winrm_trust.ps1 have both been run once.
-
-Streams a log file live from the always-on PC's data\logs folder over
-WinRM/Tailscale, same as watching it locally with `Get-Content -Wait`.
-Automatically loads the DPAPI-encrypted laptop credential created by
-save_laptop_pc_winrm_credential.ps1. An explicit -Credential still overrides
-the saved value.
+Run a PowerShell command on the always-on PC from the laptop over
+WinRM/Tailscale. By default this loads the DPAPI-encrypted credential created
+by save_laptop_pc_winrm_credential.ps1, so no password prompt is required.
 
 Usage:
-    .\scripts\tail_pc_log.ps1
-    .\scripts\tail_pc_log.ps1 -LogName pc_morning_routine.log
-    .\scripts\tail_pc_log.ps1 -LogName quant_app.log -Lines 200
-    .\scripts\save_laptop_pc_winrm_credential.ps1 # one-time password prompt
-    .\scripts\tail_pc_log.ps1                     # no later prompt
+    .\scripts\invoke_pc_command.ps1 -ScriptBlock { $env:COMPUTERNAME }
+    .\scripts\invoke_pc_command.ps1 -ScriptBlock { Get-Process python }
 #>
 
 param(
-    [string]$LogName = "quant_app.log",
-    [int]$Lines = 50,
+    [Parameter(Mandatory = $true)]
+    [scriptblock]$ScriptBlock,
+    [object[]]$ArgumentList = @(),
     [string]$PcTailscaleIp,
-    [string]$PcRepoRoot,
     [System.Management.Automation.PSCredential]$Credential,
     [string]$CredentialPath = (Join-Path $env:LOCALAPPDATA "quant_app\pc_winrm_credential.clixml")
 )
@@ -54,7 +46,7 @@ if (-not $PcTailscaleIp) {
     }
 }
 if (-not $PcTailscaleIp) {
-    throw "Couldn't determine the PC's Tailscale IP. Pass it explicitly: -PcTailscaleIp 100.x.x.x"
+    throw "Couldn't determine the PC's Tailscale IP. Pass it explicitly with -PcTailscaleIp 100.x.x.x."
 }
 
 if (-not $Credential) {
@@ -70,24 +62,12 @@ if (-not $Credential) {
     }
 }
 
-Write-Host "Tailing $LogName on $PcTailscaleIp -- Ctrl+C to stop."
-Invoke-Command -ComputerName $PcTailscaleIp -Authentication Negotiate `
-    -Credential $Credential -ScriptBlock {
-    param($RepoRoot, $LogName, $Lines)
-    if (-not $RepoRoot) {
-        $RepoRoot = @(
-            (Join-Path $env:USERPROFILE "quant_app"),
-            (Join-Path $env:USERPROFILE "Documents\quant_app")
-        ) | Where-Object {
-            Test-Path (Join-Path $_ "data\logs")
-        } | Select-Object -First 1
-    }
-    if (-not $RepoRoot) {
-        throw "Couldn't locate the quant_app repository on the PC. Pass -PcRepoRoot explicitly."
-    }
-    $Path = Join-Path $RepoRoot "data\logs\$LogName"
-    if (-not (Test-Path $Path)) {
-        throw "No such log file on the PC: $Path"
-    }
-    Get-Content -Path $Path -Tail $Lines -Wait
-} -ArgumentList $PcRepoRoot, $LogName, $Lines
+if ($ArgumentList.Count -gt 0) {
+    Invoke-Command -ComputerName $PcTailscaleIp -Authentication Negotiate `
+        -Credential $Credential `
+        -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList
+} else {
+    Invoke-Command -ComputerName $PcTailscaleIp -Authentication Negotiate `
+        -Credential $Credential `
+        -ScriptBlock $ScriptBlock
+}
